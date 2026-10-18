@@ -3598,36 +3598,12 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 # site, so a template ran somewhere other than where the
                 # selection was.
                 tab = require_tab(body.get("tab"))
-                local = template.get("scope") == "local"
-                if not local and tab is None:
-                    self.send_json({"success": False,
-                                    "error": "Not connected. A remote command "
-                                             "needs an open session."},
+                results, run_error = execute_custom_command(
+                    template, filenames, tab)
+                if run_error:
+                    self.send_json({"success": False, "error": run_error},
                                    status=400)
                     return
-                results = []
-                for filename in filenames:
-                    command, error = build_custom_command(template, filename)
-                    if error:
-                        results.append({"file": filename, "success": False,
-                                        "error": error})
-                        continue
-                    add_log("Custom command '%s': %s" % (name, command), "cmd")
-                    try:
-                        if local:
-                            code, stdout, stderr = run_linscp(command,
-                                                              tab.session if tab else None)
-                        else:
-                            code, lines, errors = tab.run_many_capture(
-                                ["cd " + quote_remote(tab.remote_dir), command])
-                            stdout, stderr = "\n".join(lines), "\n".join(errors)
-                    except ValueError as exc:
-                        results.append({"file": filename, "success": False,
-                                        "error": str(exc)})
-                        continue
-                    results.append({"file": filename, "success": code == 0,
-                                    "exit_code": code,
-                                    "stdout": stdout, "stderr": stderr})
                 self.send_json({"success": True, "results": results,
                                 "scope": template.get("scope", "remote")})
             else:
@@ -3760,6 +3736,46 @@ def build_custom_command(template, filename):
     if "{file}" not in template["command"]:
         return template["command"], ""
     return template["command"].replace("{file}", quoted), ""
+
+
+def execute_custom_command(template, filenames, tab):
+    """Run one template against every selected name.
+
+    Returns (results, error). A remote template runs in the session the
+    panel belongs to - the connection the user is looking at - while a
+    local one runs in a short-lived core process; neither ever reaches
+    a shell, and a name that is not one entry of the panel fails its
+    own result without stopping the files behind it.
+    """
+    local = template.get("scope") == "local"
+    if not local and tab is None:
+        return [], ("Not connected. A remote command needs an open "
+                    "session.")
+    name = template.get("name", "")
+    results = []
+    for filename in filenames:
+        command, error = build_custom_command(template, filename)
+        if error:
+            results.append({"file": filename, "success": False,
+                            "error": error})
+            continue
+        add_log("Custom command '%s': %s" % (name, command), "cmd")
+        try:
+            if local:
+                code, stdout, stderr = run_linscp(
+                    command, tab.session if tab else None)
+            else:
+                code, lines, errors = tab.run_many_capture(
+                    ["cd " + quote_remote(tab.remote_dir), command])
+                stdout, stderr = "\n".join(lines), "\n".join(errors)
+        except ValueError as exc:
+            results.append({"file": filename, "success": False,
+                            "error": str(exc)})
+            continue
+        results.append({"file": filename, "success": code == 0,
+                        "exit_code": code,
+                        "stdout": stdout, "stderr": stderr})
+    return results, ""
 
 
 # ---------------------------------------------------------------------------

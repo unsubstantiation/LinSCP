@@ -102,6 +102,28 @@ const responses = {
     error: '' } }
 };
 
+/* The persisted command templates the custom-commands dialog lists, saves
+ * and runs. Both fetch stubs below answer it: the browsing tests replace
+ * the first stub, and the dialog tests run after that replacement. */
+function customCommandsBody(options) {
+  let request = {};
+  try { request = JSON.parse((options && options.body) || '{}'); } catch (error) {}
+  const stored = [
+    { name: 'Checksum', command: 'checksum sha-256 {file}', scope: 'remote' },
+    { name: 'Local word count', command: 'wc {file}', scope: 'local' }
+  ];
+  if (request.action === 'save') {
+    stored.push({ name: request.name, command: request.command, scope: request.scope });
+    return { success: true, commands: stored };
+  }
+  if (request.action === 'run') {
+    return { success: true, scope: 'remote',
+      results: (request.filenames || []).map(name => (
+        { file: name, success: true, exit_code: 0, stdout: 'ok ' + name, stderr: '' })) };
+  }
+  return { success: true, commands: stored };
+}
+
 const TOKEN = 'test-token-0123456789abcdef';
 
 const calls = [];
@@ -118,6 +140,9 @@ const dom = new JSDOM(html, {
       const path = String(url).replace('http://localhost:8080', '').split('?')[0];
       calls.push({ path: path, url: String(url), options: options });
       let body = responses[path];
+      if (path === '/api/custom-commands') {
+        body = customCommandsBody(options);
+      }
       if (path === '/api/remote/search') {
         let request = {};
         try { request = JSON.parse(options.body || '{}'); } catch (error) {}
@@ -435,6 +460,10 @@ function options(id) {
         { success: true, path: dir, entries: table[dir] } :
         { success: false, error: 'No such directory: ' + dir };
       return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+    }
+    if (path === '/api/custom-commands') {
+      return Promise.resolve(
+        { ok: true, json: () => Promise.resolve(customCommandsBody(options)) });
     }
     const body = responses[path];
     if (body === undefined) {
@@ -762,6 +791,60 @@ function options(id) {
   doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
   check('ArrowDown advances selection in the focused pane',
     doc.getElementById('localFileList').children[1].getAttribute('aria-selected') === 'true');
+
+  // Explorer-style single-panel view: the focused pane fills the window,
+  // the other is hidden, and the choice survives a reload.
+  window.toggleExplorerMode();
+  const main = doc.querySelector('.commander-main');
+  check('explorer mode marks the layout and hides the unfocused pane',
+    main.classList.contains('explorer-mode') &&
+      doc.getElementById('remotePane').style.display === 'none' &&
+      doc.getElementById('localPane').style.display !== 'none',
+    'remote=' + doc.getElementById('remotePane').style.display);
+  check('explorer choice is persisted',
+    window.localStorage.getItem('lscp-explorer') === '1');
+  window.toggleExplorerMode();
+  check('leaving explorer mode shows both panes again',
+    !main.classList.contains('explorer-mode') &&
+      doc.getElementById('remotePane').style.display !== 'none');
+
+  // Custom commands: the dialog lists the persisted templates, saves a
+  // new one, and runs the chosen one against the panel selection only
+  // after an explicit confirmation showing the command and the names.
+  await window.openCustomCommands();
+  check('custom commands dialog lists the persisted templates',
+    doc.getElementById('customCommandsList').children.length === 2);
+  doc.getElementById('customCmdName').value = 'List it';
+  doc.getElementById('customCmdCommand').value = 'ls {file}';
+  doc.getElementById('customCmdScope').value = 'remote';
+  await window.saveCustomCommand();
+  const cmdSave = calls.filter(c => c.path === '/api/custom-commands').pop();
+  check('saving a template posts its name, command and scope',
+    cmdSave && JSON.parse(cmdSave.options.body).action === 'save' &&
+      JSON.parse(cmdSave.options.body).name === 'List it' &&
+      JSON.parse(cmdSave.options.body).command === 'ls {file}' &&
+      JSON.parse(cmdSave.options.body).scope === 'remote');
+  check('saved template joins the dialog list',
+    doc.getElementById('customCommandsList').children.length === 3);
+  doc.getElementById('customCmdName').value = 'Checksum';
+  let confirmedWith = null;
+  const realConfirm = window.confirm;
+  window.confirm = text => { confirmedWith = text; return true; };
+  await window.runCustomCommand();
+  window.confirm = realConfirm;
+  const cmdRun = calls.filter(c => c.path === '/api/custom-commands').pop();
+  check('running asks for confirmation naming the command',
+    confirmedWith !== null && confirmedWith.indexOf('checksum sha-256') >= 0,
+    String(confirmedWith).slice(0, 120));
+  check('run posts the template name, the selection and the tab',
+    cmdRun && JSON.parse(cmdRun.options.body).action === 'run' &&
+      JSON.parse(cmdRun.options.body).name === 'Checksum' &&
+      Array.isArray(JSON.parse(cmdRun.options.body).filenames) &&
+      JSON.parse(cmdRun.options.body).filenames.length >= 1 &&
+      'tab' in JSON.parse(cmdRun.options.body));
+  check('run renders one result per file',
+    doc.getElementById('customCommandsResult').children.length >= 1);
+  window.closeModal('customCommandsModal');
 
   check('no script errors', errors.length === 0, errors.join(' | '));
   window.close();

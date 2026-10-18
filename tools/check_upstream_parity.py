@@ -53,6 +53,7 @@ CASE_SOURCES = {
     "gui-search": "source/gui/tests/RemoteSearchTest.py",
     "gui-local-editor": "source/gui/tests/LocalEditorTest.py",
     "gui-browser-upload": "source/gui/tests/BrowserUploadTest.py",
+    "gui-security": "source/gui/tests/SecurityTest.py",
     "gui-desktop-uri": "source/gui/tests/DesktopUriTest.py",
     "platform-conversion": "tools/tests/test_platform_conversion.py",
 }

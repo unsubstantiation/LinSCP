@@ -2,7 +2,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-9 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+8 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -29,18 +29,6 @@ The loopback GUI has no multi-user account or authorization roles.
 **Acceptance criteria:**
 
 - [ ] Define deployment/isolation boundaries before enabling network access. Add password hashing, login/session expiry, CSRF protection and per-user configuration, filesystem and queue isolation. Negative authorization tests must cover every API route, not just login.
-
-## gui.explorer-custom-commands
-
-**Area:** GUI · **Status:** missing
-
-No separate upstream Explorer-style UI or custom-command framework.
-
-**Next:** Build/test Explorer navigation and custom-command execution with appropriate safety prompts.
-
-**Acceptance criteria:**
-
-- [ ] Implement single-pane Explorer navigation plus persisted command templates, explicit confirmation and safe filename substitution. Test local/remote scope, multiple selections and hostile filenames; never interpolate into a shell implicitly.
 
 ## automation.dotnet
 

@@ -621,6 +621,82 @@ class CustomCommandTests(unittest.TestCase):
         self.assertEqual(error, "")
         self.assertEqual(command, "sessions")
 
+    def test_a_remote_run_uses_the_panel_session_without_a_shell(self):
+        seen = []
+
+        class FakeTab:
+            remote_dir = "/data"
+            session = {"host": "example.com"}
+
+            def run_many_capture(self, commands, timeout=120):
+                seen.extend(commands)
+                return 0, ["523b87"], []
+
+        template = {"name": "sum", "command": "checksum sha-256 {file}",
+                    "scope": "remote"}
+        results, error = gui.execute_custom_command(
+            template, ["a.txt", "b.txt"], FakeTab())
+        self.assertEqual(error, "")
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(item["success"] for item in results))
+        self.assertEqual(results[0]["file"], "a.txt")
+        # One 'cd' plus the substituted command per file, quoted for the
+        # client's splitter rather than interpolated into a shell: no
+        # shell ever sees these words.
+        self.assertEqual(seen[0], "cd /data")
+        self.assertEqual(seen[1], 'checksum sha-256 a.txt')
+        self.assertEqual(seen[3], 'checksum sha-256 b.txt')
+        self.assertNotIn(";", "".join(seen))
+
+    def test_a_local_run_goes_through_the_core_not_a_shell(self):
+        calls = []
+
+        def fake_run(command, session=None, timeout=300):
+            calls.append((command, session))
+            return 0, "counted", ""
+
+        template = {"name": "wc", "command": "lls {file}", "scope": "local"}
+        with mock.patch.object(gui, "run_linscp", side_effect=fake_run):
+            results, error = gui.execute_custom_command(
+                template, ["odd\"name"], None)
+        self.assertEqual(error, "")
+        self.assertTrue(results[0]["success"])
+        # The name is quoted for the client's splitter: the quote inside
+        # it cannot end the operand and start a second command.
+        self.assertEqual(calls[0][0], 'lls "odd\\\"name"')
+
+    def test_a_hostile_name_fails_its_file_and_runs_the_rest(self):
+        seen = []
+
+        class FakeTab:
+            remote_dir = "/data"
+            session = {}
+
+            def run_many_capture(self, commands, timeout=120):
+                seen.extend(commands)
+                return 0, ["ok"], []
+
+        template = {"name": "sum", "command": "checksum sha-256 {file}",
+                    "scope": "remote"}
+        results, error = gui.execute_custom_command(
+            template, ["good.txt", "../escape", "fine.txt"], FakeTab())
+        self.assertEqual(error, "")
+        self.assertEqual(len(results), 3)
+        self.assertTrue(results[0]["success"])
+        self.assertFalse(results[1]["success"])
+        self.assertTrue(results[1]["error"])
+        self.assertTrue(results[2]["success"])
+        # The hostile name was never substituted into a command.
+        self.assertNotIn("escape", "".join(seen))
+
+    def test_a_remote_run_without_a_session_is_refused(self):
+        template = {"name": "sum", "command": "checksum sha-256 {file}",
+                    "scope": "remote"}
+        results, error = gui.execute_custom_command(
+            template, ["a.txt"], None)
+        self.assertEqual(results, [])
+        self.assertIn("open session", error)
+
 
 class LoginTests(unittest.TestCase):
     def setUp(self):
