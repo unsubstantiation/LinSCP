@@ -2,7 +2,7 @@
   <img src="logo/linscp-mark.png" alt="LinSCP logo" width="160" height="160" />
 </p>
 
-<img width="1681" height="1148" alt="image" src="https://github.com/user-attachments/assets/642f19d0-e14f-4f45-a8d7-02b2654d77b5" />
+<img src="pic.jpg" />
 
 # LinSCP
 
