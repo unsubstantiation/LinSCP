@@ -32,10 +32,12 @@ import linscp_gui as gui  # noqa: E402
 def split_command_line(text):
     """Split a command line the way the console client's splitter does.
 
-    Double quotes group, a backslash escapes the next character, and
-    whitespace separates. Written here rather than reused so that a
-    mistake in the quoting is visible as a wrong token count instead of
-    depending on the same code that produced it.
+    Double quotes group, a backslash escapes the next character outside
+    quotes, and inside double quotes a backslash is literal unless it
+    stands in front of a double quote or of another backslash. Written
+    here rather than reused so that a mistake in the quoting is visible
+    as a wrong token count instead of depending on the same code that
+    produced it.
     """
     tokens = []
     current = []
@@ -43,7 +45,8 @@ def split_command_line(text):
     index = 0
     while index < len(text):
         char = text[index]
-        if char == "\\" and index + 1 < len(text):
+        if char == "\\" and index + 1 < len(text) and (
+                not in_quotes or text[index + 1] in '"\\'):
             current.append(text[index + 1])
             index += 2
             continue
@@ -79,6 +82,17 @@ class OperandQuotingTests(unittest.TestCase):
         for name in ("a\\b", "back\\slash", "trailing\\", "a\\ b"):
             self.assertEqual(split_command_line(gui.quote_remote(name)), [name])
             self.assertEqual(split_command_line(gui.quote_local(name)), [name])
+
+    def test_a_path_of_a_windows_client_survives_the_splitter(self):
+        # The splitter follows the rules of a POSIX shell, so a path that
+        # came from a Windows client keeps its separators: inside double
+        # quotes a backslash is literal unless it stands in front of a
+        # double quote or of another backslash.
+        name = "C:\\Users\\me\\file.txt"
+        quoted = gui.quote_remote(name)
+        self.assertEqual(quoted, '"C:\\\\Users\\\\me\\\\file.txt"')
+        self.assertEqual(split_command_line(quoted), [name])
+        self.assertEqual(split_command_line(gui.quote_local(name)), [name])
 
     def test_a_control_character_is_refused_rather_than_quoted(self):
         # The core reads one command per line in -server mode, so a name

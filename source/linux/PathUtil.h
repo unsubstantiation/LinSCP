@@ -19,7 +19,14 @@
 namespace linscp {
 
 /* Splits a script/command line into words. Handles single quotes, double
- * quotes and backslash escapes; the quotes themselves are not kept. */
+ * quotes and backslash escapes; the quotes themselves are not kept.
+ *
+ * The rules are the ones a POSIX shell uses, because the names on this
+ * platform are POSIX names: a single-quoted word is literal, a
+ * double-quoted word keeps its spaces, and a backslash escapes the
+ * character behind it outside quotes. Inside double quotes a backslash
+ * is literal unless it stands in front of a double quote or of another
+ * backslash, so a Windows path keeps its separators there. */
 std::vector<std::string> SplitCommandLine(const std::string & line);
 /* Splits a command line holding several commands separated by ';' into the
  * individual commands. ';' inside quotes is kept. */

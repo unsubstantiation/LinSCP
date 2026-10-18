@@ -88,6 +88,10 @@ jobs:
           python3 tools/tests/test_translations.py
           python3 tools/check_upstream_parity.py
           python3 tools/tests/test_parity_inventory.py
+      - name: Check that the Windows-to-Linux conversion is complete
+        run: |
+          python3 tools/check_platform_conversion.py
+          python3 tools/tests/test_platform_conversion.py
       - name: Smoke test
         run: |
           source/linux/build/linscp -version
@@ -274,6 +278,12 @@ jobs:
           prefix = Path(os.environ['LIN_PREFIX'])
           assert gui.find_linscp_binary() == str(prefix / 'bin/linscp')
           assert (prefix / 'share/linscp/gui/web/index.html').is_file()
+          # The PowerShell module and the command templates have to be
+          # there too: without the templates the graphical client starts
+          # with an empty command list.
+          assert (prefix / 'share/linscp/automation/LinSCP.psm1').is_file()
+          assert (prefix / 'share/linscp/gui/explorer-commands.json').is_file()
+          assert gui._default_custom_commands()
           PY
 
   debian-package:
@@ -313,11 +323,15 @@ jobs:
           # The package is the product. The GUI's module and crypto helper
           # are listed by name because a package that ships only one of them
           # installs a launcher that cannot start, which is what the previous
-          # packaging did.
+          # packaging did. The command templates and the PowerShell module
+          # are listed for the same reason: an installation without them
+          # offers an empty command list and no automation entry point.
           for path in usr/bin/linscp usr/bin/linscp-gui \
                       usr/share/linscp/gui/linscp_gui.py \
                       usr/share/linscp/gui/linscp_crypto.py \
+                      usr/share/linscp/gui/explorer-commands.json \
                       usr/share/linscp/gui/web/index.html \
+                      usr/share/linscp/automation/LinSCP.psm1 \
                       usr/share/applications/linscp.desktop \
                       usr/share/pixmaps/linscp.png \
                       usr/share/icons/hicolor/scalable/apps/linscp.svg \

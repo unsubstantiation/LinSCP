@@ -1,3 +1,37 @@
+linscp (1.0-4) unstable; urgency=medium
+
+  * The Windows-to-Linux conversion is complete, and the build now checks
+    it. The script command splitter read a backslash as the start of an
+    escape inside double quotes - the rule of a Windows command line, which
+    this client inherited with it. A path carried over from a Windows
+    client lost its separators: "C:\Users\me" was read as "C:Usersme", and
+    a file named "a\b.txt" as "ab.txt", so the name of one file became the
+    name of another. The splitter follows the rules of a POSIX shell now,
+    which is what the names on this platform are.
+  * The error messages carried the operation phrases of the Windows client
+    inside a template that supplies its own preposition, so the client
+    said "Local change of directory to of '...' failed.". The phrases fit
+    the template now, in English and in Spanish.
+  * The public C ABI header of the Windows automation API
+    (source/linux/liblinscp.h) is gone: it declared a library that no
+    build produced, and the Makefile installed it. The automation object
+    model stays a tracked gap.
+  * The half-translated Nautilus file-manager extension is gone: it ran no
+    session, so it uploaded nothing, and it was neither installed nor
+    documented. The desktop extension stays a tracked gap.
+  * The Makefile, CMake and the Debian package install the same files now.
+    The graphical client's command templates are installed again - an
+    installed client started with an empty command list - and the
+    PowerShell module is in the package as well.
+  * tools/check_platform_conversion.py reads the sources and refuses a
+    Windows API call, a Windows environment variable, a Windows path, a
+    file of another platform, an installer that disagrees with the others,
+    and an error message that contradicts its template. It runs in
+    "make -C source/linux check", as the CTest case
+    "platform-conversion-check", and in CI.
+
+ -- nuipona <nuipona@users.noreply.github.com>  Sun, 18 Oct 2026 00:00:00 +0000
+
 linscp (1.0-3) unstable; urgency=medium
 
   * Test dependencies: the browser test suites use jsdom 29, the newest

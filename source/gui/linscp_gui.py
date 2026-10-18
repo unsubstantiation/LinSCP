@@ -1292,8 +1292,11 @@ def quote_remote(path):
     A backslash needs the quotes as much as a blank does. The client's
     splitter reads a backslash as the start of an escape outside quotes,
     so an unquoted 'a\\b' arrived at the server as 'ab': the name of one
-    file was the name of another. Quoting it keeps the backslash, and
-    the local side has always quoted it that way.
+    file was the name of another. Inside double quotes it reads a
+    backslash as literal unless the backslash stands in front of a
+    double quote or of another backslash, so a doubled backslash is
+    what keeps one - and a path that came from a Windows client keeps
+    its separators. The local side has always quoted it that way.
     """
     if not isinstance(path, str):
         raise ValueError("A remote path must be text.")

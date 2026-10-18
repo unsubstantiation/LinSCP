@@ -28,7 +28,8 @@
           "gui-browser-upload": "source/gui/tests/BrowserUploadTest.py - rejects missing run tokens and invalid/traversal paths, stages exact bytes from HTTP to a private file, queues nested uploads and explicit empty directories with retry-safe parent creation, verifies that background tasks use -literal for percent-sign filenames, and removes partial staging on an incomplete upload. ClientTest.js exercises browser file/folder traversal, batches, and target selection.",
           "gui-desktop-uri": "source/gui/tests/DesktopUriTest.py - validates sftp://, ftp:// and ftps:// desktop URLs, default and explicit ports, escaped credentials and paths, IPv6 authorities, rejected malformed/query URLs, and startup creation/activation of the site tab without trusting an unknown host key. It also checks core lookup under a relocated install prefix.",
           "gui-local-editor": "source/gui/tests/LocalEditorTest.py - read and atomic local text save, stale-edit conflicts, rejection of binary/large files and symlink overwrite, and panel path confinement; standard library only.",
-          "gui-localization": "source/gui/tests/LocalizationTest.js under node/jsdom - boots the real English/Spanish page with persisted, server and browser language selection; checks static text and ARIA, queue statuses, plural forms, literal placeholders, host-key verification, editor saves, sync preview and transfer API payloads, and unsaved-edit protection on language changes."
+          "gui-localization": "source/gui/tests/LocalizationTest.js under node/jsdom - boots the real English/Spanish page with persisted, server and browser language selection; checks static text and ARIA, queue statuses, plural forms, literal placeholders, host-key verification, editor saves, sync preview and transfer API payloads, and unsaved-edit protection on language changes.",
+          "platform-conversion": "tools/check_platform_conversion.py with tools/tests/test_platform_conversion.py - the guard that keeps the Windows-to-Linux conversion complete: it reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose wording contradicts the template it is filled into. Its own cases hold it to the same standard: it has to fail on the things it claims to catch and stay quiet about the ones it does not."
         }
       }
     }
@@ -2478,7 +2479,7 @@
       "id": "automation.dotnet",
       "area": "Automation",
       "status": "missing",
-      "notes": "No WinSCP .NET assembly or equivalent object model for Linux.",
+      "notes": "No WinSCP .NET assembly or equivalent object model for Linux. The C ABI header the Windows port left behind (source/linux/liblinscp.h) is gone: it declared a library that no build produced, and a public header for an API that does not exist is worse than none. The gap is unchanged - the automation object model still has to be built.",
       "gap": "Define an API contract and test automation clients; a CLI is not the assembly.",
       "acceptance": [
         "Define the Linux object-model contract and upstream compatibility boundary. Build and test an actual .NET library for session lifecycle, listing, transfer, synchronization, cancellation, structured results and error propagation. A subprocess helper alone is not assembly parity."
@@ -2488,7 +2489,7 @@
       "id": "automation.powershell",
       "area": "Automation",
       "status": "partial",
-      "notes": "automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install' puts it in PREFIX/share/linscp/automation. Nothing exercises it: no automated case runs PowerShell, so its session lifetime, pipeline objects, terminating errors, cancellation and secret handling are unevidenced, and it is a shim over the CLI rather than upstream's assembly API.",
+      "notes": "automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Nothing exercises it: no automated case runs PowerShell, so its session lifetime, pipeline objects, terminating errors, cancellation and secret handling are unevidenced, and it is a shim over the CLI rather than upstream's assembly API.",
       "gap": "Exercise the shipped module with PowerShell on Linux: a session opened and closed, an upload and a download of exact bytes, a listing as pipeline objects, a terminating error, a cancelled transfer, and a password that appears neither in the process list nor in the output.",
       "acceptance": [
         "Build cmdlets or a documented compatibility module on the tested automation contract. Exercise them with PowerShell on Linux, including pipeline objects, terminating errors, cancellation and secret handling."
@@ -2573,7 +2574,7 @@
       "id": "desktop.shell-and-extensions",
       "area": "Desktop integration",
       "status": "missing",
-      "notes": "No system file-manager shell commands or upstream extension system.",
+      "notes": "No system file-manager shell commands or upstream extension system. The half-translated Nautilus extension the Windows Explorer integration left behind is gone: it ran no session, so it uploaded nothing, and it was neither installed nor documented. The command templates of the graphical client (source/gui/explorer-commands.json) are its own feature and are shipped by all three installers.",
       "gap": "Specify desired desktop environment integrations and build/test them individually.",
       "acceptance": [
         "Specify supported file managers and extension API. Add explicit, opt-in installation and removal, selection transport without shell interpolation, confirmation and extension permission boundaries. Test packaged installation as well as source-tree execution."
@@ -2804,6 +2805,37 @@
       }
     },
     {
+      "id": "platform.conversion-completeness",
+      "area": "Packaging/platforms",
+      "status": "verified",
+      "notes": "LinSCP is a Linux-only client and the check that says so is part of the build: tools/check_platform_conversion.py reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose operation phrase contradicts the template it is filled into. It runs in 'make -C source/linux check', as the CTest case 'platform-conversion-check', and in CI. The vendored PuTTY tree is not scanned: it is upstream's code and keeps upstream's Windows comments, while the platform layer this project owns (libs/putty/unix) is.",
+      "source": [
+        "tools/check_platform_conversion.py",
+        "tools/tests/test_platform_conversion.py"
+      ],
+      "checks": {
+        "platform-conversion": [
+          "test_the_real_tree_has_no_windows_construct",
+          "test_a_windows_api_call_is_found",
+          "test_a_windows_header_is_found",
+          "test_a_windows_only_branch_is_found",
+          "test_a_windows_environment_variable_is_found",
+          "test_a_windows_drive_letter_is_found",
+          "test_a_comment_naming_a_windows_path_is_not_a_finding",
+          "test_a_test_fixture_may_hold_a_windows_path",
+          "test_a_windows_file_in_the_tree_is_found",
+          "test_a_removed_artefact_is_found",
+          "test_an_installer_that_misses_a_file_is_found",
+          "test_an_operation_phrase_ending_in_a_preposition_is_found"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "platform-conversion"
+        ]
+      }
+    },
+    {
       "id": "ftp.non-unix-listings",
       "area": "FTP/FTPS",
       "status": "verified",
@@ -2935,6 +2967,7 @@
       "Source/test citations record where evidence is defined, not a claim that every suite ran in this workspace.",
       "Mock-server/browser fixtures do not certify every real server, browser, file manager or architecture.",
       "Missing capabilities are retained and must not be deleted to pass the full-parity gate."
-    ]
+    ],
+    "conversion": "LinSCP ships on Linux alone. The Windows port was removed in 1.0-2 and this audit looked for what it left behind: the script command splitter still read a backslash as an escape inside double quotes, so a path carried over from a Windows client lost its separators; the error messages still carried the Windows wording of an operation phrase, so the template said a preposition twice; the tree still held a public C ABI header with no library behind it and a half-translated file-manager extension that could not run; and the three installers disagreed about what an installation contains. All four are fixed, and tools/check_platform_conversion.py now keeps them fixed."
   }
 }

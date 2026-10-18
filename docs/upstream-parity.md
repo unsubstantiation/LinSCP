@@ -63,6 +63,44 @@ Upstream Windows VCL forms, .NET assemblies, Explorer commands and shell
 extensions have no Linux substitute. GSSAPI, SSH tunnels, multi-user GUI
 isolation, automation APIs and desktop extensions remain in the plan.
 
+## The platform conversion
+
+LinSCP ships on Linux alone. The Windows port was removed in 1.0-2, and an
+audit of what it left behind found four things that were still Windows:
+
+- The script command splitter read a backslash as the start of an escape
+  inside double quotes, the rule a Windows command line follows. A path
+  carried over from a Windows client lost its separators: `"C:\Users\me"`
+  arrived as `C:Usersme`, and a file named `a\b.txt` was read as `ab.txt`,
+  so the name of one file became the name of another. The splitter now
+  follows the rules of a POSIX shell, which is what the names on this
+  platform are.
+- The error messages carried the operation phrases of the Windows client
+  ("change of directory to", "expansion of") inside a template that supplies
+  its own preposition, so the client said "Local change of directory to of
+  '...' failed." The phrases fit the template now, and the check below
+  refuses one that does not.
+- The tree still held `source/linux/liblinscp.h`, a public C ABI header for
+  a library no build produced, and `debian/linscp-nautilus.py`, a
+  half-translated file-manager extension that ran no session and therefore
+  uploaded nothing. Both are gone; the automation object model and the
+  desktop extensions stay tracked gaps in the plan.
+- The three installers - the Makefile, CMake and the Debian package - did
+  not install the same files. An installed graphical client started with
+  an empty command list, because the file it reads was not installed, and
+  the PowerShell module was missing from the package. They agree now.
+
+`tools/check_platform_conversion.py` is what keeps that true. It reads the
+client's own sources and refuses a Windows API call, a Windows header, a
+Windows-only compilation branch, a Windows environment variable, a Windows
+executable, a Windows path, a file of another platform, an installer that
+does not ship what the other installers ship, and an error message whose
+wording contradicts the template it is filled into. It runs in
+`make -C source/linux check`, as the CTest case `platform-conversion-check`,
+and in CI. The vendored PuTTY tree is not scanned: it is upstream's code
+and keeps upstream's Windows comments, while the platform layer this
+project owns is.
+
 ## Evidence and status rules
 
 `verified` means the stated behavior has automated evidence, not every variant

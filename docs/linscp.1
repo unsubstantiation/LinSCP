@@ -290,6 +290,20 @@ An abbreviation of
 or of a command that fits several names is refused and answered with the list
 of what it could mean, because guessing would run a different command than the
 one that was typed.
+.PP
+An argument is split on blanks. A word in single quotes is literal, a word in
+double quotes keeps its blanks, and a backslash outside quotes stands in
+front of the character behind it. Inside double quotes a backslash is
+literal unless it stands in front of a double quote or of another backslash,
+so a path that carries the separators of a Windows client keeps them: a
+.I get
+of
+.B "C:\\Users\\me\\file.txt"
+downloads the file of that name and not a file called
+.BR C:Usersmefile.txt .
+These are the rules of a POSIX shell, because the names on this platform are
+POSIX names: a backslash and an apostrophe are ordinary characters of a file
+name here, and a script that has to name such a file quotes it.
 .TP
 .BI open " site [ switches ]"
 Connect to

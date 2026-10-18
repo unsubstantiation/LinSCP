@@ -31,7 +31,7 @@ LinSCP is Linux-only. The Makefile refuses to build on other systems.
 
 ```sh
 make -C source/linux                 # -> source/linux/build/linscp
-make -C source/linux check           # unit tests
+make -C source/linux check           # unit tests and the platform check
 make -C source/linux check-live      # script and live-server suites
 ```
 
@@ -52,10 +52,18 @@ suites (`ClientTest.js`, `LocalizationTest.js`) are the ones that need Node and
 `jsdom`; CMake registers them only when both are installed. `SecurityTest.py`
 drives the server itself, with no browser: tokens, sign-in, the absence of CORS
 permission, response headers, command quoting, and the confinement of every
-local path to its pane. For the Debian package:
+local path to its pane.
+
+`make -C source/linux check` also runs `tools/check_platform_conversion.py`.
+LinSCP is a Linux-only client - the Windows port is gone - and that check
+reads the sources and refuses a Windows API call, a Windows environment
+variable, a Windows path, a file of another platform, an installer that
+disagrees with the others, and an error message whose wording contradicts the
+template it is filled into. It is what keeps the conversion complete rather
+than merely done once. For the Debian package:
 
 ```sh
-dpkg-buildpackage -b -us -uc         # -> ../linscp_1.0-3_<arch>.deb
+dpkg-buildpackage -b -us -uc         # -> ../linscp_1.0-4_<arch>.deb
 ```
 
 ## Usage
@@ -106,7 +114,8 @@ it can be pinned.
 
 Not implemented: the .NET assembly API, GSSAPI, and SSH tunnel configuration.
 `automation/LinSCP.psm1`, a PowerShell 7 wrapper over the CLI, is installed by
-the Makefile but no automated test runs it.
+the Makefile, by CMake and by the Debian package, but no automated test runs
+it.
 
 ## Documentation
 
@@ -132,7 +141,7 @@ logo/          logo artwork
 source/gui/    browser Commander: Python server, web client, tests
 source/linux/  linscp client: front end, protocol glue, tests, Makefile
 source/putty/  platform-neutral PuTTY SSH and SFTP core
-tools/         parity inventory and translation checkers
+tools/         parity inventory, translation and platform-conversion checkers
 ```
 
 ## Licence

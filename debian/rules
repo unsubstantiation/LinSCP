@@ -19,6 +19,13 @@ build-stamp:
 	$(MAKE) -C source/linux all check
 	touch $@
 
+# The tree this package installs is the tree 'make -C source/linux install'
+# and 'cmake --install' produce: the client in bin/, the graphical client's
+# modules, its command templates and its web client under share/linscp/gui/,
+# the PowerShell module under share/linscp/automation/, the manual page, the
+# desktop entry and the icons. The command templates are listed because
+# without them an installed client starts with an empty command list, where
+# a run from the source tree offers the shipped ones.
 binary: build
 	rm -rf $(destdir)
 	install -d $(destdir)/usr/bin
@@ -28,12 +35,15 @@ binary: build
 	install -d $(destdir)/usr/share/pixmaps
 	install -d $(destdir)/usr/share/icons/hicolor/scalable/apps
 	install -d $(destdir)/usr/share/linscp/gui/web
+	install -d $(destdir)/usr/share/linscp/automation
 	install -d $(destdir)/DEBIAN
 	install -m 0755 source/linux/build/linscp $(destdir)/usr/bin/linscp
 	install -m 0755 source/gui/linscp-gui $(destdir)/usr/bin/linscp-gui
 	install -m 0644 source/gui/linscp_gui.py source/gui/linscp_crypto.py \
 		$(destdir)/usr/share/linscp/gui/
+	install -m 0644 source/gui/explorer-commands.json $(destdir)/usr/share/linscp/gui/
 	install -m 0644 source/gui/web/* $(destdir)/usr/share/linscp/gui/web/
+	install -m 0644 automation/LinSCP.psm1 $(destdir)/usr/share/linscp/automation/
 	install -m 0644 debian/linscp.desktop $(destdir)/usr/share/applications/linscp.desktop
 	install -m 0644 debian/linscp.png $(destdir)/usr/share/pixmaps/linscp.png
 	install -m 0644 debian/linscp.svg $(destdir)/usr/share/icons/hicolor/scalable/apps/linscp.svg

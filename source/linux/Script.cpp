@@ -1713,7 +1713,7 @@ bool Script::ChangeLocalDirectory(const std::vector<std::string> & args)
     std::string path = ResolveLocalPath(current, args[0]);
     if (!SetLocalDirectory(path, error))
     {
-        Console::Instance().Error(Texts::LocalError("change of directory to",
+        Console::Instance().Error(Texts::LocalError("change the directory",
             path, error));
         mErrors++;
         return false;
@@ -2040,7 +2040,7 @@ bool Script::DownloadDirectoryRecursive(const std::string & remoteDir,
                     childLocal, totalSize, stage, dirErr))
             {
                 Console::Instance().Error(Texts::LocalError(
-                    "inspect the destination of", childLocal, dirErr));
+                    "inspect the destination", childLocal, dirErr));
                 mErrors++;
                 success = false;
                 if (AbortAfterFileError())
@@ -2066,7 +2066,7 @@ bool Script::DownloadDirectoryRecursive(const std::string & remoteDir,
             if (!PrepareStage(stage, dirErr))
             {
                 Console::Instance().Error(Texts::LocalError(
-                    "prepare the destination for", childLocal, dirErr));
+                    "prepare the destination", childLocal, dirErr));
                 mErrors++;
                 success = false;
                 if (AbortAfterFileError())
@@ -2108,7 +2108,7 @@ bool Script::DownloadDirectoryRecursive(const std::string & remoteDir,
                 if (!ConvertToUnixLineEndings(stage.partPath, converted, dirErr))
                 {
                     Console::Instance().Error(Texts::LocalError(
-                        "convert the line endings of", childLocal, dirErr));
+                    "convert the line endings", childLocal, dirErr));
                     mErrors++;
                     success = false;
                     if (AbortAfterFileError())
@@ -2323,7 +2323,7 @@ bool Script::UploadDirectoryRecursive(const std::string & localDir,
                 if (!MakeCRLFUploadCopy(childLocal, asciiTemp, error))
                 {
                     Console::Instance().Error(Texts::LocalError(
-                        "convert the line endings of", childLocal, error));
+                    "convert the line endings", childLocal, error));
                     mErrors++;
                     success = false;
                     if (AbortAfterFileError())
@@ -3651,7 +3651,7 @@ bool Script::GetFiles(const std::vector<std::string> & args)
         {
             if (destinationInfo.exists && !destinationInfo.isDir)
             {
-                Console::Instance().Error(Texts::LocalError("download to", destination,
+                Console::Instance().Error(Texts::LocalError("download", destination,
                     "A directory is required for multiple source files."));
                 mErrors++;
                 continue;
@@ -3736,21 +3736,21 @@ bool Script::GetFiles(const std::vector<std::string> & args)
                 localInfo.error != ENOTDIR)
             {
                 errno = localInfo.error;
-                Console::Instance().Error(Texts::LocalError("inspect destination",
+                Console::Instance().Error(Texts::LocalError("inspect the destination",
                     localPath, LastSystemError()));
                 mErrors++;
                 continue;
             }
             if (localInfo.isDir)
             {
-                Console::Instance().Error(Texts::LocalError("download to", localPath,
+                Console::Instance().Error(Texts::LocalError("download", localPath,
                     "The destination is a directory."));
                 mErrors++;
                 continue;
             }
             if (localInfo.exists && !localInfo.isRegular)
             {
-                Console::Instance().Error(Texts::LocalError("download to", localPath,
+                Console::Instance().Error(Texts::LocalError("download", localPath,
                     "The destination is not a regular file."));
                 mErrors++;
                 continue;
@@ -3775,7 +3775,7 @@ bool Script::GetFiles(const std::vector<std::string> & args)
                     localPath, totalSize, stage, error))
             {
                 Console::Instance().Error(Texts::LocalError(
-                    "inspect the destination of", localPath, error));
+                    "inspect the destination", localPath, error));
                 mErrors++;
                 continue;
             }
@@ -3798,7 +3798,7 @@ bool Script::GetFiles(const std::vector<std::string> & args)
             if (!PrepareStage(stage, error))
             {
                 Console::Instance().Error(Texts::LocalError(
-                    "prepare the destination for", localPath, error));
+                    "prepare the destination", localPath, error));
                 mErrors++;
                 if (AbortAfterFileError())
                 {
@@ -3837,7 +3837,7 @@ bool Script::GetFiles(const std::vector<std::string> & args)
                 if (!ConvertToUnixLineEndings(stage.partPath, converted, error))
                 {
                     Console::Instance().Error(Texts::LocalError(
-                        "convert the line endings of", localPath, error));
+                    "convert the line endings", localPath, error));
                     mErrors++;
                     if (AbortAfterFileError())
                     {
@@ -3874,7 +3874,7 @@ bool Script::GetFiles(const std::vector<std::string> & args)
                 if (localMode >= 0 && !SetLocalFileMode(localPath, localMode, error))
                 {
                     Console::Instance().Error(Texts::LocalError(
-                        "set the permissions of", localPath, error));
+                    "set the permissions", localPath, error));
                     mErrors++;
                 }
             }
@@ -3981,7 +3981,7 @@ bool Script::PutFiles(const std::vector<std::string> & args)
         }
         if (!ExpandLocalWildcard(ResolveLocalPath(current, sourcePatterns[i]), sources, error))
         {
-            Console::Instance().Error(Texts::LocalError("expansion of", sourcePatterns[i], error));
+            Console::Instance().Error(Texts::LocalError("expand the file name", sourcePatterns[i], error));
             mErrors++;
             continue;
         }
@@ -3998,7 +3998,7 @@ bool Script::PutFiles(const std::vector<std::string> & args)
                 }
                 continue;
             }
-            Console::Instance().Error(Texts::LocalError("expansion of", sourcePatterns[i],
+            Console::Instance().Error(Texts::LocalError("expand the file name", sourcePatterns[i],
                 "No such file."));
             mErrors++;
             continue;
@@ -4032,7 +4032,7 @@ bool Script::PutFiles(const std::vector<std::string> & args)
             {
                 if (!flags.recursive)
                 {
-                    Console::Instance().Error(Texts::LocalError("upload of", sources[n],
+                    Console::Instance().Error(Texts::LocalError("upload", sources[n],
                         Texts::Translate(
                             "Directories are not supported without recursive mode.")));
                     mErrors++;
@@ -4056,7 +4056,7 @@ bool Script::PutFiles(const std::vector<std::string> & args)
             }
             if (info.exists && !info.isRegular)
             {
-                Console::Instance().Error(Texts::LocalError("upload of", sources[n],
+                Console::Instance().Error(Texts::LocalError("upload", sources[n],
                     "Only regular files can be uploaded."));
                 mErrors++;
                 continue;
@@ -4150,7 +4150,7 @@ bool Script::PutFiles(const std::vector<std::string> & args)
                 if (!MakeCRLFUploadCopy(sources[n], asciiTemp, error))
                 {
                     Console::Instance().Error(Texts::LocalError(
-                        "convert the line endings of", sources[n], error));
+                    "convert the line endings", sources[n], error));
                     mErrors++;
                     if (AbortAfterFileError())
                     {
@@ -5806,7 +5806,7 @@ bool Script::OpenStoredSite(const std::string & name,
         std::string localError;
         if (!SetLocalDirectory(ExpandTilde(stored->localDirectory), localError))
         {
-            console.Error(Texts::LocalError("change directory",
+            console.Error(Texts::LocalError("change the directory",
                 stored->localDirectory, localError));
         }
     }

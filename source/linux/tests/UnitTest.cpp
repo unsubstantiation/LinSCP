@@ -140,6 +140,17 @@ void TestSplitCommandLine()
     CHECK_EQ(Words(SplitCommandLine("get \"two words.txt\" dest")),
         "[get][two words.txt][dest]");
     CHECK_EQ(Words(SplitCommandLine("get a\\ b.txt")), "[get][a b.txt]");
+    /* Inside double quotes a backslash is literal unless it stands in
+     * front of a double quote or of another backslash, as a POSIX shell
+     * does it. A path carried over from a Windows client keeps its
+     * separators this way. */
+    CHECK_EQ(Words(SplitCommandLine("get \"C:\\Users\\me\\file.txt\"")),
+        "[get][C:\\Users\\me\\file.txt]");
+    CHECK_EQ(Words(SplitCommandLine("get \"a\\\\b.txt\"")), "[get][a\\b.txt]");
+    CHECK_EQ(Words(SplitCommandLine("get \"say \\\"hi\\\"\"")),
+        "[get][say \"hi\"]");
+    /* A single-quoted word is literal, backslash included. */
+    CHECK_EQ(Words(SplitCommandLine("get 'C:\\Users\\me'")), "[get][C:\\Users\\me]");
     /* An unterminated quote still yields the word read so far. */
     CHECK_EQ(Words(SplitCommandLine("get 'unterminated")), "[get][unterminated]");
     /* An empty quoted argument is a word of its own. */
