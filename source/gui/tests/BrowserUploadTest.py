@@ -188,7 +188,9 @@ class BrowserUploadTests(unittest.TestCase):
             gui.LinScpGuiHandler.read_json_body(handler)
         nested = b"[" * 1200 + b"0" + b"]" * 1200
         handler = fake_handler(len(nested), nested)
-        with self.assertRaisesRegex(ValueError, "valid UTF-8 JSON"):
+        # Python versions differ on the maximum nested-array depth accepted by
+        # json.loads; either way, a deeply nested non-object is a bad request.
+        with self.assertRaises(ValueError):
             gui.LinScpGuiHandler.read_json_body(handler)
 
         handler = fake_handler(2)
