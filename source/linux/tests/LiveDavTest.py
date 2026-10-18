@@ -811,13 +811,22 @@ class LiveDavTests(unittest.TestCase):
         self.assertEqual(allowed.returncode, 0,
                          allowed.stdout + allowed.stderr)
         self.assertIn("DIFFERENT_OK", allowed.stdout)
+        # The allowed write has now created a newer version; capture that
+        # current tag after the write, not before it, so this test remains
+        # correct even when the server's one-second timestamp crosses a
+        # boundary during the upload.
         current = self.etag_of("/fresh.txt")
-
+        before_refused_state = self.server_state()
+        self.assertEqual(before_refused_state["etags"]["/fresh.txt"], current,
+                         json.dumps(before_refused_state, sort_keys=True))
         refused = self.run_script(
             "option confirm off ; etag /fresh.txt -nomatch=%s ; "
             "put %s /fresh.txt ; echo SHOULD_NOT_RUN" % (current, rival))
+        refused_state = self.server_state()
         self.assertEqual(refused.returncode, 1,
-                         refused.stdout + refused.stderr)
+                         refused.stdout + refused.stderr +
+                         "\nServer state: " + json.dumps(refused_state,
+                                                         sort_keys=True))
         self.assertNotIn("SHOULD_NOT_RUN", refused.stdout)
         self.assertIn("412", refused.stderr)
         self.assertEqual(self.if_headers("PUT", "/fresh.txt")[-1],

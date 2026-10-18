@@ -132,12 +132,11 @@ class BrowserUploadTests(unittest.TestCase):
         self.assertEqual(args[3], "Browser: Project/notes/" + file)
         self.assertEqual(pathlib.Path(kwargs["cleanup_path"]).read_bytes(), b"abc")
 
-    def test_gui_queue_uses_literal_commands_for_percent_filenames(self):
-        # Unlike run_linscp, the background queue builds a fresh command
-        # line. Do not let it expand a dropped %TIMESTAMP% as a script token.
-        task = types.SimpleNamespace(
-            kind="Upload", command='put /tmp/file "/remote/%TIMESTAMP%.txt"',
-            session={}, source="file", status="Queued")
+    def test_gui_queue_uses_the_literal_server_protocol_for_percent_filenames(self):
+        # The -server input protocol does not expand script placeholders, and
+        # it keeps a password-bearing site URL out of the process arguments.
+        task = gui.Task(5, "Upload", 'put /tmp/file "/remote/%TIMESTAMP%.txt"',
+                        {}, "file", "/remote/%TIMESTAMP%.txt", None)
         manager = gui.TaskManager.__new__(gui.TaskManager)
         with mock.patch.object(gui, "core_command_line", return_value=["linscp"]), \
              mock.patch.object(gui, "session_url", return_value="sftp://host/"), \
@@ -146,8 +145,10 @@ class BrowserUploadTests(unittest.TestCase):
                                side_effect=OSError("stub")) as popen:
             manager._run(task)
         command = popen.call_args.args[0]
-        self.assertIn("-literal", command)
-        self.assertIn("/remote/%TIMESTAMP%.txt", command[-1])
+        self.assertIn("-server", command)
+        self.assertFalse(any(arg == "-literal" or arg.startswith("-command=")
+                             for arg in command))
+        self.assertIn("%TIMESTAMP%", task.command)
         self.assertEqual(task.status, "Failed")
 
     def test_dropped_paths_are_validated_before_staging_or_queueing(self):
@@ -167,6 +168,51 @@ class BrowserUploadTests(unittest.TestCase):
                                      io.BytesIO(b"secret"), 6,
                                      "other/file.txt")
         self.assertIsNone(self.tasks.args)
+
+    def test_json_request_bodies_are_bounded_and_errors_use_api_statuses(self):
+        def fake_handler(length, payload=b""):
+            headers = mock.Mock()
+            headers.get.return_value = None
+            headers.get_all.return_value = [] if length is None else [str(length)]
+            handler = types.SimpleNamespace(headers=headers, rfile=io.BytesIO(payload))
+            handler.request_content_length = lambda: \
+                gui.LinScpGuiHandler.request_content_length(handler)
+            return handler
+
+        handler = fake_handler(gui.MAX_JSON_BODY_BYTES + 1)
+        with self.assertRaises(gui.RequestTooLarge):
+            gui.LinScpGuiHandler.read_json_body(handler)
+
+        handler = fake_handler(8, b"not-json")
+        with self.assertRaisesRegex(ValueError, "valid UTF-8 JSON"):
+            gui.LinScpGuiHandler.read_json_body(handler)
+        nested = b"[" * 1200 + b"0" + b"]" * 1200
+        handler = fake_handler(len(nested), nested)
+        # Python versions differ on the maximum nested-array depth accepted by
+        # json.loads; either way, a deeply nested non-object is a bad request.
+        with self.assertRaises(ValueError):
+            gui.LinScpGuiHandler.read_json_body(handler)
+
+        handler = fake_handler(2)
+        handler.headers.get_all.return_value = ["2", "2"]
+        with self.assertRaisesRegex(ValueError, "Multiple Content-Length"):
+            gui.LinScpGuiHandler.read_json_body(handler)
+        handler = fake_handler(0)
+        handler.headers.get.return_value = "chunked"
+        with self.assertRaisesRegex(ValueError, "Transfer-Encoding"):
+            gui.LinScpGuiHandler.read_json_body(handler)
+
+        def raise_too_large():
+            raise gui.RequestTooLarge("body is too large")
+
+        response = {}
+        handler = types.SimpleNamespace(
+            close_connection=False, _dispatch_post=raise_too_large,
+            send_json=lambda data, status=200: response.update(
+                data=data, status=status))
+        gui.LinScpGuiHandler.do_POST(handler)
+        self.assertTrue(handler.close_connection)
+        self.assertEqual(response["status"], 413)
 
     def test_http_endpoint_requires_token_and_queues_raw_file_bytes(self):
         class Tab:

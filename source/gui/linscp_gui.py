@@ -58,9 +58,15 @@ import linscp_crypto
 PORT = 8080
 HOST = "127.0.0.1"
 MAX_BROWSER_UPLOAD_BYTES = 1024 * 1024 * 1024
+MAX_JSON_BODY_BYTES = 2 * 1024 * 1024
 # Filled in by main(): one random token per run, required on every /api/ call.
 API_TOKEN = ""
 REQUIRE_TOKEN = True
+
+
+class RequestTooLarge(ValueError):
+    """A JSON API request exceeded its bounded request-body size."""
+
 # Host names a request may be addressed to. The loopback names are always
 # allowed; --allow-host adds more (a reverse proxy, for example).
 ALLOWED_HOSTS = set(["localhost", "127.0.0.1", "::1"])
@@ -359,6 +365,9 @@ STATE = {
 
 
 def add_log(message, level="info"):
+    # Core diagnostics and command strings can contain credentials even when
+    # the call site did not construct the message itself.
+    message = redact_command_for_log(str(message))
     timestamp = time.strftime("%H:%M:%S")
     with STATE_LOCK:
         entry = {"time": timestamp, "text": message, "level": level}
@@ -426,12 +435,53 @@ SESSION_KEYS = {
 # WebDAV over plain HTTP and 'webdav' over HTTPS, as in the client.
 DEFAULT_PORTS = {
     "sftp": 22, "scp": 22, "ssh": 22, "ftp": 21, "ftps": 990,
+    "ftpes": 21,
     "dav": 80, "http": 80, "webdav": 443, "https": 443, "s3": 443,
 }
 
 
 def default_port(protocol):
     return DEFAULT_PORTS.get((protocol or "sftp").lower(), 22)
+
+
+def validate_session_data(session, require_host=False):
+    """Reject malformed session values before they reach a core process."""
+    if not isinstance(session, dict):
+        return "A session must be a JSON object."
+    protocol = session.get("protocol", "sftp")
+    if protocol is None or protocol == "":
+        protocol = "sftp"
+    if not isinstance(protocol, str) or protocol.lower() not in (
+            "sftp", "ssh", "scp", "ftp", "ftps", "ftpes", "http",
+            "https", "dav", "webdav", "s3"):
+        return "The session protocol is not supported."
+    host = session.get("host", "")
+    if host is None:
+        host = ""
+    if not isinstance(host, str):
+        return "The host name must be text."
+    if require_host and not host.strip():
+        return "A host name is required."
+    if any(ord(char) < 32 or ord(char) == 127 for char in host):
+        return "The host name must not contain control characters."
+    for field in ("username", "password", "keyfile", "hostkey",
+                  "initial_dir", "local_dir"):
+        value = session.get(field)
+        if value is not None and not isinstance(value, str):
+            return "The session %s must be text." % field.replace("_", " ")
+        if isinstance(value, str) and any(
+                ord(char) < 32 or ord(char) == 127 for char in value):
+            return "The session %s must not contain control characters." % field.replace(
+                "_", " ")
+    port = session.get("port")
+    if port not in (None, ""):
+        port_text = str(port)
+        if (isinstance(port, bool) or len(port_text) > 5 or
+                not re.fullmatch(r"[0-9]+", port_text)):
+            return "The port must be a number from 1 through 65535."
+        if not 1 <= int(port_text) <= 65535:
+            return "The port must be a number from 1 through 65535."
+    return ""
 
 
 def read_stored_sessions():
@@ -641,21 +691,24 @@ def session_url(session, path=None, include_password=False):
 
 
 def core_command_line(session):
-    """The arguments every core process of this session needs.
+    """Build safe process arguments for a session.
 
-    The password is deliberately not one of them: command-line arguments
-    are visible to every user on the machine through the process list,
-    while the environment this server passes (see popen_kwargs) is
-    readable only by this user. The core reads LINSCP_PASSWORD into the
-    session, so nothing is lost by leaving it off the command line.
+    A blank host-key field means "verify it", not "accept anything". The
+    previous fallback to ``*`` silently disabled SSH host-key checking and
+    TLS certificate verification for every queued operation. Passwords are
+    never process arguments: the core reads LINSCP_PASSWORD from its
+    per-session environment, and GUI commands travel over its stdin protocol.
     """
     cmd = [find_linscp_binary(), "-batch=on"]
-    hostkey = session.get("hostkey") or "*"
-    cmd.append("-hostkey=" + hostkey)
+    if not isinstance(session, dict):
+        return cmd
+    hostkey = str(session.get("hostkey") or "").strip()
+    if hostkey:
+        cmd.append("-hostkey=" + hostkey)
     if session.get("keyfile"):
-        cmd.append("-privatekey=" + session["keyfile"])
+        cmd.append("-privatekey=" + str(session["keyfile"]))
     if session.get("username"):
-        cmd.append("-username=" + session["username"])
+        cmd.append("-username=" + str(session["username"]))
     return cmd
 
 
@@ -717,31 +770,307 @@ def popen_kwargs(password=None):
     return kwargs
 
 
+def split_linscp_commands(text):
+    """Split semicolon-separated commands without splitting quoted data.
+
+    This mirrors PathUtil::SplitCommands. GUI-generated commands are sent
+    one at a time over ``-server`` stdin, both to keep credentials out of
+    argv and to preserve literal percent signs in file names.
+    """
+    if not isinstance(text, str):
+        raise ValueError("A LinSCP command must be text.")
+    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+        raise ValueError("A LinSCP command must not contain control characters.")
+    result = []
+    current = []
+    quote = ""
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == "\\" and quote == '"' and index + 1 < len(text):
+                current.extend((char, text[index + 1]))
+                index += 2
+                continue
+            current.append(char)
+            if char == quote:
+                quote = ""
+        elif char in ("'", '"'):
+            quote = char
+            current.append(char)
+        elif char == "\\" and index + 1 < len(text):
+            current.extend((char, text[index + 1]))
+            index += 2
+            continue
+        elif char == ";":
+            part = "".join(current).strip()
+            if part:
+                result.append(part)
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    part = "".join(current).strip()
+    if part:
+        result.append(part)
+    return result
+
+
+def redact_command_for_log(command):
+    """Remove passwords embedded in command switches or site URLs."""
+    text = re.sub(r'(?i)(-password=)(?:"(?:\\.|[^"])*"|[^\s;]+)',
+                  r"\1<redacted>", command)
+    return re.sub(
+        r'(?i)([a-z][a-z0-9+.-]*://[^:/@\s]+:)[^@/\s]*@',
+        r"\1<redacted>@", text)
+
+
+class CoreCommandProcess:
+    """A short-lived, line-protocol core process with bounded command waits."""
+
+    def __init__(self, session=None):
+        self.session = session
+        self.process = None
+        self.events = queue.Queue()
+        self.pending_events = []
+        self.deferred_errors = []
+
+    def _pump(self, stream, name):
+        try:
+            for line in stream:
+                self.events.put((name, line.rstrip("\r\n")))
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.events.put((name, None))
+
+    def _next_event(self, timeout):
+        if self.pending_events:
+            return self.pending_events.pop(0)
+        return self.events.get(timeout=timeout)
+
+    def _drain_after_result(self, errors, on_error):
+        # Stdout and stderr are separate pipes. The core writes an error to
+        # stderr before its result marker on stdout, but the reader threads
+        # can enqueue those lines in the opposite order. Briefly drain the
+        # already-written diagnostics before returning this command's result.
+        started = time.monotonic()
+        quiet_until = started + 0.04
+        deadline = started + 0.2
+        pending = []
+        while time.monotonic() < quiet_until and time.monotonic() < deadline:
+            wait = min(quiet_until - time.monotonic(),
+                       deadline - time.monotonic())
+            if wait <= 0:
+                break
+            try:
+                event = self.events.get(timeout=wait)
+            except queue.Empty:
+                break
+            if event[0] == "stderr" and event[1] is not None:
+                errors.append(event[1])
+                if on_error is not None:
+                    on_error(event[1])
+            else:
+                pending.append(event)
+            quiet_until = time.monotonic() + 0.04
+        self.pending_events.extend(pending)
+
+    def start(self, timeout=15):
+        command = core_command_line(self.session) + ["-server"]
+        self.process = subprocess.Popen(
+            command, **popen_kwargs(self.session.get("password")))
+        for name, stream in (("stdout", self.process.stdout),
+                             ("stderr", self.process.stderr)):
+            threading.Thread(target=self._pump, args=(stream, name),
+                             daemon=True).start()
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.terminate()
+                raise RuntimeError("The LinSCP core server did not start in time.")
+            try:
+                name, line = self.events.get(timeout=remaining)
+            except queue.Empty:
+                self.terminate()
+                raise RuntimeError("The LinSCP core server did not start in time.")
+            if name == "stderr":
+                if line is None:
+                    continue
+                self.deferred_errors.append(line)
+                continue
+            if line is None:
+                detail = "\n".join(self.deferred_errors).strip()
+                raise RuntimeError(detail or "The LinSCP core server ended before it was ready.")
+            if line.startswith("LSCP-SERVER "):
+                return
+
+    def run_command(self, command, timeout=120, on_output=None, on_error=None,
+                    on_wait=None, should_cancel=None):
+        if self.process is None or self.process.poll() is not None:
+            return 1, [], ["The LinSCP core server is not running."]
+        if not isinstance(command, str) or any(
+                ord(char) < 32 or ord(char) == 127 for char in command):
+            return 1, [], ["A LinSCP command must be a single line without control characters."]
+        try:
+            self.process.stdin.write(command + "\n")
+            self.process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            return 1, [], ["The LinSCP core server is not accepting commands."]
+
+        output = []
+        errors = self.deferred_errors
+        self.deferred_errors = []
+        deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
+        interrupt_sent = False
+        kill_deadline = None
+        while True:
+            if on_wait is not None:
+                on_wait()
+            if should_cancel is not None and should_cancel() and not interrupt_sent:
+                interrupt_sent = True
+                kill_deadline = time.monotonic() + 2
+                try:
+                    self.process.send_signal(signal.SIGINT)
+                except OSError:
+                    pass
+            if interrupt_sent and kill_deadline is not None and \
+                    time.monotonic() >= kill_deadline and self.process.poll() is None:
+                try:
+                    self.process.kill()
+                except OSError:
+                    pass
+                kill_deadline = None
+            if deadline is not None and time.monotonic() >= deadline:
+                self.terminate()
+                errors.append("The LinSCP command timed out.")
+                return 1, output, errors
+            wait = 0.2
+            if deadline is not None:
+                wait = max(0.01, min(wait, deadline - time.monotonic()))
+            try:
+                name, line = self._next_event(wait)
+            except queue.Empty:
+                if self.process.poll() is not None:
+                    return 1, output, errors + ["The LinSCP core server ended unexpectedly."]
+                continue
+            if name == "stderr":
+                if line is None:
+                    continue
+                errors.append(line)
+                if on_error is not None:
+                    on_error(line)
+                continue
+            if line is None:
+                return 1, output, errors + ["The LinSCP core server ended unexpectedly."]
+            match = re.fullmatch(r"LSCP-RESULT ([0-9]+)", line)
+            if match:
+                self._drain_after_result(errors, on_error)
+                return int(match.group(1)), output, errors
+            output.append(line)
+            if on_output is not None:
+                on_output(line)
+
+    def _close_streams(self):
+        if self.process is None:
+            return
+        for name in ("stdin", "stdout", "stderr"):
+            stream = getattr(self.process, name, None)
+            if stream is not None:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+
+    def terminate(self):
+        if self.process is None:
+            return
+        try:
+            if self.process.poll() is None:
+                self.process.kill()
+            self.process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        finally:
+            self._close_streams()
+
+    def close(self):
+        if self.process is None:
+            return
+        if self.process.poll() is None:
+            try:
+                self.run_command("exit", timeout=5)
+            except Exception:
+                pass
+            try:
+                self.process.stdin.close()
+            except (AttributeError, OSError, ValueError):
+                pass
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.terminate()
+        self._close_streams()
+        self.process = None
+
+
 def run_linscp(command_script, session=None, timeout=300):
-    """Run one script in a short-lived core process. Returns (code, out, err)."""
+    """Run commands in a short-lived core process. Returns (code, out, err).
+
+    Commands and site URLs travel over the server's stdin protocol instead
+    of appearing in ``/proc/<pid>/cmdline``; the password is supplied only
+    through that process's per-session environment. Running each command
+    separately also preserves the old batch behavior:
+    first failure stops the script rather than allowing later commands to
+    act on a half-open session.
+    """
+    if not isinstance(command_script, str):
+        return 1, "", "A LinSCP command must be text."
     session = session or new_session()
     bin_path = find_linscp_binary()
-    cmd = core_command_line(session)
-    cmd.extend(["-literal", "-command=" + "option confirm off ; " + command_script])
-    add_log("Executing: " + _censored_command(command_script), "cmd")
+    add_log("Executing: " + redact_command_for_log(command_script), "cmd")
     try:
-        proc = subprocess.Popen(cmd, **popen_kwargs(session.get("password")))
-    except OSError as exc:
+        commands = ["option confirm off"] + split_linscp_commands(command_script)
+    except ValueError as exc:
+        return 1, "", str(exc)
+    runner = CoreCommandProcess(session)
+    output, errors = [], []
+    code = 1
+    deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
+    try:
+        start_timeout = 15 if deadline is None else max(
+            0.01, min(15, deadline - time.monotonic()))
+        runner.start(timeout=start_timeout)
+        for command in commands:
+            remaining = 0 if deadline is None else deadline - time.monotonic()
+            if deadline is not None and remaining <= 0:
+                errors.append("The LinSCP core timed out.")
+                break
+            code, lines, diagnostics = runner.run_command(
+                command, timeout=remaining if deadline is not None else 0)
+            output.extend(lines)
+            errors.extend(diagnostics)
+            if code != 0:
+                break
+    except (OSError, ValueError) as exc:
         message = ("Cannot start the LinSCP core binary '%s': %s. "
                    "Build it first (make -C source/linux) or put linscp "
                    "on PATH." % (bin_path, exc))
         add_log(message, "error")
         return 1, "", message
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        stdout, stderr = proc.communicate()
-        add_log("LinSCP core timed out after %d seconds." % timeout, "error")
-        return 1, stdout or "", "Timed out."
-    if stderr.strip():
-        add_log(stderr.strip(), "error")
-    return proc.returncode, stdout or "", stderr or ""
+    except RuntimeError as exc:
+        errors.extend(runner.deferred_errors)
+        if str(exc):
+            errors.append(str(exc))
+        code = 1
+    finally:
+        runner.close()
+    output = [redact_command_for_log(line) for line in output]
+    errors = [redact_command_for_log(line) for line in errors]
+    if errors:
+        add_log("\n".join(errors).strip(), "error")
+    return code, "\n".join(output), "\n".join(errors)
 
 
 # ---------------------------------------------------------------------------
@@ -764,6 +1093,8 @@ class CoreSession(object):
         self.lock = threading.RLock()
         self._queue = None
         self._stderr = []
+        self._stderr_lock = threading.Lock()
+        self._stderr_events = queue.Queue()
 
     def _default_name(self):
         host = self.session.get("host") or "localhost"
@@ -789,17 +1120,33 @@ class CoreSession(object):
                 self.error = str(exc)
                 return False, self.error
             self._queue = queue.Queue()
-            threading.Thread(target=self._read_stdout, daemon=True).start()
-            threading.Thread(target=self._read_stderr, daemon=True).start()
-            try:
-                line = self._queue.get(timeout=15)
-            except queue.Empty:
-                self.error = "The core process did not start."
-                return False, self.error
-            if line is None or "LSCP-SERVER" not in line:
-                self.error = "Unexpected greeting from the core process."
-                return False, self.error
-            return True, ""
+            event_queue = self._queue
+            self._stderr_events = queue.Queue()
+            stderr_events = self._stderr_events
+            process = self.proc
+            threading.Thread(target=self._read_stdout,
+                             args=(process.stdout, event_queue), daemon=True).start()
+            threading.Thread(target=self._read_stderr,
+                             args=(process.stderr, stderr_events), daemon=True).start()
+            deadline = time.monotonic() + 15
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.error = "The core process did not start."
+                    self.terminate()
+                    return False, self.error
+                try:
+                    line = event_queue.get(timeout=remaining)
+                except queue.Empty:
+                    self.error = "The core process did not start."
+                    self.terminate()
+                    return False, self.error
+                if line is None:
+                    self.error = "The core process ended before it started."
+                    self.terminate()
+                    return False, self.error
+                if line.startswith("LSCP-SERVER "):
+                    return True, ""
 
     def connect(self):
         ok, error = self.start()
@@ -808,7 +1155,8 @@ class CoreSession(object):
             self.error = error
             return False, error
         path = self.session.get("initial_dir") or "/"
-        code, output, errors = self.run_capture("open " + session_url(self.session, path))
+        code, output, errors = self.run_capture(
+            "open " + quote_remote(session_url(self.session, path)))
         # Whatever the server offered is worth remembering, connected or
         # not: a refused connection is exactly when a client needs it, to
         # offer pinning the key that was turned down.
@@ -817,7 +1165,8 @@ class CoreSession(object):
                 self.observed_hostkey = line.split(" ", 2)[-1].strip()
         if code != 0:
             detail = output + errors
-            self.error = "\n".join(detail).strip() or "Cannot connect."
+            self.error = redact_command_for_log(
+                "\n".join(detail).strip() or "Cannot connect.")
             self.connected = False
             return False, self.error
         self.run("option confirm off")
@@ -857,26 +1206,47 @@ class CoreSession(object):
                 break
         return code, lines, errors
 
-    def _read_stdout(self):
+    def _read_stdout(self, stream, event_queue):
         try:
-            for line in self.proc.stdout:
-                self._queue.put(line.rstrip("\r\n"))
+            for line in stream:
+                event_queue.put(line.rstrip("\r\n"))
         except (ValueError, OSError):
             pass
-        self._queue.put(None)
+        event_queue.put(None)
 
-    def _read_stderr(self):
+    def _read_stderr(self, stream, event_queue):
         try:
-            for line in self.proc.stderr:
-                text = line.strip()
+            for line in stream:
+                text = redact_command_for_log(line.strip())
                 if text:
                     add_log("[%s] %s" % (self.name, text), "error")
-                    try:
+                    with self._stderr_lock:
                         self._stderr.append(text)
-                    except Exception:
-                        pass
+                    event_queue.put(text)
         except (ValueError, OSError):
             pass
+        finally:
+            event_queue.put(None)
+
+    def _settle_stderr(self):
+        """Let diagnostics already written before the result marker drain."""
+        started = time.monotonic()
+        quiet_until = started + 0.04
+        deadline = started + 0.2
+        while time.monotonic() < quiet_until and time.monotonic() < deadline:
+            wait = min(quiet_until - time.monotonic(),
+                       deadline - time.monotonic())
+            if wait <= 0:
+                break
+            try:
+                self._stderr_events.get(timeout=wait)
+            except queue.Empty:
+                break
+            quiet_until = time.monotonic() + 0.04
+
+    def _stderr_snapshot(self):
+        with self._stderr_lock:
+            return list(self._stderr)
 
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
@@ -897,7 +1267,8 @@ class CoreSession(object):
                     self.connected = False
                     return 1, [error or "The session process is gone."], []
                 self.connected = True
-            del self._stderr[:]
+            with self._stderr_lock:
+                self._stderr.clear()
             # The core reads one command per line, so a command that holds
             # a newline is really two commands and the second one was
             # supplied by whatever reached this point - a file name on the
@@ -918,35 +1289,46 @@ class CoreSession(object):
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     self.terminate()
+                    self._settle_stderr()
                     self.connected = False
-                    return 1, lines + ["The command timed out after %d seconds." % timeout], list(self._stderr)
+                    return 1, lines + ["The command timed out after %d seconds." % timeout], \
+                        self._stderr_snapshot()
                 try:
                     line = self._queue.get(timeout=min(remaining, 0.5))
                 except queue.Empty:
                     continue
                 if line is None:
+                    self._settle_stderr()
                     self.connected = False
-                    return 1, lines + ["The session process ended unexpectedly."], list(self._stderr)
-                if line.startswith("LSCP-RESULT"):
-                    try:
-                        code = int(line.split()[1])
-                    except (IndexError, ValueError):
-                        code = 1
-                    return code, lines, list(self._stderr)
+                    return 1, lines + ["The session process ended unexpectedly."], \
+                        self._stderr_snapshot()
+                match = re.fullmatch(r"LSCP-RESULT ([0-9]+)", line)
+                if match:
+                    self._settle_stderr()
+                    return int(match.group(1)), lines, self._stderr_snapshot()
                 lines.append(line)
 
     def terminate(self):
         with self.lock:
-            if self.proc is None:
+            process = self.proc
+            if process is None:
                 return
             try:
-                self.proc.kill()
+                if process.poll() is None:
+                    process.kill()
             except OSError:
                 pass
             try:
-                self.proc.wait(timeout=5)
+                process.wait(timeout=5)
             except Exception:
                 pass
+            for name in ("stdin", "stdout", "stderr"):
+                stream = getattr(process, name, None)
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
             self.proc = None
             self.connected = False
 
@@ -970,10 +1352,14 @@ def get_tab(tab_id=None):
             return None
         if tab_id is None:
             tab_id = STATE["active_tab"]
+            if tab_id is None:
+                return STATE["tabs"][0]
         for tab in STATE["tabs"]:
-            if tab.id == tab_id:
+            if str(tab.id) == str(tab_id):
                 return tab
-        return STATE["tabs"][0]
+        # An explicit stale or malformed tab id must not silently operate
+        # on the first (possibly unrelated) connection.
+        return None
 
 
 def require_tab(tab_id=None):
@@ -1127,78 +1513,69 @@ class TaskManager(object):
         task.status = "Running"
         task.started = time.strftime("%H:%M:%S")
         task.error = ""
-        add_log("%s started: %s" % (task.kind, task.command), "cmd")
-        # A task runs in its own process, so it opens its own connection;
-        # that is what makes it cancellable without dropping the session
-        # the panes are browsing.
-        cmd = core_command_line(task.session)
-        # Queued tasks are GUI-generated commands too. A dropped filename can
-        # literally contain %TIMESTAMP% or %NAME%; do not expand it on retry.
-        # The URL carries no password (see session_url): the core reads it
-        # from the environment, where the process list cannot see it.
-        cmd.extend(["-literal", "-command=" + "open " + session_url(task.session) +
-                    " ; option confirm off ; " + task.command])
-        try:
-            task.proc = subprocess.Popen(
-                cmd, **popen_kwargs(task.session.get("password")))
-        except OSError as exc:
-            task.status = "Failed"
-            task.error = str(exc)
-            add_log(str(exc), "error")
-            return
-
+        add_log("%s started: %s" %
+                (task.kind, redact_command_for_log(task.command)), "cmd")
+        # Each task has its own connection so it can be interrupted without
+        # dropping the session the panes are browsing. The open command goes
+        # over stdin and the password is isolated in the child environment;
+        # neither is exposed in the process arguments.
+        runner = CoreCommandProcess(task.session)
+        task.proc = None
         captured = []
 
-        def reader(stream, sink):
-            try:
-                for line in stream:
-                    text = line.rstrip("\r\n")
-                    if text:
-                        sink(text)
-            except (ValueError, OSError):
-                pass
-
         def on_output(text):
-            captured.append(text)
-            if text.startswith(("Uploaded", "Downloaded", "Created", "Removed")):
-                task.detail = text
-                add_log(text, "info")
+            safe_text = redact_command_for_log(text)
+            if safe_text.startswith(("Uploaded", "Downloaded", "Created", "Removed")):
+                task.detail = safe_text
+                add_log(safe_text, "info")
 
-        threading.Thread(target=reader, args=(task.proc.stdout, on_output), daemon=True).start()
-        threading.Thread(target=reader,
-                         args=(task.proc.stderr, lambda text: add_log(text, "error")),
-                         daemon=True).start()
+        def on_error(text):
+            add_log(redact_command_for_log(text), "error")
 
-        while task.proc.poll() is None:
-            if task.status == "Cancelling":
-                try:
-                    task.proc.send_signal(signal.SIGINT)
-                    task.proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        task.proc.kill()
-                    except OSError:
-                        pass
-                break
+        def wait_for_command():
             task.poll_progress()
-            time.sleep(0.4)
-        task.poll_progress()
+
+        def cancelled():
+            return task.status == "Cancelling"
+
+        code = 1
+        failure = ""
         try:
-            task.proc.wait(timeout=10)
-        except Exception:
-            pass
-        code = task.proc.returncode
+            runner.start()
+            task.proc = runner.process
+            # The server protocol expands no script placeholders. A file
+            # literally named '%TIMESTAMP%.txt' therefore stays that name.
+            commands = ["open " + quote_remote(session_url(task.session)),
+                        "option confirm off"]
+            commands.extend(split_linscp_commands(task.command))
+            for command in commands:
+                if task.status == "Cancelling":
+                    break
+                code, lines, errors = runner.run_command(
+                    command, timeout=300, on_output=on_output,
+                    on_error=on_error, on_wait=wait_for_command,
+                    should_cancel=cancelled)
+                captured.extend(redact_command_for_log(line) for line in lines)
+                if code != 0:
+                    failure = "\n".join(
+                        redact_command_for_log(line) for line in errors[-6:])
+                    break
+        except (OSError, RuntimeError, ValueError) as exc:
+            failure = redact_command_for_log(str(exc))
+            code = 1
+        finally:
+            runner.close()
+            task.proc = None
+
         if task.status == "Cancelling":
             task.status = "Cancelled"
             task.finished = time.strftime("%H:%M:%S")
             add_log("%s cancelled: %s" % (task.kind, task.source), "info")
-            # The staged file of a browser upload is only removed once the
-            # core process has really stopped reading it; a cancellation
-            # that is still in flight keeps it, and the queue clear that
-            # follows takes it away.
-            if code is not None:
-                self.cleanup_source(task)
+            # The staged file is released only after the core has stopped
+            # reading it, so cancellation remains safe for retries.
+            self.cleanup_source(task)
             return
+
         move_error = ""
         if code == 0 and task.move_source:
             task.detail = "Transfer complete; removing the source..."
@@ -1210,7 +1587,8 @@ class TaskManager(object):
         if code == 0:
             self.cleanup_source(task)
         else:
-            task.error = move_error or "\n".join(captured[-6:]) or "The operation failed."
+            task.error = move_error or failure or "\n".join(captured[-6:]) or \
+                "The operation failed."
         add_log("%s %s: %s" % (task.kind, task.status.lower(), task.source),
                 "success" if code == 0 else "error")
         # Refresh the panes of the tab this task belongs to.
@@ -1255,7 +1633,7 @@ class TaskManager(object):
                     info.get("mtime") != source.get("mtime"):
                 return "The transfer completed, but the remote source changed; it was kept."
             command = "open %s ; rm %s" % (
-                session_url(task.session), quote_remote(path))
+                quote_remote(session_url(task.session)), quote_remote(path))
             code, stdout, stderr = run_linscp(command, task.session, timeout=300)
             if code != 0:
                 return "The transfer completed, but the remote source could not be removed: %s" % (
@@ -1874,38 +2252,60 @@ def save_local_browser_upload(local_dir, filename, source_stream,
         raise ValueError("The file name does not match the dropped path.")
     parent = os.path.dirname(destination)
     os.makedirs(parent, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(prefix=".linscp-drop-", dir=parent)
+    fd = None
+    temp_path = None
+    created = False
     try:
-        remaining = content_length
-        with os.fdopen(fd, "wb") as handle:
+        # O_EXCL and a cryptographically random name give mkstemp's
+        # collision/symlink protection, while the requested 0666 mode lets
+        # the kernel apply the process umask atomically. Record that result,
+        # then keep the in-progress upload private until it is complete.
+        for _attempt in range(100):
+            temp_path = os.path.join(parent,
+                                     ".linscp-drop-" + secrets.token_hex(16))
+            try:
+                fd = os.open(temp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                             0o666)
+                created = True
+                break
+            except FileExistsError:
+                continue
+        if fd is None:
+            raise FileExistsError("Could not allocate a temporary upload file.")
+        default_mode = stat.S_IMODE(os.fstat(fd).st_mode)
+        os.fchmod(fd, 0o600)
+        handle = os.fdopen(fd, "wb")
+        fd = None
+        with handle:
+            remaining = content_length
             while remaining:
                 chunk = source_stream.read(min(65536, remaining))
                 if not chunk:
                     raise IOError("The upload ended before all bytes arrived.")
                 handle.write(chunk)
                 remaining -= len(chunk)
-        # mkstemp creates its file 0600 for safety while it is being
-        # written; that is not the mode a file the user dropped into their
-        # own directory should keep. Apply the process umask the way an
-        # ordinary create would, without ever widening an existing file.
-        umask = os.umask(0)
-        os.umask(umask)
         if os.path.exists(destination):
             try:
-                os.chmod(temp_path, stat.S_IMODE(os.stat(destination).st_mode))
+                final_mode = stat.S_IMODE(os.stat(destination).st_mode)
             except OSError:
-                os.chmod(temp_path, 0o666 & ~umask)
+                final_mode = default_mode
         else:
-            os.chmod(temp_path, 0o666 & ~umask)
+            final_mode = default_mode
+        os.chmod(temp_path, final_mode)
         os.replace(temp_path, destination)
         add_log("Saved dropped local file: %s" % destination, "success")
         return destination
     except Exception:
-        try:
-            if os.path.exists(temp_path):
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if created and temp_path is not None:
+            try:
                 os.unlink(temp_path)
-        except OSError:
-            pass
+            except OSError:
+                pass
         raise
 
 
@@ -2294,15 +2694,38 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def request_content_length(self):
+        if self.headers.get("Transfer-Encoding"):
+            raise ValueError("Transfer-Encoding is not supported.")
+        values = self.headers.get_all("Content-Length", [])
+        if len(values) > 1:
+            raise ValueError("Multiple Content-Length headers are not allowed.")
+        if not values:
+            return None
+        value = values[0].strip()
+        if not re.fullmatch(r"[0-9]+", value):
+            raise ValueError("The request body length is invalid.")
+        return int(value)
+
     def read_json_body(self):
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length <= 0:
+        content_length = self.request_content_length()
+        if content_length is None:
             return {}
-        raw = self.rfile.read(content_length).decode("utf-8")
+        if content_length > MAX_JSON_BODY_BYTES:
+            raise RequestTooLarge(
+                "JSON request bodies are limited to %d bytes." % MAX_JSON_BODY_BYTES)
+        if content_length == 0:
+            return {}
+        raw = self.rfile.read(content_length)
+        if len(raw) != content_length:
+            raise ValueError("The request body ended before all bytes arrived.")
         try:
-            return json.loads(raw)
-        except Exception:
-            return {}
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+            raise ValueError("The request body must be valid UTF-8 JSON.") from exc
+        if not isinstance(body, dict):
+            raise ValueError("The request body must be a JSON object.")
+        return body
 
     # -- GET ---------------------------------------------------------------
 
@@ -2320,7 +2743,12 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
     def do_POST(self):
         try:
             return self._dispatch_post()
+        except RequestTooLarge as exc:
+            self.close_connection = True
+            return self.send_json({"success": False, "error": str(exc)},
+                                  status=413)
         except ValueError as exc:
+            self.close_connection = True
             return self.send_json({"success": False, "error": str(exc)},
                                   status=400)
 
@@ -2534,27 +2962,32 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             try:
                 tab_id = int(query.get("tab", [""])[0])
-                content_length = int(self.headers.get("Content-Length", "-1"))
+                content_length = self.request_content_length()
             except (TypeError, ValueError):
+                self.close_connection = True
                 self.send_json({"success": False,
                                 "error": "Invalid upload request."}, status=400)
                 return
-            if content_length < 0:
+            if content_length is None:
+                self.close_connection = True
                 self.send_json({"success": False,
                                 "error": "The upload size is missing."}, status=411)
                 return
             if content_length > MAX_BROWSER_UPLOAD_BYTES:
+                self.close_connection = True
                 self.send_json({"success": False,
                                 "error": "Browser uploads are limited to 1 GiB."},
                                status=413)
                 return
             if self.headers.get_content_type() != "application/octet-stream":
+                self.close_connection = True
                 self.send_json({"success": False,
                                 "error": "Expected an octet-stream file upload."},
                                status=415)
                 return
             tab = require_tab(tab_id)
             if tab is None or tab.id != tab_id:
+                self.close_connection = True
                 self.send_json({"success": False, "error": "Not connected"},
                                status=400)
                 return
@@ -2566,6 +2999,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                                             self.rfile, content_length,
                                             relative_path)
             except (IOError, OSError, ValueError) as exc:
+                self.close_connection = True
                 self.send_json({"success": False,
                                 "error": "Could not receive the file: %s" % exc},
                                status=400)
@@ -2576,21 +3010,25 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
         if path == "/api/local/drop":
             query = urllib.parse.parse_qs(parsed.query)
             try:
-                content_length = int(self.headers.get("Content-Length", "-1"))
+                content_length = self.request_content_length()
             except (TypeError, ValueError):
+                self.close_connection = True
                 self.send_json({"success": False,
                                 "error": "Invalid upload request."}, status=400)
                 return
-            if content_length < 0:
+            if content_length is None:
+                self.close_connection = True
                 self.send_json({"success": False,
                                 "error": "The upload size is missing."}, status=411)
                 return
             if content_length > MAX_BROWSER_UPLOAD_BYTES:
+                self.close_connection = True
                 self.send_json({"success": False,
                                 "error": "Browser uploads are limited to 1 GiB."},
                                status=413)
                 return
             if self.headers.get_content_type() != "application/octet-stream":
+                self.close_connection = True
                 self.send_json({"success": False,
                                 "error": "Expected an octet-stream file upload."},
                                status=415)
@@ -2605,6 +3043,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                     local_dir, filename, self.rfile, content_length,
                     relative_path)
             except (IOError, OSError, ValueError) as exc:
+                self.close_connection = True
                 self.send_json({"success": False,
                                 "error": "Could not save the dropped file: %s" % exc},
                                status=400)
@@ -2652,14 +3091,30 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/tabs/open":
             session = dict(new_session())
-            given = body.get("session") or {}
+            given = body.get("session")
+            if given is None:
+                given = {}
+            if not isinstance(given, dict):
+                self.send_json({"success": False,
+                                "error": "The session must be a JSON object."},
+                               status=400)
+                return
             for key in ("protocol", "host", "port", "username", "password",
                         "keyfile", "hostkey", "initial_dir", "local_dir"):
                 if key in given:
                     session[key] = given[key]
+            error = validate_session_data(session, require_host=True)
+            requested_name = body.get("name")
+            given_name = given.get("name")
+            name = requested_name or given_name
+            if ((requested_name is not None and not isinstance(requested_name, str)) or
+                    (given_name is not None and not isinstance(given_name, str))):
+                error = "The tab name must be text."
+            if error:
+                self.send_json({"success": False, "error": error}, status=400)
+                return
             with STATE_LOCK:
-                tab = CoreSession(STATE["next_tab"], session,
-                                  name=body.get("name") or given.get("name"))
+                tab = CoreSession(STATE["next_tab"], session, name=name)
                 STATE["next_tab"] += 1
             add_log("Connecting to %s (%s)..." % (session.get("host"), session.get("protocol")),
                     "info")
@@ -2798,7 +3253,8 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 return
             add_log("Opening a terminal on the server", "info")
             code, stdout, stderr = run_linscp(
-                "open %s ; terminal" % session_url(tab.session), tab.session)
+                "open %s ; terminal" % quote_remote(session_url(tab.session)),
+                tab.session)
             if code == 0:
                 add_log("Terminal opened", "success")
                 self.send_json({"success": True, "output": stdout})
@@ -2809,8 +3265,26 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/sessions/save":
-            name = (body.get("name") or "").strip()
-            session = body.get("session") or {}
+            raw_name = body.get("name") or ""
+            if not isinstance(raw_name, str):
+                self.send_json({"success": False,
+                                "error": "The session name must be text."},
+                               status=400)
+                return
+            name = raw_name.strip()
+            session = body.get("session")
+            if session is None:
+                session = {}
+            if not isinstance(session, dict):
+                self.send_json({"success": False,
+                                "error": "The session must be a JSON object."},
+                               status=400)
+                return
+            validation_error = validate_session_data(session)
+            if validation_error:
+                self.send_json({"success": False, "error": validation_error},
+                               status=400)
+                return
             if not name:
                 self.send_json({"success": False, "error": "A session name is required"},
                                status=400)
@@ -3243,7 +3717,8 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 preview=True,
                 conflict=body.get("conflict") or "skip")
             code, stdout, stderr = run_linscp(
-                "open %s ; %s" % (session_url(tab.session, tab.remote_dir), command),
+                "open %s ; %s" % (
+                    quote_remote(session_url(tab.session, tab.remote_dir)), command),
                 tab.session)
             if code != 0:
                 self.send_json({"success": False,
@@ -3498,20 +3973,20 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/command/exec":
             cmd_text = body.get("command", "")
+            if not isinstance(cmd_text, str):
+                self.send_json({"success": False,
+                                "error": "The command must be text."}, status=400)
+                return
             if not cmd_text:
                 self.send_json({"success": False, "error": "Empty command"}, status=400)
                 return
             tab = get_tab(body.get("tab"))
             if tab is not None and tab.connected:
                 # Run it in the live session: 'cd' and 'lcd' then stick.
-                # '-command=' splits on ';', so the terminal does too -
-                # with the same quoting rule, so a ';' inside quotes is
-                # data (a file named 'a;b.txt') rather than a second
-                # command. A bare split() cut such a name in two and ran
-                # the pieces as commands that were never typed.
+                # Split at semicolons only outside quoted operands, just as
+                # the console command parser does.
                 code, lines, errors = tab.run_many_capture(
-                    [part for part in split_gui_commands(cmd_text)
-                     if part.strip()])
+                    split_linscp_commands(cmd_text))
                 if code == 0:
                     code, pwd = tab.run("pwd")
                     for line in pwd:

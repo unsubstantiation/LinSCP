@@ -56,6 +56,7 @@ CASE_SOURCES = {
     "gui-security": "source/gui/tests/SecurityTest.py",
     "powershell": "automation/test_psmodule.py",
     "gui-desktop-uri": "source/gui/tests/DesktopUriTest.py",
+    "gui-security": "source/gui/tests/SecurityTest.py",
     "platform-conversion": "tools/tests/test_platform_conversion.py",
 }
 

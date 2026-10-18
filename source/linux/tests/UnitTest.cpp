@@ -3020,6 +3020,71 @@ void TestRelativeTime()
  * defaults a connection would use without them, and the refusals that stop
  * a setting from being silently dropped.
  */
+void TestFtpPassiveReplyParsing()
+{
+    int port = -1;
+    CHECK_TRUE(FtpClient::ParseEpsvReply(
+        "229 Entering Extended Passive Mode (|||6446|)", port));
+    CHECK_TRUE(port == 6446);
+    CHECK_TRUE(FtpClient::ParseEpsvReply(
+        "229 Entering Extended Passive Mode (!!!21!)", port));
+    CHECK_TRUE(port == 21);
+    CHECK_TRUE(FtpClient::ParseEpsvReply(
+        "229 Entering Extended Passive Mode (|||65535|)", port));
+    CHECK_TRUE(port == 65535);
+
+    const char * badEpsv[] = {
+        "229 Entering Extended Passive Mode",
+        "229 Entering Extended Passive Mode (||6446|)",
+        "229 Entering Extended Passive Mode (|||0|)",
+        "229 Entering Extended Passive Mode (|||65536|)",
+        "229 Entering Extended Passive Mode (|||999999999999|)",
+        "229 Entering Extended Passive Mode (|||64x6|)",
+        "229 Entering Extended Passive Mode (|||6446||)",
+        "229 Entering Extended Passive Mode (|||6446)",
+        "229 Entering Extended Passive Mode (|||64,46|)"
+    };
+    for (size_t i = 0; i < sizeof(badEpsv) / sizeof(badEpsv[0]); i++)
+    {
+        port = -1;
+        CHECK_FALSE(FtpClient::ParseEpsvReply(badEpsv[i], port));
+        CHECK_TRUE(port == 0);
+    }
+
+    std::string address;
+    port = -1;
+    CHECK_TRUE(FtpClient::ParsePasvReply(
+        "227 Entering Passive Mode (192,0,2,1,7,138).", address, port));
+    CHECK_EQ(address, std::string("192.0.2.1"));
+    CHECK_TRUE(port == 1930);
+    CHECK_TRUE(FtpClient::ParsePasvReply(
+        "227 Entering Passive Mode (127, 0, 0, 1, 195, 80)",
+        address, port));
+    CHECK_EQ(address, std::string("127.0.0.1"));
+    CHECK_TRUE(port == 50000);
+
+    const char * badPasv[] = {
+        "227 Entering Passive Mode",
+        "227 Entering Passive Mode (256,0,0,1,7,138)",
+        "227 Entering Passive Mode (-1,0,0,1,7,138)",
+        "227 Entering Passive Mode (1,2,3,4,5)",
+        "227 Entering Passive Mode (1,2,3,4,5,6,7)",
+        "227 Entering Passive Mode (1,2,3,4,0,0)",
+        "227 Entering Passive Mode (1,2,3,4,0,256)",
+        "227 Entering Passive Mode (1,2,3,4,9999,6)",
+        "227 Entering Passive Mode (1,2,x,4,5,6)",
+        "227 Entering Passive Mode (1 2,3,4,5,6)"
+    };
+    for (size_t i = 0; i < sizeof(badPasv) / sizeof(badPasv[0]); i++)
+    {
+        address = "stale";
+        port = -1;
+        CHECK_FALSE(FtpClient::ParsePasvReply(badPasv[i], address, port));
+        CHECK_TRUE(address.empty());
+        CHECK_TRUE(port == 0);
+    }
+}
+
 void TestFtpAndTlsSettings()
 {
     SessionOptions options;
@@ -4086,6 +4151,7 @@ int main()
     TestSyncPlanOrder();
     TestSyncStateFile();
     TestProxySettings();
+    TestFtpPassiveReplyParsing();
     TestFtpAndTlsSettings();
     TestHostKeyPinConversion();
     TestDavLockAndPropertyXml();

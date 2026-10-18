@@ -685,20 +685,11 @@ bool FtpSession::OpenPassive(std::string & error)
     }
     if (reply.code == 229)
     {
-        const size_t open = reply.Text().find('(');
-        const size_t close = reply.Text().rfind(')');
-        std::string number;
-        for (size_t i = open + 1; open != std::string::npos && close != std::string::npos && i < close; i++)
-        {
-            if (isdigit_ascii(reply.Text()[i]))
-            {
-                number += reply.Text()[i];
-            }
-        }
+        const std::string text = reply.Text();
         int port = 0;
-        if (!ParseFtpReplyNumber(number, 1, 65535, port))
+        if (!FtpClient::ParseEpsvReply(text, port))
         {
-            error = "The server's EPSV reply has no usable port: " + reply.Text();
+            error = "The server's EPSV reply has no valid port: " + text;
             return false;
         }
         return ConnectDataSocket(mOptions.hostName, port, error);
@@ -719,55 +710,14 @@ bool FtpSession::OpenPassive(std::string & error)
         error = "Passive mode failed: " + reply.Text();
         return false;
     }
-    const size_t open = reply.Text().find('(');
-    const size_t close = reply.Text().rfind(')');
-    if (open == std::string::npos || close == std::string::npos || close < open)
+    const std::string text = reply.Text();
+    std::string address;
+    int port = 0;
+    if (!FtpClient::ParsePasvReply(text, address, port))
     {
-        error = "The server's PASV reply has no address: " + reply.Text();
+        error = "The server's PASV reply has no valid address or port: " + text;
         return false;
     }
-    std::vector<int> numbers;
-    std::string number;
-    for (size_t i = open + 1; i < close; i++)
-    {
-        const char c = reply.Text()[i];
-        if (isdigit_ascii(c))
-        {
-            number += c;
-        }
-        else if (!number.empty())
-        {
-            int octet = 0;
-            if (!ParseFtpReplyNumber(number, 0, 255, octet))
-            {
-                error = "The server's PASV reply has no usable address: " +
-                    reply.Text();
-                return false;
-            }
-            numbers.push_back(octet);
-            number.clear();
-        }
-    }
-    if (!number.empty())
-    {
-        int octet = 0;
-        if (!ParseFtpReplyNumber(number, 0, 255, octet))
-        {
-            error = "The server's PASV reply has no usable address: " +
-                reply.Text();
-            return false;
-        }
-        numbers.push_back(octet);
-    }
-    if (numbers.size() != 6)
-    {
-        error = "The server's PASV reply has no address: " + reply.Text();
-        return false;
-    }
-    char address[64];
-    snprintf(address, sizeof(address), "%d.%d.%d.%d", numbers[0], numbers[1],
-        numbers[2], numbers[3]);
-    const int port = numbers[4] * 256 + numbers[5];
 
     /*
      * FtpForcePasvIp: what to do when the address in the reply is not the
@@ -798,26 +748,26 @@ bool FtpSession::OpenPassive(std::string & error)
         /* RFC 1918, loopback and link-local addresses are the ones a NAT
          * server reports about itself instead of about the destination. */
         const bool unroutable =
-            strncmp(address, "10.", 3) == 0 ||
-            strncmp(address, "192.168.", 8) == 0 ||
-            strncmp(address, "172.16.", 7) == 0 ||
-            strncmp(address, "172.17.", 7) == 0 ||
-            strncmp(address, "172.18.", 7) == 0 ||
-            strncmp(address, "172.19.", 7) == 0 ||
-            strncmp(address, "172.20.", 7) == 0 ||
-            strncmp(address, "172.21.", 7) == 0 ||
-            strncmp(address, "172.22.", 7) == 0 ||
-            strncmp(address, "172.23.", 7) == 0 ||
-            strncmp(address, "172.24.", 7) == 0 ||
-            strncmp(address, "172.25.", 7) == 0 ||
-            strncmp(address, "172.26.", 7) == 0 ||
-            strncmp(address, "172.27.", 7) == 0 ||
-            strncmp(address, "172.28.", 7) == 0 ||
-            strncmp(address, "172.29.", 7) == 0 ||
-            strncmp(address, "172.30.", 7) == 0 ||
-            strncmp(address, "172.31.", 7) == 0 ||
-            strncmp(address, "127.", 4) == 0 ||
-            strncmp(address, "169.254.", 8) == 0;
+            strncmp(address.c_str(), "10.", 3) == 0 ||
+            strncmp(address.c_str(), "192.168.", 8) == 0 ||
+            strncmp(address.c_str(), "172.16.", 7) == 0 ||
+            strncmp(address.c_str(), "172.17.", 7) == 0 ||
+            strncmp(address.c_str(), "172.18.", 7) == 0 ||
+            strncmp(address.c_str(), "172.19.", 7) == 0 ||
+            strncmp(address.c_str(), "172.20.", 7) == 0 ||
+            strncmp(address.c_str(), "172.21.", 7) == 0 ||
+            strncmp(address.c_str(), "172.22.", 7) == 0 ||
+            strncmp(address.c_str(), "172.23.", 7) == 0 ||
+            strncmp(address.c_str(), "172.24.", 7) == 0 ||
+            strncmp(address.c_str(), "172.25.", 7) == 0 ||
+            strncmp(address.c_str(), "172.26.", 7) == 0 ||
+            strncmp(address.c_str(), "172.27.", 7) == 0 ||
+            strncmp(address.c_str(), "172.28.", 7) == 0 ||
+            strncmp(address.c_str(), "172.29.", 7) == 0 ||
+            strncmp(address.c_str(), "172.30.", 7) == 0 ||
+            strncmp(address.c_str(), "172.31.", 7) == 0 ||
+            strncmp(address.c_str(), "127.", 4) == 0 ||
+            strncmp(address.c_str(), "169.254.", 8) == 0;
         if (mOptions.ftp.forcePasvIp == 0 ||
             (mOptions.ftp.forcePasvIp == 1 && unroutable))
         {
@@ -1336,6 +1286,123 @@ bool MlstFacts(const Reply & reply, FtpFacts & facts)
 }
 
 } // namespace
+
+namespace {
+
+bool ParseDecimalRange(const std::string & text, size_t maxDigits,
+    int maxValue, int & value)
+{
+    if (text.empty() || text.size() > maxDigits)
+    {
+        return false;
+    }
+    value = 0;
+    for (size_t i = 0; i < text.size(); i++)
+    {
+        if (!isdigit_ascii(text[i]))
+        {
+            return false;
+        }
+        const int digit = text[i] - '0';
+        if (value > (maxValue - digit) / 10)
+        {
+            return false;
+        }
+        value = value * 10 + digit;
+    }
+    return value <= maxValue;
+}
+
+} // namespace
+
+bool FtpClient::ParseEpsvReply(const std::string & replyText, int & port)
+{
+    port = 0;
+    const size_t open = replyText.find('(');
+    const size_t close = open == std::string::npos ? std::string::npos :
+        replyText.find(')', open + 1);
+    if (open == std::string::npos || close == std::string::npos || close <= open)
+    {
+        return false;
+    }
+    const std::string fields = replyText.substr(open + 1, close - open - 1);
+    if (fields.size() < 5)
+    {
+        return false;
+    }
+    const char delimiter = fields[0];
+    if (delimiter <= ' ' || delimiter > '~' || isdigit_ascii(delimiter) ||
+        delimiter == '(' || delimiter == ')')
+    {
+        return false;
+    }
+    if (fields[1] != delimiter || fields[2] != delimiter ||
+        fields[fields.size() - 1] != delimiter)
+    {
+        return false;
+    }
+    const std::string portText = fields.substr(3, fields.size() - 4);
+    int parsedPort = 0;
+    if (!ParseDecimalRange(portText, 5, 65535, parsedPort) || parsedPort == 0)
+    {
+        return false;
+    }
+    port = parsedPort;
+    return true;
+}
+
+bool FtpClient::ParsePasvReply(const std::string & replyText,
+    std::string & address, int & port)
+{
+    address.clear();
+    port = 0;
+    const size_t open = replyText.find('(');
+    const size_t close = open == std::string::npos ? std::string::npos :
+        replyText.find(')', open + 1);
+    if (open == std::string::npos || close == std::string::npos || close <= open)
+    {
+        return false;
+    }
+
+    std::vector<int> numbers;
+    size_t start = open + 1;
+    while (start <= close)
+    {
+        size_t end = replyText.find(',', start);
+        if (end == std::string::npos || end > close)
+        {
+            end = close;
+        }
+        int number = 0;
+        if (!ParseDecimalRange(TrimAscii(replyText.substr(start, end - start)),
+            3, 255, number))
+        {
+            return false;
+        }
+        numbers.push_back(number);
+        if (end == close)
+        {
+            break;
+        }
+        start = end + 1;
+    }
+    if (numbers.size() != 6)
+    {
+        return false;
+    }
+
+    const int parsedPort = numbers[4] * 256 + numbers[5];
+    if (parsedPort == 0)
+    {
+        return false;
+    }
+    char addressText[INET_ADDRSTRLEN];
+    snprintf(addressText, sizeof(addressText), "%d.%d.%d.%d", numbers[0],
+        numbers[1], numbers[2], numbers[3]);
+    address = addressText;
+    port = parsedPort;
+    return true;
+}
 
 bool FtpClient::Handles(const SessionOptions & options)
 {
