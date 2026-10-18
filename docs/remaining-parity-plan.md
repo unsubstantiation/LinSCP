@@ -46,9 +46,9 @@ No WinSCP .NET assembly or equivalent object model for Linux. The C ABI header t
 
 **Area:** Automation · **Status:** partial
 
-automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Nothing exercises it: no automated case runs PowerShell, so its session lifetime, pipeline objects, terminating errors, cancellation and secret handling are unevidenced, and it is a shim over the CLI rather than upstream's assembly API.
+automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Passwords travel on stdin to -server, never on a command line. The module has a test harness (automation/test_psmodule.py, run by make check-live, CTest and CI): static checks that always run, and a Pester suite against the throwaway WebDAV endpoint covering open/close, byte-exact transfers, listing objects, terminating errors, timeout cancellation and password hygiene. The live Pester run needs pwsh, which CI installs; no green live run has been recorded in this ledger yet, and the module remains a shim over the CLI rather than upstream's assembly API.
 
-**Next:** Exercise the shipped module with PowerShell on Linux: a session opened and closed, an upload and a download of exact bytes, a listing as pipeline objects, a terminating error, a cancelled transfer, and a password that appears neither in the process list nor in the output.
+**Next:** Record a green live Pester run (CI installs pwsh and runs the harness): a session opened and closed, an upload and a download of exact bytes, a listing as pipeline objects, a terminating error, a cancelled transfer, and a password that appears neither in the process list nor in the output.
 
 **Acceptance criteria:**
 

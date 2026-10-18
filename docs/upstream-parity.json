@@ -30,7 +30,8 @@
           "gui-local-editor": "source/gui/tests/LocalEditorTest.py - read and atomic local text save, stale-edit conflicts, rejection of binary/large files and symlink overwrite, and panel path confinement; standard library only.",
           "gui-localization": "source/gui/tests/LocalizationTest.js under node/jsdom - boots the real English/Spanish page with persisted, server and browser language selection; checks static text and ARIA, queue statuses, plural forms, literal placeholders, host-key verification, editor saves, sync preview and transfer API payloads, and unsaved-edit protection on language changes.",
           "platform-conversion": "tools/check_platform_conversion.py with tools/tests/test_platform_conversion.py - the guard that keeps the Windows-to-Linux conversion complete: it reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose wording contradicts the template it is filled into. Its own cases hold it to the same standard: it has to fail on the things it claims to catch and stay quiet about the ones it does not.",
-          "gui-security": "source/gui/tests/SecurityTest.py - offline boundary tests for the browser GUI: operand quoting for the client's command splitter (blanks, quotes, backslashes, control-character refusal), sync/chmod command building from fixed vocabularies, permission-mode validation, local panel containment and remote name validation, single-line server command stream, custom-command template validation/persistence/substitution/execution (local/remote scope, multiple selections, hostile names), PBKDF2 account hashing with per-session CSRF tokens and login throttling, queue staging cleanup, browser upload mode validation, and Host/token/CORS guards."
+          "gui-security": "source/gui/tests/SecurityTest.py - offline boundary tests for the browser GUI: operand quoting for the client's command splitter (blanks, quotes, backslashes, control-character refusal), sync/chmod command building from fixed vocabularies, permission-mode validation, local panel containment and remote name validation, single-line server command stream, custom-command template validation/persistence/substitution/execution (local/remote scope, multiple selections, hostile names), PBKDF2 account hashing with per-session CSRF tokens and login throttling, queue staging cleanup, browser upload mode validation, and Host/token/CORS guards.",
+          "powershell": "automation/test_psmodule.py - static checks of the PowerShell module that always run (every exported cmdlet defined, no password on a process command line, control-character and multiline refusal, marker-driven server reads, listing-parser status skipping) plus the live Pester suite (automation/LinSCP.Tests.ps1) against the throwaway WebDAV endpoint when pwsh is installed: open/close, byte-exact upload/download, listing objects, terminating errors, timeout cancellation and password hygiene. Without pwsh the live cases skip loudly."
         }
       }
     }
@@ -2516,15 +2517,31 @@
       "id": "automation.powershell",
       "area": "Automation",
       "status": "partial",
-      "notes": "automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Nothing exercises it: no automated case runs PowerShell, so its session lifetime, pipeline objects, terminating errors, cancellation and secret handling are unevidenced, and it is a shim over the CLI rather than upstream's assembly API.",
-      "gap": "Exercise the shipped module with PowerShell on Linux: a session opened and closed, an upload and a download of exact bytes, a listing as pipeline objects, a terminating error, a cancelled transfer, and a password that appears neither in the process list nor in the output.",
+      "notes": "automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Passwords travel on stdin to -server, never on a command line. The module has a test harness (automation/test_psmodule.py, run by make check-live, CTest and CI): static checks that always run, and a Pester suite against the throwaway WebDAV endpoint covering open/close, byte-exact transfers, listing objects, terminating errors, timeout cancellation and password hygiene. The live Pester run needs pwsh, which CI installs; no green live run has been recorded in this ledger yet, and the module remains a shim over the CLI rather than upstream's assembly API.",
+      "gap": "Record a green live Pester run (CI installs pwsh and runs the harness): a session opened and closed, an upload and a download of exact bytes, a listing as pipeline objects, a terminating error, a cancelled transfer, and a password that appears neither in the process list nor in the output.",
       "acceptance": [
         "Build cmdlets or a documented compatibility module on the tested automation contract. Exercise them with PowerShell on Linux, including pipeline objects, terminating errors, cancellation and secret handling."
       ],
       "source": [
         "automation/LinSCP.psm1",
-        "source/linux/Makefile"
-      ]
+        "automation/LinSCP.Tests.ps1",
+        "automation/test_psmodule.py"
+      ],
+      "checks": {
+        "powershell": [
+          "test_every_exported_cmdlet_is_defined",
+          "test_no_password_reaches_a_process_command_line",
+          "test_quoting_refuses_control_characters",
+          "test_multiline_commands_are_refused",
+          "test_server_answers_are_read_to_the_marker",
+          "test_listing_parser_skips_status_lines"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "powershell"
+        ]
+      }
     },
     {
       "id": "desktop.scheme-handlers",
