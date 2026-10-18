@@ -202,6 +202,13 @@ std::string PermissionsString(unsigned long permissions)
  *
  * Date is MM-DD-YY or MM-DD-YYYY, time is HH:MMAM/PM, <DIR> marks a
  * directory, otherwise the size follows, then the name.
+ *
+ * Some servers put a blank between the time and the meridiem ('04:00 PM')
+ * and some leave the meridiem out altogether ('04:00'). Both are read:
+ * the meridiem was the last word of the time column, and a listing that
+ * separates it from the time made the size column look like a word of
+ * its own, so the size came out as zero and the name carried the size
+ * in front of it.
  */
 
 bool LooksLikeDosListing(const std::string & line)
@@ -283,30 +290,66 @@ bool ParseDosDate(const std::string & dateStr, const std::string & timeStr,
         return false;
     }
 
-    /* Parse time: HH:MMAM or HH:MM PM or 24-hour */
+    /*
+     * Parse the time: 'HH:MM', with the meridiem attached ('HH:MMAM') or
+     * in the column next to it ('HH:MM' then 'AM'), and without one at
+     * all ('HH:MM', a 24-hour clock).
+     *
+     * The digits are checked before they are used. Reading '??' as a
+     * number produced an hour of some value out of the question marks,
+     * and mktime() folded it into a moment the file never had.
+     */
     int hour = 0, minute = 0;
     bool isPM = false;
+    bool haveMeridiem = false;
     const char * ts = timeStr.c_str();
     if (timeStr.size() >= 4)
     {
-        hour = (ts[0] - '0') * 10 + (ts[1] - '0');
-        if (ts[2] == ':')
+        if (ts[0] < '0' || ts[0] > '9' || ts[1] < '0' || ts[1] > '9' ||
+            ts[3] < '0' || ts[3] > '9' || ts[4] < '0' || ts[4] > '9')
         {
-            minute = (ts[3] - '0') * 10;
-            if (timeStr.size() > 4 && ts[4] >= '0' && ts[4] <= '9')
+            return false;
+        }
+        hour = (ts[0] - '0') * 10 + (ts[1] - '0');
+        if (ts[2] != ':')
+        {
+            return false;
+        }
+        minute = (ts[3] - '0') * 10 + (ts[4] - '0');
+        if (hour > 23 || minute > 59)
+        {
+            return false;
+        }
+        /* The meridiem, when the server wrote one. */
+        std::string tail = timeStr.substr(5);
+        while (!tail.empty() && (tail[0] == ' ' || tail[0] == '\t'))
+        {
+            tail.erase(0, 1);
+        }
+        if (tail.size() >= 2)
+        {
+            const char a = static_cast<char>(toupper(
+                static_cast<unsigned char>(tail[0])));
+            const char b = static_cast<char>(toupper(
+                static_cast<unsigned char>(tail[1])));
+            if (a == 'A' && b == 'M')
             {
-                minute += ts[4] - '0';
+                haveMeridiem = true;
+                isPM = false;
+            }
+            else if (a == 'P' && b == 'M')
+            {
+                haveMeridiem = true;
+                isPM = true;
             }
         }
-        /* Look for AM/PM */
-        size_t ampm = timeStr.find("PM");
-        if (ampm == std::string::npos)
+    }
+    if (haveMeridiem)
+    {
+        if (hour < 1 || hour > 12)
         {
-            ampm = timeStr.find("pm");
-        }
-        if (ampm != std::string::npos)
-        {
-            isPM = true;
+            /* A twelve-hour clock does not have an hour 0 or 13. */
+            return false;
         }
         if (isPM && hour < 12) hour += 12;
         if (!isPM && hour == 12) hour = 0;
@@ -343,6 +386,33 @@ bool ParseDosListingLine(const std::string & line, ListingEntry & entry)
         return false;
     }
 
+    /*
+     * The meridiem is a word of its own in some listings: '04:00 PM'
+     * puts it in the column where the size belongs. Reading the size
+     * from that column then gave the size of zero and left the size in
+     * front of the file name, so the entry described a file called
+     * '12345    filename' of no size at all.
+     */
+    {
+        std::string upper = dirOrSize;
+        for (size_t i = 0; i < upper.size(); i++)
+        {
+            upper[i] = static_cast<char>(toupper(
+                static_cast<unsigned char>(upper[i])));
+        }
+        if (upper == "AM" || upper == "PM")
+        {
+            std::string next;
+            if (!(stream >> next))
+            {
+                return false;
+            }
+            dirOrSize = next;
+            /* The meridiem belongs to the time column. */
+            timeStr += " " + upper;
+        }
+    }
+
     /* The name is everything after the size/DIR field, trimmed. */
     std::string rest;
     std::getline(stream, rest);
@@ -376,9 +446,20 @@ bool ParseDosListingLine(const std::string & line, ListingEntry & entry)
     {
         entry.isDir = false;
         entry.permissions = 0100644UL;
+        /* The size column is a number. std::stoull() accepts a sign and
+         * turns '-1' into a huge size, so the digits are checked first. */
+        bool numeric = !dirOrSize.empty();
+        for (size_t i = 0; i < dirOrSize.size(); i++)
+        {
+            if (dirOrSize[i] < '0' || dirOrSize[i] > '9')
+            {
+                numeric = false;
+                break;
+            }
+        }
         try
         {
-            entry.size = std::stoull(dirOrSize);
+            entry.size = numeric ? std::stoull(dirOrSize) : 0;
         }
         catch (...)
         {

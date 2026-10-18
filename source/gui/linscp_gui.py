@@ -1288,12 +1288,18 @@ def quote_remote(path):
     on the server can be called anything, so this is reached by listing a
     hostile server as easily as by a crafted API call - refuse the operand
     instead of sending it.
+
+    A backslash needs the quotes as much as a blank does. The client's
+    splitter reads a backslash as the start of an escape outside quotes,
+    so an unquoted 'a\\b' arrived at the server as 'ab': the name of one
+    file was the name of another. Quoting it keeps the backslash, and
+    the local side has always quoted it that way.
     """
     if not isinstance(path, str):
         raise ValueError("A remote path must be text.")
     if any(ord(char) < 32 or ord(char) == 127 for char in path):
         raise ValueError("A remote path must not contain a control character.")
-    if path and not any(ch in path for ch in " \t\"';"):
+    if path and not any(ch in path for ch in " \t\"';\\"):
         return path
     return '"' + path.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
@@ -1492,8 +1498,14 @@ def apply_local_mode(path, mode_text):
         os.chmod(path, int(text, 8))
         return
     st_mode = os.stat(path).st_mode
-    current = stat.S_IMODE(st_mode)
+    original = stat.S_IMODE(st_mode)
+    current = original
     is_dir = stat.S_ISDIR(st_mode)
+    # The three permission classes, with the mask that holds them and the
+    # shift that puts a class bit in the right place: the owner at 6, the
+    # group at 3, the others at 0.
+    classes = (("u", 0o700, 6), ("g", 0o070, 3), ("o", 0o007, 0))
+    class_bits = {"u": (0o700, 6), "g": (0o070, 3), "o": (0o007, 0)}
     # Commas and blanks separate clauses here exactly as they do in
     # ParseSymbolicPermissions(), so a mode the panel accepted for the
     # remote side means the same thing on the local one.
@@ -1518,38 +1530,58 @@ def apply_local_mode(path, mode_text):
                 # '=rwx' names nobody in front of it, so it is for
                 # everybody: the same reading the console client gives it.
                 who = 0o777
-            bits = 0
+            letters = []
             while index < len(clause) and clause[index] in "rwxXstugo":
-                letter = clause[index]
+                letters.append(clause[index])
                 index += 1
-                if letter == "r":
-                    bits |= 0o444
-                elif letter == "w":
-                    bits |= 0o222
-                elif letter == "x":
-                    bits |= 0o111
-                elif letter == "X":
-                    # 'X' is execute for a directory, or for a file that
-                    # already has one execute bit set.
-                    if is_dir or current & 0o111:
-                        bits |= 0o111
-                elif letter == "s":
-                    bits |= 0o6000
-                elif letter == "t":
-                    bits |= 0o1000
-                elif letter in "ugo":
-                    # As a permission letter, u/g/o means "whatever that
-                    # class already has", so the bits are copied from the
-                    # mode being changed.
-                    bits |= current & {"u": 0o700, "g": 0o070,
-                                       "o": 0o007}[letter]
-            selected = bits & who
-            if operator == "+":
-                current |= selected
-            elif operator == "-":
-                current &= ~selected
-            else:
-                current = (current & ~who) | selected
+            for name, class_mask, shift in classes:
+                if not who & class_mask:
+                    continue
+                bits = 0
+                for letter in letters:
+                    if letter == "r":
+                        bits |= 0o4 << shift
+                    elif letter == "w":
+                        bits |= 0o2 << shift
+                    elif letter == "x":
+                        bits |= 0o1 << shift
+                    elif letter == "X":
+                        # 'X' is execute for a directory, or for a file
+                        # that already has one execute bit set.
+                        if is_dir or original & 0o111:
+                            bits |= 0o1 << shift
+                    elif letter in "ugo":
+                        # As a permission letter, u/g/o means "whatever
+                        # that class already has", so the bits are copied
+                        # from the mode the file had: out of the class
+                        # they name and into the class being changed.
+                        source_mask, source_shift = class_bits[letter]
+                        bits |= ((original & source_mask) >> source_shift) << shift
+                if operator == "+":
+                    current |= bits
+                elif operator == "-":
+                    current &= ~bits
+                else:
+                    current = (current & ~class_mask) | (bits & class_mask)
+                # The setuid, setgid and sticky bits live outside the
+                # three permission classes. They were dropped here: the
+                # bits of 's' and 't' were masked with the class mask,
+                # which does not hold them, so 'a+s' and 'o+t' changed
+                # nothing at all while the remote chmod set them. The
+                # console client applies them per class, and so does
+                # this one now: 's' is the setuid bit for the owner and
+                # the setgid bit for the group, 't' is the sticky bit of
+                # the others.
+                special = 0
+                if "s" in letters:
+                    special = 0o4000 if name == "u" else (0o2000 if name == "g" else 0)
+                elif "t" in letters and name == "o":
+                    special = 0o1000
+                if special:
+                    if operator == "-":
+                        current &= ~special
+                    else:
+                        current |= special
     os.chmod(path, current & 0o7777)
 
 

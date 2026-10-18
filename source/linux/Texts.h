@@ -88,6 +88,7 @@ std::string PresetListed(const std::string & name);
 std::string PresetSaved(const std::string & name);
 std::string PresetRemoved(const std::string & name);
 std::string OptionSet(const std::string & name, const std::string & value);
+std::string OptionValue(const std::string & name, const std::string & value);
 std::string TerminalOpening();
 
 } // namespace Texts

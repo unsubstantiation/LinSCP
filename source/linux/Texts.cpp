@@ -434,6 +434,11 @@ std::string OptionSet(const std::string & name, const std::string & value)
     return Translate("Option {name} set to '{value}'.", {{"name", name}, {"value", value}});
 }
 
+std::string OptionValue(const std::string & name, const std::string & value)
+{
+    return Translate("{name} = {value}", {{"name", name}, {"value", value}});
+}
+
 std::string TerminalOpening()
 {
     return Translate("Opening terminal...");

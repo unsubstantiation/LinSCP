@@ -599,7 +599,7 @@
     {
       "name": "Localization/accessibility",
       "status": "partial",
-      "notes": "The Commander provides ARIA roles and keyboard navigation. English/Spanish catalogs localize its static and dynamic interface and shared CLI help, status/security messages and destructive prompts; browser, script, unit and live SFTP regressions exercise language selection, plurals, data preservation and host-key refusals. Remaining human-facing script/engine diagnostics not routed through Texts keep this area partial; server/OS diagnostics and wire data are preserved verbatim.",
+      "notes": "The Commander provides ARIA roles and keyboard navigation. English/Spanish catalogs localize its static and dynamic interface and the whole command-line client: the per-command help texts, the status, argument, switch and engine messages of the script engine, the error helpers and the option listing; browser, script, unit and live SFTP regressions exercise language selection, plurals, data preservation and host-key refusals. Server/OS diagnostics, protocol banners and wire data are preserved verbatim.",
       "verified_on": {
         "linux": [
           "gui",
@@ -2583,13 +2583,14 @@
       "id": "locale.translations",
       "area": "Localization/accessibility",
       "status": "partial",
-      "notes": "English/Spanish catalogs cover the browser interface (menus, dialogs, help, ARIA/tooltips, dynamic status/queue/sync/editor/search messages) and shared CLI messages, CLI -help/option errors, host-key warnings, passphrase/destructive-action prompts and connection status. Locale precedence, regional fallback, plurals, literal data, safe embedded JSON and internal protocol isolation are tested. Raw server/OS diagnostics and core logs are intentionally preserved.",
-      "gap": "Translate command-specific help and remaining human-facing Script.cpp status and argument/engine error strings that bypass the shared Texts functions; no full upstream language-catalog coverage is claimed.",
+      "notes": "English/Spanish catalogs cover the browser interface (menus, dialogs, help, ARIA/tooltips, dynamic status/queue/sync/editor/search messages) and the whole command-line client: the per-command help texts, the status, argument, switch and engine messages of the script engine, the operations the error helpers name and the option listing. The translation compiler rejects a message that reaches the user without a catalog entry, a command help text that nobody translated and an error operation that is not in the catalog. Locale precedence, regional fallback, plurals, literal data, safe embedded JSON and internal protocol isolation are tested. Raw server/OS diagnostics, the 'LSCP-' protocol banners and core logs are intentionally preserved.",
+      "gap": "Only English and Spanish catalogs are shipped; upstream ships catalogs for many more languages, and the upstream .NET interface has strings that this client does not have at all. No full upstream language-catalog coverage is claimed.",
       "source": [
         "source/linux/Texts.cpp",
         "source/linux/Console.cpp",
         "source/linux/Script.cpp",
         "source/linux/Session.cpp",
+        "source/linux/PuttyGlue.cpp",
         "source/linux/main.cpp",
         "source/linux/locales/en.json",
         "source/linux/locales/es.json",
@@ -2606,7 +2607,10 @@
         "script": [
           "test_translation_locale_selection_and_literal_placeholders",
           "test_translation_locale_environment_precedence",
-          "test_translated_help_and_option_errors_preserve_command_syntax"
+          "test_translated_help_and_option_errors_preserve_command_syntax",
+          "test_translated_command_help_lists_every_command",
+          "test_translated_engine_workflows_keep_the_data_literal",
+          "test_translated_synchronization_session_and_transfer_workflows"
         ],
         "live-sftp": [
           "test_spanish_transfer_and_host_key_refusal"
@@ -2633,9 +2637,8 @@
         ]
       },
       "acceptance": [
-        "Route command-specific help and every remaining human-facing script status/argument/engine message through English/Spanish catalogs, keeping paths, command tokens and server/OS diagnostics literal.",
-        "Add coverage checks that detect new uncatalogued messages and run translated positive/negative CLI workflows, including help, synchronization, editing, sessions and transfer failures.",
-        "Preserve host-key refusal behavior, machine protocol values and secret masking; review security-warning translations before adding more supported locales."
+        "Ship a catalog for every language the project claims to support and translate the whole interface into it, starting with the languages the upstream project already ships.",
+        "Add a test that walks the catalogs and reports the messages of the client that are still answered in English, so a new interface string cannot slip through untranslated."
       ]
     },
     {
