@@ -1059,14 +1059,19 @@ class ScriptTests(unittest.TestCase):
         # complained about, and that happens after the arguments are checked.
         for command in ("chmod u+x file", "chmod a=r,go-w file",
                         "chmod 640 file -recursive", "chmod -recursive 700 file",
-                        "chmod a+r file +x", "chmod a+r file +q"):
+                        "chmod a+r file +x", "chmod a+r file +q",
+                        # chmod(1) allows '=' with no letters after it,
+                        # and a '=' clears the class special bit.
+                        "chmod a= file", "chmod u=rw,g=,o=r file",
+                        "chmod u=-w file"):
             with self.subTest(command=command):
                 result = self.run_commands(command)
                 self.assertEqual(result.returncode, 1)
                 self.assertNotIn("Wrong arguments", result.stderr)
                 self.assertIn("Not connected", result.stderr)
         for command in ("chmod 999 file", "chmod u?q file", "chmod a+r",
-                        "chmod , file", "chmod -recursive", "chmod 12345 file"):
+                        "chmod u+ file", "chmod , file", "chmod -recursive",
+                        "chmod 12345 file"):
             # Everything after the mode is a file name, so a stray '+q' is
             # not a syntax error; that case is in the accepted list above.
             with self.subTest(rejected=command):

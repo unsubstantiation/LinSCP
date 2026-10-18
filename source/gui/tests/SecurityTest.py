@@ -435,7 +435,11 @@ class PermissionModeTests(unittest.TestCase):
         # blanks as well as by commas.
         for mode in ("u+x", "a=r,go-w", "o-rwx", "a+X", "=rwx", "a+rwx,u-s",
                      "g=u", "u=rwx,g=rx", "=x", "u+x-w", "g+w+r", "a=r-w",
-                     "u=rw g=r o=r", "u+x,", "UG+X", "a+t"):
+                     "u=rw g=r o=r", "u+x,", "UG+X", "a+t",
+                     # '=' may stand without a permission letter, and
+                     # clears the class it names: chmod(1) reads 'o=' so,
+                     # and so does the console client.
+                     "o=", "a=", "=", "u=rwx,g=rx,o=", "u=-w", "a=st"):
             self.assertEqual(gui.check_permission_mode(mode), "", mode)
 
     def test_the_octal_forms_the_console_client_accepts(self):
@@ -468,11 +472,11 @@ class PermissionModeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 gui.build_chmod_command("/r", mode, "f")
 
-    def test_a_clause_with_no_permission_letter_is_refused_as_the_client_does(self):
-        # chmod(1) would read 'o=' as clearing a class, but the console
-        # client asks for a letter, so the panel has to say the same thing
-        # rather than accept a mode the transfer would then refuse.
-        for mode in ("o=", "u=rwx,g=rx,o=", "a=", "u+"):
+    def test_a_clause_with_no_permission_letter_is_refused_after_plus_or_minus(self):
+        # chmod(1) allows the empty list after '=' ('o=' clears a class),
+        # and so does the console client now. After '+' and '-' it states
+        # nothing at all, so both refuse it.
+        for mode in ("u+", "u-", "a+", "go-"):
             self.assertNotEqual(gui.check_permission_mode(mode), "", mode)
 
     def test_what_is_neither_form_is_refused(self):
@@ -525,6 +529,37 @@ class PermissionModeTests(unittest.TestCase):
                 gui.apply_local_mode(target, mode)
                 self.assertEqual(stat.S_IMODE(os.stat(target).st_mode),
                                  expected, mode)
+
+    def test_a_set_operator_clears_the_class_it_names_like_chmod(self):
+        # '=' clears the class's rwx bits and the special bit that belongs
+        # to it, and a '=' with no letters after it still clears them:
+        # chmod(1)'s 'u=rw' on a 4755 file leaves 655, and 'u=' leaves 55.
+        # The console client reads the same modes with the same result.
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, "file")
+            with open(target, "w") as handle:
+                handle.write("x")
+            cases = (
+                (0o4755, "u=rw", 0o655),
+                (0o6755, "u=r", 0o2455),
+                (0o6755, "g=r", 0o4745),
+                (0o6755, "o=r", 0o6754),
+                (0o4755, "u=", 0o55),
+                (0o2755, "g=", 0o705),
+                (0o1755, "o=", 0o750),
+                (0o1755, "a=", 0o000),
+                (0o4755, "u=-w", 0o055),
+                (0o1755, "o=st", 0o1750),
+                (0o1755, "a=st", 0o7000),
+                (0o1755, "o=s", 0o750),
+                (0o4755, "g=u", 0o4775),
+                (0o4755, "u=t", 0o055),
+            )
+            for start, mode, expected in cases:
+                os.chmod(target, start)
+                gui.apply_local_mode(target, mode)
+                self.assertEqual(stat.S_IMODE(os.stat(target).st_mode),
+                                 expected, (oct(start), mode))
 
     def test_a_permission_letter_copies_the_class_it_names(self):
         # 'g=u' gives the group the permissions the owner has, as the
