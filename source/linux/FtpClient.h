@@ -40,6 +40,15 @@ namespace linscp {
  * server will not list. */
 const int kFtpTransportFailure = -1;
 
+/*
+ * One decimal number out of a PASV/EPSV server reply, range-checked.
+ * Exported for the unit suite; the engine uses it for every number a
+ * reply carries, so a hostile or confused server cannot steer the data
+ * connection with an out-of-range port or address octet.
+ */
+bool ParseFtpReplyNumber(const std::string & text, int low, int high,
+    int & value);
+
 class FtpClient
 {
 public:

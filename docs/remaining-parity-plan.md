@@ -2,7 +2,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-9 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+8 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -22,28 +22,13 @@ GSSAPI is compiled out; SSH tunnel configuration is not implemented.
 
 **Area:** Security/authentication · **Status:** missing
 
-The GUI has PBKDF2-backed accounts, expiring login sessions and CSRF protection, but accounts still share process-global tabs, remote connections, task queue, stored-session configuration and filesystem access. Authentication is not per-user authorization or isolation, so multi-user/server deployment is not safe to claim.
+The loopback GUI has no multi-user account or authorization roles.
 
-**Next:** Define the deployment boundary and implement per-user authorization and isolation before claiming multi-user/server deployment support.
-
-**Acceptance criteria:**
-
-- [ ] Define deployment/isolation boundaries before enabling network access.
-- [ ] Isolate per-user configuration, remote sessions/tabs, task queue and filesystem access.
-- [ ] Add negative authorization tests for every API route and cross-account resource access.
-
-## gui.explorer-custom-commands
-
-**Area:** GUI · **Status:** partial
-
-Commander has persisted custom-command templates, explicit local/remote scope, safe {file} substitution for multiple selected names, and a confirmation that previews the command and affected entries. Tests cover storage permissions, invalid templates, scope, hostile names and quoting; commands are sent to LinSCP, never to a shell. This is a LinSCP Commander extension, not upstream Explorer UI parity.
-
-**Next:** A separate upstream-style single-pane Explorer interface and its navigation compatibility remain unimplemented; add browser-level acceptance evidence for custom-command confirmation and execution.
+**Next:** Add authenticated accounts before claiming multi-user/server deployment support.
 
 **Acceptance criteria:**
 
-- [ ] Implement and test a separate single-pane Explorer interface and navigation behavior if upstream Explorer compatibility remains in scope; keep the existing Commander extension identified as LinSCP-specific.
-- [ ] Add browser-level tests proving confirmation, local/remote scope, multiple selections and hostile filenames through the custom-command UI; never interpolate into a shell.
+- [ ] Define deployment/isolation boundaries before enabling network access. Add password hashing, login/session expiry, CSRF protection and per-user configuration, filesystem and queue isolation. Negative authorization tests must cover every API route, not just login.
 
 ## automation.dotnet
 
@@ -61,9 +46,9 @@ No WinSCP .NET assembly or equivalent object model for Linux. The C ABI header t
 
 **Area:** Automation · **Status:** partial
 
-automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Nothing exercises it: no automated case runs PowerShell, so its session lifetime, pipeline objects, terminating errors, cancellation and secret handling are unevidenced, and it is a shim over the CLI rather than upstream's assembly API.
+automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Passwords travel on stdin to -server, never on a command line. The module has a test harness (automation/test_psmodule.py, run by make check-live, CTest and CI): static checks that always run, and a Pester suite against the throwaway WebDAV endpoint covering open/close, byte-exact transfers, listing objects, terminating errors, timeout cancellation and password hygiene. The live Pester run needs pwsh, which CI installs; no green live run has been recorded in this ledger yet, and the module remains a shim over the CLI rather than upstream's assembly API.
 
-**Next:** Exercise the shipped module with PowerShell on Linux: a session opened and closed, an upload and a download of exact bytes, a listing as pipeline objects, a terminating error, a cancelled transfer, and a password that appears neither in the process list nor in the output.
+**Next:** Record a green live Pester run (CI installs pwsh and runs the harness): a session opened and closed, an upload and a download of exact bytes, a listing as pipeline objects, a terminating error, a cancelled transfer, and a password that appears neither in the process list nor in the output.
 
 **Acceptance criteria:**
 

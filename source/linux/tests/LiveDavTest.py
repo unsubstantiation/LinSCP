@@ -801,6 +801,9 @@ class LiveDavTests(unittest.TestCase):
         # The same tag now names a version the server does not have - the
         # file it just created has its own - so the write still goes
         # through, and one that names the version it does have is refused.
+        # The tag for the refusal is read after the allowed write: every
+        # write moves the version, so the tag from before it is stale by
+        # the time the refused write runs.
         stale = absent
         allowed = self.run_script(
             "option confirm off ; etag /fresh.txt -nomatch=%s ; "

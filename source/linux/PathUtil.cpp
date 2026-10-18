@@ -599,10 +599,13 @@ bool ParseSymbolicPermissions(const std::string & text, unsigned long current,
                     return false;
                 }
             }
-            /* The bits are the remote file's own; they are written out as
-             * numbers because the value travels over SFTP regardless of what
-             * the local C library names them. */
-            const bool anyExec = (current & 0111) != 0;
+            /* The bits are the file's own as this clause sees them: chmod(1)
+             * applies its clauses left to right, so a later 'X' or 'u'
+             * reads what an earlier clause left behind, not what the file
+             * started with. They are written out as numbers because the
+             * value travels over SFTP regardless of what the local C
+             * library names them. */
+            const bool anyExec = (mode & 0111) != 0;
 
             for (unsigned int slot = 0; slot < 3; slot++)
             {
@@ -628,13 +631,13 @@ bool ParseSymbolicPermissions(const std::string & text, unsigned long current,
                         }
                         break;
                     case 'u':
-                        add |= static_cast<unsigned long>(((current & 0700) >> 6) << shift);
+                        add |= static_cast<unsigned long>(((mode & 0700) >> 6) << shift);
                         break;
                     case 'g':
-                        add |= static_cast<unsigned long>(((current & 0070) >> 3) << shift);
+                        add |= static_cast<unsigned long>(((mode & 0070) >> 3) << shift);
                         break;
                     case 'o':
-                        add |= static_cast<unsigned long>((current & 0007) << shift);
+                        add |= static_cast<unsigned long>((mode & 0007) << shift);
                         break;
                     default:
                         break;
@@ -705,7 +708,11 @@ bool TrimString(const std::string & text, std::string & result)
 bool ParseOctalMode(const std::string & text, unsigned long & result)
 {
     std::string digits = text;
-    if (digits.size() > 1 && (digits[0] == '0' || digits[0] == 'o'))
+    /* One leading zero is a prefix, so '0600' and '00600' are both 0600.
+     * Anything else - including the 'o' this used to strip, which no
+     * caller can reach because ParsePermissions only calls this for a
+     * leading digit - is part of the mode and has to be octal. */
+    if (digits.size() > 1 && digits[0] == '0')
     {
         digits = digits.substr(1);
     }

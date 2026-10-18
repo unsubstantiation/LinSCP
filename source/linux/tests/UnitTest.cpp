@@ -2734,6 +2734,69 @@ void TestPermissionModes()
     /* clauses separated by blanks as well as by commas */
     CHECK_TRUE(ParsePermissions("u=rw g=r o=r", 0777, false, mode, error));
     CHECK_EQ(ModeString(mode), std::string("0644"));
+
+    /* A later clause reads what an earlier one left behind, the way
+     * chmod(1) applies them: 'X' and the u/g/o copy letters used to read
+     * the mode the file started with, so 'u+x,g+X' on a 644 file left
+     * the group alone (0744) where chmod sets it (0754), and 'u+x,g=u'
+     * on a 640 file copied the original owner (0760) instead of the one
+     * the first clause made (0770). */
+    CHECK_TRUE(ParsePermissions("u+x,g+X", 0644, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0754"));
+    CHECK_TRUE(ParsePermissions("u+x,g=u", 0640, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0770"));
+    CHECK_TRUE(ParsePermissions("u+x,u-X", 0644, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0644"));
+    CHECK_TRUE(ParsePermissions("g=u", 0740, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0770"));
+}
+
+/* Server-controlled numbers and log escaping: a hostile server must not
+ * steer the client with an out-of-range reply, and a file name must
+ * survive the XML action log intact. */
+void TestServerReplyHardening()
+{
+    int value = 0;
+    /* PASV octets are 0..255, ports are 1..65535; anything else - text,
+     * emptiness, overflow - is a refused reply, not a data connection. */
+    CHECK_TRUE(ParseFtpReplyNumber("0", 0, 255, value));
+    CHECK_EQ(std::to_string(value), std::string("0"));
+    CHECK_TRUE(ParseFtpReplyNumber("255", 0, 255, value));
+    CHECK_EQ(std::to_string(value), std::string("255"));
+    CHECK_TRUE(ParseFtpReplyNumber("21", 1, 65535, value));
+    CHECK_EQ(std::to_string(value), std::string("21"));
+    CHECK_TRUE(ParseFtpReplyNumber("65535", 1, 65535, value));
+    CHECK_EQ(std::to_string(value), std::string("65535"));
+    CHECK_FALSE(ParseFtpReplyNumber("", 0, 255, value));
+    CHECK_FALSE(ParseFtpReplyNumber("256", 0, 255, value));
+    CHECK_FALSE(ParseFtpReplyNumber("999", 0, 255, value));
+    CHECK_FALSE(ParseFtpReplyNumber("0", 1, 65535, value));
+    CHECK_FALSE(ParseFtpReplyNumber("65536", 1, 65535, value));
+    CHECK_FALSE(ParseFtpReplyNumber("99999999999999", 1, 65535, value));
+    CHECK_FALSE(ParseFtpReplyNumber("80x", 1, 65535, value));
+    CHECK_FALSE(ParseFtpReplyNumber("-1", 0, 255, value));
+
+    /* An HTTP date with impossible numbers is refused, not converted;
+     * the header comes from the server, and an unbounded conversion of
+     * twenty digits was undefined behaviour. */
+    CHECK_TRUE(ParseHttpDate("Tue, 13 Oct 2026 05:21:00 GMT") > 0);
+    CHECK_EQ(std::to_string(
+        ParseHttpDate("Tue, 99999999999999999999 Oct 2026 05:21:00 GMT")),
+        std::string("0"));
+    CHECK_EQ(std::to_string(
+        ParseHttpDate("Tue, 13 Oct 9999999999 05:21:00 GMT")),
+        std::string("0"));
+    CHECK_EQ(std::to_string(ParseHttpDate("not a date")), std::string("0"));
+
+    /* The XML log keeps a tab as a tab: it used to write backslash-t,
+     * so two different file names logged identically and neither read
+     * back. Markup is still escaped and other controls still dropped. */
+    CHECK_EQ(Console::EscapeActionText("a\tb"),
+        std::string("a\tb"));
+    CHECK_EQ(Console::EscapeActionText("a<b>&\"c\""),
+        std::string("a&lt;b&gt;&amp;&quot;c&quot;"));
+    CHECK_EQ(Console::EscapeActionText("a\x01" "b"),
+        std::string("ab"));
 }
 
 /* The command, option and value tables resolve unambiguous prefixes. */
@@ -4099,6 +4162,7 @@ int main()
     TestS3ObjectSettings();
     TestNewScriptCommands();
     TestPermissionModes();
+    TestServerReplyHardening();
     TestNameAbbreviations();
     TestScriptParameterExpansion();
     TestTimestampFormatting();

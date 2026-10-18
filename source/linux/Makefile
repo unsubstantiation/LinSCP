@@ -262,7 +262,9 @@ check-conversion:
 # paramiko, LiveScpTest starts a throwaway sshd of its own and skips itself
 # without sshd/ssh-keygen, LiveS3Test is standard-library-only (botocore is an
 # optional extra one test skips without), LiveCurlTest uses optional pyftpdlib/
-# pyOpenSSL when available, and the GUI search test uses a fake session.
+# pyOpenSSL when available, the GUI search test uses a fake session, and the
+# PowerShell harness always runs its static checks while its live Pester run
+# skips itself without pwsh.
 check-live: $(BINDIR)/linscp
 	$(PYTHON) tests/ScriptTest.py $(BINDIR)/linscp
 	$(PYTHON) tests/LiveSftpTest.py $(BINDIR)/linscp
@@ -275,6 +277,7 @@ check-live: $(BINDIR)/linscp
 	$(PYTHON) ../../source/gui/tests/BrowserUploadTest.py
 	$(PYTHON) ../../source/gui/tests/DesktopUriTest.py
 	$(PYTHON) ../../source/gui/tests/SecurityTest.py
+	$(PYTHON) ../../automation/test_psmodule.py $(BINDIR)/linscp
 
 # Pull in the generated dependencies, if this is not the first build.
 -include $(PUTTY_OBJS:.o=.d) $(APP_OBJS:.o=.d) $(TEST_OBJS:.o=.d)

@@ -38,6 +38,7 @@ std::string EscapeXml(const std::string & text)
             case '"': result += "&quot;"; break;
             case '\'': result += "&apos;"; break;
             case '\t': result += "\t"; break;
+            case '\r': result += "&#13;"; break;
             default:
                 if (c >= 0x20 || c == 0x0a)
                 {

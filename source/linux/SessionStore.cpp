@@ -992,7 +992,18 @@ bool SessionStore::Load(std::string & error)
         const std::string value = UnescapeValue(Trim(trimmed.substr(equals + 1)));
         if (key == "port")
         {
-            current.portNumber = atoi(value.c_str());
+            /* A stored port is a number the file states, not one the user
+             * typed at a prompt that validates it: atoi() turned text
+             * into 0 and had undefined behaviour on overflow, so a file
+             * edited by hand could store a port nothing connects with.
+             * Out of range stays the previous value, which 'open' then
+             * reports the way it reports any unusable stored site. */
+            char * end = NULL;
+            const long port = strtol(value.c_str(), &end, 10);
+            if (end != NULL && *end == '\0' && port >= 1 && port <= 65535)
+            {
+                current.portNumber = static_cast<int>(port);
+            }
         }
         else if (key == "last_used")
         {
@@ -1060,18 +1071,20 @@ bool SessionStore::Load(std::string & error)
         else if (key == "proxy_exclude") { current.proxy.excludeList = value; }
         else if (key == "proxy_port")
         {
-            const int port = atoi(value.c_str());
-            if (port > 0 && port <= 65535)
+            char * end = NULL;
+            const long port = strtol(value.c_str(), &end, 10);
+            if (end != NULL && *end == '\0' && port > 0 && port <= 65535)
             {
-                current.proxy.port = port;
+                current.proxy.port = static_cast<int>(port);
             }
         }
         else if (key == "proxy_dns")
         {
-            const int dns = atoi(value.c_str());
-            if (dns >= 0 && dns <= 2)
+            char * end = NULL;
+            const long dns = strtol(value.c_str(), &end, 10);
+            if (end != NULL && *end == '\0' && dns >= 0 && dns <= 2)
             {
-                current.proxy.dns = dns;
+                current.proxy.dns = static_cast<int>(dns);
             }
         }
         else if (key == "proxy_localhost")

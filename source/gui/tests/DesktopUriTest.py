@@ -42,8 +42,14 @@ class DesktopUriTests(unittest.TestCase):
         self.assertEqual(session["host"], "2001:db8::4")
         self.assertEqual(session["port"], 2202)
         self.assertEqual(session["initial_dir"], "/etc/my files")
-        self.assertEqual(gui.session_url(session, session["initial_dir"]),
+        self.assertEqual(gui.session_url(session, session["initial_dir"],
+                                         include_password=True),
                          "sftp://alice:p%40ss@[2001:db8::4]:2202/etc/my%20files")
+        # By default the password stays out of the URL: a URL on a command
+        # line is visible in the process list, so the core reads the
+        # password from the environment instead.
+        self.assertEqual(gui.session_url(session, session["initial_dir"]),
+                         "sftp://alice@[2001:db8::4]:2202/etc/my%20files")
 
     def test_ftp_and_ftps_default_ports(self):
         ftp = gui.parse_desktop_site_url("ftp://files.example.org/pub")

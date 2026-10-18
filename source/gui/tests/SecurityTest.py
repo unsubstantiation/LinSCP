@@ -148,6 +148,8 @@ class CoreCredentialTests(unittest.TestCase):
 import json, os, sys
 with open(os.environ['LSCP_FAKE_ARGS'], 'w') as f:
     json.dump(sys.argv[1:], f)
+with open(os.environ['LSCP_FAKE_PASSWORD'], 'w') as f:
+    f.write(os.environ.get('LINSCP_PASSWORD', '<unset>'))
 print('LSCP-SERVER 1 ready', flush=True)
 with open(os.environ['LSCP_FAKE_INPUT'], 'w') as f:
     for raw in sys.stdin:
@@ -171,6 +173,7 @@ with open(os.environ['LSCP_FAKE_INPUT'], 'w') as f:
         return {
             "LSCP_FAKE_ARGS": str(pathlib.Path(directory) / "args.json"),
             "LSCP_FAKE_INPUT": str(pathlib.Path(directory) / "input.txt"),
+            "LSCP_FAKE_PASSWORD": str(pathlib.Path(directory) / "password.txt"),
         }
 
     def test_command_splitter_preserves_quoted_semicolons_and_escapes(self):
@@ -270,7 +273,7 @@ with open(os.environ['LSCP_FAKE_INPUT'], 'w') as f:
             self.assertIn("ended before it started", error)
             self.assertIsNone(session.proc)
 
-    def test_one_shot_commands_send_credentials_over_stdin_and_redact_logs(self):
+    def test_one_shot_commands_keep_credentials_out_of_stdin_and_redact_logs(self):
         with tempfile.TemporaryDirectory(prefix="linscp-core-credentials-") as directory:
             binary = self.make_fake_core(directory)
             environment = self.process_environment(directory)
@@ -291,9 +294,12 @@ with open(os.environ['LSCP_FAKE_INPUT'], 'w') as f:
             self.assertIn("-server", args)
             self.assertFalse(any("s3cret" in arg for arg in args))
             self.assertEqual(sent.splitlines(), [
-                "option confirm off", command.split(" ; ")[0],
+                "option confirm off", "open sftp://alice@example.test/",
                 "echo finished", "exit"])
-            self.assertIn("alice:s3cret@example.test", sent)
+            self.assertNotIn("s3cret", sent)
+            self.assertEqual(
+                pathlib.Path(environment["LSCP_FAKE_PASSWORD"]).read_text(),
+                "s3cret")
             self.assertFalse(any("s3cret" in str(item) for item in logs))
 
     def test_failed_server_command_returns_stderr_and_stops_the_script(self):
@@ -331,8 +337,12 @@ with open(os.environ['LSCP_FAKE_INPUT'], 'w') as f:
             self.assertIn("-server", args)
             self.assertNotIn("-hostkey=*", args)
             self.assertFalse(any("s3cret" in arg for arg in args))
-            self.assertIn("alice:s3cret@example.test", sent)
+            self.assertNotIn("s3cret", sent)
+            self.assertIn("open sftp://alice@example.test/", sent)
             self.assertIn("%TIMESTAMP%", sent)
+            self.assertEqual(
+                pathlib.Path(environment["LSCP_FAKE_PASSWORD"]).read_text(),
+                "s3cret")
             self.assertFalse(any("s3cret" in str(item) for item in logs))
 
 
@@ -833,6 +843,82 @@ class CustomCommandTests(unittest.TestCase):
         self.assertEqual(error, "")
         self.assertEqual(command, "sessions")
 
+    def test_a_remote_run_uses_the_panel_session_without_a_shell(self):
+        seen = []
+
+        class FakeTab:
+            remote_dir = "/data"
+            session = {"host": "example.com"}
+
+            def run_many_capture(self, commands, timeout=120):
+                seen.extend(commands)
+                return 0, ["523b87"], []
+
+        template = {"name": "sum", "command": "checksum sha-256 {file}",
+                    "scope": "remote"}
+        results, error = gui.execute_custom_command(
+            template, ["a.txt", "b.txt"], FakeTab())
+        self.assertEqual(error, "")
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(item["success"] for item in results))
+        self.assertEqual(results[0]["file"], "a.txt")
+        # One 'cd' plus the substituted command per file, quoted for the
+        # client's splitter rather than interpolated into a shell: no
+        # shell ever sees these words.
+        self.assertEqual(seen[0], "cd /data")
+        self.assertEqual(seen[1], 'checksum sha-256 a.txt')
+        self.assertEqual(seen[3], 'checksum sha-256 b.txt')
+        self.assertNotIn(";", "".join(seen))
+
+    def test_a_local_run_goes_through_the_core_not_a_shell(self):
+        calls = []
+
+        def fake_run(command, session=None, timeout=300):
+            calls.append((command, session))
+            return 0, "counted", ""
+
+        template = {"name": "wc", "command": "lls {file}", "scope": "local"}
+        with mock.patch.object(gui, "run_linscp", side_effect=fake_run):
+            results, error = gui.execute_custom_command(
+                template, ["odd\"name"], None)
+        self.assertEqual(error, "")
+        self.assertTrue(results[0]["success"])
+        # The name is quoted for the client's splitter: the quote inside
+        # it cannot end the operand and start a second command.
+        self.assertEqual(calls[0][0], 'lls "odd\\\"name"')
+
+    def test_a_hostile_name_fails_its_file_and_runs_the_rest(self):
+        seen = []
+
+        class FakeTab:
+            remote_dir = "/data"
+            session = {}
+
+            def run_many_capture(self, commands, timeout=120):
+                seen.extend(commands)
+                return 0, ["ok"], []
+
+        template = {"name": "sum", "command": "checksum sha-256 {file}",
+                    "scope": "remote"}
+        results, error = gui.execute_custom_command(
+            template, ["good.txt", "../escape", "fine.txt"], FakeTab())
+        self.assertEqual(error, "")
+        self.assertEqual(len(results), 3)
+        self.assertTrue(results[0]["success"])
+        self.assertFalse(results[1]["success"])
+        self.assertTrue(results[1]["error"])
+        self.assertTrue(results[2]["success"])
+        # The hostile name was never substituted into a command.
+        self.assertNotIn("escape", "".join(seen))
+
+    def test_a_remote_run_without_a_session_is_refused(self):
+        template = {"name": "sum", "command": "checksum sha-256 {file}",
+                    "scope": "remote"}
+        results, error = gui.execute_custom_command(
+            template, ["a.txt"], None)
+        self.assertEqual(results, [])
+        self.assertIn("open session", error)
+
 
 class LoginTests(unittest.TestCase):
     def setUp(self):
@@ -1177,6 +1263,123 @@ class CrossOriginTests(unittest.TestCase):
             self.assertIn(status, (400, 404), path)
 
 
+class SecretHandlingTests(unittest.TestCase):
+    """Passwords stay out of the process list, the logs and the API."""
+
+    def test_the_site_url_carries_no_password_by_default(self):
+        session = {"protocol": "sftp", "host": "h", "port": 22,
+                   "username": "u", "password": "s3cret"}
+        self.assertEqual(gui.session_url(session), "sftp://u@h/")
+        self.assertNotIn("s3cret", gui.session_url(session, "/dir"))
+        self.assertIn("s3cret",
+                      gui.session_url(session, include_password=True))
+
+    def test_the_core_command_line_carries_no_password(self):
+        cmd = gui.core_command_line({"hostkey": "", "keyfile": "",
+                                     "username": "u", "password": "s3cret"})
+        self.assertNotIn("s3cret", " ".join(cmd))
+        self.assertIn("-username=u", cmd)
+
+    def test_the_password_reaches_the_core_through_the_environment(self):
+        kwargs = gui.popen_kwargs("s3cret")
+        self.assertEqual(kwargs["env"]["LINSCP_PASSWORD"], "s3cret")
+        self.assertEqual(kwargs["env"]["LINSCP_LANGUAGE"], "en")
+        # Without a password nothing is inherited: a value exported for
+        # another purpose must not silently authenticate this session.
+        with mock.patch.dict(os.environ, {"LINSCP_PASSWORD": "outer"}):
+            kwargs = gui.popen_kwargs()
+            self.assertNotIn("LINSCP_PASSWORD", kwargs["env"])
+            kwargs = gui.popen_kwargs("")
+            self.assertNotIn("LINSCP_PASSWORD", kwargs["env"])
+
+    def test_logged_commands_mask_passwords(self):
+        self.assertEqual(
+            gui._censored_command("open sftp://u:s3cret@h/ ; ls"),
+            "open sftp://u:***@h/ ; ls")
+        self.assertEqual(
+            gui._censored_command("savesession x -password=s3cret"),
+            "savesession x -password=***")
+        self.assertEqual(
+            gui._censored_command('savesession x -password="s3 cret"'),
+            'savesession x -password="***"')
+        self.assertEqual(gui._censored_command("ls /data"), "ls /data")
+
+    def test_terminal_input_splits_on_unquoted_semicolons_only(self):
+        self.assertEqual(gui.split_gui_commands('put "a;b.txt" ; echo hi'),
+                         ['put "a;b.txt" ', ' echo hi'])
+        self.assertEqual(gui.split_gui_commands("echo 'x;y';ls"),
+                         ["echo 'x;y'", 'ls'])
+        self.assertEqual(gui.split_gui_commands("ls;"), ["ls"])
+        self.assertEqual(gui.split_gui_commands("echo a\\;b"),
+                         ["echo a\\;b"])
+
+
+class AccountValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.previous = gui.ACCOUNTS_FILE
+        gui.ACCOUNTS_FILE = os.path.join(self.directory.name, "accounts.ini")
+
+    def tearDown(self):
+        gui.ACCOUNTS_FILE = self.previous
+        self.directory.cleanup()
+
+    def test_a_user_name_that_would_forge_the_file_is_refused(self):
+        for bad in ("alice\n[admin]", "a[b", "a]b", "a=b", "", "x" * 65,
+                    "a\x00b", "tab\there"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                gui._write_account(bad, "password", "")
+        gui._write_account("alice.smith-1_x", "password", "")
+        self.assertIn("alice.smith-1_x", gui._read_accounts())
+
+    def test_a_home_directory_must_be_absolute_and_single_line(self):
+        for bad in ("relative/path", "a\n/b", "a\rb", "a\x00/b"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                gui._write_account("bob", "password", bad)
+        with self.assertRaises(ValueError):
+            gui._write_account("bob", "", "/srv/bob")
+        gui._write_account("bob", "password", "/srv/bob")
+        self.assertEqual(gui._read_accounts()["bob"]["home_dir"], "/srv/bob")
+        gui._write_account("carol", "password", "")
+        self.assertEqual(gui._read_accounts()["carol"]["home_dir"], "")
+
+    def test_a_corrupted_record_is_a_failed_login_not_an_error(self):
+        gui._write_account("dave", "password", "")
+        accounts = gui._read_accounts()
+        self.assertTrue(gui._authenticate_user("dave", "password"))
+        # Corrupt the salt and the hash in the file: the login must
+        # answer False rather than raise.
+        path = pathlib.Path(gui.ACCOUNTS_FILE)
+        text = path.read_text(encoding="utf-8")
+        path.write_text(text.replace("salt=", "salt=zzz!"),
+                        encoding="utf-8")
+        self.assertFalse(gui._authenticate_user("dave", "password"))
+        self.assertFalse(gui._verify_password("password", "", ""))
+        self.assertFalse(gui._verify_password("password", "00", "zz"))
+
+
+class LocalChmodEvolvingTests(unittest.TestCase):
+    """The local chmod reads later clauses the way chmod(1) does."""
+
+    def test_a_later_clause_sees_what_an_earlier_one_did(self):
+        directory = tempfile.TemporaryDirectory()
+        try:
+            target = os.path.join(directory.name, "file")
+            with open(target, "w") as handle:
+                handle.write("x")
+            os.chmod(target, 0o644)
+            gui.apply_local_mode(target, "u+x,g+X")
+            self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o754)
+            os.chmod(target, 0o640)
+            gui.apply_local_mode(target, "u+x,g=u")
+            self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o770)
+            os.chmod(target, 0o644)
+            gui.apply_local_mode(target, "u+x,u-X")
+            self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o644)
+        finally:
+            directory.cleanup()
+
+
 if __name__ == "__main__":
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite()
@@ -1185,7 +1388,9 @@ if __name__ == "__main__":
                  RemoteNameTests,
                  ServerCommandStreamTests, LocalListingTests,
                  CustomCommandTests, LoginTests, QueueCleanupTests,
-                 BrowserUploadModeTests, CrossOriginTests):
+                 BrowserUploadModeTests, CrossOriginTests,
+                 SecretHandlingTests, AccountValidationTests,
+                 LocalChmodEvolvingTests):
         suite.addTests(loader.loadTestsFromTestCase(case))
     result = unittest.TextTestRunner(verbosity=1).run(suite)
     failed = len(result.failures) + len(result.errors)

@@ -144,6 +144,12 @@ if(Python3_Interpreter_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/DesktopUriTest.py)
   add_test(NAME gui-security-tests COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/SecurityTest.py)
+  # The PowerShell module harness: static checks always run, while the
+  # live Pester cases skip themselves without pwsh (the suite still
+  # reports ran>0, so no ran=0 guard is needed here).
+  add_test(NAME powershell-tests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/automation/test_psmodule.py
+    $<TARGET_FILE:linscp>)
   add_test(NAME translation-tests COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_translations.py)
   add_test(NAME parity-checker-tests COMMAND ${Python3_EXECUTABLE}

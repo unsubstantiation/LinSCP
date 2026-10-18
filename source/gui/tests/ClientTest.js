@@ -102,6 +102,28 @@ const responses = {
     error: '' } }
 };
 
+/* The persisted command templates the custom-commands dialog lists, saves
+ * and runs. Both fetch stubs below answer it: the browsing tests replace
+ * the first stub, and the dialog tests run after that replacement. */
+function customCommandsBody(options) {
+  let request = {};
+  try { request = JSON.parse((options && options.body) || '{}'); } catch (error) {}
+  const stored = [
+    { name: 'Checksum', command: 'checksum sha-256 {file}', scope: 'remote' },
+    { name: 'Local word count', command: 'wc {file}', scope: 'local' }
+  ];
+  if (request.action === 'save') {
+    stored.push({ name: request.name, command: request.command, scope: request.scope });
+    return { success: true, commands: stored };
+  }
+  if (request.action === 'run') {
+    return { success: true, scope: 'remote',
+      results: (request.filenames || []).map(name => (
+        { file: name, success: true, exit_code: 0, stdout: 'SHA-256 verified', stderr: '' })) };
+  }
+  return { success: true, commands: stored };
+}
+
 const TOKEN = 'test-token-0123456789abcdef';
 
 const calls = [];
@@ -120,6 +142,9 @@ const dom = new JSDOM(html, {
       const path = String(url).replace('http://localhost:8080', '').split('?')[0];
       calls.push({ path: path, url: String(url), options: options });
       let body = responses[path];
+      if (path === '/api/custom-commands') {
+        body = customCommandsBody(options);
+      }
       if (path === '/api/remote/search') {
         let request = {};
         try { request = JSON.parse(options.body || '{}'); } catch (error) {}
@@ -452,20 +477,8 @@ function options(id) {
       return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
     }
     if (path === '/api/custom-commands') {
-      let request = {};
-      try { request = JSON.parse(options.body || '{}'); } catch (error) {}
-      if (request.action === 'list') {
-        const body = { success: true, commands: [
-          { name: 'Checksum', command: 'checksum sha-256 {file}', scope: 'remote' }
-        ] };
-        return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
-      }
-      if (request.action === 'run') {
-        const body = { success: true, scope: 'remote', results: request.filenames.map(file => ({
-          file, success: true, exit_code: 0, stdout: 'SHA-256 verified', stderr: ''
-        })) };
-        return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
-      }
+      return Promise.resolve(
+        { ok: true, json: () => Promise.resolve(customCommandsBody(options)) });
     }
     const body = responses[path];
     if (body === undefined) {
@@ -794,12 +807,40 @@ function options(id) {
   check('ArrowDown advances selection in the focused pane',
     doc.getElementById('localFileList').children[1].getAttribute('aria-selected') === 'true');
 
-  // A saved command previews its scope, command and selected names before
-  // running; declining that prompt sends nothing to the backend.
+  // Explorer-style single-panel view: the focused pane fills the window,
+  // the other is hidden, and the choice survives a reload.
+  window.toggleExplorerMode();
+  const main = doc.querySelector('.commander-main');
+  check('explorer mode marks the layout and hides the unfocused pane',
+    main.classList.contains('explorer-mode') &&
+      doc.getElementById('remotePane').style.display === 'none' &&
+      doc.getElementById('localPane').style.display !== 'none',
+    'remote=' + doc.getElementById('remotePane').style.display);
+  check('explorer choice is persisted',
+    window.localStorage.getItem('lscp-explorer') === '1');
+  window.toggleExplorerMode();
+  check('leaving explorer mode shows both panes again',
+    !main.classList.contains('explorer-mode') &&
+      doc.getElementById('remotePane').style.display !== 'none');
+
+  // Custom commands are persisted, preview their remote target, and run
+  // only on the selected entry after confirmation.
   await window.openCustomCommands();
-  check('custom command list displays persisted templates',
-    doc.querySelector('#customCommandsList .custom-command strong')?.textContent === 'Checksum',
-    text('customCommandsList') + ' calls=' + JSON.stringify(calls.filter(call => call.path === '/api/custom-commands')));
+  check('custom commands dialog lists the persisted templates',
+    doc.getElementById('customCommandsList').children.length === 2);
+  doc.getElementById('customCmdName').value = 'List it';
+  doc.getElementById('customCmdCommand').value = 'ls {file}';
+  doc.getElementById('customCmdScope').value = 'remote';
+  await window.saveCustomCommand();
+  const cmdSave = calls.filter(call => call.path === '/api/custom-commands' &&
+    JSON.parse(call.options.body || '{}').action === 'save').pop();
+  const savePayload = cmdSave ? JSON.parse(cmdSave.options.body) : {};
+  check('saving a template posts its name, command and scope',
+    savePayload.action === 'save' && savePayload.name === 'List it' &&
+      savePayload.command === 'ls {file}' && savePayload.scope === 'remote');
+  check('saved template joins the dialog list',
+    doc.getElementById('customCommandsList').children.length === 3);
+
   window.selectCustomCommand(0);
   doc.getElementById('remoteFileList').children[0]
     .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
@@ -810,11 +851,11 @@ function options(id) {
   const preview = confirmMessages[confirmMessages.length - 1] || '';
   const declinedRuns = calls.filter(call => call.path === '/api/custom-commands' &&
     JSON.parse(call.options.body || '{}').action === 'run').length;
-  check('custom command confirmation previews its command and selected name',
+  check('custom command confirmation previews the command and selected name',
     preview.includes('checksum sha-256 keep.txt') && preview.includes('keep.txt') &&
-      preview.toLowerCase().includes('remote panel'),
-    preview);
-  check('declining a custom command confirmation queues no work', declinedRuns === priorRuns);
+      preview.toLowerCase().includes('remote panel'), preview);
+  check('declining a custom command confirmation queues no work',
+    declinedRuns === priorRuns);
 
   confirmResult = true;
   await window.runCustomCommand();
@@ -823,12 +864,14 @@ function options(id) {
   const customPayload = customRun ? JSON.parse(customRun.options.body) : {};
   check('confirmed custom command runs only on the selected remote entry',
     customPayload.action === 'run' && customPayload.tab === 1 &&
-      customPayload.filenames && customPayload.filenames.length === 1 &&
+      Array.isArray(customPayload.filenames) &&
+      customPayload.filenames.length === 1 &&
       customPayload.filenames[0] === 'keep.txt', JSON.stringify(customPayload));
   check('custom command results are rendered as text',
     text('customCommandsResult').includes('keep.txt') &&
       text('customCommandsResult').includes('SHA-256 verified'),
     text('customCommandsResult'));
+  window.closeModal('customCommandsModal');
 
   check('no script errors', errors.length === 0, errors.join(' | '));
   window.close();
