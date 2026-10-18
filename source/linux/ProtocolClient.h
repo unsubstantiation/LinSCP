@@ -24,6 +24,17 @@ bool IsCurlEndpointUnreachable(int code);
  * replies for one property. Exposed so the unit suite can pin them.
  */
 bool DavLockTokenFromXml(const std::string & xml, std::string & token);
+/* The lock token this session holds for a path, or an empty string. */
+std::string DavTokenFor(const SessionOptions & options,
+    const std::string & remotePath);
+/* An entity tag as an If header carries it: quoted, 'W/' kept in front of
+ * the quotes, and '*' left standing for any tag. */
+std::string DavEntityTag(const std::string & value);
+/* The If header a WebDAV write of a path carries: the lock token and the
+ * ETag precondition the session recorded for it, as the one condition list
+ * RFC 4918 reads. Empty when the session states nothing about the path. */
+std::string DavIfHeader(const SessionOptions & options,
+    const std::string & remotePath);
 bool DavValidPropertyName(const std::string & name, std::string & error);
 std::string DavPropertyPropfindBody(const std::string & name);
 std::string DavPropertyUpdateBody(const std::string & name,

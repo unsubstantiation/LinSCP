@@ -2,7 +2,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-12 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+11 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -104,19 +104,6 @@ The shared LIST parser accepts Unix long listings. MLSD provides a structured al
 
 - [ ] Add fixture-based DOS/VMS listing cases with spaces, date/size variants and directory types, plus malformed-input rejection.
 - [ ] Exercise LIST fallback against live servers that emit the supported formats; document formats still unsupported.
-
-## dav.etag-preconditions
-
-**Area:** WebDAV · **Status:** partial
-
-The 'etag' command records an If-Match or If-None-Match precondition per path with the session, and a WebDAV upload, delete or move of that path sends it in the If header next to any lock token; '-get' reads the current ETag with a Depth-0 PROPFIND and says so when the path is not there; a session whose protocol has no ETags is refused rather than left believing a write is conditional. What is missing is evidence and the collection semantics: no automated case shows a matching ETag letting a write through, a stale one refused, or a refused precondition leaving the destination untouched.
-
-**Next:** Prove the precondition against a live WebDAV server - a matching ETag writes, a stale one is refused with 412 and changes nothing at the destination, an absent resource answers If-None-Match - and define what a precondition on a collection means instead of inheriting one path's rule.
-
-**Acceptance criteria:**
-
-- [ ] Test successful conditional writes and stale ETag failures against a live DAV server, including If-Match, If-None-Match and absent resources.
-- [ ] Define collection semantics and prove a rejected precondition leaves all destination bytes and metadata unchanged.
 
 ## s3.versioned-objects
 

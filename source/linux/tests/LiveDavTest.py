@@ -21,7 +21,12 @@ what a DAV filesystem has to answer:
   - an upload/download roundtrip with a checksum, including escaped names
     containing spaces, %, ? and # across PUT/GET/PROPFIND/MOVE/COPY;
   - mkdir -parents creating nested remote paths and refusing a file as parent;
-  - keepuptodate uploading local changes and waking on a nested file event.
+  - keepuptodate uploading local changes and waking on a nested file event;
+  - ETag preconditions: '-get' reading the server's tag, a matching
+    '-match=' writing, a stale one refused with 412 and the destination
+    left untouched, '-nomatch=' writing only where the version differs, a
+    lock and a tag travelling in one condition list, and what a
+    precondition recorded on a collection guards.
 
 The client uses curl over plain HTTP and the server is the standard
 library, so the suite needs nothing beyond Python and curl.
@@ -637,6 +642,327 @@ class LiveDavTests(unittest.TestCase):
         invalid = self.run_script("property /property.txt -get=no such name")
         self.assertEqual(invalid.returncode, 1,
                          invalid.stdout + invalid.stderr)
+
+    # -- ETag preconditions -------------------------------------------------
+    def etag_of(self, path):
+        """The entity tag the server has for a path, quotes and all."""
+        return self.server_state()["etags"][path]
+
+    def if_headers(self, command=None, path=None):
+        """The If headers the server was asked to honour, in order."""
+        return [entry["header"] for entry in self.server_state()["if_headers"]
+                if (command is None or entry["command"] == command) and
+                (path is None or entry["path"] == path)]
+
+    def test_etag_get_reads_the_version_the_server_has(self):
+        """'-get' is what a script records a precondition from, so it has to
+        answer with the server's own tag - and a path that is not there has
+        to say so rather than print nothing at all."""
+        source = self.root / "dav-etag-source.txt"
+        source.write_text("the first version\n", encoding="utf-8")
+        stored = self.run_script(
+            "option confirm off ; put %s /etag.txt ; etag /etag.txt -get" %
+            source)
+        self.assertEqual(stored.returncode, 0, stored.stdout + stored.stderr)
+        etag = self.etag_of("/etag.txt")
+        self.assertTrue(etag.startswith('"') and etag.endswith('"'), etag)
+        self.assertIn(etag, stored.stdout)
+
+        # Writing moves the tag: a precondition recorded from the old one
+        # is what makes the next write conditional at all.
+        self.run_script("option confirm off ; put %s /etag.txt" % source)
+        second = self.run_script("etag /etag.txt -get")
+        self.assertIn(self.etag_of("/etag.txt"), second.stdout)
+
+        missing = self.run_script("etag /no-such-file.txt -get")
+        self.assertEqual(missing.returncode, 0,
+                         missing.stdout + missing.stderr)
+        self.assertIn("No ETag: '/no-such-file.txt' does not exist.",
+                      missing.stdout)
+
+    def test_a_matching_etag_writes_and_a_stale_one_is_refused(self):
+        """The server has to be the one that decides, and a refused write
+        has to leave the destination exactly as it was.
+
+        '-match=' records the version the script read; the upload that
+        follows carries it in the If header. A tag the server has moved on
+        from is answered with 412, the command fails, and the bytes on the
+        server are still the ones that were there before - not a partial
+        write and not the content the refused upload offered.
+        """
+        first = self.root / "dav-cond-first.txt"
+        first.write_text("the version the script read\n", encoding="utf-8")
+        second = self.root / "dav-cond-second.txt"
+        second.write_text("the version the script writes\n", encoding="utf-8")
+        rival = self.root / "dav-cond-rival.txt"
+        rival.write_text("a write over a version nobody read\n",
+                         encoding="utf-8")
+
+        created = self.run_script(
+            "option confirm off ; put %s /cond.txt" % first)
+        self.assertEqual(created.returncode, 0,
+                         created.stdout + created.stderr)
+        read = self.etag_of("/cond.txt")
+
+        allowed = self.run_script(
+            "option confirm off ; etag /cond.txt -match=%s ; "
+            "put %s /cond.txt ; echo WROTE" % (read, second))
+        self.assertEqual(allowed.returncode, 0,
+                         allowed.stdout + allowed.stderr)
+        self.assertIn("WROTE", allowed.stdout)
+        self.assertIn("If-Match: %s on /cond.txt." % read, allowed.stdout)
+        # The tag went into the header quoted, the way a server compares
+        # one, even though the command splitter took the quotes the user
+        # pasted for the quoting of the argument.
+        self.assertEqual(self.if_headers("PUT", "/cond.txt")[-1],
+                         "([%s])" % read)
+
+        back = self.root / "dav-cond-readback.txt"
+        self.assertEqual(self.run_script("get /cond.txt %s" % back).returncode,
+                         0)
+        self.assertEqual(back.read_bytes(), second.read_bytes())
+
+        # The tag of the version that has now been written over is stale.
+        refused = self.run_script(
+            "option confirm off ; etag /cond.txt -match=%s ; "
+            "put %s /cond.txt ; echo SHOULD_NOT_RUN" % (read, rival))
+        self.assertEqual(refused.returncode, 1,
+                         refused.stdout + refused.stderr)
+        self.assertNotIn("SHOULD_NOT_RUN", refused.stdout)
+        self.assertIn("412", refused.stderr)
+        self.assertEqual(self.if_headers("PUT", "/cond.txt")[-1],
+                         "([%s])" % read)
+
+        untouched = self.root / "dav-cond-untouched.txt"
+        self.assertEqual(
+            self.run_script("get /cond.txt %s" % untouched).returncode, 0)
+        self.assertEqual(untouched.read_bytes(), second.read_bytes())
+
+        # A delete is guarded by the same recorded version, and so is a
+        # move: a precondition that only stopped uploads would not be one.
+        for command, expected in (
+                ("rm /cond.txt", "412"),
+                # A 412 on a move answers two questions, and the one about
+                # the destination is not the one being asked here.
+                ("mv /cond.txt /moved.txt", "ETag precondition")):
+            with self.subTest(command=command):
+                refused = self.run_script(
+                    "option confirm off ; etag /cond.txt -match=%s ; %s ; "
+                    "echo SHOULD_NOT_RUN" % (read, command))
+                self.assertEqual(refused.returncode, 1,
+                                 refused.stdout + refused.stderr)
+                self.assertNotIn("SHOULD_NOT_RUN", refused.stdout)
+                self.assertIn(expected, refused.stderr)
+        self.assertEqual(self.etag_of("/cond.txt"),
+                         self.server_state()["etags"]["/cond.txt"])
+        self.assertNotIn("/moved.txt", self.server_state()["etags"])
+
+        # Clearing the precondition lets the same write through.
+        cleared = self.run_script(
+            "option confirm off ; etag /cond.txt -clear ; "
+            "put %s /cond.txt ; echo CLEARED" % rival)
+        self.assertEqual(cleared.returncode, 0,
+                         cleared.stdout + cleared.stderr)
+        self.assertIn("Cleared ETag precondition on /cond.txt.",
+                      cleared.stdout)
+        self.assertIn("CLEARED", cleared.stdout)
+
+    def test_if_none_match_writes_only_where_the_version_differs(self):
+        """'-nomatch=' is If-None-Match: write only where the server does
+        NOT have this version.
+
+        Spelled without the 'Not' the condition asks for the opposite, and
+        a script that meant "only if nobody changed it" would have written
+        only over a file it had already seen replaced. A path that is not
+        there at all has no version to differ from, so the write that
+        creates it goes through - which is what makes this the guard a
+        script reads a file with before deciding to create it.
+        """
+        source = self.root / "dav-nomatch-source.txt"
+        source.write_text("what the script offers\n", encoding="utf-8")
+        rival = self.root / "dav-nomatch-rival.txt"
+        rival.write_text("what would overwrite it\n", encoding="utf-8")
+
+        # A tag from a path that does not exist yet: nothing to match, so
+        # the condition holds and the file is created. The root's own tag
+        # is read once, before the create moves the listing it names.
+        absent = self.etag_of("/")
+        created = self.run_script(
+            "option confirm off ; etag /fresh.txt -nomatch=%s ; "
+            "put %s /fresh.txt ; echo CREATED" % (absent, source))
+        self.assertEqual(created.returncode, 0,
+                         created.stdout + created.stderr)
+        self.assertIn("CREATED", created.stdout)
+        self.assertIn("If-None-Match: %s on /fresh.txt." % absent,
+                      created.stdout)
+        self.assertEqual(self.if_headers("PUT", "/fresh.txt")[-1],
+                         "(Not [%s])" % absent)
+
+        # The same tag now names a version the server does not have - the
+        # file it just created has its own - so the write still goes
+        # through, and one that names the version it does have is refused.
+        stale = absent
+        current = self.etag_of("/fresh.txt")
+        allowed = self.run_script(
+            "option confirm off ; etag /fresh.txt -nomatch=%s ; "
+            "put %s /fresh.txt ; echo DIFFERENT_OK" % (stale, source))
+        self.assertEqual(allowed.returncode, 0,
+                         allowed.stdout + allowed.stderr)
+        self.assertIn("DIFFERENT_OK", allowed.stdout)
+
+        refused = self.run_script(
+            "option confirm off ; etag /fresh.txt -nomatch=%s ; "
+            "put %s /fresh.txt ; echo SHOULD_NOT_RUN" % (current, rival))
+        self.assertEqual(refused.returncode, 1,
+                         refused.stdout + refused.stderr)
+        self.assertNotIn("SHOULD_NOT_RUN", refused.stdout)
+        self.assertIn("412", refused.stderr)
+        self.assertEqual(self.if_headers("PUT", "/fresh.txt")[-1],
+                         "(Not [%s])" % current)
+
+        untouched = self.root / "dav-nomatch-readback.txt"
+        self.assertEqual(
+            self.run_script("get /fresh.txt %s" % untouched).returncode, 0)
+        self.assertEqual(untouched.read_bytes(), source.read_bytes())
+
+    def test_an_asterisk_is_refused_rather_than_sent_as_a_precondition(self):
+        """'*' is the "only if absent" of a bare If-None-Match header, and
+        the If header a condition travels in has no room for it: a quoted
+        asterisk is a tag no resource carries, so the condition would hold
+        on every write and guard nothing while looking like a guard."""
+        for switch in ("-nomatch=*", "-match=*"):
+            with self.subTest(switch=switch):
+                refused = self.run_script(
+                    "etag /whatever.txt %s ; echo SHOULD_NOT_RUN" % switch)
+                self.assertEqual(refused.returncode, 1,
+                                 refused.stdout + refused.stderr)
+                self.assertIn("is not an entity tag", refused.stderr)
+                self.assertNotIn("SHOULD_NOT_RUN", refused.stdout)
+        self.assertEqual(self.if_headers(), [])
+
+    def test_a_lock_and_an_etag_travel_in_one_condition_list(self):
+        """A path that is both locked and has a version recorded states both
+        in one If header.
+
+        RFC 4918 reads an If header as either no-tag lists or tagged lists
+        and never as both, and every condition of one list has to hold. A
+        header that put the token in one list and the tag in another was
+        one no server is asked to parse, and a token sent without the angle
+        brackets of a Coded-URL was one a standard server did not find.
+        """
+        source = self.root / "dav-both-source.txt"
+        source.write_text("the version under the lock\n", encoding="utf-8")
+        changed = self.root / "dav-both-changed.txt"
+        changed.write_text("the owner's new version\n", encoding="utf-8")
+        rival = self.root / "dav-both-rival.txt"
+        rival.write_text("a writer with no lock and no version\n",
+                         encoding="utf-8")
+
+        written = self.run_script(
+            "option confirm off ; put %s /both.txt ; echo WRITTEN" % source)
+        self.assertEqual(written.returncode, 0,
+                         written.stdout + written.stderr)
+        read = self.etag_of("/both.txt")
+
+        # Both belong to one session: the lock token and the recorded
+        # version live with the connection that took them, so the write
+        # that carries them has to be the same run that has them.
+        owner = self.run_script(
+            "option confirm off ; etag /both.txt -match=%s ; "
+            "lock /both.txt -timeout=600 ; put %s /both.txt ; "
+            "echo OWNER_OK" % (read, changed))
+        self.assertEqual(owner.returncode, 0, owner.stdout + owner.stderr)
+        self.assertIn("OWNER_OK", owner.stdout)
+        token = self.server_state()["locks"]["/both.txt"]
+        # One list, both conditions, the token as a Coded-URL.
+        self.assertEqual(self.if_headers("PUT", "/both.txt")[-1],
+                         "(<%s> [%s])" % (token, read))
+
+        # A session that holds neither is refused by the lock, and the file
+        # keeps the version the owner wrote.
+        refused = self.run_script(
+            "option confirm off ; put %s /both.txt ; echo SHOULD_NOT_RUN" %
+            rival)
+        self.assertEqual(refused.returncode, 1,
+                         refused.stdout + refused.stderr)
+        self.assertNotIn("SHOULD_NOT_RUN", refused.stdout)
+        self.assertIn("423", refused.stderr)
+
+        self.run_script("unlock /both.txt")
+        back = self.root / "dav-both-readback.txt"
+        self.assertEqual(self.run_script("get /both.txt %s" % back).returncode,
+                         0)
+        self.assertEqual(back.read_bytes(), changed.read_bytes())
+
+    def test_a_precondition_names_the_path_it_was_recorded_for(self):
+        """What a precondition on a collection means: it guards the
+        collection, and nothing below it.
+
+        A collection's tag names its listing, so a member that inherited
+        it would be refused by the first change the listing made - the tag
+        goes stale, and every later write below that directory fails too.
+        The rule recorded for a path is therefore the rule that path is
+        written under, and a member states its own.
+        """
+        source = self.root / "dav-coll-source.txt"
+        source.write_text("a member of the collection\n", encoding="utf-8")
+        changed = self.root / "dav-coll-changed.txt"
+        changed.write_text("the same member, changed\n", encoding="utf-8")
+
+        made = self.run_script(
+            "option confirm off ; mkdir /col ; put %s /col/inner.txt ; "
+            "echo READY" % source)
+        self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+        listing = self.etag_of("/col")
+
+        # The member's own write carries no precondition, even though the
+        # collection above it has one recorded: nothing was stated for its
+        # path, and the listing the tag names does not move when a member
+        # changes its content.
+        guarded = self.run_script(
+            "option confirm off ; etag /col -match=%s ; "
+            "put %s /col/inner.txt ; echo MEMBER_WRITTEN" % (listing, changed))
+        self.assertEqual(guarded.returncode, 0,
+                         guarded.stdout + guarded.stderr)
+        self.assertIn("MEMBER_WRITTEN", guarded.stdout)
+        self.assertEqual(self.if_headers("PUT", "/col/inner.txt"), [])
+        self.assertEqual(self.etag_of("/col"), listing)
+
+        # Removing the member moves the listing, so the tag recorded before
+        # it is stale for the collection - which is exactly why a member
+        # cannot inherit one.
+        emptied = self.run_script(
+            "option confirm off ; etag /col -match=%s ; "
+            "rm /col/inner.txt ; echo MEMBER_REMOVED" % listing)
+        self.assertEqual(emptied.returncode, 0,
+                         emptied.stdout + emptied.stderr)
+        self.assertIn("MEMBER_REMOVED", emptied.stdout)
+        self.assertEqual(self.if_headers("DELETE", "/col/inner.txt"), [])
+        emptied_tag = self.etag_of("/col")
+        self.assertNotEqual(emptied_tag, listing)
+
+        # A write aimed at the collection itself is refused by a tag that
+        # is not its own, and by the one it had before its listing moved;
+        # both leave it standing.
+        for stale in ('"not-this-tag"', listing):
+            with self.subTest(tag=stale):
+                refused = self.run_script(
+                    "option confirm off ; etag /col -match=%s ; "
+                    "rmdir /col ; echo SHOULD_NOT_RUN" % stale)
+                self.assertEqual(refused.returncode, 1,
+                                 refused.stdout + refused.stderr)
+                self.assertIn("412", refused.stderr)
+                self.assertNotIn("SHOULD_NOT_RUN", refused.stdout)
+                self.assertIn("/col", self.server_state()["etags"])
+
+        # The collection's current tag lets its own removal through.
+        removed = self.run_script(
+            "option confirm off ; etag /col -match=%s ; "
+            "rmdir /col ; echo REMOVED" % emptied_tag)
+        self.assertEqual(removed.returncode, 0,
+                         removed.stdout + removed.stderr)
+        self.assertIn("REMOVED", removed.stdout)
+        self.assertNotIn("/col", self.server_state()["etags"])
 
     def test_cp_uses_webdav_copy_and_preserves_the_source(self):
         """COPY is a server-side operation: the destination has to match

@@ -40,10 +40,14 @@ The review corrected stale claims without upgrading unimplemented work:
 - Local-pane desktop drops, cross-browser enumeration APIs, local edit
   monitoring, session folders and conflict controls have test evidence. This
   does not certify all real browser/file-manager/server combinations.
-- WebDAV session locks and dead properties are implemented Linux extensions.
-  `etag` records an If-Match/If-None-Match precondition and WebDAV writes send
-  it, but no automated case proves it yet and collection preconditions are not
-  defined.
+- WebDAV session locks, dead properties and ETag preconditions are implemented
+  Linux extensions. `etag` records an If-Match/If-None-Match tag per path, a
+  WebDAV write of that path sends it in one no-tag `If` list next to any lock
+  token, a stale tag is refused by the server with 412 and leaves the
+  destination's bytes and listing untouched, `*` is refused rather than sent as
+  a tag nothing matches, a protocol with no entity tags is refused by name, and
+  a precondition guards the path it was recorded for rather than everything
+  below a collection.
 - English/Spanish GUI and shared CLI localization exists. Remaining
   human-facing script/engine diagnostics keep localization partial.
 - Non-UTF-8 editor transcoding and upstream XML consumer/schema compatibility

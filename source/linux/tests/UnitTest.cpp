@@ -3591,19 +3591,65 @@ void TestSshTunnelParsing()
 
 void TestDavEtagHelpers()
 {
-    /* DavGetEtag: the function is a static method on ProtocolClient, tested
-     * with live DAV tests.  Here we test the precondition helpers on the
-     * session. */
+    /* DavGetEtag() is a static method on ProtocolClient and needs a
+     * server, so the live WebDAV suite covers it. What is checked here is
+     * the shape of what a write then sends, because a header a server
+     * cannot read is a precondition that is not there. */
+
+    /* An entity tag is quoted in the header that carries it, and the value
+     * a user pastes back from 'etag -get' has already lost its quotes to
+     * the command splitter: both spellings are stored the same way. */
+    CHECK_EQ(DavEntityTag("abc123"), std::string("\"abc123\""));
+    CHECK_EQ(DavEntityTag("\"abc123\""), std::string("\"abc123\""));
+    CHECK_EQ(DavEntityTag("W/abc123"), std::string("W/\"abc123\""));
+    CHECK_EQ(DavEntityTag("W/\"abc123\""), std::string("W/\"abc123\""));
+    CHECK_EQ(DavEntityTag("*"), std::string("*"));
+
     SessionOptions options;
-    options.davEtags["/test.txt"].ifMatch = "\"abc123\"";
-    CHECK_EQ(options.davEtags["/test.txt"].ifMatch, std::string("\"abc123\""));
-    CHECK_TRUE(options.davEtags["/test.txt"].ifNoneMatch.empty());
-    options.davEtags["/other.txt"].ifNoneMatch = "\"xyz789\"";
-    CHECK_EQ(options.davEtags["/other.txt"].ifNoneMatch, std::string("\"xyz789\""));
+    CHECK_EQ(DavIfHeader(options, "/a.txt"), std::string());
+
+    /* A lock token is a Coded-URL, so the angle brackets are part of it. */
+    options.davLocks["/a.txt"] = "opaquelocktoken:1";
+    CHECK_EQ(DavIfHeader(options, "/a.txt"),
+        std::string("(<opaquelocktoken:1>)"));
+
+    /* A path that is both locked and has a version recorded states both in
+     * ONE list: RFC 4918 reads an If header as either no-tag lists or
+     * tagged lists and never as both, and every condition of a list has to
+     * hold. */
+    options.davEtags["/a.txt"].ifMatch = "\"v1\"";
+    CHECK_EQ(DavIfHeader(options, "/a.txt"),
+        std::string("(<opaquelocktoken:1> [\"v1\"])"));
+
+    options.davLocks.erase("/a.txt");
+    CHECK_EQ(DavIfHeader(options, "/a.txt"), std::string("([\"v1\"])"));
+
+    /* '-nomatch=' is If-None-Match, which a condition list spells with the
+     * 'Not' in front of the tag. */
+    options.davEtags["/a.txt"] = SessionOptions::EtagPrecondition();
+    options.davEtags["/a.txt"].ifNoneMatch = "\"v1\"";
+    CHECK_EQ(DavIfHeader(options, "/a.txt"), std::string("(Not [\"v1\"])"));
+
+    /* A precondition names the path it was recorded for: a collection's
+     * tag does not guard a member, whose own writes move the listing the
+     * tag names. */
+    options.davEtags["/dir"].ifMatch = "\"v2\"";
+    CHECK_EQ(DavIfHeader(options, "/dir/inner.txt"), std::string());
+    CHECK_EQ(DavIfHeader(options, "/dir"), std::string("([\"v2\"])"));
+    CHECK_EQ(DavIfHeader(options, "/directory.txt"), std::string());
+
+    /* The precondition the session keeps, per path. */
+    SessionOptions stored;
+    stored.davEtags["/test.txt"].ifMatch = "\"abc123\"";
+    CHECK_EQ(stored.davEtags["/test.txt"].ifMatch, std::string("\"abc123\""));
+    CHECK_TRUE(stored.davEtags["/test.txt"].ifNoneMatch.empty());
+    stored.davEtags["/other.txt"].ifNoneMatch = "\"xyz789\"";
+    CHECK_EQ(stored.davEtags["/other.txt"].ifNoneMatch,
+        std::string("\"xyz789\""));
     /* Clear by erasing */
-    options.davEtags.erase("/test.txt");
-    CHECK_TRUE(options.davEtags.find("/test.txt") == options.davEtags.end());
-    CHECK_FALSE(options.davEtags.find("/other.txt") == options.davEtags.end());
+    stored.davEtags.erase("/test.txt");
+    CHECK_TRUE(stored.davEtags.find("/test.txt") == stored.davEtags.end());
+    CHECK_FALSE(stored.davEtags.find("/other.txt") == stored.davEtags.end());
 }
 
 void TestScpEngine()

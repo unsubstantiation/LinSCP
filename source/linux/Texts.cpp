@@ -347,7 +347,10 @@ std::string EtagCleared(const std::string & path)
 
 std::string NoEtag(const std::string & path)
 {
-    return Translate("No ETag (path does not exist).");
+    /* The path is part of the answer: a script that asked about several
+     * has to tell which one the server has not got, and the sibling
+     * message for a resource the server did report on names it too. */
+    return Translate("No ETag: '{path}' does not exist.", {{"path", path}});
 }
 
 std::string NoEtagReported(const std::string & path)

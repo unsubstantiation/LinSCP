@@ -76,7 +76,7 @@ Run `linscp -help` for the options and `man linscp` for the full reference.
 | `scp://`, `ssh://` | the client's SSH code: the server's shell for directory work, rcp for bytes | no resume; the protocol has no offset |
 | `ftp://` | native FTP engine for listing and metadata; curl for transfers | |
 | `ftps://` | curl, implicit TLS; `ftp://` with explicit TLS settings also uses curl | |
-| `dav://`, `webdav://` | curl, with PROPFIND, MOVE, COPY, locks and dead properties | partial |
+| `dav://`, `webdav://` | curl, with PROPFIND, MOVE, COPY, locks, dead properties and ETag preconditions | |
 | `s3://` | curl, with SigV4 signing and multipart transfers | partial |
 
 Host keys are verified. `-hostkey=` takes a SHA-256 or MD5 fingerprint. An

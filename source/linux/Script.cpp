@@ -6970,11 +6970,11 @@ bool Script::EtagCommand(const std::vector<std::string> & args)
         const std::string lower = ToLower(args[i]);
         if (StartsWith(lower, "-match="))
         {
-            matchEtag = args[i].substr(strlen("-match="));
+            matchEtag = DavEntityTag(args[i].substr(strlen("-match=")));
         }
         else if (StartsWith(lower, "-nomatch="))
         {
-            nomatchEtag = args[i].substr(strlen("-nomatch="));
+            nomatchEtag = DavEntityTag(args[i].substr(strlen("-nomatch=")));
         }
         else if (lower == "-get")
         {
@@ -7000,6 +7000,20 @@ bool Script::EtagCommand(const std::vector<std::string> & args)
     {
         Console::Instance().Error(Texts::WrongArguments("etag",
             "Syntax: etag <file> -match=ETAG | -nomatch=ETAG | -get | -clear"));
+        mErrors++;
+        return false;
+    }
+    /* '*' is the "only where there is nothing yet" of a bare
+     * If-None-Match header, and the If header this client states a
+     * precondition in has no room for it: RFC 4918 reads a condition as a
+     * state token or an entity tag, so a quoted "*" would be a tag no
+     * resource carries and the condition would hold on every write,
+     * guarding nothing while looking like a guard. Refused instead. */
+    if (matchEtag == "*" || nomatchEtag == "*")
+    {
+        Console::Instance().Error(Texts::WrongArguments("etag",
+            "'*' is not an entity tag. Give the tag 'etag <file> -get' "
+            "prints, which a path that is not there answers with."));
         mErrors++;
         return false;
     }

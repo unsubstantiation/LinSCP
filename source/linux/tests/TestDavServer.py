@@ -23,6 +23,7 @@ prints "READY <port>" once listening.
 
 import calendar
 import datetime
+import hashlib
 import json
 import re
 import sys
@@ -68,6 +69,10 @@ class Store:
         self.locks = {}
         self.properties = {}
         self.lock_count = 0
+        # Every If header a request carried, in the order they arrived:
+        # a precondition is only worth what the client actually sent, and
+        # this is the only place a test can read that back.
+        self.if_headers = []
 
     @staticmethod
     def normalize(path):
@@ -125,6 +130,28 @@ class Store:
             return "deleted"
         del self.items[path]
         return "deleted"
+
+    def etag_of(self, path):
+        """The strong entity tag of a stored resource, or None if absent.
+
+        Derived from what the resource is - its bytes, or for a collection
+        the names it holds - and from when it last changed, so a write
+        always moves it and a test can tell a stale tag from a current one.
+        """
+        entry = self.get(path)
+        if entry is None:
+            return None
+        path = self.normalize(path)
+        digest = hashlib.sha1()
+        digest.update(entry["kind"].encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(entry["mtime"]).encode("utf-8"))
+        if entry["kind"] == "dir":
+            digest.update("\0".join(sorted(self.children_of(path)))
+                          .encode("utf-8"))
+        else:
+            digest.update(entry.get("data", b""))
+        return '"%s"' % digest.hexdigest()
 
     def children_of(self, path):
         """Immediate members, sorted - '/' means top-level only."""
@@ -246,6 +273,23 @@ class Store:
         return self.properties.get(self.normalize(path), {})
 
 
+def _etag_matches(left, right):
+    """Whether two entity tags name the same version.
+
+    A weak tag ('W/"..."') is a claim about equivalence rather than about
+    bytes, and comparing one to a strong tag byte for byte would refuse a
+    precondition the server meant to honour.
+    """
+    def strong(value):
+        value = value.strip()
+        if value.upper().startswith("W/"):
+            value = value[2:].strip()
+        if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+            value = value[1:-1]
+        return value
+    return strong(left) == strong(right)
+
+
 def _now():
     return calendar.timegm(
         datetime.datetime.now(datetime.timezone.utc).timetuple())
@@ -288,10 +332,88 @@ class DavHandler(BaseHTTPRequestHandler):
         return urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
 
     def if_tokens(self):
-        """The tokens of an 'If: (<token>)' (or tagged-list) header."""
+        """The state tokens of an 'If' header, from any of its lists.
+
+        A state token is a Coded-URL, so it is the '<...>' of a condition;
+        an entity tag is '["..."]' and is not one. Taking the whole list
+        instead read a list that also carried a precondition as a token
+        nobody holds, and the write it guarded was refused as locked.
+        """
         header = self.headers.get("If", "")
-        return [part.strip().strip("<>") for part in
-                re.findall(r"\(([^)]*)\)", header) if part.strip()]
+        return [part.strip() for group in re.findall(r"\(([^)]*)\)", header)
+                for part in re.findall(r"<([^>]*)>", group)]
+
+    def precondition_lists(self):
+        """The condition lists of an 'If' header.
+
+        Each list is a conjunction and the lists are alternatives, as
+        RFC 4918 10.4 reads them, so a request passes when one list holds
+        in full. A condition is ('token'|'etag', value, negated).
+        """
+        header = self.headers.get("If", "")
+        lists = []
+        for group in re.findall(r"\(([^)]*)\)", header):
+            conditions = []
+            for match in re.finditer(r"(Not\s+)?(<([^>]*)>|\[([^\]]*)\])",
+                                     group):
+                negated = bool((match.group(1) or "").strip())
+                if match.group(3) is not None:
+                    conditions.append(("token", match.group(3).strip(),
+                                       negated))
+                else:
+                    conditions.append(("etag",
+                                       match.group(4).strip().strip('"'),
+                                       negated))
+            if conditions:
+                lists.append(conditions)
+        return lists
+
+    def precondition_failed(self, path):
+        """True when the 'If' header this request carries does not hold.
+
+        A header with no list this server can read is refused rather than
+        ignored: a write that went through because its guard could not be
+        parsed is the failure a precondition exists to prevent.
+        """
+        if not self.headers.get("If", "").strip():
+            return False
+        lists = self.precondition_lists()
+        if not lists:
+            return True
+        current = SERVER_STORE.etag_of(path)
+        held = SERVER_STORE.lock_owner(path)
+        for conditions in lists:
+            holds_all = True
+            for kind, value, negated in conditions:
+                if kind == "token":
+                    holds = held is not None and held["token"] == value
+                elif value == "*":
+                    # '*' stands for any entity tag: it holds whenever the
+                    # resource is there, and negated it is the "only if
+                    # absent" a client states with -nomatch=*.
+                    holds = current is not None
+                else:
+                    holds = current is not None and _etag_matches(current,
+                                                                  value)
+                if negated:
+                    holds = not holds
+                if not holds:
+                    holds_all = False
+                    break
+            if holds_all:
+                return False
+        return True
+
+    def record_if_header(self, path):
+        header = self.headers.get("If", "")
+        if header.strip():
+            SERVER_STORE.if_headers.append({"command": self.command,
+                                            "path": self.normalize(path),
+                                            "header": header})
+
+    def send_precondition_failed(self):
+        self.send_error_text(412, "Precondition Failed: the If header this "
+                                  "request carries does not hold.")
 
     def locked_out(self, path):
         """True when a lock guards this path and the request proves no
@@ -355,6 +477,12 @@ class DavHandler(BaseHTTPRequestHandler):
                 type_prop = "<d:resourcetype/>"
                 length_prop = ("<d:getcontentlength>%d</d:getcontentlength>"
                                % len(data))
+            # getetag is what a client records a precondition from, so a
+            # collection carries one too: it names the version of the
+            # listing, which is all a collection has to compare.
+            etag = SERVER_STORE.etag_of(target)
+            etag_prop = ("<d:getetag>%s</d:getetag>" % xml_escape(etag)
+                         if etag else "")
             # The dead properties this store holds, in the namespace the
             # client wrote them in, next to the live ones.
             dead = "".join(
@@ -364,12 +492,12 @@ class DavHandler(BaseHTTPRequestHandler):
                     SERVER_STORE.get_properties(target).items()))
             responses.append(
                 "<d:response><d:href>%s</d:href>"
-                "<d:propstat><d:prop>%s%s"
+                "<d:propstat><d:prop>%s%s%s"
                 "<d:getlastmodified>%s</d:getlastmodified>%s"
                 "</d:prop>"
                 "<d:status>HTTP/1.1 200 OK</d:status>"
                 "</d:propstat></d:response>"
-                % (xml_escape(href), type_prop, length_prop,
+                % (xml_escape(href), type_prop, length_prop, etag_prop,
                    http_date(entry["mtime"]), dead))
         body = PROPFIND_BODY % "".join(responses)
         self.send_body(207, body, "application/xml; charset=utf-8")
@@ -476,6 +604,9 @@ class DavHandler(BaseHTTPRequestHandler):
                 "locks": {path: entry["token"] for path, entry
                           in SERVER_STORE.locks.items()},
                 "properties": SERVER_STORE.properties,
+                "etags": {path: SERVER_STORE.etag_of(path)
+                          for path in sorted(SERVER_STORE.items)},
+                "if_headers": SERVER_STORE.if_headers,
             }).encode("utf-8")
             self.send_body(200, body, "application/json")
             return
@@ -491,7 +622,8 @@ class DavHandler(BaseHTTPRequestHandler):
             return
         data = item.get("data", b"")
         extra = (("Last-Modified", http_date(item["mtime"])),
-                 ("Accept-Ranges", "bytes"))
+                 ("Accept-Ranges", "bytes"),
+                 ("ETag", SERVER_STORE.etag_of(path) or ""))
         range_header = self.headers.get("Range")
         if range_header:
             match = re.match(r"bytes=(\d+)-(\d*)$", range_header.strip())
@@ -525,8 +657,12 @@ class DavHandler(BaseHTTPRequestHandler):
         if item is None or item["kind"] != "dir":
             self.send_error_text(409, "The parent collection does not exist.")
             return
+        self.record_if_header(path)
         if self.locked_out(path):
             self.send_locked()
+            return
+        if self.precondition_failed(path):
+            self.send_precondition_failed()
             return
         existed = SERVER_STORE.get(path) is not None
         SERVER_STORE.add_file(path, data)
@@ -538,8 +674,12 @@ class DavHandler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
         path = self.local_path()
+        self.record_if_header(path)
         if self.locked_out(path):
             self.send_locked()
+            return
+        if self.precondition_failed(path):
+            self.send_precondition_failed()
             return
         result = SERVER_STORE.delete(path)
         if result == "deleted":
@@ -578,8 +718,12 @@ class DavHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlsplit(destination)
         dest = urllib.parse.unquote(parsed.path or destination)
         overwrite = self.headers.get("Overwrite", "T").upper() != "F"
+        self.record_if_header(self.local_path())
         if self.locked_out(self.local_path()):
             self.send_locked()
+            return
+        if self.precondition_failed(self.local_path()):
+            self.send_precondition_failed()
             return
         result = SERVER_STORE.move(self.local_path(), dest, overwrite)
         if result in ("created", "replaced"):
@@ -613,6 +757,10 @@ class DavHandler(BaseHTTPRequestHandler):
             return
         dest = urllib.parse.unquote(parsed.path or destination)
         overwrite = self.headers.get("Overwrite", "T").upper() != "F"
+        self.record_if_header(self.local_path())
+        if self.precondition_failed(self.local_path()):
+            self.send_precondition_failed()
+            return
         result = SERVER_STORE.copy(self.local_path(), dest, overwrite)
         if result in ("created", "replaced"):
             self.send_response(201 if result == "created" else 204)

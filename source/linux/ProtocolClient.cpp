@@ -19,6 +19,112 @@
 
 namespace linscp {
 
+/* The lock token this session holds for a path, or an empty string: the
+ * If header that makes the server enforce the lock. */
+std::string DavTokenFor(const SessionOptions & options,
+    const std::string & remotePath)
+{
+    std::map<std::string, std::string>::const_iterator found =
+        options.davLocks.find(remotePath);
+    return found == options.davLocks.end() ? std::string() : found->second;
+}
+
+/*
+ * An entity tag as an If header carries it: quoted, with the 'W/' of a
+ * weak tag in front of the quotes.
+ *
+ * 'etag -get' prints the server's tag with its quotes, and the command
+ * splitter reads those quotes as the quoting of the argument, so what the
+ * switch hands over is the tag without them. An unquoted tag is not one a
+ * server compares, so both spellings are stored the way the header needs
+ * it rather than sent as the user happened to type them. '*' is passed
+ * through unchanged: it is not an entity tag, and the command that records
+ * a precondition refuses it rather than send a condition that would hold
+ * on every write and guard nothing.
+ */
+std::string DavEntityTag(const std::string & value)
+{
+    std::string text = value;
+    std::string weak;
+    if (text.compare(0, 2, "W/") == 0)
+    {
+        weak = "W/";
+        text = text.substr(2);
+    }
+    if (text == "*")
+    {
+        return text;
+    }
+    if (text.size() >= 2 && text[0] == '"' && text[text.size() - 1] == '"')
+    {
+        return weak + text;
+    }
+    return weak + "\"" + text + "\"";
+}
+
+/*
+ * The If header a write of this path carries, or an empty string when the
+ * session has nothing to state about it.
+ *
+ * RFC 4918 10.4 reads an If header as either no-tag lists or tagged lists
+ * and never as both, every condition inside one list has to hold, and the
+ * lists themselves are alternatives. A path that is both locked and has an
+ * ETag recorded therefore goes as one list - '(<token> ["etag"])' - which
+ * says "I hold this lock and I read this version". It used to go as a
+ * no-tag list followed by a tagged one, a header no server is asked to
+ * parse, and the lock token went without the angle brackets that make it a
+ * Coded-URL, so a server reading the standard grammar found no token in it
+ * and answered 423 to the writer that held the lock.
+ *
+ * The no-tag form is used throughout, so the conditions apply to the
+ * resource the request is aimed at: a tagged list spells a URL, and one
+ * built from the remote path alone would resolve against the request and
+ * could guard a resource nobody was writing.
+ *
+ * '-nomatch=' is If-None-Match - write only if the version the server has
+ * is not this one - which a condition list spells 'Not ["etag"]'. Without
+ * the 'Not' it asked for the opposite of what the command's own help
+ * promises: a write would have gone through only over the very version the
+ * user said they had not seen.
+ */
+std::string DavIfHeader(const SessionOptions & options,
+    const std::string & remotePath)
+{
+    std::string conditions;
+    const std::string lockToken = DavTokenFor(options, remotePath);
+    if (!lockToken.empty())
+    {
+        conditions += "<" + lockToken + ">";
+    }
+    std::map<std::string, SessionOptions::EtagPrecondition>::const_iterator
+        etagFound = options.davEtags.find(remotePath);
+    if (etagFound != options.davEtags.end())
+    {
+        const SessionOptions::EtagPrecondition & precondition =
+            etagFound->second;
+        /* 'etag' records one action per call, so at most one of the two is
+         * set; both are spelled out because a list of conditions is read
+         * as the conjunction it is. */
+        if (!precondition.ifMatch.empty())
+        {
+            if (!conditions.empty())
+            {
+                conditions += " ";
+            }
+            conditions += "[" + precondition.ifMatch + "]";
+        }
+        if (!precondition.ifNoneMatch.empty())
+        {
+            if (!conditions.empty())
+            {
+                conditions += " ";
+            }
+            conditions += "Not [" + precondition.ifNoneMatch + "]";
+        }
+    }
+    return conditions.empty() ? std::string() : "(" + conditions + ")";
+}
+
 namespace {
 
 std::string ToLower(const std::string & text)
@@ -812,6 +918,55 @@ bool DavElementBody(const std::string & xml, size_t tagStart,
     return true;
 }
 
+/*
+ * The text of an element with XML's character references resolved.
+ *
+ * A server may escape what it puts inside an element, and a value that is
+ * itself quoted - an entity tag - arrives as '&quot;abc&quot;' from one
+ * that does. Handing that back as the tag left a precondition no server
+ * could match, and a path or a property value with an ampersand in it came
+ * back spelled differently from the way it was stored, so every value read
+ * out of a reply is resolved on the way out. Only the five references XML
+ * defines are: a numeric one is left as it came rather than half-decoded.
+ */
+std::string DavXmlUnescape(const std::string & text)
+{
+    static const struct
+    {
+        const char * name;
+        char value;
+    } kEntities[] = {
+        { "&amp;", '&' }, { "&lt;", '<' }, { "&gt;", '>' },
+        { "&quot;", '"' }, { "&apos;", '\'' },
+    };
+    std::string out;
+    for (size_t i = 0; i < text.size(); i++)
+    {
+        if (text[i] != '&')
+        {
+            out += text[i];
+            continue;
+        }
+        bool resolved = false;
+        for (size_t e = 0; e < sizeof(kEntities) / sizeof(kEntities[0]); e++)
+        {
+            const size_t length = strlen(kEntities[e].name);
+            if (text.compare(i, length, kEntities[e].name) == 0)
+            {
+                out += kEntities[e].value;
+                i += length - 1;
+                resolved = true;
+                break;
+            }
+        }
+        if (!resolved)
+        {
+            out += text[i];
+        }
+    }
+    return out;
+}
+
 bool DavFindText(const std::string & xml, const std::string & local,
     size_t from, std::string & value)
 {
@@ -826,7 +981,7 @@ bool DavFindText(const std::string & xml, const std::string & local,
     {
         return false;
     }
-    value = xml.substr(bodyStart, bodyEnd - bodyStart);
+    value = DavXmlUnescape(xml.substr(bodyStart, bodyEnd - bodyStart));
     return true;
 }
 
@@ -1088,45 +1243,6 @@ bool DavPropfindOnce(const SessionOptions & options, const std::string & path,
 const char * const kDavPropertyNamespace = "urn:linscp:properties";
 const char * const kDavPropertyPrefix = "lscp";
 
-/* The lock token this session holds for a path, or an empty string: the
- * If header that makes the server enforce the lock. */
-std::string DavTokenFor(const SessionOptions & options, const std::string & remotePath)
-{
-    std::map<std::string, std::string>::const_iterator found =
-        options.davLocks.find(remotePath);
-    return found == options.davLocks.end() ? std::string() : found->second;
-}
-
-/* Build the combined If header for lock tokens AND ETag preconditions.
- * Lock tokens go in parentheses (token-list), ETags in angle brackets
- * (entity-tag-list), following RFC 4918 §10.4. */
-std::string DavIfHeader(const SessionOptions & options, const std::string & remotePath)
-{
-    std::string header;
-    const std::string lockToken = DavTokenFor(options, remotePath);
-    std::map<std::string, SessionOptions::EtagPrecondition>::const_iterator
-        etagFound = options.davEtags.find(remotePath);
-    if (!lockToken.empty())
-    {
-        header += "(" + lockToken + ")";
-    }
-    if (etagFound != options.davEtags.end())
-    {
-        const SessionOptions::EtagPrecondition & ep = etagFound->second;
-        if (!ep.ifMatch.empty())
-        {
-            if (!header.empty()) header += " ";
-            header += "<" + remotePath + "> ([" + ep.ifMatch + "])";
-        }
-        if (!ep.ifNoneMatch.empty())
-        {
-            if (!header.empty()) header += " ";
-            header += "<" + remotePath + "> ([" + ep.ifNoneMatch + "])";
-        }
-    }
-    return header;
-}
-
 std::string DavTrimmed(const std::string & text)
 {
     size_t begin = 0;
@@ -1158,10 +1274,6 @@ std::string DavXmlEscape(const std::string & text)
     }
     return out;
 }
-
-
-
-
 
 
 /* The first failing status inside a 207 reply, for PROPPATCH answers: a
@@ -2231,6 +2343,18 @@ int ProtocolClient::Move(const SessionOptions & options, const std::string & fro
         }
         if (moved.httpCode == 412)
         {
+            /* A 412 answers two different questions and only one of them
+             * is about the destination: a precondition this session
+             * recorded for the source is the server saying the version it
+             * has is not the one the move was asked to apply to, which is
+             * nothing to do with what sits at the other path. */
+            if (options.davEtags.find(fromPath) != options.davEtags.end())
+            {
+                error = "The server refused to move '" + fromPath +
+                    "': the ETag precondition recorded for it does not "
+                    "hold any more.";
+                return -1;
+            }
             error = "The destination '" + toPath +
                 "' exists and the server refused to overwrite it.";
             return -1;
@@ -2354,7 +2478,8 @@ bool DavLockTokenFromXml(const std::string & xml, std::string & token)
     {
         return false;
     }
-    token = DavTrimmed(xml.substr(textStart + 1, end - textStart - 1));
+    token = DavTrimmed(DavXmlUnescape(
+        xml.substr(textStart + 1, end - textStart - 1)));
     return !token.empty();
 }
 
