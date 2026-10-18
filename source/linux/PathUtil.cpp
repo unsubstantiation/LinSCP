@@ -1,5 +1,6 @@
 #include "PathUtil.h"
 
+#include "ListingParse.h"
 #include "Platform.h"
 
 #include <cctype>
@@ -382,26 +383,12 @@ std::string FormatSize(uint64_t size)
 
 std::string FormatPermissions(unsigned long permissions)
 {
-    static const char * bits = "rwxrwxrwx";
-    std::string result;
-    result += (permissions & 0040000) ? 'd' : '-';
-    for (int i = 0; i < 9; i++)
-    {
-        result += (permissions & (0400 >> i)) ? bits[i] : '-';
-    }
-    if (permissions & 0004000)
-    {
-        result[3] = (permissions & 0000100) ? 's' : 'S';
-    }
-    if (permissions & 0002000)
-    {
-        result[6] = (permissions & 0000010) ? 's' : 'S';
-    }
-    if (permissions & 0001000)
-    {
-        result[9] = (permissions & 0000001) ? 't' : 'T';
-    }
-    return result;
+    /* One implementation, not two: this used to spell out its own mode
+     * string and knew only the directory type, so 'ls' and 'attr' printed
+     * a symbolic link, a device or a socket as an ordinary file while the
+     * shared listing parser printed the type the attributes really
+     * carried. PermissionsString() is what a listing line is built from. */
+    return PermissionsString(permissions);
 }
 
 std::string FormatFileTime(unsigned long time)
@@ -477,12 +464,13 @@ namespace linscp {
 
 /*
  * A symbolic permission expression, in the style of chmod(1): a comma
- * separated list of '<who><op><perms>' clauses, where <who> is any of
- * u, g, o, a (default 'a' for '=', nothing for '+' and '-'), <op> is one
- * of '+', '-' or '=' and <perms> is any of r, w, x, X (exec only for
+ * separated list of '<who>(<op><perms>)+' clauses, where <who> is any of
+ * u, g, o, a (default 'a' for '=', and required for '+' and '-'), <op> is
+ * one of '+', '-' or '=' and <perms> is any of r, w, x, X (exec only for
  * directories and for files that are already executable), s, t and the
  * letters u, g and o, which copy the corresponding class of the mode that
- * the file has now.
+ * the file has now. Several operator groups in one clause apply left to
+ * right, as chmod(1) applies them: 'u+x-w' is 'u+x' and then 'u-w'.
  *
  * 'u=rw' leaves the group and the other bits alone. The process umask is
  * deliberately not applied to '=': the caller states the mode it wants.
@@ -490,8 +478,13 @@ namespace linscp {
 bool ParseSymbolicPermissions(const std::string & text, unsigned long current,
     bool isDirectory, unsigned long & result, std::string & error)
 {
+    /* The caller's mode is only ever replaced by a finished one: a
+     * clause that is refused half way through left the part it had
+     * already applied behind, so a failure answered with a mode nobody
+     * asked for. */
     result = current;
     error.clear();
+    unsigned long mode = current;
 
     std::string wanted;
     TrimString(text, wanted);
@@ -532,111 +525,141 @@ bool ParseSymbolicPermissions(const std::string & text, unsigned long current,
             i++;
         }
 
-        if (i >= wanted.size() ||
-            (wanted[i] != '+' && wanted[i] != '-' && wanted[i] != '='))
+        /*
+         * One clause is '<who>' followed by one or more '<op><letters>'
+         * groups, which is what chmod(1) reads: 'u+x-w' gives the owner
+         * the execute bit and then takes the write bit away again. Only
+         * the first group was read before, so the rest of the clause was
+         * refused as an unknown permission letter - and the graphical
+         * client, which applies the same expression to a local file with
+         * chmod(1)'s own grammar, accepted a mode the remote chmod then
+         * refused.
+         */
+        size_t groups = 0;
+        while (i < wanted.size() &&
+               (wanted[i] == '+' || wanted[i] == '-' || wanted[i] == '='))
+        {
+            const char op = wanted[i++];
+            if (who == 0)
+            {
+                if (op != '=')
+                {
+                    /* '+x' named nobody and changed nothing at all. A
+                     * mode that silently does nothing is worse than one
+                     * that is refused, and the graphical client already
+                     * asks for u, g, o or a in front of it. */
+                    error = "'+' and '-' need u, g, o or a in front of "
+                        "them in '" + text + "'";
+                    return false;
+                }
+                /* '=rwx' names nobody in front of it, so it is for
+                 * everybody, and the groups behind it are for the same
+                 * classes. */
+                who = 7;
+            }
+            groups++;
+
+            std::string perms;
+            while (i < wanted.size() && wanted[i] != ',' &&
+                   wanted[i] != '+' && wanted[i] != '-' && wanted[i] != '=' &&
+                   !isspace(static_cast<unsigned char>(wanted[i])))
+            {
+                /* The case matters here: 'X' means something else than
+                 * 'x'. */
+                perms += wanted[i];
+                i++;
+            }
+            if (perms.empty())
+            {
+                error = "expected a permission letter in '" + text + "'";
+                return false;
+            }
+            for (size_t p = 0; p < perms.size(); p++)
+            {
+                /* chmod(1) accepts these and only these; case matters. */
+                const char c = perms[p];
+                if (strchr("rwxXstuugo", c) == NULL)
+                {
+                    error = "unknown permission letter '" +
+                        std::string(1, c) + "' in '" + text + "'";
+                    return false;
+                }
+            }
+            /* The bits are the remote file's own; they are written out as
+             * numbers because the value travels over SFTP regardless of what
+             * the local C library names them. */
+            const bool anyExec = (current & 0111) != 0;
+
+            for (unsigned int slot = 0; slot < 3; slot++)
+            {
+                if ((who & (1u << slot)) == 0)
+                {
+                    continue;
+                }
+                const int shift = static_cast<int>(2 - slot) * 3;
+                const unsigned long slotMask = static_cast<unsigned long>(0x7 << shift);
+
+                unsigned long add = 0;
+                for (size_t p = 0; p < perms.size(); p++)
+                {
+                    switch (perms[p])
+                    {
+                    case 'r': add |= static_cast<unsigned long>(0x4 << shift); break;
+                    case 'w': add |= static_cast<unsigned long>(0x2 << shift); break;
+                    case 'x': add |= static_cast<unsigned long>(0x1 << shift); break;
+                    case 'X':
+                        if (anyExec || isDirectory)
+                        {
+                            add |= static_cast<unsigned long>(0x1 << shift);
+                        }
+                        break;
+                    case 'u':
+                        add |= static_cast<unsigned long>(((current & 0700) >> 6) << shift);
+                        break;
+                    case 'g':
+                        add |= static_cast<unsigned long>(((current & 0070) >> 3) << shift);
+                        break;
+                    case 'o':
+                        add |= static_cast<unsigned long>((current & 0007) << shift);
+                        break;
+                    default:
+                        break;
+                    }
+                }
+
+                if (op == '+')
+                {
+                    mode = static_cast<unsigned long>(mode | add);
+                }
+                else if (op == '-')
+                {
+                    mode = static_cast<unsigned long>(mode & ~add);
+                }
+                else
+                {
+                    mode = static_cast<unsigned long>((mode & ~slotMask) | (add & slotMask));
+                }
+
+                /* The special bits live outside the three permission classes. */
+                if (perms.find('s') != std::string::npos)
+                {
+                    const unsigned long special = (slot == 0 ? 04000 :
+                        (slot == 1 ? 02000 : 0));
+                    mode = (op == '-' ? static_cast<unsigned long>(mode & ~special)
+                                        : static_cast<unsigned long>(mode | special));
+                }
+                if (perms.find('t') != std::string::npos &&
+                    (who & (1u << slot)) != 0 && slot == 2)
+                {
+                    mode = (op == '-' ? static_cast<unsigned long>(mode & ~01000)
+                                        : static_cast<unsigned long>(mode | 01000));
+                }
+            }
+        }
+        if (groups == 0)
         {
             error = "expected '+', '-' or '=' in '" + text + "'";
             return false;
-        }
-        const char op = wanted[i++];
-        if (who == 0 && op == '=')
-        {
-            who = 7;
-        }
-
-        std::string perms;
-        while (i < wanted.size() && wanted[i] != ',' &&
-               !isspace(static_cast<unsigned char>(wanted[i])))
-        {
-            /* The case matters here: 'X' means something else than 'x'. */
-            perms += wanted[i];
-            i++;
-        }
-        if (perms.empty())
-        {
-            error = "expected a permission letter in '" + text + "'";
-            return false;
-        }
-        for (size_t p = 0; p < perms.size(); p++)
-        {
-            /* chmod(1) accepts these and only these; case matters. */
-            const char c = perms[p];
-            if (strchr("rwxXstuugo", c) == NULL)
-            {
-                error = "unknown permission letter '" + std::string(1, c) +
-                    "' in '" + text + "'";
-                return false;
-            }
-        }
-        /* The bits are the remote file's own; they are written out as
-         * numbers because the value travels over SFTP regardless of what
-         * the local C library names them. */
-        const bool anyExec = (current & 0111) != 0;
-
-        for (unsigned int slot = 0; slot < 3; slot++)
-        {
-            if ((who & (1u << slot)) == 0)
-            {
-                continue;
-            }
-            const int shift = static_cast<int>(2 - slot) * 3;
-            const unsigned long slotMask = static_cast<unsigned long>(0x7 << shift);
-
-            unsigned long add = 0;
-            for (size_t p = 0; p < perms.size(); p++)
-            {
-                switch (perms[p])
-                {
-                case 'r': add |= static_cast<unsigned long>(0x4 << shift); break;
-                case 'w': add |= static_cast<unsigned long>(0x2 << shift); break;
-                case 'x': add |= static_cast<unsigned long>(0x1 << shift); break;
-                case 'X':
-                    if (anyExec || isDirectory)
-                    {
-                        add |= static_cast<unsigned long>(0x1 << shift);
-                    }
-                    break;
-                case 'u':
-                    add |= static_cast<unsigned long>(((current & 0700) >> 6) << shift);
-                    break;
-                case 'g':
-                    add |= static_cast<unsigned long>(((current & 0070) >> 3) << shift);
-                    break;
-                case 'o':
-                    add |= static_cast<unsigned long>((current & 0007) << shift);
-                    break;
-                default:
-                    break;
-                }
-            }
-
-            if (op == '+')
-            {
-                result = static_cast<unsigned long>(result | add);
-            }
-            else if (op == '-')
-            {
-                result = static_cast<unsigned long>(result & ~add);
-            }
-            else
-            {
-                result = static_cast<unsigned long>((result & ~slotMask) | (add & slotMask));
-            }
-
-            /* The special bits live outside the three permission classes. */
-            if (perms.find('s') != std::string::npos)
-            {
-                const unsigned long special = (slot == 0 ? 04000 :
-                    (slot == 1 ? 02000 : 0));
-                result = (op == '-' ? static_cast<unsigned long>(result & ~special)
-                                    : static_cast<unsigned long>(result | special));
-            }
-            if (perms.find('t') != std::string::npos &&
-                (who & (1u << slot)) != 0 && slot == 2)
-            {
-                result = (op == '-' ? static_cast<unsigned long>(result & ~01000)
-                                    : static_cast<unsigned long>(result | 01000));
-            }
         }
     }
     if (clauses == 0)
@@ -644,6 +667,7 @@ bool ParseSymbolicPermissions(const std::string & text, unsigned long current,
         error = "'" + text + "' states no permission at all";
         return false;
     }
+    result = mode;
     return true;
 }
 

@@ -500,7 +500,7 @@
   "Upload public key to the server": "Subir la clave pública al servidor",
   "Watches the local directory and copies what changes in\n        it to the remote one. It runs as a queue item until you cancel it, so\n        it can be stopped without disturbing the session.": "Vigila el directorio local y copia al remoto lo que cambia en él. Se ejecuta como un elemento de la cola hasta que lo cancele, así que puede detenerse sin perturbar la sesión.",
   "Watching the local directory; changes are copied as they happen.": "Vigilando el directorio local; los cambios se copian según ocurren.",
-  "bytes": "bytes",
+  "KiB": "KiB",
   "passes, 0 = until cancelled": "pasadas, 0 = hasta cancelarlo",
   "seconds, 0 = watch only": "segundos, 0 = solo vigilar",
   "{count} command failed.": "Falló {count} comando.",

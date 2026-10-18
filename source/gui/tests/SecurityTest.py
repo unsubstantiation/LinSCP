@@ -158,7 +158,12 @@ class CommandBuildingTests(unittest.TestCase):
         self.assertIn("-speed=100000000",
                       gui.transfer_switches({"speed": 100000000}))
 
-    def test_resume_support_takes_on_off_or_a_byte_count(self):
+    def test_resume_support_takes_on_off_or_a_size_in_kib(self):
+        # -resumesupport= is a number of KiB in the client, in its help and
+        # in its manual page, and the dialog says KiB too. The panel used to
+        # label the same field 'bytes' and pass the number through
+        # unchanged, so a threshold a user typed in bytes was read 1024
+        # times too large.
         self.assertIn("-resumesupport=on",
                       gui.transfer_switches({"resumesupport": "on"}))
         self.assertIn("-resumesupport=off",
@@ -169,19 +174,54 @@ class CommandBuildingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 gui.transfer_switches({"resumesupport": value})
 
+    def test_the_resume_threshold_the_dialog_offers_is_in_the_clients_unit(self):
+        page = (GUI_DIR / "web" / "index.html").read_text(encoding="utf-8")
+        field = page.split('id="transferResumeSize"')[1].split("</div>")[0]
+        self.assertIn("KiB", field)
+        self.assertNotIn("bytes", field)
+
 
 class PermissionModeTests(unittest.TestCase):
-    def test_the_octal_forms_the_console_client_accepts(self):
-        for mode in ("644", "0644", "7777", "0", "4755"):
-            self.assertEqual(gui.check_permission_mode(mode), "", mode)
-
     def test_the_symbolic_forms_the_console_client_accepts(self):
         # The same grammar ParseSymbolicPermissions() in the console client
         # accepts, including '=rwx', which names nobody in front of it and
-        # so applies to everybody.
+        # so applies to everybody, several operator groups in one clause,
+        # which is how chmod(1) reads 'u+x-w', and clauses separated by
+        # blanks as well as by commas.
         for mode in ("u+x", "a=r,go-w", "o-rwx", "a+X", "=rwx", "a+rwx,u-s",
-                     "g=u", "u=rwx,g=rx", "=x"):
+                     "g=u", "u=rwx,g=rx", "=x", "u+x-w", "g+w+r", "a=r-w",
+                     "u=rw g=r o=r", "u+x,", "UG+X", "a+t"):
             self.assertEqual(gui.check_permission_mode(mode), "", mode)
+
+    def test_the_octal_forms_the_console_client_accepts(self):
+        # ParseOctalMode() reads one leading zero as a prefix, so the
+        # padded spelling a script keeps its modes in is a mode the client
+        # takes - and one the panel must not turn down.
+        for mode in ("644", "0644", "00644", "7777", "07777", "0", "0000",
+                     "4755", "04755", "1777"):
+            self.assertEqual(gui.check_permission_mode(mode), "", mode)
+        for mode in ("000644", "12345", "99999", "8", "08", "64x", ""):
+            self.assertNotEqual(gui.check_permission_mode(mode), "", mode)
+
+    def test_a_mode_the_console_client_refuses_is_refused_here_too(self):
+        # '+x' names nobody: the client refuses it rather than change
+        # nothing at all, and a panel that accepted it would answer a
+        # failure to a mode it had just called usable.
+        for mode in ("+x", "-w", "u=rwx,x-w", "u+q", "u?x", "u", "zzz", ",",
+                     "u+x -w"):
+            self.assertNotEqual(gui.check_permission_mode(mode), "", mode)
+
+    def test_a_symbolic_mode_reaches_the_client_as_one_operand(self):
+        # The clauses of a symbolic mode may be separated by blanks, which
+        # the client's splitter would otherwise read as a second file name.
+        commands = gui.build_chmod_command("/remote dir", "u=rw g=r", "a name")
+        self.assertEqual(split_command_line(commands[1]),
+                         ["chmod", "u=rw g=r", "a name"])
+        self.assertEqual(split_command_line(commands[0]), ["cd", "/remote dir"])
+        # A mode the client refuses never becomes a command at all.
+        for mode in ("+x", "644 x", "u+x; rm x"):
+            with self.assertRaises(ValueError):
+                gui.build_chmod_command("/r", mode, "f")
 
     def test_a_clause_with_no_permission_letter_is_refused_as_the_client_does(self):
         # chmod(1) would read 'o=' as clearing a class, but the console

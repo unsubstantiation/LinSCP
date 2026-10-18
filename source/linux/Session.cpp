@@ -1179,7 +1179,11 @@ bool Base64ToBytes(const std::string & text, std::string & out)
     static const char * alphabet =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     out.clear();
-    int accumulator = 0;
+    /* Unsigned, and masked back to the bits that have not been emitted
+     * yet: a signed accumulator grew past INT_MAX on the fifth character
+     * of any input, which is undefined behaviour rather than a long
+     * fingerprint, and a digest is only ever 32 bytes. */
+    unsigned int accumulator = 0;
     int bits = 0;
     for (size_t i = 0; i < text.size(); i++)
     {
@@ -1193,12 +1197,13 @@ bool Base64ToBytes(const std::string & text, std::string & out)
         {
             return false;
         }
-        accumulator = (accumulator << 6) | static_cast<int>(found - alphabet);
+        accumulator = ((accumulator << 6) |
+            static_cast<unsigned int>(found - alphabet)) & 0xFFFu;
         bits += 6;
         if (bits >= 8)
         {
             bits -= 8;
-            out += static_cast<char>((accumulator >> bits) & 0xFF);
+            out += static_cast<char>((accumulator >> bits) & 0xFFu);
         }
     }
     return true;
@@ -1565,6 +1570,40 @@ bool HasWhitespaceOrControl(const std::string & text)
 
 } // namespace
 
+/*
+ * The URL schemes this client connects with, and the protocol name each
+ * one stands for: 'ftpes' is FTP with explicit TLS, so it is stored as
+ * 'ftp' with the TLS mode set beside it.
+ *
+ * 'savesession -protocol=' is checked against the same list, so a site
+ * cannot be stored under a scheme nothing here can open. Before that the
+ * value was stored as written - an empty one included, which came back as
+ * '://@host' in the session list and connected to nothing.
+ */
+bool ResolveProtocolScheme(const std::string & scheme, std::string & protocol)
+{
+    static const struct
+    {
+        const char * scheme;
+        const char * protocol;
+    } kSchemes[] = {
+        { "sftp", "sftp" }, { "ssh", "ssh" }, { "scp", "scp" },
+        { "ftp", "ftp" }, { "ftps", "ftps" }, { "ftpes", "ftp" },
+        { "http", "http" }, { "https", "https" }, { "s3", "s3" },
+        { "dav", "dav" }, { "webdav", "webdav" },
+    };
+    for (size_t i = 0; i < sizeof(kSchemes) / sizeof(kSchemes[0]); i++)
+    {
+        if (scheme == kSchemes[i].scheme)
+        {
+            protocol = kSchemes[i].protocol;
+            return true;
+        }
+    }
+    protocol.clear();
+    return false;
+}
+
 bool ParseSiteUrl(const std::string & url, SessionOptions & options, std::string & error)
 {
     error.clear();
@@ -1589,10 +1628,8 @@ bool ParseSiteUrl(const std::string & url, SessionOptions & options, std::string
     {
         scheme[i] = static_cast<char>(tolower(static_cast<unsigned char>(scheme[i])));
     }
-    if (scheme != "sftp" && scheme != "ssh" && scheme != "scp" &&
-        scheme != "ftp" && scheme != "ftps" && scheme != "ftpes" &&
-        scheme != "http" && scheme != "https" && scheme != "s3" &&
-        scheme != "dav" && scheme != "webdav")
+    std::string resolved;
+    if (!ResolveProtocolScheme(scheme, resolved))
     {
         error = "Unsupported protocol '" + scheme + "'.";
         return false;
@@ -1606,7 +1643,7 @@ bool ParseSiteUrl(const std::string & url, SessionOptions & options, std::string
     /* 'ftpes://' is upstream's explicit-TLS spelling of FTP and is the
      * same protocol as 'ftp://' once the TLS mode is set. 'ftps://' means
      * implicit TLS, as upstream's FtpsImplicitPortNumber does. */
-    parsed.protocol = scheme == "ftpes" ? "ftp" : scheme;
+    parsed.protocol = resolved;
     if (scheme == "ftps")
     {
         parsed.tls.ftpsMode = 1;

@@ -264,6 +264,10 @@ int SessionDefaultPort(const std::string & protocol, int ftpsMode);
  * is neither.
  */
 bool HostKeySha256(const std::string & hostKey, std::string & base64);
+/* Whether a URL scheme is one this client connects with, and the protocol
+ * name it stands for. Returns false for anything else, an empty scheme
+ * included. */
+bool ResolveProtocolScheme(const std::string & scheme, std::string & protocol);
 /* Parses 'sftp://[user[:password]@]host[:port]/[path]' (the password may
  * also be given by -password= or LINSCP_PASSWORD). */
 bool ParseSiteUrl(const std::string & url, SessionOptions & options,
