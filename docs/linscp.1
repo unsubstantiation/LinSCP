@@ -1,4 +1,4 @@
-.TH LINSCP 1 "2026-10-16" "LinSCP 1.0" "LinSCP"
+.TH LINSCP 1 "2026-10-18" "LinSCP 1.0" "LinSCP"
 .SH NAME
 linscp \- secure file transfer client for the command line
 .SH SYNOPSIS
@@ -341,10 +341,17 @@ of them. This build applies the proxy settings
 .B ProxyLocalhost=
 0|1 and
 .BR ProxyExcludeList= ,
-and refuses any other setting by name rather than accepting one it would
-drop. The native SFTP and SCP transports negotiate every method; a protocol
-served through curl uses SOCKS4, SOCKS5 and HTTP proxies and refuses a telnet
-or local-command proxy instead of connecting around it.
+For S3 sessions it also applies
+.BR S3StorageClass= ,
+.BR S3Acl= ,
+.BR S3ServerSideEncryption= ,
+.BR S3KmsKeyId= ,
+.BR S3RequestPayer= " and"
+.BR S3Metadata= .
+Any other setting is refused by name rather than accepted and dropped. The
+native SFTP and SCP transports negotiate every method; a protocol served
+through curl uses SOCKS4, SOCKS5 and HTTP proxies and refuses a telnet or
+local-command proxy instead of connecting around it.
 .I ProxyLocalhost=1
 is needed to send a connection to localhost through a proxy, as upstream
 does not proxy it otherwise.
@@ -369,6 +376,16 @@ prints names only;
 .B \-a
 is accepted and does nothing, as entries starting with a dot are always
 listed.
+.TP
+.BI versions " [object-or-prefix]"
+List S3 object versions and delete markers. With no argument, the current
+remote directory is used. An object path not ending in
+.B /
+lists that exact key; the bucket root or a path ending in
+.B /
+lists all versions below that prefix. Each result prints its state, object
+path, opaque version ID, size and modification time; delete markers have no
+size. The command is available only in an S3 session.
 .TP
 .BI lls " [directory[/mask]]"
 List local files in the columns upstream prints: date, time, size (or
@@ -395,7 +412,7 @@ Optional switches include
 .BR \-append " (add to the end of the target instead of replacing it),"
 .BR \-speed= KB " (limit the transfer to that many kilobytes per second, 0 for"
 no limit),
-.BR \-resumesupport= on|off|KB "( (whether, and from what size, an"
+.BR \-resumesupport= on|off|KB " (whether, and from what size, an"
 interrupted file is continued instead of restarted),
 and
 .BR \-preservetime " / " \-preservetime=all " (keep the timestamps;"
@@ -404,7 +421,9 @@ with
 those of directories too),
 .BR \-permissions " / " \-permissions= mode " / " \-nopermissions ,
 and
-.BR \-rawtransfersettings[=N] .
+.BR \-rawtransfersettings[=N] ,
+and (for S3 only)
+.B \-versionid=ID .
 On a download,
 .B \-permissions
 without a value gives the local file the permissions of the remote one
@@ -415,6 +434,16 @@ sets the octal mode outright
 and
 .B \-nopermissions
 leaves whatever the file got while being created.
+For S3,
+.B \-versionid=ID
+selects an exact object version. The command accepts one non-wildcard remote
+object and one optional local target, and this switch cannot be combined with
+.B \-delete
+or
+.BR \-append .
+The version ID is opaque. When a transfer resumes, its staging suffix is
+specific to that version so partial data from different versions is never
+mixed.
 .B \-rawtransfersettings
 accepts upstream's own
 .I key=value
@@ -757,8 +786,16 @@ picked by name. The switches of a transfer always win over the preset.
 .BI echo " [" message ]
 Print a message to the console output.
 .TP
-.BI rm " file"
-Remove remote files.
+.BI rm " [\-onlyfile] [\-versionid=ID] file [file ...]"
+Remove remote files. With
+.B \-onlyfile
+skip directories instead of removing them. In a versioned S3 bucket, an
+ordinary delete creates a delete marker. For S3 only,
+.B \-versionid=ID
+deletes just that named object version or delete marker; it requires one exact
+object path and cannot be combined with
+.BR \-onlyfile .
+Wildcards and multiple paths are not supported with this switch.
 .TP
 .BI rmdir " directory"
 Remove a remote directory.
@@ -989,13 +1026,20 @@ or
 tag per path, a WebDAV write of that path carries it in the same
 .B If
 header, and a write over a version this client has not read is refused with
-412. S3 uses Signature
-Version 4, supports object listing/stat/transfer and CopyObject, and uses
-multipart uploads for files larger than 16 MiB; an interrupted multipart
-upload restarts from the first part. ACLs, versioning, storage classes and
-server-side encryption options are absent. SCP is WinSCP's remote-shell
-implementation - listings, stat, directory and metadata commands over the
-server's shell, transfers over its own
+412. S3 uses Signature Version 4 and supports object/version listing,
+stat, transfers, CopyObject and multipart copy. The
+.B versions
+command lists version history and delete markers;
+.B get \-versionid=
+and
+.B rm \-versionid=
+read or remove one exact object version. In a versioned bucket, a normal
+delete adds a delete marker. Multipart uploads for files larger than 16 MiB
+resume matching local files from a private sidecar containing the upload ID
+and completed part ETags. S3 session settings include storage class, ACL,
+server-side encryption, KMS key ID, request payer and object metadata. SCP is
+WinSCP's remote-shell implementation - listings, stat, directory and metadata
+commands over the server's shell, transfers over its own
 .B scp
 - and the one thing it cannot do is continue a partial transfer, because the
 rcp protocol has no offset to continue from; FTP uses a generic listing

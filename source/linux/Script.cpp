@@ -1,5 +1,7 @@
 #include "Script.h"
 #include "ProtocolClient.h"
+#include "S3Client.h"
+#include "S3SigV4.h"
 #include "ScpClient.h"
 #include "ScriptParams.h"
 
@@ -305,7 +307,7 @@ const char * const kCommandNames[] = {
     "open", "option", "presets", "property", "pwd", "put", "quit", "recv",
     "rename", "rm", "rmdir", "rmsession", "rmspreset", "send", "session",
     "sessions", "stat", "savepreset", "savesession", "show", "symlink",
-    "sync", "synchronize", "terminal", "unlock", "?"
+    "sync", "synchronize", "terminal", "unlock", "versions", "?"
 };
 
 std::vector<std::string> CommandNames()
@@ -836,11 +838,18 @@ int Script::RemoteStat(const std::string & path, LscpAttrs * attrs, std::string 
 int Script::RemoteGet(const std::string & remote, const std::string & local,
     unsigned long long resumeOffset, bool preserveTime,
     unsigned long long * size, LscpProgressFn progress, void * ctx,
-    std::string & error, bool append)
+    std::string & error, bool append, const std::string & versionId)
 {
     error.clear();
     int res = 0;
-    if (UseNativeSftp(mSession.Options().protocol))
+    if (!versionId.empty() &&
+        ToLower(mSession.Options().protocol) != "s3")
+    {
+        error = Texts::Translate(
+            "Version-specific downloads are available only for S3.");
+        res = -1;
+    }
+    else if (UseNativeSftp(mSession.Options().protocol))
     {
         res = append ?
             lscp_sftp_get_append(remote.c_str(), local.c_str(), size, progress, ctx) :
@@ -866,6 +875,11 @@ int Script::RemoteGet(const std::string & remote, const std::string & local,
                     "\" result=\"" + (touched ? "ok" : "failed") + "\"");
             }
         }
+    }
+    else if (!versionId.empty())
+    {
+        res = S3Client::Get(mSession.Options(), remote, local, resumeOffset,
+            preserveTime, size, progress, ctx, error, mSpeedLimit, versionId);
     }
     else
     {
@@ -1691,6 +1705,69 @@ bool Script::ListRemote(const std::vector<std::string> & args)
         NoMatch(mask, std::string());
     }
     Console::Instance().Status(Texts::DirectoryRead(count));
+    return true;
+}
+
+bool Script::ListS3Versions(const std::vector<std::string> & args)
+{
+    if (!RequireConnection())
+    {
+        return false;
+    }
+    if (args.size() > 1 || (!args.empty() && !args[0].empty() &&
+        args[0][0] == '-'))
+    {
+        Console::Instance().Error(Texts::WrongArguments("versions",
+            Texts::Translate("Syntax: versions [<object-or-prefix>]")));
+        mErrors++;
+        return false;
+    }
+    if (ToLower(mSession.Options().protocol) != "s3")
+    {
+        Console::Instance().Error(Texts::WrongArguments("versions",
+            Texts::Translate(
+                "The 'versions' command is available only for S3 sessions.")));
+        mErrors++;
+        return false;
+    }
+
+    const std::string path = args.empty() ? mRemoteDirectory :
+        ResolveRemotePath(mRemoteDirectory, args[0]);
+    std::vector<S3ObjectVersion> versions;
+    std::string error;
+    if (!S3Client::ListVersions(mSession.Options(), path, versions, error))
+    {
+        Console::Instance().Error(Texts::Translate(
+            "Could not list S3 object versions for '{path}': {reason}",
+            {{"path", path}, {"reason", error}}));
+        mErrors++;
+        return false;
+    }
+    if (versions.empty())
+    {
+        Console::Instance().WriteLine(Texts::Translate(
+            "No S3 object versions found for '{path}'.", {{"path", path}}));
+        return true;
+    }
+
+    Console::Instance().WriteLine(Texts::Translate(
+        "Object versions for '{path}':", {{"path", path}}));
+    const size_t bucketEnd = path.find('/', 1);
+    const std::string bucketRoot = bucketEnd == std::string::npos ? path :
+        path.substr(0, bucketEnd);
+    for (size_t i = 0; i < versions.size(); i++)
+    {
+        const S3ObjectVersion & item = versions[i];
+        const std::string state = item.isDeleteMarker ?
+            Texts::Translate("delete marker") : item.isLatest ?
+            Texts::Translate("latest") : Texts::Translate("version");
+        const std::string size = item.isDeleteMarker ? "-" :
+            std::to_string(item.size);
+        const std::string modified = item.mtime == 0 ? "?" :
+            FormatFileTime(item.mtime);
+        Console::Instance().WriteLine(state + "  " + bucketRoot + "/" +
+            item.key + "  " + item.versionId + "  " + size + "  " + modified);
+    }
     return true;
 }
 
@@ -2630,7 +2707,8 @@ bool Script::TransportContinues() const
 
 bool Script::ResolveStage(bool eligible, bool upload,
     const std::string & finalPath, unsigned long long totalSize,
-    TransferStage & stage, std::string & error)
+    TransferStage & stage, std::string & error,
+    const std::string & stageSuffix)
 {
     error.clear();
     stage = TransferStage();
@@ -2643,7 +2721,9 @@ bool Script::ResolveStage(bool eligible, bool upload,
      * name a file to stage either. */
     const std::string baseName = upload ?
         RemoteFileName(finalPath) : LocalFileName(finalPath);
-    if (baseName.size() + strlen(kPartialExt) > 255 ||
+    const std::string effectiveSuffix = stageSuffix.empty() ?
+        std::string(kPartialExt) : stageSuffix;
+    if (baseName.size() + effectiveSuffix.size() > 255 ||
         (!finalPath.empty() && finalPath[finalPath.size() - 1] == '/'))
     {
         eligible = false;
@@ -2656,7 +2736,7 @@ bool Script::ResolveStage(bool eligible, bool upload,
     }
 
     stage.staged = true;
-    stage.partPath = finalPath + kPartialExt;
+    stage.partPath = finalPath + effectiveSuffix;
 
     unsigned long long partSize = 0;
     bool partExists = false;
@@ -2812,8 +2892,12 @@ bool Script::FinishStage(const TransferStage & stage, std::string & error)
             {"part", stage.partPath}});
         return false;
     }
-    if (statResult == LSCP_SFTP_STAT_EXISTS)
+    if (statResult == LSCP_SFTP_STAT_EXISTS &&
+        ToLower(mSession.Options().protocol) != "s3")
     {
+        /* S3 CopyObject replaces the current object by creating a new
+         * version. Deleting first would insert an unnecessary delete marker
+         * between the old and new versions. */
         std::string removeError;
         if (RemoteRemove(stage.finalPath, removeError) != 0)
         {
@@ -3367,6 +3451,27 @@ bool Script::ParseTransferSwitches(const std::string & command, bool uploads,
             flags.speedKBytesPerSecond = static_cast<unsigned>(limit);
             continue;
         }
+        if (a == "-versionid=" || StartsWith(a, "-versionid="))
+        {
+            if (uploads)
+            {
+                return SwitchError(command, Texts::Translate(
+                    "'-versionid' is available only for S3 downloads."));
+            }
+            if (flags.versionIdGiven)
+            {
+                return SwitchError(command, Texts::Translate(
+                    "Give '-versionid' only once."));
+            }
+            flags.versionId = a.substr(strlen("-versionid="));
+            if (flags.versionId.empty())
+            {
+                return SwitchError(command, Texts::Translate(
+                    "The value of '-versionid' cannot be empty."));
+            }
+            flags.versionIdGiven = true;
+            continue;
+        }
         if (StartsWith(a, "-resumesupport="))
         {
             const std::string value = ToLower(a.substr(strlen("-resumesupport=")));
@@ -3565,6 +3670,26 @@ bool Script::GetFiles(const std::vector<std::string> & args)
         return false;
     }
 
+    const bool versioned = flags.versionIdGiven;
+    if (versioned && ToLower(mSession.Options().protocol) != "s3")
+    {
+        return SwitchError("get", Texts::Translate(
+            "'-versionid' is available only for S3 downloads."));
+    }
+    if (versioned && (flags.deleteSource || flags.append))
+    {
+        return SwitchError("get", Texts::Translate(
+            "'-versionid' cannot be combined with '-delete' or '-append'."));
+    }
+    if (versioned && (paths.size() > 2 ||
+        (!paths.empty() && HasWildcard(paths[0]))))
+    {
+        return SwitchError("get", Texts::Translate(
+            "'-versionid' needs one exact S3 object path and one optional "
+            "local destination; wildcards and multiple sources are not "
+            "supported."));
+    }
+
     if (paths.empty())
     {
         Console::Instance().Error(Texts::WrongArguments("get",
@@ -3623,7 +3748,12 @@ bool Script::GetFiles(const std::vector<std::string> & args)
     {
         std::vector<std::string> sources;
         std::string error;
-        if (!ExpandRemote(sourcePatterns[i], sources, error))
+        if (versioned)
+        {
+            sources.push_back(ResolveRemotePath(mRemoteDirectory,
+                sourcePatterns[i]));
+        }
+        else if (!ExpandRemote(sourcePatterns[i], sources, error))
         {
             Console::Instance().Error(Texts::RemoteError("read", sourcePatterns[i], error));
             mErrors++;
@@ -3672,7 +3802,17 @@ bool Script::GetFiles(const std::vector<std::string> & args)
         for (size_t n = 0; n < sources.size(); n++)
         {
             LscpAttrs sourceAttrs = {};
-            int statRes = RemoteStat(sources[n], &sourceAttrs, error);
+            int statRes = versioned ?
+                S3Client::StatVersion(mSession.Options(), sources[n],
+                    flags.versionId, &sourceAttrs, error) :
+                RemoteStat(sources[n], &sourceAttrs, error);
+            if (versioned && statRes != LSCP_SFTP_STAT_EXISTS)
+            {
+                Console::Instance().Error(Texts::RemoteError("read",
+                    sources[n], error.empty() ? "No such object version." : error));
+                mErrors++;
+                continue;
+            }
             bool isDir = (statRes == LSCP_SFTP_STAT_EXISTS) &&
                 (sourceAttrs.flags & LSCP_ATTR_PERMISSIONS) != 0 &&
                 (sourceAttrs.permissions & 0040000) != 0;
@@ -3771,8 +3911,12 @@ bool Script::GetFiles(const std::vector<std::string> & args)
              * confirmation below still runs before anything is removed
              * or written. */
             TransferStage stage;
+            const std::string stageSuffix = versioned ?
+                std::string(".filepart.v") +
+                    s3sig::Sha256Hex(flags.versionId) :
+                std::string(".filepart");
             if (!ResolveStage(!flags.append && Resumes(flags, totalSize), false,
-                    localPath, totalSize, stage, error))
+                    localPath, totalSize, stage, error, stageSuffix))
             {
                 Console::Instance().Error(Texts::LocalError(
                     "inspect the destination", localPath, error));
@@ -3818,7 +3962,7 @@ bool Script::GetFiles(const std::vector<std::string> & args)
             {
                 result = RemoteGet(sources[n], stage.partPath, stage.resumeOffset,
                     flags.preserveTime, &size, ProgressCallback, NULL, error,
-                    flags.append);
+                    flags.append, versioned ? flags.versionId : std::string());
             }
             Console::Instance().TransferEnd(result == 0);
             if (result != 0)
@@ -6248,6 +6392,8 @@ bool Script::RemoveRemote(const std::vector<std::string> & args)
     }
     std::vector<std::string> files;
     bool onlyFile = false;
+    bool versionIdGiven = false;
+    std::string versionId;
     for (size_t i = 0; i < args.size(); i++)
     {
         if (args[i] == "-onlyfile")
@@ -6255,15 +6401,78 @@ bool Script::RemoveRemote(const std::vector<std::string> & args)
             onlyFile = true;
             continue;
         }
+        if (args[i] == "-versionid=" || StartsWith(args[i], "-versionid="))
+        {
+            if (versionIdGiven)
+            {
+                return SwitchError("rm", Texts::Translate(
+                    "Give '-versionid' only once."));
+            }
+            versionId = args[i].substr(strlen("-versionid="));
+            if (versionId.empty())
+            {
+                return SwitchError("rm", Texts::Translate(
+                    "The value of '-versionid' cannot be empty."));
+            }
+            versionIdGiven = true;
+            continue;
+        }
         files.push_back(args[i]);
     }
     if (files.empty())
     {
         Console::Instance().Error(Texts::WrongArguments("rm",
-            Texts::Translate("Syntax: rm [-onlyfile] <file(s)>")));
+            Texts::Translate("Syntax: rm [-onlyfile] [-versionid=ID] <file(s)>")));
         mErrors++;
         return false;
     }
+    if (versionIdGiven)
+    {
+        if (ToLower(mSession.Options().protocol) != "s3")
+        {
+            return SwitchError("rm", Texts::Translate(
+                "'-versionid' is available only for S3 object versions."));
+        }
+        if (onlyFile || files.size() != 1 || HasWildcard(files[0]))
+        {
+            return SwitchError("rm", Texts::Translate(
+                "'-versionid' needs one exact S3 object path; '-onlyfile', "
+                "wildcards and multiple paths are not supported."));
+        }
+        const std::string path = ResolveRemotePath(mRemoteDirectory, files[0]);
+        if (mConfirm)
+        {
+            const ConfirmationResult confirmation = ConfirmDestructiveAction(
+                Texts::Translate("Delete S3 version '{version}' of '{path}'?",
+                    {{"version", versionId}, {"path", path}}));
+            if (confirmation != ConfirmationResult::Accepted)
+            {
+                if (confirmation == ConfirmationResult::Unavailable)
+                {
+                    mErrors++;
+                    return false;
+                }
+                return true;
+            }
+        }
+        std::string error;
+        if (S3Client::RemoveVersion(mSession.Options(), path, versionId,
+                error) != 0)
+        {
+            Console::Instance().Error(Texts::RemoteError("remove", path, error));
+            mErrors++;
+            return false;
+        }
+        Console::Instance().LogAction("delete",
+            "filename=\"" + Console::EscapeActionText(path) +
+            "\" version=\"" + Console::EscapeActionText(versionId) +
+            "\" result=\"ok\"");
+        Console::Instance().Status(Texts::Translate(
+            "Removed S3 object version '{version}' of '{path}'.",
+            {{"version", versionId}, {"path", path}}));
+        return true;
+    }
+
     bool ok = true;
     for (size_t i = 0; i < files.size(); i++)
     {
@@ -8492,10 +8701,13 @@ const struct ScriptCommandHelpEntry
             "  -resumesupport=on|off|<KB>, -speed=<KB/s>, -neweronly,\n"
             "  -noneweronly, -preservetime, -preservetime=all,\n"
             "  -nopreservetime, -r, -transfer=binary|ascii|automatic,\n"
-            "  -permissions[=<mode>], -nopermissions,\n"
+            "  -permissions[=<mode>], -nopermissions, -versionid=<ID>,\n"
             "  -rawtransfersettings[=<count>], -filemask=<mask>.\n"
+            "  For S3, -versionid downloads that exact object version; it\n"
+            "  stages separately per version so resumes never mix versions.\n"
             "  Without a value, -permissions gives the downloaded file\n"
             "  the permissions of the remote one." },
+
         { "help", "help [ <command> ]\n"
             "  Prints the list of commands, or the help of one command." },
         { "keepuptodate", "keepuptodate [ <localdir> [ <remotedir> ] ]\n"
@@ -8560,9 +8772,10 @@ const struct ScriptCommandHelpEntry
             "  together with -resume)." },
         { "pwd", "pwd\n"
             "  Prints the remote working directory." },
-        { "rm", "rm [ -onlyfile ] <file> [ <file>... ]\n"
+        { "rm", "rm [ -onlyfile ] [ -versionid=ID ] <file> [ <file>... ]\n"
             "  Deletes remote files (masks allowed); -onlyfile skips\n"
-            "  directories." },
+            "  directories. On S3, -versionid deletes just that version\n"
+            "  (including a delete marker) instead of the current object." },
         { "rmdir", "rmdir <directory> [ <directory>... ]\n"
             "  Deletes empty remote directories." },
         { "rmsession", "rmsession <name>\n"
@@ -8630,6 +8843,10 @@ const struct ScriptCommandHelpEntry
             "  Opens an interactive shell terminal on the server." },
         { "unlock", "unlock <file>\n"
             "  Releases the lock 'lock <file>' took in this session." },
+        { "versions", "versions [ <object-or-prefix> ]\n"
+            "  Lists S3 object versions and delete markers. An object path\n"
+            "  lists that exact key; a bucket or trailing-slash prefix\n"
+            "  lists every matching key. Results are paginated." },
 };
 }
 
@@ -8827,6 +9044,11 @@ bool Script::ExecuteCommand(const std::string & line)
     if (command == "ls" || command == "dir")
     {
         ListRemote(args);
+        return true;
+    }
+    if (command == "versions")
+    {
+        ListS3Versions(args);
         return true;
     }
     if (command == "lcd")

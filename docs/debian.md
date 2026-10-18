@@ -271,7 +271,14 @@ streamed fallback when COPY is refused), locks and dead properties. Its URL
 paths are percent-encoded, so spaces, percent signs and query characters in
 file names are transferred literally. S3 uses SigV4 signing, object listing,
 stat and CRUD, CopyObject and multipart copy, and multipart uploads above
-16 MiB, which resume from a local sidecar.
+16 MiB, which resume from a local sidecar. It also lists object-version history
+with `versions` and supports exact-version downloads and deletions with
+`get -versionid=` and `rm -versionid=`. In versioned buckets, a normal delete
+creates a delete marker; `rm -versionid=` deletes only the named version or
+marker. S3 `-rawsettings` supports `S3StorageClass`, `S3Acl`,
+`S3ServerSideEncryption`, `S3KmsKeyId`, `S3RequestPayer` and `S3Metadata`.
+Object and version listings validate continuation markers rather than silently
+returning incomplete results.
 
 Proxies are set through `-rawsettings` on `open` or `savesession`, using
 upstream's names:
@@ -395,9 +402,11 @@ watch cannot be set up, the client falls back to timer polling. It runs in the
 foreground until Ctrl-C, or until `-count=` passes complete, so a
 non-interactive script must give `-count=`.
 
-Not implemented: the .NET assembly API, GSSAPI, SSH tunnels, and the S3
-version-aware operations. S3 and WebDAV are partial. See the
-[parity audit](upstream-parity.md) for the full list.
+Not implemented: the .NET assembly API, GSSAPI, SSH tunnels and broad GUI
+parity. S3 version-aware operations are implemented as described above; S3 and
+WebDAV still cover documented subsets rather than every upstream extension.
+See the [parity audit](upstream-parity.md) for the full list of verified
+capabilities and remaining gaps.
 
 ## Troubleshooting
 

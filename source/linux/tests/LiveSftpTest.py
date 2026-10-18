@@ -1270,6 +1270,21 @@ class LiveSftpTests(unittest.TestCase):
                     "<chmod ", "<touch ", "<call ", "<rm "):
             self.assertIn(tag, xml_text)
 
+    def test_s3_version_switches_are_refused_on_native_sftp(self):
+        """Version IDs are an S3 operation and must not be silently
+        ignored or sent to an SFTP server."""
+        local = self.local / "must-not-exist.bin"
+        for command in (
+                "get -versionid=opaque /versioned.bin %s" % local,
+                "rm -versionid=opaque /versioned.bin"):
+            with self.subTest(command=command):
+                result = self.run_script(command + " ; echo SHOULD_NOT_RUN")
+                self.assertEqual(result.returncode, 1,
+                                 result.stdout + result.stderr)
+                self.assertIn("available only for S3", result.stderr)
+                self.assertNotIn("SHOULD_NOT_RUN", result.stdout)
+        self.assertFalse(local.exists())
+
     def test_etag_names_a_protocol_that_has_no_etags(self):
         """An ETag precondition is a WebDAV idea, and a session on a
         transport with no entity tags is told so by name.

@@ -197,7 +197,11 @@ class Store:
 
     def __init__(self):
         self.buckets = {}  # name -> creation epoch
-        self.objects = {}  # (bucket, key) -> (bytes, mtime)
+        self.objects = {}  # (bucket, key) -> (bytes, mtime), current version only
+        self.versions = {}  # (bucket, key) -> oldest-to-newest version records
+        self.next_version_id = 1
+        self.list_pagination_fault = ""
+        self.version_pagination_fault = ""
         self.object_headers = {}  # "bucket/key" -> dict of x-amz-* headers
         self.request_payers = []
         self.uploads = {}  # UploadId -> {bucket, key, parts, headers}
@@ -210,18 +214,67 @@ class Store:
         if bucket not in self.buckets:
             self.buckets[bucket] = epoch
 
+    def _new_version_id(self):
+        # Deliberately opaque and URL-hostile: the client has to escape the
+        # version marker and the versionId query value without changing it.
+        version_id = "v%d+/%%&=?" % self.next_version_id
+        self.next_version_id += 1
+        return version_id
+
     def put(self, bucket, key, data, epoch):
         self.ensure_bucket(bucket, epoch)
+        version_id = self._new_version_id()
+        self.versions.setdefault((bucket, key), []).append({
+            "version_id": version_id,
+            "data": data,
+            "mtime": epoch,
+            "delete_marker": False,
+        })
         self.objects[(bucket, key)] = (data, epoch)
+        return version_id
 
     def get(self, bucket, key):
         return self.objects.get((bucket, key))
 
-    def delete(self, bucket, key):
-        if (bucket, key) in self.objects:
-            del self.objects[(bucket, key)]
-            return True
+    def get_version(self, bucket, key, version_id):
+        for item in reversed(self.versions.get((bucket, key), [])):
+            if item["version_id"] == version_id:
+                return item
+        return None
+
+    def delete_version(self, bucket, key, version_id):
+        records = self.versions.get((bucket, key), [])
+        for index, item in enumerate(records):
+            if item["version_id"] == version_id:
+                del records[index]
+                if records:
+                    latest = records[-1]
+                    if latest["delete_marker"]:
+                        self.objects.pop((bucket, key), None)
+                    else:
+                        self.objects[(bucket, key)] = (
+                            latest["data"], latest["mtime"])
+                else:
+                    self.objects.pop((bucket, key), None)
+                    self.versions.pop((bucket, key), None)
+                return True
         return False
+
+    def delete(self, bucket, key, version_id=None, epoch=None):
+        if version_id is not None:
+            return self.delete_version(bucket, key, version_id)
+        epoch = epoch or datetime.datetime.now(
+            datetime.timezone.utc).timestamp()
+        self.ensure_bucket(bucket, epoch)
+        version_id = self._new_version_id()
+        self.versions.setdefault((bucket, key), []).append({
+            "version_id": version_id,
+            "data": b"",
+            "mtime": epoch,
+            "delete_marker": True,
+        })
+        self.objects.pop((bucket, key), None)
+        return version_id
 
     def keys_of(self, bucket):
         return sorted(key for (b, key) in self.objects if b == bucket)
@@ -256,13 +309,20 @@ class S3Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD" and body:
             self.wfile.write(body)
 
-    def send_error_xml(self, status, code, message):
-        self.send_xml(status,
-                      '<?xml version="1.0" encoding="UTF-8"?>\n'
-                      "<Error><Code>%s</Code><Message>%s</Message>"
-                      "<Resource>%s</Resource><RequestId>test</RequestId>"
-                      "</Error>" % (xml_escape(code), xml_escape(message),
-                                    xml_escape(self.path)))
+    def send_error_xml(self, status, code, message, extra=()):
+        body = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                "<Error><Code>%s</Code><Message>%s</Message>"
+                "<Resource>%s</Resource><RequestId>test</RequestId>"
+                "</Error>" % (xml_escape(code), xml_escape(message),
+                              xml_escape(self.path))).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/xml")
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in extra:
+            self.send_header(name, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def send_bytes(self, status, data, extra=(), content_length=None):
         self.send_response(status)
@@ -313,15 +373,18 @@ class S3Handler(BaseHTTPRequestHandler):
             if method == "GET" and bucket == "" and key == "":
                 self.list_buckets()
             elif method == "GET" and key == "":
-                self.list_objects(bucket, query)
+                if "versions" in params:
+                    self.list_object_versions(bucket, query)
+                else:
+                    self.list_objects(bucket, query)
             elif method == "HEAD" and key == "":
                 self.head_bucket(bucket)
             elif method == "PUT" and key == "" and not body:
                 self.create_bucket(bucket)
             elif method == "GET":
-                self.get_object(bucket, key)
+                self.get_object(bucket, key, params)
             elif method == "HEAD":
-                self.head_object(bucket, key)
+                self.head_object(bucket, key, params)
             elif method == "PUT" and "uploadId" in params:
                 self.put_multipart_part(params, headers, body)
             elif method == "PUT":
@@ -333,7 +396,7 @@ class S3Handler(BaseHTTPRequestHandler):
             elif method == "DELETE" and "uploadId" in params:
                 self.abort_multipart(params)
             elif method == "DELETE":
-                self.delete_object(bucket, key)
+                self.delete_object(bucket, key, params)
             else:
                 self.send_error_xml(405, "MethodNotAllowed",
                                     "Method %s is not allowed." % method)
@@ -350,6 +413,58 @@ class S3Handler(BaseHTTPRequestHandler):
                 self.send_bytes(400, b"Unknown test error operation.")
                 return
             STORE.embedded_errors.add(operation)
+            self.send_bytes(204, b"")
+            return
+        if parsed.path == "/__test__/inject-pagination-fault":
+            params = urllib.parse.parse_qs(parsed.query)
+            target = params.get("target", [""])[0]
+            fault = params.get("fault", [""])[0]
+            if target == "objects" and fault in ("repeat-token", "missing-token"):
+                STORE.list_pagination_fault = fault
+            elif target == "versions" and fault in (
+                    "repeat-marker", "missing-version-marker"):
+                STORE.version_pagination_fault = fault
+            else:
+                self.send_bytes(400, b"Unknown pagination fault.")
+                return
+            self.send_bytes(204, b"")
+            return
+        if parsed.path == "/__test__/seed-objects":
+            # Fill a bucket with flat keys so ListObjectsV2 crosses its
+            # default 1000-key page boundary.
+            params = urllib.parse.parse_qs(parsed.query)
+            bucket = params.get("bucket", ["test-bucket"])[0]
+            try:
+                count = int(params.get("count", ["0"])[0])
+            except ValueError:
+                count = 0
+            if count < 1 or count > 5000:
+                self.send_bytes(400, b"Invalid object count.")
+                return
+            now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            STORE.ensure_bucket(bucket, now)
+            for index in range(count):
+                STORE.put(bucket, "item-%04d.txt" % index, b"x", now + index)
+            self.send_bytes(204, b"")
+            return
+        if parsed.path == "/__test__/seed-versions":
+            # Create enough history to force ListObjectVersions pagination
+            # without making the test launch a thousand curl processes.
+            params = urllib.parse.parse_qs(parsed.query)
+            bucket = params.get("bucket", ["test-bucket"])[0]
+            key = params.get("key", ["pagination/object"])[0]
+            try:
+                count = int(params.get("count", ["0"])[0])
+            except ValueError:
+                count = 0
+            if count < 1 or count > 5000:
+                self.send_bytes(400, b"Invalid version count.")
+                return
+            now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            STORE.ensure_bucket(bucket, now)
+            for index in range(count):
+                STORE.put(bucket, key, ("seed-%d" % index).encode("ascii"),
+                          now + index)
             self.send_bytes(204, b"")
             return
         if parsed.path == "/__test__/state":
@@ -445,6 +560,12 @@ class S3Handler(BaseHTTPRequestHandler):
         if truncated:
             continuation = ("<NextContinuationToken>%d</NextContinuationToken>"
                             % (offset + len(page)))
+        if STORE.list_pagination_fault == "missing-token" and truncated:
+            continuation = ""
+        elif STORE.list_pagination_fault == "repeat-token" and token:
+            truncated = True
+            continuation = ("<NextContinuationToken>%s</NextContinuationToken>"
+                            % xml_escape(token))
         self.send_xml(200,
                       '<?xml version="1.0" encoding="UTF-8"?>\n'
                       "<ListBucketResult><Name>%s</Name><Prefix>%s</Prefix>"
@@ -455,6 +576,90 @@ class S3Handler(BaseHTTPRequestHandler):
                          max_keys, xml_escape(delimiter),
                          "true" if truncated else "false",
                          continuation, body))
+
+    def list_object_versions(self, bucket, query):
+        if bucket not in STORE.buckets:
+            self.send_error_xml(404, "NoSuchBucket",
+                                "The specified bucket does not exist.")
+            return
+        params = urllib.parse.parse_qs(query, keep_blank_values=True)
+        prefix = params.get("prefix", [""])[0]
+        key_marker = params.get("key-marker", [""])[0]
+        version_marker = params.get("version-id-marker", [""])[0]
+        try:
+            max_keys = max(1, int(params.get("max-keys", ["1000"])[0]))
+        except ValueError:
+            max_keys = 1000
+
+        items = []
+        keys = sorted(key for (stored_bucket, key) in STORE.versions
+                      if stored_bucket == bucket and key.startswith(prefix))
+        for key in keys:
+            records = STORE.versions[(bucket, key)]
+            for index in range(len(records) - 1, -1, -1):
+                items.append((key, records[index], index == len(records) - 1))
+
+        start = 0
+        if key_marker:
+            marker_found = False
+            for index, (key, record, _) in enumerate(items):
+                if key < key_marker:
+                    continue
+                if key > key_marker:
+                    start = index
+                    marker_found = True
+                    break
+                if not version_marker:
+                    continue
+                if record["version_id"] == version_marker:
+                    start = index + 1
+                    marker_found = True
+                    break
+            if not marker_found:
+                start = len(items)
+
+        page = items[start:start + max_keys]
+        truncated = start + len(page) < len(items)
+
+        def version_xml(key, record, latest):
+            tag = "DeleteMarker" if record["delete_marker"] else "Version"
+            common = ("<Key>%s</Key><VersionId>%s</VersionId>"
+                      "<IsLatest>%s</IsLatest><LastModified>%s</LastModified>"
+                      % (xml_escape(key), xml_escape(record["version_id"]),
+                         "true" if latest else "false",
+                         iso8601(record["mtime"])))
+            size = "" if record["delete_marker"] else (
+                "<Size>%d</Size>" % len(record["data"]))
+            return "<%s>%s%s</%s>" % (tag, common, size, tag)
+
+        body = "".join(version_xml(key, record, latest)
+                        for key, record, latest in page)
+        next_markers = ""
+        if truncated and page:
+            last_key, last_record, _ = page[-1]
+            next_markers = ("<NextKeyMarker>%s</NextKeyMarker>"
+                            "<NextVersionIdMarker>%s</NextVersionIdMarker>"
+                            % (xml_escape(last_key),
+                               xml_escape(last_record["version_id"])))
+        if STORE.version_pagination_fault == "missing-version-marker" and truncated:
+            next_markers = ("<NextKeyMarker>%s</NextKeyMarker>" %
+                            xml_escape(page[-1][0])) if page else ""
+        elif STORE.version_pagination_fault == "repeat-marker" and key_marker:
+            truncated = True
+            next_markers = ("<NextKeyMarker>%s</NextKeyMarker>"
+                            "<NextVersionIdMarker>%s</NextVersionIdMarker>"
+                            % (xml_escape(key_marker),
+                               xml_escape(version_marker)))
+        self.send_xml(200,
+                      '<?xml version="1.0" encoding="UTF-8"?>\n'
+                      "<ListVersionsResult><Name>%s</Name><Prefix>%s</Prefix>"
+                      "<KeyMarker>%s</KeyMarker><VersionIdMarker>%s</VersionIdMarker>"
+                      "<MaxKeys>%d</MaxKeys><IsTruncated>%s</IsTruncated>"
+                      "%s%s</ListVersionsResult>"
+                      % (xml_escape(bucket), xml_escape(prefix),
+                         xml_escape(key_marker), xml_escape(version_marker),
+                         max_keys, "true" if truncated else "false",
+                         next_markers, body))
 
     def head_bucket(self, bucket):
         if bucket not in STORE.buckets:
@@ -468,13 +673,36 @@ class S3Handler(BaseHTTPRequestHandler):
             datetime.timezone.utc).timestamp())
         self.send_bytes(200, b"", extra=(("ETag", '"%s"' % bucket),))
 
-    def get_object(self, bucket, key):
-        record = STORE.get(bucket, key)
+    def _object_record(self, bucket, key, params):
+        version_values = params.get("versionId")
+        if version_values is None:
+            record = STORE.get(bucket, key)
+            if record is None:
+                self.send_error_xml(404, "NoSuchKey",
+                                    "The specified key does not exist.")
+                return None, None
+            return record, None
+
+        version_id = version_values[0]
+        version = STORE.get_version(bucket, key, version_id)
+        if version is None:
+            self.send_error_xml(404, "NoSuchVersion",
+                                "The specified version does not exist.")
+            return None, version_id
+        if version["delete_marker"]:
+            self.send_error_xml(405, "MethodNotAllowed",
+                                "The specified version is a delete marker.",
+                                extra=(("x-amz-delete-marker", "true"),
+                                       ("x-amz-version-id", version_id)))
+            return None, version_id
+        return (version["data"], version["mtime"]), version_id
+
+    def get_object(self, bucket, key, params):
+        record, version_id = self._object_record(bucket, key, params)
         if record is None:
-            self.send_error_xml(404, "NoSuchKey",
-                                "The specified key does not exist.")
             return
         data, mtime = record
+        version_header = (("x-amz-version-id", version_id),) if version_id else ()
         range_header = self.headers.get("Range")
         if range_header:
             match = re.match(r"bytes=(\d+)-(\d*)$", range_header.strip())
@@ -497,25 +725,24 @@ class S3Handler(BaseHTTPRequestHandler):
                 ("Last-Modified", http_date(mtime)),
                 ("Accept-Ranges", "bytes"),
                 ("Content-Type", "application/octet-stream"),
-            ))
+            ) + version_header)
             return
         self.send_bytes(200, data, extra=(
             ("Last-Modified", http_date(mtime)),
             ("Accept-Ranges", "bytes"),
             ("Content-Type", "application/octet-stream"),
-        ))
+        ) + version_header)
 
-    def head_object(self, bucket, key):
-        record = STORE.get(bucket, key)
+    def head_object(self, bucket, key, params):
+        record, version_id = self._object_record(bucket, key, params)
         if record is None:
-            self.send_error_xml(404, "NoSuchKey",
-                                "The specified key does not exist.")
             return
         data, mtime = record
+        version_header = (("x-amz-version-id", version_id),) if version_id else ()
         self.send_bytes(200, b"", extra=(
             ("Last-Modified", http_date(mtime)),
             ("Content-Type", "application/octet-stream"),
-        ), content_length=len(data))
+        ) + version_header, content_length=len(data))
 
     def put_object(self, bucket, key, headers, body):
         if key == "":
@@ -725,16 +952,26 @@ class S3Handler(BaseHTTPRequestHandler):
         })
         self.send_bytes(204, b"")
 
-    def delete_object(self, bucket, key):
+    def delete_object(self, bucket, key, params):
         if bucket not in STORE.buckets:
             self.send_error_xml(404, "NoSuchBucket",
                                 "The specified bucket does not exist.")
             return
-        if not STORE.delete(bucket, key):
-            self.send_error_xml(404, "NoSuchKey",
-                                "The specified key does not exist.")
+
+        version_values = params.get("versionId")
+        if version_values is not None:
+            version_id = version_values[0]
+            if not STORE.delete_version(bucket, key, version_id):
+                self.send_error_xml(404, "NoSuchVersion",
+                                    "The specified version does not exist.")
+                return
+            self.send_bytes(204, b"", extra=(("x-amz-version-id", version_id),))
             return
-        self.send_bytes(204, b"")
+
+        epoch = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        version_id = STORE.delete(bucket, key, epoch=epoch)
+        self.send_bytes(204, b"", extra=(("x-amz-delete-marker", "true"),
+                                          ("x-amz-version-id", version_id)))
 
 
 def main():

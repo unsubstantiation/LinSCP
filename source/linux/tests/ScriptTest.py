@@ -123,6 +123,16 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("get [ <switches> ] <file> [ <file>... ] [ <target> ]",
                       detail.stdout)
         self.assertIn("Descarga archivos.", detail.stdout)
+        self.assertIn("-versionid=<ID>", detail.stdout)
+        self.assertIn("usa un archivo temporal distinto por versión", detail.stdout)
+        version_help = self.run_commands("help versions",
+                                         env={"LINSCP_LANGUAGE": "es"})
+        self.assertEqual(version_help.returncode, 0, version_help.stderr)
+        self.assertIn("Lista las versiones de objetos S3", version_help.stdout)
+        usage = subprocess.run([BINARY, "-help"], capture_output=True,
+                               text=True, timeout=10, env=self.environment())
+        self.assertIn("versions [OBJECT]", usage.stdout)
+        self.assertIn("-versionid=ID", usage.stdout)
 
     def test_translated_engine_workflows_keep_the_data_literal(self):
         spanish = {"LINSCP_LANGUAGE": "es"}
@@ -167,6 +177,15 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("Opción no admitida '-nonsense'",
                       result.stdout + result.stderr)
+        for command, message in (
+                ("get -versionid= /tmp/x", "no puede estar vacío"),
+                ("get -versionid=one -versionid=two /tmp/x",
+                 "una sola vez"),
+                ("put -versionid=one /tmp/x", "solo está disponible para")):
+            with self.subTest(command=command):
+                result = self.run_commands(command, env=spanish)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(message, result.stdout + result.stderr)
         # The sessions of the user are listed in the language of the user,
         # and the name of the configuration file stays literal.
         result = self.run_commands("sessions list", env=spanish)

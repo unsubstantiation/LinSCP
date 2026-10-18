@@ -22,12 +22,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -387,6 +389,31 @@ std::vector<std::string> XmlAll(const std::string & text, const char * tag)
         at = end + close.size();
     }
     return blocks;
+}
+
+bool ParseUnsignedDecimal(const std::string & text,
+    unsigned long long & value)
+{
+    if (text.empty())
+    {
+        return false;
+    }
+    unsigned long long parsed = 0;
+    for (size_t i = 0; i < text.size(); i++)
+    {
+        if (text[i] < '0' || text[i] > '9')
+        {
+            return false;
+        }
+        const unsigned digit = static_cast<unsigned>(text[i] - '0');
+        if (parsed > (ULLONG_MAX - digit) / 10ULL)
+        {
+            return false;
+        }
+        parsed = parsed * 10ULL + digit;
+    }
+    value = parsed;
+    return true;
 }
 
 std::string XmlEscape(const std::string & text)
@@ -1472,6 +1499,8 @@ bool ListObjects(const S3Site & site, const SessionOptions & options,
     std::vector<S3Entry> entries;
     std::map<std::string, size_t> seen;
     std::string continuation;
+    std::set<std::string> seenContinuationTokens;
+    bool listedAll = false;
     const std::string bucketPath = "/" + s3sig::UriEncode(bucket, false);
 
     for (int page = 0; page < 1000; page++)
@@ -1579,19 +1608,219 @@ bool ListObjects(const S3Site & site, const SessionOptions & options,
         }
 
         std::string truncated;
-        if (!XmlFind(response.out, "IsTruncated", truncated) ||
-            truncated != "true")
+        if (!XmlFind(response.out, "IsTruncated", truncated))
         {
+            error = "The S3 ListObjects response did not say whether it was "
+                "truncated.";
+            return false;
+        }
+        if (truncated == "false")
+        {
+            listedAll = true;
             break;
         }
-        if (!XmlFind(response.out, "NextContinuationToken", continuation) ||
-            continuation.empty())
+        if (truncated != "true")
         {
-            break;
+            error = "The S3 ListObjects response has an invalid IsTruncated "
+                "value.";
+            return false;
         }
+        std::string nextContinuation;
+        if (!XmlFind(response.out, "NextContinuationToken", nextContinuation) ||
+            nextContinuation.empty())
+        {
+            error = "The S3 ListObjects response is truncated but has no "
+                "continuation token; refusing to return an incomplete listing.";
+            return false;
+        }
+        if (!seenContinuationTokens.insert(nextContinuation).second)
+        {
+            error = "The S3 ListObjects response repeated a continuation "
+                "token; refusing to loop or return an incomplete listing.";
+            return false;
+        }
+        continuation.swap(nextContinuation);
+    }
+    if (!listedAll)
+    {
+        error = "The S3 ListObjects response exceeded 1000 pages; refusing "
+            "to return an incomplete listing.";
+        return false;
     }
 
     return AppendEntry(names, entries, error);
+}
+
+bool ListObjectVersions(const S3Site & site, const SessionOptions & options,
+    const std::string & bucket, const std::string & prefix,
+    bool exactKey, std::vector<S3ObjectVersion> & versions,
+    std::string & error)
+{
+    const std::string bucketPath = "/" + s3sig::UriEncode(bucket, false);
+    std::string keyMarker;
+    std::string versionIdMarker;
+    std::set<std::pair<std::string, std::string> > seenMarkers;
+    std::vector<S3ObjectVersion> gathered;
+    bool listedAll = false;
+
+    /* AWS returns at most 1000 records per page. The hard limit prevents a
+     * malicious or broken endpoint from making us loop forever or accumulating
+     * an unbounded history in memory; reaching it is an error, never a
+     * successful partial listing. */
+    for (unsigned int page = 0; page < 1000; page++)
+    {
+        std::string query = "versions=&prefix=" +
+            s3sig::UriEncode(prefix, false);
+        if (!keyMarker.empty())
+        {
+            query += "&key-marker=" + s3sig::UriEncode(keyMarker, false);
+        }
+        if (!versionIdMarker.empty())
+        {
+            query += "&version-id-marker=" +
+                s3sig::UriEncode(versionIdMarker, false);
+        }
+
+        S3Response response;
+        if (!InvokeCurl(site, options, "GET", bucketPath, query,
+                std::vector<std::pair<std::string, std::string> >(),
+                kEmptySha256, std::vector<std::string>(), std::string(),
+                response, error))
+        {
+            return false;
+        }
+        if (response.httpCode >= 400 || response.curlCode != 0 ||
+            response.httpCode == 0)
+        {
+            error = HttpFailure(response, "ListObjectVersions");
+            return false;
+        }
+
+        size_t at = 0;
+        while (true)
+        {
+            const size_t versionAt = response.out.find("<Version>", at);
+            const size_t markerAt = response.out.find("<DeleteMarker>", at);
+            if (versionAt == std::string::npos && markerAt == std::string::npos)
+            {
+                break;
+            }
+            const bool deleteMarker = markerAt != std::string::npos &&
+                (versionAt == std::string::npos || markerAt < versionAt);
+            const char * tag = deleteMarker ? "DeleteMarker" : "Version";
+            const size_t start = deleteMarker ? markerAt : versionAt;
+            const std::string open = std::string("<") + tag + ">";
+            const std::string close = std::string("</") + tag + ">";
+            const size_t bodyStart = start + open.size();
+            const size_t end = response.out.find(close, bodyStart);
+            if (end == std::string::npos)
+            {
+                error = "The S3 ListObjectVersions response contains an "
+                    "unfinished " + std::string(tag) + " record.";
+                return false;
+            }
+            const std::string block = response.out.substr(bodyStart,
+                end - bodyStart);
+            S3ObjectVersion item;
+            item.isDeleteMarker = deleteMarker;
+            std::string latest;
+            std::string modified;
+            if (!XmlFind(block, "Key", item.key) || item.key.empty() ||
+                !XmlFind(block, "VersionId", item.versionId) ||
+                item.versionId.empty() ||
+                !XmlFind(block, "IsLatest", latest) ||
+                !XmlFind(block, "LastModified", modified))
+            {
+                error = "The S3 ListObjectVersions response contains a "
+                    "record without its key, version ID, latest flag or "
+                    "modification time.";
+                return false;
+            }
+            if (latest != "true" && latest != "false")
+            {
+                error = "The S3 ListObjectVersions response contains an "
+                    "invalid IsLatest value.";
+                return false;
+            }
+            item.isLatest = latest == "true";
+            item.mtime = Iso8601Epoch(modified);
+            if (!deleteMarker)
+            {
+                std::string sizeText;
+                if (!XmlFind(block, "Size", sizeText) ||
+                    !ParseUnsignedDecimal(sizeText, item.size))
+                {
+                    error = "The S3 ListObjectVersions response contains an "
+                        "invalid object size.";
+                    return false;
+                }
+            }
+            if (!exactKey || item.key == prefix)
+            {
+                gathered.push_back(item);
+            }
+            at = end + close.size();
+        }
+
+        std::string truncated;
+        if (!XmlFind(response.out, "IsTruncated", truncated))
+        {
+            error = "The S3 ListObjectVersions response did not say whether "
+                "it was truncated.";
+            return false;
+        }
+        if (truncated == "false")
+        {
+            listedAll = true;
+            break;
+        }
+        if (truncated != "true")
+        {
+            error = "The S3 ListObjectVersions response has an invalid "
+                "IsTruncated value.";
+            return false;
+        }
+
+        std::string nextKeyMarker;
+        if (!XmlFind(response.out, "NextKeyMarker", nextKeyMarker) ||
+            nextKeyMarker.empty())
+        {
+            error = "The S3 ListObjectVersions response is truncated but "
+                "has no next key marker; refusing to return an incomplete "
+                "listing.";
+            return false;
+        }
+        std::string nextVersionMarker;
+        if (!XmlFind(response.out, "NextVersionIdMarker", nextVersionMarker) ||
+            nextVersionMarker.empty())
+        {
+            error = "The S3 ListObjectVersions response is truncated but "
+                "has no next version ID marker; refusing to return an "
+                "incomplete listing.";
+            return false;
+        }
+        const std::pair<std::string, std::string> marker(nextKeyMarker,
+            nextVersionMarker);
+        if (marker == std::make_pair(keyMarker, versionIdMarker) ||
+            !seenMarkers.insert(marker).second)
+        {
+            error = "The S3 ListObjectVersions response repeated its "
+                "pagination marker; refusing to loop or return an "
+                "incomplete listing.";
+            return false;
+        }
+        keyMarker.swap(nextKeyMarker);
+        versionIdMarker.swap(nextVersionMarker);
+    }
+
+    if (!listedAll)
+    {
+        error = "The S3 ListObjectVersions response exceeded 1000 pages; "
+            "refusing to return an incomplete listing.";
+        return false;
+    }
+    versions.swap(gathered);
+    return true;
 }
 
 /* ---- shared request blocks --------------------------------------------- */
@@ -1599,10 +1828,15 @@ bool ListObjects(const S3Site & site, const SessionOptions & options,
 /* Runs a signed request and translates the outcome into one of the
  * stat codes, filling 'attrs' when the target exists. */
 int StatRequest(const S3Site & site, const SessionOptions & options,
-    const std::string & path, LscpAttrs * attrs, std::string & error)
+    const std::string & path, LscpAttrs * attrs, std::string & error,
+    const std::string & query = std::string(), bool * deleteMarker = NULL)
 {
+    if (deleteMarker != NULL)
+    {
+        *deleteMarker = false;
+    }
     S3Response response;
-    if (!InvokeCurl(site, options, "HEAD", EncodePath(path), std::string(),
+    if (!InvokeCurl(site, options, "HEAD", EncodePath(path), query,
             std::vector<std::pair<std::string, std::string> >(),
             kEmptySha256, std::vector<std::string>(1, "-I"),
             std::string(), response, error))
@@ -1625,6 +1859,12 @@ int StatRequest(const S3Site & site, const SessionOptions & options,
     }
     if (response.httpCode >= 400)
     {
+        const std::string headers = ToLower(response.out);
+        if (deleteMarker != NULL && response.httpCode == 405 &&
+            headers.find("x-amz-delete-marker: true") != std::string::npos)
+        {
+            *deleteMarker = true;
+        }
         error = ErrorFromXml(response.out, response.httpCode);
         return LSCP_SFTP_STAT_ERROR;
     }
@@ -1760,6 +2000,34 @@ bool S3Client::List(const SessionOptions & options,
     return ListObjects(site, options, bucket, key, names, error);
 }
 
+bool S3Client::ListVersions(const SessionOptions & options,
+    const std::string & remotePath, std::vector<S3ObjectVersion> & versions,
+    std::string & error)
+{
+    error.clear();
+    versions.clear();
+    const S3Site site = S3SiteOf(options);
+    if (!site.ok)
+    {
+        error = site.error;
+        return false;
+    }
+    std::string path = remotePath;
+    if (path.empty() || path[0] != '/')
+    {
+        path = "/" + path;
+    }
+    std::string bucket;
+    std::string key;
+    if (!SplitBucketKey(path, bucket, key, error))
+    {
+        return false;
+    }
+    const bool exactKey = !key.empty() && !EndsWith(key, "/");
+    return ListObjectVersions(site, options, bucket, key, exactKey,
+        versions, error);
+}
+
 int S3Client::Stat(const SessionOptions & options,
     const std::string & remotePath, LscpAttrs * attrs, std::string & error)
 {
@@ -1822,6 +2090,61 @@ int S3Client::Stat(const SessionOptions & options,
     return LSCP_SFTP_STAT_MISSING;
 }
 
+int S3Client::StatVersion(const SessionOptions & options,
+    const std::string & remotePath, const std::string & versionId,
+    LscpAttrs * attrs, std::string & error)
+{
+    error.clear();
+    if (attrs != NULL)
+    {
+        memset(attrs, 0, sizeof(*attrs));
+    }
+    if (versionId.empty())
+    {
+        error = "An S3 version ID cannot be empty.";
+        return LSCP_SFTP_STAT_ERROR;
+    }
+    const S3Site site = S3SiteOf(options);
+    if (!site.ok)
+    {
+        error = site.error;
+        return LSCP_SFTP_STAT_ERROR;
+    }
+    std::string path = remotePath;
+    if (path.empty() || path[0] != '/')
+    {
+        path = "/" + path;
+    }
+    std::string bucket;
+    std::string key;
+    if (!SplitBucketKey(path, bucket, key, error) || key.empty() ||
+        EndsWith(key, "/"))
+    {
+        if (error.empty())
+        {
+            error = "'" + remotePath + "' is not an S3 object name.";
+        }
+        return LSCP_SFTP_STAT_ERROR;
+    }
+    bool deleteMarker = false;
+    const std::string query = "versionId=" +
+        s3sig::UriEncode(versionId, false);
+    const int result = StatRequest(site, options, path, attrs, error, query,
+        &deleteMarker);
+    if (deleteMarker)
+    {
+        error = "S3 version '" + versionId + "' of '" + path +
+            "' is a delete marker, not a downloadable object.";
+        return LSCP_SFTP_STAT_ERROR;
+    }
+    if (result == LSCP_SFTP_STAT_MISSING)
+    {
+        error = "S3 object version '" + versionId + "' of '" + path +
+            "' does not exist.";
+    }
+    return result;
+}
+
 bool S3Client::CheckEndpoint(const SessionOptions & options,
     const std::string & remotePath, std::string & error)
 {
@@ -1873,8 +2196,10 @@ int S3Client::Get(const SessionOptions & options,
     const std::string & remotePath, const std::string & localPath,
     unsigned long long resumeOffset, bool preserveTime,
     unsigned long long * size, LscpProgressFn progress, void * progressCtx,
-    std::string & error, unsigned speedKBytesPerSecond)
+    std::string & error, unsigned speedKBytesPerSecond,
+    const std::string & versionId)
 {
+    error.clear();
     if (size != NULL)
     {
         *size = 0;
@@ -1913,9 +2238,11 @@ int S3Client::Get(const SessionOptions & options,
         extraArgs.push_back(std::to_string(speedKBytesPerSecond) + "k");
     }
 
+    const std::string query = versionId.empty() ? std::string() :
+        "versionId=" + s3sig::UriEncode(versionId, false);
     S3Response response;
     if (!InvokeCurl(site, options, "GET", EncodePath(remotePath),
-            std::string(),
+            query,
             std::vector<std::pair<std::string, std::string> >(),
             kEmptySha256, extraArgs, localPath, response, error,
             progress, progressCtx, false))
@@ -2055,6 +2382,57 @@ int S3Client::Remove(const SessionOptions & options,
         response.curlCode != 0)
     {
         error = HttpFailure(response, "Remove");
+        return -1;
+    }
+    return 0;
+}
+
+int S3Client::RemoveVersion(const SessionOptions & options,
+    const std::string & remotePath, const std::string & versionId,
+    std::string & error)
+{
+    error.clear();
+    if (versionId.empty())
+    {
+        error = "An S3 version ID cannot be empty.";
+        return -1;
+    }
+    const S3Site site = S3SiteOf(options);
+    if (!site.ok)
+    {
+        error = site.error;
+        return -1;
+    }
+    std::string path = remotePath;
+    if (path.empty() || path[0] != '/')
+    {
+        path = "/" + path;
+    }
+    std::string bucket;
+    std::string key;
+    if (!SplitBucketKey(path, bucket, key, error) || key.empty() ||
+        EndsWith(key, "/"))
+    {
+        if (error.empty())
+        {
+            error = "'" + remotePath + "' is not an S3 object name.";
+        }
+        return -1;
+    }
+    const std::string query = "versionId=" +
+        s3sig::UriEncode(versionId, false);
+    S3Response response;
+    if (!InvokeCurl(site, options, "DELETE", EncodePath(path), query,
+            std::vector<std::pair<std::string, std::string> >(),
+            kEmptySha256, std::vector<std::string>(), std::string(),
+            response, error))
+    {
+        return -1;
+    }
+    if (response.httpCode < 200 || response.httpCode >= 300 ||
+        response.curlCode != 0)
+    {
+        error = HttpFailure(response, "Remove S3 version");
         return -1;
     }
     return 0;
