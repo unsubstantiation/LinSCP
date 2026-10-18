@@ -52,6 +52,54 @@ class DesktopUriTests(unittest.TestCase):
         self.assertEqual((ftps["protocol"], ftps["port"]), ("ftps", 990))
         self.assertEqual(ftp["initial_dir"], "/pub")
 
+    def test_session_url_writes_the_port_the_protocol_does_not_imply(self):
+        # The port used to be written whenever it was not 22, whatever the
+        # protocol: an SFTP site on port 21 reached the server only because
+        # 21 is not 22, and an FTP site on port 22 reached port 21 only
+        # because 22 was dropped. The protocol decides which port is implied.
+        def url(protocol, port):
+            session = gui.new_session()
+            session.update({"protocol": protocol, "host": "h",
+                            "username": "u", "port": port})
+            return gui.session_url(session)
+        self.assertEqual(url("sftp", 22), "sftp://u@h/")
+        self.assertEqual(url("sftp", 2222), "sftp://u@h:2222/")
+        self.assertEqual(url("sftp", 21), "sftp://u@h:21/")
+        self.assertEqual(url("ftp", 21), "ftp://u@h/")
+        self.assertEqual(url("ftp", 2121), "ftp://u@h:2121/")
+        self.assertEqual(url("ftps", 990), "ftps://u@h/")
+        self.assertEqual(url("dav", 80), "dav://u@h/")
+        self.assertEqual(url("webdav", 443), "webdav://u@h/")
+        self.assertEqual(url("s3", 443), "s3://u@h/")
+        self.assertEqual(url("s3", 9000), "s3://u@h:9000/")
+        self.assertEqual(url("ftp", 0), "ftp://u@h/")
+
+    def test_stored_sites_without_a_port_take_the_port_of_their_protocol(self):
+        # Earlier versions wrote port=22 for every protocol the site manager
+        # offered, so a sessions.ini may hold an FTP site on 'port 22'. It
+        # is read as the FTP port, as the console client reads it; a real
+        # port is kept, and so is the SSH port of an SSH protocol.
+        with tempfile.TemporaryDirectory(prefix="linscp-sessions-") as temp:
+            path = pathlib.Path(temp) / "sessions.ini"
+            path.write_text(
+                "[legacy-ftp]\nprotocol=ftp\nhost=h\nport=22\n\n"
+                "[no-port]\nprotocol=s3\nhost=h\n\n"
+                "[real-port]\nprotocol=ftp\nhost=h\nport=2121\n\n"
+                "[ssh]\nprotocol=sftp\nhost=h\nport=22\n\n"
+                "[dav-https]\nprotocol=webdav\nhost=h\nport=22\n",
+                encoding="utf-8")
+            old = dict(gui.os.environ)
+            gui.os.environ["LINSCP_CONFIG_DIR"] = temp
+            try:
+                ports = {item["name"]: item["port"]
+                         for item in gui.read_stored_sessions()}
+            finally:
+                gui.os.environ.clear()
+                gui.os.environ.update(old)
+        self.assertEqual(ports, {"legacy-ftp": 21, "no-port": 443,
+                                 "real-port": 2121, "ssh": 22,
+                                 "dav-https": 443})
+
     def test_bad_or_unsupported_site_urls_are_refused(self):
         for uri in (
                 "https://example.org/",

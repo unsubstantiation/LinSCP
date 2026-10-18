@@ -735,6 +735,39 @@ class ScriptTests(unittest.TestCase):
                 self.assertEqual(
                     self.run_commands("rmsession demo").returncode, 0)
 
+    def test_savesession_stores_the_port_of_the_protocol(self):
+        """A site stored without -port= takes the port of its protocol.
+
+        The session defaults carry the SSH port, and a site saved from
+        them with '-protocol=ftp' kept it: 'open' then spoke FTP to port
+        22, where an SSH banner answered. An explicit -port=, and the
+        SSH port of an SSH protocol, are kept as they are.
+        """
+        stored = pathlib.Path(self.config) / "sessions.ini"
+        cases = (("sftp", "", "22"), ("scp", "", "22"), ("ftp", "", "21"),
+                 ("ftps", "", "990"), ("ftp", " -rawsettings Ftps=1", "990"),
+                 ("dav", "", "80"), ("webdav", "", "443"), ("s3", "", "443"),
+                 ("ftp", " -port=2121", "2121"), ("s3", " -port=9000", "9000"))
+        for protocol, extra, port in cases:
+            with self.subTest(protocol=protocol, extra=extra):
+                result = self.run_commands(
+                    "savesession demo -host=demo.example.com -protocol="
+                    + protocol + extra)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                text = stored.read_text(encoding="utf-8")
+                self.assertIn("protocol=" + protocol, text)
+                self.assertIn("port=" + port + "\n", text)
+                self.assertEqual(
+                    self.run_commands("rmsession demo").returncode, 0)
+        # A port given on the command line is the user's, whatever the
+        # protocol's own default is.
+        result = subprocess.run(
+            [BINARY, "-port=2222",
+             "-command=savesession demo -host=demo.example.com -protocol=sftp"],
+            capture_output=True, text=True, timeout=10, env=self.environment())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("port=2222\n", stored.read_text(encoding="utf-8"))
+
     def test_keepuptodate_reads_its_numbers_strictly(self):
         """'-interval=12abc' was 12 seconds and '-count=2xyz' two passes.
 

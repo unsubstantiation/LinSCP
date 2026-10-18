@@ -15,6 +15,16 @@
     implemented through the LinSCP CLI with -server mode for persistent
     sessions.
 
+    The -server protocol is one command per line on the client's stdin.
+    The client answers with any number of output lines on stdout, then
+    exactly one 'LSCP-RESULT <code>' line; its diagnostics go to stderr.
+    Every cmdlet here therefore reads stdout up to the marker line and
+    drains stderr while it waits, instead of assuming how many lines a
+    command prints: 'open' prints a 'Connecting to...' line before its
+    marker, a failed 'get' prints nothing but the marker, and a reader
+    that expected a fixed number of lines fell out of step with the
+    server on the first command that printed a different number.
+
 .EXAMPLE
     $session = Open-LScpSession -Url "sftp://user@host:22/path"
     Get-LScpItem -Session $session -RemotePath "/data/file.txt" -LocalPath "/tmp/file.txt"
@@ -27,22 +37,26 @@ $Script:Sessions = @{}
 function Find-LinScpBinary {
     <#
     .SYNOPSIS
-        Locates the linscp binary on PATH.
+        Locates the linscp binary on PATH, or in the usual install locations.
     #>
     if ($Script:LinScpBin) { return $Script:LinScpBin }
     $candidates = @(
         "linscp",
         "/usr/bin/linscp",
         "/usr/local/bin/linscp",
-        (Join-Path $env:HOME ".local/bin/linscp")
+        (Join-Path $env:HOME ".local/bin/linscp"),
+        # PREFIX/share/linscp/automation/LinSCP.psm1 -> PREFIX/bin/linscp,
+        # whatever prefix 'make install' or 'cmake --install' used.
+        (Join-Path $PSScriptRoot "../../../bin/linscp")
     )
     foreach ($c in $candidates) {
-        if (Get-Command $c -ErrorAction SilentlyContinue) {
-            $Script:LinScpBin = (Get-Command $c).Source
+        $command = Get-Command $c -CommandType Application -ErrorAction SilentlyContinue
+        if ($command) {
+            $Script:LinScpBin = $command.Source
             return $Script:LinScpBin
         }
-        if (Test-Path $c) {
-            $Script:LinScpBin = $c
+        if ((Test-Path -LiteralPath $c -PathType Leaf)) {
+            $Script:LinScpBin = (Resolve-Path -LiteralPath $c).Path
             return $Script:LinScpBin
         }
     }
@@ -60,9 +74,13 @@ function ConvertTo-LScpArgument {
         literal unless it stands in front of a double quote or of another
         backslash. A backslash is therefore doubled and a double quote is
         escaped, and the whole value is wrapped in double quotes.
+
+        A control character cannot be quoted at all: the server reads one
+        command per line, so a value holding a newline would be a second
+        command. Such a value is refused.
     #>
     param([string]$Value)
-    if ($null -eq $Value) { return '""' }
+    if ($null -eq $Value -or $Value -eq '') { return '""' }
     if ($Value -match "[\x00-\x1F\x7F]") {
         throw "Value contains a control character and cannot be safely quoted."
     }
@@ -71,33 +89,45 @@ function ConvertTo-LScpArgument {
     return '"' + $escaped + '"'
 }
 
+function New-LScpProcessStartInfo {
+    param([string[]]$Arguments)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = Find-LinScpBinary
+    foreach ($a in $Arguments) { $psi.ArgumentList.Add($a) }
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    # The listing parser below reads the client's status lines, which are
+    # translated; the objects this module returns are the same in every
+    # locale, so the client it drives speaks English to it.
+    $psi.Environment["LINSCP_LANGUAGE"] = "en"
+    return $psi
+}
+
 function Invoke-LinScp {
     <#
     .SYNOPSIS
-        Runs a linscp command and returns structured output.
+        Runs a linscp command line to completion and returns its output.
+    .PARAMETER Arguments
+        The command-line arguments, one per element; they are passed to the
+        process as they are, with no shell in between.
+    .OUTPUTS
+        An object with ExitCode, Stdout and Stderr.
     #>
     param(
         [string[]]$Arguments,
         [switch]$CaptureOutput
     )
-    $bin = Find-LinScpBinary
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $bin
-    # Use ArgumentList when available (pwsh 7+ on .NET Core) to avoid shell
-    # interpolation; fall back to manual quoting for older hosts.
-    if ($psi.PSObject.Properties.Match('ArgumentList').Count -gt 0) {
-        $psi.ArgumentList.Clear()
-        foreach ($a in $Arguments) { $psi.ArgumentList.Add($a) }
-    } else {
-        $psi.Arguments = ($Arguments | ForEach-Object { ConvertTo-LScpArgument $_ }) -join " "
-    }
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
+    $psi = New-LScpProcessStartInfo -Arguments $Arguments
+    $psi.RedirectStandardInput = $false
     $proc = [System.Diagnostics.Process]::Start($psi)
+    # Both pipes are read at once: reading one to its end while the other
+    # fills its buffer stops the client, which then never ends either.
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
     $stdout = $proc.StandardOutput.ReadToEnd()
-    $stderr = $proc.StandardError.ReadToEnd()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
     $proc.WaitForExit()
     [PSCustomObject]@{
         ExitCode = $proc.ExitCode
@@ -106,18 +136,149 @@ function Invoke-LinScp {
     }
 }
 
+function Read-LScpResponse {
+    <#
+    .SYNOPSIS
+        Reads the server's answer to one command: every stdout line up to
+        the 'LSCP-RESULT <code>' marker, and whatever reached stderr
+        meanwhile.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [PSCustomObject]$Session,
+        [int]$TimeoutSeconds = 0
+    )
+    $lines = New-Object System.Collections.Generic.List[string]
+    $errors = New-Object System.Collections.Generic.List[string]
+    $deadline = if ($TimeoutSeconds -gt 0) { [DateTime]::UtcNow.AddSeconds($TimeoutSeconds) } else { [DateTime]::MaxValue }
+    while ($true) {
+        if ($null -eq $Session.StdoutTask) {
+            $Session.StdoutTask = $Session.Stdout.ReadLineAsync()
+        }
+        if ($null -eq $Session.StderrTask -and -not $Session.StderrClosed) {
+            $Session.StderrTask = $Session.Stderr.ReadLineAsync()
+        }
+        $tasks = New-Object System.Collections.Generic.List[System.Threading.Tasks.Task]
+        $tasks.Add($Session.StdoutTask)
+        if ($null -ne $Session.StderrTask) { $tasks.Add($Session.StderrTask) }
+        $waitMs = -1
+        if ($TimeoutSeconds -gt 0) {
+            $remaining = ($deadline - [DateTime]::UtcNow).TotalMilliseconds
+            if ($remaining -le 0) {
+                Stop-LScpProcess -Session $Session
+                throw "The LinSCP command did not answer within $TimeoutSeconds seconds; the session was closed."
+            }
+            $waitMs = [int][Math]::Ceiling($remaining)
+        }
+        $index = [System.Threading.Tasks.Task]::WaitAny($tasks.ToArray(), $waitMs)
+        if ($index -lt 0) { continue }
+        if ($tasks[$index] -eq $Session.StderrTask) {
+            $line = $Session.StderrTask.GetAwaiter().GetResult()
+            $Session.StderrTask = $null
+            if ($null -eq $line) { $Session.StderrClosed = $true } else { $errors.Add($line) }
+            continue
+        }
+        $line = $Session.StdoutTask.GetAwaiter().GetResult()
+        $Session.StdoutTask = $null
+        if ($null -eq $line) {
+            # The server is gone. Whatever stderr still holds says why. A
+            # read that is still outstanding is finished first: a second
+            # read on the same stream while one is pending is an error.
+            if ($null -ne $Session.StderrTask) {
+                $pending = $Session.StderrTask.GetAwaiter().GetResult()
+                $Session.StderrTask = $null
+                if ($null -eq $pending) { $Session.StderrClosed = $true } else { $errors.Add($pending) }
+            }
+            if (-not $Session.StderrClosed) {
+                $rest = $Session.Stderr.ReadToEnd()
+                if ($rest) { $errors.AddRange([string[]]($rest -split "`n" | Where-Object { $_ })) }
+                $Session.StderrClosed = $true
+            }
+            $detail = ($errors -join "`n").Trim()
+            if (-not $detail) { $detail = "The LinSCP server process ended unexpectedly." }
+            throw $detail
+        }
+        if ($line -match '^LSCP-RESULT (\d+)') {
+            return [PSCustomObject]@{
+                Code   = [int]$Matches[1]
+                Output = $lines.ToArray()
+                Errors = $errors.ToArray()
+            }
+        }
+        $lines.Add($line)
+    }
+}
+
+function Send-LScpCommand {
+    <#
+    .SYNOPSIS
+        Sends one command line to the server of a session and returns its
+        answer: Code (0 on success), Output (stdout lines) and Errors
+        (stderr lines).
+    .DESCRIPTION
+        The values of a command are quoted by the cmdlets that build them;
+        a caller of this function quotes its own with ConvertTo-LScpArgument.
+        A command holding a newline is two commands and is refused.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [PSCustomObject]$Session,
+        [Parameter(Mandatory=$true)]
+        [string]$Command,
+        [int]$TimeoutSeconds = 0
+    )
+    if ($Command -match "[\r\n]") {
+        throw "A LinSCP command must be a single line."
+    }
+    if ($null -eq $Session.Process -or $Session.Process.HasExited) {
+        throw "The LinSCP session is not open."
+    }
+    $Session.Stdin.WriteLine($Command)
+    $Session.Stdin.Flush()
+    return Read-LScpResponse -Session $Session -TimeoutSeconds $TimeoutSeconds
+}
+
+function Stop-LScpProcess {
+    param([PSCustomObject]$Session)
+    try {
+        if ($null -ne $Session.Process -and -not $Session.Process.HasExited) {
+            $Session.Process.Kill()
+        }
+    } catch {}
+    if ($Session.Id -and $Script:Sessions.ContainsKey($Session.Id)) {
+        $Script:Sessions.Remove($Session.Id)
+    }
+}
+
+function Format-LScpFailure {
+    param([PSCustomObject]$Response, [string]$Default)
+    $text = (@($Response.Errors) + @($Response.Output) | Where-Object { $_ }) -join "`n"
+    if (-not $text.Trim()) { $text = $Default }
+    return $text.Trim()
+}
+
 function Open-LScpSession {
     <#
     .SYNOPSIS
         Opens a persistent LinSCP session.
     .PARAMETER Url
-        The session URL (sftp://user@host:port/path).
+        The session URL (sftp://user@host:port/path) or the name of a
+        stored session.
     .PARAMETER Password
-        Password for authentication.
+        Password for authentication. It is written to the client's stdin,
+        never to its command line, so it does not appear in the process
+        list; prefer -SecurePassword where the script has a SecureString.
+    .PARAMETER SecurePassword
+        The password as a SecureString.
     .PARAMETER HostKey
-        Expected host key fingerprint.
+        Expected host key fingerprint ('*' accepts any key, for one
+        connection only). Without it, the client verifies the key against
+        its cache and refuses an unknown one, reporting the fingerprint.
     .PARAMETER PrivateKey
         Path to the private key file.
+    .PARAMETER TimeoutSeconds
+        How long to wait for the connection; 0 waits for the client's
+        own timeout.
     .OUTPUTS
         A session object for use with other cmdlets.
     #>
@@ -125,72 +286,83 @@ function Open-LScpSession {
         [Parameter(Mandatory=$true)]
         [string]$Url,
         [string]$Password,
+        [securestring]$SecurePassword,
         [string]$HostKey,
-        [string]$PrivateKey
+        [string]$PrivateKey,
+        [int]$TimeoutSeconds = 0
     )
-    $bin = Find-LinScpBinary
-    $proc = New-Object System.Diagnostics.Process
-    $proc.StartInfo.FileName = $bin
-    $proc.StartInfo.Arguments = "-server"
-    $proc.StartInfo.RedirectStandardInput = $true
-    $proc.StartInfo.RedirectStandardOutput = $true
-    $proc.StartInfo.RedirectStandardError = $true
-    $proc.StartInfo.UseShellExecute = $false
-    $proc.StartInfo.CreateNoWindow = $true
-    $proc.Start() | Out-Null
-
-    # Wait for the ready banner.
-    $ready = $proc.StandardOutput.ReadLine()
-    if ($ready -notmatch "^LSCP-SERVER") {
-        $proc.Kill()
-        throw "LinSCP server did not start correctly."
+    if ($SecurePassword) {
+        $Password = [System.Net.NetworkCredential]::new('', $SecurePassword).Password
     }
+    $psi = New-LScpProcessStartInfo -Arguments @("-server")
+    $proc = [System.Diagnostics.Process]::Start($psi)
 
     $session = [PSCustomObject]@{
-        Process = $proc
-        Url     = $Url
-        Stdin   = $proc.StandardInput
-        Stdout  = $proc.StandardOutput
+        Id           = [guid]::NewGuid().ToString()
+        Url          = $Url
+        Process      = $proc
+        Stdin        = $proc.StandardInput
+        Stdout       = $proc.StandardOutput
+        Stderr       = $proc.StandardError
+        StdoutTask   = $null
+        StderrTask   = $null
+        StderrClosed = $false
+    }
+
+    # Wait for the ready banner.
+    $ready = $session.Stdout.ReadLine()
+    if ($null -eq $ready -or $ready -notmatch "^LSCP-SERVER") {
+        $detail = ""
+        try { $detail = $session.Stderr.ReadToEnd().Trim() } catch {}
+        Stop-LScpProcess -Session $session
+        if ($detail) { throw "LinSCP server did not start correctly: $detail" }
+        throw "LinSCP server did not start correctly."
     }
 
     # Build the open command with proper quoting so a URL or password
     # holding spaces, semicolons or quotes does not become a second
-    # command when the server splits on ';' and quotes.
+    # command when the server splits on quotes.
     $openCmd = "open $(ConvertTo-LScpArgument $Url)"
     if ($Password) { $openCmd += " -password=$(ConvertTo-LScpArgument $Password)" }
     if ($HostKey)  { $openCmd += " -hostkey=$(ConvertTo-LScpArgument $HostKey)" }
     if ($PrivateKey) { $openCmd += " -privatekey=$(ConvertTo-LScpArgument $PrivateKey)" }
 
-    $session.Stdin.WriteLine($openCmd)
-    $session.Stdin.Flush()
-    $result = $session.Stdout.ReadLine()
-    if ($result -match "LSCP-RESULT 1") {
-        $session.Process.Kill()
-        throw "Failed to open session: $result"
+    try {
+        $response = Send-LScpCommand -Session $session -Command $openCmd -TimeoutSeconds $TimeoutSeconds
+    } catch {
+        Stop-LScpProcess -Session $session
+        throw "Failed to open session: $($_.Exception.Message)"
     }
+    if ($response.Code -ne 0) {
+        Stop-LScpProcess -Session $session
+        throw "Failed to open session: $(Format-LScpFailure $response 'the client refused the connection')"
+    }
+    # Confirmations cannot be answered through this pipe: an overwrite
+    # the client would ask about is done, as in the graphical client.
+    Send-LScpCommand -Session $session -Command "option confirm off" | Out-Null
 
-    $sessionId = [guid]::NewGuid().ToString()
-    $Script:Sessions[$sessionId] = $session
-    $session | Add-Member -NotePropertyName "Id" -NotePropertyValue $sessionId
+    $Script:Sessions[$session.Id] = $session
     return $session
 }
 
 function Close-LScpSession {
     <#
     .SYNOPSIS
-        Closes a LinSCP session.
+        Closes a LinSCP session and ends its server process.
     #>
     param(
         [Parameter(Mandatory=$true)]
         [PSCustomObject]$Session
     )
     try {
-        $Session.Stdin.WriteLine("close")
-        $Session.Stdin.Flush()
-        $Session.Stdout.ReadLine() | Out-Null
-        $Session.Stdin.WriteLine("exit")
-        $Session.Stdin.Flush()
-        $Session.Process.WaitForExit(5000) | Out-Null
+        if ($null -ne $Session.Process -and -not $Session.Process.HasExited) {
+            Send-LScpCommand -Session $Session -Command "close" -TimeoutSeconds 30 | Out-Null
+            $Session.Stdin.WriteLine("exit")
+            $Session.Stdin.Flush()
+            if (-not $Session.Process.WaitForExit(5000)) {
+                $Session.Process.Kill()
+            }
+        }
     } catch {
         try { $Session.Process.Kill() } catch {}
     }
@@ -203,6 +375,9 @@ function Get-LScpItem {
     <#
     .SYNOPSIS
         Downloads a file from the remote server.
+    .OUTPUTS
+        An object with Success, Output (the client's stdout lines) and
+        Error (the diagnostic, when it failed).
     #>
     param(
         [Parameter(Mandatory=$true)]
@@ -211,17 +386,17 @@ function Get-LScpItem {
         [string]$RemotePath,
         [Parameter(Mandatory=$true)]
         [string]$LocalPath,
-        [switch]$PreserveTime
+        [switch]$PreserveTime,
+        [int]$TimeoutSeconds = 0
     )
-    $cmd = "get $(ConvertTo-LScpArgument $RemotePath) $(ConvertTo-LScpArgument $LocalPath)"
+    $cmd = "get"
     if ($PreserveTime) { $cmd += " -preservetime" }
-    $Session.Stdin.WriteLine($cmd)
-    $Session.Stdin.Flush()
-    $result = $Session.Stdout.ReadLine()
-    $Session.Stdout.ReadLine() | Out-Null
+    $cmd += " $(ConvertTo-LScpArgument $RemotePath) $(ConvertTo-LScpArgument $LocalPath)"
+    $response = Send-LScpCommand -Session $Session -Command $cmd -TimeoutSeconds $TimeoutSeconds
     return [PSCustomObject]@{
-        Success = $result -notmatch "LSCP-RESULT 1"
-        Output  = $result
+        Success = ($response.Code -eq 0)
+        Output  = $response.Output
+        Error   = if ($response.Code -eq 0) { "" } else { Format-LScpFailure $response 'The download failed.' }
     }
 }
 
@@ -229,6 +404,9 @@ function Send-LScpItem {
     <#
     .SYNOPSIS
         Uploads a file to the remote server.
+    .OUTPUTS
+        An object with Success, Output (the client's stdout lines) and
+        Error (the diagnostic, when it failed).
     #>
     param(
         [Parameter(Mandatory=$true)]
@@ -237,47 +415,108 @@ function Send-LScpItem {
         [string]$LocalPath,
         [Parameter(Mandatory=$true)]
         [string]$RemotePath,
-        [switch]$PreserveTime
+        [switch]$PreserveTime,
+        [int]$TimeoutSeconds = 0
     )
-    $cmd = "put $(ConvertTo-LScpArgument $LocalPath) $(ConvertTo-LScpArgument $RemotePath)"
+    $cmd = "put"
     if ($PreserveTime) { $cmd += " -preservetime" }
-    $Session.Stdin.WriteLine($cmd)
-    $Session.Stdin.Flush()
-    $result = $Session.Stdout.ReadLine()
-    $Session.Stdout.ReadLine() | Out-Null
+    $cmd += " $(ConvertTo-LScpArgument $LocalPath) $(ConvertTo-LScpArgument $RemotePath)"
+    $response = Send-LScpCommand -Session $Session -Command $cmd -TimeoutSeconds $TimeoutSeconds
     return [PSCustomObject]@{
-        Success = $result -notmatch "LSCP-RESULT 1"
-        Output  = $result
+        Success = ($response.Code -eq 0)
+        Output  = $response.Output
+        Error   = if ($response.Code -eq 0) { "" } else { Format-LScpFailure $response 'The upload failed.' }
     }
+}
+
+# A listing line in long format starts with a mode string: the file type,
+# nine permission characters and perhaps an ACL or attribute marker. That,
+# not its position, is what tells an entry from the status lines around
+# it ('Reading directory /x...' and '3 entries').
+$Script:ListingMode = '^[-a-zA-Z?][-rwxsStTlL]{9}[+@.]?$'
+
+function ConvertFrom-LScpListing {
+    <#
+    .SYNOPSIS
+        Turns the lines of 'ls' into objects, one per entry.
+    #>
+    param(
+        [string[]]$Lines,
+        [string]$Directory = ""
+    )
+    $entries = @()
+    foreach ($line in $Lines) {
+        $text = $line.Trim()
+        if (-not $text) { continue }
+        $parts = $text -split '\s+', 9
+        if ($parts.Count -lt 9 -or $parts[0] -notmatch $Script:ListingMode) { continue }
+        $name = $parts[8]
+        $target = ""
+        $isLink = $parts[0].StartsWith("l")
+        if ($isLink) {
+            $arrow = $name.IndexOf(" -> ")
+            if ($arrow -ge 0) {
+                $target = $name.Substring($arrow + 4)
+                $name = $name.Substring(0, $arrow)
+            }
+        }
+        if ($name -eq "." -or $name -eq "..") { continue }
+        $size = 0L
+        [void][long]::TryParse($parts[4], [ref]$size)
+        $fullName = if ($Directory) { $Directory.TrimEnd('/') + '/' + $name } else { $name }
+        $entries += [PSCustomObject]@{
+            Name        = $name
+            FullName    = $fullName
+            IsDirectory = $parts[0].StartsWith("d")
+            IsLink      = $isLink
+            LinkTarget  = $target
+            Length      = $size
+            Permissions = $parts[0]
+            Owner       = $parts[2]
+            Group       = $parts[3]
+            Modified    = "$($parts[5]) $($parts[6]) $($parts[7])"
+        }
+    }
+    return $entries
 }
 
 function Get-LScpDirectory {
     <#
     .SYNOPSIS
         Lists a remote directory.
+    .OUTPUTS
+        One object per entry: Name, FullName, IsDirectory, IsLink,
+        LinkTarget, Length, Permissions, Owner, Group and Modified.
+        A directory that cannot be read is a terminating error.
     #>
     param(
         [Parameter(Mandatory=$true)]
         [PSCustomObject]$Session,
-        [string]$RemotePath
+        [string]$RemotePath,
+        [int]$TimeoutSeconds = 0
     )
-    $cmd = "ls"
+    $cmd = "ls -la"
     if ($RemotePath) { $cmd += " $(ConvertTo-LScpArgument $RemotePath)" }
-    $Session.Stdin.WriteLine($cmd)
-    $Session.Stdin.Flush()
-    $lines = @()
-    while ($true) {
-        $line = $Session.Stdout.ReadLine()
-        if ($line -match "^LSCP-RESULT") { break }
-        $lines += $line
+    $response = Send-LScpCommand -Session $Session -Command $cmd -TimeoutSeconds $TimeoutSeconds
+    if ($response.Code -ne 0) {
+        throw (Format-LScpFailure $response 'The directory could not be listed.')
     }
-    return $lines
+    $directory = $RemotePath
+    foreach ($line in $response.Output) {
+        if ($line -match '^Reading directory (.*)\.\.\.$') { $directory = $Matches[1]; break }
+    }
+    return ConvertFrom-LScpListing -Lines $response.Output -Directory $directory
 }
 
 function Sync-LScpDirectory {
     <#
     .SYNOPSIS
         Synchronizes directories.
+    .PARAMETER Direction
+        'local' updates the local directory, 'remote' the remote one,
+        'both' each from the other.
+    .OUTPUTS
+        An object with Success, Lines (the client's output) and Error.
     #>
     param(
         [Parameter(Mandatory=$true)]
@@ -287,33 +526,36 @@ function Sync-LScpDirectory {
         [string]$LocalDir,
         [string]$RemoteDir,
         [switch]$Delete,
-        [switch]$Preview
+        [switch]$Preview,
+        [int]$TimeoutSeconds = 0
     )
     if ($Direction -notin @('local','remote','both')) {
         throw "Direction must be local, remote or both."
+    }
+    if ($RemoteDir -and -not $LocalDir) {
+        # The client reads the first directory as the local one, so a
+        # remote directory on its own would have been taken for it.
+        throw "A remote directory needs the local directory beside it."
     }
     $cmd = "synchronize $Direction"
     if ($LocalDir) { $cmd += " $(ConvertTo-LScpArgument $LocalDir)" }
     if ($RemoteDir) { $cmd += " $(ConvertTo-LScpArgument $RemoteDir)" }
     if ($Delete) { $cmd += " -delete" }
     if ($Preview) { $cmd += " -preview" }
-    $Session.Stdin.WriteLine($cmd)
-    $Session.Stdin.Flush()
-    $lines = @()
-    while ($true) {
-        $line = $Session.Stdout.ReadLine()
-        if ($line -match "^LSCP-RESULT") { break }
-        $lines += $line
-    }
+    $response = Send-LScpCommand -Session $Session -Command $cmd -TimeoutSeconds $TimeoutSeconds
     return [PSCustomObject]@{
-        Success = $lines[-1] -notmatch "LSCP-RESULT 1"
-        Lines   = $lines
+        Success = ($response.Code -eq 0)
+        Lines   = $response.Output
+        Error   = if ($response.Code -eq 0) { "" } else { Format-LScpFailure $response 'The synchronization failed.' }
     }
 }
 
 Export-ModuleMember -Function @(
     "Find-LinScpBinary",
+    "ConvertTo-LScpArgument",
+    "ConvertFrom-LScpListing",
     "Invoke-LinScp",
+    "Send-LScpCommand",
     "Open-LScpSession",
     "Close-LScpSession",
     "Get-LScpItem",

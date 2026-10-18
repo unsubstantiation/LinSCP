@@ -713,6 +713,33 @@ function options(id) {
     folderDel && JSON.parse(folderDel.options.body).name === 'GUI' &&
       JSON.parse(folderDel.options.body).folder === true);
 
+  // The site form's port follows the protocol while it is still a default,
+  // and keeps a port the user typed. The form used to leave 22 under every
+  // protocol, so an FTP site was stored with the SSH port.
+  window.newSite();
+  doc.getElementById('siteProtocol').value = 'ftp';
+  window.siteProtocolChanged();
+  check('choosing FTP in the site form moves the port to 21',
+    doc.getElementById('sitePort').value === '21');
+  doc.getElementById('siteProtocol').value = 'webdav';
+  window.siteProtocolChanged();
+  check('the site form offers WebDAV over HTTPS on port 443',
+    doc.getElementById('sitePort').value === '443');
+  doc.getElementById('sitePort').value = '8443';
+  doc.getElementById('siteProtocol').value = 's3';
+  window.siteProtocolChanged();
+  check('a port the user typed survives a protocol change',
+    doc.getElementById('sitePort').value === '8443');
+  doc.getElementById('sitePort').value = '';
+  doc.getElementById('siteProtocol').value = 'sftp';
+  window.siteProtocolChanged();
+  check('an empty port takes the default of the new protocol',
+    doc.getElementById('sitePort').value === '22');
+  window.fillSiteForm({ name: 'legacy', protocol: 'ftps', host: 'h', port: 0 });
+  check('a stored site without a port shows the port of its protocol',
+    doc.getElementById('sitePort').value === '990' &&
+      window.currentSiteForm().port === 990);
+
   // Synchronize conflict policy selector and resolution bar.
   window.openSynchronize();
   await window.resolveSyncConflictPolicy('newer');

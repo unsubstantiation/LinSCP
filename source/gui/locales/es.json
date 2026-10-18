@@ -95,6 +95,7 @@
   "FTP": "FTP",
   "FTPS": "FTPS",
   "WebDAV": "WebDAV",
+  "WebDAV (HTTPS)": "WebDAV (HTTPS)",
   "Amazon S3": "Amazon S3",
   "Host name:": "Servidor:",
   "Port number:": "Puerto:",

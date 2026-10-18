@@ -1445,6 +1445,18 @@ SessionOptions SessionStore::ToSessionOptions(const StoredSession & session,
     if (session.portNumber > 0)
     {
         options.portNumber = session.portNumber;
+        /* Earlier versions of 'savesession' and of the graphical client
+         * wrote the SSH port for every site nobody gave a port for, so a
+         * file may still hold 'port=22' on an FTP, WebDAV or S3 site. That
+         * value is the default they failed to replace, not a choice, and
+         * it is read as the port of the protocol - the same rule 'open
+         * ftp://host' applies to a URL without a port. */
+        const int protocolDefault = SessionDefaultPort(options.protocol,
+            session.tls.ftpsMode);
+        if (session.portNumber == 22 && protocolDefault != 22)
+        {
+            options.portNumber = protocolDefault;
+        }
     }
     if (!session.userName.empty())
     {
