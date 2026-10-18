@@ -11,7 +11,7 @@ The inventory is pinned to [winscp/winscp at
 It is a development snapshot, not a claim about the latest release. The initial
 source review compared upstream `source/core/Script.cpp`, `Script.h`,
 `CopyParam.h`, `Terminal.h`, and core/forms inventories with the Linux client,
-build configuration and GUI. Linux inventory reconciliation: **2026-10-15**.
+build configuration and GUI. Linux inventory reconciliation: **2026-10-18**.
 
 The source of truth is [upstream-parity.json](upstream-parity.json). Its generated
 [complete ledger view](linux-feature-inventory.md) includes:
@@ -33,8 +33,11 @@ entry; it does not implement the feature.
 
 The review corrected stale claims without upgrading unimplemented work:
 
-- S3 multipart upload state/restart, multipart copy and signed object-write
-  options are implemented; S3 version-aware operations remain missing.
+- S3 multipart upload state/restart, multipart copy, signed object-write
+  options and version-aware operations are implemented. `versions` lists object
+  history; `get -versionid=` and `rm -versionid=` operate on one exact version,
+  and object/version listing fails closed if a paginated response omits or
+  repeats its continuation marker.
 - Native FTP directory/metadata operations, active/passive policy and TLS
   settings are implemented; non-Unix LIST dialects remain missing.
 - Local-pane desktop drops, cross-browser enumeration APIs, local edit

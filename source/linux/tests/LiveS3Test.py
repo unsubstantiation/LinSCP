@@ -40,6 +40,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BINARY = str(pathlib.Path(sys.argv.pop(1)).resolve())
@@ -154,6 +155,32 @@ class LiveS3Tests(unittest.TestCase):
         with urllib.request.urlopen(url, context=context, timeout=15) as response:
             self.assertEqual(response.status, 204)
 
+    def seed_versions(self, bucket, key, count):
+        context = ssl._create_unverified_context()
+        query = urllib.parse.urlencode({
+            "bucket": bucket, "key": key, "count": count,
+        })
+        url = "https://127.0.0.1:%d/__test__/seed-versions?%s" % (
+            self.port, query)
+        with urllib.request.urlopen(url, context=context, timeout=30) as response:
+            self.assertEqual(response.status, 204)
+
+    def seed_objects(self, bucket, count):
+        context = ssl._create_unverified_context()
+        query = urllib.parse.urlencode({"bucket": bucket, "count": count})
+        url = "https://127.0.0.1:%d/__test__/seed-objects?%s" % (
+            self.port, query)
+        with urllib.request.urlopen(url, context=context, timeout=30) as response:
+            self.assertEqual(response.status, 204)
+
+    def inject_pagination_fault(self, target, fault):
+        context = ssl._create_unverified_context()
+        query = urllib.parse.urlencode({"target": target, "fault": fault})
+        url = "https://127.0.0.1:%d/__test__/inject-pagination-fault?%s" % (
+            self.port, query)
+        with urllib.request.urlopen(url, context=context, timeout=15) as response:
+            self.assertEqual(response.status, 204)
+
     # -- tests --------------------------------------------------------------
     def test_missing_secret_is_refused_before_any_request(self):
         """A site without a secret key cannot be signed at all, and says
@@ -262,6 +289,147 @@ class LiveS3Tests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("SizeBytes:", result.stdout)
         self.assertRegex(result.stdout, r"(?m)^\S.* roundtrip\.bin$")
+
+    def test_version_listing_get_delete_markers_and_versioned_resume(self):
+        """Opaque version IDs round-trip through SigV4 query encoding;
+        downloads resume into a per-version staging file, and deletion can
+        remove one historical version or a delete marker without touching
+        the remaining versions."""
+        old_source = self.root / "version-old.bin"
+        new_source = self.root / "version-new.bin"
+        old_payload = bytes(bytearray((i * 13 + 7) % 256
+                                      for i in range(180000)))
+        new_payload = b"new current version\n" * 9000
+        old_source.write_bytes(old_payload)
+        new_source.write_bytes(new_payload)
+
+        result = self.run_script(
+            "option confirm off ; mkdir /photos ; "
+            "put %s /photos/versioned.bin ; "
+            "put %s /photos/versioned.bin ; "
+            "versions /photos/versioned.bin" % (old_source, new_source))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        records = []
+        for line in result.stdout.splitlines():
+            marker = "  /photos/versioned.bin  "
+            if marker in line:
+                state, rest = line.split(marker, 1)
+                records.append((state.strip(), rest.split("  ", 1)[0]))
+        self.assertEqual(len(records), 2, result.stdout)
+        old_version = next(version_id for state, version_id in records
+                           if state == "version")
+        current_version = next(version_id for state, version_id in records
+                               if state == "latest")
+        # The server's IDs contain '/', '+', '%', '&', '=' and '?'; they
+        # must be treated as opaque query values, not shell or URL syntax.
+        self.assertIn("/", old_version)
+        self.assertIn("%", old_version)
+        self.assertIn("&", old_version)
+
+        destination = self.root / "versioned-download.bin"
+        version_stage = pathlib.Path(
+            str(destination) + ".filepart.v" +
+            hashlib.sha256(old_version.encode("utf-8")).hexdigest())
+        version_stage.write_bytes(old_payload[:76543])
+        unrelated_stage = pathlib.Path(str(destination) + ".filepart")
+        unrelated_stage.write_bytes(new_payload[:80000])
+        current_download = self.root / "current-download.bin"
+        command = (
+            "option confirm off ; "
+            "get -resume -versionid=%s /photos/versioned.bin %s ; "
+            "get -versionid=%s /photos/versioned.bin %s ; echo VERSION_GET_OK" %
+            (old_version, destination, current_version, current_download))
+        result = self.run_script(command, extra_args=("-literal",))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("VERSION_GET_OK", result.stdout)
+        self.assertEqual(sha256_of(old_source), sha256_of(destination))
+        self.assertEqual(sha256_of(new_source), sha256_of(current_download))
+        self.assertFalse(version_stage.exists())
+        self.assertTrue(unrelated_stage.exists())
+
+        result = self.run_script(
+            "option confirm off ; rm -versionid=%s /photos/versioned.bin ; "
+            "versions /photos/versioned.bin" % old_version,
+            extra_args=("-literal",))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        remaining = []
+        for line in result.stdout.splitlines():
+            marker = "  /photos/versioned.bin  "
+            if marker in line:
+                remaining.append(line.split(marker, 1)[1].split("  ", 1)[0])
+        self.assertEqual(remaining, [current_version], result.stdout)
+
+        result = self.run_script(
+            "option confirm off ; rm /photos/versioned.bin ; "
+            "versions /photos/versioned.bin")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        marker_records = []
+        for line in result.stdout.splitlines():
+            marker = "  /photos/versioned.bin  "
+            if marker in line:
+                state, rest = line.split(marker, 1)
+                if state.strip() == "delete marker":
+                    marker_records.append(rest.split("  ", 1)[0])
+        self.assertEqual(len(marker_records), 1, result.stdout)
+        delete_marker_id = marker_records[0]
+
+        failed = self.root / "delete-marker-download.bin"
+        result = self.run_script(
+            "get -versionid=%s /photos/versioned.bin %s" %
+            (delete_marker_id, failed), extra_args=("-literal",))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("delete marker", result.stderr)
+        self.assertFalse(failed.exists())
+
+        result = self.run_script(
+            "option confirm off ; rm -versionid=%s /photos/versioned.bin ; "
+            "get /photos/versioned.bin %s" % (delete_marker_id, failed),
+            extra_args=("-literal",))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sha256_of(new_source), sha256_of(failed))
+
+    def test_version_listing_paginates_all_versions(self):
+        """A listing spanning the S3 page boundary must include records
+        from both pages and preserve the exact key's version count."""
+        self.seed_versions("test-bucket", "pagination/object", 1001)
+        result = self.run_script("versions /test-bucket/pagination/object",
+                                 timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        marker = "  /test-bucket/pagination/object  "
+        records = [line for line in result.stdout.splitlines()
+                   if marker in line]
+        self.assertEqual(len(records), 1001, result.stdout[-2000:])
+
+    def test_object_listing_rejects_broken_pagination_state(self):
+        """ListObjects must fail closed on a missing or repeated token,
+        rather than claim that one page was the complete directory."""
+        self.seed_objects("test-bucket", 1001)
+        for fault, expected in (
+                ("repeat-token", "repeated a continuation token"),
+                ("missing-token", "has no continuation token")):
+            with self.subTest(fault=fault):
+                self.inject_pagination_fault("objects", fault)
+                result = self.run_script("ls /test-bucket", timeout=90)
+                self.assertEqual(result.returncode, 1,
+                                 result.stdout + result.stderr)
+                self.assertIn(expected, result.stderr)
+                self.assertNotIn("item-0000.txt", result.stdout)
+
+    def test_version_listing_rejects_broken_pagination_state(self):
+        """A truncated ListObjectVersions response must provide a new
+        key/version marker, and the client must reject a repeated marker."""
+        self.seed_versions("test-bucket", "pagination/object", 1001)
+        for fault, expected in (
+                ("repeat-marker", "repeated its pagination marker"),
+                ("missing-version-marker", "has no next version ID marker")):
+            with self.subTest(fault=fault):
+                self.inject_pagination_fault("versions", fault)
+                result = self.run_script(
+                    "versions /test-bucket/pagination/object", timeout=90)
+                self.assertEqual(result.returncode, 1,
+                                 result.stdout + result.stderr)
+                self.assertIn(expected, result.stderr)
+                self.assertNotIn("Object versions for", result.stdout)
 
     def test_cp_uses_s3_copy_object_and_keeps_the_source(self):
         source = self.root / "copy-source.txt"
@@ -380,8 +548,9 @@ class LiveS3Tests(unittest.TestCase):
         self.assertEqual(sha256_of(source), sha256_of(destination))
 
     def test_rename_and_remove(self):
-        """Rename is CopyObject plus a delete of the source; remove is a
-        DELETE that has to fail on a missing key afterwards."""
+        """Rename is CopyObject plus a delete marker on the source; a
+        repeated S3 DELETE creates another marker, while current reads still
+        see the key as absent."""
         first = self.root / "a.txt"
         first.write_text("alpha\n", encoding="utf-8")
         second = self.root / "b.txt"
@@ -393,15 +562,20 @@ class LiveS3Tests(unittest.TestCase):
             "ls -l /photos ; "
             "get /photos/renamed.txt %s/renamed.txt ; "
             "rm /photos/b.txt ; "
-            "rm /photos/b.txt ; echo SHOULD_NOT_SEE" %
+            "rm /photos/b.txt ; versions /photos/b.txt ; echo REMOVE_OK" %
             (first, second, self.root))
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("renamed.txt", result.stdout)
-        # renamed.txt is the copy of a.txt; b.txt was the one removed.
+        self.assertIn("REMOVE_OK", result.stdout)
+        self.assertIn("delete marker", result.stdout)
+        # renamed.txt is the copy of a.txt; b.txt was hidden by two markers.
         self.assertEqual((self.root / "renamed.txt").read_text(),
                          "alpha\n")
-        # The second rm (b.txt already gone) is what must fail the script.
-        self.assertIn("No such file or directory", result.stderr)
+
+        # A current-version read still sees b.txt as absent.
+        result = self.run_script(
+            "get /photos/b.txt %s/gone-b.txt ; echo SHOULD_NOT_SEE" % self.root)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertNotIn("SHOULD_NOT_SEE", result.stdout)
 
         # a.txt really moved: the old name is gone.

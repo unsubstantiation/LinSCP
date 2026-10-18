@@ -2,7 +2,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-8 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+7 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -78,19 +78,6 @@ English/Spanish catalogs cover the browser interface (menus, dialogs, help, ARIA
 
 - [ ] Ship a catalog for every language the project claims to support and translate the whole interface into it, starting with the languages the upstream project already ships.
 - [ ] Add a test that walks the catalogs and reports the messages of the client that are still answered in English, so a new interface string cannot slip through untranslated.
-
-## s3.versioned-objects
-
-**Area:** Amazon S3 · **Status:** missing
-
-The client manages current bucket objects; it does not expose version IDs, version listing, version-specific retrieval or delete markers.
-
-**Next:** Define and implement version-aware operations rather than claiming current-object CRUD is versioning support.
-
-**Acceptance criteria:**
-
-- [ ] Test version listing with pagination and exact version-specific reads against a versioned S3 endpoint.
-- [ ] Test deletion of a named version versus creation/removal of delete markers without losing unrelated versions.
 
 ## automation.upstream-xml-compatibility
 

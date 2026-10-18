@@ -76,6 +76,9 @@ struct TransferFlags
     bool preserveTime;
     bool recursive;
     bool resume;
+    /* Exact S3 object version for get; opaque, not a key path. */
+    std::string versionId;
+    bool versionIdGiven;
     /* The effective file mask ('-filemask=' or 'option include/exclude'). */
     FileMask mask;
     /* binary, ASCII or automatic line-ending conversion. */
@@ -116,7 +119,8 @@ struct TransferFlags
 
     TransferFlags() : deleteSource(false), deleteObsolete(false),
         newerOnly(false), preserveTime(false), recursive(true),
-        resume(false), transferMode(TransferMode::Binary), permissions(-1),
+        resume(false), versionIdGiven(false),
+        transferMode(TransferMode::Binary), permissions(-1),
         maskGiven(false), resumeSupport(ResumeUnset), resumeThreshold(0),
         speedKBytesPerSecond(0), append(false), preserveTimeDirs(false),
         explicitSettings(0) {}
@@ -271,7 +275,8 @@ private:
 
     bool ResolveStage(bool eligible, bool upload,
         const std::string & finalPath, unsigned long long totalSize,
-        TransferStage & stage, std::string & error);
+        TransferStage & stage, std::string & error,
+        const std::string & stageSuffix = ".filepart");
     /* Removes a staging file that cannot be continued; clears 'stale'
      * once nothing is in the way. No-op otherwise. */
     bool PrepareStage(TransferStage & stage, std::string & error);
@@ -293,6 +298,7 @@ private:
     bool ChangeRemoteDirectory(const std::vector<std::string> & args);
     void PrintRemoteDirectory();
     bool ListRemote(const std::vector<std::string> & args);
+    bool ListS3Versions(const std::vector<std::string> & args);
     void NoMatch(const std::string & mask, const std::string & error);
     bool ChangeLocalDirectory(const std::vector<std::string> & args);
     void PrintLocalDirectory();
@@ -422,7 +428,7 @@ private:
     int RemoteGet(const std::string & remote, const std::string & local,
         unsigned long long resumeOffset, bool preserveTime, unsigned long long * size,
         LscpProgressFn progress, void * ctx, std::string & error,
-        bool append = false);
+        bool append = false, const std::string & versionId = std::string());
     int RemotePut(const std::string & local, const std::string & remote,
         int permissions, unsigned long long resumeOffset, bool preserveTime,
         unsigned long long * size, LscpProgressFn progress, void * ctx,
