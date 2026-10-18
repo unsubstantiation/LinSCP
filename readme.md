@@ -80,7 +80,7 @@ Run `linscp -help` for the options and `man linscp` for the full reference.
 
 | URL | Served by | Notes |
 | --- | --- | --- |
-| `sftp://` | native SFTP over the bundled PuTTY core | full command set |
+| `sftp://` | native SFTP v3 over libssh (copy-data / check-file-name extensions included) | full command set |
 | `scp://`, `ssh://` | the client's SSH code: the server's shell for directory work, rcp for bytes | no resume; the protocol has no offset |
 | `ftp://` | native FTP engine for listing and metadata; curl for transfers | |
 | `ftps://` | curl, implicit TLS; `ftp://` with explicit TLS settings also uses curl | |
@@ -136,11 +136,10 @@ it.
 automation/    PowerShell 7 wrapper over the CLI (not tested)
 debian/        Debian packaging
 docs/          documentation, manual page and parity inventory
-libs/putty/    POSIX platform layer and charset code from PuTTY 0.85
 logo/          logo artwork
 source/gui/    browser Commander: Python server, web client, tests
 source/linux/  linscp client: front end, protocol glue, tests, Makefile
-source/putty/  platform-neutral PuTTY SSH and SFTP core
+source/linux/  console client: libssh transport, native SFTP/SCP
 tools/         parity inventory, translation and platform-conversion checkers
 ```
 
@@ -150,4 +149,4 @@ LinSCP is distributed under the [PolyForm Noncommercial License
 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0):
 noncommercial use only. This is not an open source licence. The full terms are
 in [`LICENSE`](LICENSE); the copyright line, the MIT notice for the
-PuTTY-derived core and the artwork terms are in [`NOTICE`](NOTICE).
+third-party components and the artwork terms are in [`NOTICE`](NOTICE).

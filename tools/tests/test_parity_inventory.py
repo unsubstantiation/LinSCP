@@ -139,7 +139,7 @@ class InventoryTests(unittest.TestCase):
 
     def test_capability_matrix_cannot_lose_areas_or_invent_evidence(self):
         valid = {"id": "sftp.example", "area": "SFTP", "status": "verified",
-                 "notes": "A narrowly checked behavior", "source": ["source/linux/SftpClient.c"],
+                 "notes": "A narrowly checked behavior", "source": ["source/linux/SftpClient.cpp"],
                  "checks": {"live-sftp": ["test_open_with_a_wrong_password_is_refused"]},
                  "verified_on": {"linux": ["live-sftp"]}}
         inventory = {"features": [{"name": "SFTP"}],

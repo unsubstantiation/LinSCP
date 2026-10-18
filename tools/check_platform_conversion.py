@@ -24,11 +24,8 @@ Windows path to say what the client does with one, and a test has to
 be able to hold a name that a POSIX file system allows and a Windows
 one does not.
 
-The vendored PuTTY tree (source/putty, libs/putty) is upstream code
-that still carries upstream's Windows comments and conditionals. It is
-upstream's business, not this client's, so it is not scanned; the
-platform layer under libs/putty/unix is the part this project owns and
-that one *is* scanned.
+The vendored xterm.js files (source/gui/web/vendor) are upstream code
+that is not scanned; everything else in the tree is this project's own.
 
 Usage:
     python3 tools/check_platform_conversion.py
@@ -41,8 +38,8 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-# The files this check reads. The vendored PuTTY tree is excluded on
-# purpose: it is upstream's code and keeps upstream's Windows comments.
+# The files this check reads. The vendored xterm.js files under
+# source/gui/web/vendor are upstream code and are excluded on purpose.
 SCAN_ROOTS = [
     'source/linux',
     'source/gui',

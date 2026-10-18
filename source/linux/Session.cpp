@@ -4,6 +4,7 @@
 #include "PathUtil.h"
 #include "ProtocolClient.h"
 #include "SftpClient.h"
+#include "SshKeys.h"
 #include "Texts.h"
 
 #include <cctype>
@@ -12,19 +13,24 @@
 #include <cstdlib>
 #include <cstring>
 #include <set>
+#include <string>
+#include <vector>
 
-#include "PuttyCompat.h"
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <libssh/libssh.h>
+#include <libssh/sftp.h>
 
 namespace linscp {
 
 namespace {
 
-/* Deriving from the core's trait structs keeps static_cast working in both
- * directions. */
-struct ScpSeat : public Seat
-{
-    Session * session;
-};
+Session * g_currentSession = NULL;
 
 std::string LowerCaseAscii(const std::string & text)
 {
@@ -36,429 +42,454 @@ std::string LowerCaseAscii(const std::string & text)
     return result;
 }
 
-struct ScpLogPolicy : public LogPolicy
+std::string Base64Encode(const unsigned char * data, size_t length)
 {
-    Session * session;
-};
+    static const char digits[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string result;
+    for (size_t i = 0; i < length; i += 3)
+    {
+        unsigned int value = data[i] << 16;
+        const size_t remaining = length - i;
+        if (remaining > 1)
+        {
+            value |= data[i + 1] << 8;
+        }
+        if (remaining > 2)
+        {
+            value |= data[i + 2];
+        }
+        result += digits[(value >> 18) & 63];
+        result += digits[(value >> 12) & 63];
+        result += remaining > 1 ? digits[(value >> 6) & 63] : '=';
+        result += remaining > 2 ? digits[value & 63] : '=';
+    }
+    return result;
+}
+
+/* The SHA-256 fingerprint the way OpenSSH and this client print it:
+ * 'SHA256:' plus the unpadded base64 of the digest. */
+std::string Sha256Fingerprint(ssh_key key)
+{
+    unsigned char * hash = NULL;
+    size_t length = 0;
+    if (ssh_get_publickey_hash(key, SSH_PUBLICKEY_HASH_SHA256,
+            &hash, &length) != SSH_OK)
+    {
+        return std::string();
+    }
+    std::string encoded = Base64Encode(hash, length);
+    ssh_clean_pubkey_hash(&hash);
+    while (!encoded.empty() && encoded[encoded.size() - 1] == '=')
+    {
+        encoded.erase(encoded.size() - 1);
+    }
+    return "SHA256:" + encoded;
+}
+
+/* The MD5 fingerprint as colon-separated hex, the ssh-keygen spelling. */
+std::string Md5Fingerprint(ssh_key key)
+{
+    unsigned char * hash = NULL;
+    size_t length = 0;
+    if (ssh_get_publickey_hash(key, SSH_PUBLICKEY_HASH_MD5,
+            &hash, &length) != SSH_OK)
+    {
+        return std::string();
+    }
+    std::string result;
+    for (size_t i = 0; i < length; i++)
+    {
+        char buffer[4];
+        snprintf(buffer, sizeof(buffer), "%s%02x", i ? ":" : "", hash[i]);
+        result += buffer;
+    }
+    ssh_clean_pubkey_hash(&hash);
+    return result;
+}
 
 /*
- * The core describes a security decision as a list of typed lines, the way
- * its own dialog boxes show them. The console renders the prose and pulls
- * the individual values out of the same list, so there is one source of
- * truth for what the user is being asked about.
+ * Whether 'host' is named by the proxy exclusion list: a comma or
+ * semicolon separated list in which '*' matches any run of characters
+ * (the upstream spelling, e.g. '*.example.com,localhost').
  */
-std::string DialogTextValue(SeatDialogText * text, const char * key)
+bool ProxyExcluded(const ProxySettings & proxy, const std::string & host)
 {
-    if (text == NULL || key == NULL)
+    const std::string list = proxy.excludeList;
+    size_t start = 0;
+    while (start <= list.size())
     {
-        return std::string();
-    }
-    for (size_t i = 0; i + 1 < text->nitems; i++)
-    {
-        if (text->items[i].type == SDT_MORE_INFO_KEY &&
-            text->items[i].text != NULL &&
-            strcmp(text->items[i].text, key) == 0 &&
-            text->items[i+1].type == SDT_MORE_INFO_VALUE_SHORT &&
-            text->items[i+1].text != NULL)
+        size_t end = list.find_first_of(",;", start);
+        if (end == std::string::npos)
         {
-            return text->items[i+1].text;
+            end = list.size();
         }
-    }
-    return std::string();
-}
-
-std::string DialogTextFirstDisplay(SeatDialogText * text)
-{
-    if (text == NULL)
-    {
-        return std::string();
-    }
-    for (size_t i = 0; i < text->nitems; i++)
-    {
-        if (text->items[i].type == SDT_DISPLAY && text->items[i].text != NULL)
+        std::string pattern = list.substr(start, end - start);
+        const size_t first = pattern.find_first_not_of(" \t");
+        const size_t last = pattern.find_last_not_of(" \t");
+        pattern = first == std::string::npos ? std::string() :
+            pattern.substr(first, last - first + 1);
+        if (!pattern.empty())
         {
-            return text->items[i].text;
-        }
-    }
-    return std::string();
-}
-
-void PrintDialogText(SeatDialogText * text)
-{
-    if (text == NULL)
-    {
-        return;
-    }
-    for (size_t i = 0; i < text->nitems; i++)
-    {
-        switch (text->items[i].type)
-        {
-        case SDT_TITLE:
-        case SDT_SCARY_HEADING:
-        case SDT_PARA:
-        case SDT_DISPLAY:
-            if (text->items[i].text != NULL)
+            /* Glob match, iterative with backtracking on '*'. */
+            size_t p = 0, h = 0, starP = std::string::npos, starH = 0;
+            const std::string lowerPattern = LowerCaseAscii(pattern);
+            const std::string lowerHost = LowerCaseAscii(host);
+            bool matched = false;
+            while (h < lowerHost.size())
             {
-                Console::Instance().Error(text->items[i].text);
+                if (p < lowerPattern.size() &&
+                    (lowerPattern[p] == '?' || lowerPattern[p] == lowerHost[h]))
+                {
+                    p++;
+                    h++;
+                }
+                else if (p < lowerPattern.size() && lowerPattern[p] == '*')
+                {
+                    starP = p++;
+                    starH = h;
+                }
+                else if (starP != std::string::npos)
+                {
+                    p = starP + 1;
+                    h = ++starH;
+                }
+                else
+                {
+                    break;
+                }
+                if (h == lowerHost.size())
+                {
+                    while (p < lowerPattern.size() && lowerPattern[p] == '*')
+                    {
+                        p++;
+                    }
+                    matched = p == lowerPattern.size();
+                }
             }
+            if (matched)
+            {
+                return true;
+            }
+        }
+        if (end == list.size())
+        {
             break;
-        default:
-            /* Prompts, batch-abort text and more-info blobs are for a
-             * dialog box; the console asks its own question. */
-            break;
         }
+        start = end + 1;
     }
-}
-
-size_t seat_output(Seat * seat, SeatOutputType type, const void * data, size_t len)
-{
-    ScpSeat * scpSeat = static_cast<ScpSeat *>(seat);
-    const char * bytes = static_cast<const char *>(data);
-
-    if (type == SEAT_OUTPUT_STDERR)
-    {
-        /*
-         * The native SCP engine reads a command's error output as the
-         * reason for a failure ('ls: cannot access ...: No such file or
-         * directory') instead of printing it, because that text is the
-         * message the user is owed. Anything else - the 'call' command,
-         * whose output belongs on the screen - keeps printing it.
-         */
-        if (scpSeat->session->CapturesStderr())
-        {
-            scpSeat->session->AppendCapturedStderr(bytes, len);
-            return 0;
-        }
-        Console::Instance().Write(std::string(bytes, len));
-        return 0;
-    }
-    scpSeat->session->DeliverChannelData(bytes, len);
-    return 0;
-}
-
-bool seat_eof(Seat * seat)
-{
-    return true;
-}
-
-void seat_notify_remote_exit(Seat * seat)
-{
-    Console::Instance().LogEvent(Texts::Translate(
-        "The remote side closed the connection."));
-    static_cast<ScpSeat *>(seat)->session->NotifyRemoteExit();
-}
-
-void seat_notify_remote_disconnect(Seat * seat)
-{
-    Console::Instance().LogEvent(Texts::Translate(
-        "The remote side disconnected."));
-    static_cast<ScpSeat *>(seat)->session->NotifyRemoteExit();
-}
-
-void seat_connection_fatal(Seat * seat, const char * message)
-{
-    Console::Instance().Fatal(message != NULL ? message : "Connection failed");
-    Session * session = static_cast<ScpSeat *>(seat)->session;
-    session->SetConnectionError(message != NULL ? message : "Connection failed");
-    session->NotifyRemoteExit();
-}
-
-void seat_nonfatal(Seat * seat, const char * message)
-{
-    if (message != NULL)
-    {
-        Console::Instance().LogEvent(std::string("Warning: ") + message);
-    }
-}
-
-SeatPromptResult seat_get_userpass_input(Seat * seat, prompts_t * prompts)
-{
-    Session * session = static_cast<ScpSeat *>(seat)->session;
-    const SessionOptions & options = session->Options();
-    Console & console = Console::Instance();
-
-    if (prompts->instruction != NULL && prompts->instruction[0] != '\0')
-    {
-        console.WriteLine(prompts->instruction);
-    }
-
-    for (size_t i = 0; i < prompts->n_prompts; i++)
-    {
-        prompt_t * prompt = prompts->prompts[i];
-        std::string text = prompt->prompt != NULL ? prompt->prompt : "";
-        std::string answer;
-
-        const std::string lowerPrompt = LowerCaseAscii(text);
-        bool isUserName = prompt->echo &&
-            (lowerPrompt.find("username") != std::string::npos ||
-             lowerPrompt.find("user name") != std::string::npos ||
-             lowerPrompt.find("login") != std::string::npos);
-        bool isPassphrase = !prompt->echo &&
-            lowerPrompt.find("passphrase") != std::string::npos;
-        bool isPassword = !prompt->echo &&
-            (lowerPrompt.find("password") != std::string::npos || isPassphrase);
-
-        if (isUserName && !options.userName.empty() && session->UserName().empty())
-        {
-            answer = options.userName;
-        }
-        else if (isPassphrase && !options.keyPassphrase.empty() && !session->PasswordUsed())
-        {
-            answer = options.keyPassphrase;
-        }
-        else if (isPassword && !options.password.empty() && !session->PasswordUsed())
-        {
-            answer = options.password;
-        }
-        else if (console.IsInteractive())
-        {
-            const bool read = prompt->echo ?
-                console.ReadLine(text, answer) : console.ReadPassword(text, answer);
-            if (!read)
-            {
-                return make_spr_sw_abort_static("No more input available");
-            }
-            if (isUserName)
-            {
-                session->SetUserName(answer);
-            }
-        }
-        else
-        {
-            return make_spr_sw_abort_static(
-                "No stored answer for this prompt and not running interactively");
-        }
-
-        prompt_set_result(prompt, answer.c_str());
-        if (isPassword)
-        {
-            session->MarkPasswordUsed();
-        }
-    }
-
-    return SPR_OK;
-}
-
-SeatPromptResult seat_confirm_ssh_host_key(Seat * seat, const char * host, int port,
-    const char * keytype, char * keystr, SeatDialogText * text, HelpCtx helpctx,
-    void (*callback)(void * ctx, SeatPromptResult result), void * ctx)
-{
-    Session * session = static_cast<ScpSeat *>(seat)->session;
-    Console & console = Console::Instance();
-    /*
-     * The core states the fingerprints in the dialog text, as
-     * 'SHA256 fingerprint' / 'MD5 fingerprint' pairs. SHA-256 is what
-     * everybody compares by these days, so that is the one to show, with
-     * the default fingerprint as a fallback.
-     */
-    std::string fingerprint = DialogTextValue(text, "SHA256 fingerprint");
-    if (fingerprint.empty())
-    {
-        fingerprint = DialogTextValue(text, "MD5 fingerprint");
-    }
-    if (fingerprint.empty())
-    {
-        fingerprint = DialogTextFirstDisplay(text);
-    }
-    if (fingerprint.empty())
-    {
-        fingerprint = "(no fingerprint available)";
-    }
-    /* One machine readable line for whatever the server just offered, so
-     * that a script or the graphical interface can pin this key later
-     * instead of being told only that something went wrong.
-     *
-     * An SCP session opens a connection per command and is offered the same
-     * key every time, so the line is printed once per host and key per
-     * process: a listing that repeated a fact already stated would bury the
-     * listing, and a fact stated once is just as pinnable. */
-    const std::string hostkeyLine = "HOSTKEY " + std::string(keytype) + " " +
-        fingerprint;
-    static std::set<std::string> reportedHostKeys;
-    const bool hostKeyAlreadyReported = !reportedHostKeys.insert(
-        std::string(host) + ":" + std::to_string(port) + " " + keytype + " " +
-        fingerprint).second;
-
-    /* An explicit pin must be checked even if the core can also establish
-     * trust from its cache or a host certificate. */
-    if (session->ExpectHostKey())
-    {
-        if (session->HostKeyMatches(fingerprint))
-        {
-            store_host_key(seat, host, port, keytype, keystr);
-            return SPR_OK;
-        }
-        console.Error(Texts::HostKeyUnexpected(host, port, keytype, fingerprint,
-            session->ExpectedHostKey()));
-        return make_spr_sw_abort_static("The host key does not match the expected one");
-    }
-
-    /* '*' is a deliberate one-session override, not a trust decision: do
-     * not poison the persistent host-key cache with an unchecked key.
-     * Report what was accepted anyway, so that a client (the graphical
-     * interface, an automation script) can pin this key for the next
-     * connection instead of accepting any key again. */
-    if (session->AcceptAnyHostKey())
-    {
-        if (!hostKeyAlreadyReported)
-        {
-            console.WriteLine(hostkeyLine);
-        }
-        return SPR_OK;
-    }
-
-    /*
-     * Consult the host key cache. The core hands every connection to the
-     * Seat, so this comparison is what makes a cached key trusted: a key
-     * that matches the stored one is accepted without a prompt, a key
-     * that differs from a stored one is refused, and only a host with no
-     * cached key at all is a new host.
-     */
-    const int cacheState = linscp_check_cached_host_key(host, port, keytype, keystr);
-    if (cacheState > 0)
-    {
-        Console::Instance().LogEvent(Texts::HostKeyCached(host, port));
-        return SPR_OK;
-    }
-    if (cacheState < 0)
-    {
-        console.WriteLine(hostkeyLine);
-        console.Error(Texts::HostKeyMismatch(host, port, keytype, fingerprint));
-        return make_spr_sw_abort_static("The host key does not match the cached one");
-    }
-
-    console.WriteLine(hostkeyLine);
-    console.Error(Texts::HostKeyUnknown(host, port, keytype, fingerprint));
-    if (!console.IsInteractive())
-    {
-        return make_spr_sw_abort_static(
-            "The host key is not cached; use -hostkey to accept it");
-    }
-    if (console.Confirm(Texts::Translate("Continue connecting and cache the host key?"), false))
-    {
-        store_host_key(seat, host, port, keytype, keystr);
-        return SPR_OK;
-    }
-    return SPR_USER_ABORT;
-}
-
-SeatPromptResult seat_confirm_weak_crypto_primitive(Seat * seat, SeatDialogText * text,
-    void (*callback)(void * ctx, SeatPromptResult result), void * ctx)
-{
-    /*
-     * The core puts the algorithm names and the reason in the dialog text.
-     * The console cannot show a modal dialog, so it prints the explanation
-     * and carries on: refusing here would turn every older server into a
-     * connection failure.
-     */
-    PrintDialogText(text);
-    return SPR_OK;
-}
-
-SeatPromptResult seat_confirm_weak_cached_hostkey(Seat * seat, SeatDialogText * text,
-    void (*callback)(void * ctx, SeatPromptResult result), void * ctx)
-{
-    PrintDialogText(text);
-    return SPR_OK;
-}
-
-const char * seat_get_display(Seat * seat, SeatDisplayType dtype)
-{
-    return getenv("DISPLAY");
-}
-
-bool seat_is_utf8(Seat * seat)
-{
-    return true;
-}
-
-bool seat_verbose(Seat * seat)
-{
-    return static_cast<ScpSeat *>(seat)->session->Options().verbose;
-}
-
-bool seat_interactive(Seat * seat)
-{
-    return Console::Instance().IsInteractive();
-}
-
-/* One iteration of the event loop, so that the caller stays in control. */
-bool pump_once(void * ctx, bool fd_ready, bool callback_ran)
-{
     return false;
 }
 
-void log_policy_eventlog(LogPolicy * policy, const char * event)
+/* Connects a TCP socket to host:port. Returns the fd, or -1 with 'error'. */
+int TcpConnect(const std::string & host, int port, int timeoutSecs,
+    std::string & error)
 {
-    if (event != NULL)
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo * addresses = NULL;
+    char portText[16];
+    snprintf(portText, sizeof(portText), "%d", port);
+    if (getaddrinfo(host.c_str(), portText, &hints, &addresses) != 0)
     {
-        Console::Instance().LogEvent(event);
+        error = "Cannot resolve '" + host + "'.";
+        return -1;
     }
+    int fd = -1;
+    for (struct addrinfo * ai = addresses; ai != NULL; ai = ai->ai_next)
+    {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0)
+        {
+            continue;
+        }
+        struct timeval timeout;
+        timeout.tv_sec = timeoutSecs;
+        timeout.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
+        {
+            break;
+        }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(addresses);
+    if (fd < 0)
+    {
+        error = "Cannot connect to " + host + ":" + portText + ".";
+    }
+    return fd;
 }
 
-int log_policy_askappend(LogPolicy * policy, Filename * filename,
-    void (*callback)(void * ctx, int result), void * ctx)
+bool SendAll(int fd, const char * data, size_t length)
 {
-    return 2; /* overwrite */
+    size_t sent = 0;
+    while (sent < length)
+    {
+        const ssize_t n = send(fd, data + sent, length - sent, 0);
+        if (n <= 0)
+        {
+            return false;
+        }
+        sent += static_cast<size_t>(n);
+    }
+    return true;
 }
 
-void log_policy_logging_error(LogPolicy * policy, const char * event)
+bool RecvSome(int fd, std::string & chunk)
 {
-    Console::Instance().Error(std::string("Session log error: ") +
-        (event != NULL ? event : "(unknown)"));
+    char buffer[4096];
+    const ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
+    if (n <= 0)
+    {
+        return false;
+    }
+    chunk.append(buffer, static_cast<size_t>(n));
+    return true;
 }
 
-SeatVtable MakeSeatVtable()
+/* Resolves 'host' to an IPv4 address in network order, for SOCKS4. */
+bool ResolveIpv4(const std::string & host, unsigned char bytes[4])
 {
-    SeatVtable vt;
-    memset(&vt, 0, sizeof(vt));
-    vt.output = seat_output;
-    vt.eof = seat_eof;
-    vt.sent = nullseat_sent;
-    vt.banner = nullseat_banner;
-    vt.get_userpass_input = seat_get_userpass_input;
-    vt.notify_session_started = nullseat_notify_session_started;
-    vt.notify_remote_exit = seat_notify_remote_exit;
-    vt.notify_remote_disconnect = seat_notify_remote_disconnect;
-    vt.connection_fatal = seat_connection_fatal;
-    vt.nonfatal = seat_nonfatal;
-    vt.update_specials_menu = nullseat_update_specials_menu;
-    vt.get_ttymode = nullseat_get_ttymode;
-    vt.set_busy_status = nullseat_set_busy_status;
-    vt.confirm_ssh_host_key = seat_confirm_ssh_host_key;
-    vt.confirm_weak_crypto_primitive = seat_confirm_weak_crypto_primitive;
-    vt.confirm_weak_cached_hostkey = seat_confirm_weak_cached_hostkey;
-    vt.prompt_descriptions = nullseat_prompt_descriptions;
-    vt.is_utf8 = seat_is_utf8;
-    vt.echoedit_update = nullseat_echoedit_update;
-    vt.get_display = seat_get_display;
-    vt.get_windowid = nullseat_get_windowid;
-    vt.get_window_pixel_size = nullseat_get_window_pixel_size;
-    vt.stripctrl_new = nullseat_stripctrl_new;
-    vt.set_trust_status = nullseat_set_trust_status;
-    vt.can_set_trust_status = nullseat_can_set_trust_status_no;
-    vt.has_mixed_input_stream = nullseat_has_mixed_input_stream_no;
-    vt.verbose = seat_verbose;
-    vt.interactive = seat_interactive;
-    vt.get_cursor_position = nullseat_get_cursor_position;
-    return vt;
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo * addresses = NULL;
+    if (getaddrinfo(host.c_str(), NULL, &hints, &addresses) != 0)
+    {
+        return false;
+    }
+    bool found = false;
+    for (struct addrinfo * ai = addresses; ai != NULL && !found; ai = ai->ai_next)
+    {
+        const struct sockaddr_in * sin =
+            reinterpret_cast<const struct sockaddr_in *>(ai->ai_addr);
+        memcpy(bytes, &sin->sin_addr.s_addr, 4);
+        found = true;
+    }
+    freeaddrinfo(addresses);
+    return found;
 }
 
-LogPolicyVtable MakeLogPolicyVtable()
+/*
+ * Opens the transport socket for a proxied connection: speaks SOCKS4,
+ * SOCKS5, HTTP CONNECT or the telnet-proxy command dialogue to the
+ * proxy, and returns a socket that carries SSH bytes to the target.
+ * Returns -1 with 'error' set. (The 'Cmd' proxy is not done here:
+ * libssh runs it itself through SSH_OPTIONS_PROXYCOMMAND.)
+ */
+int ProxySocket(const SessionOptions & options, std::string & error)
 {
-    LogPolicyVtable vt;
-    memset(&vt, 0, sizeof(vt));
-    vt.eventlog = log_policy_eventlog;
-    vt.askappend = log_policy_askappend;
-    vt.logging_error = log_policy_logging_error;
-    vt.verbose = null_lp_verbose_no;
-    return vt;
+    const ProxySettings & proxy = options.proxy;
+    const std::string & target = options.hostName;
+    const int targetPort = options.portNumber;
+    int fd = TcpConnect(proxy.host, proxy.EffectivePort(),
+        options.timeoutSecs, error);
+    if (fd < 0)
+    {
+        return -1;
+    }
+
+    const bool remoteDns = proxy.ResolvesRemotely();
+    switch (proxy.method)
+    {
+    case ProxyMethod::Socks5:
+    {
+        std::string greeting;
+        greeting += '\x05';
+        if (proxy.userName.empty())
+        {
+            greeting += '\x01';
+            greeting += '\x00';
+        }
+        else
+        {
+            greeting += '\x02';
+            greeting += '\x00';
+            greeting += '\x02';
+        }
+        std::string reply;
+        if (!SendAll(fd, greeting.data(), greeting.size()) ||
+            !RecvSome(fd, reply) || reply.size() < 2 ||
+            static_cast<unsigned char>(reply[0]) != 5)
+        {
+            error = "The SOCKS5 proxy did not answer the greeting.";
+            break;
+        }
+        if (static_cast<unsigned char>(reply[1]) == 2)
+        {
+            std::string auth;
+            auth += '\x01';
+            auth += static_cast<char>(proxy.userName.size());
+            auth += proxy.userName;
+            auth += static_cast<char>(proxy.password.size());
+            auth += proxy.password;
+            reply.clear();
+            if (!SendAll(fd, auth.data(), auth.size()) ||
+                !RecvSome(fd, reply) || reply.size() < 2 || reply[1] != 0)
+            {
+                error = "The SOCKS5 proxy refused the user name and password.";
+                break;
+            }
+        }
+        else if (static_cast<unsigned char>(reply[1]) != 0)
+        {
+            error = "The SOCKS5 proxy refused the authentication method.";
+            break;
+        }
+        std::string request;
+        request += '\x05';
+        request += '\x01'; /* CONNECT */
+        request += '\x00';
+        if (remoteDns)
+        {
+            request += '\x03';
+            request += static_cast<char>(target.size());
+            request += target;
+        }
+        else
+        {
+            unsigned char bytes[4];
+            if (!ResolveIpv4(target, bytes))
+            {
+                error = "Cannot resolve '" + target + "'.";
+                break;
+            }
+            request += '\x01';
+            request.append(reinterpret_cast<char *>(bytes), 4);
+        }
+        request += static_cast<char>((targetPort >> 8) & 0xff);
+        request += static_cast<char>(targetPort & 0xff);
+        reply.clear();
+        if (!SendAll(fd, request.data(), request.size()) ||
+            !RecvSome(fd, reply) || reply.size() < 2 || reply[1] != 0)
+        {
+            error = "The SOCKS5 proxy refused the connection to " + target + ".";
+            break;
+        }
+        return fd;
+    }
+    case ProxyMethod::Socks4:
+    {
+        unsigned char bytes[4];
+        const bool socks4a = remoteDns && !ResolveIpv4(target, bytes);
+        if (!socks4a && !ResolveIpv4(target, bytes))
+        {
+            error = "Cannot resolve '" + target + "'.";
+            break;
+        }
+        std::string request;
+        request += '\x04';
+        request += '\x01'; /* CONNECT */
+        request += static_cast<char>((targetPort >> 8) & 0xff);
+        request += static_cast<char>(targetPort & 0xff);
+        if (socks4a)
+        {
+            request += '\x00';
+            request += '\x00';
+            request += '\x00';
+            request += '\x01';
+        }
+        else
+        {
+            request.append(reinterpret_cast<char *>(bytes), 4);
+        }
+        request += proxy.userName;
+        request += '\x00';
+        if (socks4a)
+        {
+            request += target;
+            request += '\x00';
+        }
+        std::string reply;
+        if (!SendAll(fd, request.data(), request.size()) ||
+            !RecvSome(fd, reply) || reply.size() < 8 ||
+            static_cast<unsigned char>(reply[1]) != 90)
+        {
+            error = "The SOCKS4 proxy refused the connection to " + target + ".";
+            break;
+        }
+        return fd;
+    }
+    case ProxyMethod::Http:
+    {
+        std::string request = "CONNECT " + target + ":" +
+            std::to_string(targetPort) + " HTTP/1.1\r\nHost: " + target +
+            ":" + std::to_string(targetPort) + "\r\n";
+        if (!proxy.userName.empty())
+        {
+            const std::string credentials = proxy.userName + ":" + proxy.password;
+            request += "Proxy-Authorization: Basic " +
+                Base64Encode(reinterpret_cast<const unsigned char *>(
+                    credentials.data()), credentials.size()) + "\r\n";
+        }
+        request += "\r\n";
+        std::string reply;
+        if (!SendAll(fd, request.data(), request.size()))
+        {
+            error = "Cannot write to the HTTP proxy.";
+            break;
+        }
+        while (reply.find("\r\n\r\n") == std::string::npos &&
+            reply.size() < 16384)
+        {
+            if (!RecvSome(fd, reply))
+            {
+                error = "The HTTP proxy closed the connection.";
+                break;
+            }
+        }
+        if (error.empty() &&
+            reply.find(" 200") == std::string::npos)
+        {
+            error = "The HTTP proxy refused the connection to " + target + ".";
+            break;
+        }
+        if (!error.empty())
+        {
+            break;
+        }
+        return fd;
+    }
+    case ProxyMethod::Telnet:
+    {
+        /* The telnet proxy's dialogue is the configured command with
+         * %host and %port substituted, answered by a connection. */
+        std::string command = proxy.command.empty() ?
+            "connect %host %port" : proxy.command;
+        std::string::size_type pos;
+        while ((pos = command.find("%host")) != std::string::npos)
+        {
+            command.replace(pos, 5, target);
+        }
+        while ((pos = command.find("%port")) != std::string::npos)
+        {
+            command.replace(pos, 5, std::to_string(targetPort));
+        }
+        if (!SendAll(fd, command.data(), command.size()) ||
+            !SendAll(fd, "\r\n", 2))
+        {
+            error = "Cannot write to the telnet proxy.";
+            break;
+        }
+        return fd;
+    }
+    default:
+        break;
+    }
+
+    if (error.empty())
+    {
+        error = "Unsupported proxy method.";
+    }
+    close(fd);
+    return -1;
 }
-
-const SeatVtable seat_vtable = MakeSeatVtable();
-const LogPolicyVtable log_policy_vtable = MakeLogPolicyVtable();
-
-Session * g_currentSession = NULL;
 
 } // namespace
 
@@ -1839,10 +1870,13 @@ bool ParseSiteUrl(const std::string & url, SessionOptions & options, std::string
 }
 
 Session::Session() :
-    mSeat(NULL),
-    mLogPolicy(NULL),
-    mLogCtx(NULL),
-    mBackend(NULL),
+    mSsh(NULL),
+    mChannel(NULL),
+    mSftp(NULL),
+    mExitCode(INT_MAX),
+    mShellMode(false),
+    mShellColumns(80),
+    mShellRows(24),
     mOpen(false),
     mAlive(false),
     mPasswordUsed(false),
@@ -1871,14 +1905,13 @@ bool Session::TakeAllReceived(std::string & out)
 
 bool Session::SendEof()
 {
-    if (mBackend == NULL)
+    if (mChannel == NULL)
     {
         return false;
     }
-    /* The core turns this into the channel's EOF: 'scp -t' waits for the
-     * end of its input before it exits and reports its status. */
-    backend_special(static_cast<Backend *>(mBackend), SS_EOF, 0);
-    return true;
+    /* The channel EOF: 'scp -t' waits for the end of its input before
+     * it exits and reports its status. */
+    return ssh_channel_send_eof(static_cast<ssh_channel>(mChannel)) == SSH_OK;
 }
 
 void Session::PumpUntilExit()
@@ -1977,50 +2010,147 @@ bool Session::TakeReceivedData(char * buffer, size_t len)
 
 bool Session::SendData(const char * data, size_t len)
 {
-    if (mBackend == NULL)
+    if (mChannel == NULL)
     {
         return false;
     }
     Console::Instance().LogTraffic(data, len, false);
-    backend_send(static_cast<Backend *>(mBackend), data, len);
+    ssh_channel channel = static_cast<ssh_channel>(mChannel);
+    size_t sent = 0;
+    while (sent < len)
+    {
+        const int written = ssh_channel_write(channel, data + sent,
+            static_cast<uint32_t>(len - sent));
+        if (written == SSH_ERROR)
+        {
+            return false;
+        }
+        sent += static_cast<size_t>(written);
+    }
     return true;
 }
 
 size_t Session::SendBufferSize()
 {
-    if (mBackend == NULL)
+    if (mChannel == NULL)
     {
         return 0;
     }
-    return backend_sendbuffer(static_cast<Backend *>(mBackend));
+    const int window = ssh_channel_window_size(
+        static_cast<ssh_channel>(mChannel));
+    return window > 0 ? static_cast<size_t>(window) : 0;
 }
 
+/*
+ * One pump of an exec or shell channel: reads whatever stdout and
+ * stderr are available without blocking for long, delivers them, and
+ * notices the end of the command. An SFTP session has no channel to
+ * pump (libssh's SFTP calls drive the connection themselves), so it
+ * simply reports whether the session is alive.
+ */
 bool Session::Pump()
 {
-    if (mBackend == NULL)
+    if (mChannel == NULL)
     {
+        return mAlive;
+    }
+    ssh_channel channel = static_cast<ssh_channel>(mChannel);
+    bool readAny = false;
+    for (int stream = 0; stream < 2; stream++)
+    {
+        const int isStderr = stream == 1 ? 1 : 0;
+        for (;;)
+        {
+            char buffer[16384];
+            const int got = ssh_channel_read_nonblocking(channel, buffer,
+                sizeof(buffer), isStderr);
+            if (got == SSH_AGAIN)
+            {
+                break;
+            }
+            if (got == SSH_EOF)
+            {
+                break;
+            }
+            if (got == SSH_ERROR)
+            {
+                mAlive = false;
+                if (mConnectionError.empty())
+                {
+                    const char * reason = ssh_get_error(
+                        static_cast<ssh_session>(mSsh));
+                    mConnectionError = reason != NULL && reason[0] != '\0' ?
+                        reason : Texts::ConnectionClosed();
+                }
+                return false;
+            }
+            if (got == 0)
+            {
+                break;
+            }
+            readAny = true;
+            if (isStderr && !mShellMode)
+            {
+                /*
+                 * The native SCP engine reads a command's error output
+                 * as the reason for a failure instead of printing it.
+                 * Anything else - the 'call' command, whose output
+                 * belongs on the screen - keeps printing it.
+                 */
+                if (mCaptureStderr)
+                {
+                    AppendCapturedStderr(buffer, static_cast<size_t>(got));
+                }
+                else
+                {
+                    Console::Instance().Write(
+                        std::string(buffer, static_cast<size_t>(got)));
+                }
+            }
+            else
+            {
+                DeliverChannelData(buffer, static_cast<size_t>(got));
+            }
+        }
+    }
+    if (ssh_channel_is_eof(channel) || ssh_channel_is_closed(channel))
+    {
+        const int exitCode = ssh_channel_get_exit_status(channel);
+        if (exitCode >= 0)
+        {
+            mExitCode = exitCode;
+        }
+        mAlive = false;
         return false;
     }
-    cli_main_loop(cliloop_no_pw_setup, cliloop_no_pw_check, pump_once, this);
+    if (!readAny && mAlive)
+    {
+        /* Wait briefly for the channel to produce something, so a
+         * PumpUntilExit loop does not spin. */
+        ssh_channel_poll_timeout(channel, 50, 0);
+    }
     return mAlive;
 }
 
 bool Session::ReceiveData(char * buffer, size_t len)
 {
-    while (!TakeReceivedData(buffer, len))
+    for (;;)
     {
+        if (TakeReceivedData(buffer, len))
+        {
+            return true;
+        }
         if (!mAlive)
         {
             Console::Instance().LogEvent(std::string("The session is no longer alive: ") +
                 (mConnectionError.empty() ? std::string("closed by the server") : mConnectionError));
             return false;
         }
-        if (!Pump())
-        {
-            return false;
-        }
+        /* Pump() may deliver the last bytes and the end of the channel
+         * in one call, so the buffer is checked again at the top before
+         * the not-alive case can fail the read. */
+        Pump();
     }
-    return true;
 }
 
 void Session::NotifyRemoteExit()
@@ -2156,6 +2286,279 @@ void Session::ClearDavEtag(const std::string & remotePath)
     mOptions.davEtags.erase(remotePath);
 }
 
+namespace {
+
+/*
+ * The host key decision, with the same outcomes the PuTTY Seat callback
+ * used to produce: a pinned key is checked first, '*' accepts without
+ * caching, a cached key is trusted or refused on mismatch, and only a
+ * genuinely new key is offered to the user (and, in a run that cannot
+ * ask, refused with the fingerprint printed so it can be pinned).
+ */
+bool VerifyServerKey(Session & session, ssh_session ssh, std::string & error)
+{
+    const SessionOptions & options = session.Options();
+    Console & console = Console::Instance();
+    const std::string & host = options.hostName;
+    const int port = options.portNumber;
+
+    ssh_key key = NULL;
+    if (ssh_get_server_publickey(ssh, &key) != SSH_OK || key == NULL)
+    {
+        error = "The server did not present a host key.";
+        return false;
+    }
+    const std::string keytype = ssh_key_type_to_char(ssh_key_type(key));
+    const std::string fingerprint = Sha256Fingerprint(key);
+    const std::string md5Fingerprint = Md5Fingerprint(key);
+    char * base64 = NULL;
+    std::string blob;
+    if (ssh_pki_export_pubkey_base64(key, &base64) == SSH_OK && base64 != NULL)
+    {
+        blob = base64;
+        ssh_string_free_char(base64);
+    }
+    ssh_key_free(key);
+
+    /* One machine readable line for whatever the server just offered, so
+     * that a script or the graphical interface can pin this key later.
+     * An SCP session opens a connection per command and is offered the
+     * same key every time, so the line is printed once per host and key
+     * per process. */
+    const std::string hostkeyLine = "HOSTKEY " + keytype + " " + fingerprint;
+    static std::set<std::string> reportedHostKeys;
+    const bool hostKeyAlreadyReported = !reportedHostKeys.insert(
+        host + ":" + std::to_string(port) + " " + keytype + " " +
+        fingerprint).second;
+
+    if (session.ExpectHostKey())
+    {
+        if (session.HostKeyMatches(fingerprint) ||
+            session.HostKeyMatches(md5Fingerprint))
+        {
+            StoreHostKey(host.c_str(), port, keytype.c_str(), blob.c_str());
+            return true;
+        }
+        console.Error(Texts::HostKeyUnexpected(host, port, keytype,
+            fingerprint, session.ExpectedHostKey()));
+        error = "The host key does not match the expected one";
+        return false;
+    }
+
+    /* '*' is a deliberate one-session override, not a trust decision: do
+     * not poison the persistent host-key cache with an unchecked key. */
+    if (session.AcceptAnyHostKey())
+    {
+        if (!hostKeyAlreadyReported)
+        {
+            console.WriteLine(hostkeyLine);
+        }
+        return true;
+    }
+
+    const int cacheState = CheckCachedHostKey(host.c_str(), port,
+        keytype.c_str(), blob.c_str());
+    if (cacheState > 0)
+    {
+        console.LogEvent(Texts::HostKeyCached(host, port));
+        return true;
+    }
+    if (cacheState < 0)
+    {
+        console.WriteLine(hostkeyLine);
+        console.Error(Texts::HostKeyMismatch(host, port, keytype, fingerprint));
+        error = "The host key does not match the cached one";
+        return false;
+    }
+
+    console.WriteLine(hostkeyLine);
+    console.Error(Texts::HostKeyUnknown(host, port, keytype, fingerprint));
+    if (!console.IsInteractive())
+    {
+        error = "The host key is not cached; use -hostkey to accept it";
+        return false;
+    }
+    if (console.Confirm(
+            Texts::Translate("Continue connecting and cache the host key?"),
+            false))
+    {
+        StoreHostKey(host.c_str(), port, keytype.c_str(), blob.c_str());
+        return true;
+    }
+    error = "Aborted by the user";
+    return false;
+}
+
+/*
+ * Authentication: agent and explicit/default key files first, then
+ * keyboard-interactive, then the password. The stored password answers
+ * password-style keyboard-interactive prompts too, which is how servers
+ * that only offer that method still work from a script.
+ */
+bool AuthenticateServer(Session & session, ssh_session ssh, std::string & error)
+{
+    const SessionOptions & options = session.Options();
+    Console & console = Console::Instance();
+
+    if (ssh_userauth_none(ssh, NULL) == SSH_AUTH_SUCCESS)
+    {
+        return true;
+    }
+    const int methods = ssh_userauth_list(ssh, NULL);
+    std::string keyError;
+
+    if (methods & SSH_AUTH_METHOD_PUBLICKEY)
+    {
+        if (ssh_userauth_agent(ssh, NULL) == SSH_AUTH_SUCCESS)
+        {
+            return true;
+        }
+        if (!options.privateKeyFile.empty())
+        {
+            const std::string keyFile = ExpandTilde(options.privateKeyFile);
+            if (IsPuttyKeyFile(keyFile))
+            {
+                keyError = "The PuTTY key file '" + keyFile + "' cannot "
+                    "be read by this build; convert it to an OpenSSH key "
+                    "first, for example with 'puttygen " + keyFile +
+                    " -O private-openssh'.";
+            }
+            else
+            {
+                ssh_key key = NULL;
+                const char * passphrase = options.keyPassphrase.empty() ?
+                    NULL : options.keyPassphrase.c_str();
+                if (ssh_pki_import_privkey_file(keyFile.c_str(), passphrase,
+                        NULL, NULL, &key) == SSH_OK)
+                {
+                    const int rc = ssh_userauth_publickey(ssh, NULL, key);
+                    ssh_key_free(key);
+                    if (rc == SSH_AUTH_SUCCESS)
+                    {
+                        return true;
+                    }
+                }
+                else if (keyError.empty())
+                {
+                    keyError = "Cannot read the private key '" + keyFile +
+                        "' (or its passphrase is wrong).";
+                }
+            }
+        }
+        if (options.privateKeyFile.empty() &&
+            ssh_userauth_publickey_auto(ssh, NULL, NULL) == SSH_AUTH_SUCCESS)
+        {
+            return true;
+        }
+    }
+
+    if (methods & SSH_AUTH_METHOD_INTERACTIVE)
+    {
+        int rc;
+        while ((rc = ssh_userauth_kbdint(ssh, NULL, NULL)) == SSH_AUTH_INFO)
+        {
+            const int prompts = ssh_userauth_kbdint_getnprompts(ssh);
+            for (int i = 0; i < prompts; i++)
+            {
+                char echo = 0;
+                const char * prompt =
+                    ssh_userauth_kbdint_getprompt(ssh, i, &echo);
+                const std::string text = prompt != NULL ? prompt : "";
+                const std::string lower = LowerCaseAscii(text);
+                const bool isPassword = echo == 0 &&
+                    (lower.find("password") != std::string::npos ||
+                     lower.find("passphrase") != std::string::npos);
+                std::string answer;
+                if (isPassword && !options.password.empty())
+                {
+                    answer = options.password;
+                    session.MarkPasswordUsed();
+                }
+                else if (echo != 0 && !options.userName.empty() &&
+                    (lower.find("username") != std::string::npos ||
+                     lower.find("user name") != std::string::npos ||
+                     lower.find("login") != std::string::npos))
+                {
+                    answer = options.userName;
+                }
+                else if (console.IsInteractive())
+                {
+                    const bool read = echo != 0 ?
+                        console.ReadLine(text, answer) :
+                        console.ReadPassword(text, answer);
+                    if (!read)
+                    {
+                        error = "No more input available";
+                        return false;
+                    }
+                }
+                else
+                {
+                    error = "The server asked a question this run cannot "
+                        "answer ('" + text + "').";
+                    return false;
+                }
+                ssh_userauth_kbdint_setanswer(ssh,
+                    static_cast<unsigned int>(i), answer.c_str());
+            }
+        }
+        if (rc == SSH_AUTH_SUCCESS)
+        {
+            return true;
+        }
+    }
+
+    if (methods & SSH_AUTH_METHOD_PASSWORD)
+    {
+        if (!options.password.empty())
+        {
+            if (ssh_userauth_password(ssh, NULL,
+                    options.password.c_str()) == SSH_AUTH_SUCCESS)
+            {
+                session.MarkPasswordUsed();
+                return true;
+            }
+        }
+        else if (console.IsInteractive())
+        {
+            std::string answer;
+            const std::string user = options.userName.empty() ?
+                CurrentUserName() : options.userName;
+            if (console.ReadPassword(
+                    Texts::PasswordPrompt(user, options.hostName), answer) &&
+                ssh_userauth_password(ssh, NULL, answer.c_str()) ==
+                    SSH_AUTH_SUCCESS)
+            {
+                session.MarkPasswordUsed();
+                return true;
+            }
+        }
+    }
+
+    const char * reason = ssh_get_error(ssh);
+    error = "Authentication failed";
+    if (!keyError.empty())
+    {
+        error += ": " + keyError;
+    }
+    else if (reason != NULL && reason[0] != '\0')
+    {
+        error += std::string(": ") + reason;
+    }
+    else if (!options.password.empty() || !options.privateKeyFile.empty())
+    {
+        error += ": the server refused the credentials offered.";
+    }
+    else
+    {
+        error += ": no password or key was offered (use -password or "
+            "-privatekey, or the LINSCP_PASSWORD variable).";
+    }
+    return false;
+}
+
+} // namespace
+
 bool Session::Open(const SessionOptions & options, std::string & error)
 {
     /*
@@ -2227,7 +2630,7 @@ bool Session::Connect(const SessionOptions & options, const char * program,
         error = "The port number must be between 1 and 65535.";
         return false;
     }
-    if (options.timeoutSecs <= 0 || options.timeoutSecs > INT_MAX / 1000)
+    if (options.timeoutSecs <= 0 || options.timeoutSecs > 3600)
     {
         error = "The connection timeout must be a positive number of seconds.";
         return false;
@@ -2237,138 +2640,185 @@ bool Session::Connect(const SessionOptions & options, const char * program,
         return false;
     }
 
+    /* OpenShell sets mShellMode before connecting; Close() clears it as
+     * part of dropping the previous channel, so carry it over. */
+    const bool shellMode = mShellMode;
     Close();
+    mShellMode = shellMode;
 
     mOptions = options;
     mUserName = options.userName;
     mPasswordUsed = false;
     mAlive = true;
+    mExitCode = INT_MAX;
     mConnectionError.clear();
     mCapturedStderr.clear();
 
-    ScpSeat * seat = new ScpSeat();
-    seat->session = this;
-    seat->vt = &seat_vtable;
-    mSeat = seat;
+    ssh_session ssh = ssh_new();
+    if (ssh == NULL)
+    {
+        error = "Cannot allocate an SSH session.";
+        mAlive = false;
+        return false;
+    }
+    mSsh = ssh;
 
-    ScpLogPolicy * logPolicy = new ScpLogPolicy();
-    logPolicy->session = this;
-    logPolicy->vt = &log_policy_vtable;
-    mLogPolicy = logPolicy;
-
-    Console::Instance().LogEvent(Texts::Translate(
-        "Preparing the session configuration"));
-    Conf * conf = conf_new();
-    do_defaults(NULL, conf);
-    Console::Instance().LogEvent(Texts::Translate(
-        "Loaded the default configuration"));
-    conf_set_int(conf, CONF_protocol, PROT_SSH);
-    conf_set_str(conf, CONF_host, mOptions.hostName.c_str());
-    conf_set_int(conf, CONF_port, mOptions.portNumber);
+    ssh_options_set(ssh, SSH_OPTIONS_HOST, mOptions.hostName.c_str());
+    unsigned int port = static_cast<unsigned int>(mOptions.portNumber);
+    ssh_options_set(ssh, SSH_OPTIONS_PORT, &port);
+    long timeout = mOptions.timeoutSecs;
+    ssh_options_set(ssh, SSH_OPTIONS_TIMEOUT, &timeout);
     if (!mOptions.userName.empty())
     {
-        conf_set_str(conf, CONF_username, mOptions.userName.c_str());
+        ssh_options_set(ssh, SSH_OPTIONS_USER, mOptions.userName.c_str());
     }
-    if (!mOptions.privateKeyFile.empty())
+    if (mOptions.verbose)
     {
-        std::string keyError;
-        const std::string keyFile = PreparePrivateKeyFile(
-            ExpandTilde(mOptions.privateKeyFile), keyError,
-            mOptions.keyPassphrase);
-        if (keyFile.empty())
-        {
-            error = keyError;
-            Close();
-            return false;
-        }
-        Filename * fileName = filename_from_str(keyFile.c_str());
-        conf_set_filename(conf, CONF_keyfile, fileName);
-        filename_free(fileName);
+        int verbosity = SSH_LOG_FUNCTIONS;
+        ssh_options_set(ssh, SSH_OPTIONS_LOG_VERBOSITY, &verbosity);
     }
-    /* Run the SFTP subsystem, like psftp does, or the given command
-     * through an 'exec' request. */
-    conf_set_bool(conf, CONF_ssh_subsys, subsystem);
-    conf_set_str(conf, CONF_remote_cmd, program);
-    conf_set_bool(conf, CONF_ssh_simple, true);
-    conf_set_bool(conf, CONF_nopty, true);
-    linscp_set_connect_timeout(mOptions.timeoutSecs);
-    conf_set_bool(conf, CONF_ssh_show_banner, true);
-    conf_set_int(conf, CONF_proxy_log_to_term, FORCE_OFF);
 
     /*
      * The proxy of the session, under the same names upstream's session
-     * settings use. PuTTY's core does the negotiation (SOCKS 4 and 5, HTTP
-     * CONNECT, a telnet command or a local command), so this is only a
-     * translation of the settings into the core's configuration.
+     * settings use. SOCKS4, SOCKS5, HTTP CONNECT and the telnet dialogue
+     * are spoken by ProxySocket() and the connected socket is handed to
+     * libssh; a 'Cmd' proxy is a command libssh runs itself. An excluded
+     * destination (or localhost, unless asked) connects directly.
      */
-    if (mOptions.proxy.Active())
+    const bool directProxy = !mOptions.proxy.Active() ||
+        ProxyExcluded(mOptions.proxy, mOptions.hostName) ||
+        (!mOptions.proxy.evenLocalhost &&
+            (mOptions.hostName == "localhost" ||
+             mOptions.hostName == "127.0.0.1" || mOptions.hostName == "::1"));
+    if (!directProxy)
     {
         const ProxySettings & proxy = mOptions.proxy;
-        int type = PROXY_NONE;
-        switch (proxy.method)
-        {
-        case ProxyMethod::Socks4: type = PROXY_SOCKS4; break;
-        case ProxyMethod::Socks5: type = PROXY_SOCKS5; break;
-        case ProxyMethod::Http:   type = PROXY_HTTP;   break;
-        case ProxyMethod::Telnet: type = PROXY_TELNET; break;
-        case ProxyMethod::Local:  type = PROXY_CMD;    break;
-        default:                  type = PROXY_NONE;   break;
-        }
-        conf_set_int(conf, CONF_proxy_type, type);
-        conf_set_str(conf, CONF_proxy_host, proxy.host.c_str());
-        conf_set_int(conf, CONF_proxy_port, proxy.EffectivePort());
-        conf_set_str(conf, CONF_proxy_username, proxy.userName.c_str());
-        conf_set_str(conf, CONF_proxy_password, proxy.password.c_str());
-        conf_set_str(conf, CONF_proxy_telnet_command, proxy.command.c_str());
-        conf_set_str(conf, CONF_proxy_exclude_list, proxy.excludeList.c_str());
-        conf_set_int(conf, CONF_proxy_dns,
-            proxy.dns == 0 ? FORCE_OFF : proxy.dns == 2 ? FORCE_ON : AUTO);
-        conf_set_bool(conf, CONF_even_proxy_localhost, proxy.evenLocalhost);
-
         Console::Instance().LogEvent(std::string("Connecting through the ") +
             ProxyMethodName(proxy.method) + " proxy " +
             (proxy.method == ProxyMethod::Local ?
                 proxy.command : proxy.host + ":" + std::to_string(proxy.EffectivePort())));
+        if (proxy.method == ProxyMethod::Local)
+        {
+            /* libssh substitutes %h and %p in a proxy command itself;
+             * translate the %host/%port spelling this client accepts. */
+            std::string command = proxy.command;
+            std::string::size_type pos;
+            while ((pos = command.find("%host")) != std::string::npos)
+            {
+                command.replace(pos, 5, "%h");
+            }
+            while ((pos = command.find("%port")) != std::string::npos)
+            {
+                command.replace(pos, 5, "%p");
+            }
+            ssh_options_set(ssh, SSH_OPTIONS_PROXYCOMMAND, command.c_str());
+        }
+        else
+        {
+            const int fd = ProxySocket(mOptions, error);
+            if (fd < 0)
+            {
+                Close();
+                return false;
+            }
+            socket_t sock = static_cast<socket_t>(fd);
+            ssh_options_set(ssh, SSH_OPTIONS_FD, &sock);
+        }
     }
-
-    mLogCtx = log_init(static_cast<LogPolicy *>(mLogPolicy), conf);
 
     Console::Instance().LogEvent(Texts::Translate(
         "Starting the SSH connection to {host}", {{"host", HostDescription()}}));
-    char * realHost = NULL;
-    Backend * backend = NULL;
-    char * initError = backend_init(&ssh_backend, static_cast<Seat *>(mSeat),
-        &backend, static_cast<LogContext *>(mLogCtx), conf,
-        mOptions.hostName.c_str(), mOptions.portNumber, &realHost, true, false);
-    conf_free(conf);
-    mBackend = backend;
-
-    if (initError != NULL)
+    if (ssh_connect(ssh) != SSH_OK)
     {
-        error = initError;
-        sfree(initError);
+        const char * reason = ssh_get_error(ssh);
+        error = reason != NULL && reason[0] != '\0' ? reason :
+            "Cannot connect to " + HostDescription() + ".";
         Close();
         return false;
     }
-    sfree(realHost);
+
+    if (!VerifyServerKey(*this, ssh, error))
+    {
+        Close();
+        return false;
+    }
+    if (!AuthenticateServer(*this, ssh, error))
+    {
+        Close();
+        return false;
+    }
+    if (mUserName.empty())
+    {
+        /* libssh connects as the local user when none is configured. */
+        mUserName = CurrentUserName();
+    }
 
     if (takeCurrent)
     {
         SetCurrentSession(this);
     }
 
-    Console::Instance().LogEvent(subsystem ?
-        "Waiting for the SSH channel to open" :
-        "Waiting for the command to start");
-    while (mAlive && !backend_sendok(static_cast<Backend *>(mBackend)))
+    if (subsystem)
     {
-        Pump();
+        /* The SFTP protocol itself is spoken by SftpClient.cpp over this
+         * subsystem channel (it needs the copy-data and check-file-name
+         * extensions, which libssh's own SFTP client cannot send). */
+        Console::Instance().LogEvent(Texts::Translate(
+            "Waiting for the SSH channel to open"));
+        ssh_channel channel = ssh_channel_new(ssh);
+        if (channel == NULL || ssh_channel_open_session(channel) != SSH_OK ||
+            ssh_channel_request_subsystem(channel, "sftp") != SSH_OK)
+        {
+            const char * reason = ssh_get_error(ssh);
+            error = reason != NULL && reason[0] != '\0' ? reason :
+                "The server did not offer an SFTP subsystem.";
+            if (channel != NULL)
+            {
+                ssh_channel_free(channel);
+            }
+            Close();
+            return false;
+        }
+        mChannel = channel;
     }
-    if (!mAlive)
+    else
     {
-        error = mConnectionError.empty() ? Texts::ConnectionClosed() : mConnectionError;
-        Close();
-        return false;
+        ssh_channel channel = ssh_channel_new(ssh);
+        if (channel == NULL || ssh_channel_open_session(channel) != SSH_OK)
+        {
+            const char * reason = ssh_get_error(ssh);
+            error = reason != NULL && reason[0] != '\0' ? reason :
+                "The server did not open a channel.";
+            if (channel != NULL)
+            {
+                ssh_channel_free(channel);
+            }
+            Close();
+            return false;
+        }
+        mChannel = channel;
+        int rc;
+        if (mShellMode)
+        {
+            rc = ssh_channel_request_pty_size(channel, "xterm-256color",
+                mShellColumns, mShellRows);
+            if (rc == SSH_OK)
+            {
+                rc = ssh_channel_request_shell(channel);
+            }
+        }
+        else
+        {
+            rc = ssh_channel_request_exec(channel, program);
+        }
+        if (rc != SSH_OK)
+        {
+            const char * reason = ssh_get_error(ssh);
+            error = reason != NULL && reason[0] != '\0' ? reason :
+                "The server refused to run the command.";
+            Close();
+            return false;
+        }
     }
 
     mOpen = true;
@@ -2377,42 +2827,63 @@ bool Session::Connect(const SessionOptions & options, const char * program,
 
 void Session::Close()
 {
-    /* A failed transfer can leave request IDs queued in the SFTP core. The
-     * connection is being discarded, so release that state before another
-     * session can start reusing it. */
+    /* libssh keeps no SFTP request bookkeeping to release, but the call
+     * keeps the SFTP client's error state tidy for the next session. */
     lscp_sftp_cleanup();
     if (g_currentSession == this)
     {
         SetCurrentSession(NULL);
     }
-    if (mBackend != NULL)
+    if (mSftp != NULL)
     {
-        backend_free(static_cast<Backend *>(mBackend));
-        mBackend = NULL;
+        sftp_free(static_cast<sftp_session>(mSftp));
+        mSftp = NULL;
     }
-    if (mLogCtx != NULL)
+    if (mChannel != NULL)
     {
-        log_free(static_cast<LogContext *>(mLogCtx));
-        mLogCtx = NULL;
+        ssh_channel channel = static_cast<ssh_channel>(mChannel);
+        ssh_channel_close(channel);
+        ssh_channel_free(channel);
+        mChannel = NULL;
     }
-    if (mSeat != NULL)
+    if (mSsh != NULL)
     {
-        delete static_cast<ScpSeat *>(mSeat);
-        mSeat = NULL;
+        ssh_disconnect(static_cast<ssh_session>(mSsh));
+        ssh_free(static_cast<ssh_session>(mSsh));
+        mSsh = NULL;
     }
-    if (mLogPolicy != NULL)
-    {
-        delete static_cast<ScpLogPolicy *>(mLogPolicy);
-        mLogPolicy = NULL;
-    }
-    /* A key file imported from the OpenSSH format is only needed while
-     * the session is open. */
-    DiscardImportedPrivateKeyFile();
+    mShellMode = false;
     mReceived.clear();
     mReceivedStart = 0;
     mReceivedEnd = 0;
     mOpen = false;
     mAlive = false;
+}
+
+bool Session::OpenShell(const SessionOptions & options, int columns,
+    int rows, std::string & error)
+{
+    mShellMode = true;
+    mShellColumns = columns > 0 ? columns : 80;
+    mShellRows = rows > 0 ? rows : 24;
+    const bool opened = Connect(options, "", false, false, error);
+    if (!opened)
+    {
+        mShellMode = false;
+    }
+    return opened;
+}
+
+bool Session::ShellResize(int columns, int rows)
+{
+    if (mChannel == NULL || !mShellMode)
+    {
+        return false;
+    }
+    mShellColumns = columns;
+    mShellRows = rows;
+    return ssh_channel_change_pty_size(static_cast<ssh_channel>(mChannel),
+        columns, rows) == SSH_OK;
 }
 
 namespace {
@@ -2427,11 +2898,7 @@ void ExecOutputSink(void * ctx, const char * data, size_t len)
 
 int Session::ExitCode() const
 {
-    if (mBackend == NULL)
-    {
-        return -1;
-    }
-    return backend_exitcode(static_cast<Backend *>(mBackend));
+    return mExitCode;
 }
 
 bool Session::OpenExec(const SessionOptions & options,

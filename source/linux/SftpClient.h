@@ -1,13 +1,12 @@
 /*
  * SftpClient: the SFTP protocol operations of the POSIX front end.
  *
- * This module is compiled as C on purpose: it drives libs/putty/ssh/sftp.c,
- * whose header uses `new' as a structure member name (SftpServerVtable::new)
- * and therefore cannot be included from C++. The front end gets a plain C
- * API with none of the PuTTY types in it.
- *
- * The transport (sftp_senddata/sftp_recvdata/sftp_sendbuffer) is provided
- * by PuttyGlue.cpp, which forwards to the open Session.
+ * The SFTP v3 wire protocol is spoken by SftpClient.cpp directly -
+ * including the OpenSSH copy-data and check-file-name extensions, for
+ * which libssh's own SFTP client has no API - over the libssh subsystem
+ * channel owned by Session. The front end gets this plain C API, with no
+ * libssh types in it; the byte transport is Session::SendData and
+ * Session::ReceiveData on the current session.
  */
 
 #ifndef LINSCP_SFTPCLIENT_H

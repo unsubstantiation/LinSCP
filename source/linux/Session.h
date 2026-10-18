@@ -1,9 +1,10 @@
 /*
- * Session: one SSH connection to an SFTP server, driving the shared
- * PuTTY core (source/putty) through its Seat and LogPolicy traits.
+ * Session: one SSH connection to an SFTP server, driving libssh
+ * (ssh_session / ssh_channel / sftp_session, held as void * so this
+ * header stays free of the library's types).
  *
  * The console client keeps exactly one session at a time; the SFTP
- * transport glue in PuttyGlue.cpp reaches it through CurrentSession().
+ * client in SftpClient.cpp reaches it through CurrentSession().
  */
 
 #ifndef LINSCP_SESSION_H
@@ -296,8 +297,10 @@ public:
     void SetDavEtag(const std::string & remotePath, const std::string & ifMatch,
         const std::string & ifNoneMatch);
     void ClearDavEtag(const std::string & remotePath);
-    /* struct Seat *, for get_log_seat(). */
-    void * SeatHandle() const { return mSeat; }
+    /* struct ssh_session_s * / struct sftp_session_struct *, for the
+     * SFTP client and the key helpers. */
+    void * SshHandle() const { return mSsh; }
+    void * SftpHandle() const { return mSftp; }
     const std::string & ConnectionError() const { return mConnectionError; }
     int ExitCode() const;
     std::string UserName() const;
@@ -361,7 +364,19 @@ public:
     bool PasswordUsed() const { return mPasswordUsed; }
     void MarkPasswordUsed() { mPasswordUsed = true; }
 
-    /* Host key policy, used by the seat's confirm_ssh_host_key. */
+    /*
+     * An interactive shell on the server: a channel with a PTY, for the
+     * embedded terminal of the graphical client (and the '-shell' mode
+     * of the console client, which is what the GUI spawns). Output of
+     * both the channel's stdout and stderr goes to the output sink (see
+     * SetOutputSink); input goes through SendData; Pump() reads what is
+     * available. OpenShell connects a session of its own, like OpenExec.
+     */
+    bool OpenShell(const SessionOptions & options, int columns, int rows,
+        std::string & error);
+    bool ShellResize(int columns, int rows);
+
+    /* Host key policy, used when the transport verifies the server key. */
     bool HostKeyMatches(const std::string & fingerprint) const;
     bool AcceptAnyHostKey() const { return mOptions.hostKey == "*"; }
     bool ExpectHostKey() const { return !mOptions.hostKey.empty() && mOptions.hostKey != "*"; }
@@ -374,10 +389,13 @@ private:
     bool TakeReceivedData(char * buffer, size_t len);
 
     SessionOptions mOptions;
-    void * mSeat;              /* struct Seat * */
-    void * mLogPolicy;         /* struct LogPolicy * */
-    void * mLogCtx;            /* struct LogContext * */
-    void * mBackend;           /* struct Backend * */
+    void * mSsh;               /* struct ssh_session_s * */
+    void * mChannel;           /* struct ssh_channel_s * (exec/shell) */
+    void * mSftp;              /* struct sftp_session_struct * */
+    int mExitCode;             /* channel exit status; INT_MAX: none yet */
+    bool mShellMode;           /* channel is a PTY shell: stderr merges */
+    int mShellColumns;         /* PTY size of a shell channel */
+    int mShellRows;
     bool mOpen;
     bool mAlive;
     std::string mConnectionError;

@@ -17,7 +17,12 @@
 #include "Session.h"
 #include "Texts.h"
 
-#include "PuttyCompat.h"
+#include <csignal>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+#include <unistd.h>
+
 
 namespace {
 
@@ -64,6 +69,129 @@ bool ParsePositiveInteger(const char * text, int maximum, int * result)
     return true;
 }
 
+/* The remote shell's output goes to stdout exactly as it arrived: this
+ * mode is a byte pipe with a PTY on the far end, which is what the
+ * graphical client's embedded terminal spawns. */
+void ShellOutputSink(void * ctx, const char * data, size_t len)
+{
+    (void)ctx;
+    fwrite(data, 1, len, stdout);
+    fflush(stdout);
+}
+
+volatile sig_atomic_t g_windowChanged = 0;
+
+void OnWindowChanged(int)
+{
+    g_windowChanged = 1;
+}
+
+int TerminalColumns()
+{
+    struct winsize size;
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col > 0)
+    {
+        return size.ws_col;
+    }
+    return 80;
+}
+
+int TerminalRows()
+{
+    struct winsize size;
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_row > 0)
+    {
+        return size.ws_row;
+    }
+    return 24;
+}
+
+/*
+ * 'linscp -shell sftp://user@host/': an interactive shell on the server
+ * with stdin/stdout as a raw byte pipe. The graphical client runs this
+ * behind a pseudo-terminal and renders it with xterm.js; run from a
+ * real terminal it behaves like ssh without the file commands. The
+ * exit status is the shell's.
+ */
+int RunShell(linscp::SessionOptions options, const std::string & url,
+    linscp::Console & console)
+{
+    std::string error;
+    if (!linscp::ParseSiteUrl(url, options, error))
+    {
+        console.Error(error);
+        return 1;
+    }
+    if (!linscp::UseNativeSftp(options.protocol) &&
+        !linscp::UseNativeScp(options.protocol))
+    {
+        console.Error(linscp::Texts::Translate(
+            "A shell is only available for SSH (sftp:// or scp://) "
+            "sessions, not for '{protocol}'.",
+            {{"protocol", options.protocol}}));
+        return 1;
+    }
+    options.protocol = "sftp";
+
+    linscp::Session session;
+    session.SetOutputSink(ShellOutputSink, NULL);
+    if (!session.OpenShell(options, TerminalColumns(), TerminalRows(), error))
+    {
+        console.Error(error);
+        return 1;
+    }
+
+    /* Raw mode on a real terminal: the server side echoes and edits. */
+    struct termios original;
+    const bool rawMode = tcgetattr(STDIN_FILENO, &original) == 0;
+    if (rawMode)
+    {
+        struct termios raw = original;
+        cfmakeraw(&raw);
+        tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = OnWindowChanged;
+        sigaction(SIGWINCH, &action, NULL);
+    }
+
+    bool inputOpen = true;
+    while (session.IsAlive())
+    {
+        if (g_windowChanged)
+        {
+            g_windowChanged = 0;
+            session.ShellResize(TerminalColumns(), TerminalRows());
+        }
+        struct pollfd fds[1];
+        fds[0].fd = STDIN_FILENO;
+        fds[0].events = POLLIN;
+        const int ready = poll(fds, inputOpen ? 1 : 0, 20);
+        if (ready > 0 && (fds[0].revents & (POLLIN | POLLHUP | POLLERR)))
+        {
+            char buffer[4096];
+            const ssize_t got = read(STDIN_FILENO, buffer, sizeof(buffer));
+            if (got <= 0)
+            {
+                inputOpen = false;
+                session.SendEof();
+            }
+            else if (!session.SendData(buffer, static_cast<size_t>(got)))
+            {
+                break;
+            }
+        }
+        session.Pump();
+    }
+    const int exitCode = session.ExitCode();
+    session.Close();
+    if (rawMode)
+    {
+        tcsetattr(STDIN_FILENO, TCSANOW, &original);
+    }
+    return exitCode == INT_MAX ? 1 : exitCode;
+}
+
 } // namespace
 
 int main(int argc, char ** argv)
@@ -82,6 +210,7 @@ int main(int argc, char ** argv)
     bool batch = false;
     bool launchGui = false;
     bool serverMode = false;
+    bool shellMode = false;
     bool help = false;
     bool version = false;
     bool scriptSpecified = false;
@@ -180,6 +309,10 @@ int main(int argc, char ** argv)
         {
             serverMode = true;
         }
+        else if (strcmp(arg, "-shell") == 0 || strcmp(arg, "--shell") == 0)
+        {
+            shellMode = true;
+        }
         else if (strcmp(arg, "-verbose") == 0)
         {
             options.verbose = true;
@@ -234,6 +367,16 @@ int main(int argc, char ** argv)
     if (serverMode && (scriptSpecified || commandSpecified))
     {
         console.Error(linscp::Texts::Translate("-server reads commands from standard input and cannot be combined with -script or -command."));
+        return 1;
+    }
+    if (shellMode && (scriptSpecified || commandSpecified || serverMode))
+    {
+        console.Error(linscp::Texts::Translate("-shell opens an interactive shell on the site given as the argument and cannot be combined with -script, -command or -server."));
+        return 1;
+    }
+    if (shellMode && url.empty())
+    {
+        console.Error(linscp::Texts::Translate("-shell requires a site URL, for example sftp://user@example.com/."));
         return 1;
     }
     if (scriptSpecified && commandSpecified)
@@ -293,19 +436,16 @@ int main(int argc, char ** argv)
     console.SetBatchMode(batch);
     console.SetVerbose(options.verbose);
 
-    /* The platform layer of the PuTTY core needs these before any socket
-     * or file descriptor is registered, and before any critical section
-     * can be taken. */
-    linscp_platform_init();
-    sk_init();
-    uxsel_init();
-
     linscp::Script script;
     script.SetDefaults(options);
     script.SetScriptParameters(parameters);
 
     int result;
-    if (serverMode)
+    if (shellMode)
+    {
+        result = RunShell(options, url, console);
+    }
+    else if (serverMode)
     {
         result = script.RunServer();
     }
@@ -328,6 +468,5 @@ int main(int argc, char ** argv)
         result = script.RunInteractive(url);
     }
 
-    sk_cleanup();
     return result;
 }

@@ -19,12 +19,10 @@ Comment:
  grant the rights Debian's Social Contract requires, and in particular it does
  not permit commercial use or redistribution for commercial purposes.
 
-Files: source/putty/* libs/putty/*
-Copyright: 1997-2026 Simon Tatham and the PuTTY contributors
+Files: source/gui/web/vendor/*
+Copyright: 2017-2019 the xterm.js authors; 2014-2016 SourceLair Private
+ Company; 2012-2013 Christopher Jeffrey
 License: MIT
- The PuTTY distribution as a whole is copyright Simon Tatham and
- contributors, and is licensed under the MIT licence:
- .
  Permission is hereby granted, free of charge, to any person obtaining a
  copy of this software and associated documentation files (the "Software"),
  to deal in the Software without restriction, including without limitation
@@ -43,7 +41,7 @@ License: MIT
  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  DEALINGS IN THE SOFTWARE.
  .
- The same notice is kept in libs/putty/LICENCE and source/putty/LICENCE.
+ The same notice is kept in source/gui/web/vendor/LICENSE-xterm.txt.
 
 Files: logo/* debian/linscp.png debian/linscp.svg source/gui/web/favicon.png
  source/gui/web/icon.svg

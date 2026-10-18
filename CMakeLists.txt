@@ -7,9 +7,11 @@
 # Makefile, `make -C source/linux`, which produces the same binary; this
 # file exists so that the CMake/CTest workflow is available as well.
 #
-# SFTP is served by the native PuTTY engine: the platform-neutral core in
-# source/putty plus the POSIX platform layer vendored from upstream PuTTY
-# in libs/putty/unix. Every other protocol goes through the curl backend
+# SSH, SFTP and SCP are served by libssh: the transport, authentication
+# and host key policy live in source/linux/Session.cpp, and the SFTP v3
+# protocol itself (including the copy-data and check-file-name
+# extensions) is spoken by source/linux/SftpClient.cpp over a libssh
+# subsystem channel. Every other protocol goes through the curl backend
 # in source/linux/ProtocolClient.cpp.
 
 # 3.25 is Debian 13 (trixie), the oldest release this project supports.
@@ -30,18 +32,6 @@ set(CMAKE_C_STANDARD 99)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
-
-# The vendored PuTTY core (and the Makefile build) is compiled without
-# NDEBUG: parts of the core sit behind assert-enabled code paths, and
-# defining NDEBUG changes which code is generated (it even leaves an
-# undefined ltime reference in logging.c). Strip it to match the
-# supported Makefile build exactly.
-foreach(lang C CXX)
-  foreach(config RELEASE RELWITHDEBINFO MINSIZEREL)
-    string(REPLACE "-DNDEBUG" "" CMAKE_${lang}_FLAGS_${config}
-      "${CMAKE_${lang}_FLAGS_${config}}")
-  endforeach()
-endforeach()
 
 set(FRONTEND source/linux)
 
@@ -66,8 +56,8 @@ set(FRONTEND_SOURCES
   ${FRONTEND}/Platform.cpp
   ${FRONTEND}/Texts.cpp
   ${FRONTEND}/TextMode.cpp
-  ${FRONTEND}/PuttyGlue.cpp
-  ${FRONTEND}/SftpClient.c
+  ${FRONTEND}/SshKeys.cpp
+  ${FRONTEND}/SftpClient.cpp
   ${FRONTEND}/HashUtil.c
 )
 
@@ -77,17 +67,10 @@ target_include_directories(linscp-frontend PUBLIC ${FRONTEND})
 add_executable(linscp ${FRONTEND}/main.cpp)
 target_link_libraries(linscp PRIVATE linscp-frontend)
 
-# Maintainer utility for regenerating and validating PuTTY's checked-in
-# single-byte charset tables. It is not installed or needed at runtime.
-add_executable(sbcsgen libs/putty/charset/sbcsgen.cpp)
-
 enable_testing()
 add_executable(linscp-unittest ${FRONTEND}/tests/UnitTest.cpp)
 target_link_libraries(linscp-unittest PRIVATE linscp-frontend)
 add_test(NAME unit-tests COMMAND linscp-unittest)
-add_test(NAME charset-generator COMMAND sbcsgen --check
-  --input ${CMAKE_CURRENT_SOURCE_DIR}/libs/putty/charset/sbcs.dat
-  --expected ${CMAKE_CURRENT_SOURCE_DIR}/libs/putty/charset/sbcsdat.c)
 
 # Server-free script regressions and the offline upstream gap inventory.
 # Python is optional for a C++-only build; CI always provides it.
@@ -183,64 +166,15 @@ if(NODE_EXECUTABLE)
   endif()
 endif()
 
-# ---- PuTTY core + POSIX platform layer (mirrors source/linux/Makefile) ----
-file(GLOB_RECURSE PUTTY_CORE_SOURCES CONFIGURE_DEPENDS
-  ${CMAKE_CURRENT_SOURCE_DIR}/source/putty/*.c)
-list(REMOVE_ITEM PUTTY_CORE_SOURCES
-  ${CMAKE_CURRENT_SOURCE_DIR}/source/putty/ssh/nosharing.c)
+# ---- libssh + OpenSSL (SSH/SFTP/SCP transport and hashes) ---------------
+find_package(ZLIB REQUIRED)
+find_package(libssh REQUIRED)
+find_package(OpenSSL REQUIRED)
+target_link_libraries(linscp-frontend PUBLIC ssh OpenSSL::Crypto)
 
-file(GLOB PUTTY_UNIX_SOURCES CONFIGURE_DEPENDS
-  ${CMAKE_CURRENT_SOURCE_DIR}/libs/putty/unix/*.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/libs/putty/unix/utils/*.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/libs/putty/unix/stubs/*.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/libs/putty/utils/*.c)
-file(GLOB PUTTY_CHARSET_SOURCES CONFIGURE_DEPENDS
-  ${CMAKE_CURRENT_SOURCE_DIR}/libs/putty/charset/*.c)
-list(REMOVE_ITEM PUTTY_CHARSET_SOURCES
-  ${CMAKE_CURRENT_SOURCE_DIR}/libs/putty/charset/enum.c)
-
-add_library(putty STATIC
-  ${PUTTY_CORE_SOURCES}
-  ${PUTTY_UNIX_SOURCES}
-  ${PUTTY_CHARSET_SOURCES}
-  ${CMAKE_CURRENT_SOURCE_DIR}/libs/putty/ssh/sftp.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/libs/putty/ssh/sftpcommon.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/libs/putty/psftpcommon.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/libs/putty/pinger.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/libs/putty/timing.c)
-
-target_compile_definitions(putty PRIVATE
-  FORK_BUILD MPEXT PLATFORM_HAS_SMEMCLR NO_GSSAPI
-  HAVE_AES_NI=0 HAVE_SHA_NI=0 HAVE_CLMUL=0
-  HAVE_NEON_CRYPTO=0 HAVE_NEON_PMULL=0 HAVE_NEON_SHA512=0
-  HAVE_SYS_TYPES_H=1 HAVE_SYS_STAT_H=1 HAVE_SYS_TIME_H=1
-  HAVE_SYS_SELECT_H=1 HAVE_SYS_SOCKET_H=1 HAVE_SYS_IOCTL_H=1
-  HAVE_SYS_UN_H=1 HAVE_SYS_UIO_H=1 HAVE_NETDB_H=1 HAVE_NETINET_IN_H=1
-  HAVE_ARPA_INET_H=1 HAVE_POLL_H=1 HAVE_FCNTL_H=1 HAVE_TERMIOS_H=1
-  HAVE_UNISTD_H=1 HAVE_PWD_H=1 HAVE_GLOB_H=1 HAVE_POLL=1
-  HAVE_CLOCK_GETTIME=1 HAVE_CLOCK_MONOTONIC=1 HAVE_SETPWENT=1
-  HAVE_ENDPWENT=1 HAVE_FUTIMES=1 HAVE_GETADDRINFO=1 HAVE_UTIMES=1
-  HAVE_SYSCTLBYNAME=0 HAVE_SO_PEERCRED=1 HAVE_GETAUXVAL=1
-  HAVE_SYS_AUXV_H=1 HAVE_ASM_HWCAP_H=1 HAVE_ELF_AUX_INFO=0
-  HAVE_SYS_SYSCTL_H=0)
-target_compile_definitions(putty PUBLIC _FILE_OFFSET_BITS=64)
-set_source_files_properties(
-  ${CMAKE_CURRENT_SOURCE_DIR}/source/putty/be_list.c
-  PROPERTIES COMPILE_DEFINITIONS APPNAME=LinSCP)
-target_include_directories(putty PUBLIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/source/putty
-  ${CMAKE_CURRENT_SOURCE_DIR}/libs/putty/unix
-  ${CMAKE_CURRENT_SOURCE_DIR}/libs/putty
-  ${CMAKE_CURRENT_SOURCE_DIR}/libs/putty/charset)
-
-find_package(Threads REQUIRED)
-target_link_libraries(putty PUBLIC Threads::Threads)
-target_link_libraries(linscp-frontend PUBLIC putty)
-target_compile_definitions(linscp-frontend PRIVATE
-  FORK_BUILD MPEXT PLATFORM_HAS_SMEMCLR NO_GSSAPI
-  HAVE_AES_NI=0 HAVE_SHA_NI=0 HAVE_CLMUL=0
-  HAVE_NEON_CRYPTO=0 HAVE_NEON_PMULL=0 HAVE_NEON_SHA512=0)
-
+# GSSAPI stays compiled out, as in the Makefile build: libssh may have
+# it, but this client's settings refuse it by name (see SshTunnel.cpp).
+target_compile_definitions(linscp-frontend PRIVATE NO_GSSAPI)
 target_compile_options(linscp-frontend PRIVATE -Wall)
 
 # ---- install -------------------------------------------------------------
