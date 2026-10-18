@@ -2,7 +2,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-11 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+9 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -92,19 +92,6 @@ English/Spanish catalogs cover the browser interface (menus, dialogs, help, ARIA
 - [ ] Add coverage checks that detect new uncatalogued messages and run translated positive/negative CLI workflows, including help, synchronization, editing, sessions and transfer failures.
 - [ ] Preserve host-key refusal behavior, machine protocol values and secret masking; review security-warning translations before adding more supported locales.
 
-## ftp.non-unix-listings
-
-**Area:** FTP/FTPS · **Status:** missing
-
-The shared LIST parser accepts Unix long listings. MLSD provides a structured alternative, but DOS/VMS and other non-Unix LIST dialects have no parser.
-
-**Next:** Implement the non-Unix LIST formats selected for support without treating an unparsed directory as empty.
-
-**Acceptance criteria:**
-
-- [ ] Add fixture-based DOS/VMS listing cases with spaces, date/size variants and directory types, plus malformed-input rejection.
-- [ ] Exercise LIST fallback against live servers that emit the supported formats; document formats still unsupported.
-
 ## s3.versioned-objects
 
 **Area:** Amazon S3 · **Status:** missing
@@ -117,19 +104,6 @@ The client manages current bucket objects; it does not expose version IDs, versi
 
 - [ ] Test version listing with pagination and exact version-specific reads against a versioned S3 endpoint.
 - [ ] Test deletion of a named version versus creation/removal of delete markers without losing unrelated versions.
-
-## editing.non-utf8-encodings
-
-**Area:** Editing/search · **Status:** missing
-
-The browser editor/search require UTF-8. CLI editing supports EOL/BOM preservation, but there is no explicit legacy-encoding selection or transcoding policy.
-
-**Next:** Add an explicit encoding contract and conversion implementation for any supported non-UTF-8 encodings.
-
-**Acceptance criteria:**
-
-- [ ] Round-trip each supported encoding through CLI and browser editing with byte-exact fixtures and a documented BOM/EOL policy.
-- [ ] Reject invalid input or unrepresentable output without replacing bytes silently or overwriting the original file.
 
 ## automation.upstream-xml-compatibility
 

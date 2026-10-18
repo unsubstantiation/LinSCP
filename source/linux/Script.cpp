@@ -915,6 +915,21 @@ int Script::RemotePut(const std::string & local, const std::string & remote,
     {
         res = ProtocolClient::Put(mSession.Options(), local, remote, permissions,
             resumeOffset, preserveTime, size, progress, ctx, error, mSpeedLimit);
+        if (res == 0 && ProtocolClient::IsDavProtocol(mSession.Options().protocol))
+        {
+            // A successful write changes the resource's ETag on the server,
+            // so the precondition recorded for the previous version is now
+            // stale. Clear it so the next write is unconditional unless the
+            // user explicitly records the new tag with 'etag -get' and
+            // 'etag -match=' again; leaving a stale tag would make the
+            // next upload fail with 412 even though the user did not ask
+            // to guard it.
+            if (mSession.Options().davEtags.find(remote) !=
+                mSession.Options().davEtags.end())
+            {
+                mSession.ClearDavEtag(remote);
+            }
+        }
     }
     Console::Instance().LogAction("upload",
         "filename=\"" + Console::EscapeActionText(local) +
@@ -1084,6 +1099,14 @@ int Script::RemoteRemove(const std::string & path, std::string & error)
     {
         res = ProtocolClient::Remove(mSession.Options(), path, error);
     }
+    if (res == 0 && ProtocolClient::IsDavProtocol(mSession.Options().protocol))
+    {
+        if (mSession.Options().davEtags.find(path) !=
+            mSession.Options().davEtags.end())
+        {
+            mSession.ClearDavEtag(path);
+        }
+    }
     Console::Instance().LogAction("rm",
         "filename=\"" + Console::EscapeActionText(path) +
         "\" result=\"" + (res == 0 ? "ok" : "failed") + "\"");
@@ -1105,6 +1128,14 @@ int Script::RemoteRemoveDir(const std::string & path, std::string & error)
     else
     {
         res = ProtocolClient::RemoveDir(mSession.Options(), path, error);
+    }
+    if (res == 0 && ProtocolClient::IsDavProtocol(mSession.Options().protocol))
+    {
+        if (mSession.Options().davEtags.find(path) !=
+            mSession.Options().davEtags.end())
+        {
+            mSession.ClearDavEtag(path);
+        }
     }
     Console::Instance().LogAction("rm",
         "filename=\"" + Console::EscapeActionText(path) +

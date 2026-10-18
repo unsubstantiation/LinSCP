@@ -49,6 +49,21 @@ function Find-LinScpBinary {
     throw "linscp binary not found. Install LinSCP or add it to PATH."
 }
 
+function ConvertTo-LScpArgument {
+    <#
+    .SYNOPSIS
+        Escapes a value for the LinSCP command splitter.
+    #>
+    param([string]$Value)
+    if ($null -eq $Value) { return '""' }
+    if ($Value -match "[\x00-\x1F\x7F]") {
+        throw "Value contains a control character and cannot be safely quoted."
+    }
+    if ($Value -notmatch '[ \t\"'';\\]') { return $Value }
+    $escaped = $Value -replace '\\', '\\' -replace '"', '\"'
+    return '"' + $escaped + '"'
+}
+
 function Invoke-LinScp {
     <#
     .SYNOPSIS
@@ -61,7 +76,14 @@ function Invoke-LinScp {
     $bin = Find-LinScpBinary
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $bin
-    $psi.Arguments = ($Arguments -join " ")
+    # Use ArgumentList when available (pwsh 7+ on .NET Core) to avoid shell
+    # interpolation; fall back to manual quoting for older hosts.
+    if ($psi.PSObject.Properties.Match('ArgumentList').Count -gt 0) {
+        $psi.ArgumentList.Clear()
+        foreach ($a in $Arguments) { $psi.ArgumentList.Add($a) }
+    } else {
+        $psi.Arguments = ($Arguments | ForEach-Object { ConvertTo-LScpArgument $_ }) -join " "
+    }
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
@@ -124,11 +146,13 @@ function Open-LScpSession {
         Stdout  = $proc.StandardOutput
     }
 
-    # Build the open command.
-    $openCmd = "open $Url"
-    if ($Password) { $openCmd += " -password=$Password" }
-    if ($HostKey)  { $openCmd += " -hostkey=$HostKey" }
-    if ($PrivateKey) { $openCmd += " -privatekey=$PrivateKey" }
+    # Build the open command with proper quoting so a URL or password
+    # holding spaces, semicolons or quotes does not become a second
+    # command when the server splits on ';' and quotes.
+    $openCmd = "open $(ConvertTo-LScpArgument $Url)"
+    if ($Password) { $openCmd += " -password=$(ConvertTo-LScpArgument $Password)" }
+    if ($HostKey)  { $openCmd += " -hostkey=$(ConvertTo-LScpArgument $HostKey)" }
+    if ($PrivateKey) { $openCmd += " -privatekey=$(ConvertTo-LScpArgument $PrivateKey)" }
 
     $session.Stdin.WriteLine($openCmd)
     $session.Stdin.Flush()
@@ -182,7 +206,7 @@ function Get-LScpItem {
         [string]$LocalPath,
         [switch]$PreserveTime
     )
-    $cmd = "get `"$RemotePath`" `"$LocalPath`""
+    $cmd = "get $(ConvertTo-LScpArgument $RemotePath) $(ConvertTo-LScpArgument $LocalPath)"
     if ($PreserveTime) { $cmd += " -preservetime" }
     $Session.Stdin.WriteLine($cmd)
     $Session.Stdin.Flush()
@@ -208,7 +232,7 @@ function Send-LScpItem {
         [string]$RemotePath,
         [switch]$PreserveTime
     )
-    $cmd = "put `"$LocalPath`" `"$RemotePath`""
+    $cmd = "put $(ConvertTo-LScpArgument $LocalPath) $(ConvertTo-LScpArgument $RemotePath)"
     if ($PreserveTime) { $cmd += " -preservetime" }
     $Session.Stdin.WriteLine($cmd)
     $Session.Stdin.Flush()
@@ -231,7 +255,7 @@ function Get-LScpDirectory {
         [string]$RemotePath
     )
     $cmd = "ls"
-    if ($RemotePath) { $cmd += " `"$RemotePath`"" }
+    if ($RemotePath) { $cmd += " $(ConvertTo-LScpArgument $RemotePath)" }
     $Session.Stdin.WriteLine($cmd)
     $Session.Stdin.Flush()
     $lines = @()
@@ -258,9 +282,12 @@ function Sync-LScpDirectory {
         [switch]$Delete,
         [switch]$Preview
     )
+    if ($Direction -notin @('local','remote','both')) {
+        throw "Direction must be local, remote or both."
+    }
     $cmd = "synchronize $Direction"
-    if ($LocalDir) { $cmd += " `"$LocalDir`"" }
-    if ($RemoteDir) { $cmd += " `"$RemoteDir`"" }
+    if ($LocalDir) { $cmd += " $(ConvertTo-LScpArgument $LocalDir)" }
+    if ($RemoteDir) { $cmd += " $(ConvertTo-LScpArgument $RemoteDir)" }
     if ($Delete) { $cmd += " -delete" }
     if ($Preview) { $cmd += " -preview" }
     $Session.Stdin.WriteLine($cmd)
