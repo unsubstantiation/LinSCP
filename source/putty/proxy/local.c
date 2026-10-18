@@ -269,5 +269,5 @@ void local_proxy_opener_set_socket(DeferredSocketOpener *opener,
     assert(opener->vt == &LocalProxyOpener_openervt);
     LocalProxyOpener *lp = container_of(opener, LocalProxyOpener, opener);
     lp->socket = socket;
-    queue_toplevel_callback(get_callback_set(lp->plug), local_proxy_opener_coroutine, lp);
+    queue_toplevel_callback(local_proxy_opener_coroutine, lp);
 }

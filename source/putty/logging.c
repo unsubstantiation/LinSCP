@@ -11,30 +11,20 @@
 
 #include "putty.h"
 
-// #define FORK_LOG_PACKETS
-
 /* log session to file stuff ... */
 struct LogContext {
-#ifndef FORK_BUILD
     FILE *lgfp;
     enum { L_CLOSED, L_OPENING, L_OPEN, L_ERROR } state;
     bufchain queue;
     Filename *currlogfilename;
-#endif
     LogPolicy *lp;
-#ifndef FORK_BUILD
     Conf *conf;
-#endif
     int logtype;                       /* cached out of conf */
 };
-
-#ifndef FORK_BUILD
 
 static Filename *xlatlognam(const Filename *s,
                             const char *hostname, int port,
                             const struct tm *tm);
-
-#endif
 
 /*
  * Internal wrapper function which must be called for _all_ output
@@ -44,12 +34,6 @@ static Filename *xlatlognam(const Filename *s,
  */
 static void logwrite(LogContext *ctx, ptrlen data)
 {
-#if defined(FORK_LOG_PACKETS)
-    // FORK_BUILD: All out uses of logwrite call it with ptrlen_from_asciz, so it's safe to ignore data.len
-    ctx->lp->vt->eventlog(ctx->lp, data.ptr);
-#elif defined(FORK_BUILD)
-    assert(false);
-#else
     /*
      * In state L_CLOSED, we call logfopen, which will set the state
      * to one of L_OPENING, L_OPEN or L_ERROR. Hence we process all of
@@ -69,7 +53,6 @@ static void logwrite(LogContext *ctx, ptrlen data)
                         "due to error while writing");
         }
     }                                  /* else L_ERROR, so ignore the write */
-#endif
 }
 
 /*
@@ -80,10 +63,6 @@ static PRINTF_LIKE(2, 3) void logprintf(LogContext *ctx, const char *fmt, ...)
 {
     va_list ap;
     char *data;
-
-#ifndef FORK_LOG_PACKETS
-    assert(false);
-#endif
 
     va_start(ap, fmt);
     data = dupvprintf(fmt, ap);
@@ -98,19 +77,15 @@ static PRINTF_LIKE(2, 3) void logprintf(LogContext *ctx, const char *fmt, ...)
  */
 void logflush(LogContext *ctx)
 {
-#ifndef FORK_BUILD
     if (ctx->logtype > 0)
         if (ctx->state == L_OPEN)
             fflush(ctx->lgfp);
-#endif
 }
 
 LogPolicy *log_get_policy(LogContext *ctx)
 {
     return ctx->lp;
 }
-
-#ifndef FORK_BUILD
 
 static void logfopen_callback(void *vctx, int mode)
 {
@@ -141,7 +116,7 @@ static void logfopen_callback(void *vctx, int mode)
                   " =~=~=~=~=~=~=~=~=~=~=~=\r\n", buf);
     }
 
-    event = dupprintf(FORK_BOM "%s session log (%s mode) to file: %s",
+    event = dupprintf("%s session log (%s mode) to file: %s",
                       ctx->state == L_ERROR ?
                       (mode == 0 ? "Disabled writing" : "Error writing") :
                       (mode == 1 ? "Appending" : "Writing new"),
@@ -238,8 +213,6 @@ void logtraffic(LogContext *ctx, unsigned char c, int logmode)
     }
 }
 
-#endif
-
 static void logevent_internal(LogContext *ctx, const char *event)
 {
     if (ctx->logtype == LGTYP_PACKETS || ctx->logtype == LGTYP_SSHRAW) {
@@ -296,18 +269,14 @@ void log_packet(LogContext *ctx, int direction, int type,
     size_t p = 0, b = 0, omitted = 0;
     int output_pos = 0; /* NZ if pending output in dumpdata */
 
-#ifndef FORK_LOG_PACKETS
     if (!(ctx->logtype == LGTYP_SSHRAW ||
           (ctx->logtype == LGTYP_PACKETS && texttype)))
         return;
 
-    assert(false);
-#endif
-
     /* Packet header. */
     if (texttype) {
-        logprintf(ctx, "%s packet len=%d ",
-                  direction == PKT_INCOMING ? "Incoming" : "Outgoing", (int)len);
+        logprintf(ctx, "%s packet ",
+                  direction == PKT_INCOMING ? "Incoming" : "Outgoing");
 
         if (seq)
             logprintf(ctx, "#0x%lx, ", *seq);
@@ -413,47 +382,29 @@ void log_packet(LogContext *ctx, int direction, int type,
 LogContext *log_init(LogPolicy *lp, Conf *conf)
 {
     LogContext *ctx = snew(LogContext);
-#ifndef FORK_BUILD
     ctx->lgfp = NULL;
     ctx->state = L_CLOSED;
-#endif
     ctx->lp = lp;
-#ifndef FORK_BUILD
     ctx->conf = conf_copy(conf);
-#endif
-    ctx->logtype = conf_get_int(conf, CONF_logtype);
-#ifndef FORK_BUILD
+    ctx->logtype = conf_get_int(ctx->conf, CONF_logtype);
     ctx->currlogfilename = NULL;
     bufchain_init(&ctx->queue);
-#endif
     return ctx;
-}
-
-// FORK_BUILD
-LogPolicy *log_get_logpolicy(LogContext *ctx)
-{
-    return ctx->lp;
 }
 
 void log_free(LogContext *ctx)
 {
-#ifndef FORK_BUILD
     logfclose(ctx);
     bufchain_clear(&ctx->queue);
     if (ctx->currlogfilename)
         filename_free(ctx->currlogfilename);
     conf_free(ctx->conf);
-#endif
     sfree(ctx);
 }
-
-#ifndef FORK_BUILD
 
 void log_reconfig(LogContext *ctx, Conf *conf)
 {
     bool reset_logging;
-
-    assert(false); // FORK_BUILD
 
     if (!filename_equal(conf_get_filename(ctx->conf, CONF_logfilename),
                         conf_get_filename(conf, CONF_logfilename)) ||
@@ -491,8 +442,6 @@ static Filename *xlatlognam(const Filename *src,
     strbuf *buffer;
     const char *s;
     Filename *ret;
-
-    assert(false); // FORK_BUILD
 
     buffer = strbuf_new();
     s = filename_to_str(src);
@@ -553,6 +502,3 @@ static Filename *xlatlognam(const Filename *src,
     strbuf_free(buffer);
     return ret;
 }
-
-#endif
-

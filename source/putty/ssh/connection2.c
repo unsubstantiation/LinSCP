@@ -11,8 +11,6 @@
 #include "channel.h"
 #include "sshcr.h"
 #include "connection2.h"
-// FORK_BUILD
-#define queue_toplevel_callback(FN, CTX) queue_toplevel_callback(get_log_callback_set(CTX->cl.logctx), FN, CTX)
 
 static void ssh2_connection_free(PacketProtocolLayer *);
 static void ssh2_connection_process_queue(PacketProtocolLayer *);
@@ -21,7 +19,6 @@ static bool ssh2_connection_get_specials(
 static void ssh2_connection_special_cmd(PacketProtocolLayer *ppl,
                                         SessionSpecialCode code, int arg);
 static void ssh2_connection_reconfigure(PacketProtocolLayer *ppl, Conf *conf);
-static unsigned int ssh2_connection_linscp_query(PacketProtocolLayer *ppl, int query);
 
 static const PacketProtocolLayerVtable ssh2_connection_vtable = {
     .free = ssh2_connection_free,
@@ -32,7 +29,6 @@ static const PacketProtocolLayerVtable ssh2_connection_vtable = {
     .queued_data_size = ssh_ppl_default_queued_data_size,
     .final_output = ssh_ppl_default_final_output,
     .name = "ssh-connection",
-    .linscp_query = ssh2_connection_linscp_query,
 };
 
 static SshChannel *ssh2_lportfwd_open(
@@ -269,9 +265,7 @@ PacketProtocolLayer *ssh2_connection_new(
 
     s->channels = newtree234(ssh2_channelcmp);
 
-    #ifndef FORK_BUILD
     s->x11authtree = newtree234(x11_authcmp);
-    #endif
 
     s->user_input = user_input;
 
@@ -294,9 +288,7 @@ static void ssh2_connection_free(PacketProtocolLayer *ppl)
 {
     struct ssh2_connection_state *s =
         container_of(ppl, struct ssh2_connection_state, ppl);
-    #ifndef FORK_BUILD
     struct X11FakeAuth *auth;
-    #endif
     struct ssh2_channel *c;
     struct ssh_rportfwd *rpf;
 
@@ -308,14 +300,12 @@ static void ssh2_connection_free(PacketProtocolLayer *ppl)
         ssh2_channel_free(c);
     freetree234(s->channels);
 
-    #ifndef FORK_BUILD
     while ((auth = delpos234(s->x11authtree, 0)) != NULL) {
         if (auth->disp)
             x11_free_display(auth->disp);
         x11_free_fake_auth(auth);
     }
     freetree234(s->x11authtree);
-    #endif
 
     if (s->rportfwds) {
         while ((rpf = delpos234(s->rportfwds, 0)) != NULL)
@@ -327,7 +317,7 @@ static void ssh2_connection_free(PacketProtocolLayer *ppl)
     if (s->antispoof_prompt)
         free_prompts(s->antispoof_prompt);
 
-    delete_callbacks_for_context(get_log_callback_set(s->cl.logctx), s);
+    delete_callbacks_for_context(s);
 
     sfree(s);
 }
@@ -346,13 +336,9 @@ static bool ssh2_connection_filter_queue(struct ssh2_connection_state *s)
 
     while (1) {
         if (ssh2_common_filter_queue(&s->ppl))
-        {
             return true;
-        }
         if ((pktin = pq_peek(s->ppl.in_pq)) == NULL)
-        {
             return false;
-        }
 
         switch (pktin->type) {
           case SSH2_MSG_GLOBAL_REQUEST:
@@ -1049,11 +1035,6 @@ static void ssh2_connection_process_queue(PacketProtocolLayer *ppl)
         &s->ppl, &s->cl, s->conf, s->term_width, s->term_height,
         s->ssh_is_simple, &s->mainchan_sc);
     s->started = true;
-    // FORK_BUILD
-    if (!s->mainchan)
-    {
-        s->ready = true;
-    }
 
     /*
      * Transfer data!
@@ -1253,13 +1234,6 @@ static void ssh2_check_termination_callback(void *vctx)
     ssh2_check_termination(s);
 }
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#endif
-#ifdef __clang__
-#pragma clang diagnostic ignored "-Wdisabled-macro-expansion"
-#endif
-
 static void ssh2_channel_destroy(struct ssh2_channel *c)
 {
     struct ssh2_connection_state *s = c->connlayer;
@@ -1457,7 +1431,6 @@ static void ssh2channel_x11_sharing_handover(
     const char *peer_addr, int peer_port, int endian,
     int protomajor, int protominor, const void *initial_data, int initial_len)
 {
-    #ifndef FORK_BUILD
     struct ssh2_channel *c = container_of(sc, struct ssh2_channel, sc);
     /*
      * This function is called when we've just discovered that an X
@@ -1476,9 +1449,6 @@ static void ssh2channel_x11_sharing_handover(
                             initial_data, initial_len);
     chan_free(c->chan);
     c->chan = NULL;
-    #else
-    assert(false);
-    #endif
 }
 
 static void ssh2channel_window_override_removed(SshChannel *sc)
@@ -1548,30 +1518,20 @@ static void ssh2_sharing_no_more_downstreams(ConnectionLayer *cl)
     queue_toplevel_callback(ssh2_check_termination_callback, s);
 }
 
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif
-
 static struct X11FakeAuth *ssh2_add_x11_display(
     ConnectionLayer *cl, int authtype, struct X11Display *disp)
 {
-    #ifndef FORK_BUILD
     struct ssh2_connection_state *s =
         container_of(cl, struct ssh2_connection_state, cl);
     struct X11FakeAuth *auth = x11_invent_fake_auth(s->x11authtree, authtype);
     auth->disp = disp;
     return auth;
-    #else
-    assert(false);
-    return NULL;
-    #endif
 }
 
 static struct X11FakeAuth *ssh2_add_sharing_x11_display(
     ConnectionLayer *cl, int authtype, ssh_sharing_connstate *share_cs,
     share_channel *share_chan)
 {
-    #ifndef FORK_BUILD
     struct ssh2_connection_state *s =
         container_of(cl, struct ssh2_connection_state, cl);
     struct X11FakeAuth *auth;
@@ -1586,23 +1546,15 @@ static struct X11FakeAuth *ssh2_add_sharing_x11_display(
     auth->share_chan = share_chan;
 
     return auth;
-    #else
-    assert(false);
-    return NULL;
-    #endif
 }
 
 static void ssh2_remove_sharing_x11_display(
     ConnectionLayer *cl, struct X11FakeAuth *auth)
 {
-    #ifndef FORK_BUILD
     struct ssh2_connection_state *s =
         container_of(cl, struct ssh2_connection_state, cl);
     del234(s->x11authtree, auth);
     x11_free_fake_auth(auth);
-    #else
-    assert(false);
-    #endif
 }
 
 static unsigned ssh2_alloc_sharing_channel(
@@ -1773,7 +1725,6 @@ static void ssh2_set_wants_user_input(ConnectionLayer *cl, bool wanted)
     s->want_user_input = wanted;
     if (wanted)
         ssh_check_sendok(s->ppl.ssh);
-    s->ready = true; // FORK_BUILD
 }
 
 static bool ssh2_get_wants_user_input(ConnectionLayer *cl)
@@ -1808,34 +1759,4 @@ static void ssh2_connection_reconfigure(PacketProtocolLayer *ppl, Conf *conf)
 
     if (s->portfwdmgr_configured)
         portfwdmgr_config(s->portfwdmgr, s->conf);
-}
-
-#include <puttyexp.h>
-
-static unsigned int ssh2_connection_linscp_query(PacketProtocolLayer *ppl, int query)
-{
-    struct ssh2_connection_state *s =
-        container_of(ppl, struct ssh2_connection_state, ppl);
-
-    if (query == FORK_QUERY_REMMAXPKT)
-    {
-        if (!s->mainchan)
-        {
-            return 0;
-        }
-        else
-        {
-            struct ssh2_channel *c = container_of(s->mainchan_sc, struct ssh2_channel, sc);
-            return c->remmaxpkt;
-        }
-    }
-    else if (query == FORK_QUERY_MAIN_CHANNEL)
-    {
-        return s->ready;
-    }
-    else
-    {
-        assert(0);
-        return 0;
-    }
 }

@@ -362,7 +362,7 @@ public:
     void MarkPasswordUsed() { mPasswordUsed = true; }
 
     /* Host key policy, used by the seat's confirm_ssh_host_key. */
-    bool HostKeyMatches(const char * const * fingerprints) const;
+    bool HostKeyMatches(const std::string & fingerprint) const;
     bool AcceptAnyHostKey() const { return mOptions.hostKey == "*"; }
     bool ExpectHostKey() const { return !mOptions.hostKey.empty() && mOptions.hostKey != "*"; }
     const std::string & ExpectedHostKey() const { return mOptions.hostKey; }

@@ -13,8 +13,6 @@
 
 #include "version.h"
 
-#ifndef FORK_BUILD
-
 const char ver[] = TEXTVER;
 const char sshver[] = SSHVER;
 
@@ -23,14 +21,3 @@ const char sshver[] = SSHVER;
  * compile time assertion to verify this.
  */
 enum { vorpal_sword = 1 / (sizeof(sshver) <= 40) };
-
-#else
-
-#include "puttyexp.h"
-
-const char * get_putty_version(void)
-{
-    return TEXTVER;
-}
-
-#endif

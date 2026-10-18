@@ -139,13 +139,10 @@ static void mainchan_open_confirmation(Channel *chan)
          * Send the CHANNEL_REQUESTS for the main session channel.
          */
         char *key, *val, *cmd;
-        #ifndef FORK_BUILD
         struct X11Display *x11disp;
         struct X11FakeAuth *x11auth;
-        #endif
         bool retry_cmd_now = false;
 
-        #ifndef FORK_BUILD
         if (conf_get_bool(mc->conf, CONF_x11_forward)) {
             char *x11_setup_err;
             if ((x11disp = x11_setup_display(
@@ -164,7 +161,6 @@ static void mainchan_open_confirmation(Channel *chan)
                 mc->req_x11 = true;
             }
         }
-        #endif
 
         if (ssh_agent_forwarding_permitted(mc->cl)) {
             sshfwd_request_agent_forwarding(mc->sc, true);
@@ -216,10 +212,8 @@ static void mainchan_try_fallback_command(mainchan *mc)
     const char *cmd = conf_get_str_ambi(mc->conf, CONF_remote_cmd2, NULL);
     if (conf_get_bool(mc->conf, CONF_ssh_subsys2)) {
         sshfwd_start_subsystem(mc->sc, true, cmd);
-    } else if (*cmd) {
-        sshfwd_start_command(mc->sc, true, cmd);
     } else {
-        sshfwd_start_shell(mc->sc, true); // FORK_BUILD
+        sshfwd_start_command(mc->sc, true, cmd);
     }
     mc->req_cmd_fallback = true;
 }
@@ -298,7 +292,7 @@ static void mainchan_request_response(Channel *chan, bool success)
         if (success) {
             ppl_logevent("Started a shell/command");
             mainchan_ready(mc);
-        } else if (*conf_get_str_ambi(mc->conf, CONF_remote_cmd2, NULL) || conf_get_bool(mc->conf, CONF_force_remote_cmd2)) { // FORK_BUILD
+        } else if (*conf_get_str_ambi(mc->conf, CONF_remote_cmd2, NULL)) {
             ppl_logevent("Primary command failed; attempting fallback");
             mainchan_try_fallback_command(mc);
         } else {
@@ -479,7 +473,6 @@ void mainchan_get_specials(
 {
     /* FIXME: this _does_ depend on whether these services are supported */
 
-    /* FORK_BUILD (causes linker warning and we do not use these)
     add_special(ctx, "Break", SS_BRK, 0);
 
     #define SIGNAL_MAIN(name, desc) \
@@ -499,7 +492,6 @@ void mainchan_get_specials(
     #undef SIGNAL_SUB
 
     add_special(ctx, NULL, SS_EXITMENU, 0);
-    */
 }
 
 static const char *ssh_signal_lookup(SessionSpecialCode code)

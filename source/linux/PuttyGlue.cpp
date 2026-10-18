@@ -2,21 +2,13 @@
  * PuttyGlue: the platform layer the shared PuTTY core expects from its
  * front end, for the POSIX build.
  *
- * Three groups of functions live here:
+ * Two groups of functions live here:
  *
- *  1. The MPEXT callback-set seam. The fork's core was built for
- *     upstream's Windows front end, where every SSH session owns a
- *     `struct callback_set' reached through get_callback_set() and
- *     get_seat_callback_set() (MPEXT means "one callback queue per
- *     session"). The console client has a single session, so all of
- *     these return one statically allocated set; the vendored POSIX
- *     platform layer reaches it through linscp_posix_callback_set().
- *
- *  2. Persistent storage (storage.h): saved sessions, the SSH host key
+ *  1. Persistent storage (storage.h): saved sessions, the SSH host key
  *     cache and the random seed file, as plain files below the
  *     configuration directory.
  *
- *  3. The SFTP transport (sftp_senddata/sftp_recvdata/sftp_sendbuffer),
+ *  2. The SFTP transport (sftp_senddata/sftp_recvdata/sftp_sendbuffer),
  *     which simply forwards to the session that is currently open.
  */
 
@@ -673,42 +665,6 @@ bool PublicKeyAuthorizedLine(const std::string & keyFile, std::string & line,
 
 extern "C" {
 
-/* --- 1. The MPEXT callback-set seam ---------------------------------- */
-
-struct callback_set * linscp_posix_callback_set(void)
-{
-    static struct callback_set callbackSet;
-    static bool initialised = false;
-    if (!initialised)
-    {
-        memset(&callbackSet, 0, sizeof(callbackSet));
-        linscp_critical_section_init(&callbackSet.ready_critsec[0]);
-        initialised = true;
-    }
-    return &callbackSet;
-}
-
-struct callback_set * get_callback_set(Plug * plug)
-{
-    return linscp_posix_callback_set();
-}
-
-struct callback_set * get_seat_callback_set(Seat * seat)
-{
-    return linscp_posix_callback_set();
-}
-
-struct callback_set * get_log_callback_set(LogContext * ctx)
-{
-    return linscp_posix_callback_set();
-}
-
-Seat * get_log_seat(LogContext * ctx)
-{
-    linscp::Session * session = linscp::CurrentSession();
-    return session != NULL ? static_cast<Seat *>(session->SeatHandle()) : NULL;
-}
-
 /* Protects the random pool and the bignum code; see platform.h. The
  * critical sections must be recursive (sshrand.c re-enters the section
  * from the noise callback), so they are set up here rather than with a
@@ -758,12 +714,6 @@ void linscp_critical_section_leave(CRITICAL_SECTION * cs)
 {
     pthread_mutex_unlock(cs);
 }
-
-/* The SSH local version string, sent in the version exchange. Upstream
- * provides it in utils/version.c, which FORK_BUILD leaves out, so the
- * front end provides it. ssh.h declares it without 'const' when MPEXT is
- * set. */
-char sshver[] = "LinSCP-1.0";
 
 /* Connection sharing is supported by the vendored unix/sharing.c. */
 const bool share_can_be_upstream = true;
@@ -1058,7 +1008,45 @@ int linscp_check_cached_host_key(const char * hostname, int port,
     return 0;
 }
 
-bool have_ssh_host_key(Seat * seat, const char * host, int port, const char * keytype)
+/*
+ * The core can enumerate saved sessions for its own configuration dialog.
+ * LinSCP stores and lists sessions through SessionStore instead, so this
+ * enumeration is empty; nothing in the client calls it.
+ */
+struct settings_e
+{
+    int unused;
+};
+
+settings_e * enum_settings_start(void)
+{
+    return NULL;
+}
+
+bool enum_settings_next(settings_e * handle, strbuf * out)
+{
+    (void)handle;
+    (void)out;
+    return false;
+}
+
+void enum_settings_finish(settings_e * handle)
+{
+    (void)handle;
+}
+
+/*
+ * The core's view of the host key cache: 0 when the key matches, 1 when the
+ * host has no key of that type yet, 2 when it has a different one.
+ */
+int check_stored_host_key(const char * hostname, int port,
+    const char * keytype, const char * key)
+{
+    const int state = linscp_check_cached_host_key(hostname, port, keytype, key);
+    return state > 0 ? 0 : (state < 0 ? 2 : 1);
+}
+
+bool have_ssh_host_key(const char * host, int port, const char * keytype)
 {
     return retrieve_host_key(host, port, keytype, NULL, 0) != 0;
 }

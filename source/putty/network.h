@@ -235,13 +235,7 @@ SockAddr *sk_addr_dup(SockAddr *addr);
 /* NB, control of 'addr' is passed via sk_new, which takes responsibility
  * for freeing it, as for new_connection() */
 Socket *sk_new(SockAddr *addr, int port, bool privport, bool oobinline,
-               bool nodelay, bool keepalive, Plug *p
-#ifdef MPEXT
-              , int timeout,
-              int sndbuf,
-              const char *srcaddr
-#endif
-              );
+               bool nodelay, bool keepalive, Plug *p);
 
 Socket *sk_newlistener(const char *srcaddr, int port, Plug *plug,
                        bool local_host_only, int address_family);
@@ -257,12 +251,10 @@ static inline size_t sk_write_oob(Socket *s, const void *data, size_t len)
 static inline void sk_write_eof(Socket *s)
 { s->vt->write_eof(s); }
 
-#ifndef __cplusplus
 static inline void plug_log(
     Plug *p, Socket *s, int type, SockAddr *addr, int port,
     const char *msg, int code)
-{ p->vt->log(p, s, type, addr, port, msg, code); }
-#endif
+{ p->vt->log(p, s, (PlugLogType)type, addr, port, msg, code); }
 static inline void plug_closing(Plug *p, PlugCloseType type, const char *msg)
 { p->vt->closing(p, type, msg); }
 static inline void plug_closing_normal(Plug *p)

@@ -1,0 +1,76 @@
+LinSCP - copyright and third-party notices
+
+Copyright (c) 2026 unsubstantiation (https://fairuniversal.com)
+
+Required Notice: Copyright (c) 2026 unsubstantiation (https://fairuniversal.com)
+
+LinSCP is licensed under the PolyForm Noncommercial License 1.0.0. It may be
+used, copied, modified and distributed only for noncommercial purposes, and
+only if this notice and the copyright line above are kept. The full terms are
+in the file LICENSE and at
+<https://polyformproject.org/licenses/noncommercial/1.0.0>.
+
+This is not an open source licence: commercial use is not granted.
+
+
+Third-party components
+
+The SSH and SFTP protocol core under source/putty, and the POSIX platform
+layer under libs/putty that is derived from PuTTY's Unix front end, come from
+PuTTY and are distributed under its MIT licence:
+
+PuTTY is copyright 1997-2026 Simon Tatham.
+
+Portions copyright Robert de Bath, Joris van Rantwijk, Delian
+Delchev, Andreas Schultz, Jeroen Massar, Wez Furlong, Nicolas Barry,
+Justin Bradford, Ben Harris, Malcolm Smith, Ahmad Khalifa, Markus
+Kuhn, Colin Watson, Christopher Staite, Lorenz Diener, Christian
+Brabandt, Jeff Smith, Pavel Kryukov, Maxim Kuznetsov, Svyatoslav
+Kuzmich, Nico Williams, Viktor Dukhovni, Josh Dersch, Lars Brinkhoff,
+and CORE SDI S.A.
+
+Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation files
+(the "Software"), to deal in the Software without restriction,
+including without limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of the Software,
+and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT.  IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE
+FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+The same notice is kept in libs/putty/LICENCE and source/putty/LICENCE.
+
+
+Artwork
+
+The logo, the icons and the screenshots in logo/, debian/ and
+source/gui/web/ are original work created for this project. They are not
+licensed under the PolyForm Noncommercial License and may not be redistributed
+with another program.
+
+
+History
+
+LinSCP began as a fork of WinSCP. The WinSCP-derived code has been removed
+from this source tree; it survives only in the git history, where those old
+commits stay under the GNU General Public License version 3. The files in the
+current tree are LinSCP's own work, apart from the PuTTY components named
+above, and are licensed as described in LICENSE.
+
+
+Privacy
+
+This program does not collect or transmit usage statistics, and it does not
+contact any vendor server for update checks or installation reports. Beyond
+that, the only network traffic it generates is the file transfer traffic you
+start yourself.

@@ -1,10 +1,5 @@
 #include "putty.h"
 
-// pre_connect_command not supported in LinSCP
-// (needs subprocess_waiter.c - what needs callback injection)
-
-#ifndef FORK_BUILD
-
 typedef struct PreConnWrapper PreConnWrapper;
 struct PreConnWrapper {
     /* The Plug from the client who instantiated us */
@@ -306,14 +301,12 @@ static const SocketVtable preconn_sockvt = {
     .socket_error = preconn_socket_error,
     .endpoint_info = preconn_endpoint_info,
 };
-#endif
 
 Socket *new_main_connection(
     SockAddr *addr, const char *hostname, int port, bool privport,
     bool oobinline, bool nodelay, bool keepalive, Plug *plug, Conf *conf,
     Interactor *itr, LogContext *logctx)
 {
-#ifndef FORK_BUILD
     char *command = NULL;
 
     const char *template = conf_get_str(conf, CONF_pre_connect_command);
@@ -336,11 +329,9 @@ Socket *new_main_connection(
     }
 
     if (!command) {
-#endif
         /* No pre-connection command: just open the main socket immediately */
         return new_connection(addr, hostname, port, privport, oobinline,
                               nodelay, keepalive, plug, conf, itr);
-#ifndef FORK_BUILD
     }
 
     PreConnWrapper *wr = snew(PreConnWrapper);
@@ -374,5 +365,4 @@ Socket *new_main_connection(
     sfree(command);
 
     return &wr->sockimpl;
-#endif
 }

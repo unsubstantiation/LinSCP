@@ -249,16 +249,14 @@ static size_t tempseat_banner(Seat *seat, const void *data, size_t len)
 static SeatPromptResult tempseat_confirm_ssh_host_key(
     Seat *seat, const char *host, int port, const char *keytype,
     char *keystr, SeatDialogText *text, HelpCtx helpctx,
-    void (*callback)(void *ctx, SeatPromptResult result), void *ctx,
-    char **fingerprints, bool is_certificate, int ca_count, bool already_verified) // FORK_BUILD
+    void (*callback)(void *ctx, SeatPromptResult result), void *ctx)
 {
     unreachable("confirm_ssh_host_key should never be called on TempSeat");
 }
 
 static SeatPromptResult tempseat_confirm_weak_crypto_primitive(
     Seat *seat, SeatDialogText *text,
-    void (*callback)(void *ctx, SeatPromptResult result), void *ctx,
-    const char *algtype, const char *algname, int wcr) // FORK_BUILD
+    void (*callback)(void *ctx, SeatPromptResult result), void *ctx)
 {
     unreachable("confirm_weak_crypto_primitive "
                 "should never be called on TempSeat");

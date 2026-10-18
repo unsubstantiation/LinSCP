@@ -23,8 +23,6 @@ struct PacketProtocolLayerVtable {
 
     /* Protocol-level name of this layer. */
     const char *name;
-
-    unsigned int (*linscp_query)(PacketProtocolLayer *ppl, int query);
 };
 
 struct PacketProtocolLayer {
@@ -73,8 +71,6 @@ static inline size_t ssh_ppl_queued_data_size(PacketProtocolLayer *ppl)
 { return ppl->vt->queued_data_size(ppl); }
 static inline void ssh_ppl_final_output(PacketProtocolLayer *ppl)
 { ppl->vt->final_output(ppl); }
-static inline unsigned int ssh_ppl_linscp_query(PacketProtocolLayer *ppl, int query)
-{ return ppl->vt->linscp_query(ppl, query); }
 
 static inline InteractionReadySeat ppl_get_iseat(PacketProtocolLayer *ppl)
 { return interactor_announce(ppl->interactor); }
@@ -125,8 +121,7 @@ PacketProtocolLayer *ssh2_userauth_new(
     const char *default_username, bool change_username,
     bool try_ki_auth, bool try_gssapi_auth, bool try_gssapi_kex_auth,
     bool gssapi_fwd, struct ssh_connection_shared_gss_state *shgss,
-    const char *auth_plugin,
-    const char * loghost, bool change_password, Seat *seat); // FORK_BUILD
+    const char *auth_plugin);
 PacketProtocolLayer *ssh2_connection_new(
     Ssh *ssh, ssh_sharing_state *connshare, bool is_simple,
     Conf *conf, const char *peer_verstring, bufchain *user_input,

@@ -50,7 +50,8 @@ binary: build
 	install -m 0644 docs/linscp.1 $(destdir)/usr/share/man/man1/linscp.1
 	gzip -9f $(destdir)/usr/share/man/man1/linscp.1
 	install -m 0644 debian/copyright $(destdir)/usr/share/doc/$(package)/copyright
-	install -m 0644 license.txt $(destdir)/usr/share/doc/$(package)/LICENSE.txt
+	install -m 0644 LICENSE $(destdir)/usr/share/doc/$(package)/LICENSE
+	install -m 0644 NOTICE $(destdir)/usr/share/doc/$(package)/NOTICE
 	install -m 0644 docs/debian.md $(destdir)/usr/share/doc/$(package)/README.Debian
 	dpkg-shlibdeps -Tdebian/substvars $(destdir)/usr/bin/linscp
 	dpkg-gencontrol -p$(package) -P$(destdir)

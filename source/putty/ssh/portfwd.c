@@ -1165,37 +1165,3 @@ char *portfwdmgr_connect(PortFwdManager *mgr, Channel **chan_ret,
 
     return NULL;
 }
-
-#ifdef MPEXT
-
-#include "puttyexp.h"
-
-int is_pfwd(Plug * plug)
-{
-  return
-    (plug->vt->closing == pfd_closing) ||
-    (plug->vt->closing == pfl_closing);
-}
-
-Seat * get_pfwd_seat(Plug * plug)
-{
-  LogContext * logctx;
-  if (plug->vt->closing == pfl_closing)
-  {
-    struct PortListener *pl = container_of(plug, struct PortListener, plug);
-    logctx = pl->cl->logctx;
-  }
-  else if (plug->vt->closing == pfd_closing)
-  {
-    struct PortForwarding *pf = container_of(plug, struct PortForwarding, plug);
-    logctx = pf->cl->logctx;
-  }
-  else
-  {
-    assert(false);
-    logctx = NULL;
-  }
-  return get_log_seat(logctx);
-}
-
-#endif

@@ -11,46 +11,6 @@
 #ifndef PUTTY_DEFS_H
 #define PUTTY_DEFS_H
 
-#ifdef FORK_BUILD
-/*
- * The hardware-accelerated crypto in source/putty/crypto is guarded per
- * toolchain (see the #if at the top of crypto/aes-ni.c), so a platform can
- * turn any of these off from the command line when it does not compile the
- * accelerated sources. [linscp-compat]
- */
-#ifndef HAVE_AES_NI
-#define HAVE_AES_NI 1
-#endif
-#ifndef HAVE_SHA_NI
-#define HAVE_SHA_NI 0 // to be enabled
-#endif
-#ifndef HAVE_CLMUL
-#define HAVE_CLMUL 0 // to be enabled
-#endif
-#ifndef HAVE_NEON_CRYPTO
-#define HAVE_NEON_CRYPTO 0
-#endif
-#ifndef HAVE_NEON_SHA512
-#define HAVE_NEON_SHA512 0
-#endif
-#ifndef HAVE_NEON_PMULL
-#define HAVE_NEON_PMULL 0
-#endif
-#define HAVE_ARM_DIT 0
-#define HAVE_WMEMCHR 1
-#define HAVE_CMAKE_H 0
-#define HAVE_NO_STDINT_H 0
-#define HAVE_STRTOUMAX 1
-#define HAVE_ADDDLLDIRECTORY 1
-#define HAVE_GETNAMEDPIPECLIENTPROCESSID 1
-#define HAVE_AFUNIX_H 0 // maybe have, but we are not using them in FORK_BUILD anyway
-#define HAVE_COUNTOF 0 // have, but it's implementation does not support non-compile-time constant arrays
-#define SSH 1
-#define OTHERBACKENDS 0
-#define SERIAL 0
-#endif
-
-#ifndef FORK_BUILD
 #ifdef NDEBUG
 /*
  * PuTTY is a security project, so assertions are important - if an
@@ -60,7 +20,6 @@
  * out.
  */
 #error Do not compile this code base with NDEBUG defined!
-#endif
 #endif
 
 #if HAVE_CMAKE_H
@@ -283,7 +242,6 @@ struct unicode_data;
     TYPECHECK(object == &((type *)0)->field,                            \
               ((type *)(((char *)(object)) - offsetof(type, field))))
 
-#undef NORETURN // FORK_BUILD
 #if defined __GNUC__ || defined __clang__
 #define NORETURN __attribute__((__noreturn__))
 #elif defined _MSC_VER

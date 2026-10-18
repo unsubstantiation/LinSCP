@@ -11,18 +11,7 @@
 #define VALUE(eval, sval) { eval, sval, false }
 #define VALUE_OBSOLETE(eval, sval) { eval, sval, true }
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#endif
-#ifdef __clang__
-#pragma clang diagnostic ignored "-Wmissing-variable-declarations" // FORK_BUILD
-#endif
-
 #include "conf-enums.h"
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif
 
 bool conf_enum_map_to_storage(const ConfSaveEnumType *etype,
                               int confval, int *storageval_out)

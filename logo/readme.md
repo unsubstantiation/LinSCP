@@ -18,7 +18,7 @@ and a green arrow leaving to the right (uploads).
 ## Licence
 
 The artwork in this folder is original to this fork and is **not** covered by
-the GNU General Public License that covers the code. The same artwork is copied
-to `../debian/linscp.png`, `../debian/linscp.svg`,
+the PolyForm Noncommercial License that covers the code. The same artwork is
+copied to `../debian/linscp.png`, `../debian/linscp.svg`,
 `../source/gui/web/favicon.png` and `../source/gui/web/icon.svg`, and those
-copies carry the same licence. See section B of [`../license.txt`](../license.txt).
+copies carry the same licence. See [`../NOTICE`](../NOTICE).

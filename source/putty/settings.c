@@ -1056,7 +1056,6 @@ bool do_defaults(const char *session, Conf *conf)
     return load_settings(session, conf);
 }
 
-#ifndef FORK_BUILD
 static int sessioncmp(const void *av, const void *bv)
 {
     const char *a = *(const char *const *) av;
@@ -1138,4 +1137,3 @@ void get_sesslist(struct sesslist *list, bool allocate)
         list->sessions = NULL;
     }
 }
-#endif

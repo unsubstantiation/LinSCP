@@ -1291,29 +1291,3 @@ CONF_OPTION(winclass,
     DEFAULT_STR(""),
     SAVE_KEYWORD("WindowClass"),
 )
-
-/* FORK_BUILD BEGIN */
-CONF_OPTION(connect_timeout,
-    VALUE_TYPE(INT),
-    NOT_SAVED,
-)
-CONF_OPTION(sndbuf,
-    VALUE_TYPE(INT),
-    NOT_SAVED,
-)
-CONF_OPTION(srcaddr,
-    VALUE_TYPE(STR),
-    DEFAULT_STR(""),
-    NOT_SAVED,
-)
-CONF_OPTION(force_remote_cmd2,
-    VALUE_TYPE(BOOL),
-    DEFAULT_BOOL(false),
-    NOT_SAVED,
-)
-CONF_OPTION(change_password,
-    VALUE_TYPE(BOOL),
-    DEFAULT_BOOL(false),
-    NOT_SAVED,
-)
-/* FORK_BUILD END */

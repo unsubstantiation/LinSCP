@@ -12,7 +12,6 @@
 #include "channel.h"
 
 typedef struct agentf {
-    struct callback_set * callback_set; // FORK_BUILD
     SshChannel *c;
     bufchain inbuffer;
     agent_pending_query *pending;
@@ -98,7 +97,7 @@ static void agentf_try_forward(agentf *af)
         bufchain_fetch_consume(
             &af->inbuffer, strbuf_append(message, length), length);
         af->pending = agent_query(
-            message, &reply, &replylen, agentf_callback, af, af->callback_set); // FORK_BUILD
+            message, &reply, &replylen, agentf_callback, af);
         strbuf_free(message);
 
         if (af->pending)
@@ -173,10 +172,9 @@ static const ChannelVtable agentf_channelvt = {
     .request_response = chan_no_request_response,
 };
 
-Channel *agentf_new(SshChannel *c, struct callback_set *callback_set) // FORK_BUILD
+Channel *agentf_new(SshChannel *c)
 {
     agentf *af = snew(agentf);
-    af->callback_set = callback_set; // FORK_BUILD
     af->c = c;
     af->chan.vt = &agentf_channelvt;
     af->chan.initial_fixed_window_size = 0;

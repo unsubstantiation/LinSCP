@@ -124,8 +124,8 @@ void ssh2_bpp_new_outgoing_crypto(
             (ssh_cipher_alg(s->out.cipher)->flags & SSH_CIPHER_IS_CBC) &&
             !(s->bpp.remote_bugs & BUG_CHOKES_ON_SSH2_IGNORE));
 
-        bpp_logevent("Initialised %s [%s] outbound encryption",
-                     ssh_cipher_alg(s->out.cipher)->text_name, ssh_cipher_alg(s->out.cipher)->ssh2_id);
+        bpp_logevent("Initialised %s outbound encryption",
+                     ssh_cipher_alg(s->out.cipher)->text_name);
     } else {
         s->out.cipher = NULL;
         s->cbc_ignore_workaround = false;
@@ -192,8 +192,8 @@ void ssh2_bpp_new_incoming_crypto(
         ssh_cipher_setkey(s->in.cipher, ckey);
         ssh_cipher_setiv(s->in.cipher, iv);
 
-        bpp_logevent("Initialised %s [%s] inbound encryption",
-                     ssh_cipher_alg(s->in.cipher)->text_name, ssh_cipher_alg(s->in.cipher)->ssh2_id);
+        bpp_logevent("Initialised %s inbound encryption",
+                     ssh_cipher_alg(s->in.cipher)->text_name);
     } else {
         s->in.cipher = NULL;
     }
@@ -997,26 +997,3 @@ static void ssh2_bpp_handle_output(BinaryPacketProtocol *bpp)
 
     ssh_sendbuffer_changed(bpp->ssh);
 }
-
-#ifdef MPEXT
-const ssh_cipher * ssh2_bpp_get_cscipher(BinaryPacketProtocol *bpp)
-{
-    return container_of(bpp, struct ssh2_bpp_state, bpp)->out.cipher;
-}
-
-const ssh_cipher * ssh2_bpp_get_sccipher(BinaryPacketProtocol *bpp)
-{
-    return container_of(bpp, struct ssh2_bpp_state, bpp)->in.cipher;
-}
-
-const struct ssh_compressor * ssh2_bpp_get_cscomp(BinaryPacketProtocol *bpp)
-{
-    return container_of(bpp, struct ssh2_bpp_state, bpp)->out_comp;
-}
-
-const struct ssh_decompressor * ssh2_bpp_get_sccomp(BinaryPacketProtocol *bpp)
-{
-    return container_of(bpp, struct ssh2_bpp_state, bpp)->in_decomp;
-}
-
-#endif

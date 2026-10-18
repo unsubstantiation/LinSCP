@@ -55,30 +55,25 @@ void pq_base_push_front(PacketQueueBase *pqb, PacketQueueNode *node)
         queue_idempotent_callback(pqb->ic);
 }
 
-#ifndef FORK_BUILD
 static PacketQueueNode pktin_freeq_head = {
     &pktin_freeq_head, &pktin_freeq_head, true
 };
-#endif
 
-/*FORK_BUILD static*/ void pktin_free_queue_callback(void *vctx)
+static void pktin_free_queue_callback(void *vctx)
 {
-    struct callback_set * set = (struct callback_set *)vctx;
-    while (set->pktin_freeq_head->next != set->pktin_freeq_head) {
-        PacketQueueNode *node = set->pktin_freeq_head->next;
+    while (pktin_freeq_head.next != &pktin_freeq_head) {
+        PacketQueueNode *node = pktin_freeq_head.next;
         PktIn *pktin = container_of(node, PktIn, qnode);
-        set->pktin_freeq_head->next = node->next;
+        pktin_freeq_head.next = node->next;
         sfree(pktin);
     }
 
-    set->pktin_freeq_head->prev = set->pktin_freeq_head;
+    pktin_freeq_head.prev = &pktin_freeq_head;
 }
 
-#ifndef FORK_BUILD
 static IdempotentCallback ic_pktin_free = {
     pktin_free_queue_callback, NULL, false
 };
-#endif
 
 static inline void pq_unlink_common(PacketQueueBase *pqb,
                                     PacketQueueNode *node)
@@ -105,33 +100,15 @@ static PktIn *pq_in_after(PacketQueueBase *pqb,
         return NULL;
 
     if (pop) {
-        #ifdef FORK_BUILD
-        struct callback_set * set = get_seat_callback_set(pqb->seat);
-        assert(set != NULL);
-        if (set->ic_pktin_free == NULL)
-        {
-            set->pktin_freeq_head = snew(PacketQueueNode);
-            set->pktin_freeq_head->next = set->pktin_freeq_head;
-            set->pktin_freeq_head->prev = set->pktin_freeq_head;
-            set->pktin_freeq_head->on_free_queue = TRUE;
-
-            set->ic_pktin_free = snew(IdempotentCallback);
-            set->ic_pktin_free->fn = pktin_free_queue_callback;
-            set->ic_pktin_free->ctx = set;
-            set->ic_pktin_free->queued = FALSE;
-            set->ic_pktin_free->set = set;
-        }
-        #endif
-
         pq_unlink_common(pqb, node);
 
-        node->prev = set->pktin_freeq_head->prev; // FORK_BUILD
-        node->next = set->pktin_freeq_head; // FORK_BUILD
+        node->prev = pktin_freeq_head.prev;
+        node->next = &pktin_freeq_head;
         node->next->prev = node;
         node->prev->next = node;
         node->on_free_queue = true;
 
-        queue_idempotent_callback(set->ic_pktin_free); // FORK_BUILD
+        queue_idempotent_callback(&ic_pktin_free);
     }
 
     return container_of(node, PktIn, qnode);
@@ -153,19 +130,17 @@ static PktOut *pq_out_after(PacketQueueBase *pqb,
     return container_of(node, PktOut, qnode);
 }
 
-void pq_in_init(PktInQueue *pq, Seat * seat) // FORK_BUILD
+void pq_in_init(PktInQueue *pq)
 {
     pq->pqb.ic = NULL;
-    pq->pqb.seat = seat;
     pq->pqb.end.next = pq->pqb.end.prev = &pq->pqb.end;
     pq->after = pq_in_after;
     pq->pqb.total_size = 0;
 }
 
-void pq_out_init(PktOutQueue *pq, Seat * seat) // FORK_BUILD
+void pq_out_init(PktOutQueue *pq)
 {
     pq->pqb.ic = NULL;
-    pq->pqb.seat = seat;
     pq->pqb.end.next = pq->pqb.end.prev = &pq->pqb.end;
     pq->after = pq_out_after;
     pq->pqb.total_size = 0;
@@ -728,7 +703,7 @@ void ssh_ppl_replace(PacketProtocolLayer *old, PacketProtocolLayer *new)
 
 void ssh_ppl_free(PacketProtocolLayer *ppl)
 {
-    delete_callbacks_for_context(get_seat_callback_set(ppl->seat), ppl); // FORK_BUILD
+    delete_callbacks_for_context(ppl);
     ppl->vt->free(ppl);
 }
 
@@ -746,7 +721,6 @@ void ssh_ppl_setup_queues(PacketProtocolLayer *ppl,
     ppl->in_pq->pqb.ic = &ppl->ic_process_queue;
     ppl->ic_process_queue.fn = ssh_ppl_ic_process_queue_callback;
     ppl->ic_process_queue.ctx = ppl;
-    ppl->ic_process_queue.set = get_seat_callback_set(ppl->seat);
 
     /* If there's already something on the input queue, it will want
      * handling immediately. */
@@ -759,8 +733,7 @@ void ssh_ppl_user_output_string_and_free(PacketProtocolLayer *ppl, char *text)
     /* Messages sent via this function are from the SSH layer, not
      * from the server-side process, so they always have the stderr
      * flag set. */
-    SeatOutputType stderrflag = (SeatOutputType)-1; // FORK_BUILD
-    seat_output(ppl->seat, stderrflag, text, strlen(text)); // FORK_BUILD
+    seat_stderr_pl(ppl->seat, ptrlen_from_asciz(text));
     sfree(text);
 }
 
@@ -809,22 +782,19 @@ static void ssh_bpp_output_packet_callback(void *context)
 
 void ssh_bpp_common_setup(BinaryPacketProtocol *bpp)
 {
-    pq_in_init(&bpp->in_pq, get_log_seat(bpp->logctx)); // FORK_BUILD
-    pq_out_init(&bpp->out_pq, get_log_seat(bpp->logctx)); // FORK_BUILD
+    pq_in_init(&bpp->in_pq);
+    pq_out_init(&bpp->out_pq);
     bpp->input_eof = false;
     bpp->ic_in_raw.fn = ssh_bpp_input_raw_data_callback;
-    bpp->ic_in_raw.set = get_log_callback_set(bpp->logctx);
     bpp->ic_in_raw.ctx = bpp;
     bpp->ic_out_pq.fn = ssh_bpp_output_packet_callback;
-    bpp->ic_out_pq.set = get_log_callback_set(bpp->logctx);
     bpp->ic_out_pq.ctx = bpp;
     bpp->out_pq.pqb.ic = &bpp->ic_out_pq;
 }
 
 void ssh_bpp_free(BinaryPacketProtocol *bpp)
 {
-    // FORK_BUILD
-    delete_callbacks_for_context(get_log_callback_set(bpp->logctx), bpp);
+    delete_callbacks_for_context(bpp);
     bpp->vt->free(bpp);
 }
 
@@ -950,7 +920,7 @@ SeatPromptResult verify_ssh_host_key(
     /*
      * Next, check the host key cache.
      */
-    int storage_status = 1; // FORK_BUILD check_stored_host_key(host, port, keytype, keystr);
+    int storage_status = check_stored_host_key(host, port, keytype, keystr);
     if (storage_status == 0) /* matching key was found in the cache */
         return SPR_OK;
 
@@ -1001,7 +971,7 @@ SeatPromptResult verify_ssh_host_key(
                     "pretending to be the server.");
             }
         } else {
-            // assert(storage_status == 2); FORK_BUILD
+            assert(storage_status == 2);
             seat_dialog_text_append(
                 text, SDT_PARA, "which does not match the certified key %s "
                 "had previously cached for this server.", appname);
@@ -1110,8 +1080,7 @@ SeatPromptResult verify_ssh_host_key(
     }
 
     SeatPromptResult toret = seat_confirm_ssh_host_key(
-        iseat, host, port, keytype, keystr, text, helpctx, callback, ctx,
-        fingerprints, key && ssh_key_alg(key)->is_certificate, ca_count, false); // FORK_BUILD
+        iseat, host, port, keytype, keystr, text, helpctx, callback, ctx);
     seat_dialog_text_free(text);
     return toret;
 }
@@ -1175,8 +1144,7 @@ SeatPromptResult confirm_weak_crypto_primitive(
     seat_dialog_text_append(text, SDT_PROMPT, "Continue with connection?");
 
     SeatPromptResult toret = seat_confirm_weak_crypto_primitive(
-        iseat, text, callback, ctx,
-        algtype, algname, wcr); // FORK_BUILD
+        iseat, text, callback, ctx);
     seat_dialog_text_free(text);
     return toret;
 }

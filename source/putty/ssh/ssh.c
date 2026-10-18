@@ -189,13 +189,12 @@ static void ssh_got_ssh_version(struct ssh_version_receiver *rcv,
      * connect_to_host().
      */
     assert(ssh->version == major_version);
-    assert(ssh->version == 2);
 
     old_bpp = ssh->bpp;
     ssh->remote_bugs = ssh_verstring_get_bugs(old_bpp);
 
     if (!ssh->bare_connection) {
-        /*FORK_BUILD if (ssh->version == 2)*/ {
+        if (ssh->version == 2) {
             PacketProtocolLayer *userauth_layer, *transport_child_layer;
 
             /*
@@ -216,7 +215,7 @@ static void ssh_got_ssh_version(struct ssh_version_receiver *rcv,
             /* Load and pick the highest GSS library on the preference
              * list. */
             if (!ssh->gss_state.libs)
-                ssh->gss_state.libs = ssh_gss_setup(ssh->conf, ssh->logctx); // FORK_BUILD
+                ssh->gss_state.libs = ssh_gss_setup(ssh->conf);
             ssh->gss_state.lib = NULL;
             if (ssh->gss_state.libs->nlibraries > 0) {
                 int i, j;
@@ -275,11 +274,7 @@ static void ssh_got_ssh_version(struct ssh_version_receiver *rcv,
                     false,
                     NULL,
 #endif
-                    conf_get_str(ssh->conf, CONF_auth_plugin),
-                    conf_get_str(ssh->conf, CONF_loghost),
-                    conf_get_bool(ssh->conf, CONF_change_password), // FORK_BUILD
-                    ssh->seat
-                    );
+                    conf_get_str(ssh->conf, CONF_auth_plugin));
                 ssh_connect_ppl(ssh, userauth_layer);
                 transport_child_layer = userauth_layer;
 
@@ -303,7 +298,23 @@ static void ssh_got_ssh_version(struct ssh_version_receiver *rcv,
                 ssh2_userauth_set_transport_layer(userauth_layer,
                                                   ssh->base_layer);
 
-        } // FORK_BUILD
+        }
+#ifndef FORK_BUILD
+        else {
+
+            ssh->bpp = ssh1_bpp_new(ssh->logctx);
+            ssh_connect_bpp(ssh);
+
+            connection_layer = ssh1_connection_new(
+                ssh, ssh->conf, &ssh->user_input, &ssh->cl);
+            ssh_connect_ppl(ssh, connection_layer);
+
+            ssh->base_layer = ssh1_login_new(
+                ssh->conf, ssh->savedhost, ssh->savedport, connection_layer);
+            ssh_connect_ppl(ssh, ssh->base_layer);
+
+        }
+#endif
 
     } else {
         ssh->bpp = ssh2_bare_bpp_new(ssh->logctx);
@@ -588,7 +599,7 @@ void ssh_sw_abort_deferred(Ssh *ssh, const char *fmt, ...)
     if (!ssh->deferred_abort_message) {
         GET_FORMATTED_MSG;
         ssh->deferred_abort_message = msg;
-        queue_toplevel_callback(get_seat_callback_set(ssh->seat), ssh_deferred_abort_callback, ssh);
+        queue_toplevel_callback(ssh_deferred_abort_callback, ssh);
     }
 }
 
@@ -773,14 +784,9 @@ static char *connect_to_host(
 {
     SockAddr *addr;
     const char *err;
-    int addressfamily;
+    int addressfamily, sshprot;
 
     ssh->plug.vt = &Ssh_plugvt;
-    
-    #ifdef MPEXT
-    // make sure the field is initialized, in case lookup below fails
-    ssh->fullhostname = NULL;
-    #endif
 
     /*
      * Try connection-sharing, in case that means we don't open a
@@ -850,8 +856,15 @@ static char *connect_to_host(
      * The SSH version number is always fixed (since we no longer support
      * fallback between versions), so set it now.
      */
+    sshprot = conf_get_int(ssh->conf, CONF_sshprot);
+    assert(sshprot == 0 || sshprot == 3);
+    if (sshprot == 0)
+        /* SSH-1 only */
+        ssh->version = 1;
+    if (sshprot == 3 || ssh->bare_connection) {
         /* SSH-2 only */
-        ssh->version = 2; // FORK_BUILD
+        ssh->version = 2;
+    }
 
     /*
      * Set up the initial BPP that will do the version string
@@ -862,7 +875,7 @@ static char *connect_to_host(
     ssh->bpp = ssh_verstring_new(
         ssh->conf, ssh->logctx, ssh->bare_connection,
         ssh->version == 1 ? "1.5" : "2.0", &ssh->version_receiver,
-        false, ""); // FORK_BUILD (impl_name provided in sshver already)
+        false, "PuTTY");
     ssh_connect_bpp(ssh);
     queue_idempotent_callback(&ssh->bpp->ic_in_raw);
 
@@ -959,7 +972,6 @@ static char *ssh_init(const BackendVtable *vt, Seat *seat,
     bufchain_init(&ssh->user_input);
     ssh->ic_out_raw.fn = ssh_bpp_output_raw_data_callback;
     ssh->ic_out_raw.ctx = ssh;
-    ssh->ic_out_raw.set = get_seat_callback_set(seat);
 
     ssh->term_width = conf_get_int(ssh->conf, CONF_width);
     ssh->term_height = conf_get_int(ssh->conf, CONF_height);
@@ -1007,11 +1019,7 @@ static void ssh_free(Backend *be)
     ssh_shutdown(ssh);
 
     if (is_tempseat(ssh->seat))
-    {
-        Seat * realseat = tempseat_get_real(ssh->seat); // FORK_BUILD
         tempseat_free(ssh->seat);
-        ssh->seat = realseat; // FORK_BUILD
-    }
 
     conf_free(ssh->conf);
     if (ssh->connshare)
@@ -1034,7 +1042,7 @@ static void ssh_free(Backend *be)
     sfree(ssh->deferred_abort_message);
     sfree(ssh->description);
 
-    delete_callbacks_for_context(get_seat_callback_set(ssh->seat), ssh); /* likely to catch ic_out_raw */ // FORK_BUILD (seat)
+    delete_callbacks_for_context(ssh); /* likely to catch ic_out_raw */
 
     need_random_unref = ssh->need_random_unref;
     sfree(ssh);
@@ -1089,12 +1097,8 @@ static size_t ssh_sendbuffer(Backend *be)
 
     backlog = ssh_stdin_backlog(ssh->cl);
 
-    #ifndef FORK_BUILD
-    // This throttles LinSCP unnecessarily, as it uses its own throttling mechanism.
-    // This value is used only by LinSCP, never directly by PuTTY code.
     if (ssh->base_layer)
         backlog += ssh_ppl_queued_data_size(ssh->base_layer);
-    #endif
 
     /*
      * If the SSH socket itself has backed up, add the total backup
@@ -1212,8 +1216,10 @@ void ssh_check_sendok(Ssh *ssh)
 {
     /* Called when the connection layer might have caused ssh_sendok
      * to start returning true */
+#ifndef FORK_BUILD
     if (ssh->ldisc)
-        ; // ldisc_check_sendok(ssh->ldisc); FORK_BUILD
+        ldisc_check_sendok(ssh->ldisc);
+#endif
 }
 
 void ssh_ldisc_update(Ssh *ssh)
@@ -1233,7 +1239,6 @@ static bool ssh_ldisc(Backend *be, int option)
 static void ssh_provide_ldisc(Backend *be, Ldisc *ldisc)
 {
     Ssh *ssh = container_of(be, Ssh, backend);
-    assert(false); // FORK_BUILD
     ssh->ldisc = ldisc;
 }
 
@@ -1333,66 +1338,3 @@ const BackendVtable sshconn_backend = {
     .protocol = PROT_SSHCONN,
     .flags = BACKEND_SUPPORTS_NC_HOST | BACKEND_NOTIFIES_SESSION_START,
 };
-
-#ifdef MPEXT
-
-#include "puttyexp.h"
-
-int is_ssh(Plug * plug)
-{
-  return plug->vt->closing == ssh_closing;
-}
-
-int get_ssh_version(Backend * be)
-{
-  Ssh * ssh = container_of(be, Ssh, backend);
-  return ssh->version;
-}
-
-Seat * get_ssh_seat(Plug * plug)
-{
-  return container_of(plug, Ssh, plug)->seat;
-}
-
-const ssh_cipher * get_cscipher(Backend * be)
-{
-  Ssh * ssh = container_of(be, Ssh, backend);
-  return ssh2_bpp_get_cscipher(ssh->bpp);
-}
-
-const ssh_cipher * get_sccipher(Backend * be)
-{
-  Ssh * ssh = container_of(be, Ssh, backend);
-  return ssh2_bpp_get_sccipher(ssh->bpp);
-}
-
-const struct ssh_compressor * get_cscomp(Backend * be)
-{
-  Ssh * ssh = container_of(be, Ssh, backend);
-  return ssh2_bpp_get_cscomp(ssh->bpp);
-}
-
-const struct ssh_decompressor * get_sccomp(Backend * be)
-{
-  Ssh * ssh = container_of(be, Ssh, backend);
-  return ssh2_bpp_get_sccomp(ssh->bpp);
-}
-
-unsigned int linscp_query(Backend * be, int query)
-{
-  Ssh * ssh = container_of(be, Ssh, backend);
-  if ((ssh->base_layer != NULL) && (ssh->base_layer->vt->linscp_query != NULL))
-  {
-    return ssh_ppl_linscp_query(ssh->base_layer, query);
-  }
-  else
-  {
-    return 0;
-  }
-}
-
-void md5checksum(const char * buffer, int len, unsigned char output[16])
-{
-  hash_simple(&ssh_md5, make_ptrlen(buffer, len), output);
-}
-#endif

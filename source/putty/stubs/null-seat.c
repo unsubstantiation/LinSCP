@@ -24,13 +24,11 @@ void nullseat_set_busy_status(Seat *seat, BusyStatus status) {}
 SeatPromptResult nullseat_confirm_ssh_host_key(
     Seat *seat, const char *host, int port, const char *keytype,
     char *keystr, SeatDialogText *text, HelpCtx helpctx,
-    void (*callback)(void *ctx, SeatPromptResult result), void *ctx,
-    char **fingerprints, bool is_certificate, int ca_count, bool already_verified) // FORK_BUILD
+    void (*callback)(void *ctx, SeatPromptResult result), void *ctx)
 { return SPR_SW_ABORT("this seat can't handle interactive prompts"); }
 SeatPromptResult nullseat_confirm_weak_crypto_primitive(
     Seat *seat, SeatDialogText *text,
-    void (*callback)(void *ctx, SeatPromptResult result), void *ctx,
-    const char *algtype, const char *algname, int wcr) // FORK_BUILD
+    void (*callback)(void *ctx, SeatPromptResult result), void *ctx)
 { return SPR_SW_ABORT("this seat can't handle interactive prompts"); }
 SeatPromptResult nullseat_confirm_weak_cached_hostkey(
     Seat *seat, SeatDialogText *text,

@@ -80,7 +80,6 @@ struct ProxyNegotiator {
     bool reconnect;
 };
 
-#ifndef __cplusplus
 struct ProxyNegotiatorVT {
     ProxyNegotiator *(*new)(const ProxyNegotiatorVT *);
     void (*process_queue)(ProxyNegotiator *);
@@ -100,7 +99,6 @@ extern const ProxyNegotiatorVT http_proxy_negotiator_vt;
 extern const ProxyNegotiatorVT socks4_proxy_negotiator_vt;
 extern const ProxyNegotiatorVT socks5_proxy_negotiator_vt;
 extern const ProxyNegotiatorVT telnet_proxy_negotiator_vt;
-#endif
 
 /*
  * Centralised functions to allow ProxyNegotiators to get hold of a
@@ -125,9 +123,5 @@ void local_proxy_opener_set_socket(DeferredSocketOpener *opener,
 char *platform_setup_local_proxy(Socket *socket, const char *cmd);
 
 #include "cproxy.h"
-
-#ifdef FORK_BUILD
-ProxySocket * get_proxy_plug_socket(Plug * p);
-#endif
 
 #endif

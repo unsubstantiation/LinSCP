@@ -78,7 +78,7 @@ struct NetSocket {
     bool listener;
     bool nodelay, keepalive;           /* for connect()-type sockets */
     bool privport;
-    /* LinSCP: MPEXT socket creation parameters (see sk_new below) */
+    /* Optional socket tuning (connect timeout, send buffer, source address). */
     int connect_timeout;               /* milliseconds, 0 = none */
     int sndbuf;                        /* SO_SNDBUF, 0 = leave alone */
     char *srcaddr;                     /* local address to bind, or NULL */
@@ -811,9 +811,16 @@ static int try_connect(NetSocket *sock)
     return err;
 }
 
+/* Set from the front end before connecting; see platform.h. */
+static int default_connect_timeout = 0;        /* milliseconds */
+
+void linscp_set_connect_timeout(int seconds)
+{
+    default_connect_timeout = seconds > 0 ? seconds * 1000 : 0;
+}
+
 Socket *sk_new(SockAddr *addr, int port, bool privport, bool oobinline,
-               bool nodelay, bool keepalive, Plug *plug,
-               int connect_timeout, int sndbuf, const char *srcaddr)
+               bool nodelay, bool keepalive, Plug *plug)
 {
     NetSocket *s;
     int err;
@@ -845,10 +852,10 @@ Socket *sk_new(SockAddr *addr, int port, bool privport, bool oobinline,
     s->keepalive = keepalive;
     s->privport = privport;
     s->port = port;
-    /* LinSCP: MPEXT socket parameters (WinSCP-style configuration) */
-    s->connect_timeout = connect_timeout > 0 ? connect_timeout : 0;
-    s->sndbuf = sndbuf > 0 ? sndbuf : 0;
-    s->srcaddr = (srcaddr && srcaddr[0]) ? dupstr(srcaddr) : NULL;
+    /* Optional socket tuning, off unless a caller sets it. */
+    s->connect_timeout = default_connect_timeout;
+    s->sndbuf = 0;
+    s->srcaddr = NULL;
 
     do {
         err = try_connect(s);
@@ -1081,7 +1088,7 @@ static void sk_net_close(Socket *sock)
     }
     if (s->addr)
         sk_addr_free(s->addr);
-    delete_callbacks_for_context(DEFAULT_CALLBACK_SET, s);
+    delete_callbacks_for_context(s);
     sfree(s->srcaddr); /* LinSCP */
     sfree(s);
 }
@@ -1222,7 +1229,7 @@ void try_send(NetSocket *s)
                  * Arrange to be called back from the top level to
                  * deal with the error condition on this socket.
                  */
-                queue_toplevel_callback(DEFAULT_CALLBACK_SET, socket_error_callback, s);
+                queue_toplevel_callback(socket_error_callback, s);
                 return;
             }
         } else {

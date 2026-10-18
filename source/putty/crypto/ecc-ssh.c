@@ -31,38 +31,6 @@
 #include "mpint.h"
 #include "ecc.h"
 
-#ifdef MPEXT
-static int ec_curve_cleanup = 0;
-
-static void finalize_common(struct ec_curve * curve)
-{
-    mp_free(curve->p);
-}
-
-static void finalize_wcurve(struct ec_curve *curve)
-{
-    ecc_weierstrass_curve_free(curve->w.wc);
-    ecc_weierstrass_point_free(curve->w.G);
-    mp_free(curve->w.G_order);
-    finalize_common(curve);
-}
-
-static void finalize_mcurve(struct ec_curve *curve)
-{
-    ecc_montgomery_curve_free(curve->m.mc);
-    ecc_montgomery_point_free(curve->m.G);
-    finalize_common(curve);
-}
-
-static void finalize_ecurve(struct ec_curve *curve)
-{
-    ecc_edwards_curve_free(curve->e.ec);
-    ecc_edwards_point_free(curve->e.G);
-    mp_free(curve->e.G_order);
-    finalize_common(curve);
-}
-#endif
-
 /* ----------------------------------------------------------------------
  * Elliptic curve definitions
  */
@@ -117,25 +85,10 @@ static void initialise_ecurve(
     curve->e.G_order = mp_copy(G_order);
 }
 
-#ifdef MPEXT
-#define FORK_CURVE_CLEANUP(TYPE) \
-    if (ec_curve_cleanup) \
-    { \
-        if (initialised) finalize_##TYPE##curve(&curve); \
-        initialised = 0; \
-        return NULL; \
-    }
-#else
-/* Curve cleanup at process exit is an MPEXT (Windows) feature only. */
-#define FORK_CURVE_CLEANUP(TYPE)
-#endif
-
 static struct ec_curve *ec_p256(void)
 {
     static struct ec_curve curve = { 0 };
     static bool initialised = false;
-
-    FORK_CURVE_CLEANUP(w);
 
     if (!initialised) {
         mp_int *p = MP_LITERAL(0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff);
@@ -168,8 +121,6 @@ static struct ec_curve *ec_p384(void)
     static struct ec_curve curve = { 0 };
     static bool initialised = false;
 
-    FORK_CURVE_CLEANUP(w);
-
     if (!initialised) {
         mp_int *p = MP_LITERAL(0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff);
         mp_int *a = MP_LITERAL(0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000fffffffc);
@@ -200,8 +151,6 @@ static struct ec_curve *ec_p521(void)
 {
     static struct ec_curve curve = { 0 };
     static bool initialised = false;
-
-    FORK_CURVE_CLEANUP(w);
 
     if (!initialised) {
         mp_int *p = MP_LITERAL(0x01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
@@ -234,8 +183,6 @@ static struct ec_curve *ec_curve25519(void)
     static struct ec_curve curve = { 0 };
     static bool initialised = false;
 
-    FORK_CURVE_CLEANUP(m);
-
     if (!initialised) {
         mp_int *p = MP_LITERAL(0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed);
         mp_int *a = MP_LITERAL(0x0000000000000000000000000000000000000000000000000000000000076d06);
@@ -264,8 +211,6 @@ static struct ec_curve *ec_curve448(void)
     static struct ec_curve curve = { 0 };
     static bool initialised = false;
 
-    FORK_CURVE_CLEANUP(m);
-
     if (!initialised) {
         mp_int *p = MP_LITERAL(0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
         mp_int *a = MP_LITERAL(0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000262a6);
@@ -293,8 +238,6 @@ static struct ec_curve *ec_ed25519(void)
 {
     static struct ec_curve curve = { 0 };
     static bool initialised = false;
-
-    FORK_CURVE_CLEANUP(e);
 
     if (!initialised) {
         mp_int *p = MP_LITERAL(0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed);
@@ -1858,22 +1801,3 @@ bool ec_ed_alg_and_curve_by_bits(
     *curve = ((struct ecsign_extra *)(*alg)->extra)->curve();
     return true;
 }
-
-#ifdef MPEXT
-
-#include "puttyexp.h"
-
-void ec_cleanup(void)
-{
-  ec_curve_cleanup = 1;
-  ec_p256();
-  ec_p384();
-  ec_p521();
-  ec_curve25519();
-  ec_ed25519();
-  ec_curve448();
-  // in case we want to restart (unlikely)
-  ec_curve_cleanup = 0;
-}
-
-#endif
