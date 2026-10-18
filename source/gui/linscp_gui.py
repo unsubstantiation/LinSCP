@@ -1435,15 +1435,29 @@ def contained_local_path(base, name):
     """
     if not isinstance(name, str) or not name:
         return None, "Select an item first."
-    if name in (".", "..") or "/" in name or "\x00" in name:
+    # Reject path separators, NUL and control characters. A backslash is
+    # not a separator on POSIX but is rejected for consistency with the
+    # browser drop handlers that treat it as a separator attempt.
+    if name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
         return None, ("\"%s\" is not a single file name in this directory."
                       % name)
     if any(ord(char) < 32 or ord(char) == 127 for char in name):
         return None, "A file name must not contain a control character."
+    if len(name.encode("utf-8")) > 255:
+        return None, "The file name is too long."
     if not isinstance(base, str) or not base or not os.path.isabs(base):
         return None, "The local directory of this panel is not set."
-    target = os.path.join(base, name)
-    if os.path.commonpath([os.path.abspath(base), target]) != os.path.abspath(base):
+    # Use realpath to prevent a symlink in the base directory from
+    # escaping containment via string-prefix checks alone.
+    try:
+        real_base = os.path.realpath(base)
+        target = os.path.join(base, name)
+        # The target itself may be a symlink; realpath would resolve it and
+        # hide the fact that the operation would act on the link itself.
+        # For containment we only need to ensure the parent is inside base.
+        if os.path.commonpath([real_base, os.path.abspath(target)]) != real_base:
+            return None, "That name escapes the directory the panel is showing."
+    except ValueError:
         return None, "That name escapes the directory the panel is showing."
     return target, ""
 
@@ -1902,12 +1916,22 @@ def save_stored_session(name, session, pin_hostkey=False):
         # setting: only pin it when the caller insists.
         if key == "hostkey" and str(value).strip() == "*" and not pin_hostkey:
             continue
-        command += ' %s="%s"' % (flag, str(value).replace('"', ""))
+        text = str(value)
+        # A control character in a session field would become a second
+        # command when the core reads one command per line in -server mode.
+        # The quoting that protects spaces and semicolons cannot make a
+        # newline safe, so the field is refused rather than sent.
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+            return False, "The %s contains a control character and cannot be saved." % key
+        command += " %s=%s" % (flag, quote_remote(text))
     # Keep a usable password across edits: the console client encrypts
     # it into sessions.ini itself. A locked one (no readable key file)
     # is not in 'session' and stays as it is in the file.
     if session.get("password"):
-        command += ' -password="%s"' % str(session["password"]).replace('"', "")
+        text = str(session["password"])
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+            return False, "The password contains a control character and cannot be saved."
+        command += " -password=%s" % quote_remote(text)
     code, stdout, stderr = run_linscp(command, session)
     if code == 0:
         add_log("Saved session '%s'" % name, "success")
