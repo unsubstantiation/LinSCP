@@ -6099,8 +6099,14 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
     }
     if (savePassword)
     {
-        session.password = passwordGiven ? explicitPassword :
-            (connected ? options.password : std::string());
+        /* An explicit '-password=SECRET' wins; otherwise the password the
+         * run already knows - from '-password=', from LINSCP_PASSWORD, or
+         * from the open connection - is the one stored. The graphical
+         * client passes its password through the environment so that it
+         * never appears on a command line another user could read, and
+         * 'savesession <name> -password' is how it asks for that value
+         * to be stored without stating it again. */
+        session.password = passwordGiven ? explicitPassword : options.password;
         if (session.password.empty())
         {
             console.Error(Texts::WrongArguments("savesession",
@@ -6967,12 +6973,22 @@ bool Script::LockRemote(const std::vector<std::string> & args)
         if (StartsWith(lower, "-timeout="))
         {
             const std::string value = args[i].substr(strlen("-timeout="));
-            bool digits = !value.empty();
+            bool digits = !value.empty() && value.size() <= 9;
             for (size_t j = 0; digits && j < value.size(); j++)
             {
                 digits = value[j] >= '0' && value[j] <= '9';
             }
-            if (!digits || atoi(value.c_str()) <= 0)
+            long parsed = 0;
+            if (digits)
+            {
+                /* Bounded above: twenty digits are all digits, but they
+                 * are not a number of seconds atoi() can hold - the
+                 * conversion was undefined behaviour rather than a
+                 * refused switch. */
+                parsed = strtol(value.c_str(), NULL, 10);
+                digits = parsed > 0 && parsed <= 2147483647L;
+            }
+            if (!digits)
             {
                 Console::Instance().Error(Texts::WrongArguments("lock",
                     Texts::Translate(
@@ -6981,7 +6997,7 @@ bool Script::LockRemote(const std::vector<std::string> & args)
                 mErrors++;
                 return false;
             }
-            timeout = atoi(value.c_str());
+            timeout = static_cast<int>(parsed);
         }
         else if (args[i].size() > 1 && args[i][0] == '-')
         {

@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock as mock
 import urllib.error
 import urllib.request
 
@@ -944,6 +945,123 @@ class CrossOriginTests(unittest.TestCase):
             self.assertIn(status, (400, 404), path)
 
 
+class SecretHandlingTests(unittest.TestCase):
+    """Passwords stay out of the process list, the logs and the API."""
+
+    def test_the_site_url_carries_no_password_by_default(self):
+        session = {"protocol": "sftp", "host": "h", "port": 22,
+                   "username": "u", "password": "s3cret"}
+        self.assertEqual(gui.session_url(session), "sftp://u@h/")
+        self.assertNotIn("s3cret", gui.session_url(session, "/dir"))
+        self.assertIn("s3cret",
+                      gui.session_url(session, include_password=True))
+
+    def test_the_core_command_line_carries_no_password(self):
+        cmd = gui.core_command_line({"hostkey": "", "keyfile": "",
+                                     "username": "u", "password": "s3cret"})
+        self.assertNotIn("s3cret", " ".join(cmd))
+        self.assertIn("-username=u", cmd)
+
+    def test_the_password_reaches_the_core_through_the_environment(self):
+        kwargs = gui.popen_kwargs("s3cret")
+        self.assertEqual(kwargs["env"]["LINSCP_PASSWORD"], "s3cret")
+        self.assertEqual(kwargs["env"]["LINSCP_LANGUAGE"], "en")
+        # Without a password nothing is inherited: a value exported for
+        # another purpose must not silently authenticate this session.
+        with mock.patch.dict(os.environ, {"LINSCP_PASSWORD": "outer"}):
+            kwargs = gui.popen_kwargs()
+            self.assertNotIn("LINSCP_PASSWORD", kwargs["env"])
+            kwargs = gui.popen_kwargs("")
+            self.assertNotIn("LINSCP_PASSWORD", kwargs["env"])
+
+    def test_logged_commands_mask_passwords(self):
+        self.assertEqual(
+            gui._censored_command("open sftp://u:s3cret@h/ ; ls"),
+            "open sftp://u:***@h/ ; ls")
+        self.assertEqual(
+            gui._censored_command("savesession x -password=s3cret"),
+            "savesession x -password=***")
+        self.assertEqual(
+            gui._censored_command('savesession x -password="s3 cret"'),
+            'savesession x -password="***"')
+        self.assertEqual(gui._censored_command("ls /data"), "ls /data")
+
+    def test_terminal_input_splits_on_unquoted_semicolons_only(self):
+        self.assertEqual(gui.split_gui_commands('put "a;b.txt" ; echo hi'),
+                         ['put "a;b.txt" ', ' echo hi'])
+        self.assertEqual(gui.split_gui_commands("echo 'x;y';ls"),
+                         ["echo 'x;y'", 'ls'])
+        self.assertEqual(gui.split_gui_commands("ls;"), ["ls"])
+        self.assertEqual(gui.split_gui_commands("echo a\\;b"),
+                         ["echo a\\;b"])
+
+
+class AccountValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.previous = gui.ACCOUNTS_FILE
+        gui.ACCOUNTS_FILE = os.path.join(self.directory.name, "accounts.ini")
+
+    def tearDown(self):
+        gui.ACCOUNTS_FILE = self.previous
+        self.directory.cleanup()
+
+    def test_a_user_name_that_would_forge_the_file_is_refused(self):
+        for bad in ("alice\n[admin]", "a[b", "a]b", "a=b", "", "x" * 65,
+                    "a\x00b", "tab\there"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                gui._write_account(bad, "password", "")
+        gui._write_account("alice.smith-1_x", "password", "")
+        self.assertIn("alice.smith-1_x", gui._read_accounts())
+
+    def test_a_home_directory_must_be_absolute_and_single_line(self):
+        for bad in ("relative/path", "a\n/b", "a\rb", "a\x00/b"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                gui._write_account("bob", "password", bad)
+        with self.assertRaises(ValueError):
+            gui._write_account("bob", "", "/srv/bob")
+        gui._write_account("bob", "password", "/srv/bob")
+        self.assertEqual(gui._read_accounts()["bob"]["home_dir"], "/srv/bob")
+        gui._write_account("carol", "password", "")
+        self.assertEqual(gui._read_accounts()["carol"]["home_dir"], "")
+
+    def test_a_corrupted_record_is_a_failed_login_not_an_error(self):
+        gui._write_account("dave", "password", "")
+        accounts = gui._read_accounts()
+        self.assertTrue(gui._authenticate_user("dave", "password"))
+        # Corrupt the salt and the hash in the file: the login must
+        # answer False rather than raise.
+        path = pathlib.Path(gui.ACCOUNTS_FILE)
+        text = path.read_text(encoding="utf-8")
+        path.write_text(text.replace("salt=", "salt=zzz!"),
+                        encoding="utf-8")
+        self.assertFalse(gui._authenticate_user("dave", "password"))
+        self.assertFalse(gui._verify_password("password", "", ""))
+        self.assertFalse(gui._verify_password("password", "00", "zz"))
+
+
+class LocalChmodEvolvingTests(unittest.TestCase):
+    """The local chmod reads later clauses the way chmod(1) does."""
+
+    def test_a_later_clause_sees_what_an_earlier_one_did(self):
+        directory = tempfile.TemporaryDirectory()
+        try:
+            target = os.path.join(directory.name, "file")
+            with open(target, "w") as handle:
+                handle.write("x")
+            os.chmod(target, 0o644)
+            gui.apply_local_mode(target, "u+x,g+X")
+            self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o754)
+            os.chmod(target, 0o640)
+            gui.apply_local_mode(target, "u+x,g=u")
+            self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o770)
+            os.chmod(target, 0o644)
+            gui.apply_local_mode(target, "u+x,u-X")
+            self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o644)
+        finally:
+            directory.cleanup()
+
+
 if __name__ == "__main__":
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite()
@@ -951,7 +1069,9 @@ if __name__ == "__main__":
                  PermissionModeTests, PanelContainmentTests, RemoteNameTests,
                  ServerCommandStreamTests, LocalListingTests,
                  CustomCommandTests, LoginTests, QueueCleanupTests,
-                 BrowserUploadModeTests, CrossOriginTests):
+                 BrowserUploadModeTests, CrossOriginTests,
+                 SecretHandlingTests, AccountValidationTests,
+                 LocalChmodEvolvingTests):
         suite.addTests(loader.loadTestsFromTestCase(case))
     result = unittest.TextTestRunner(verbosity=1).run(suite)
     failed = len(result.failures) + len(result.errors)

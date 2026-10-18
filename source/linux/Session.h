@@ -256,8 +256,8 @@ bool SessionUsesTls(const SessionOptions & options);
  * TLS mode: 990 for implicit FTPS, 21 for FTP and explicit FTPS. */
 int SessionDefaultPort(const std::string & protocol, int ftpsMode);
 /*
- * The SHA-256 host key pin of a '-hostkey=' value, as curl's
- * '--hostpubsha256' wants it (unpadded base64). Accepts the hex digest with
+ * The SHA-256 host key pin of a '-hostkey=' value, as unpadded base64
+ * (the way OpenSSH prints it). Accepts the hex digest with
  * optional ':' separators, OpenSSH's 'SHA256:base64' and curl's own
  * 'sha256//base64' - all of them the digest of the same host key, so the
  * conversion decodes and does not re-hash. Returns false for a value that

@@ -61,6 +61,12 @@ class Store:
 
     def __init__(self):
         self.items = {"/": {"kind": "dir", "mtime": _now()}}
+        # Every write moves the entity tags, even a rewrite of the same
+        # bytes within the same second: without this two successive PUTs
+        # of identical content could share one tag, and a precondition
+        # test could not tell whether the second write changed the
+        # version. Real servers version on write, not on content alone.
+        self.write_seq = 0
         self.copy_count = 0
         self.reject_next_copy = False
         # path -> token, and path -> {name: value} for the dead properties.
@@ -111,7 +117,9 @@ class Store:
         if item is None or item["kind"] != "dir":
             return "no-parent"
         existed = path in self.items
-        self.items[path] = {"kind": "file", "mtime": _now(), "data": data}
+        self.write_seq += 1
+        self.items[path] = {"kind": "file", "mtime": _now(), "data": data,
+                            "seq": self.write_seq}
         return "replaced" if existed else "created"
 
     def delete(self, path):
@@ -146,6 +154,8 @@ class Store:
         digest.update(entry["kind"].encode("utf-8"))
         digest.update(b"\0")
         digest.update(str(entry["mtime"]).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(entry.get("seq", 0)).encode("utf-8"))
         if entry["kind"] == "dir":
             digest.update("\0".join(sorted(self.children_of(path)))
                           .encode("utf-8"))
