@@ -2000,6 +2000,28 @@ def contained_local_path(base, name):
     return target, ""
 
 
+def check_remote_entry_name(name):
+    """Validate that a remote name is a single entry in the current panel.
+
+    Returns an error message, or an empty string when the name is safe to
+    use as the operand of a mkdir/rm/rmdir/mv/chmod/ln that is run after
+    'cd <panel_dir>'. The local panel rejects '.', '..', separators and
+    control characters in the name it is given; the remote panel must do
+    the same, or a '../../etc' entry from a second browser window or a
+    hostile remote listing could operate outside the directory the panel
+    is showing.
+    """
+    if not isinstance(name, str) or not name:
+        return "Select an item first."
+    if name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
+        return ("\"%s\" is not a single file name in this directory." % name)
+    if any(ord(char) < 32 or ord(char) == 127 for char in name):
+        return "A file name must not contain a control character."
+    if len(name.encode("utf-8")) > 255:
+        return "The file name is too long."
+    return ""
+
+
 def build_chmod_command(remote_dir, mode_text, name):
     """The commands a remote chmod runs: enter the panel, change one entry.
 
@@ -3422,10 +3444,15 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if tab is None:
                 self.send_json({"success": False, "error": "Not connected"}, status=400)
                 return
+            name = body.get("name") or ""
+            name_error = check_remote_entry_name(name)
+            if name_error:
+                self.send_json({"success": False, "error": name_error}, status=400)
+                return
             code, lines = tab.run_many(["cd " + quote_remote(tab.remote_dir),
-                                        "mkdir " + quote_remote(body.get("name") or "")])
+                                        "mkdir " + quote_remote(name)])
             if code == 0:
-                add_log("Created remote directory: %s" % body.get("name"), "success")
+                add_log("Created remote directory: %s" % name, "success")
                 self.send_json({"success": True})
             else:
                 self.send_json({"success": False,
@@ -3441,6 +3468,10 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             errors, deleted = [], []
             for item in names:
                 name = item if isinstance(item, str) else item.get("name")
+                name_error = check_remote_entry_name(name or "")
+                if name_error:
+                    errors.append(name_error)
+                    continue
                 is_dir = item.get("is_dir", False) if isinstance(item, dict) else False
                 code, lines = tab.run_many([
                     "cd " + quote_remote(tab.remote_dir),
@@ -3461,13 +3492,18 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if tab is None:
                 self.send_json({"success": False, "error": "Not connected"}, status=400)
                 return
+            old_name = body.get("old_name") or ""
+            new_name = body.get("new_name") or ""
+            name_error = (check_remote_entry_name(old_name) or
+                          check_remote_entry_name(new_name))
+            if name_error:
+                self.send_json({"success": False, "error": name_error}, status=400)
+                return
             code, lines = tab.run_many([
                 "cd " + quote_remote(tab.remote_dir),
-                "mv " + quote_remote(body.get("old_name") or "") + " " +
-                quote_remote(body.get("new_name") or "")])
+                "mv " + quote_remote(old_name) + " " + quote_remote(new_name)])
             if code == 0:
-                add_log("Renamed %s to %s" % (body.get("old_name"), body.get("new_name")),
-                        "success")
+                add_log("Renamed %s to %s" % (old_name, new_name), "success")
                 self.send_json({"success": True})
             else:
                 self.send_json({"success": False,
@@ -3479,10 +3515,14 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if tab is None:
                 self.send_json({"success": False, "error": "Not connected"}, status=400)
                 return
+            name = body.get("name") or ""
+            name_error = check_remote_entry_name(name)
+            if name_error:
+                self.send_json({"success": False, "error": name_error}, status=400)
+                return
             mode_text = str(body.get("permissions") or "644")
             try:
-                commands = build_chmod_command(tab.remote_dir, mode_text,
-                                               body.get("name") or "")
+                commands = build_chmod_command(tab.remote_dir, mode_text, name)
             except ValueError as exc:
                 self.send_json({"success": False, "error": str(exc)}, status=400)
                 return
@@ -3564,6 +3604,10 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             switches = transfer_switches(body)
             priority = bool(body.get("priority"))
             for name in names:
+                name_error = check_remote_entry_name(name or "")
+                if name_error:
+                    self.send_json({"success": False, "error": name_error}, status=400)
+                    return
                 remote_path = posixpath.join(tab.remote_dir, name)
                 local_target = os.path.join(local_dir, name)
                 command = "lcd %s ; cd %s ; get %s %s" % (
@@ -3589,17 +3633,23 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             switches = transfer_switches(body)
             priority = bool(body.get("priority"))
             for name in names:
-                local_path = os.path.join(tab.local_dir, name)
+                # A local upload name must also be a single entry: the
+                # panel shows one directory, '../../etc/passwd' is not in it.
+                local_target, contain_error = contained_local_path(
+                    tab.local_dir, name)
+                if contain_error:
+                    self.send_json({"success": False, "error": contain_error}, status=400)
+                    return
                 remote_target = posixpath.join(remote_dir, name)
                 command = "lcd %s ; cd %s ; put %s %s" % (
                     quote_local(tab.local_dir), quote_remote(remote_dir),
                     switches, quote_local(name))
-                task = TASKS.submit("Upload", command, tab.session, local_path,
+                task = TASKS.submit("Upload", command, tab.session, local_target,
                                     remote_target, tab.id,
                                     progress_remote=(tab.id, remote_target),
                                     priority=priority)
                 try:
-                    task.bytes_total = os.path.getsize(local_path)
+                    task.bytes_total = os.path.getsize(local_target)
                 except OSError:
                     task.bytes_total = 0
             self.send_json({"success": True})
@@ -4693,12 +4743,29 @@ def main():
             startup_url = arg
             continue
         if arg.startswith("--port="):
+            port_text = arg.split("=", 1)[1].strip()
             try:
-                port = int(arg.split("=", 1)[1])
+                port = int(port_text)
             except ValueError:
-                pass
+                print("Invalid port '%s': expected a number from 0 through 65535."
+                      % port_text, file=sys.stderr)
+                return 2
+            if not 0 <= port <= 65535:
+                print("Invalid port %d: must be between 0 and 65535." % port,
+                      file=sys.stderr)
+                return 2
         elif arg.startswith("--host="):
             host = arg.split("=", 1)[1]
+            # Listening on an address the Host check refuses is a server
+            # that cannot answer its own address: add the bind address to
+            # the allowed set so a request for it is not rejected before
+            # --allow-any-host is needed. 0.0.0.0 and :: are wildcard
+            # binds, not Host header values, and are skipped: a request
+            # addressed to the wildcard is always an attempt to talk to
+            # something other than this loopback service.
+            host_lc = host.strip().lower()
+            if host_lc and host_lc not in ("0.0.0.0", "::", "::0"):
+                ALLOWED_HOSTS.add(host_lc)
         elif arg.startswith("--token="):
             fixed_token = arg.split("=", 1)[1].strip()
         elif arg == "--no-auth":
