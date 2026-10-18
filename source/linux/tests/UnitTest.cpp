@@ -3250,6 +3250,39 @@ void TestNonUnixListingFormats()
         CHECK_TRUE(entry.typeKnown);
         CHECK_EQ(std::to_string(entry.size), std::string("12345"));
     }
+    /*
+     * A server that puts a blank between the time and the meridiem wrote
+     * the meridiem into the column where the size belongs. The size came
+     * out as zero and the name carried the size in front of it.
+     */
+    {
+        ListingEntry entry;
+        CHECK_TRUE(ParseDosListingLine(
+            "07-14-22  04:00 PM            12345    filename.txt", entry));
+        CHECK_EQ(entry.name, std::string("filename.txt"));
+        CHECK_FALSE(entry.isDir);
+        CHECK_EQ(std::to_string(entry.size), std::string("12345"));
+    }
+    {
+        ListingEntry entry;
+        CHECK_TRUE(ParseDosListingLine(
+            "03-25-23  11:22 PM       <DIR>          dirname", entry));
+        CHECK_EQ(entry.name, std::string("dirname"));
+        CHECK_TRUE(entry.isDir);
+    }
+    /* A meridiem in a listing of its own is not a file name. */
+    {
+        ListingEntry entry;
+        CHECK_FALSE(ParseDosListingLine(
+            "07-14-22  04:00 PM", entry));
+    }
+    /* A time that is not a time is not a time. */
+    {
+        ListingEntry entry;
+        CHECK_TRUE(ParseDosListingLine(
+            "07-14-22  ??:??             12345    filename.txt", entry));
+        CHECK_FALSE(entry.timeKnown);
+    }
     /* DOS line should not match Unix. */
     {
         ListingEntry entry;

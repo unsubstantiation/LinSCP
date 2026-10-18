@@ -72,6 +72,14 @@ class OperandQuotingTests(unittest.TestCase):
             self.assertEqual(split_command_line(gui.quote_remote(name)), [name])
             self.assertEqual(split_command_line(gui.quote_local(name)), [name])
 
+    def test_a_backslash_is_quoted_so_the_splitter_keeps_it(self):
+        # The client's splitter reads a backslash as the start of an
+        # escape outside quotes, so an unquoted 'a\b' arrived at the
+        # server as 'ab': the name of one file was the name of another.
+        for name in ("a\\b", "back\\slash", "trailing\\", "a\\ b"):
+            self.assertEqual(split_command_line(gui.quote_remote(name)), [name])
+            self.assertEqual(split_command_line(gui.quote_local(name)), [name])
+
     def test_a_control_character_is_refused_rather_than_quoted(self):
         # The core reads one command per line in -server mode, so a name
         # holding a newline is two commands and the second one is whatever
@@ -255,6 +263,45 @@ class PermissionModeTests(unittest.TestCase):
             os.chmod(target, 0o600)
             gui.apply_local_mode(target, "a+X")
             self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o711)
+
+    def test_the_special_bits_are_applied_like_the_console_client_does(self):
+        # 's' and 't' live outside the three permission classes. They were
+        # masked with the class mask, which does not hold them, so 'a+s'
+        # and 'o+t' changed nothing at all while the remote chmod set the
+        # setuid, setgid and sticky bits.
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, "file")
+            with open(target, "w") as handle:
+                handle.write("x")
+            cases = (
+                ("a+s", 0o6644),
+                ("u+s", 0o4644),
+                ("g+s", 0o2644),
+                ("o+s", 0o644),
+                ("o+t", 0o1644),
+                ("a+t", 0o1644),
+                ("u+t", 0o644),
+                ("u-s", 0o644),
+            )
+            for mode, expected in cases:
+                os.chmod(target, 0o644)
+                gui.apply_local_mode(target, mode)
+                self.assertEqual(stat.S_IMODE(os.stat(target).st_mode),
+                                 expected, mode)
+
+    def test_a_permission_letter_copies_the_class_it_names(self):
+        # 'g=u' gives the group the permissions the owner has, as the
+        # console client's ParseSymbolicPermissions() does.
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, "file")
+            with open(target, "w") as handle:
+                handle.write("x")
+            for mode, expected in (("g=u", 0o664), ("u=g", 0o444),
+                                   ("g=u", 0o664)):
+                os.chmod(target, 0o644)
+                gui.apply_local_mode(target, mode)
+                self.assertEqual(stat.S_IMODE(os.stat(target).st_mode),
+                                 expected, mode)
 
 
 class PanelContainmentTests(unittest.TestCase):
