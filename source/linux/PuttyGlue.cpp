@@ -483,8 +483,9 @@ std::string PreparePrivateKeyFile(const std::string & keyFile,
     }
 
     gImportedKeyPath = importedPath;
-    Console::Instance().LogEvent("Imported the " + std::string(key_type_to_str(type)) +
-        " key file '" + keyFile + "' as a PuTTY key file.");
+    Console::Instance().LogEvent(Texts::Translate(
+        "Imported the {type} key file '{path}' as a PuTTY key file.",
+        {{"type", std::string(key_type_to_str(type))}, {"path", keyFile}}));
     return importedPath;
 }
 
@@ -799,8 +800,8 @@ const char * in_memory_key_data(const Filename * fn)
 
 void old_keyfile_warning(void)
 {
-    linscp::Console::Instance().Error(
-        "Warning: this private key is in an old format; consider converting it.");
+    linscp::Console::Instance().Error(linscp::Texts::Translate(
+        "Warning: this private key is in an old format; consider converting it."));
 }
 
 /* --- 2. Persistent storage ------------------------------------------- */

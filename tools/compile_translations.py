@@ -124,12 +124,150 @@ def check_gui_coverage(catalogs, source):
 def check_cli_coverage(catalogs):
     missing = set()
     for path in (ROOT / 'source/linux').glob('*.cpp'):
-        for literals in re.findall(r'\bTranslate\(\s*((?:"(?:\\.|[^"\\])*"\s*)+)', path.read_text(encoding='utf-8')):
+        source = path.read_text(encoding='utf-8')
+        translated = set()
+        for literals in re.findall(r'\bTranslate\(\s*((?:"(?:\\.|[^"\\])*"\s*)+)', source):
             key = ''.join(ast.literal_eval(x) for x in re.findall(r'"(?:\\.|[^"\\])*"', literals))
+            translated.add(key)
             if key not in catalogs['en']:
                 missing.add(key)
+        # A message that is printed from a plain literal never reaches the
+        # catalog, so it stays English in every language.
+        for message in output_messages(source):
+            if message not in translated:
+                missing.add(message)
+        for message in operation_messages(source):
+            if message not in catalogs['en']:
+                missing.add(message)
+    for message in command_help_messages():
+        if message not in catalogs['en']:
+            missing.add(message)
     if missing:
         raise ValueError('Uncatalogued CLI messages: ' + repr(sorted(missing)))
+
+
+OUTPUT_CALL = re.compile(
+    r'(?:Console::Instance\(\)|console)\.(?:Status|Error|WriteLine|LogEvent)\(\s*"')
+
+
+def output_messages(source):
+    """The messages a console call prints from a plain string literal.
+
+    A message that reaches the user without going through the catalog is
+    the one that stays English in every language, so the check that the
+    catalog is complete has to see it as well. A literal without a letter
+    is only layout, and the 'LSCP-' banners belong to the protocol the
+    graphical client speaks, not to the language of the client.
+    """
+    messages = set()
+    for match in OUTPUT_CALL.finditer(source):
+        start = match.end() - 1
+        index = match.end()
+        parts = []
+        while True:
+            while True:
+                if source[index] == '\\':
+                    index += 2
+                    continue
+                if source[index] == '"':
+                    break
+                index += 1
+            parts.append(ast.literal_eval(source[start:index + 1]))
+            index += 1
+            # Adjacent literals are one message.
+            probe = index
+            while probe < len(source) and source[probe].isspace():
+                probe += 1
+            if probe < len(source) and source[probe] == '"':
+                start = probe
+                index = probe + 1
+                continue
+            break
+        message = ''.join(parts)
+        if not re.search('[A-Za-z]', message):
+            continue
+        if message.startswith('LSCP-'):
+            continue
+        messages.add(message)
+    return messages
+
+
+OPERATION_CALL = re.compile(r'Texts::(?:RemoteError|LocalError)\(\s*"')
+
+
+def operation_messages(source):
+    """The operations the error helpers name.
+
+    The helper looks the operation up in the catalog by itself, so an
+    operation that is not there stays English inside a translated
+    sentence.
+    """
+    messages = set()
+    for match in OPERATION_CALL.finditer(source):
+        index = match.end()
+        start = index - 1
+        while True:
+            if source[index] == '\\':
+                index += 2
+                continue
+            if source[index] == '"':
+                break
+            index += 1
+        messages.add(ast.literal_eval(source[start:index + 1]))
+    return messages
+
+
+HELP_TABLE = re.compile(r'kScriptCommandHelps\[\] = \{(.*?)\n\};', re.S)
+C_LITERAL = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+
+def unescape_c(text):
+    """The characters a C string literal stands for."""
+    out = []
+    index = 0
+    simple = {'n': '\n', 't': '\t', 'r': '\r', '\\': '\\', '"': '"', "'": "'"}
+    while index < len(text):
+        char = text[index]
+        if char == '\\' and index + 1 < len(text):
+            following = text[index + 1]
+            if following in simple:
+                out.append(simple[following])
+                index += 2
+                continue
+            if following == 'x' and index + 3 < len(text):
+                out.append(chr(int(text[index + 2:index + 4], 16)))
+                index += 4
+                continue
+        out.append(char)
+        index += 1
+    return ''.join(out)
+
+
+def command_help_messages():
+    """The per-command help texts of the script engine.
+
+    They are data rather than calls, so the coverage check above cannot
+    see them: a new help text that nobody translated would be the one
+    message the client still answers in English. The table is read the
+    way the compiler reads it - the literals of an entry joined together,
+    with the C escapes resolved.
+    """
+    source = (ROOT / 'source/linux/Script.cpp').read_text(encoding='utf-8')
+    block = HELP_TABLE.search(source)
+    if not block:
+        raise ValueError('No kScriptCommandHelps table in source/linux/Script.cpp')
+    body = block.group(1)
+    starts = [match.start() for match in re.finditer(r'\{\s*"', body)]
+    messages = set()
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else len(body)
+        entry = body[start:end]
+        name = re.match(r'\{\s*"((?:[^"\\]|\\.)*)"', entry)
+        if not name:
+            raise ValueError('A help entry has no command name')
+        literals = C_LITERAL.findall(entry[name.end():])
+        messages.add(unescape_c(''.join(literals)))
+    return messages
 
 
 def main():

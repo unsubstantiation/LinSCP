@@ -82,15 +82,14 @@ No system file-manager shell commands or upstream extension system.
 
 **Area:** Localization/accessibility · **Status:** partial
 
-English/Spanish catalogs cover the browser interface (menus, dialogs, help, ARIA/tooltips, dynamic status/queue/sync/editor/search messages) and shared CLI messages, CLI -help/option errors, host-key warnings, passphrase/destructive-action prompts and connection status. Locale precedence, regional fallback, plurals, literal data, safe embedded JSON and internal protocol isolation are tested. Raw server/OS diagnostics and core logs are intentionally preserved.
+English/Spanish catalogs cover the browser interface (menus, dialogs, help, ARIA/tooltips, dynamic status/queue/sync/editor/search messages) and the whole command-line client: the per-command help texts, the status, argument, switch and engine messages of the script engine, the operations the error helpers name and the option listing. The translation compiler rejects a message that reaches the user without a catalog entry, a command help text that nobody translated and an error operation that is not in the catalog. Locale precedence, regional fallback, plurals, literal data, safe embedded JSON and internal protocol isolation are tested. Raw server/OS diagnostics, the 'LSCP-' protocol banners and core logs are intentionally preserved.
 
-**Next:** Translate command-specific help and remaining human-facing Script.cpp status and argument/engine error strings that bypass the shared Texts functions; no full upstream language-catalog coverage is claimed.
+**Next:** Only English and Spanish catalogs are shipped; upstream ships catalogs for many more languages, and the upstream .NET interface has strings that this client does not have at all. No full upstream language-catalog coverage is claimed.
 
 **Acceptance criteria:**
 
-- [ ] Route command-specific help and every remaining human-facing script status/argument/engine message through English/Spanish catalogs, keeping paths, command tokens and server/OS diagnostics literal.
-- [ ] Add coverage checks that detect new uncatalogued messages and run translated positive/negative CLI workflows, including help, synchronization, editing, sessions and transfer failures.
-- [ ] Preserve host-key refusal behavior, machine protocol values and secret masking; review security-warning translations before adding more supported locales.
+- [ ] Ship a catalog for every language the project claims to support and translate the whole interface into it, starting with the languages the upstream project already ships.
+- [ ] Add a test that walks the catalogs and reports the messages of the client that are still answered in English, so a new interface string cannot slip through untranslated.
 
 ## s3.versioned-objects
 

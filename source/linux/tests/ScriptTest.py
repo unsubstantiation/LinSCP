@@ -104,6 +104,87 @@ class ScriptTests(unittest.TestCase):
         result = self.run_commands("echo Delete %1%", env={"LINSCP_LANGUAGE": "es"})
         self.assertIn("Delete", result.stdout)
 
+    def test_translated_command_help_lists_every_command(self):
+        english = self.run_commands("help")
+        spanish = self.run_commands("help", env={"LINSCP_LANGUAGE": "es"})
+        self.assertEqual(english.returncode, 0)
+        self.assertEqual(spanish.returncode, 0)
+        # The names of the commands are data and stay literal; only the
+        # description next to them is translated.
+        names = [line.split()[0] for line in english.stdout.splitlines()
+                 if line and not line[0].isspace() and line.split()]
+        self.assertTrue(names)
+        for name in names:
+            with self.subTest(command=name):
+                self.assertIn(name, spanish.stdout)
+        self.assertIn("Descarga archivos.", spanish.stdout)
+        self.assertNotIn("Downloads files.", spanish.stdout)
+        detail = self.run_commands("help get", env={"LINSCP_LANGUAGE": "es"})
+        self.assertIn("get [ <switches> ] <file> [ <file>... ] [ <target> ]",
+                      detail.stdout)
+        self.assertIn("Descarga archivos.", detail.stdout)
+
+    def test_translated_engine_workflows_keep_the_data_literal(self):
+        spanish = {"LINSCP_LANGUAGE": "es"}
+        result = self.run_commands("option batch; option transfer", env=spanish)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("batch = ", result.stdout)
+        self.assertIn("transfer = ", result.stdout)
+        # A wrong switch is reported in the language of the user, and the
+        # name of the switch itself stays literal.
+        result = self.run_commands("open sftp://host -nonsense", env=spanish)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Opción desconocida '-nonsense'",
+                      result.stdout + result.stderr)
+        # A value that the option does not accept is named in the message.
+        result = self.run_commands("option editmaxsize abc", env=spanish)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("El valor de 'editmaxsize' debe ser un número de bytes.",
+                      result.stdout + result.stderr)
+        # The list of the option names is data, the word before it is not.
+        result = self.run_commands("option -nonsense", env=spanish)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("admitidos: echo, batch", result.stdout + result.stderr)
+        # An unknown command keeps its own name.
+        result = self.run_commands("nosuchcommand", env=spanish)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Orden desconocida 'nosuchcommand'",
+                      result.stdout + result.stderr)
+
+    def test_translated_synchronization_session_and_transfer_workflows(self):
+        spanish = {"LINSCP_LANGUAGE": "es"}
+        # The synchronization refuses a criteria it cannot use, and says so
+        # in the language of the user.
+        result = self.run_commands("synchronize both -criteria=checksum /a /b",
+                                   env=spanish)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("'-criteria=checksum' no se puede combinar con la "
+                      "dirección 'both'",
+                      result.stdout + result.stderr)
+        # A transfer that is asked for with an unknown switch is refused
+        # before it touches the network.
+        result = self.run_commands("get -nonsense /tmp/x", env=spanish)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Opción no admitida '-nonsense'",
+                      result.stdout + result.stderr)
+        # The sessions of the user are listed in the language of the user,
+        # and the name of the configuration file stays literal.
+        result = self.run_commands("sessions list", env=spanish)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("No hay ninguna sesión guardada.",
+                      result.stdout + result.stderr)
+        # The editor refuses a second file with a message of its own.
+        result = self.run_commands("edit", env=spanish)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Un archivo a la vez.", result.stdout + result.stderr)
+        # A preset that is not there is named, and the path of the
+        # configuration file stays literal.
+        result = self.run_commands("option preset nosuchpreset", env=spanish)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("No hay ningún preajuste de transferencia llamado "
+                      "'nosuchpreset'",
+                      result.stdout + result.stderr)
+
     def test_default_abort(self):
         for file in (False, True):
             with self.subTest(file=file):

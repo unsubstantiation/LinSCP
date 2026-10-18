@@ -606,8 +606,9 @@ bool CollectRawSettings(const std::vector<std::string> & args, size_t & index,
         if (end == NULL || *end != '\0' || parsed < 0 ||
             static_cast<long>(static_cast<int>(parsed)) != parsed)
         {
-            error = "The value of '-rawsettings' is the number of settings "
-                "that follow it, as in '-rawsettings=2'.";
+            error = Texts::Translate(
+                "The value of '-rawsettings' is the number of settings that "
+                "follow it, as in '-rawsettings=2'.");
             return false;
         }
         cap = static_cast<int>(parsed);
@@ -623,7 +624,9 @@ bool CollectRawSettings(const std::vector<std::string> & args, size_t & index,
             {
                 break;
             }
-            error = "'" + next + "' is not a 'name=value' session setting.";
+            error = Texts::Translate(
+                "'{name}' is not a 'name=value' session setting.",
+                {{"name", next}});
             return false;
         }
         const size_t eq = next.find('=');
@@ -633,8 +636,10 @@ bool CollectRawSettings(const std::vector<std::string> & args, size_t & index,
     }
     if (cap >= 0 && taken < cap)
     {
-        error = "'-rawsettings=" + std::to_string(cap) + "' was given, but "
-            "only " + std::to_string(taken) + " setting parameter(s) follow.";
+        error = Texts::Translate(
+            "'-rawsettings={count}' was given, but only {taken} setting "
+            "parameter(s) follow.",
+            {{"count", std::to_string(cap)}, {"taken", std::to_string(taken)}});
         return false;
     }
     return true;
@@ -736,8 +741,9 @@ bool Script::RequireConnection()
     {
         const SessionOptions options = mSession.Options();
         const std::string lastDirectory = mRemoteDirectory;
-        Console::Instance().Status("The connection was lost; reconnecting to " +
-            mSession.HostDescription() + "...");
+        Console::Instance().Status(Texts::Translate(
+            "The connection was lost; reconnecting to {host}...",
+            {{"host", mSession.HostDescription()}}));
         mSession.Close();
         std::string error;
         if (!mSession.Open(options, error))
@@ -905,8 +911,9 @@ int Script::RemotePut(const std::string & local, const std::string & remote,
                     "\" result=\"" + (touchRes == 0 ? "ok" : "failed") + "\"");
                 if (touchRes != 0)
                 {
-                    Console::Instance().Status("Could not set the timestamps of '" +
-                        remote + "': " + lscp_sftp_error());
+                    Console::Instance().Status(Texts::Translate(
+                        "Could not set the timestamps of '{path}': {reason}",
+                        {{"path", remote}, {"reason", lscp_sftp_error()}}));
                 }
             }
         }
@@ -962,8 +969,9 @@ int Script::RemoteSetTimes(const std::string & path, unsigned long atime,
     }
     if (!UseNativeSftp(mSession.Options().protocol))
     {
-        error = "Setting the timestamps of a directory needs the native "
-            "SFTP transport or an SCP session.";
+        error = Texts::Translate(
+            "Setting the timestamps of a directory needs the native SFTP "
+            "transport or an SCP session.");
         Console::Instance().LogAction("touch",
             "filename=\"" + Console::EscapeActionText(path) +
             "\" result=\"failed\"");
@@ -1295,7 +1303,7 @@ bool Script::OpenSite(const std::vector<std::string> & args)
         else if (StartsWith(args[i], "-"))
         {
             Console::Instance().Error(Texts::WrongArguments("open",
-                "Unknown switch '" + args[i] + "'."));
+                Texts::Translate("Unknown switch '{switch}'.", {{"switch", args[i]}})));
             mErrors++;
             return false;
         }
@@ -1306,7 +1314,8 @@ bool Script::OpenSite(const std::vector<std::string> & args)
         else
         {
             Console::Instance().Error(Texts::WrongArguments("open",
-                "Unexpected argument '" + args[i] + "'."));
+                Texts::Translate("Unexpected argument '{argument}'.",
+                    {{"argument", args[i]}})));
             mErrors++;
             return false;
         }
@@ -1315,7 +1324,7 @@ bool Script::OpenSite(const std::vector<std::string> & args)
     if (url.empty())
     {
         Console::Instance().Error(Texts::WrongArguments("open",
-            "Syntax: open sftp://[user[:password]@]host[:port]/[path]"));
+            Texts::Translate("Syntax: open sftp://[user[:password]@]host[:port]/[path]")));
         mErrors++;
         return false;
     }
@@ -1456,13 +1465,14 @@ void Script::CloseSite(const std::vector<std::string> & args)
     if (args.size() > 1)
     {
         Console::Instance().Error(Texts::WrongArguments("close",
-            "Syntax: close [<index>]."));
+            Texts::Translate("Syntax: close [<index>].")));
         mErrors++;
         return;
     }
     if (!args.empty() && args[0] != "1")
     {
-        Console::Instance().Error("Invalid session index '" + args[0] + "'.");
+        Console::Instance().Error(Texts::Translate(
+            "Invalid session index '{index}'.", {{"index", args[0]}}));
         mErrors++;
         return;
     }
@@ -1471,7 +1481,7 @@ void Script::CloseSite(const std::vector<std::string> & args)
     mRemoteDirectory.clear();
     mHomeDirectory.clear();
     Console::Instance().LogAction("session", "action=\"close\"");
-    Console::Instance().WriteLine("Session '" + name + "' closed.");
+    Console::Instance().WriteLine(Texts::SessionClosed(name));
 }
 
 bool Script::ChangeRemoteDirectory(const std::vector<std::string> & args)
@@ -1483,7 +1493,7 @@ bool Script::ChangeRemoteDirectory(const std::vector<std::string> & args)
     if (args.size() > 1)
     {
         Console::Instance().Error(Texts::WrongArguments("cd",
-            "Syntax: cd [<directory>]"));
+            Texts::Translate("Syntax: cd [<directory>]")));
         mErrors++;
         return false;
     }
@@ -1614,7 +1624,7 @@ bool Script::ListRemote(const std::vector<std::string> & args)
                     break;
                 default:
                     Console::Instance().Error(Texts::WrongArguments("ls",
-                        "Syntax: ls [-al1] [<directory>[/<mask>]]"));
+                        Texts::Translate("Syntax: ls [-al1] [<directory>[/<mask>]]")));
                     mErrors++;
                     return false;
                 }
@@ -1627,7 +1637,7 @@ bool Script::ListRemote(const std::vector<std::string> & args)
         else
         {
             Console::Instance().Error(Texts::WrongArguments("ls",
-                "Syntax: ls [-al1] [<directory>[/<mask>]]"));
+                Texts::Translate("Syntax: ls [-al1] [<directory>[/<mask>]]")));
             mErrors++;
             return false;
         }
@@ -1689,7 +1699,7 @@ bool Script::ChangeLocalDirectory(const std::vector<std::string> & args)
     std::string error;
     if (args.size() != 1)
     {
-        Console::Instance().Error(Texts::WrongArguments("lcd", "Syntax: lcd <directory>"));
+        Console::Instance().Error(Texts::WrongArguments("lcd", Texts::Translate("Syntax: lcd <directory>")));
         mErrors++;
         return false;
     }
@@ -1703,7 +1713,7 @@ bool Script::ChangeLocalDirectory(const std::vector<std::string> & args)
     std::string path = ResolveLocalPath(current, args[0]);
     if (!SetLocalDirectory(path, error))
     {
-        Console::Instance().Error(Texts::LocalError("change of directory to " + path,
+        Console::Instance().Error(Texts::LocalError("change of directory to",
             path, error));
         mErrors++;
         return false;
@@ -1784,7 +1794,8 @@ bool Script::CreateRemoteDirectoryRecursive(const std::string & path, std::strin
         {
             return true;
         }
-        error = "Path '" + path + "' exists and is not a directory.";
+        error = Texts::Translate("Path '{path}' exists and is not a directory.",
+            {{"path", path}});
         return false;
     }
     std::string parent = RemoteDirName(path);
@@ -1850,7 +1861,8 @@ bool Script::RemoveLocalItemRecursive(const std::string & path)
             mErrors++;
             return false;
         }
-        Console::Instance().Status("Removed local directory '" + path + "'.");
+        Console::Instance().Status(Texts::Translate(
+            "Removed local directory '{path}'.", {{"path", path}}));
         return success;
     }
     if (!RemoveLocalFile(path, error))
@@ -1859,7 +1871,8 @@ bool Script::RemoveLocalItemRecursive(const std::string & path)
         mErrors++;
         return false;
     }
-    Console::Instance().Status("Removed local file '" + path + "'.");
+    Console::Instance().Status(Texts::Translate(
+        "Removed local file '{path}'.", {{"path", path}}));
     return true;
 }
 
@@ -1908,7 +1921,8 @@ bool Script::RemoveRemoteItemRecursive(const std::string & path)
             mErrors++;
             return false;
         }
-        Console::Instance().Status("Removed remote directory '" + path + "'.");
+        Console::Instance().Status(Texts::Translate(
+            "Removed remote directory '{path}'.", {{"path", path}}));
         return success;
     }
     if (RemoteRemove(path, error) != 0)
@@ -1917,7 +1931,8 @@ bool Script::RemoveRemoteItemRecursive(const std::string & path)
         mErrors++;
         return false;
     }
-    Console::Instance().Status("Removed remote file '" + path + "'.");
+    Console::Instance().Status(Texts::Translate(
+        "Removed remote file '{path}'.", {{"path", path}}));
     return true;
 }
 
@@ -2422,8 +2437,9 @@ bool Script::UploadDirectoryRecursive(const std::string & localDir,
             if (RemoteSetTimes(remoteDir, info.atime != 0 ? info.atime : info.mtime,
                 info.mtime, timeError) != 0 && !timeError.empty())
             {
-                Console::Instance().Status("Could not set the timestamps of '" +
-                    remoteDir + "': " + timeError);
+                Console::Instance().Status(Texts::Translate(
+                    "Could not set the timestamps of '{path}': {reason}",
+                    {{"path", remoteDir}, {"reason", timeError}}));
             }
         }
     }
@@ -2471,8 +2487,10 @@ bool Script::ResolveAbbreviation(const std::vector<std::string> & names,
     if (index == kNameAmbiguous)
     {
         Console::Instance().Error(Texts::WrongArguments(typed,
-            "The " + what + " '" + typed + "' is ambiguous: it matches " +
-            matches + ". Type them out in full."));
+            Texts::Translate(
+                "The {what} '{name}' is ambiguous: it matches {matches}. "
+                "Type them out in full.",
+                {{"what", what}, {"name", typed}, {"matches", matches}})));
         mErrors++;
         return false;
     }
@@ -2706,9 +2724,11 @@ bool Script::ResolveStage(bool eligible, bool upload,
     {
         stage.continuing = true;
         stage.resumeOffset = partSize;
-        Console::Instance().Status(std::string("Resuming ") +
-            (upload ? "upload of '" : "download of '") + baseName +
-            "' from byte " + std::to_string(partSize));
+        Console::Instance().Status(upload ?
+            Texts::Translate("Resuming upload of '{path}' from byte {offset}",
+                {{"path", baseName}, {"offset", std::to_string(partSize)}}) :
+            Texts::Translate("Resuming download of '{path}' from byte {offset}",
+                {{"path", baseName}, {"offset", std::to_string(partSize)}}));
         return true;
     }
     if (partSize == totalSize)
@@ -2744,8 +2764,9 @@ bool Script::PrepareStage(TransferStage & stage, std::string & error)
     }
     if (result != 0)
     {
-        error = "Cannot remove the incomplete staging file '" +
-            stage.partPath + "': " + error;
+        error = Texts::Translate(
+            "Cannot remove the incomplete staging file '{path}': {reason}",
+            {{"path", stage.partPath}, {"reason", error}});
         return false;
     }
     stage.stale = false;
@@ -2765,9 +2786,11 @@ bool Script::FinishStage(const TransferStage & stage, std::string & error)
         if (rename(stage.partPath.c_str(), stage.finalPath.c_str()) != 0)
         {
             error = LastSystemError();
-            error = "The transfer completed, but '" + stage.finalPath +
-                "' could not be put in place (" + error +
-                "); the complete file is at '" + stage.partPath + "'.";
+            error = Texts::Translate(
+                "The transfer completed, but '{path}' could not be put in "
+                "place ({reason}); the complete file is at '{part}'.",
+                {{"path", stage.finalPath}, {"reason", error},
+                {"part", stage.partPath}});
             return false;
         }
         return true;
@@ -2781,9 +2804,12 @@ bool Script::FinishStage(const TransferStage & stage, std::string & error)
     const int statResult = RemoteStat(stage.finalPath, &attrs, statError);
     if (statResult == LSCP_SFTP_STAT_ERROR)
     {
-        error = "The transfer completed, but '" + stage.finalPath +
-            "' could not be inspected for the final move (" + statError +
-            "); the complete file is at '" + stage.partPath + "'.";
+        error = Texts::Translate(
+            "The transfer completed, but '{path}' could not be inspected "
+            "for the final move ({reason}); the complete file is at "
+            "'{part}'.",
+            {{"path", stage.finalPath}, {"reason", statError},
+            {"part", stage.partPath}});
         return false;
     }
     if (statResult == LSCP_SFTP_STAT_EXISTS)
@@ -2791,18 +2817,22 @@ bool Script::FinishStage(const TransferStage & stage, std::string & error)
         std::string removeError;
         if (RemoteRemove(stage.finalPath, removeError) != 0)
         {
-            error = "The transfer completed, but '" + stage.finalPath +
-                "' could not be replaced (" + removeError +
-                "); the complete file is at '" + stage.partPath + "'.";
+            error = Texts::Translate(
+                "The transfer completed, but '{path}' could not be replaced "
+                "({reason}); the complete file is at '{part}'.",
+                {{"path", stage.finalPath}, {"reason", removeError},
+                {"part", stage.partPath}});
             return false;
         }
     }
     std::string renameError;
     if (RemoteRename(stage.partPath, stage.finalPath, renameError) != 0)
     {
-        error = "The transfer completed, but '" + stage.finalPath +
-            "' could not be put in place (" + renameError +
-            "); the complete file is at '" + stage.partPath + "'.";
+        error = Texts::Translate(
+            "The transfer completed, but '{path}' could not be put in "
+            "place ({reason}); the complete file is at '{part}'.",
+            {{"path", stage.finalPath}, {"reason", renameError},
+            {"part", stage.partPath}});
         return false;
     }
     return true;
@@ -2866,8 +2896,9 @@ bool ApplyRawTransferSetting(const std::string & rawKey,
         long long mode = 0;
         if (!RawInteger(value, mode) || mode < 0 || mode > 2)
         {
-            error = "The raw transfer setting 'TransferMode' must be 0 "
-                "(binary), 1 (ascii) or 2 (automatic).";
+            error = Texts::Translate(
+                "The raw transfer setting 'TransferMode' must be 0 (binary), "
+                "1 (ascii) or 2 (automatic).");
             return false;
         }
         flags.transferMode = mode == 0 ? TransferMode::Binary :
@@ -2880,8 +2911,9 @@ bool ApplyRawTransferSetting(const std::string & rawKey,
         bool on = false;
         if (!RawBool(value, on))
         {
-            error = "The raw transfer setting '" + rawKey + "' must be 1 "
-                "or 0.";
+            error = Texts::Translate(
+                "The raw transfer setting '{name}' must be 1 or 0.",
+                {{"name", rawKey}});
             return false;
         }
         if (key == "preservetime")
@@ -2903,8 +2935,9 @@ bool ApplyRawTransferSetting(const std::string & rawKey,
         long long mode = 0;
         if (!RawInteger(value, mode) || mode < 0 || mode > 2)
         {
-            error = "The raw transfer setting 'ResumeSupport' must be 0 "
-                "(on), 1 (smart) or 2 (off).";
+            error = Texts::Translate(
+                "The raw transfer setting 'ResumeSupport' must be 0 (on), "
+                "1 (smart) or 2 (off).");
             return false;
         }
         flags.resumeSupport = mode == 0 ? TransferFlags::ResumeOn :
@@ -2916,8 +2949,9 @@ bool ApplyRawTransferSetting(const std::string & rawKey,
         long long bytes = 0;
         if (!RawInteger(value, bytes) || bytes < 0)
         {
-            error = "The raw transfer setting 'ResumeThreshold' must be a "
-                "number of bytes.";
+            error = Texts::Translate(
+                "The raw transfer setting 'ResumeThreshold' must be a number "
+                "of bytes.");
             return false;
         }
         flags.resumeThreshold = static_cast<unsigned long long>(bytes);
@@ -2930,8 +2964,9 @@ bool ApplyRawTransferSetting(const std::string & rawKey,
         long long cps = 0;
         if (!RawInteger(value, cps) || cps < 0)
         {
-            error = "The raw transfer setting 'CPSLimit' must be a number "
-                "of bytes per second.";
+            error = Texts::Translate(
+                "The raw transfer setting 'CPSLimit' must be a number of "
+                "bytes per second.");
             return false;
         }
         flags.speedKBytesPerSecond = static_cast<unsigned>((cps + 1023) / 1024);
@@ -2944,8 +2979,9 @@ bool ApplyRawTransferSetting(const std::string & rawKey,
             bool on = false;
             if (!RawBool(value, on))
             {
-                error = "The raw transfer setting 'PreserveRights' must be "
-                    "1 or 0.";
+                error = Texts::Translate(
+                    "The raw transfer setting 'PreserveRights' must be 1 or "
+                    "0.");
                 return false;
             }
             if (!on)
@@ -2966,8 +3002,9 @@ bool ApplyRawTransferSetting(const std::string & rawKey,
         std::string modeError;
         if (!ParsePermissions(value, 0644, false, mode, modeError))
         {
-            error = "The raw transfer setting 'Text' is not a permission "
-                "mode: " + modeError;
+            error = Texts::Translate(
+                "The raw transfer setting 'Text' is not a permission mode: "
+                "{reason}", {{"reason", modeError}});
             return false;
         }
         flags.permissions = static_cast<int>(mode & 07777);
@@ -2984,15 +3021,17 @@ bool ApplyRawTransferSetting(const std::string & rawKey,
     {
         if (key == refused[i])
         {
-            error = "The raw transfer setting '" + rawKey + "' has no "
-                "equivalent in this build and will not be ignored.";
+            error = Texts::Translate(
+                "The raw transfer setting '{name}' has no equivalent in this "
+                "build and will not be ignored.", {{"name", rawKey}});
             return false;
         }
     }
-    error = "The raw transfer setting '" + rawKey + "' is not known to "
-        "this build; the settings it accepts are TransferMode, "
-        "PreserveTime, PreserveTimeDirs, ResumeSupport, ResumeThreshold, "
-        "CPSLimit, NewerOnly, PreserveRights and Text.";
+    error = Texts::Translate(
+        "The raw transfer setting '{name}' is not known to this build; the "
+        "settings it accepts are TransferMode, PreserveTime, "
+        "PreserveTimeDirs, ResumeSupport, ResumeThreshold, CPSLimit, "
+        "NewerOnly, PreserveRights and Text.", {{"name", rawKey}});
     return false;
 }
 
@@ -3025,10 +3064,11 @@ bool Script::ApplySessionPreset(TransferFlags & flags, std::string & error)
         preset = mPresets.Find(mActivePresetName);
         if (preset == NULL)
         {
-            error = "The transfer preset '" + mActivePresetName + "' does "
-                "not exist in '" + mPresets.Path() + "' any more; pick "
-                "another with 'option preset <name>' or clear it with "
-                "'option preset off'.";
+            error = Texts::Translate(
+                "The transfer preset '{name}' does not exist in '{path}' any "
+                "more; pick another with 'option preset <name>' or clear it "
+                "with 'option preset off'.",
+                {{"name", mActivePresetName}, {"path", mPresets.Path()}});
             return false;
         }
     }
@@ -3202,9 +3242,9 @@ bool Script::ParseTransferSwitches(const std::string & command, bool uploads,
                 if (end == NULL || *end != '\0' || parsed < 0 ||
                     static_cast<long>(static_cast<int>(parsed)) != parsed)
                 {
-                    return SwitchError(command, "The value of "
-                        "'-rawtransfersettings' is the number of settings "
-                        "that follow it, as in '-rawtransfersettings=2'.");
+                    return SwitchError(command, Texts::Translate(
+                        "The value of '-rawtransfersettings' is the number of settings "
+                        "that follow it, as in '-rawtransfersettings=2'."));
                 }
                 cap = static_cast<int>(parsed);
             }
@@ -3219,8 +3259,8 @@ bool Script::ParseTransferSwitches(const std::string & command, bool uploads,
                     {
                         break;
                     }
-                    return SwitchError(command, "'" + next + "' is not a "
-                        "'key=value' raw transfer setting.");
+                    return SwitchError(command, Texts::Translate("'{name}' is not a 'key=value' raw transfer setting.",
+                        {{"name", next}}));
                 }
                 const size_t eq = next.find('=');
                 std::string rawError;
@@ -3234,9 +3274,11 @@ bool Script::ParseTransferSwitches(const std::string & command, bool uploads,
             }
             if (cap >= 0 && taken < cap)
             {
-                return SwitchError(command, "'-rawtransfersettings=" +
-                    std::to_string(cap) + "' was given, but only " +
-                    std::to_string(taken) + " setting parameter(s) follow.");
+                return SwitchError(command, Texts::Translate(
+                    "'-rawtransfersettings={count}' was given, but only "
+                    "{taken} setting parameter(s) follow.",
+                    {{"count", std::to_string(cap)},
+                    {"taken", std::to_string(taken)}}));
             }
             continue;
         }
@@ -3247,9 +3289,9 @@ bool Script::ParseTransferSwitches(const std::string & command, bool uploads,
             const std::string value = ToLower(a.substr(strlen("-preservetime=")));
             if (value != "all")
             {
-                return SwitchError(command, "The only value of "
-                    "'-preservetime' is 'all' (directories are timed too); "
-                    "use '-nopreservetime' to keep no timestamps.");
+                return SwitchError(command, Texts::Translate(
+                    "The only value of '-preservetime' is 'all' (directories are "
+                    "timed too); use '-nopreservetime' to keep no timestamps."));
             }
             flags.preserveTime = true;
             flags.preserveTimeDirs = true;
@@ -3263,10 +3305,14 @@ bool Script::ParseTransferSwitches(const std::string & command, bool uploads,
                 matches))
             {
                 return SwitchError(command, matches.empty() ?
-                    "The value of '-transfer' must be binary, ascii or "
-                    "automatic." :
-                    "The value '" + a.substr(strlen("-transfer=")) + "' of "
-                    "'-transfer' is ambiguous: it matches " + matches + ".");
+                                    Texts::Translate(
+                                        "The value of '-transfer' must be binary, ascii or "
+                                        "automatic.") :
+                                    Texts::Translate(
+                                        "The value '{value}' of '-transfer' is ambiguous: it "
+                                        "matches {matches}.",
+                                        {{"value", a.substr(strlen("-transfer="))},
+                                        {"matches", matches}}));
             }
             flags.transferMode = mode;
             flags.explicitSettings |= 1;
@@ -3288,8 +3334,9 @@ bool Script::ParseTransferSwitches(const std::string & command, bool uploads,
             if (!ParseOctalPermissions(a.substr(strlen("-permissions=")),
                 permissions))
             {
-                return SwitchError(command, "The value of '-permissions' must "
-                    "be an octal number from 0 through 7777.");
+                return SwitchError(command, Texts::Translate(
+                    "The value of '-permissions' must be an octal number from 0 "
+                    "through 7777."));
             }
             flags.permissions = static_cast<int>(permissions);
             flags.explicitSettings |= 16;
@@ -3313,9 +3360,9 @@ bool Script::ParseTransferSwitches(const std::string & command, bool uploads,
             if (end == NULL || *end != '\0' || limit < 0 ||
                 limit > static_cast<long>(UINT_MAX))
             {
-                return SwitchError(command, "The value of '-speed' must be a "
-                    "whole number of kilobytes per second (0 removes the "
-                    "limit).");
+                return SwitchError(command, Texts::Translate(
+                    "The value of '-speed' must be a whole number of kilobytes per "
+                    "second (0 removes the limit)."));
             }
             flags.speedKBytesPerSecond = static_cast<unsigned>(limit);
             continue;
@@ -3339,9 +3386,9 @@ bool Script::ParseTransferSwitches(const std::string & command, bool uploads,
                     static_cast<unsigned long long>(threshold) >
                         ULLONG_MAX / 1024ULL)
                 {
-                    return SwitchError(command, "The value of "
-                        "'-resumesupport' must be on, off or a number of "
-                        "kilobytes a file must reach to be resumed.");
+                    return SwitchError(command, Texts::Translate(
+                        "The value of '-resumesupport' must be on, off or a number of "
+                        "kilobytes a file must reach to be resumed."));
                 }
                 flags.resumeSupport = TransferFlags::ResumeSmart;
                 flags.resumeThreshold =
@@ -3351,21 +3398,24 @@ bool Script::ParseTransferSwitches(const std::string & command, bool uploads,
             flags.explicitSettings |= 8;
             continue;
         }
-        return SwitchError(command, "Unsupported switch '" + a + "'; it will "
-            "not be ignored. Prefix a filename beginning with '-' with './'.");
+        return SwitchError(command, Texts::Translate(
+            "Unsupported switch '{switch}'; it will not be ignored. "
+            "Prefix a filename beginning with '-' with './'.",
+            {{"switch", a}}));
     }
 
     if (flags.append && flags.resume)
     {
-        return SwitchError(command, "'-append' and '-resume' cannot be used "
-            "together: one continues at the end of the destination, the "
-            "other at a shared offset in it.");
+        return SwitchError(command, Texts::Translate(
+            "'-append' and '-resume' cannot be used together: one "
+            "continues at the end of the destination, the other at a "
+            "shared offset in it."));
     }
     if (resumeForced && mode != TransferMode::Binary)
     {
-        return SwitchError(command, "Resuming a transfer is binary only: an "
-            "ASCII transfer converts line endings, so byte offsets do not "
-            "survive.");
+        return SwitchError(command, Texts::Translate(
+            "Resuming a transfer is binary only: an ASCII transfer "
+            "converts line endings, so byte offsets do not survive."));
     }
     return true;
 }
@@ -3378,8 +3428,9 @@ void Script::ResolveTransferMask(TransferFlags & flags) const
     {
         if (mOptionMaskUsed)
         {
-            Console::Instance().Status("The -filemask switch overrides the "
-                "include/exclude option mask for this command.");
+            Console::Instance().Status(Texts::Translate(
+                "The -filemask switch overrides the include/exclude option mask "
+                "for this command."));
         }
         return;
     }
@@ -3391,7 +3442,7 @@ bool Script::ListLocal(const std::vector<std::string> & args)
     if (args.size() > 1)
     {
         Console::Instance().Error(Texts::WrongArguments("lls",
-            "Syntax: lls [<directory>[/<mask>]]"));
+            Texts::Translate("Syntax: lls [<directory>[/<mask>]]")));
         mErrors++;
         return false;
     }
@@ -3517,7 +3568,7 @@ bool Script::GetFiles(const std::vector<std::string> & args)
     if (paths.empty())
     {
         Console::Instance().Error(Texts::WrongArguments("get",
-            "Syntax: get [switches] <remotefile(s)> [<localpath>]"));
+            Texts::Translate("Syntax: get [switches] <remotefile(s)> [<localpath>]")));
         mErrors++;
         return false;
     }
@@ -3526,8 +3577,9 @@ bool Script::GetFiles(const std::vector<std::string> & args)
      * that is not the offset it read on the remote one. */
     if (flags.append && !UseNativeSftp(mSession.Options().protocol))
     {
-        return SwitchError("get", "'-append' needs the native SFTP "
-            "transport; the transfer backends cannot position a write.");
+        return SwitchError("get", Texts::Translate(
+            "'-append' needs the native SFTP transport; the transfer "
+            "backends cannot position a write."));
     }
     /*
      * SCP's rcp protocol has no offset to continue from, so a transfer
@@ -3545,10 +3597,11 @@ bool Script::GetFiles(const std::vector<std::string> & args)
         (flags.resumeSupport == TransferFlags::ResumeUnset &&
          mResumeMode == ResumeMode::On)))
     {
-        return SwitchError("get", "SCP cannot resume a transfer: the rcp "
-            "protocol has no offset to continue from, and a partial file "
-            "nobody can position is not one to splice bytes onto. Use "
-            "'option resume off' or '-resumesupport=off'.");
+        return SwitchError("get", Texts::Translate(
+            "SCP cannot resume a transfer: the rcp protocol has no offset "
+            "to continue from, and a partial file nobody can position is "
+            "not one to splice bytes onto. Use 'option resume off' or "
+            "'-resumesupport=off'."));
     }
     ResolveTransferMask(flags);
     SpeedLimitForThisCommand limiter(flags.speedKBytesPerSecond, &mSpeedLimit);
@@ -3580,8 +3633,9 @@ bool Script::GetFiles(const std::vector<std::string> & args)
         {
             if (HasWildcard(sourcePatterns[i]))
             {
-                Console::Instance().Status("No file matching '" +
-                    sourcePatterns[i] + "' was found.");
+                Console::Instance().Status(Texts::Translate(
+                    "No file matching '{pattern}' was found.",
+                    {{"pattern", sourcePatterns[i]}}));
                 if (mFailOnNoMatch)
                 {
                     mErrors++;
@@ -3639,7 +3693,8 @@ bool Script::GetFiles(const std::vector<std::string> & args)
                 if (!flags.recursive)
                 {
                     Console::Instance().Error(Texts::TransferFailed(sources[n],
-                        "Directories are not supported without recursive mode."));
+                        Texts::Translate(
+                            "Directories are not supported without recursive mode.")));
                     mErrors++;
                     continue;
                 }
@@ -3851,15 +3906,16 @@ bool Script::PutFiles(const std::vector<std::string> & args)
     if (paths.empty())
     {
         Console::Instance().Error(Texts::WrongArguments("put",
-            "Syntax: put [switches] <localfile(s)> [<remotepath>]"));
+            Texts::Translate("Syntax: put [switches] <localfile(s)> [<remotepath>]")));
         mErrors++;
         return false;
     }
 
     if (flags.append && !UseNativeSftp(mSession.Options().protocol))
     {
-        return SwitchError("put", "'-append' needs the native SFTP "
-            "transport; the transfer backends cannot position a write.");
+        return SwitchError("put", Texts::Translate(
+            "'-append' needs the native SFTP transport; the transfer "
+            "backends cannot position a write."));
     }
     /*
      * SCP's rcp protocol has no offset to continue from, so a transfer
@@ -3877,10 +3933,11 @@ bool Script::PutFiles(const std::vector<std::string> & args)
         (flags.resumeSupport == TransferFlags::ResumeUnset &&
          mResumeMode == ResumeMode::On)))
     {
-        return SwitchError("put", "SCP cannot resume a transfer: the rcp "
-            "protocol has no offset to continue from, and a partial file "
-            "nobody can position is not one to splice bytes onto. Use "
-            "'option resume off' or '-resumesupport=off'.");
+        return SwitchError("put", Texts::Translate(
+            "SCP cannot resume a transfer: the rcp protocol has no offset "
+            "to continue from, and a partial file nobody can position is "
+            "not one to splice bytes onto. Use 'option resume off' or "
+            "'-resumesupport=off'."));
     }
     ResolveTransferMask(flags);
     SpeedLimitForThisCommand limiter(flags.speedKBytesPerSecond, &mSpeedLimit);
@@ -3932,8 +3989,9 @@ bool Script::PutFiles(const std::vector<std::string> & args)
         {
             if (HasWildcard(sourcePatterns[i]))
             {
-                Console::Instance().Status("No file matching '" +
-                    sourcePatterns[i] + "' was found.");
+                Console::Instance().Status(Texts::Translate(
+                    "No file matching '{pattern}' was found.",
+                    {{"pattern", sourcePatterns[i]}}));
                 if (mFailOnNoMatch)
                 {
                     mErrors++;
@@ -3975,7 +4033,8 @@ bool Script::PutFiles(const std::vector<std::string> & args)
                 if (!flags.recursive)
                 {
                     Console::Instance().Error(Texts::LocalError("upload of", sources[n],
-                        "Directories are not supported without recursive mode."));
+                        Texts::Translate(
+                            "Directories are not supported without recursive mode.")));
                     mErrors++;
                     continue;
                 }
@@ -4405,8 +4464,9 @@ bool Script::ParseSyncArguments(const std::vector<std::string> & args,
             TransferMode mode;
             if (!ParseTransferMode(lower.substr(strlen("-transfer=")), mode))
             {
-                error = "The value of '-transfer' must be binary, ascii or "
-                    "automatic.";
+                error = Texts::Translate(
+                    "The value of '-transfer' must be binary, ascii or "
+                    "automatic.");
                 return false;
             }
             options.transferMode = mode;
@@ -4457,7 +4517,8 @@ bool Script::ParseSyncArguments(const std::vector<std::string> & args,
             if (!RawInteger(a.substr(strlen("-interval=")), value) ||
                 value < 1 || value > 86400)
             {
-                error = "The interval must be between 1 and 86400 seconds.";
+                error = Texts::Translate(
+                    "The interval must be between 1 and 86400 seconds.");
                 return false;
             }
             interval = static_cast<int>(value);
@@ -4468,14 +4529,16 @@ bool Script::ParseSyncArguments(const std::vector<std::string> & args,
             if (!RawInteger(a.substr(strlen("-count=")), value) ||
                 value < 1 || value > 1000000)
             {
-                error = "The count must be a positive number of passes.";
+                error = Texts::Translate(
+                    "The count must be a positive number of passes.");
                 return false;
             }
             count = static_cast<int>(value);
         }
         else if (!a.empty() && a[0] == '-')
         {
-            error = "Unsupported switch '" + a + "'; it will not be ignored.";
+            error = Texts::Translate("Unsupported switch '{switch}'; it will not be ignored.",
+                {{"switch", a}});
             return false;
         }
         else
@@ -4486,18 +4549,21 @@ bool Script::ParseSyncArguments(const std::vector<std::string> & args,
 
     if (!modeGiven || dirs.size() > 2)
     {
-        error = "Syntax: " + command +
-            (modeOptional ? std::string(" [LOCAL [REMOTE]]") :
-                std::string(" local|remote|both [LOCAL [REMOTE]]")) +
-            " [-delete] [-nodelete] [-mirror] [-preview] [-nonrecursive] "
+        error = Texts::Translate(
+            "Syntax: {command}{modes} [-delete] [-nodelete] [-mirror] "
+            "[-preview] [-nonrecursive] "
             "[-criteria=time|size|checksum|either|both|none] [-filemask=MASK] "
             "[-transfer=binary|ascii|automatic] [-interval=SECS] [-count=N] "
-            "[-continue].";
+            "[-continue].",
+            {{"command", command},
+            {"modes", modeOptional ? std::string(" [LOCAL [REMOTE]]") :
+            std::string(" local|remote|both [LOCAL [REMOTE]]")}});
         return false;
     }
     if (options.mirror && options.mode == SyncMode::Both)
     {
-        error = "'-mirror' cannot be combined with the 'both' direction.";
+        error = Texts::Translate(
+            "'-mirror' cannot be combined with the 'both' direction.");
         return false;
     }
     /*
@@ -4510,17 +4576,19 @@ bool Script::ParseSyncArguments(const std::vector<std::string> & args,
     {
         if (options.criteria.checksum)
         {
-            error = "'-criteria=checksum' cannot be combined with the 'both' "
+            error = Texts::Translate(
+                "'-criteria=checksum' cannot be combined with the 'both' "
                 "direction, which compares the record of the previous "
                 "synchronization instead of the files; synchronize 'local' or "
-                "'remote' to compare contents.";
+                "'remote' to compare contents.");
             return false;
         }
         if (options.criteria.Empty())
         {
-            error = "'-criteria=none' cannot be combined with the 'both' "
+            error = Texts::Translate(
+                "'-criteria=none' cannot be combined with the 'both' "
                 "direction: with nothing compared there is no way to tell "
-                "which side changed.";
+                "which side changed.");
             return false;
         }
     }
@@ -4613,10 +4681,11 @@ bool Script::ExecuteSynchronizationPlan(SyncPlan & plan, const SyncOptions & opt
 
     if (deleteAllowed && plan.HasConflicts())
     {
-        console.Error("The plan has " +
-            std::to_string(plan.Count(SyncAction::Conflict)) +
-            " conflict(s); nothing was deleted. Resolve the conflicts (or "
-            "synchronize without -delete) and run the synchronization again.");
+        console.Error(Texts::Translate(
+            "The plan has {count} conflict(s); nothing was deleted. Resolve the "
+            "conflicts (or synchronize without -delete) and run the "
+            "synchronization again.",
+            {{"count", std::to_string(plan.Count(SyncAction::Conflict))}}));
         deleteAllowed = false;
         mErrors++;
         success = false;
@@ -4638,8 +4707,9 @@ bool Script::ExecuteSynchronizationPlan(SyncPlan & plan, const SyncOptions & opt
                 break;
 
             case SyncAction::Conflict:
-                console.Error("Conflict: '" + item.path + "' " + item.reason +
-                    ", so it was left unchanged.");
+                console.Error(Texts::Translate(
+                    "Conflict: '{path}' {reason}, so it was left unchanged.",
+                    {{"path", item.path}, {"reason", item.reason}}));
                 mErrors++;
                 success = false;
                 break;
@@ -4656,7 +4726,8 @@ bool Script::ExecuteSynchronizationPlan(SyncPlan & plan, const SyncOptions & opt
                     }
                     else
                     {
-                        console.Status("Created remote directory '" + remotePath + "'.");
+                        console.Status(Texts::Translate("Created remote directory '{path}'.",
+                            {{"path", remotePath}}));
                     }
                     break;
                 }
@@ -4682,7 +4753,8 @@ bool Script::ExecuteSynchronizationPlan(SyncPlan & plan, const SyncOptions & opt
                         break;
                     }
                     bytesTransferred += size;
-                    console.Status("Uploaded " + Texts::FileTransferred(remotePath, size));
+                    console.Status(Texts::Translate("Uploaded ") +
+                        Texts::FileTransferred(remotePath, size));
                     RecordSyncState(options.state, item.path, localPath, remotePath);
                 }
                 break;
@@ -4699,7 +4771,8 @@ bool Script::ExecuteSynchronizationPlan(SyncPlan & plan, const SyncOptions & opt
                     }
                     else
                     {
-                        console.Status("Created local directory '" + localPath + "'.");
+                        console.Status(Texts::Translate("Created local directory '{path}'.",
+                            {{"path", localPath}}));
                     }
                     break;
                 }
@@ -4725,7 +4798,8 @@ bool Script::ExecuteSynchronizationPlan(SyncPlan & plan, const SyncOptions & opt
                         break;
                     }
                     bytesTransferred += size;
-                    console.Status("Downloaded " + Texts::FileTransferred(localPath, size));
+                    console.Status(Texts::Translate("Downloaded ") +
+                        Texts::FileTransferred(localPath, size));
                     RecordSyncState(options.state, item.path, localPath, remotePath);
                 }
                 break;
@@ -4735,7 +4809,8 @@ bool Script::ExecuteSynchronizationPlan(SyncPlan & plan, const SyncOptions & opt
                 {
                     if (options.deleteObsolete)
                     {
-                        console.Status("Kept '" + localPath + "'.");
+                        console.Status(Texts::Translate("Kept '{path}'.",
+                            {{"path", localPath}}));
                     }
                     break;
                 }
@@ -4760,7 +4835,8 @@ bool Script::ExecuteSynchronizationPlan(SyncPlan & plan, const SyncOptions & opt
                 {
                     if (options.deleteObsolete)
                     {
-                        console.Status("Kept '" + remotePath + "'.");
+                        console.Status(Texts::Translate("Kept '{path}'.",
+                            {{"path", remotePath}}));
                     }
                     break;
                 }
@@ -4812,7 +4888,8 @@ bool Script::SynchronizeDirectories(const std::vector<std::string> & args)
         ResolveRemotePath(mRemoteDirectory, dirs[1]) : mRemoteDirectory;
     if (localDir.empty())
     {
-        console.Error("Cannot determine local directory: " + error);
+        console.Error(Texts::Translate("Cannot determine local directory: {reason}",
+            {{"reason", error}}));
         mErrors++;
         return false;
     }
@@ -4854,10 +4931,10 @@ bool Script::SynchronizeDirectories(const std::vector<std::string> & args)
     if (options.deleteObsolete &&
         (IsFileSystemRoot(localDir) || IsFileSystemRoot(remoteDir)))
     {
-        console.Error("Refusing to delete obsolete entries directly in the root "
-            "directory '" +
-            (IsFileSystemRoot(localDir) ? localDir : remoteDir) +
-            "'. Synchronize a subdirectory instead.");
+        console.Error(Texts::Translate(
+            "Refusing to delete obsolete entries directly in the root directory "
+            "'{path}'. Synchronize a subdirectory instead.",
+            {{"path", IsFileSystemRoot(localDir) ? localDir : remoteDir}}));
         mErrors++;
         return false;
     }
@@ -4866,13 +4943,16 @@ bool Script::SynchronizeDirectories(const std::vector<std::string> & args)
         /* Without a previous pass there is no way to tell a file that was
          * deleted on one side from a file that was created on the other,
          * so this pass only transfers and records what it saw. */
-        console.Status("No previous synchronization of these directories is on "
-            "record: this pass transfers files but deletes nothing. Run it "
-            "again to let deletions follow.");
+        console.Status(Texts::Translate(
+            "No previous synchronization of these directories is on record: "
+            "this pass transfers files but deletes nothing. Run it again to "
+            "let deletions follow."));
     }
 
-    console.Status("Synchronizing (" + std::string(SyncModeName(options.mode)) +
-        ") '" + localDir + "' and '" + remoteDir + "'...");
+    console.Status(Texts::Translate(
+        "Synchronizing ({mode}) '{local}' and '{remote}'...",
+        {{"mode", std::string(SyncModeName(options.mode))},
+        {"local", localDir}, {"remote", remoteDir}}));
 
     unsigned long long bytes = 0;
     bool ok = ExecuteSynchronizationPlan(plan, options, true, bytes);
@@ -4915,8 +4995,9 @@ bool Script::KeepUpToDate(const std::vector<std::string> & args)
     if (count == 0 && !console.IsInteractive())
     {
         console.Error(Texts::WrongArguments("keepuptodate",
-            "It would run until it is interrupted; give -count=<passes> to run "
-            "a fixed number of passes."));
+            Texts::Translate(
+                "It would run until it is interrupted; give -count=<passes> to "
+                "run a fixed number of passes.")));
         mErrors++;
         return false;
     }
@@ -4927,7 +5008,8 @@ bool Script::KeepUpToDate(const std::vector<std::string> & args)
         ResolveRemotePath(mRemoteDirectory, dirs[1]) : mRemoteDirectory;
     if (localDir.empty())
     {
-        console.Error("Cannot determine local directory: " + error);
+        console.Error(Texts::Translate("Cannot determine local directory: {reason}",
+            {{"reason", error}}));
         mErrors++;
         return false;
     }
@@ -4938,8 +5020,9 @@ bool Script::KeepUpToDate(const std::vector<std::string> & args)
     if (options.deleteObsolete &&
         (IsFileSystemRoot(localDir) || IsFileSystemRoot(remoteDir)))
     {
-        console.Error("Refusing to delete obsolete entries directly in the root "
-            "directory; synchronize a subdirectory instead.");
+        console.Error(Texts::Translate(
+            "Refusing to delete obsolete entries directly in the root directory; "
+            "synchronize a subdirectory instead."));
         mErrors++;
         return false;
     }
@@ -4961,15 +5044,20 @@ bool Script::KeepUpToDate(const std::vector<std::string> & args)
     InstallInterruptHandler();
     if (eventDriven)
     {
-        console.Status("Watching local changes in '" + localDir + "' and " +
-            "keeping remote '" + remoteDir + "' up to date (full check every " +
-            std::to_string(interval) + " seconds). Press Ctrl-C to stop.");
+        console.Status(Texts::Translate(
+            "Watching local changes in '{local}' and keeping remote "
+            "'{remote}' up to date (full check every {interval} seconds). "
+            "Press Ctrl-C to stop.",
+            {{"local", localDir}, {"remote", remoteDir},
+            {"interval", std::to_string(interval)}}));
     }
     else
     {
-        console.Status("Watching '" + localDir + "' and '" + remoteDir +
-            "' every " + std::to_string(interval) +
-            " seconds. Press Ctrl-C to stop.");
+        console.Status(Texts::Translate(
+            "Watching '{local}' and '{remote}' every {interval} seconds. "
+            "Press Ctrl-C to stop.",
+            {{"local", localDir}, {"remote", remoteDir},
+            {"interval", std::to_string(interval)}}));
     }
 
     bool ok = true;
@@ -4977,7 +5065,7 @@ bool Script::KeepUpToDate(const std::vector<std::string> & args)
     {
         if (Interrupted())
         {
-            console.Status("Stopped watching.");
+            console.Status(Texts::Translate("Stopped watching."));
             break;
         }
         if (!mSession.IsOpen() || !mSession.IsAlive())
@@ -5007,8 +5095,9 @@ bool Script::KeepUpToDate(const std::vector<std::string> & args)
             plan.Count(SyncAction::DeleteRemote) == 0 &&
             plan.Count(SyncAction::Conflict) == 0)
         {
-            console.Status("Pass " + std::to_string(pass) +
-                ": nothing to do (every file is up to date).");
+            console.Status(Texts::Translate(
+                "Pass {pass}: nothing to do (every file is up to date).",
+                {{"pass", std::to_string(pass)}}));
         }
         else
         {
@@ -5041,7 +5130,7 @@ bool Script::KeepUpToDate(const std::vector<std::string> & args)
         }
         if (Interrupted())
         {
-            console.Status("Stopped watching.");
+            console.Status(Texts::Translate("Stopped watching."));
             break;
         }
         if (eventDriven)
@@ -5052,8 +5141,9 @@ bool Script::KeepUpToDate(const std::vector<std::string> & args)
             if (!watcher.Available())
             {
                 eventDriven = false;
-                console.Status("Native local change notifications stopped; "
-                    "continuing with timer polling.");
+                console.Status(Texts::Translate(
+                    "Native local change notifications stopped; continuing with "
+                    "timer polling."));
             }
         }
         else
@@ -5141,7 +5231,7 @@ bool Script::EditRemoteFile(const std::vector<std::string> & args)
             if (eol != "preserve" && eol != "lf" && eol != "crlf")
             {
                 console.Error(Texts::WrongArguments("edit",
-                    "The value of '-eol' must be preserve, lf or crlf."));
+                    Texts::Translate("The value of '-eol' must be preserve, lf or crlf.")));
                 mErrors++;
                 return false;
             }
@@ -5163,8 +5253,8 @@ bool Script::EditRemoteFile(const std::vector<std::string> & args)
                 passes > static_cast<long long>(UINT_MAX))
             {
                 console.Error(Texts::WrongArguments("edit",
-                    "The value of '-monitor' must be a positive number of "
-                    "passes."));
+                    Texts::Translate(
+                        "The value of '-monitor' must be a positive number of passes.")));
                 mErrors++;
                 return false;
             }
@@ -5174,7 +5264,8 @@ bool Script::EditRemoteFile(const std::vector<std::string> & args)
         else if (!a.empty() && a[0] == '-')
         {
             console.Error(Texts::WrongArguments("edit",
-                "Unsupported switch '" + a + "'; it will not be ignored."));
+                Texts::Translate("Unsupported switch '{switch}'; it will not be ignored.",
+                    {{"switch", a}})));
             mErrors++;
             return false;
         }
@@ -5187,8 +5278,9 @@ bool Script::EditRemoteFile(const std::vector<std::string> & args)
     if (paths.size() != 1)
     {
         console.Error(Texts::WrongArguments("edit",
-            "Syntax: edit [-force] [-keep] [-editor=COMMAND] <remotefile>. "
-            "One file at a time."));
+            Texts::Translate(
+                "Syntax: edit [-force] [-keep] [-editor=COMMAND] <remotefile>. "
+                "One file at a time.")));
         mErrors++;
         return false;
     }
@@ -5223,10 +5315,11 @@ bool Script::SavePresetCommand(const std::vector<std::string> & args)
     if (args.size() < 2)
     {
         console.Error(Texts::WrongArguments("savepreset",
-            "Syntax: savepreset <name> <setting>[=<value>]... "
-            "(settings: transfer=, preservetime=, neweronly, speed=, "
-            "resumesupport=, permissions=, host=, user=, remotedir=, "
-            "localdir=, mask=)."));
+            Texts::Translate(
+                "Syntax: savepreset <name> <setting>[=<value>]... "
+                "(settings: transfer=, preservetime=, neweronly, speed=, "
+                "resumesupport=, permissions=, host=, user=, remotedir=, "
+                "localdir=, mask=).")));
         mErrors++;
         return false;
     }
@@ -5234,7 +5327,8 @@ bool Script::SavePresetCommand(const std::vector<std::string> & args)
     if (!TransferPresetStore::IsValidName(name))
     {
         console.Error(Texts::WrongArguments("savepreset",
-            "The preset name '" + name + "' is not valid."));
+            Texts::Translate("The preset name '{name}' is not valid.",
+                {{"name", name}})));
         mErrors++;
         return false;
     }
@@ -5289,7 +5383,8 @@ bool Script::SavePresetCommand(const std::vector<std::string> & args)
         mErrors++;
         return false;
     }
-    console.Status("Stored transfer preset '" + preset.name + "'.");
+    console.Status(Texts::Translate("Stored transfer preset '{name}'.",
+        {{"name", preset.name}}));
     return true;
 }
 
@@ -5299,7 +5394,7 @@ bool Script::RemovePresetCommand(const std::vector<std::string> & args)
     if (args.size() != 1)
     {
         console.Error(Texts::WrongArguments("rmspreset",
-            "Syntax: rmspreset <name>."));
+            Texts::Translate("Syntax: rmspreset <name>.")));
         mErrors++;
         return false;
     }
@@ -5314,8 +5409,9 @@ bool Script::RemovePresetCommand(const std::vector<std::string> & args)
     if (existing == NULL)
     {
         console.Error(Texts::WrongArguments("rmspreset",
-            "There is no transfer preset named '" + args[0] + "' in '" +
-            mPresets.Path() + "'."));
+            Texts::Translate(
+                "There is no transfer preset named '{name}' in '{path}'.",
+                {{"name", args[0]}, {"path", mPresets.Path()}})));
         mErrors++;
         return false;
     }
@@ -5336,7 +5432,8 @@ bool Script::RemovePresetCommand(const std::vector<std::string> & args)
     {
         mActivePresetName.clear();
     }
-    console.Status("Removed transfer preset '" + name + "'.");
+    console.Status(Texts::Translate("Removed transfer preset '{name}'.",
+        {{"name", name}}));
     return true;
 }
 
@@ -5346,7 +5443,7 @@ bool Script::ListPresetsCommand(const std::vector<std::string> & args)
     if (!args.empty())
     {
         console.Error(Texts::WrongArguments("presets",
-            "Syntax: presets."));
+            Texts::Translate("Syntax: presets.")));
         mErrors++;
         return false;
     }
@@ -5359,17 +5456,20 @@ bool Script::ListPresetsCommand(const std::vector<std::string> & args)
     }
     if (mPresets.Presets().empty())
     {
-        console.Status("There are no transfer presets in '" +
-            mPresets.Path() + "' (create one with 'savepreset').");
+        console.Status(Texts::Translate(
+            "There are no transfer presets in '{path}' (create one with "
+            "'savepreset').", {{"path", mPresets.Path()}}));
         return true;
     }
-    console.Status("Transfer presets in '" + mPresets.Path() + "':");
+    console.Status(Texts::Translate("Transfer presets in '{path}':",
+        {{"path", mPresets.Path()}}));
     for (size_t i = 0; i < mPresets.Presets().size(); i++)
     {
         const TransferPreset & preset = mPresets.Presets()[i];
-        console.Status("  " + preset.name +
-            (preset.name == mActivePresetName ? " (active)" : "") +
-            " - " + preset.Describe());
+        console.Status(Texts::Translate(" {name}{active} - {description}",
+            {{"name", preset.name},
+            {"active", preset.name == mActivePresetName ? " (active)" : ""},
+            {"description", preset.Describe()}}));;
     }
     return true;
 }
@@ -5394,13 +5494,14 @@ bool Script::SessionCommand(const std::vector<std::string> & args)
     if (args.size() > 1)
     {
         Console::Instance().Error(Texts::WrongArguments("session",
-            "Syntax: session [<index>]."));
+            Texts::Translate("Syntax: session [<index>].")));
         mErrors++;
         return false;
     }
     if (!args.empty() && args[0] != "1")
     {
-        Console::Instance().Error("Invalid session index '" + args[0] + "'.");
+        Console::Instance().Error(Texts::Translate(
+            "Invalid session index '{index}'.", {{"index", args[0]}}));
         mErrors++;
         return false;
     }
@@ -5411,7 +5512,9 @@ bool Script::SessionCommand(const std::vector<std::string> & args)
         snprintf(index, sizeof(index), "%3d", 1);
         Console::Instance().WriteLine(std::string(index) + "  " + name);
     }
-    Console::Instance().WriteLine("Active session: 1 (" + name + ")");
+    Console::Instance().WriteLine(Texts::Translate(
+        "Active session: {index} ({name})",
+        {{"index", std::string("1")}, {"name", name}}));
     return true;
 }
 
@@ -5433,7 +5536,7 @@ bool Script::StoredSessionsCommand(const std::vector<std::string> & args)
         if (args.size() != 2)
         {
             console.Error(Texts::WrongArguments("sessions",
-                "Syntax: session export <file>."));
+                Texts::Translate("Syntax: session export <file>.")));
             mErrors++;
             return false;
         }
@@ -5443,8 +5546,10 @@ bool Script::StoredSessionsCommand(const std::vector<std::string> & args)
             mErrors++;
             return false;
         }
-        console.Status("Exported " + std::to_string(mSessions.Sessions().size()) +
-            " session(s) to '" + args[1] + "'.");
+        console.Status(Texts::Translate(
+            "Exported {count} session(s) to '{path}'.",
+            {{"count", std::to_string(mSessions.Sessions().size())},
+            {"path", args[1]}}));
         return true;
     }
 
@@ -5453,7 +5558,7 @@ bool Script::StoredSessionsCommand(const std::vector<std::string> & args)
         if (args.size() != 2)
         {
             console.Error(Texts::WrongArguments("sessions",
-                "Syntax: session import <file>."));
+                Texts::Translate("Syntax: session import <file>.")));
             mErrors++;
             return false;
         }
@@ -5462,8 +5567,11 @@ bool Script::StoredSessionsCommand(const std::vector<std::string> & args)
         const int imported = mSessions.ImportFile(ExpandTilde(args[1]), merge, error);
         if (imported == 0)
         {
-            console.Error("No sessions were imported from '" + args[1] + "'; " +
-                (error.empty() ? std::string("the file has none.") : error));
+            console.Error(Texts::Translate(
+                "No sessions were imported from '{path}'; {reason}",
+                {{"path", args[1]},
+                {"reason", error.empty() ? std::string("the file has none.") :
+                error}}));
             mErrors++;
             return false;
         }
@@ -5473,8 +5581,9 @@ bool Script::StoredSessionsCommand(const std::vector<std::string> & args)
             mErrors++;
             return false;
         }
-        console.Status("Imported " + std::to_string(imported) +
-            " session(s) from '" + args[1] + "'.");
+        console.Status(Texts::Translate(
+            "Imported {count} session(s) from '{path}'.",
+            {{"count", std::to_string(imported)}, {"path", args[1]}}));
         return true;
     }
 
@@ -5488,7 +5597,7 @@ bool Script::StoredSessionsCommand(const std::vector<std::string> & args)
         const std::vector<std::string> folders = mSessions.Folders();
         if (folders.empty())
         {
-            console.WriteLine("There are no session folders.");
+            console.WriteLine(Texts::Translate("There are no session folders."));
             return true;
         }
         for (size_t i = 0; i < folders.size(); i++)
@@ -5508,8 +5617,9 @@ bool Script::StoredSessionsCommand(const std::vector<std::string> & args)
             mSessions.SessionsInFolder(folder);
         if (inFolder.empty())
         {
-            console.Error("There are no stored sessions in folder '" +
-                folder + "'.");
+            console.Error(Texts::Translate(
+                "There are no stored sessions in folder '{folder}'.",
+                {{"folder", folder}}));
             mErrors++;
             return false;
         }
@@ -5525,7 +5635,9 @@ bool Script::StoredSessionsCommand(const std::vector<std::string> & args)
         const StoredSession * stored = mSessions.Find(args[0]);
         if (stored == NULL)
         {
-            console.Error("There is no stored session named '" + args[0] + "'.");
+            console.Error(Texts::Translate(
+                "There is no stored session named '{name}'.",
+                {{"name", args[0]}}));
             mErrors++;
             return false;
         }
@@ -5535,24 +5647,27 @@ bool Script::StoredSessionsCommand(const std::vector<std::string> & args)
     if (args.size() > 1)
     {
         console.Error(Texts::WrongArguments("session",
-            "Syntax: sessions [NAME|list|export <file>|import <file>]."));
+            Texts::Translate("Syntax: sessions [NAME|list|export <file>|import <file>].")));
         mErrors++;
         return false;
     }
 
     if (mSessions.Empty())
     {
-        console.WriteLine("There are no stored sessions. Use "
-            "'savesession <name>' to store the current connection.");
+        console.WriteLine(Texts::Translate(
+            "There are no stored sessions. Use 'savesession <name>' to store "
+            "the current connection."));
         if (!path.empty())
         {
-            console.WriteLine("Sessions are stored in " + path);
+            console.WriteLine(Texts::Translate("Sessions are stored in {path}",
+                {{"path", path}}));
         }
         return true;
     }
 
-    console.WriteLine("Stored sessions in " + (path.empty() ?
-        std::string("(no configuration directory)") : path) + ":");
+    console.WriteLine(Texts::Translate("Stored sessions in {path}:",
+        {{"path", path.empty() ? std::string("(no configuration directory)")
+        : path}}));
     const std::vector<StoredSession> & sessions = mSessions.Sessions();
     size_t width = 0;
     for (size_t i = 0; i < sessions.size(); i++)
@@ -5612,11 +5727,12 @@ bool Script::OpenStoredSite(const std::string & name,
 
     if (!stored->proxyError.empty())
     {
-        Console::Instance().Error("The proxy of the stored session '" +
-            stored->name + "' cannot be used: " + stored->proxyError +
-            ". The site is not opened without the proxy it was stored with; "
-            "store the proxy again with 'savesession " + stored->name +
-            " -rawsettings ProxyMethod=... ProxyHost=...'.");
+        Console::Instance().Error(Texts::Translate(
+            "The proxy of the stored session '{name}' cannot be used: {reason}. "
+            "The site is not opened without the proxy it was stored with; "
+            "store the proxy again with 'savesession {name} "
+            "-rawsettings ProxyMethod=... ProxyHost=...'.",
+            {{"name", stored->name}, {"reason", stored->proxyError}}));
         mErrors++;
         return false;
     }
@@ -5644,9 +5760,10 @@ bool Script::OpenStoredSite(const std::string & name,
          * password-only session will fail at authentication with this
          * already on screen to explain why.
          */
-        console.Error("The stored password of session '" + stored->name +
-            "' cannot be used: " + stored->passwordError +
-            ". Continuing without it.");
+        console.Error(Texts::Translate(
+            "The stored password of session '{name}' cannot be used: {reason}. "
+            "Continuing without it.",
+            {{"name", stored->name}, {"reason", stored->passwordError}}));
     }
     console.Status(Texts::Translate("Connecting to {host} (stored session '{name}')...", {{"host", options.hostName}, {"name", stored->name}}));
     if (!mSession.Open(options, error))
@@ -5715,10 +5832,12 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
     if (args.empty())
     {
         console.Error(Texts::WrongArguments("savesession",
-            "Syntax: savesession <name> [-host=HOST] [-port=N] [-username=NAME] "
-            "[-protocol=SCHEME] [-privatekey=FILE] [-hostkey=KEY] "
-            "[-remotedir=DIR] [-localdir=DIR] [-preset=NAME] "
-            "[-rawsettings NAME=VALUE...] [-password] [-password=PWD]."));
+            Texts::Translate(
+                "Syntax: savesession <name> [-host=HOST] [-port=N] "
+                "[-username=NAME] [-protocol=SCHEME] [-privatekey=FILE] "
+                "[-hostkey=KEY] [-remotedir=DIR] [-localdir=DIR] "
+                "[-preset=NAME] [-rawsettings NAME=VALUE...] [-password] "
+                "[-password=PWD].")));
         mErrors++;
         return false;
     }
@@ -5727,7 +5846,8 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
     if (!SessionStore::IsValidName(name))
     {
         console.Error(Texts::WrongArguments("savesession",
-            "The session name '" + name + "' is not valid."));
+            Texts::Translate("The session name '{name}' is not valid.",
+                {{"name", name}})));
         mErrors++;
         return false;
     }
@@ -5800,7 +5920,8 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
             if (!ResolveProtocolScheme(scheme, protocol))
             {
                 console.Error(Texts::WrongArguments("savesession",
-                    "Unsupported protocol '" + scheme + "'."));
+                    Texts::Translate("Unsupported protocol '{protocol}'.",
+                        {{"protocol", scheme}})));
                 mErrors++;
                 return false;
             }
@@ -5853,7 +5974,7 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
         else
         {
             console.Error(Texts::WrongArguments("savesession",
-                "Unknown switch '" + a + "'."));
+                Texts::Translate("Unknown switch '{switch}'.", {{"switch", a}})));
             mErrors++;
             return false;
         }
@@ -5868,7 +5989,8 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
     if (options.hostName.empty())
     {
         console.Error(Texts::WrongArguments("savesession",
-            "There is no host to store: connect first, or give -host=HOST."));
+            Texts::Translate(
+                "There is no host to store: connect first, or give -host=HOST.")));
         mErrors++;
         return false;
     }
@@ -5893,9 +6015,10 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
             if (preset == NULL)
             {
                 console.Error(Texts::WrongArguments("savesession",
-                    "There is no transfer preset named '" + storedPreset +
-                    "' in '" + mPresets.Path() + "'; create it with "
-                    "'savepreset' first."));
+                    Texts::Translate(
+                        "There is no transfer preset named '{name}' in '{path}'; "
+                        "create it with 'savepreset' first.",
+                        {{"name", storedPreset}, {"path", mPresets.Path()}})));
                 mErrors++;
                 return false;
             }
@@ -5957,8 +6080,9 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
         if (session.password.empty())
         {
             console.Error(Texts::WrongArguments("savesession",
-                "The password of this connection is not known (it was typed or "
-                "taken from a key or an agent), so it cannot be stored."));
+                Texts::Translate(
+                    "The password of this connection is not known (it was typed or "
+                    "taken from a key or an agent), so it cannot be stored.")));
             mErrors++;
             return false;
         }
@@ -5996,18 +6120,22 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
         mErrors++;
         return false;
     }
-    console.Status("Stored session '" + name + "' for " + session.protocol + "://" +
-        session.userName + "@" + session.hostName +
-        (mSessions.Path().empty() ? std::string() :
-            std::string(" in ") + mSessions.Path()) + ".");
+    console.Status(Texts::Translate(
+        "Stored session '{name}' for {protocol}://{user}@{host}{location}.",
+        {{"name", name}, {"protocol", session.protocol},
+        {"user", session.userName}, {"host", session.hostName},
+        {"location", mSessions.Path().empty() ? std::string() :
+        std::string(" in ") + mSessions.Path()}}));
     if (!session.password.empty())
     {
-        console.Status("Warning: the password was stored encrypted in the "
-            "session file" +
-            (mSessions.KeyPath().empty() ? std::string() :
-                std::string(" under '") + mSessions.KeyPath() + "'") +
-            ". It is readable by this account only; remove it with "
-            "'savesession " + name + "' after connecting with a key or an agent.");
+        console.Status(Texts::Translate(
+            "Warning: the password was stored encrypted in the session "
+            "file{location}. It is readable by this account only; remove it "
+            "with 'savesession {name}' after connecting with a key or an "
+            "agent.",
+            {{"location", mSessions.KeyPath().empty() ? std::string() :
+            std::string(" under '") + mSessions.KeyPath() + "'"},
+            {"name", name}}));
     }
     return true;
 }
@@ -6031,14 +6159,15 @@ bool Script::RemoveStoredSessionEntry(const std::vector<std::string> & args)
             mErrors++;
             return false;
         }
-        console.Status("Removed " + std::to_string(removed) +
-            " stored session(s) in folder '" + args[1] + "'.");
+        console.Status(Texts::Translate(
+            "Removed {count} stored session(s) in folder '{folder}'.",
+            {{"count", std::to_string(removed)}, {"folder", args[1]}}));
         return true;
     }
     if (args.size() != 1)
     {
         console.Error(Texts::WrongArguments("rmsession",
-            "Syntax: rmsession [-folder] <name>."));
+            Texts::Translate("Syntax: rmsession [-folder] <name>.")));
         mErrors++;
         return false;
     }
@@ -6058,8 +6187,9 @@ bool Script::RemoveStoredSessionEntry(const std::vector<std::string> & args)
             mErrors++;
             return false;
         }
-        console.Status("Removed " + std::to_string(removed) +
-            " stored session(s) in folder '" + args[0] + "'.");
+        console.Status(Texts::Translate(
+            "Removed {count} stored session(s) in folder '{folder}'.",
+            {{"count", std::to_string(removed)}, {"folder", args[0]}}));
         return true;
     }
     std::string error;
@@ -6075,7 +6205,8 @@ bool Script::RemoveStoredSessionEntry(const std::vector<std::string> & args)
         mErrors++;
         return false;
     }
-    console.Status("Removed the stored session '" + args[0] + "'.");
+    console.Status(Texts::Translate(
+        "Removed the stored session '{name}'.", {{"name", args[0]}}));
     return true;
 }
 
@@ -6099,7 +6230,7 @@ bool Script::RemoveRemote(const std::vector<std::string> & args)
     if (files.empty())
     {
         Console::Instance().Error(Texts::WrongArguments("rm",
-            "Syntax: rm [-onlyfile] <file(s)>"));
+            Texts::Translate("Syntax: rm [-onlyfile] <file(s)>")));
         mErrors++;
         return false;
     }
@@ -6126,8 +6257,9 @@ bool Script::RemoveRemote(const std::vector<std::string> & args)
             }
             else
             {
-                Console::Instance().Status("No file matching '" + files[i] +
-                    "' found.");
+                Console::Instance().Status(Texts::Translate(
+                    "No file matching '{pattern}' found.",
+                    {{"pattern", files[i]}}));
             }
             continue;
         }
@@ -6140,8 +6272,9 @@ bool Script::RemoveRemote(const std::vector<std::string> & args)
                     (attrs.flags & LSCP_ATTR_PERMISSIONS) != 0 &&
                     (attrs.permissions & 0040000) != 0)
                 {
-                    Console::Instance().Status("Skipped the directory '" +
-                        paths[n] + "' (-onlyfile).");
+                    Console::Instance().Status(Texts::Translate(
+                        "Skipped the directory '{path}' (-onlyfile).",
+                        {{"path", paths[n]}}));
                     continue;
                 }
             }
@@ -6180,7 +6313,7 @@ bool Script::RemoveRemoteDirectory(const std::vector<std::string> & args)
     if (args.empty())
     {
         Console::Instance().Error(Texts::WrongArguments("rmdir",
-            "Syntax: rmdir <directory> [<directory2> ...]"));
+            Texts::Translate("Syntax: rmdir <directory> [<directory2> ...]")));
         mErrors++;
         return false;
     }
@@ -6228,7 +6361,7 @@ bool Script::MakeRemoteDirectory(const std::vector<std::string> & args)
         (!parents && (args.size() != 1 || args[0].empty() || args[0][0] == '-')))
     {
         Console::Instance().Error(Texts::WrongArguments("mkdir",
-            "Syntax: mkdir [-parents] <directory>"));
+            Texts::Translate("Syntax: mkdir [-parents] <directory>")));
         mErrors++;
         return false;
     }
@@ -6254,7 +6387,7 @@ bool Script::MoveRemote(const std::vector<std::string> & args)
     if (args.size() < 2)
     {
         Console::Instance().Error(Texts::WrongArguments("mv",
-            "Syntax: mv <source> [ <source>... ] <target>"));
+            Texts::Translate("Syntax: mv <source> [ <source>... ] <target>")));
         mErrors++;
         return false;
     }
@@ -6273,8 +6406,9 @@ bool Script::MoveRemote(const std::vector<std::string> & args)
         if (!targetIsDir)
         {
             Console::Instance().Error(Texts::WrongArguments("mv",
-                "When several files are moved at once, the target must be an "
-                "existing directory: '" + to + "' is not."));
+                Texts::Translate(
+                    "When several files are moved at once, the target must be an "
+                    "existing directory: '{path}' is not.", {{"path", to}})));
             mErrors++;
             return false;
         }
@@ -6432,9 +6566,10 @@ int Script::RemoteSymlink(const std::string & target,
     }
     if (!UseNativeSftp(mSession.Options().protocol))
     {
-        error = "Creating symbolic links needs the native SFTP backend or an "
-            "SCP session; the '" + mSession.Options().protocol +
-            "' protocol cannot do it.";
+        error = Texts::Translate(
+            "Creating symbolic links needs the native SFTP backend or an "
+            "SCP session; the '{protocol}' protocol cannot do it.",
+            {{"protocol", mSession.Options().protocol}});
         return -1;
     }
     if (lscp_sftp_symlink(target.c_str(), linkPath.c_str()) != 0)
@@ -6453,7 +6588,7 @@ int Script::RemoteStreamCopy(const std::string & from, const std::string & to,
     const std::string temp = MakeTempPath("copy");
     if (temp.empty())
     {
-        error = "Cannot create a temporary file for the copy.";
+        error = Texts::Translate("Cannot create a temporary file for the copy.");
         return -1;
     }
     unsigned long long size = 0;
@@ -6476,7 +6611,7 @@ bool Script::CopyRemote(const std::vector<std::string> & args)
     if (args.size() < 2)
     {
         Console::Instance().Error(Texts::WrongArguments("cp",
-            "Syntax: cp <source> [ <source>... ] <target>"));
+            Texts::Translate("Syntax: cp <source> [ <source>... ] <target>")));
         mErrors++;
         return false;
     }
@@ -6653,8 +6788,9 @@ bool Script::CopyRemoteOneFile(const std::string & from,
         const int result = lscp_sftp_copy(from.c_str(), to.c_str());
         if (result == 0)
         {
-            Console::Instance().Status("Copied '" + from + "' to '" + to +
-                "' on the server.");
+            Console::Instance().Status(Texts::Translate(
+                "Copied '{from}' to '{to}' on the server.",
+                {{"from", from}, {"to", to}}));
             return true;
         }
         if (result == -1)
@@ -6664,8 +6800,9 @@ bool Script::CopyRemoteOneFile(const std::string & from,
             mErrors++;
             return false;
         }
-        Console::Instance().Status("The server cannot copy files by itself; " +
-            std::string("copying through this client."));
+        Console::Instance().Status(Texts::Translate(
+            "The server cannot copy files by itself; copying through this "
+            "client."));
     }
     else
     {
@@ -6673,8 +6810,9 @@ bool Script::CopyRemoteOneFile(const std::string & from,
             error);
         if (result == 0)
         {
-            Console::Instance().Status("Copied '" + from + "' to '" + to +
-                "' on the server.");
+            Console::Instance().Status(Texts::Translate(
+                "Copied '{from}' to '{to}' on the server.",
+                {{"from", from}, {"to", to}}));
             return true;
         }
         if (result < 0)
@@ -6691,7 +6829,8 @@ bool Script::CopyRemoteOneFile(const std::string & from,
         mErrors++;
         return false;
     }
-    Console::Instance().Status("Copied '" + from + "' to '" + to + "'.");
+    Console::Instance().Status(Texts::Translate("Copied '{from}' to '{to}'.",
+        {{"from", from}, {"to", to}}));
     return true;
 }
 
@@ -6704,7 +6843,8 @@ bool Script::LinkRemote(const std::vector<std::string> & args, const char * name
     if (args.size() != 2)
     {
         Console::Instance().Error(Texts::WrongArguments(name,
-            "Syntax: " + std::string(name) + " <target> <link>"));
+            Texts::Translate("Syntax: {command} <target> <link>",
+                {{"command", std::string(name)}})));
         mErrors++;
         return false;
     }
@@ -6718,8 +6858,9 @@ bool Script::LinkRemote(const std::vector<std::string> & args, const char * name
         mErrors++;
         return false;
     }
-    Console::Instance().Status("Created '" + linkPath + "' pointing at '" +
-        target + "'.");
+    Console::Instance().Status(Texts::Translate(
+        "Created '{link}' pointing at '{target}'.",
+        {{"link", linkPath}, {"target", target}}));
     return true;
 }
 
@@ -6732,8 +6873,9 @@ bool Script::ChecksumRemote(const std::vector<std::string> & args)
     if (args.size() != 2)
     {
         Console::Instance().Error(Texts::WrongArguments("checksum",
-            "Syntax: checksum <algorithm> <file> (algorithm: sha-256, "
-            "sha-1, md5 or crc32)"));
+            Texts::Translate(
+                "Syntax: checksum <algorithm> <file> (algorithm: sha-256, "
+                "sha-1, md5 or crc32)")));
         mErrors++;
         return false;
     }
@@ -6754,7 +6896,8 @@ bool Script::ChecksumRemote(const std::vector<std::string> & args)
         (attrs.permissions & 0040000) != 0)
     {
         Console::Instance().Error(Texts::WrongArguments("checksum",
-            "'" + path + "' is a directory, not a file."));
+            Texts::Translate("'{path}' is a directory, not a file.",
+                {{"path", path}})));
         mErrors++;
         return false;
     }
@@ -6808,8 +6951,9 @@ bool Script::LockRemote(const std::vector<std::string> & args)
             if (!digits || atoi(value.c_str()) <= 0)
             {
                 Console::Instance().Error(Texts::WrongArguments("lock",
-                    "The value of '-timeout' is the number of seconds the "
-                    "server should keep the lock for."));
+                    Texts::Translate(
+                        "The value of '-timeout' is the number of seconds the server "
+                        "should keep the lock for.")));
                 mErrors++;
                 return false;
             }
@@ -6818,7 +6962,7 @@ bool Script::LockRemote(const std::vector<std::string> & args)
         else if (args[i].size() > 1 && args[i][0] == '-')
         {
             Console::Instance().Error(Texts::WrongArguments("lock",
-                "Unknown switch '" + args[i] + "'."));
+                Texts::Translate("Unknown switch '{switch}'.", {{"switch", args[i]}})));
             mErrors++;
             return false;
         }
@@ -6830,7 +6974,7 @@ bool Script::LockRemote(const std::vector<std::string> & args)
     if (paths.size() != 1)
     {
         Console::Instance().Error(Texts::WrongArguments("lock",
-            "Syntax: lock <file> [-timeout=SECONDS]"));
+            Texts::Translate("Syntax: lock <file> [-timeout=SECONDS]")));
         mErrors++;
         return false;
     }
@@ -6844,7 +6988,8 @@ bool Script::LockRemote(const std::vector<std::string> & args)
         return false;
     }
     mSession.SetDavLock(path, token);
-    Console::Instance().WriteLine("Locked " + path + " with token " + token + ".");
+    Console::Instance().WriteLine(Texts::Translate(
+        "Locked {path} with token {token}.", {{"path", path}, {"token", token}}));
     return true;
 }
 
@@ -6857,7 +7002,8 @@ bool Script::UnlockRemote(const std::vector<std::string> & args)
     if (args.size() != 1)
     {
         Console::Instance().Error(Texts::WrongArguments("unlock",
-            "Syntax: unlock <file> (releases the lock 'lock <file>' took)"));
+            Texts::Translate(
+                "Syntax: unlock <file> (releases the lock 'lock <file>' took)")));
         mErrors++;
         return false;
     }
@@ -6866,8 +7012,10 @@ bool Script::UnlockRemote(const std::vector<std::string> & args)
     if (token.empty())
     {
         Console::Instance().Error(Texts::WrongArguments("unlock",
-            "This session holds no lock on '" + path + "'; take one with "
-            "'lock " + args[0] + "' first."));
+            Texts::Translate(
+                "This session holds no lock on '{path}'; take one with "
+                "'lock {command}' first.",
+                {{"path", path}, {"command", args[0]}})));
         mErrors++;
         return false;
     }
@@ -6879,7 +7027,8 @@ bool Script::UnlockRemote(const std::vector<std::string> & args)
         return false;
     }
     mSession.ClearDavLock(path);
-    Console::Instance().WriteLine("Unlocked " + path + ".");
+    Console::Instance().WriteLine(Texts::Translate("Unlocked {path}.",
+        {{"path", path}}));
     return true;
 }
 
@@ -6910,7 +7059,7 @@ bool Script::DavPropertyCommand(const std::vector<std::string> & args)
             if (equals == std::string::npos)
             {
                 Console::Instance().Error(Texts::WrongArguments("property",
-                    "'-set' takes NAME=VALUE."));
+                    Texts::Translate("'-set' takes NAME=VALUE.")));
                 mErrors++;
                 return false;
             }
@@ -6921,7 +7070,7 @@ bool Script::DavPropertyCommand(const std::vector<std::string> & args)
         else if (args[i].size() > 1 && args[i][0] == '-')
         {
             Console::Instance().Error(Texts::WrongArguments("property",
-                "Unknown switch '" + args[i] + "'."));
+                Texts::Translate("Unknown switch '{switch}'.", {{"switch", args[i]}})));
             mErrors++;
             return false;
         }
@@ -6933,8 +7082,9 @@ bool Script::DavPropertyCommand(const std::vector<std::string> & args)
     if (paths.size() != 1 || getGiven == setGiven || (getGiven && getName.empty()))
     {
         Console::Instance().Error(Texts::WrongArguments("property",
-            "Syntax: property <file> -get=NAME | property <file> "
-            "-set=NAME=VALUE"));
+            Texts::Translate(
+                "Syntax: property <file> -get=NAME | property <file> "
+                "-set=NAME=VALUE")));
         mErrors++;
         return false;
     }
@@ -6950,7 +7100,7 @@ bool Script::DavPropertyCommand(const std::vector<std::string> & args)
             mErrors++;
             return false;
         }
-        Console::Instance().WriteLine("Set " + setName + " on " + path + ".");
+        Console::Instance().WriteLine(Texts::PropertySet(setName, path));
         return true;
     }
     std::string value;
@@ -7018,7 +7168,7 @@ bool Script::EtagCommand(const std::vector<std::string> & args)
         else if (args[i].size() > 1 && args[i][0] == '-')
         {
             Console::Instance().Error(Texts::WrongArguments("etag",
-                "Unknown switch '" + args[i] + "'."));
+                Texts::Translate("Unknown switch '{switch}'.", {{"switch", args[i]}})));
             mErrors++;
             return false;
         }
@@ -7030,7 +7180,8 @@ bool Script::EtagCommand(const std::vector<std::string> & args)
     if (paths.size() != 1)
     {
         Console::Instance().Error(Texts::WrongArguments("etag",
-            "Syntax: etag <file> -match=ETAG | -nomatch=ETAG | -get | -clear"));
+            Texts::Translate(
+                "Syntax: etag <file> -match=ETAG | -nomatch=ETAG | -get | -clear")));
         mErrors++;
         return false;
     }
@@ -7043,8 +7194,9 @@ bool Script::EtagCommand(const std::vector<std::string> & args)
     if (matchEtag == "*" || nomatchEtag == "*")
     {
         Console::Instance().Error(Texts::WrongArguments("etag",
-            "'*' is not an entity tag. Give the tag 'etag <file> -get' "
-            "prints, which a path that is not there answers with."));
+            Texts::Translate(
+                "'*' is not an entity tag. Give the tag 'etag <file> -get' "
+                "prints, which a path that is not there answers with.")));
         mErrors++;
         return false;
     }
@@ -7053,7 +7205,8 @@ bool Script::EtagCommand(const std::vector<std::string> & args)
     if (actions != 1)
     {
         Console::Instance().Error(Texts::WrongArguments("etag",
-            "Give exactly one of -match=ETAG, -nomatch=ETAG, -get or -clear."));
+            Texts::Translate(
+                "Give exactly one of -match=ETAG, -nomatch=ETAG, -get or -clear.")));
         mErrors++;
         return false;
     }
@@ -7181,7 +7334,8 @@ bool Script::RemoteChecksumFile(const std::string & path,
     const std::string temp = MakeTempPath("sum");
     if (temp.empty())
     {
-        error = "Cannot create a temporary file for the checksum.";
+        error = Texts::Translate(
+            "Cannot create a temporary file for the checksum.");
         return false;
     }
     unsigned long long size = 0;
@@ -7215,7 +7369,8 @@ bool Script::CallRemote(const std::vector<std::string> & args, const char * name
     if (args.empty())
     {
         Console::Instance().Error(Texts::WrongArguments(name,
-            "Syntax: " + std::string(name) + " <command>"));
+            Texts::Translate("Syntax: {command} <command>",
+                {{"command", std::string(name)}})));
         mErrors++;
         return false;
     }
@@ -7223,8 +7378,10 @@ bool Script::CallRemote(const std::vector<std::string> & args, const char * name
     if (!UseNativeSftp(options.protocol) && !UseNativeScp(options.protocol))
     {
         Console::Instance().Error(Texts::WrongArguments(name,
-            "Executing a command on the server needs an SSH (sftp:// or scp://) "
-            "session, not '" + options.protocol + "'."));
+            Texts::Translate(
+                "Executing a command on the server needs an SSH (sftp:// or "
+                "scp://) session, not '{protocol}'.",
+                {{"protocol", options.protocol}})));
         mErrors++;
         return false;
     }
@@ -7292,9 +7449,9 @@ bool Script::CopyPublicKey(const std::vector<std::string> & args)
         }
         else if (!args[i].empty() && args[i][0] == '-')
         {
-            return SwitchError("copyid", "Syntax: copyid [<keyfile>] "
-                "[-passphrase=<passphrase>]; without a file the private key "
-                "of the session is used.");
+            return SwitchError("copyid", Texts::Translate(
+                "Syntax: copyid [<keyfile>] [-passphrase=<passphrase>]; "
+                "without a file the private key of the session is used."));
         }
         else if (!haveKeyArg)
         {
@@ -7303,9 +7460,9 @@ bool Script::CopyPublicKey(const std::vector<std::string> & args)
         }
         else
         {
-            return SwitchError("copyid", "Syntax: copyid [<keyfile>] "
-                "[-passphrase=<passphrase>]; without a file the private key "
-                "of the session is used.");
+            return SwitchError("copyid", Texts::Translate(
+                "Syntax: copyid [<keyfile>] [-passphrase=<passphrase>]; "
+                "without a file the private key of the session is used."));
         }
     }
     if (!RequireConnection())
@@ -7315,8 +7472,9 @@ bool Script::CopyPublicKey(const std::vector<std::string> & args)
     const SessionOptions & options = mSession.Options();
     if (!UseNativeSftp(options.protocol) && !UseNativeScp(options.protocol))
     {
-        return SwitchError("copyid", "Installing a public key needs an SSH "
-            "(sftp:// or scp://) session, not '" + options.protocol + "'.");
+        return SwitchError("copyid", Texts::Translate(
+            "Installing a public key needs an SSH (sftp:// or scp://) "
+            "session, not '{protocol}'.", {{"protocol", options.protocol}}));
     }
     if (!haveKeyArg)
     {
@@ -7328,8 +7486,9 @@ bool Script::CopyPublicKey(const std::vector<std::string> & args)
     }
     if (keyFile.empty())
     {
-        return SwitchError("copyid", "There is no private key: connect with "
-            "-privatekey=<file>, or give the key file to the command.");
+        return SwitchError("copyid", Texts::Translate(
+            "There is no private key: connect with -privatekey=<file>, "
+            "or give the key file to the command."));
     }
     std::string keyLine;
     std::string error;
@@ -7340,8 +7499,9 @@ bool Script::CopyPublicKey(const std::vector<std::string> & args)
     }
     if (mHomeDirectory.empty())
     {
-        return SwitchError("copyid", "The home directory of the session is "
-            "not known, so ~/.ssh/authorized_keys cannot be located.");
+        return SwitchError("copyid", Texts::Translate(
+            "The home directory of the session is not known, so "
+            "~/.ssh/authorized_keys cannot be located."));
     }
 
     const std::string sshDirectory = JoinRemotePath(mHomeDirectory, ".ssh");
@@ -7356,10 +7516,11 @@ bool Script::CopyPublicKey(const std::vector<std::string> & args)
         if (RemoteMakeDir(sshDirectory, 0700, makeError) != 0)
         {
             mErrors++;
-            return SwitchError("copyid", "Cannot create '" + sshDirectory +
-                "': " + makeError);
+            return SwitchError("copyid", Texts::Translate("Cannot create '{path}': {reason}",
+                {{"path", sshDirectory}, {"reason", makeError}}));
         }
-        Console::Instance().Status("Created '" + sshDirectory + "'.");
+        Console::Instance().Status(Texts::Translate("Created '{path}'.",
+            {{"path", sshDirectory}}));
     }
 
     /* Keep the keys that are installed already; a repeated 'copyid' must not
@@ -7368,8 +7529,8 @@ bool Script::CopyPublicKey(const std::vector<std::string> & args)
     const std::string temp = MakeTempPath("authkeys");
     if (temp.empty())
     {
-        return SwitchError("copyid", "Cannot create a temporary file for the "
-            "authorized keys.");
+        return SwitchError("copyid", Texts::Translate(
+            "Cannot create a temporary file for the authorized keys."));
     }
     bool installed = false;
     bool failed = false;
@@ -7382,8 +7543,8 @@ bool Script::CopyPublicKey(const std::vector<std::string> & args)
         {
             remove(temp.c_str());
             mErrors++;
-            return SwitchError("copyid", "Cannot read '" + authorizedKeys +
-                "': " + getError);
+            return SwitchError("copyid", Texts::Translate("Cannot read '{path}': {reason}",
+                {{"path", authorizedKeys}, {"reason", getError}}));
         }
         FILE * file = fopen(temp.c_str(), "rb");
         if (file != NULL)
@@ -7414,16 +7575,17 @@ bool Script::CopyPublicKey(const std::vector<std::string> & args)
     if (installed)
     {
         remove(temp.c_str());
-        Console::Instance().Status("The key is already installed in '" +
-            authorizedKeys + "'.");
+        Console::Instance().Status(Texts::Translate(
+            "The key is already installed in '{path}'.",
+            {{"path", authorizedKeys}}));
         return true;
     }
 
     FILE * file = fopen(temp.c_str(), "wb");
     if (file == NULL)
     {
-        return SwitchError("copyid", "Cannot write a temporary file for the "
-            "authorized keys.");
+        return SwitchError("copyid", Texts::Translate(
+            "Cannot write a temporary file for the authorized keys."));
     }
     for (size_t i = 0; i < kept.size(); i++)
     {
@@ -7445,8 +7607,9 @@ bool Script::CopyPublicKey(const std::vector<std::string> & args)
         mErrors++;
         return false;
     }
-    Console::Instance().Status("Installed the public key of '" + keyFile +
-        "' in '" + authorizedKeys + "'.");
+    Console::Instance().Status(Texts::Translate(
+        "Installed the public key of '{key}' in '{path}'.",
+        {{"key", keyFile}, {"path", authorizedKeys}}));
     return true;
 }
 
@@ -7469,7 +7632,8 @@ bool Script::ApplyRemotePermissions(const std::string & path, const std::string 
     std::string modeError;
     if (!ParsePermissions(mode, current, isDirectory, wanted, modeError))
     {
-        Console::Instance().Error("'" + path + "': " + modeError);
+        Console::Instance().Error(Texts::Translate("'{path}': {reason}",
+            {{"path", path}, {"reason", modeError}}));
         mErrors++;
         return false;
     }
@@ -7550,7 +7714,7 @@ bool Script::ChangeRemotePermissions(const std::vector<std::string> & args)
     if (rest.size() < 2)
     {
         Console::Instance().Error(Texts::WrongArguments("chmod",
-            "Syntax: chmod <permissions> <file(s)> [-recursive]"));
+            Texts::Translate("Syntax: chmod <permissions> <file(s)> [-recursive]")));
         mErrors++;
         return false;
     }
@@ -7563,8 +7727,10 @@ bool Script::ChangeRemotePermissions(const std::vector<std::string> & args)
     if (!ParsePermissions(mode, 0644, false, probe, modeError))
     {
         Console::Instance().Error(Texts::WrongArguments("chmod",
-            "'" + mode + "' is not a valid mode: " + modeError +
-            ". Use an octal number such as 644 or an expression such as u+x."));
+            Texts::Translate(
+                "'{mode}' is not a valid mode: {reason}. Use an octal number "
+                "such as 644 or an expression such as u+x.",
+                {{"mode", mode}, {"reason", modeError}})));
         mErrors++;
         return false;
     }
@@ -7626,7 +7792,7 @@ bool Script::AttrRemote(const std::vector<std::string> & args)
     }
     if (args.size() != 1)
     {
-        Console::Instance().Error(Texts::WrongArguments("stat", "Syntax: stat <file>"));
+        Console::Instance().Error(Texts::WrongArguments("stat", Texts::Translate("Syntax: stat <file>")));
         mErrors++;
         return false;
     }
@@ -7640,31 +7806,39 @@ bool Script::AttrRemote(const std::vector<std::string> & args)
          * to it reads like the client gave up without asking. */
         if (statResult == LSCP_SFTP_STAT_MISSING && error.empty())
         {
-            error = "There is no such file or directory.";
+            error = Texts::Translate("There is no such file or directory.");
         }
         Console::Instance().Error(Texts::RemoteError("read the attributes of", path,
             error));
         mErrors++;
         return false;
     }
-    Console::Instance().WriteLine("Path:        " + path);
-    Console::Instance().WriteLine("Size:        " + FormatSize(attrs.size));
-    Console::Instance().WriteLine("Permissions: " + FormatPermissions(attrs.permissions));
-    Console::Instance().WriteLine("Modified:    " + FormatFileTime(attrs.mtime));
+    Console::Instance().WriteLine(Texts::Translate("Path:        {path}",
+        {{"path", path}}));
+    Console::Instance().WriteLine(Texts::Translate("Size:        {size}",
+        {{"size", FormatSize(attrs.size)}}));
+    Console::Instance().WriteLine(Texts::Translate("Permissions: {permissions}",
+        {{"permissions", FormatPermissions(attrs.permissions)}}));
+    Console::Instance().WriteLine(Texts::Translate("Modified:    {time}",
+        {{"time", FormatFileTime(attrs.mtime)}}));
     if ((attrs.flags & LSCP_ATTR_SIZE) != 0)
     {
-        Console::Instance().WriteLine("SizeBytes:   " + std::to_string(attrs.size));
+        Console::Instance().WriteLine(Texts::Translate("SizeBytes:   {size}",
+            {{"size", std::to_string(attrs.size)}}));
     }
     if ((attrs.flags & LSCP_ATTR_ACMODTIME) != 0)
     {
         /* Seconds since the epoch, for a script or the graphical client
          * that wants to compare timestamps rather than read them. */
-        Console::Instance().WriteLine("ModifiedEpoch: " + std::to_string(attrs.mtime));
-        Console::Instance().WriteLine("AccessedEpoch: " + std::to_string(attrs.atime));
+        Console::Instance().WriteLine(Texts::Translate("ModifiedEpoch: {time}",
+            {{"time", std::to_string(attrs.mtime)}}));
+        Console::Instance().WriteLine(Texts::Translate("AccessedEpoch: {time}",
+            {{"time", std::to_string(attrs.atime)}}));
     }
-    Console::Instance().WriteLine("Owner:       " + std::string(
-        attrs.flags & LSCP_ATTR_UIDGID ?
-        std::to_string(attrs.uid) + ":" + std::to_string(attrs.gid) : std::string("unknown")));
+    Console::Instance().WriteLine(Texts::Translate("Owner:       {owner}",
+        {{"owner", std::string(attrs.flags & LSCP_ATTR_UIDGID ?
+        std::to_string(attrs.uid) + ":" + std::to_string(attrs.gid) :
+        std::string("unknown"))}}));
     return true;
 }
 
@@ -7680,7 +7854,7 @@ bool Script::StatRemote(const std::vector<std::string> & args)
     }
     if (args.size() != 1)
     {
-        Console::Instance().Error(Texts::WrongArguments("stat", "Syntax: stat <file>"));
+        Console::Instance().Error(Texts::WrongArguments("stat", Texts::Translate("Syntax: stat <file>")));
         mErrors++;
         return false;
     }
@@ -7694,7 +7868,7 @@ bool Script::StatRemote(const std::vector<std::string> & args)
          * to it reads like the client gave up without asking. */
         if (statResult == LSCP_SFTP_STAT_MISSING && error.empty())
         {
-            error = "There is no such file or directory.";
+            error = Texts::Translate("There is no such file or directory.");
         }
         Console::Instance().Error(Texts::RemoteError("read the attributes of", path,
             error));
@@ -7724,7 +7898,7 @@ void Script::OpenTerminal(const std::vector<std::string> & args)
     if (!args.empty())
     {
         Console::Instance().Error(Texts::WrongArguments("terminal",
-            "The command takes no arguments."));
+            Texts::Translate("The command takes no arguments.")));
         mErrors++;
         return;
     }
@@ -7732,9 +7906,10 @@ void Script::OpenTerminal(const std::vector<std::string> & args)
     const SessionOptions & options = mSession.Options();
     if (!UseNativeSftp(options.protocol) && !UseNativeScp(options.protocol))
     {
-        Console::Instance().Error("An interactive terminal is only available "
-            "for SSH (sftp:// or scp://) sessions, not for '" +
-            options.protocol + "'.");
+        Console::Instance().Error(Texts::Translate(
+            "An interactive terminal is only available for SSH (sftp:// or "
+            "scp://) sessions, not for '{protocol}'.",
+            {{"protocol", options.protocol}}));
         mErrors++;
         return;
     }
@@ -7757,9 +7932,10 @@ void Script::OpenTerminal(const std::vector<std::string> & args)
         }
         if (extension == ".ppk")
         {
-            Console::Instance().LogEvent("The PuTTY key file '" + key +
-                "' is not passed to the system ssh client; the terminal will "
-                "use the agent or ask for a password.");
+            Console::Instance().LogEvent(Texts::Translate(
+                "The PuTTY key file '{key}' is not passed to the system ssh "
+                "client; the terminal will use the agent or ask for a "
+                "password.", {{"key", key}}));
         }
     }
 
@@ -7772,16 +7948,17 @@ void Script::OpenTerminal(const std::vector<std::string> & args)
         return;
     }
 
-    Console::Instance().WriteLine("Opened a terminal on " +
-        (userName.empty() ? options.hostName : userName + "@" + options.hostName) + ".");
+    Console::Instance().WriteLine(Texts::Translate("Opened a terminal on {target}.",
+        {{"target", userName.empty() ? options.hostName :
+        userName + "@" + options.hostName}}));
 }
 
 bool Script::SetOption(const std::vector<std::string> & args)
 {
-    const std::string supported =
+    const std::string supported = Texts::Translate(
         "supported: echo, batch, confirm, resume, transfer, include, exclude, "
         "failonnomatch, synchdelete, reconnecttime, editor, editmaxsize, "
-        "preset";
+        "preset");
     if (args.empty())
     {
         /* 'option' with no name lists every option and its value, like
@@ -7820,14 +7997,14 @@ bool Script::SetOption(const std::vector<std::string> & args)
     {
         if (name == "echo")
         {
-            Console::Instance().Status(std::string("echo = ") +
-                (mEchoCommands ? "on" : "off"));
+            Console::Instance().Status(Texts::OptionValue("echo",
+                mEchoCommands ? "on" : "off"));
             return true;
         }
         if (name == "confirm")
         {
-            Console::Instance().Status(std::string("confirm = ") +
-                (mConfirm ? "on" : "off"));
+            Console::Instance().Status(Texts::OptionValue("confirm",
+                mConfirm ? "on" : "off"));
             return true;
         }
         if (name == "batch")
@@ -7835,26 +8012,26 @@ bool Script::SetOption(const std::vector<std::string> & args)
             const char * value = mBatchMode == BatchMode::Abort ? "abort" :
                 mBatchMode == BatchMode::Continue ? "continue" :
                 mBatchMode == BatchMode::On ? "on" : "off";
-            Console::Instance().Status(std::string("batch = ") + value);
+            Console::Instance().Status(Texts::OptionValue("batch", value));
             return true;
         }
         if (name == "resume")
         {
             const char * value = mResumeMode == ResumeMode::On ? "on" :
                 mResumeMode == ResumeMode::Off ? "off" : "automatic";
-            Console::Instance().Status(std::string("resume = ") + value);
+            Console::Instance().Status(Texts::OptionValue("resume", value));
             return true;
         }
         if (name == "transfer")
         {
-            Console::Instance().Status(std::string("transfer = ") +
-                TransferModeName(mTransferMode));
+            Console::Instance().Status(Texts::OptionValue("transfer",
+                TransferModeName(mTransferMode)));
             return true;
         }
         if (name == "preset")
         {
-            Console::Instance().Status("preset = " +
-                (mActivePresetName.empty() ? std::string("off") :
+            Console::Instance().Status(Texts::OptionValue("preset",
+                mActivePresetName.empty() ? std::string("off") :
                  mActivePresetName));
             return true;
         }
@@ -7869,8 +8046,8 @@ bool Script::SetOption(const std::vector<std::string> & args)
                 }
                 masks += mOptionMask.include[i].text;
             }
-            Console::Instance().Status("include = " +
-                (masks.empty() ? std::string("(none)") : masks));
+            Console::Instance().Status(Texts::OptionValue("include",
+                masks.empty() ? std::string("(none)") : masks));
             return true;
         }
         if (name == "exclude")
@@ -7884,45 +8061,48 @@ bool Script::SetOption(const std::vector<std::string> & args)
                 }
                 masks += mOptionMask.exclude[i].text;
             }
-            Console::Instance().Status("exclude = " +
-                (masks.empty() ? std::string("(none)") : masks));
+            Console::Instance().Status(Texts::OptionValue("exclude",
+                masks.empty() ? std::string("(none)") : masks));
             return true;
         }
         if (name == "failonnomatch")
         {
-            Console::Instance().Status(std::string("failonnomatch = ") +
-                (mFailOnNoMatch ? "on" : "off"));
+            Console::Instance().Status(Texts::OptionValue("failonnomatch",
+                mFailOnNoMatch ? "on" : "off"));
             return true;
         }
         if (name == "synchdelete")
         {
-            Console::Instance().Status(std::string("synchdelete = ") +
-                (mSyncDeleteDefault ? "on" : "off"));
+            Console::Instance().Status(Texts::OptionValue("synchdelete",
+                mSyncDeleteDefault ? "on" : "off"));
             return true;
         }
         if (name == "reconnecttime")
         {
-            Console::Instance().Status(std::string("reconnecttime = ") +
-                (mReconnectSeconds > 0 ? std::to_string(mReconnectSeconds) :
+            Console::Instance().Status(Texts::OptionValue("reconnecttime",
+                mReconnectSeconds > 0 ? std::to_string(mReconnectSeconds) :
                 std::string("off")));
             return true;
         }
         if (name == "editor")
         {
-            Console::Instance().Status(std::string("editor = ") +
-                (mEditor.empty() ? std::string("(from LINSCP_EDITOR, VISUAL or EDITOR)") : mEditor));
+            Console::Instance().Status(Texts::OptionValue("editor",
+                mEditor.empty() ? std::string("(from LINSCP_EDITOR, VISUAL or EDITOR)")
+                : mEditor));
             return true;
         }
         if (name == "editmaxsize")
         {
-            Console::Instance().Status("editmaxsize = " + std::to_string(mEditMaxSize));
+            Console::Instance().Status(Texts::OptionValue("editmaxsize",
+                std::to_string(mEditMaxSize)));
             return true;
         }
     }
     if (args.size() != 2)
     {
         Console::Instance().Error(Texts::WrongArguments("option",
-            "Syntax: option [<name> [<value>]] (" + supported + ")"));
+            Texts::Translate("Syntax: option [<name> [<value>]] ({options})",
+                {{"options", supported}})));
         mErrors++;
         return false;
     }
@@ -8001,7 +8181,7 @@ bool Script::SetOption(const std::vector<std::string> & args)
         else
         {
             Console::Instance().Error(Texts::WrongArguments("option",
-                "The value of 'resume' must be on, off or automatic."));
+                Texts::Translate("The value of 'resume' must be on, off or automatic.")));
             mErrors++;
             return false;
         }
@@ -8040,8 +8220,10 @@ bool Script::SetOption(const std::vector<std::string> & args)
         if (preset == NULL)
         {
             Console::Instance().Error(Texts::WrongArguments("option",
-                "There is no transfer preset named '" + args[1] + "' in '" +
-                mPresets.Path() + "'; create it with 'savepreset'."));
+                Texts::Translate(
+                    "There is no transfer preset named '{name}' in '{path}'; "
+                    "create it with 'savepreset'.",
+                    {{"name", args[1]}, {"path", mPresets.Path()}})));
             mErrors++;
             return false;
         }
@@ -8106,8 +8288,9 @@ bool Script::SetOption(const std::vector<std::string> & args)
         if (seconds < 1 || seconds > 3600)
         {
             Console::Instance().Error(Texts::WrongArguments("option",
-                "The value of 'reconnecttime' must be a number of seconds "
-                "from 1 to 3600, or 'off'."));
+                Texts::Translate(
+                    "The value of 'reconnecttime' must be a number of seconds "
+                    "from 1 to 3600, or 'off'.")));
             mErrors++;
             return false;
         }
@@ -8135,7 +8318,8 @@ bool Script::SetOption(const std::vector<std::string> & args)
         else
         {
             Console::Instance().Error(Texts::WrongArguments("option",
-                "The value of 'batch' must be 'on', 'off', 'abort' or 'continue'."));
+                Texts::Translate(
+                    "The value of 'batch' must be 'on', 'off', 'abort' or 'continue'.")));
             mErrors++;
             return false;
         }
@@ -8156,7 +8340,7 @@ bool Script::SetOption(const std::vector<std::string> & args)
             if (args[1][i] < '0' || args[1][i] > '9')
             {
                 Console::Instance().Error(Texts::WrongArguments("option",
-                    "The value of 'editmaxsize' must be a number of bytes."));
+                    Texts::Translate("The value of 'editmaxsize' must be a number of bytes.")));
                 mErrors++;
                 return false;
             }
@@ -8169,7 +8353,8 @@ bool Script::SetOption(const std::vector<std::string> & args)
         if (bytes == 0)
         {
             Console::Instance().Error(Texts::WrongArguments("option",
-                "The value of 'editmaxsize' must be a positive number of bytes."));
+                Texts::Translate(
+                    "The value of 'editmaxsize' must be a positive number of bytes.")));
             mErrors++;
             return false;
         }
@@ -8177,7 +8362,8 @@ bool Script::SetOption(const std::vector<std::string> & args)
         return true;
     }
     Console::Instance().Error(Texts::WrongArguments("option",
-        "The option '" + args[0] + "' is not supported by this build."));
+        Texts::Translate("The option '{name}' is not supported by this build.",
+            {{"name", args[0]}})));
     mErrors++;
     return false;
 }
@@ -8407,17 +8593,22 @@ const struct ScriptCommandHelpEntry
 };
 }
 
-const char * Script::CommandHelp(const std::string & command)
+/* The help of one command, in the language of this run, or an empty
+ * string when the command has none. The text itself is the message in
+ * the catalog, so the English wording is the key and the translation is
+ * looked up by it; the usage line stays as it was written, because it
+ * holds command and switch names. */
+std::string Script::CommandHelp(const std::string & command)
 {
     for (size_t i = 0; i < sizeof(kScriptCommandHelps) /
         sizeof(kScriptCommandHelps[0]); i++)
     {
         if (command == kScriptCommandHelps[i].name)
         {
-            return kScriptCommandHelps[i].help;
+            return Texts::Translate(kScriptCommandHelps[i].help);
         }
     }
-    return NULL;
+    return std::string();
 }
 
 void Script::PrintHelp(const std::vector<std::string> & args)
@@ -8426,13 +8617,13 @@ void Script::PrintHelp(const std::vector<std::string> & args)
     {
         for (size_t i = 0; i < args.size(); i++)
         {
-            const char * help = CommandHelp(ToLower(args[i]));
-            if (help == NULL)
+            std::string help = CommandHelp(ToLower(args[i]));
+            if (help.empty())
             {
                 /* Aliases share the help of the command they stand for. */
                 help = CommandHelp(CanonicalCommandAlias(ToLower(args[i])));
             }
-            if (help == NULL)
+            if (help.empty())
             {
                 Console::Instance().Error(Texts::UnknownCommand(args[i]));
                 mErrors++;
@@ -8449,7 +8640,7 @@ void Script::PrintHelp(const std::vector<std::string> & args)
     for (size_t i = 0; i < sizeof(kScriptCommandHelps) /
         sizeof(kScriptCommandHelps[0]); i++)
     {
-        const std::string help = kScriptCommandHelps[i].help;
+        const std::string help = Texts::Translate(kScriptCommandHelps[i].help);
         size_t summaryStart = help.find('\n');
         std::string summary = summaryStart == std::string::npos ?
             std::string() : help.substr(summaryStart + 1);
@@ -8548,7 +8739,7 @@ bool Script::ExecuteCommand(const std::string & line)
         if (!args.empty())
         {
             Console::Instance().Error(Texts::WrongArguments(command,
-                "The command takes no arguments."));
+                Texts::Translate("The command takes no arguments.")));
             mErrors++;
             return true;
         }
@@ -8613,7 +8804,7 @@ bool Script::ExecuteCommand(const std::string & line)
         if (!args.empty())
         {
             Console::Instance().Error(Texts::WrongArguments(command,
-                "The command takes no arguments."));
+                Texts::Translate("The command takes no arguments.")));
             mErrors++;
             return true;
         }
@@ -8787,8 +8978,9 @@ bool Script::ExecuteCommand(const std::string & line)
     if (command == "show")
     {
         Console::Instance().Error(Texts::WrongArguments(command,
-            "The connection runs the SFTP subsystem, so remote shell commands "
-            "are not available in this build."));
+            Texts::Translate(
+                "The connection runs the SFTP subsystem, so remote shell "
+                "commands are not available in this build.")));
         mErrors++;
         return true;
     }
@@ -8813,8 +9005,9 @@ int Script::RunFile(const std::string & path)
         file = fopen(path.c_str(), "rb");
         if (file == NULL)
         {
-            Console::Instance().Error("Cannot open the script file '" + path + "': " +
-                LastSystemError());
+            Console::Instance().Error(Texts::Translate(
+                "Cannot open the script file '{path}': {reason}",
+                {{"path", path}, {"reason", LastSystemError()}}));
             return 1;
         }
         closeFile = true;
@@ -8862,12 +9055,14 @@ int Script::RunFile(const std::string & path)
     }
     if (ferror(file))
     {
-        Console::Instance().Error("Error while reading the script file '" + path + "'.");
+        Console::Instance().Error(Texts::Translate(
+            "Error while reading the script file '{path}'.", {{"path", path}}));
         mErrors++;
     }
     if (closeFile && fclose(file) != 0)
     {
-        Console::Instance().Error("Error while closing the script file '" + path + "'.");
+        Console::Instance().Error(Texts::Translate(
+            "Error while closing the script file '{path}'.", {{"path", path}}));
         mErrors++;
     }
     return mErrors != 0 ? 1 : 0;

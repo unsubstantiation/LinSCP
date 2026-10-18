@@ -373,7 +373,7 @@ private:
     void OpenTerminal(const std::vector<std::string> & args);
     void PrintHelp(const std::vector<std::string> & args);
     /* Help text of one command, or NULL. */
-    static const char * CommandHelp(const std::string & command);
+    static std::string CommandHelp(const std::string & command);
     void PrintStatus();
 
     bool DownloadDirectoryRecursive(const std::string & remoteDir,

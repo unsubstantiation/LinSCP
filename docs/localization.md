@@ -3,7 +3,7 @@
 ## Supported languages and coverage
 
 English (`en`) and Spanish (`es`) catalogs ship with the application. There
-are 121 CLI catalog entries and 387 browser entries, including whole help
+are 371 CLI catalog entries and 506 browser entries, including whole help
 messages and plural variants. They are embedded at build time; there are no
 runtime downloads, gettext dependencies or installed OS locale requirements.
 
@@ -12,15 +12,19 @@ Translated surfaces:
 - Browser menus, toolbars, dialogs, help, ARIA labels, tooltips, placeholders,
   host-key verification, queue states and controls, synchronization summaries
   and reasons, search results, editor states and confirmation/error messages.
-- Shared CLI `Texts` messages, `-help` and option errors, connection status,
-  host-key warnings, client-side key passphrase prompts, overwrite/delete
-  confirmations and confirmation-answer hints.
+- The whole command-line client: the per-command help texts, the status,
+  argument, switch and engine messages of the script engine, the operations
+  the error helpers name, the option listing, `-help` and option errors,
+  connection status, host-key warnings, client-side key passphrase prompts,
+  overwrite/delete confirmations and confirmation-answer hints.
 - Browser plural forms and decimal/date presentation. CLI/protocol numbers
   remain locale independent.
 
-**This is not complete upstream language coverage.** Command-specific help,
-human-facing status and argument/engine errors still exist in `Script.cpp`,
-outside the shared `Texts` API. The inventory therefore retains `locale.translations` as **partial**.
+**This is not complete upstream language coverage.** Only English and
+Spanish are shipped, while upstream ships catalogs for many more languages.
+The inventory therefore retains `locale.translations` as **partial**, now for
+the missing languages alone: every message the client prints in this build
+goes through a catalog, and the compiler refuses a new one that does not.
 Server-provided SSH challenges, protocol data, core/OS diagnostic details,
 command-console output and logs are deliberately retained verbatim. A browser
 operation failure shows a translated explanation with the diagnostic detail;
@@ -77,6 +81,10 @@ machine protocol, parsed sync plans, progress reports or error handling.
    `placeholder` attributes are translated before startup. `code` and `kbd`
    text and input values are not rewritten. Dynamic file/session data is
    never walked or translated.
+   A message that the command-line client prints has to go through
+   `Texts::Translate`: the compiler rejects a `Console` call that prints a
+   plain literal, a command help text that nobody translated and an error
+   operation that is not in the catalog.
 4. Run `python3 tools/compile_translations.py`. Commit the catalogs together
    with `source/linux/Translations.inc` and the generated inline catalog block
    in `source/gui/web/index.html`. Do not hand-edit generated blocks.

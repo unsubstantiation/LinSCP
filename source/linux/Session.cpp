@@ -98,13 +98,15 @@ bool seat_eof(Seat * seat)
 
 void seat_notify_remote_exit(Seat * seat)
 {
-    Console::Instance().LogEvent("The remote side closed the connection.");
+    Console::Instance().LogEvent(Texts::Translate(
+        "The remote side closed the connection."));
     static_cast<ScpSeat *>(seat)->session->NotifyRemoteExit();
 }
 
 void seat_notify_remote_disconnect(Seat * seat)
 {
-    Console::Instance().LogEvent("The remote side disconnected.");
+    Console::Instance().LogEvent(Texts::Translate(
+        "The remote side disconnected."));
     static_cast<ScpSeat *>(seat)->session->NotifyRemoteExit();
 }
 
@@ -2171,8 +2173,9 @@ bool Session::Open(const SessionOptions & options, std::string & error)
         mConnectionError.clear();
         mOpen = true;
         SetCurrentSession(this);
-        Console::Instance().LogEvent("Connected via " + mOptions.protocol +
-            " to " + mOptions.hostName);
+        Console::Instance().LogEvent(Texts::Translate(
+            "Connected via {protocol} to {host}",
+            {{"protocol", mOptions.protocol}, {"host", mOptions.hostName}}));
         return true;
     }
     return Connect(options, "sftp", true, true, error);
@@ -2220,10 +2223,12 @@ bool Session::Connect(const SessionOptions & options, const char * program,
     logPolicy->vt = &log_policy_vtable;
     mLogPolicy = logPolicy;
 
-    Console::Instance().LogEvent("Preparing the session configuration");
+    Console::Instance().LogEvent(Texts::Translate(
+        "Preparing the session configuration"));
     Conf * conf = conf_new();
     do_defaults(NULL, conf);
-    Console::Instance().LogEvent("Loaded the default configuration");
+    Console::Instance().LogEvent(Texts::Translate(
+        "Loaded the default configuration"));
     conf_set_int(conf, CONF_protocol, PROT_SSH);
     conf_set_str(conf, CONF_host, mOptions.hostName.c_str());
     conf_set_int(conf, CONF_port, mOptions.portNumber);
@@ -2295,7 +2300,8 @@ bool Session::Connect(const SessionOptions & options, const char * program,
 
     mLogCtx = log_init(static_cast<LogPolicy *>(mLogPolicy), conf);
 
-    Console::Instance().LogEvent("Starting the SSH connection to " + HostDescription());
+    Console::Instance().LogEvent(Texts::Translate(
+        "Starting the SSH connection to {host}", {{"host", HostDescription()}}));
     char * realHost = NULL;
     Backend * backend = NULL;
     char * initError = backend_init(&ssh_backend, static_cast<Seat *>(mSeat),
