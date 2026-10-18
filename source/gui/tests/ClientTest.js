@@ -119,7 +119,7 @@ function customCommandsBody(options) {
   if (request.action === 'run') {
     return { success: true, scope: 'remote',
       results: (request.filenames || []).map(name => (
-        { file: name, success: true, exit_code: 0, stdout: 'ok ' + name, stderr: '' })) };
+        { file: name, success: true, exit_code: 0, stdout: 'SHA-256 verified', stderr: '' })) };
   }
   return { success: true, commands: stored };
 }
@@ -128,6 +128,8 @@ const TOKEN = 'test-token-0123456789abcdef';
 
 const calls = [];
 const errors = [];
+const confirmMessages = [];
+let confirmResult = true;
 
 const dom = new JSDOM(html, {
   url: 'http://localhost:8080/',
@@ -154,13 +156,26 @@ const dom = new JSDOM(html, {
           ], truncated: false, scanned: 4, skipped: 1, bytes_scanned: 64 };
         }
       }
+      if (path === '/api/custom-commands') {
+        let request = {};
+        try { request = JSON.parse(options.body || '{}'); } catch (error) {}
+        if (request.action === 'list') {
+          body = { success: true, commands: [
+            { name: 'Checksum', command: 'checksum sha-256 {file}', scope: 'remote' }
+          ] };
+        } else if (request.action === 'run') {
+          body = { success: true, scope: 'remote', results: request.filenames.map(file => ({
+            file, success: true, exit_code: 0, stdout: 'SHA-256 verified', stderr: ''
+          })) };
+        }
+      }
       if (body === undefined) {
         return Promise.resolve({ ok: true, json: () => Promise.resolve({ success: true }) });
       }
       return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
     };
     window.prompt = () => 'asked';
-    window.confirm = () => true;
+    window.confirm = message => { confirmMessages.push(message); return confirmResult; };
     window.alert = () => {};
     window.addEventListener('error', event => errors.push('window error: ' + event.message));
     window.addEventListener('unhandledrejection', event =>
@@ -808,9 +823,8 @@ function options(id) {
     !main.classList.contains('explorer-mode') &&
       doc.getElementById('remotePane').style.display !== 'none');
 
-  // Custom commands: the dialog lists the persisted templates, saves a
-  // new one, and runs the chosen one against the panel selection only
-  // after an explicit confirmation showing the command and the names.
+  // Custom commands are persisted, preview their remote target, and run
+  // only on the selected entry after confirmation.
   await window.openCustomCommands();
   check('custom commands dialog lists the persisted templates',
     doc.getElementById('customCommandsList').children.length === 2);
@@ -818,32 +832,45 @@ function options(id) {
   doc.getElementById('customCmdCommand').value = 'ls {file}';
   doc.getElementById('customCmdScope').value = 'remote';
   await window.saveCustomCommand();
-  const cmdSave = calls.filter(c => c.path === '/api/custom-commands').pop();
+  const cmdSave = calls.filter(call => call.path === '/api/custom-commands' &&
+    JSON.parse(call.options.body || '{}').action === 'save').pop();
+  const savePayload = cmdSave ? JSON.parse(cmdSave.options.body) : {};
   check('saving a template posts its name, command and scope',
-    cmdSave && JSON.parse(cmdSave.options.body).action === 'save' &&
-      JSON.parse(cmdSave.options.body).name === 'List it' &&
-      JSON.parse(cmdSave.options.body).command === 'ls {file}' &&
-      JSON.parse(cmdSave.options.body).scope === 'remote');
+    savePayload.action === 'save' && savePayload.name === 'List it' &&
+      savePayload.command === 'ls {file}' && savePayload.scope === 'remote');
   check('saved template joins the dialog list',
     doc.getElementById('customCommandsList').children.length === 3);
-  doc.getElementById('customCmdName').value = 'Checksum';
-  let confirmedWith = null;
-  const realConfirm = window.confirm;
-  window.confirm = text => { confirmedWith = text; return true; };
+
+  window.selectCustomCommand(0);
+  doc.getElementById('remoteFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  const priorRuns = calls.filter(call => call.path === '/api/custom-commands' &&
+    JSON.parse(call.options.body || '{}').action === 'run').length;
+  confirmResult = false;
   await window.runCustomCommand();
-  window.confirm = realConfirm;
-  const cmdRun = calls.filter(c => c.path === '/api/custom-commands').pop();
-  check('running asks for confirmation naming the command',
-    confirmedWith !== null && confirmedWith.indexOf('checksum sha-256') >= 0,
-    String(confirmedWith).slice(0, 120));
-  check('run posts the template name, the selection and the tab',
-    cmdRun && JSON.parse(cmdRun.options.body).action === 'run' &&
-      JSON.parse(cmdRun.options.body).name === 'Checksum' &&
-      Array.isArray(JSON.parse(cmdRun.options.body).filenames) &&
-      JSON.parse(cmdRun.options.body).filenames.length >= 1 &&
-      'tab' in JSON.parse(cmdRun.options.body));
-  check('run renders one result per file',
-    doc.getElementById('customCommandsResult').children.length >= 1);
+  const preview = confirmMessages[confirmMessages.length - 1] || '';
+  const declinedRuns = calls.filter(call => call.path === '/api/custom-commands' &&
+    JSON.parse(call.options.body || '{}').action === 'run').length;
+  check('custom command confirmation previews the command and selected name',
+    preview.includes('checksum sha-256 keep.txt') && preview.includes('keep.txt') &&
+      preview.toLowerCase().includes('remote panel'), preview);
+  check('declining a custom command confirmation queues no work',
+    declinedRuns === priorRuns);
+
+  confirmResult = true;
+  await window.runCustomCommand();
+  const customRun = calls.filter(call => call.path === '/api/custom-commands' &&
+    JSON.parse(call.options.body || '{}').action === 'run').pop();
+  const customPayload = customRun ? JSON.parse(customRun.options.body) : {};
+  check('confirmed custom command runs only on the selected remote entry',
+    customPayload.action === 'run' && customPayload.tab === 1 &&
+      Array.isArray(customPayload.filenames) &&
+      customPayload.filenames.length === 1 &&
+      customPayload.filenames[0] === 'keep.txt', JSON.stringify(customPayload));
+  check('custom command results are rendered as text',
+    text('customCommandsResult').includes('keep.txt') &&
+      text('customCommandsResult').includes('SHA-256 verified'),
+    text('customCommandsResult'));
   window.closeModal('customCommandsModal');
 
   check('no script errors', errors.length === 0, errors.join(' | '));

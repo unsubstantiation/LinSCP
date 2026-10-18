@@ -56,6 +56,13 @@ public:
      * with no TLS mode set by the scheme or by 'Ftps='. */
     static bool Handles(const SessionOptions & options);
 
+    /* Parse the server-supplied data endpoint without accepting malformed
+     * or out-of-range ports/octet values. Exposed for the connection-free
+     * regression tests. */
+    static bool ParseEpsvReply(const std::string & replyText, int & port);
+    static bool ParsePasvReply(const std::string & replyText,
+        std::string & address, int & port);
+
     /* MLSD when the server offers it and FtpUseMlsd allows it, LIST
      * otherwise, with the 'ls -l' parser shared with the curl backend. */
     static bool List(const SessionOptions & options, const std::string & remotePath,

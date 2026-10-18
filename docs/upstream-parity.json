@@ -2266,8 +2266,10 @@
           "explorer choice is persisted",
           "custom commands dialog lists the persisted templates",
           "saving a template posts its name, command and scope",
-          "running asks for confirmation naming the command",
-          "run posts the template name, the selection and the tab"
+          "custom command confirmation previews the command and selected name",
+          "declining a custom command confirmation queues no work",
+          "confirmed custom command runs only on the selected remote entry",
+          "custom command results are rendered as text"
         ],
         "gui-security": [
           "test_a_template_that_is_not_one_command_line_is_refused",
@@ -2464,7 +2466,7 @@
           "test_literal_commands_preserve_file_names_with_percent_signs"
         ],
         "gui-browser-upload": [
-          "test_gui_queue_uses_literal_commands_for_percent_filenames"
+          "test_gui_queue_uses_the_literal_server_protocol_for_percent_filenames"
         ]
       },
       "verified_on": {

@@ -21,7 +21,7 @@ import tempfile
 import threading
 import time
 import unittest
-import unittest.mock as mock
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -122,6 +122,228 @@ class OperandQuotingTests(unittest.TestCase):
                 gui.quote_remote(value)
             with self.assertRaises(ValueError):
                 gui.quote_local(value)
+
+
+class TabLookupTests(unittest.TestCase):
+    def test_unknown_tab_ids_do_not_fall_back_to_an_unrelated_connection(self):
+        old_tabs = gui.STATE["tabs"]
+        old_active = gui.STATE["active_tab"]
+        first = type("Tab", (), {"id": 1})()
+        second = type("Tab", (), {"id": 2})()
+        try:
+            gui.STATE["tabs"] = [first, second]
+            gui.STATE["active_tab"] = 1
+            self.assertIs(gui.get_tab("2"), second)
+            self.assertIsNone(gui.get_tab("999"))
+            self.assertIs(gui.get_tab(), first)
+        finally:
+            gui.STATE["tabs"] = old_tabs
+            gui.STATE["active_tab"] = old_active
+
+
+class CoreCredentialTests(unittest.TestCase):
+    def make_fake_core(self, directory):
+        executable = pathlib.Path(directory) / "fake-linscp"
+        script = r'''#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ['LSCP_FAKE_ARGS'], 'w') as f:
+    json.dump(sys.argv[1:], f)
+with open(os.environ['LSCP_FAKE_PASSWORD'], 'w') as f:
+    f.write(os.environ.get('LINSCP_PASSWORD', '<unset>'))
+print('LSCP-SERVER 1 ready', flush=True)
+with open(os.environ['LSCP_FAKE_INPUT'], 'w') as f:
+    for raw in sys.stdin:
+        line = raw.rstrip("\r\n")
+        f.write(line + "\n"); f.flush()
+        if line == 'exit':
+            print('LSCP-RESULT 0', flush=True)
+            break
+        if line == 'bad':
+            print('Synthetic command failure', file=sys.stderr, flush=True)
+            print('LSCP-RESULT 1', flush=True)
+            continue
+        print('OK', flush=True)
+        print('LSCP-RESULT 0', flush=True)
+'''
+        executable.write_text(script, encoding="utf-8")
+        executable.chmod(0o755)
+        return str(executable)
+
+    def process_environment(self, directory):
+        return {
+            "LSCP_FAKE_ARGS": str(pathlib.Path(directory) / "args.json"),
+            "LSCP_FAKE_INPUT": str(pathlib.Path(directory) / "input.txt"),
+            "LSCP_FAKE_PASSWORD": str(pathlib.Path(directory) / "password.txt"),
+        }
+
+    def test_command_splitter_preserves_quoted_semicolons_and_escapes(self):
+        self.assertEqual(
+            gui.split_linscp_commands(
+                'put "local;a" "remote\\;b" ; echo "x;y"'),
+            ['put "local;a" "remote\\;b"', 'echo "x;y"'])
+        self.assertEqual(
+            gui.split_linscp_commands("echo 'left;right' ; echo done"),
+            ["echo 'left;right'", "echo done"])
+
+    def test_session_values_are_typed_before_becoming_commands_or_arguments(self):
+        self.assertEqual(gui.validate_session_data({
+            "protocol": "sftp", "host": "example.test", "port": 22},
+            require_host=True), "")
+        self.assertIn("protocol", gui.validate_session_data({
+            "protocol": "sftp; echo injected", "host": "example.test"}))
+        self.assertIn("protocol", gui.validate_session_data({
+            "protocol": False, "host": "example.test"}))
+        self.assertIn("host name", gui.validate_session_data({
+            "protocol": "sftp", "host": 123}))
+        self.assertIn("host name", gui.validate_session_data({
+            "protocol": "sftp", "host": 0}))
+        self.assertIn("port", gui.validate_session_data({
+            "protocol": "sftp", "host": "example.test", "port": "22x"}))
+        self.assertIn("port", gui.validate_session_data({
+            "protocol": "sftp", "host": "example.test", "port": "9" * 5000}))
+        self.assertIn("host name is required", gui.validate_session_data({
+            "protocol": "sftp", "host": " "}, require_host=True))
+
+    def test_log_redaction_covers_url_and_password_switch_strings(self):
+        text = ('open sftp://alice:p%40ss@example.test/ ; '
+                'save -password="two words"')
+        redacted = gui.redact_command_for_log(text)
+        self.assertNotIn("p%40ss", redacted)
+        self.assertNotIn("two words", redacted)
+        self.assertEqual(
+            redacted,
+            "open sftp://alice:<redacted>@example.test/ ; "
+            "save -password=<redacted>")
+
+    def test_all_log_messages_are_redacted_at_the_storage_boundary(self):
+        with gui.STATE_LOCK:
+            old_logs = list(gui.STATE["logs"])
+        try:
+            gui.add_log("Core diagnostic: sftp://alice:s3cret@example.test/")
+            with gui.STATE_LOCK:
+                message = gui.STATE["logs"][-1]["text"]
+            self.assertNotIn("s3cret", message)
+            self.assertIn("<redacted>", message)
+        finally:
+            with gui.STATE_LOCK:
+                gui.STATE["logs"][:] = old_logs
+
+    def test_process_arguments_do_not_disable_verification_or_carry_passwords(self):
+        session = {"protocol": "sftp", "host": "example.test",
+                   "username": "alice", "password": "top secret",
+                   "hostkey": ""}
+        with mock.patch.object(gui, "find_linscp_binary", return_value="linscp"):
+            args = gui.core_command_line(session)
+        self.assertFalse(any("top secret" in arg for arg in args))
+        self.assertFalse(any(arg == "-hostkey=*" for arg in args))
+        self.assertNotIn("-password=top secret", args)
+        session["hostkey"] = "SHA256:verified"
+        with mock.patch.object(gui, "find_linscp_binary", return_value="linscp"):
+            args = gui.core_command_line(session)
+        self.assertIn("-hostkey=SHA256:verified", args)
+
+    def test_persistent_server_keeps_its_pipe_readers_bound_to_that_process(self):
+        with tempfile.TemporaryDirectory(prefix="linscp-session-process-") as directory:
+            binary = self.make_fake_core(directory)
+            environment = self.process_environment(directory)
+            session = gui.CoreSession(3, {"protocol": "sftp",
+                                          "host": "example.test"})
+            with mock.patch.dict(os.environ, environment), \
+                 mock.patch.object(gui, "find_linscp_binary", return_value=binary):
+                ok, error = session.start()
+                self.assertTrue(ok, error)
+                process = session.proc
+                session.terminate()
+            self.assertIsNone(session.proc)
+            self.assertIsNotNone(process.returncode)
+
+    def test_persistent_server_rejects_a_bad_greeting_and_reaps_the_process(self):
+        with tempfile.TemporaryDirectory(prefix="linscp-session-greeting-") as directory:
+            executable = pathlib.Path(directory) / "bad-core"
+            executable.write_text(
+                "#!/usr/bin/env python3\nprint('not the protocol', flush=True)\n",
+                encoding="utf-8")
+            executable.chmod(0o755)
+            session = gui.CoreSession(4, {"protocol": "sftp",
+                                          "host": "example.test"})
+            with mock.patch.object(gui, "find_linscp_binary",
+                                   return_value=str(executable)):
+                ok, error = session.start()
+            self.assertFalse(ok)
+            self.assertIn("ended before it started", error)
+            self.assertIsNone(session.proc)
+
+    def test_one_shot_commands_keep_credentials_out_of_stdin_and_redact_logs(self):
+        with tempfile.TemporaryDirectory(prefix="linscp-core-credentials-") as directory:
+            binary = self.make_fake_core(directory)
+            environment = self.process_environment(directory)
+            logs = []
+            session = {"protocol": "sftp", "host": "example.test",
+                       "username": "alice", "password": "s3cret", "hostkey": ""}
+            command = "open " + gui.session_url(session) + " ; echo finished"
+            with mock.patch.dict(os.environ, environment), \
+                 mock.patch.object(gui, "find_linscp_binary", return_value=binary), \
+                 mock.patch.object(gui, "add_log",
+                                   side_effect=lambda *args: logs.append(args)):
+                code, output, error = gui.run_linscp(command, session)
+            self.assertEqual(code, 0, error)
+            self.assertIn("OK", output)
+            self.assertEqual(error, "")
+            args = json.loads(pathlib.Path(environment["LSCP_FAKE_ARGS"]).read_text())
+            sent = pathlib.Path(environment["LSCP_FAKE_INPUT"]).read_text()
+            self.assertIn("-server", args)
+            self.assertFalse(any("s3cret" in arg for arg in args))
+            self.assertEqual(sent.splitlines(), [
+                "option confirm off", "open sftp://alice@example.test/",
+                "echo finished", "exit"])
+            self.assertNotIn("s3cret", sent)
+            self.assertEqual(
+                pathlib.Path(environment["LSCP_FAKE_PASSWORD"]).read_text(),
+                "s3cret")
+            self.assertFalse(any("s3cret" in str(item) for item in logs))
+
+    def test_failed_server_command_returns_stderr_and_stops_the_script(self):
+        with tempfile.TemporaryDirectory(prefix="linscp-core-error-") as directory:
+            binary = self.make_fake_core(directory)
+            environment = self.process_environment(directory)
+            with mock.patch.dict(os.environ, environment), \
+                 mock.patch.object(gui, "find_linscp_binary", return_value=binary), \
+                 mock.patch.object(gui, "add_log"):
+                code, output, error = gui.run_linscp("bad ; echo must-not-run")
+            self.assertEqual(code, 1)
+            self.assertIn("Synthetic command failure", error)
+            self.assertNotIn("must-not-run", output)
+            sent = pathlib.Path(environment["LSCP_FAKE_INPUT"]).read_text()
+            self.assertEqual(sent.splitlines(), ["option confirm off", "bad", "exit"])
+
+    def test_queued_task_keeps_password_and_unpinned_host_key_out_of_argv(self):
+        with tempfile.TemporaryDirectory(prefix="linscp-task-credentials-") as directory:
+            binary = self.make_fake_core(directory)
+            environment = self.process_environment(directory)
+            logs = []
+            session = {"protocol": "sftp", "host": "example.test",
+                       "username": "alice", "password": "s3cret", "hostkey": ""}
+            task = gui.Task(8, "Upload", 'put /tmp/file "/remote/%TIMESTAMP%.txt"',
+                            session, "file", "/remote/%TIMESTAMP%.txt", None)
+            manager = gui.TaskManager.__new__(gui.TaskManager)
+            with mock.patch.dict(os.environ, environment), \
+                 mock.patch.object(gui, "find_linscp_binary", return_value=binary), \
+                 mock.patch.object(gui, "add_log",
+                                   side_effect=lambda *args: logs.append(args)):
+                manager._run(task)
+            self.assertEqual(task.status, "Completed", task.error)
+            args = json.loads(pathlib.Path(environment["LSCP_FAKE_ARGS"]).read_text())
+            sent = pathlib.Path(environment["LSCP_FAKE_INPUT"]).read_text()
+            self.assertIn("-server", args)
+            self.assertNotIn("-hostkey=*", args)
+            self.assertFalse(any("s3cret" in arg for arg in args))
+            self.assertNotIn("s3cret", sent)
+            self.assertIn("open sftp://alice@example.test/", sent)
+            self.assertIn("%TIMESTAMP%", sent)
+            self.assertEqual(
+                pathlib.Path(environment["LSCP_FAKE_PASSWORD"]).read_text(),
+                "s3cret")
+            self.assertFalse(any("s3cret" in str(item) for item in logs))
 
 
 class CommandBuildingTests(unittest.TestCase):
@@ -876,6 +1098,15 @@ class QueueCleanupTests(unittest.TestCase):
 
 
 class BrowserUploadModeTests(unittest.TestCase):
+    def test_upload_never_reads_or_temporarily_changes_the_process_umask(self):
+        import io
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(gui.os, "umask",
+                               side_effect=AssertionError("process umask raced")):
+            destination = gui.save_local_browser_upload(
+                directory, "dropped.txt", io.BytesIO(b"content"), 7)
+            self.assertEqual(pathlib.Path(destination).read_bytes(), b"content")
+
     def test_a_dropped_file_gets_the_mode_an_ordinary_create_would(self):
         # mkstemp() creates 0600, and os.replace() keeps it, so a file the
         # user dropped into their own directory came out owner-only.
@@ -941,8 +1172,11 @@ class CrossOriginTests(unittest.TestCase):
         cls.output = []
 
         def collect():
-            for line in cls.process.stdout:
-                cls.output.append(line.rstrip("\n"))
+            try:
+                for line in cls.process.stdout:
+                    cls.output.append(line.rstrip("\n"))
+            except (OSError, ValueError):
+                pass
 
         cls.reader = threading.Thread(target=collect, daemon=True)
         cls.reader.start()
@@ -961,6 +1195,10 @@ class CrossOriginTests(unittest.TestCase):
             time.sleep(0.1)
         if not cls.port or not cls.token:
             cls.process.kill()
+            cls.process.wait(timeout=10)
+            if cls.process.stdout:
+                cls.process.stdout.close()
+            cls.reader.join(timeout=2)
             raise unittest.SkipTest(
                 "the GUI server did not report its address: %s"
                 % " | ".join(cls.output[-6:]))
@@ -972,6 +1210,10 @@ class CrossOriginTests(unittest.TestCase):
             cls.process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             cls.process.kill()
+            cls.process.wait(timeout=10)
+        cls.reader.join(timeout=2)
+        if cls.process.stdout:
+            cls.process.stdout.close()
         import shutil
         shutil.rmtree(cls.directory, ignore_errors=True)
 
@@ -1176,8 +1418,9 @@ class LocalChmodEvolvingTests(unittest.TestCase):
 if __name__ == "__main__":
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite()
-    for case in (OperandQuotingTests, CommandBuildingTests,
-                 PermissionModeTests, PanelContainmentTests, RemoteNameTests,
+    for case in (OperandQuotingTests, TabLookupTests, CoreCredentialTests,
+                 CommandBuildingTests, PermissionModeTests, PanelContainmentTests,
+                 RemoteNameTests,
                  ServerCommandStreamTests, LocalListingTests,
                  CustomCommandTests, LoginTests, QueueCleanupTests,
                  BrowserUploadModeTests, CrossOriginTests,
