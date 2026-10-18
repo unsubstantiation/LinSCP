@@ -22,25 +22,28 @@ GSSAPI is compiled out; SSH tunnel configuration is not implemented.
 
 **Area:** Security/authentication · **Status:** missing
 
-The loopback GUI has no multi-user account or authorization roles.
+The GUI has PBKDF2-backed accounts, expiring login sessions and CSRF protection, but accounts still share process-global tabs, remote connections, task queue, stored-session configuration and filesystem access. Authentication is not per-user authorization or isolation, so multi-user/server deployment is not safe to claim.
 
-**Next:** Add authenticated accounts before claiming multi-user/server deployment support.
+**Next:** Define the deployment boundary and implement per-user authorization and isolation before claiming multi-user/server deployment support.
 
 **Acceptance criteria:**
 
-- [ ] Define deployment/isolation boundaries before enabling network access. Add password hashing, login/session expiry, CSRF protection and per-user configuration, filesystem and queue isolation. Negative authorization tests must cover every API route, not just login.
+- [ ] Define deployment/isolation boundaries before enabling network access.
+- [ ] Isolate per-user configuration, remote sessions/tabs, task queue and filesystem access.
+- [ ] Add negative authorization tests for every API route and cross-account resource access.
 
 ## gui.explorer-custom-commands
 
-**Area:** GUI · **Status:** missing
+**Area:** GUI · **Status:** partial
 
-No separate upstream Explorer-style UI or custom-command framework.
+Commander has persisted custom-command templates, explicit local/remote scope, safe {file} substitution for multiple selected names, and a confirmation that previews the command and affected entries. Tests cover storage permissions, invalid templates, scope, hostile names and quoting; commands are sent to LinSCP, never to a shell. This is a LinSCP Commander extension, not upstream Explorer UI parity.
 
-**Next:** Build/test Explorer navigation and custom-command execution with appropriate safety prompts.
+**Next:** A separate upstream-style single-pane Explorer interface and its navigation compatibility remain unimplemented; add browser-level acceptance evidence for custom-command confirmation and execution.
 
 **Acceptance criteria:**
 
-- [ ] Implement single-pane Explorer navigation plus persisted command templates, explicit confirmation and safe filename substitution. Test local/remote scope, multiple selections and hostile filenames; never interpolate into a shell implicitly.
+- [ ] Implement and test a separate single-pane Explorer interface and navigation behavior if upstream Explorer compatibility remains in scope; keep the existing Commander extension identified as LinSCP-specific.
+- [ ] Add browser-level tests proving confirmation, local/remote scope, multiple selections and hostile filenames through the custom-command UI; never interpolate into a shell.
 
 ## automation.dotnet
 

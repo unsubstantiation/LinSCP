@@ -13,10 +13,10 @@
     "policy": "A status of 'verified' means the behavior was checked, not that it looked right while somebody was reading the code. So an entry carries 'verified_on': for each platform LinSCP ships on, the suites whose tests cover it. LinSCP ships on Linux alone - the Windows port was removed - so an entry may be 'verified' only when 'linux' appears in that map naming the suites that actually ran it. The rule is still written for any number of platforms, and a suite that is not listed under a platform cannot be cited for it, because evidence nobody can reproduce is not evidence. The notes stay authoritative about what is missing either way - evidence for the parts that are covered does not certify the rest, which is why --require-full fails while any entry is not verified.",
     "platforms": {
       "linux": {
-        "how": "make -C source/linux all check && make -C source/linux check-live (the same suites also run under CMake/CTest: cmake -S . -B build && cmake --build build && ctest --test-dir build); dpkg-buildpackage -b -us -uc builds the .deb that CI installs; `make -C source/linux check-live` includes the browser upload regression suite; npm install --no-save --package-lock=false jsdom@29 && node source/gui/tests/ClientTest.js && node source/gui/tests/LocalizationTest.js exercises the browser UI; python3 tools/tests/test_translations.py checks catalog generation.",
+        "how": "make -C source/linux all check && make -C source/linux check-live (the same suites also run under CMake/CTest: cmake -S . -B build && cmake --build build && ctest --test-dir build); dpkg-buildpackage -b -us -uc builds the .deb that CI installs; `make -C source/linux check-live` includes browser upload and GUI security regressions; npm install --no-save --package-lock=false jsdom@29 && node source/gui/tests/ClientTest.js && node source/gui/tests/LocalizationTest.js exercises the browser UI; python3 tools/tests/test_translations.py checks catalog generation.",
         "date": "2026-10-17",
         "suites": {
-          "unit": "source/linux/tests/UnitTest.cpp - checks of the parts that need no I/O: permission and mode parsing, masks, path handling, the transfer and synchronization planners (every word and list '-criteria=' takes, the ones it refuses, a plan refused over a file nobody could hash, and '-conflict=skip|local|remote|newer' two-way resolution), the proxy session settings, the FTP engine and TLS policy settings, the S3 object write settings and multipart upload resume state sidecar, the SSH private-key passphrase option and XML action log elements, the host-key pin spellings, the native SCP engine's connection-free parts (the shell quoting a remote path needs, the paths it refuses to send, one 'ls -l' line as an entry including a symbolic link's own name, the exact date columns of '--full-time' with the offset they are in, the rcp header lines read and written byte for byte, and the 'touch -t' stamp), the WebDAV lock-token and dead-property XML, parameter and timestamp expansion, the stored-session file and folder hierarchy helpers, the editor content-comparison and EOL normalization helpers, the file-hash and HMAC helpers, and AWS Signature Version 4 signing. Includes English/Spanish help, security messages, named-placeholder safety, locale fallback and plural-count messages.",
+          "unit": "source/linux/tests/UnitTest.cpp - checks of the parts that need no I/O: permission and mode parsing, masks, path handling, the transfer and synchronization planners (every word and list '-criteria=' takes, the ones it refuses, a plan refused over a file nobody could hash, and '-conflict=skip|local|remote|newer' two-way resolution), the proxy session settings, the FTP engine and TLS policy settings (including strict EPSV/PASV reply parsing and range rejection), the S3 object write settings and multipart upload resume state sidecar, the SSH private-key passphrase option and XML action log elements, the host-key pin spellings, the native SCP engine's connection-free parts (the shell quoting a remote path needs, the paths it refuses to send, one 'ls -l' line as an entry including a symbolic link's own name, the exact date columns of '--full-time' with the offset they are in, the rcp header lines read and written byte for byte, and the 'touch -t' stamp), the WebDAV lock-token and dead-property XML, parameter and timestamp expansion, the stored-session file and folder hierarchy helpers, the editor content-comparison and EOL normalization helpers, the file-hash and HMAC helpers, and AWS Signature Version 4 signing. Includes English/Spanish help, security messages, named-placeholder safety, locale fallback and plural-count messages.",
           "script": "source/linux/tests/ScriptTest.py - the command line and script semantics against no server: abbreviations, switches, batch modes and exit codes, local listings, help, -log and -xmllog, and stored-session password encryption (a 'savesession -password' value\nwritten as 'lscp1$' ciphertext under sessions.key and preserved across a\nre-save without the key file). The transfer presets are checked here too: the savepreset/option preset/rmspreset lifecycle, a preset stored with a site and restored when it opens, -permissions on downloads, and -rawtransfersettings validation. So are the synchronization criteria (every word and list '-criteria=' takes, the values it refuses with the names it accepts, and the two the 'both' direction cannot honour) and the raw proxy settings of 'open' and 'savesession': each upstream name applied, an unknown one refused, an incomplete or unusable proxy refused, and the password masked in the echo and in the action log. It checks -literal command input (including GUI filenames with percent placeholders), mkdir -parents argument validation, that an SSH session of either spelling (scp:// or ssh://) is served by this client's own SSH code and never asks the curl on PATH for anything - a fake curl that records every call is the witness - with a host key pin in either digest spelling compared by the client instead of handed to a library whose support cannot be known, and the adjacent -gui launcher plus Makefile/CMake source-tree launchers.",
           "live-sftp": "source/linux/tests/LiveSftpTest.py against source/linux/tests/TestSftpServer.py - refused opens (wrong password, unexpected host key), operations the server denies, an interrupted download kept in '.filepart' and its resume (automatic and with -resume), the same for an interrupted upload, a continuation that must not splice an existing destination, a stale oversized staging file, resuming across a connection that died, option resume off disabling staging, and timestamps in both directions, a synchronization whose '-criteria=checksum' sees a change the timestamp and the size hide and brings the local copy back in line, sessions carried by a SOCKS5 proxy with and without credentials (TestProxyServer.py, a wrong password refused by the proxy rather than worked around) and a stored site that keeps its proxy, and the shared stored-password format (a password encrypted by the GUI\nmodule opening a stored session, a missing key file reported without losing\nthe value, and a core-written password decrypted by the GUI's reader). Recursive directory copy and multiple source files into an existing destination directory are tested over SFTP; the test server refuses the optional copy-data extension, so these prove the streamed fallback rather than the native extension. A second server mode implements copy-data and verifies the native extension path as well as exact copied bytes. The server can also refuse check-file-name, which proves the download-and-hash fallback for sha-256, sha-1, md5 and crc32, or implement the extension, which proves the native sha-256 digest and that the client does not fall back after a valid reply. It also proves that synchronize remote with a path exclusion ('-filemask=|skip/') leaves an excluded file untouched despite -delete and does not upload files from the excluded subtree. Recursive symbolic chmod is checked over a nested tree, including exact directory and file modes. copyid installs a generated OpenSSH public key into the test SFTP home, verifies the 0700/0600 permissions and proves that repeating the command does not duplicate the key. It also proves that 'etag' is refused by name on a transport with no entity tags - setting or clearing one fails and says which protocol it was asked of, '-get' answers without failing, and nothing is recorded, so the next upload of that path is an ordinary one.",
           "live-scp": "source/linux/tests/LiveScpTest.py against a throwaway OpenSSH daemon - one per test, on a port the kernel picks, with host and user keys generated for the run and public-key authentication only, so nothing outside the test's own temporary directory is read or written. It covers the native SCP engine's shell half: 'open' resolving the login's home directory and the site's initial path in one connection (and refusing a path the server will not change into), 'cd' ending where the server's shell went, listings from 'ls -l -a --full-time' with names holding spaces, hidden entries, subdirectories and symbolic links kept as links, 'stat' from 'ls -l -d' answering \"missing\" for a path that is not there, mkdir/chmod/mv/rm/rmdir, 'ln -s', a server-side 'cp -p', 'call' and the checksum computed from a downloaded file. Its rcp half: byte-exact downloads and uploads of a many-chunk file, an empty file and a name with spaces, a recursive tree with an empty directory and preserved directory times, '-preservetime' both ways, '-permissions' on an upload, ASCII line-ending conversion, '-speed=' pacing, and the progress percentage of an interactive run typed into a PTY. And its refusals: a host key pin checked in OpenSSH's SHA-256 spelling, as a hex digest with and without separators and as MD5, an unknown key refused in a batch run with the key printed, a wrong pin refused, resume refused by name, a stale '.filepart' discarded rather than spliced onto, an interrupted download leaving nothing under the final name, a permission the server did not grant reported in the server's own sentence, an unreachable port and a refused login reported by 'open', and a SOCKS5 proxy that really carries the session. sshd, ssh-keygen and the server's own scp binary are required; without them every case skips loudly instead of passing quietly.",
@@ -29,7 +29,8 @@
           "gui-desktop-uri": "source/gui/tests/DesktopUriTest.py - validates sftp://, ftp:// and ftps:// desktop URLs, default and explicit ports, escaped credentials and paths, IPv6 authorities, rejected malformed/query URLs, and startup creation/activation of the site tab without trusting an unknown host key. It also checks core lookup under a relocated install prefix.",
           "gui-local-editor": "source/gui/tests/LocalEditorTest.py - read and atomic local text save, stale-edit conflicts, rejection of binary/large files and symlink overwrite, and panel path confinement; standard library only.",
           "gui-localization": "source/gui/tests/LocalizationTest.js under node/jsdom - boots the real English/Spanish page with persisted, server and browser language selection; checks static text and ARIA, queue statuses, plural forms, literal placeholders, host-key verification, editor saves, sync preview and transfer API payloads, and unsaved-edit protection on language changes.",
-          "platform-conversion": "tools/check_platform_conversion.py with tools/tests/test_platform_conversion.py - the guard that keeps the Windows-to-Linux conversion complete: it reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose wording contradicts the template it is filled into. Its own cases hold it to the same standard: it has to fail on the things it claims to catch and stay quiet about the ones it does not."
+          "platform-conversion": "tools/check_platform_conversion.py with tools/tests/test_platform_conversion.py - the guard that keeps the Windows-to-Linux conversion complete: it reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose wording contradicts the template it is filled into. Its own cases hold it to the same standard: it has to fail on the things it claims to catch and stay quiet about the ones it does not.",
+          "gui-security": "source/gui/tests/SecurityTest.py - runs the GUI security regression classes under the standard-library unittest runner, including session validation, credential-safe process arguments and redacted logs, persistent command streams, safe custom-command templates and filename substitution, API authorization/CORS, local/remote path confinement, upload modes and resource cleanup."
         }
       }
     }
@@ -546,14 +547,15 @@
     {
       "name": "GUI",
       "status": "partial",
-      "notes": "Browser Commander provides persistent session tabs, dual panes, transfer queue controls, synchronization preview/conflict controls, UTF-8 editing/search, synchronized browsing and host-key verification. Local and remote panes accept files/folders through FileSystemEntry, FileSystemHandle and plain File APIs with path validation; English/Spanish interface localization is implemented. These behaviors are covered by gui, gui-localization, gui-browser-upload, gui-local-editor and gui-search. A separate Explorer UI and custom-command framework are missing; automated browser API fixtures are not a real-world browser/file-manager compatibility certification.",
+      "notes": "Browser Commander provides persistent session tabs, dual panes, transfer queue controls, synchronization preview/conflict controls, UTF-8 editing/search, synchronized browsing and host-key verification. Local and remote panes accept files/folders through FileSystemEntry, FileSystemHandle and plain File APIs with path validation; English/Spanish interface localization and persisted, scoped custom-command templates with safe filename substitution and an execution confirmation are implemented. These behaviors are covered by gui, gui-localization, gui-browser-upload, gui-local-editor, gui-search and gui-security. A separate upstream-style single-pane Explorer UI is not implemented; automated browser API fixtures are not a real-world browser/file-manager compatibility certification.",
       "verified_on": {
         "linux": [
           "gui",
           "gui-localization",
           "gui-browser-upload",
           "gui-local-editor",
-          "gui-search"
+          "gui-search",
+          "gui-security"
         ]
       },
       "gap": "See remaining capabilities: gui.explorer-custom-commands."
@@ -2029,10 +2031,12 @@
       "id": "security.gui-account",
       "area": "Security/authentication",
       "status": "missing",
-      "notes": "The loopback GUI has no multi-user account or authorization roles.",
-      "gap": "Add authenticated accounts before claiming multi-user/server deployment support.",
+      "notes": "The GUI has PBKDF2-backed accounts, expiring login sessions and CSRF protection, but accounts still share process-global tabs, remote connections, task queue, stored-session configuration and filesystem access. Authentication is not per-user authorization or isolation, so multi-user/server deployment is not safe to claim.",
+      "gap": "Define the deployment boundary and implement per-user authorization and isolation before claiming multi-user/server deployment support.",
       "acceptance": [
-        "Define deployment/isolation boundaries before enabling network access. Add password hashing, login/session expiry, CSRF protection and per-user configuration, filesystem and queue isolation. Negative authorization tests must cover every API route, not just login."
+        "Define deployment/isolation boundaries before enabling network access.",
+        "Isolate per-user configuration, remote sessions/tabs, task queue and filesystem access.",
+        "Add negative authorization tests for every API route and cross-account resource access."
       ]
     },
     {
@@ -2251,12 +2255,41 @@
     {
       "id": "gui.explorer-custom-commands",
       "area": "GUI",
-      "status": "missing",
-      "notes": "No separate upstream Explorer-style UI or custom-command framework.",
-      "gap": "Build/test Explorer navigation and custom-command execution with appropriate safety prompts.",
+      "status": "partial",
+      "notes": "Commander has persisted custom-command templates, explicit local/remote scope, safe {file} substitution for multiple selected names, and a confirmation that previews the command and affected entries. Tests cover storage permissions, invalid templates, scope, hostile names and quoting; commands are sent to LinSCP, never to a shell. This is a LinSCP Commander extension, not upstream Explorer UI parity.",
+      "gap": "A separate upstream-style single-pane Explorer interface and its navigation compatibility remain unimplemented; add browser-level acceptance evidence for custom-command confirmation and execution.",
       "acceptance": [
-        "Implement single-pane Explorer navigation plus persisted command templates, explicit confirmation and safe filename substitution. Test local/remote scope, multiple selections and hostile filenames; never interpolate into a shell implicitly."
-      ]
+        "Implement and test a separate single-pane Explorer interface and navigation behavior if upstream Explorer compatibility remains in scope; keep the existing Commander extension identified as LinSCP-specific.",
+        "Add browser-level tests proving confirmation, local/remote scope, multiple selections and hostile filenames through the custom-command UI; never interpolate into a shell."
+      ],
+      "source": [
+        "source/gui/linscp_gui.py",
+        "source/gui/web/index.html",
+        "source/gui/explorer-commands.json"
+      ],
+      "checks": {
+        "gui": [
+          "custom command list displays persisted templates",
+          "custom command confirmation previews its command and selected name",
+          "declining a custom command confirmation queues no work",
+          "confirmed custom command runs only on the selected remote entry",
+          "custom command results are rendered as text"
+        ],
+        "gui-security": [
+          "test_the_shipped_templates_are_there_on_a_first_run",
+          "test_a_saved_command_replaces_the_shipped_ones_in_the_user_file",
+          "test_a_selected_name_is_quoted_for_the_client_not_for_a_shell",
+          "test_a_local_template_quotes_its_name_as_a_local_path",
+          "test_a_name_that_is_not_one_entry_of_the_panel_is_refused",
+          "test_a_template_that_is_not_one_command_line_is_refused"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "gui",
+          "gui-security"
+        ]
+      }
     },
     {
       "id": "editing.remote-editor",
@@ -2436,7 +2469,7 @@
           "test_literal_commands_preserve_file_names_with_percent_signs"
         ],
         "gui-browser-upload": [
-          "test_gui_queue_uses_literal_commands_for_percent_filenames"
+          "test_gui_queue_uses_the_literal_server_protocol_for_percent_filenames"
         ]
       },
       "verified_on": {
