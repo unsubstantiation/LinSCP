@@ -55,7 +55,6 @@ WARN ?= -Wall
 #                              on architecture-specific intrinsics flags.
 PUTTY_DEFS := \
 	-DFORK_BUILD \
-	-DMPEXT \
 	-DPLATFORM_HAS_SMEMCLR \
 	-DNO_GSSAPI \
 	-DHAVE_AES_NI=0 \
@@ -111,8 +110,7 @@ CFLAGS_PUTTY := -std=gnu99 $(OPT) -g $(WARN) -Wno-unused-parameter $(DEPFLAGS) \
 	-D_FILE_OFFSET_BITS=64 $(PUTTY_DEFS) $(PUTTY_INCLUDES) -pthread $(CFLAGS)
 
 # The front end includes the core headers, so it must be compiled with the
-# same $(PUTTY_DEFS) as the core itself (MPEXT in particular changes the
-# signatures the core exposes).
+# same $(PUTTY_DEFS) as the core itself.
 CXXFLAGS_APP := -std=gnu++17 $(OPT) -g $(WARN) -pthread $(DEPFLAGS) \
 	-D_FILE_OFFSET_BITS=64 $(PUTTY_DEFS) \
 	-I. -I$(TOP)/source/putty -I$(TOP)/libs/putty/unix \

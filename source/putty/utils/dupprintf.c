@@ -51,7 +51,7 @@
 #if defined _WINDOWS && \
     !defined __MINGW32__ && \
     !defined __WINE__ && \
-    (!defined _MSC_VER || _MSC_VER < 1900) // FORK_BUILD
+    _MSC_VER < 1900
 #define vsnprintf _vsnprintf
 #endif
 

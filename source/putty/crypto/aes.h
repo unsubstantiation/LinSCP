@@ -66,13 +66,7 @@ static inline void aes_encrypt_ecb_block(ssh_cipher *ciph, void *blk)
     AES_EXTRA_BITS(impl_c, 192);                \
     AES_EXTRA_BITS(impl_c, 256)
 
-// FORK_BUILD string constants are for avoiding 
-// Warning 1060: Different alignments specified for same segment, %s. Using highest alignment.rdata
-// in objconv
-
 #define AES_CBC_VTABLE(impl_c, impl_display, bits)                      \
-    static const char ssh_aes ## bits ## _cbc ## impl_c ## ssh2_id[] = "aes" #bits "-cbc"; /*FORK_BUILD*/ \
-    static const char ssh_aes ## bits ## _cbc ## impl_c ## text_name[] = "AES-" #bits " CBC (" impl_display ")"; /*FORK_BUILD*/ \
     const ssh_cipheralg ssh_aes ## bits ## _cbc ## impl_c = {           \
         .new = aes ## impl_c ## _new,                                   \
         .free = aes ## impl_c ## _free,                                 \
@@ -81,18 +75,16 @@ static inline void aes_encrypt_ecb_block(ssh_cipher *ciph, void *blk)
         .encrypt = aes ## bits ## impl_c ## _cbc_encrypt,               \
         .decrypt = aes ## bits ## impl_c ## _cbc_decrypt,               \
         .next_message = nullcipher_next_message,                        \
-        .ssh2_id = ssh_aes ## bits ## _cbc ## impl_c ## ssh2_id, /*FORK_BUILD*/ \
+        .ssh2_id = "aes" #bits "-cbc",                                  \
         .blksize = 16,                                                  \
         .real_keybits = bits,                                           \
         .padded_keybytes = bits/8,                                      \
         .flags = SSH_CIPHER_IS_CBC,                                     \
-        .text_name = ssh_aes ## bits ## _cbc ## impl_c ## text_name, /*FORK_BUILD*/ \
-        .extra = &aes ## bits ## impl_c ## _extra,                              \
+        .text_name = "AES-" #bits " CBC (" impl_display ")",            \
+        .extra = &aes ## bits ## impl_c ## _extra,                      \
     }
 
 #define AES_SDCTR_VTABLE(impl_c, impl_display, bits)                    \
-    static const char ssh_aes ## bits ## _sdctr ## impl_c ## ssh2_id[] = "aes" #bits "-ctr"; /*FORK_BUILD*/ \
-    static const char ssh_aes ## bits ## _sdctr ## impl_c ## text_name[] = "AES-" #bits " SDCTR (" impl_display ")"; /*FORK_BUILD*/ \
     const ssh_cipheralg ssh_aes ## bits ## _sdctr ## impl_c = {         \
         .new = aes ## impl_c ## _new,                                   \
         .free = aes ## impl_c ## _free,                                 \
@@ -101,18 +93,16 @@ static inline void aes_encrypt_ecb_block(ssh_cipher *ciph, void *blk)
         .encrypt = aes ## bits ## impl_c ## _sdctr,                     \
         .decrypt = aes ## bits ## impl_c ## _sdctr,                     \
         .next_message = nullcipher_next_message,                        \
-        .ssh2_id = ssh_aes ## bits ## _sdctr ## impl_c ## ssh2_id, /*FORK_BUILD*/ \
+        .ssh2_id = "aes" #bits "-ctr",                                  \
         .blksize = 16,                                                  \
         .real_keybits = bits,                                           \
         .padded_keybytes = bits/8,                                      \
         .flags = 0,                                                     \
-        .text_name = ssh_aes ## bits ## _sdctr ## impl_c ## text_name, /*FORK_BUILD*/ \
+        .text_name = "AES-" #bits " SDCTR (" impl_display ")",          \
         .extra = &aes ## bits ## impl_c ## _extra,                      \
     }
 
 #define AES_GCM_VTABLE(impl_c, impl_display, bits)                      \
-    static const char ssh_aes ## bits ## _gcm ## impl_c ## ssh2_id[] = "aes" #bits "-gcm@openssh.com"; /*FORK_BUILD*/ \
-    static const char ssh_aes ## bits ## _gcm ## impl_c ## text_name[] = "AES-" #bits " GCM (" impl_display ")"; /*FORK_BUILD*/ \
     const ssh_cipheralg ssh_aes ## bits ## _gcm ## impl_c = {           \
         .new = aes ## impl_c ## _new,                                   \
         .free = aes ## impl_c ## _free,                                 \
@@ -126,12 +116,12 @@ static inline void aes_encrypt_ecb_block(ssh_cipher *ciph, void *blk)
         /* 192-bit AES-GCM is included only so that testcrypt can run   \
          * standard test vectors against it. OpenSSH doesn't define a   \
          * protocol id for it. So we set its ssh2_id to NULL. */        \
-        .ssh2_id = bits==192 ? NULL : ssh_aes ## bits ## _gcm ## impl_c ## ssh2_id,   \
+        .ssh2_id = bits==192 ? NULL : "aes" #bits "-gcm@openssh.com",   \
         .blksize = 16,                                                  \
         .real_keybits = bits,                                           \
         .padded_keybytes = bits/8,                                      \
         .flags = SSH_CIPHER_SEPARATE_LENGTH,                            \
-        .text_name = ssh_aes ## bits ## _gcm ## impl_c ## text_name,            \
+        .text_name = "AES-" #bits " GCM (" impl_display ")",            \
         .required_mac = &ssh2_aesgcm_mac,                               \
         .extra = &aes ## bits ## impl_c ## _extra,                      \
     }

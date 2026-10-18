@@ -21,52 +21,23 @@ struct BlowfishContext {
  * If you have Simon Tatham's 'spigot' exact real calculator
  * available, or any other method of generating 8336 fractional hex
  * digits of pi on standard output, you can regenerate these tables
- * exactly as below using the following C++17 program. Pipe the
- * fractional hex digits from spigot to the program's standard input:
- *
- * #include <algorithm>
- * #include <cctype>
- * #include <cstddef>
- * #include <iostream>
- * #include <string>
- *
- * int main() {
- *     std::string digits;
- *     for (char c; std::cin.get(c);) {
- *         if (std::isxdigit(static_cast<unsigned char>(c)))
- *             digits.push_back(c);
- *     }
- *     if (!digits.empty() && digits.front() == '3')
- *         digits.erase(digits.begin()); // discard the leading "3."
- *     if (digits.size() != 8336) {
- *         std::cerr << "expected 8336 hexadecimal digits\n";
- *         return 1;
- *     }
- *     const char *names[] = {"parray", "sbox0", "sbox1", "sbox2", "sbox3"};
- *     const std::size_t lengths[] = {18, 256, 256, 256, 256};
- *     std::size_t offset = 0;
- *     for (std::size_t array = 0; array < 5; ++array) {
- *         std::cout << "static const uint32_t " << names[array] << "[] = {\n";
- *         for (std::size_t i = 0; i < lengths[array]; ++i) {
- *             std::string word = digits.substr(offset, 8);
- *             offset += 8;
- *             std::transform(word.begin(), word.end(), word.begin(),
- *                 [](unsigned char c) {
- *                     return static_cast<char>(std::toupper(c));
- *                 });
- *             std::cout << (i % 6 == 0 ? "    " : " ") << "0x"
- *                       << word << ",";
- *             if (i % 6 == 5 || i + 1 == lengths[array])
- *                 std::cout << "\n";
- *         }
- *         std::cout << "};\n\n";
- *     }
- *     return 0;
- * }
- *
- * Compile the copied helper and run it like this:
- *   c++ -std=c++17 -O2 -o blowfish-init blowfish-init.cpp
- *   spigot -n -B16 -d8336 pi | ./blowfish-init
+ * exactly as below using the following Perl script (adjusting the
+ * first line or two if your pi-generator is not spigot).
+
+open my $spig, "spigot -n -B16 -d8336 pi |";
+read $spig, $ignore, 2; # throw away the leading "3."
+for my $name ("parray", "sbox0".."sbox3") {
+    print "static const uint32_t ${name}[] = {\n";
+    my $len = $name eq "parray" ? 18 : 256;
+    for my $i (1..$len) {
+        read $spig, $word, 8;
+        printf "%s0x%s,", ($i%6==1 ? "    " : " "), uc $word;
+        print "\n" if ($i == $len || $i%6 == 0);
+    }
+    print "};\n\n";
+}
+close $spig;
+
  */
 static const uint32_t parray[] = {
     0x243F6A88, 0x85A308D3, 0x13198A2E, 0x03707344, 0xA4093822, 0x299F31D0,

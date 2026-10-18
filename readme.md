@@ -146,6 +146,8 @@ tools/         parity inventory, translation and platform-conversion checkers
 
 ## Licence
 
-LinSCP is distributed under the GNU General Public License version 3. The
-attribution and third-party notices are in [`license.txt`](license.txt). The
-logo artwork is not GPL-licensed; see section B of that file.
+LinSCP is distributed under the [PolyForm Noncommercial License
+1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0):
+noncommercial use only. This is not an open source licence. The full terms are
+in [`LICENSE`](LICENSE); the copyright line, the MIT notice for the
+PuTTY-derived core and the artwork terms are in [`NOTICE`](NOTICE).

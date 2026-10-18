@@ -626,7 +626,6 @@ static void share_remove_channel(struct ssh_sharing_connstate *cs,
     sfree(chan);
 }
 
-#ifndef FORK_BUILD
 static struct share_xchannel *share_add_xchannel(
     struct ssh_sharing_connstate *cs, unsigned upstream_id, unsigned server_id)
 {
@@ -646,7 +645,6 @@ static struct share_xchannel *share_add_xchannel(
     }
     return xc;
 }
-#endif
 
 static struct share_xchannel *share_find_xchannel_by_upstream(
     struct ssh_sharing_connstate *cs, unsigned upstream_id)
@@ -1094,7 +1092,6 @@ static void share_xchannel_failure(struct ssh_sharing_connstate *cs,
     share_dead_xchannel_respond(cs, xc);
 }
 
-#ifndef FORK_BUILD
 void share_setup_x11_channel(ssh_sharing_connstate *cs, share_channel *chan,
                              unsigned upstream_id, unsigned server_id,
                              unsigned server_currwin, unsigned server_maxpkt,
@@ -1159,7 +1156,6 @@ void share_setup_x11_channel(ssh_sharing_connstate *cs, share_channel *chan,
         chan->x11_one_shot = false;
     }
 }
-#endif
 
 void share_got_pkt_from_server(ssh_sharing_connstate *cs, int type,
                                const void *vpkt, int pktlen)
@@ -1625,7 +1621,6 @@ static void share_got_pkt_from_downstream(struct ssh_sharing_connstate *cs,
                 break;
             }
 
-            #ifndef FORK_BUILD
             /*
              * Another thing we treat specially is X11 forwarding
              * requests. For these, we have to make up another set of
@@ -1705,7 +1700,6 @@ static void share_got_pkt_from_downstream(struct ssh_sharing_connstate *cs,
 
                 break;
             }
-            #endif
         }
 
         ssh_send_packet_from_downstream(cs->parent->cl, cs->id,

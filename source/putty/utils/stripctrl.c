@@ -12,6 +12,7 @@
 #include <wctype.h>
 
 #include "putty.h"
+/* terminal.h belongs to upstream's terminal code, which this client does not build. */
 #ifndef FORK_BUILD
 #include "terminal.h"
 #endif
@@ -47,11 +48,12 @@ struct StripCtrlCharsImpl {
     StripCtrlChars public;
 };
 
-#ifndef FORK_BUILD
 static void stripctrl_locale_BinarySink_write(
     BinarySink *bs, const void *vp, size_t len);
+#ifndef FORK_BUILD
 static void stripctrl_term_BinarySink_write(
     BinarySink *bs, const void *vp, size_t len);
+#endif
 
 static StripCtrlCharsImpl *stripctrl_new_common(
     BinarySink *bs_out, bool permit_cr, wchar_t substitution)
@@ -73,6 +75,7 @@ StripCtrlChars *stripctrl_new(
     return &scc->public;
 }
 
+#ifndef FORK_BUILD
 StripCtrlChars *stripctrl_new_term_fn(
     BinarySink *bs_out, bool permit_cr, wchar_t substitution,
     Terminal *term, unsigned long (*translate)(
@@ -134,7 +137,6 @@ void stripctrl_enable_line_limiting(StripCtrlChars *sccpub)
     scc->line_start = true;
 }
 
-#ifndef FORK_BUILD
 static inline bool stripctrl_ctrlchar_ok(StripCtrlCharsImpl *scc, wchar_t wc)
 {
     return wc == L'\n' || (wc == L'\r' && scc->permit_cr);
@@ -190,6 +192,7 @@ static inline void stripctrl_locale_put_wc(StripCtrlCharsImpl *scc, wchar_t wc)
         put_data(scc->bs_out, outbuf, produced);
 }
 
+#ifndef FORK_BUILD
 static inline void stripctrl_term_put_wc(
     StripCtrlCharsImpl *scc, unsigned long wc)
 {
@@ -243,6 +246,8 @@ static inline void stripctrl_term_put_wc(
         put_byte(scc->bs_out, wc);
     }
 }
+
+#endif
 
 static inline size_t stripctrl_locale_try_consume(
     StripCtrlCharsImpl *scc, const char *p, size_t len)
@@ -396,6 +401,7 @@ static void stripctrl_locale_BinarySink_write(
     sfree(previous_locale);
 }
 
+#ifndef FORK_BUILD
 static void stripctrl_term_BinarySink_write(
     BinarySink *bs, const void *vp, size_t len)
 {
@@ -426,6 +432,8 @@ static void stripctrl_term_BinarySink_write(
     }
 }
 
+#endif
+
 char *stripctrl_string_ptrlen(StripCtrlChars *sccpub, ptrlen str)
 {
     strbuf *out = strbuf_new();
@@ -434,7 +442,6 @@ char *stripctrl_string_ptrlen(StripCtrlChars *sccpub, ptrlen str)
     stripctrl_retarget(sccpub, NULL);
     return strbuf_to_str(out);
 }
-#endif
 
 #ifdef STRIPCTRL_TEST
 

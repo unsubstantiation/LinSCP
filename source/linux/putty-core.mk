@@ -6,13 +6,11 @@ PUTTY_CORE_SRCS := \
 	../../source/putty/be_list.c \
 	../../source/putty/callback.c \
 	../../source/putty/crypto/aes-common.c \
-	../../source/putty/crypto/aes-ni.c \
 	../../source/putty/crypto/aes-select.c \
 	../../source/putty/crypto/aes-sw.c \
 	../../source/putty/crypto/aesgcm-ref-poly.c \
 	../../source/putty/crypto/aesgcm-select.c \
 	../../source/putty/crypto/aesgcm-sw.c \
-	../../source/putty/crypto/aesold.c \
 	../../source/putty/crypto/arcfour.c \
 	../../source/putty/crypto/argon2.c \
 	../../source/putty/crypto/bcrypt.c \
@@ -53,7 +51,7 @@ PUTTY_CORE_SRCS := \
 	../../source/putty/import.c \
 	../../source/putty/logging.c \
 	../../source/putty/proxy/cproxy.c \
-	../../source/putty/proxy/http_p.c \
+	../../source/putty/proxy/http.c \
 	../../source/putty/proxy/interactor.c \
 	../../source/putty/proxy/local.c \
 	../../source/putty/proxy/newmain.c \
@@ -67,7 +65,7 @@ PUTTY_CORE_SRCS := \
 	../../source/putty/ssh/bpp-bare.c \
 	../../source/putty/ssh/bpp2.c \
 	../../source/putty/ssh/censor2.c \
-	../../source/putty/ssh/common_p.c \
+	../../source/putty/ssh/common.c \
 	../../source/putty/ssh/connection2-client.c \
 	../../source/putty/ssh/connection2.c \
 	../../source/putty/ssh/gssc.c \
@@ -146,12 +144,12 @@ PUTTY_CORE_SRCS := \
 	../../source/putty/utils/sk_free_peer_info.c \
 	../../source/putty/utils/smemclr.c \
 	../../source/putty/utils/smemeq.c \
-	../../source/putty/utils/spr_get_err_message.c \
+	../../source/putty/utils/spr_get_error_message.c \
 	../../source/putty/utils/ssh2_pick_fingerprint.c \
 	../../source/putty/utils/sshutils.c \
 	../../source/putty/utils/strbuf.c \
-	../../source/putty/utils/string_length_for_printf.c \
 	../../source/putty/utils/stripctrl.c \
+	../../source/putty/utils/string_length_for_printf.c \
 	../../source/putty/utils/tempseat.c \
 	../../source/putty/utils/tree234.c \
 	../../source/putty/utils/version.c \

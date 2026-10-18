@@ -1,6 +1,23 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: LinSCP
-Source: https://github.com/nuipona/linscp
+Source: https://github.com/unsubstantiation/linscp
+
+Files: *
+Copyright: 2026 unsubstantiation (https://fairuniversal.com)
+License: PolyForm-Noncommercial-1.0.0
+ This software is licensed under the PolyForm Noncommercial License 1.0.0.
+ Noncommercial use only.
+ .
+ The full text is in the file LICENSE in the source package, and at
+ <https://polyformproject.org/licenses/noncommercial/1.0.0>.
+ .
+ Every copy must keep the line "Required Notice: Copyright (c) 2026
+ unsubstantiation (https://fairuniversal.com)" together with the licence
+ terms, and the attribution notices in the file NOTICE.
+Comment:
+ The PolyForm Noncommercial License is not a DFSG-free licence: it does not
+ grant the rights Debian's Social Contract requires, and in particular it does
+ not permit commercial use or redistribution for commercial purposes.
 
 Files: source/putty/* libs/putty/*
 Copyright: 1997-2026 Simon Tatham and the PuTTY contributors
@@ -25,31 +42,14 @@ License: MIT
  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  DEALINGS IN THE SOFTWARE.
+ .
+ The same notice is kept in libs/putty/LICENCE and source/putty/LICENCE.
 
 Files: logo/* debian/linscp.png debian/linscp.svg source/gui/web/favicon.png
  source/gui/web/icon.svg
-Copyright: 2026 LinSCP contributors
+Copyright: 2026 unsubstantiation (https://fairuniversal.com)
 License: LicenseRef-LinSCP-Logo
- This original artwork is not licensed under the GNU General Public License and
- may not be redistributed with another program. Its inclusion in the LinSCP
- source tree does not grant permission to use the artwork independently.
-
-Files: *
-Copyright: 2026 the LinSCP contributors
-           2000-2026 Martin Prikryl and the WinSCP contributors (the forked
-           history, kept in the git history of the repository; see license.txt
-           section B)
-License: GPL-3+
- This program is free software: you can redistribute it and/or modify it
- under the terms of the GNU General Public License as published by the Free
- Software Foundation, either version 3 of the License, or (at your option)
- any later version.
- .
- This program is distributed in the hope that it will be useful, but
- WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License
- for more details.
- .
- On Debian systems the full text of the GNU General Public License version
- 3 is in /usr/share/common-licenses/GPL-3; a copy is also shipped in this
- source package as license.txt.
+ This original artwork is not licensed under the PolyForm Noncommercial
+ License and may not be redistributed with another program. Its inclusion in
+ the LinSCP source tree does not grant permission to use the artwork
+ independently.

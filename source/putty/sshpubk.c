@@ -91,31 +91,6 @@ LoadFileStatus lf_load_fp(LoadedFile *lf, FILE *fp)
 
 LoadFileStatus lf_load(LoadedFile *lf, const Filename *filename)
 {
-    #ifdef FORK_BUILD
-    const char * data = in_memory_key_data(filename);
-    if (data != NULL)
-    {
-        LoadFileStatus status = LF_OK;
-        int len = strlen(data);
-        char buf[3] = { '\0' };
-        int i;
-        for (i = 0; i < len; i += 2)
-        {
-            if (lf->len == lf->max_size)
-            {
-                status = LF_TOO_BIG;
-                break;
-            }
-            buf[0] = data[i];
-            buf[1] = data[i + 1];
-            lf->data[lf->len] = strtol(buf, NULL, 16);
-            lf->len++;
-        }
-
-        BinarySource_INIT(lf, lf->data, lf->len);
-        return status;
-    }
-    #endif
     FILE *fp = f_open(filename, "rb", false);
     if (!fp)
         return LF_ERROR;
@@ -156,8 +131,6 @@ LoadedFile *lf_load_keyfile(const Filename *filename, const char **errptr)
     return lf;
 }
 
-#ifndef FORK_BUILD
-/* This API does not support in-memory keys like lf_load, so make sure it's not in use */
 LoadedFile *lf_load_keyfile_fp(FILE *fp, const char **errptr)
 {
     LoadedFile *lf = lf_new(MAX_KEY_FILE_SIZE);
@@ -167,15 +140,12 @@ LoadedFile *lf_load_keyfile_fp(FILE *fp, const char **errptr)
     }
     return lf;
 }
-#endif
 
 static bool expect_signature(BinarySource *src, ptrlen realsig)
 {
     ptrlen thissig = get_data(src, realsig.len);
     return !get_err(src) && ptrlen_eq_ptrlen(realsig, thissig);
 }
-
-#ifndef FORK_BUILD
 
 static int rsa1_load_s_internal(BinarySource *src, RSAKey *key, bool pub_only,
                                 char **commentptr, const char *passphrase,
@@ -225,6 +195,12 @@ static int rsa1_load_s_internal(BinarySource *src, RSAKey *key, bool pub_only,
      * Decrypt remainder of buffer.
      */
     if (ciphertype) {
+#ifdef FORK_BUILD
+        /* Encrypted SSH-1 key files need the SSH-1 DES implementation,
+         * which this client does not build. */
+        *error = "encrypted SSH-1 private keys are not supported";
+        goto end;
+#else
         size_t enclen = get_avail(src);
         if (enclen & 7)
             goto end;
@@ -237,6 +213,7 @@ static int rsa1_load_s_internal(BinarySource *src, RSAKey *key, bool pub_only,
         smemclr(keybuf, sizeof(keybuf));        /* burn the evidence */
 
         BinarySource_BARE_INIT_PL(src, ptrlen_from_strbuf(buf));
+#endif
     }
 
     /*
@@ -428,7 +405,12 @@ strbuf *rsa1_save_sb(RSAKey *key, const char *passphrase)
      * The public part of the key.
      */
     put_datapl(buf, rsa1_signature);
+#ifdef FORK_BUILD
+    /* No SSH-1, so no SSH-1 key encryption either. */
+    put_byte(buf, 0);
+#else
     put_byte(buf, passphrase ? SSH1_CIPHER_3DES : 0); /* encryption type */
+#endif
     put_uint32(buf, 0);                              /* reserved */
     rsa_ssh1_public_blob(BinarySink_UPCAST(buf), key,
                          RSA_SSH1_MODULUS_FIRST);
@@ -467,6 +449,7 @@ strbuf *rsa1_save_sb(RSAKey *key, const char *passphrase)
     /*
      * Now encrypt the encrypted portion.
      */
+#ifndef FORK_BUILD
     if (passphrase) {
         unsigned char keybuf[16];
 
@@ -474,6 +457,7 @@ strbuf *rsa1_save_sb(RSAKey *key, const char *passphrase)
         des3_encrypt_pubkey(keybuf, buf->u + estart, buf->len - estart);
         smemclr(keybuf, sizeof(keybuf));        /* burn the evidence */
     }
+#endif
 
     return buf;
 }
@@ -494,8 +478,6 @@ bool rsa1_save_f(const Filename *filename, RSAKey *key, const char *passphrase)
     strbuf_free(buf);
     return toret;
 }
-
-#endif
 
 /* ----------------------------------------------------------------------
  * SSH-2 private key load/store functions.
@@ -1190,7 +1172,7 @@ static bool rfc4716_loadpub(BinarySource *src, char **algorithm,
     return false;
 }
 
-/*FORK_BUILD static*/ bool openssh_loadpub(BinarySource *src, char **algorithm,
+static bool openssh_loadpub(BinarySource *src, char **algorithm,
                             BinarySink *bs,
                             char **commentptr, const char **errorstr)
 {
@@ -1967,7 +1949,7 @@ static int key_type_s_internal(BinarySource *src)
         return SSH_KEYTYPE_SSH1_PUBLIC;
 
     BinarySource_REWIND(src);
-    if (find_pubkey_alg_len(get_nonchars(src, " \n")) != NULL && // FORK_BUILD test fix
+    if (find_pubkey_alg_len(get_nonchars(src, " \n")) > 0 &&
         get_chars(src, " ").len == 1 &&
         get_chars(src, "0123456789ABCDEFGHIJKLMNOPQRSTUV"
                   "WXYZabcdefghijklmnopqrstuvwxyz+/=").len > 0 &&

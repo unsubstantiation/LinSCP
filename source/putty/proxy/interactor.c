@@ -109,8 +109,7 @@ InteractionReadySeat interactor_announce(Interactor *itr)
         sfree(adjective);
         sfree(desc);
 
-        // FORK_BUILD We could comment out whole this function
-        // FORK_BUILD seat_antispoof_msg(iseat, msg);
+        seat_antispoof_msg(iseat, msg);
         sfree(msg);
 
         itr_top->last_to_talk = itr;

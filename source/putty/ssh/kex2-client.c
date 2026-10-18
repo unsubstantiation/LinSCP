@@ -13,13 +13,11 @@
 #include "transport2.h"
 #include "mpint.h"
 
-#ifndef FORK_BUILD
 /*
  * Another copy of the symbol defined in mpunsafe.c. See the comment
  * there.
  */
 const int deliberate_symbol_clash = 12345;
-#endif
 
 void ssh2kex_coroutine(struct ssh2_transport_state *s, bool *aborted)
 {
@@ -919,15 +917,11 @@ void ssh2kex_coroutine(struct ssh2_transport_state *s, bool *aborted)
                 sfree(base_fp);
 
                 strbuf *id_string = strbuf_new();
-                #ifndef FORK_BUILD
                 StripCtrlChars *id_string_scc = stripctrl_new(
                     BinarySink_UPCAST(id_string), false, L'\0');
-                #endif
                 ssh_key_cert_id_string(
-                    s->hkey, BinarySink_UPCAST(id_string/*FORK_BUILD _scc*/));
-                #ifndef FORK_BUILD
+                    s->hkey, BinarySink_UPCAST(id_string_scc));
                 stripctrl_free(id_string_scc);
-                #endif
                 ppl_logevent("Certificate ID string is \"%s\"", id_string->s);
                 strbuf_free(id_string);
 
@@ -962,10 +956,6 @@ void ssh2kex_coroutine(struct ssh2_transport_state *s, bool *aborted)
                 }
                 if (cert_ok) {
                     strbuf_free(error);
-                    // FORK_BUILD (does not "verify", only informs about the hostkeys)
-                    seat_confirm_ssh_host_key(
-                        ppl_get_iseat(&s->ppl), s->savedhost, s->savedport, ssh_key_cache_id(s->hkey), s->keystr, NULL, NULL, NULL, NULL,
-                        fingerprints, true, 0, true);
                     ssh2_free_all_fingerprints(fingerprints);
                     ppl_logevent("Accepted certificate");
                     goto host_key_ok;

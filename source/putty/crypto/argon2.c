@@ -567,7 +567,7 @@ void argon2_choose_passes(
     ptrlen P, ptrlen S, ptrlen K, ptrlen X,
     strbuf *out)
 {
-    unsigned long desired_time = (TICKSPERSEC * milliseconds) / 1000 /*FORK_BUILD*/ * 3;
+    unsigned long desired_time = (TICKSPERSEC * milliseconds) / 1000;
 
     /*
      * We only need the time taken to be approximately right, so we

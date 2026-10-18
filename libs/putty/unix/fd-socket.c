@@ -143,7 +143,7 @@ static void fdsocket_close(Socket *s)
     if (fds->addr)
         sk_addr_free(fds->addr);
 
-    delete_callbacks_for_context(DEFAULT_CALLBACK_SET, fds);
+    delete_callbacks_for_context(fds);
 
     sfree(fds);
 }
@@ -181,7 +181,7 @@ static int fdsocket_try_send(FdSocket *fds)
         if (ret < 0 && errno != EWOULDBLOCK) {
             if (!fds->pending_error) {
                 fds->pending_error = errno;
-                queue_toplevel_callback(DEFAULT_CALLBACK_SET, fdsocket_error_callback, fds);
+                queue_toplevel_callback(fdsocket_error_callback, fds);
             }
             return 0;
         } else if (ret <= 0) {
@@ -368,7 +368,7 @@ void setup_fd_socket(Socket *s, int infd, int outfd, int inerrfd)
         uxsel_set(fds->inerrfd, SELECT_R, fdsocket_select_result_input_error);
     }
 
-    queue_toplevel_callback(DEFAULT_CALLBACK_SET, fdsocket_connect_success_callback, fds);
+    queue_toplevel_callback(fdsocket_connect_success_callback, fds);
 }
 
 void fd_socket_set_psb_prefix(Socket *s, const char *prefix)

@@ -506,17 +506,14 @@ char **cmdline_arg_remainder(CmdlineArg *argp);
  * ----------------------------------------------------------------------
  * LinSCP POSIX compatibility shims  [linscp-compat]
  *
- * The shared PuTTY core in source/putty/ is the WinSCP fork of PuTTY
- * 0.85, which upstream is built for Windows with MPEXT defined ("one
- * callback set per SSH session"). A handful of Win32 types and calls are
- * baked into that mode; the POSIX equivalents live here so the same core
- * builds natively on Linux. See ../../docs/debian.md.
+ * The shared PuTTY core in source/putty/ is unmodified PuTTY 0.85. A
+ * handful of Win32 types and calls appear in the platform-neutral part of
+ * that tree; the POSIX equivalents live here so it builds natively on
+ * Linux. See ../../docs/debian.md.
  * ----------------------------------------------------------------------
  */
 
 #include <pthread.h>                   /* for CRITICAL_SECTION below */
-
-#include "tree234.h"          /* callback_set holds a tree234 of handle waits */
 
 typedef int BOOL;
 #define TRUE  1
@@ -529,10 +526,7 @@ typedef int BOOL;
 #define CALLBACK
 #endif
 
-/*
- * HANDLE only appears in the (unused on POSIX) event-driven handle-wait
- * half of the per-session callback_set structure.
- */
+/* Win32 handle type; unused on POSIX but referenced by shared headers. */
 typedef void *HANDLE;
 
 typedef unsigned int WPARAM;
@@ -547,6 +541,9 @@ typedef long LPARAM;
  * The wrappers are implemented in source/linux/PuttyGlue.cpp; call
  * linscp_platform_init() before anything can take a section.
  */
+/* Default TCP connect timeout for new sockets, in seconds (0 = none). */
+void linscp_set_connect_timeout(int seconds);
+
 typedef pthread_mutex_t CRITICAL_SECTION;
 void linscp_platform_init(void);
 void linscp_critical_section_init(CRITICAL_SECTION *cs);
@@ -556,15 +553,6 @@ void linscp_critical_section_leave(CRITICAL_SECTION *cs);
 #define DeleteCriticalSection(cs)      pthread_mutex_destroy(cs)
 #define EnterCriticalSection(cs)       linscp_critical_section_enter(cs)
 #define LeaveCriticalSection(cs)       linscp_critical_section_leave(cs)
-
-/*
- * Each SSH session in the Windows build owns a `struct callback_set`
- * (that is what MPEXT means); the core reaches it through these three
- * accessors, which the front end implements. source/linux/PuttyGlue.cpp
- * provides them for this port.
- */
-struct callback_set *linscp_posix_callback_set(void);
-#define DEFAULT_CALLBACK_SET linscp_posix_callback_set()
 
 /* [end linscp-compat] */
 

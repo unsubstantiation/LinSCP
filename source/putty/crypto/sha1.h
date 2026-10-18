@@ -34,7 +34,6 @@ static inline bool check_availability(const struct sha1_extra *extra)
  * Macro to define a SHA-1 vtable together with its 'extra'
  * structure.
  */
-// FORK_BUILD Restore use of impl_display, once we have HW-accelerated variant
 #define SHA1_VTABLE(impl_c, impl_display)                               \
     static struct sha1_extra_mutable sha1_ ## impl_c ## _extra_mut;     \
     static const struct sha1_extra sha1_ ## impl_c ## _extra = {        \
@@ -49,7 +48,7 @@ static inline bool check_availability(const struct sha1_extra *extra)
         .free = sha1_ ## impl_c ## _free,                               \
         .hlen = 20,                                                     \
         .blocklen = 64,                                                 \
-        HASHALG_NAMES_BARE("SHA-1"),                 \
+        HASHALG_NAMES_ANNOTATED("SHA-1", impl_display),                 \
         .extra = &sha1_ ## impl_c ## _extra,                            \
     }
 

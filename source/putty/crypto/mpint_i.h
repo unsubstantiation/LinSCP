@@ -127,7 +127,7 @@
           (rh) = MULADD_hi;                                               \
       } while (0)
 
-#elif (defined __GNUC__ || defined _LLP64 || (defined __STDC__ && __STDC__ >= 199901L)) && BB_OK(5)
+#elif (defined __GNUC__ || defined _LLP64 || __STDC__ >= 199901L) && BB_OK(5)
 
   /* 32-bit BignumInt, using C99 unsigned long long as BignumDblInt */
 
@@ -135,7 +135,7 @@
   #define BIGNUM_INT_BITS_BITS 5
   #define DEFINE_BIGNUMDBLINT typedef unsigned long long BignumDblInt
 
-#elif defined _MSC_VER && BB_OK(5) || defined(MPEXT)
+#elif defined _MSC_VER && BB_OK(5)
 
   /* 32-bit BignumInt, using Visual Studio __int64 as BignumDblInt */
 
@@ -317,9 +317,7 @@ struct MontyContext {
      * Persistent scratch space from which monty_* functions can
      * allocate storage for intermediate values.
      */
-    // FORK_BUILD: this is volatile member that needs to be guarded for thread-safety
-    // We want to know if it starts being used elsewhre/otherwise.
-    mp_int *linscp_guarded_scratch;
+    mp_int *scratch;
 };
 
 /* Functions shared between mpint.c and mpunsafe.c */

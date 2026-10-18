@@ -44,7 +44,7 @@ void cli_main_loop(cliloop_pw_setup_t pw_setup,
             pollwrap_add_fd_rwx(pw, fd, rwx);
         }
 
-        if (toplevel_callback_pending(DEFAULT_CALLBACK_SET)) {
+        if (toplevel_callback_pending()) {
             ret = pollwrap_poll_instant(pw);
         } else if (run_timers(now, &next)) {
             do {
@@ -102,7 +102,7 @@ void cli_main_loop(cliloop_pw_setup_t pw_setup,
 
         pw_check(ctx, pw);
 
-        bool ran_callback = run_toplevel_callbacks(DEFAULT_CALLBACK_SET);
+        bool ran_callback = run_toplevel_callbacks();
 
         if (!cont(ctx, found_fd, ran_callback))
             break;

@@ -56,7 +56,7 @@ struct ssh_gss_library;
  * The free function cleans up the structure, and its associated
  * libraries (if any).
  */
-struct ssh_gss_liblist *ssh_gss_setup(Conf *conf, LogContext *logctx);
+struct ssh_gss_liblist *ssh_gss_setup(Conf *conf);
 void ssh_gss_cleanup(struct ssh_gss_liblist *list);
 
 /*

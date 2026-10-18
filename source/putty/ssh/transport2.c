@@ -9,6 +9,7 @@
 #include "bpp.h"
 #include "ppl.h"
 #include "sshcr.h"
+/* server.h belongs to upstream's server build, which this client does not use. */
 #ifndef FORK_BUILD
 #include "server.h"
 #endif
@@ -61,7 +62,6 @@ static void ssh2_transport_final_output(PacketProtocolLayer *ppl);
 static const char *terrapin_vulnerable(
     bool strict_kex, const transport_direction *d);
 static bool try_to_avoid_terrapin(const struct ssh2_transport_state *s);
-static unsigned int ssh2_transport_linscp_query(PacketProtocolLayer *ppl, int query);
 
 static const PacketProtocolLayerVtable ssh2_transport_vtable = {
     .free = ssh2_transport_free,
@@ -72,7 +72,6 @@ static const PacketProtocolLayerVtable ssh2_transport_vtable = {
     .queued_data_size = ssh2_transport_queued_data_size,
     .final_output = ssh2_transport_final_output,
     .name = NULL, /* no protocol name for this layer */
-    .linscp_query = ssh2_transport_linscp_query,
 };
 
 #ifndef NO_GSSAPI
@@ -122,12 +121,11 @@ PacketProtocolLayer *ssh2_transport_new(
     s->hostkeyblob = strbuf_new();
     s->host_cas = newtree234(ca_blob_compare);
 
-    pq_in_init(&s->pq_in_higher, higher_layer->seat); // FORK_BUILD
-    pq_out_init(&s->pq_out_higher, higher_layer->seat); // FORK_BUILD
+    pq_in_init(&s->pq_in_higher);
+    pq_out_init(&s->pq_out_higher);
     s->pq_out_higher.pqb.ic = &s->ic_pq_out_higher;
     s->ic_pq_out_higher.fn = ssh2_transport_higher_layer_packet_callback;
     s->ic_pq_out_higher.ctx = &s->ppl;
-    s->ic_pq_out_higher.set = get_seat_callback_set(higher_layer->seat);
 
     s->higher_layer = higher_layer;
     s->higher_layer->selfptr = &s->higher_layer;
@@ -507,7 +505,7 @@ PktIn *ssh2_transport_pop(struct ssh2_transport_state *s)
 }
 
 static void ssh2_write_kexinit_lists(
-    /*FORK_BUILD*/ Seat * seat, BinarySink *pktout,
+    BinarySink *pktout,
     struct kexinit_algorithm_list kexlists[NKEXLIST],
     Conf *conf, const SshServerConfig *ssc, int remote_bugs,
     const char *hk_host, int hk_port, const ssh_keyalg *hk_prev,
@@ -780,7 +778,7 @@ static void ssh2_write_kexinit_lists(
                 if (a->id != preferred_hk[i])
                     continue;
                 if (conf_get_bool(conf, CONF_ssh_prefer_known_hostkeys) &&
-                    have_ssh_host_key(seat, hk_host, hk_port, // FORK_BUILD
+                    have_ssh_host_key(hk_host, hk_port,
                                       a->alg->cache_id)) {
                     alg = ssh2_kexinit_addalg(&kexlists[KEXLIST_HOSTKEY],
                                               a->alg->ssh_id);
@@ -944,16 +942,18 @@ static void ssh2_write_kexinit_lists(
      */
     for (i = 0; i < NKEXLIST; i++) {
         strbuf *list = strbuf_new();
-        #ifndef FORK_BUILD
+        /* Client-only build: there is no server configuration to override
+         * the algorithm lists with. */
+#ifndef FORK_BUILD
         if (ssc && ssc->kex_override[i].ptr) {
             put_datapl(list, ssc->kex_override[i]);
         } else {
-        #endif
+#endif
             for (j = 0; j < kexlists[i].nalgs; j++)
                 add_to_commasep_pl(list, kexlists[i].algs[j].name);
-        #ifndef FORK_BUILD
+#ifndef FORK_BUILD
         }
-        #endif
+#endif
         if (i == KEXLIST_KEX && first_time) {
             if (our_hostkeys) {        /* we're the server */
                 add_to_commasep_pl(list, ext_info_s);
@@ -1471,7 +1471,7 @@ static void ssh2_transport_process_queue(PacketProtocolLayer *ppl)
     put_byte(s->outgoing_kexinit, SSH2_MSG_KEXINIT);
     random_read(strbuf_append(s->outgoing_kexinit, 16), 16);
     ssh2_write_kexinit_lists(
-        /*FORK_BUILD*/ s->ppl.seat, BinarySink_UPCAST(s->outgoing_kexinit), s->kexlists,
+        BinarySink_UPCAST(s->outgoing_kexinit), s->kexlists,
         s->conf, s->ssc, s->ppl.remote_bugs,
         s->savedhost, s->savedport, s->hostkey_alg, s->thc, s->host_cas,
         s->hostkeys, s->nhostkeys,
@@ -1594,7 +1594,7 @@ static void ssh2_transport_process_queue(PacketProtocolLayer *ppl)
             int j = hks.indices[i];
             if (ssh2_hostkey_algs[j].alg != s->hostkey_alg &&
                 ssh2_hostkey_algs[j].alg->cache_id &&
-                !have_ssh_host_key(s->ppl.seat, s->savedhost, s->savedport, // FORK_BUILD
+                !have_ssh_host_key(s->savedhost, s->savedport,
                                    ssh2_hostkey_algs[j].alg->cache_id)) {
                 s->uncert_hostkeys[s->n_uncert_hostkeys++] = j;
             }
@@ -2097,9 +2097,7 @@ static void ssh2_transport_timer(void *ctx, unsigned long now)
     unsigned long mins;
     unsigned long ticks;
 
-    // FORK_BUILD: our FORK_QUERY_TIMER implementation of schedule_timer
-    //  does not guarantee the `now` to be exactly as scheduled
-    if (s->kex_in_progress || now < s->next_rekey)
+    if (s->kex_in_progress || now != s->next_rekey)
         return;
 
     mins = sanitise_rekey_time(conf_get_int(s->conf, CONF_ssh_rekey_time), 60);
@@ -2669,7 +2667,7 @@ static bool try_to_avoid_terrapin(const struct ssh2_transport_state *s)
     put_byte(alt_client_kexinit, SSH2_MSG_KEXINIT);
     put_padding(alt_client_kexinit, 16, 'x'); /* fake random padding */
     ssh2_write_kexinit_lists(
-        /*FORK_BUILD*/ s->ppl.seat, BinarySink_UPCAST(alt_client_kexinit), alt_kexlists, alt_conf,
+        BinarySink_UPCAST(alt_client_kexinit), alt_kexlists, alt_conf,
         s->ssc, s->ppl.remote_bugs, s->savedhost, s->savedport, s->hostkey_alg,
         s->thc, s->host_cas, s->hostkeys, s->nhostkeys, !s->got_session_id,
         s->can_gssapi_keyex,
@@ -2730,62 +2728,4 @@ static bool try_to_avoid_terrapin(const struct ssh2_transport_state *s)
     conf_free(alt_conf);
 
     return avoidable;
-}
-
-#include "puttyexp.h"
-
-static unsigned int ssh2_transport_linscp_query(PacketProtocolLayer *ppl, int query)
-{
-    struct ssh2_transport_state *s =
-        container_of(ppl, struct ssh2_transport_state, ppl);
-    if (query == FORK_QUERY_TIMER)
-    {
-        ssh2_transport_timer(s, GETTICKCOUNT());
-        return 1;
-    }
-    else if (s->higher_layer->vt->linscp_query != NULL)
-    {
-        return ssh_ppl_linscp_query(s->higher_layer, query);
-    }
-    else
-    {
-        return 0;
-    }
-}
-
-// FORK_BUILD
-void get_hostkey_algs(int type, int * count, cp_ssh_keyalg ** sign_keys)
-{
-    int i;
-    int max = lenof(ssh2_hostkey_algs);
-    *count = 0;
-    *sign_keys = snewn(max, cp_ssh_keyalg);
-    for (i = 0; i < max; i++)
-    {
-        if ((type < 0) || (ssh2_hostkey_algs[i].id == type))
-        {
-            *((*sign_keys) + (*count)) = ssh2_hostkey_algs[i].alg;
-            (*count)++;
-        }
-    }
-}
-
-// FORK_BUILD
-void get_macs(int * count, const struct ssh2_macalg * const ** amacs)
-{
-    *amacs = macs;
-    *count = lenof(macs);
-}
-
-int have_any_ssh2_hostkey(Seat * seat, const char * host, int port)
-{
-    int j;
-    for (j = 0; j < lenof(ssh2_hostkey_algs); j++)
-    {
-        if (have_ssh_host_key(seat, host, port, ssh2_hostkey_algs[j].alg->cache_id))
-        {
-            return 1;
-        }
-    }
-    return 0;
 }

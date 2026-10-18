@@ -319,12 +319,7 @@ char *buildinfo(const char *newline);
  * function labelled NORETURN just in case some unusual kind of system
  * header wasn't foresighted enough to label abort() itself that way.
  */
-static inline NORETURN void unreachable_internal(void) { 
-  #ifndef FORK_VS
-  // Not to try to link to VS abort
-  abort();
-  #endif
-}
+static inline NORETURN void unreachable_internal(void) { abort(); }
 #define unreachable(msg) (assert(false && msg), unreachable_internal())
 
 /*
@@ -519,13 +514,11 @@ void stripctrl_retarget(StripCtrlChars *sccpub, BinarySink *new_bs_out);
 void stripctrl_reset(StripCtrlChars *sccpub);
 void stripctrl_free(StripCtrlChars *sanpub);
 void stripctrl_enable_line_limiting(StripCtrlChars *sccpub);
-#ifndef FORK_BUILD
 char *stripctrl_string_ptrlen(StripCtrlChars *sccpub, ptrlen str);
 static inline char *stripctrl_string(StripCtrlChars *sccpub, const char *str)
 {
     return stripctrl_string_ptrlen(sccpub, ptrlen_from_asciz(str));
 }
-#endif
 
 /*
  * A mechanism for loading a file from disk into a memory buffer where

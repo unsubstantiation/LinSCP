@@ -45,7 +45,7 @@ static void proxy_telnet_free(ProxyNegotiator *pn)
     if (s->prompts)
         free_prompts(s->prompts);
     burnstr(s->formatted_cmd);
-    delete_callbacks_for_context(get_seat_callback_set(pn->ps->clientseat), s);
+    delete_callbacks_for_context(s);
     sfree(s);
 }
 
@@ -117,7 +117,7 @@ static void proxy_telnet_process_queue(ProxyNegotiator *pn)
              * backend_init and the frontend has finished getting
              * everything ready.
              */
-            queue_toplevel_callback(get_seat_callback_set(pn->ps->clientseat), proxy_telnet_process_queue_callback, s);
+            queue_toplevel_callback(proxy_telnet_process_queue_callback, s);
             crReturnV;
 
             while (true) {

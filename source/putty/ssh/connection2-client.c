@@ -16,7 +16,6 @@ static ChanopenResult chan_open_x11(
     struct ssh2_connection_state *s, SshChannel *sc,
     ptrlen peeraddr, int peerport)
 {
-    #ifndef FORK_BUILD
     PacketProtocolLayer *ppl = &s->ppl; /* for ppl_logevent */
     char *peeraddr_str;
     Channel *ch;
@@ -36,10 +35,6 @@ static ChanopenResult chan_open_x11(
     sfree(peeraddr_str);
     ppl_logevent("Opened X11 forward channel");
     CHANOPEN_RETURN_SUCCESS(ch);
-    #else
-    assert(false);
-    CHANOPEN_RETURN_FAILURE(SSH2_OPEN_UNKNOWN_CHANNEL_TYPE, ("Unsupported"));
-    #endif
 }
 
 static ChanopenResult chan_open_forwarded_tcpip(
@@ -112,14 +107,13 @@ static ChanopenResult chan_open_auth_agent(
         portfwd_raw_setup(ch, skt, sc);
         CHANOPEN_RETURN_SUCCESS(ch);
     } else {
-        struct callback_set *callback_set = get_callback_set(plug); // FORK_BUILD
         portfwd_raw_free(ch);
         /*
          * Otherwise, fall back to the old-fashioned system of parsing the
          * forwarded data stream ourselves for message boundaries, and
          * passing each individual message to the one-off agent_query().
          */
-        CHANOPEN_RETURN_SUCCESS(agentf_new(sc, callback_set));
+        CHANOPEN_RETURN_SUCCESS(agentf_new(sc));
     }
 }
 

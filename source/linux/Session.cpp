@@ -41,34 +41,79 @@ struct ScpLogPolicy : public LogPolicy
     Session * session;
 };
 
+/*
+ * The core describes a security decision as a list of typed lines, the way
+ * its own dialog boxes show them. The console renders the prose and pulls
+ * the individual values out of the same list, so there is one source of
+ * truth for what the user is being asked about.
+ */
+std::string DialogTextValue(SeatDialogText * text, const char * key)
+{
+    if (text == NULL || key == NULL)
+    {
+        return std::string();
+    }
+    for (size_t i = 0; i + 1 < text->nitems; i++)
+    {
+        if (text->items[i].type == SDT_MORE_INFO_KEY &&
+            text->items[i].text != NULL &&
+            strcmp(text->items[i].text, key) == 0 &&
+            text->items[i+1].type == SDT_MORE_INFO_VALUE_SHORT &&
+            text->items[i+1].text != NULL)
+        {
+            return text->items[i+1].text;
+        }
+    }
+    return std::string();
+}
+
+std::string DialogTextFirstDisplay(SeatDialogText * text)
+{
+    if (text == NULL)
+    {
+        return std::string();
+    }
+    for (size_t i = 0; i < text->nitems; i++)
+    {
+        if (text->items[i].type == SDT_DISPLAY && text->items[i].text != NULL)
+        {
+            return text->items[i].text;
+        }
+    }
+    return std::string();
+}
+
+void PrintDialogText(SeatDialogText * text)
+{
+    if (text == NULL)
+    {
+        return;
+    }
+    for (size_t i = 0; i < text->nitems; i++)
+    {
+        switch (text->items[i].type)
+        {
+        case SDT_TITLE:
+        case SDT_SCARY_HEADING:
+        case SDT_PARA:
+        case SDT_DISPLAY:
+            if (text->items[i].text != NULL)
+            {
+                Console::Instance().Error(text->items[i].text);
+            }
+            break;
+        default:
+            /* Prompts, batch-abort text and more-info blobs are for a
+             * dialog box; the console asks its own question. */
+            break;
+        }
+    }
+}
+
 size_t seat_output(Seat * seat, SeatOutputType type, const void * data, size_t len)
 {
     ScpSeat * scpSeat = static_cast<ScpSeat *>(seat);
     const char * bytes = static_cast<const char *>(data);
-
-    /*
-     * FORK_BUILD delivers the core's informational messages through the
-     * same callback as the channel data, marked with a leading UTF-8 BOM
-     * (FORK_BOM in putty.h). They are meant for the user and must never be
-     * handed to the SFTP layer, so they are stripped off here.
-     */
-    const size_t bomLength = sizeof(FORK_BOM) - 1;
-    if (len >= bomLength && memcmp(bytes, FORK_BOM, bomLength) == 0)
-    {
-        std::string message(bytes + bomLength, len - bomLength);
-        while (!message.empty() &&
-               (message[message.size() - 1] == '\n' ||
-                message[message.size() - 1] == '\r'))
-        {
-            message.erase(message.size() - 1);
-        }
-        if (!message.empty())
-        {
-            Console::Instance().Status(message);
-            Console::Instance().Status("\n");
-        }
-        return 0;
-    }
 
     if (type == SEAT_OUTPUT_STDERR)
     {
@@ -196,31 +241,24 @@ SeatPromptResult seat_get_userpass_input(Seat * seat, prompts_t * prompts)
 
 SeatPromptResult seat_confirm_ssh_host_key(Seat * seat, const char * host, int port,
     const char * keytype, char * keystr, SeatDialogText * text, HelpCtx helpctx,
-    void (*callback)(void * ctx, SeatPromptResult result), void * ctx,
-    char ** fingerprints, bool is_certificate, int ca_count, bool already_verified)
+    void (*callback)(void * ctx, SeatPromptResult result), void * ctx)
 {
     Session * session = static_cast<ScpSeat *>(seat)->session;
     Console & console = Console::Instance();
     /*
-     * 'fingerprints' is indexed by FingerprintType, not NUL-terminated, and
-     * each entry reads '<key type> <bits> <fingerprint>'. SHA-256 is what
-     * everybody compares by these days, so that is the one to show.
+     * The core states the fingerprints in the dialog text, as
+     * 'SHA256 fingerprint' / 'MD5 fingerprint' pairs. SHA-256 is what
+     * everybody compares by these days, so that is the one to show, with
+     * the default fingerprint as a fallback.
      */
-    std::string fingerprint;
-    if (fingerprints != NULL && fingerprints[SSH_FPTYPE_SHA256] != NULL)
+    std::string fingerprint = DialogTextValue(text, "SHA256 fingerprint");
+    if (fingerprint.empty())
     {
-        fingerprint = fingerprints[SSH_FPTYPE_SHA256];
+        fingerprint = DialogTextValue(text, "MD5 fingerprint");
     }
-    else
+    if (fingerprint.empty())
     {
-        for (int i = 0; fingerprints != NULL && i < SSH_N_FPTYPES; i++)
-        {
-            if (fingerprints[i] != NULL)
-            {
-                fingerprint = fingerprints[i];
-                break;
-            }
-        }
+        fingerprint = DialogTextFirstDisplay(text);
     }
     if (fingerprint.empty())
     {
@@ -245,7 +283,7 @@ SeatPromptResult seat_confirm_ssh_host_key(Seat * seat, const char * host, int p
      * trust from its cache or a host certificate. */
     if (session->ExpectHostKey())
     {
-        if (session->HostKeyMatches(fingerprints))
+        if (session->HostKeyMatches(fingerprint))
         {
             store_host_key(seat, host, port, keytype, keystr);
             return SPR_OK;
@@ -266,11 +304,6 @@ SeatPromptResult seat_confirm_ssh_host_key(Seat * seat, const char * host, int p
         {
             console.WriteLine(hostkeyLine);
         }
-        return SPR_OK;
-    }
-
-    if (already_verified)
-    {
         return SPR_OK;
     }
 
@@ -310,19 +343,22 @@ SeatPromptResult seat_confirm_ssh_host_key(Seat * seat, const char * host, int p
 }
 
 SeatPromptResult seat_confirm_weak_crypto_primitive(Seat * seat, SeatDialogText * text,
-    void (*callback)(void * ctx, SeatPromptResult result), void * ctx,
-    const char * algtype, const char * algname, int wcr)
+    void (*callback)(void * ctx, SeatPromptResult result), void * ctx)
 {
-    Console::Instance().Error(Texts::Translate("Warning: the server only offers a weak {type} algorithm ({name}). Continuing.",
-        {{"type", algtype}, {"name", algname}}));
+    /*
+     * The core puts the algorithm names and the reason in the dialog text.
+     * The console cannot show a modal dialog, so it prints the explanation
+     * and carries on: refusing here would turn every older server into a
+     * connection failure.
+     */
+    PrintDialogText(text);
     return SPR_OK;
 }
 
 SeatPromptResult seat_confirm_weak_cached_hostkey(Seat * seat, SeatDialogText * text,
     void (*callback)(void * ctx, SeatPromptResult result), void * ctx)
 {
-    Console::Instance().Error(
-        Texts::Translate("Warning: the cached host key uses a weak algorithm. Continuing."));
+    PrintDialogText(text);
     return SPR_OK;
 }
 
@@ -2025,7 +2061,7 @@ std::string WithoutFingerprintMarker(const std::string & text)
 
 } // namespace
 
-bool Session::HostKeyMatches(const char * const * fingerprints) const
+bool Session::HostKeyMatches(const std::string & fingerprint) const
 {
     const std::string expected = mOptions.hostKey;
     if (expected.empty())
@@ -2043,21 +2079,17 @@ bool Session::HostKeyMatches(const char * const * fingerprints) const
     std::string expectedDigest;
     const bool haveDigest = HostKeySha256(expected, expectedDigest);
 
-    for (int i = 0; fingerprints != NULL && i < SSH_N_FPTYPES; i++)
+    /*
+     * The core states one fingerprint, either bare ('SHA256:xyz') or as
+     * '<key type> <bits> <fingerprint>', so the whole string and the digest
+     * on its own are both accepted.
+     */
+    if (!fingerprint.empty())
     {
-        if (fingerprints[i] == NULL)
-        {
-            continue;
-        }
-        /*
-         * The core hands every fingerprint type over as '<key type> <bits>
-         * <fingerprint>', e.g. 'ssh-rsa 2048 SHA256:xyz', so the whole
-         * string and the digest on its own are both accepted.
-         */
-        const std::string candidate = fingerprints[i];
-        const std::string::size_type lastSpace = candidate.find_last_of(" \t");
-        const std::string forms[2] = { candidate,
-            candidate.substr(lastSpace + 1) };
+        const std::string::size_type lastSpace = fingerprint.find_last_of(" \t");
+        const std::string forms[2] = { fingerprint,
+            lastSpace == std::string::npos ? fingerprint
+                                           : fingerprint.substr(lastSpace + 1) };
         for (int n = 0; n < 2; n++)
         {
             const std::string & form = forms[n];
@@ -2259,7 +2291,7 @@ bool Session::Connect(const SessionOptions & options, const char * program,
     conf_set_str(conf, CONF_remote_cmd, program);
     conf_set_bool(conf, CONF_ssh_simple, true);
     conf_set_bool(conf, CONF_nopty, true);
-    conf_set_int(conf, CONF_connect_timeout, mOptions.timeoutSecs * 1000);
+    linscp_set_connect_timeout(mOptions.timeoutSecs);
     conf_set_bool(conf, CONF_ssh_show_banner, true);
     conf_set_int(conf, CONF_proxy_log_to_term, FORCE_OFF);
 

@@ -17,7 +17,6 @@ struct ssh2_connection_state {
     int term_width, term_height;
     bool want_user_input;
     bufchain *user_input;
-    bool ready; // FORK_BUILD
 
     bool ssh_is_simple;
     bool persistent;
@@ -29,7 +28,7 @@ struct ssh2_connection_state {
     bool all_channels_throttled;
 
     bool X11_fwd_enabled;
-    // tree234 *x11authtree; FORK_BUILD
+    tree234 *x11authtree;
 
     bool got_pty;
 

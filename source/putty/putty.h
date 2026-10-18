@@ -19,8 +19,6 @@ typedef enum {
     FILTER_SOUND_FILES, /* whatever kind of sound file we can use as bell */
 } FilereqFilter;
 
-struct callback_set;
-
 #include "defs.h"
 #include "platform.h"
 #include "network.h"
@@ -1258,8 +1256,7 @@ struct SeatVtable {
     SeatPromptResult (*confirm_ssh_host_key)(
         Seat *seat, const char *host, int port, const char *keytype,
         char *keystr, SeatDialogText *text, HelpCtx helpctx,
-        void (*callback)(void *ctx, SeatPromptResult result), void *ctx,
-        char **fingerprints, bool is_certificate, int ca_count, bool already_verified); // FORK_BUILD
+        void (*callback)(void *ctx, SeatPromptResult result), void *ctx);
 
     /*
      * Check with the seat whether it's OK to use a cryptographic
@@ -1269,8 +1266,7 @@ struct SeatVtable {
      */
     SeatPromptResult (*confirm_weak_crypto_primitive)(
         Seat *seat, SeatDialogText *text,
-        void (*callback)(void *ctx, SeatPromptResult result), void *ctx,
-        const char *algtype, const char *algname, int wcr);
+        void (*callback)(void *ctx, SeatPromptResult result), void *ctx);
 
     /*
      * Variant form of confirm_weak_crypto_primitive, which prints a
@@ -1418,18 +1414,14 @@ static inline void seat_set_busy_status(Seat *seat, BusyStatus status)
 static inline SeatPromptResult seat_confirm_ssh_host_key(
     InteractionReadySeat iseat, const char *h, int p, const char *ktyp,
     char *kstr, SeatDialogText *text, HelpCtx helpctx,
-    void (*cb)(void *ctx, SeatPromptResult result), void *ctx,
-    char **fingerprints, bool is_certificate, int ca_count, bool already_verified) // FORK_BUILD
+    void (*cb)(void *ctx, SeatPromptResult result), void *ctx)
 { return iseat.seat->vt->confirm_ssh_host_key(
-        iseat.seat, h, p, ktyp, kstr, text, helpctx, cb, ctx,
-        fingerprints, is_certificate, ca_count, already_verified); } // FORK_BUILD
+        iseat.seat, h, p, ktyp, kstr, text, helpctx, cb, ctx); }
 static inline SeatPromptResult seat_confirm_weak_crypto_primitive(
     InteractionReadySeat iseat, SeatDialogText *text,
-    void (*cb)(void *ctx, SeatPromptResult result), void *ctx,
-    const char *algtype, const char *algname, int wcr) // FORK_BUILD 
+    void (*cb)(void *ctx, SeatPromptResult result), void *ctx)
 { return iseat.seat->vt->confirm_weak_crypto_primitive(
-        iseat.seat, text, cb, ctx,
-        algtype, algname, wcr); } // FORK_BUILD
+        iseat.seat, text, cb, ctx); }
 static inline SeatPromptResult seat_confirm_weak_cached_hostkey(
     InteractionReadySeat iseat, SeatDialogText *text,
     void (*cb)(void *ctx, SeatPromptResult result), void *ctx)
@@ -1520,12 +1512,10 @@ void nullseat_set_busy_status(Seat *seat, BusyStatus status);
 SeatPromptResult nullseat_confirm_ssh_host_key(
     Seat *seat, const char *host, int port, const char *keytype,
     char *keystr, SeatDialogText *text, HelpCtx helpctx,
-    void (*callback)(void *ctx, SeatPromptResult result), void *ctx,
-    char **fingerprints, bool is_certificate, int ca_count, bool already_verified); // FORK_BUILD
+    void (*callback)(void *ctx, SeatPromptResult result), void *ctx);
 SeatPromptResult nullseat_confirm_weak_crypto_primitive(
     Seat *seat, SeatDialogText *text,
-    void (*callback)(void *ctx, SeatPromptResult result), void *ctx,
-    const char *algtype, const char *algname, int wcr); // FORK_BUILD
+    void (*callback)(void *ctx, SeatPromptResult result), void *ctx);
 SeatPromptResult nullseat_confirm_weak_cached_hostkey(
     Seat *seat, SeatDialogText *text,
     void (*callback)(void *ctx, SeatPromptResult result), void *ctx);
@@ -1554,7 +1544,6 @@ bool nullseat_get_cursor_position(Seat *seat, int *x, int *y);
  * support module (console.c in each platform subdirectory).
  */
 
-#ifndef FORK_BUILD
 void console_connection_fatal(Seat *seat, const char *message);
 void console_nonfatal(Seat *seat, const char *message);
 SeatPromptResult console_confirm_ssh_host_key(
@@ -1573,7 +1562,6 @@ void console_set_trust_status(Seat *seat, bool trusted);
 bool console_can_set_trust_status(Seat *seat);
 bool console_has_mixed_input_stream(Seat *seat);
 const SeatDialogPromptDescriptions *console_prompt_descriptions(Seat *seat);
-#endif
 
 /*
  * Other centralised seat functions.
@@ -1775,7 +1763,7 @@ static inline void win_unthrottle(TermWin *win, size_t size)
 /*
  * Global functions not specific to a connection instance.
  */
-NORETURN void nonfatal(const char *, ...) PRINTF_LIKE(1, 2); // FORK_BUILD
+void nonfatal(const char *, ...) PRINTF_LIKE(1, 2);
 NORETURN void modalfatalbox(const char *, ...) PRINTF_LIKE(1, 2);
 NORETURN void cleanup_exit(int);
 
@@ -2335,7 +2323,7 @@ int mk_wcswidth_cjk(const unsigned int *pwcs, size_t n);
 typedef struct agent_pending_query agent_pending_query;
 agent_pending_query *agent_query(
     strbuf *in, void **out, int *outlen,
-    void (*callback)(void *, void *, int), void *callback_ctx, struct callback_set * callback_set); // FORK_BUILD
+    void (*callback)(void *, void *, int), void *callback_ctx);
 void agent_cancel_query(agent_pending_query *);
 void agent_query_synchronous(strbuf *in, void **out, int *outlen);
 bool agent_exists(void);
@@ -2359,7 +2347,7 @@ void pgp_fingerprints(void);
  * have_ssh_host_key() just returns true if a key of that type is
  * already cached and false otherwise.
  */
-bool have_ssh_host_key(Seat *seat, const char *host, int port, const char *keytype);
+bool have_ssh_host_key(const char *host, int port, const char *keytype);
 
 /*
  * Exports from console frontends (console.c in platform subdirs)
@@ -2484,8 +2472,6 @@ void conf_filesel_handler(dlgcontrol *ctrl, dlgparam *dlg,
 void conf_fontsel_handler(dlgcontrol *ctrl, dlgparam *dlg,
                           void *data, int event);
 
-// to avoid "[bcc32c Warning] anonymous types declared in an anonymous union are an extension"
-#ifndef FORK_BUILD
 struct conf_editbox_handler_type {
     /* Structure passed as context2 to conf_editbox_handler */
     enum { EDIT_STR, EDIT_INT, EDIT_FIXEDPOINT } type;
@@ -2520,7 +2506,6 @@ extern const struct conf_editbox_handler_type conf_editbox_str;
 extern const struct conf_editbox_handler_type conf_editbox_int;
 #define ED_STR CP(&conf_editbox_str)
 #define ED_INT CP(&conf_editbox_int)
-#endif
 
 void setup_config_box(struct controlbox *b, bool midsession,
                       int protocol, int protcfginfo);
@@ -2580,9 +2565,7 @@ enum {
  * as fontspec_serialise and fontspec_deserialise above.
  */
 Filename *filename_from_str(const char *string);
-Filename *filename_from_utf8(const char *ustr); // FORK_BUILD
 const char *filename_to_str(const Filename *fn);
-const char* in_memory_key_data(const Filename *fn); // FORK_BUILD
 bool filename_equal(const Filename *f1, const Filename *f2);
 bool filename_is_null(const Filename *fn);
 Filename *filename_copy(const Filename *fn);
@@ -2717,43 +2700,13 @@ unsigned long timing_last_clock(void);
  * loop, as in PSFTP, for example - if a callback has run then perhaps
  * it might have done whatever the loop's caller was waiting for.
  */
-#ifdef MPEXT
-typedef struct callback callback;
-struct IdempotentCallback;
-typedef struct PacketQueueNode PacketQueueNode;
-typedef struct handle_list_node handle_list_node;
-struct handle_list_node {
-    handle_list_node *next, *prev;
-};
-struct callback_set {
-    struct callback *cbcurr, *cbhead, *cbtail;
-    IdempotentCallback * ic_pktin_free;
-    PacketQueueNode * pktin_freeq_head;
-    handle_list_node ready_head[1];
-    CRITICAL_SECTION ready_critsec[1];
-    HANDLE ready_event;
-    tree234 *handlewaits_tree_real;
-};
-#define CALLBACK_SET_ONLY struct callback_set * callback_set_v
-#define CALLBACK_SET CALLBACK_SET_ONLY,
-#else
-#define CALLBACK_SET_ONLY void
-#define CALLBACK_SET
-#endif
-void queue_toplevel_callback(CALLBACK_SET toplevel_callback_fn_t fn, void *ctx);
-bool run_toplevel_callbacks(CALLBACK_SET_ONLY);
-bool toplevel_callback_pending(CALLBACK_SET_ONLY);
-bool is_idempotent_callback_pending(CALLBACK_SET struct IdempotentCallback *ic); // FORK_BUILD
-struct callback_set * get_callback_set(Plug * plug);
-struct callback_set * get_seat_callback_set(Seat * seat);
+void queue_toplevel_callback(toplevel_callback_fn_t fn, void *ctx);
+bool run_toplevel_callbacks(void);
+bool toplevel_callback_pending(void);
 void delete_callbacks(
-    CALLBACK_SET
     bool (*delete_this_one)(void *predicate_ctx, toplevel_callback_fn_t fn,
                             void *callback_ctx), void *predicate_ctx);
-void delete_callbacks_for_context(CALLBACK_SET void *ctx);
-LogPolicy *log_get_logpolicy(LogContext *ctx); // FORK_BUILD
-Seat * get_log_seat(LogContext * lp); // FORK_BUILD
-struct callback_set * get_log_callback_set(LogContext * lp); // FORK_BUILD
+void delete_callbacks_for_context(void *ctx);
 
 /*
  * Another facility in callback.c deals with 'idempotent' callbacks,
@@ -2768,15 +2721,12 @@ struct IdempotentCallback {
     toplevel_callback_fn_t fn;
     void *ctx;
     bool queued;
-    struct callback_set * set;
 };
 void queue_idempotent_callback(struct IdempotentCallback *ic);
 
-#ifndef MPEXT
 typedef void (*toplevel_callback_notify_fn_t)(void *ctx);
 void request_callback_notifications(toplevel_callback_notify_fn_t notify,
                                     void *ctx);
-#endif
 
 /*
  * Facility provided by the platform to spawn a parallel subprocess
@@ -2850,30 +2800,5 @@ void subproc_waiter_free(SubprocessWaiter *waiter);
     (LOW_SURROGATE_START + (((codept) - 0x10000) & 0x3FF))
 #define FROM_SURROGATES(wch1, wch2) \
     (0x10000 + (((wch1) & 0x3FF) << 10) + ((wch2) & 0x3FF))
-
-#ifdef FORK_BUILD
-extern CRITICAL_SECTION putty_section;
-void putty_initialize(void);
-void putty_finalize(void);
-void pktin_free_queue_callback(void *vctx);
-#define FORK_PUTTY_SECTION_ENTER EnterCriticalSection(&putty_section);
-#define FORK_PUTTY_SECTION_LEAVE LeaveCriticalSection(&putty_section);
-#else
-#define FORK_PUTTY_SECTION_ENTER
-#define FORK_PUTTY_SECTION_LEAVE
-#endif
-
-#ifdef MPEXT
-// To mark carefully selected messages from PuTTY code as UTF-8.
-// Only for messages that are certain not to ever get ansi-encoded component,
-// but known to get UTF-8 encoded component (currently private key path only)
-#define FORK_BOM "\xEF\xBB\xBF"
-#endif
-
-#ifdef _DEBUG
-#undef assert
-void DoAssertC(char * Message, char * Filename, int LineNumber);
-#define assert(p) ((p) ? (void)0 : DoAssertC(TEXT(#p), TEXT(__FILE__), __LINE__))
-#endif
 
 #endif

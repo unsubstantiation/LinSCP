@@ -1,16 +1,11 @@
 #include <stdio.h>
 #include <string.h>
 
-#define FORK_SSH
-
 #include "puttymem.h"
 #include "tree234.h"
-#ifndef FORK_VS
 #include "network.h"
-#endif
 #include "misc.h"
 
-#ifndef FORK_VS
 struct ssh_channel;
 
 /*
@@ -92,7 +87,6 @@ typedef struct PacketQueueBase {
     PacketQueueNode end;
     size_t total_size;    /* sum of all formal_size fields on the queue */
     struct IdempotentCallback *ic;
-    Seat * seat; // FORK_BUILD
 } PacketQueueBase;
 
 typedef struct PktInQueue {
@@ -110,8 +104,8 @@ void pq_base_push_front(PacketQueueBase *pqb, PacketQueueNode *node);
 void pq_base_concatenate(PacketQueueBase *dest,
                          PacketQueueBase *q1, PacketQueueBase *q2);
 
-void pq_in_init(PktInQueue *pq, Seat * seat); // FORK_BUILD
-void pq_out_init(PktOutQueue *pq, Seat * seat); // FORK_BUILD
+void pq_in_init(PktInQueue *pq);
+void pq_out_init(PktOutQueue *pq);
 void pq_in_clear(PktInQueue *pq);
 void pq_out_clear(PktOutQueue *pq);
 
@@ -608,9 +602,7 @@ void duprsakey(RSAKey *dst, const RSAKey *src);
 void freersapriv(RSAKey *key);
 void freersakey(RSAKey *key);
 key_components *rsa_components(RSAKey *key);
-#endif // FORK_VS
 
-#ifndef FORK_VS
 uint32_t crc32_rfc1662(ptrlen data);
 uint32_t crc32_ssh1(ptrlen data);
 uint32_t crc32_update(uint32_t crc_input, ptrlen data);
@@ -650,24 +642,10 @@ RFC6979Result rfc6979_attempt(RFC6979 *s);
 void rfc6979_free(RFC6979 *s);
 mp_int *rfc6979(const ssh_hashalg *hashalg, mp_int *modulus,
                 mp_int *private_key, ptrlen message);
-#endif
 
 struct ssh_cipher {
     const ssh_cipheralg *vt;
 };
-
-#ifndef FORK_VS
-#ifdef MPEXT
-// Resolve ambiguity with OpenSSL
-#define SHA_Init putty_SHA_Init
-#define SHA_Final putty_SHA_Final
-#define SHA256_Init putty_SHA256_Init
-#define SHA256_Final putty_SHA256_Final
-#define SHA512_Init putty_SHA512_Init
-#define SHA512_Final putty_SHA512_Final
-#endif
-
-#endif // FORK_VS
 
 struct ssh_cipheralg {
     ssh_cipher *(*new)(const ssh_cipheralg *alg);
@@ -710,8 +688,6 @@ struct ssh_cipheralg {
     const void *extra;
 };
 
-#ifndef FORK_VS
-
 static inline ssh_cipher *ssh_cipher_new(const ssh_cipheralg *alg)
 { return alg->new(alg); }
 static inline void ssh_cipher_free(ssh_cipher *c)
@@ -735,11 +711,7 @@ static inline void ssh_cipher_next_message(ssh_cipher *c)
 static inline const struct ssh_cipheralg *ssh_cipher_alg(ssh_cipher *c)
 { return c->vt; }
 
-#endif
-
 void nullcipher_next_message(ssh_cipher *);
-
-#ifndef FORK_VS
 
 struct ssh2_ciphers {
     int nciphers;
@@ -803,8 +775,6 @@ void mac_simple(const ssh2_macalg *alg, ptrlen key, ptrlen data, void *output);
  * for use in SSH. It's used as a subroutine in RFC 6979. */
 ssh2_mac *hmac_new_from_hash(const ssh_hashalg *hash);
 
-#endif // !FORK_VS
-
 struct ssh_hash {
     const ssh_hashalg *vt;
     BinarySink_DELEGATE_IMPLEMENTATION;
@@ -859,8 +829,6 @@ static inline void ssh_hash_digest_nondestructive(ssh_hash *h,
 #define HASHALG_NAMES_ANNOTATED(base, ann) \
     .text_basename = base, .annotation = ann, .text_name = base " (" ann ")"
 
-#ifndef FORK_VS
-
 void hash_simple(const ssh_hashalg *alg, ptrlen data, void *output);
 
 struct ssh_kex {
@@ -874,12 +842,16 @@ struct ssh_kex {
     const void *extra;                 /* private to the kex methods */
 };
 
-#ifndef __cplusplus // FORK_BUILD not needed and won't compile, as KEYTYPE_* needs type
 static inline bool kex_is_gss(const struct ssh_kex *kex)
 {
+#ifdef NO_GSSAPI
+    /* No GSSAPI in this build, so no kex method can be a GSS one. */
+    (void)kex;
+    return false;
+#else
     return kex->main_type == KEXTYPE_GSS || kex->main_type == KEXTYPE_GSS_ECDH;
-}
 #endif
+}
 
 struct ssh_kexes {
     int nkexes;
@@ -1317,9 +1289,7 @@ extern const ssh2_macalg ssh_hmac_sha256;
 extern const ssh2_macalg ssh_hmac_sha384;
 extern const ssh2_macalg ssh_hmac_sha512;
 extern const ssh2_macalg ssh2_poly1305;
-#endif
 extern const ssh2_macalg ssh2_aesgcm_mac;
-#ifndef FORK_VS
 extern const ssh2_macalg ssh2_aesgcm_mac_sw;
 extern const ssh2_macalg ssh2_aesgcm_mac_ref_poly;
 extern const ssh2_macalg ssh2_aesgcm_mac_clmul;
@@ -1357,11 +1327,7 @@ bool platform_dit_available(void);
 /*
  * PuTTY version number formatted as an SSH version string.
  */
-extern
-#ifndef MPEXT
-  const
-#endif
-  char sshver[];
+extern const char sshver[];
 
 /*
  * Gross hack: pscp will try to start SFTP but fall back to scp1 if
@@ -1507,8 +1473,7 @@ int x11_identify_auth_proto(ptrlen protoname);
 void *x11_dehexify(ptrlen hex, int *outlen);
 bool x11_parse_ip(const char *addr_string, unsigned long *ip);
 
-struct callback_set;
-Channel *agentf_new(SshChannel *c, struct callback_set *callback_set); // FORK_BUILD
+Channel *agentf_new(SshChannel *c);
 
 bool dh_is_gex(const ssh_kex *kex);
 dh_ctx *dh_setup_group(const ssh_kex *kex);
@@ -1663,20 +1628,18 @@ static inline bool ssh_fptype_is_cert(FingerprintType fptype)
 {
     return fptype >= SSH_FPTYPE_MD5_CERT;
 }
-#ifndef __cplusplus // FORK_BUILD not needed and won't compile
 static inline FingerprintType ssh_fptype_from_cert(FingerprintType fptype)
 {
     if (ssh_fptype_is_cert(fptype))
-        fptype -= (SSH_FPTYPE_MD5_CERT - SSH_FPTYPE_MD5);
+        fptype = (FingerprintType)(fptype - (SSH_FPTYPE_MD5_CERT - SSH_FPTYPE_MD5));
     return fptype;
 }
 static inline FingerprintType ssh_fptype_to_cert(FingerprintType fptype)
 {
     if (!ssh_fptype_is_cert(fptype))
-        fptype += (SSH_FPTYPE_MD5_CERT - SSH_FPTYPE_MD5);
+        fptype = (FingerprintType)(fptype + (SSH_FPTYPE_MD5_CERT - SSH_FPTYPE_MD5));
     return fptype;
 }
-#endif
 
 #define SSH_N_FPTYPES (SSH_FPTYPE_SHA256_CERT + 1)
 #define SSH_FPTYPE_DEFAULT SSH_FPTYPE_SHA256
@@ -1701,9 +1664,6 @@ void ssh2_free_all_fingerprints(char **);
 int key_type(const Filename *filename);
 int key_type_s(BinarySource *src);
 const char *key_type_to_str(int type);
-bool openssh_loadpub(BinarySource *src, char **algorithm, // FORK_BUILD
-                     BinarySink *bs,
-                     char **commentptr, const char **errorstr);
 
 bool import_possible(int type);
 int import_target_type(int type);
@@ -2069,8 +2029,6 @@ bool ssh_transient_hostkey_cache_verify(
 bool ssh_transient_hostkey_cache_has(
     ssh_transient_hostkey_cache *thc, const ssh_keyalg *alg);
 bool ssh_transient_hostkey_cache_non_empty(ssh_transient_hostkey_cache *thc);
-
-#endif // FORK_VS
 
 /*
  * Protocol definitions for authentication helper plugins

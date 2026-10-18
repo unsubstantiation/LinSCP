@@ -98,13 +98,7 @@ static void sk_proxy_close (Socket *s)
 {
     ProxySocket *ps = container_of(s, ProxySocket, sock);
 
-    #ifdef FORK_BUILD
-    if (ps->sub_socket != NULL)
-    #endif
     sk_close(ps->sub_socket);
-    #ifdef FORK_BUILD
-    if (ps->proxy_addr != NULL)
-    #endif
     sk_addr_free(ps->proxy_addr);
     sk_addr_free(ps->remote_addr);
     proxy_negotiator_cleanup(ps);
@@ -237,12 +231,7 @@ static void proxy_negotiate(ProxySocket *ps)
         ps->sub_socket = sk_new(proxy_addr, ps->proxy_port,
                                 ps->proxy_privport, ps->proxy_oobinline,
                                 ps->proxy_nodelay, ps->proxy_keepalive,
-                                &ps->plugimpl,
-                                #ifdef FORK_BUILD
-                                conf_get_int(ps->conf, CONF_connect_timeout), conf_get_int(ps->conf, CONF_sndbuf),
-                                conf_get_str(ps->conf, CONF_srcaddr)
-                                #endif
-                                );
+                                &ps->plugimpl);
         ps->pn->reconnect = false;
         /* If the negotiator has asked us to reconnect, they are
          * expecting that on the next call their input queue will
@@ -436,11 +425,6 @@ static SocketEndpointInfo *sk_proxy_endpoint_info(Socket *s, bool peer)
     if (peer)
         return NULL;
 
-    #ifdef FORK_BUILD
-    // if proxy is connected synchronously, we get here from sk_new even before ps->sub_socket is assigned
-    if (ps->sub_socket == NULL) return NULL;
-    #endif
-
     /* But we can at least tell where we're coming _from_. */
     return sk_endpoint_info(ps->sub_socket, false);
 }
@@ -568,11 +552,6 @@ Socket *new_connection(SockAddr *addr, const char *hostname,
 
         ps->sub_socket = NULL;
 
-        #ifdef FORK_BUILD
-        ps->proxy_addr = NULL;
-        ps->pn = NULL;
-        #endif
-
         /*
          * If we've been given an Interactor by the caller, set ourselves
          * up to work with it.
@@ -664,12 +643,7 @@ Socket *new_connection(SockAddr *addr, const char *hostname,
         ps->sub_socket = sk_new(proxy_addr, ps->proxy_port,
                                 ps->proxy_privport, ps->proxy_oobinline,
                                 ps->proxy_nodelay, ps->proxy_keepalive,
-                                &ps->plugimpl,
-                                #ifdef FORK_BUILD
-                                conf_get_int(conf, CONF_connect_timeout), conf_get_int(conf, CONF_sndbuf),
-                                conf_get_str(conf, CONF_srcaddr)
-                                #endif
-                                );
+                                &ps->plugimpl);
         if (sk_socket_error(ps->sub_socket) != NULL)
             return &ps->sock;
 
@@ -681,12 +655,7 @@ Socket *new_connection(SockAddr *addr, const char *hostname,
     }
 
     /* no proxy, so just return the direct socket */
-    return sk_new(addr, port, privport, oobinline, nodelay, keepalive, plug,
-        #ifdef FORK_BUILD
-        conf_get_int(conf, CONF_connect_timeout), conf_get_int(conf, CONF_sndbuf),
-        conf_get_str(conf, CONF_srcaddr)
-        #endif
-    );
+    return sk_new(addr, port, privport, oobinline, nodelay, keepalive, plug);
 }
 
 Socket *new_listener(const char *srcaddr, int port, Plug *plug,
@@ -698,10 +667,3 @@ Socket *new_listener(const char *srcaddr, int port, Plug *plug,
 
     return sk_newlistener(srcaddr, port, plug, local_host_only, addressfamily);
 }
-
-#ifdef FORK_BUILD
-ProxySocket * get_proxy_plug_socket(Plug * p)
-{
-    return container_of(p, ProxySocket, plugimpl);
-}
-#endif

@@ -683,10 +683,6 @@ static key_components *opensshcert_components(ssh_key *key)
 
 static SeatDialogText *opensshcert_cert_info(ssh_key *key)
 {
-#ifdef FORK_BUILD
-    assert(false);
-    return NULL;
-#else
     opensshcert_key *ck = container_of(key, opensshcert_key, sshk);
     SeatDialogText *text = seat_dialog_text_new();
     strbuf *tmp = strbuf_new();
@@ -882,7 +878,6 @@ static SeatDialogText *opensshcert_cert_info(ssh_key *key)
 
     strbuf_free(tmp);
     return text;
-#endif
 }
 
 static int opensshcert_pubkey_bits(const ssh_keyalg *self, ptrlen blob)
