@@ -1540,9 +1540,12 @@ def check_permission_mode(mode_text):
             while index < len(clause) and clause[index] in "rwxXstuugo":
                 index += 1
                 letters += 1
-            if letters == 0:
+            if letters == 0 and operator != "=":
+                # chmod(1) allows the empty list after '=' ('u=' clears
+                # the class) but not after '+' or '-', where it states
+                # nothing; the console client reads it the same way.
                 return ("A symbolic mode needs a permission letter after "
-                        "-, + or =, from r, w, x, X, s, t, u, g or o.")
+                        "+ or -, from r, w, x, X, s, t, u, g or o.")
         if groups == 0:
             return ("A symbolic mode needs one of -, + or = after "
                     "u, g, o or a, as in u+x or a=r,go-w.")
@@ -1716,26 +1719,28 @@ def apply_local_mode(path, mode_text):
                         # the class being changed.
                         source_mask, source_shift = class_bits[letter]
                         bits |= ((current & source_mask) >> source_shift) << shift
+                # The setuid, setgid and sticky bits live outside the
+                # three permission classes. '=' clears the class's own
+                # special bit along with its rwx bits, which is what
+                # chmod(1) does: 'u=rw' drops setuid, 'g=r' drops setgid
+                # and 'o=' drops the sticky bit. 's' is the setuid bit for
+                # the owner and the setgid bit for the group, 't' is the
+                # sticky bit of the others; the two are independent, so
+                # 'o=st' clears the others' bits and sets sticky again.
+                class_special = {"u": 0o4000, "g": 0o2000, "o": 0o1000}[name]
                 if operator == "+":
                     current |= bits
                 elif operator == "-":
                     current &= ~bits
                 else:
-                    current = (current & ~class_mask) | (bits & class_mask)
-                # The setuid, setgid and sticky bits live outside the
-                # three permission classes. They were dropped here: the
-                # bits of 's' and 't' were masked with the class mask,
-                # which does not hold them, so 'a+s' and 'o+t' changed
-                # nothing at all while the remote chmod set them. The
-                # console client applies them per class, and so does
-                # this one now: 's' is the setuid bit for the owner and
-                # the setgid bit for the group, 't' is the sticky bit of
-                # the others.
+                    current &= ~(class_mask | class_special)
+                    current |= bits & class_mask
                 special = 0
                 if "s" in letters:
-                    special = 0o4000 if name == "u" else (0o2000 if name == "g" else 0)
-                elif "t" in letters and name == "o":
-                    special = 0o1000
+                    special |= 0o4000 if name == "u" else (
+                        0o2000 if name == "g" else 0)
+                if "t" in letters and name == "o":
+                    special |= 0o1000
                 if special:
                     if operator == "-":
                         current &= ~special

@@ -2682,6 +2682,51 @@ void TestPermissionModes()
     CHECK_TRUE(ParsePermissions("a-t", 01755, false, mode, error));
     CHECK_EQ(ModeString(mode), std::string("0755"));
 
+    /* '=' clears the whole class it names, its special bit included, and
+     * an empty list after '=' is a valid mode that clears the class. Both
+     * are chmod(1) behaviour: 'u=rw' on a 4755 file leaves 655, not 4655,
+     * and 'u=' is the same clear with nothing set again. The expected
+     * values here and below were checked against chmod(1). */
+    CHECK_TRUE(ParsePermissions("u=rw", 04755, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0655"));
+    CHECK_TRUE(ParsePermissions("u=r", 06755, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("2455"));
+    CHECK_TRUE(ParsePermissions("g=r", 06755, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("4745"));
+    CHECK_TRUE(ParsePermissions("o=r", 06755, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("6754"));
+    CHECK_TRUE(ParsePermissions("u=", 04755, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0055"));
+    CHECK_TRUE(ParsePermissions("g=", 02755, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0705"));
+    CHECK_TRUE(ParsePermissions("o=", 01755, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0750"));
+    CHECK_TRUE(ParsePermissions("a=", 07755, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0000"));
+    CHECK_TRUE(ParsePermissions("=", 04755, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0000"));
+    /* '=' with nothing after it, then another operator group: the 'who'
+     * letters stay in force for the groups of the same clause. */
+    CHECK_TRUE(ParsePermissions("u=-w", 04755, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0055"));
+    /* 's' and 't' are independent: 'o=st' clears the others' rwx and
+     * sticky, then sets sticky again, as chmod(1) does. */
+    CHECK_TRUE(ParsePermissions("o=st", 01755, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("1750"));
+    CHECK_TRUE(ParsePermissions("a=st", 01755, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("7000"));
+    CHECK_TRUE(ParsePermissions("o=s", 01755, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0750"));
+    /* A copy letter copies rwx only; the setuid bit is not the owner's
+     * class as far as copying goes, and is left alone by a 'g=' clause. */
+    CHECK_TRUE(ParsePermissions("g=u", 04755, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("4775"));
+    CHECK_TRUE(ParsePermissions("u=t", 04755, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0055"));
+    /* ...and the empty list is still not a mode after '+' or '-'. */
+    CHECK_FALSE(ParsePermissions("u+", 0644, false, mode, error));
+    CHECK_FALSE(ParsePermissions("u-", 0644, false, mode, error));
+
     /* 'X' means exec where there already is exec, and always for a
      * directory. */
     CHECK_TRUE(ParsePermissions("a+X", 0644, false, mode, error));

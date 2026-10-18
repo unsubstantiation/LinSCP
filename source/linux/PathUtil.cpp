@@ -486,8 +486,15 @@ namespace linscp {
  * the file has now. Several operator groups in one clause apply left to
  * right, as chmod(1) applies them: 'u+x-w' is 'u+x' and then 'u-w'.
  *
- * 'u=rw' leaves the group and the other bits alone. The process umask is
- * deliberately not applied to '=': the caller states the mode it wants.
+ * 'u=rw' leaves the group and the other bits alone, but '=' clears the
+ * whole class it names: its rwx bits and the special bit that belongs to
+ * it - setuid for u, setgid for g, sticky for o - before the listed
+ * letters are set again. 'u=' therefore clears the owner's rwx and setuid
+ * bits, exactly as chmod(1) does, while 'u=rw' leaves 04000 clear; and the
+ * empty list is only allowed after '=', never after '+' or '-', which is
+ * also chmod(1)'s rule. The process umask is deliberately not applied:
+ * the caller states the mode it wants, and a client that silently masked
+ * the bits it was asked for would report a mode the file does not have.
  */
 bool ParseSymbolicPermissions(const std::string & text, unsigned long current,
     bool isDirectory, unsigned long & result, std::string & error)
@@ -583,8 +590,11 @@ bool ParseSymbolicPermissions(const std::string & text, unsigned long current,
                 perms += wanted[i];
                 i++;
             }
-            if (perms.empty())
+            if (perms.empty() && op != '=')
             {
+                /* chmod(1) allows the empty list after '=' ('u=' clears
+                 * the class) but not after '+' or '-', where it means
+                 * nothing at all. */
                 error = "expected a permission letter in '" + text + "'";
                 return false;
             }
@@ -615,6 +625,12 @@ bool ParseSymbolicPermissions(const std::string & text, unsigned long current,
                 }
                 const int shift = static_cast<int>(2 - slot) * 3;
                 const unsigned long slotMask = static_cast<unsigned long>(0x7 << shift);
+                /* The special bit that belongs to this class. '=' clears
+                 * it along with the rwx bits, which is what chmod(1)
+                 * does: 'u=rw' on a setuid file clears setuid, 'g=r' on
+                 * a setgid one clears setgid, and 'o=' clears sticky. */
+                const unsigned long classSpecial = static_cast<unsigned long>(
+                    slot == 0 ? 04000 : (slot == 1 ? 02000 : 01000));
 
                 unsigned long add = 0;
                 for (size_t p = 0; p < perms.size(); p++)
@@ -654,7 +670,8 @@ bool ParseSymbolicPermissions(const std::string & text, unsigned long current,
                 }
                 else
                 {
-                    mode = static_cast<unsigned long>((mode & ~slotMask) | (add & slotMask));
+                    mode = static_cast<unsigned long>((mode &
+                        ~(slotMask | classSpecial)) | (add & slotMask));
                 }
 
                 /* The special bits live outside the three permission classes. */
@@ -662,11 +679,16 @@ bool ParseSymbolicPermissions(const std::string & text, unsigned long current,
                 {
                     const unsigned long special = (slot == 0 ? 04000 :
                         (slot == 1 ? 02000 : 0));
-                    mode = (op == '-' ? static_cast<unsigned long>(mode & ~special)
-                                        : static_cast<unsigned long>(mode | special));
+                    if (op == '-')
+                    {
+                        mode = static_cast<unsigned long>(mode & ~special);
+                    }
+                    else if (special != 0)
+                    {
+                        mode = static_cast<unsigned long>(mode | special);
+                    }
                 }
-                if (perms.find('t') != std::string::npos &&
-                    (who & (1u << slot)) != 0 && slot == 2)
+                if (perms.find('t') != std::string::npos && slot == 2)
                 {
                     mode = (op == '-' ? static_cast<unsigned long>(mode & ~01000)
                                         : static_cast<unsigned long>(mode | 01000));
