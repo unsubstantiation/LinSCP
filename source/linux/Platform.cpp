@@ -552,8 +552,15 @@ unsigned long ParseHttpDate(const std::string & text)
     int minute = 0;
     int second = 0;
     char monthName[16] = {0};
-    if (sscanf(start, " %d %15s %d %d:%d:%d", &day, monthName, &year, &hour,
+    /* Width-limited: the header comes from the server, and an unbounded
+     * %d on twenty digits is undefined behaviour rather than a refused
+     * date. The ranges below turn a parsed-but-impossible date into one. */
+    if (sscanf(start, " %2d %15s %4d %2d:%2d:%2d", &day, monthName, &year, &hour,
             &minute, &second) != 6)
+    {
+        return 0;
+    }
+    if (year < 1970 || year > 9999 || hour > 23 || minute > 59 || second > 60)
     {
         return 0;
     }

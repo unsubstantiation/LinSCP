@@ -1212,13 +1212,14 @@ bool Base64ToBytes(const std::string & text, std::string & out)
 }
 
 /*
- * The SHA-256 host key pin of a '-hostkey=' value, as curl's
- * '--hostpubsha256' wants it: the base64 spelling of the digest. Accepted
- * forms are the hex digest with optional ':' separators, OpenSSH's
- * 'SHA256:base64' and curl's own 'sha256//base64'. All of them are the
- * digest of the same host key, so the conversion decodes and re-encodes
- * instead of hashing the key again; the pin is only ever compared with
- * what curl computed, never derived from the host key here.
+ * The SHA-256 host key pin of a '-hostkey=' value, as the base64 spelling
+ * of the digest (unpadded, the way OpenSSH prints it). Accepted forms are
+ * the hex digest with optional ':' separators, OpenSSH's 'SHA256:base64'
+ * and curl's old 'sha256//base64' spelling. All of them are the digest of
+ * the same host key, so the conversion decodes and re-encodes instead of
+ * hashing the key again; both sides of Session::HostKeyMatches go through
+ * here, so one pin works in every spelling. No SSH protocol goes through
+ * curl any more, so this is an internal comparison, not a curl option.
  */
 bool HostKeySha256(const std::string & hostKey, std::string & base64)
 {

@@ -103,6 +103,50 @@ bool isdigit_ascii(char c)
     return c >= '0' && c <= '9';
 }
 
+} // namespace
+
+/*
+ * One decimal number out of a PASV/EPSV server reply, with its range
+ * checked. Exported for the unit suite (see FtpClient.h).
+ *
+ * atoi() was used here before: it stops at the first character that is
+ * not a digit and has undefined behaviour on overflow, so a PASV reply
+ * of '(999,999,999,999,999,999)' built an address nobody asked for and
+ * a port past 65535, and an EPSV reply with twenty digits was undefined
+ * behaviour rather than a refused reply. A data connection to the wrong
+ * port is not something to be approximate about: the whole field has to
+ * be digits and in range, or the reply is refused with the server's own
+ * text attached.
+ */
+bool ParseFtpReplyNumber(const std::string & text, int low, int high, int & value)
+{
+    value = 0;
+    if (text.empty() || text.size() > 5)
+    {
+        return false;
+    }
+    for (size_t i = 0; i < text.size(); i++)
+    {
+        if (!isdigit_ascii(text[i]))
+        {
+            return false;
+        }
+    }
+    long parsed = 0;
+    for (size_t i = 0; i < text.size(); i++)
+    {
+        parsed = parsed * 10 + (text[i] - '0');
+    }
+    if (parsed < low || parsed > high)
+    {
+        return false;
+    }
+    value = static_cast<int>(parsed);
+    return true;
+}
+
+namespace {
+
 /*
  * Waits until 'fd' is readable (or writable for POLLOUT) for at most
  * 'timeoutMs' milliseconds. Returns 1 when ready, 0 on timeout and -1 on
@@ -651,12 +695,13 @@ bool FtpSession::OpenPassive(std::string & error)
                 number += reply.Text()[i];
             }
         }
-        if (number.empty())
+        int port = 0;
+        if (!ParseFtpReplyNumber(number, 1, 65535, port))
         {
-            error = "The server's EPSV reply has no port: " + reply.Text();
+            error = "The server's EPSV reply has no usable port: " + reply.Text();
             return false;
         }
-        return ConnectDataSocket(mOptions.hostName, atoi(number.c_str()), error);
+        return ConnectDataSocket(mOptions.hostName, port, error);
     }
     if (reply.code != 500 && reply.code != 501 && reply.code != 502 &&
         reply.code != 522)
@@ -692,13 +737,27 @@ bool FtpSession::OpenPassive(std::string & error)
         }
         else if (!number.empty())
         {
-            numbers.push_back(atoi(number.c_str()));
+            int octet = 0;
+            if (!ParseFtpReplyNumber(number, 0, 255, octet))
+            {
+                error = "The server's PASV reply has no usable address: " +
+                    reply.Text();
+                return false;
+            }
+            numbers.push_back(octet);
             number.clear();
         }
     }
     if (!number.empty())
     {
-        numbers.push_back(atoi(number.c_str()));
+        int octet = 0;
+        if (!ParseFtpReplyNumber(number, 0, 255, octet))
+        {
+            error = "The server's PASV reply has no usable address: " +
+                reply.Text();
+            return false;
+        }
+        numbers.push_back(octet);
     }
     if (numbers.size() != 6)
     {

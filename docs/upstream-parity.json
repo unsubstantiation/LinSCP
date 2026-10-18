@@ -14,14 +14,14 @@
     "platforms": {
       "linux": {
         "how": "make -C source/linux all check && make -C source/linux check-live (the same suites also run under CMake/CTest: cmake -S . -B build && cmake --build build && ctest --test-dir build); dpkg-buildpackage -b -us -uc builds the .deb that CI installs; `make -C source/linux check-live` includes the browser upload regression suite; npm install --no-save --package-lock=false jsdom@29 && node source/gui/tests/ClientTest.js && node source/gui/tests/LocalizationTest.js exercises the browser UI; python3 tools/tests/test_translations.py checks catalog generation.",
-        "date": "2026-10-17",
+        "date": "2026-10-18",
         "suites": {
           "unit": "source/linux/tests/UnitTest.cpp - checks of the parts that need no I/O: permission and mode parsing, masks, path handling, the transfer and synchronization planners (every word and list '-criteria=' takes, the ones it refuses, a plan refused over a file nobody could hash, and '-conflict=skip|local|remote|newer' two-way resolution), the proxy session settings, the FTP engine and TLS policy settings, the S3 object write settings and multipart upload resume state sidecar, the SSH private-key passphrase option and XML action log elements, the host-key pin spellings, the native SCP engine's connection-free parts (the shell quoting a remote path needs, the paths it refuses to send, one 'ls -l' line as an entry including a symbolic link's own name, the exact date columns of '--full-time' with the offset they are in, the rcp header lines read and written byte for byte, and the 'touch -t' stamp), the WebDAV lock-token and dead-property XML, parameter and timestamp expansion, the stored-session file and folder hierarchy helpers, the editor content-comparison and EOL normalization helpers, the file-hash and HMAC helpers, and AWS Signature Version 4 signing. Includes English/Spanish help, security messages, named-placeholder safety, locale fallback and plural-count messages.",
           "script": "source/linux/tests/ScriptTest.py - the command line and script semantics against no server: abbreviations, switches, batch modes and exit codes, local listings, help, -log and -xmllog, and stored-session password encryption (a 'savesession -password' value\nwritten as 'lscp1$' ciphertext under sessions.key and preserved across a\nre-save without the key file). The transfer presets are checked here too: the savepreset/option preset/rmspreset lifecycle, a preset stored with a site and restored when it opens, -permissions on downloads, and -rawtransfersettings validation. So are the synchronization criteria (every word and list '-criteria=' takes, the values it refuses with the names it accepts, and the two the 'both' direction cannot honour) and the raw proxy settings of 'open' and 'savesession': each upstream name applied, an unknown one refused, an incomplete or unusable proxy refused, and the password masked in the echo and in the action log. It checks -literal command input (including GUI filenames with percent placeholders), mkdir -parents argument validation, that an SSH session of either spelling (scp:// or ssh://) is served by this client's own SSH code and never asks the curl on PATH for anything - a fake curl that records every call is the witness - with a host key pin in either digest spelling compared by the client instead of handed to a library whose support cannot be known, and the adjacent -gui launcher plus Makefile/CMake source-tree launchers.",
           "live-sftp": "source/linux/tests/LiveSftpTest.py against source/linux/tests/TestSftpServer.py - refused opens (wrong password, unexpected host key), operations the server denies, an interrupted download kept in '.filepart' and its resume (automatic and with -resume), the same for an interrupted upload, a continuation that must not splice an existing destination, a stale oversized staging file, resuming across a connection that died, option resume off disabling staging, and timestamps in both directions, a synchronization whose '-criteria=checksum' sees a change the timestamp and the size hide and brings the local copy back in line, sessions carried by a SOCKS5 proxy with and without credentials (TestProxyServer.py, a wrong password refused by the proxy rather than worked around) and a stored site that keeps its proxy, and the shared stored-password format (a password encrypted by the GUI\nmodule opening a stored session, a missing key file reported without losing\nthe value, and a core-written password decrypted by the GUI's reader). Recursive directory copy and multiple source files into an existing destination directory are tested over SFTP; the test server refuses the optional copy-data extension, so these prove the streamed fallback rather than the native extension. A second server mode implements copy-data and verifies the native extension path as well as exact copied bytes. The server can also refuse check-file-name, which proves the download-and-hash fallback for sha-256, sha-1, md5 and crc32, or implement the extension, which proves the native sha-256 digest and that the client does not fall back after a valid reply. It also proves that synchronize remote with a path exclusion ('-filemask=|skip/') leaves an excluded file untouched despite -delete and does not upload files from the excluded subtree. Recursive symbolic chmod is checked over a nested tree, including exact directory and file modes. copyid installs a generated OpenSSH public key into the test SFTP home, verifies the 0700/0600 permissions and proves that repeating the command does not duplicate the key. It also proves that 'etag' is refused by name on a transport with no entity tags - setting or clearing one fails and says which protocol it was asked of, '-get' answers without failing, and nothing is recorded, so the next upload of that path is an ordinary one.",
           "live-scp": "source/linux/tests/LiveScpTest.py against a throwaway OpenSSH daemon - one per test, on a port the kernel picks, with host and user keys generated for the run and public-key authentication only, so nothing outside the test's own temporary directory is read or written. It covers the native SCP engine's shell half: 'open' resolving the login's home directory and the site's initial path in one connection (and refusing a path the server will not change into), 'cd' ending where the server's shell went, listings from 'ls -l -a --full-time' with names holding spaces, hidden entries, subdirectories and symbolic links kept as links, 'stat' from 'ls -l -d' answering \"missing\" for a path that is not there, mkdir/chmod/mv/rm/rmdir, 'ln -s', a server-side 'cp -p', 'call' and the checksum computed from a downloaded file. Its rcp half: byte-exact downloads and uploads of a many-chunk file, an empty file and a name with spaces, a recursive tree with an empty directory and preserved directory times, '-preservetime' both ways, '-permissions' on an upload, ASCII line-ending conversion, '-speed=' pacing, and the progress percentage of an interactive run typed into a PTY. And its refusals: a host key pin checked in OpenSSH's SHA-256 spelling, as a hex digest with and without separators and as MD5, an unknown key refused in a batch run with the key printed, a wrong pin refused, resume refused by name, a stale '.filepart' discarded rather than spliced onto, an interrupted download leaving nothing under the final name, a permission the server did not grant reported in the server's own sentence, an unreachable port and a refused login reported by 'open', and a SOCKS5 proxy that really carries the session. sshd, ssh-keygen and the server's own scp binary are required; without them every case skips loudly instead of passing quietly.",
           "live-s3": "source/linux/tests/LiveS3Test.py against source/linux/tests/TestS3Server.py - a throwaway S3 endpoint over TLS (the fixtures are committed) that re-derives every SigV4 signature with its own hmac/hashlib code: missing and wrong credentials refused, bucket/object CRUD, resumed downloads using HTTP byte ranges, CopyObject for cp and rename, and a 20 MiB+123 upload checked as multipart initiation, three parts with returned ETags, completion, exact roundtrip checksum and no leftover upload. Synthetic HTTP-200 Error documents exercise CopyObject and multipart completion parsing, including abort cleanup after completion fails. The server also accepts a botocore-signed reference request. The client reaches it with curl over TLS on 127.0.0.1.",
-          "gui": "source/gui/tests/ClientTest.js under node with jsdom - the real Commander page booted against a stubbed backend: rendering, selection, the editor, synchronization preview and run, filename and full-text search controls/results, the site manager, terminal, queue, host-key verification, synchronized browsing (the counterpart probe, following and refusing when the other side has no such folder) and drag and drop between the panes (payload, drop-target highlight, queued upload with the dragged names, same-pane drop ignored), and browser file/folder drop enumeration with nested paths and explicit empty directories.",
+          "gui": "source/gui/tests/ClientTest.js under node with jsdom - the real Commander page booted against a stubbed backend: rendering, selection, the editor, synchronization preview and run, filename and full-text search controls/results, the site manager, terminal, queue, host-key verification, synchronized browsing (the counterpart probe, following and refusing when the other side has no such folder) and drag and drop between the panes (payload, drop-target highlight, queued upload with the dragged names, same-pane drop ignored), and browser file/folder drop enumeration with nested paths and explicit empty directories. It also checks the Explorer-style single-panel view (toggle, pane hiding, persisted choice) and the custom-commands dialog (persisted template list, save payload, explicit run confirmation and per-file run results).",
           "live-dav": "source/linux/tests/LiveDavTest.py against source/linux/tests/TestDavServer.py - a throwaway WebDAV endpoint over plain HTTP with Basic challenge authentication, which also implements LOCK/UNLOCK (refusing a write from a session that holds no token with 423), PROPPATCH and dead properties, so the lock and property behavior is asserted against the server's own state rather than against the client alone: PROPFIND listings, stat with real size/time/missing-path handling, mkdir/rmdir/MOVE/DELETE, and upload/download; single-file cp uses COPY with an absolute Destination and Overwrite header, verified by a server-side operation counter and an exact readback while the source remains; a 405 refusal also verifies the streamed fallback byte-for-byte. It also checks upstream-shaped console output, aliases and transfer presets. keepuptodate uploads local files to the remote side, and a nested file arrival wakes the inotify watcher rather than waiting for the 30-second rescan. The suite is standard-library-only and needs nothing but curl. It also covers -parents mkdir and literal remote names containing spaces, percent signs, question marks and hashes through DAV PROPFIND/GET/PUT/MOVE/COPY. ETag preconditions are asserted against the server's own recorded state and its If headers: a matching tag writes, a stale one is refused with 412 and changes nothing at the destination, If-None-Match writes only where the version differs, a lock token and a tag travel in one no-tag condition list, '*' is refused rather than sent, and a precondition recorded on a collection guards that collection alone.",
           "live-curl": "source/linux/tests/LiveCurlTest.py - throwaway pyftpdlib FTP, implicit FTPS and explicit-TLS (AUTH TLS) servers verify authenticated downloads/uploads and FTP .filepart completion; a recording handler proves which commands the session sent, so the suite checks that a listing is MLSD with LIST absent, that FtpUseMlsd=0 and a server refusing MLSD both fall back to LIST, that FtpUseMlsd=2 fails instead of listing without facts (and never sends LIST), and that FtpPasvMode=0 opens the data connection with PORT. The explicit-TLS case walks the TLS policy in one session: ftpes:// and Ftps=3 on an ftp:// URL, a refused handshake when the certificate is not accepted, CaCertificateFile, a PinnedPublicKey that matches, one that does not, MaxTlsVersion=1.1 refused against MinTlsVersion=1.2 accepted, and a host-key fingerprint refused with the setting to use instead. A saved site is stored and reopened by name to prove the FTP/TLS policy travels with it. No SSH protocol is served by curl any more, so none is tested here: sftp:// is LiveSftpTest.py's and scp:// is LiveScpTest.py's.",
           "gui-search": "source/gui/tests/RemoteSearchTest.py - backend tests with a fake session covering literal UTF-8 content search, case sensitivity, filename-mask filtering, binary/non-UTF-8 and oversized-file skips, and scan-budget enforcement. The jsdom ClientTest.js also checks the GUI toggle, request payload, bounded-search summary and escaped result snippet.",
@@ -29,7 +29,9 @@
           "gui-desktop-uri": "source/gui/tests/DesktopUriTest.py - validates sftp://, ftp:// and ftps:// desktop URLs, default and explicit ports, escaped credentials and paths, IPv6 authorities, rejected malformed/query URLs, and startup creation/activation of the site tab without trusting an unknown host key. It also checks core lookup under a relocated install prefix.",
           "gui-local-editor": "source/gui/tests/LocalEditorTest.py - read and atomic local text save, stale-edit conflicts, rejection of binary/large files and symlink overwrite, and panel path confinement; standard library only.",
           "gui-localization": "source/gui/tests/LocalizationTest.js under node/jsdom - boots the real English/Spanish page with persisted, server and browser language selection; checks static text and ARIA, queue statuses, plural forms, literal placeholders, host-key verification, editor saves, sync preview and transfer API payloads, and unsaved-edit protection on language changes.",
-          "platform-conversion": "tools/check_platform_conversion.py with tools/tests/test_platform_conversion.py - the guard that keeps the Windows-to-Linux conversion complete: it reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose wording contradicts the template it is filled into. Its own cases hold it to the same standard: it has to fail on the things it claims to catch and stay quiet about the ones it does not."
+          "platform-conversion": "tools/check_platform_conversion.py with tools/tests/test_platform_conversion.py - the guard that keeps the Windows-to-Linux conversion complete: it reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose wording contradicts the template it is filled into. Its own cases hold it to the same standard: it has to fail on the things it claims to catch and stay quiet about the ones it does not.",
+          "gui-security": "source/gui/tests/SecurityTest.py - offline boundary tests for the browser GUI: operand quoting for the client's command splitter (blanks, quotes, backslashes, control-character refusal), sync/chmod command building from fixed vocabularies, permission-mode validation, local panel containment and remote name validation, single-line server command stream, custom-command template validation/persistence/substitution/execution (local/remote scope, multiple selections, hostile names), PBKDF2 account hashing with per-session CSRF tokens and login throttling, queue staging cleanup, browser upload mode validation, and Host/token/CORS guards.",
+          "powershell": "automation/test_psmodule.py - static checks of the PowerShell module that always run (every exported cmdlet defined, no password on a process command line, control-character and multiline refusal, marker-driven server reads, listing-parser status skipping) plus the live Pester suite (automation/LinSCP.Tests.ps1) against the throwaway WebDAV endpoint when pwsh is installed: open/close, byte-exact upload/download, listing objects, terminating errors, timeout cancellation and password hygiene. Without pwsh the live cases skip loudly."
         }
       }
     }
@@ -545,18 +547,18 @@
     },
     {
       "name": "GUI",
-      "status": "partial",
-      "notes": "Browser Commander provides persistent session tabs, dual panes, transfer queue controls, synchronization preview/conflict controls, UTF-8 editing/search, synchronized browsing and host-key verification. Local and remote panes accept files/folders through FileSystemEntry, FileSystemHandle and plain File APIs with path validation; English/Spanish interface localization is implemented. These behaviors are covered by gui, gui-localization, gui-browser-upload, gui-local-editor and gui-search. A separate Explorer UI and custom-command framework are missing; automated browser API fixtures are not a real-world browser/file-manager compatibility certification.",
+      "status": "verified",
+      "notes": "Browser Commander provides persistent session tabs, dual panes, an Explorer-style single-panel view with persisted custom-command templates (explicit confirmation, safe per-file substitution, local/remote scope), transfer queue controls, synchronization preview/conflict controls, UTF-8 editing/search, synchronized browsing and host-key verification. Local and remote panes accept files/folders through FileSystemEntry, FileSystemHandle and plain File APIs with path validation; English/Spanish interface localization is implemented. These behaviors are covered by gui, gui-localization, gui-browser-upload, gui-local-editor, gui-search and gui-security. Automated browser API fixtures are not a real-world browser/file-manager compatibility certification.",
       "verified_on": {
         "linux": [
           "gui",
           "gui-localization",
           "gui-browser-upload",
           "gui-local-editor",
-          "gui-search"
+          "gui-search",
+          "gui-security"
         ]
-      },
-      "gap": "See remaining capabilities: gui.explorer-custom-commands."
+      }
     },
     {
       "name": "Editing/search",
@@ -2251,12 +2253,38 @@
     {
       "id": "gui.explorer-custom-commands",
       "area": "GUI",
-      "status": "missing",
-      "notes": "No separate upstream Explorer-style UI or custom-command framework.",
-      "gap": "Build/test Explorer navigation and custom-command execution with appropriate safety prompts.",
-      "acceptance": [
-        "Implement single-pane Explorer navigation plus persisted command templates, explicit confirmation and safe filename substitution. Test local/remote scope, multiple selections and hostile filenames; never interpolate into a shell implicitly."
-      ]
+      "status": "verified",
+      "notes": "Explorer-style single-pane navigation plus persisted custom-command templates. The Commander toggles to a single-panel view (the focused pane fills the window, the other is hidden, the choice persists across reloads). Command templates are persisted per configuration directory (shipped defaults from explorer-commands.json), listed/edited in a dialog, and run against the focused panel's selection only after an explicit confirmation showing the command and the names. Each selected name is substituted for {file} quoted for the client's command splitter - never interpolated into a shell - with local and remote scopes, one result per file, and a hostile name failing its own file without stopping the rest.",
+      "source": [
+        "source/gui/linscp_gui.py",
+        "source/gui/web/index.html",
+        "source/gui/explorer-commands.json"
+      ],
+      "checks": {
+        "gui": [
+          "explorer mode marks the layout and hides the unfocused pane",
+          "explorer choice is persisted",
+          "custom commands dialog lists the persisted templates",
+          "saving a template posts its name, command and scope",
+          "running asks for confirmation naming the command",
+          "run posts the template name, the selection and the tab"
+        ],
+        "gui-security": [
+          "test_a_template_that_is_not_one_command_line_is_refused",
+          "test_a_selected_name_is_quoted_for_the_client_not_for_a_shell",
+          "test_a_name_that_is_not_one_entry_of_the_panel_is_refused",
+          "test_a_remote_run_uses_the_panel_session_without_a_shell",
+          "test_a_local_run_goes_through_the_core_not_a_shell",
+          "test_a_hostile_name_fails_its_file_and_runs_the_rest",
+          "test_a_remote_run_without_a_session_is_refused"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "gui",
+          "gui-security"
+        ]
+      }
     },
     {
       "id": "editing.remote-editor",
@@ -2489,15 +2517,31 @@
       "id": "automation.powershell",
       "area": "Automation",
       "status": "partial",
-      "notes": "automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Nothing exercises it: no automated case runs PowerShell, so its session lifetime, pipeline objects, terminating errors, cancellation and secret handling are unevidenced, and it is a shim over the CLI rather than upstream's assembly API.",
-      "gap": "Exercise the shipped module with PowerShell on Linux: a session opened and closed, an upload and a download of exact bytes, a listing as pipeline objects, a terminating error, a cancelled transfer, and a password that appears neither in the process list nor in the output.",
+      "notes": "automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Passwords travel on stdin to -server, never on a command line. The module has a test harness (automation/test_psmodule.py, run by make check-live, CTest and CI): static checks that always run, and a Pester suite against the throwaway WebDAV endpoint covering open/close, byte-exact transfers, listing objects, terminating errors, timeout cancellation and password hygiene. The live Pester run needs pwsh, which CI installs; no green live run has been recorded in this ledger yet, and the module remains a shim over the CLI rather than upstream's assembly API.",
+      "gap": "Record a green live Pester run (CI installs pwsh and runs the harness): a session opened and closed, an upload and a download of exact bytes, a listing as pipeline objects, a terminating error, a cancelled transfer, and a password that appears neither in the process list nor in the output.",
       "acceptance": [
         "Build cmdlets or a documented compatibility module on the tested automation contract. Exercise them with PowerShell on Linux, including pipeline objects, terminating errors, cancellation and secret handling."
       ],
       "source": [
         "automation/LinSCP.psm1",
-        "source/linux/Makefile"
-      ]
+        "automation/LinSCP.Tests.ps1",
+        "automation/test_psmodule.py"
+      ],
+      "checks": {
+        "powershell": [
+          "test_every_exported_cmdlet_is_defined",
+          "test_no_password_reaches_a_process_command_line",
+          "test_quoting_refuses_control_characters",
+          "test_multiline_commands_are_refused",
+          "test_server_answers_are_read_to_the_marker",
+          "test_listing_parser_skips_status_lines"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "powershell"
+        ]
+      }
     },
     {
       "id": "desktop.scheme-handlers",

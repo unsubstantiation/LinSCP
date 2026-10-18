@@ -592,6 +592,20 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("password=", stored.read_text(encoding="utf-8"))
 
+    def test_savesession_stores_the_password_from_the_environment(self):
+        """'savesession <name> -password' stores the password the run knows
+        without stating it: the graphical client passes its password in
+        LINSCP_PASSWORD so that it never appears on a command line, and
+        this is how it asks for that value to be stored."""
+        result = self.run_commands(
+            "savesession envstored -host=env.example.com -password",
+            env={"LINSCP_PASSWORD": "from-the-environment"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stored = pathlib.Path(self.config) / "sessions.ini"
+        text = stored.read_text(encoding="utf-8")
+        self.assertIn("password=lscp1$", text)
+        self.assertNotIn("from-the-environment", text)
+
     def test_savesession_keeps_a_password_it_cannot_decrypt(self):
         """Without the key file the encrypted value is unreadable, and an
         unrelated re-save must not destroy what it cannot see."""

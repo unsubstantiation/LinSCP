@@ -102,11 +102,24 @@ def _hash_password(password, salt=None):
 
 
 def _verify_password(password, stored_hash, stored_salt):
-    """Verify a password against the stored PBKDF2 hash."""
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
-                              bytes.fromhex(stored_salt),
-                              iterations=300000, dklen=32)
-    return hmac.compare_digest(dk.hex(), stored_hash)
+    """Verify a password against the stored PBKDF2 hash.
+
+    A corrupted accounts file (a salt that is not hex, a missing hash)
+    answers False rather than raising: a login attempt against a broken
+    record is a failed login, not a server error with a traceback.
+    """
+    try:
+        salt_bytes = bytes.fromhex(stored_salt or "")
+        if len(salt_bytes) != 16:
+            return False
+        if not stored_hash or len(stored_hash) != 64:
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                                  salt_bytes,
+                                  iterations=300000, dklen=32)
+        return hmac.compare_digest(dk.hex(), stored_hash)
+    except (ValueError, TypeError):
+        return False
 
 
 def _read_accounts():
@@ -128,10 +141,33 @@ def _read_accounts():
 
 
 def _write_account(username, password, home_dir=""):
-    """Create or update a user account in accounts.ini."""
+    """Create or update a user account in accounts.ini.
+
+    The user name and the home directory are lines of the file, so a
+    newline in either would be a second line - a forged account section
+    or a forged key. Both are refused rather than written.
+    """
     if not ACCOUNTS_FILE:
         raise ValueError("No accounts file was given; start the server with "
                          "--accounts-file=FILE to say where to keep them.")
+    username = str(username or "")
+    home_dir = str(home_dir or "")
+    if not username or len(username) > 64:
+        raise ValueError("A user name of 1 to 64 characters is required.")
+    if (any(ord(ch) < 32 or ord(ch) == 127 for ch in username) or
+            "\n" in username or "\r" in username or
+            "[" in username or "]" in username or "=" in username):
+        raise ValueError("The user name contains a character that cannot "
+                         "be stored in the accounts file.")
+    if (any(ord(ch) < 32 or ord(ch) == 127 for ch in home_dir) or
+            "\n" in home_dir or "\r" in home_dir):
+        raise ValueError("The home directory contains a control character "
+                         "and cannot be stored.")
+    if home_dir and not home_dir.startswith("/"):
+        raise ValueError("The home directory must be an absolute path, "
+                         "or blank for none.")
+    if not password:
+        raise ValueError("An empty password is not accepted.")
     hash_hex, salt_hex = _hash_password(password)
     accounts = _read_accounts()
     if username in accounts:
@@ -566,12 +602,22 @@ def new_session():
     }
 
 
-def session_url(session, path=None):
+def session_url(session, path=None, include_password=False):
+    """The site URL of a session, without its password by default.
+
+    A password in a URL reaches the process list when the URL is part of
+    a '-command=' argument, where any user on the machine can read it.
+    The core reads LINSCP_PASSWORD into every session it opens, so the
+    password travels in the environment instead - readable only by this
+    user - and the URL carries the user name alone. Pass
+    include_password=True only for a URL that stays inside this process
+    (never one placed on a command line).
+    """
     proto = session.get("protocol") or "sftp"
     host = session.get("host") or "localhost"
     port = int(session.get("port") or default_port(proto))
     user = session.get("username") or ""
-    password = session.get("password") or ""
+    password = (session.get("password") or "") if include_password else ""
     url = proto + "://"
     if user:
         url += urllib.parse.quote(user, safe="")
@@ -595,7 +641,14 @@ def session_url(session, path=None):
 
 
 def core_command_line(session):
-    """The arguments every core process of this session needs."""
+    """The arguments every core process of this session needs.
+
+    The password is deliberately not one of them: command-line arguments
+    are visible to every user on the machine through the process list,
+    while the environment this server passes (see popen_kwargs) is
+    readable only by this user. The core reads LINSCP_PASSWORD into the
+    session, so nothing is lost by leaving it off the command line.
+    """
     cmd = [find_linscp_binary(), "-batch=on"]
     hostkey = session.get("hostkey") or "*"
     cmd.append("-hostkey=" + hostkey)
@@ -603,9 +656,27 @@ def core_command_line(session):
         cmd.append("-privatekey=" + session["keyfile"])
     if session.get("username"):
         cmd.append("-username=" + session["username"])
-    if session.get("password"):
-        cmd.append("-password=" + session["password"])
     return cmd
+
+
+def _censored_command(text):
+    """A command line as it may be written to the GUI log.
+
+    The console client masks passwords in its own logs the same way;
+    this one must not write what the core was spared from seeing on its
+    command line. A URL userinfo password and a '-password=' value both
+    become '***'.
+    """
+    import re as _re
+    text = _re.sub(r"(://[^/:@\s]+:)[^@\s]+(@)",
+                   r"\1***\2", text)
+    text = _re.sub(r"(?i)(-password=)([^\s;\"]+)",
+                   r"\1***", text)
+    text = _re.sub(r"(?i)(-password=\")([^\"]*)(\")",
+                   r"\1***\3", text)
+    text = _re.sub(r"(?i)(proxypassword=)([^\s;\"]+)",
+                   r"\1***", text)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -622,10 +693,18 @@ def ui_language(environment=None):
     return "es" if base == "es" else "en"
 
 
-def popen_kwargs():
+def popen_kwargs(password=None):
     # These processes speak an internal machine protocol. Browser messages
     # are localized separately; changing these diagnostics breaks parsers.
     environment = dict(os.environ, LINSCP_LANGUAGE="en")
+    if password:
+        # The password of the session, where the process list cannot see
+        # it: the core reads LINSCP_PASSWORD into every session it opens.
+        # An empty password is left unset so that a password exported for
+        # another purpose is not silently reused here.
+        environment["LINSCP_PASSWORD"] = password
+    else:
+        environment.pop("LINSCP_PASSWORD", None)
     kwargs = {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
@@ -644,9 +723,9 @@ def run_linscp(command_script, session=None, timeout=300):
     bin_path = find_linscp_binary()
     cmd = core_command_line(session)
     cmd.extend(["-literal", "-command=" + "option confirm off ; " + command_script])
-    add_log("Executing: " + command_script, "cmd")
+    add_log("Executing: " + _censored_command(command_script), "cmd")
     try:
-        proc = subprocess.Popen(cmd, **popen_kwargs())
+        proc = subprocess.Popen(cmd, **popen_kwargs(session.get("password")))
     except OSError as exc:
         message = ("Cannot start the LinSCP core binary '%s': %s. "
                    "Build it first (make -C source/linux) or put linscp "
@@ -704,7 +783,8 @@ class CoreSession(object):
             if self.session.get("keyfile"):
                 cmd.append("-privatekey=" + self.session["keyfile"])
             try:
-                self.proc = subprocess.Popen(cmd, **popen_kwargs())
+                self.proc = subprocess.Popen(
+                    cmd, **popen_kwargs(self.session.get("password")))
             except OSError as exc:
                 self.error = str(exc)
                 return False, self.error
@@ -1054,10 +1134,13 @@ class TaskManager(object):
         cmd = core_command_line(task.session)
         # Queued tasks are GUI-generated commands too. A dropped filename can
         # literally contain %TIMESTAMP% or %NAME%; do not expand it on retry.
+        # The URL carries no password (see session_url): the core reads it
+        # from the environment, where the process list cannot see it.
         cmd.extend(["-literal", "-command=" + "open " + session_url(task.session) +
                     " ; option confirm off ; " + task.command])
         try:
-            task.proc = subprocess.Popen(cmd, **popen_kwargs())
+            task.proc = subprocess.Popen(
+                cmd, **popen_kwargs(task.session.get("password")))
         except OSError as exc:
             task.status = "Failed"
             task.error = str(exc)
@@ -1303,6 +1386,49 @@ TASKS = TaskManager()
 # ---------------------------------------------------------------------------
 # Listing helpers
 # ---------------------------------------------------------------------------
+
+def split_gui_commands(text):
+    """Split terminal input on ';', honouring the client's quoting.
+
+    Mirrors SplitCommands() in source/linux/PathUtil.cpp: a ';' inside
+    single or double quotes, or escaped with a backslash, does not end
+    a command. The server loop takes one command per line and does not
+    split at all, so this is what lets the terminal offer ';' the way
+    '-command=' does without breaking quoted names that hold one.
+    """
+    result = []
+    current = []
+    quote = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            if char == "\\" and quote == '"' and index + 1 < len(text):
+                current.append(char)
+                index += 1
+                current.append(text[index])
+            elif char == quote:
+                quote = None
+                current.append(char)
+            else:
+                current.append(char)
+        elif char in ("'", '"'):
+            quote = char
+            current.append(char)
+        elif char == "\\" and index + 1 < len(text):
+            current.append(char)
+            index += 1
+            current.append(text[index])
+        elif char == ";":
+            result.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    if current or not result:
+        result.append("".join(current))
+    return result
+
 
 def quote_remote(path):
     """Quote a remote path so that it survives the command splitter.
@@ -1575,16 +1701,21 @@ def apply_local_mode(path, mode_text):
                         bits |= 0o1 << shift
                     elif letter == "X":
                         # 'X' is execute for a directory, or for a file
-                        # that already has one execute bit set.
-                        if is_dir or original & 0o111:
+                        # that already has one execute bit set. Like
+                        # chmod(1), a later clause reads what an earlier
+                        # one left behind, not what the file started
+                        # with: 'u+x,g+X' on a 644 file sets the group
+                        # bit because the owner gained one first.
+                        if is_dir or current & 0o111:
                             bits |= 0o1 << shift
                     elif letter in "ugo":
                         # As a permission letter, u/g/o means "whatever
-                        # that class already has", so the bits are copied
-                        # from the mode the file had: out of the class
-                        # they name and into the class being changed.
+                        # that class has now", so the bits are copied
+                        # out of the class they name - as the mode
+                        # stands after the earlier clauses - and into
+                        # the class being changed.
                         source_mask, source_shift = class_bits[letter]
-                        bits |= ((original & source_mask) >> source_shift) << shift
+                        bits |= ((current & source_mask) >> source_shift) << shift
                 if operator == "+":
                     current |= bits
                 elif operator == "-":
@@ -1997,12 +2128,15 @@ def save_stored_session(name, session, pin_hostkey=False):
         command += " %s=%s" % (flag, quote_remote(text))
     # Keep a usable password across edits: the console client encrypts
     # it into sessions.ini itself. A locked one (no readable key file)
-    # is not in 'session' and stays as it is in the file.
+    # is not in 'session' and stays as it is in the file. The value
+    # travels in the environment (see run_linscp), so '-password' names
+    # it without stating it: a '-password=SECRET' here would be visible
+    # in the process list and in the GUI log.
     if session.get("password"):
         text = str(session["password"])
         if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
             return False, "The password contains a control character and cannot be saved."
-        command += " -password=%s" % quote_remote(text)
+        command += " -password"
     code, stdout, stderr = run_linscp(command, session)
     if code == 0:
         add_log("Saved session '%s'" % name, "success")
@@ -2057,7 +2191,8 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                                      % (self._request_host() or "this host")},
                            status=403)
             return False
-        if REQUIRE_TOKEN and self._supplied_token() != API_TOKEN:
+        if REQUIRE_TOKEN and not hmac.compare_digest(
+                self._supplied_token(), API_TOKEN):
             self.send_json({"success": False,
                             "error": "This API needs this run's token in an "
                                      "X-LSCP-Token header."}, status=401)
@@ -2228,9 +2363,11 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 tabs = [tab.describe() for tab in STATE["tabs"]]
                 active = STATE["active_tab"]
             tab = get_tab()
+            session = dict(tab.session) if tab else new_session()
+            session.pop("password", None)
             self.send_json({
                 "connected": tab is not None and tab.connected,
-                "session": tab.session if tab else new_session(),
+                "session": session,
                 "local_dir": tab.local_dir if tab else os.path.expanduser("~"),
                 "remote_dir": tab.remote_dir if tab else "/",
                 "binary": LINSCP_BIN,
@@ -3367,9 +3504,14 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             tab = get_tab(body.get("tab"))
             if tab is not None and tab.connected:
                 # Run it in the live session: 'cd' and 'lcd' then stick.
-                # '-command=' splits on ';', so the terminal does too.
+                # '-command=' splits on ';', so the terminal does too -
+                # with the same quoting rule, so a ';' inside quotes is
+                # data (a file named 'a;b.txt') rather than a second
+                # command. A bare split() cut such a name in two and ran
+                # the pieces as commands that were never typed.
                 code, lines, errors = tab.run_many_capture(
-                    [part for part in cmd_text.split(";") if part.strip()])
+                    [part for part in split_gui_commands(cmd_text)
+                     if part.strip()])
                 if code == 0:
                     code, pwd = tab.run("pwd")
                     for line in pwd:
@@ -3456,36 +3598,12 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 # site, so a template ran somewhere other than where the
                 # selection was.
                 tab = require_tab(body.get("tab"))
-                local = template.get("scope") == "local"
-                if not local and tab is None:
-                    self.send_json({"success": False,
-                                    "error": "Not connected. A remote command "
-                                             "needs an open session."},
+                results, run_error = execute_custom_command(
+                    template, filenames, tab)
+                if run_error:
+                    self.send_json({"success": False, "error": run_error},
                                    status=400)
                     return
-                results = []
-                for filename in filenames:
-                    command, error = build_custom_command(template, filename)
-                    if error:
-                        results.append({"file": filename, "success": False,
-                                        "error": error})
-                        continue
-                    add_log("Custom command '%s': %s" % (name, command), "cmd")
-                    try:
-                        if local:
-                            code, stdout, stderr = run_linscp(command,
-                                                              tab.session if tab else None)
-                        else:
-                            code, lines, errors = tab.run_many_capture(
-                                ["cd " + quote_remote(tab.remote_dir), command])
-                            stdout, stderr = "\n".join(lines), "\n".join(errors)
-                    except ValueError as exc:
-                        results.append({"file": filename, "success": False,
-                                        "error": str(exc)})
-                        continue
-                    results.append({"file": filename, "success": code == 0,
-                                    "exit_code": code,
-                                    "stdout": stdout, "stderr": stderr})
                 self.send_json({"success": True, "results": results,
                                 "scope": template.get("scope", "remote")})
             else:
@@ -3618,6 +3736,46 @@ def build_custom_command(template, filename):
     if "{file}" not in template["command"]:
         return template["command"], ""
     return template["command"].replace("{file}", quoted), ""
+
+
+def execute_custom_command(template, filenames, tab):
+    """Run one template against every selected name.
+
+    Returns (results, error). A remote template runs in the session the
+    panel belongs to - the connection the user is looking at - while a
+    local one runs in a short-lived core process; neither ever reaches
+    a shell, and a name that is not one entry of the panel fails its
+    own result without stopping the files behind it.
+    """
+    local = template.get("scope") == "local"
+    if not local and tab is None:
+        return [], ("Not connected. A remote command needs an open "
+                    "session.")
+    name = template.get("name", "")
+    results = []
+    for filename in filenames:
+        command, error = build_custom_command(template, filename)
+        if error:
+            results.append({"file": filename, "success": False,
+                            "error": error})
+            continue
+        add_log("Custom command '%s': %s" % (name, command), "cmd")
+        try:
+            if local:
+                code, stdout, stderr = run_linscp(
+                    command, tab.session if tab else None)
+            else:
+                code, lines, errors = tab.run_many_capture(
+                    ["cd " + quote_remote(tab.remote_dir), command])
+                stdout, stderr = "\n".join(lines), "\n".join(errors)
+        except ValueError as exc:
+            results.append({"file": filename, "success": False,
+                            "error": str(exc)})
+            continue
+        results.append({"file": filename, "success": code == 0,
+                        "exit_code": code,
+                        "stdout": stdout, "stderr": stderr})
+    return results, ""
 
 
 # ---------------------------------------------------------------------------

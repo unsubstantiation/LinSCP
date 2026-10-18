@@ -199,6 +199,16 @@ function Read-LScpResponse {
             throw $detail
         }
         if ($line -match '^LSCP-RESULT (\d+)') {
+            # The marker won the race with stderr: a diagnostic line that
+            # arrived just after it would otherwise be lost, leaving a
+            # failure with nothing saying why. Collect what already
+            # finished, without waiting for what did not.
+            if ($null -ne $Session.StderrTask -and $Session.StderrTask.IsCompleted) {
+                $trailing = $Session.StderrTask.GetAwaiter().GetResult()
+                $Session.StderrTask = $null
+                if ($null -eq $trailing) { $Session.StderrClosed = $true }
+                elseif ($trailing) { $errors.Add($trailing) }
+            }
             return [PSCustomObject]@{
                 Code   = [int]$Matches[1]
                 Output = $lines.ToArray()
@@ -357,8 +367,13 @@ function Close-LScpSession {
     try {
         if ($null -ne $Session.Process -and -not $Session.Process.HasExited) {
             Send-LScpCommand -Session $Session -Command "close" -TimeoutSeconds 30 | Out-Null
-            $Session.Stdin.WriteLine("exit")
-            $Session.Stdin.Flush()
+            # The server answers 'exit' with its marker before it goes:
+            # read the answer so the pipes are drained, then wait for
+            # the process itself. A dead server answers nothing, which
+            # is already closed enough.
+            try {
+                Send-LScpCommand -Session $Session -Command "exit" -TimeoutSeconds 30 | Out-Null
+            } catch {}
             if (-not $Session.Process.WaitForExit(5000)) {
                 $Session.Process.Kill()
             }
