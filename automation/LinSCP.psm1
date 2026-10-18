@@ -53,6 +53,13 @@ function ConvertTo-LScpArgument {
     <#
     .SYNOPSIS
         Escapes a value for the LinSCP command splitter.
+
+    .DESCRIPTION
+        The splitter follows the rules of a POSIX shell: a word in double
+        quotes keeps its blanks, and a backslash inside those quotes is
+        literal unless it stands in front of a double quote or of another
+        backslash. A backslash is therefore doubled and a double quote is
+        escaped, and the whole value is wrapped in double quotes.
     #>
     param([string]$Value)
     if ($null -eq $Value) { return '""' }

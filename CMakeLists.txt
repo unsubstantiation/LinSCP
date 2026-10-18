@@ -150,6 +150,14 @@ if(Python3_Interpreter_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_parity_inventory.py)
   add_test(NAME parity-inventory COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_upstream_parity.py)
+  # The guard that keeps this a Linux-only client: it reads the sources
+  # and refuses a Windows construct, a file of another platform, an
+  # installer that disagrees with the others, and an error message that
+  # contradicts the template it is filled into.
+  add_test(NAME platform-conversion-check COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_platform_conversion.py)
+  add_test(NAME platform-conversion-tests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_platform_conversion.py)
 endif()
 
 # Browser workflow tests are available when the optional node/jsdom test
@@ -230,9 +238,12 @@ target_compile_definitions(linscp-frontend PRIVATE
 target_compile_options(linscp-frontend PRIVATE -Wall)
 
 # ---- install -------------------------------------------------------------
-# The same layout the Debian package installs: the console client and the
-# GUI launcher in bin/, the GUI's Python modules and web client under
-# share/linscp/gui/, the manual page, the desktop entry and the icons.
+# The same layout the Debian package and 'make -C source/linux install'
+# produce: the console client and the GUI launcher in bin/, the GUI's
+# Python modules, command templates and web client under share/linscp/gui/,
+# the PowerShell module under share/linscp/automation/, the manual page,
+# the desktop entry and the icons. Nothing else is installed: this client
+# has no library, no header and no other platform's surface.
 install(TARGETS linscp RUNTIME DESTINATION bin)
 install(PROGRAMS source/gui/linscp-gui DESTINATION bin)
 install(FILES docs/linscp.1 DESTINATION share/man/man1)
@@ -243,4 +254,9 @@ install(FILES source/gui/linscp_gui.py source/gui/linscp_crypto.py
   DESTINATION share/linscp/gui
   PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
     GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+# The command templates the graphical client starts with: without this
+# file an installed client offers an empty list, where a run from the
+# source tree offers the shipped ones.
+install(FILES source/gui/explorer-commands.json DESTINATION share/linscp/gui)
 install(DIRECTORY source/gui/web/ DESTINATION share/linscp/gui/web)
+install(FILES automation/LinSCP.psm1 DESTINATION share/linscp/automation)

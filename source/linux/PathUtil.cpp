@@ -46,7 +46,21 @@ std::vector<std::string> SplitCommandLine(const std::string & line)
             i++;
             while (i < line.size() && line[i] != quote)
             {
-                if (quote == '"' && line[i] == '\\' && i + 1 < line.size())
+                /*
+                 * Inside double quotes a backslash is an escape only in
+                 * front of a double quote or of another backslash, as a
+                 * POSIX shell does it. It used to escape any character,
+                 * which is the rule a Windows command line follows and
+                 * the rule this client inherited with it. On Linux a
+                 * backslash is an ordinary character of a file name, so
+                 * the old rule silently shortened it: a path written
+                 * "C:\Users\me" arrived as "C:Usersme", and a file named
+                 * "a\b.txt" was read as "ab.txt" - the name of one file
+                 * became the name of another. A script carried over
+                 * from the Windows client must keep its backslashes.
+                 */
+                if (quote == '"' && line[i] == '\\' && i + 1 < line.size() &&
+                    (line[i + 1] == '"' || line[i + 1] == '\\'))
                 {
                     i++;
                 }

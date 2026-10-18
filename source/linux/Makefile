@@ -11,7 +11,15 @@
 # Usage:
 #   make -C source/linux            # builds build/linscp
 #   make -C source/linux check      # runs the unit tests
+#   make -C source/linux check-live # script and live-server suites
 #   make -C source/linux clean
+#
+# 'make install' lays out the same tree as 'cmake --install' and the
+# Debian package: the client in bin/, the graphical client's modules and
+# command templates under share/linscp/gui/, the PowerShell module under
+# share/linscp/automation/, the manual page, the desktop entry and the
+# icons. Nothing else is installed: this client has no library, no
+# header and no other platform's surface.
 #
 # See ../../docs/debian.md for the Debian package build.
 
@@ -30,6 +38,9 @@ BINDIR := $(BUILD)
 CC ?= cc
 CXX ?= c++
 AR ?= ar
+
+# The Python 3 interpreter the checkers and the script suites run with.
+PYTHON ?= python3
 
 OPT ?= -O2
 WARN ?= -Wall
@@ -181,7 +192,7 @@ PUTTY_LIB := $(BUILD)/libputty.a
 PREFIX ?= /usr
 DESTDIR ?=
 
-.PHONY: all clean check check-live install
+.PHONY: all clean check check-live check-conversion install
 
 all: $(BINDIR)/linscp
 
@@ -235,6 +246,16 @@ check: $(BINDIR)/unittest $(SBSCGEN)
 	$(BINDIR)/unittest
 	$(SBSCGEN) --check --input $(TOP)/libs/putty/charset/sbcs.dat \
 		--expected $(TOP)/libs/putty/charset/sbcsdat.c
+	$(PYTHON) $(TOP)/tools/check_platform_conversion.py
+	$(PYTHON) $(TOP)/tools/tests/test_platform_conversion.py
+
+# The guard that keeps this a Linux-only client: it reads the sources
+# and refuses a Windows construct, a file of another platform, an
+# installer that disagrees with the others, and an error message that
+# contradicts the template it is filled into.
+check-conversion:
+	$(PYTHON) $(TOP)/tools/check_platform_conversion.py
+	$(PYTHON) $(TOP)/tools/tests/test_platform_conversion.py
 
 # Transfers against the servers in tests/, which take seconds rather than
 # milliseconds: ScriptTest is server-free, LiveSftpTest skips itself without
@@ -242,8 +263,6 @@ check: $(BINDIR)/unittest $(SBSCGEN)
 # without sshd/ssh-keygen, LiveS3Test is standard-library-only (botocore is an
 # optional extra one test skips without), LiveCurlTest uses optional pyftpdlib/
 # pyOpenSSL when available, and the GUI search test uses a fake session.
-PYTHON ?= python3
-
 check-live: $(BINDIR)/linscp
 	$(PYTHON) tests/ScriptTest.py $(BINDIR)/linscp
 	$(PYTHON) tests/LiveSftpTest.py $(BINDIR)/linscp
@@ -268,10 +287,11 @@ install: $(BINDIR)/linscp
 	install -d $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps
 	install -d $(DESTDIR)$(PREFIX)/share/linscp/gui/web
 	install -d $(DESTDIR)$(PREFIX)/share/linscp/automation
-	install -d $(DESTDIR)$(PREFIX)/include/linscp
 	install -m 0755 $(BINDIR)/linscp $(DESTDIR)$(PREFIX)/bin/linscp
 	install -m 0755 $(TOP)/source/gui/linscp-gui $(DESTDIR)$(PREFIX)/bin/linscp-gui
 	install -m 0644 $(TOP)/source/gui/linscp_gui.py $(TOP)/source/gui/linscp_crypto.py \
+		$(DESTDIR)$(PREFIX)/share/linscp/gui/
+	install -m 0644 $(TOP)/source/gui/explorer-commands.json \
 		$(DESTDIR)$(PREFIX)/share/linscp/gui/
 	install -m 0644 $(TOP)/source/gui/web/* $(DESTDIR)$(PREFIX)/share/linscp/gui/web/
 	install -m 0644 $(TOP)/debian/linscp.desktop $(DESTDIR)$(PREFIX)/share/applications/linscp.desktop
@@ -279,7 +299,6 @@ install: $(BINDIR)/linscp
 	install -m 0644 $(TOP)/debian/linscp.svg $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/linscp.svg
 	install -m 0644 $(TOP)/docs/linscp.1 $(DESTDIR)$(PREFIX)/share/man/man1/linscp.1
 	install -m 0644 $(TOP)/automation/LinSCP.psm1 $(DESTDIR)$(PREFIX)/share/linscp/automation/
-	install -m 0644 $(TOP)/source/linux/liblinscp.h $(DESTDIR)$(PREFIX)/include/linscp/
 
 clean:
 	rm -rf $(BUILD)

@@ -46,7 +46,7 @@ No separate upstream Explorer-style UI or custom-command framework.
 
 **Area:** Automation · **Status:** missing
 
-No WinSCP .NET assembly or equivalent object model for Linux.
+No WinSCP .NET assembly or equivalent object model for Linux. The C ABI header the Windows port left behind (source/linux/liblinscp.h) is gone: it declared a library that no build produced, and a public header for an API that does not exist is worse than none. The gap is unchanged - the automation object model still has to be built.
 
 **Next:** Define an API contract and test automation clients; a CLI is not the assembly.
 
@@ -58,7 +58,7 @@ No WinSCP .NET assembly or equivalent object model for Linux.
 
 **Area:** Automation · **Status:** partial
 
-automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install' puts it in PREFIX/share/linscp/automation. Nothing exercises it: no automated case runs PowerShell, so its session lifetime, pipeline objects, terminating errors, cancellation and secret handling are unevidenced, and it is a shim over the CLI rather than upstream's assembly API.
+automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Nothing exercises it: no automated case runs PowerShell, so its session lifetime, pipeline objects, terminating errors, cancellation and secret handling are unevidenced, and it is a shim over the CLI rather than upstream's assembly API.
 
 **Next:** Exercise the shipped module with PowerShell on Linux: a session opened and closed, an upload and a download of exact bytes, a listing as pipeline objects, a terminating error, a cancelled transfer, and a password that appears neither in the process list nor in the output.
 
@@ -70,7 +70,7 @@ automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console cl
 
 **Area:** Desktop integration · **Status:** missing
 
-No system file-manager shell commands or upstream extension system.
+No system file-manager shell commands or upstream extension system. The half-translated Nautilus extension the Windows Explorer integration left behind is gone: it ran no session, so it uploaded nothing, and it was neither installed nor documented. The command templates of the graphical client (source/gui/explorer-commands.json) are its own feature and are shipped by all three installers.
 
 **Next:** Specify desired desktop environment integrations and build/test them individually.
 

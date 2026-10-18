@@ -62,8 +62,8 @@ make -C source/linux BUILD=build-asan OPT=-O0 \
 
 ```sh
 dpkg-buildpackage -b -us -uc
-# -> ../linscp_1.0-3_amd64.deb
-sudo dpkg -i ../linscp_1.0-3_amd64.deb
+# -> ../linscp_1.0-4_amd64.deb
+sudo dpkg -i ../linscp_1.0-4_amd64.deb
 ```
 
 `debian/rules` does not use debhelper. The build is one plain Makefile, so the
@@ -74,7 +74,8 @@ install these paths:
 | --- | --- |
 | `/usr/bin/linscp` | the console client |
 | `/usr/bin/linscp-gui` | the graphical client launcher |
-| `/usr/share/linscp/gui/` | the GUI's Python modules and web client |
+| `/usr/share/linscp/gui/` | the GUI's Python modules, its command templates and its web client |
+| `/usr/share/linscp/automation/LinSCP.psm1` | the PowerShell 7 wrapper over the console client |
 | `/usr/share/man/man1/linscp.1.gz` | the manual page |
 | `/usr/share/applications/linscp.desktop` | the desktop entry, with `sftp://`, `ftp://` and `ftps://` handlers |
 | `/usr/share/pixmaps/linscp.png`, `/usr/share/icons/hicolor/scalable/apps/linscp.svg` | the icons |
@@ -82,6 +83,11 @@ install these paths:
 
 `linscp -gui` and the desktop entry both start `linscp-gui`, which runs
 the GUI's Python modules under `/usr/share/linscp/gui/`.
+
+`make -C source/linux install` and `cmake --install` lay out the same tree
+under the prefix they are given. The three installers are kept in step by
+`tools/check_platform_conversion.py`, which fails when one of them ships a
+file the others do not.
 
 The CI `debian-package` job builds the package, checks that the main paths
 above are present, installs it, and starts the installed GUI. A launcher that
@@ -195,6 +201,17 @@ abbreviated to any unique prefix: `synch local` is `synchronize local`, and
 `option bat cont` is `option batch continue`. An abbreviation that fits several
 names is refused with the candidates, so that a different command is never run
 by mistake.
+
+An argument is split on blanks. A word in single quotes is literal, a word in
+double quotes keeps its blanks, and a backslash outside quotes stands in front
+of the character behind it. Inside double quotes a backslash is literal
+unless it stands in front of a double quote or of another backslash, so a path
+carried over from a Windows client keeps its separators: `get
+"C:\Users\me\file.txt"` downloads the file of that name and not a file called
+`C:Usersmefile.txt`. These are the rules of a POSIX shell, because the names
+on this platform are POSIX names: a backslash and an apostrophe are ordinary
+characters of a file name here, so a script that has to name such a file
+quotes it.
 
 In a script or an interactive line, `%1%` to `%9%` are replaced by `-parameter`
 values. `%TIMESTAMP%` is the local time; `%TIMESTAMP#yyyy-mm-dd%` sets a
@@ -398,3 +415,18 @@ Automated tests are the evidence for each feature. The
 prints an evidence line that reports its passes, failures and skipped cases.
 [`upstream-parity.md`](upstream-parity.md) explains how the evidence is recorded
 and checked.
+
+One of those commands checks the platform itself. LinSCP is a Linux-only
+client - the Windows port is gone - and
+
+```sh
+python3 tools/check_platform_conversion.py
+```
+
+reads the sources and refuses a Windows API call, a Windows environment
+variable, a Windows path, a file of another platform, an installer that
+disagrees with the others, and an error message whose wording contradicts
+the template it is filled into. `make -C source/linux check` runs it, CTest
+registers it as `platform-conversion-check`, and CI runs it on every push.
+`tools/tests/test_platform_conversion.py` holds the check itself to the same
+standard: it has to fail on the things it claims to catch.
