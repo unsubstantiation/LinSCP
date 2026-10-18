@@ -4,10 +4,10 @@ This is the operator reference for the Debian build of LinSCP: the console
 client, its options and commands, protocols, authentication, packaging and
 troubleshooting. For an overview, see the top-level [readme.md](../readme.md).
 
-The client `linscp` is built from the platform-neutral PuTTY core
-(`source/putty`), a POSIX platform layer from upstream PuTTY 0.85
-(`libs/putty/unix`, `libs/putty/charset`) and the LinSCP front end
-(`source/linux`).
+The client `linscp` is built from the LinSCP front end (`source/linux`)
+on libssh: Session.cpp owns the transport, authentication and host-key
+policy, and SftpClient.cpp speaks the SFTP v3 wire protocol itself over
+a libssh subsystem channel.
 
 ## Requirements
 
@@ -256,7 +256,7 @@ open sftp://user@example.com:2222/var/data -hostkey=<fingerprint>
 The password is optional in the URL. Prefer `-password=` or
 `LINSCP_PASSWORD`, so that it does not end up in a script file.
 
-**SSH.** `sftp://` uses the bundled PuTTY SFTP client. `scp://` (and `ssh://`)
+**SSH.** `sftp://` uses this client's own SFTP v3 implementation over libssh. `scp://` (and `ssh://`)
 uses `source/linux/ScpClient.cpp`: it runs the server's login shell for
 listings, `stat`, `cd` and the directory and metadata commands, and the server's
 own `scp` for the bytes, over the rcp protocol. Each SCP command opens its own
@@ -357,10 +357,9 @@ that user's local pane.
 
 * **ssh-agent** (recommended): with `SSH_AUTH_SOCK` set, the keys in the agent
   are offered automatically.
-* **Private key file**: `-privatekey=` takes a PuTTY `.ppk` file, an OpenSSH key
-  (`id_rsa`, `id_ed25519`, PEM) or an ssh.com key. A key in another format is
-  imported by the core into a temporary `.ppk`, which is removed when the
-  session closes. An encrypted key asks for its passphrase in an interactive
+* **Private key file**: `-privatekey=` takes an OpenSSH key
+  (`id_rsa`, `id_ed25519`, PEM). PuTTY `.ppk` files are not read; convert
+  them with `puttygen` first. An encrypted key asks for its passphrase in an interactive
   run. In `-batch` mode the connection fails and says to run interactively or
   pass `-passphrase=` to `open`; for scripts, load the key into the agent.
 * **Password**: `-password=` or `LINSCP_PASSWORD`. Interactive runs ask for

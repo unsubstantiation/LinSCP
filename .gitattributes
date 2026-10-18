@@ -1,8 +1,1 @@
-libs/* linguist-vendored
-source/putty/* linguist-vendored
-
-# Preserve this upstream CRLF file while allowing whitespace checks.
-source/putty/crypto/blowfish.c whitespace=cr-at-eol
-
-# The vendored PuTTY tree keeps its upstream CRLF line endings, so there
-# is deliberately no broad eol rule here: the LinSCP sources are LF.
+source/gui/web/vendor/* linguist-vendored

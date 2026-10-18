@@ -842,8 +842,8 @@
       "status": "verified",
       "notes": "Native PuTTY SFTP session refuses bad credentials and unexpected SSH host keys.",
       "source": [
-        "source/linux/PuttyGlue.cpp",
-        "source/linux/SftpClient.c"
+        "source/linux/SshKeys.cpp",
+        "source/linux/SftpClient.cpp"
       ],
       "checks": {
         "live-sftp": [
@@ -863,7 +863,7 @@
       "status": "verified",
       "notes": "Transfers, directories, renames, symbolic links (ln/symlink) and chmod use native SFTP requests rather than curl.",
       "source": [
-        "source/linux/SftpClient.c",
+        "source/linux/SftpClient.cpp",
         "source/linux/Script.cpp"
       ],
       "checks": {
@@ -884,7 +884,7 @@
       "status": "verified",
       "notes": "Native copy-data replies are used when offered; a multi-source/recursive streamed fallback works when absent.",
       "source": [
-        "source/linux/SftpClient.c",
+        "source/linux/SftpClient.cpp",
         "source/linux/Script.cpp"
       ],
       "checks": {
@@ -905,7 +905,7 @@
       "status": "verified",
       "notes": "Server check-file-name is used for sha-256 and all documented hashes fall back to downloaded bytes when refused.",
       "source": [
-        "source/linux/SftpClient.c",
+        "source/linux/SftpClient.cpp",
         "source/linux/Script.cpp"
       ],
       "checks": {
@@ -926,7 +926,7 @@
       "status": "verified",
       "notes": "Octal and recursive symbolic chmod plus file and directory timestamp preservation (-preservetime=all) work against the live SFTP server.",
       "source": [
-        "source/linux/SftpClient.c",
+        "source/linux/SftpClient.cpp",
         "source/linux/Script.cpp"
       ],
       "checks": {
@@ -1467,7 +1467,7 @@
       "status": "verified",
       "notes": "Interrupted uploads/downloads stage in .filepart and continue there rather than splicing the final destination.",
       "source": [
-        "source/linux/SftpClient.c",
+        "source/linux/SftpClient.cpp",
         "source/linux/Script.cpp"
       ],
       "checks": {
@@ -1922,7 +1922,7 @@
       "status": "verified",
       "notes": "Native SFTP refuses an unknown/unexpected host key until it is pinned.",
       "source": [
-        "source/linux/PuttyGlue.cpp",
+        "source/linux/SshKeys.cpp",
         "source/linux/Session.cpp"
       ],
       "checks": {
@@ -1942,7 +1942,7 @@
       "status": "verified",
       "notes": "Password, unencrypted and passphrase-protected private-key (-passphrase=), ssh-agent and copyid public/private key installation work against the live SFTP server.",
       "source": [
-        "source/linux/PuttyGlue.cpp",
+        "source/linux/SshKeys.cpp",
         "source/linux/Session.cpp",
         "source/linux/Script.cpp"
       ],
@@ -2667,7 +2667,7 @@
         "source/linux/Console.cpp",
         "source/linux/Script.cpp",
         "source/linux/Session.cpp",
-        "source/linux/PuttyGlue.cpp",
+        "source/linux/SshKeys.cpp",
         "source/linux/main.cpp",
         "source/linux/locales/en.json",
         "source/linux/locales/es.json",
@@ -2745,7 +2745,7 @@
       "notes": "source/linux/Makefile builds the native Linux/PuTTY client, refuses non-Linux hosts and provides an install target staged under DESTDIR/PREFIX.",
       "source": [
         "source/linux/Makefile",
-        "libs/putty/unix/platform.h"
+        "source/linux/Makefile"
       ],
       "checks": {
         "script": [
@@ -2884,7 +2884,7 @@
       "id": "platform.conversion-completeness",
       "area": "Packaging/platforms",
       "status": "verified",
-      "notes": "LinSCP is a Linux-only client and the check that says so is part of the build: tools/check_platform_conversion.py reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose operation phrase contradicts the template it is filled into. It runs in 'make -C source/linux check', as the CTest case 'platform-conversion-check', and in CI. The vendored PuTTY tree is not scanned: it is upstream's code and keeps upstream's Windows comments, while the platform layer this project owns (libs/putty/unix) is.",
+      "notes": "LinSCP is a Linux-only client and the check that says so is part of the build: tools/check_platform_conversion.py reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose operation phrase contradicts the template it is filled into. It runs in 'make -C source/linux check', as the CTest case 'platform-conversion-check', and in CI. The vendored xterm.js files under source/gui/web/vendor are upstream code and are not scanned; everything else in the tree is this project's own.",
       "source": [
         "tools/check_platform_conversion.py",
         "tools/tests/test_platform_conversion.py"

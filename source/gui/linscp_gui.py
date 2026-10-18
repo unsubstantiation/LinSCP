@@ -48,8 +48,13 @@ import subprocess
 import tempfile
 import threading
 import urllib.parse
+import base64
+import fcntl
 import hashlib
 import hmac
+import pty
+import struct
+import termios
 from fnmatch import fnmatch
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
@@ -1367,6 +1372,131 @@ def require_tab(tab_id=None):
     if tab is None or not tab.connected:
         return None
     return tab
+
+
+# ---------------------------------------------------------------------------
+# Embedded terminal (xterm.js in the page, 'linscp -shell' behind a pty)
+# ---------------------------------------------------------------------------
+
+class TerminalProcess:
+    """One 'linscp -shell' child behind a pseudo-terminal.
+
+    The browser renders the byte stream with xterm.js; this class only
+    owns the pty, the child's output buffer and its size. Output is
+    polled by absolute offset so a slow poll loses nothing, and the
+    buffer is capped: a terminal nobody reads cannot grow without end.
+    """
+
+    BUFFER_LIMIT = 1024 * 1024
+
+    def __init__(self, argv, env):
+        master, slave = pty.openpty()
+        self._set_size(slave, 30, 100)
+        self.proc = subprocess.Popen(argv, stdin=slave, stdout=slave,
+                                     stderr=slave, env=env,
+                                     start_new_session=True, close_fds=True)
+        os.close(slave)
+        self.master = master
+        self.buffer = bytearray()
+        self.dropped = 0
+        self.lock = threading.Lock()
+        self.alive = True
+        self.thread = threading.Thread(target=self._pump_output, daemon=True)
+        self.thread.start()
+
+    @staticmethod
+    def _set_size(fd, rows, cols):
+        fcntl.ioctl(fd, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols, 0, 0))
+
+    def _pump_output(self):
+        try:
+            while True:
+                chunk = os.read(self.master, 65536)
+                if not chunk:
+                    break
+                with self.lock:
+                    self.buffer += chunk
+                    excess = len(self.buffer) - self.BUFFER_LIMIT
+                    if excess > 0:
+                        del self.buffer[:excess]
+                        self.dropped += excess
+        except OSError:
+            pass
+        finally:
+            self.alive = False
+            try:
+                self.proc.wait(timeout=5)
+            except Exception:
+                pass
+
+    def write(self, data):
+        if self.alive and data:
+            os.write(self.master, data)
+
+    def resize(self, cols, rows):
+        if cols > 0 and rows > 0:
+            self._set_size(self.master, rows, cols)
+
+    def poll(self, after):
+        with self.lock:
+            start = max(after - self.dropped, 0)
+            data = bytes(self.buffer[start:])
+            offset = self.dropped + len(self.buffer)
+        return data, offset, self.alive, self.proc.poll()
+
+    def close(self):
+        self.alive = False
+        try:
+            self.proc.terminate()
+        except Exception:
+            pass
+        try:
+            os.close(self.master)
+        except OSError:
+            pass
+
+
+TERMINALS = {}
+TERMINALS_LOCK = threading.Lock()
+
+
+def start_terminal(tab):
+    """Open an embedded terminal for a connected tab's session."""
+    session = tab.session
+    protocol = str(session.get("protocol") or "sftp")
+    if protocol not in ("sftp", "scp"):
+        raise ValueError("A terminal is only available for "
+                         "SSH (sftp:// or scp://) sessions.")
+    argv = core_command_line(session) + ["-shell", session_url(session)]
+    env = popen_kwargs(session.get("password"))["env"]
+    term = TerminalProcess(argv, env)
+    terminal_id = secrets.token_hex(8)
+    with TERMINALS_LOCK:
+        TERMINALS[terminal_id] = (str(tab.id), term)
+    return terminal_id
+
+
+def get_terminal(terminal_id):
+    with TERMINALS_LOCK:
+        entry = TERMINALS.get(str(terminal_id or ""))
+    return entry[1] if entry else None
+
+
+def close_terminal(terminal_id):
+    with TERMINALS_LOCK:
+        entry = TERMINALS.pop(str(terminal_id or ""), None)
+    if entry:
+        entry[1].close()
+
+
+def close_tab_terminals(tab_id):
+    with TERMINALS_LOCK:
+        doomed = [key for key, (owner, _term) in TERMINALS.items()
+                  if owner == str(tab_id)]
+        terms = [TERMINALS.pop(key)[1] for key in doomed]
+    for term in terms:
+        term.close()
 
 
 def find_challenge(tab_id):
@@ -2833,6 +2963,25 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             })
             return
 
+        if path == "/api/terminal/output":
+            if not self.guarded():
+                return
+            term = get_terminal(query.get("terminal", [None])[0])
+            if term is None:
+                self.send_json({"success": False,
+                                "error": "No such terminal."}, status=400)
+                return
+            try:
+                after = int(query.get("after", ["0"])[0])
+            except ValueError:
+                after = 0
+            data, offset, alive, exit_code = term.poll(after)
+            self.send_json({"success": True,
+                            "data": base64.b64encode(data).decode("ascii"),
+                            "offset": offset, "alive": alive,
+                            "exit_code": exit_code})
+            return
+
         if path == "/api/logs":
             with STATE_LOCK:
                 self.send_json({"logs": list(STATE["logs"])})
@@ -3239,6 +3388,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             pending = pop_challenge(tab_id)
             if pending is not None:
                 pending.terminate()
+            close_tab_terminals(tab_id)
             with STATE_LOCK:
                 for index, tab in enumerate(STATE["tabs"]):
                     if tab.id == tab_id or str(tab.id) == str(tab_id):
@@ -3278,17 +3428,42 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if tab is None:
                 self.send_json({"success": False, "error": "Not connected"}, status=400)
                 return
-            add_log("Opening a terminal on the server", "info")
-            code, stdout, stderr = run_linscp(
-                "open %s ; terminal" % quote_remote(session_url(tab.session)),
-                tab.session)
-            if code == 0:
-                add_log("Terminal opened", "success")
-                self.send_json({"success": True, "output": stdout})
-            else:
-                message = stderr.strip() or stdout.strip() or "Cannot open a terminal"
-                add_log(message, "error")
-                self.send_json({"success": False, "error": message}, status=400)
+            try:
+                terminal_id = start_terminal(tab)
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)}, status=400)
+                return
+            add_log("Terminal opened on %s" % session_url(tab.session), "success")
+            self.send_json({"success": True, "terminal": terminal_id})
+            return
+
+        if path == "/api/terminal/input":
+            term = get_terminal(body.get("terminal"))
+            if term is None:
+                self.send_json({"success": False,
+                                "error": "No such terminal."}, status=400)
+                return
+            try:
+                data = base64.b64decode(str(body.get("data") or ""))
+            except Exception:
+                self.send_json({"success": False,
+                                "error": "Terminal input was not base64."},
+                               status=400)
+                return
+            cols = int(body.get("cols") or 0)
+            rows = int(body.get("rows") or 0)
+            if cols and rows:
+                term.resize(cols, rows)
+            try:
+                term.write(data)
+            except OSError:
+                pass
+            self.send_json({"success": True, "alive": term.alive})
+            return
+
+        if path == "/api/terminal/close":
+            close_terminal(body.get("terminal"))
+            self.send_json({"success": True})
             return
 
         if path == "/api/sessions/save":

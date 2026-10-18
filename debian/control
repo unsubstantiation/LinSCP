@@ -2,7 +2,8 @@ Source: linscp
 Section: net
 Priority: optional
 Maintainer: nuipona <nuipona@users.noreply.github.com>
-Build-Depends: dpkg-dev (>= 1.20), g++ | c++-compiler, make
+Build-Depends: dpkg-dev (>= 1.20), g++ | c++-compiler, make, pkg-config,
+ libssh-dev (>= 0.10), libssl-dev, zlib1g-dev
 Standards-Version: 4.7.4
 Rules-Requires-Root: no
 
@@ -15,8 +16,9 @@ Description: graphical and console file transfer client for Linux
  by WinSCP. It provides an interactive command-line client (linscp) and
  a dual-pane Commander graphical client (linscp-gui) in the browser.
  .
- SFTP and SCP are served by the bundled PuTTY core and this client's own
- protocol code - for SCP the remote-shell directory engine and the rcp
+ SSH, SFTP and SCP are served by libssh and this client's own protocol
+ code - the SFTP v3 wire protocol (with the copy-data and check-file-name
+ extensions) and, for SCP, the remote-shell directory engine and the rcp
  transfer protocol; ftp, ftps, WebDAV and S3 go through curl, which is why
  it is recommended. The client provides transfer resume and recursive
  synchronization, public-key, ssh-agent and password authentication,

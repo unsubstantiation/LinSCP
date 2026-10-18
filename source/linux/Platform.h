@@ -4,9 +4,8 @@
  *
  * Everything above this layer (PathUtil, LocalFs, Console, Script,
  * ProtocolClient, Session) is written against these helpers plus the
- * C++ standard library. SFTP is served by the native PuTTY engine
- * (Session + SftpClient.c + PuttyGlue.cpp) over the PuTTY Unix platform
- * layer in libs/putty/unix; the other protocols go through the curl
+ * C++ standard library. SSH, SFTP and SCP are served by libssh (Session + the native
+ * SftpClient.cpp); the other protocols go through the curl
  * backend in ProtocolClient.cpp.
  */
 

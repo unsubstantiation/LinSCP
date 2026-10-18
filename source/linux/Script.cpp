@@ -25,7 +25,7 @@
 
 /* The public half of a key file, which only the bundled PuTTY core can
  * read on POSIX. */
-#include "PuttyCompat.h"
+#include "SshKeys.h"
 
 #include <unistd.h>
 
