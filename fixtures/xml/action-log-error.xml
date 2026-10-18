@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<action-log>
+  <session name="test-session" protocol="SFTP" />
+  <upload remote-path="/data/file.txt" size="0" result="failure" error="Connection refused." />
+  <message type="error" text="Connection refused." />
+</action-log>

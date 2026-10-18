@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<action-log>
+  <session name="test-session" protocol="SFTP" />
+  <upload remote-path="/data/file.txt" size="1024" result="success" />
+  <message text="Upload completed." />
+</action-log>

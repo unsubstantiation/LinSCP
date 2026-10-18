@@ -16,7 +16,7 @@ GSSAPI is compiled out; SSH tunnel configuration is not implemented.
 
 **Acceptance criteria:**
 
-- [ ] Enable optional GSSAPI with dependency detection and a Kerberos test realm. Add authenticated SSH forwarding, destination host-key verification and lifecycle cleanup. Security-review credentials, forwarding exposure and failure paths before enabling either by default.
+- [ ] Enable optional GSSAPI with dependency detection and a Kerberos test realm. Add authenticated SSH forwarding, destination host-key verification and lifecycle cleanup. Security-review credentials, forwarding exposure and failure paths before enabling either by default. Note: build uses `-DNO_GSSAPI`; feature remains unimplemented.
 
 ## security.gui-account
 
@@ -24,7 +24,7 @@ GSSAPI is compiled out; SSH tunnel configuration is not implemented.
 
 The loopback GUI has no multi-user account or authorization roles.
 
-**Next:** Add authenticated accounts before claiming multi-user/server deployment support.
+**Next:** Add authenticated accounts before claiming multi-user/server deployment support. No multi-user account or authorization roles exist in the loopback GUI; feature remains unimplemented.
 
 **Acceptance criteria:**
 
@@ -36,7 +36,7 @@ The loopback GUI has no multi-user account or authorization roles.
 
 No WinSCP .NET assembly or equivalent object model for Linux. The C ABI header the Windows port left behind (source/linux/liblinscp.h) is gone: it declared a library that no build produced, and a public header for an API that does not exist is worse than none. The gap is unchanged - the automation object model still has to be built.
 
-**Next:** Define an API contract and test automation clients; a CLI is not the assembly.
+**Next:** Define the Linux object-model contract and upstream compatibility boundary. No .NET library exists; feature remains unimplemented. A CLI is not the assembly.
 
 **Acceptance criteria:**
 
@@ -44,7 +44,11 @@ No WinSCP .NET assembly or equivalent object model for Linux. The C ABI header t
 
 ## automation.powershell
 
-**Area:** Automation · **Status:** partial
+**Area:** Automation · **Status:** partial (updated)
+
+The PowerShell 7 module (`automation/LinSCP.psm1`) passes all static checks (exported cmdlets match definitions, no passwords reach the command line, control-character refusal and multiline refusal are implemented). The live Pester suite (`automation/LinSCP.Tests.ps1`) requires `pwsh` (PowerShell 7), which this workspace does not have installed; without it the live cases skip loudly rather than reporting a green run. The fixtures `fixtures/xml/action-log-success.xml` and `fixtures/xml/action-log-error.xml` were added to validate XML action-log structure for upstream compatibility.
+
+**Next:** Record a green live Pester run (install pwsh, run the harness): a session opened and closed, an upload and a download of exact bytes, a listing as pipeline objects, a terminating error, a cancelled transfer, and a password that appears neither in the process list nor in the output.
 
 automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Passwords travel on stdin to -server, never on a command line. The module has a test harness (automation/test_psmodule.py, run by make check-live, CTest and CI): static checks that always run, and a Pester suite against the throwaway WebDAV endpoint covering open/close, byte-exact transfers, listing objects, terminating errors, timeout cancellation and password hygiene. The live Pester run needs pwsh, which CI installs; no green live run has been recorded in this ledger yet, and the module remains a shim over the CLI rather than upstream's assembly API.
 
@@ -60,7 +64,7 @@ automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console cl
 
 No system file-manager shell commands or upstream extension system. The half-translated Nautilus extension the Windows Explorer integration left behind is gone: it ran no session, so it uploaded nothing, and it was neither installed nor documented. The command templates of the graphical client (source/gui/explorer-commands.json) are its own feature and are shipped by all three installers.
 
-**Next:** Specify desired desktop environment integrations and build/test them individually.
+**Next:** Specify desired desktop environment integrations and build/test them individually. No file-manager shell commands or upstream extension system exists; feature remains unimplemented.
 
 **Acceptance criteria:**
 
@@ -72,7 +76,7 @@ No system file-manager shell commands or upstream extension system. The half-tra
 
 English/Spanish catalogs cover the browser interface (menus, dialogs, help, ARIA/tooltips, dynamic status/queue/sync/editor/search messages) and the whole command-line client: the per-command help texts, the status, argument, switch and engine messages of the script engine, the operations the error helpers name and the option listing. The translation compiler rejects a message that reaches the user without a catalog entry, a command help text that nobody translated and an error operation that is not in the catalog. Locale precedence, regional fallback, plurals, literal data, safe embedded JSON and internal protocol isolation are tested. Raw server/OS diagnostics, the 'LSCP-' protocol banners and core logs are intentionally preserved.
 
-**Next:** Only English and Spanish catalogs are shipped; upstream ships catalogs for many more languages, and the upstream .NET interface has strings that this client does not have at all. No full upstream language-catalog coverage is claimed.
+**Next:** Only English and Spanish catalogs are shipped (`source/linux/locales/en.json`, `es.json`; `source/gui/locales/en.json`, `es.json`). Upstream ships catalogs for many more languages. Feature remains partial: full upstream language-catalog coverage not implemented.
 
 **Acceptance criteria:**
 
@@ -85,7 +89,7 @@ English/Spanish catalogs cover the browser interface (menus, dialogs, help, ARIA
 
 The XML action log emits structured command, message and transfer actions with secret masking. Its structure resembles upstream but schema/consumer equivalence has not been established.
 
-**Next:** Pin the intended upstream XML schema and validate successful/failing operations with actual automation consumers.
+**Next:** Pin the intended upstream XML schema and validate successful/failing operations with actual automation consumers. Fixtures added: `fixtures/xml/action-log-success.xml` and `fixtures/xml/action-log-error.xml`.
 
 **Acceptance criteria:**
 
