@@ -1270,6 +1270,46 @@ class LiveSftpTests(unittest.TestCase):
                     "<chmod ", "<touch ", "<call ", "<rm "):
             self.assertIn(tag, xml_text)
 
+    def test_etag_names_a_protocol_that_has_no_etags(self):
+        """An ETag precondition is a WebDAV idea, and a session on a
+        transport with no entity tags is told so by name.
+
+        Recording one here would be worse than refusing: nothing on SFTP
+        compares a write against a version, so the next 'put' would go
+        through unconditionally while the script believed it was guarded.
+        '-get' is the one action that is an answer rather than a refusal -
+        it says the protocol has no ETags and succeeds, because asking what
+        version a server has is a question SFTP cannot answer and a script
+        that asks it of several protocols should not stop at the first.
+        """
+        asked = self.run_script("etag /config.ini -get ; echo ASKED")
+        self.assertEqual(asked.returncode, 0, asked.stdout + asked.stderr)
+        self.assertIn("ETag not available", asked.stdout)
+        self.assertIn("ASKED", asked.stdout)
+
+        for switch in ("-match=\"abc\"", "-nomatch=abc", "-clear"):
+            with self.subTest(switch=switch):
+                refused = self.run_script(
+                    "etag /config.ini %s ; echo SHOULD_NOT_RUN" % switch)
+                self.assertEqual(refused.returncode, 1,
+                                 refused.stdout + refused.stderr)
+                self.assertIn("ETag not available", refused.stderr)
+                self.assertNotIn("SHOULD_NOT_RUN", refused.stdout)
+
+        # Nothing was recorded on the way, so the path is an ordinary one:
+        # the next upload of it is not waiting on a version that will never
+        # come, and the bytes land unchanged.
+        source = self.local / "etag-refused.txt"
+        source.write_text("written with no precondition\n", encoding="utf-8")
+        written = self.run_script(
+            "option confirm off ; put %s /etag-refused.txt ; echo WROTE" %
+            source)
+        self.assertEqual(written.returncode, 0,
+                         written.stdout + written.stderr)
+        self.assertIn("WROTE", written.stdout)
+        self.assertEqual((self.root / "etag-refused.txt").read_bytes(),
+                         source.read_bytes())
+
 
 def run_and_report():
     """Run the suite, then print one line that says what was actually run.

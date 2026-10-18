@@ -102,7 +102,7 @@
   "{name}={value}": "{name}={value}",
   "{type}: {etag} on {path}.": "{type}: {etag} en {path}.",
   "Cleared ETag precondition on {path}.": "Precondición ETag eliminada en {path}.",
-  "No ETag (path does not exist).": "Sin ETag (la ruta no existe).",
+  "No ETag: '{path}' does not exist.": "Sin ETag: '{path}' no existe.",
   "The server reported no ETag for '{path}'.": "El servidor no reportó ningún ETag de '{path}'.",
   "(ETag not available for {protocol} protocol.)": "(ETag no disponible para el protocolo {protocol}.)",
   "{count} differences found.": "{count} diferencias encontradas.",

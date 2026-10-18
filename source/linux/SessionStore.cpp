@@ -345,7 +345,7 @@ bool Base64Decode(const std::string & text, std::string & data)
     {
         return false;
     }
-    int val = 0;
+    unsigned int val = 0;
     int valb = -8;
     for (size_t i = 0; i < text.size(); i++)
     {
@@ -359,11 +359,16 @@ bool Base64Decode(const std::string & text, std::string & data)
         {
             return false;
         }
-        val = (val << 6) + static_cast<int>(found - b64Digits);
+        /* Unsigned, and kept to the bits that have not been emitted yet:
+         * a signed accumulator overflowed on the fifth character of any
+         * input longer than a few bytes, which is undefined behaviour
+         * rather than more decoded data. */
+        val = ((val << 6) |
+            static_cast<unsigned int>(found - b64Digits)) & 0xFFFu;
         valb += 6;
         if (valb >= 0)
         {
-            data += static_cast<char>((val >> valb) & 0xFF);
+            data += static_cast<char>((val >> valb) & 0xFFu);
             valb -= 8;
         }
     }

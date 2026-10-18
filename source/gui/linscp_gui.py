@@ -1314,6 +1314,9 @@ def quote_local(path):
     return '"' + path.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
+MODE_CHARACTERS = "01234567ugoaUGOA-+=rwxXst, \t"
+
+
 def check_permission_mode(mode_text):
     """Validate a chmod mode the way the console client accepts one.
 
@@ -1322,39 +1325,57 @@ def check_permission_mode(mode_text):
     command line, so this is what stands between a permissions field and
     the session's command stream. Both the octal and the symbolic forms
     'chmod' documents are accepted, and nothing else.
+
+    The grammar is the one ParseSymbolicPermissions() and ParseOctalMode()
+    in the console client parse, character for character: a mode this
+    panel accepts has to be a mode the remote chmod accepts too, and one
+    the client would refuse is refused here rather than answered with a
+    failure after the user was told the mode was usable.
     """
     text = str(mode_text or "").strip()
     if not text:
         return "Enter a permission mode, such as 644 or u+x."
     if len(text) > 64:
         return "That permission mode is too long."
-    if all(ch in "01234567" for ch in text):
-        if len(text) > 4:
-            return "Permissions must be an octal mode such as 644."
-        return ""
-    # Symbolic: [ugoa...][[-+=][rwxXstugo...]...], comma separated, with the
-    # same grammar the console client parses in ParseSymbolicPermissions().
-    # A mode that is neither form is refused here rather than sent to be
-    # misread there, and one the client would accept is not refused here.
-    for clause in text.split(","):
-        clause = clause.strip()
-        if not clause:
-            return "That permission mode has an empty clause."
+    # A mode is only ever these characters. A newline, a semicolon or a
+    # quote is refused here rather than reaching the command stream.
+    if any(ch not in MODE_CHARACTERS for ch in text):
+        return ("That permission mode has a character that is not part of "
+                "an octal or a symbolic mode.")
+    if text[0].isdigit():
+        # ParseOctalMode(): one leading zero is a prefix, and what is left
+        # is one to four octal digits. '00644' is the client's own spelling
+        # of 644, so refusing it here would refuse a mode it accepts.
+        digits = text[1:] if len(text) > 1 and text[0] == "0" else text
+        if digits and len(digits) <= 4 and all(ch in "01234567" for ch in digits):
+            return ""
+        return "Permissions must be an octal mode such as 644."
+    # Symbolic: one or more '<who>(<op><letters>)+' clauses, separated by
+    # commas or blanks. Several operator groups in one clause apply left to
+    # right, as chmod(1) applies them: 'u+x-w' is 'u+x' and then 'u-w'.
+    clauses = text.replace(",", " ").split()
+    if not clauses:
+        return "That permission mode states no permission at all."
+    for clause in clauses:
         index = 0
-        while index < len(clause) and clause[index] in "ugoa":
+        who = ""
+        while index < len(clause) and clause[index] in "ugoaUGOA":
+            who += clause[index].lower()
             index += 1
-        if index >= len(clause) or clause[index] not in "-+=":
-            return ("A symbolic mode needs one of -, + or = after "
-                    "u, g, o or a, as in u+x or a=r,go-w.")
-        if index == 0 and clause[0] != "=":
-            # '=rwx' with no letters in front applies to everybody, which
-            # is what the console client does with it. Anything else needs
-            # to say who it is for.
-            return ("A symbolic mode starts with u, g, o or a, "
-                    "as in u+x or a=r,go-w.")
-        while index < len(clause):
+        groups = 0
+        while index < len(clause) and clause[index] in "-+=":
             operator = clause[index]
             index += 1
+            if not who:
+                if operator != "=":
+                    # '+x' names nobody, and the client refuses it rather
+                    # than quietly change nothing.
+                    return ("A symbolic mode starts with u, g, o or a, "
+                            "as in u+x or a=r,go-w.")
+                # '=rwx' with no letters in front applies to everybody,
+                # which is what the console client does with it.
+                who = "a"
+            groups += 1
             letters = 0
             while index < len(clause) and clause[index] in "rwxXstuugo":
                 index += 1
@@ -1362,9 +1383,12 @@ def check_permission_mode(mode_text):
             if letters == 0:
                 return ("A symbolic mode needs a permission letter after "
                         "-, + or =, from r, w, x, X, s, t, u, g or o.")
-            if index < len(clause) and clause[index] not in "-+=":
-                return ("A symbolic mode has something after its permission "
-                        "letters that is not another -, + or =.")
+        if groups == 0:
+            return ("A symbolic mode needs one of -, + or = after "
+                    "u, g, o or a, as in u+x or a=r,go-w.")
+        if index != len(clause):
+            return ("A symbolic mode has something after its permission "
+                    "letters that is not another -, + or =.")
     return ""
 
 
@@ -1424,6 +1448,23 @@ def contained_local_path(base, name):
     return target, ""
 
 
+def build_chmod_command(remote_dir, mode_text, name):
+    """The commands a remote chmod runs: enter the panel, change one entry.
+
+    The mode is an operand of the client's command splitter as much as the
+    name is. A symbolic mode may separate its clauses with blanks - the
+    client reads 'u=rw g=r' as two clauses - so unquoted it would arrive as
+    a second file name and the chmod would run against a path nobody asked
+    for. It is validated here too, so the endpoint cannot send a mode the
+    client would refuse after the panel called it usable.
+    """
+    mode_error = check_permission_mode(mode_text)
+    if mode_error:
+        raise ValueError(mode_error)
+    return ["cd " + quote_remote(remote_dir),
+            "chmod %s %s" % (quote_remote(mode_text), quote_remote(name))]
+
+
 def apply_local_mode(path, mode_text):
     """Apply an octal or symbolic mode to a local path.
 
@@ -1439,12 +1480,14 @@ def apply_local_mode(path, mode_text):
     st_mode = os.stat(path).st_mode
     current = stat.S_IMODE(st_mode)
     is_dir = stat.S_ISDIR(st_mode)
-    for clause in text.split(","):
-        clause = clause.strip()
+    # Commas and blanks separate clauses here exactly as they do in
+    # ParseSymbolicPermissions(), so a mode the panel accepted for the
+    # remote side means the same thing on the local one.
+    for clause in text.replace(",", " ").split():
         index = 0
         who = 0
-        while index < len(clause) and clause[index] in "ugoa":
-            letter = clause[index]
+        while index < len(clause) and clause[index] in "ugoaUGOA":
+            letter = clause[index].lower()
             index += 1
             if letter == "u":
                 who |= 0o700
@@ -1454,7 +1497,7 @@ def apply_local_mode(path, mode_text):
                 who |= 0o007
             else:
                 who |= 0o777
-        while index < len(clause):
+        while index < len(clause) and clause[index] in "-+=":
             operator = clause[index]
             index += 1
             if who == 0 and operator == "=":
@@ -2731,13 +2774,13 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 self.send_json({"success": False, "error": "Not connected"}, status=400)
                 return
             mode_text = str(body.get("permissions") or "644")
-            mode_error = check_permission_mode(mode_text)
-            if mode_error:
-                self.send_json({"success": False, "error": mode_error}, status=400)
+            try:
+                commands = build_chmod_command(tab.remote_dir, mode_text,
+                                               body.get("name") or "")
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)}, status=400)
                 return
-            code, lines = tab.run_many([
-                "cd " + quote_remote(tab.remote_dir),
-                "chmod %s %s" % (mode_text, quote_remote(body.get("name") or ""))])
+            code, lines = tab.run_many(commands)
             if code == 0:
                 add_log("Changed remote permissions: %s" % body.get("name"), "success")
                 self.send_json({"success": True})
@@ -3541,14 +3584,18 @@ def transfer_switches(body):
         if text in ("on", "off"):
             switches.append("-resumesupport=" + text)
         else:
+            # The client's -resumesupport= takes a number of KiB, the same
+            # unit its manual page, its help and the field the transfer
+            # dialog shows all state; a byte count sent here would have
+            # been read 1024 times too large.
             try:
                 threshold = int(text)
             except ValueError:
                 raise ValueError("Resume support must be on, off or a number "
-                                 "of bytes.")
+                                 "of KiB.")
             if threshold < 0:
                 raise ValueError("Resume support must be on, off or a number "
-                                 "of bytes.")
+                                 "of KiB.")
             switches.append("-resumesupport=%d" % threshold)
     return " ".join(part for part in switches if part)
 

@@ -5,6 +5,7 @@
 
 #include <cctype>
 #include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -299,8 +300,8 @@ std::string ToLower(const std::string & text)
 const char * const kCommandNames[] = {
     "!", "ascii", "attr", "binary", "bye", "call", "cd", "checksum", "chmod",
     "close", "copyid", "cp", "del", "delsession", "dir", "echo", "edit",
-    "end", "exit", "get", "help", "keepuptodate", "lcd", "lls", "ln",
-    "etag", "lock", "lpwd", "ls", "man", "md", "mkdir", "mget", "mput", "mv",
+    "end", "etag", "exit", "get", "help", "keepuptodate", "lcd", "lls", "ln",
+    "lock", "lpwd", "ls", "man", "md", "mkdir", "mget", "mput", "mv",
     "open", "option", "presets", "property", "pwd", "put", "quit", "recv",
     "rename", "rm", "rmdir", "rmsession", "rmspreset", "send", "session",
     "sessions", "stat", "savepreset", "savesession", "show", "symlink",
@@ -492,6 +493,16 @@ void ProgressCallback(unsigned long long transferred, unsigned long long total, 
     Console::Instance().TransferProgress(transferred);
 }
 
+/*
+ * Whether 'text' begins with 'prefix' and carries a value after it.
+ *
+ * The character more than the prefix is deliberate: a switch given with
+ * nothing behind its '=' is refused as unknown rather than read as an
+ * empty value, because an empty '-filemask=' or '-transfer=' would
+ * otherwise silently change what a transfer does. A switch whose value may
+ * legitimately be empty says so at its own place in the argument loop, the
+ * way '-rawsettings' and '-preset=' do.
+ */
 bool StartsWith(const std::string & text, const char * prefix)
 {
     size_t len = strlen(prefix);
@@ -3265,7 +3276,11 @@ bool Script::ParseTransferSwitches(const std::string & command, bool uploads,
             }
             char * end = NULL;
             const long limit = strtol(value.c_str(), &end, 10);
-            if (end == NULL || *end != '\0' || limit < 0)
+            /* A value strtol() saturated, or one wider than the field it
+             * is stored in, would have been truncated into a different
+             * limit than the one the switch asked for. */
+            if (end == NULL || *end != '\0' || limit < 0 ||
+                limit > static_cast<long>(UINT_MAX))
             {
                 return SwitchError(command, "The value of '-speed' must be a "
                     "whole number of kilobytes per second (0 removes the "
@@ -3286,7 +3301,12 @@ bool Script::ParseTransferSwitches(const std::string & command, bool uploads,
             {
                 char * end = NULL;
                 const long threshold = strtol(value.c_str(), &end, 10);
-                if (end == NULL || *end != '\0' || threshold < 0)
+                /* The threshold becomes a number of bytes, so a value that
+                 * does not survive the multiplication is refused rather
+                 * than wrapped into a smaller one. */
+                if (end == NULL || *end != '\0' || threshold < 0 ||
+                    static_cast<unsigned long long>(threshold) >
+                        ULLONG_MAX / 1024ULL)
                 {
                     return SwitchError(command, "The value of "
                         "'-resumesupport' must be on, off or a number of "
@@ -4399,23 +4419,28 @@ bool Script::ParseSyncArguments(const std::vector<std::string> & args,
         }
         else if (StartsWith(lower, "-interval="))
         {
-            const int value = atoi(a.substr(strlen("-interval=")).c_str());
-            if (value < 1 || value > 86400)
+            /* Strictly digits: atoi() accepted '-interval=12abc' as 12, so
+             * a mistyped value became a different interval rather than an
+             * error. */
+            long long value = 0;
+            if (!RawInteger(a.substr(strlen("-interval=")), value) ||
+                value < 1 || value > 86400)
             {
                 error = "The interval must be between 1 and 86400 seconds.";
                 return false;
             }
-            interval = value;
+            interval = static_cast<int>(value);
         }
         else if (StartsWith(lower, "-count="))
         {
-            const int value = atoi(a.substr(strlen("-count=")).c_str());
-            if (value < 1 || value > 1000000)
+            long long value = 0;
+            if (!RawInteger(a.substr(strlen("-count=")), value) ||
+                value < 1 || value > 1000000)
             {
                 error = "The count must be a positive number of passes.";
                 return false;
             }
-            count = value;
+            count = static_cast<int>(value);
         }
         else if (!a.empty() && a[0] == '-')
         {
@@ -5054,10 +5079,6 @@ private:
 bool Script::EditRemoteFile(const std::vector<std::string> & args)
 {
     Console & console = Console::Instance();
-    if (!RequireConnection())
-    {
-        return false;
-    }
 
     EditOptions options;
     options.editor = mEditor;
@@ -5103,8 +5124,12 @@ bool Script::EditRemoteFile(const std::vector<std::string> & args)
         else if (StartsWith(lower, "-monitor="))
         {
             const std::string val = a.substr(strlen("-monitor="));
-            const int passes = atoi(val.c_str());
-            if (passes <= 0)
+            /* Strictly digits: atoi() accepted '-monitor=3abc' as 3, so a
+             * mistyped value became a different number of passes rather
+             * than an error. */
+            long long passes = 0;
+            if (!RawInteger(val, passes) || passes <= 0 ||
+                passes > static_cast<long long>(UINT_MAX))
             {
                 console.Error(Texts::WrongArguments("edit",
                     "The value of '-monitor' must be a positive number of "
@@ -5134,6 +5159,13 @@ bool Script::EditRemoteFile(const std::vector<std::string> & args)
             "Syntax: edit [-force] [-keep] [-editor=COMMAND] <remotefile>. "
             "One file at a time."));
         mErrors++;
+        return false;
+    }
+    /* The switches are read before the connection is asked for, the way
+     * 'synchronize' and 'keepuptodate' read theirs: a command that cannot
+     * run as written should say so without opening a session first. */
+    if (!RequireConnection())
+    {
         return false;
     }
 
@@ -5703,7 +5735,24 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
         }
         else if (StartsWith(lower, "-port="))
         {
-            options.portNumber = atoi(a.substr(strlen("-port=")).c_str());
+            /* atoi() was used here before: it stops at the first character
+             * that is not a digit and returns 0 for text, so '-port=22x'
+             * stored port 22 and '-port=ssh' stored no port at all, with
+             * nothing to say either had happened. A stored site is opened
+             * later by a script that cannot ask, so the value has to be
+             * whole and in range now. */
+            const std::string value = a.substr(strlen("-port="));
+            long long port = 0;
+            if (!RawInteger(value, port) || port < 1 || port > 65535)
+            {
+                console.Error(Texts::WrongArguments("savesession",
+                    Texts::Translate(
+                        "Invalid port number '{value}' (expected 1 through 65535).",
+                        {{"value", value}})));
+                mErrors++;
+                return false;
+            }
+            options.portNumber = static_cast<int>(port);
         }
         else if (StartsWith(lower, "-username="))
         {
@@ -5711,7 +5760,20 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
         }
         else if (StartsWith(lower, "-protocol="))
         {
-            options.protocol = ToLower(a.substr(strlen("-protocol=")));
+            /* Checked against the schemes 'open' accepts: a stored site is
+             * opened later by a script that cannot ask, so a protocol
+             * nothing here connects with is refused now rather than stored
+             * and failed at open time. */
+            const std::string scheme = ToLower(a.substr(strlen("-protocol=")));
+            std::string protocol;
+            if (!ResolveProtocolScheme(scheme, protocol))
+            {
+                console.Error(Texts::WrongArguments("savesession",
+                    "Unsupported protocol '" + scheme + "'."));
+                mErrors++;
+                return false;
+            }
+            options.protocol = protocol;
         }
         else if (StartsWith(lower, "-privatekey="))
         {
@@ -5729,8 +5791,11 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
         {
             localDirectory = ExpandTilde(a.substr(strlen("-localdir=")));
         }
-        else if (StartsWith(lower, "-preset="))
+        else if (a == "-preset=" || StartsWith(lower, "-preset="))
         {
+            /* The help of this command offers '-preset=' as the way to
+             * clear the preset a site loads, so the empty value is the
+             * switch's own meaning here and not a missing one. */
             storedPreset = a.substr(strlen("-preset="));
             presetGiven = true;
         }
@@ -6905,11 +6970,11 @@ bool Script::EtagCommand(const std::vector<std::string> & args)
         const std::string lower = ToLower(args[i]);
         if (StartsWith(lower, "-match="))
         {
-            matchEtag = args[i].substr(strlen("-match="));
+            matchEtag = DavEntityTag(args[i].substr(strlen("-match=")));
         }
         else if (StartsWith(lower, "-nomatch="))
         {
-            nomatchEtag = args[i].substr(strlen("-nomatch="));
+            nomatchEtag = DavEntityTag(args[i].substr(strlen("-nomatch=")));
         }
         else if (lower == "-get")
         {
@@ -6935,6 +7000,20 @@ bool Script::EtagCommand(const std::vector<std::string> & args)
     {
         Console::Instance().Error(Texts::WrongArguments("etag",
             "Syntax: etag <file> -match=ETAG | -nomatch=ETAG | -get | -clear"));
+        mErrors++;
+        return false;
+    }
+    /* '*' is the "only where there is nothing yet" of a bare
+     * If-None-Match header, and the If header this client states a
+     * precondition in has no room for it: RFC 4918 reads a condition as a
+     * state token or an entity tag, so a quoted "*" would be a tag no
+     * resource carries and the condition would hold on every write,
+     * guarding nothing while looking like a guard. Refused instead. */
+    if (matchEtag == "*" || nomatchEtag == "*")
+    {
+        Console::Instance().Error(Texts::WrongArguments("etag",
+            "'*' is not an entity tag. Give the tag 'etag <file> -get' "
+            "prints, which a path that is not there answers with."));
         mErrors++;
         return false;
     }
@@ -8254,6 +8333,16 @@ const struct ScriptCommandHelpEntry
         { "sessions", "sessions [ NAME | list | export <file> | import <file> ]\n"
             "  Lists the stored sites, opens one by name, or exports and\n"
             "  imports the whole list." },
+        { "etag", "etag <file> -match=ETAG | -nomatch=ETAG | -get | -clear\n"
+            "  Records an ETag precondition for one WebDAV path with this\n"
+            "  session: an upload, a delete or a move of that path then\n"
+            "  sends it in the If header next to any lock token, so the\n"
+            "  server refuses (412) a write over a version this client has\n"
+            "  not seen instead of accepting it. '-get' prints the ETag the\n"
+            "  server reports now and says so when the path is not there,\n"
+            "  '-clear' forgets the precondition. Give exactly one of the\n"
+            "  four. A protocol with no ETags is refused rather than left\n"
+            "  believing a write is conditional." },
         { "lock", "lock <file> [-timeout=SECONDS]\n"
             "  Takes an exclusive WebDAV write lock on one file and\n"
             "  remembers its token: uploads, deletes and moves of that\n"

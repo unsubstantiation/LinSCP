@@ -487,6 +487,20 @@ void TestFormatting()
     CHECK_EQ(FormatPermissions(0041755), "drwxr-xr-t");
     CHECK_EQ(FormatPermissions(0041754), "drwxr-xr-T");
 
+    /* The type column is part of what a listing says: 'ls' and 'attr'
+     * build their line here, and a symbolic link, a device or a socket
+     * that printed as an ordinary file told the reader the entry could be
+     * transferred as one. FormatPermissions() and the shared listing
+     * parser are one implementation now, so they cannot disagree. */
+    CHECK_EQ(FormatPermissions(0120777), "lrwxrwxrwx");
+    CHECK_EQ(FormatPermissions(0140600), "srw-------");
+    CHECK_EQ(FormatPermissions(0020660), "crw-rw----");
+    CHECK_EQ(FormatPermissions(0060440), "br--r-----");
+    CHECK_EQ(FormatPermissions(0010644), "prw-r--r--");
+    CHECK_EQ(FormatPermissions(0120777), PermissionsString(0120777));
+    CHECK_EQ(FormatPermissions(0104755), PermissionsString(0104755));
+    CHECK_EQ(FormatPermissions(0040755), PermissionsString(0040755));
+
     /* The exact layout of a timestamp is locale and clock dependent, so
      * only check that it looks like 'ls -l' output. */
     const std::string when = FormatFileTime(1700000000UL);
@@ -2635,6 +2649,28 @@ void TestPermissionModes()
     CHECK_TRUE(ParsePermissions("a+X", 0644, true, mode, error));
     CHECK_EQ(ModeString(mode), std::string("0755"));
 
+    /* Several operator groups in one clause apply left to right, the way
+     * chmod(1) applies them and the way the graphical client applies them
+     * to a local file: reading only the first left the rest to be refused
+     * as an unknown permission letter, so the panel accepted a mode the
+     * remote chmod then rejected. */
+    CHECK_TRUE(ParsePermissions("u+x-w", 0644, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0544"));
+    CHECK_TRUE(ParsePermissions("g+w+r", 0644, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0664"));
+    CHECK_TRUE(ParsePermissions("a=r-w", 0644, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0444"));
+    /* The who letters are read case insensitively, the permission letters
+     * are not: 'X' is not 'x'. */
+    CHECK_TRUE(ParsePermissions("UG+X", 0644, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0644"));
+    CHECK_TRUE(ParsePermissions("UG+X", 0744, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0754"));
+    /* An octal mode may carry one leading zero, which is how '00644'
+     * reaches the client from a script that pads its modes. */
+    CHECK_TRUE(ParsePermissions("00644", 0000, false, mode, error));
+    CHECK_EQ(ModeString(mode), std::string("0644"));
+
     /* a bad expression is refused, and the mode is left alone */
     mode = 0600;
     CHECK_FALSE(ParsePermissions("u?x", 0644, false, mode, error));
@@ -2646,6 +2682,13 @@ void TestPermissionModes()
     CHECK_FALSE(ParsePermissions(",", 0644, false, mode, error));
     CHECK_FALSE(ParsePermissions(",,", 0644, false, mode, error));
     CHECK_FALSE(ParsePermissions("999", 0644, false, mode, error));
+    /* '+x' names nobody, so it would change nothing at all: a mode that
+     * silently does nothing is refused rather than applied. */
+    CHECK_FALSE(ParsePermissions("+x", 0644, false, mode, error));
+    CHECK_FALSE(ParsePermissions("-w", 0644, false, mode, error));
+    CHECK_FALSE(ParsePermissions("u=rwx,x-w", 0644, false, mode, error));
+    /* A refused expression leaves the mode at the one the file has. */
+    CHECK_EQ(ModeString(mode), std::string("0644"));
     /* clauses separated by blanks as well as by commas */
     CHECK_TRUE(ParsePermissions("u=rw g=r o=r", 0777, false, mode, error));
     CHECK_EQ(ModeString(mode), std::string("0644"));
@@ -3051,6 +3094,23 @@ void TestHostKeyPinConversion()
     /* An MD5 pin is a real pin, just not one this conversion produces. */
     CHECK_FALSE(HostKeySha256("MD5:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99", pin));
     CHECK_FALSE(HostKeySha256("aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99", pin));
+
+    /* The decoder keeps only the bits it has not emitted yet. An
+     * accumulator that grew without bound overflowed a signed int on the
+     * fifth character of any input, which is undefined behaviour rather
+     * than a longer digest - and every real fingerprint is longer than
+     * four characters. Padding and a repeated alphabet exercise the same
+     * path and have to land on the same pin. */
+    CHECK_TRUE(HostKeySha256(base64 + "=", pin));
+    CHECK_EQ(pin, base64);
+    /* The top of the alphabet, so every six-bit group is all ones: 32
+     * bytes of 0xFF, spelled the way OpenSSH prints it and the way curl
+     * compares it. */
+    const std::string ones = "//////////////////////////////////////////8";
+    CHECK_TRUE(HostKeySha256(ones + "=", pin));
+    CHECK_EQ(pin, ones);
+    CHECK_TRUE(HostKeySha256("SHA256:" + ones, pin));
+    CHECK_EQ(pin, ones);
 }
 
 /*
@@ -3531,19 +3591,65 @@ void TestSshTunnelParsing()
 
 void TestDavEtagHelpers()
 {
-    /* DavGetEtag: the function is a static method on ProtocolClient, tested
-     * with live DAV tests.  Here we test the precondition helpers on the
-     * session. */
+    /* DavGetEtag() is a static method on ProtocolClient and needs a
+     * server, so the live WebDAV suite covers it. What is checked here is
+     * the shape of what a write then sends, because a header a server
+     * cannot read is a precondition that is not there. */
+
+    /* An entity tag is quoted in the header that carries it, and the value
+     * a user pastes back from 'etag -get' has already lost its quotes to
+     * the command splitter: both spellings are stored the same way. */
+    CHECK_EQ(DavEntityTag("abc123"), std::string("\"abc123\""));
+    CHECK_EQ(DavEntityTag("\"abc123\""), std::string("\"abc123\""));
+    CHECK_EQ(DavEntityTag("W/abc123"), std::string("W/\"abc123\""));
+    CHECK_EQ(DavEntityTag("W/\"abc123\""), std::string("W/\"abc123\""));
+    CHECK_EQ(DavEntityTag("*"), std::string("*"));
+
     SessionOptions options;
-    options.davEtags["/test.txt"].ifMatch = "\"abc123\"";
-    CHECK_EQ(options.davEtags["/test.txt"].ifMatch, std::string("\"abc123\""));
-    CHECK_TRUE(options.davEtags["/test.txt"].ifNoneMatch.empty());
-    options.davEtags["/other.txt"].ifNoneMatch = "\"xyz789\"";
-    CHECK_EQ(options.davEtags["/other.txt"].ifNoneMatch, std::string("\"xyz789\""));
+    CHECK_EQ(DavIfHeader(options, "/a.txt"), std::string());
+
+    /* A lock token is a Coded-URL, so the angle brackets are part of it. */
+    options.davLocks["/a.txt"] = "opaquelocktoken:1";
+    CHECK_EQ(DavIfHeader(options, "/a.txt"),
+        std::string("(<opaquelocktoken:1>)"));
+
+    /* A path that is both locked and has a version recorded states both in
+     * ONE list: RFC 4918 reads an If header as either no-tag lists or
+     * tagged lists and never as both, and every condition of a list has to
+     * hold. */
+    options.davEtags["/a.txt"].ifMatch = "\"v1\"";
+    CHECK_EQ(DavIfHeader(options, "/a.txt"),
+        std::string("(<opaquelocktoken:1> [\"v1\"])"));
+
+    options.davLocks.erase("/a.txt");
+    CHECK_EQ(DavIfHeader(options, "/a.txt"), std::string("([\"v1\"])"));
+
+    /* '-nomatch=' is If-None-Match, which a condition list spells with the
+     * 'Not' in front of the tag. */
+    options.davEtags["/a.txt"] = SessionOptions::EtagPrecondition();
+    options.davEtags["/a.txt"].ifNoneMatch = "\"v1\"";
+    CHECK_EQ(DavIfHeader(options, "/a.txt"), std::string("(Not [\"v1\"])"));
+
+    /* A precondition names the path it was recorded for: a collection's
+     * tag does not guard a member, whose own writes move the listing the
+     * tag names. */
+    options.davEtags["/dir"].ifMatch = "\"v2\"";
+    CHECK_EQ(DavIfHeader(options, "/dir/inner.txt"), std::string());
+    CHECK_EQ(DavIfHeader(options, "/dir"), std::string("([\"v2\"])"));
+    CHECK_EQ(DavIfHeader(options, "/directory.txt"), std::string());
+
+    /* The precondition the session keeps, per path. */
+    SessionOptions stored;
+    stored.davEtags["/test.txt"].ifMatch = "\"abc123\"";
+    CHECK_EQ(stored.davEtags["/test.txt"].ifMatch, std::string("\"abc123\""));
+    CHECK_TRUE(stored.davEtags["/test.txt"].ifNoneMatch.empty());
+    stored.davEtags["/other.txt"].ifNoneMatch = "\"xyz789\"";
+    CHECK_EQ(stored.davEtags["/other.txt"].ifNoneMatch,
+        std::string("\"xyz789\""));
     /* Clear by erasing */
-    options.davEtags.erase("/test.txt");
-    CHECK_TRUE(options.davEtags.find("/test.txt") == options.davEtags.end());
-    CHECK_FALSE(options.davEtags.find("/other.txt") == options.davEtags.end());
+    stored.davEtags.erase("/test.txt");
+    CHECK_TRUE(stored.davEtags.find("/test.txt") == stored.davEtags.end());
+    CHECK_FALSE(stored.davEtags.find("/other.txt") == stored.davEtags.end());
 }
 
 void TestScpEngine()

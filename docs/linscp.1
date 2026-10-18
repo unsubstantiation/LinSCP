@@ -578,6 +578,55 @@ Release the lock
 took in this session. A lock taken by another client cannot be released, and
 this session cannot release a lock it did not take.
 .TP
+.BI etag " file \-match=" etag
+Record an
+.B If-Match
+precondition for one WebDAV path with this session. Uploads, deletes and moves
+of that path then carry the tag in the
+.B If
+header, in the same condition list as a lock token, so the server refuses (412)
+a write over a version this client has not read instead of accepting it. The
+value is the tag
+.B etag
+.I file
+.B \-get
+prints: the command splitter takes the quotes off an argument, so this client
+puts them back and keeps a
+.B W/
+weakness prefix outside them.
+.TP
+.BI etag " file \-nomatch=" etag
+Record an
+.B If-None-Match
+precondition: the write goes through only where the server's tag differs, which
+is how a script writes over a resource nobody has written since it read it.
+.B *
+is refused rather than sent, because the
+.B If
+header has no way to say \(dqonly where there is nothing yet\(dq and a quoted
+asterisk is a tag no resource carries: the condition would hold on every write
+and guard nothing while looking like a guard.
+.TP
+.BI etag " file \-get"
+Print the ETag the server reports for
+.I file
+now, read with a Depth-0
+.BR PROPFIND .
+A path that is not there says so, and a server that reports no tag for a path
+that is says that instead; the two are different answers.
+.TP
+.BI etag " file \-clear"
+Forget the precondition recorded for
+.IR file .
+Give exactly one of the four actions per call. A precondition guards the path
+it was recorded for and nothing below it: a collection's tag names its listing,
+so the first member written under an inherited one would stale it and fail
+every later write in that directory. A session whose protocol has no entity
+tags (the SSH engines, FTP and S3) is refused by name rather than left
+believing a write is conditional. Upstream has no ETag preconditions, so
+.B etag
+is a LinSCP extension.
+.TP
 .BI property " file \-get=" name
 Read one WebDAV dead property of
 .IR file .
@@ -916,10 +965,17 @@ reachable through
 .BR lock ,
 .B unlock
 and
-.BR property ;
-a conditional request beyond a lock token (an
+.BR property ,
+and a conditional request beyond a lock token is sent too:
+.B etag
+records an
 .B If-Match
-etag, for instance) is not sent. S3 uses Signature
+or
+.B If-None-Match
+tag per path, a WebDAV write of that path carries it in the same
+.B If
+header, and a write over a version this client has not read is refused with
+412. S3 uses Signature
 Version 4, supports object listing/stat/transfer and CopyObject, and uses
 multipart uploads for files larger than 16 MiB; an interrupted multipart
 upload restarts from the first part. ACLs, versioning, storage classes and

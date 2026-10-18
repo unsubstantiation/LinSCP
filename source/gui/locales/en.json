@@ -500,7 +500,7 @@
   "Upload public key to the server": "Upload public key to the server",
   "Watches the local directory and copies what changes in\n        it to the remote one. It runs as a queue item until you cancel it, so\n        it can be stopped without disturbing the session.": "Watches the local directory and copies what changes in\n        it to the remote one. It runs as a queue item until you cancel it, so\n        it can be stopped without disturbing the session.",
   "Watching the local directory; changes are copied as they happen.": "Watching the local directory; changes are copied as they happen.",
-  "bytes": "bytes",
+  "KiB": "KiB",
   "passes, 0 = until cancelled": "passes, 0 = until cancelled",
   "seconds, 0 = watch only": "seconds, 0 = watch only",
   "{count} command failed.": "{count} command failed.",

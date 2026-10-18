@@ -572,6 +572,147 @@ class ScriptTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("Wrong arguments", result.stderr)
 
+    def test_savesession_rejects_a_port_it_cannot_use(self):
+        """A stored site is opened later by a script that cannot ask, so
+        its port has to be whole and in range when it is stored.
+
+        atoi() stopped at the first character that was not a digit and
+        returned 0 for text: '-port=22x' stored port 22, '-port=99999'
+        stored a port nothing listens on, '-port=ssh' stored no port at
+        all, and every one of them reported that the site was stored.
+        """
+        for value in ("abc", "22x", "0", "-5", "65536", "99999",
+                      "12345678901234567890"):
+            with self.subTest(port=value):
+                result = self.run_commands(
+                    "savesession demo -host=demo.example.com -port=" + value)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("Invalid port number", result.stderr)
+        stored = pathlib.Path(self.config) / "sessions.ini"
+        if stored.is_file():
+            self.assertNotIn("port=", stored.read_text(encoding="utf-8"))
+
+        for value in ("1", "22", "2222", "65535"):
+            with self.subTest(port=value):
+                result = self.run_commands(
+                    "savesession demo -host=demo.example.com -port=" + value)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Stored session 'demo'", result.stdout)
+                self.assertIn(
+                    "port=" + value,
+                    (pathlib.Path(self.config) / "sessions.ini").read_text(
+                        encoding="utf-8"))
+                self.assertEqual(
+                    self.run_commands("rmsession demo").returncode, 0)
+
+    def test_savesession_clears_a_preset_with_an_empty_value(self):
+        """'-preset=' is the documented way to clear a stored preset.
+
+        The prefix test behind every switch of this command asked for one
+        character more than the prefix, so a switch whose value is
+        legitimately empty was reported as an unknown switch - including
+        this one, which the command's own help offers.
+        """
+        stored = pathlib.Path(self.config) / "sessions.ini"
+        self.assertEqual(
+            self.run_commands("savepreset fast transfer=binary").returncode, 0)
+        result = self.run_commands(
+            "savesession demo -host=demo.example.com -preset=fast")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("preset=fast", stored.read_text(encoding="utf-8"))
+
+        result = self.run_commands(
+            "savesession demo -host=demo.example.com -preset=")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Stored session 'demo'", result.stdout)
+        self.assertNotIn("preset=", stored.read_text(encoding="utf-8"))
+
+    def test_savesession_rejects_a_protocol_nothing_connects_with(self):
+        """A stored site is opened later by a script that cannot ask.
+
+        The protocol was stored as written, so a site could be saved under
+        a scheme no engine here serves - an empty one included, which the
+        session list then printed as '://@host'.
+        """
+        for value in ("bogus", "file", "sftp:", "webdav2"):
+            with self.subTest(protocol=value):
+                result = self.run_commands(
+                    "savesession demo -host=demo.example.com -protocol=" + value)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("Unsupported protocol", result.stderr)
+        stored = pathlib.Path(self.config) / "sessions.ini"
+        for value, written in (("sftp", "sftp"), ("SFTP", "sftp"),
+                               ("scp", "scp"), ("ftpes", "ftp"),
+                               ("ftps", "ftps"), ("webdav", "webdav"),
+                               ("s3", "s3")):
+            with self.subTest(protocol=value):
+                result = self.run_commands(
+                    "savesession demo -host=demo.example.com -protocol=" + value)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("protocol=" + written,
+                              stored.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    self.run_commands("rmsession demo").returncode, 0)
+
+    def test_keepuptodate_reads_its_numbers_strictly(self):
+        """'-interval=12abc' was 12 seconds and '-count=2xyz' two passes.
+
+        A mistyped value became a different interval rather than an
+        error, and the watch ran on it. Both switches are read before the
+        connection is asked for, so this needs no server.
+        """
+        for switch in ("-interval=12abc", "-interval=abc", "-interval=0",
+                       "-interval=86401", "-count=2xyz", "-count=0",
+                       "-count=-1"):
+            with self.subTest(switch=switch):
+                result = self.run_commands("keepuptodate %s %s %s"
+                                           % (os.devnull, os.devnull, switch))
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("Wrong arguments of 'keepuptodate'",
+                              result.stderr)
+        # Values that parse reach the connection, and say so.
+        result = self.run_commands(
+            "keepuptodate %s %s -interval=30 -count=1" % (os.devnull,
+                                                          os.devnull))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Not connected", result.stderr)
+
+    def test_edit_reads_its_monitor_count_strictly(self):
+        for value in ("3abc", "abc", "0", "-1"):
+            with self.subTest(value=value):
+                result = self.run_commands("edit -monitor=%s /no/such/file"
+                                           % value)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("The value of '-monitor'", result.stderr)
+        # A count that parses reaches the connection instead: the switches
+        # are read before a session is asked for, the way 'synchronize' and
+        # 'keepuptodate' read theirs.
+        result = self.run_commands("edit -monitor=2 /no/such/file")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Not connected", result.stderr)
+
+    def test_every_command_the_help_lists_has_its_own_help(self):
+        """'help <command>' answers for every command it lists.
+
+        'etag' dispatched but had no help entry, so 'help etag' answered
+        "Unknown command 'etag'" for a command that worked - the one place
+        a user can ask what a switch does refused the command that had it.
+        """
+        listing = self.run_commands("help")
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        names = [line.split()[0] for line in listing.stdout.splitlines()
+                 if line and not line[0].isspace()]
+        self.assertIn("etag", names)
+        self.assertIn("get", names)
+        self.assertGreater(len(names), 40)
+        for name in names:
+            with self.subTest(command=name):
+                result = self.run_commands("help " + name)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("Unknown command",
+                                 result.stdout + result.stderr)
+                self.assertTrue(result.stdout.split("\n")[0].startswith(name))
+
     def test_editor_options(self):
         result = self.run_commands("option editor vim; option editor")
         self.assertEqual(result.returncode, 0, result.stderr)
