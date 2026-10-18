@@ -1893,6 +1893,36 @@ void TestSessionStore()
         CHECK_EQ(options.userName, "alice");
         CHECK_EQ(options.initialDirectory, "/srv/www");
 
+        /* 'port=22' on a site of another protocol is what earlier versions
+         * wrote for 'no port given', and is read as the protocol's own
+         * port; a real port, and the SSH port of an SSH site, are kept. */
+        StoredSession legacy;
+        legacy.name = "legacy";
+        legacy.hostName = "files.example.com";
+        legacy.protocol = "ftp";
+        legacy.portNumber = 22;
+        CHECK_TRUE(SessionStore::ToSessionOptions(legacy, defaults).portNumber == 21);
+        legacy.tls.ftpsMode = 1;
+        CHECK_TRUE(SessionStore::ToSessionOptions(legacy, defaults).portNumber == 990);
+        legacy.tls.ftpsMode = 0;
+        legacy.protocol = "s3";
+        CHECK_TRUE(SessionStore::ToSessionOptions(legacy, defaults).portNumber == 443);
+        legacy.protocol = "webdav";
+        CHECK_TRUE(SessionStore::ToSessionOptions(legacy, defaults).portNumber == 443);
+        legacy.protocol = "dav";
+        CHECK_TRUE(SessionStore::ToSessionOptions(legacy, defaults).portNumber == 80);
+        legacy.portNumber = 2121;
+        legacy.protocol = "ftp";
+        CHECK_TRUE(SessionStore::ToSessionOptions(legacy, defaults).portNumber == 2121);
+        legacy.portNumber = 22;
+        legacy.protocol = "scp";
+        CHECK_TRUE(SessionStore::ToSessionOptions(legacy, defaults).portNumber == 22);
+        legacy.portNumber = 0;
+        legacy.protocol = "ftp";
+        defaults.portNumber = 2222;
+        CHECK_TRUE(SessionStore::ToSessionOptions(legacy, defaults).portNumber == 2222);
+        defaults.portNumber = 22;
+
         /* The connection round-trips back into a session. */
         StoredSession back = SessionStore::FromSessionOptions("copy", options,
             "/srv/www", "/home/alice/www");
@@ -2896,6 +2926,20 @@ void TestRelativeTime()
     /* a unit followed by 'S' starts the period instead of counting on */
     CHECK_TRUE(TryRelativeTime("1DS", base, false, result, error));
     CHECK_EQ(std::to_string(result), std::to_string(StartOfDay(base - 86400)));
+    /* Noon hides a unit that drops the finer fields: from 12:34:56, an
+     * hour or minute offset without 'S' keeps the minutes and seconds,
+     * and with 'S' it snaps to the start of that hour or minute. */
+    const std::time_t odd = base + 34 * 60 + 56;   /* 12:34:56 */
+    CHECK_TRUE(TryRelativeTime("2H", odd, true, result, error));
+    CHECK_EQ(std::to_string(result), std::to_string(odd + 2 * 3600));
+    CHECK_TRUE(TryRelativeTime("1N", odd, true, result, error));
+    CHECK_EQ(std::to_string(result), std::to_string(odd + 60));
+    CHECK_TRUE(TryRelativeTime("15S", odd, false, result, error));
+    CHECK_EQ(std::to_string(result), std::to_string(odd - 15));
+    CHECK_TRUE(TryRelativeTime("2HS", odd, true, result, error));
+    CHECK_EQ(std::to_string(result), std::to_string(base + 2 * 3600));
+    CHECK_TRUE(TryRelativeTime("1NS", odd, true, result, error));
+    CHECK_EQ(std::to_string(result), std::to_string(base + 35 * 60));
     /* months and weeks are deliberately not units: upstream reserves 'M'
      * and 'K'/'G' for sizes, and supports S, N, H, D and Y only. */
     CHECK_FALSE(TryRelativeTime("1WS", base, false, result, error));

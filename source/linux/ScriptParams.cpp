@@ -483,18 +483,30 @@ bool TryRelativeTime(const std::string & text, std::time_t base, bool add,
         return false;
     }
 
+    /* The offset counts on from the current moment; only a trailing 'S'
+     * (and 'today'/'yesterday') snaps the result to the start of the unit.
+     * Minutes and hours used to drop the finer fields unconditionally, so
+     * '%TIMESTAMP+2H#hh:nn%' at 06:38 printed 08:00 and '+1N' lost the
+     * seconds, which contradicted the documented rule and the day and year
+     * units next to them. */
     switch (unit)
     {
         case 'S':
             parts.tm_sec += static_cast<int>(amount);
             break;
         case 'N':
-            parts.tm_sec = 0;
+            if (startOfUnit)
+            {
+                parts.tm_sec = 0;
+            }
             parts.tm_min += static_cast<int>(amount);
             break;
         case 'H':
-            parts.tm_sec = 0;
-            parts.tm_min = 0;
+            if (startOfUnit)
+            {
+                parts.tm_sec = 0;
+                parts.tm_min = 0;
+            }
             parts.tm_hour += static_cast<int>(amount);
             break;
         case 'D':

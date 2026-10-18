@@ -119,6 +119,36 @@ class RemoteSearchTests(unittest.TestCase):
         self.assertEqual(tab.downloads, [])
         self.assertEqual(stats["scanned"], 0)
 
+    def test_listing_keeps_entries_named_like_the_status_lines(self):
+        """The status line that closes a listing was recognised by its
+        word, anywhere in the line, so a file called 'entries.txt' or a
+        directory called 'log-entries' was missing from the remote panel
+        and from a search. An entry is told by its mode string."""
+        lines = [
+            "Reading directory /data with many words in its name a b c...",
+            "-rw-r--r--    1 alice users 1234 Oct 18 06:00 entries.txt",
+            "drwxr-xr-x    2 alice users 4096 Oct 18 06:00 log-entries",
+            "drwxr-xr-x+   2 alice users 4096 Oct 18 06:00 acl dir",
+            "lrwxrwxrwx    1 alice users   10 Oct 18 06:00 link -> target",
+            "-rw-r--r--    1 alice users   10 Oct 18 06:00 Connected report",
+            "5 entries",
+        ]
+        entries = gui.parse_ls_output(lines)
+        self.assertEqual([item["name"] for item in entries],
+                         ["acl dir", "log-entries", "Connected report",
+                          "entries.txt", "link"])
+        self.assertEqual(entries[-1]["link_target"], "target")
+        self.assertTrue(entries[0]["is_dir"])
+        tab = FakeTab({"/data": [("entries.txt", False),
+                                 ("log-entries", True)],
+                       "/data/log-entries": [("2026.log", False)]},
+                      {"/data/entries.txt": b"x",
+                       "/data/log-entries/2026.log": b"y"})
+        matches = gui.remote_search(tab, "/data", "*", 500, False)
+        self.assertEqual({item["path"] for item in matches},
+                         {"/data/entries.txt", "/data/log-entries",
+                          "/data/log-entries/2026.log"})
+
     def test_content_search_stops_at_the_scan_budget(self):
         directories = {"/docs": [("%03d.txt" % i, False)
                                   for i in range(gui.MAX_CONTENT_SEARCH_FILES + 1)]}

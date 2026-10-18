@@ -5871,6 +5871,8 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
     bool savePassword = false;
     std::string explicitPassword;
     bool passwordGiven = false;
+    bool portGiven = false;
+    bool protocolGiven = false;
     /* Upstream's session settings, applied on top of the proxy the site
      * already has: 'savesession <name> -rawsettings ProxyMethod=SOCKS5
      * ProxyHost=proxy.example.com'. */
@@ -5904,6 +5906,7 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
                 return false;
             }
             options.portNumber = static_cast<int>(port);
+            portGiven = true;
         }
         else if (StartsWith(lower, "-username="))
         {
@@ -5911,6 +5914,7 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
         }
         else if (StartsWith(lower, "-protocol="))
         {
+            protocolGiven = true;
             /* Checked against the schemes 'open' accepts: a stored site is
              * opened later by a script that cannot ask, so a protocol
              * nothing here connects with is refused now rather than stored
@@ -6072,6 +6076,26 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
          * ciphertext nobody could read does not survive it. */
         session.proxyPasswordRaw.clear();
         session.proxyError.clear();
+    }
+    /*
+     * The port of a site nobody gave one for. The session defaults carry
+     * the SSH port, and a site stored from them with '-protocol=ftp' or
+     * '-protocol=s3' used to keep it: 'savesession mirror -host=h
+     * -protocol=ftp' then 'open mirror' spoke FTP to port 22. 'open
+     * ftp://h' already ignores the SSH default for such a scheme, so the
+     * stored site follows the same rule and takes the port of its own
+     * protocol - the implicit-TLS one when '-rawsettings Ftps=1' asks for
+     * it, which is why this comes after the raw settings. A port given
+     * explicitly, or the one an open connection really uses, is kept.
+     */
+    if (!portGiven && (!connected || protocolGiven) && session.portNumber == 22)
+    {
+        const int protocolDefault = SessionDefaultPort(session.protocol,
+            session.tls.ftpsMode);
+        if (protocolDefault != 22)
+        {
+            session.portNumber = protocolDefault;
+        }
     }
     if (savePassword)
     {

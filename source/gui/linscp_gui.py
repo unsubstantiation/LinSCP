@@ -385,6 +385,19 @@ SESSION_KEYS = {
 }
 
 
+# The port each protocol listens on when the site does not say: the same
+# table the console client applies to a URL without a port. 'dav' is
+# WebDAV over plain HTTP and 'webdav' over HTTPS, as in the client.
+DEFAULT_PORTS = {
+    "sftp": 22, "scp": 22, "ssh": 22, "ftp": 21, "ftps": 990,
+    "dav": 80, "http": 80, "webdav": 443, "https": 443, "s3": 443,
+}
+
+
+def default_port(protocol):
+    return DEFAULT_PORTS.get((protocol or "sftp").lower(), 22)
+
+
 def read_stored_sessions():
     """Parse sessions.ini into the dictionaries the web client uses."""
     path = session_store_path()
@@ -431,6 +444,14 @@ def read_stored_sessions():
     if current:
         sessions.append(current)
     for item in sessions:
+        # A site without a port, and one written with the SSH port by an
+        # earlier version that defaulted every protocol to 22, takes the
+        # port of its protocol: the console client reads the file the
+        # same way, and the site manager then shows the port that is
+        # really used instead of 22 beside 'FTP'.
+        implied = default_port(item.get("protocol"))
+        if item.get("port") in (None, 0, 22) and implied != 22:
+            item["port"] = implied
         value = item.get("password") or ""
         item["password_locked"] = False
         item["password_error"] = ""
@@ -548,7 +569,7 @@ def new_session():
 def session_url(session, path=None):
     proto = session.get("protocol") or "sftp"
     host = session.get("host") or "localhost"
-    port = int(session.get("port") or 22)
+    port = int(session.get("port") or default_port(proto))
     user = session.get("username") or ""
     password = session.get("password") or ""
     url = proto + "://"
@@ -561,7 +582,11 @@ def session_url(session, path=None):
         url += "[" + host + "]"
     else:
         url += host
-    if port and port != 22:
+    # The port is written whenever it is not the protocol's own default.
+    # Comparing with the SSH port alone sent an FTP site stored with port
+    # 22 to the FTP default and an SFTP site on port 21 to port 21 only
+    # by accident; the protocol decides which port is implied.
+    if port and port != default_port(proto):
         url += ":%d" % port
     url += "/"
     if path:
@@ -1753,6 +1778,12 @@ def save_local_browser_upload(local_dir, filename, source_stream,
         raise
 
 
+# A listing line in long format starts with a mode string: the file type,
+# nine permission characters and perhaps an ACL or attribute marker, as
+# PermissionsString() writes it and as a server's own 'ls -l' does.
+LISTING_MODE = re.compile(r"^[-a-zA-Z?][-rwxsStTlL]{9}[+@.]?$")
+
+
 def parse_ls_output(stdout):
     entries = []
     lines = stdout.splitlines() if isinstance(stdout, str) else list(stdout)
@@ -1762,14 +1793,19 @@ def parse_ls_output(stdout):
         if line.startswith("Reading directory"):
             in_listing = True
             continue
-        if "entries" in line or line.startswith("sftp>") or line.startswith("Connecting") \
+        if line.startswith("sftp>") or line.startswith("Connecting") \
                 or line.startswith("Connected") or line.startswith("LSCP-RESULT"):
             continue
         if not in_listing or not line:
             continue
 
         parts = line.split(None, 8)
-        if len(parts) >= 9:
+        # The status line that closes a listing ('3 entries') used to be
+        # recognised by its word, anywhere in the line, so a file called
+        # 'entries.txt' or a directory called 'log-entries' was not shown
+        # in the remote panel at all. What tells an entry from a status
+        # line is its mode string, so that is what is checked.
+        if len(parts) >= 9 and LISTING_MODE.match(parts[0]):
             perms, links, owner, group, size_str, m1, m2, m3, name = parts
             is_link = perms.startswith("l")
             is_dir = perms.startswith("d")
