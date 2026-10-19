@@ -42,7 +42,10 @@ binary: build
 	install -m 0644 source/gui/linscp_gui.py source/gui/linscp_crypto.py \
 		$(destdir)/usr/share/linscp/gui/
 	install -m 0644 source/gui/explorer-commands.json $(destdir)/usr/share/linscp/gui/
-	install -m 0644 source/gui/web/* $(destdir)/usr/share/linscp/gui/web/
+	install -m 0644 $(shell find source/gui/web -maxdepth 1 -type f) \
+		$(destdir)/usr/share/linscp/gui/web/
+	install -d $(destdir)/usr/share/linscp/gui/web/vendor
+	install -m 0644 source/gui/web/vendor/* $(destdir)/usr/share/linscp/gui/web/vendor/
 	install -m 0644 automation/LinSCP.psm1 $(destdir)/usr/share/linscp/automation/
 	install -m 0644 debian/linscp.desktop $(destdir)/usr/share/applications/linscp.desktop
 	install -m 0644 debian/linscp.png $(destdir)/usr/share/pixmaps/linscp.png
