@@ -13,6 +13,7 @@
 #define LINSCP_PLATFORM_H
 
 #include <ctime>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -135,7 +136,9 @@ std::string FindExecutableOnPath(const std::string & name);
 std::string ExecutableDirectory();
 
 /* Starts the graphical client (linscp-gui). This replaces the current
- * process and only returns on failure. */
+ * process and only returns on failure. On a console a human is reading, the
+ * client is asked to open its page in the desktop's browser as well, which is
+ * how -gui shows a window on a Wayland session. */
 bool LaunchGuiApplication(std::string & error);
 
 /* Arguments of the system 'ssh' command client that open an interactive
@@ -152,13 +155,104 @@ std::vector<std::string> BuildSshArguments(const std::string & userName,
  * external editor of the 'edit' command, which needs the terminal. */
 int RunInteractive(const std::vector<std::string> & args, std::string & error);
 
+/* A path probe, so that the display-server detection below can be tested
+ * without a compositor: it answers whether a file exists. */
+typedef bool (*PathExistsFn)(const std::string & path, void * ctx);
+
+/*
+ * The display servers a window of this process could be shown on, as one
+ * environment describes them.
+ *
+ * Wayland is reachable when the compositor's socket sits in
+ * $XDG_RUNTIME_DIR: the one $WAYLAND_DISPLAY names, or the default
+ * 'wayland-0' when that variable is unset and a compositor left its socket
+ * behind (which is how a session started by a service manager, or a client
+ * re-executed by one, still finds the display). X11 is reachable when
+ * $DISPLAY is set.
+ *
+ * Both have to be asked about, and a program that opens a window has to be
+ * one the session can show: a Wayland session exports no $DISPLAY at all
+ * where XWayland is not running, and a Wayland-only terminal under X11 exits
+ * before it maps anything.
+ */
+struct DesktopSession
+{
+    DesktopSession() : wayland(false), x11(false),
+        waylandWithoutRuntimeDirectory(false) {}
+
+    bool wayland;
+    bool x11;
+    /* The socket the detection looked for, empty when there was no
+     * directory to look in. Named in the error message, because 'the
+     * compositor was not found' is only useful if it says where. */
+    std::string waylandSocketPath;
+    /* The socket name to add to the environment of a child, when it was
+     * found without $WAYLAND_DISPLAY. Empty when the environment named it
+     * already, or when there is no Wayland session. */
+    std::string inferredWaylandDisplay;
+    /* $WAYLAND_DISPLAY is set but $XDG_RUNTIME_DIR is not, so neither this
+     * client nor the program it starts can locate the socket. */
+    bool waylandWithoutRuntimeDirectory;
+};
+
+/* The detection above, from an environment the caller supplies: the unit
+ * tests hand in their own variables and their own path probe. */
+DesktopSession DetectDesktopSession(
+    const std::map<std::string, std::string> & environment,
+    PathExistsFn pathExists, void * ctx);
+
+/* One terminal this client knows how to start: the program, the option that
+ * makes it run a command instead of a login shell, and the display server it
+ * can draw on - "" for either, "wayland" and "x11" for a program that only
+ * speaks one of them. */
+struct TerminalProgram
+{
+    const char * name;
+    const char * const leadingArgs[3];
+    const char * backend;
+};
+
+/* The terminals in the order they are offered, for the unit tests and for
+ * the documentation that lists them. */
+const TerminalProgram * KnownTerminalPrograms(size_t * count);
+
+/* The terminal program to start, and the option that gives it a command. */
+struct TerminalChoice
+{
+    TerminalChoice() : viaXWayland(false) {}
+
+    std::string program;
+    std::vector<std::string> leadingArgs;
+    /* The chosen program is an X11 one and the session is Wayland, so the
+     * window is served by XWayland: it works, but it is not scaled by the
+     * compositor and looks blurry on a high-resolution display. */
+    bool viaXWayland;
+};
+
+/*
+ * The first program of KnownTerminalPrograms() that is installed and can
+ * show a window in 'session'; 'installed' holds the names found on PATH.
+ * An X11 terminal in a Wayland session is kept as a fallback - XWayland
+ * makes it work, which is why viaXWayland is reported rather than the
+ * program refused - while a Wayland-only terminal is refused in an X11
+ * session, because it would exit without a window and without a message the
+ * user would see. The program is empty when the session can show no window
+ * at all or when nothing installed fits it.
+ */
+TerminalChoice ChooseTerminalProgram(const DesktopSession & session,
+    const std::vector<std::string> & installed);
+
 /* Opens an interactive terminal on the given server: the system ssh in a
  * desktop terminal emulator (the terminal from LINSCP_TERMINAL,
- * otherwise the first of the common ones that is installed). Returns
- * false with 'error' set when nothing could be started. */
+ * otherwise the first installed one that this display session can show a
+ * window in). Returns false with 'error' set when nothing could be started.
+ * When 'note' is non-NULL it receives a message to tell the user about the
+ * choice that was made - that the window is an XWayland one, say - which is
+ * not a failure and not worth refusing. */
 bool LaunchTerminalForServer(const std::string & userName,
     const std::string & hostName, int portNumber,
-    const std::string & privateKeyFile, std::string & error);
+    const std::string & privateKeyFile, std::string & error,
+    std::string * note = NULL);
 
 } // namespace linscp
 

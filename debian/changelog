@@ -1,3 +1,38 @@
+linscp (1.0-5) unstable; urgency=medium
+
+  * The client now reads a Wayland session as the desktop it is, instead of
+    asking X11 alone. The window "terminal" opens was already refused when
+    neither DISPLAY nor WAYLAND_DISPLAY was set, but which terminal was
+    started afterwards did not depend on the session at all: a Wayland session
+    whose x-terminal-emulator points at xterm got an X11 program, and an X11
+    session with foot installed got a program that exits before it maps
+    anything - the client said "Opened a terminal" and no window ever
+    appeared. Terminals are now classified by the display server they can draw
+    on, the compositor is found by its socket in XDG_RUNTIME_DIR (which is how
+    a session started by a launcher or a user service is still found, and the
+    inferred WAYLAND_DISPLAY is exported to the child), and a window that only
+    XWayland can show is announced rather than chosen quietly.
+  * The graphical client can ask the desktop for its window: linscp-gui
+    --open-browser opens the served address through $BROWSER, xdg-open or
+    gio - the URI launcher that works on both display servers - instead of
+    leaving the user to copy the printed address, and it says so when there is
+    no session to open a window in. linscp.desktop starts it that way, drops
+    the startup notification it could never complete (the launcher maps no
+    window) and gained TryExec; the package recommends xdg-utils, which is
+    where xdg-open comes from, and prints the address instead when the user
+    chose not to install it.
+  * tools/check_wayland_compatibility.py is the guard. It refuses a
+    display-session decision that reads DISPLAY with no WAYLAND_DISPLAY in
+    view, a terminal candidate that does not say what it draws on, an X11-only
+    or Wayland-only helper program, a desktop entry a compositor cannot act
+    on, documentation of the terminal choice that never mentions Wayland, and
+    the console and graphical detections disagreeing. It runs in "make -C
+    source/linux check", as the CTest cases wayland-compatibility-check and
+    wayland-compatibility-tests, and in CI, with its own regressions in
+    tools/tests/test_wayland_compatibility.py.
+
+ -- nuipona <nuipona@users.noreply.github.com>  Mon, 19 Oct 2026 00:00:00 +0000
+
 linscp (1.0-4) unstable; urgency=medium
 
   * The Windows-to-Linux conversion is complete, and the build now checks

@@ -8198,12 +8198,21 @@ void Script::OpenTerminal(const std::vector<std::string> & args)
     }
 
     std::string error;
+    std::string note;
     if (!LaunchTerminalForServer(userName, options.hostName, options.portNumber,
-            key, error))
+            key, error, &note))
     {
         Console::Instance().Error(error);
         mErrors++;
         return;
+    }
+
+    /* Which window the session got is worth one line: 'it opened a
+     * terminal' followed by a blurry window, or by no window at all, is the
+     * report a user cannot act on. */
+    if (!note.empty())
+    {
+        Console::Instance().Status(note);
     }
 
     Console::Instance().WriteLine(Texts::Translate("Opened a terminal on {target}.",

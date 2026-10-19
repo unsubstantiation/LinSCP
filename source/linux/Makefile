@@ -99,7 +99,7 @@ TEST_OBJS := $(OBJDIR)/linux/tests/UnitTest.o
 PREFIX ?= /usr
 DESTDIR ?=
 
-.PHONY: all clean check check-live check-conversion install
+.PHONY: all clean check check-live check-conversion check-wayland install
 
 all: $(BINDIR)/linscp
 
@@ -131,6 +131,8 @@ check: $(BINDIR)/unittest
 	$(BINDIR)/unittest
 	$(PYTHON) $(TOP)/tools/check_platform_conversion.py
 	$(PYTHON) $(TOP)/tools/tests/test_platform_conversion.py
+	$(PYTHON) $(TOP)/tools/check_wayland_compatibility.py
+	$(PYTHON) $(TOP)/tools/tests/test_wayland_compatibility.py
 
 # The guard that keeps this a Linux-only client: it reads the sources
 # and refuses a Windows construct, a file of another platform, an
@@ -139,6 +141,16 @@ check: $(BINDIR)/unittest
 check-conversion:
 	$(PYTHON) $(TOP)/tools/check_platform_conversion.py
 	$(PYTHON) $(TOP)/tools/tests/test_platform_conversion.py
+
+# The other half of 'runs on Linux': a Wayland desktop, where an
+# application that only asks for $DISPLAY finds no display at all. It
+# refuses a display-server decision that reads one variable, a
+# terminal that may not be able to draw on this compositor, a helper
+# program only one display server answers, a desktop entry nobody can
+# act on, and the two detections of the session disagreeing.
+check-wayland:
+	$(PYTHON) $(TOP)/tools/check_wayland_compatibility.py
+	$(PYTHON) $(TOP)/tools/tests/test_wayland_compatibility.py
 
 # Transfers against the servers in tests/, which take seconds rather than
 # milliseconds: ScriptTest is server-free, LiveSftpTest skips itself without

@@ -485,6 +485,184 @@ void TestTerminalCommandLine()
     CHECK_EQ(ppk[0], "-t");
 }
 
+/* The display server the 'terminal' command looks for a window in. A
+ * Wayland session is recognised by the compositor's socket rather than by a
+ * variable, which a launcher or a service manager may not have forwarded,
+ * and a terminal that cannot draw on this session must not be started at
+ * all: an X11-only program has XWayland to fall back on, a Wayland-only one
+ * has nothing and exits before it maps a window. */
+namespace {
+
+/* The paths the probe below claims exist, so that no test needs a
+ * compositor - or the absence of one - to say what the session is. */
+struct SocketPaths
+{
+    const char * paths[4];
+};
+
+bool ProbeSocket(const std::string & path, void * ctx)
+{
+    const SocketPaths * listed = static_cast<const SocketPaths *>(ctx);
+    for (int i = 0; i < 4 && listed->paths[i] != NULL; i++)
+    {
+        if (path == listed->paths[i])
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::map<std::string, std::string> DesktopEnvironment(const char * name,
+    const char * value, const char * firstName = NULL,
+    const char * firstValue = NULL)
+{
+    std::map<std::string, std::string> environment;
+    if (firstName != NULL)
+    {
+        environment[firstName] = firstValue != NULL ? firstValue : "";
+    }
+    environment[name] = value != NULL ? value : "";
+    return environment;
+}
+
+std::vector<std::string> Installed(const char * first,
+    const char * second = NULL, const char * third = NULL)
+{
+    std::vector<std::string> installed;
+    if (first != NULL) installed.push_back(first);
+    if (second != NULL) installed.push_back(second);
+    if (third != NULL) installed.push_back(third);
+    return installed;
+}
+
+} // namespace
+
+void TestDesktopSessionDetection()
+{
+    SocketPaths none = {{NULL, NULL, NULL, NULL}};
+    SocketPaths sockets = {{"/run/user/1000/wayland-0",
+        "/run/user/1000/wayland-server-1", "/tmp/wayland-socket", NULL}};
+
+    /* X11 is taken from $DISPLAY without looking for anything: the variable
+     * may name a forwarded display on another machine. */
+    const DesktopSession x11 = DetectDesktopSession(
+        DesktopEnvironment("DISPLAY", ":0"), ProbeSocket, &none);
+    CHECK_TRUE(x11.x11);
+    CHECK_FALSE(x11.wayland);
+
+    /* A named Wayland socket that is there. */
+    const DesktopSession wayland = DetectDesktopSession(
+        DesktopEnvironment("WAYLAND_DISPLAY", "wayland-0",
+            "XDG_RUNTIME_DIR", "/run/user/1000"), ProbeSocket, &sockets);
+    CHECK_TRUE(wayland.wayland);
+    CHECK_FALSE(wayland.x11);
+    CHECK_TRUE(wayland.inferredWaylandDisplay.empty());
+
+    /* The default name, found with no $WAYLAND_DISPLAY at all: a session
+     * started by something that does not forward the variable still has a
+     * compositor, and the child has to be told the name it found. */
+    const DesktopSession inferred = DetectDesktopSession(
+        DesktopEnvironment("XDG_RUNTIME_DIR", "/run/user/1000"),
+        ProbeSocket, &sockets);
+    CHECK_TRUE(inferred.wayland);
+    CHECK_EQ(inferred.inferredWaylandDisplay, "wayland-0");
+    CHECK_EQ(inferred.waylandSocketPath, "/run/user/1000/wayland-0");
+
+    /* A named socket that is not in the runtime directory is no session;
+     * a chosen compositor may run on another name. */
+    const DesktopSession absent = DetectDesktopSession(
+        DesktopEnvironment("WAYLAND_DISPLAY", "wayland-7",
+            "XDG_RUNTIME_DIR", "/run/user/1000"), ProbeSocket, &sockets);
+    CHECK_FALSE(absent.wayland);
+    CHECK_FALSE(absent.waylandWithoutRuntimeDirectory);
+
+    /* $WAYLAND_DISPLAY without $XDG_RUNTIME_DIR: no client can reach the
+     * socket, and the message has to say which of the two is missing. */
+    const DesktopSession orphaned = DetectDesktopSession(
+        DesktopEnvironment("WAYLAND_DISPLAY", "wayland-0"), ProbeSocket, &none);
+    CHECK_FALSE(orphaned.wayland);
+    CHECK_TRUE(orphaned.waylandWithoutRuntimeDirectory);
+
+    /* An absolute path in the variable, which libwayland accepts. */
+    CHECK_TRUE(DetectDesktopSession(DesktopEnvironment("WAYLAND_DISPLAY",
+        "/tmp/wayland-socket", "XDG_RUNTIME_DIR", "/run/user/1000"),
+        ProbeSocket, &sockets).wayland);
+
+    /* Neither variable: no window is possible anywhere. */
+    const DesktopSession headless = DetectDesktopSession(
+        std::map<std::string, std::string>(), ProbeSocket, &none);
+    CHECK_FALSE(headless.x11);
+    CHECK_FALSE(headless.wayland);
+
+    /* Which terminal a session gets. */
+    const std::vector<std::string> xWaylandAndNative = Installed("xterm",
+        "foot", "gnome-terminal");
+    CHECK_EQ(ChooseTerminalProgram(x11, xWaylandAndNative).program,
+        "gnome-terminal");
+    /* On Wayland the program that speaks the compositor's own protocol wins,
+     * and where only X11 ones are installed the choice is still made -
+     * reported as an XWayland fallback rather than refused. */
+    const TerminalChoice onWayland = ChooseTerminalProgram(inferred,
+        xWaylandAndNative);
+    CHECK_EQ(onWayland.program, "gnome-terminal");
+    CHECK_FALSE(onWayland.viaXWayland);
+    const TerminalChoice fallback = ChooseTerminalProgram(inferred,
+        Installed("xterm", "urxvt"));
+    CHECK_EQ(fallback.program, "urxvt");
+    CHECK_TRUE(fallback.viaXWayland);
+    /* A Wayland-only terminal is refused under X11, in either session. */
+    CHECK_TRUE(ChooseTerminalProgram(x11, Installed("foot")).program.empty());
+    CHECK_EQ(ChooseTerminalProgram(inferred, Installed("foot")).program,
+        "foot");
+    /* No session at all: no program, however many are installed. */
+    CHECK_TRUE(ChooseTerminalProgram(headless,
+        xWaylandAndNative).program.empty());
+    /* Debian's configured default is the X11 terminal alternative, so under
+     * Wayland a program that speaks the compositor's own protocol is tried
+     * first, and under X11 the configured default keeps its place. */
+    const std::vector<std::string> distroDefault = Installed(
+        "x-terminal-emulator", "konsole");
+    CHECK_EQ(ChooseTerminalProgram(x11, distroDefault).program,
+        "x-terminal-emulator");
+    CHECK_EQ(ChooseTerminalProgram(inferred, distroDefault).program, "konsole");
+    /* The option that makes the program run a command travels with the
+     * choice: gnome-terminal wants '--', wezterm wants its own subcommand
+     * before it, and foot wants nothing at all. */
+    const TerminalChoice withSeparator = ChooseTerminalProgram(x11,
+        Installed("gnome-terminal"));
+    CHECK_EQ(std::to_string(withSeparator.leadingArgs.size()), "1");
+    CHECK_EQ(withSeparator.leadingArgs[0], "--");
+    CHECK_EQ(std::to_string(ChooseTerminalProgram(inferred,
+        Installed("foot")).leadingArgs.size()), "0");
+    const TerminalChoice wezterm = ChooseTerminalProgram(inferred,
+        Installed("wezterm"));
+    CHECK_EQ(wezterm.leadingArgs[0], "start");
+    CHECK_EQ(wezterm.leadingArgs[1], "--");
+
+    /* Every entry of the table names a backend a session can be matched
+     * against, and each of the three kinds is present: a silent drop of one
+     * of them would leave a whole display server without a terminal. */
+    size_t count = 0;
+    const TerminalProgram * programs = KnownTerminalPrograms(&count);
+    CHECK_TRUE(count >= 13);
+    bool sawWaylandOnly = false;
+    bool sawX11Only = false;
+    bool sawEither = false;
+    for (size_t i = 0; i < count; i++)
+    {
+        CHECK_TRUE(programs[i].name[0] != '\0');
+        const std::string backend = programs[i].backend != NULL ?
+            programs[i].backend : "";
+        CHECK_TRUE(backend.empty() || backend == "wayland" ||
+            backend == "x11");
+        sawWaylandOnly = sawWaylandOnly || backend == "wayland";
+        sawX11Only = sawX11Only || backend == "x11";
+        sawEither = sawEither || backend.empty();
+    }
+    CHECK_TRUE(sawWaylandOnly && sawX11Only && sawEither);
+}
+
 void TestFormatting()
 {
     CHECK_EQ(FormatSize(0), "0");
@@ -4182,6 +4360,7 @@ int main()
     TestFormatting();
     TestDateParsing();
     TestTerminalCommandLine();
+    TestDesktopSessionDetection();
     TestParseSiteUrl();
     TestLocalFs();
     TestSessionRegistry();

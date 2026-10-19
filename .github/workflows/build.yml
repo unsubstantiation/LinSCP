@@ -92,6 +92,15 @@ jobs:
         run: |
           python3 tools/check_platform_conversion.py
           python3 tools/tests/test_platform_conversion.py
+      - name: Check that the desktop session is not assumed to be X11
+        run: |
+          # Wayland is the display server of a default Debian desktop, and the
+          # way to get it wrong is silent: the client reports no display at
+          # all, or starts a terminal that cannot draw on this compositor and
+          # shows nothing. The behavior itself is covered by the desktop GUI
+          # suite below, which runs the launcher and the session detection.
+          python3 tools/check_wayland_compatibility.py
+          python3 tools/tests/test_wayland_compatibility.py
       - name: Smoke test
         run: |
           source/linux/build/linscp -version

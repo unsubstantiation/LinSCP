@@ -10,11 +10,15 @@ Rules-Requires-Root: no
 Package: linscp
 Architecture: any
 Depends: ${shlibs:Depends}, python3
-Recommends: curl
+Recommends: curl, xdg-utils
 Description: graphical and console file transfer client for Linux
  LinSCP is a native noncommercial file transfer client for Linux, inspired
  by WinSCP. It provides an interactive command-line client (linscp) and
  a dual-pane Commander graphical client (linscp-gui) in the browser.
+ .
+ The desktop entry starts the graphical client through xdg-utils, so
+ the browser window is asked for the way a Wayland session expects; without
+ xdg-utils the address is printed and nothing is opened.
  .
  SSH, SFTP and SCP are served by libssh and this client's own protocol
  code - the SFTP v3 wire protocol (with the copy-data and check-file-name

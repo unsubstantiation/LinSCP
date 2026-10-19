@@ -58,6 +58,7 @@ CASE_SOURCES = {
     "gui-desktop-uri": "source/gui/tests/DesktopUriTest.py",
     "gui-security": "source/gui/tests/SecurityTest.py",
     "platform-conversion": "tools/tests/test_platform_conversion.py",
+    "wayland-compatibility": "tools/tests/test_wayland_compatibility.py",
 }
 
 

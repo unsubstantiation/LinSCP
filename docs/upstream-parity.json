@@ -31,7 +31,8 @@
           "gui-localization": "source/gui/tests/LocalizationTest.js under node/jsdom - boots the real English/Spanish page with persisted, server and browser language selection; checks static text and ARIA, queue statuses, plural forms, literal placeholders, host-key verification, editor saves, sync preview and transfer API payloads, and unsaved-edit protection on language changes.",
           "platform-conversion": "tools/check_platform_conversion.py with tools/tests/test_platform_conversion.py - the guard that keeps the Windows-to-Linux conversion complete: it reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose wording contradicts the template it is filled into. Its own cases hold it to the same standard: it has to fail on the things it claims to catch and stay quiet about the ones it does not.",
           "gui-security": "source/gui/tests/SecurityTest.py - offline boundary tests for the browser GUI: operand quoting for the client's command splitter (blanks, quotes, backslashes, control-character refusal), sync/chmod command building from fixed vocabularies, permission-mode validation, local panel containment and remote name validation, single-line server command stream, custom-command template validation/persistence/substitution/execution (local/remote scope, multiple selections, hostile names), PBKDF2 account hashing with per-session CSRF tokens and login throttling, queue staging cleanup, browser upload mode validation, and Host/token/CORS guards.",
-          "powershell": "automation/test_psmodule.py - static checks of the PowerShell module that always run (every exported cmdlet defined, no password on a process command line, control-character and multiline refusal, marker-driven server reads, listing-parser status skipping) plus the live Pester suite (automation/LinSCP.Tests.ps1) against the throwaway WebDAV endpoint when pwsh is installed: open/close, byte-exact upload/download, listing objects, terminating errors, timeout cancellation and password hygiene. Without pwsh the live cases skip loudly."
+          "powershell": "automation/test_psmodule.py - static checks of the PowerShell module that always run (every exported cmdlet defined, no password on a process command line, control-character and multiline refusal, marker-driven server reads, listing-parser status skipping) plus the live Pester suite (automation/LinSCP.Tests.ps1) against the throwaway WebDAV endpoint when pwsh is installed: open/close, byte-exact upload/download, listing objects, terminating errors, timeout cancellation and password hygiene. Without pwsh the live cases skip loudly.",
+          "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases."
         }
       }
     }
@@ -591,13 +592,15 @@
     {
       "name": "Desktop integration",
       "status": "partial",
-      "notes": "The desktop entry registers SFTP/FTP/FTPS URLs, the GUI opens startup URLs without bypassing host-key verification, and launcher/core lookup supports relocatable prefixes. Local and remote pane desktop drops are tested using browser API fixtures. Covered by gui-desktop-uri, script, gui and gui-browser-upload; file-manager shell commands and a general upstream extension system are missing, and real browser/desktop combinations still need acceptance validation.",
+      "notes": "The desktop entry registers SFTP/FTP/FTPS URLs and launches the graphical client through the desktop's own URI launcher, so it opens the same on a Wayland session as under X11; the GUI parses startup URLs without bypassing host-key verification, and launcher/core lookup supports relocatable prefixes. Local and remote pane desktop drops are tested using browser API fixtures, and a display-session decision that ignores Wayland is refused by the compatibility check. Covered by gui-desktop-uri, script, gui, gui-browser-upload, unit and wayland-compatibility; file-manager shell commands and a general upstream extension system are missing, real browser/desktop combinations and a live compositor still need acceptance validation.",
       "verified_on": {
         "linux": [
           "gui-desktop-uri",
           "script",
           "gui",
-          "gui-browser-upload"
+          "gui-browser-upload",
+          "unit",
+          "wayland-compatibility"
         ]
       },
       "gap": "See remaining capabilities: desktop.shell-and-extensions."
@@ -621,13 +624,14 @@
     {
       "name": "Packaging/platforms",
       "status": "verified",
-      "notes": "Linux-only build and packaging across source/linux/Makefile (including DESTDIR/PREFIX install), CMakeLists.txt/CTest, and Debian packaging files, with relocatable prefix lookup, POSIX runtime services, terminal/console handling and inotify file events, covered by unit, script, live-dav and gui-desktop-uri.",
+      "notes": "Linux-only build and packaging across source/linux/Makefile (including DESTDIR/PREFIX install), CMakeLists.txt/CTest, and Debian packaging files, with relocatable prefix lookup, POSIX runtime services, terminal/console handling, display-session detection for Wayland and X11, and inotify file events, covered by unit, script, live-dav, gui-desktop-uri and wayland-compatibility.",
       "verified_on": {
         "linux": [
           "unit",
           "script",
           "live-dav",
-          "gui-desktop-uri"
+          "gui-desktop-uri",
+          "wayland-compatibility"
         ]
       }
     }
@@ -2647,6 +2651,50 @@
       }
     },
     {
+      "id": "desktop.wayland-session",
+      "area": "Desktop integration",
+      "status": "verified",
+      "notes": "A desktop session is recognised as Wayland or as X11 before anything is asked of it, and only a program that can draw on it is started. The console client finds the compositor by its socket in XDG_RUNTIME_DIR - the default 'wayland-0' when WAYLAND_DISPLAY is not exported, so a session started by a launcher or a user service is still found - and refuses a Wayland-only terminal under X11, where it exits before mapping a window, while an X11-only one under Wayland is a reported XWayland fallback rather than a silent choice. The graphical client draws no window itself and asks the desktop's own URI launcher ($BROWSER, xdg-open, gio) for a browser, which needs no X11 and no window manager of the X11 kind; linscp.desktop starts it with that option and does not claim a startup notification it could never complete. Covered by unit, gui-desktop-uri and wayland-compatibility; no case runs against a live compositor, so the interaction with one is not certified here.",
+      "source": [
+        "source/linux/Platform.cpp",
+        "source/linux/Platform.h",
+        "source/gui/linscp_gui.py",
+        "debian/linscp.desktop",
+        "tools/check_wayland_compatibility.py"
+      ],
+      "checks": {
+        "unit": [
+          "TestDesktopSessionDetection"
+        ],
+        "gui-desktop-uri": [
+          "test_a_wayland_session_is_found_by_its_socket",
+          "test_a_variable_without_its_directory_names_no_session",
+          "test_the_desktop_uri_launcher_is_the_way_that_needs_no_x11",
+          "test_a_found_compositor_is_handed_to_the_child",
+          "test_no_window_is_requested_without_a_session",
+          "test_the_address_opened_carries_the_bound_name"
+        ],
+        "wayland-compatibility": [
+          "test_the_real_tree_needs_no_x11",
+          "test_an_x11_only_display_test_is_found",
+          "test_a_terminal_row_without_a_display_server_is_found",
+          "test_startup_notification_nobody_can_complete_is_found",
+          "test_detectors_that_disagree_are_found"
+        ],
+        "script": [
+          "test_the_gui_launcher_is_asked_for_a_window_only_when_somebody_reads"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "gui-desktop-uri",
+          "script",
+          "unit",
+          "wayland-compatibility"
+        ]
+      }
+    },
+    {
       "id": "desktop.shell-and-extensions",
       "area": "Desktop integration",
       "status": "missing",
@@ -2839,7 +2887,7 @@
       "id": "platform.terminal-and-console",
       "area": "Packaging/platforms",
       "status": "verified",
-      "notes": "Linux command-line parsing, terminal-facing configuration and the native console entry point are built from the Linux sources.",
+      "notes": "Linux command-line parsing, terminal-facing configuration and the native console entry point are built from the Linux sources. Which terminal 'terminal' starts depends on the display server the session runs on; that behavior is its own row, desktop.wayland-session.",
       "source": [
         "source/linux/Console.cpp",
         "source/linux/Platform.cpp"
@@ -3055,8 +3103,10 @@
       "Verified means the stated scoped behavior has named automated evidence, not every upstream variant.",
       "Source/test citations record where evidence is defined, not a claim that every suite ran in this workspace.",
       "Mock-server/browser fixtures do not certify every real server, browser, file manager or architecture.",
-      "Missing capabilities are retained and must not be deleted to pass the full-parity gate."
+      "Missing capabilities are retained and must not be deleted to pass the full-parity gate.",
+      "The Wayland and X11 behavior is established from the sources, from fixtures that say which display server this is, and from a check that refuses the X11-only shapes; no case in this ledger runs against a live compositor, so a real Wayland session is not certified by it."
     ],
-    "conversion": "LinSCP ships on Linux alone. The Windows port was removed in 1.0-2 and this audit looked for what it left behind: the script command splitter still read a backslash as an escape inside double quotes, so a path carried over from a Windows client lost its separators; the error messages still carried the Windows wording of an operation phrase, so the template said a preposition twice; the tree still held a public C ABI header with no library behind it and a half-translated file-manager extension that could not run; and the three installers disagreed about what an installation contains. All four are fixed, and tools/check_platform_conversion.py now keeps them fixed."
+    "conversion": "LinSCP ships on Linux alone. The Windows port was removed in 1.0-2 and this audit looked for what it left behind: the script command splitter still read a backslash as an escape inside double quotes, so a path carried over from a Windows client lost its separators; the error messages still carried the Windows wording of an operation phrase, so the template said a preposition twice; the tree still held a public C ABI header with no library behind it and a half-translated file-manager extension that could not run; and the three installers disagreed about what an installation contains. All four are fixed, and tools/check_platform_conversion.py now keeps them fixed.",
+    "wayland": "A Linux desktop runs on Wayland or on X11, and the way an application gets that wrong is silent: it asks for $DISPLAY, finds nothing on a session that exports $WAYLAND_DISPLAY and no X server at all, and reports that the user has no desktop. LinSCP draws no window of its own, so this is about the three times it asks the desktop for something - the terminal window 'terminal' opens, the browser window the graphical client asks the desktop to show, and the desktop entry that starts it. tools/check_wayland_compatibility.py keeps them session-aware, and refuses X11-only and Wayland-only helper programs outright, so that neither display server is a privileged case here."
   }
 }

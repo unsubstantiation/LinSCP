@@ -104,6 +104,32 @@ wording contradicts the template it is filled into. It runs in
 and in CI. Third-party library sources are not vendored in this repository; the
 platform layer and protocol integration maintained here are checked directly.
 
+## The display session
+
+"Linux" is not one desktop. A session runs on Wayland or on X11, and an
+application that only asks for X11 does not fail loudly - it asks for
+`$DISPLAY`, finds nothing on a Wayland session where XWayland is not running,
+and concludes the user has no desktop. LinSCP draws no window of its own, so
+three places are where this can go wrong: the terminal window `terminal` opens,
+the browser window the graphical client asks to be shown, and the desktop entry
+that starts it. They are covered by `desktop.wayland-session`, and
+`tools/check_wayland_compatibility.py` keeps them that way: it refuses a
+display-session decision that reads `DISPLAY` with no `WAYLAND_DISPLAY` in
+view, a terminal candidate that does not say which display server it can draw
+on, an X11-only or Wayland-only helper program (`xclip`, `xdotool`, `wmctrl`,
+`grim`), a desktop entry whose startup notification no compositor can
+complete, documentation of the terminal choice that never mentions Wayland, and
+the two detections - the console client's and the graphical client's -
+disagreeing about the variables that say what a session is. Its own regressions
+are in `tools/tests/test_wayland_compatibility.py`, which is a cited evidence
+suite; the check runs in `make -C source/linux check`, as the CTest cases
+`wayland-compatibility-check` and `wayland-compatibility-tests`, and in CI.
+
+What no case here establishes is the interaction with a live compositor. The
+evidence is source-level plus fixtures that assert what the session is; opening
+a terminal on a Wayland desktop and clicking the entry in an application grid
+are the checks that would say more, and they are recorded as still needed.
+
 ## Evidence and status rules
 
 `verified` means the stated behavior has automated evidence, not every variant

@@ -4,11 +4,14 @@ import hashlib
 import hmac
 import os
 import pathlib
-import struct
+import pty
+import select
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 BINARY = str(pathlib.Path(sys.argv.pop(1)).resolve())
@@ -178,6 +181,52 @@ class ScriptTests(unittest.TestCase):
                                     env=self.environment())
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("ADJACENT_GUI", result.stdout)
+
+    def test_the_gui_launcher_is_asked_for_a_window_only_when_somebody_reads(self):
+        # The desktop is asked for a browser window (the way that works on a
+        # Wayland session as well as under X11) when a person ran the client
+        # from a terminal; a run whose output goes to a pipe or a file is an
+        # automation, and an automation never asked for a browser.
+        with tempfile.TemporaryDirectory(prefix="linscp-gui-window-") as temp:
+            binary = pathlib.Path(temp) / "linscp"
+            launcher = pathlib.Path(temp) / "linscp-gui"
+            shutil.copyfile(BINARY, binary)  # not a symlink: /proc/self/exe is resolved
+            binary.chmod(0o755)
+            launcher.write_text('#!/bin/sh\necho "GUIARGS:$*"\n', encoding="utf-8")
+            launcher.chmod(0o755)
+
+            piped = subprocess.run([str(binary), "-gui"], capture_output=True,
+                                   text=True, timeout=10, env=self.environment())
+            self.assertEqual(piped.stdout.strip(), "GUIARGS:", piped.stdout)
+
+            pid, terminal = pty.fork()
+            if pid == 0:
+                os.execve(str(binary), [str(binary), "-gui"], self.environment())
+                os._exit(127)
+            # The launcher prints its arguments and exits, and the client is
+            # replaced by it, so the read ends at the first line: waiting for
+            # the process would wait for a browser nobody opened.
+            deadline = time.monotonic() + 10
+            output = b""
+            try:
+                while time.monotonic() < deadline:
+                    ready, _, _ = select.select([terminal], [], [], 0.2)
+                    if not ready:
+                        continue
+                    try:
+                        chunk = os.read(terminal, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    output += chunk
+                    if b"GUIARGS:" in output:
+                        break
+            finally:
+                os.close(terminal)
+            os.waitpid(pid, 0)
+            self.assertIn("GUIARGS:--open-browser",
+                          output.decode("utf-8", "replace"))
 
     def test_gui_launcher_finds_source_tree_from_make_and_cmake_builds(self):
         with tempfile.TemporaryDirectory(prefix="linscp-source-") as temp:

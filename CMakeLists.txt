@@ -150,6 +150,16 @@ if(Python3_Interpreter_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_platform_conversion.py)
   add_test(NAME platform-conversion-tests COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_platform_conversion.py)
+  # The other half of 'this is a Linux client': a Wayland desktop, where an
+  # application that only asks for $DISPLAY finds no display at all. It
+  # refuses a display-server decision that reads one variable, a terminal that
+  # may not draw on this compositor, a helper only one display server answers,
+  # a desktop entry a compositor cannot act on, and the console and graphical
+  # clients disagreeing about what a session is.
+  add_test(NAME wayland-compatibility-check COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_wayland_compatibility.py)
+  add_test(NAME wayland-compatibility-tests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_wayland_compatibility.py)
 endif()
 
 # Browser workflow tests are available when the optional node/jsdom test
