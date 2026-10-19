@@ -1,6 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<action-log>
-  <session name="test-session" protocol="SFTP" />
-  <upload remote-path="/data/file.txt" size="0" result="failure" error="Connection refused." />
-  <message type="error" text="Connection refused." />
-</action-log>
+<session xmlns="http://winscp.net/schema/session/1.0" name="testuser@example.com" start="2026-10-19T10:15:00.000Z">
+  <group name="get /data/missing.txt" start="2026-10-19T10:15:01.000Z">
+    <download>
+      <filename value="/data/missing.txt" />
+      <destination value="/home/testuser/missing.txt" />
+      <result success="false">
+        <message>No such file or directory.</message>
+      </result>
+    </download>
+    <failure>
+      <message>Cannot get '/data/missing.txt': No such file or directory.</message>
+    </failure>
+  </group>
+</session>

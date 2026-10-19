@@ -142,6 +142,11 @@ const SiteSettingKey kSiteSettingKeys[] = {
     { "tunnel_username", "TunnelUserName" },
     { "tunnel_private_key", "TunnelPublicKeyFile" },
     { "tunnel_hostkey", "TunnelHostKey" },
+    { "tunnel_local_port", "TunnelLocalPortNumber" },
+    { "auth_gssapi", "AuthGSSAPI" },
+    { "auth_gssapi_kex", "AuthGSSAPIKEX" },
+    { "gssapi_fwd_tgt", "GSSAPIFwdTGT" },
+    { "logical_host", "LogicalHostName" },
     { "ftp_pasv_mode", "FtpPasvMode" },
     { "ftp_force_pasv_ip", "FtpForcePasvIp" },
     { "ftp_use_mlsd", "FtpUseMlsd" },
@@ -231,7 +236,29 @@ std::string ValueOf(const StoredSession & session, const std::string & key,
         if (key == "tunnel_username") { return session.tunnel.userName; }
         if (key == "tunnel_private_key") { return session.tunnel.privateKeyFile; }
         if (key == "tunnel_hostkey") { return session.tunnel.hostKey; }
+        if (key == "tunnel_local_port")
+        {
+            *isNumber = true;
+            return session.tunnel.localPortNumber > 0 ?
+                std::to_string(session.tunnel.localPortNumber) :
+                std::string();
+        }
     }
+    /* GSSAPI policy: written only where it differs from upstream's
+     * defaults (mic on, key exchange and delegation off). */
+    if (key == "auth_gssapi")
+    {
+        return session.gssapi.auth ? std::string() : std::string("0");
+    }
+    if (key == "auth_gssapi_kex")
+    {
+        return session.gssapi.authKex ? std::string("1") : std::string();
+    }
+    if (key == "gssapi_fwd_tgt")
+    {
+        return session.gssapi.forwardTgt ? std::string("1") : std::string();
+    }
+    if (key == "logical_host") { return session.gssapi.logicalHost; }
     /* The FTP/TLS settings of the site: written only when they differ
      * from what a connection would use without them. */
     if (key == "ftp_pasv_mode")
@@ -1054,6 +1081,7 @@ bool SessionStore::Load(std::string & error)
             scratch.tls = current.tls;
             scratch.s3 = current.s3;
             scratch.tunnel = current.tunnel;
+            scratch.gssapi = current.gssapi;
             std::string settingError;
             if (ApplySessionRawSetting(SettingNameForSiteKey(key), value,
                 scratch, settingError))
@@ -1062,6 +1090,7 @@ bool SessionStore::Load(std::string & error)
                 current.tls = scratch.tls;
                 current.s3 = scratch.s3;
                 current.tunnel = scratch.tunnel;
+                current.gssapi = scratch.gssapi;
             }
             else if (current.settingError.empty())
             {
@@ -1377,7 +1406,9 @@ bool SessionStore::Save(std::string & error) const
             "s3_storage_class", "s3_acl", "s3_sse", "s3_kms_key_id",
             "s3_request_payer", "s3_metadata", "tunnel", "tunnel_host",
             "tunnel_port", "tunnel_username", "tunnel_private_key",
-            "tunnel_hostkey", "tunnel_password", "tunnel_passphrase"
+            "tunnel_hostkey", "tunnel_password", "tunnel_passphrase",
+            "tunnel_local_port", "auth_gssapi", "auth_gssapi_kex",
+            "gssapi_fwd_tgt", "logical_host"
         };
         for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++)
         {
@@ -1531,6 +1562,7 @@ SessionOptions SessionStore::ToSessionOptions(const StoredSession & session,
     options.tls = session.tls;
     options.s3 = session.s3;
     options.tunnel = session.tunnel;
+    options.gssapi = session.gssapi;
     return options;
 }
 
@@ -1553,6 +1585,7 @@ StoredSession SessionStore::FromSessionOptions(const std::string & name,
     session.tls = options.tls;
     session.s3 = options.s3;
     session.tunnel = options.tunnel;
+    session.gssapi = options.gssapi;
     // A connected session is not permission to persist its credentials.
     // To store these, give them explicitly to savesession -rawsettings.
     session.tunnel.password.clear();

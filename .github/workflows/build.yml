@@ -42,7 +42,7 @@ jobs:
           # suite skips, which is why the skip count is printed.
           set -o pipefail
           python3 -m venv "$RUNNER_TEMP/live-test-venv"
-          "$RUNNER_TEMP/live-test-venv/bin/pip" install --quiet paramiko botocore pyftpdlib pyOpenSSL
+          "$RUNNER_TEMP/live-test-venv/bin/pip" install --quiet paramiko botocore pyftpdlib pyOpenSSL xmlschema
           "$RUNNER_TEMP/live-test-venv/bin/python" \
             -u source/linux/tests/LiveSftpTest.py source/linux/build/linscp 2>&1 |
             tee "$RUNNER_TEMP/live-tests.log"
@@ -248,7 +248,7 @@ jobs:
           set -o pipefail
           status=0
           for suite in BrowserUploadTest DesktopUriTest SecurityTest \
-                       LocalWorkspaceTest; do
+                       LocalWorkspaceTest ShellIntegrationTest; do
             python3 "source/gui/tests/$suite.py" 2>&1 |
               tee "$RUNNER_TEMP/gui-$suite.log" || status=$?
           done
@@ -277,7 +277,26 @@ jobs:
             sudo apt-get install -y -qq powershell
           fi
           pwsh --version
-          python3 automation/test_psmodule.py source/linux/build/linscp
+          set -o pipefail
+          python3 automation/test_psmodule.py source/linux/build/linscp 2>&1 |
+            tee "$RUNNER_TEMP/powershell-tests.log"
+          # The harness skips its live Pester cases loudly when pwsh is
+          # absent, which is right on a developer machine and wrong here:
+          # pwsh was installed above, so a run that still skipped (or a
+          # Pester run with no cases) is a failure, not evidence.
+          grep -E 'evidence: suite=powershell .*ran=[1-9][0-9]* skipped=0 failed=0' \
+            "$RUNNER_TEMP/powershell-tests.log" > /dev/null || {
+            echo "::error::the live PowerShell suite did not run in CI"
+            exit 1
+          }
+          grep -E 'pester: total=[1-9][0-9]* skipped=0' \
+            "$RUNNER_TEMP/powershell-tests.log" > /dev/null || {
+            echo "::error::Pester ran no cases in CI"
+            exit 1
+          }
+          grep '^evidence: ' "$RUNNER_TEMP/powershell-tests.log" |
+            { while IFS= read -r line; do
+              printf '::notice::%s\n' "${line//]/%5D}"; done; } || :
 
   linux-cmake:
     name: Linux (CMake)
@@ -298,7 +317,7 @@ jobs:
           # The venv goes on PATH before configure so
           # find_package(Python3) resolves the tests to it.
           python3 -m venv "$RUNNER_TEMP/live-test-venv"
-          "$RUNNER_TEMP/live-test-venv/bin/pip" install --quiet paramiko botocore pyftpdlib pyOpenSSL
+          "$RUNNER_TEMP/live-test-venv/bin/pip" install --quiet paramiko botocore pyftpdlib pyOpenSSL xmlschema
           # The venv has to be the interpreter find_package(Python3)
           # resolves at configure time, because ctest bakes that
           # absolute path into every test command; GITHUB_PATH

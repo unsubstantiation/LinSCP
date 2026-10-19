@@ -1,0 +1,265 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  XML Schema for the XML log format '-xmllog=' writes: the upstream
+  WinSCP session log namespace http://winscp.net/schema/session/1.0.
+
+  This schema is pinned here, in the repository, from upstream's own
+  definition of the format: the emitter in winscp/winscp
+  source/core/SessionInfo.cpp (TSessionActionRecord/TActionLog at the
+  parity pin, see docs/upstream-parity.json) and the "XML Logging"
+  documentation page (winscp.net/eng/docs/logging_xml), which describes
+  every element below and names this namespace as the schema's home.
+  It is written from that specification, not copied from the published
+  schema file, so the tests can validate offline:
+
+    - '<session>' holds operations directly, or '<group>' elements (one
+      per script command; this client always groups), each holding
+      operation elements and, for a failed command, one '<failure>'.
+    - Every operation element carries '<name value="..."/>' parameter
+      children (an empty value is written as '<name />') and ends with
+      one '<result success="true|false"/>'; a failure result holds one
+      '<message>' per error line.
+    - 'ls' carries a '<files>' container of '<file>' entries whose
+      '<type>' is the single 'ls' type character in upper case ('D' for
+      a directory), 'stat' one '<file>' with no '<filename>'.
+    - Every timestamp is UTC in the 'YYYY-MM-DDTHH:MM:SS.NNNZ' spelling.
+    - 'difference' (one synchronization comparison item) takes the
+      parameters upstream emits for it: action, type, filename, size,
+      modification, in the order its emitter writes them.
+
+  An operation the format has no element for (creating a symbolic link
+  is the documented example) is simply absent from the log.
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://winscp.net/schema/session/1.0"
+           xmlns="http://winscp.net/schema/session/1.0"
+           elementFormDefault="qualified">
+
+  <!-- A '<name value="..."/>' parameter; the value is absent when empty. -->
+  <xs:complexType name="parameter">
+    <xs:attribute name="value" type="xs:string"/>
+  </xs:complexType>
+  <xs:complexType name="integerParameter">
+    <xs:attribute name="value" type="xs:integer"/>
+  </xs:complexType>
+  <xs:complexType name="timestampParameter">
+    <xs:attribute name="value" type="xs:dateTime"/>
+  </xs:complexType>
+
+  <xs:element name="filename" type="parameter"/>
+  <xs:element name="destination" type="parameter"/>
+  <xs:element name="command" type="parameter"/>
+  <xs:element name="output" type="parameter"/>
+  <xs:element name="erroroutput" type="parameter"/>
+  <xs:element name="exitcode" type="integerParameter"/>
+  <xs:element name="algorithm" type="parameter"/>
+  <xs:element name="permissions" type="parameter"/>
+  <xs:element name="size" type="integerParameter"/>
+  <xs:element name="modification" type="timestampParameter"/>
+  <xs:element name="type" type="parameter"/>
+  <xs:element name="owner" type="parameter"/>
+  <xs:element name="action" type="parameter"/>
+
+  <xs:element name="message" type="xs:string"/>
+
+  <xs:complexType name="resultType">
+    <xs:sequence>
+      <xs:element ref="message" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attribute name="success" type="xs:boolean" use="required"/>
+  </xs:complexType>
+  <xs:element name="result" type="resultType"/>
+
+  <xs:complexType name="failureType">
+    <xs:sequence>
+      <xs:element ref="message" minOccurs="1" maxOccurs="unbounded"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:element name="failure" type="failureType"/>
+
+  <xs:complexType name="fileType">
+    <xs:sequence>
+      <xs:element ref="filename" minOccurs="0"/>
+      <xs:element ref="type"/>
+      <xs:element ref="size" minOccurs="0"/>
+      <xs:element ref="modification" minOccurs="0"/>
+      <xs:element ref="permissions" minOccurs="0"/>
+      <xs:element ref="owner" minOccurs="0"/>
+      <xs:element name="group" type="parameter" minOccurs="0"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:element name="file" type="fileType"/>
+
+  <xs:complexType name="filesType">
+    <xs:sequence>
+      <xs:element ref="file" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:element name="files" type="filesType"/>
+
+  <!-- upload, download -->
+  <xs:complexType name="transferType">
+    <xs:sequence>
+      <xs:element ref="filename" minOccurs="0"/>
+      <xs:element ref="destination" minOccurs="0"/>
+      <xs:element ref="size" minOccurs="0"/>
+      <xs:element ref="result"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <!-- rm, mkdir -->
+  <xs:complexType name="filenameType">
+    <xs:sequence>
+      <xs:element ref="filename" minOccurs="0"/>
+      <xs:element ref="result"/>
+    </xs:sequence>
+    <xs:attribute name="recursive" type="xs:boolean"/>
+  </xs:complexType>
+
+  <!-- mv, cp -->
+  <xs:complexType name="moveType">
+    <xs:sequence>
+      <xs:element ref="filename" minOccurs="0"/>
+      <xs:element ref="destination" minOccurs="0"/>
+      <xs:element ref="result"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="chmodType">
+    <xs:sequence>
+      <xs:element ref="filename" minOccurs="0"/>
+      <xs:element ref="permissions" minOccurs="0"/>
+      <xs:element ref="result"/>
+    </xs:sequence>
+    <xs:attribute name="recursive" type="xs:boolean"/>
+  </xs:complexType>
+
+  <xs:complexType name="touchType">
+    <xs:sequence>
+      <xs:element ref="filename" minOccurs="0"/>
+      <xs:element ref="modification" minOccurs="0"/>
+      <xs:element ref="result"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="callType">
+    <xs:sequence>
+      <xs:element ref="command" minOccurs="0"/>
+      <xs:element ref="destination" minOccurs="0"/>
+      <xs:element ref="output" minOccurs="0"/>
+      <xs:element ref="erroroutput" minOccurs="0"/>
+      <xs:element ref="exitcode" minOccurs="0"/>
+      <xs:element ref="result"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="lsType">
+    <xs:sequence>
+      <xs:element ref="destination" minOccurs="0"/>
+      <xs:element ref="files" minOccurs="0"/>
+      <xs:element ref="result"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="statType">
+    <xs:sequence>
+      <xs:element ref="filename" minOccurs="0"/>
+      <xs:element ref="file" minOccurs="0"/>
+      <xs:element ref="result"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="checksumType">
+    <xs:sequence>
+      <xs:element ref="filename" minOccurs="0"/>
+      <xs:element ref="algorithm" minOccurs="0"/>
+      <!-- The checksum value's element has the action's own name; it is
+           declared locally so the two can differ in type. -->
+      <xs:element name="checksum" type="parameter" minOccurs="0"/>
+      <xs:element ref="result"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="cwdType">
+    <xs:sequence>
+      <!-- Likewise: '<cwd><cwd value="..."/></cwd>'. -->
+      <xs:element name="cwd" type="parameter" minOccurs="0"/>
+      <xs:element ref="result"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <!-- One synchronization comparison item. Upstream writes 'action'
+       first, then the local and/or remote file's type/filename/size/
+       modification groups; a reader takes them in order. -->
+  <xs:complexType name="differenceType">
+    <xs:sequence>
+      <xs:choice minOccurs="0" maxOccurs="unbounded">
+        <xs:element ref="action"/>
+        <xs:element ref="type"/>
+        <xs:element ref="filename"/>
+        <xs:element ref="size"/>
+        <xs:element ref="modification"/>
+      </xs:choice>
+      <xs:element ref="result"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:element name="upload" type="transferType"/>
+  <xs:element name="download" type="transferType"/>
+  <xs:element name="rm" type="filenameType"/>
+  <xs:element name="mkdir" type="filenameType"/>
+  <xs:element name="mv" type="moveType"/>
+  <xs:element name="cp" type="moveType"/>
+  <xs:element name="chmod" type="chmodType"/>
+  <xs:element name="touch" type="touchType"/>
+  <xs:element name="call" type="callType"/>
+  <xs:element name="ls" type="lsType"/>
+  <xs:element name="stat" type="statType"/>
+  <xs:element name="checksum" type="checksumType"/>
+  <xs:element name="cwd" type="cwdType"/>
+  <xs:element name="difference" type="differenceType"/>
+
+  <xs:group name="operations">
+    <xs:choice>
+      <xs:element ref="upload"/>
+      <xs:element ref="download"/>
+      <xs:element ref="rm"/>
+      <xs:element ref="mkdir"/>
+      <xs:element ref="mv"/>
+      <xs:element ref="cp"/>
+      <xs:element ref="chmod"/>
+      <xs:element ref="touch"/>
+      <xs:element ref="call"/>
+      <xs:element ref="ls"/>
+      <xs:element ref="stat"/>
+      <xs:element ref="checksum"/>
+      <xs:element ref="cwd"/>
+      <xs:element ref="difference"/>
+      <xs:element ref="failure"/>
+    </xs:choice>
+  </xs:group>
+
+  <xs:element name="group">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:group ref="operations" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="name" type="xs:string" use="required"/>
+      <xs:attribute name="start" type="xs:dateTime" use="required"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="session">
+    <xs:complexType>
+      <xs:choice minOccurs="0" maxOccurs="unbounded">
+        <xs:element ref="group"/>
+        <xs:group ref="operations"/>
+      </xs:choice>
+      <xs:attribute name="name" type="xs:string"/>
+      <!-- Upstream always writes 'start'; 'id' appears on sessions an
+           assembly drives. Neither is needed by a reader. -->
+      <xs:attribute name="start" type="xs:dateTime"/>
+      <xs:attribute name="id" type="xs:string"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>

@@ -2,7 +2,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-7 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+4 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -10,14 +10,14 @@ Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
 **Area:** Security/authentication · **Status:** partial
 
-Authenticated SSH jump-host connections now work for SFTP/SCP/SSH, including GUI tabs, background operations and the embedded terminal. Tunnel* raw settings, independent host-key verification, inherited proxy settings, encrypted stored jump credentials and bounded lifecycle cleanup are implemented. GSSAPI remains unavailable; removing NO_GSSAPI no longer pretends otherwise.
+Authenticated SSH jump-host connections now work for SFTP/SCP/SSH, including GUI tabs, background operations and the embedded terminal. Tunnel* raw settings, independent host-key verification, inherited proxy settings, encrypted stored jump credentials and bounded lifecycle cleanup are implemented. Kerberos/GSSAPI is now wired through libssh: AuthGSSAPI, AuthGSSAPIKEX, GSSAPIFwdTGT and LogicalHostName persist in stored sessions and the GUI; gssapi-with-mic is attempted before public-key auth with fallback to the existing methods; optional RFC 4462 GSSAPI key exchange is offered only when no host key is pinned; credential delegation stays off unless GSSAPIFwdTGT=1 is explicitly set. Runtime support is detected from libssh's advertised version so stub builds refuse explicit Kerberos delegation/logical-host/key-exchange settings by name instead of silently dropping them. TunnelLocalPortNumber now binds the requested loopback port for the jump session's own destination connection; 0 keeps the private socket pair. Non-SSH destination tunnels still fail closed, and no isolated Kerberos/KDC realm is certified by the current fixtures.
 
-**Next:** GSSAPI/Kerberos authentication still needs implementation, dependency detection, realm tests and credential-delegation review. Tunnels for non-SSH destination protocols and fixed local-listener ports are not supported; they fail closed rather than connect directly.
+**Next:** Validate GSSAPI/Kerberos against an isolated realm (principal selection, missing/expired credentials, mutual authentication and opt-in delegation) before claiming realm parity. Tunnels for non-SSH destination protocols are not supported; they fail closed rather than connect directly.
 
 **Acceptance criteria:**
 
-- [ ] Implement optional GSSAPI against an isolated Kerberos realm, testing principal selection, missing/expired credentials, mutual authentication and opt-in delegation; obtain security review before enabling it by default.
-- [ ] Define and test tunneling for FTP/FTPS/WebDAV/S3, including data-channel routing, TLS SNI/certificate verification and S3 signing for the original destination. If fixed listener ports are supported, bind loopback only, test collisions/authorization and clean up on every failure.
+- [ ] Validate optional GSSAPI against an isolated Kerberos realm, testing principal selection, missing/expired credentials, mutual authentication and opt-in delegation; obtain security review before treating delegation as fully certified.
+- [ ] Define and test tunneling for FTP/FTPS/WebDAV/S3, including data-channel routing, TLS SNI/certificate verification and S3 signing for the original destination. Fixed SSH tunnel listener ports must remain loopback-only, fail on collisions and clean up on every failure.
 
 ## security.gui-account
 
@@ -43,30 +43,6 @@ No WinSCP .NET assembly or equivalent object model for Linux. The C ABI header t
 
 - [ ] Define the Linux object-model contract and upstream compatibility boundary. Build and test an actual .NET library for session lifecycle, listing, transfer, synchronization, cancellation, structured results and error propagation. A subprocess helper alone is not assembly parity.
 
-## automation.powershell
-
-**Area:** Automation · **Status:** partial
-
-automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Passwords travel on stdin to -server, never on a command line. The module has a test harness (automation/test_psmodule.py, run by make check-live, CTest and CI): static checks that always run, and a Pester suite against the throwaway WebDAV endpoint covering open/close, byte-exact transfers, listing objects, terminating errors, timeout cancellation and password hygiene. The live Pester run needs pwsh, which CI installs; no green live run has been recorded in this ledger yet, and the module remains a shim over the CLI rather than upstream's assembly API.
-
-**Next:** Record a green live Pester run (CI installs pwsh and runs the harness): a session opened and closed, an upload and a download of exact bytes, a listing as pipeline objects, a terminating error, a cancelled transfer, and a password that appears neither in the process list nor in the output.
-
-**Acceptance criteria:**
-
-- [ ] Build cmdlets or a documented compatibility module on the tested automation contract. Exercise them with PowerShell on Linux, including pipeline objects, terminating errors, cancellation and secret handling.
-
-## desktop.shell-and-extensions
-
-**Area:** Desktop integration · **Status:** missing
-
-No system file-manager shell commands or upstream extension system. The half-translated Nautilus extension the Windows Explorer integration left behind is gone: it ran no session, so it uploaded nothing, and it was neither installed nor documented. The command templates of the graphical client (source/gui/explorer-commands.json) are its own feature and are shipped by all three installers.
-
-**Next:** Specify desired desktop environment integrations and build/test them individually.
-
-**Acceptance criteria:**
-
-- [ ] Specify supported file managers and extension API. Add explicit, opt-in installation and removal, selection transport without shell interpolation, confirmation and extension permission boundaries. Test packaged installation as well as source-tree execution.
-
 ## locale.translations
 
 **Area:** Localization/accessibility · **Status:** partial
@@ -79,19 +55,6 @@ English/Spanish catalogs cover the browser interface (menus, dialogs, help, ARIA
 
 - [ ] Ship a catalog for every language the project claims to support and translate the whole interface into it, starting with the languages the upstream project already ships.
 - [ ] Add a test that walks the catalogs and reports the messages of the client that are still answered in English, so a new interface string cannot slip through untranslated.
-
-## automation.upstream-xml-compatibility
-
-**Area:** Automation · **Status:** partial
-
-The XML action log emits structured command, message and transfer actions with secret masking. Its structure resembles upstream but schema/consumer equivalence has not been established.
-
-**Next:** Pin the intended upstream XML schema and validate successful/failing operations with actual automation consumers.
-
-**Acceptance criteria:**
-
-- [ ] Compare schema-valid fixtures for command results, transfer errors, cancellation and session lifecycle against the pinned upstream format.
-- [ ] Test at least one upstream-compatible parser and prove secret redaction preserves a valid document.
 
 ## Cross-cutting release gate
 

@@ -1,10 +1,12 @@
 /*
  * SSH jump-host connections for the native SFTP/SCP/SSH transports.
  * A private socket pair carries one verified destination connection over
- * an authenticated direct-tcpip channel. No TCP listener is exposed.
+ * an authenticated direct-tcpip channel. No TCP listener is exposed
+ * unless 'TunnelLocalPortNumber' names a port, and then the listener is
+ * loopback-only, serves this one session's connection and is closed
+ * with it.
  *
  * The legacy -L/-R/-D parsing helpers below are not a forwarding service.
- * GSSAPI remains disabled; detecting a library is not authentication support.
  */
 
 #ifndef LINSCP_SSHTUNNEL_H
@@ -28,8 +30,12 @@ struct SshTunnelSettings
     std::string privateKeyFile;
     std::string keyPassphrase;
     std::string hostKey;
+    /* 'TunnelLocalPortNumber': 0 keeps the private socket pair (no
+     * listener at all); a port binds that loopback port for the jump
+     * session's own connection, so a firewall rule can name it. */
+    int localPortNumber;
 
-    SshTunnelSettings() : enabled(false), portNumber(22) {}
+    SshTunnelSettings() : enabled(false), portNumber(22), localPortNumber(0) {}
 };
 
 class SshJumpTunnel
@@ -81,10 +87,11 @@ bool ParseTunnelSpec(const std::string & spec, TunnelType type,
 /* Builds the ssh(1) command-line flags for one tunnel. */
 std::string TunnelSshFlags(const SshTunnel & tunnel);
 
-/* GSSAPI is deliberately unavailable until authentication and realm tests
- * exist. This check must not imply that removing a build flag enables it. */
+/* Whether the libssh this process loaded can really speak GSSAPI: the
+ * library advertises it in ssh_version(), which a stub build does not.
+ * Authentication code must ask this rather than assuming the symbol
+ * that linked is an implementation. */
 bool IsGssapiSupported();
-bool ApplyGssapiSetting(const std::string & value, std::string & error);
 
 } // namespace linscp
 

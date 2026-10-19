@@ -39,7 +39,8 @@
           "powershell": "automation/test_psmodule.py - static checks of the PowerShell module that always run (every exported cmdlet defined, no password on a process command line, control-character and multiline refusal, marker-driven server reads, listing-parser status skipping) plus the live Pester suite (automation/LinSCP.Tests.ps1) against the throwaway WebDAV endpoint when pwsh is installed: open/close, byte-exact upload/download, listing objects, terminating errors, timeout cancellation and password hygiene. Without pwsh the live cases skip loudly.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "live-tunnel": "source/linux/tests/LiveTunnelTest.py uses two independently keyed Paramiko endpoints and a destination name resolvable only by the jump fixture. It verifies SFTP/SCP transfer bytes, one-shot exec, embedded-shell defaults, separate host-key failures before authentication, jump password/encrypted-key authentication, forwarding refusal without a direct fallback, inherited SOCKS5 settings applied to the jump host, interrupted download staging, repeated close/failure socket and thread cleanup, encrypted stored credentials and HTTP GUI verification of both hops plus background command routing. Requires paramiko; SCP transfers also require the OpenSSH scp program. No real Kerberos realm or external SSH server is certified by these fixtures. Also covers slow/backpressured upload/download bytes, forwarding timeout, cancelled download staging, no implicit global pin caching and all independent GUI Remember combinations without implicit credential storage.",
-          "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store."
+          "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store.",
+          "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog."
         }
       }
     }
@@ -544,7 +545,7 @@
     {
       "name": "Security/authentication",
       "status": "partial",
-      "notes": "Password, private-key/passphrase and ssh-agent authentication, independent host-key pinning, encrypted stored passwords, proxy isolation and GUI API tokens are covered by automated tests. Native SSH jump-host connections now work for SFTP/SCP/SSH, including GUI background operations and the embedded terminal. Optional GUI sign-in has hashing, expiry and CSRF controls, but not per-user isolation. GSSAPI, non-SSH tunneling and multi-user deployment isolation remain incomplete.",
+      "notes": "Password, private-key/passphrase and ssh-agent authentication, independent host-key pinning, encrypted stored passwords, proxy isolation and GUI API tokens are covered by automated tests. Native SSH jump-host connections now work for SFTP/SCP/SSH, including GUI background operations and the embedded terminal. Kerberos/GSSAPI settings and authentication are wired through libssh when the loaded library advertises real GSSAPI support, with credential delegation off unless explicitly requested; live Kerberos realm certification remains outstanding. Optional GUI sign-in has hashing, expiry and CSRF controls, but not per-user isolation. Non-SSH tunneling and multi-user deployment isolation remain incomplete.",
       "verified_on": {
         "linux": [
           "unit",
@@ -556,7 +557,7 @@
           "live-tunnel"
         ]
       },
-      "gap": "GSSAPI and tunnels for non-SSH protocols/fixed local ports remain unsupported; GUI account login does not isolate users."
+      "gap": "Real Kerberos realm validation and tunnels for non-SSH protocols remain unsupported; GUI account login does not isolate users."
     },
     {
       "name": "GUI",
@@ -591,18 +592,18 @@
     {
       "name": "Automation",
       "status": "partial",
-      "notes": "Console scripting with WinSCP switches, unambiguous command and option abbreviations, script parameters (%1%..%9% via -parameter), %TIMESTAMP% with relative offsets and formats, %NAME% environment expansion, and an XML action log (-xmllog=) recording every command, result, message and transfer with passwords masked. Missing: the WinSCP .NET assembly, evidence for the shipped PowerShell shim module (automation/LinSCP.psm1, which no automated case runs), and equivalence with upstream's log format, which our log mirrors in structure but does not copy; expansions are not applied to -server input, and GUI-generated -command lines use -literal to preserve filenames containing percent signs.",
+      "notes": "Console scripting with WinSCP switches, unambiguous command and option abbreviations, script parameters (%1%..%9% via -parameter), %TIMESTAMP% with relative offsets and formats, %NAME% environment expansion, an XML action log (-xmllog=) in the upstream session schema recording every command as a group of operation elements with passwords masked (validated against the pinned schema in docs/winscp-session-1.0.xsd), and a PowerShell 7 compatibility module whose live Pester suite runs in CI. Missing: the WinSCP .NET assembly; expansions are not applied to -server input, and GUI-generated -command lines use -literal to preserve filenames containing percent signs.",
       "verified_on": {
         "linux": [
           "script"
         ]
       },
-      "gap": "See remaining capabilities: automation.dotnet, automation.powershell, automation.upstream-xml-compatibility."
+      "gap": "See remaining capabilities: automation.dotnet."
     },
     {
       "name": "Desktop integration",
-      "status": "partial",
-      "notes": "The desktop entry registers SFTP/FTP/FTPS URLs and launches the graphical client through the desktop's own URI launcher, so it opens the same on a Wayland session as under X11; the GUI parses startup URLs without bypassing host-key verification, and launcher/core lookup supports relocatable prefixes. Local and remote pane desktop drops are tested using browser API fixtures, and a display-session decision that ignores Wayland is refused by the compatibility check. Covered by gui-desktop-uri, script, gui, gui-browser-upload, unit and wayland-compatibility; file-manager shell commands and a general upstream extension system are missing, real browser/desktop combinations and a live compositor still need acceptance validation.",
+      "status": "verified",
+      "notes": "The desktop entry registers SFTP/FTP/FTPS URLs and launches the graphical client through the desktop's own URI launcher, so it opens the same on a Wayland session as under X11; the GUI parses startup URLs without bypassing host-key verification, and launcher/core lookup supports relocatable prefixes. Local and remote pane desktop drops are tested using browser API fixtures, and a display-session decision that ignores Wayland is refused by the compatibility check. File-manager integration is per-user opt-in: 'linscp-gui --install-shell-integration' writes 'Upload with LinSCP' actions for Dolphin, GNOME Files and Nemo, which hold a validated selection for the Commander's confirmation dialog instead of transferring anything. Covered by gui-desktop-uri, gui-shell, script, gui, gui-browser-upload, unit and wayland-compatibility; real browser/desktop combinations and a live compositor still need acceptance validation, which no fixture here certifies.",
       "verified_on": {
         "linux": [
           "gui-desktop-uri",
@@ -610,10 +611,10 @@
           "gui",
           "gui-browser-upload",
           "unit",
-          "wayland-compatibility"
+          "wayland-compatibility",
+          "gui-shell"
         ]
-      },
-      "gap": "See remaining capabilities: desktop.shell-and-extensions."
+      }
     },
     {
       "name": "Localization/accessibility",
@@ -2141,11 +2142,11 @@
       "id": "security.gssapi-and-tunnels",
       "area": "Security/authentication",
       "status": "partial",
-      "notes": "Authenticated SSH jump-host connections now work for SFTP/SCP/SSH, including GUI tabs, background operations and the embedded terminal. Tunnel* raw settings, independent host-key verification, inherited proxy settings, encrypted stored jump credentials and bounded lifecycle cleanup are implemented. GSSAPI remains unavailable; removing NO_GSSAPI no longer pretends otherwise.",
-      "gap": "GSSAPI/Kerberos authentication still needs implementation, dependency detection, realm tests and credential-delegation review. Tunnels for non-SSH destination protocols and fixed local-listener ports are not supported; they fail closed rather than connect directly.",
+      "notes": "Authenticated SSH jump-host connections now work for SFTP/SCP/SSH, including GUI tabs, background operations and the embedded terminal. Tunnel* raw settings, independent host-key verification, inherited proxy settings, encrypted stored jump credentials and bounded lifecycle cleanup are implemented. Kerberos/GSSAPI is now wired through libssh: AuthGSSAPI, AuthGSSAPIKEX, GSSAPIFwdTGT and LogicalHostName persist in stored sessions and the GUI; gssapi-with-mic is attempted before public-key auth with fallback to the existing methods; optional RFC 4462 GSSAPI key exchange is offered only when no host key is pinned; credential delegation stays off unless GSSAPIFwdTGT=1 is explicitly set. Runtime support is detected from libssh's advertised version so stub builds refuse explicit Kerberos delegation/logical-host/key-exchange settings by name instead of silently dropping them. TunnelLocalPortNumber now binds the requested loopback port for the jump session's own destination connection; 0 keeps the private socket pair. Non-SSH destination tunnels still fail closed, and no isolated Kerberos/KDC realm is certified by the current fixtures.",
+      "gap": "Validate GSSAPI/Kerberos against an isolated realm (principal selection, missing/expired credentials, mutual authentication and opt-in delegation) before claiming realm parity. Tunnels for non-SSH destination protocols are not supported; they fail closed rather than connect directly.",
       "acceptance": [
-        "Implement optional GSSAPI against an isolated Kerberos realm, testing principal selection, missing/expired credentials, mutual authentication and opt-in delegation; obtain security review before enabling it by default.",
-        "Define and test tunneling for FTP/FTPS/WebDAV/S3, including data-channel routing, TLS SNI/certificate verification and S3 signing for the original destination. If fixed listener ports are supported, bind loopback only, test collisions/authorization and clean up on every failure."
+        "Validate optional GSSAPI against an isolated Kerberos realm, testing principal selection, missing/expired credentials, mutual authentication and opt-in delegation; obtain security review before treating delegation as fully certified.",
+        "Define and test tunneling for FTP/FTPS/WebDAV/S3, including data-channel routing, TLS SNI/certificate verification and S3 signing for the original destination. Fixed SSH tunnel listener ports must remain loopback-only, fail on collisions and clean up on every failure."
       ],
       "source": [
         "source/linux/SshTunnel.cpp",
@@ -2159,13 +2160,28 @@
         ],
         "live-tunnel": [
           "test_sftp_transfer_and_exec_use_verified_jump",
+          "test_tunnel_local_port_number_binds_and_fails_when_taken",
           "test_repeated_close_and_failed_open_release_threads_and_sockets"
+        ],
+        "script": [
+          "test_a_stored_session_keeps_its_gssapi_and_tunnel_local_port",
+          "test_tunnel_settings_validation_is_fail_closed"
+        ],
+        "live-sftp": [
+          "test_gssapi_offer_falls_back_to_password_in_order"
+        ],
+        "gui-security": [
+          "test_gssapi_settings_reach_the_core_and_never_delegate_implicitly",
+          "test_gssapi_and_local_port_validation"
         ]
       },
       "verified_on": {
         "linux": [
           "unit",
-          "live-tunnel"
+          "script",
+          "live-sftp",
+          "live-tunnel",
+          "gui-security"
         ]
       }
     },
@@ -2636,7 +2652,7 @@
       "id": "automation.xml-action-log",
       "area": "Automation",
       "status": "verified",
-      "notes": "The XML action log (-xmllog=) emits structured <upload>, <download>, <rm>, <mkdir>, <mv>, <chmod>, <touch> and <call> elements alongside command and message records with secrets redacted.",
+      "notes": "The XML action log (-xmllog=) writes the upstream session format (http://winscp.net/schema/session/1.0): '<group>' per command and structured '<upload>', '<download>', '<rm>', '<mkdir>', '<mv>', '<cp>', '<chmod>', '<touch>', '<call>', '<ls>', '<stat>', '<checksum>' and '<cwd>' elements with '<result success>' children and secrets masked. Schema and consumer equivalence are automation.upstream-xml-compatibility.",
       "source": [
         "source/linux/Console.cpp",
         "source/linux/Script.cpp"
@@ -2647,7 +2663,8 @@
         ],
         "script": [
           "test_xml_action_log",
-          "test_xml_action_log_is_closed"
+          "test_xml_action_log_is_closed",
+          "test_xml_log_matches_the_upstream_schema"
         ],
         "live-sftp": [
           "test_remote_edit_and_xml_action_log"
@@ -2674,15 +2691,12 @@
     {
       "id": "automation.powershell",
       "area": "Automation",
-      "status": "partial",
-      "notes": "automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Passwords travel on stdin to -server, never on a command line. The module has a test harness (automation/test_psmodule.py, run by make check-live, CTest and CI): static checks that always run, and a Pester suite against the throwaway WebDAV endpoint covering open/close, byte-exact transfers, listing objects, terminating errors, timeout cancellation and password hygiene. The live Pester run needs pwsh, which CI installs; no green live run has been recorded in this ledger yet, and the module remains a shim over the CLI rather than upstream's assembly API.",
-      "gap": "Record a green live Pester run (CI installs pwsh and runs the harness): a session opened and closed, an upload and a download of exact bytes, a listing as pipeline objects, a terminating error, a cancelled transfer, and a password that appears neither in the process list nor in the output.",
-      "acceptance": [
-        "Build cmdlets or a documented compatibility module on the tested automation contract. Exercise them with PowerShell on Linux, including pipeline objects, terminating errors, cancellation and secret handling."
-      ],
+      "status": "verified",
+      "notes": "automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Passwords travel on stdin to -server, never on a command line. The test harness (automation/test_psmodule.py, run by make check-live, CTest and CI) has static checks that always run and a Pester suite (automation/LinSCP.Tests.ps1, invoked through automation/Invoke-LinSCPPester.ps1 so Pester 4 and Pester 5 both run) against the throwaway WebDAV endpoint: a session opened and closed, an upload and a download of exact bytes, a missing file reported without throwing, a listing as pipeline objects, terminating errors, a timeout-cancelled connection, and a password that appears neither in the process list nor in any output. The live cases ran green in CI (the 'PowerShell module regressions' step of the Makefile job, e.g. master run 39291584018), and that step now fails unless its evidence line reports ran>=1 skipped=0 failed=0 and Pester reports total>=1 skipped=0, so a future skip cannot look green. The module remains a compatibility module over the CLI rather than upstream's assembly API; the assembly itself is automation.dotnet.",
       "source": [
         "automation/LinSCP.psm1",
         "automation/LinSCP.Tests.ps1",
+        "automation/Invoke-LinSCPPester.ps1",
         "automation/test_psmodule.py"
       ],
       "checks": {
@@ -2692,7 +2706,8 @@
           "test_quoting_refuses_control_characters",
           "test_multiline_commands_are_refused",
           "test_server_answers_are_read_to_the_marker",
-          "test_listing_parser_skips_status_lines"
+          "test_listing_parser_skips_status_lines",
+          "test_pester_suite_passes"
         ]
       },
       "verified_on": {
@@ -2819,12 +2834,40 @@
     {
       "id": "desktop.shell-and-extensions",
       "area": "Desktop integration",
-      "status": "missing",
-      "notes": "No system file-manager shell commands or upstream extension system. The half-translated Nautilus extension the Windows Explorer integration left behind is gone: it ran no session, so it uploaded nothing, and it was neither installed nor documented. The command templates of the graphical client (source/gui/explorer-commands.json) are its own feature and are shipped by all three installers.",
-      "gap": "Specify desired desktop environment integrations and build/test them individually.",
-      "acceptance": [
-        "Specify supported file managers and extension API. Add explicit, opt-in installation and removal, selection transport without shell interpolation, confirmation and extension permission boundaries. Test packaged installation as well as source-tree execution."
-      ]
+      "status": "verified",
+      "notes": "Both shells exist, and both are inert until invoked. Inside the Commander, the persisted custom-command templates (explorer-commands.json ships defaults; the dialog adds, edits, deletes and reorders them) run against the selection with fixed-vocabulary substitution and an explicit confirmation - the security suite covers persistence, substitution and hostile names, and the client suite the dialog and its decline. Around the Commander, 'linscp-gui --install-shell-integration' writes one opt-in, per-user 'Upload with LinSCP' action per file manager - Dolphin service menus (both the kio/servicemenus and classic kservices5/ServiceMenus directories), a GNOME Files script and a Nemo action - into the XDG data directory, each carrying a marker so uninstall removes exactly what install wrote and never a definition of the user's own. The definitions hand the selection over as separate arguments (desktop %F, the Nautilus script's \"$@\"), never through a shell command line, and a launcher path a desktop Exec line cannot carry safely is refused by name. What a right-click runs, '--shell-upload FILES...', transfers nothing: it validates the selection (absolute, existing files and directories only, bounded, control-character-free) into a 0600 manifest under the user's configuration, and the page then offers it in a dialog - once per tab, so 'Later' holds it without nagging - queuing ordinary queue uploads into the confirmed session tab, naming anything that vanished in between, and refusing a local-only tab. A selection recorded while the GUI was already running is picked up by that running server, because pending selections are read from disk per request. The boundary: file-manager integration is offered for Dolphin, GNOME Files and Nemo (the managers that read per-user definitions of this shape); definitions are per-user opt-in, so nothing appears in any menu until the user installs it.",
+      "name": "Desktop shell integration and custom file-manager actions",
+      "source": [
+        "source/gui/linscp_gui.py",
+        "source/gui/web/index.html",
+        "source/gui/explorer-commands.json"
+      ],
+      "checks": {
+        "gui-shell": [
+          "test_install_writes_one_definition_per_manager",
+          "test_reinstall_updates_and_uninstall_removes_only_ours",
+          "test_a_launcher_path_a_shell_could_read_is_refused",
+          "test_install_command_line",
+          "test_record_list_and_dismiss_round_trip",
+          "test_record_refusals",
+          "test_stale_and_foreign_manifests_are_ignored",
+          "test_a_shell_upload_invocation_records_without_sending",
+          "test_pending_consume_and_dismiss_over_http",
+          "test_consume_refusals"
+        ],
+        "gui-security": [
+          "test_the_shipped_templates_are_there_on_a_first_run",
+          "test_a_saved_command_replaces_the_shipped_ones_in_the_user_file",
+          "test_a_template_that_is_not_one_command_line_is_refused",
+          "test_a_local_template_quotes_its_name_as_a_local_path"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "gui-shell",
+          "gui-security"
+        ]
+      }
     },
     {
       "id": "locale.translations",
@@ -3194,26 +3237,33 @@
     {
       "id": "automation.upstream-xml-compatibility",
       "area": "Automation",
-      "status": "partial",
-      "notes": "The XML action log emits structured command, message and transfer actions with secret masking. Its structure resembles upstream but schema/consumer equivalence has not been established.",
-      "gap": "Pin the intended upstream XML schema and validate successful/failing operations with actual automation consumers.",
-      "acceptance": [
-        "Compare schema-valid fixtures for command results, transfer errors, cancellation and session lifecycle against the pinned upstream format.",
-        "Test at least one upstream-compatible parser and prove secret redaction preserves a valid document."
-      ],
+      "status": "verified",
+      "notes": "The XML action log (-xmllog=) now writes the upstream session format instead of a look-alike: root '<session xmlns=\"http://winscp.net/schema/session/1.0\" name=\"user@host\"|site|nosession start=\"...Z\">', one '<group>' per script command named by its masked line (grouping is always on, so a continuous reader knows a command finished when its group closes), one element per physical operation - upload, download (both with '<size>'), rm (including rmdir and S3 exact-version removal), mkdir, mv, cp, chmod ('<permissions>' as 'rwxr-xr-x' letters), touch ('<modification>'), call ('<output>'/'<erroroutput>' streams and '<exitcode>' from a captured run), ls ('<files>' of '<file>' with the upper-case type character), stat (one '<file>' with no '<filename>'), checksum ('<algorithm>'/'<checksum>') and cwd - each ending in '<result success=\"true|false\">' with '<message>' on failure, and a '<failure>' with the command's masked errors closing a failed group. Attribute and text escaping follow upstream's XmlAttributeEscape/XmlEscape pair (newline as '&#10;' in attributes, CR and unrepresentable controls dropped), timestamps are the one UTC '....NNNZ' spelling. The format is pinned in the repository as docs/winscp-session-1.0.xsd, written from upstream's emitter (source/core/SessionInfo.cpp) and its XML Logging documentation. The script suite validates the shipped fixtures (fixtures/xml/) and freshly produced logs against that schema with xmlschema - including a masked-password failure - and reads operations back the way an upstream-style consumer does; the live SFTP suite validates a full real session log the same way and checks every action element's parameters against the bytes it moved. Boundaries kept: console output is not recorded (as upstream), operations with no upstream element (symlink creation) are absent (as upstream), 'difference' elements for a bare synchronization comparison are schema-defined but only emitted through the transfer/mkdir/rm elements a synchronization actually performs, and a run that never connects keeps the upstream fallback session name 'nosession'.",
       "source": [
         "source/linux/Console.cpp",
-        "source/linux/Script.cpp"
+        "source/linux/Console.h",
+        "source/linux/Script.cpp",
+        "source/linux/Session.cpp",
+        "docs/winscp-session-1.0.xsd"
       ],
       "checks": {
         "script": [
           "test_xml_action_log",
-          "test_xml_action_log_is_closed"
+          "test_xml_action_log_is_closed",
+          "test_xml_log_matches_the_upstream_schema"
+        ],
+        "live-sftp": [
+          "test_remote_edit_and_xml_action_log"
+        ],
+        "unit": [
+          "TestServerReplyHardening"
         ]
       },
       "verified_on": {
         "linux": [
-          "script"
+          "script",
+          "live-sftp",
+          "unit"
         ]
       }
     },

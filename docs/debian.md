@@ -128,7 +128,7 @@ linscp -batch -command="open sftp://user@example.com/; cd /data; ls; get * /tmp"
 | `-port=<number>` | port (default 22) |
 | `-timeout=<secs>` | connection timeout (default 15) |
 | `-log=<file>` | write the session log to a file |
-| `-xmllog=<file>` | write an XML action log of every command, message and transfer, with passwords masked |
+| `-xmllog=<file>` | write an XML log in the upstream session format (`http://winscp.net/schema/session/1.0`, pinned as [winscp-session-1.0.xsd](winscp-session-1.0.xsd)): one `<group>` per command and one element per operation, with passwords masked |
 | `-parameter <value>...` | script parameters, for `%1%` to `%9%` |
 | `-batch` | never ask; fail instead |
 | `-server` | read one command per line on standard input and answer each with `LSCP-RESULT`; the GUI drives the client this way |
@@ -322,8 +322,11 @@ TunnelHostKey=SHA256:...`; `TunnelPortNumber`, `TunnelPublicKeyFile`,
 `TunnelPassword` and `TunnelPassphrase` configure the jump independently of the
 destination. Global `-rawsettings=N` also supplies defaults to `-shell`.
 The parent proxy reaches the jump, and a private socket pair replaces a local
-TCP listener. Fixed `TunnelLocalPortNumber` values other than `0`, GSSAPI and
-curl-backed destination protocols are refused. See [SSH tunnels](ssh-tunnels.md)
+TCP listener by default. A nonzero `TunnelLocalPortNumber` binds that
+loopback port for this session's own tunneled connection. GSSAPI/Kerberos
+uses libssh when the loaded library advertises it; credential delegation is
+off unless `GSSAPIFwdTGT=1` is set. Curl-backed destination protocols over an
+SSH tunnel are refused. See [SSH tunnels](ssh-tunnels.md)
 for secure examples, storage policy and regression commands.
 
 The GUI challenges each hop separately. Remembering a key stores only that
@@ -361,6 +364,14 @@ is never interrupted by a window it did not ask for. The Commander offers:
 * A console log and an embedded command line.
 * Drag-and-drop of files and folders from a file manager into either pane.
   Relative paths and empty directories are kept, and unsafe paths are rejected.
+* An opt-in **Upload with LinSCP** file-manager action:
+  `linscp-gui --install-shell-integration` writes one small per-user
+  definition each for Dolphin (KDE), Files (GNOME) and Nemo (Cinnamon)
+  under the XDG data directory (`--uninstall-shell-integration` removes
+  exactly those, and never a definition it did not write). Choosing the
+  action only holds the selection for the Commander, which offers it in
+  a dialog; nothing is uploaded until that is confirmed against a
+  session tab.
 * Multi-user sign-in when the server is started with `--accounts-file=`.
 * A desktop entry and URL scheme handlers, from `linscp.desktop`, which starts the
   server with `--open-browser` so the desktop's own launcher shows the page - the
@@ -492,10 +503,10 @@ watch cannot be set up, the client falls back to timer polling. It runs in the
 foreground until Ctrl-C, or until `-count=` passes complete, so a
 non-interactive script must give `-count=`.
 
-Not implemented: the .NET assembly API, GSSAPI, multi-user GUI isolation,
-desktop extensions, broader localization and upstream XML compatibility.
-Local-to-local sessions and named workspaces are implemented. SSH jump hosts work for SFTP/SCP/SSH;
-non-SSH tunnels and fixed listener ports do not. S3 version-aware operations are implemented as described above; S3 and
+Not implemented: the .NET assembly API, multi-user GUI isolation and broader
+localization beyond English/Spanish. Local-to-local sessions and named
+workspaces are implemented. SSH jump hosts work for SFTP/SCP/SSH;
+non-SSH tunnels do not, and live Kerberos-realm certification remains open. S3 version-aware operations are implemented as described above; S3 and
 WebDAV still cover documented subsets rather than every upstream extension.
 See the [parity audit](upstream-parity.md) for the full list of verified
 capabilities and remaining gaps.

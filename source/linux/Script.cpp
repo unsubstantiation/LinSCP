@@ -825,6 +825,69 @@ void Script::RemoteFreeNames(LscpNames * names)
     }
 }
 
+/*
+ * The XML action log's spelling of what the listings already know: the
+ * nine permission letters without the type character (upstream's
+ * Rights.Text), and the '<file>' of an 'ls'/'stat' element from one set of
+ * attributes. A member the backend did not report stays absent, as in
+ * upstream's RecordFile.
+ */
+static std::string XmlPermissionsText(unsigned long permissions)
+{
+    const std::string text = FormatPermissions(permissions);
+    return text.size() > 1 ? text.substr(1) : text;
+}
+
+static XmlFileInfo XmlFileInfoFromAttrs(const std::string & name,
+    const LscpAttrs & attrs)
+{
+    XmlFileInfo file;
+    file.name = name;
+    if ((attrs.flags & LSCP_ATTR_PERMISSIONS) != 0)
+    {
+        const std::string text = FormatPermissions(attrs.permissions);
+        if (!text.empty())
+        {
+            file.type = static_cast<char>(toupper(
+                static_cast<unsigned char>(text[0])));
+        }
+        file.permissions = XmlPermissionsText(attrs.permissions);
+        if (file.type != 'D' && (attrs.flags & LSCP_ATTR_SIZE) != 0)
+        {
+            file.hasSize = true;
+            file.size = attrs.size;
+        }
+    }
+    else if ((attrs.flags & LSCP_ATTR_SIZE) != 0)
+    {
+        file.hasSize = true;
+        file.size = attrs.size;
+    }
+    if ((attrs.flags & LSCP_ATTR_ACMODTIME) != 0 && attrs.mtime != 0)
+    {
+        file.hasModification = true;
+        file.modification = attrs.mtime;
+    }
+    if ((attrs.flags & LSCP_ATTR_UIDGID) != 0)
+    {
+        file.owner = std::to_string(attrs.uid);
+        file.group = std::to_string(attrs.gid);
+    }
+    return file;
+}
+
+/* One server-side copy in the XML log, from whichever of its exits
+ * CopyRemoteOneFile takes. */
+static void XmlLogCopy(const std::string & from, const std::string & to,
+    bool success, const std::string & error)
+{
+    XmlParams params;
+    params.push_back(std::make_pair("filename", from));
+    params.push_back(std::make_pair("destination", to));
+    Console::Instance().XmlAction("cp", params, success,
+        success ? std::string() : error);
+}
+
 int Script::RemoteStat(const std::string & path, LscpAttrs * attrs, std::string & error)
 {
     error.clear();
@@ -871,13 +934,12 @@ int Script::RemoteGet(const std::string & remote, const std::string & local,
                 (attrs.flags & LSCP_ATTR_ACMODTIME) != 0 && attrs.mtime != 0)
             {
                 /* Some servers report an atime of zero; keep the
-                 * modification time in that case. */
-                const bool touched = SetFileTimes(local,
+                 * modification time in that case. Setting a local time
+                 * after a download is not a remote operation, so the XML
+                 * log has no '<touch>' for it, as upstream has none. */
+                SetFileTimes(local,
                     attrs.atime != 0 ? attrs.atime : attrs.mtime,
                     attrs.mtime);
-                Console::Instance().LogAction("touch",
-                    "filename=\"" + Console::EscapeActionText(local) +
-                    "\" result=\"" + (touched ? "ok" : "failed") + "\"");
             }
         }
     }
@@ -891,10 +953,22 @@ int Script::RemoteGet(const std::string & remote, const std::string & local,
         res = ProtocolClient::Get(mSession.Options(), remote, local, resumeOffset,
             preserveTime, size, progress, ctx, error, mSpeedLimit);
     }
-    Console::Instance().LogAction("download",
-        "filename=\"" + Console::EscapeActionText(remote) +
-        "\" destination=\"" + Console::EscapeActionText(local) +
-        "\" result=\"" + (res == 0 ? "ok" : "failed") + "\"");
+    {
+        XmlParams params;
+        params.push_back(std::make_pair("filename", remote));
+        params.push_back(std::make_pair("destination", local));
+        if (res == 0)
+        {
+            const LocalFileInfo downloaded = StatLocal(local);
+            if (downloaded.exists)
+            {
+                params.push_back(std::make_pair("size",
+                    std::to_string(downloaded.size)));
+            }
+        }
+        Console::Instance().XmlAction("download", params, res == 0,
+            res == 0 ? std::string() : error);
+    }
     return res;
 }
 
@@ -925,9 +999,16 @@ int Script::RemotePut(const std::string & local, const std::string & remote,
             {
                 const int touchRes = lscp_sftp_set_times(remote.c_str(),
                     info.atime != 0 ? info.atime : info.mtime, info.mtime);
-                Console::Instance().LogAction("touch",
-                    "filename=\"" + Console::EscapeActionText(remote) +
-                    "\" result=\"" + (touchRes == 0 ? "ok" : "failed") + "\"");
+                {
+                    XmlParams touchParams;
+                    touchParams.push_back(std::make_pair("filename", remote));
+                    touchParams.push_back(std::make_pair("modification",
+                        Console::XmlTimestamp(info.mtime)));
+                    Console::Instance().XmlAction("touch", touchParams,
+                        touchRes == 0,
+                        touchRes == 0 ? std::string() :
+                            std::string(lscp_sftp_error()));
+                }
                 if (touchRes != 0)
                 {
                     Console::Instance().Status(Texts::Translate(
@@ -957,10 +1038,22 @@ int Script::RemotePut(const std::string & local, const std::string & remote,
             }
         }
     }
-    Console::Instance().LogAction("upload",
-        "filename=\"" + Console::EscapeActionText(local) +
-        "\" destination=\"" + Console::EscapeActionText(remote) +
-        "\" result=\"" + (res == 0 ? "ok" : "failed") + "\"");
+    {
+        XmlParams params;
+        params.push_back(std::make_pair("filename", local));
+        params.push_back(std::make_pair("destination", remote));
+        if (res == 0)
+        {
+            const LocalFileInfo uploaded = StatLocal(local);
+            if (uploaded.exists)
+            {
+                params.push_back(std::make_pair("size",
+                    std::to_string(uploaded.size)));
+            }
+        }
+        Console::Instance().XmlAction("upload", params, res == 0,
+            res == 0 ? std::string() : error);
+    }
     return res;
 }
 
@@ -970,20 +1063,20 @@ int Script::RemoteSetTimes(const std::string & path, unsigned long atime,
     unsigned long mtime, std::string & error)
 {
     error.clear();
+    XmlParams params;
+    params.push_back(std::make_pair("filename", path));
+    params.push_back(std::make_pair("modification",
+        Console::XmlTimestamp(mtime)));
     if (UseNativeScp(mSession.Options().protocol))
     {
         /* 'touch' sets both times to the one value, which is all a shell
          * offers; the modification time is the one a comparison reads. */
         if (!ScpClient::SetTimes(mSession.Options(), path, atime, mtime, error))
         {
-            Console::Instance().LogAction("touch",
-                "filename=\"" + Console::EscapeActionText(path) +
-                "\" result=\"failed\"");
+            Console::Instance().XmlAction("touch", params, false, error);
             return -1;
         }
-        Console::Instance().LogAction("touch",
-            "filename=\"" + Console::EscapeActionText(path) +
-            "\" result=\"ok\"");
+        Console::Instance().XmlAction("touch", params, true);
         return 0;
     }
     if (!UseNativeSftp(mSession.Options().protocol))
@@ -991,9 +1084,7 @@ int Script::RemoteSetTimes(const std::string & path, unsigned long atime,
         error = Texts::Translate(
             "Setting the timestamps of a directory needs the native SFTP "
             "transport or an SCP session.");
-        Console::Instance().LogAction("touch",
-            "filename=\"" + Console::EscapeActionText(path) +
-            "\" result=\"failed\"");
+        Console::Instance().XmlAction("touch", params, false, error);
         return -1;
     }
     const int res = lscp_sftp_set_times(path.c_str(), atime, mtime);
@@ -1001,9 +1092,8 @@ int Script::RemoteSetTimes(const std::string & path, unsigned long atime,
     {
         error = lscp_sftp_error();
     }
-    Console::Instance().LogAction("touch",
-        "filename=\"" + Console::EscapeActionText(path) +
-        "\" result=\"" + (res == 0 ? "ok" : "failed") + "\"");
+    Console::Instance().XmlAction("touch", params, res == 0,
+        res == 0 ? std::string() : error);
     return res;
 }
 
@@ -1134,9 +1224,12 @@ int Script::RemoteRemove(const std::string & path, std::string & error)
             mSession.ClearDavEtag(path);
         }
     }
-    Console::Instance().LogAction("rm",
-        "filename=\"" + Console::EscapeActionText(path) +
-        "\" result=\"" + (res == 0 ? "ok" : "failed") + "\"");
+    {
+        XmlParams params;
+        params.push_back(std::make_pair("filename", path));
+        Console::Instance().XmlAction("rm", params, res == 0,
+            res == 0 ? std::string() : error);
+    }
     return res;
 }
 
@@ -1164,9 +1257,12 @@ int Script::RemoteRemoveDir(const std::string & path, std::string & error)
             mSession.ClearDavEtag(path);
         }
     }
-    Console::Instance().LogAction("rm",
-        "filename=\"" + Console::EscapeActionText(path) +
-        "\" result=\"" + (res == 0 ? "ok" : "failed") + "\"");
+    {
+        XmlParams params;
+        params.push_back(std::make_pair("filename", path));
+        Console::Instance().XmlAction("rm", params, res == 0,
+            res == 0 ? std::string() : error);
+    }
     return res;
 }
 
@@ -1186,9 +1282,12 @@ int Script::RemoteMakeDir(const std::string & path, int permissions, std::string
     {
         res = ProtocolClient::MakeDir(mSession.Options(), path, error);
     }
-    Console::Instance().LogAction("mkdir",
-        "filename=\"" + Console::EscapeActionText(path) +
-        "\" result=\"" + (res == 0 ? "ok" : "failed") + "\"");
+    {
+        XmlParams params;
+        params.push_back(std::make_pair("filename", path));
+        Console::Instance().XmlAction("mkdir", params, res == 0,
+            res == 0 ? std::string() : error);
+    }
     return res;
 }
 
@@ -1208,10 +1307,13 @@ int Script::RemoteRename(const std::string & from, const std::string & to, std::
     {
         res = ProtocolClient::Move(mSession.Options(), from, to, error);
     }
-    Console::Instance().LogAction("mv",
-        "filename=\"" + Console::EscapeActionText(from) +
-        "\" destination=\"" + Console::EscapeActionText(to) +
-        "\" result=\"" + (res == 0 ? "ok" : "failed") + "\"");
+    {
+        XmlParams params;
+        params.push_back(std::make_pair("filename", from));
+        params.push_back(std::make_pair("destination", to));
+        Console::Instance().XmlAction("mv", params, res == 0,
+            res == 0 ? std::string() : error);
+    }
     return res;
 }
 
@@ -1253,12 +1355,17 @@ int Script::RemoteSetPermissions(const std::string & path, int permissions,
         res = ProtocolClient::SetPermissions(mSession.Options(), path,
             permissions, error);
     }
-    char octal[16];
-    snprintf(octal, sizeof(octal), "%04o", permissions & 07777);
-    Console::Instance().LogAction("chmod",
-        "filename=\"" + Console::EscapeActionText(path) +
-        "\" permissions=\"" + octal +
-        "\" result=\"" + (res == 0 ? "ok" : "failed") + "\"");
+    {
+        /* Upstream writes the letters ('rwxr-xr-x'), not the octal the
+         * user typed: the log is for a reader that compares them with
+         * the permissions of an 'ls' element. */
+        XmlParams params;
+        params.push_back(std::make_pair("filename", path));
+        params.push_back(std::make_pair("permissions",
+            XmlPermissionsText(static_cast<unsigned long>(permissions))));
+        Console::Instance().XmlAction("chmod", params, res == 0,
+            res == 0 ? std::string() : error);
+    }
     return res;
 }
 
@@ -1448,14 +1555,12 @@ bool Script::OpenSite(const std::vector<std::string> & args)
         }
     }
 
-    /* The log records where the session went, never how it was
-     * authenticated: the password is simply not part of the element. */
-    Console::Instance().LogAction("session",
-        "action=\"open\" protocol=\"" + Console::EscapeActionText(options.protocol) +
-        "\" host=\"" + Console::EscapeActionText(options.hostName) +
-        "\" port=\"" + std::to_string(options.portNumber) +
-        "\" user=\"" + Console::EscapeActionText(options.userName) +
-        "\" directory=\"" + Console::EscapeActionText(mRemoteDirectory) + "\"");
+    /* The XML log's '<session>' root is named after the connection, the
+     * way upstream names it: 'user@host' for an ad-hoc URL. It records
+     * where the session went, never how it was authenticated: no
+     * password is part of the format. */
+    Console::Instance().XmlSessionName(options.userName.empty() ?
+        options.hostName : options.userName + "@" + options.hostName);
 
     Console::Instance().Status(Texts::Translate("Connected, the remote directory is {path}", {{"path", mRemoteDirectory}}));
     return true;
@@ -1499,7 +1604,8 @@ void Script::CloseSite(const std::vector<std::string> & args)
     mSession.Close();
     mRemoteDirectory.clear();
     mHomeDirectory.clear();
-    Console::Instance().LogAction("session", "action=\"close\"");
+    /* The XML log has no element for closing: the '<group>' of this
+     * command closing is the record, as it is upstream. */
     Console::Instance().WriteLine(Texts::SessionClosed(name));
 }
 
@@ -1531,6 +1637,10 @@ bool Script::ChangeRemoteDirectory(const std::vector<std::string> & args)
             Console::Instance().Error(Texts::RemoteError("change directory to", path,
                 lscp_sftp_error()));
             mErrors++;
+            XmlParams params;
+            params.push_back(std::make_pair("cwd", path));
+            Console::Instance().XmlAction("cwd", params, false,
+                lscp_sftp_error());
             return false;
         }
         mRemoteDirectory = canonical;
@@ -1548,6 +1658,9 @@ bool Script::ChangeRemoteDirectory(const std::vector<std::string> & args)
             Console::Instance().Error(Texts::RemoteError("change directory to",
                 path, error));
             mErrors++;
+            XmlParams params;
+            params.push_back(std::make_pair("cwd", path));
+            Console::Instance().XmlAction("cwd", params, false, error);
             return false;
         }
         mRemoteDirectory = resolved;
@@ -1555,6 +1668,11 @@ bool Script::ChangeRemoteDirectory(const std::vector<std::string> & args)
     else
     {
         mRemoteDirectory = path;
+    }
+    {
+        XmlParams params;
+        params.push_back(std::make_pair("cwd", mRemoteDirectory));
+        Console::Instance().XmlAction("cwd", params, true);
     }
     Console::Instance().WriteLine(mRemoteDirectory);
     return true;
@@ -1686,9 +1804,14 @@ bool Script::ListRemote(const std::vector<std::string> & args)
     {
         Console::Instance().Error(Texts::CannotReadDirectory(path, readError));
         mErrors++;
+        XmlParams params;
+        params.push_back(std::make_pair("destination", path));
+        Console::Instance().XmlActionFiles("ls", params,
+            std::vector<XmlFileInfo>(), false, readError);
         return false;
     }
     int count = 0;
+    std::vector<XmlFileInfo> listed;
     for (int i = 0; i < names->count; i++)
     {
         std::string name = names->names[i].filename != NULL ?
@@ -1702,9 +1825,19 @@ bool Script::ListRemote(const std::vector<std::string> & args)
             continue;
         }
         PrintRemoteEntry(name, names->names[i], longFormat);
+        listed.push_back(XmlFileInfoFromAttrs(name, names->names[i].attrs));
         count++;
     }
     RemoteFreeNames(names);
+    {
+        /* Only an explicit 'ls' reaches the XML log, as upstream: the
+         * listings a transfer makes for itself are not operations the
+         * script asked to see. The entries are the ones printed, with
+         * the mask applied and the dot entries left out. */
+        XmlParams params;
+        params.push_back(std::make_pair("destination", path));
+        Console::Instance().XmlActionFiles("ls", params, listed, true);
+    }
     if (!mask.empty() && count == 0)
     {
         NoMatch(mask, std::string());
@@ -5972,6 +6105,9 @@ bool Script::OpenStoredSite(const std::string & name,
     }
 
     mStoredSessionName = stored->name;
+    /* A stored site names the XML log's '<session>' root, as upstream's
+     * stored sessions name theirs. */
+    console.XmlSessionName(stored->name);
     console.Status(Texts::Translate("Connected, the remote directory is {path}", {{"path", mRemoteDirectory}}));
 
     /* Remember when this session was last used; a failure to record it
@@ -6217,6 +6353,7 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
             session.tunnelPasswordRaw = previous->tunnelPasswordRaw;
             session.tunnelPassphraseRaw = previous->tunnelPassphraseRaw;
             session.tunnelError = previous->tunnelError;
+            session.gssapi = previous->gssapi;
         }
     }
     if (!rawSettings.empty())
@@ -6238,6 +6375,7 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
         session.tls = scratch.tls;
         session.s3 = scratch.s3;
         session.tunnel = scratch.tunnel;
+        session.gssapi = scratch.gssapi;
         for (const RawSetting & setting : rawSettings)
         {
             const std::string key = ToLower(setting.first);
@@ -6509,10 +6647,14 @@ bool Script::RemoveRemote(const std::vector<std::string> & args)
             mErrors++;
             return false;
         }
-        Console::Instance().LogAction("delete",
-            "filename=\"" + Console::EscapeActionText(path) +
-            "\" version=\"" + Console::EscapeActionText(versionId) +
-            "\" result=\"ok\"");
+        {
+            /* An exact-version removal is an 'rm' of the object in the
+             * XML log; the version it removed is in the group name (the
+             * command line), the format having no element for it. */
+            XmlParams params;
+            params.push_back(std::make_pair("filename", path));
+            Console::Instance().XmlAction("rm", params, true);
+        }
         Console::Instance().Status(Texts::Translate(
             "Removed S3 object version '{version}' of '{path}'.",
             {{"version", versionId}, {"path", path}}));
@@ -7073,6 +7215,7 @@ bool Script::CopyRemoteOneFile(const std::string & from,
         const int result = lscp_sftp_copy(from.c_str(), to.c_str());
         if (result == 0)
         {
+            XmlLogCopy(from, to, true, std::string());
             Console::Instance().Status(Texts::Translate(
                 "Copied '{from}' to '{to}' on the server.",
                 {{"from", from}, {"to", to}}));
@@ -7083,6 +7226,7 @@ bool Script::CopyRemoteOneFile(const std::string & from,
             Console::Instance().Error(Texts::RemoteError("copy", from,
                 lscp_sftp_error()));
             mErrors++;
+            XmlLogCopy(from, to, false, lscp_sftp_error());
             return false;
         }
         Console::Instance().Status(Texts::Translate(
@@ -7095,6 +7239,7 @@ bool Script::CopyRemoteOneFile(const std::string & from,
             error);
         if (result == 0)
         {
+            XmlLogCopy(from, to, true, std::string());
             Console::Instance().Status(Texts::Translate(
                 "Copied '{from}' to '{to}' on the server.",
                 {{"from", from}, {"to", to}}));
@@ -7104,6 +7249,7 @@ bool Script::CopyRemoteOneFile(const std::string & from,
         {
             Console::Instance().Error(Texts::RemoteError("copy", from, error));
             mErrors++;
+            XmlLogCopy(from, to, false, error);
             return false;
         }
     }
@@ -7112,8 +7258,10 @@ bool Script::CopyRemoteOneFile(const std::string & from,
     {
         Console::Instance().Error(Texts::RemoteError("copy", from, error));
         mErrors++;
+        XmlLogCopy(from, to, false, error);
         return false;
     }
+    XmlLogCopy(from, to, true, std::string());
     Console::Instance().Status(Texts::Translate("Copied '{from}' to '{to}'.",
         {{"from", from}, {"to", to}}));
     return true;
@@ -7194,11 +7342,22 @@ bool Script::ChecksumRemote(const std::vector<std::string> & args)
     {
         Console::Instance().Error(failure);
         mErrors++;
+        XmlParams params;
+        params.push_back(std::make_pair("filename", path));
+        params.push_back(std::make_pair("algorithm", requested));
+        Console::Instance().XmlAction("checksum", params, false, failure);
         return false;
     }
     if (!note.empty())
     {
         Console::Instance().Status(note);
+    }
+    {
+        XmlParams params;
+        params.push_back(std::make_pair("filename", path));
+        params.push_back(std::make_pair("algorithm", requested));
+        params.push_back(std::make_pair("checksum", hex));
+        Console::Instance().XmlAction("checksum", params, true);
     }
     Console::Instance().WriteLine(hex + " " + path);
     return true;
@@ -7682,11 +7841,39 @@ bool Script::CallRemote(const std::vector<std::string> & args, const char * name
     }
     const std::string command = JoinCommandWords(args);
     std::string error;
-    const bool ok = Session::ExecRemote(options, command, error);
-    Console::Instance().LogAction("call",
-        "command=\"" + Console::EscapeActionText(command) +
-        "\" destination=\"" + Console::EscapeActionText(mRemoteDirectory) +
-        "\" result=\"" + (ok ? "ok" : "failed") + "\"");
+    bool ok;
+    if (Console::Instance().IsActionLogOpen())
+    {
+        /* The XML log records what the command printed, stream by
+         * stream, with its exit code: that is what a reader of the log
+         * (upstream's own model of 'call') expects to find, so this run
+         * captures instead of only printing. */
+        Session::ExecCaptured captured;
+        ok = Session::ExecRemoteCaptured(options, command, error, captured);
+        XmlParams params;
+        params.push_back(std::make_pair("command", command));
+        params.push_back(std::make_pair("destination", mRemoteDirectory));
+        if (!captured.output.empty())
+        {
+            params.push_back(std::make_pair("output", captured.output));
+        }
+        if (!captured.errorOutput.empty())
+        {
+            params.push_back(std::make_pair("erroroutput",
+                captured.errorOutput));
+        }
+        if (captured.exitCode != INT_MAX)
+        {
+            params.push_back(std::make_pair("exitcode",
+                std::to_string(captured.exitCode)));
+        }
+        Console::Instance().XmlAction("call", params, ok,
+            ok ? std::string() : error);
+    }
+    else
+    {
+        ok = Session::ExecRemote(options, command, error);
+    }
     if (!ok)
     {
         Console::Instance().Error(Texts::RemoteError("run the command on",
@@ -8166,6 +8353,8 @@ bool Script::StatRemote(const std::vector<std::string> & args)
     LscpAttrs attrs;
     std::string error;
     const int statResult = RemoteStat(path, &attrs, error);
+    XmlParams params;
+    params.push_back(std::make_pair("filename", path));
     if (statResult != LSCP_SFTP_STAT_EXISTS)
     {
         /* A path that is not there is an answer, and an empty reason next
@@ -8177,8 +8366,12 @@ bool Script::StatRemote(const std::vector<std::string> & args)
         Console::Instance().Error(Texts::RemoteError("read the attributes of", path,
             error));
         mErrors++;
+        Console::Instance().XmlActionFile("stat", params, XmlFileInfo(),
+            false, error);
         return false;
     }
+    Console::Instance().XmlActionFile("stat", params,
+        XmlFileInfoFromAttrs(std::string(), attrs), true);
     LscpName entry = LscpName();
     entry.attrs = attrs;
     PrintRemoteEntry(RemoteFileName(path), entry, true);
@@ -8993,19 +9186,37 @@ bool Script::ExecuteLine(const std::string & line)
         Console::Instance().WriteLine(CensoredForLog(line));
     }
     const int before = mErrors;
-    /* The action log records what was asked and, afterwards, how it ended;
-     * the messages in between belong to this command. */
+    /* In the XML log a command is a '<group>' named by its (masked)
+     * line: the operations it performed are its children, and a failure
+     * ends it with a '<failure>' holding the errors it printed, masked
+     * the same way before they are kept in a file. A reader following
+     * the file knows the command is over when the group closes. */
     if (Console::Instance().IsActionLogOpen())
     {
-        Console::Instance().LogAction("command",
-            "line=\"" + Console::EscapeActionText(CensoredForLog(line)) + "\"");
+        /* The line still carries the spacing around its ';' separator;
+         * upstream names the group by the command itself. */
+        std::string groupName = CensoredForLog(line);
+        const size_t first = groupName.find_first_not_of(" \t");
+        const size_t last = groupName.find_last_not_of(" \t");
+        groupName = first == std::string::npos ? std::string() :
+            groupName.substr(first, last - first + 1);
+        Console::Instance().XmlBeginGroup(groupName);
     }
     const bool keepRunning = ExecuteCommand(line);
     mLastCommandFailed = mErrors != before;
     if (Console::Instance().IsActionLogOpen())
     {
-        Console::Instance().LogAction("result",
-            "status=\"" + std::string(mLastCommandFailed ? "error" : "ok") + "\"");
+        if (mLastCommandFailed)
+        {
+            std::vector<std::string> messages =
+                Console::Instance().TakeActionErrors();
+            for (size_t i = 0; i < messages.size(); i++)
+            {
+                messages[i] = CensoredForLog(messages[i]);
+            }
+            Console::Instance().XmlFailure(messages);
+        }
+        Console::Instance().XmlEndGroup();
     }
     if (mErrors != before && (mBatchMode == BatchMode::Abort || mBatchMode == BatchMode::On))
     {

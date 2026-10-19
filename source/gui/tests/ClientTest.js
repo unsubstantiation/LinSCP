@@ -72,6 +72,10 @@ const responses = {
   '/api/local/save': { success: true,
     info: { size: 12, mtime: 1791875272, mtime_ns: 1791875272000000000 } },
   '/api/transfer/move': { success: true },
+  '/api/shell/pending': { success: true, pending: [] },
+  '/api/shell/consume': { success: true, queued: ['a.txt', 'folder'],
+    missing: [], remote_dir: '/tmp/slowremote' },
+  '/api/shell/dismiss': { success: true },
   '/api/sync/preview': { success: true, plan: {
     header: { local: '/tmp/slowlocal', remote: '/tmp/slowremote', mode: 'both', criteria: 'time', mask: '(none)' },
     items: [
@@ -777,19 +781,34 @@ function options(id) {
   window.fillSiteForm({name: 'jump-site', host: 'destination.example', protocol: 'sftp',
     tunnel: true, tunnel_host: 'jump.example', tunnel_port: 2222,
     tunnel_username: 'jumper', tunnel_password: 'jump-secret',
-    tunnel_passphrase: 'phrase', tunnel_hostkey: 'SHA256:jump'});
+    tunnel_passphrase: 'phrase', tunnel_hostkey: 'SHA256:jump',
+    tunnel_local_port: 22222, auth_gssapi: false, auth_gssapi_kex: true,
+    gssapi_fwd_tgt: true, logical_host: 'srv.example.org'});
   check('site manager restores SSH tunnel settings',
     doc.getElementById('siteTunnel').checked &&
     doc.getElementById('siteTunnelHost').value === 'jump.example' &&
     doc.getElementById('siteTunnelPort').value === '2222' &&
     doc.getElementById('siteTunnelHostKey').value === 'SHA256:jump' &&
     !doc.getElementById('siteTunnelFields').disabled);
+  check('site manager restores tunnel local port and Kerberos settings',
+    doc.getElementById('siteTunnelLocalPort').value === '22222' &&
+    !doc.getElementById('siteGssapiAuth').checked &&
+    doc.getElementById('siteGssapiKex').checked &&
+    doc.getElementById('siteGssapiFwdTgt').checked &&
+    doc.getElementById('siteLogicalHost').value === 'srv.example.org');
   doc.getElementById('siteTunnelRemember').checked = false;
   await window.saveSite();
   const tunnelSave = JSON.parse(calls.filter(c => c.path === '/api/sessions/save').pop().options.body);
   check('tunnel credentials are saved only when requested',
     tunnelSave.session.tunnel && tunnelSave.session.tunnel_host === 'jump.example' &&
     tunnelSave.session.tunnel_password === '' && tunnelSave.session.tunnel_passphrase === '');
+  check('Kerberos settings and tunnel local port are saved with the site',
+    tunnelSave.session.tunnel_local_port === 22222 &&
+    tunnelSave.session.auth_gssapi === false &&
+    tunnelSave.session.auth_gssapi_kex === true &&
+    tunnelSave.session.gssapi_fwd_tgt === true &&
+    tunnelSave.session.logical_host === 'srv.example.org',
+    JSON.stringify(tunnelSave.session));
   window.showHostKeyChallenge({tab: 1, role: 'tunnel', host: 'jump.example', port: 2222,
     fingerprint: 'SHA256:jump'});
   check('host-key dialog distinguishes the SSH tunnel host',
@@ -809,6 +828,11 @@ function options(id) {
   check('a new site resets and disables SSH tunnel fields',
     !doc.getElementById('siteTunnel').checked && doc.getElementById('siteTunnelFields').disabled &&
     doc.getElementById('siteTunnelPass').value === '');
+  check('a new site defaults Kerberos on without delegation or key exchange',
+    doc.getElementById('siteGssapiAuth').checked &&
+    !doc.getElementById('siteGssapiKex').checked &&
+    !doc.getElementById('siteGssapiFwdTgt').checked &&
+    doc.getElementById('siteTunnelLocalPort').value === '0');
 
   // The site form's port follows the protocol while it is still a default,
   // and keeps a port the user typed. The form used to leave 22 under every
@@ -961,6 +985,34 @@ function options(id) {
       text('customCommandsResult').includes('SHA-256 verified'),
     text('customCommandsResult'));
   window.closeModal('customCommandsModal');
+
+  /* A file-manager selection is offered in a dialog; only confirming
+   * it queues anything, and names are shown as text, never markup. */
+  responses['/api/shell/pending'] = { success: true, pending: [{
+    id: 'a'.repeat(32), created: 1,
+    files: [ { name: 'a.txt', path: '/home/u/a.txt', is_dir: false, size: 3 },
+             { name: 'folder', path: '/home/u/folder', is_dir: true, size: 0 },
+             { name: '<img>.png', path: '/home/u/x.png', is_dir: false, size: 1 } ] }] };
+  await window.checkShellPending();
+  check('shell offer dialog opened',
+    doc.getElementById('shellUploadModal').classList.contains('open'));
+  check('shell offer lists the files',
+    doc.getElementById('shellUploadList').children.length === 3);
+  check('shell offer treats names as text',
+    doc.getElementById('shellUploadList').innerHTML.includes('&lt;img&gt;.png'));
+  check('shell offer names the target directory',
+    text('shellUploadButton').startsWith('Upload to /'), text('shellUploadButton'));
+  check('offering queues nothing',
+    !calls.some(call => call.path === '/api/shell/consume'));
+  responses['/api/shell/pending'] = { success: true, pending: [] };
+  await window.shellUploadConfirm();
+  const shellConsume = calls.filter(call => call.path === '/api/shell/consume').pop();
+  const shellPayload = shellConsume ? JSON.parse(shellConsume.options.body) : {};
+  check('confirming posts the selection id against the active tab',
+    shellPayload.id === 'a'.repeat(32) && shellPayload.tab === 1,
+    JSON.stringify(shellPayload));
+  check('confirmed shell upload closes the dialog',
+    !doc.getElementById('shellUploadModal').classList.contains('open'));
 
   check('no script errors', errors.length === 0, errors.join(' | '));
   window.close();

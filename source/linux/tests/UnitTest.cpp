@@ -3031,6 +3031,21 @@ void TestServerReplyHardening()
         std::string("a&lt;b&gt;&amp;&quot;c&quot;"));
     CHECK_EQ(Console::EscapeActionText("a\x01" "b"),
         std::string("ab"));
+    /* The two upstream escapes of the XML log: an attribute value writes
+     * a newline as a character reference (a reader would fold a literal
+     * one to a space and a 'call' output would lose its lines), element
+     * text keeps it, and both drop the carriage return. */
+    CHECK_EQ(Console::EscapeXmlAttr("a\nb\rc"),
+        std::string("a&#10;bc"));
+    CHECK_EQ(Console::EscapeXmlText("a\nb\rc"),
+        std::string("a\nbc"));
+    CHECK_EQ(Console::EscapeXmlText("x <&> \"y\""),
+        std::string("x &lt;&amp;&gt; \"y\""));
+    /* One timestamp spelling, in UTC with the millisecond field. */
+    CHECK_EQ(Console::XmlTimestamp(0),
+        std::string("1970-01-01T00:00:00.000Z"));
+    CHECK_EQ(Console::XmlTimestamp(1760000000UL),
+        std::string("2025-10-09T08:53:20.000Z"));
 }
 
 /* The command, option and value tables resolve unambiguous prefixes. */
@@ -3946,7 +3961,10 @@ void TestSshJumpSettings()
     CHECK_TRUE(options.tunnel.enabled);
     CHECK_TRUE(ApplySessionRawSetting("TunnelPortNumber", "65535", options, error));
     CHECK_TRUE(ApplySessionRawSetting("TunnelLocalPortNumber", "0", options, error));
-    CHECK_FALSE(ApplySessionRawSetting("TunnelLocalPortNumber", "8000", options, error));
+    CHECK_TRUE(options.tunnel.localPortNumber == 0);
+    CHECK_TRUE(ApplySessionRawSetting("TunnelLocalPortNumber", "8000", options, error));
+    CHECK_TRUE(options.tunnel.localPortNumber == 8000);
+    CHECK_TRUE(ApplySessionRawSetting("TunnelLocalPortNumber", "0", options, error));
     CHECK_FALSE(ApplySessionRawSetting("TunnelPortFwd", "L8000:host:22", options, error));
     CHECK_TRUE(ApplySessionRawSetting("TunnelPassword", "  secret  ", options, error));
     CHECK_TRUE(ApplySessionRawSetting("TunnelPassphrase", "  passphrase  ", options, error));
@@ -4093,13 +4111,64 @@ void TestSshTunnelParsing()
         tunnel.bindPort = 1080;
         CHECK_EQ(TunnelSshFlags(tunnel), std::string("-D 0.0.0.0:1080"));
     }
-    /* Library detection alone must never claim an authentication feature. */
+    /* Library detection alone must never claim an authentication feature:
+     * the answer tracks what the loaded libssh advertises, and the
+     * settings are real either way. */
     {
-        /* Removing NO_GSSAPI must not turn a stub into claimed support. */
+        const std::string version = Texts::VersionLine();
+        CHECK_TRUE(IsGssapiSupported() ==
+            (version.find("gssapi") != std::string::npos));
         std::string error;
-        CHECK_FALSE(IsGssapiSupported());
-        CHECK_FALSE(ApplyGssapiSetting("1", error));
-        CHECK_TRUE(error.find("GSSAPI") != std::string::npos);
+        SessionOptions options;
+        /* Upstream's defaults: gssapi-with-mic on, key exchange and
+         * credential delegation off. */
+        CHECK_TRUE(options.gssapi.auth);
+        CHECK_FALSE(options.gssapi.authKex);
+        CHECK_FALSE(options.gssapi.forwardTgt);
+        CHECK_TRUE(IsSessionRawSettingName("AuthGSSAPI"));
+        CHECK_TRUE(ApplySessionRawSetting("AuthGSSAPI", "0", options, error));
+        CHECK_FALSE(options.gssapi.auth);
+        /* No key-exchange list while the method itself is off. */
+        CHECK_TRUE(GssapiKeyExchangeList(options).empty());
+        CHECK_TRUE(ApplySessionRawSetting("AuthGSSAPI", "1", options, error));
+        CHECK_TRUE(ApplySessionRawSetting("AuthGSSAPIKEX", "1", options, error));
+        CHECK_TRUE(options.gssapi.authKex);
+        CHECK_FALSE(ApplySessionRawSetting("AuthGSSAPIKEX", "yes",
+            options, error));
+        /* Delegation is only ever on by an explicit 1. */
+        CHECK_FALSE(options.gssapi.forwardTgt);
+        CHECK_TRUE(ApplySessionRawSetting("GSSAPIFwdTGT", "1", options, error));
+        CHECK_TRUE(options.gssapi.forwardTgt);
+        CHECK_TRUE(ApplySessionRawSetting("LogicalHostName",
+            "files.example.org", options, error));
+        CHECK_EQ(options.gssapi.logicalHost, "files.example.org");
+        CHECK_FALSE(ApplySessionRawSetting("LogicalHostName",
+            "two hosts", options, error));
+        /* The list starts with the Kerberos exchanges when this libssh
+         * can use them, and a pinned host key suppresses it entirely:
+         * a pin must be checked, and GSSAPI key exchange has no key. */
+        const std::string kex = GssapiKeyExchangeList(options);
+        if (IsGssapiSupported())
+        {
+            CHECK_TRUE(kex.rfind("gss-group14-sha256-", 0) == 0);
+            CHECK_TRUE(kex.find("curve25519-sha256") != std::string::npos);
+        }
+        else
+        {
+            CHECK_TRUE(kex.empty());
+        }
+        options.hostKey = "SHA256:abc";
+        CHECK_TRUE(GssapiKeyExchangeList(options).empty());
+        options.hostKey = "*";
+        CHECK_EQ(GssapiKeyExchangeList(options), kex);
+        /* The tunnel local port is a real setting now, range-checked. */
+        CHECK_TRUE(ApplySessionRawSetting("TunnelLocalPortNumber", "22222",
+            options, error));
+        CHECK_EQ(std::to_string(options.tunnel.localPortNumber), "22222");
+        CHECK_FALSE(ApplySessionRawSetting("TunnelLocalPortNumber", "65536",
+            options, error));
+        CHECK_FALSE(ApplySessionRawSetting("TunnelLocalPortNumber", "-1",
+            options, error));
     }
 }
 

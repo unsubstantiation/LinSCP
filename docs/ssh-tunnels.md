@@ -3,14 +3,16 @@
 LinSCP supports one authenticated SSH jump host for an SFTP, SCP or SSH
 session. It opens an SSH `direct-tcpip` channel to the destination and connects
 the destination's independent SSH transport through a private socket pair.
-No local TCP listener is opened. The jump host resolves the destination name;
+No local TCP listener is opened unless `TunnelLocalPortNumber` selects a
+loopback port for this session's own connection. The jump host resolves the destination name;
 the destination retains its own username, credentials and host-key identity.
 Any configured parent proxy is used to reach the **jump host**, not to bypass
 it and reach the destination directly.
 
 This is a supported subset, **not full WinSCP tunnel or authentication parity**.
-GSSAPI/Kerberos, fixed local listener ports and tunneling to curl-backed
-FTP/FTPS/WebDAV/S3 destinations are not implemented. Unsupported or malformed
+Kerberos/GSSAPI settings are supported through libssh when it advertises real
+GSSAPI support, but live realm certification remains open; tunneling to
+curl-backed FTP/FTPS/WebDAV/S3 destinations is not implemented. Unsupported or malformed
 settings fail rather than silently make a direct connection. See the
 [remaining parity plan](remaining-parity-plan.md).
 
@@ -44,7 +46,7 @@ apply to `-shell`. An `open` or `savesession` command can specify its own
 | `TunnelPublicKeyFile` | Jump private key file |
 | `TunnelPassphrase` | Passphrase for that private key |
 | `TunnelHostKey` | Jump fingerprint; empty uses the host-key cache/confirmation policy |
-| `TunnelLocalPortNumber` | Only `0` is accepted; no TCP listener is exposed |
+| `TunnelLocalPortNumber` | `0` (default) uses a private socket pair; `1`–`65535` binds that loopback port for this session's own connection and fails if it is taken |
 
 Use `LINSCP_TUNNEL_PASSWORD` and `LINSCP_TUNNEL_PASSPHRASE` when supplying jump
 secrets to a process. `LINSCP_PASSWORD` still belongs to the **destination**.

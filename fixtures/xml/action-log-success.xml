@@ -1,6 +1,42 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<action-log>
-  <session name="test-session" protocol="SFTP" />
-  <upload remote-path="/data/file.txt" size="1024" result="success" />
-  <message text="Upload completed." />
-</action-log>
+<session xmlns="http://winscp.net/schema/session/1.0" name="testuser@example.com" start="2026-10-19T10:15:00.000Z">
+  <group name="put -preservetime -permissions=644 report.txt /data/report.txt" start="2026-10-19T10:15:01.000Z">
+    <upload>
+      <filename value="/home/testuser/report.txt" />
+      <destination value="/data/report.txt" />
+      <size value="1024" />
+      <result success="true" />
+    </upload>
+    <touch>
+      <filename value="/data/report.txt" />
+      <modification value="2026-10-18T09:30:00.000Z" />
+      <result success="true" />
+    </touch>
+    <chmod>
+      <filename value="/data/report.txt" />
+      <permissions value="rw-r--r--" />
+      <result success="true" />
+    </chmod>
+  </group>
+  <group name="ls /data" start="2026-10-19T10:15:02.000Z">
+    <ls>
+      <destination value="/data" />
+      <files>
+        <file>
+          <filename value="report.txt" />
+          <type value="-" />
+          <size value="1024" />
+          <modification value="2026-10-18T09:30:00.000Z" />
+          <permissions value="rw-r--r--" />
+        </file>
+        <file>
+          <filename value="archive" />
+          <type value="D" />
+          <modification value="2026-10-01T08:00:00.000Z" />
+          <permissions value="rwxr-xr-x" />
+        </file>
+      </files>
+      <result success="true" />
+    </ls>
+  </group>
+</session>

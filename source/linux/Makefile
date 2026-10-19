@@ -56,10 +56,10 @@ CXXFLAGS_APP += $(ARGON2_CFLAGS)
 DEPFLAGS := -MMD -MP
 
 CFLAGS_APP := -std=gnu99 $(OPT) -g $(WARN) -Wno-unused-parameter $(DEPFLAGS) \
-	-D_FILE_OFFSET_BITS=64 -DNO_GSSAPI $(SSH_CFLAGS) -pthread $(CFLAGS)
+	-D_FILE_OFFSET_BITS=64 $(SSH_CFLAGS) -pthread $(CFLAGS)
 
 CXXFLAGS_APP := -std=gnu++17 $(OPT) -g $(WARN) -pthread $(DEPFLAGS) \
-	-D_FILE_OFFSET_BITS=64 -DNO_GSSAPI $(SSH_CFLAGS) -I. $(CXXFLAGS)
+	-D_FILE_OFFSET_BITS=64 $(SSH_CFLAGS) -I. $(CXXFLAGS)
 
 # Front end (this directory).
 APP_SRCS := \
@@ -172,6 +172,7 @@ check-live: $(BINDIR)/linscp
 	$(PYTHON) ../../source/gui/tests/LocalEditorTest.py
 	$(PYTHON) ../../source/gui/tests/BrowserUploadTest.py
 	$(PYTHON) ../../source/gui/tests/DesktopUriTest.py
+	$(PYTHON) ../../source/gui/tests/ShellIntegrationTest.py
 	$(PYTHON) ../../source/gui/tests/SecurityTest.py
 	$(PYTHON) ../../source/gui/tests/LocalWorkspaceTest.py
 	$(PYTHON) ../../source/gui/tests/TerminalTest.py

@@ -1454,6 +1454,40 @@ class TunnelSettingsTests(unittest.TestCase):
                 self.assertNotEqual(gui.validate_session_data(dict(session, **change)), "")
         self.assertEqual(gui.validate_session_data(dict(session, tunnel=False, protocol="ftp")), "")
 
+    def test_gssapi_settings_reach_the_core_and_never_delegate_implicitly(self):
+        args = gui.core_command_line(self.session())
+        # Upstream's defaults: gssapi-with-mic tried; key exchange and,
+        # above all, credential delegation off unless a site asks.
+        self.assertIn("AuthGSSAPI=1", args)
+        self.assertIn("AuthGSSAPIKEX=0", args)
+        self.assertIn("GSSAPIFwdTGT=0", args)
+        self.assertIn("LogicalHostName=", args)
+        self.assertIn("TunnelLocalPortNumber=0", args)
+        custom = dict(self.session(), auth_gssapi=False, auth_gssapi_kex=True,
+                      gssapi_fwd_tgt=True, logical_host="srv.example.org",
+                      tunnel_local_port=22222)
+        args = gui.core_command_line(custom)
+        self.assertIn("AuthGSSAPI=0", args)
+        self.assertIn("AuthGSSAPIKEX=1", args)
+        self.assertIn("GSSAPIFwdTGT=1", args)
+        self.assertIn("LogicalHostName=srv.example.org", args)
+        self.assertIn("TunnelLocalPortNumber=22222", args)
+
+    def test_gssapi_and_local_port_validation(self):
+        session = self.session()
+        for change in ({"tunnel_local_port": 65536},
+                       {"tunnel_local_port": "22x"},
+                       {"tunnel_local_port": -1},
+                       {"logical_host": "two hosts"},
+                       {"auth_gssapi": {"not": "a flag"}},
+                       {"auth_gssapi": ["1"]}):
+            with self.subTest(change=change):
+                self.assertNotEqual(
+                    gui.validate_session_data(dict(session, **change)), "")
+        self.assertEqual(gui.validate_session_data(
+            dict(session, tunnel_local_port=0, auth_gssapi=False,
+                 logical_host="srv.example.org")), "")
+
     def test_tunnel_credentials_are_redacted_in_every_quoting_style(self):
         for field in ("TunnelPassword", "TunnelPassphrase", "TunnelPasswordPlain",
                       "TunnelPassphrasePlain", "ProxyPassword", "ProxyPasswordPlain", "-passphrase", "-password"):

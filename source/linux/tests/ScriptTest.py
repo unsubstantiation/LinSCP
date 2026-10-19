@@ -1193,8 +1193,13 @@ class ScriptTests(unittest.TestCase):
 
 
     def test_xml_action_log(self):
-        """'-xmllog=' writes a parseable log of what the script did."""
+        """'-xmllog=' writes the upstream XML log: one '<session>' root
+        in the http://winscp.net/schema/session/1.0 namespace, one
+        '<group>' per command named by its masked line, and a
+        '<failure>' with the command's errors when it failed. Console
+        output is not part of the format."""
         import xml.etree.ElementTree as ET
+        ns = "{http://winscp.net/schema/session/1.0}"
         with tempfile.TemporaryDirectory() as tmp:
             log = pathlib.Path(tmp) / "actions.xml"
             # 'batch continue' keeps the run going past the two failures, so
@@ -1207,33 +1212,42 @@ class ScriptTests(unittest.TestCase):
                 env=self.environment())
             self.assertTrue(log.exists(), result.stderr)
             root = ET.parse(log).getroot()
-            self.assertEqual(root.tag, "log_session")
-            self.assertIn("LinSCP", root.get("client", ""))
-            self.assertTrue(root.get("created"))
-            elements = [element.tag for element in root]
-            self.assertIn("command", elements)
-            self.assertIn("result", elements)
-            lines = [element.get("line", "").strip() for element in root
-                     if element.tag == "command"]
-            self.assertEqual(len(lines), 4, lines)
-            self.assertEqual(lines[1], "echo text")
-            self.assertEqual(lines[2], "no-such-command")
-            statuses = [element.get("status") for element in root
-                        if element.tag == "result"]
-            self.assertEqual(statuses, ["ok", "ok", "error", "error"])
-            kinds = dict((element.get("type"), 0) for element in root
-                         if element.tag == "message")
-            self.assertEqual(sorted(kinds), ["error", "output"])
-            messages = [element.text or "" for element in root
-                        if element.tag == "message"]
-            self.assertIn("text", "".join(messages))
-            self.assertIn("Unknown command", "".join(messages))
+            self.assertEqual(root.tag, ns + "session")
+            # The first group is written before any connection exists, so
+            # the root takes upstream's fallback name.
+            self.assertEqual(root.get("name"), "nosession")
+            self.assertRegex(root.get("start", ""),
+                             r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+            groups = [element for element in root
+                      if element.tag == ns + "group"]
+            self.assertEqual(len(groups), len(root),
+                             "the log holds groups and nothing else")
+            names = [group.get("name") for group in groups]
+            self.assertEqual(names, [
+                "option batch continue", "echo text", "no-such-command",
+                "open sftp://user:***@127.0.0.1:1/"], names)
+            # Successful commands with no remote operation are empty
+            # groups; a failed one ends with its errors.
+            self.assertEqual(list(groups[0]), [])
+            self.assertEqual(list(groups[1]), [])
+            for group, needle in ((groups[2], "Unknown command"),
+                                  (groups[3], "Cannot open session")):
+                failures = group.findall(ns + "failure")
+                self.assertEqual(len(failures), 1)
+                messages = ["".join(m.itertext()) for m in
+                            failures[0].findall(ns + "message")]
+                self.assertIn(needle, "".join(messages))
+            # The text 'echo' printed is console output, not an operation:
+            # it must not be in the XML log at all.
+            self.assertNotIn(">text<", log.read_text(encoding="utf-8"))
             # A password must not be written to a file the user keeps.
             self.assertNotIn("secret", log.read_text(encoding="utf-8"))
 
     def test_xml_action_log_is_closed(self):
-        """The log ends in one complete document, not in a half element."""
+        """The log ends in one complete document, not in a half element,
+        even when no command ever opened a session."""
         import xml.etree.ElementTree as ET
+        ns = "{http://winscp.net/schema/session/1.0}"
         with tempfile.TemporaryDirectory() as tmp:
             log = pathlib.Path(tmp) / "closed.xml"
             subprocess.run([BINARY, "-xmllog=" + str(log), "-batch",
@@ -1241,7 +1255,78 @@ class ScriptTests(unittest.TestCase):
                            capture_output=True, text=True, timeout=30,
                            env=self.environment())
             root = ET.parse(log).getroot()
-            self.assertEqual([element.tag for element in root][-1], "result")
+            self.assertEqual(root.tag, ns + "session")
+            self.assertEqual([element.tag for element in root],
+                             [ns + "group"])
+            text = log.read_text(encoding="utf-8")
+            self.assertTrue(text.rstrip().endswith("</session>"), text)
+
+    def test_xml_log_matches_the_upstream_schema(self):
+        """The committed fixtures and a log this run produces both
+        validate against the pinned upstream schema
+        (docs/winscp-session-1.0.xsd), secret masking included, and an
+        upstream-style consumer (namespace-aware, 'value'-attribute
+        parameters, 'result success') reads the operations back."""
+        import xml.etree.ElementTree as ET
+        try:
+            import xmlschema
+        except ImportError:
+            self.skipTest("xmlschema is not installed; the XML log "
+                          "schema check needs it (pip install xmlschema)")
+        ns = "{http://winscp.net/schema/session/1.0}"
+        repo = pathlib.Path(__file__).resolve().parent.parent.parent.parent
+        schema = xmlschema.XMLSchema(
+            str(repo / "docs" / "winscp-session-1.0.xsd"))
+        fixtures = [repo / "fixtures" / "xml" / "action-log-success.xml",
+                    repo / "fixtures" / "xml" / "action-log-error.xml"]
+        for fixture in fixtures:
+            schema.validate(str(fixture))
+
+        # A failed 'open' with a password in the URL: masking the group
+        # name and the failure must keep the document schema-valid, and
+        # the secret must not be in it.
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "masked.xml"
+            subprocess.run(
+                [BINARY, "-xmllog=" + str(log), "-batch",
+                 "-command=open sftp://user:secret@127.0.0.1:1/ "
+                 "-password=also-secret"],
+                capture_output=True, text=True, timeout=30,
+                env=self.environment())
+            schema.validate(str(log))
+            text = log.read_text(encoding="utf-8")
+            self.assertNotIn("secret", text)
+            self.assertNotIn("also-secret", text)
+
+        # The consumer side, the way the upstream assembly's log reader
+        # walks it: groups, then action elements, then '<name value>'
+        # parameters and the result.
+        root = ET.parse(fixtures[0]).getroot()
+        uploads = []
+        for group in root.iter(ns + "group"):
+            for action in group.iter(ns + "upload"):
+                uploads.append(dict(
+                    (child.tag[len(ns):], child.get("value"))
+                    for child in action
+                    if child.tag != ns + "result"))
+                result = action.find(ns + "result")
+                self.assertEqual(result.get("success"), "true")
+        self.assertEqual(uploads, [{
+            "filename": "/home/testuser/report.txt",
+            "destination": "/data/report.txt", "size": "1024"}])
+        files = []
+        for entry in root.iter(ns + "file"):
+            files.append(dict((child.tag[len(ns):], child.get("value"))
+                              for child in entry))
+        self.assertEqual(files[0]["type"], "-")
+        self.assertEqual(files[1]["type"], "D")
+        # ... and the error fixture: the same message in the action's
+        # result and in the group's failure, as upstream duplicates it.
+        error_root = ET.parse(fixtures[1]).getroot()
+        download = error_root.find(".//" + ns + "download")
+        self.assertEqual(
+            download.find(ns + "result").get("success"), "false")
+        self.assertIsNotNone(error_root.find(".//" + ns + "failure"))
 
     def test_copyid_arguments(self):
         result = self.run_commands("copyid one two; echo SHOULD_NOT_RUN")
@@ -1561,6 +1646,39 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("proxy_method", text)
         self.assertNotIn("proxy_password", text)
 
+    def test_a_stored_session_keeps_its_gssapi_and_tunnel_local_port(self):
+        """The Kerberos settings and TunnelLocalPortNumber are stored with
+        the site under upstream's raw names; an unusable value is refused
+        by name rather than dropped."""
+        result = self.run_commands(
+            "savesession kerb -host=files.example.com -username=alice "
+            "-rawsettings AuthGSSAPI=0 AuthGSSAPIKEX=1 GSSAPIFwdTGT=1 "
+            "LogicalHostName=srv.example.org Tunnel=1 "
+            "TunnelHostName=jump.example.com TunnelLocalPortNumber=22222")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stored = pathlib.Path(self.config) / "sessions.ini"
+        text = stored.read_text(encoding="utf-8")
+        self.assertIn("auth_gssapi=0", text)
+        self.assertIn("auth_gssapi_kex=1", text)
+        self.assertIn("gssapi_fwd_tgt=1", text)
+        self.assertIn("logical_host=srv.example.org", text)
+        self.assertIn("tunnel_local_port=22222", text)
+
+        result = self.run_commands(
+            "savesession kerb -host=files.example.com "
+            "-rawsettings AuthGSSAPI=maybe ; echo SHOULD_NOT_RUN")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("AuthGSSAPI", result.stderr)
+        self.assertNotIn("SHOULD_NOT_RUN", result.stdout)
+
+        result = self.run_commands(
+            "savesession kerb -host=files.example.com "
+            "-rawsettings TunnelLocalPortNumber=65536 ; "
+            "echo SHOULD_NOT_RUN")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("TunnelLocalPortNumber", result.stderr)
+        self.assertNotIn("SHOULD_NOT_RUN", result.stdout)
+
     def test_proxy_passwords_are_masked_in_logs(self):
         """A proxy password authenticates, so it is masked wherever the
         command is repeated: the echoed line, the session log and the XML
@@ -1678,7 +1796,7 @@ class ScriptTests(unittest.TestCase):
                 ("Tunnel=2", "Tunnel"),
                 ("TunnelPortNumber=22x", "TunnelPortNumber"),
                 ("TunnelPortNumber=999999999999999999999", "TunnelPortNumber"),
-                ("TunnelLocalPortNumber=8080", "private socket pair"),
+                ("TunnelLocalPortNumber=65536", "TunnelLocalPortNumber"),
                 ('Tunnel=1 TunnelHostName="two hosts"', "TunnelHostName")):
             with self.subTest(settings=settings):
                 result = self.run_commands("open sftp://127.0.0.1:1/ -rawsettings " + settings)

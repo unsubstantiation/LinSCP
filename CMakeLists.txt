@@ -131,6 +131,8 @@ if(Python3_Interpreter_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/BrowserUploadTest.py)
   add_test(NAME gui-desktop-uri-tests COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/DesktopUriTest.py)
+  add_test(NAME gui-shell-integration-tests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/ShellIntegrationTest.py)
   add_test(NAME gui-security-tests COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/SecurityTest.py)
   add_test(NAME gui-local-workspace-tests COMMAND ${Python3_EXECUTABLE}
@@ -196,9 +198,10 @@ target_include_directories(linscp-frontend PRIVATE ${ARGON2_INCLUDE_DIR})
 find_package(Threads REQUIRED)
 target_link_libraries(linscp-frontend PUBLIC ssh OpenSSL::Crypto ${ARGON2_LIBRARY} Threads::Threads)
 
-# GSSAPI stays compiled out, as in the Makefile build: libssh may have
-# it, but this client's settings refuse it by name (see SshTunnel.cpp).
-target_compile_definitions(linscp-frontend PRIVATE NO_GSSAPI)
+# GSSAPI is used through libssh at run time, not compiled against a
+# Kerberos library here: IsGssapiSupported() asks the loaded libssh
+# whether it really has it (see SshTunnel.cpp), so a stub build runs
+# the same binary with Kerberos settings refused by name.
 target_compile_options(linscp-frontend PRIVATE -Wall)
 
 # ---- install -------------------------------------------------------------

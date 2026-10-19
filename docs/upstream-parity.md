@@ -64,6 +64,19 @@ The review corrected stale claims without upgrading unimplemented work:
   human-facing script/engine diagnostics keep localization partial.
 - Non-UTF-8 editor transcoding and upstream XML consumer/schema compatibility
   are now explicit capability rows rather than prose-only limitations.
+- The XML action log (`-xmllog=`) now writes the upstream session format
+  (`http://winscp.net/schema/session/1.0`) rather than a structured
+  look-alike of this client's own: `<session>` named for the connection,
+  `<group>` per command (always grouped), operation elements with
+  `value`-attribute parameters and `<result success>` children, `<failure>`
+  for a failed command, upstream's escape pair and UTC timestamp spelling.
+  The schema is pinned in the repository (`docs/winscp-session-1.0.xsd`,
+  written from upstream's emitter and its XML Logging documentation), the
+  shipped fixtures and freshly produced logs validate against it, and the
+  live SFTP suite reads a real session's operations back the way an
+  upstream-style consumer does. The PowerShell compatibility module's live
+  Pester evidence is likewise recorded: CI installs `pwsh`, and its step
+  now fails unless the evidence line reports the live cases actually ran.
 - `?`, `delsession`, `terminal`, `presets`, `savepreset` and `rmspreset` are
   explicitly inventoried rather than left outside the command ledger.
 - `scp://` (and `ssh://`) sessions use this client's own SSH code, not curl, so
@@ -71,10 +84,10 @@ The review corrected stale claims without upgrading unimplemented work:
   The rcp protocol has no offset, so a resume is refused by name and a stale
   staging file is discarded.
 
-Upstream Windows VCL forms, .NET assemblies, Explorer commands and shell
-extensions do not have full Linux equivalents. GSSAPI, broader tunnel policy,
-multi-user GUI isolation, automation APIs and desktop extensions remain in the
-plan.
+Upstream Windows VCL forms and .NET assemblies do not have full Linux
+equivalents. Live Kerberos-realm certification, broader non-SSH tunnel
+policy, multi-user GUI isolation and a .NET-compatible automation API remain
+in the plan.
 
 ### SSH jump-host implementation and newly identified gaps
 
@@ -107,8 +120,10 @@ plan.
   but no per-user isolation of resources or OS privileges. It is a partially
   implemented LinSCP deployment extension, not an upstream desktop capability.
 
-The combined GSSAPI/tunnel row remains partial; a verified SSH-only subset does
-not close that gap. The full-parity gate must continue to fail until the
+The combined GSSAPI/tunnel row remains partial; SSH jumps, an optional
+loopback `TunnelLocalPortNumber` and libssh-backed GSSAPI wiring are
+implemented, but real Kerberos-realm certification and non-SSH tunnels do not
+close that gap. The full-parity gate must continue to fail until the
 remaining capabilities are implemented and independently evidenced.
 
 ## Local verification on 2026-10-19
