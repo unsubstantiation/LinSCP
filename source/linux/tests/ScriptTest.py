@@ -1,6 +1,10 @@
 """Server-free CLI regression tests for the Linux client."""
+import base64
+import hashlib
+import hmac
 import os
 import pathlib
+import struct
 import shutil
 import subprocess
 import sys
@@ -9,6 +13,48 @@ import unittest
 
 BINARY = str(pathlib.Path(sys.argv.pop(1)).resolve())
 SUITE_NAME = "script"
+
+
+def _ssh_string(data):
+    return struct.pack(">I", len(data)) + data
+
+
+def _mpint(number):
+    if number == 0:
+        return _ssh_string(b"")
+    data = number.to_bytes((number.bit_length() + 7) // 8, "big")
+    if data[0] & 0x80:
+        data = b"\0" + data
+    return _ssh_string(data)
+
+
+def _ppk_rsa_fixture(version=2, valid_mac=True):
+    # Small, deterministic RSA values keep this fixture dependency-free.
+    # They are for parser regression tests only and must never be used as keys.
+    algorithm = b"ssh-rsa"
+    comment = b"LinSCP PPK parser test"
+    public = _ssh_string(algorithm) + _mpint(17) + _mpint(3233)
+    private = _mpint(2753) + _mpint(61) + _mpint(53) + _mpint(38)
+    encryption = b"none"
+    mac_data = b"".join(_ssh_string(part) for part in
+                        (algorithm, encryption, comment, public, private))
+    digest = hashlib.sha1 if version == 2 else hashlib.sha256
+    mac_key = b"putty-private-key-file-mac-key"
+    mac = hmac.new(mac_key, mac_data, digest).hexdigest()
+    if not valid_mac:
+        mac = ("0" if mac[0] != "0" else "1") + mac[1:]
+    lines = [
+        "PuTTY-User-Key-File-%d: ssh-rsa" % version,
+        "Encryption: none",
+        "Comment: " + comment.decode("ascii"),
+        "Public-Lines: 1",
+        base64.b64encode(public).decode("ascii"),
+    ]
+    if version == 3:
+        lines.append("Key-Derivation: none")
+    lines.extend(("Private-Lines: 1", base64.b64encode(private).decode("ascii"),
+                  "Private-MAC: " + mac, ""))
+    return "\n".join(lines)
 
 
 class ScriptTests(unittest.TestCase):
@@ -37,6 +83,87 @@ class ScriptTests(unittest.TestCase):
                                       env=env)
         return subprocess.run([BINARY, "-command=" + text],
                               capture_output=True, text=True, timeout=10, env=env)
+
+    def test_ppk_v2_v3_conversion_and_mac_validation(self):
+        with tempfile.TemporaryDirectory(prefix="linscp-ppk-") as temp:
+            root = pathlib.Path(temp)
+            for version in (2, 3):
+                source = root / ("fixture-v%d.ppk" % version)
+                target = root / ("converted-v%d.pem" % version)
+                source.write_text(_ppk_rsa_fixture(version), encoding="ascii")
+                result = subprocess.run(
+                    [BINARY, "-convertkey=" + str(source), "-output=" + str(target)],
+                    capture_output=True, text=True, timeout=10,
+                    env=self.environment())
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("BEGIN PRIVATE KEY", target.read_text(encoding="ascii"))
+                self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+            bad_source = root / "bad-mac.ppk"
+            bad_target = root / "must-not-exist.pem"
+            bad_source.write_text(_ppk_rsa_fixture(2, valid_mac=False), encoding="ascii")
+            result = subprocess.run(
+                [BINARY, "-convertkey=" + str(bad_source), "-output=" + str(bad_target)],
+                capture_output=True, text=True, timeout=10,
+                env=self.environment())
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(bad_target.exists())
+            self.assertIn("integrity", result.stderr.lower())
+
+            # Exercise the v2 AES path and ensure conversion keeps the source
+            # passphrase on the PEM output. OpenSSL's command is optional in
+            # minimal test environments; the core itself links libcrypto.
+            if shutil.which("openssl"):
+                password = b"test-passphrase"
+                algorithm = b"ssh-rsa"
+                comment = b"encrypted fixture"
+                public = _ssh_string(algorithm) + _mpint(17) + _mpint(3233)
+                private = _mpint(2753) + _mpint(61) + _mpint(53) + _mpint(38)
+                padding = (-len(private)) % 16
+                plaintext = private + bytes(padding)
+                plain_path = root / "private-plain.bin"
+                cipher_path = root / "private-cipher.bin"
+                plain_path.write_bytes(plaintext)
+                first = hashlib.sha1(struct.pack(">I", 0) + password).digest()
+                second = hashlib.sha1(struct.pack(">I", 1) + password).digest()
+                aes_key = (first + second)[:32]
+                subprocess.run([
+                    "openssl", "enc", "-aes-256-cbc", "-K", aes_key.hex(),
+                    "-iv", "00" * 16, "-nosalt", "-nopad", "-in", str(plain_path),
+                    "-out", str(cipher_path)], check=True, capture_output=True,
+                    timeout=10)
+                ciphertext = cipher_path.read_bytes()
+                encryption = b"aes256-cbc"
+                mac_data = b"".join(_ssh_string(part) for part in
+                                    (algorithm, encryption, comment, public, plaintext))
+                mac_key = hashlib.sha1(b"putty-private-key-file-mac-key" + password).digest()
+                mac = hmac.new(mac_key, mac_data, hashlib.sha1).hexdigest()
+                encrypted_source = root / "encrypted-v2.ppk"
+                encrypted_target = root / "encrypted-output.pem"
+                ppk_lines = [
+                    "PuTTY-User-Key-File-2: ssh-rsa",
+                    "Encryption: aes256-cbc",
+                    "Comment: " + comment.decode("ascii"),
+                    "Public-Lines: 1",
+                    base64.b64encode(public).decode("ascii"),
+                    "Private-Lines: 1",
+                    base64.b64encode(ciphertext).decode("ascii"),
+                    "Private-MAC: " + mac,
+                    "",
+                ]
+                encrypted_source.write_text("\n".join(ppk_lines), encoding="ascii")
+                result = subprocess.run(
+                    [BINARY, "-convertkey=" + str(encrypted_source),
+                     "-output=" + str(encrypted_target),
+                     "-passphrase=" + password.decode("ascii")],
+                    capture_output=True, text=True, timeout=10,
+                    env=self.environment())
+                self.assertEqual(result.returncode, 0, result.stderr)
+                check = subprocess.run([
+                    "openssl", "pkey", "-in", str(encrypted_target),
+                    "-passin", "pass:" + password.decode("ascii"), "-noout"],
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(check.returncode, 0, check.stderr)
 
     def test_gui_launcher_is_selected_beside_the_running_binary(self):
         with tempfile.TemporaryDirectory(prefix="linscp-install-") as temp:

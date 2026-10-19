@@ -16,13 +16,19 @@ a libssh subsystem channel.
 | GNU make | the build system, `source/linux/Makefile` |
 | a C and C++17 compiler (`gcc`/`g++` or `clang`) | the core is C, the front end is C++ |
 | POSIX threads | the core's critical sections (`-pthread`) |
+| `libssh-dev` | SSH transport, authentication, host keys and SFTP/SCP channels |
+| `libssl-dev` | OpenSSL hashing, cryptographic helpers and PPK key material conversion |
+| `libargon2-dev` | Argon2 key derivation for encrypted PPK v3 keys |
+| `zlib1g-dev` | compression support required by the native build |
+| `pkg-config` | discovers native SSH and crypto compiler/linker flags |
 | `dpkg-dev` | only to build the `.deb` package |
 | `curl` (run time) | FTP transfers, FTPS, `dav://`/`webdav://` and `s3://` |
 | `python3` (run time) | the graphical client, `linscp-gui` |
 | Node 20.19 or newer with `npm` (tests only) | the browser test suites boot the page in `jsdom` |
 
 ```sh
-sudo apt install build-essential dpkg-dev curl python3
+sudo apt install build-essential dpkg-dev pkg-config libssh-dev libssl-dev \
+  libargon2-dev zlib1g-dev curl python3
 ```
 
 ## Building
@@ -113,7 +119,9 @@ linscp -batch -command="open sftp://user@example.com/; cd /data; ls; get * /tmp"
 | `-command=<cmds>` | run commands; separate several with `;` |
 | `-literal` | with `-command`, do not expand `%...%` in paths; used by GUI-generated commands |
 | `-hostkey=<fingerprint>` | pin the host key; `*` accepts any key for this connection only |
-| `-privatekey=<file>` | private key for public key authentication (`.ppk` or OpenSSH format) |
+| `-privatekey=<file>` | OpenSSH or PPK v2/v3 private key for public-key authentication |
+| `-passphrase=<text>` | private-key passphrase (prefer an interactive prompt or ssh-agent over putting it on the command line) |
+| `-convertkey=<input.ppk> -output=<output.pem>` | verify and convert PPK v2/v3 to a PEM private key; prompts for encrypted-key passphrase when interactive |
 | `-username=<name>` | user name |
 | `-password=<password>` | password; prefer `LINSCP_PASSWORD`, which keeps it out of the command line |
 | `-port=<number>` | port (default 22) |
@@ -190,7 +198,9 @@ follow symbolic links.
 `copyid [<keyfile>]` appends the public half of the session's private key, or
 of `<keyfile>`, to `~/.ssh/authorized_keys` on the server. It creates `~/.ssh`
 as `0700` and the file as `0600`, and reports when the key is already
-installed. It needs an `sftp://` or `scp://` session.
+installed. OpenSSH public/private keys and PPK v2/v3 keys are supported;
+PPK MAC integrity is verified, so an encrypted PPK needs its passphrase
+(interactive prompt or `-passphrase=`). It needs an `sftp://` or `scp://` session.
 
 `synchronize local|remote|both [localdir [remotedir]]` compares directory trees
 and copies newer and missing files in the chosen direction. `keepuptodate` is
@@ -357,11 +367,22 @@ that user's local pane.
 
 * **ssh-agent** (recommended): with `SSH_AUTH_SOCK` set, the keys in the agent
   are offered automatically.
-* **Private key file**: `-privatekey=` takes an OpenSSH key
-  (`id_rsa`, `id_ed25519`, PEM). PuTTY `.ppk` files are not read; convert
-  them with `puttygen` first. An encrypted key asks for its passphrase in an interactive
-  run. In `-batch` mode the connection fails and says to run interactively or
-  pass `-passphrase=` to `open`; for scripts, load the key into the agent.
+* **Private key file**: `-privatekey=` accepts OpenSSH/PEM keys and PPK v2/v3
+  files. PPK RSA, DSA, NIST ECDSA, Ed25519 and Ed448 key components are
+  decoded and integrity-checked natively. Authentication still depends on
+  libssh supporting that SSH algorithm (Ed448 may be conversion-only); server
+  policy can also reject legacy DSA. Encrypted PPK v2 and v3 files are
+  supported; encrypted v3 uses Argon2 and therefore needs the `libargon2`
+  runtime library. To bound untrusted-file resource use, PPK v3 KDF settings
+  above 256 MiB, 100 passes or 64-way parallelism are refused. An encrypted
+  key asks for its passphrase interactively. In `-batch` mode, supply
+  `-passphrase=` to
+  `open` or load the key into ssh-agent. To make a standalone PEM copy, run
+  `linscp -convertkey=input.ppk -output=output.pem`; this validates the key,
+  never overwrites an existing output file, prompts for an encrypted key's
+  passphrase when interactive, and retains encryption with that passphrase.
+  Keep the passphrase out of shell history
+  where possible.
 * **Password**: `-password=` or `LINSCP_PASSWORD`. Interactive runs ask for
   one when it is missing. `-batch` runs fail instead of asking.
 * **Stored password**: `savesession <name> -password=...` stores it encrypted,

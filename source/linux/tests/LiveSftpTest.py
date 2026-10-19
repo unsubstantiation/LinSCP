@@ -377,6 +377,18 @@ class LiveSftpTests(unittest.TestCase):
         self.assertIn("Cannot open session", result.stderr)
         self.assertNotIn("Connected", result.stdout)
 
+    def test_interactive_shell_uses_a_libssh_pty_channel(self):
+        environment = dict(os.environ, LINSCP_PASSWORD=PASSWORD)
+        url = "sftp://%s@127.0.0.1:%d/" % (USER, self.port)
+        result = subprocess.run(
+            [BINARY, "-batch", "-hostkey=*", "-shell", url],
+            input=b"pwd\nexit\n", stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=environment, timeout=30)
+        self.assertEqual(result.returncode, 0,
+                         result.stderr.decode("utf-8", "replace"))
+        self.assertIn(str(self.root).encode(), result.stdout)
+        self.assertIn(b"TEST-SHELL>", result.stdout)
+
     def test_open_with_an_unexpected_host_key_is_refused(self):
         """A pinned key that does not match has to stop the connection, and
         say that it was the key rather than the network."""

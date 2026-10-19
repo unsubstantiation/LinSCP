@@ -157,8 +157,8 @@ char * DupString(const std::string & text)
     return copy;
 }
 
-/* curl is the transfer engine for every protocol the native PuTTY SFTP
- * transport does not serve. */
+/* curl is the transfer engine for every protocol not served by the
+ * native libssh SFTP transport or the native SCP engine. */
 const std::string & CurlExecutable()
 {
     static const std::string executable = [] {
@@ -416,8 +416,8 @@ std::string BuildUrl(const SessionOptions & options, const std::string & remoteP
         (options.hostName.empty() || options.hostName[0] != '[');
     std::string url = proto + "://" +
         (ipv6 ? "[" + options.hostName + "]" : options.hostName);
-    /* No SSH protocol is built here: sftp:// goes through the PuTTY SFTP
-     * client and scp:// through the SCP engine, neither of which is a URL. */
+    /* No SSH protocol is built here: sftp:// goes through libssh and
+     * scp:// through the native SCP engine, neither of which is a URL. */
     if (options.portNumber > 0 &&
         !((proto == "ftp" && options.portNumber == 21) ||
           (proto == "ftps" && options.portNumber == 990) ||
@@ -616,9 +616,9 @@ void BuildCommonCurlArgs(const SessionOptions & options, std::vector<std::string
             args.push_back("--proxy-user");
             args.push_back(proxy.userName + ":" + proxy.password);
         }
-        /* PuTTY separates ProxyExcludeList entries by whitespace or comma,
+        /* the session format separates ProxyExcludeList entries by whitespace or comma,
          * while curl expects commas. Add curl's loopback exclusions for
-         * PuTTY's default ProxyLocalhost=0 policy. CIDR matching handles all
+         * the default ProxyLocalhost=0 policy. CIDR matching handles all
          * of IPv4's loopback block, not just 127.0.0.1; localhost and ::1
          * cover the usual name and IPv6 loopback forms. */
         std::string list;
@@ -1433,7 +1433,7 @@ bool ProtocolClient::IsDavProtocol(const std::string & proto)
 bool ProtocolClient::IsMultiProtocol(const std::string & proto)
 {
     /* The protocols this curl backend serves. Neither SSH protocol is one
-     * of them: sftp:// goes through the native PuTTY SFTP engine and
+     * of them: sftp:// goes through the native libssh SFTP engine and
      * scp:// through the native SCP engine (ScpClient.cpp). */
     std::string p = ToLower(proto);
     return p == "ftp" || p == "ftps" || p == "http" || p == "https" ||
@@ -1681,7 +1681,7 @@ bool ProtocolClient::CheckEndpoint(const SessionOptions & options,
          * Worth saying in our own words: a curl built without the protocol
          * fails every command of such a session, and a user cannot tell that
          * apart from a broken host. (SFTP is not at risk here: it goes
-         * through the native PuTTY transport.)
+         * through the native libssh transport.)
          */
         error += " This curl does not support the '" + options.protocol +
             "' protocol; install a curl built with the support it needs.";

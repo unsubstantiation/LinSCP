@@ -13,6 +13,7 @@
 #include "Console.h"
 #include "PathUtil.h"
 #include "Platform.h"
+#include "PpkKey.h"
 #include "Script.h"
 #include "Session.h"
 #include "Texts.h"
@@ -204,6 +205,8 @@ int main(int argc, char ** argv)
     std::string url;
     std::string logFile;
     std::string xmlLogFile;
+    std::string convertKeyInput;
+    std::string convertKeyOutput;
     /* The script parameters of this run, substituted for %1% .. %9%. */
     std::vector<std::string> parameters;
     bool collectingParameters = false;
@@ -216,6 +219,8 @@ int main(int argc, char ** argv)
     bool scriptSpecified = false;
     bool commandSpecified = false;
     bool literalCommand = false;
+    bool convertKeySpecified = false;
+    bool convertOutputSpecified = false;
     const char * value = NULL;
 
     for (int i = 1; i < argc; i++)
@@ -264,6 +269,20 @@ int main(int argc, char ** argv)
         else if (StartsWith(arg, "-privatekey=", &value))
         {
             options.privateKeyFile = value;
+        }
+        else if (StartsWith(arg, "-passphrase=", &value))
+        {
+            options.keyPassphrase = value;
+        }
+        else if (StartsWith(arg, "-convertkey=", &value))
+        {
+            convertKeySpecified = true;
+            convertKeyInput = value;
+        }
+        else if (StartsWith(arg, "-output=", &value))
+        {
+            convertOutputSpecified = true;
+            convertKeyOutput = value;
         }
         else if (StartsWith(arg, "-username=", &value))
         {
@@ -343,6 +362,12 @@ int main(int argc, char ** argv)
         }
     }
 
+    if (launchGui && (convertKeySpecified || convertOutputSpecified))
+    {
+        console.Error(linscp::Texts::Translate(
+            "Key conversion syntax: linscp -convertkey=INPUT.ppk -output=OUTPUT.pem [-passphrase=PASSPHRASE]."));
+        return 1;
+    }
     if (launchGui)
     {
         std::string guiError;
@@ -363,6 +388,42 @@ int main(int argc, char ** argv)
     {
         console.WriteLine(linscp::Texts::Usage());
         return 0;
+    }
+    if (convertKeySpecified)
+    {
+        if (convertKeyInput.empty() || convertKeyOutput.empty() || !url.empty() || scriptSpecified ||
+            commandSpecified || serverMode || shellMode || launchGui)
+        {
+            console.Error(linscp::Texts::Translate(
+                "Key conversion syntax: linscp -convertkey=INPUT.ppk -output=OUTPUT.pem [-passphrase=PASSPHRASE]."));
+            return 1;
+        }
+        std::string error;
+        const std::string input = linscp::ExpandTilde(convertKeyInput);
+        const std::string output = linscp::ExpandTilde(convertKeyOutput);
+        std::string passphrase = options.keyPassphrase;
+        for (int attempt = 0; attempt < 3; ++attempt)
+        {
+            if (linscp::ConvertPpkToOpenSsh(input, output, passphrase, error))
+            {
+                console.WriteLine(linscp::Texts::Translate(
+                    "Converted key written to '{path}'.", {{"path", output}}));
+                return 0;
+            }
+            if (error.find("integrity check failed") == std::string::npos ||
+                !passphrase.empty() || batch || !console.IsInteractive() || attempt == 2)
+                break;
+            if (!console.ReadPassword("PPK key passphrase: ", passphrase))
+                break;
+        }
+        console.Error(error);
+        return 1;
+    }
+    if (convertOutputSpecified)
+    {
+        console.Error(linscp::Texts::Translate(
+            "-output is only valid with -convertkey."));
+        return 1;
     }
     if (serverMode && (scriptSpecified || commandSpecified))
     {

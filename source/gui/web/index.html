@@ -2370,21 +2370,40 @@
     const fit = new FitAddon.FitAddon();
     term.loadAddon(fit);
     term.open(screen);
-    fit.fit();
-    const state = { id: result.terminal, term, fit, offset: 0, timer: null, closed: false };
+    const state = { id: result.terminal, term, fit, offset: 0, timer: null,
+      closed: false, backendClosed: false, inputQueue: Promise.resolve(),
+      resizeObserver: null, resizeFrame: 0 };
     embeddedTerminal = state;
-    term.onData(data => {
+    const sendTerminalInput = data => {
+      if (state.closed) return;
       const bytes = new TextEncoder().encode(data);
       let binary = '';
       bytes.forEach(b => { binary += String.fromCharCode(b); });
-      apiPost('/api/terminal/input', { terminal: state.id, data: btoa(binary),
-        cols: term.cols, rows: term.rows });
-    });
-    term.onResize(() => {
-      apiPost('/api/terminal/input', { terminal: state.id, data: '',
-        cols: term.cols, rows: term.rows });
-    });
+      // HTTP requests are handled concurrently by the backend. Serialize
+      // input so rapid keypresses and pasted text arrive at the PTY in order.
+      state.inputQueue = state.inputQueue.then(() => {
+        if (!state.closed) return apiPost('/api/terminal/input', {
+          terminal: state.id, data: btoa(binary), cols: term.cols, rows: term.rows
+        });
+      }).catch(() => {});
+    };
+    const fitTerminal = () => {
+      if (state.closed || state.resizeFrame) return;
+      state.resizeFrame = requestAnimationFrame(() => {
+        state.resizeFrame = 0;
+        if (!state.closed) fit.fit();
+      });
+    };
+    term.onData(sendTerminalInput);
+    term.onResize(() => sendTerminalInput(''));
     openModal('terminalModal');
+    // Fit only once the modal is visible; measuring a display:none terminal
+    // gives the remote PTY a tiny or stale size on its first paint.
+    fit.fit();
+    if (typeof ResizeObserver !== 'undefined') {
+      state.resizeObserver = new ResizeObserver(fitTerminal);
+      state.resizeObserver.observe(screen);
+    }
     term.focus();
     const poll = async () => {
       if (state.closed) return;
@@ -2401,6 +2420,8 @@
         state.offset = out.offset;
         if (!out.alive) {
           state.closed = true;
+          state.backendClosed = true;
+          apiPost('/api/terminal/close', { terminal: state.id });
           term.write('\r\n');
           toast(t("The terminal session ended."));
           return;
@@ -2418,7 +2439,12 @@
     if (!state) return;
     state.closed = true;
     if (state.timer) clearTimeout(state.timer);
-    apiPost('/api/terminal/close', { terminal: state.id });
+    if (state.resizeFrame) cancelAnimationFrame(state.resizeFrame);
+    if (state.resizeObserver) state.resizeObserver.disconnect();
+    if (!state.backendClosed) {
+      apiPost('/api/terminal/close', { terminal: state.id });
+      state.backendClosed = true;
+    }
     state.term.dispose();
   }
 

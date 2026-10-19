@@ -522,7 +522,7 @@ bool LaunchGuiApplication(std::string & error)
 /*
  * The date columns of the protocol backends: curl's 'Last-Modified'
  * header and the date column of an 'ls -l' listing. Both live here so
- * that the unit tests can reach them without the PuTTY core.
+ * that the unit tests can reach them without an SSH connection.
  */
 
 static int MonthFromName(const std::string & name)
@@ -690,10 +690,9 @@ std::vector<std::string> BuildSshArguments(const std::string & userName,
     const std::string & privateKeyFile)
 {
     std::vector<std::string> args;
-    /* The system ssh client reads OpenSSH key files but cannot read the
-     * PuTTY .ppk files that this client's own SSH core uses; a .ppk is
-     * therefore left to the agent (the terminal then asks for a password
-     * when there is no usable agent key). */
+    /* The system ssh client reads OpenSSH key files but not PPK-format
+     * files, so those are left to the agent (the terminal then asks for a
+     * password when no agent key is available). */
     std::string keyExtension = privateKeyFile.size() >= 4 ?
         privateKeyFile.substr(privateKeyFile.size() - 4) : std::string();
     for (size_t i = 0; i < keyExtension.size(); i++)

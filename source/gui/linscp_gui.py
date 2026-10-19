@@ -1391,10 +1391,15 @@ class TerminalProcess:
 
     def __init__(self, argv, env):
         master, slave = pty.openpty()
-        self._set_size(slave, 30, 100)
-        self.proc = subprocess.Popen(argv, stdin=slave, stdout=slave,
-                                     stderr=slave, env=env,
-                                     start_new_session=True, close_fds=True)
+        try:
+            self._set_size(slave, 30, 100)
+            self.proc = subprocess.Popen(argv, stdin=slave, stdout=slave,
+                                         stderr=slave, env=env,
+                                         start_new_session=True, close_fds=True)
+        except Exception:
+            os.close(master)
+            os.close(slave)
+            raise
         os.close(slave)
         self.master = master
         self.buffer = bytearray()
@@ -1431,11 +1436,22 @@ class TerminalProcess:
                 pass
 
     def write(self, data):
-        if self.alive and data:
-            os.write(self.master, data)
+        if not data:
+            return
+        view = memoryview(data)
+        while self.alive and view:
+            try:
+                written = os.write(self.master, view)
+            except InterruptedError:
+                continue
+            if written <= 0:
+                raise OSError("The terminal input could not be written.")
+            view = view[written:]
 
     def resize(self, cols, rows):
-        if cols > 0 and rows > 0:
+        # ioctl dimensions are unsigned shorts. Bound them before packing so
+        # an invalid or hostile API value cannot crash the terminal pump.
+        if 0 < cols <= 1000 and 0 < rows <= 1000:
             self._set_size(self.master, rows, cols)
 
     def poll(self, after):
@@ -1447,14 +1463,28 @@ class TerminalProcess:
 
     def close(self):
         self.alive = False
-        try:
-            self.proc.terminate()
-        except Exception:
-            pass
+        if self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except OSError:
+                pass
+            try:
+                self.proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                try:
+                    self.proc.kill()
+                except OSError:
+                    pass
+                try:
+                    self.proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
         try:
             os.close(self.master)
         except OSError:
             pass
+        if self.thread is not threading.current_thread():
+            self.thread.join(timeout=1)
 
 
 TERMINALS = {}
@@ -3433,6 +3463,11 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             except ValueError as exc:
                 self.send_json({"success": False, "error": str(exc)}, status=400)
                 return
+            except OSError as exc:
+                self.send_json({"success": False,
+                                "error": "Cannot start the terminal: %s" % exc},
+                               status=500)
+                return
             add_log("Terminal opened on %s" % session_url(tab.session), "success")
             self.send_json({"success": True, "terminal": terminal_id})
             return
@@ -3443,9 +3478,15 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 self.send_json({"success": False,
                                 "error": "No such terminal."}, status=400)
                 return
+            encoded = body.get("data") or ""
+            if not isinstance(encoded, str):
+                self.send_json({"success": False,
+                                "error": "Terminal input was not base64."},
+                               status=400)
+                return
             try:
-                data = base64.b64decode(str(body.get("data") or ""))
-            except Exception:
+                data = base64.b64decode(encoded, validate=True)
+            except (ValueError, base64.binascii.Error):
                 self.send_json({"success": False,
                                 "error": "Terminal input was not base64."},
                                status=400)

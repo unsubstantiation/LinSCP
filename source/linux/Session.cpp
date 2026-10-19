@@ -5,9 +5,11 @@
 #include "ProtocolClient.h"
 #include "SftpClient.h"
 #include "SshKeys.h"
+#include "PpkKey.h"
 #include "Texts.h"
 
 #include <cctype>
+#include <cerrno>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include <openssl/crypto.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -666,7 +669,7 @@ bool ParseProxyMethod(const std::string & text, ProxyMethod & method)
         }
     }
     /* Upstream also stores the method as its number, and 'local' is what
-     * the local-command proxy is called outside PuTTY's own table. */
+     * the local-command proxy is called outside the transport table. */
     if (lower == "local" || lower == "command")
     {
         method = ProxyMethod::Local;
@@ -2021,7 +2024,11 @@ bool Session::SendData(const char * data, size_t len)
     {
         const int written = ssh_channel_write(channel, data + sent,
             static_cast<uint32_t>(len - sent));
-        if (written == SSH_ERROR)
+        /* A nonblocking libssh channel can report SSH_AGAIN (a negative
+         * result); zero also makes no forward progress. Treat either as a
+         * failed write instead of converting it to a huge size_t or
+         * spinning forever on an interactive terminal input. */
+        if (written <= 0)
         {
             return false;
         }
@@ -2289,10 +2296,10 @@ void Session::ClearDavEtag(const std::string & remotePath)
 namespace {
 
 /*
- * The host key decision, with the same outcomes the PuTTY Seat callback
- * used to produce: a pinned key is checked first, '*' accepts without
- * caching, a cached key is trusted or refused on mismatch, and only a
- * genuinely new key is offered to the user (and, in a run that cannot
+ * The host-key decision preserves the established policy: a pinned key is
+ * checked first, '*' accepts without caching, a cached key is trusted or
+ * refused on mismatch, and only a genuinely new key is offered to the user
+ * (and, in a run that cannot
  * ask, refused with the fingerprint printed so it can be pinned).
  */
 bool VerifyServerKey(Session & session, ssh_session ssh, std::string & error)
@@ -2389,6 +2396,57 @@ bool VerifyServerKey(Session & session, ssh_session ssh, std::string & error)
     return false;
 }
 
+bool ImportPrivateKeyFile(const std::string & keyFile, const char * passphrase,
+    ssh_key * key, std::string & error)
+{
+    if (!IsPpkKeyFile(keyFile))
+    {
+        if (ssh_pki_import_privkey_file(keyFile.c_str(), passphrase, NULL, NULL,
+                key) == SSH_OK)
+            return true;
+        error = "Cannot read the private key '" + keyFile +
+            "' (or its passphrase is wrong).";
+        return false;
+    }
+
+    std::string pem;
+    if (!PpkPrivateKeyPem(keyFile, passphrase != NULL ? passphrase : "", pem, error))
+        return false;
+    char tempPath[] = "/tmp/linscp-ppk-XXXXXX";
+    const int fd = mkstemp(tempPath);
+    if (fd < 0)
+    {
+        OPENSSL_cleanse(pem.data(), pem.size());
+        error = "Cannot create a secure temporary file to import the PPK key.";
+        return false;
+    }
+    size_t written = 0;
+    while (written < pem.size())
+    {
+        const ssize_t count = write(fd, pem.data() + written, pem.size() - written);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        written += static_cast<size_t>(count);
+    }
+    const bool fileReady = written == pem.size() && fsync(fd) == 0;
+    close(fd);
+    OPENSSL_cleanse(pem.data(), pem.size());
+    if (!fileReady)
+    {
+        unlink(tempPath);
+        error = "Cannot write the temporary PPK key for libssh.";
+        return false;
+    }
+    const int rc = ssh_pki_import_privkey_file(tempPath, NULL, NULL, NULL, key);
+    unlink(tempPath);
+    if (rc != SSH_OK)
+    {
+        error = "The PPK key was decoded but could not be imported by libssh.";
+        return false;
+    }
+    return true;
+}
+
 /*
  * Authentication: agent and explicit/default key files first, then
  * keyboard-interactive, then the password. The stored password answers
@@ -2416,20 +2474,13 @@ bool AuthenticateServer(Session & session, ssh_session ssh, std::string & error)
         if (!options.privateKeyFile.empty())
         {
             const std::string keyFile = ExpandTilde(options.privateKeyFile);
-            if (IsPuttyKeyFile(keyFile))
-            {
-                keyError = "The PuTTY key file '" + keyFile + "' cannot "
-                    "be read by this build; convert it to an OpenSSH key "
-                    "first, for example with 'puttygen " + keyFile +
-                    " -O private-openssh'.";
-            }
-            else
+            std::string keyPassphrase = options.keyPassphrase;
+            for (int attempt = 0; attempt < 3; ++attempt)
             {
                 ssh_key key = NULL;
-                const char * passphrase = options.keyPassphrase.empty() ?
-                    NULL : options.keyPassphrase.c_str();
-                if (ssh_pki_import_privkey_file(keyFile.c_str(), passphrase,
-                        NULL, NULL, &key) == SSH_OK)
+                const char * passphrase = keyPassphrase.empty() ? NULL :
+                    keyPassphrase.c_str();
+                if (ImportPrivateKeyFile(keyFile, passphrase, &key, keyError))
                 {
                     const int rc = ssh_userauth_publickey(ssh, NULL, key);
                     ssh_key_free(key);
@@ -2437,12 +2488,14 @@ bool AuthenticateServer(Session & session, ssh_session ssh, std::string & error)
                     {
                         return true;
                     }
+                    break;
                 }
-                else if (keyError.empty())
-                {
-                    keyError = "Cannot read the private key '" + keyFile +
-                        "' (or its passphrase is wrong).";
-                }
+                if (!IsPpkKeyFile(keyFile) || !keyPassphrase.empty() ||
+                    !console.IsInteractive() || attempt == 2)
+                    break;
+                if (!console.ReadPassword(Texts::Translate("Private key passphrase: "),
+                        keyPassphrase))
+                    break;
             }
         }
         if (options.privateKeyFile.empty() &&
@@ -2581,9 +2634,8 @@ bool Session::Open(const SessionOptions & options, std::string & error)
             return false;
         }
         /* A proxy the curl protocols cannot carry is refused rather than
-         * connected around - except for SCP, which the native engine
-         * connects through the PuTTY core, where a telnet or local command
-         * proxy works exactly as it does for SFTP. */
+         * connected around - except for SCP, whose native libssh transport
+         * supports telnet and local-command proxy connections as SFTP does. */
         if (!UseNativeScp(options.protocol) &&
             !ProxyUsableByCurl(options.proxy, error))
         {

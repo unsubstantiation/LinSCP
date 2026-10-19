@@ -5,8 +5,8 @@
  * transfer protocol that runs on it, and upstream drives both. Listings,
  * stat and the metadata operations are shell commands; the bytes of a
  * transfer go through 'scp -f' and 'scp -t' on an SSH channel whose wire
- * protocol the client speaks itself. This engine does the same over the
- * bundled PuTTY core, so an scp:// session no longer needs a curl built
+ * protocol the client speaks itself. This engine does the same over
+ * libssh, so an scp:// session no longer needs a curl built
  * with libssh2, and its host key is verified by the code that verifies an
  * sftp:// one instead of being handed to curl's fingerprint options.
  *

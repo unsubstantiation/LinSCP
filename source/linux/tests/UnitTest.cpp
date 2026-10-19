@@ -456,7 +456,7 @@ void TestDateParsing()
 
 /* The 'terminal' command hands the connection details to the system ssh
  * client; the argument list must not grow options that ssh does not
- * take, and a PuTTY key file must not be passed as -i. */
+ * take, and a PPK-format key file must not be passed as -i. */
 void TestTerminalCommandLine()
 {
     const std::vector<std::string> plain = BuildSshArguments("user", "host", 22, "");
@@ -478,7 +478,7 @@ void TestTerminalCommandLine()
     const std::vector<std::string> anonymous = BuildSshArguments("", "host", 22, "");
     CHECK_EQ(anonymous[1], "host");
 
-    /* A PuTTY key file cannot be read by the ssh client. */
+    /* A PPK-format key file cannot be read by the ssh client. */
     const std::vector<std::string> ppk = BuildSshArguments("user", "host", 22,
         "/keys/private.PPK");
     CHECK_EQ(std::to_string(ppk.size()), "2");
@@ -801,9 +801,8 @@ void TestScriptCommands()
 
 void TestSessionRegistry()
 {
-    /* The SFTP transport glue in PuttyGlue.cpp reaches the live session
-     * through this pair, so it must start out empty and follow
-     * SetCurrentSession(). */
+    /* The SFTP transport adapter reaches the live session through this
+     * pair, so it must start out empty and follow SetCurrentSession(). */
     CHECK_TRUE(CurrentSession() == NULL);
     Session session;
     CHECK_FALSE(session.IsOpen());
@@ -1727,8 +1726,8 @@ void TestProxySettings()
     CHECK_TRUE(ProxyDefaultPort(ProxyMethod::Telnet) == 23);
 
     /* The port actually used, and who resolves the destination name: the
-     * rule PuTTY applies, where SOCKS4 is the one method that cannot take
-     * a name. */
+     * rule used by this proxy implementation, where SOCKS4 is the one
+     * method that cannot take a name. */
     ProxySettings proxy;
     CHECK_FALSE(proxy.Active());
     CHECK_TRUE(proxy.dns == 1);

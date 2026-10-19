@@ -19,9 +19,10 @@ is the console file transfer client of LinSCP. It connects to an SFTP or an
 SCP server over SSH, and transfers files to and from the local file system,
 either from a script, from a command line, or interactively.
 .PP
-The SSH, SFTP and SCP protocol code is the PuTTY core plus this client's own
-SCP engine, driven by a POSIX front end. Neither SSH protocol is handed to
-another program.
+SSH transport, authentication and host-key verification use libssh. The
+client speaks the SFTP v3 protocol over a libssh subsystem channel and
+implements SCP over libssh channels; neither protocol is delegated to curl
+or another SSH library.
 .SH OPTIONS
 .TP
 .BI \-script= file
@@ -70,13 +71,31 @@ sessions are checked by this client's own SSH code, so what a pin enforces
 does not depend on any external program's build.
 .TP
 .BI \-privatekey= file
-Private key to authenticate with. Both PuTTY
-.B .ppk
-files and OpenSSH/ssh.com keys (including the OpenSSH new format used by
-.IR id_rsa " and " id_ed25519 )
-are accepted; a key in a foreign format is imported for the connection. An
-encrypted key asks for its passphrase interactively and cannot be used in
-batch mode: load such a key into an ssh-agent instead.
+OpenSSH/PEM or PPK v2/v3 private key to authenticate with. PPK keys are
+parsed natively, their integrity MAC is checked, and the decoded key is
+imported by libssh. RSA, DSA, NIST ECDSA, Ed25519 and Ed448 PPK key
+components are parsed; authentication depends on the algorithm being
+supported by libssh, and servers may reject legacy DSA. Encrypted v3 keys
+require the Argon2 runtime library. KDF settings above 256 MiB, 100 passes or
+64-way parallelism are refused to bound resource use. An encrypted key asks
+for its passphrase interactively. In batch mode, provide
+.B -passphrase=
+or load the key into ssh-agent.
+.TP
+.BI \-passphrase= passphrase
+Private-key passphrase. Avoid putting secrets in process arguments or shell
+history; interactive prompting or ssh-agent is preferred.
+.TP
+.BI \-convertkey= input.ppk
+Convert a PPK v2/v3 key to PEM. Must be used with
+.BI \-output= output.pem .
+The converter verifies the PPK MAC, prompts for a passphrase when needed,
+retains encryption with the same passphrase, and refuses to overwrite an
+existing output file. The output is created with permissions 0600.
+.TP
+.BI \-output= output.pem
+Destination for
+.BR \-convertkey= .
 .TP
 .BI \-username= name
 User name to authenticate with.
@@ -831,14 +850,14 @@ the server's
 of the connected user.
 .B ~/.ssh
 is created with mode 0700 and the file with 0600, and a key that is already
-there is not added a second time. OpenSSH public and private key files and PuTTY
-.B .ppk
-files are read, an encrypted key is asked for its passphrase interactively and
-refused in batch mode, and an
+there is not added a second time. OpenSSH public and private key files and
+PPK v2/v3 files are supported; the PPK MAC is checked, so an encrypted PPK
+needs its passphrase (interactively or with
+.BR \-passphrase= ). Other foreign formats are not supported. An
 .B sftp://
 or
 .B scp://
-session is required. Key files are read through the bundled PuTTY core.
+session is required. OpenSSH keys are read through libssh.
 .TP
 .BI stat " file"
 Print the listing line of a remote path, the line
@@ -1003,7 +1022,7 @@ linscp \-gui
 .SH LIMITATIONS
 LinSCP does not implement full WinSCP feature parity, and Linux is the only
 platform it is built, packaged and tested on. Native SFTP and native SCP
-through the bundled PuTTY core, basic recursive transfers/resume,
+through libssh, basic recursive transfers/resume,
 synchronization, persistent sessions, a remote editor and a browser-based
 graphical interface exist. The remaining protocols use curl and depend on its
 build capabilities: when the installed curl lacks the protocol, opening such an

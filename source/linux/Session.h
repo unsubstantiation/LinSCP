@@ -19,7 +19,7 @@
 
 namespace linscp {
 
-/* True when 'protocol' is served by the native PuTTY SFTP engine rather
+/* True when 'protocol' is served by the native libssh SFTP engine rather
  * than by the curl backend of ProtocolClient. All protocol dispatch in
  * Script goes through this helper, never through a bare comparison
  * against "sftp". */

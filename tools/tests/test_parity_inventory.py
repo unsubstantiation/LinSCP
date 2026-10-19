@@ -207,7 +207,8 @@ class InventoryTests(unittest.TestCase):
         errors = []
         checker.check_feature_rollups(inventory, errors)
         self.assertEqual(errors, [])
-        next(f for f in inventory['features'] if f['name'] == 'Amazon S3')['status'] = 'verified'
+        next(f for f in inventory['features']
+             if f['name'] == 'Security/authentication')['status'] = 'verified'
         checker.check_feature_rollups(inventory, errors)
         self.assertIn('verified area has tracked gaps', ' | '.join(errors))
 
