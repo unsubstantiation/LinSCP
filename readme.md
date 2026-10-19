@@ -144,8 +144,8 @@ it can be pinned.
   X11-only.
 
 Full WinSCP parity is **not** implemented. Remaining gaps include the .NET
-assembly API, GSSAPI, multi-user GUI isolation, desktop extensions, broader
-localization and upstream XML compatibility. Local-to-local sessions with two
+assembly API, multi-user GUI isolation, broader localization beyond
+English/Spanish, and further live Kerberos-realm validation of GSSAPI. Local-to-local sessions with two
 local panes and named multi-tab workspaces are implemented and covered by the
 `gui-local` suite.
 `automation/LinSCP.psm1` is a PowerShell 7 CLI wrapper with static tests and

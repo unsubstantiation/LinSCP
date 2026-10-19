@@ -6353,6 +6353,7 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
             session.tunnelPasswordRaw = previous->tunnelPasswordRaw;
             session.tunnelPassphraseRaw = previous->tunnelPassphraseRaw;
             session.tunnelError = previous->tunnelError;
+            session.gssapi = previous->gssapi;
         }
     }
     if (!rawSettings.empty())
@@ -6374,6 +6375,7 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
         session.tls = scratch.tls;
         session.s3 = scratch.s3;
         session.tunnel = scratch.tunnel;
+        session.gssapi = scratch.gssapi;
         for (const RawSetting & setting : rawSettings)
         {
             const std::string key = ToLower(setting.first);

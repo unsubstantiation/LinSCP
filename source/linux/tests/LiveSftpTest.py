@@ -111,10 +111,12 @@ class LiveSftpTests(unittest.TestCase):
             self.stop_proxy(*self.proxies.pop())
 
     # -- the server ---------------------------------------------------------
-    def start_server(self, copy_data=False, check_file_name=False):
+    def start_server(self, copy_data=False, check_file_name=False,
+                     gssapi_offer=False):
         env = dict(os.environ, LSCP_TEST_ROOT=str(self.root), LSCP_TEST_PORT="0",
                    LSCP_TEST_COPY_DATA="1" if copy_data else "0",
-                   LSCP_TEST_CHECK_FILE_NAME="1" if check_file_name else "0")
+                   LSCP_TEST_CHECK_FILE_NAME="1" if check_file_name else "0",
+                   LSCP_TEST_GSSAPI_OFFER="1" if gssapi_offer else "0")
         # Its own process group, so that tearDown can stop the server and
         # anything it left behind without touching the test runner.
         popen_args = dict(env=env, stdout=subprocess.PIPE,
@@ -255,6 +257,36 @@ class LiveSftpTests(unittest.TestCase):
         return path
 
     # -- tests --------------------------------------------------------------
+    def test_gssapi_offer_falls_back_to_password_in_order(self):
+        """When the server advertises gssapi-with-mic but no Kerberos
+        credential exists, the attempt is made (with a capable libssh)
+        or named as unavailable (a stub build), and password
+        authentication still completes the session. With AuthGSSAPI=0
+        the method is not considered at all."""
+        self.stop_server()
+        self.start_server(gssapi_offer=True)
+        downloaded = self.local / "gssapi-fallback.bin"
+        source = self.write_in_jail("gssapi.bin", 4097)
+        log = self.config / "session.log"
+
+        result = self.run_script(
+            "option confirm off ; get /gssapi.bin %s" % downloaded)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sha256_of(source), sha256_of(downloaded))
+        text = log.read_text(encoding="utf-8", errors="replace")
+        self.assertTrue(
+            "Attempting GSSAPI authentication" in text or
+            "The server offers GSSAPI" in text, text)
+
+        log.unlink(missing_ok=True)  # -log appends: read this run only
+        result = self.run_script(
+            "option confirm off ; get /gssapi.bin %s" % downloaded,
+            open_args=["-rawsettings", "AuthGSSAPI=0"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        text = log.read_text(encoding="utf-8", errors="replace")
+        self.assertNotIn("Attempting GSSAPI authentication", text)
+        self.assertNotIn("The server offers GSSAPI", text)
+
     def test_cp_multiple_sources_and_recursive_tree(self):
         """The copy-data extension is optional: SFTP copies must still work
         through the streamed fallback for multiple files and whole trees."""

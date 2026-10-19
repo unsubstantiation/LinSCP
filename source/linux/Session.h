@@ -191,6 +191,27 @@ struct S3Settings
     }
 };
 
+/*
+ * Kerberos single-sign-on under upstream's session-setting names:
+ * 'AuthGSSAPI' (try gssapi-with-mic when the server offers it),
+ * 'AuthGSSAPIKEX' (offer the RFC 4462 key exchanges, under which the
+ * server is authenticated by Kerberos instead of a host key),
+ * 'GSSAPIFwdTGT' (delegate credentials to the server - off unless a
+ * session asks, because a delegated ticket lets the server act as the
+ * user elsewhere) and 'LogicalHostName' (the name the service ticket
+ * is asked for, when the server's Kerberos identity is not the host
+ * name it was reached by). The defaults are upstream's.
+ */
+struct GssapiSettings
+{
+    bool auth;
+    bool authKex;
+    bool forwardTgt;
+    std::string logicalHost;
+
+    GssapiSettings() : auth(true), authKex(false), forwardTgt(false) {}
+};
+
 struct SessionOptions
 {
     std::string protocol;
@@ -212,6 +233,8 @@ struct SessionOptions
     ProxySettings proxy;
     /* An authenticated SSH jump host, separate from the destination. */
     SshTunnelSettings tunnel;
+    /* Kerberos/GSSAPI authentication policy. */
+    GssapiSettings gssapi;
     /* The FTP engine's policy, the TLS policy and S3 object policy. */
     FtpSettings ftp;
     TlsSettings tls;
@@ -253,6 +276,18 @@ bool IsSessionRawSettingName(const std::string & name);
  * saying so beats connecting without verification) and the FTP settings.
  */
 bool ValidateSessionSettings(const SessionOptions & options, std::string & error);
+/* The key-exchange list to offer when GSSAPI key exchange is on: the
+ * RFC 4462 algorithms first, then this client's ordinary ones. Empty
+ * when it is off, when the loaded libssh cannot use GSSAPI, or when a
+ * host key is pinned - a pinned key must be checked, and a Kerberos
+ * key exchange presents none. */
+std::string GssapiKeyExchangeList(const SessionOptions & options);
+/* The key-exchange list to offer when GSSAPI key exchange is on: the
+ * RFC 4462 algorithms first, then this client's ordinary ones. Empty
+ * when it is off, when the loaded libssh cannot use GSSAPI, or when a
+ * host key is pinned - a pinned key must be checked, and a Kerberos
+ * key exchange presents none. */
+std::string GssapiKeyExchangeList(const SessionOptions & options);
 /* True when the session talks to the FTP server over implicit TLS, which
  * is what an 'ftps://' URL or 'Ftps=1' asks for. */
 bool SessionUsesImplicitTls(const SessionOptions & options);

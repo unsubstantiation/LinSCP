@@ -29,6 +29,9 @@ PORT = int(os.environ.get("LSCP_TEST_PORT", "12765"))
 USER, PASSWORD = "testuser", "testpass"
 ROOT = os.environ.get("LSCP_TEST_ROOT", "/tmp/lscp-sftp-root")
 COPY_DATA = os.environ.get("LSCP_TEST_COPY_DATA") == "1"
+# Advertise gssapi-with-mic (without being able to complete it), so a
+# client can be seen attempting Kerberos and falling back in order.
+GSSAPI_OFFER = os.environ.get("LSCP_TEST_GSSAPI_OFFER") == "1"
 CHECK_FILE_NAME = os.environ.get("LSCP_TEST_CHECK_FILE_NAME") == "1"
 
 HOST_KEY = paramiko.RSAKey.generate(2048)
@@ -290,6 +293,8 @@ class Server(paramiko.ServerInterface):
         return paramiko.AUTH_FAILED
 
     def get_allowed_auths(self, username):
+        if GSSAPI_OFFER:
+            return "gssapi-with-mic,password,publickey"
         return "password,publickey"
 
     def check_channel_request(self, kind, chanid):

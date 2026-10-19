@@ -1646,6 +1646,39 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("proxy_method", text)
         self.assertNotIn("proxy_password", text)
 
+    def test_a_stored_session_keeps_its_gssapi_and_tunnel_local_port(self):
+        """The Kerberos settings and TunnelLocalPortNumber are stored with
+        the site under upstream's raw names; an unusable value is refused
+        by name rather than dropped."""
+        result = self.run_commands(
+            "savesession kerb -host=files.example.com -username=alice "
+            "-rawsettings AuthGSSAPI=0 AuthGSSAPIKEX=1 GSSAPIFwdTGT=1 "
+            "LogicalHostName=srv.example.org Tunnel=1 "
+            "TunnelHostName=jump.example.com TunnelLocalPortNumber=22222")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stored = pathlib.Path(self.config) / "sessions.ini"
+        text = stored.read_text(encoding="utf-8")
+        self.assertIn("auth_gssapi=0", text)
+        self.assertIn("auth_gssapi_kex=1", text)
+        self.assertIn("gssapi_fwd_tgt=1", text)
+        self.assertIn("logical_host=srv.example.org", text)
+        self.assertIn("tunnel_local_port=22222", text)
+
+        result = self.run_commands(
+            "savesession kerb -host=files.example.com "
+            "-rawsettings AuthGSSAPI=maybe ; echo SHOULD_NOT_RUN")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("AuthGSSAPI", result.stderr)
+        self.assertNotIn("SHOULD_NOT_RUN", result.stdout)
+
+        result = self.run_commands(
+            "savesession kerb -host=files.example.com "
+            "-rawsettings TunnelLocalPortNumber=65536 ; "
+            "echo SHOULD_NOT_RUN")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("TunnelLocalPortNumber", result.stderr)
+        self.assertNotIn("SHOULD_NOT_RUN", result.stdout)
+
     def test_proxy_passwords_are_masked_in_logs(self):
         """A proxy password authenticates, so it is masked wherever the
         command is repeated: the echoed line, the session log and the XML
@@ -1763,7 +1796,7 @@ class ScriptTests(unittest.TestCase):
                 ("Tunnel=2", "Tunnel"),
                 ("TunnelPortNumber=22x", "TunnelPortNumber"),
                 ("TunnelPortNumber=999999999999999999999", "TunnelPortNumber"),
-                ("TunnelLocalPortNumber=8080", "private socket pair"),
+                ("TunnelLocalPortNumber=65536", "TunnelLocalPortNumber"),
                 ('Tunnel=1 TunnelHostName="two hosts"', "TunnelHostName")):
             with self.subTest(settings=settings):
                 result = self.run_commands("open sftp://127.0.0.1:1/ -rawsettings " + settings)

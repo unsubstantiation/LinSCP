@@ -837,6 +837,11 @@ std::vector<std::string> SessionRawSettingNames()
             "TunnelPassphrase", "TunnelHostKey", "TunnelLocalPortNumber",
             "TunnelPasswordPlain", "TunnelPassphrasePlain"})
         names.push_back(name);
+    /* Kerberos/GSSAPI authentication, under upstream's names. */
+    names.push_back("AuthGSSAPI");
+    names.push_back("AuthGSSAPIKEX");
+    names.push_back("GSSAPIFwdTGT");
+    names.push_back("LogicalHostName");
     /* The FTP engine's policy, under upstream's names. */
     names.push_back("FtpPasvMode");
     names.push_back("FtpForcePasvIp");
@@ -999,13 +1004,14 @@ bool ApplySessionRawSetting(const std::string & name, const std::string & value,
     }
     if (lower == "tunnellocalportnumber")
     {
-        // Unlike upstream, the native tunnel exposes no listening port.
-        if (text != "0")
+        int port = 0;
+        if (text != "0" && !ParsePortValue(text, port))
         {
-            error = Texts::Translate("TunnelLocalPortNumber must be 0: native SSH tunnels use "
-                "a private socket pair, not a TCP listener.");
+            error = Texts::Translate("TunnelLocalPortNumber must be 0 (no listener) or "
+                "between 1 and 65535.");
             return false;
         }
+        options.tunnel.localPortNumber = port;
         return true;
     }
     if (lower == "tunnelhostname") { options.tunnel.hostName = text; return true; }
@@ -1017,6 +1023,36 @@ bool ApplySessionRawSetting(const std::string & name, const std::string & value,
         { options.tunnel.password = value; return true; }
     if (lower == "tunnelpassphrase" || lower == "tunnelpassphraseplain")
         { options.tunnel.keyPassphrase = value; return true; }
+
+    if (lower == "authgssapi" || lower == "authgssapikex" ||
+        lower == "gssapifwdtgt")
+    {
+        if (text != "0" && text != "1")
+        {
+            error = Texts::Translate("The value of '{name}' must be 0 or 1, not '{value}'.",
+                {{"name", name}, {"value", value}});
+            return false;
+        }
+        const bool on = text == "1";
+        if (lower == "authgssapi") { options.gssapi.auth = on; }
+        else if (lower == "authgssapikex") { options.gssapi.authKex = on; }
+        else { options.gssapi.forwardTgt = on; }
+        return true;
+    }
+    if (lower == "logicalhostname")
+    {
+        for (size_t i = 0; i < text.size(); i++)
+        {
+            const unsigned char c = static_cast<unsigned char>(text[i]);
+            if (c <= ' ' || c == 0x7f)
+            {
+                error = Texts::Translate("LogicalHostName must be one host name.");
+                return false;
+            }
+        }
+        options.gssapi.logicalHost = text;
+        return true;
+    }
 
     if (lower == "ftppasvmode")
     {
@@ -1494,9 +1530,38 @@ bool LooksLikeCertificateFingerprint(const std::string & text)
     return hex.size() == 64 || hex.size() == 40 || hex.size() == 32;
 }
 
+std::string GssapiKeyExchangeList(const SessionOptions & options)
+{
+    if (!options.gssapi.auth || !options.gssapi.authKex ||
+        !IsGssapiSupported())
+    {
+        return std::string();
+    }
+    if (!options.hostKey.empty() && options.hostKey != "*")
+    {
+        return std::string();
+    }
+    return "gss-group14-sha256-,gss-group16-sha512-,gss-nistp256-sha256-,"
+        "gss-curve25519-sha256-,curve25519-sha256,"
+        "curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,"
+        "ecdh-sha2-nistp521,diffie-hellman-group16-sha512,"
+        "diffie-hellman-group18-sha512,diffie-hellman-group14-sha256,"
+        "diffie-hellman-group-exchange-sha256";
+}
+
 bool ValidateSessionSettings(const SessionOptions & options, std::string & error)
 {
     error.clear();
+    if ((UseNativeSftp(options.protocol) || UseNativeScp(options.protocol)) &&
+        options.gssapi.auth && !IsGssapiSupported() &&
+        (options.gssapi.authKex || options.gssapi.forwardTgt ||
+         !options.gssapi.logicalHost.empty()))
+    {
+        error = Texts::Translate("This build's libssh cannot use GSSAPI, so the session's "
+            "Kerberos settings (AuthGSSAPIKEX, GSSAPIFwdTGT, LogicalHostName) "
+            "would be dropped.");
+        return false;
+    }
     if (!ValidateProxySettings(options.proxy, error))
     {
         return false;
@@ -2452,6 +2517,25 @@ bool VerifyServerKey(Session & session, ssh_session ssh, std::string & error)
     ssh_key key = NULL;
     if (ssh_get_server_publickey(ssh, &key) != SSH_OK || key == NULL)
     {
+        /* A GSSAPI key exchange authenticates the server with Kerberos
+         * instead of a host key. Connect() does not offer it when a
+         * key is pinned; refuse anyway if one is, so a pin is never
+         * silently skipped. */
+        const char * kex = ssh_get_kex_algo(ssh);
+        if (kex != NULL && std::strncmp(kex, "gss-", 4) == 0)
+        {
+            if (!options.hostKey.empty() && options.hostKey != "*")
+            {
+                error = Texts::Translate("A host key is pinned, but the GSSAPI key "
+                    "exchange presents none to check it against.");
+                return false;
+            }
+            console.LogEvent(Texts::Translate(
+                "The server is authenticated by Kerberos (GSSAPI key "
+                "exchange {algorithm}); it has no host key to check",
+                {{"algorithm", kex}}));
+            return true;
+        }
         error = "The server did not present a host key.";
         return false;
     }
@@ -2612,6 +2696,27 @@ bool AuthenticateServer(Session & session, ssh_session ssh, std::string & error)
     }
     const int methods = ssh_userauth_list(ssh, NULL);
     std::string keyError;
+
+    if ((methods & SSH_AUTH_METHOD_GSSAPI_MIC) && options.gssapi.auth)
+    {
+        if (IsGssapiSupported())
+        {
+            console.LogEvent(Texts::Translate(
+                "Attempting GSSAPI authentication"));
+            if (ssh_userauth_gssapi(ssh) == SSH_AUTH_SUCCESS)
+            {
+                console.LogEvent(Texts::Translate(
+                    "Authenticated with GSSAPI"));
+                return true;
+            }
+        }
+        else
+        {
+            console.LogEvent(Texts::Translate(
+                "The server offers GSSAPI, but this build's libssh "
+                "cannot use it"));
+        }
+    }
 
     if (methods & SSH_AUTH_METHOD_PUBLICKEY)
     {
@@ -2876,6 +2981,37 @@ bool Session::Connect(const SessionOptions & options, const char * program,
     {
         int verbosity = SSH_LOG_FUNCTIONS;
         ssh_options_set(ssh, SSH_OPTIONS_LOG_VERBOSITY, &verbosity);
+    }
+
+    // Kerberos single sign-on: credential delegation stays off unless
+    // the session asks for it by name, and the logical host name only
+    // changes which service ticket is requested, never where the
+    // connection goes.
+    if (IsGssapiSupported() && mOptions.gssapi.auth)
+    {
+        int delegate = mOptions.gssapi.forwardTgt ? 1 : 0;
+        ssh_options_set(ssh, SSH_OPTIONS_GSSAPI_DELEGATE_CREDENTIALS,
+            &delegate);
+        if (!mOptions.gssapi.logicalHost.empty())
+        {
+            ssh_options_set(ssh, SSH_OPTIONS_GSSAPI_SERVER_IDENTITY,
+                mOptions.gssapi.logicalHost.c_str());
+        }
+        if (mOptions.gssapi.forwardTgt)
+        {
+            Console::Instance().LogEvent(Texts::Translate(
+                "Kerberos credentials will be delegated to the server "
+                "(GSSAPIFwdTGT)"));
+        }
+    }
+    const std::string kexList = GssapiKeyExchangeList(mOptions);
+    if (!kexList.empty() &&
+        ssh_options_set(ssh, SSH_OPTIONS_KEY_EXCHANGE, kexList.c_str()) !=
+            SSH_OK)
+    {
+        Console::Instance().LogEvent(Texts::Translate(
+            "This libssh cannot offer GSSAPI key exchange; using its "
+            "default key exchange"));
     }
 
     /*

@@ -10,14 +10,14 @@ Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
 **Area:** Security/authentication · **Status:** partial
 
-Authenticated SSH jump-host connections now work for SFTP/SCP/SSH, including GUI tabs, background operations and the embedded terminal. Tunnel* raw settings, independent host-key verification, inherited proxy settings, encrypted stored jump credentials and bounded lifecycle cleanup are implemented. GSSAPI remains unavailable; removing NO_GSSAPI no longer pretends otherwise.
+Authenticated SSH jump-host connections now work for SFTP/SCP/SSH, including GUI tabs, background operations and the embedded terminal. Tunnel* raw settings, independent host-key verification, inherited proxy settings, encrypted stored jump credentials and bounded lifecycle cleanup are implemented. Kerberos/GSSAPI is now wired through libssh: AuthGSSAPI, AuthGSSAPIKEX, GSSAPIFwdTGT and LogicalHostName persist in stored sessions and the GUI; gssapi-with-mic is attempted before public-key auth with fallback to the existing methods; optional RFC 4462 GSSAPI key exchange is offered only when no host key is pinned; credential delegation stays off unless GSSAPIFwdTGT=1 is explicitly set. Runtime support is detected from libssh's advertised version so stub builds refuse explicit Kerberos delegation/logical-host/key-exchange settings by name instead of silently dropping them. TunnelLocalPortNumber now binds the requested loopback port for the jump session's own destination connection; 0 keeps the private socket pair. Non-SSH destination tunnels still fail closed, and no isolated Kerberos/KDC realm is certified by the current fixtures.
 
-**Next:** GSSAPI/Kerberos authentication still needs implementation, dependency detection, realm tests and credential-delegation review. Tunnels for non-SSH destination protocols and fixed local-listener ports are not supported; they fail closed rather than connect directly.
+**Next:** Validate GSSAPI/Kerberos against an isolated realm (principal selection, missing/expired credentials, mutual authentication and opt-in delegation) before claiming realm parity. Tunnels for non-SSH destination protocols are not supported; they fail closed rather than connect directly.
 
 **Acceptance criteria:**
 
-- [ ] Implement optional GSSAPI against an isolated Kerberos realm, testing principal selection, missing/expired credentials, mutual authentication and opt-in delegation; obtain security review before enabling it by default.
-- [ ] Define and test tunneling for FTP/FTPS/WebDAV/S3, including data-channel routing, TLS SNI/certificate verification and S3 signing for the original destination. If fixed listener ports are supported, bind loopback only, test collisions/authorization and clean up on every failure.
+- [ ] Validate optional GSSAPI against an isolated Kerberos realm, testing principal selection, missing/expired credentials, mutual authentication and opt-in delegation; obtain security review before treating delegation as fully certified.
+- [ ] Define and test tunneling for FTP/FTPS/WebDAV/S3, including data-channel routing, TLS SNI/certificate verification and S3 signing for the original destination. Fixed SSH tunnel listener ports must remain loopback-only, fail on collisions and clean up on every failure.
 
 ## security.gui-account
 

@@ -322,8 +322,11 @@ TunnelHostKey=SHA256:...`; `TunnelPortNumber`, `TunnelPublicKeyFile`,
 `TunnelPassword` and `TunnelPassphrase` configure the jump independently of the
 destination. Global `-rawsettings=N` also supplies defaults to `-shell`.
 The parent proxy reaches the jump, and a private socket pair replaces a local
-TCP listener. Fixed `TunnelLocalPortNumber` values other than `0`, GSSAPI and
-curl-backed destination protocols are refused. See [SSH tunnels](ssh-tunnels.md)
+TCP listener by default. A nonzero `TunnelLocalPortNumber` binds that
+loopback port for this session's own tunneled connection. GSSAPI/Kerberos
+uses libssh when the loaded library advertises it; credential delegation is
+off unless `GSSAPIFwdTGT=1` is set. Curl-backed destination protocols over an
+SSH tunnel are refused. See [SSH tunnels](ssh-tunnels.md)
 for secure examples, storage policy and regression commands.
 
 The GUI challenges each hop separately. Remembering a key stores only that
@@ -500,10 +503,10 @@ watch cannot be set up, the client falls back to timer polling. It runs in the
 foreground until Ctrl-C, or until `-count=` passes complete, so a
 non-interactive script must give `-count=`.
 
-Not implemented: the .NET assembly API, GSSAPI, multi-user GUI isolation,
-desktop extensions, broader localization and upstream XML compatibility.
-Local-to-local sessions and named workspaces are implemented. SSH jump hosts work for SFTP/SCP/SSH;
-non-SSH tunnels and fixed listener ports do not. S3 version-aware operations are implemented as described above; S3 and
+Not implemented: the .NET assembly API, multi-user GUI isolation and broader
+localization beyond English/Spanish. Local-to-local sessions and named
+workspaces are implemented. SSH jump hosts work for SFTP/SCP/SSH;
+non-SSH tunnels do not, and live Kerberos-realm certification remains open. S3 version-aware operations are implemented as described above; S3 and
 WebDAV still cover documented subsets rather than every upstream extension.
 See the [parity audit](upstream-parity.md) for the full list of verified
 capabilities and remaining gaps.

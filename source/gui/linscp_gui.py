@@ -457,8 +457,44 @@ TUNNEL_RAW_FIELDS = {
     "tunnel_port": "TunnelPortNumber", "tunnel_username": "TunnelUserName",
     "tunnel_private_key": "TunnelPublicKeyFile", "tunnel_hostkey": "TunnelHostKey",
     "tunnel_password": "TunnelPassword", "tunnel_passphrase": "TunnelPassphrase",
+    "tunnel_local_port": "TunnelLocalPortNumber",
 }
 SESSION_KEYS.update({field: field for field in TUNNEL_RAW_FIELDS})
+
+# Kerberos policy travels the same way, under the core's raw names. The
+# defaults are upstream's: gssapi-with-mic tried, key exchange and
+# credential delegation off (delegation in particular is never on
+# unless a site asks for it).
+GSSAPI_RAW_FIELDS = {
+    "auth_gssapi": "AuthGSSAPI", "auth_gssapi_kex": "AuthGSSAPIKEX",
+    "gssapi_fwd_tgt": "GSSAPIFwdTGT", "logical_host": "LogicalHostName",
+}
+GSSAPI_DEFAULTS = {"auth_gssapi": "1", "auth_gssapi_kex": "0",
+                   "gssapi_fwd_tgt": "0", "logical_host": ""}
+SESSION_KEYS.update({field: field for field in GSSAPI_RAW_FIELDS})
+
+
+def _raw_bool(value, default):
+    """One session flag as the '0'/'1' a raw setting takes."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int):
+        return "1" if value else "0"
+    return "0" if str(value).strip().lower() in ("0", "false") else "1"
+
+
+def gssapi_raw_settings(session):
+    """The session's Kerberos settings as 'Name=value' raw settings."""
+    settings = []
+    for field, name in GSSAPI_RAW_FIELDS.items():
+        if field == "logical_host":
+            value = str(session.get(field) or "")
+        else:
+            value = _raw_bool(session.get(field), GSSAPI_DEFAULTS[field])
+        settings.append(name + "=" + value)
+    return settings
 
 
 # The port each protocol listens on when the site does not say: the same
@@ -544,7 +580,8 @@ def validate_session_data(session, require_host=False):
     for field in ("username", "password", "keyfile", "hostkey",
                   "initial_dir", "local_dir", "other_local_dir",
                   "tunnel_host", "tunnel_username",
-                  "tunnel_private_key", "tunnel_hostkey", "tunnel_password", "tunnel_passphrase"):
+                  "tunnel_private_key", "tunnel_hostkey", "tunnel_password", "tunnel_passphrase",
+                  "logical_host"):
         value = session.get(field)
         if value is not None and not isinstance(value, str):
             return "The session %s must be text." % field.replace("_", " ")
@@ -572,8 +609,19 @@ def validate_session_data(session, require_host=False):
         if (len(tunnel_port) > 5 or not re.fullmatch(r"[0-9]+", tunnel_port) or
                 not 1 <= int(tunnel_port) <= 65535):
             return "The SSH tunnel port must be a number from 1 through 65535."
+        local_port = str(session.get("tunnel_local_port", 0) or 0)
+        if (len(local_port) > 5 or not re.fullmatch(r"[0-9]+", local_port) or
+                not 0 <= int(local_port) <= 65535):
+            return "The tunnel local port must be 0 or a number from 1 through 65535."
         if session.get("tunnel_error"):
             return "The stored SSH tunnel credentials cannot be read; store them again."
+    for field in ("auth_gssapi", "auth_gssapi_kex", "gssapi_fwd_tgt"):
+        value = session.get(field)
+        if value is not None and not isinstance(value, (bool, int, str)):
+            return "The session Kerberos settings must be true or false."
+    logical_host = session.get("logical_host")
+    if logical_host and any(char.isspace() for char in str(logical_host)):
+        return "The logical host name must not contain whitespace."
     return ""
 
 
@@ -613,6 +661,10 @@ def read_stored_sessions():
             # Keep malformed values invalid rather than silently connecting directly.
             current[field] = value == "1" if value in ("0", "1") else value
         elif field == "tunnel_port":
+            current[field] = int(value) if value.isascii() and value.isdigit() and len(value) <= 5 else value
+        elif field in ("auth_gssapi", "auth_gssapi_kex", "gssapi_fwd_tgt"):
+            current[field] = value == "1" if value in ("0", "1") else value
+        elif field == "tunnel_local_port":
             current[field] = int(value) if value.isascii() and value.isdigit() and len(value) <= 5 else value
         elif field == "port":
             try:
@@ -925,6 +977,9 @@ def new_session():
         "tunnel": False, "tunnel_host": "", "tunnel_port": 22,
         "tunnel_username": "", "tunnel_password": "", "tunnel_passphrase": "",
         "tunnel_private_key": "", "tunnel_hostkey": "", "tunnel_error": "",
+        "tunnel_local_port": 0,
+        "auth_gssapi": True, "auth_gssapi_kex": False,
+        "gssapi_fwd_tgt": False, "logical_host": "",
     }
 
 
@@ -993,8 +1048,14 @@ def core_command_line(session):
         for field, name in TUNNEL_RAW_FIELDS.items():
             if field in ("tunnel_password", "tunnel_passphrase"):
                 continue
-            value = "1" if field == "tunnel" else str(session.get(field, 22 if field == "tunnel_port" else ""))
+            default = 22 if field == "tunnel_port" else (
+                0 if field == "tunnel_local_port" else "")
+            value = "1" if field == "tunnel" else str(session.get(field, default))
             settings.append(name + "=" + value)
+    else:
+        settings = []
+    settings += gssapi_raw_settings(session)
+    if settings:
         cmd += ["-rawsettings=" + str(len(settings))] + settings
     return cmd
 
@@ -4116,12 +4177,17 @@ def save_stored_session(name, session, pin_hostkey=False, preserve_tunnel_creden
         for field, raw_name in TUNNEL_RAW_FIELDS.items():
             if preserve_tunnel_credentials and field in ("tunnel_password", "tunnel_passphrase"):
                 continue
-            value = ("1" if session.get("tunnel") else "0") if field == "tunnel" else session.get(field, 22 if field == "tunnel_port" else "")
+            default = 22 if field == "tunnel_port" else (
+                0 if field == "tunnel_local_port" else "")
+            value = ("1" if session.get("tunnel") else "0") if field == "tunnel" else session.get(field, default)
             if field != "tunnel" and not session.get("tunnel"):
                 continue
             if field == "tunnel_hostkey" and value == "*" and not pin_hostkey:
                 value = ""  # Never persist a one-connection trust bypass.
             settings.append(raw_name + "=" + quote_remote(str(value)))
+        settings += [setting.split("=", 1)[0] + "=" +
+                     quote_remote(setting.split("=", 1)[1])
+                     for setting in gssapi_raw_settings(session)]
         command += " -rawsettings " + " ".join(settings)
     code, stdout, stderr = run_linscp(command, session)
     if code == 0:

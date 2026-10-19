@@ -249,6 +249,38 @@ class LiveTunnelTests(unittest.TestCase):
         self.assertIn("return code 7", failed.stderr)
         self.assertFalse((self.remote / "forbidden").exists())
 
+    def test_tunnel_local_port_number_binds_and_fails_when_taken(self):
+        """TunnelLocalPortNumber binds that loopback port for the
+        session's own connection (so a firewall rule can name it), and
+        a port already in use refuses the open instead of sharing."""
+        import socket as _socket
+        probe = _socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        chosen = probe.getsockname()[1]
+        probe.close()
+        payload = os.urandom(65537)
+        source = self.root / "port-upload.bin"
+        source.write_bytes(payload)
+        result = self.run_script(
+            self.opening({"TunnelLocalPortNumber": str(chosen)}) +
+            "\nput %s /port-payload.bin" % quote(source), timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.remote / "port-payload.bin").read_bytes(),
+                         payload)
+
+        holder = _socket.socket()
+        holder.bind(("127.0.0.1", chosen))
+        holder.listen(1)
+        try:
+            result = self.run_script(
+                self.opening({"TunnelLocalPortNumber": str(chosen)}) +
+                "\nmkdir forbidden")
+        finally:
+            holder.close()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tunnel local port", result.stderr)
+        self.assertFalse((self.remote / "forbidden").exists())
+
     def test_scp_uses_the_same_tunnel_transport(self):
         if not shutil.which("scp"):
             self.skipTest("the SCP fixture needs the OpenSSH scp program")

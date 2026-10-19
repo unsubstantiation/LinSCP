@@ -11,6 +11,9 @@
 #include <thread>
 #include <system_error>
 #include <poll.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <libssh/libssh.h>
 
@@ -204,16 +207,12 @@ std::string TunnelSshFlags(const SshTunnel & tunnel)
 
 bool IsGssapiSupported()
 {
-    // Merely finding a Kerberos library does not wire an authentication path.
-    return false;
-}
-
-bool ApplyGssapiSetting(const std::string & value, std::string & error)
-{
-    (void)value;
-    error = Texts::Translate("GSSAPI/Kerberos is not available: authentication support is "
-        "not implemented in this client.");
-    return false;
+    /* A libssh built with real GSSAPI names it in its version string
+     * (".../gssapi"); a stub build still links ssh_userauth_gssapi but
+     * cannot use it, and must not be mistaken for support. */
+    const char * version = ssh_version(0);
+    return version != NULL &&
+        std::string(version).find("gssapi") != std::string::npos;
 }
 
 struct SshJumpTunnel::Impl
@@ -222,6 +221,10 @@ struct SshJumpTunnel::Impl
     ssh_channel channel = NULL;
     ssh_event event = NULL;
     int bridge = -1;
+    /* The TunnelLocalPortNumber listener, when one was bound: held for
+     * the session so the port stays this tunnel's, and closed in
+     * Stop(). Nothing further is accepted on it. */
+    int listener = -1;
     std::atomic<bool> stop{false};
     std::thread worker;
 
@@ -345,6 +348,10 @@ int SshJumpTunnel::Start(const SessionOptions & destination, std::string & error
     jump.verbose = destination.verbose;
     // Match upstream: the proxy reaches the jump host, never the destination.
     jump.proxy = destination.proxy;
+    // Kerberos policy travels to the jump host, except the destination's
+    // logical host name: the jump's ticket is for the jump's own name.
+    jump.gssapi = destination.gssapi;
+    jump.gssapi.logicalHost.clear();
     if (!mImpl->jump.OpenTunnelTransport(jump, error))
     {
         error = Texts::Translate("SSH tunnel: {reason}", {{"reason", error}});
@@ -362,8 +369,71 @@ int SshJumpTunnel::Start(const SessionOptions & destination, std::string & error
         Stop();
         return -1;
     }
+    /*
+     * The local end of the forwarded connection. The ordinary shape is
+     * a private socket pair - no port exists for another process to
+     * find. 'TunnelLocalPortNumber' instead binds that loopback port
+     * (upstream's model, so a firewall rule can name the port): our own
+     * destination connection is the one connection accepted on it, the
+     * listener then just holds the port for the session, and a port
+     * already in use fails the open instead of being shared.
+     */
     int pair[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, pair) != 0)
+    if (tunnel.localPortNumber > 0)
+    {
+        const int listener = socket(AF_INET,
+            SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_in address;
+        std::memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(
+            static_cast<unsigned short>(tunnel.localPortNumber));
+        if (listener < 0 ||
+            bind(listener, reinterpret_cast<struct sockaddr *>(&address),
+                sizeof(address)) != 0 ||
+            listen(listener, 1) != 0)
+        {
+            error = Texts::Translate("Cannot listen on the tunnel local port "
+                "127.0.0.1:{port}: {reason}",
+                {{"port", std::to_string(tunnel.localPortNumber)},
+                 {"reason", std::strerror(errno)}});
+            if (listener >= 0) close(listener);
+            Stop();
+            return -1;
+        }
+        mImpl->listener = listener;
+        const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct pollfd ready = {listener, POLLIN, 0};
+        if (client < 0 ||
+            connect(client,
+                reinterpret_cast<struct sockaddr *>(&address),
+                sizeof(address)) != 0 ||
+            poll(&ready, 1, 5000) != 1)
+        {
+            error = Texts::Translate("Cannot connect through the tunnel local port "
+                "127.0.0.1:{port}.",
+                {{"port", std::to_string(tunnel.localPortNumber)}});
+            if (client >= 0) close(client);
+            Stop();
+            return -1;
+        }
+        pair[1] = accept4(listener, NULL, NULL,
+            SOCK_CLOEXEC | SOCK_NONBLOCK);
+        pair[0] = client;
+        if (pair[1] < 0)
+        {
+            error = Texts::Translate("Cannot connect through the tunnel local port "
+                "127.0.0.1:{port}.",
+                {{"port", std::to_string(tunnel.localPortNumber)}});
+            close(client);
+            Stop();
+            return -1;
+        }
+        const int flags = fcntl(pair[0], F_GETFL, 0);
+        if (flags >= 0) fcntl(pair[0], F_SETFL, flags | O_NONBLOCK);
+    }
+    else if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, pair) != 0)
     {
         error = Texts::Translate("Cannot create the private SSH tunnel socket pair.");
         Stop();
@@ -412,6 +482,7 @@ void SshJumpTunnel::Stop()
         mImpl->channel = NULL;
     }
     if (mImpl->bridge >= 0) { close(mImpl->bridge); mImpl->bridge = -1; }
+    if (mImpl->listener >= 0) { close(mImpl->listener); mImpl->listener = -1; }
     mImpl->jump.Close();
 }
 

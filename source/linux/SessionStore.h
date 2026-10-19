@@ -76,6 +76,9 @@ struct StoredSession
      * 'proxyPasswordRaw' - so that re-saving the site does not destroy
      * it - with the reason in 'proxyPasswordError'.
      */
+    /* Kerberos/GSSAPI policy of this site ('AuthGSSAPI',
+     * 'AuthGSSAPIKEX', 'GSSAPIFwdTGT', 'LogicalHostName'). */
+    GssapiSettings gssapi;
     ProxySettings proxy;
     std::string proxyPasswordRaw;
     /* Why the stored proxy cannot be used: a password this machine cannot

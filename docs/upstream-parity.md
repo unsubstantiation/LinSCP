@@ -84,10 +84,10 @@ The review corrected stale claims without upgrading unimplemented work:
   The rcp protocol has no offset, so a resume is refused by name and a stale
   staging file is discarded.
 
-Upstream Windows VCL forms, .NET assemblies, Explorer commands and shell
-extensions do not have full Linux equivalents. GSSAPI, broader tunnel policy,
-multi-user GUI isolation, automation APIs and desktop extensions remain in the
-plan.
+Upstream Windows VCL forms and .NET assemblies do not have full Linux
+equivalents. Live Kerberos-realm certification, broader non-SSH tunnel
+policy, multi-user GUI isolation and a .NET-compatible automation API remain
+in the plan.
 
 ### SSH jump-host implementation and newly identified gaps
 
@@ -120,8 +120,10 @@ plan.
   but no per-user isolation of resources or OS privileges. It is a partially
   implemented LinSCP deployment extension, not an upstream desktop capability.
 
-The combined GSSAPI/tunnel row remains partial; a verified SSH-only subset does
-not close that gap. The full-parity gate must continue to fail until the
+The combined GSSAPI/tunnel row remains partial; SSH jumps, an optional
+loopback `TunnelLocalPortNumber` and libssh-backed GSSAPI wiring are
+implemented, but real Kerberos-realm certification and non-SSH tunnels do not
+close that gap. The full-parity gate must continue to fail until the
 remaining capabilities are implemented and independently evidenced.
 
 ## Local verification on 2026-10-19
