@@ -361,6 +361,14 @@ is never interrupted by a window it did not ask for. The Commander offers:
 * A console log and an embedded command line.
 * Drag-and-drop of files and folders from a file manager into either pane.
   Relative paths and empty directories are kept, and unsafe paths are rejected.
+* An opt-in **Upload with LinSCP** file-manager action:
+  `linscp-gui --install-shell-integration` writes one small per-user
+  definition each for Dolphin (KDE), Files (GNOME) and Nemo (Cinnamon)
+  under the XDG data directory (`--uninstall-shell-integration` removes
+  exactly those, and never a definition it did not write). Choosing the
+  action only holds the selection for the Commander, which offers it in
+  a dialog; nothing is uploaded until that is confirmed against a
+  session tab.
 * Multi-user sign-in when the server is started with `--accounts-file=`.
 * A desktop entry and URL scheme handlers, from `linscp.desktop`, which starts the
   server with `--open-browser` so the desktop's own launcher shows the page - the

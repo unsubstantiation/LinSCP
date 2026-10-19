@@ -248,7 +248,7 @@ jobs:
           set -o pipefail
           status=0
           for suite in BrowserUploadTest DesktopUriTest SecurityTest \
-                       LocalWorkspaceTest; do
+                       LocalWorkspaceTest ShellIntegrationTest; do
             python3 "source/gui/tests/$suite.py" 2>&1 |
               tee "$RUNNER_TEMP/gui-$suite.log" || status=$?
           done

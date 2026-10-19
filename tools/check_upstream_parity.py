@@ -59,6 +59,7 @@ CASE_SOURCES = {
     "gui-local": "source/gui/tests/LocalWorkspaceTest.py",
     "powershell": "automation/test_psmodule.py",
     "gui-desktop-uri": "source/gui/tests/DesktopUriTest.py",
+    "gui-shell": "source/gui/tests/ShellIntegrationTest.py",
     "platform-conversion": "tools/tests/test_platform_conversion.py",
     "wayland-compatibility": "tools/tests/test_wayland_compatibility.py",
 }

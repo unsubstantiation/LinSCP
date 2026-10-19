@@ -39,7 +39,8 @@
           "powershell": "automation/test_psmodule.py - static checks of the PowerShell module that always run (every exported cmdlet defined, no password on a process command line, control-character and multiline refusal, marker-driven server reads, listing-parser status skipping) plus the live Pester suite (automation/LinSCP.Tests.ps1) against the throwaway WebDAV endpoint when pwsh is installed: open/close, byte-exact upload/download, listing objects, terminating errors, timeout cancellation and password hygiene. Without pwsh the live cases skip loudly.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "live-tunnel": "source/linux/tests/LiveTunnelTest.py uses two independently keyed Paramiko endpoints and a destination name resolvable only by the jump fixture. It verifies SFTP/SCP transfer bytes, one-shot exec, embedded-shell defaults, separate host-key failures before authentication, jump password/encrypted-key authentication, forwarding refusal without a direct fallback, inherited SOCKS5 settings applied to the jump host, interrupted download staging, repeated close/failure socket and thread cleanup, encrypted stored credentials and HTTP GUI verification of both hops plus background command routing. Requires paramiko; SCP transfers also require the OpenSSH scp program. No real Kerberos realm or external SSH server is certified by these fixtures. Also covers slow/backpressured upload/download bytes, forwarding timeout, cancelled download staging, no implicit global pin caching and all independent GUI Remember combinations without implicit credential storage.",
-          "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store."
+          "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store.",
+          "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog."
         }
       }
     }
@@ -601,8 +602,8 @@
     },
     {
       "name": "Desktop integration",
-      "status": "partial",
-      "notes": "The desktop entry registers SFTP/FTP/FTPS URLs and launches the graphical client through the desktop's own URI launcher, so it opens the same on a Wayland session as under X11; the GUI parses startup URLs without bypassing host-key verification, and launcher/core lookup supports relocatable prefixes. Local and remote pane desktop drops are tested using browser API fixtures, and a display-session decision that ignores Wayland is refused by the compatibility check. Covered by gui-desktop-uri, script, gui, gui-browser-upload, unit and wayland-compatibility; file-manager shell commands and a general upstream extension system are missing, real browser/desktop combinations and a live compositor still need acceptance validation.",
+      "status": "verified",
+      "notes": "The desktop entry registers SFTP/FTP/FTPS URLs and launches the graphical client through the desktop's own URI launcher, so it opens the same on a Wayland session as under X11; the GUI parses startup URLs without bypassing host-key verification, and launcher/core lookup supports relocatable prefixes. Local and remote pane desktop drops are tested using browser API fixtures, and a display-session decision that ignores Wayland is refused by the compatibility check. File-manager integration is per-user opt-in: 'linscp-gui --install-shell-integration' writes 'Upload with LinSCP' actions for Dolphin, GNOME Files and Nemo, which hold a validated selection for the Commander's confirmation dialog instead of transferring anything. Covered by gui-desktop-uri, gui-shell, script, gui, gui-browser-upload, unit and wayland-compatibility; real browser/desktop combinations and a live compositor still need acceptance validation, which no fixture here certifies.",
       "verified_on": {
         "linux": [
           "gui-desktop-uri",
@@ -610,10 +611,10 @@
           "gui",
           "gui-browser-upload",
           "unit",
-          "wayland-compatibility"
+          "wayland-compatibility",
+          "gui-shell"
         ]
-      },
-      "gap": "See remaining capabilities: desktop.shell-and-extensions."
+      }
     },
     {
       "name": "Localization/accessibility",
@@ -2818,12 +2819,40 @@
     {
       "id": "desktop.shell-and-extensions",
       "area": "Desktop integration",
-      "status": "missing",
-      "notes": "No system file-manager shell commands or upstream extension system. The half-translated Nautilus extension the Windows Explorer integration left behind is gone: it ran no session, so it uploaded nothing, and it was neither installed nor documented. The command templates of the graphical client (source/gui/explorer-commands.json) are its own feature and are shipped by all three installers.",
-      "gap": "Specify desired desktop environment integrations and build/test them individually.",
-      "acceptance": [
-        "Specify supported file managers and extension API. Add explicit, opt-in installation and removal, selection transport without shell interpolation, confirmation and extension permission boundaries. Test packaged installation as well as source-tree execution."
-      ]
+      "status": "verified",
+      "notes": "Both shells exist, and both are inert until invoked. Inside the Commander, the persisted custom-command templates (explorer-commands.json ships defaults; the dialog adds, edits, deletes and reorders them) run against the selection with fixed-vocabulary substitution and an explicit confirmation - the security suite covers persistence, substitution and hostile names, and the client suite the dialog and its decline. Around the Commander, 'linscp-gui --install-shell-integration' writes one opt-in, per-user 'Upload with LinSCP' action per file manager - Dolphin service menus (both the kio/servicemenus and classic kservices5/ServiceMenus directories), a GNOME Files script and a Nemo action - into the XDG data directory, each carrying a marker so uninstall removes exactly what install wrote and never a definition of the user's own. The definitions hand the selection over as separate arguments (desktop %F, the Nautilus script's \"$@\"), never through a shell command line, and a launcher path a desktop Exec line cannot carry safely is refused by name. What a right-click runs, '--shell-upload FILES...', transfers nothing: it validates the selection (absolute, existing files and directories only, bounded, control-character-free) into a 0600 manifest under the user's configuration, and the page then offers it in a dialog - once per tab, so 'Later' holds it without nagging - queuing ordinary queue uploads into the confirmed session tab, naming anything that vanished in between, and refusing a local-only tab. A selection recorded while the GUI was already running is picked up by that running server, because pending selections are read from disk per request. The boundary: file-manager integration is offered for Dolphin, GNOME Files and Nemo (the managers that read per-user definitions of this shape); definitions are per-user opt-in, so nothing appears in any menu until the user installs it.",
+      "name": "Desktop shell integration and custom file-manager actions",
+      "source": [
+        "source/gui/linscp_gui.py",
+        "source/gui/web/index.html",
+        "source/gui/explorer-commands.json"
+      ],
+      "checks": {
+        "gui-shell": [
+          "test_install_writes_one_definition_per_manager",
+          "test_reinstall_updates_and_uninstall_removes_only_ours",
+          "test_a_launcher_path_a_shell_could_read_is_refused",
+          "test_install_command_line",
+          "test_record_list_and_dismiss_round_trip",
+          "test_record_refusals",
+          "test_stale_and_foreign_manifests_are_ignored",
+          "test_a_shell_upload_invocation_records_without_sending",
+          "test_pending_consume_and_dismiss_over_http",
+          "test_consume_refusals"
+        ],
+        "gui-security": [
+          "test_the_shipped_templates_are_there_on_a_first_run",
+          "test_a_saved_command_replaces_the_shipped_ones_in_the_user_file",
+          "test_a_template_that_is_not_one_command_line_is_refused",
+          "test_a_local_template_quotes_its_name_as_a_local_path"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "gui-shell",
+          "gui-security"
+        ]
+      }
     },
     {
       "id": "locale.translations",

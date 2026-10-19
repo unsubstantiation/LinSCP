@@ -72,6 +72,10 @@ const responses = {
   '/api/local/save': { success: true,
     info: { size: 12, mtime: 1791875272, mtime_ns: 1791875272000000000 } },
   '/api/transfer/move': { success: true },
+  '/api/shell/pending': { success: true, pending: [] },
+  '/api/shell/consume': { success: true, queued: ['a.txt', 'folder'],
+    missing: [], remote_dir: '/tmp/slowremote' },
+  '/api/shell/dismiss': { success: true },
   '/api/sync/preview': { success: true, plan: {
     header: { local: '/tmp/slowlocal', remote: '/tmp/slowremote', mode: 'both', criteria: 'time', mask: '(none)' },
     items: [
@@ -961,6 +965,34 @@ function options(id) {
       text('customCommandsResult').includes('SHA-256 verified'),
     text('customCommandsResult'));
   window.closeModal('customCommandsModal');
+
+  /* A file-manager selection is offered in a dialog; only confirming
+   * it queues anything, and names are shown as text, never markup. */
+  responses['/api/shell/pending'] = { success: true, pending: [{
+    id: 'a'.repeat(32), created: 1,
+    files: [ { name: 'a.txt', path: '/home/u/a.txt', is_dir: false, size: 3 },
+             { name: 'folder', path: '/home/u/folder', is_dir: true, size: 0 },
+             { name: '<img>.png', path: '/home/u/x.png', is_dir: false, size: 1 } ] }] };
+  await window.checkShellPending();
+  check('shell offer dialog opened',
+    doc.getElementById('shellUploadModal').classList.contains('open'));
+  check('shell offer lists the files',
+    doc.getElementById('shellUploadList').children.length === 3);
+  check('shell offer treats names as text',
+    doc.getElementById('shellUploadList').innerHTML.includes('&lt;img&gt;.png'));
+  check('shell offer names the target directory',
+    text('shellUploadButton').startsWith('Upload to /'), text('shellUploadButton'));
+  check('offering queues nothing',
+    !calls.some(call => call.path === '/api/shell/consume'));
+  responses['/api/shell/pending'] = { success: true, pending: [] };
+  await window.shellUploadConfirm();
+  const shellConsume = calls.filter(call => call.path === '/api/shell/consume').pop();
+  const shellPayload = shellConsume ? JSON.parse(shellConsume.options.body) : {};
+  check('confirming posts the selection id against the active tab',
+    shellPayload.id === 'a'.repeat(32) && shellPayload.tab === 1,
+    JSON.stringify(shellPayload));
+  check('confirmed shell upload closes the dialog',
+    !doc.getElementById('shellUploadModal').classList.contains('open'));
 
   check('no script errors', errors.length === 0, errors.join(' | '));
   window.close();

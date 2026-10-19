@@ -172,6 +172,7 @@ check-live: $(BINDIR)/linscp
 	$(PYTHON) ../../source/gui/tests/LocalEditorTest.py
 	$(PYTHON) ../../source/gui/tests/BrowserUploadTest.py
 	$(PYTHON) ../../source/gui/tests/DesktopUriTest.py
+	$(PYTHON) ../../source/gui/tests/ShellIntegrationTest.py
 	$(PYTHON) ../../source/gui/tests/SecurityTest.py
 	$(PYTHON) ../../source/gui/tests/LocalWorkspaceTest.py
 	$(PYTHON) ../../source/gui/tests/TerminalTest.py

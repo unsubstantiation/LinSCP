@@ -30,6 +30,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 MODULE = HERE / "LinSCP.psm1"
 PESTER = HERE / "LinSCP.Tests.ps1"
+PESTER_RUNNER = HERE / "Invoke-LinSCPPester.ps1"
 DAV_SERVER = ROOT / "source" / "linux" / "tests" / "TestDavServer.py"
 BINARY = str(pathlib.Path(sys.argv.pop(1)).resolve()) \
     if len(sys.argv) > 1 else shutil.which("linscp")

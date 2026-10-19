@@ -4150,6 +4150,343 @@ def save_confirmed_hostkey(tab, field, fingerprint, name):
     return save_stored_session(name, session, preserve_tunnel_credentials=True)
 
 
+# ---------------------------------------------------------------------------
+# File-manager shell integration (opt-in "Upload with LinSCP" actions)
+# ---------------------------------------------------------------------------
+#
+# Windows clients get an Explorer context menu; on Linux the equivalent is
+# one small definition per file manager, in per-user directories, all of
+# them running this program as "linscp-gui --shell-upload FILES...". That
+# invocation never transfers anything by itself: it validates and records
+# the selection in a per-user manifest, then starts (or reaches) the GUI,
+# where the page offers the upload against a session the user has open.
+# Nothing is queued until the page confirms, so a right-click can never
+# send files anywhere unattended. Filenames reach us as separate argv
+# entries (%F in the desktop definitions, "$@" in the Nautilus script),
+# never through a shell command line a name could break out of.
+
+SHELL_MARKER = "linscp-shell-integration"
+SHELL_UPLOAD_MAX_FILES = 512
+SHELL_MANIFEST_MAX_AGE = 7 * 24 * 3600
+_SHELL_MANIFEST_ID = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _xdg_data_home():
+    root = os.environ.get("XDG_DATA_HOME")
+    if root:
+        return root
+    return os.path.join(os.path.expanduser("~"), ".local", "share")
+
+
+def _shell_launcher():
+    """The absolute launcher path the file-manager definitions will run.
+
+    A definition written with a bare name depends on the file manager's
+    PATH, which a desktop session can set to almost anything; a path with
+    characters the desktop Exec syntax or a POSIX shell would read as
+    syntax is refused rather than quoted creatively, because the result
+    would be executed on every right-click.
+    """
+    found = shutil.which("linscp-gui")
+    if not found:
+        candidate = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
+        if candidate and os.path.isfile(candidate):
+            found = candidate
+    if not found:
+        raise ValueError("the linscp-gui launcher is not on PATH, so there "
+                         "is nothing for a file manager to run")
+    found = os.path.abspath(found)
+    for bad in ('"', "'", '$', '`', '\\', '%', '\n', '\r'):
+        if bad in found:
+            raise ValueError("the launcher path %r contains %r, which "
+                             "cannot be carried safely in a desktop Exec "
+                             "line" % (found, bad))
+    return found
+
+
+def _exec_token(path):
+    """One launcher path as one desktop Exec argument."""
+    return '"%s"' % path if " " in path else path
+
+
+def shell_integration_definitions(launcher):
+    """(file manager, path, content, mode) for every definition we write.
+
+    One canonical location per manager (Dolphin also reads the older
+    kservices5 service-menu directory, so both are written; an absent
+    extra copy is harmless to the managers that do not look there).
+    """
+    data = _xdg_data_home()
+    note = ("# %s: written by 'linscp-gui --install-shell-integration';\n"
+            "# remove it with 'linscp-gui --uninstall-shell-integration'.\n")
+    marker_note = note % SHELL_MARKER
+    dolphin = (marker_note +
+        "[Desktop Entry]\n"
+        "Type=Service\n"
+        "ServiceTypes=KonqPopupMenu/Plugin\n"
+        "MimeType=all/allfiles;inode/directory;\n"
+        "Actions=LinSCPUpload;\n"
+        "X-KDE-Priority=TopLevel\n"
+        "X-LinSCP-Shell-Integration=true\n"
+        "\n"
+        "[Desktop Action LinSCPUpload]\n"
+        "Name=Upload with LinSCP\n"
+        "Comment=Send the selected files to a server with LinSCP\n"
+        "Icon=linscp\n"
+        "Exec=%s --shell-upload %%F\n" % _exec_token(launcher))
+    nemo = (marker_note +
+        "[Nemo Action]\n"
+        "Active=true\n"
+        "Name=Upload with LinSCP\n"
+        "Comment=Send the selected files to a server with LinSCP\n"
+        "Icon-Name=linscp\n"
+        "Selection=Any\n"
+        "Extensions=any\n"
+        "Quote=double\n"
+        "Exec=%s --shell-upload %%F\n" % _exec_token(launcher))
+    nautilus = ("#!/bin/sh\n" + marker_note +
+        'exec "%s" --shell-upload "$@"\n' % launcher)
+    return [
+        ("Dolphin (KDE)",
+         os.path.join(data, "kio", "servicemenus", "linscp-upload.desktop"),
+         dolphin, 0o644),
+        ("Dolphin (KDE, classic service menus)",
+         os.path.join(data, "kservices5", "ServiceMenus",
+                      "linscp-upload.desktop"),
+         dolphin, 0o644),
+        ("Files (GNOME)",
+         os.path.join(data, "nautilus", "scripts", "LinSCP Upload"),
+         nautilus, 0o755),
+        ("Nemo (Cinnamon)",
+         os.path.join(data, "nemo", "actions", "linscp-upload.nemo_action"),
+         nemo, 0o644),
+    ]
+
+
+def _shell_target_status(path):
+    """'missing', 'ours' or 'foreign' for one definition path."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            head = handle.read(4096)
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "foreign"
+    return "ours" if SHELL_MARKER in head else "foreign"
+
+
+def install_shell_integration():
+    """Write the per-user file-manager definitions.
+
+    Returns one (manager, path, outcome) triple per definition. A file
+    that exists without our marker is the user's own and is never
+    overwritten; it is reported as 'kept (not written by LinSCP)'.
+    """
+    launcher = _shell_launcher()
+    results = []
+    for manager, path, content, mode in shell_integration_definitions(launcher):
+        status = _shell_target_status(path)
+        if status == "foreign":
+            results.append((manager, path, "kept (not written by LinSCP)"))
+            continue
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.chmod(path, mode)
+        results.append((manager, path,
+                        "updated" if status == "ours" else "installed"))
+    return results
+
+
+def uninstall_shell_integration():
+    """Remove definitions install_shell_integration wrote, nothing else."""
+    launcher = _shell_launcher()
+    results = []
+    for manager, path, _content, _mode in shell_integration_definitions(launcher):
+        status = _shell_target_status(path)
+        if status == "missing":
+            results.append((manager, path, "not installed"))
+        elif status == "foreign":
+            results.append((manager, path, "kept (not written by LinSCP)"))
+        else:
+            os.unlink(path)
+            results.append((manager, path, "removed"))
+    return results
+
+
+def shell_integration_status():
+    """Where each definition stands, for --help output and tests."""
+    launcher = _shell_launcher()
+    return [(manager, path, _shell_target_status(path))
+            for manager, path, _c, _m in shell_integration_definitions(launcher)]
+
+
+def _shell_manifest_dir():
+    path = os.path.join(_config_root(), "shell-manifests")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def _shell_manifest_path(manifest_id):
+    if not _SHELL_MANIFEST_ID.match(manifest_id or ""):
+        raise ValueError("No such file-manager selection.")
+    return os.path.join(_shell_manifest_dir(), manifest_id + ".json")
+
+
+def record_shell_upload(paths):
+    """Validate one file-manager selection and store it as a manifest.
+
+    Only absolute paths of existing files and directories are recorded:
+    a file manager hands over no other kind, and a relative or vanished
+    path means a caller other than one of our definitions.
+    """
+    if not paths:
+        raise ValueError("no files were given")
+    if len(paths) > SHELL_UPLOAD_MAX_FILES:
+        raise ValueError("too many files in one selection (at most %d)"
+                         % SHELL_UPLOAD_MAX_FILES)
+    files = []
+    seen = set()
+    for raw in paths:
+        if not isinstance(raw, str) or not raw:
+            raise ValueError("an empty path was given")
+        if any(ord(char) < 0x20 or ord(char) == 0x7f for char in raw):
+            raise ValueError("a path contains a control character: %r" % raw)
+        if not os.path.isabs(raw):
+            raise ValueError("a relative path was given: %r" % raw)
+        path = os.path.realpath(raw)
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            info = os.stat(path)
+        except OSError:
+            raise ValueError("not found: %s" % raw)
+        if stat.S_ISDIR(info.st_mode):
+            files.append({"path": path, "name": os.path.basename(path),
+                          "is_dir": True, "size": 0})
+        elif stat.S_ISREG(info.st_mode):
+            files.append({"path": path, "name": os.path.basename(path),
+                          "is_dir": False, "size": info.st_size})
+        else:
+            raise ValueError("not a file or directory: %s" % raw)
+        if not files[-1]["name"]:
+            raise ValueError("a path has no name to upload under: %s" % raw)
+    manifest_id = secrets.token_hex(16)
+    record = {"id": manifest_id, "created": time.time(), "files": files}
+    target = _shell_manifest_path(manifest_id)
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(record, handle)
+    return manifest_id, files
+
+
+def _read_shell_manifest(manifest_id):
+    path = _shell_manifest_path(manifest_id)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            record = json.load(handle)
+    except FileNotFoundError:
+        raise ValueError("That file-manager selection is no longer waiting.")
+    except ValueError:
+        raise ValueError("That file-manager selection cannot be read.")
+    files = record.get("files")
+    if record.get("id") != manifest_id or not isinstance(files, list) or \
+            not files or len(files) > SHELL_UPLOAD_MAX_FILES:
+        raise ValueError("That file-manager selection cannot be read.")
+    for item in files:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str) \
+                or not os.path.isabs(item["path"]):
+            raise ValueError("That file-manager selection cannot be read.")
+    return record
+
+
+def list_shell_pending():
+    """Selections still waiting, oldest first; stale ones are dropped.
+
+    Read from disk on every call: the process that recorded a selection
+    (started by the file manager) is not necessarily the one serving the
+    page, because a GUI may already have been running.
+    """
+    directory = _shell_manifest_dir()
+    pending = []
+    now = time.time()
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return pending
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        manifest_id = name[:-5]
+        if not _SHELL_MANIFEST_ID.match(manifest_id):
+            continue
+        try:
+            record = _read_shell_manifest(manifest_id)
+        except ValueError:
+            continue
+        created = record.get("created") or 0
+        if now - created > SHELL_MANIFEST_MAX_AGE:
+            try:
+                os.unlink(os.path.join(directory, name))
+            except OSError:
+                pass
+            continue
+        pending.append({
+            "id": manifest_id,
+            "created": created,
+            "files": [{"name": item.get("name") or os.path.basename(item["path"]),
+                       "path": item["path"],
+                       "is_dir": bool(item.get("is_dir")),
+                       "size": int(item.get("size") or 0)}
+                      for item in record["files"]],
+        })
+    pending.sort(key=lambda item: item["created"])
+    return pending
+
+
+def dismiss_shell_upload(manifest_id):
+    """Forget a waiting selection; True when there was one to forget."""
+    try:
+        os.unlink(_shell_manifest_path(manifest_id))
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def consume_shell_upload(manifest_id, tab):
+    """Queue one waiting selection as uploads into a session tab.
+
+    The manifest is removed whatever the per-file outcome, and the
+    outcome is reported per file, so a file deleted since the
+    right-click is named once instead of being offered forever.
+    """
+    record = _read_shell_manifest(manifest_id)
+    dismiss_shell_upload(manifest_id)
+    remote_dir = tab.remote_dir
+    queued, missing = [], []
+    for item in record["files"]:
+        path = item["path"]
+        name = item.get("name") or os.path.basename(path)
+        if not os.path.exists(path):
+            missing.append(name)
+            continue
+        remote_target = posixpath.join(remote_dir, name)
+        command = "lcd %s ; cd %s ; put %s %s" % (
+            quote_local(os.path.dirname(path)), quote_remote(remote_dir),
+            transfer_switches({}), quote_local(name))
+        task = TASKS.submit("Upload", command, tab.session, path,
+                            remote_target, tab.id,
+                            progress_remote=(tab.id, remote_target))
+        if not item.get("is_dir"):
+            try:
+                task.bytes_total = os.path.getsize(path)
+            except OSError:
+                task.bytes_total = 0
+        queued.append(name)
+    return {"queued": queued, "missing": missing, "remote_dir": remote_dir}
+
+
 class LinScpGuiHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=WEB_DIR, **kwargs)
@@ -4435,6 +4772,12 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
         if path == "/api/logs":
             with STATE_LOCK:
                 self.send_json({"logs": list(STATE["logs"])})
+            return
+
+        if path == "/api/shell/pending":
+            # File-manager selections waiting to be offered as uploads.
+            # Nothing here transfers; the page asks the user first.
+            self.send_json({"success": True, "pending": list_shell_pending()})
             return
 
         if path == "/api/transfers":
@@ -5525,6 +5868,35 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                     task.bytes_total = os.path.getsize(local_target)
                 except OSError:
                     task.bytes_total = 0
+            self.send_json({"success": True})
+            return
+
+        if path == "/api/shell/consume":
+            tab = require_tab(body.get("tab"))
+            if tab is None or getattr(tab, "is_local", False):
+                self.send_json(
+                    {"success": False,
+                     "error": "Files from a file manager can only be sent "
+                              "to a session tab."},
+                    status=400)
+                return
+            try:
+                result = consume_shell_upload(body.get("id"), tab)
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
+            result["success"] = True
+            self.send_json(result)
+            return
+
+        if path == "/api/shell/dismiss":
+            try:
+                dismiss_shell_upload(body.get("id"))
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
             self.send_json({"success": True})
             return
 
@@ -6723,7 +7095,15 @@ def main():
     startup_url = None
     print_token = False
     open_browser = False
-    for arg in sys.argv[1:]:
+    shell_files = None
+    argv = sys.argv[1:]
+    if "--shell-upload" in argv:
+        # Everything after the flag is the file manager's selection -
+        # file names are data here, never options of our own.
+        cut = argv.index("--shell-upload")
+        shell_files = argv[cut + 1:]
+        argv = argv[:cut]
+    for arg in argv:
         if (startup_url is None and arg.lower().startswith(
                 ("sftp://", "ftp://", "ftps://"))):
             startup_url = arg
@@ -6768,6 +7148,20 @@ def main():
                 ALLOWED_ORIGINS.add(value)
         elif arg.startswith("--accounts-file="):
             ACCOUNTS_FILE = arg.split("=", 1)[1].strip()
+        elif arg in ("--install-shell-integration",
+                     "--uninstall-shell-integration"):
+            action = (install_shell_integration
+                      if arg == "--install-shell-integration"
+                      else uninstall_shell_integration)
+            try:
+                results = action()
+            except (OSError, ValueError) as exc:
+                print("Cannot change the file-manager integration: %s"
+                      % exc, file=sys.stderr)
+                return 1
+            for manager, path, outcome in results:
+                print("%s: %s (%s)" % (manager, path, outcome))
+            return 0
         elif arg == "--print-token":
             print_token = True
         elif arg == "--open-browser":
@@ -6813,11 +7207,36 @@ def main():
             print("                         (default: none; the client is same-origin)")
             print("  --accounts-file=FILE   enable multi-user accounts (PBKDF2)")
             print("  --add-account          create a user account interactively")
+            print("  --install-shell-integration")
+            print("                         add an 'Upload with LinSCP'")
+            print("                         action to this user's Dolphin (KDE),")
+            print("                         Files (GNOME) and Nemo (Cinnamon),")
+            print("                         per-user, in the XDG data directory")
+            print("  --uninstall-shell-integration")
+            print("                         remove those actions again")
+            print("  --shell-upload FILES...  what the actions above run:")
+            print("                         hold the selected files for the GUI")
+            print("                         to offer as uploads (never sends by")
+            print("                         itself)")
             print("  --print-token          write the token to the terminal")
             print("  --open-browser         ask the desktop to open the page")
             print("                         in a browser (through xdg-open, so")
             print("                         it works on Wayland as on X11)")
             return 0
+    if shell_files is not None:
+        if not shell_files:
+            print("--shell-upload was given no files.", file=sys.stderr)
+            return 2
+        try:
+            _manifest_id, recorded = record_shell_upload(shell_files)
+        except ValueError as exc:
+            print("Cannot accept those files: %s" % exc, file=sys.stderr)
+            return 2
+        print("%d file(s) from the file manager held for LinSCP; the GUI "
+              "will offer to upload them." % len(recorded))
+        # Started from a context menu there is no terminal to read;
+        # opening the page is the whole point of the invocation.
+        open_browser = True
     startup_session = None
     if startup_url:
         try:
@@ -6842,6 +7261,10 @@ def main():
         httpd = ThreadingHTTPServer(server_address, LinScpGuiHandler)
     except OSError as exc:
         print("Cannot listen on %s:%d: %s" % (host, port, exc), file=sys.stderr)
+        if shell_files:
+            print("A GUI appears to be running already; the files from "
+                  "the file manager are waiting in it (or for the next "
+                  "start).", file=sys.stderr)
         return 1
     # '--port=0' asks the kernel for a free port, so the number to tell the
     # user is the one that was bound, not the one that was asked for.

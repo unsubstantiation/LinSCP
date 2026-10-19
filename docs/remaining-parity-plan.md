@@ -2,7 +2,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-5 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+4 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -42,18 +42,6 @@ No WinSCP .NET assembly or equivalent object model for Linux. The C ABI header t
 **Acceptance criteria:**
 
 - [ ] Define the Linux object-model contract and upstream compatibility boundary. Build and test an actual .NET library for session lifecycle, listing, transfer, synchronization, cancellation, structured results and error propagation. A subprocess helper alone is not assembly parity.
-
-## desktop.shell-and-extensions
-
-**Area:** Desktop integration · **Status:** missing
-
-No system file-manager shell commands or upstream extension system. The half-translated Nautilus extension the Windows Explorer integration left behind is gone: it ran no session, so it uploaded nothing, and it was neither installed nor documented. The command templates of the graphical client (source/gui/explorer-commands.json) are its own feature and are shipped by all three installers.
-
-**Next:** Specify desired desktop environment integrations and build/test them individually.
-
-**Acceptance criteria:**
-
-- [ ] Specify supported file managers and extension API. Add explicit, opt-in installation and removal, selection transport without shell interpolation, confirmation and extension permission boundaries. Test packaged installation as well as source-tree execution.
 
 ## locale.translations
 

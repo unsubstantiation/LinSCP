@@ -131,6 +131,8 @@ if(Python3_Interpreter_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/BrowserUploadTest.py)
   add_test(NAME gui-desktop-uri-tests COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/DesktopUriTest.py)
+  add_test(NAME gui-shell-integration-tests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/ShellIntegrationTest.py)
   add_test(NAME gui-security-tests COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/SecurityTest.py)
   add_test(NAME gui-local-workspace-tests COMMAND ${Python3_EXECUTABLE}
