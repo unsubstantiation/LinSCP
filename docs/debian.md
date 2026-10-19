@@ -24,6 +24,7 @@ a libssh subsystem channel.
 | `dpkg-dev` | only to build the `.deb` package |
 | `curl` (run time) | FTP transfers, FTPS, `dav://`/`webdav://` and `s3://` |
 | `python3` (run time) | the graphical client, `linscp-gui` |
+| `xdg-utils` (recommended, run time) | the `xdg-open` launcher that shows the graphical client in a browser on a Wayland or X11 desktop |
 | Node 20.19 or newer with `npm` (tests only) | the browser test suites boot the page in `jsdom` |
 
 ```sh
@@ -68,8 +69,8 @@ make -C source/linux BUILD=build-asan OPT=-O0 \
 
 ```sh
 dpkg-buildpackage -b -us -uc
-# -> ../linscp_1.0-4_amd64.deb
-sudo dpkg -i ../linscp_1.0-4_amd64.deb
+# -> ../linscp_1.0-5_amd64.deb
+sudo dpkg -i ../linscp_1.0-5_amd64.deb
 ```
 
 `debian/rules` does not use debhelper. The build is one plain Makefile, so the
@@ -245,11 +246,24 @@ non-zero exit status. `echo` prints a message to the script output.
 `terminal` opens an interactive shell on the server, as the "Open Terminal"
 button of WinSCP does. It starts the system `ssh` client in a terminal window
 on the desktop. The program is taken from `LINSCP_TERMINAL` (`<program>
-[args]`, for example `xterm -e`), or else the first installed program from:
-`x-terminal-emulator`, `gnome-terminal`, `konsole`, `xfce4-terminal`,
-`mate-terminal`, `lxterminal`, `terminator`, `alacritty`, `kitty`, `foot`,
-`wezterm`, `urxvt` and `xterm`. It works only for SSH (`sftp://` and `scp://`)
-sessions. The graphical client's "Terminal" button runs the same command.
+[args]`, for example `xterm -e`), or else from these, in this order and among
+the ones that are installed: `x-terminal-emulator`, `gnome-terminal`,
+`konsole`, `xfce4-terminal`, `mate-terminal`, `lxterminal`, `terminator`,
+`alacritty`, `kitty`, `foot`, `wezterm`, `urxvt` and `xterm`.
+
+Which of them is chosen depends on the display server, because a window can
+only be shown on one it speaks. A session is found by its socket rather than
+by one variable: X11 by `DISPLAY`, Wayland by the compositor's socket in
+`XDG_RUNTIME_DIR` — the one `WAYLAND_DISPLAY` names, or the default
+`wayland-0` when that variable is not exported, which is how a session
+started by a launcher or a user service is still found. A Wayland-only
+terminal such as `foot` is therefore never started under X11, where it would
+exit before mapping anything, and an X11-only one under Wayland is a fallback
+after the terminals that speak the compositor's own protocol: it works through
+XWayland, at the cost of a window the compositor does not scale, which the
+client says in one line. `wayland(7)` and the portal man pages have the
+desktop side. It works only for SSH (`sftp://` and `scp://`) sessions. The
+graphical client's "Terminal" button runs the same command.
 
 `call` (and `!`) runs a command over a one-shot SSH exec channel, using a second
 connection, so the SFTP session stays open.
@@ -309,7 +323,9 @@ writes the same files.
 ## Graphical client (`linscp-gui`)
 
 `linscp-gui` and `linscp -gui` start a dark, WinSCP-style Commander in the
-browser:
+browser. Run at a terminal, `linscp -gui` also asks the desktop for the browser
+window (`--open-browser`); with its output redirected it does not, so a script
+is never interrupted by a window it did not ask for. The Commander offers:
 
 * A dual-pane explorer, with the local filesystem on the left and the server on
   the right, and a single-panel view for a narrow window.
@@ -332,7 +348,9 @@ browser:
 * Drag-and-drop of files and folders from a file manager into either pane.
   Relative paths and empty directories are kept, and unsafe paths are rejected.
 * Multi-user sign-in when the server is started with `--accounts-file=`.
-* A desktop entry and URL scheme handlers, from `linscp.desktop`.
+* A desktop entry and URL scheme handlers, from `linscp.desktop`, which starts the
+  server with `--open-browser` so the desktop's own launcher shows the page - the
+  way that needs no X11 on a Wayland session.
 
 ### Reaching the server
 
@@ -362,6 +380,44 @@ changes need the CSRF token that the sign-in answered with, and five failed
 sign-ins lock a user name out for a minute. Sessions last an hour. Each account
 can carry a `home_dir`, which is recorded but not yet enforced as the root of
 that user's local pane.
+
+### Desktop sessions (Wayland and X11)
+
+Neither client draws a window, so neither needs a display server to work: the
+console client writes to the terminal it was started in, and the graphical
+client is a page a browser shows. What has to know about the session is the
+small set of places where LinSCP asks the desktop for something.
+
+* `terminal` starts a window, so it picks a terminal that can draw on the
+  display server in use — see [`terminal` above](#commands). It reads
+  `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` and `DISPLAY`, and nothing else.
+* `linscp-gui --open-browser` asks the desktop to open the Commander's address.
+  The launcher is `$BROWSER` when it is set, otherwise `xdg-open`, otherwise
+  `gio open`; on a Wayland session `xdg-open` reaches the browser through the
+  desktop portal, which is the one route that needs no X11 at all. `linscp.desktop`
+  starts the server with that option, so clicking LinSCP in an application
+  grid opens the Commander. If no session can be reached — a server started
+  over ssh, say — nothing is launched and the address is printed instead.
+* The embedded terminal in the browser page is a pseudo-terminal with xterm.js
+  rendering the bytes, so it is not a client of either display server and
+  behaves the same on both.
+* Drag and drop from a file manager into a pane is the compositor's and the
+  browser's business; LinSCP only receives the dropped names. Dropping out of
+  the browser onto a native application is a browser limitation on any display
+  server, not a Wayland one.
+* The desktop entry sets `StartupNotify=false` on purpose: this launcher starts
+  a server and prints an address, and a compositor waiting for a window from it
+  would wait until it gave up.
+
+Neither client uses `xclip`, `xdotool`, `wmctrl`, `xrandr` or `scrot`, which is
+the usual way a Linux desktop application ends up working only under X11.
+`python3 tools/check_wayland_compatibility.py` is the guard that keeps it that
+way; `make -C source/linux check` runs it and CTest registers it as
+`wayland-compatibility-check`.
+
+What it cannot certify is the interaction with a real compositor: the check
+reads sources. Running `terminal` on a Wayland session, and `--open-browser`
+from a desktop grid, is the test that does.
 
 ## Authentication
 
@@ -459,3 +515,20 @@ the template it is filled into. `make -C source/linux check` runs it, CTest
 registers it as `platform-conversion-check`, and CI runs it on every push.
 `tools/tests/test_platform_conversion.py` holds the check itself to the same
 standard: it has to fail on the things it claims to catch.
+
+A second one guards the display server. LinSCP ships for both Wayland and X11
+desktops, and the way an application gets that wrong is to ask for X11 alone,
+so
+
+```sh
+python3 tools/check_wayland_compatibility.py
+```
+
+refuses a display-server test that reads `DISPLAY` without `WAYLAND_DISPLAY`, a
+terminal started without saying which display server it draws on, an X11-only
+or Wayland-only helper, a desktop entry a Wayland compositor cannot act on, a
+documented terminal choice that never mentions Wayland, and the two
+implementations of the detection disagreeing about the variables they read.
+`make -C source/linux check` runs it, CTest registers it as
+`wayland-compatibility-check`, and `tools/tests/test_wayland_compatibility.py`
+has to show it failing on each of those.

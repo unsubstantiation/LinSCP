@@ -1,17 +1,33 @@
 #!/usr/bin/env python3
-"""Tests for Linux desktop scheme-handler startup URLs."""
+"""Tests for the Linux desktop integration of the GUI.
 
+Two things a desktop does to this client: hand it a site URL through a scheme
+handler, and decide whether a window can be shown at all - which on a Wayland
+session is a different question from the one X11 answers.
+"""
+
+import os
 import pathlib
+import stat
 import sys
 import tempfile
 import threading
 import time
 import types
 import unittest
+import urllib.parse
+from unittest import mock
 
 GUI_DIR = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(GUI_DIR))
 import linscp_gui as gui  # noqa: E402
+
+
+def write_executable(path, body="#!/bin/sh\nexit 0\n"):
+    """An executable file, so that a launcher lookup finds what it names."""
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(body)
+    os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP)
 
 
 class DesktopUriTests(unittest.TestCase):
@@ -187,8 +203,218 @@ class DesktopUriTests(unittest.TestCase):
                 gui.STATE["next_tab"], gui.STATE["challenges"] = old
 
 
+class DesktopSessionTests(unittest.TestCase):
+    """Which display server this is, and how a window is asked for."""
+
+    def wayland_environment(self, directory, name="wayland-0"):
+        """An environment whose runtime directory holds a compositor socket."""
+        socket = os.path.join(directory, name)
+        with open(socket, "wb"):
+            pass
+        return {"XDG_RUNTIME_DIR": directory}, socket
+
+    def test_a_wayland_session_is_found_by_its_socket(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment, _socket = self.wayland_environment(directory)
+            self.assertEqual(gui.detect_desktop_session(environment),
+                             (True, False, "wayland-0"))
+            self.assertTrue(gui.has_desktop_session(environment))
+
+    def test_an_exported_socket_name_is_used_as_it_stands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment, _socket = self.wayland_environment(
+                directory, name="wayland-2")
+            environment["WAYLAND_DISPLAY"] = "wayland-2"
+            wayland, x11, inferred = gui.detect_desktop_session(environment)
+            self.assertTrue(wayland)
+            self.assertFalse(x11)
+            # Nothing to add to a child: the environment says it already.
+            self.assertEqual(inferred, "")
+
+    def test_an_absolute_socket_path_is_honoured(self):
+        # A compositor socket handed out by a container or a service manager
+        # can be named by path, which libwayland accepts in the variable.
+        with tempfile.TemporaryDirectory() as directory:
+            _environment, socket = self.wayland_environment(directory)
+            wayland, _x11, _inferred = gui.detect_desktop_session(
+                {"WAYLAND_DISPLAY": socket})
+            self.assertTrue(wayland)
+
+    def test_a_variable_without_its_directory_names_no_session(self):
+        # WAYLAND_DISPLAY with no XDG_RUNTIME_DIR is a compositor no client can
+        # reach: the runtime directory is the only place a socket is looked for.
+        wayland, _x11, _inferred = gui.detect_desktop_session(
+            {"WAYLAND_DISPLAY": "wayland-0"})
+        self.assertFalse(wayland)
+        self.assertFalse(gui.has_desktop_session({"WAYLAND_DISPLAY": "wayland-0"}))
+
+    def test_x11_is_taken_from_the_display_variable_alone(self):
+        # $DISPLAY may name a forwarded server on another machine, where this
+        # process could not find a socket and the display still is there.
+        environment = {"DISPLAY": "localhost:10.0"}
+        self.assertEqual(gui.detect_desktop_session(environment),
+                         (False, True, ""))
+        self.assertTrue(gui.has_desktop_session(environment))
+
+    def test_a_headless_environment_reports_no_session(self):
+        self.assertEqual(gui.detect_desktop_session({}), (False, False, ""))
+        self.assertFalse(gui.has_desktop_session({}))
+
+    def test_an_absent_compositor_socket_is_no_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(
+                gui.detect_desktop_session({"XDG_RUNTIME_DIR": directory}),
+                (False, False, ""))
+
+    def test_a_wayland_session_with_xwayland_reports_both(self):
+        # A session that exports both can show either kind of window, and the
+        # name is already there for a child to find.
+        with tempfile.TemporaryDirectory() as directory:
+            environment, _socket = self.wayland_environment(directory)
+            environment["DISPLAY"] = ":0"
+            environment["WAYLAND_DISPLAY"] = "wayland-0"
+            self.assertEqual(gui.detect_desktop_session(environment),
+                             (True, True, ""))
+
+    def test_the_users_own_browser_is_asked_first(self):
+        # $BROWSER is the variable that says which browser a user means, it
+        # holds a colon-separated list, and a program in it may want the URL
+        # where its %s is. Only the first entry is a browser.
+        with tempfile.TemporaryDirectory() as directory:
+            firefox = os.path.join(directory, "firefox")
+            write_executable(firefox)
+            fallback = os.path.join(directory, "epiphany")
+            write_executable(fallback)
+            environment = {"PATH": directory}
+            self.assertEqual(
+                gui.browser_open_command(
+                    "http://localhost:8080/",
+                    dict(environment, BROWSER=fallback + " --private-window")),
+                [fallback, "--private-window", "http://localhost:8080/"])
+            # An entry whose program is missing is passed over, because the
+            # variable is a preference list and not a single command.
+            self.assertEqual(
+                gui.browser_open_command(
+                    "http://localhost:8080/",
+                    dict(environment, BROWSER="no-such-browser:%s" % fallback)),
+                [fallback, "http://localhost:8080/"])
+            self.assertEqual(
+                gui.browser_open_command(
+                    "http://localhost:8080/",
+                    dict(environment, BROWSER=firefox + " --app=%s")),
+                [firefox, "--app=http://localhost:8080/"])
+
+    def test_a_browser_that_is_not_there_falls_back_to_the_desktop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            launcher = os.path.join(directory, "xdg-open")
+            write_executable(launcher)
+            self.assertEqual(
+                gui.browser_open_command("http://localhost:8080/",
+                                         {"PATH": directory,
+                                          "BROWSER": "no-such-browser-here"}),
+                [launcher, "http://localhost:8080/"])
+
+    def test_the_desktop_uri_launcher_is_the_way_that_needs_no_x11(self):
+        # xdg-open is the freedesktop launcher, and on a sandboxed or Wayland
+        # session it hands the request to the portal. gio is the same from GLib.
+        with tempfile.TemporaryDirectory() as directory:
+            xdg = os.path.join(directory, "xdg-open")
+            write_executable(xdg)
+            self.assertEqual(gui.browser_open_command("http://l/", {"PATH": directory}),
+                             [xdg, "http://l/"])
+            os.remove(xdg)
+            write_executable(os.path.join(directory, "gio"))
+            self.assertEqual(gui.browser_open_command("http://l/", {"PATH": directory}),
+                             ["gio", "open", "http://l/"])
+
+    def test_no_launcher_is_reported_rather_than_guessed(self):
+        # Naming a browser of its own is how a launcher overrides the user, so
+        # the answer to 'no launcher' is the address and the reason.
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIsNone(gui.browser_open_command("http://l/",
+                                                       {"PATH": directory}))
+
+    def test_the_address_opened_carries_the_bound_name(self):
+        # The server answers a Host header naming loopback or --host=; a URL
+        # with any other name would be refused by the server that just opened
+        # it, which is how a window ends up showing 'connection refused'.
+        for host, name in (("127.0.0.1", "127.0.0.1"),
+                           ("localhost", "localhost"),
+                           ("::1", "::1"),
+                           ("10.0.0.5", "10.0.0.5"),
+                           ("fe80::1", "fe80::1"),
+                           ("Files.Example.ORG", "files.example.org"),
+                           ("0.0.0.0", "localhost"),
+                           ("::", "localhost"),
+                           ("", "localhost")):
+            url = gui.browser_url_for(host, 8080)
+            self.assertEqual(urllib.parse.urlparse(url).hostname, name, host)
+            self.assertTrue(url.endswith(":8080/"), url)
+
+    def test_no_window_is_requested_without_a_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            write_executable(os.path.join(directory, "xdg-open"))
+            with mock.patch.object(gui.subprocess, "Popen") as popened:
+                reason = gui.open_in_browser("http://localhost:8080/",
+                                             {"PATH": directory})
+            self.assertIn("no desktop session", reason)
+            popened.assert_not_called()
+
+    def test_the_launcher_is_started_detached_and_quiet(self):
+        with tempfile.TemporaryDirectory() as directory:
+            launcher = os.path.join(directory, "xdg-open")
+            write_executable(launcher)
+            environment = {"PATH": directory, "DISPLAY": ":0"}
+            with mock.patch.object(gui.subprocess, "Popen") as popened:
+                reason = gui.open_in_browser("http://localhost:8080/",
+                                             environment)
+            self.assertEqual(reason, "")
+            argv = popened.call_args[0][0]
+            self.assertEqual(argv, [launcher, "http://localhost:8080/"])
+            self.assertTrue(popened.call_args[1]["start_new_session"])
+            # The API token of the run never reaches a command line, where any
+            # process listing on the machine would show it.
+            self.assertNotIn("token", " ".join(argv))
+
+    def test_a_found_compositor_is_handed_to_the_child(self):
+        # The child looks the socket up by name, and a name the environment
+        # does not carry has to be exported for it.
+        with tempfile.TemporaryDirectory() as directory:
+            environment, _socket = self.wayland_environment(directory)
+            environment["PATH"] = directory
+            write_executable(os.path.join(directory, "xdg-open"))
+            with mock.patch.object(gui.subprocess, "Popen") as popened:
+                self.assertEqual(gui.open_in_browser("http://l/", environment), "")
+            self.assertEqual(
+                popened.call_args[1]["env"].get("WAYLAND_DISPLAY"), "wayland-0")
+
+    def test_a_launcher_that_cannot_be_started_is_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            launcher = os.path.join(directory, "xdg-open")
+            write_executable(launcher)
+            with mock.patch.object(gui.subprocess, "Popen",
+                                   side_effect=OSError("no such file")):
+                reason = gui.open_in_browser("http://l/",
+                                             {"PATH": directory,
+                                              "DISPLAY": ":0"})
+            self.assertIn("xdg-open", reason)
+            self.assertIn("no such file", reason)
+
+    def test_the_launcher_receives_the_server_address_after_it_listens(self):
+        # main() opens the browser only once the port is bound: a launcher told
+        # about the address first would open an error page.
+        source = (GUI_DIR / "linscp_gui.py").read_text()
+        bound = source.index("bound_port = httpd.server_address[1]")
+        opened = source.index("reason = open_in_browser(")
+        self.assertLess(bound, opened)
+        self.assertLess(opened, source.index("httpd.serve_forever()"))
+
+
+
 if __name__ == "__main__":
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(DesktopUriTests)
+    loader = unittest.defaultTestLoader
+    suite = unittest.TestSuite([loader.loadTestsFromTestCase(DesktopUriTests),
+                                loader.loadTestsFromTestCase(DesktopSessionTests)])
     result = unittest.TextTestRunner(verbosity=1).run(suite)
     failed = len(result.failures) + len(result.errors)
     print("evidence: suite=gui-desktop-uri platform=linux ran=%d skipped=%d failed=%d" %

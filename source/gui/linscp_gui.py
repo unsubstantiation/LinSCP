@@ -30,6 +30,15 @@ Host keys are verified rather than accepted: a new site starts with no host
 key, so the first connection reports the fingerprint it was offered and
 waits for the user to pin it (once, or remembered in the stored session)
 instead of connecting with ``-hostkey=*``.
+
+Display servers
+---------------
+The server talks to no display server of its own: the Commander is a page, and
+the browser that shows it is a window like any other, mapped by the compositor
+rather than by this process. ``--open-browser`` asks the desktop's URI launcher
+(``xdg-open``, or ``gio`` where there is none) to show the address, which is
+the route that works on Wayland and on X11 alike; it does not need XWayland,
+``xdotool`` or ``wmctrl``, none of which a Wayland session can answer.
 """
 
 import os
@@ -638,6 +647,167 @@ def open_desktop_site(session):
 
     threading.Thread(target=connect, daemon=True).start()
     return tab
+
+
+# ---------------------------------------------------------------------------
+# Showing the Commander in a window of the desktop session
+#
+# A Wayland client cannot ask to be mapped, placed or focused: the compositor
+# decides all three, and the X11 helpers a launcher used to reach for
+# (xdotool, wmctrl, xprop) cannot talk to it at all. So the server never
+# touches the display server itself. It asks the desktop's own URI launcher to
+# open its address, which is the one route that works on Wayland and on X11
+# alike, and the browser window that answers is a window like any other.
+#
+# The rules about which session this is are the ones
+# source/linux/Platform.cpp applies to the terminal window of 'terminal', and
+# they are kept in step by tools/check_wayland_compatibility.py.
+# ---------------------------------------------------------------------------
+
+def detect_desktop_session(environment=None):
+    """The display servers a window started from here could be shown on.
+
+    Returns ``(wayland, x11, wayland_display)``, where ``wayland_display`` is
+    the name to put into a child's environment when this environment does not
+    name it and yet the compositor's socket is there - empty when there is
+    nothing to add.
+
+    X11 is taken from ``$DISPLAY``, which may name a forwarded server on
+    another machine. Wayland is recognised by the socket in
+    ``$XDG_RUNTIME_DIR`` rather than by ``$WAYLAND_DISPLAY`` alone, because
+    the two fail in opposite directions: a session started by a launcher or a
+    user service often carries no variable while the default ``wayland-0``
+    socket sits in the runtime directory, and a variable without that
+    directory names a socket no Wayland client can find.
+    """
+    environment = os.environ if environment is None else environment
+    x11 = bool(environment.get("DISPLAY"))
+    named = environment.get("WAYLAND_DISPLAY") or ""
+    runtime = environment.get("XDG_RUNTIME_DIR") or ""
+    socket = ""
+    if named.startswith("/"):
+        socket = named
+    elif runtime:
+        socket = os.path.join(runtime, named or "wayland-0")
+    wayland = bool(socket) and os.path.exists(socket)
+    # Found by its default name rather than announced: a Wayland client
+    # started as our child has to be given that name to look the socket up.
+    return wayland, x11, ("wayland-0" if wayland and not named else "")
+
+
+def has_desktop_session(environment=None):
+    """Whether a window started from here could be shown at all."""
+    wayland, x11, _inferred = detect_desktop_session(environment)
+    return wayland or x11
+
+
+def find_on_path(program, environment):
+    """The executable ``program`` names, as the environment under
+    consideration would find it.
+
+    ``shutil.which`` looks at the interpreter's own ``PATH``, which is a
+    different thing from the session being asked about - and the answer has to
+    come from the session, because it is the session's launcher that gets
+    started. A name with a separator in it is a path already.
+    """
+    if not program:
+        return None
+    if os.path.sep in program:
+        expanded = os.path.expanduser(program)
+        if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+            return expanded
+        return None
+    return shutil.which(program, path=environment.get("PATH"))
+
+
+def browser_open_command(url, environment=None):
+    """The command that asks the desktop to show ``url``, or ``None``.
+
+    ``$BROWSER`` comes first because it is the variable a user sets to say
+    which browser they mean: a colon-separated preference list, walked left to
+    right, where an entry whose program is not installed is passed over and a
+    program may want the URL where its ``%s`` is. ``xdg-open`` is the
+    freedesktop launcher, which on a Wayland or otherwise sandboxed session
+    hands the request to the desktop's portal instead of starting a program
+    directly; ``gio open`` is the same thing from GLib. Nothing here names a
+    browser of its own: guessing one is how a launcher ends up overriding the
+    user.
+    """
+    environment = os.environ if environment is None else environment
+    for entry in (environment.get("BROWSER") or "").split(":"):
+        words = entry.split()
+        if not words:
+            continue
+        program = find_on_path(words[0], environment)
+        if program is None:
+            # An entry naming a browser that is not installed is skipped
+            # rather than reported: the variable is a preference list, and the
+            # desktop launcher behind it is the desktop's own answer.
+            continue
+        rest = words[1:]
+        if any("%s" in word for word in rest):
+            return [program] + [word.replace("%s", url) for word in rest]
+        return [program] + rest + [url]
+    launcher = find_on_path("xdg-open", environment)
+    if launcher:
+        return [launcher, url]
+    if find_on_path("gio", environment):
+        return ["gio", "open", url]
+    return None
+
+
+def browser_url_for(host, port):
+    """The address to ask the desktop to open for this bind.
+
+    A wildcard bind has no name of its own, so the loopback name is used; a
+    bound address is used as it was given, because that is the name the Host
+    check was told to answer, and an IPv6 literal needs the brackets a URL
+    requires. Opening a name the server would refuse is how a launcher ends up
+    showing an error page for a server that is running happily.
+    """
+    name = (host or "").strip().lower()
+    if name in ("", "0.0.0.0", "::", "::0"):
+        name = "localhost"
+    elif name == "::1":
+        name = "[::1]"
+    elif ":" in name and not name.startswith("["):
+        name = "[%s]" % name
+    return "http://%s:%d/" % (name, port)
+
+
+def open_in_browser(url, environment=None):
+    """Open the Commander's address in a window of the desktop session.
+
+    Returns an empty string on success and the reason it did not happen
+    otherwise, so that the caller can print advice instead of staying silent:
+    a server started over ssh has no session to open a window in, and the
+    address it printed is still the one to paste into a browser elsewhere.
+
+    The URL carries no token - the page the server serves carries it, so
+    nothing a ``ps`` of this machine shows is a secret. A child that has to be
+    told where the compositor is gets the name that was found for it, which is
+    what a Wayland client looks for first.
+    """
+    environment = os.environ if environment is None else environment
+    wayland, x11, inferred = detect_desktop_session(environment)
+    if not wayland and not x11:
+        return ("no desktop session was found (neither DISPLAY nor a Wayland "
+                "socket in XDG_RUNTIME_DIR is set here)")
+    command = browser_open_command(url, environment)
+    if command is None:
+        return ("no desktop URI launcher is installed (looked for xdg-open "
+                "and gio)")
+    child = dict(os.environ)
+    if inferred:
+        child.setdefault("WAYLAND_DISPLAY", inferred)
+    try:
+        subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, env=child)
+    except OSError as exc:
+        return "the desktop launcher '%s' could not be started: %s" % (
+            command[0], exc)
+    return ""
 
 
 def new_session():
@@ -4958,6 +5128,7 @@ def main():
     fixed_token = None
     startup_url = None
     print_token = False
+    open_browser = False
     for arg in sys.argv[1:]:
         if (startup_url is None and arg.lower().startswith(
                 ("sftp://", "ftp://", "ftps://"))):
@@ -5005,6 +5176,8 @@ def main():
             ACCOUNTS_FILE = arg.split("=", 1)[1].strip()
         elif arg == "--print-token":
             print_token = True
+        elif arg == "--open-browser":
+            open_browser = True
         elif arg == "--add-account":
             # Interactive: create a user account and exit.
             if not ACCOUNTS_FILE:
@@ -5047,6 +5220,9 @@ def main():
             print("  --accounts-file=FILE   enable multi-user accounts (PBKDF2)")
             print("  --add-account          create a user account interactively")
             print("  --print-token          write the token to the terminal")
+            print("  --open-browser         ask the desktop to open the page")
+            print("                         in a browser (through xdg-open, so")
+            print("                         it works on Wayland as on X11)")
             return 0
     startup_session = None
     if startup_url:
@@ -5098,6 +5274,15 @@ def main():
         print("Warning: the Host header is not checked (--allow-any-host).")
     else:
         print("Answering requests for: %s" % ", ".join(sorted(ALLOWED_HOSTS)))
+    if open_browser:
+        # Only after the port is bound: a launcher told about the address
+        # before anything was listening opened an error page, which is the
+        # one thing a user blames the client for.
+        address = browser_url_for(host, bound_port)
+        reason = open_in_browser(address)
+        if reason:
+            print("Not opening a browser: %s." % reason)
+            print("Open %s in a browser of your own." % address)
     sys.stdout.flush()
 
     try:

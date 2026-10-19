@@ -172,7 +172,17 @@ before those operations.
 Launch the graphical Commander desktop interface. It is a dual\-pane browser
 served on a local port: the remote pane, the transfer queue, the built\-in
 editor, synchronization and the site manager all drive the commands described
-here, and each tab keeps one connection open. The server listens on
+here, and each tab keeps one connection open. The server draws no window of
+its own, so it needs neither X11 nor a Wayland compositor;
+.BI linscp\-gui\ \-\-open\-browser
+asks the desktop's own URI launcher
+.RB ( xdg\-open ,
+or
+.B gio
+where there is none) to open the address, which is the way that works on a
+Wayland session as well as on an X11 one. This client passes that option when
+its output is a terminal, so a run at a keyboard gets a window and a run whose
+output goes to a pipe or a file starts no browser nobody asked for. The server listens on
 .B 127.0.0.1
 only and every
 .I /api/
@@ -882,7 +892,22 @@ variable (for example
 .BR "xterm -e"
 or
 .BR foot ),
-otherwise the first common desktop terminal that is installed. SSH
+otherwise from the common desktop terminals, in the order they are listed in
+.IR docs/debian.md ,
+among the installed ones that can show a window on the display server this
+session runs on.
+Wayland is recognised by the compositor's socket in
+.BR XDG_RUNTIME_DIR ,
+whose default name
+.B wayland\-0
+is used when
+.B WAYLAND_DISPLAY
+is not exported, and X11 by
+.BR DISPLAY .
+A Wayland\-only terminal is therefore not started under X11, where it would
+exit before mapping anything, and an X11\-only one under Wayland is chosen
+only once no terminal that speaks the compositor's own protocol is installed:
+XWayland shows it, unscaled. SSH
 .RB ( sftp:// " and " scp:// )
 sessions only.
 .TP

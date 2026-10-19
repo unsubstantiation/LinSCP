@@ -2,6 +2,7 @@
 
 #include "LocalFs.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cctype>
 #include <cstdint>
@@ -513,7 +514,26 @@ bool LaunchGuiApplication(std::string & error)
     {
         guiBin = "/usr/bin/linscp-gui";
     }
-    execl(guiBin.c_str(), guiBin.c_str(), static_cast<char *>(NULL));
+    /* A reader at a keyboard asked for a desktop interface, so the desktop is
+     * asked for its window; the launcher it uses - $BROWSER, xdg-open, gio -
+     * is the one route a Wayland session answers as well as an X11 one. A run
+     * whose output goes somewhere else is nobody looking at a printed
+     * address, and a browser an automation never asked for is a complaint
+     * waiting to happen, so the option is not passed there. */
+    std::vector<std::string> args;
+    args.push_back(guiBin);
+    if (StdOutIsTerminal())
+    {
+        args.push_back("--open-browser");
+    }
+    std::vector<char *> argv;
+    argv.reserve(args.size() + 1);
+    for (size_t i = 0; i < args.size(); i++)
+    {
+        argv.push_back(const_cast<char *>(args[i].c_str()));
+    }
+    argv.push_back(NULL);
+    execv(argv[0], argv.data());
     error = std::string("Failed to launch LinSCP GUI '") + guiBin +
         "': " + strerror(errno);
     return false;
@@ -683,6 +703,13 @@ unsigned long ParseListingDate(const std::string & monthName,
  * server that the session is using. The console client cannot make its
  * own terminal window, so it hands the same job to the system ssh client
  * in a terminal emulator.
+ *
+ * A window belongs to a display server, and a Linux desktop runs either
+ * Wayland or X11 - so the choice of program has to be made against the
+ * session this process is in, and not against X11 alone: a client that
+ * only asks for $DISPLAY finds no display on a Wayland session where
+ * XWayland is not running, and a terminal that only speaks Wayland exits
+ * before it maps anything when run under X11.
  */
 
 std::vector<std::string> BuildSshArguments(const std::string & userName,
@@ -719,33 +746,79 @@ std::vector<std::string> BuildSshArguments(const std::string & userName,
 
 namespace {
 
-struct TerminalProgram
-{
-    const char * name;
-    const char * leadingArgs[3];
-};
-
 /*
- * The terminal emulators of the common desktops, with the option that
- * makes them run a command instead of a shell. Some of them take the
- * command after '--', some after '-e' or '-x', and kitty/foot take it
- * directly.
+ * The terminal emulators this client starts, with the option that makes
+ * them run a command instead of a login shell, and the display server they
+ * can draw on: "" for a program that speaks both protocols and picks one at
+ * run time, "wayland" and "x11" for a program that speaks only one.
+ *
+ * The order is the order a session is offered them in. The two passes
+ * ChooseTerminalProgram() makes are what keeps one list enough for both
+ * display servers: a Wayland session takes the programs that can draw on it
+ * first and only then the X11 ones, which XWayland shows, while an X11
+ * session has no Wayland socket to offer and so never sees the
+ * Wayland-only programs at all.
  */
 const TerminalProgram kTerminalPrograms[] = {
-    {"x-terminal-emulator", {"-e", NULL}},
-    {"gnome-terminal", {"--", NULL}},
-    {"konsole", {"-e", NULL}},
-    {"xfce4-terminal", {"-x", NULL}},
-    {"mate-terminal", {"-x", NULL}},
-    {"lxterminal", {"-e", NULL}},
-    {"terminator", {"-x", NULL}},
-    {"alacritty", {"-e", NULL}},
-    {"kitty", {NULL}},
-    {"foot", {NULL}},
-    {"wezterm", {"start", "--", NULL}},
-    {"urxvt", {"-e", NULL}},
-    {"xterm", {"-e", NULL}},
+    /* Debian's configured default terminal. It is listed as an X11 program
+     * on purpose: the alternative is defined by policy for X11 terminals,
+     * and where it points at xterm on a Wayland session that window is an
+     * XWayland one - or no window at all, if XWayland is not running. A
+     * terminal that speaks Wayland itself is therefore tried first. */
+    {"x-terminal-emulator", {"-e", NULL}, "x11"},
+    {"gnome-terminal", {"--", NULL}, ""},
+    {"konsole", {"-e", NULL}, ""},
+    {"xfce4-terminal", {"-x", NULL}, "x11"},
+    {"mate-terminal", {"-x", NULL}, "x11"},
+    {"lxterminal", {"-e", NULL}, "x11"},
+    {"terminator", {"-x", NULL}, "x11"},
+    {"alacritty", {"-e", NULL}, ""},
+    {"kitty", {NULL}, ""},
+    {"foot", {NULL}, "wayland"},
+    {"wezterm", {"start", "--", NULL}, ""},
+    {"urxvt", {"-e", NULL}, "x11"},
+    {"xterm", {"-e", NULL}, "x11"},
 };
+
+const char * EnvironmentValue(
+    const std::map<std::string, std::string> & environment, const char * name)
+{
+    const std::map<std::string, std::string>::const_iterator found =
+        environment.find(std::string(name));
+    return found != environment.end() ? found->second.c_str() : "";
+}
+
+std::string JoinPath(const std::string & directory, const std::string & name)
+{
+    if (directory.empty())
+    {
+        return name;
+    }
+    if (directory[directory.size() - 1] == '/')
+    {
+        return directory + name;
+    }
+    return directory + "/" + name;
+}
+
+bool PathExists(const std::string & path, void *)
+{
+    return !path.empty() && access(path.c_str(), F_OK) == 0;
+}
+
+/* The three variables that say which display server this process was
+ * started under. Nothing else in the environment is looked at: a full copy
+ * would let a variable nobody intended reach the detection. */
+std::map<std::string, std::string> DesktopEnvironment()
+{
+    std::map<std::string, std::string> environment;
+    const char * names[] = { "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR" };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+    {
+        environment[names[i]] = EnvironmentVariable(names[i]);
+    }
+    return environment;
+}
 
 std::vector<std::string> SplitWhitespace(const std::string & text)
 {
@@ -784,13 +857,126 @@ std::string SshHint(const std::string & userName, const std::string & hostName,
     return hint;
 }
 
+bool BackendIs(const char * backend, const char * name)
+{
+    return backend != NULL && strcmp(backend, name) == 0;
+}
+
 } // namespace
+
+DesktopSession DetectDesktopSession(
+    const std::map<std::string, std::string> & environment,
+    PathExistsFn pathExists, void * ctx)
+{
+    DesktopSession session;
+    /* X11 is taken on trust: $DISPLAY may name a forwarded display on
+     * another machine, where there is no socket to find in this one. */
+    session.x11 = *EnvironmentValue(environment, "DISPLAY") != '\0';
+
+    const std::string waylandDisplay =
+        EnvironmentValue(environment, "WAYLAND_DISPLAY");
+    const std::string runtimeDirectory =
+        EnvironmentValue(environment, "XDG_RUNTIME_DIR");
+    /* A compositor socket is found by path, so a missing directory is a
+     * session no Wayland client can join - which is worth saying, because
+     * the variable that is set looks like one that is. */
+    if (!waylandDisplay.empty() && runtimeDirectory.empty())
+    {
+        session.waylandWithoutRuntimeDirectory = true;
+    }
+    if (!waylandDisplay.empty() && waylandDisplay[0] == '/')
+    {
+        /* An absolute path in the variable, which libwayland accepts for the
+         * sockets a service manager or a container hands out. */
+        session.waylandSocketPath = waylandDisplay;
+    }
+    else if (!runtimeDirectory.empty())
+    {
+        /* The default socket name of every compositor, so that a session
+         * started without $WAYLAND_DISPLAY in the environment - from a
+         * systemd user service, or through a launcher that does not forward
+         * it - is still found. */
+        session.waylandSocketPath = JoinPath(runtimeDirectory,
+            waylandDisplay.empty() ? std::string("wayland-0") : waylandDisplay);
+    }
+    if (!session.waylandSocketPath.empty() &&
+        (pathExists == NULL || pathExists(session.waylandSocketPath, ctx)))
+    {
+        session.wayland = true;
+        if (waylandDisplay.empty())
+        {
+            session.inferredWaylandDisplay = "wayland-0";
+        }
+    }
+    return session;
+}
+
+const TerminalProgram * KnownTerminalPrograms(size_t * count)
+{
+    if (count != NULL)
+    {
+        *count = sizeof(kTerminalPrograms) / sizeof(kTerminalPrograms[0]);
+    }
+    return kTerminalPrograms;
+}
+
+TerminalChoice ChooseTerminalProgram(const DesktopSession & session,
+    const std::vector<std::string> & installed)
+{
+    TerminalChoice choice;
+    if (!session.wayland && !session.x11)
+    {
+        return choice;
+    }
+    size_t count = 0;
+    const TerminalProgram * programs = KnownTerminalPrograms(&count);
+    for (int pass = 0; pass < 2; pass++)
+    {
+        for (size_t i = 0; i < count; i++)
+        {
+            const TerminalProgram & candidate = programs[i];
+            if (BackendIs(candidate.backend, "wayland") && !session.wayland)
+            {
+                continue;
+            }
+            /* An X11-only program in a Wayland session is a fallback
+             * through XWayland: usable, but not the first choice. */
+            const bool throughXWayland =
+                BackendIs(candidate.backend, "x11") && !session.x11;
+            if (pass == 0 ? throughXWayland : !throughXWayland)
+            {
+                continue;
+            }
+            if (std::find(installed.begin(), installed.end(),
+                    std::string(candidate.name)) == installed.end())
+            {
+                continue;
+            }
+            choice.program = candidate.name;
+            for (int n = 0; n < 3 && candidate.leadingArgs[n] != NULL; n++)
+            {
+                choice.leadingArgs.push_back(candidate.leadingArgs[n]);
+            }
+            choice.viaXWayland = throughXWayland;
+            return choice;
+        }
+    }
+    return choice;
+}
 
 bool LaunchTerminalForServer(const std::string & userName,
     const std::string & hostName, int portNumber,
-    const std::string & privateKeyFile, std::string & error)
+    const std::string & privateKeyFile, std::string & error,
+    std::string * note)
 {
     error.clear();
+    if (note != NULL)
+    {
+        note->clear();
+    }
+
+    const DesktopSession session = DetectDesktopSession(DesktopEnvironment(),
+        PathExists, NULL);
 
     std::string program;
     std::vector<std::string> leading;
@@ -799,39 +985,80 @@ bool LaunchTerminalForServer(const std::string & userName,
     {
         /* '<program> [args]', e.g. 'xterm -e' or 'foot'. */
         const std::vector<std::string> words = SplitWhitespace(overrideProgram);
+        if (words.empty())
+        {
+            error = "LINSCP_TERMINAL names no program to run.";
+            return false;
+        }
         program = words[0];
         leading.assign(words.begin() + 1, words.end());
     }
     else
     {
-        if (EnvironmentVariable("DISPLAY").empty() &&
-            EnvironmentVariable("WAYLAND_DISPLAY").empty())
+        if (!session.wayland && !session.x11)
         {
-            error = "No graphical session was found (DISPLAY and WAYLAND_DISPLAY "
-                "are not set), so no terminal window can be opened.";
+            if (session.waylandWithoutRuntimeDirectory)
+            {
+                error = "WAYLAND_DISPLAY is set but XDG_RUNTIME_DIR is not, "
+                    "so the compositor's socket cannot be found. Start LinSCP "
+                    "from a shell of the desktop session, where "
+                    "XDG_RUNTIME_DIR is /run/user/<uid>.";
+            }
+            else if (!session.waylandSocketPath.empty())
+            {
+                /* Saying where the socket was looked for is the part a user can
+                 * act on: a compositor on another socket name, or a runtime
+                 * directory of another session, reads as 'no desktop' otherwise. */
+                error = "No graphical session was found: the compositor "
+                    "socket '" + session.waylandSocketPath + "' is not there "
+                    "and DISPLAY is not set, so no terminal window can be "
+                    "opened. Set XDG_RUNTIME_DIR and WAYLAND_DISPLAY to the "
+                    "session the compositor of this desktop runs on.";
+            }
+            else
+            {
+                error = "No graphical session was found (DISPLAY and "
+                    "WAYLAND_DISPLAY are not set), so no terminal window can "
+                    "be opened.";
+            }
             error += SshHint(userName, hostName, portNumber);
             return false;
         }
-        for (size_t i = 0; i < sizeof(kTerminalPrograms) / sizeof(kTerminalPrograms[0]); i++)
+        std::vector<std::string> installed;
+        size_t count = 0;
+        const TerminalProgram * programs = KnownTerminalPrograms(&count);
+        for (size_t i = 0; i < count; i++)
         {
-            const std::string found = FindExecutableOnPath(kTerminalPrograms[i].name);
-            if (found.empty())
+            if (!FindExecutableOnPath(programs[i].name).empty())
             {
-                continue;
+                installed.push_back(programs[i].name);
             }
-            program = found;
-            for (int n = 0; n < 3 && kTerminalPrograms[i].leadingArgs[n] != NULL; n++)
-            {
-                leading.push_back(kTerminalPrograms[i].leadingArgs[n]);
-            }
-            break;
         }
-        if (program.empty())
+        const TerminalChoice choice = ChooseTerminalProgram(session, installed);
+        if (choice.program.empty())
         {
-            error = "None of the common desktop terminals is installed; set "
-                "LINSCP_TERMINAL to the terminal program to use.";
+            error = session.wayland ?
+                std::string("None of the common desktop terminals is "
+                    "installed; set LINSCP_TERMINAL to the terminal program "
+                    "to use.") :
+                std::string("None of the installed desktop terminals can show "
+                    "a window in this session; set LINSCP_TERMINAL to the "
+                    "terminal program to use.");
             error += SshHint(userName, hostName, portNumber);
             return false;
+        }
+        program = choice.program;
+        leading = choice.leadingArgs;
+        if (choice.viaXWayland && note != NULL)
+        {
+            *note = session.x11 ?
+                ("'" + program + "' is an X11 terminal, shown by XWayland: the "
+                    "compositor does not scale it, so it looks blurry on a "
+                    "high-resolution display.") :
+                ("'" + program + "' is an X11 terminal and this session has no "
+                    "X server, so it needs XWayland to show a window at all. "
+                    "Where none appears, install a terminal that speaks "
+                    "Wayland or set LINSCP_TERMINAL.");
         }
     }
 
@@ -880,6 +1107,14 @@ bool LaunchTerminalForServer(const std::string & userName,
         {
             _exit(grandchild < 0 ? 1 : 0);
         }
+        /* A terminal the environment did not announce still has to be told
+         * where the compositor is: the socket was found in
+         * XDG_RUNTIME_DIR, and the program only looks it up by name. */
+        if (!session.inferredWaylandDisplay.empty())
+        {
+            setenv("WAYLAND_DISPLAY",
+                session.inferredWaylandDisplay.c_str(), 1);
+        }
         (void)fcntl(statusPipe[1], F_SETFD, FD_CLOEXEC);
         std::vector<char *> argv;
         argv.reserve(command.size() + 1);
@@ -910,5 +1145,6 @@ bool LaunchTerminalForServer(const std::string & userName,
     }
     return true;
 }
+
 
 } // namespace linscp

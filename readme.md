@@ -19,6 +19,8 @@ parity**: see [Protocols](#protocols) and the [parity audit](docs/upstream-parit
 - Build dependencies: `libssh-dev`, `libssl-dev`, `libargon2-dev`, `zlib1g-dev` and `pkg-config`.
 - `curl` at run time, for FTP transfers, FTPS, WebDAV and S3.
 - Python 3, for the graphical client.
+- `xdg-utils` (recommended), so `linscp-gui --open-browser` can ask the desktop
+  for a browser window on Wayland as well as under X11.
 - Node 20.19 or newer with `npm`, for the optional browser test suites
   (`npm install jsdom@29`). Not needed to build or use the client.
 
@@ -62,10 +64,20 @@ reads the sources and refuses a Windows API call, a Windows environment
 variable, a Windows path, a file of another platform, an installer that
 disagrees with the others, and an error message whose wording contradicts the
 template it is filled into. It is what keeps the conversion complete rather
-than merely done once. For the Debian package:
+than merely done once.
+
+A second check guards the other half of "runs on Linux": a Wayland desktop,
+where an application that only asks for `$DISPLAY` sees no display at all.
+`tools/check_wayland_compatibility.py` refuses a display-server test that reads
+`DISPLAY` without `WAYLAND_DISPLAY`, a terminal candidate that does not say
+which display server it draws on, an X11-only or Wayland-only helper program,
+a desktop entry a Wayland compositor cannot act on, and the two
+implementations of the detection disagreeing about what a session is. It runs
+in `make -C source/linux check`, in CTest as `wayland-compatibility-check`, and
+in CI. For the Debian package:
 
 ```sh
-dpkg-buildpackage -b -us -uc         # -> ../linscp_1.0-4_<arch>.deb
+dpkg-buildpackage -b -us -uc         # -> ../linscp_1.0-5_<arch>.deb
 ```
 
 ## Usage
@@ -74,6 +86,7 @@ dpkg-buildpackage -b -us -uc         # -> ../linscp_1.0-4_<arch>.deb
 linscp -batch -script=script.txt
 linscp -batch -command="open sftp://user@example.com/; cd /data; get *.csv /tmp"
 linscp-gui                         # browser Commander on 127.0.0.1:8080
+linscp-gui --open-browser          # ... and ask the desktop to show it
 ```
 
 Run `linscp -help` for the options and `man linscp` for the full reference.
@@ -117,6 +130,12 @@ it can be pinned.
   search, checksums, properties, saved command templates, multi-user sign-in,
   local file editing and drag-and-drop in both panes.
 - **Localization:** English and Spanish, for the CLI and the GUI.
+- **Desktop sessions:** works on Wayland and on X11 alike. The clients draw no
+  window of their own; the terminal `terminal` opens is chosen among the ones
+  that can draw on this display server, and `--open-browser` asks the desktop's
+  own launcher (`xdg-open`, `$BROWSER`) for a browser window. No `xclip`,
+  `xdotool`, `wmctrl` or `xrandr`, which is what makes a Linux application
+  X11-only.
 
 Not implemented: the .NET assembly API, GSSAPI, and SSH tunnel configuration.
 `automation/LinSCP.psm1`, a PowerShell 7 wrapper over the CLI, is installed by
