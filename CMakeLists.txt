@@ -88,6 +88,11 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME live-sftp-tests COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/${FRONTEND}/tests/LiveSftpTest.py
     $<TARGET_FILE:linscp>)
+  # Two independent Paramiko SSH endpoints exercise real direct-tcpip
+  # forwarding, both host-key checks, GUI/shell wiring and cleanup.
+  add_test(NAME live-tunnel-tests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/${FRONTEND}/tests/LiveTunnelTest.py
+    $<TARGET_FILE:linscp>)
   # Starts the throwaway S3 endpoint in tests/ over TLS; standard-library
   # only, with botocore an optional extra one test skips without.
   # The SCP engine talks to a throwaway sshd it starts itself; the suite
@@ -114,7 +119,7 @@ if(Python3_Interpreter_FOUND)
   # against, and the Makefile workflow's grep enforces the same
   # contract. The timeout bounds a suite whose throwaway server
   # hangs, which would otherwise eat the default 1500 seconds.
-  set_tests_properties(live-sftp-tests live-scp-tests live-s3-tests
+  set_tests_properties(live-sftp-tests live-tunnel-tests live-scp-tests live-s3-tests
     live-dav-tests live-curl-tests PROPERTIES
     FAIL_REGULAR_EXPRESSION "ran=0 "
     TIMEOUT 600)
@@ -181,12 +186,13 @@ endif()
 
 # ---- libssh + OpenSSL (SSH/SFTP/SCP transport and hashes) ---------------
 find_package(ZLIB REQUIRED)
-find_package(libssh REQUIRED)
+find_package(libssh 0.10 REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_path(ARGON2_INCLUDE_DIR argon2.h REQUIRED)
 find_library(ARGON2_LIBRARY NAMES argon2 REQUIRED)
 target_include_directories(linscp-frontend PRIVATE ${ARGON2_INCLUDE_DIR})
-target_link_libraries(linscp-frontend PUBLIC ssh OpenSSL::Crypto ${ARGON2_LIBRARY})
+find_package(Threads REQUIRED)
+target_link_libraries(linscp-frontend PUBLIC ssh OpenSSL::Crypto ${ARGON2_LIBRARY} Threads::Threads)
 
 # GSSAPI stays compiled out, as in the Makefile build: libssh may have
 # it, but this client's settings refuse it by name (see SshTunnel.cpp).

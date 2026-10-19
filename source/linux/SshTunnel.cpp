@@ -3,6 +3,16 @@
  */
 
 #include "SshTunnel.h"
+#include "Session.h"
+#include "Texts.h"
+
+#include <atomic>
+#include <cerrno>
+#include <thread>
+#include <system_error>
+#include <poll.h>
+#include <sys/socket.h>
+#include <libssh/libssh.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -48,60 +58,7 @@ bool ParsePort(const std::string & text, int & port)
     return true;
 }
 
-#ifndef NO_GSSAPI
-/*
- * Whether a shared object the dynamic linker would find is installed.
- *
- * Libraries live in the loader's directories, not on PATH, and are not
- * marked executable, so searching PATH for one never found it and
- * GSSAPI reported itself missing on a system that had it. Only built
- * where it can be reached: this build compiles GSSAPI out.
- */
-bool SharedObjectInstalled(const char * soname)
-{
-    static const char * const dirs[] = {
-        "/lib", "/usr/lib", "/lib64", "/usr/lib64",
-        "/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu",
-        "/lib/aarch64-linux-gnu", "/usr/lib/aarch64-linux-gnu",
-        "/lib/i386-linux-gnu", "/usr/lib/i386-linux-gnu"
-    };
-    const char * extra = getenv("LD_LIBRARY_PATH");
-    std::string searchDirs;
-    if (extra != NULL)
-    {
-        searchDirs = extra;
-    }
-    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
-    {
-        const std::string candidate = std::string(dirs[i]) + "/" + soname;
-        if (access(candidate.c_str(), R_OK) == 0)
-        {
-            return true;
-        }
-    }
-    size_t start = 0;
-    while (start <= searchDirs.size())
-    {
-        const size_t colon = searchDirs.find(':', start);
-        const std::string dir = searchDirs.substr(start,
-            colon == std::string::npos ? colon : colon - start);
-        if (!dir.empty())
-        {
-            const std::string candidate = dir + "/" + soname;
-            if (access(candidate.c_str(), R_OK) == 0)
-            {
-                return true;
-            }
-        }
-        if (colon == std::string::npos)
-        {
-            break;
-        }
-        start = colon + 1;
-    }
-    return false;
-}
-#endif /* NO_GSSAPI */
+
 
 } // namespace
 
@@ -247,28 +204,215 @@ std::string TunnelSshFlags(const SshTunnel & tunnel)
 
 bool IsGssapiSupported()
 {
-#ifdef NO_GSSAPI
+    // Merely finding a Kerberos library does not wire an authentication path.
     return false;
-#else
-    /* Runtime check: the Kerberos library has to be where the dynamic
-     * linker looks, not on PATH, and it does not have to be executable. */
-    return SharedObjectInstalled("libgssapi_krb5.so.2");
-#endif
 }
 
 bool ApplyGssapiSetting(const std::string & value, std::string & error)
 {
     (void)value;
-    if (!IsGssapiSupported())
+    error = Texts::Translate("GSSAPI/Kerberos is not available: authentication support is "
+        "not implemented in this client.");
+    return false;
+}
+
+struct SshJumpTunnel::Impl
+{
+    Session jump;
+    ssh_channel channel = NULL;
+    ssh_event event = NULL;
+    int bridge = -1;
+    std::atomic<bool> stop{false};
+    std::thread worker;
+
+    void Run()
     {
-        error = "GSSAPI/Kerberos is not available in this build. "
-            "Install libgssapi-krb5-2 and rebuild with -DNO_GSSAPI removed "
-            "to enable it.";
-        return false;
+        // Only this thread touches the jump libssh session while it runs.
+        // Backpressure is bounded in both directions; do not queue unlimited
+        // writes into libssh when the underlying SSH socket cannot drain.
+        char toChannel[32768], toSocket[32768];
+        size_t channelBegin = 0, channelEnd = 0, socketBegin = 0, socketEnd = 0;
+        bool localEof = false, sentEof = false, remoteEof = false;
+        ssh_session ssh = static_cast<ssh_session>(jump.SshHandle());
+        while (!stop.load())
+        {
+            if (ssh_event_dopoll(event, 0) == SSH_ERROR || !ssh_is_connected(ssh))
+                break;
+            bool progress = false;
+            if (!localEof && channelBegin == channelEnd)
+            {
+                const ssize_t n = recv(bridge, toChannel, sizeof(toChannel), 0);
+                if (n > 0)
+                {
+                    channelBegin = 0;
+                    channelEnd = static_cast<size_t>(n);
+                    progress = true;
+                }
+                else if (n == 0)
+                {
+                    localEof = true;
+                    progress = true;
+                }
+                else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                    break;
+            }
+            if (channelBegin < channelEnd && !(ssh_get_status(ssh) & SSH_WRITE_PENDING))
+            {
+                const int n = ssh_channel_write(channel, toChannel + channelBegin,
+                    static_cast<uint32_t>(channelEnd - channelBegin));
+                if (n == SSH_ERROR) break;
+                if (n > 0)
+                {
+                    channelBegin += static_cast<size_t>(n);
+                    progress = true;
+                }
+            }
+            if (localEof && channelBegin == channelEnd && !sentEof)
+            {
+                const int rc = ssh_channel_send_eof(channel);
+                if (rc == SSH_ERROR) break;
+                if (rc == SSH_OK) { sentEof = true; progress = true; }
+            }
+            if (!remoteEof && socketBegin == socketEnd)
+            {
+                const int n = ssh_channel_read_nonblocking(channel, toSocket,
+                    sizeof(toSocket), 0);
+                if (n == SSH_ERROR) break;
+                if (n > 0)
+                {
+                    socketBegin = 0;
+                    socketEnd = static_cast<size_t>(n);
+                    progress = true;
+                }
+                else if (ssh_channel_is_eof(channel) || ssh_channel_is_closed(channel))
+                {
+                    remoteEof = true;
+                    shutdown(bridge, SHUT_WR);
+                    progress = true;
+                }
+            }
+            if (socketBegin < socketEnd)
+            {
+                const ssize_t n = send(bridge, toSocket + socketBegin,
+                    socketEnd - socketBegin, MSG_NOSIGNAL);
+                if (n > 0)
+                {
+                    socketBegin += static_cast<size_t>(n);
+                    progress = true;
+                }
+                else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                    break;
+            }
+            if (localEof && remoteEof && channelBegin == channelEnd && socketBegin == socketEnd)
+                break;
+            if (!progress)
+            {
+                struct pollfd fds[2] = {
+                    {bridge, 0, 0}, {ssh_get_fd(ssh), POLLIN, 0}
+                };
+                if (!localEof && channelBegin == channelEnd) fds[0].events |= POLLIN;
+                if (socketBegin < socketEnd) fds[0].events |= POLLOUT;
+                if (ssh_get_poll_flags(ssh) & SSH_WRITE_PENDING) fds[1].events |= POLLOUT;
+                // Short, bounded wait makes Stop() independent of a silent peer.
+                if (poll(fds, 2, 100) < 0 && errno != EINTR) break;
+                if (fds[0].revents & (POLLERR | POLLNVAL | POLLHUP)) break;
+            }
+        }
+        // Wake any destination operation blocked in libssh on failure/stop.
+        shutdown(bridge, SHUT_RDWR);
     }
-    /* When the build enables libssh GSSAPI support, libssh handles the
-     * authentication exchange. This setting only validates the request. */
-    return true;
+};
+
+SshJumpTunnel::SshJumpTunnel() : mImpl(new Impl()) {}
+SshJumpTunnel::~SshJumpTunnel() { Stop(); }
+
+int SshJumpTunnel::Start(const SessionOptions & destination, std::string & error)
+{
+    Stop();
+    mImpl->stop.store(false);
+    const SshTunnelSettings & tunnel = destination.tunnel;
+    SessionOptions jump;
+    jump.protocol = "sftp";
+    jump.hostName = tunnel.hostName;
+    jump.portNumber = tunnel.portNumber;
+    jump.userName = tunnel.userName;
+    jump.password = tunnel.password;
+    jump.privateKeyFile = tunnel.privateKeyFile;
+    jump.keyPassphrase = tunnel.keyPassphrase;
+    jump.hostKey = tunnel.hostKey;
+    jump.cachePinnedHostKeys = destination.cachePinnedHostKeys;
+    jump.timeoutSecs = destination.timeoutSecs;
+    jump.verbose = destination.verbose;
+    // Match upstream: the proxy reaches the jump host, never the destination.
+    jump.proxy = destination.proxy;
+    if (!mImpl->jump.OpenTunnelTransport(jump, error))
+    {
+        error = Texts::Translate("SSH tunnel: {reason}", {{"reason", error}});
+        return -1;
+    }
+    ssh_session ssh = static_cast<ssh_session>(mImpl->jump.SshHandle());
+    mImpl->channel = ssh_channel_new(ssh);
+    if (mImpl->channel == NULL ||
+        ssh_channel_open_forward(mImpl->channel, destination.hostName.c_str(),
+            destination.portNumber, "127.0.0.1", 0) != SSH_OK)
+    {
+        error = Texts::Translate("SSH tunnel forwarding to {host}:{port} failed: {reason}",
+            {{"host", destination.hostName}, {"port", std::to_string(destination.portNumber)},
+             {"reason", ssh_get_error(ssh)}});
+        Stop();
+        return -1;
+    }
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, pair) != 0)
+    {
+        error = Texts::Translate("Cannot create the private SSH tunnel socket pair.");
+        Stop();
+        return -1;
+    }
+    mImpl->bridge = pair[1];
+    ssh_set_blocking(ssh, 0);
+    mImpl->event = ssh_event_new();
+    if (mImpl->event == NULL || ssh_event_add_session(mImpl->event, ssh) != SSH_OK)
+    {
+        error = Texts::Translate("Cannot create the SSH tunnel event loop.");
+        close(pair[0]);
+        Stop();
+        return -1;
+    }
+    try
+    {
+        mImpl->worker = std::thread(&Impl::Run, mImpl.get());
+    }
+    catch (const std::system_error &)
+    {
+        error = Texts::Translate("Cannot start the SSH tunnel forwarding worker.");
+        close(pair[0]);
+        Stop();
+        return -1;
+    }
+    return pair[0];
+}
+
+void SshJumpTunnel::Stop()
+{
+    mImpl->stop.store(true);
+    if (mImpl->bridge >= 0) shutdown(mImpl->bridge, SHUT_RDWR);
+    if (mImpl->worker.joinable()) mImpl->worker.join();
+    if (mImpl->event != NULL)
+    {
+        if (mImpl->jump.SshHandle() != NULL)
+            ssh_event_remove_session(mImpl->event,
+                static_cast<ssh_session>(mImpl->jump.SshHandle()));
+        ssh_event_free(mImpl->event);
+        mImpl->event = NULL;
+    }
+    if (mImpl->channel != NULL)
+    {
+        ssh_channel_free(mImpl->channel);
+        mImpl->channel = NULL;
+    }
+    if (mImpl->bridge >= 0) { close(mImpl->bridge); mImpl->bridge = -1; }
+    mImpl->jump.Close();
 }
 
 } // namespace linscp

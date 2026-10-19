@@ -1672,6 +1672,114 @@ class ScriptTests(unittest.TestCase):
             self.assertIn("source/linux", rules_text)
 
 
+    def test_tunnel_settings_validation_is_fail_closed(self):
+        for settings, expected in (
+                ("Tunnel=1", "TunnelHostName"),
+                ("Tunnel=2", "Tunnel"),
+                ("TunnelPortNumber=22x", "TunnelPortNumber"),
+                ("TunnelPortNumber=999999999999999999999", "TunnelPortNumber"),
+                ("TunnelLocalPortNumber=8080", "private socket pair"),
+                ('Tunnel=1 TunnelHostName="two hosts"', "TunnelHostName")):
+            with self.subTest(settings=settings):
+                result = self.run_commands("open sftp://127.0.0.1:1/ -rawsettings " + settings)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stderr)
+        for protocol in ("ftp", "ftps", "dav", "webdav", "s3"):
+            result = self.run_commands("open %s://127.0.0.1:1/ -rawsettings Tunnel=1 TunnelHostName=jump" % protocol)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("will not be connected directly", result.stderr)
+
+    def test_global_rawsettings_have_counted_operands(self):
+        for args, expected in ((["-rawsettings=1", "Tunnel=0"], 0),
+                               (["-rawsettings", "Tunnel=0"], 0),
+                               (["-rawsettings=2", "Tunnel=0"], 1),
+                               (["-rawsettings=bad", "Tunnel=0"], 1),
+                               (["-rawsettings=1", "ImaginarySetting=1"], 1)):
+            result = subprocess.run([BINARY, *args, "-command=echo done"],
+                                    capture_output=True, text=True, timeout=10, env=self.environment())
+            self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+            if expected == 0:
+                self.assertIn("done", result.stdout)
+
+    def test_tunnel_storage_redaction_and_unreadable_credentials(self):
+        log = pathlib.Path(self.config) / "actions.xml"
+        commands = ('option echo on\nsavesession tunneled -host=destination -rawsettings '
+                    'Tunnel=1 TunnelHostName=jump TunnelUserName=jumper '
+                    'TunnelHostKey=SHA256:pinned TunnelPublicKeyFile="/keys/jump key" '
+                    'TunnelPassword="  password with \\"quotes\\"  " '
+                    "'TunnelPassphrase=phrase with spaces'\nexit\n")
+        result = subprocess.run([BINARY, "-batch", "-script=/dev/stdin", "-xmllog=" + str(log)],
+                                input=commands, capture_output=True, text=True, timeout=10,
+                                env=self.environment())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        ini = pathlib.Path(self.config) / "sessions.ini"
+        key = pathlib.Path(self.config) / "sessions.key"
+        contents = ini.read_text()
+        for secret in ('password with', 'phrase with spaces'):
+            self.assertNotIn(secret, contents)
+            self.assertNotIn(secret, result.stdout + result.stderr)
+            self.assertNotIn(secret, log.read_text())
+        self.assertIn("TunnelPassword=***", result.stdout)
+        self.assertIn("TunnelPassphrase=***", result.stdout)
+        self.assertIn("tunnel_password=lscp1$", contents)
+        self.assertIn("tunnel_passphrase=lscp1$", contents)
+        self.assertEqual(ini.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+        saved_key = key.read_bytes()
+        encrypted = [line for line in contents.splitlines() if line.startswith(("tunnel_password=", "tunnel_passphrase="))]
+        key.unlink()
+        # An unrelated edit preserves opaque ciphertext rather than discarding it.
+        result = self.run_commands("savesession tunneled -host=destination -rawsettings TunnelUserName=other")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for line in encrypted:
+            self.assertIn(line, ini.read_text())
+        result = self.run_commands("open tunneled")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot be used", result.stderr)
+        self.assertNotIn("Connecting to", result.stdout)
+        key.write_bytes(saved_key)
+        key.chmod(0o600)
+        # Disabling the tunnel drops its stored secrets, not the shared key file.
+        result = self.run_commands("savesession tunneled -host=destination -rawsettings Tunnel=0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("tunnel_", ini.read_text())
+        self.assertTrue(key.exists())
+
+    def test_tunnel_plain_aliases_encrypt_and_replace_locked_credentials(self):
+        result = self.run_commands('option echo on; savesession alias -host=destination '
+                                  '-rawsettings Tunnel=1 TunnelHostName=jump '
+                                  'TunnelPasswordPlain="alias password" '
+                                  '\'TunnelPassphrasePlain=alias phrase\'')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("TunnelPasswordPlain=***", result.stdout)
+        self.assertIn("TunnelPassphrasePlain=***", result.stdout)
+        ini = pathlib.Path(self.config) / "sessions.ini"
+        first = ini.read_text()
+        self.assertIn("tunnel_password=lscp1$", first)
+        self.assertIn("tunnel_passphrase=lscp1$", first)
+        for secret in ("alias password", "alias phrase"):
+            self.assertNotIn(secret, first + result.stdout + result.stderr)
+        # The aliases must also replace, not preserve, opaque old ciphertext.
+        (pathlib.Path(self.config) / "sessions.key").unlink()
+        result = self.run_commands('savesession alias -host=destination -rawsettings '
+                                  'TunnelPasswordPlain="new password" TunnelPassphrasePlain="new phrase"')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        current = ini.read_text()
+        self.assertIn("tunnel_password=lscp1$", current)
+        for line in first.splitlines():
+            if line.startswith(("tunnel_password=", "tunnel_passphrase=")):
+                self.assertNotIn(line, current)
+        self.assertNotIn("new password", current)
+
+    def test_corrupt_stored_tunnel_toggle_cannot_become_a_direct_connection(self):
+        ini = pathlib.Path(self.config) / "sessions.ini"
+        ini.write_text('[broken]\nhost=127.0.0.1\nport=1\ntunnel=maybe\ntunnel_host=jump\n')
+        result = self.run_commands("open broken")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stored setting 'tunnel'", result.stderr)
+        self.assertNotIn("Connecting to", result.stdout)
+
+
 def run_and_report():
     """Run the suite, then print one line that says what was actually run.
 

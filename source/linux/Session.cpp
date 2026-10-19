@@ -27,13 +27,20 @@
 #include <unistd.h>
 
 #include <libssh/libssh.h>
+#include <libssh/callbacks.h>
 #include <libssh/sftp.h>
+
+#if LIBSSH_VERSION_INT < SSH_VERSION_INT(0, 10, 0)
+#error "LinSCP requires libssh 0.10 or newer (caller-owned transport sockets)."
+#endif
 
 namespace linscp {
 
 namespace {
 
 Session * g_currentSession = NULL;
+
+bool HasWhitespaceOrControl(const std::string & text);
 
 std::string LowerCaseAscii(const std::string & text)
 {
@@ -203,7 +210,7 @@ int TcpConnect(const std::string & host, int port, int timeoutSecs,
     int fd = -1;
     for (struct addrinfo * ai = addresses; ai != NULL; ai = ai->ai_next)
     {
-        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
         if (fd < 0)
         {
             continue;
@@ -499,6 +506,7 @@ int ProxySocket(const SessionOptions & options, std::string & error)
 SessionOptions::SessionOptions() :
     protocol("sftp"),
     portNumber(22),
+    cachePinnedHostKeys(true),
     timeoutSecs(15),
     verbose(false)
 {
@@ -824,6 +832,11 @@ bool ApplyProxyRawSetting(const std::string & name, const std::string & value,
 std::vector<std::string> SessionRawSettingNames()
 {
     std::vector<std::string> names = ProxyRawSettingNames();
+    for (const char * name : {"Tunnel", "TunnelHostName", "TunnelPortNumber",
+            "TunnelUserName", "TunnelPassword", "TunnelPublicKeyFile",
+            "TunnelPassphrase", "TunnelHostKey", "TunnelLocalPortNumber",
+            "TunnelPasswordPlain", "TunnelPassphrasePlain"})
+        names.push_back(name);
     /* The FTP engine's policy, under upstream's names. */
     names.push_back("FtpPasvMode");
     names.push_back("FtpForcePasvIp");
@@ -962,6 +975,48 @@ bool ApplySessionRawSetting(const std::string & name, const std::string & value,
     {
         return ApplyProxyRawSetting(name, value, options.proxy, error);
     }
+
+    if (lower == "tunnel")
+    {
+        if (text != "0" && text != "1")
+        {
+            error = Texts::Translate("Tunnel must be 0 (off) or 1 (on).");
+            return false;
+        }
+        options.tunnel.enabled = text == "1";
+        return true;
+    }
+    if (lower == "tunnelportnumber")
+    {
+        int port = 0;
+        if (!ParsePortValue(text, port) || port < 1 || port > 65535)
+        {
+            error = Texts::Translate("TunnelPortNumber must be between 1 and 65535.");
+            return false;
+        }
+        options.tunnel.portNumber = port;
+        return true;
+    }
+    if (lower == "tunnellocalportnumber")
+    {
+        // Unlike upstream, the native tunnel exposes no listening port.
+        if (text != "0")
+        {
+            error = Texts::Translate("TunnelLocalPortNumber must be 0: native SSH tunnels use "
+                "a private socket pair, not a TCP listener.");
+            return false;
+        }
+        return true;
+    }
+    if (lower == "tunnelhostname") { options.tunnel.hostName = text; return true; }
+    if (lower == "tunnelusername") { options.tunnel.userName = text; return true; }
+    if (lower == "tunnelhostkey") { options.tunnel.hostKey = text; return true; }
+    if (lower == "tunnelpublickeyfile") { options.tunnel.privateKeyFile = value; return true; }
+    // Passwords and passphrases are opaque, including leading/trailing spaces.
+    if (lower == "tunnelpassword" || lower == "tunnelpasswordplain")
+        { options.tunnel.password = value; return true; }
+    if (lower == "tunnelpassphrase" || lower == "tunnelpassphraseplain")
+        { options.tunnel.keyPassphrase = value; return true; }
 
     if (lower == "ftppasvmode")
     {
@@ -1446,6 +1501,27 @@ bool ValidateSessionSettings(const SessionOptions & options, std::string & error
     {
         return false;
     }
+    if (options.tunnel.enabled)
+    {
+        if (!UseNativeSftp(options.protocol) && !UseNativeScp(options.protocol))
+        {
+            error = Texts::Translate("SSH tunnels currently support sftp://, scp:// and ssh:// "
+                "sessions only; this protocol will not be connected directly.");
+            return false;
+        }
+        if (options.tunnel.hostName.empty() ||
+            HasWhitespaceOrControl(options.tunnel.hostName))
+        {
+            error = Texts::Translate("TunnelHostName must be a nonempty host name without "
+                "whitespace or control characters.");
+            return false;
+        }
+        if (options.tunnel.portNumber < 1 || options.tunnel.portNumber > 65535)
+        {
+            error = Texts::Translate("TunnelPortNumber must be between 1 and 65535.");
+            return false;
+        }
+    }
     if (options.tls.minVersion != 0 && options.tls.maxVersion != 0 &&
         options.tls.minVersion > options.tls.maxVersion)
     {
@@ -1872,8 +1948,71 @@ bool ParseSiteUrl(const std::string & url, SessionOptions & options, std::string
     return true;
 }
 
+// libssh can receive data, exit-status and transport shutdown in one poll.
+// A later get_exit_status() rejects a session in SSH_SESSION_STATE_ERROR even
+// if the authenticated status was already received. Consume exec/shell data
+// and record completion while processing the packets, before that teardown.
+// Status alone is NOT completion: require the peer's EOF or channel-close too.
+struct Session::ChannelCallbacks
+{
+    ssh_channel_callbacks_struct callbacks{};
+    Session & owner;
+    int status = INT_MAX;
+    bool remoteEnd = false;
+    bool receivedData = false;
+
+    explicit ChannelCallbacks(Session & session) : owner(session)
+    {
+        ssh_callbacks_init(&callbacks);
+        callbacks.userdata = this;
+        callbacks.channel_data_function = OnData;
+        callbacks.channel_eof_function = OnEnd;
+        callbacks.channel_close_function = OnEnd;
+        callbacks.channel_exit_status_function = OnStatus;
+        callbacks.channel_exit_signal_function = OnSignal;
+    }
+
+    void UpdateStatus()
+    {
+        if (remoteEnd && status != INT_MAX) owner.mExitCode = status;
+    }
+
+    static int OnData(ssh_session, ssh_channel, void * data, uint32_t length,
+        int isStderr, void * context)
+    {
+        ChannelCallbacks & self = *static_cast<ChannelCallbacks *>(context);
+        self.receivedData = true;
+        self.owner.HandleChannelData(data, length, isStderr != 0);
+        return static_cast<int>(length); // All bytes delivered; none left buffered in libssh.
+    }
+
+    static void OnEnd(ssh_session, ssh_channel, void * context)
+    {
+        ChannelCallbacks & self = *static_cast<ChannelCallbacks *>(context);
+        self.remoteEnd = true;
+        self.UpdateStatus();
+    }
+
+    static void OnStatus(ssh_session, ssh_channel, int status, void * context)
+    {
+        ChannelCallbacks & self = *static_cast<ChannelCallbacks *>(context);
+        self.status = status >= 0 ? status : 1;
+        self.UpdateStatus();
+    }
+
+    static void OnSignal(ssh_session, ssh_channel, const char *, int,
+        const char *, const char *, void * context)
+    {
+        ChannelCallbacks & self = *static_cast<ChannelCallbacks *>(context);
+        self.status = 1; // A signalled command must never become a successful exit.
+        self.UpdateStatus();
+    }
+};
+
 Session::Session() :
     mSsh(NULL),
+    mTransportSocket(-1),
+    mTunnelTransport(false),
     mChannel(NULL),
     mSftp(NULL),
     mExitCode(INT_MAX),
@@ -1944,6 +2083,19 @@ void Session::DeliverChannelData(const void * data, size_t len)
         return;
     }
     PushReceivedData(data, len);
+}
+
+void Session::HandleChannelData(const void * data, size_t len, bool isStderr)
+{
+    if (isStderr && !mShellMode)
+    {
+        if (mCaptureStderr) AppendCapturedStderr(data, len);
+        else Console::Instance().Write(std::string(static_cast<const char *>(data), len));
+    }
+    else
+    {
+        DeliverChannelData(data, len);
+    }
 }
 
 Session::~Session()
@@ -2051,9 +2203,8 @@ size_t Session::SendBufferSize()
 /*
  * One pump of an exec or shell channel: reads whatever stdout and
  * stderr are available without blocking for long, delivers them, and
- * notices the end of the command. An SFTP session has no channel to
- * pump (libssh's SFTP calls drive the connection themselves), so it
- * simply reports whether the session is alive.
+ * notices the end of the command. SFTP responses use the same pump, feeding
+ * the native protocol buffer rather than an exec/shell output callback.
  */
 bool Session::Pump()
 {
@@ -2063,6 +2214,7 @@ bool Session::Pump()
     }
     ssh_channel channel = static_cast<ssh_channel>(mChannel);
     bool readAny = false;
+    if (mChannelCallbacks) mChannelCallbacks->receivedData = false;
     for (int stream = 0; stream < 2; stream++)
     {
         const int isStderr = stream == 1 ? 1 : 0;
@@ -2082,6 +2234,11 @@ bool Session::Pump()
             if (got == SSH_ERROR)
             {
                 mAlive = false;
+                // Data callbacks consumed every preceding byte, and a known
+                // status is published only after authenticated EOF/close.
+                // A subsequent transport shutdown cannot invalidate that
+                // completed command. A truncated stream still fails below.
+                if (mChannelCallbacks && mExitCode != INT_MAX) return false;
                 if (mConnectionError.empty())
                 {
                     const char * reason = ssh_get_error(
@@ -2096,40 +2253,23 @@ bool Session::Pump()
                 break;
             }
             readAny = true;
-            if (isStderr && !mShellMode)
-            {
-                /*
-                 * The native SCP engine reads a command's error output
-                 * as the reason for a failure instead of printing it.
-                 * Anything else - the 'call' command, whose output
-                 * belongs on the screen - keeps printing it.
-                 */
-                if (mCaptureStderr)
-                {
-                    AppendCapturedStderr(buffer, static_cast<size_t>(got));
-                }
-                else
-                {
-                    Console::Instance().Write(
-                        std::string(buffer, static_cast<size_t>(got)));
-                }
-            }
-            else
-            {
-                DeliverChannelData(buffer, static_cast<size_t>(got));
-            }
+            HandleChannelData(buffer, static_cast<size_t>(got), isStderr != 0);
         }
     }
     if (ssh_channel_is_eof(channel) || ssh_channel_is_closed(channel))
     {
-        const int exitCode = ssh_channel_get_exit_status(channel);
-        if (exitCode >= 0)
+        if (mExitCode == INT_MAX)
         {
-            mExitCode = exitCode;
+            // EOF can precede the status. This drives pending packets; a
+            // callback still retains the status if the getter reports an
+            // error after processing it and a transport close together.
+            const int exitCode = ssh_channel_get_exit_status(channel);
+            if (exitCode >= 0) mExitCode = exitCode;
         }
         mAlive = false;
         return false;
     }
+    if (mChannelCallbacks) readAny = readAny || mChannelCallbacks->receivedData;
     if (!readAny && mAlive)
     {
         /* Wait briefly for the channel to produce something, so a
@@ -2332,20 +2472,24 @@ bool VerifyServerKey(Session & session, ssh_session ssh, std::string & error)
      * An SCP session opens a connection per command and is offered the
      * same key every time, so the line is printed once per host and key
      * per process. */
-    const std::string hostkeyLine = "HOSTKEY " + keytype + " " + fingerprint;
+    const std::string hostkeyLine = std::string(session.IsTunnelTransport() ?
+        "TUNNELHOSTKEY " : "HOSTKEY ") + keytype + " " + fingerprint;
     static std::set<std::string> reportedHostKeys;
     const bool hostKeyAlreadyReported = !reportedHostKeys.insert(
-        host + ":" + std::to_string(port) + " " + keytype + " " +
-        fingerprint).second;
+        host + ":" + std::to_string(port) + " " + hostkeyLine).second;
 
     if (session.ExpectHostKey())
     {
         if (session.HostKeyMatches(fingerprint) ||
             session.HostKeyMatches(md5Fingerprint))
         {
-            StoreHostKey(host.c_str(), port, keytype.c_str(), blob.c_str());
+            if (options.cachePinnedHostKeys)
+                StoreHostKey(host.c_str(), port, keytype.c_str(), blob.c_str());
             return true;
         }
+        console.WriteLine(hostkeyLine);
+        console.WriteLine(std::string("HOSTKEYSTATE ") +
+            (session.IsTunnelTransport() ? "tunnel" : "destination") + " changed");
         console.Error(Texts::HostKeyUnexpected(host, port, keytype,
             fingerprint, session.ExpectedHostKey()));
         error = "The host key does not match the expected one";
@@ -2373,6 +2517,8 @@ bool VerifyServerKey(Session & session, ssh_session ssh, std::string & error)
     if (cacheState < 0)
     {
         console.WriteLine(hostkeyLine);
+        console.WriteLine(std::string("HOSTKEYSTATE ") +
+            (session.IsTunnelTransport() ? "tunnel" : "destination") + " changed");
         console.Error(Texts::HostKeyMismatch(host, port, keytype, fingerprint));
         error = "The host key does not match the cached one";
         return false;
@@ -2382,7 +2528,9 @@ bool VerifyServerKey(Session & session, ssh_session ssh, std::string & error)
     console.Error(Texts::HostKeyUnknown(host, port, keytype, fingerprint));
     if (!console.IsInteractive())
     {
-        error = "The host key is not cached; use -hostkey to accept it";
+        error = session.IsTunnelTransport() ?
+            Texts::Translate("The tunnel host key is not cached; use -rawsettings TunnelHostKey=FINGERPRINT to accept it") :
+            "The host key is not cached; use -hostkey to accept it";
         return false;
     }
     if (console.Confirm(
@@ -2619,7 +2767,7 @@ bool Session::Open(const SessionOptions & options, std::string & error)
      * transport cannot honour would otherwise turn into a direct connection
      * the session never asked for.
      */
-    if (!ValidateProxySettings(options.proxy, error))
+    if (!ValidateSessionSettings(options, error))
     {
         return false;
     }
@@ -2687,7 +2835,7 @@ bool Session::Connect(const SessionOptions & options, const char * program,
         error = "The connection timeout must be a positive number of seconds.";
         return false;
     }
-    if (!ValidateProxySettings(options.proxy, error))
+    if (!ValidateSessionSettings(options, error))
     {
         return false;
     }
@@ -2742,7 +2890,24 @@ bool Session::Connect(const SessionOptions & options, const char * program,
         (!mOptions.proxy.evenLocalhost &&
             (mOptions.hostName == "localhost" ||
              mOptions.hostName == "127.0.0.1" || mOptions.hostName == "::1"));
-    if (!directProxy)
+    if (mOptions.tunnel.enabled)
+    {
+        mTunnel.reset(new SshJumpTunnel());
+        mTransportSocket = mTunnel->Start(mOptions, error);
+        if (mTransportSocket < 0)
+        {
+            Close();
+            return false;
+        }
+        socket_t sock = static_cast<socket_t>(mTransportSocket);
+        if (ssh_options_set(ssh, SSH_OPTIONS_FD, &sock) != SSH_OK)
+        {
+            error = Texts::Translate("Cannot attach the SSH tunnel transport.");
+            Close();
+            return false;
+        }
+    }
+    else if (!directProxy)
     {
         const ProxySettings & proxy = mOptions.proxy;
         Console::Instance().LogEvent(std::string("Connecting through the ") +
@@ -2773,8 +2938,14 @@ bool Session::Connect(const SessionOptions & options, const char * program,
                 Close();
                 return false;
             }
+            mTransportSocket = fd;
             socket_t sock = static_cast<socket_t>(fd);
-            ssh_options_set(ssh, SSH_OPTIONS_FD, &sock);
+            if (ssh_options_set(ssh, SSH_OPTIONS_FD, &sock) != SSH_OK)
+            {
+                error = Texts::Translate("Cannot attach the proxy transport.");
+                Close();
+                return false;
+            }
         }
     }
 
@@ -2833,7 +3004,7 @@ bool Session::Connect(const SessionOptions & options, const char * program,
         }
         mChannel = channel;
     }
-    else
+    else if (program != NULL)
     {
         ssh_channel channel = ssh_channel_new(ssh);
         if (channel == NULL || ssh_channel_open_session(channel) != SSH_OK)
@@ -2849,6 +3020,13 @@ bool Session::Connect(const SessionOptions & options, const char * program,
             return false;
         }
         mChannel = channel;
+        mChannelCallbacks.reset(new ChannelCallbacks(*this));
+        if (ssh_set_channel_callbacks(channel, &mChannelCallbacks->callbacks) != SSH_OK)
+        {
+            error = Texts::Translate("Cannot register SSH channel callbacks.");
+            Close();
+            return false;
+        }
         int rc;
         if (mShellMode)
         {
@@ -2877,13 +3055,19 @@ bool Session::Connect(const SessionOptions & options, const char * program,
     return true;
 }
 
+bool Session::OpenTunnelTransport(const SessionOptions & options, std::string & error)
+{
+    mTunnelTransport = true;
+    return Connect(options, NULL, false, false, error);
+}
+
 void Session::Close()
 {
-    /* libssh keeps no SFTP request bookkeeping to release, but the call
-     * keeps the SFTP client's error state tidy for the next session. */
-    lscp_sftp_cleanup();
+    // Only the owner may reset the process-wide SFTP state. An exec or
+    // jump transport can close while the main SFTP session is still active.
     if (g_currentSession == this)
     {
+        lscp_sftp_cleanup();
         SetCurrentSession(NULL);
     }
     if (mSftp != NULL)
@@ -2904,6 +3088,16 @@ void Session::Close()
         ssh_free(static_cast<ssh_session>(mSsh));
         mSsh = NULL;
     }
+    // libssh can retain a locally freed channel until session teardown;
+    // keep callback storage alive through both channel_free and ssh_free.
+    mChannelCallbacks.reset();
+    if (mTransportSocket >= 0)
+    {
+        close(mTransportSocket);
+        mTransportSocket = -1;
+    }
+    // Close the destination before joining/releasing its jump transport.
+    mTunnel.reset();
     mShellMode = false;
     mReceived.clear();
     mReceivedStart = 0;
@@ -2993,7 +3187,12 @@ bool Session::ExecRemote(const SessionOptions & options,
         error = exec.ConnectionError();
         return false;
     }
-    if (exitCode > 0 && exitCode != INT_MAX)
+    if (exitCode == INT_MAX)
+    {
+        error = Texts::Translate("The remote command ended without an exit status.");
+        return false;
+    }
+    if (exitCode > 0)
     {
         error = "Command '" + command + "' failed with return code " +
             std::to_string(exitCode) + ".";

@@ -163,6 +163,7 @@ check-wayland:
 check-live: $(BINDIR)/linscp
 	$(PYTHON) tests/ScriptTest.py $(BINDIR)/linscp
 	$(PYTHON) tests/LiveSftpTest.py $(BINDIR)/linscp
+	$(PYTHON) tests/LiveTunnelTest.py $(BINDIR)/linscp
 	$(PYTHON) tests/LiveScpTest.py $(BINDIR)/linscp
 	$(PYTHON) tests/LiveS3Test.py $(BINDIR)/linscp
 	$(PYTHON) tests/LiveDavTest.py $(BINDIR)/linscp

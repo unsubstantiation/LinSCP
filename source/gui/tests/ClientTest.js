@@ -757,6 +757,42 @@ function options(id) {
     folderDel && JSON.parse(folderDel.options.body).name === 'GUI' &&
       JSON.parse(folderDel.options.body).folder === true);
 
+  window.fillSiteForm({name: 'jump-site', host: 'destination.example', protocol: 'sftp',
+    tunnel: true, tunnel_host: 'jump.example', tunnel_port: 2222,
+    tunnel_username: 'jumper', tunnel_password: 'jump-secret',
+    tunnel_passphrase: 'phrase', tunnel_hostkey: 'SHA256:jump'});
+  check('site manager restores SSH tunnel settings',
+    doc.getElementById('siteTunnel').checked &&
+    doc.getElementById('siteTunnelHost').value === 'jump.example' &&
+    doc.getElementById('siteTunnelPort').value === '2222' &&
+    doc.getElementById('siteTunnelHostKey').value === 'SHA256:jump' &&
+    !doc.getElementById('siteTunnelFields').disabled);
+  doc.getElementById('siteTunnelRemember').checked = false;
+  await window.saveSite();
+  const tunnelSave = JSON.parse(calls.filter(c => c.path === '/api/sessions/save').pop().options.body);
+  check('tunnel credentials are saved only when requested',
+    tunnelSave.session.tunnel && tunnelSave.session.tunnel_host === 'jump.example' &&
+    tunnelSave.session.tunnel_password === '' && tunnelSave.session.tunnel_passphrase === '');
+  window.showHostKeyChallenge({tab: 1, role: 'tunnel', host: 'jump.example', port: 2222,
+    fingerprint: 'SHA256:jump'});
+  check('host-key dialog distinguishes the SSH tunnel host',
+    text('hostKeyQuestion').includes('SSH tunnel host') && text('hostKeyQuestion').includes('jump.example'));
+  await window.acceptHostKey();
+  const tunnelVerify = JSON.parse(calls.filter(c => c.path === '/api/tabs/verify').pop().options.body);
+  check('host-key confirmation carries the tunnel role', tunnelVerify.role === 'tunnel');
+  window.showHostKeyChallenge({tab: 1, role: 'tunnel', host: 'jump.example', port: 2222,
+    fingerprint: 'SHA256:changed', changed: true});
+  check('changed tunnel keys carry a prominent warning and do not default to remember',
+    text('hostKeyTitle') === 'Changed host key' &&
+    text('hostKeyQuestion').includes('connection may be intercepted') &&
+    !text('hostKeyQuestion').includes('not cached yet') &&
+    !doc.getElementById('hostKeyRemember').checked);
+  await window.cancelHostKey();
+  window.newSite();
+  check('a new site resets and disables SSH tunnel fields',
+    !doc.getElementById('siteTunnel').checked && doc.getElementById('siteTunnelFields').disabled &&
+    doc.getElementById('siteTunnelPass').value === '');
+
   // The site form's port follows the protocol while it is still a default,
   // and keeps a port the user typed. The form used to leave 22 under every
   // protocol, so an FTP site was stored with the SSH port.

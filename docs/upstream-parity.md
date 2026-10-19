@@ -12,7 +12,14 @@ The inventory is pinned to [winscp/winscp at
 It is a development snapshot, not a claim about the latest release. The initial
 source review compared upstream `source/core/Script.cpp`, `Script.h`,
 `CopyParam.h`, `Terminal.h`, and core/forms inventories with the Linux client,
-build configuration and GUI. Linux inventory reconciliation: **2026-10-18**.
+build configuration and GUI. Linux inventory reconciliation: **2026-10-19**.
+
+The 2026-10-19 command-registration review also compared upstream master
+[`24e7b4ec1001406cc2edf2b8c88483d66d4449d8`](https://github.com/winscp/winscp/tree/24e7b4ec1001406cc2edf2b8c88483d66d4449d8)
+with the pin: its `Script.cpp`/`Script.h` still register the same 40 commands.
+The pin is deliberately unchanged: reviewing registrations and the
+[13 intervening commits](https://github.com/winscp/winscp/compare/69edabbe2dc2c62661a7d3fc7e2396b5f42d504d...24e7b4ec1001406cc2edf2b8c88483d66d4449d8)
+is not an exhaustive behavioral review of upstream master.
 
 The source of truth is [upstream-parity.json](upstream-parity.json). Its generated
 [complete ledger view](linux-feature-inventory.md) includes:
@@ -40,7 +47,8 @@ The review corrected stale claims without upgrading unimplemented work:
   and object/version listing fails closed if a paginated response omits or
   repeats its continuation marker.
 - Native FTP directory/metadata operations, active/passive policy and TLS
-  settings are implemented; non-Unix LIST dialects remain missing.
+  settings are implemented. The shared LIST parser has named Unix, DOS/IIS
+  and VMS cases; this does not certify every server listing dialect.
 - Local-pane desktop drops, cross-browser enumeration APIs, local edit
   monitoring, session folders and conflict controls have test evidence. This
   does not certify all real browser/file-manager/server combinations.
@@ -64,8 +72,60 @@ The review corrected stale claims without upgrading unimplemented work:
   staging file is discarded.
 
 Upstream Windows VCL forms, .NET assemblies, Explorer commands and shell
-extensions have no Linux substitute. GSSAPI, SSH tunnels, multi-user GUI
-isolation, automation APIs and desktop extensions remain in the plan.
+extensions do not have full Linux equivalents. GSSAPI, broader tunnel policy,
+multi-user GUI isolation, automation APIs and desktop extensions remain in the
+plan.
+
+### SSH jump-host implementation and newly identified gaps
+
+- [SSH jump hosts](ssh-tunnels.md) now work for SFTP/SCP/SSH, with independent
+  credentials and host-key decisions, encrypted storage, inherited proxy routing,
+  GUI/background/terminal integration and bounded transport cleanup. The
+  `live-tunnel` suite is registered in Make, CTest and native CI. Slow transfers,
+  cancellation, timeout, failed keys/authentication/forwarding and per-hop
+  Remember choices are tested, not just a successful connection.
+- Transport-only and exec sessions no longer reset another session's global SFTP
+  state. Exec/shell data and exit-status callbacks now preserve authenticated
+  output/status when libssh processes completion and transport shutdown in one
+  poll. Status is accepted only with channel EOF/close; an early success status
+  followed by a truncated connection still fails. Repeated direct/tunneled shell
+  tests check full stdout/stderr bytes, exit 0/7 and this truncation case. The
+  fixture also joins its output threads before teardown.
+- Changed host keys have a distinct GUI warning. A tab-only approval no longer
+  implicitly enters the global cache. Remembering one hop neither remembers the
+  other hop nor implicitly saves connection passwords/passphrases.
+- Upstream `SessionData` exposes `IsLocalBrowser`/`OtherLocalDirectory` and
+  named workspace operations. LinSCP's local pane, saved sites/folders and live
+  tabs do not implement these workflows. `gui.local-to-local` and
+  `sessions.workspaces` are now explicit protected gaps in the ledger.
+- GUI sign-in has tested password hashing, expiry, throttling and CSRF tokens,
+  but no per-user isolation of resources or OS privileges. It is a partially
+  implemented LinSCP deployment extension, not an upstream desktop capability.
+
+The combined GSSAPI/tunnel row remains partial; a verified SSH-only subset does
+not close that gap. The full-parity gate must continue to fail until the
+remaining capabilities are implemented and independently evidenced.
+
+## Local verification on 2026-10-19
+
+These results cover this Linux checkout, not the upstream Windows test matrix:
+
+| Check | Result |
+| --- | --- |
+| Makefile build and `check` | Passed; 1,760 native checks, platform and Wayland guards |
+| CMake build and full CTest run | 24/24 CTest entries passed |
+| CLI script regressions | 78 cases, no skips/failures |
+| Live SFTP / SCP / S3 / WebDAV / FTP(S) | 37 / 17 / 18 / 26 / 10 cases, no skips/failures |
+| Live SSH jump hosts and shell completion | 18 cases, no skips/failures; includes repeated direct/tunneled shell subcases |
+| GUI security | 110 cases, no skips/failures |
+| Browser client, localization, GUI terminal/upload/editor/search/URI tests | Passed |
+| Translation generation and parity-inventory checks | Passed, including registrations at the reviewed upstream master |
+
+The PowerShell test entry passed its static checks but **skipped its live Pester
+suite because `pwsh` is absent**; this is not live PowerShell evidence. The full
+Debian package build and a real Wayland/X11 desktop acceptance run were not
+performed here. `--require-full` correctly exits nonzero with the remaining
+tracked gaps; a green normal CTest run does not override that gate.
 
 ## The platform conversion
 

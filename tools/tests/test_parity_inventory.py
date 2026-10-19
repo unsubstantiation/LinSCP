@@ -178,12 +178,15 @@ class InventoryTests(unittest.TestCase):
 
     def test_pinned_gaps_cannot_be_deleted_to_fake_full_parity(self):
         inventory = json.loads((ROOT / "docs/upstream-parity.json").read_text())
-        inventory["capabilities"] = [row for row in inventory["capabilities"]
-                                     if row["id"] != "dav.locks"]
-        errors = []
-        check_capabilities(inventory, errors)
-        self.assertIn("Pinned upstream gap was dropped from the inventory: dav.locks",
-                      errors)
+        for capability in ("dav.locks", "gui.local-to-local", "sessions.workspaces"):
+            with self.subTest(capability=capability):
+                candidate = copy.deepcopy(inventory)
+                candidate["capabilities"] = [row for row in candidate["capabilities"]
+                                             if row["id"] != capability]
+                errors = []
+                check_capabilities(candidate, errors)
+                self.assertIn("Pinned upstream gap was dropped from the inventory: " + capability,
+                              errors)
 
     def test_every_dispatcher_name_is_in_exactly_one_group(self):
         inventory = json.loads((ROOT / "docs/upstream-parity.json").read_text())

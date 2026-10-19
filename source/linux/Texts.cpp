@@ -92,6 +92,7 @@ std::string Usage()
 "  -script=FILE      execute commands from FILE ('-' reads stdin)\n"
 "  -command=CMD      execute commands (separate several with ';')\n"
 "  -literal          with -command, treat %...% in paths as literal text\n"
+"  -rawsettings[=N]  session defaults as N NAME=VALUE arguments (also -shell)\n"
 "  -hostkey=KEY      pin the host key (fingerprint or '*' for this connection)\n"
 "  -password=PWD     password to use (prefer the LINSCP_PASSWORD variable)\n"
 "  -privatekey=FILE  OpenSSH/PEM or PPK v2/v3 private key for authentication\n"

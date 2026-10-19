@@ -34,6 +34,7 @@
 #include "SyncPlanner.h"
 #include "ProtocolClient.h"
 #include "SshTunnel.h"
+#include "SftpClient.h"
 #include "Editor.h"
 #include "ScpClient.h"
 #include "FtpClient.h"
@@ -987,8 +988,19 @@ void TestSessionRegistry()
     CHECK_FALSE(session.IsAlive());
     SetCurrentSession(&session);
     CHECK_TRUE(CurrentSession() == &session);
-    SetCurrentSession(NULL);
+    // No network I/O: this owner has no channel, so init leaves an error.
+    CHECK_TRUE(lscp_sftp_init() != 0);
+    const std::string originalError = lscp_sftp_error();
+    CHECK_FALSE(originalError.empty());
+    {
+        Session auxiliary;
+        auxiliary.Close();
+    }
+    CHECK_TRUE(CurrentSession() == &session);
+    CHECK_EQ(lscp_sftp_error(), originalError);
+    session.Close();
     CHECK_TRUE(CurrentSession() == NULL);
+    CHECK_EQ(lscp_sftp_error(), "");
 }
 
 /* ------------------------------------------------------------------ *
@@ -3894,6 +3906,70 @@ void TestEncodingHelpers()
     }
 }
 
+
+void TestSshJumpSettings()
+{
+    SessionOptions options;
+    std::string error;
+    CHECK_FALSE(options.tunnel.enabled);
+    CHECK_TRUE(options.tunnel.portNumber == 22);
+    CHECK_TRUE(IsSessionRawSettingName("TunnelHostKey"));
+    CHECK_TRUE(ApplySessionRawSetting("tUnNeL", "1", options, error));
+    CHECK_FALSE(ValidateSessionSettings(options, error));
+    CHECK_TRUE(ApplySessionRawSetting("TunnelHostName", "jump.example", options, error));
+    CHECK_TRUE(ValidateSessionSettings(options, error));
+    for (const char * protocol : {"sftp", "scp", "ssh"})
+    {
+        options.protocol = protocol;
+        CHECK_TRUE(ValidateSessionSettings(options, error));
+    }
+    for (const char * protocol : {"ftp", "ftps", "dav", "webdav", "s3"})
+    {
+        options.protocol = protocol;
+        CHECK_FALSE(ValidateSessionSettings(options, error));
+        CHECK_TRUE(error.find("tunnel") != std::string::npos);
+    }
+    options.protocol = "sftp";
+    for (const char * host : {"", "two hosts", "host\ncommand", "host\tname"})
+    {
+        options.tunnel.hostName = host;
+        CHECK_FALSE(ValidateSessionSettings(options, error));
+    }
+    options.tunnel.hostName = "::1";
+    CHECK_TRUE(ValidateSessionSettings(options, error));
+    for (const char * value : {"0", "-1", "65536", "22x", "99999999999999999999", ""})
+    {
+        CHECK_FALSE(ApplySessionRawSetting("TunnelPortNumber", value, options, error));
+        CHECK_TRUE(options.tunnel.portNumber == 22);
+    }
+    CHECK_FALSE(ApplySessionRawSetting("Tunnel", "2", options, error));
+    CHECK_TRUE(options.tunnel.enabled);
+    CHECK_TRUE(ApplySessionRawSetting("TunnelPortNumber", "65535", options, error));
+    CHECK_TRUE(ApplySessionRawSetting("TunnelLocalPortNumber", "0", options, error));
+    CHECK_FALSE(ApplySessionRawSetting("TunnelLocalPortNumber", "8000", options, error));
+    CHECK_FALSE(ApplySessionRawSetting("TunnelPortFwd", "L8000:host:22", options, error));
+    CHECK_TRUE(ApplySessionRawSetting("TunnelPassword", "  secret  ", options, error));
+    CHECK_TRUE(ApplySessionRawSetting("TunnelPassphrase", "  passphrase  ", options, error));
+    CHECK_EQ(options.tunnel.password, std::string("  secret  "));
+    CHECK_EQ(options.tunnel.keyPassphrase, std::string("  passphrase  "));
+    CHECK_TRUE(IsSessionRawSettingName("TunnelPasswordPlain"));
+    CHECK_TRUE(IsSessionRawSettingName("TunnelPassphrasePlain"));
+    CHECK_TRUE(ApplySessionRawSetting("TunnelPasswordPlain", " alias secret ", options, error));
+    CHECK_TRUE(ApplySessionRawSetting("TunnelPassphrasePlain", " alias phrase ", options, error));
+    CHECK_EQ(options.tunnel.password, std::string(" alias secret "));
+    CHECK_EQ(options.tunnel.keyPassphrase, std::string(" alias phrase "));
+    StoredSession stored = SessionStore::FromSessionOptions("site", options, "/", "/");
+    CHECK_TRUE(stored.tunnel.enabled);
+    CHECK_TRUE(stored.tunnel.password.empty());
+    CHECK_TRUE(stored.tunnel.keyPassphrase.empty());
+    stored.tunnel.password = "saved";
+    CHECK_EQ(SessionStore::ToSessionOptions(stored, SessionOptions()).tunnel.password,
+        std::string("saved"));
+    CHECK_TRUE(ApplySessionRawSetting("Tunnel", "0", options, error));
+    options.protocol = "ftp";
+    CHECK_TRUE(ValidateSessionSettings(options, error));
+}
+
 void TestSshTunnelParsing()
 {
     /* Local tunnel */
@@ -4017,10 +4093,9 @@ void TestSshTunnelParsing()
         tunnel.bindPort = 1080;
         CHECK_EQ(TunnelSshFlags(tunnel), std::string("-D 0.0.0.0:1080"));
     }
-    /* GSSAPI detection: always available when NO_GSSAPI is not defined */
+    /* Library detection alone must never claim an authentication feature. */
     {
-        /* In the test build, GSSAPI is compiled out (NO_GSSAPI), so
-         * IsGssapiSupported should return false. */
+        /* Removing NO_GSSAPI must not turn a stub into claimed support. */
         std::string error;
         CHECK_FALSE(IsGssapiSupported());
         CHECK_FALSE(ApplyGssapiSetting("1", error));
@@ -4393,6 +4468,7 @@ int main()
     TestNonUnixListingFormats();
     TestEncodingHelpers();
     TestSshTunnelParsing();
+    TestSshJumpSettings();
     TestDavEtagHelpers();
     TestScpEngine();
 

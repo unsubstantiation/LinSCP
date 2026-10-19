@@ -444,6 +444,16 @@ SESSION_KEYS = {
 }
 
 
+# Field names are shared with sessions.ini; credentials never enter argv.
+TUNNEL_RAW_FIELDS = {
+    "tunnel": "Tunnel", "tunnel_host": "TunnelHostName",
+    "tunnel_port": "TunnelPortNumber", "tunnel_username": "TunnelUserName",
+    "tunnel_private_key": "TunnelPublicKeyFile", "tunnel_hostkey": "TunnelHostKey",
+    "tunnel_password": "TunnelPassword", "tunnel_passphrase": "TunnelPassphrase",
+}
+SESSION_KEYS.update({field: field for field in TUNNEL_RAW_FIELDS})
+
+
 # The port each protocol listens on when the site does not say: the same
 # table the console client applies to a URL without a port. 'dav' is
 # WebDAV over plain HTTP and 'webdav' over HTTPS, as in the client.
@@ -479,7 +489,8 @@ def validate_session_data(session, require_host=False):
     if any(ord(char) < 32 or ord(char) == 127 for char in host):
         return "The host name must not contain control characters."
     for field in ("username", "password", "keyfile", "hostkey",
-                  "initial_dir", "local_dir"):
+                  "initial_dir", "local_dir", "tunnel_host", "tunnel_username",
+                  "tunnel_private_key", "tunnel_hostkey", "tunnel_password", "tunnel_passphrase"):
         value = session.get(field)
         if value is not None and not isinstance(value, str):
             return "The session %s must be text." % field.replace("_", " ")
@@ -495,6 +506,20 @@ def validate_session_data(session, require_host=False):
             return "The port must be a number from 1 through 65535."
         if not 1 <= int(port_text) <= 65535:
             return "The port must be a number from 1 through 65535."
+    if "tunnel" in session and not isinstance(session["tunnel"], bool):
+        return "The SSH tunnel setting must be true or false."
+    if session.get("tunnel"):
+        if protocol not in ("sftp", "scp", "ssh"):
+            return "SSH tunnels require an SFTP or SCP session."
+        tunnel_host = session.get("tunnel_host") or ""
+        if not tunnel_host or any(char.isspace() for char in tunnel_host):
+            return "An SSH tunnel host name without whitespace is required."
+        tunnel_port = str(session.get("tunnel_port", 22))
+        if (len(tunnel_port) > 5 or not re.fullmatch(r"[0-9]+", tunnel_port) or
+                not 1 <= int(tunnel_port) <= 65535):
+            return "The SSH tunnel port must be a number from 1 through 65535."
+        if session.get("tunnel_error"):
+            return "The stored SSH tunnel credentials cannot be read; store them again."
     return ""
 
 
@@ -529,7 +554,12 @@ def read_stored_sessions():
         if field is None:
             continue
         value = _unescape(value.strip())
-        if field == "port":
+        if field == "tunnel":
+            # Keep malformed values invalid rather than silently connecting directly.
+            current[field] = value == "1" if value in ("0", "1") else value
+        elif field == "tunnel_port":
+            current[field] = int(value) if value.isascii() and value.isdigit() and len(value) <= 5 else value
+        elif field == "port":
             try:
                 current["port"] = int(value)
             except ValueError:
@@ -577,6 +607,18 @@ def read_stored_sessions():
             # existed; the console client rewrites it encrypted on the
             # next save.
             pass
+        item["tunnel_error"] = ""
+        for field in ("tunnel_password", "tunnel_passphrase"):
+            value = item.get(field) or ""
+            if value.startswith("lscp1$"):
+                item[field] = ""
+                try:
+                    key = linscp_crypto.load_key(linscp_crypto.key_path_for(path))
+                    item[field] = linscp_crypto.decrypt(value, key)
+                    if not item[field]:
+                        item["tunnel_error"] = "The stored SSH tunnel credential is empty."
+                except linscp_crypto.PasswordError as exc:
+                    item["tunnel_error"] = str(exc)
     sessions.sort(key=lambda item: item["name"].lower())
     return sessions
 
@@ -824,6 +866,9 @@ def new_session():
         "hostkey": "",
         "initial_dir": "/",
         "local_dir": os.path.expanduser("~"),
+        "tunnel": False, "tunnel_host": "", "tunnel_port": 22,
+        "tunnel_username": "", "tunnel_password": "", "tunnel_passphrase": "",
+        "tunnel_private_key": "", "tunnel_hostkey": "", "tunnel_error": "",
     }
 
 
@@ -884,27 +929,23 @@ def core_command_line(session):
         cmd.append("-privatekey=" + str(session["keyfile"]))
     if session.get("username"):
         cmd.append("-username=" + str(session["username"]))
+    if session.get("tunnel"):
+        error = validate_session_data(session)
+        if error:
+            raise ValueError(error)
+        settings = []
+        for field, name in TUNNEL_RAW_FIELDS.items():
+            if field in ("tunnel_password", "tunnel_passphrase"):
+                continue
+            value = "1" if field == "tunnel" else str(session.get(field, 22 if field == "tunnel_port" else ""))
+            settings.append(name + "=" + value)
+        cmd += ["-rawsettings=" + str(len(settings))] + settings
     return cmd
 
 
 def _censored_command(text):
-    """A command line as it may be written to the GUI log.
-
-    The console client masks passwords in its own logs the same way;
-    this one must not write what the core was spared from seeing on its
-    command line. A URL userinfo password and a '-password=' value both
-    become '***'.
-    """
-    import re as _re
-    text = _re.sub(r"(://[^/:@\s]+:)[^@\s]+(@)",
-                   r"\1***\2", text)
-    text = _re.sub(r"(?i)(-password=)([^\s;\"]+)",
-                   r"\1***", text)
-    text = _re.sub(r"(?i)(-password=\")([^\"]*)(\")",
-                   r"\1***\3", text)
-    text = _re.sub(r"(?i)(proxypassword=)([^\s;\"]+)",
-                   r"\1***", text)
-    return text
+    """Compatibility helper; every log path shares the same credential mask."""
+    return redact_command_for_log(text, replacement="***", preserve_quotes=True)
 
 
 # ---------------------------------------------------------------------------
@@ -921,10 +962,12 @@ def ui_language(environment=None):
     return "es" if base == "es" else "en"
 
 
-def popen_kwargs(password=None):
+def popen_kwargs(password=None, session=None):
     # These processes speak an internal machine protocol. Browser messages
     # are localized separately; changing these diagnostics breaks parsers.
-    environment = dict(os.environ, LINSCP_LANGUAGE="en")
+    # Only the GUI's explicit Remember action may persist a key. In
+    # particular, accepting one hop must not cache the other hop's pin.
+    environment = dict(os.environ, LINSCP_LANGUAGE="en", LINSCP_CACHE_PINNED_HOSTKEYS="0")
     if password:
         # The password of the session, where the process list cannot see
         # it: the core reads LINSCP_PASSWORD into every session it opens.
@@ -933,6 +976,13 @@ def popen_kwargs(password=None):
         environment["LINSCP_PASSWORD"] = password
     else:
         environment.pop("LINSCP_PASSWORD", None)
+    for field, name in (("tunnel_password", "LINSCP_TUNNEL_PASSWORD"),
+                        ("tunnel_passphrase", "LINSCP_TUNNEL_PASSPHRASE")):
+        value = (session or {}).get(field) if (session or {}).get("tunnel") else None
+        if value:
+            environment[name] = value
+        else:
+            environment.pop(name, None)
     kwargs = {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
@@ -991,13 +1041,26 @@ def split_linscp_commands(text):
     return result
 
 
-def redact_command_for_log(command):
-    """Remove passwords embedded in command switches or site URLs."""
-    text = re.sub(r'(?i)(-password=)(?:"(?:\\.|[^"])*"|[^\s;]+)',
-                  r"\1<redacted>", command)
+def redact_command_for_log(command, replacement="<redacted>", preserve_quotes=False):
+    """Mask credentials in both Name="value" and "Name=value" spellings."""
+    token_pattern = r"(?:[^\s\"'\\]+|\\.|\"(?:\\.|[^\"])*\"|'[^']*')+"
+    secret_pattern = re.compile(r"(?i)(?:-password|-passphrase|proxypassword|tunnelpassword|tunnelpassphrase)(?:plain)?=")
+
+    def redact_token(match):
+        token = match.group()
+        secret = secret_pattern.search(token)
+        if secret:
+            prefix = token[:secret.end()].lstrip('\"\'')
+            quote = token[secret.end():secret.end() + 1]
+            if preserve_quotes and quote in ("'", '"'):
+                return prefix + quote + replacement + quote
+            return prefix + replacement
+        return token
+
+    text = re.sub(token_pattern, redact_token, command)
     return re.sub(
         r'(?i)([a-z][a-z0-9+.-]*://[^:/@\s]+:)[^@/\s]*@',
-        r"\1<redacted>@", text)
+        lambda match: match.group(1) + replacement + "@", text)
 
 
 class CoreCommandProcess:
@@ -1054,7 +1117,7 @@ class CoreCommandProcess:
     def start(self, timeout=15):
         command = core_command_line(self.session) + ["-server"]
         self.process = subprocess.Popen(
-            command, **popen_kwargs(self.session.get("password")))
+            command, **popen_kwargs(self.session.get("password"), self.session))
         for name, stream in (("stdout", self.process.stdout),
                              ("stderr", self.process.stderr)):
             threading.Thread(target=self._pump, args=(stream, name),
@@ -1263,6 +1326,8 @@ class CoreSession(object):
         self.local_dir = session.get("local_dir") or os.path.expanduser("~")
         self.connected = False
         self.observed_hostkey = ""
+        self.hostkey_role = "destination"
+        self.hostkey_changed = False
         self.error = ""
         self.proc = None
         self.lock = threading.RLock()
@@ -1282,15 +1347,10 @@ class CoreSession(object):
         with self.lock:
             if self.proc is not None and self.proc.poll() is None:
                 return True, ""
-            cmd = [find_linscp_binary(), "-server", "-batch=on"]
-            hostkey = (self.session.get("hostkey") or "").strip()
-            if hostkey:
-                cmd.append("-hostkey=" + hostkey)
-            if self.session.get("keyfile"):
-                cmd.append("-privatekey=" + self.session["keyfile"])
+            cmd = core_command_line(self.session) + ["-server"]
             try:
                 self.proc = subprocess.Popen(
-                    cmd, **popen_kwargs(self.session.get("password")))
+                    cmd, **popen_kwargs(self.session.get("password"), self.session))
             except OSError as exc:
                 self.error = str(exc)
                 return False, self.error
@@ -1329,6 +1389,9 @@ class CoreSession(object):
             self.connected = False
             self.error = error
             return False, error
+        self.observed_hostkey = ""
+        self.hostkey_role = "destination"
+        self.hostkey_changed = False
         path = self.session.get("initial_dir") or "/"
         code, output, errors = self.run_capture(
             "open " + quote_remote(session_url(self.session, path)))
@@ -1336,8 +1399,11 @@ class CoreSession(object):
         # not: a refused connection is exactly when a client needs it, to
         # offer pinning the key that was turned down.
         for line in output + errors:
-            if line.startswith("HOSTKEY "):
+            if line.startswith(("HOSTKEY ", "TUNNELHOSTKEY ")):
                 self.observed_hostkey = line.split(" ", 2)[-1].strip()
+                self.hostkey_role = "tunnel" if line.startswith("TUNNELHOSTKEY ") else "destination"
+            elif line == "HOSTKEYSTATE %s changed" % self.hostkey_role:
+                self.hostkey_changed = True
         if code != 0:
             detail = output + errors
             self.error = redact_command_for_log(
@@ -1507,13 +1573,20 @@ class CoreSession(object):
             self.proc = None
             self.connected = False
 
+    def hostkey_challenge(self):
+        prefix = "tunnel_" if self.hostkey_role == "tunnel" else ""
+        return {"tab": self.id, "host": self.session.get(prefix + "host"),
+                "port": self.session.get(prefix + "port", 22),
+                "fingerprint": self.observed_hostkey, "role": self.hostkey_role,
+                "changed": self.hostkey_changed}
+
     def describe(self):
         return {
             "id": self.id,
             "name": self.name,
             "connected": self.connected and self.alive(),
             "session": {key: value for key, value in self.session.items()
-                        if key != "password"},
+                        if key not in ("password", "tunnel_password", "tunnel_passphrase")},
             "remote_dir": self.remote_dir,
             "local_dir": self.local_dir,
             "observed_hostkey": self.observed_hostkey,
@@ -1669,7 +1742,7 @@ def start_terminal(tab):
         raise ValueError("A terminal is only available for "
                          "SSH (sftp:// or scp://) sessions.")
     argv = core_command_line(session) + ["-shell", session_url(session)]
-    env = popen_kwargs(session.get("password"))["env"]
+    env = popen_kwargs(session.get("password"), session)["env"]
     term = TerminalProcess(argv, env)
     terminal_id = secrets.token_hex(8)
     with TERMINALS_LOCK:
@@ -2860,7 +2933,7 @@ def parse_sync_preview(output):
 # HTTP API
 # ---------------------------------------------------------------------------
 
-def save_stored_session(name, session, pin_hostkey=False):
+def save_stored_session(name, session, pin_hostkey=False, preserve_tunnel_credentials=False):
     """Write a session through 'savesession', so sessions.ini stays the only
     copy of it. Returns (ok, message)."""
     command = "savesession %s" % quote_remote(name)
@@ -2894,6 +2967,21 @@ def save_stored_session(name, session, pin_hostkey=False):
         if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
             return False, "The password contains a control character and cannot be saved."
         command += " -password"
+    if "tunnel" in session:
+        error = validate_session_data(session)
+        if error:
+            return False, error
+        settings = []
+        for field, raw_name in TUNNEL_RAW_FIELDS.items():
+            if preserve_tunnel_credentials and field in ("tunnel_password", "tunnel_passphrase"):
+                continue
+            value = ("1" if session.get("tunnel") else "0") if field == "tunnel" else session.get(field, 22 if field == "tunnel_port" else "")
+            if field != "tunnel" and not session.get("tunnel"):
+                continue
+            if field == "tunnel_hostkey" and value == "*" and not pin_hostkey:
+                value = ""  # Never persist a one-connection trust bypass.
+            settings.append(raw_name + "=" + quote_remote(str(value)))
+        command += " -rawsettings " + " ".join(settings)
     code, stdout, stderr = run_linscp(command, session)
     if code == 0:
         add_log("Saved session '%s'" % name, "success")
@@ -2901,6 +2989,24 @@ def save_stored_session(name, session, pin_hostkey=False):
     message = stderr.strip() or stdout.strip() or "Cannot save the session"
     add_log(message, "error")
     return False, message
+
+
+def save_confirmed_hostkey(tab, field, fingerprint, name):
+    """Remember just this hop's pin, not transient credentials/other pins.
+
+    A destination challenge may follow a jump challenge. Save each explicit
+    choice independently, even if a later hop or authentication fails. Existing
+    saved secrets are preserved; merely checking Remember never stores the
+    passwords/passphrases used to establish this tab.
+    """
+    previous = next((site for site in read_stored_sessions() if site["name"] == name), {})
+    session = dict(tab.session)
+    for key in ("hostkey", "tunnel_hostkey", "password"):
+        session[key] = previous.get(key, "")
+    session[field] = fingerprint
+    session["tunnel_password"] = ""
+    session["tunnel_passphrase"] = ""
+    return save_stored_session(name, session, preserve_tunnel_credentials=True)
 
 
 class LinScpGuiHandler(SimpleHTTPRequestHandler):
@@ -3149,7 +3255,8 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 active = STATE["active_tab"]
             tab = get_tab()
             session = dict(tab.session) if tab else new_session()
-            session.pop("password", None)
+            for secret in ("password", "tunnel_password", "tunnel_passphrase"):
+                session.pop(secret, None)
             self.send_json({
                 "connected": tab is not None and tab.connected,
                 "session": session,
@@ -3476,7 +3583,10 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                                status=400)
                 return
             for key in ("protocol", "host", "port", "username", "password",
-                        "keyfile", "hostkey", "initial_dir", "local_dir"):
+                        "keyfile", "hostkey", "initial_dir", "local_dir",
+                        "tunnel", "tunnel_host", "tunnel_port", "tunnel_username",
+                        "tunnel_private_key", "tunnel_hostkey", "tunnel_password",
+                        "tunnel_passphrase", "tunnel_error"):
                 if key in given:
                     session[key] = given[key]
             error = validate_session_data(session, require_host=True)
@@ -3519,10 +3629,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             add_log("Connection failed: %s" % error, "error")
             challenge = None
             if tab.observed_hostkey:
-                challenge = {"tab": tab.id,
-                             "host": session.get("host"),
-                             "port": session.get("port"),
-                             "fingerprint": tab.observed_hostkey}
+                challenge = tab.hostkey_challenge()
                 add_log("Host key offered by %s: %s" %
                         (session.get("host"), tab.observed_hostkey), "info")
             self.send_json({"success": False, "error": error, "challenge": challenge,
@@ -3531,11 +3638,12 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/tabs/verify":
             tab_id = body.get("tab")
-            fingerprint = (body.get("fingerprint") or "").strip()
-            if not fingerprint:
+            fingerprint = body.get("fingerprint") or ""
+            if not isinstance(fingerprint, str) or not fingerprint.strip():
                 self.send_json({"success": False, "error": "No host key given"},
                                status=400)
                 return
+            fingerprint = fingerprint.strip()
             tab = find_challenge(tab_id)
             if tab is None:
                 with STATE_LOCK:
@@ -3550,17 +3658,26 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 return
             # Restart the core with the key pinned, so the decision is
             # enforced by the client rather than by the interface.
-            tab.session["hostkey"] = fingerprint
-            tab.observed_hostkey = fingerprint
+            expected_role = getattr(tab, "hostkey_role", "destination")
+            if (body.get("role", "destination") != expected_role or
+                    fingerprint != tab.observed_hostkey):
+                self.send_json({"success": False, "error": "The host-key challenge has changed."}, status=409)
+                return
+            field = "tunnel_hostkey" if expected_role == "tunnel" else "hostkey"
+            tab.session[field] = fingerprint
+            if body.get("remember"):
+                name = body.get("name") or tab.name or ""
+                if isinstance(name, str) and name.strip():
+                    name = name.strip()
+                    ok_save, message = save_confirmed_hostkey(tab, field, fingerprint, name)
+                    add_log("Stored the pinned host key in '%s'" % name
+                            if ok_save else message, "success" if ok_save else "error")
             tab.terminate()
             ok, error = tab.connect()
             if not ok:
                 add_log("Still cannot connect: %s" % error, "error")
                 self.send_json({"success": False, "error": error,
-                                "challenge": {"tab": tab.id,
-                                              "host": tab.session.get("host"),
-                                              "port": tab.session.get("port"),
-                                              "fingerprint": tab.observed_hostkey}},
+                                "challenge": tab.hostkey_challenge()},
                                status=400)
                 return
             with STATE_LOCK:
@@ -3569,13 +3686,6 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                     STATE["tabs"].append(tab)
                 STATE["active_tab"] = tab.id
             add_log("Connected to %s (host key pinned)" % tab.name, "success")
-            if body.get("remember"):
-                name = (body.get("name") or tab.name or "").strip()
-                if name:
-                    ok_save, message = save_stored_session(name, tab.session)
-                    add_log("Stored the pinned host key in '%s'" % name
-                            if ok_save else message,
-                            "success" if ok_save else "error")
             self.send_json({"success": True, "tab": tab.describe()})
             return
 

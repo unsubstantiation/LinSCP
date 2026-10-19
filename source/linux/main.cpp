@@ -190,6 +190,11 @@ int RunShell(linscp::SessionOptions options, const std::string & url,
     {
         tcsetattr(STDIN_FILENO, TCSANOW, &original);
     }
+    if (!session.ConnectionError().empty())
+    {
+        console.Error(session.ConnectionError());
+        return 1;
+    }
     return exitCode == INT_MAX ? 1 : exitCode;
 }
 
@@ -257,6 +262,40 @@ int main(int argc, char ** argv)
             /* A GUI command contains literal file names, not script
              * parameters or environment/timestamp placeholders. */
             literalCommand = true;
+        }
+        else if (strcmp(arg, "-rawsettings") == 0 || StartsWith(arg, "-rawsettings=", &value))
+        {
+            int count = -1;
+            if (strcmp(arg, "-rawsettings") != 0 &&
+                !ParsePositiveInteger(value, argc, &count))
+            {
+                console.Error(linscp::Texts::Translate(
+                    "-rawsettings requires a positive setting count."));
+                return 1;
+            }
+            int taken = 0;
+            while (i + 1 < argc && (count < 0 || taken < count))
+            {
+                const std::string setting = argv[i + 1];
+                const size_t equals = setting.find('=');
+                if (setting.empty() || setting[0] == '-' || equals == std::string::npos)
+                    break;
+                std::string error;
+                if (!linscp::ApplySessionRawSetting(setting.substr(0, equals),
+                        setting.substr(equals + 1), options, error))
+                {
+                    console.Error(error);
+                    return 1;
+                }
+                ++i;
+                ++taken;
+            }
+            if (taken == 0 || (count >= 0 && taken != count))
+            {
+                console.Error(linscp::Texts::Translate(
+                    "-rawsettings requires NAME=VALUE arguments matching its count."));
+                return 1;
+            }
         }
         else if (StartsWith(arg, "-hostkey=", &value))
         {
@@ -473,6 +512,24 @@ int main(int argc, char ** argv)
         {
             options.password = password;
         }
+    }
+
+    // The GUI keeps tab-only pins in memory and persists each hop only when
+    // its own Remember checkbox is selected. CLI pin caching stays unchanged.
+    const char * cachePins = getenv("LINSCP_CACHE_PINNED_HOSTKEYS");
+    options.cachePinnedHostKeys = cachePins == NULL || std::strcmp(cachePins, "0") != 0;
+
+    // Like LINSCP_PASSWORD, these belong to this core process, never a
+    // subprocess command line. The GUI clears inherited values per session.
+    if (options.tunnel.password.empty())
+    {
+        const char * secret = getenv("LINSCP_TUNNEL_PASSWORD");
+        if (secret != NULL) options.tunnel.password = secret;
+    }
+    if (options.tunnel.keyPassphrase.empty())
+    {
+        const char * secret = getenv("LINSCP_TUNNEL_PASSPHRASE");
+        if (secret != NULL) options.tunnel.keyPassphrase = secret;
     }
 
     if (!logFile.empty())

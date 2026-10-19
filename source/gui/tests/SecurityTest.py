@@ -1415,6 +1415,147 @@ class LocalChmodEvolvingTests(unittest.TestCase):
             directory.cleanup()
 
 
+class TunnelSettingsTests(unittest.TestCase):
+    def session(self):
+        return dict(gui.new_session(), host="destination.example", tunnel=True,
+                    tunnel_host="jump.example", tunnel_port=2222,
+                    tunnel_username="jumper", tunnel_hostkey="SHA256:jump",
+                    tunnel_password='jump secret "quoted"', tunnel_passphrase="key secret")
+
+    def test_tunnel_arguments_and_environment_keep_credentials_separate(self):
+        session = self.session()
+        args = gui.core_command_line(session)
+        self.assertIn("TunnelHostName=jump.example", args)
+        self.assertIn("TunnelPortNumber=2222", args)
+        self.assertIn("TunnelHostKey=SHA256:jump", args)
+        self.assertFalse(any("TunnelPassword=" in arg or "TunnelPassphrase=" in arg for arg in args))
+        for field in ("tunnel_password", "tunnel_passphrase"):
+            self.assertNotIn(session[field], " ".join(args))
+        with mock.patch.dict(os.environ, LINSCP_TUNNEL_PASSWORD="inherited-password",
+                             LINSCP_TUNNEL_PASSPHRASE="inherited-passphrase"):
+            environment = gui.popen_kwargs(session=session)["env"]
+            self.assertEqual(environment["LINSCP_CACHE_PINNED_HOSTKEYS"], "0")
+            self.assertEqual(environment["LINSCP_TUNNEL_PASSWORD"], session["tunnel_password"])
+            self.assertEqual(environment["LINSCP_TUNNEL_PASSPHRASE"], session["tunnel_passphrase"])
+            for other in (None, {}, {"tunnel": False, "tunnel_password": "not-used"}):
+                environment = gui.popen_kwargs(session=other)["env"]
+                self.assertNotIn("LINSCP_TUNNEL_PASSWORD", environment)
+                self.assertNotIn("LINSCP_TUNNEL_PASSPHRASE", environment)
+
+    def test_tunnel_validation_never_silently_disables_a_bad_tunnel(self):
+        session = self.session()
+        self.assertEqual(gui.validate_session_data(session), "")
+        for change in ({"tunnel": "0"}, {"tunnel": 1}, {"tunnel_port": "22x"},
+                       {"tunnel_port": False}, {"tunnel_port": 65536},
+                       {"tunnel_host": ""}, {"tunnel_host": "bad host"},
+                       {"tunnel_password": "injected\ncommand"}, {"protocol": "ftp"},
+                       {"tunnel_error": "stored credential is unreadable"}):
+            with self.subTest(change=change):
+                self.assertNotEqual(gui.validate_session_data(dict(session, **change)), "")
+        self.assertEqual(gui.validate_session_data(dict(session, tunnel=False, protocol="ftp")), "")
+
+    def test_tunnel_credentials_are_redacted_in_every_quoting_style(self):
+        for field in ("TunnelPassword", "TunnelPassphrase", "TunnelPasswordPlain",
+                      "TunnelPassphrasePlain", "ProxyPassword", "ProxyPasswordPlain", "-passphrase", "-password"):
+            for operand in (field + '="value with \\"quotes\\""',
+                            '"' + field + '=value with spaces"',
+                            "'" + field + "=value with spaces'", field + "='single quoted value'"):
+                command = "open sftp://user:secret@host -rawsettings " + operand
+                masked = gui.redact_command_for_log(command)
+                self.assertNotIn("secret", masked)
+                self.assertNotIn("value", masked)
+                self.assertNotIn("quotes", masked)
+                self.assertIn("<redacted>", masked)
+
+    def test_tunnel_credentials_are_not_in_tab_descriptions(self):
+        session = self.session()
+        described = gui.CoreSession(1, session).describe()["session"]
+        self.assertNotIn("password", described)
+        self.assertNotIn("tunnel_password", described)
+        self.assertNotIn("tunnel_passphrase", described)
+        self.assertEqual(described["tunnel_host"], "jump.example")
+
+    def test_tunnel_key_challenge_identifies_the_correct_host(self):
+        tab = gui.CoreSession(1, self.session())
+        with mock.patch.object(tab, "start", return_value=(True, "")), \
+                mock.patch.object(tab, "run_capture", return_value=(1, ["TUNNELHOSTKEY ssh-ed25519 SHA256:jump"], [])):
+            self.assertFalse(tab.connect()[0])
+        self.assertEqual(tab.hostkey_challenge(), {"tab": 1, "host": "jump.example", "port": 2222,
+                                                 "role": "tunnel", "fingerprint": "SHA256:jump", "changed": False})
+        with mock.patch.object(tab, "start", return_value=(True, "")), \
+                mock.patch.object(tab, "run_capture", return_value=(1, ["HOSTKEY ssh-ed25519 SHA256:destination"], [])):
+            self.assertFalse(tab.connect()[0])
+        self.assertEqual(tab.hostkey_challenge()["host"], "destination.example")
+        self.assertEqual(tab.hostkey_challenge()["role"], "destination")
+
+    def test_changed_key_challenges_are_explicit_for_both_hops(self):
+        tab = gui.CoreSession(1, self.session())
+        for role, marker in (("tunnel", "TUNNELHOSTKEY"), ("destination", "HOSTKEY")):
+            lines = [marker + " ssh-rsa SHA256:new", "HOSTKEYSTATE " + role + " changed"]
+            with mock.patch.object(tab, "start", return_value=(True, "")), \
+                    mock.patch.object(tab, "run_capture", return_value=(1, lines, [])):
+                self.assertFalse(tab.connect()[0])
+            self.assertTrue(tab.hostkey_challenge()["changed"])
+            self.assertEqual(tab.hostkey_challenge()["role"], role)
+
+    def test_remembering_one_hop_never_saves_transient_secrets_or_the_other_pin(self):
+        session = dict(self.session(), password="transient", hostkey="SHA256:once-destination")
+        tab = gui.CoreSession(1, session)
+        for field in ("tunnel_hostkey", "hostkey"):
+            other = "hostkey" if field == "tunnel_hostkey" else "tunnel_hostkey"
+            previous = {"name": "site", "password": "already-stored", other: "SHA256:old"}
+            with mock.patch.object(gui, "read_stored_sessions", return_value=[previous]), \
+                    mock.patch.object(gui, "run_linscp", return_value=(0, "", "")) as run:
+                self.assertTrue(gui.save_confirmed_hostkey(tab, field, "SHA256:remember", "site")[0])
+            command, saved = run.call_args.args
+            self.assertEqual(saved[field], "SHA256:remember")
+            self.assertEqual(saved[other], "SHA256:old")
+            self.assertEqual(saved["password"], "already-stored")
+            self.assertEqual(saved["tunnel_password"], "")
+            self.assertEqual(saved["tunnel_passphrase"], "")
+            self.assertNotIn("TunnelPassword=", command)
+            self.assertNotIn("TunnelPassphrase=", command)
+            self.assertNotIn("transient", str(run.call_args))
+
+    def test_tunnel_credentials_in_sessions_are_decrypted_or_explicitly_locked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ini = pathlib.Path(directory) / "sessions.ini"
+            key = pathlib.Path(directory) / "sessions.key"
+            secret = b"x" * 32
+            key.write_bytes(secret)
+            key.chmod(0o600)
+            ini.write_text("[site]\nhost=dest\ntunnel=1\ntunnel_host=jump\ntunnel_port=2222\n" +
+                           "tunnel_password=" + gui.linscp_crypto.encrypt("  password  ", secret) + "\n" +
+                           "tunnel_passphrase=" + gui.linscp_crypto.encrypt("passphrase", secret) + "\n")
+            with mock.patch.object(gui, "session_store_path", return_value=str(ini)):
+                stored = gui.read_stored_sessions()[0]
+                self.assertTrue(stored["tunnel"])
+                self.assertEqual(stored["tunnel_port"], 2222)
+                self.assertEqual(stored["tunnel_password"], "  password  ")
+                self.assertEqual(stored["tunnel_passphrase"], "passphrase")
+                key.unlink()
+                stored = gui.read_stored_sessions()[0]
+                self.assertEqual(stored["tunnel_password"], "")
+                self.assertEqual(stored["tunnel_passphrase"], "")
+                self.assertTrue(stored["tunnel_error"])
+                self.assertIn("cannot be read", gui.validate_session_data(stored))
+
+    def test_saving_tunnel_credentials_uses_stdin_commands_and_never_stores_wildcard(self):
+        with mock.patch.object(gui, "run_linscp", return_value=(0, "", "")) as run:
+            session = dict(self.session(), tunnel_hostkey="*")
+            self.assertTrue(gui.save_stored_session("site", session)[0])
+            command = run.call_args.args[0]
+            words = split_command_line(command)
+            self.assertIn("Tunnel=1", words)
+            self.assertIn("TunnelPassword=" + session["tunnel_password"], words)
+            self.assertNotIn("TunnelHostKey=*", words)
+            session["tunnel"] = False
+            self.assertTrue(gui.save_stored_session("site", session)[0])
+            command = run.call_args.args[0]
+            self.assertIn("Tunnel=0", command)
+            self.assertNotIn("TunnelPassword", command)
+
+
 if __name__ == "__main__":
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite()
@@ -1425,7 +1566,7 @@ if __name__ == "__main__":
                  CustomCommandTests, LoginTests, QueueCleanupTests,
                  BrowserUploadModeTests, CrossOriginTests,
                  SecretHandlingTests, AccountValidationTests,
-                 LocalChmodEvolvingTests):
+                 LocalChmodEvolvingTests, TunnelSettingsTests):
         suite.addTests(loader.loadTestsFromTestCase(case))
     result = unittest.TextTestRunner(verbosity=1).run(suite)
     failed = len(result.failures) + len(result.errors)

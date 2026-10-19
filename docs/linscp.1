@@ -1,4 +1,4 @@
-.TH LINSCP 1 "2026-10-18" "LinSCP 1.0" "LinSCP"
+.TH LINSCP 1 "2026-10-19" "LinSCP 1.0" "LinSCP"
 .SH NAME
 linscp \- secure file transfer client for the command line
 .SH SYNOPSIS
@@ -50,8 +50,7 @@ to accept any key for this connection only; it is not added to the persistent
 host-key cache. Without this option an unknown host key is accepted only
 after the client has been able to ask; in
 .B \-batch
-mode the connection fails instead. Either way the key the server offered is
-reported on a
+mode the connection fails instead. A refused key is reported on a
 .B HOSTKEY
 line, so a script or the graphical interface can pin it afterwards instead of
 accepting any key next time. An MD5 fingerprint may be given with or without
@@ -69,6 +68,17 @@ and
 .B scp://
 sessions are checked by this client's own SSH code, so what a pin enforces
 does not depend on any external program's build.
+.TP
+.BR \-rawsettings [= N ]
+Supply session defaults as upstream-style name=value assignments. With
+.I N
+exactly that many assignments are consumed; otherwise following recognized
+assignments are consumed. These defaults also reach the embedded SSH shell.
+Per-command settings on
+.B open
+or
+.B savesession
+can override them. Unknown settings are refused rather than ignored.
 .TP
 .BI \-privatekey= file
 OpenSSH/PEM or PPK v2/v3 private key to authenticate with. PPK keys are
@@ -974,6 +984,39 @@ and
 .B show
 are rejected: the connection runs the SFTP subsystem only, so there is no
 remote shell to run a command in.
+.SH SSH TUNNELS
+For SFTP, SCP and SSH destinations,
+.B \-rawsettings Tunnel=1
+uses an independent authenticated SSH jump host.
+.B TunnelHostName
+is required;
+.B TunnelPortNumber
+(default 22),
+.BR TunnelUserName ,
+.BR TunnelPassword ,
+.BR TunnelPublicKeyFile ,
+.B TunnelPassphrase
+and
+.B TunnelHostKey
+configure its independent identity and host-key policy.
+.B TunnelPasswordPlain
+and
+.B TunnelPassphrasePlain
+are accepted plaintext-input aliases; persisted secrets are encrypted locally.
+The destination keeps its own credentials and fingerprint. The jump resolves
+the destination name, and any parent proxy reaches the jump rather than
+bypassing it. Unknown or changed keys on either hop fail in batch mode;
+.B TUNNELHOSTKEY
+identifies the jump's fingerprint, while
+.B HOSTKEY
+identifies the destination's. Verify both independently before accepting them.
+.PP
+The transport uses a private socket pair, not a TCP listener.
+.B TunnelLocalPortNumber
+accepts only 0. Non-SSH destination protocols and GSSAPI are unsupported and
+fail closed. The site manager, queue and embedded terminal share this policy.
+Each GUI host-key Remember choice is independent and does not implicitly store
+passwords or the other hop's transient pin. Changed keys carry a distinct warning.
 .SH AUTHENTICATION
 The keys held by a running ssh-agent are offered automatically when
 .B SSH_AUTH_SOCK
@@ -983,6 +1026,18 @@ is set, which is the simplest way to authenticate with an OpenSSH key.
 Password to use when
 .B \-password=
 is not given.
+.TP
+.B LINSCP_TUNNEL_PASSWORD / LINSCP_TUNNEL_PASSPHRASE
+Supply the jump password and private-key passphrase without putting them in
+process arguments. The destination password remains separate. Environment
+variables may still be readable by the same OS user or privileged processes.
+Secrets are saved only when explicitly supplied to savesession, or with the
+GUI's password/passphrase save controls, using the existing encrypted store.
+.TP
+.B LINSCP_CACHE_PINNED_HOSTKEYS
+Set to 0 to suppress automatic global caching of explicitly pinned SSH keys.
+The GUI sets this in each core process and persists only the hop pins the user
+explicitly chooses to remember. The default CLI caching policy is unchanged.
 .SH EXIT STATUS
 Zero if every command succeeded, non-zero otherwise.
 .SH EXAMPLES
@@ -1088,8 +1143,10 @@ commands over the server's shell, transfers over its own
 - and the one thing it cannot do is continue a partial transfer, because the
 rcp protocol has no offset to continue from; FTP uses a generic listing
 parser. File masks, ASCII/automatic conversion, reconnect and transfer presets
-are implemented; the .NET/PowerShell automation API and broad GUI parity are
-not.
+are implemented. The .NET assembly API, GSSAPI, local-to-local sessions,
+named multi-tab workspaces and broad GUI parity remain incomplete. A
+PowerShell 7 CLI wrapper exists with static and optional live Pester tests;
+it is not the WinSCP .NET object model.
 .PP
 .B keepuptodate
 reflects local changes on the remote side and runs in the foreground. A
@@ -1099,15 +1156,13 @@ recursive inotify watcher, plus a full comparison at each
 used when the watch cannot be set up. A non-interactive run must use
 .BR \-count= .
 .PP
-The graphical interface is a local web application, not a remote one: it is
-reachable from the machine that runs it (or through a proxy you point at it
-with
-.IR \-allow\-host ),
-and its API is protected by a per\-run token rather than by a user account,
-so it expects to be the only thing talking to that port. The remote pane
-queues file/folder drops from a file manager, including nested paths and
-empty directories when the browser exposes file\-entry APIs. Local\-pane
-drops and cross\-desktop compatibility are not established.
+The graphical interface is intended for a trusted local user. Its API uses
+per-run tokens; optional account sign-in adds hashing, expiry, throttling and
+per-login CSRF tokens, but does not isolate users' tabs, queues, configuration,
+filesystem access or commands. Do not expose one backend to mutually untrusted
+users. Both panes support browser file/folder drops, with nested paths and
+empty directories when browser file-entry APIs are available. Fixtures do not
+certify every browser, file manager or desktop combination.
 .PP
 .B synchronize
 both directions relies on a record of the previous synchronization written to

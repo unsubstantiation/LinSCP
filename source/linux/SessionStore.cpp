@@ -136,6 +136,12 @@ struct SiteSettingKey
 };
 
 const SiteSettingKey kSiteSettingKeys[] = {
+    { "tunnel", "Tunnel" },
+    { "tunnel_host", "TunnelHostName" },
+    { "tunnel_port", "TunnelPortNumber" },
+    { "tunnel_username", "TunnelUserName" },
+    { "tunnel_private_key", "TunnelPublicKeyFile" },
+    { "tunnel_hostkey", "TunnelHostKey" },
     { "ftp_pasv_mode", "FtpPasvMode" },
     { "ftp_force_pasv_ip", "FtpForcePasvIp" },
     { "ftp_use_mlsd", "FtpUseMlsd" },
@@ -216,6 +222,15 @@ std::string ValueOf(const StoredSession & session, const std::string & key,
             *isNumber = true;
             return std::string(session.proxy.evenLocalhost ? "1" : "0");
         }
+    }
+    if (session.tunnel.enabled)
+    {
+        if (key == "tunnel") { return "1"; }
+        if (key == "tunnel_host") { return session.tunnel.hostName; }
+        if (key == "tunnel_port") { return std::to_string(session.tunnel.portNumber); }
+        if (key == "tunnel_username") { return session.tunnel.userName; }
+        if (key == "tunnel_private_key") { return session.tunnel.privateKeyFile; }
+        if (key == "tunnel_hostkey") { return session.tunnel.hostKey; }
     }
     /* The FTP/TLS settings of the site: written only when they differ
      * from what a connection would use without them. */
@@ -1038,6 +1053,7 @@ bool SessionStore::Load(std::string & error)
             scratch.ftp = current.ftp;
             scratch.tls = current.tls;
             scratch.s3 = current.s3;
+            scratch.tunnel = current.tunnel;
             std::string settingError;
             if (ApplySessionRawSetting(SettingNameForSiteKey(key), value,
                 scratch, settingError))
@@ -1045,6 +1061,7 @@ bool SessionStore::Load(std::string & error)
                 current.ftp = scratch.ftp;
                 current.tls = scratch.tls;
                 current.s3 = scratch.s3;
+                current.tunnel = scratch.tunnel;
             }
             else if (current.settingError.empty())
             {
@@ -1092,65 +1109,47 @@ bool SessionStore::Load(std::string & error)
             current.proxy.evenLocalhost = value == "1" || Lower(value) == "on" ||
                 Lower(value) == "true";
         }
-        else if (key == "proxy_password")
+        else if (key == "proxy_password" || key == "tunnel_password" ||
+                 key == "tunnel_passphrase")
         {
+            std::string & plain = key == "proxy_password" ? current.proxy.password :
+                (key == "tunnel_password" ? current.tunnel.password : current.tunnel.keyPassphrase);
+            std::string & raw = key == "proxy_password" ? current.proxyPasswordRaw :
+                (key == "tunnel_password" ? current.tunnelPasswordRaw : current.tunnelPassphraseRaw);
+            std::string & credentialError = key == "proxy_password" ? current.proxyError : current.tunnelError;
             if (!StartsWith(value, kPasswordPrefix))
             {
-                /* A plaintext value from a hand-edited file is used as it
-                 * stands and rewritten encrypted on the next save, exactly
-                 * like the session password. */
-                current.proxy.password = value;
+                // Migrate legacy plaintext on the next save, just like the site password.
+                plain = value;
             }
             else
             {
-                current.proxyPasswordRaw = value;
+                raw = value;
                 if (!keyTried)
                 {
                     keyTried = true;
-                    const KeyReadResult read =
-                        ReadKeyFile(mKeyPath, keyBytes, keyError);
+                    const KeyReadResult read = ReadKeyFile(mKeyPath, keyBytes, keyError);
                     keyOk = read == KeyReadOk;
-                    if (read == KeyReadInvalid)
-                    {
-                        /* keyError explains the file itself. */
-                    }
-                    else if (read == KeyReadMissing)
-                    {
+                    if (read == KeyReadMissing)
                         keyError = "the encryption key file '" + mKeyPath +
-                            "' does not exist (it is created when the first "
-                            "password is stored); restore it from a copy or "
-                            "store the proxy password again";
-                    }
+                            "' does not exist; restore it or store the credential again";
                 }
-                std::string proxyPassword;
                 std::string decryptError;
                 if (!keyOk)
                 {
-                    if (current.proxyError.empty())
-                    {
-                        current.proxyError = keyError;
-                    }
+                    credentialError = keyError;
                 }
-                else if (!DecryptPassword(value, keyBytes, proxyPassword,
-                             decryptError))
+                else if (!DecryptPassword(value, keyBytes, plain, decryptError))
                 {
-                    if (current.proxyError.empty())
-                    {
-                        current.proxyError = decryptError;
-                    }
+                    credentialError = decryptError;
                 }
-                else if (proxyPassword.empty())
+                else if (plain.empty())
                 {
-                    if (current.proxyError.empty())
-                    {
-                        current.proxyError =
-                            "the stored proxy password in the file is empty";
-                    }
+                    credentialError = "the stored credential in '" + key + "' is empty";
                 }
                 else
                 {
-                    current.proxy.password = proxyPassword;
-                    current.proxyPasswordRaw.clear();
+                    raw.clear();
                 }
             }
         }
@@ -1267,6 +1266,8 @@ bool SessionStore::Save(std::string & error) const
      * unchanged rather than dropped. */
     std::vector<std::string> proxyPasswordValues(sorted.size());
     std::vector<bool> hasProxyPasswordValue(sorted.size(), false);
+    std::vector<std::string> tunnelPasswordValues(sorted.size());
+    std::vector<std::string> tunnelPassphraseValues(sorted.size());
     bool anyPassword = false;
     for (size_t i = 0; i < sorted.size(); i++)
     {
@@ -1327,6 +1328,28 @@ bool SessionStore::Save(std::string & error) const
             hasProxyPasswordValue[i] = true;
             anyPassword = true;
         }
+        if (sorted[i].tunnel.enabled)
+        {
+            for (int secret = 0; secret < 2; ++secret)
+            {
+                const std::string & plain = secret == 0 ?
+                    sorted[i].tunnel.password : sorted[i].tunnel.keyPassphrase;
+                const std::string & raw = secret == 0 ?
+                    sorted[i].tunnelPasswordRaw : sorted[i].tunnelPassphraseRaw;
+                std::string & encoded = secret == 0 ?
+                    tunnelPasswordValues[i] : tunnelPassphraseValues[i];
+                if (!plain.empty())
+                {
+                    std::string key;
+                    if (!LoadOrCreateKeyFile(mKeyPath, key, error)) return false;
+                    const bool ok = EncryptPassword(plain, key, encoded, error);
+                    BurnKey(reinterpret_cast<unsigned char *>(&key[0]), key.size());
+                    if (!ok) return false;
+                }
+                else encoded = raw;
+                anyPassword = anyPassword || !encoded.empty();
+            }
+        }
     }
 
     FILE * file = fopen(mPath.c_str(), "wb");
@@ -1352,7 +1375,9 @@ bool SessionStore::Save(std::string & error) const
             "tls_certificate_file", "tls_certificate_key_file",
             "ca_certificate_file", "ca_certificate_dir", "pinned_public_key",
             "s3_storage_class", "s3_acl", "s3_sse", "s3_kms_key_id",
-            "s3_request_payer", "s3_metadata"
+            "s3_request_payer", "s3_metadata", "tunnel", "tunnel_host",
+            "tunnel_port", "tunnel_username", "tunnel_private_key",
+            "tunnel_hostkey", "tunnel_password", "tunnel_passphrase"
         };
         for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++)
         {
@@ -1377,6 +1402,13 @@ bool SessionStore::Save(std::string & error) const
                     continue;
                 }
                 value = proxyPasswordValues[i];
+            }
+            else if (strcmp(keys[k], "tunnel_password") == 0 ||
+                     strcmp(keys[k], "tunnel_passphrase") == 0)
+            {
+                value = strcmp(keys[k], "tunnel_password") == 0 ?
+                    tunnelPasswordValues[i] : tunnelPassphraseValues[i];
+                if (value.empty()) continue;
             }
             else
             {
@@ -1498,6 +1530,7 @@ SessionOptions SessionStore::ToSessionOptions(const StoredSession & session,
     options.ftp = session.ftp;
     options.tls = session.tls;
     options.s3 = session.s3;
+    options.tunnel = session.tunnel;
     return options;
 }
 
@@ -1519,6 +1552,11 @@ StoredSession SessionStore::FromSessionOptions(const std::string & name,
     session.ftp = options.ftp;
     session.tls = options.tls;
     session.s3 = options.s3;
+    session.tunnel = options.tunnel;
+    // A connected session is not permission to persist its credentials.
+    // To store these, give them explicitly to savesession -rawsettings.
+    session.tunnel.password.clear();
+    session.tunnel.keyPassphrase.clear();
     session.lastUsed = static_cast<unsigned long long>(time(NULL));
     return session;
 }
