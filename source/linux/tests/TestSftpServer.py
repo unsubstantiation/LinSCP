@@ -297,14 +297,55 @@ class Server(paramiko.ServerInterface):
 
     def check_channel_exec_request(self, channel, command):
         def run():
-            proc = subprocess.run(command, shell=True, capture_output=True,
-                                  cwd=ROOT)
-            if proc.stdout:
-                channel.sendall(proc.stdout)
-            if proc.stderr:
-                channel.sendall_stderr(proc.stderr)
-            channel.send_exit_status(proc.returncode)
-            channel.close()
+            # Stream all three pipes: SCP's interactive acknowledgement
+            # exchange cannot work with subprocess.run(capture_output=True).
+            proc = subprocess.Popen(command, shell=True, stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    cwd=ROOT)
+
+            def input_pipe():
+                try:
+                    while True:
+                        data = channel.recv(32768)
+                        if not data:
+                            break
+                        proc.stdin.write(data)
+                        proc.stdin.flush()
+                except (EOFError, OSError, ValueError):
+                    pass
+                finally:
+                    try:
+                        proc.stdin.close()
+                    except (OSError, ValueError):
+                        pass
+
+            def output_pipe(stream, send):
+                try:
+                    while True:
+                        data = os.read(stream.fileno(), 32768)
+                        if not data:
+                            break
+                        send(data)
+                except (EOFError, OSError):
+                    pass
+                finally:
+                    stream.close()
+
+            incoming = threading.Thread(target=input_pipe, daemon=True)
+            outgoing = threading.Thread(target=output_pipe,
+                                        args=(proc.stdout, channel.sendall), daemon=True)
+            errors = threading.Thread(target=output_pipe,
+                                      args=(proc.stderr, channel.sendall_stderr), daemon=True)
+            for pump in (incoming, outgoing, errors):
+                pump.start()
+            status = proc.wait()
+            outgoing.join(timeout=10)
+            errors.join(timeout=10)
+            try:
+                channel.send_exit_status(status)
+            finally:
+                channel.close()
+            incoming.join(timeout=5)
         thread = threading.Thread(target=run, daemon=True)
         self.exec_threads.append(thread)
         thread.start()
@@ -330,8 +371,18 @@ class Server(paramiko.ServerInterface):
                         command = line.rstrip(b"\r").decode("utf-8", "replace")
                         if command == "pwd":
                             response = os.getcwd().encode("utf-8") + b"\r\n"
-                        elif command == "exit":
+                        elif command == "burst":
+                            channel.sendall(b"x" * (256 * 1024))
+                            channel.sendall_stderr(b"y" * (128 * 1024))
+                            continue
+                        elif command == "truncated-status":
+                            # A status packet is not proof that all output
+                            # arrived. Deliberately omit channel EOF/close.
                             channel.send_exit_status(0)
+                            channel.transport.close()
+                            return
+                        elif command in ("exit", "exit 0", "exit 7"):
+                            channel.send_exit_status(7 if command == "exit 7" else 0)
                             channel.close()
                             return
                         else:
@@ -360,7 +411,10 @@ def handle(client):
         if channel is not None:
             while not channel.closed and transport.is_active():
                 channel.status_event.wait(0.05)
-            for thread in server.exec_threads:
+            # Channel.close marks it closed before its final packets have
+            # necessarily been sent. Do not tear down the transport while
+            # the shell thread is still publishing its exit status/EOF.
+            for thread in server.exec_threads + server.shell_threads:
                 thread.join(timeout=10)
     except Exception as exc:  # noqa
         print("server error:", exc, file=sys.stderr)

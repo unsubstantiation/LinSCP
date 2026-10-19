@@ -38,12 +38,14 @@ REQUIRED_GAP_IDS = {
     "ftp.non-unix-listings", "dav.etag-preconditions",
     "s3.versioned-objects", "editing.non-utf8-encodings",
     "automation.upstream-xml-compatibility",
+    "gui.local-to-local", "sessions.workspaces",
 }
 
 CASE_SOURCES = {
     "unit": "source/linux/tests/UnitTest.cpp",
     "script": "source/linux/tests/ScriptTest.py",
     "live-sftp": "source/linux/tests/LiveSftpTest.py",
+    "live-tunnel": "source/linux/tests/LiveTunnelTest.py",
     "live-s3": "source/linux/tests/LiveS3Test.py",
     "live-dav": "source/linux/tests/LiveDavTest.py",
     "live-curl": "source/linux/tests/LiveCurlTest.py",
@@ -56,7 +58,6 @@ CASE_SOURCES = {
     "gui-security": "source/gui/tests/SecurityTest.py",
     "powershell": "automation/test_psmodule.py",
     "gui-desktop-uri": "source/gui/tests/DesktopUriTest.py",
-    "gui-security": "source/gui/tests/SecurityTest.py",
     "platform-conversion": "tools/tests/test_platform_conversion.py",
     "wayland-compatibility": "tools/tests/test_wayland_compatibility.py",
 }

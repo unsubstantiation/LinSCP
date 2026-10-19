@@ -93,6 +93,12 @@ struct StoredSession
     FtpSettings ftp;
     TlsSettings tls;
     S3Settings s3;
+    SshTunnelSettings tunnel;
+    /* Preserve unreadable ciphertext across unrelated saves, but never
+     * connect with a missing/incorrect jump-host credential. */
+    std::string tunnelPasswordRaw;
+    std::string tunnelPassphraseRaw;
+    std::string tunnelError;
     /* Why a stored FTP/TLS/S3 setting cannot be used, if one cannot: the file
      * then holds a value this build does not accept (a newer version's
      * setting, or a typo), and 'open' says so instead of connecting with a

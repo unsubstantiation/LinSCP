@@ -1,25 +1,53 @@
 /*
- * SshTunnel: SSH port-forwarding (tunnel) configuration.
+ * SSH jump-host connections for the native SFTP/SCP/SSH transports.
+ * A private socket pair carries one verified destination connection over
+ * an authenticated direct-tcpip channel. No TCP listener is exposed.
  *
- * Upstream WinSCP allows SSH tunnels: local (-L) and remote (-R) port
- * forwarding, with dynamic forwarding (-D) for SOCKS proxying through
- * the SSH connection.  This file provides the configuration and
- * lifecycle management for tunnel connections.
- *
- * GSSAPI (Kerberos) authentication is handled at compile time: when the
- * build system detects libgssapi_krb5, GSSAPI is available and
- * '-rawsettings Gssapi=1' enables it.  Without the library the setting
- * is refused by name with the reason, exactly like every other setting
- * this build does not apply.
+ * The legacy -L/-R/-D parsing helpers below are not a forwarding service.
+ * GSSAPI remains disabled; detecting a library is not authentication support.
  */
 
 #ifndef LINSCP_SSHTUNNEL_H
 #define LINSCP_SSHTUNNEL_H
 
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace linscp {
+
+struct SessionOptions;
+
+struct SshTunnelSettings
+{
+    bool enabled;
+    std::string hostName;
+    int portNumber;
+    std::string userName;
+    std::string password;
+    std::string privateKeyFile;
+    std::string keyPassphrase;
+    std::string hostKey;
+
+    SshTunnelSettings() : enabled(false), portNumber(22) {}
+};
+
+class SshJumpTunnel
+{
+public:
+    SshJumpTunnel();
+    ~SshJumpTunnel();
+    /* Returns one owned socket, or -1. The caller must close it after
+     * disconnecting its libssh session. Stop() joins the forwarding worker. */
+    int Start(const SessionOptions & destination, std::string & error);
+    void Stop();
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> mImpl;
+    SshJumpTunnel(const SshJumpTunnel &) = delete;
+    SshJumpTunnel & operator=(const SshJumpTunnel &) = delete;
+};
 
 /*
  * SSH tunnel specification, as the user would write it on the ssh(1)
@@ -53,15 +81,8 @@ bool ParseTunnelSpec(const std::string & spec, TunnelType type,
 /* Builds the ssh(1) command-line flags for one tunnel. */
 std::string TunnelSshFlags(const SshTunnel & tunnel);
 
-/*
- * GSSAPI/Kerberos availability.
- *
- * This build compiles with -DNO_GSSAPI unless the build system detects
- * libgssapi_krb5 at configure time.  When GSSAPI is not available,
- * IsGssapiSupported() returns false and ApplyGssapiSetting() returns an
- * error with the reason, so a '-rawsettings Gssapi=1' is refused by
- * name rather than silently dropped.
- */
+/* GSSAPI is deliberately unavailable until authentication and realm tests
+ * exist. This check must not imply that removing a build flag enables it. */
 bool IsGssapiSupported();
 bool ApplyGssapiSetting(const std::string & value, std::string & error);
 

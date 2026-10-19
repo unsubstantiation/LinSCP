@@ -2,33 +2,34 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-7 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+9 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
 ## security.gssapi-and-tunnels
 
-**Area:** Security/authentication · **Status:** missing
+**Area:** Security/authentication · **Status:** partial
 
-GSSAPI is compiled out; SSH tunnel configuration is not implemented.
+Authenticated SSH jump-host connections now work for SFTP/SCP/SSH, including GUI tabs, background operations and the embedded terminal. Tunnel* raw settings, independent host-key verification, inherited proxy settings, encrypted stored jump credentials and bounded lifecycle cleanup are implemented. GSSAPI remains unavailable; removing NO_GSSAPI no longer pretends otherwise.
 
-**Next:** Implement and test GSSAPI/SSH tunnels only with an explicit security review.
+**Next:** GSSAPI/Kerberos authentication still needs implementation, dependency detection, realm tests and credential-delegation review. Tunnels for non-SSH destination protocols and fixed local-listener ports are not supported; they fail closed rather than connect directly.
 
 **Acceptance criteria:**
 
-- [ ] Enable optional GSSAPI with dependency detection and a Kerberos test realm. Add authenticated SSH forwarding, destination host-key verification and lifecycle cleanup. Security-review credentials, forwarding exposure and failure paths before enabling either by default.
+- [ ] Implement optional GSSAPI against an isolated Kerberos realm, testing principal selection, missing/expired credentials, mutual authentication and opt-in delegation; obtain security review before enabling it by default.
+- [ ] Define and test tunneling for FTP/FTPS/WebDAV/S3, including data-channel routing, TLS SNI/certificate verification and S3 signing for the original destination. If fixed listener ports are supported, bind loopback only, test collisions/authorization and clean up on every failure.
 
 ## security.gui-account
 
-**Area:** Security/authentication · **Status:** missing
+**Area:** Security/authentication · **Status:** partial
 
-The loopback GUI has no multi-user account or authorization roles.
+Optional account login exists: PBKDF2 password hashes, session expiry, per-login CSRF tokens and login throttling have automated coverage. This is a LinSCP server-deployment extension, not a feature of the WinSCP desktop client. Tabs, queues, configuration and local-process privileges remain shared across signed-in users; login alone is not multi-user isolation.
 
-**Next:** Add authenticated accounts before claiming multi-user/server deployment support.
+**Next:** Do not deploy the GUI to mutually untrusted users. Isolate each user's configuration, tabs, queue, logs, terminals and filesystem access (including command execution), or run separate GUI processes under separate OS accounts.
 
 **Acceptance criteria:**
 
-- [ ] Define deployment/isolation boundaries before enabling network access. Add password hashing, login/session expiry, CSRF protection and per-user configuration, filesystem and queue isolation. Negative authorization tests must cover every API route, not just login.
+- [ ] Define the deployment trust boundary and implement per-user ownership/isolation for every API resource and filesystem operation. Run negative authorization tests across every route, not just login, before claiming multi-user/server deployment support.
 
 ## automation.dotnet
 
@@ -91,6 +92,30 @@ The XML action log emits structured command, message and transfer actions with s
 
 - [ ] Compare schema-valid fixtures for command results, transfer errors, cancellation and session lifecycle against the pinned upstream format.
 - [ ] Test at least one upstream-compatible parser and prove secret redaction preserves a valid document.
+
+## gui.local-to-local
+
+**Area:** GUI · **Status:** missing
+
+Upstream SessionData exposes IsLocalBrowser and OtherLocalDirectory for two-local-directory sessions. LinSCP can manage its local pane and accept local browser drops, but its opposite pane and cross-panel transfer routes require a remote session; there is no local-to-local session mode.
+
+**Next:** Implement a no-network two-local-pane mode; local uploads into one pane are not local-to-local transfer parity.
+
+**Acceptance criteria:**
+
+- [ ] Open two independent local panes without a remote connection and test recursive copies/moves, overwrite decisions, metadata and symlink policy, queue progress/cancellation and safe handling of source/destination overlap.
+
+## sessions.workspaces
+
+**Area:** Sessions/configuration · **Status:** missing
+
+Upstream TStoredSessionList implements named workspaces (NewWorkspace, GetWorkspaces, SaveWorkspaceData). LinSCP stores individual sites/folders and has live tabs, but no save/restore of a named group of tabs with their navigation state.
+
+**Next:** Add named workspace save/restore rather than treating stored-session folders or in-memory tabs as workspace support.
+
+**Acceptance criteria:**
+
+- [ ] Persist and restore named workspaces with tab order, active tab and both pane paths; test partial connection failures, renamed/deleted sites, process restart and preservation of host-key and credential-storage policies.
 
 ## Cross-cutting release gate
 

@@ -16,7 +16,7 @@ parity**: see [Protocols](#protocols) and the [parity audit](docs/upstream-parit
 ## Requirements
 
 - Debian 13 (trixie) or newer, with a GCC or Clang toolchain.
-- Build dependencies: `libssh-dev`, `libssl-dev`, `libargon2-dev`, `zlib1g-dev` and `pkg-config`.
+- Build dependencies: `libssh-dev` (0.10 or newer), `libssl-dev`, `libargon2-dev`, `zlib1g-dev` and `pkg-config`.
 - `curl` at run time, for FTP transfers, FTPS, WebDAV and S3.
 - Python 3, for the graphical client.
 - `xdg-utils` (recommended), so `linscp-gui --open-browser` can ask the desktop
@@ -123,12 +123,17 @@ it can be pinned.
   parameters, `%TIMESTAMP%` and environment expansion, `option batch` and
   `option confirm`, and an XML action log (`-xmllog=`).
 - **Stored sessions:** shared between the CLI and the GUI, with folders,
-  encrypted passwords in `sessions.key`, and proxy settings through
-  `-rawsettings`.
+  encrypted passwords in `sessions.ini` (key in `sessions.key`), and proxy
+  settings through `-rawsettings`.
+- **SSH jump hosts:** independent jump/destination authentication and host-key
+  verification, encrypted saved jump credentials, GUI/queue/terminal support,
+  and fail-closed proxy/forwarding behavior. See [SSH tunnels](docs/ssh-tunnels.md)
+  for configuration and limits.
 - **Graphical client:** dual-pane layout, transfer queue with pause, retry and
   priority reordering, transfer settings, sync preview, `keepuptodate`, remote
   search, checksums, properties, saved command templates, multi-user sign-in,
-  local file editing and drag-and-drop in both panes.
+  local file editing and drag-and-drop in both panes. Sign-in does not isolate
+  users' tabs, files or commands: do not share one backend among untrusted users.
 - **Localization:** English and Spanish, for the CLI and the GUI.
 - **Desktop sessions:** works on Wayland and on X11 alike. The clients draw no
   window of their own; the terminal `terminal` opens is chosen among the ones
@@ -137,10 +142,13 @@ it can be pinned.
   `xdotool`, `wmctrl` or `xrandr`, which is what makes a Linux application
   X11-only.
 
-Not implemented: the .NET assembly API, GSSAPI, and SSH tunnel configuration.
-`automation/LinSCP.psm1`, a PowerShell 7 wrapper over the CLI, is installed by
-the Makefile, by CMake and by the Debian package, but no automated test runs
-it.
+Full WinSCP parity is **not** implemented. Remaining gaps include the .NET
+assembly API, GSSAPI, local-to-local sessions, named multi-tab workspaces,
+desktop extensions, broader localization and upstream XML compatibility.
+`automation/LinSCP.psm1` is a PowerShell 7 CLI wrapper with static tests and
+optional live Pester tests, not the WinSCP .NET API. See the
+[remaining parity plan](docs/remaining-parity-plan.md) for scope and acceptance
+criteria; passing the inventory checker is not a full-parity certification.
 
 ## Documentation
 
@@ -158,7 +166,7 @@ it.
 ## Repository layout
 
 ```
-automation/    PowerShell 7 wrapper over the CLI (not tested)
+automation/    PowerShell 7 CLI wrapper, static and optional Pester tests
 debian/        Debian packaging
 docs/          documentation, manual page and parity inventory
 logo/          logo artwork

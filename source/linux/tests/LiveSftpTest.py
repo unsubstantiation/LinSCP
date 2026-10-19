@@ -385,7 +385,7 @@ class LiveSftpTests(unittest.TestCase):
             input=b"pwd\nexit\n", stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=environment, timeout=30)
         self.assertEqual(result.returncode, 0,
-                         result.stderr.decode("utf-8", "replace"))
+                         (result.stdout + result.stderr).decode("utf-8", "replace"))
         self.assertIn(str(self.root).encode(), result.stdout)
         self.assertIn(b"TEST-SHELL>", result.stdout)
 

@@ -352,47 +352,52 @@ std::string CensoredForLog(const std::string & line)
         from = colon + 4;
     }
 
-    /*
-     * The values that authenticate are masked wherever they appear: as the
-     * '-password=' switch and as the 'ProxyPassword=' session setting of a
-     * '-rawsettings' switch (also quoted values).
-     */
-    static const char * const secrets[] = {
-        "-password=", "-passphrase=", "proxypassword="
-    };
-    for (size_t secret = 0;
-         secret < sizeof(secrets) / sizeof(secrets[0]); secret++)
+    // Work with complete shell-style tokens: secrets may be quoted after
+    // '=' or as a whole "Name=value with spaces" argument. Finding the next
+    // literal space/quote leaks the tail of single-quoted and escaped values.
+    std::string censored;
+    for (size_t at = 0; at < result.size();)
     {
-        const std::string needle = secrets[secret];
-        /* 'result' changes length as values are masked, so the
-         * case-insensitive search restarts from the current position. */
-        std::string lowered = ToLower(result);
-        size_t switchAt = 0;
-        while ((switchAt = lowered.find(needle, switchAt)) != std::string::npos)
+        if (isspace(static_cast<unsigned char>(result[at])))
         {
-            const size_t value = switchAt + needle.size();
-            if (value < result.size() && result[value] == '"')
-            {
-                const size_t quote = result.find('"', value + 1);
-                if (quote != std::string::npos)
-                {
-                    result.replace(value + 1, quote - value - 1, "***");
-                    lowered = ToLower(result);
-                    switchAt = quote + 1;
-                    continue;
-                }
-            }
-            size_t end = result.find(' ', value);
-            if (end == std::string::npos)
-            {
-                end = result.size();
-            }
-            result.replace(value, end - value, "***");
-            lowered = ToLower(result);
-            switchAt = value + 3;
+            censored += result[at++];
+            continue;
         }
+        const size_t begin = at;
+        char quote = 0;
+        while (at < result.size())
+        {
+            const char c = result[at];
+            if (c == '\\' && quote != '\'' && at + 1 < result.size())
+            {
+                at += 2;
+                continue;
+            }
+            if (c == '\'' || c == '"')
+            {
+                if (quote == c) quote = 0;
+                else if (quote == 0) quote = c;
+            }
+            if (quote == 0 && isspace(static_cast<unsigned char>(c))) break;
+            ++at;
+        }
+        const std::string token = result.substr(begin, at - begin);
+        const std::vector<std::string> words = SplitCommandLine(token);
+        bool secret = false;
+        if (words.size() == 1)
+        {
+            const size_t eq = words[0].find('=');
+            const std::string name = ToLower(words[0].substr(0, eq));
+            secret = eq != std::string::npos && (name == "-password" ||
+                name == "-passphrase" || name == "proxypassword" ||
+                name == "tunnelpassword" || name == "tunnelpassphrase" ||
+                name == "tunnelpasswordplain" || name == "tunnelpassphraseplain" ||
+                name == "proxypasswordplain");
+            if (secret) censored += words[0].substr(0, eq + 1) + "***";
+        }
+        if (!secret) censored += token;
     }
-    return result;
+    return censored;
 }
 
 bool IsKnownCommand(const std::string & name)
@@ -5881,6 +5886,17 @@ bool Script::OpenStoredSite(const std::string & name,
         return false;
     }
 
+    const std::string storedError = !stored->settingError.empty() ? stored->settingError :
+        (stored->tunnel.enabled ? stored->tunnelError : std::string());
+    if (!storedError.empty())
+    {
+        Console::Instance().Error(Texts::Translate(
+            "The settings of stored session '{name}' cannot be used: {reason}.",
+            {{"name", stored->name}, {"reason", storedError}}));
+        mErrors++;
+        return false;
+    }
+
     SessionOptions options = SessionStore::ToSessionOptions(*stored, mDefaults);
     /* The switches of the command change the settings of the site: a
      * password typed for this connection, a host key accepted for it, or a
@@ -6197,6 +6213,10 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
             session.proxy = previous->proxy;
             session.proxyPasswordRaw = previous->proxyPasswordRaw;
             session.proxyError = previous->proxyError;
+            session.tunnel = previous->tunnel;
+            session.tunnelPasswordRaw = previous->tunnelPasswordRaw;
+            session.tunnelPassphraseRaw = previous->tunnelPassphraseRaw;
+            session.tunnelError = previous->tunnelError;
         }
     }
     if (!rawSettings.empty())
@@ -6216,6 +6236,25 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
         session.proxy = scratch.proxy;
         session.ftp = scratch.ftp;
         session.tls = scratch.tls;
+        session.s3 = scratch.s3;
+        session.tunnel = scratch.tunnel;
+        for (const RawSetting & setting : rawSettings)
+        {
+            const std::string key = ToLower(setting.first);
+            if (key == "tunnelpassword" || key == "tunnelpasswordplain")
+                session.tunnelPasswordRaw.clear();
+            if (key == "tunnelpassphrase" || key == "tunnelpassphraseplain")
+                session.tunnelPassphraseRaw.clear();
+        }
+        if (!session.tunnel.enabled)
+        {
+            session.tunnel.password.clear();
+            session.tunnel.keyPassphrase.clear();
+            session.tunnelPasswordRaw.clear();
+            session.tunnelPassphraseRaw.clear();
+        }
+        if (session.tunnelPasswordRaw.empty() && session.tunnelPassphraseRaw.empty())
+            session.tunnelError.clear();
         /* What the switch states replaces the stored value, so a
          * ciphertext nobody could read does not survive it. */
         session.proxyPasswordRaw.clear();
@@ -6282,6 +6321,13 @@ bool Script::SaveStoredSession(const std::vector<std::string> & args)
     }
 
     std::string error;
+    if (session.tunnel.enabled && !ValidateSessionSettings(
+            SessionStore::ToSessionOptions(session, SessionOptions()), error))
+    {
+        console.Error(error);
+        mErrors++;
+        return false;
+    }
     if (!mSessions.AddOrUpdate(session, error))
     {
         console.Error(error);

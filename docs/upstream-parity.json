@@ -7,14 +7,19 @@
       "source/core/Script.cpp",
       "source/core/Script.h",
       "source/resource/TextsCore2.rc"
-    ]
+    ],
+    "latest_command_review": {
+      "commit": "24e7b4ec1001406cc2edf2b8c88483d66d4449d8",
+      "reviewed_on": "2026-10-19",
+      "scope": "Compared Script.cpp/Script.h registrations at current upstream master: the same 40 commands. Reviewed SessionData tunnel, local-browser and workspace surfaces at the pinned baseline. This is not a full behavior review of upstream master."
+    }
   },
   "verification": {
     "policy": "A status of 'verified' means the behavior was checked, not that it looked right while somebody was reading the code. So an entry carries 'verified_on': for each platform LinSCP ships on, the suites whose tests cover it. LinSCP ships on Linux alone - the Windows port was removed - so an entry may be 'verified' only when 'linux' appears in that map naming the suites that actually ran it. The rule is still written for any number of platforms, and a suite that is not listed under a platform cannot be cited for it, because evidence nobody can reproduce is not evidence. The notes stay authoritative about what is missing either way - evidence for the parts that are covered does not certify the rest, which is why --require-full fails while any entry is not verified.",
     "platforms": {
       "linux": {
         "how": "make -C source/linux all check && make -C source/linux check-live (the same suites also run under CMake/CTest: cmake -S . -B build && cmake --build build && ctest --test-dir build); dpkg-buildpackage -b -us -uc builds the .deb that CI installs; `make -C source/linux check-live` includes the browser upload regression suite; npm install --no-save --package-lock=false jsdom@29 && node source/gui/tests/ClientTest.js && node source/gui/tests/LocalizationTest.js exercises the browser UI; python3 tools/tests/test_translations.py checks catalog generation.",
-        "date": "2026-10-18",
+        "date": "2026-10-19",
         "suites": {
           "unit": "source/linux/tests/UnitTest.cpp - checks of the parts that need no I/O: permission and mode parsing, masks, path handling, the transfer and synchronization planners (every word and list '-criteria=' takes, the ones it refuses, a plan refused over a file nobody could hash, and '-conflict=skip|local|remote|newer' two-way resolution), the proxy session settings, the FTP engine and TLS policy settings, the S3 object write settings and multipart upload resume state sidecar, the SSH private-key passphrase option and XML action log elements, the host-key pin spellings, the native SCP engine's connection-free parts (the shell quoting a remote path needs, the paths it refuses to send, one 'ls -l' line as an entry including a symbolic link's own name, the exact date columns of '--full-time' with the offset they are in, the rcp header lines read and written byte for byte, and the 'touch -t' stamp), the WebDAV lock-token and dead-property XML, parameter and timestamp expansion, the stored-session file and folder hierarchy helpers, the editor content-comparison and EOL normalization helpers, the file-hash and HMAC helpers, and AWS Signature Version 4 signing. Includes English/Spanish help, security messages, named-placeholder safety, locale fallback and plural-count messages.",
           "script": "source/linux/tests/ScriptTest.py - the command line and script semantics against no server: abbreviations, switches, batch modes and exit codes, local listings, help, -log and -xmllog, and stored-session password encryption (a 'savesession -password' value\nwritten as 'lscp1$' ciphertext under sessions.key and preserved across a\nre-save without the key file). The transfer presets are checked here too: the savepreset/option preset/rmspreset lifecycle, a preset stored with a site and restored when it opens, -permissions on downloads, and -rawtransfersettings validation. So are the synchronization criteria (every word and list '-criteria=' takes, the values it refuses with the names it accepts, and the two the 'both' direction cannot honour) and the raw proxy settings of 'open' and 'savesession': each upstream name applied, an unknown one refused, an incomplete or unusable proxy refused, and the password masked in the echo and in the action log. It checks -literal command input (including GUI filenames with percent placeholders), mkdir -parents argument validation, that an SSH session of either spelling (scp:// or ssh://) is served by this client's own SSH code and never asks the curl on PATH for anything - a fake curl that records every call is the witness - with a host key pin in either digest spelling compared by the client instead of handed to a library whose support cannot be known, and the adjacent -gui launcher plus Makefile/CMake source-tree launchers.",
@@ -32,7 +37,8 @@
           "platform-conversion": "tools/check_platform_conversion.py with tools/tests/test_platform_conversion.py - the guard that keeps the Windows-to-Linux conversion complete: it reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose wording contradicts the template it is filled into. Its own cases hold it to the same standard: it has to fail on the things it claims to catch and stay quiet about the ones it does not.",
           "gui-security": "source/gui/tests/SecurityTest.py - offline boundary tests for the browser GUI: operand quoting for the client's command splitter (blanks, quotes, backslashes, control-character refusal), sync/chmod command building from fixed vocabularies, permission-mode validation, local panel containment and remote name validation, single-line server command stream, custom-command template validation/persistence/substitution/execution (local/remote scope, multiple selections, hostile names), PBKDF2 account hashing with per-session CSRF tokens and login throttling, queue staging cleanup, browser upload mode validation, and Host/token/CORS guards.",
           "powershell": "automation/test_psmodule.py - static checks of the PowerShell module that always run (every exported cmdlet defined, no password on a process command line, control-character and multiline refusal, marker-driven server reads, listing-parser status skipping) plus the live Pester suite (automation/LinSCP.Tests.ps1) against the throwaway WebDAV endpoint when pwsh is installed: open/close, byte-exact upload/download, listing objects, terminating errors, timeout cancellation and password hygiene. Without pwsh the live cases skip loudly.",
-          "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases."
+          "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
+          "live-tunnel": "source/linux/tests/LiveTunnelTest.py uses two independently keyed Paramiko endpoints and a destination name resolvable only by the jump fixture. It verifies SFTP/SCP transfer bytes, one-shot exec, embedded-shell defaults, separate host-key failures before authentication, jump password/encrypted-key authentication, forwarding refusal without a direct fallback, inherited SOCKS5 settings applied to the jump host, interrupted download staging, repeated close/failure socket and thread cleanup, encrypted stored credentials and HTTP GUI verification of both hops plus background command routing. Requires paramiko; SCP transfers also require the OpenSSH scp program. No real Kerberos realm or external SSH server is certified by these fixtures. Also covers slow/backpressured upload/download bytes, forwarding timeout, cancelled download staging, no implicit global pin caching and all independent GUI Remember combinations without implicit credential storage."
         }
       }
     }
@@ -521,8 +527,8 @@
     },
     {
       "name": "Sessions/configuration",
-      "status": "verified",
-      "notes": "Shared `sessions.ini` site manager with `sessions.key` password encryption, folder trees (`sessions folders`, `sessions [folder/]`, `rmsession -folder` and GUI folder headers), transfer presets, and stored proxy, FTP/TLS and S3 raw settings. Covered by the unit, script, live-sftp, live-curl and gui suites.",
+      "status": "partial",
+      "notes": "Shared `sessions.ini` site manager with `sessions.key` password encryption, folder trees (`sessions folders`, `sessions [folder/]`, `rmsession -folder` and GUI folder headers), transfer presets, and stored proxy, FTP/TLS and S3 raw settings. Covered by the unit, script, live-sftp, live-curl and gui suites. Tunnel connection policy and encrypted jump credentials are shared with the GUI. Named multi-tab workspaces are missing; stored folders are not workspace parity.",
       "verified_on": {
         "linux": [
           "unit",
@@ -531,12 +537,13 @@
           "live-curl",
           "gui"
         ]
-      }
+      },
+      "gap": "Named workspace persistence/restore is not implemented."
     },
     {
       "name": "Security/authentication",
       "status": "partial",
-      "notes": "Password, private-key/passphrase and ssh-agent authentication, host-key pinning, stored-password encryption, proxy isolation and loopback GUI API tokens are covered by unit, script, live-sftp, live-scp, live-curl and gui-browser-upload. No part of a host-key pin depends on the installed curl any more: both SSH protocols are served by this client's own SSH code, which compares every fingerprint spelling a pin arrives in - a hex or base64 SHA-256 digest, with or without its marker, and an MD5 digest with or without the 'MD5:' marker ssh-keygen prints - and refuses a key that does not match. TLS verification and public-key pinning stay curl's and are configurable. GSSAPI is compiled out, SSH tunnel configuration is not implemented and the GUI has no multi-user accounts or authorization roles.",
+      "notes": "Password, private-key/passphrase and ssh-agent authentication, independent host-key pinning, encrypted stored passwords, proxy isolation and GUI API tokens are covered by automated tests. Native SSH jump-host connections now work for SFTP/SCP/SSH, including GUI background operations and the embedded terminal. Optional GUI sign-in has hashing, expiry and CSRF controls, but not per-user isolation. GSSAPI, non-SSH tunneling and multi-user deployment isolation remain incomplete.",
       "verified_on": {
         "linux": [
           "unit",
@@ -544,15 +551,16 @@
           "live-sftp",
           "live-scp",
           "live-curl",
-          "gui-browser-upload"
+          "gui-browser-upload",
+          "live-tunnel"
         ]
       },
-      "gap": "See remaining capabilities: security.gssapi-and-tunnels, security.gui-account."
+      "gap": "GSSAPI and tunnels for non-SSH protocols/fixed local ports remain unsupported; GUI account login does not isolate users."
     },
     {
       "name": "GUI",
-      "status": "verified",
-      "notes": "Browser Commander provides persistent session tabs, dual panes, an Explorer-style single-panel view with persisted custom-command templates (explicit confirmation, safe per-file substitution, local/remote scope), transfer queue controls, synchronization preview/conflict controls, UTF-8 editing/search, synchronized browsing and host-key verification. Local and remote panes accept files/folders through FileSystemEntry, FileSystemHandle and plain File APIs with path validation; English/Spanish interface localization is implemented. These behaviors are covered by gui, gui-localization, gui-browser-upload, gui-local-editor, gui-search and gui-security. Automated browser API fixtures are not a real-world browser/file-manager compatibility certification.",
+      "status": "partial",
+      "notes": "Browser Commander provides persistent session tabs, dual panes, an Explorer-style single-panel view with persisted custom-command templates (explicit confirmation, safe per-file substitution, local/remote scope), transfer queue controls, synchronization preview/conflict controls, UTF-8 editing/search, synchronized browsing and host-key verification. Local and remote panes accept files/folders through FileSystemEntry, FileSystemHandle and plain File APIs with path validation; English/Spanish interface localization is implemented. These behaviors are covered by gui, gui-localization, gui-browser-upload, gui-local-editor, gui-search and gui-security. Automated browser API fixtures are not a real-world browser/file-manager compatibility certification. SSH tunnel settings and separate hop-key confirmation are implemented. Upstream local-to-local sessions are missing; local pane CRUD/drop support does not provide a second local pane.",
       "verified_on": {
         "linux": [
           "gui",
@@ -562,7 +570,8 @@
           "gui-search",
           "gui-security"
         ]
-      }
+      },
+      "gap": "Upstream local-to-local sessions are not implemented."
     },
     {
       "name": "Editing/search",
@@ -2052,24 +2061,136 @@
       }
     },
     {
+      "id": "security.ssh-jump-hosts",
+      "area": "Security/authentication",
+      "status": "verified",
+      "notes": "Scoped native SSH jump-host support: Tunnel=1 plus TunnelHostName/PortNumber/UserName/Password/PublicKeyFile/Passphrase/HostKey creates an authenticated direct-tcpip channel for an SFTP/SCP/SSH destination. A private close-on-exec socket pair, not a TCP listener, joins the independent transports. The jump resolves the destination, inherits the proxy and has its own credentials/key check; destination keys retain their original host/port identity. Passwords/passphrases are encrypted at rest when explicitly saved, masked in logs, absent from GUI process arguments/status and isolated per child environment. The GUI offers separate key challenges and credential-saving controls; queued operations and -shell retain the tunnel. Tests exercise exact bytes, refusals, interrupted staging and cleanup. This does not claim GSSAPI or non-SSH tunnel support. Changed keys have an explicit warning; per-hop Remember choices persist independently, without saving transient credentials or globally caching a tab-only pin. Slow/backpressured I/O, forwarding timeout and process cancellation are covered too. TunnelPasswordPlain/TunnelPassphrasePlain aliases are accepted, encrypted at rest and censored in logs; this is not encrypted WinSCP password import. Exec/shell callbacks retain output and exit status through coalesced channel/transport closure, but only publish a status after authenticated EOF/close; repeated direct/tunneled stdout/stderr/exit-7 and deliberately truncated-status fixtures cover this boundary.",
+      "source": [
+        "source/linux/SshTunnel.cpp",
+        "source/linux/Session.cpp",
+        "source/linux/SessionStore.cpp",
+        "source/linux/Script.cpp",
+        "source/linux/main.cpp",
+        "source/gui/linscp_gui.py",
+        "source/gui/web/index.html"
+      ],
+      "checks": {
+        "unit": [
+          "TestSshJumpSettings",
+          "TestSessionRegistry"
+        ],
+        "script": [
+          "test_tunnel_settings_validation_is_fail_closed",
+          "test_global_rawsettings_have_counted_operands",
+          "test_tunnel_storage_redaction_and_unreadable_credentials",
+          "test_corrupt_stored_tunnel_toggle_cannot_become_a_direct_connection",
+          "test_tunnel_plain_aliases_encrypt_and_replace_locked_credentials"
+        ],
+        "live-tunnel": [
+          "test_sftp_transfer_and_exec_use_verified_jump",
+          "test_scp_uses_the_same_tunnel_transport",
+          "test_encrypted_private_key_authentication_on_jump",
+          "test_jump_key_refused_before_authentication_or_forwarding",
+          "test_destination_key_is_checked_independently",
+          "test_authentication_and_forward_refusals_never_connect_directly",
+          "test_jump_disconnect_fails_transfer_without_publishing_partial_file",
+          "test_repeated_close_and_failed_open_release_threads_and_sockets",
+          "test_stored_tunnel_credentials_are_encrypted_and_reusable",
+          "test_proxy_settings_reach_the_jump_host_not_the_destination",
+          "test_global_tunnel_defaults_reach_the_embedded_shell",
+          "test_gui_verifies_both_hops_and_queued_commands_keep_the_tunnel",
+          "test_backpressure_preserves_upload_and_download_bytes",
+          "test_forwarding_timeout_never_falls_back_to_a_direct_connection",
+          "test_cancelling_a_tunneled_transfer_closes_the_jump_and_keeps_staging",
+          "test_gui_remember_choices_are_independent_and_do_not_store_credentials",
+          "test_shell_output_and_nonzero_status_survive_immediate_server_close",
+          "test_shell_status_without_end_of_output_is_not_success"
+        ],
+        "gui-security": [
+          "test_tunnel_arguments_and_environment_keep_credentials_separate",
+          "test_tunnel_validation_never_silently_disables_a_bad_tunnel",
+          "test_tunnel_credentials_are_redacted_in_every_quoting_style",
+          "test_tunnel_credentials_are_not_in_tab_descriptions",
+          "test_tunnel_key_challenge_identifies_the_correct_host",
+          "test_tunnel_credentials_in_sessions_are_decrypted_or_explicitly_locked",
+          "test_saving_tunnel_credentials_uses_stdin_commands_and_never_stores_wildcard",
+          "test_changed_key_challenges_are_explicit_for_both_hops",
+          "test_remembering_one_hop_never_saves_transient_secrets_or_the_other_pin"
+        ],
+        "gui": [
+          "site manager restores SSH tunnel settings",
+          "tunnel credentials are saved only when requested",
+          "host-key dialog distinguishes the SSH tunnel host",
+          "host-key confirmation carries the tunnel role",
+          "a new site resets and disables SSH tunnel fields",
+          "changed tunnel keys carry a prominent warning and do not default to remember"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "unit",
+          "script",
+          "live-tunnel",
+          "gui-security",
+          "gui"
+        ]
+      }
+    },
+    {
       "id": "security.gssapi-and-tunnels",
       "area": "Security/authentication",
-      "status": "missing",
-      "notes": "GSSAPI is compiled out; SSH tunnel configuration is not implemented.",
-      "gap": "Implement and test GSSAPI/SSH tunnels only with an explicit security review.",
+      "status": "partial",
+      "notes": "Authenticated SSH jump-host connections now work for SFTP/SCP/SSH, including GUI tabs, background operations and the embedded terminal. Tunnel* raw settings, independent host-key verification, inherited proxy settings, encrypted stored jump credentials and bounded lifecycle cleanup are implemented. GSSAPI remains unavailable; removing NO_GSSAPI no longer pretends otherwise.",
+      "gap": "GSSAPI/Kerberos authentication still needs implementation, dependency detection, realm tests and credential-delegation review. Tunnels for non-SSH destination protocols and fixed local-listener ports are not supported; they fail closed rather than connect directly.",
       "acceptance": [
-        "Enable optional GSSAPI with dependency detection and a Kerberos test realm. Add authenticated SSH forwarding, destination host-key verification and lifecycle cleanup. Security-review credentials, forwarding exposure and failure paths before enabling either by default."
-      ]
+        "Implement optional GSSAPI against an isolated Kerberos realm, testing principal selection, missing/expired credentials, mutual authentication and opt-in delegation; obtain security review before enabling it by default.",
+        "Define and test tunneling for FTP/FTPS/WebDAV/S3, including data-channel routing, TLS SNI/certificate verification and S3 signing for the original destination. If fixed listener ports are supported, bind loopback only, test collisions/authorization and clean up on every failure."
+      ],
+      "source": [
+        "source/linux/SshTunnel.cpp",
+        "source/linux/Session.cpp",
+        "source/linux/SessionStore.cpp",
+        "source/gui/linscp_gui.py"
+      ],
+      "checks": {
+        "unit": [
+          "TestSshJumpSettings"
+        ],
+        "live-tunnel": [
+          "test_sftp_transfer_and_exec_use_verified_jump",
+          "test_repeated_close_and_failed_open_release_threads_and_sockets"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "unit",
+          "live-tunnel"
+        ]
+      }
     },
     {
       "id": "security.gui-account",
       "area": "Security/authentication",
-      "status": "missing",
-      "notes": "The loopback GUI has no multi-user account or authorization roles.",
-      "gap": "Add authenticated accounts before claiming multi-user/server deployment support.",
+      "status": "partial",
+      "notes": "Optional account login exists: PBKDF2 password hashes, session expiry, per-login CSRF tokens and login throttling have automated coverage. This is a LinSCP server-deployment extension, not a feature of the WinSCP desktop client. Tabs, queues, configuration and local-process privileges remain shared across signed-in users; login alone is not multi-user isolation.",
+      "gap": "Do not deploy the GUI to mutually untrusted users. Isolate each user's configuration, tabs, queue, logs, terminals and filesystem access (including command execution), or run separate GUI processes under separate OS accounts.",
       "acceptance": [
-        "Define deployment/isolation boundaries before enabling network access. Add password hashing, login/session expiry, CSRF protection and per-user configuration, filesystem and queue isolation. Negative authorization tests must cover every API route, not just login."
-      ]
+        "Define the deployment trust boundary and implement per-user ownership/isolation for every API resource and filesystem operation. Run negative authorization tests across every route, not just login, before claiming multi-user/server deployment support."
+      ],
+      "source": [
+        "source/gui/linscp_gui.py"
+      ],
+      "checks": {
+        "gui-security": [
+          "test_the_accounts_file_holds_hashes_not_passwords_and_only_this_user",
+          "test_each_login_session_gets_its_own_csrf_token"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "gui-security"
+        ]
+      }
     },
     {
       "id": "gui.commander-panes-tabs",
@@ -3094,11 +3215,35 @@
           "script"
         ]
       }
+    },
+    {
+      "id": "gui.local-to-local",
+      "area": "GUI",
+      "status": "missing",
+      "notes": "Upstream SessionData exposes IsLocalBrowser and OtherLocalDirectory for two-local-directory sessions. LinSCP can manage its local pane and accept local browser drops, but its opposite pane and cross-panel transfer routes require a remote session; there is no local-to-local session mode.",
+      "gap": "Implement a no-network two-local-pane mode; local uploads into one pane are not local-to-local transfer parity.",
+      "acceptance": [
+        "Open two independent local panes without a remote connection and test recursive copies/moves, overwrite decisions, metadata and symlink policy, queue progress/cancellation and safe handling of source/destination overlap."
+      ],
+      "source": [],
+      "checks": {}
+    },
+    {
+      "id": "sessions.workspaces",
+      "area": "Sessions/configuration",
+      "status": "missing",
+      "notes": "Upstream TStoredSessionList implements named workspaces (NewWorkspace, GetWorkspaces, SaveWorkspaceData). LinSCP stores individual sites/folders and has live tabs, but no save/restore of a named group of tabs with their navigation state.",
+      "gap": "Add named workspace save/restore rather than treating stored-session folders or in-memory tabs as workspace support.",
+      "acceptance": [
+        "Persist and restore named workspaces with tab order, active tab and both pane paths; test partial connection failures, renamed/deleted sites, process restart and preservation of host-key and credential-storage policies."
+      ],
+      "source": [],
+      "checks": {}
     }
   ],
   "scope": {
     "definition": "Inventory of the pinned upstream script registrations, Linux additions, reviewed feature areas and known implementation/compatibility gaps. Completeness of this ledger is not full WinSCP feature parity or an exhaustive behavioral/security certification.",
-    "reviewed_on": "2026-10-15",
+    "reviewed_on": "2026-10-19",
     "limitations": [
       "Verified means the stated scoped behavior has named automated evidence, not every upstream variant.",
       "Source/test citations record where evidence is defined, not a claim that every suite ran in this workspace.",

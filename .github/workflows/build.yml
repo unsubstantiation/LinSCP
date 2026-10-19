@@ -10,6 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake pkg-config \
+            libssh-dev libssl-dev libargon2-dev zlib1g-dev curl
       - name: Build and run unit tests
         run: |
           set -o pipefail
@@ -49,6 +54,17 @@ jobs:
           grep '^evidence: ' "$RUNNER_TEMP/live-tests.log" |
             { while IFS= read -r line; do
               printf '::notice::%s\n' "${line//]/%5D}"; done; } || :
+      - name: Live SSH tunnel regressions
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/live-test-venv/bin/python" \
+            -u source/linux/tests/LiveTunnelTest.py source/linux/build/linscp 2>&1 |
+            tee "$RUNNER_TEMP/live-tunnel-tests.log"
+          grep -E 'evidence: suite=live-tunnel .*ran=[1-9]' \
+            "$RUNNER_TEMP/live-tunnel-tests.log" > /dev/null || {
+            echo "::error::the live SSH tunnel suite ran no tests"
+            exit 1
+          }
       - name: Live S3 regressions
         run: |
           # Same venv as the SFTP suite: the S3 suite's own server is
@@ -250,6 +266,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake pkg-config \
+            libssh-dev libssl-dev libargon2-dev zlib1g-dev curl
       - name: Configure and build
         run: |
           # ctest runs the same live suites as the Makefile

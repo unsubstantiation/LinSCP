@@ -12,10 +12,12 @@
 
 #include <cstddef>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "Platform.h"
+#include "SshTunnel.h"
 
 namespace linscp {
 
@@ -200,12 +202,16 @@ struct SessionOptions
     std::string keyPassphrase;
     /* Expected host key: empty = use the cache/ask, "*" = accept any. */
     std::string hostKey;
+    /* GUI approvals may be tab-only; persist explicit pins only on request. */
+    bool cachePinnedHostKeys;
     /* Directory to change to once connected (from the URL path). */
     std::string initialDirectory;
     int timeoutSecs;
     bool verbose;
     /* The proxy this session connects through, if any. */
     ProxySettings proxy;
+    /* An authenticated SSH jump host, separate from the destination. */
+    SshTunnelSettings tunnel;
     /* The FTP engine's policy, the TLS policy and S3 object policy. */
     FtpSettings ftp;
     TlsSettings tls;
@@ -379,6 +385,7 @@ public:
     /* Host key policy, used when the transport verifies the server key. */
     bool HostKeyMatches(const std::string & fingerprint) const;
     bool AcceptAnyHostKey() const { return mOptions.hostKey == "*"; }
+    bool IsTunnelTransport() const { return mTunnelTransport; }
     bool ExpectHostKey() const { return !mOptions.hostKey.empty() && mOptions.hostKey != "*"; }
     const std::string & ExpectedHostKey() const { return mOptions.hostKey; }
 
@@ -387,10 +394,16 @@ private:
     Session & operator=(const Session &);
 
     bool TakeReceivedData(char * buffer, size_t len);
+    void HandleChannelData(const void * data, size_t len, bool isStderr);
+    struct ChannelCallbacks;
 
     SessionOptions mOptions;
     void * mSsh;               /* struct ssh_session_s * */
+    int mTransportSocket;      /* caller-owned SSH_OPTIONS_FD (libssh >= 0.10) */
+    std::unique_ptr<SshJumpTunnel> mTunnel;
+    bool mTunnelTransport;    /* host-key diagnostics name the jump host */
     void * mChannel;           /* struct ssh_channel_s * (exec/shell) */
+    std::unique_ptr<ChannelCallbacks> mChannelCallbacks;
     void * mSftp;              /* struct sftp_session_struct * */
     int mExitCode;             /* channel exit status; INT_MAX: none yet */
     bool mShellMode;           /* channel is a PTY shell: stderr merges */
@@ -412,6 +425,10 @@ private:
     /* Shared connection setup of Open() and ExecRemote(): connects and
      * starts 'program' (subsystem or exec), optionally becoming the
      * session the SFTP transport glue talks to. */
+    friend class SshJumpTunnel;
+    /* Authenticated SSH only; no shell, subsystem, or global current session. */
+    bool OpenTunnelTransport(const SessionOptions & options, std::string & error);
+
     bool Connect(const SessionOptions & options, const char * program,
         bool subsystem, bool takeCurrent, std::string & error);
 };

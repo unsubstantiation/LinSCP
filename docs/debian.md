@@ -16,7 +16,7 @@ a libssh subsystem channel.
 | GNU make | the build system, `source/linux/Makefile` |
 | a C and C++17 compiler (`gcc`/`g++` or `clang`) | the core is C, the front end is C++ |
 | POSIX threads | the core's critical sections (`-pthread`) |
-| `libssh-dev` | SSH transport, authentication, host keys and SFTP/SCP channels |
+| `libssh-dev` (>= 0.10) | SSH transport, authentication, host keys and SFTP/SCP channels |
 | `libssl-dev` | OpenSSL hashing, cryptographic helpers and PPK key material conversion |
 | `libargon2-dev` | Argon2 key derivation for encrypted PPK v3 keys |
 | `zlib1g-dev` | compression support required by the native build |
@@ -316,6 +316,20 @@ protocols use the core's own proxy code. SOCKS and HTTP proxies apply to the
 curl-backed protocols as `--proxy`. A setting or proxy this build cannot use is
 refused by name, never dropped silently.
 
+SSH jump hosts are available for SFTP/SCP/SSH. Enable them with
+`-rawsettings Tunnel=1 TunnelHostName=jump.example.com TunnelUserName=jumper
+TunnelHostKey=SHA256:...`; `TunnelPortNumber`, `TunnelPublicKeyFile`,
+`TunnelPassword` and `TunnelPassphrase` configure the jump independently of the
+destination. Global `-rawsettings=N` also supplies defaults to `-shell`.
+The parent proxy reaches the jump, and a private socket pair replaces a local
+TCP listener. Fixed `TunnelLocalPortNumber` values other than `0`, GSSAPI and
+curl-backed destination protocols are refused. See [SSH tunnels](ssh-tunnels.md)
+for secure examples, storage policy and regression commands.
+
+The GUI challenges each hop separately. Remembering a key stores only that
+hop's pin, not transient credentials or an unchecked key on the other hop.
+Changed keys have a distinct warning and do not default to being remembered.
+
 Stored sessions live in `sessions.ini`, in folders with `sessions folders`,
 `sessions [folder/]` and `rmsession -folder`. The graphical client reads and
 writes the same files.
@@ -478,8 +492,9 @@ watch cannot be set up, the client falls back to timer polling. It runs in the
 foreground until Ctrl-C, or until `-count=` passes complete, so a
 non-interactive script must give `-count=`.
 
-Not implemented: the .NET assembly API, GSSAPI, SSH tunnels and broad GUI
-parity. S3 version-aware operations are implemented as described above; S3 and
+Not implemented: the .NET assembly API, GSSAPI, local-to-local sessions,
+named workspaces and broad GUI parity. SSH jump hosts work for SFTP/SCP/SSH;
+non-SSH tunnels and fixed listener ports do not. S3 version-aware operations are implemented as described above; S3 and
 WebDAV still cover documented subsets rather than every upstream extension.
 See the [parity audit](upstream-parity.md) for the full list of verified
 capabilities and remaining gaps.
