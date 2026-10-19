@@ -241,10 +241,27 @@ jobs:
           exit $status
       - name: GUI integration regression tests
         run: |
-          python3 source/gui/tests/BrowserUploadTest.py
-          python3 source/gui/tests/DesktopUriTest.py
-          python3 source/gui/tests/SecurityTest.py
-          python3 source/gui/tests/LocalWorkspaceTest.py
+          # Each suite prints one evidence line. They are surfaced as
+          # annotations and the local-to-local suite is required to have
+          # run cases: it skips itself when its server cannot start, and a
+          # skip is not a pass.
+          set -o pipefail
+          status=0
+          for suite in BrowserUploadTest DesktopUriTest SecurityTest \
+                       LocalWorkspaceTest; do
+            python3 "source/gui/tests/$suite.py" 2>&1 |
+              tee "$RUNNER_TEMP/gui-$suite.log" || status=$?
+          done
+          cat "$RUNNER_TEMP"/gui-*.log |
+            grep '^evidence: ' |
+            { while IFS= read -r line; do
+              printf '::notice::%s\n' "${line//]/%5D}"; done; } || :
+          grep -E 'evidence: suite=gui-local .*ran=[1-9]' \
+            "$RUNNER_TEMP/gui-LocalWorkspaceTest.log" > /dev/null || {
+            echo "::error::the local-to-local suite ran no tests"
+            exit 1
+          }
+          exit $status
       - name: PowerShell module regressions
         run: |
           # The harness runs its static checks everywhere; the live Pester
