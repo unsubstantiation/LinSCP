@@ -381,6 +381,7 @@ jobs:
                       usr/share/linscp/gui/linscp_crypto.py \
                       usr/share/linscp/gui/explorer-commands.json \
                       usr/share/linscp/gui/web/index.html \
+                      usr/share/linscp/gui/web/vendor/xterm.js \
                       usr/share/linscp/automation/LinSCP.psm1 \
                       usr/share/applications/linscp.desktop \
                       usr/share/pixmaps/linscp.png \
