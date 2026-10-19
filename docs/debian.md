@@ -492,8 +492,9 @@ watch cannot be set up, the client falls back to timer polling. It runs in the
 foreground until Ctrl-C, or until `-count=` passes complete, so a
 non-interactive script must give `-count=`.
 
-Not implemented: the .NET assembly API, GSSAPI, local-to-local sessions,
-named workspaces and broad GUI parity. SSH jump hosts work for SFTP/SCP/SSH;
+Not implemented: the .NET assembly API, GSSAPI, multi-user GUI isolation,
+desktop extensions, broader localization and upstream XML compatibility.
+Local-to-local sessions and named workspaces are implemented. SSH jump hosts work for SFTP/SCP/SSH;
 non-SSH tunnels and fixed listener ports do not. S3 version-aware operations are implemented as described above; S3 and
 WebDAV still cover documented subsets rather than every upstream extension.
 See the [parity audit](upstream-parity.md) for the full list of verified

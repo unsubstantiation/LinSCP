@@ -244,6 +244,7 @@ jobs:
           python3 source/gui/tests/BrowserUploadTest.py
           python3 source/gui/tests/DesktopUriTest.py
           python3 source/gui/tests/SecurityTest.py
+          python3 source/gui/tests/LocalWorkspaceTest.py
       - name: PowerShell module regressions
         run: |
           # The harness runs its static checks everywhere; the live Pester

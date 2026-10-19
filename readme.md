@@ -143,8 +143,10 @@ it can be pinned.
   X11-only.
 
 Full WinSCP parity is **not** implemented. Remaining gaps include the .NET
-assembly API, GSSAPI, local-to-local sessions, named multi-tab workspaces,
-desktop extensions, broader localization and upstream XML compatibility.
+assembly API, GSSAPI, multi-user GUI isolation, desktop extensions, broader
+localization and upstream XML compatibility. Local-to-local sessions with two
+local panes and named multi-tab workspaces are implemented and covered by the
+`gui-local` suite.
 `automation/LinSCP.psm1` is a PowerShell 7 CLI wrapper with static tests and
 optional live Pester tests, not the WinSCP .NET API. See the
 [remaining parity plan](docs/remaining-parity-plan.md) for scope and acceptance

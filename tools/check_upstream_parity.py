@@ -56,6 +56,7 @@ CASE_SOURCES = {
     "gui-local-editor": "source/gui/tests/LocalEditorTest.py",
     "gui-browser-upload": "source/gui/tests/BrowserUploadTest.py",
     "gui-security": "source/gui/tests/SecurityTest.py",
+    "gui-local": "source/gui/tests/LocalWorkspaceTest.py",
     "powershell": "automation/test_psmodule.py",
     "gui-desktop-uri": "source/gui/tests/DesktopUriTest.py",
     "platform-conversion": "tools/tests/test_platform_conversion.py",

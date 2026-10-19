@@ -64,6 +64,7 @@ import hmac
 import pty
 import struct
 import termios
+import zlib
 from fnmatch import fnmatch
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
@@ -439,6 +440,12 @@ SESSION_KEYS = {
     "remotedir": "initial_dir",
     "local_directory": "local_dir",
     "localdir": "local_dir",
+    # Upstream's local browser persists its second local directory beside
+    # the first. The console client has no local protocol, but the GUI's
+    # local tabs and workspaces do, and a site saved from one has to carry
+    # both panes or restoring it would silently drop a pane.
+    "other_local_directory": "other_local_dir",
+    "otherlocaldir": "other_local_dir",
     "password": "password",
     "last_used": "last_used",
 }
@@ -468,6 +475,38 @@ def default_port(protocol):
     return DEFAULT_PORTS.get((protocol or "sftp").lower(), 22)
 
 
+def session_is_local(session):
+    """Whether a session names two local directories instead of a server.
+
+    Upstream's TSessionData calls this a local browser: LocalDirectory and
+    OtherLocalDirectory are set and there is no host to log in to. The GUI
+    uses the same shape so a local tab can be stored and restored without a
+    core process.
+    """
+    return (isinstance(session, dict) and
+            str(session.get("protocol") or "").lower() == "local")
+
+
+def validate_local_directory(path, label):
+    """Validate one pane directory of a local-to-local session."""
+    if not isinstance(path, str) or not path:
+        return "The %s is required." % label
+    if any(ord(char) < 32 or ord(char) == 127 for char in path):
+        return "The %s must not contain control characters." % label
+    if not os.path.isabs(path):
+        return "The %s must be an absolute path." % label
+    if not os.path.isdir(path):
+        return "The %s is not a directory." % label
+    return ""
+
+
+def validate_local_panes(local_dir, other_dir):
+    error = validate_local_directory(local_dir, "local directory")
+    if error:
+        return error
+    return validate_local_directory(other_dir, "other local directory")
+
+
 def validate_session_data(session, require_host=False):
     """Reject malformed session values before they reach a core process."""
     if not isinstance(session, dict):
@@ -477,8 +516,22 @@ def validate_session_data(session, require_host=False):
         protocol = "sftp"
     if not isinstance(protocol, str) or protocol.lower() not in (
             "sftp", "ssh", "scp", "ftp", "ftps", "ftpes", "http",
-            "https", "dav", "webdav", "s3"):
+            "https", "dav", "webdav", "s3", "local"):
         return "The session protocol is not supported."
+    if protocol.lower() == "local":
+        # A local-to-local session has no server, port, credentials or
+        # tunnel: every remote field is irrelevant, and validating a port
+        # it does not have would reject a perfectly good local workspace.
+        for field in ("local_dir", "other_local_dir"):
+            value = session.get(field)
+            if value is not None and not isinstance(value, str):
+                return "The session %s must be text." % field.replace("_", " ")
+            if isinstance(value, str) and any(
+                    ord(char) < 32 or ord(char) == 127 for char in value):
+                return ("The session %s must not contain control characters."
+                        % field.replace("_", " "))
+        return validate_local_panes(session.get("local_dir") or "",
+                                    session.get("other_local_dir") or "")
     host = session.get("host", "")
     if host is None:
         host = ""
@@ -489,7 +542,8 @@ def validate_session_data(session, require_host=False):
     if any(ord(char) < 32 or ord(char) == 127 for char in host):
         return "The host name must not contain control characters."
     for field in ("username", "password", "keyfile", "hostkey",
-                  "initial_dir", "local_dir", "tunnel_host", "tunnel_username",
+                  "initial_dir", "local_dir", "other_local_dir",
+                  "tunnel_host", "tunnel_username",
                   "tunnel_private_key", "tunnel_hostkey", "tunnel_password", "tunnel_passphrase"):
         value = session.get(field)
         if value is not None and not isinstance(value, str):
@@ -544,7 +598,8 @@ def read_stored_sessions():
                 "name": _unescape(text[1:-1]),
                 "protocol": "sftp", "host": "", "port": 22, "username": "",
                 "password": "", "keyfile": "", "hostkey": "",
-                "initial_dir": "/", "local_dir": "", "last_used": 0,
+                "initial_dir": "/", "local_dir": "",
+                "other_local_dir": "", "last_used": 0,
             }
             continue
         if current is None or "=" not in text:
@@ -866,6 +921,7 @@ def new_session():
         "hostkey": "",
         "initial_dir": "/",
         "local_dir": os.path.expanduser("~"),
+        "other_local_dir": "",
         "tunnel": False, "tunnel_host": "", "tunnel_port": 22,
         "tunnel_username": "", "tunnel_password": "", "tunnel_passphrase": "",
         "tunnel_private_key": "", "tunnel_hostkey": "", "tunnel_error": "",
@@ -1321,9 +1377,13 @@ class CoreSession(object):
     def __init__(self, tab_id, session, name=None):
         self.id = tab_id
         self.session = dict(session)
-        self.name = name or self._default_name()
         self.remote_dir = session.get("initial_dir") or "/"
         self.local_dir = session.get("local_dir") or os.path.expanduser("~")
+        self.other_local_dir = session.get("other_local_dir") or ""
+        self.site_name = session.get("site") or ""
+        # A local tab's default name is built from both pane directories,
+        # so the fields have to exist before the name is decided.
+        self.name = name or self._default_name()
         self.connected = False
         self.observed_hostkey = ""
         self.hostkey_role = "destination"
@@ -1336,7 +1396,15 @@ class CoreSession(object):
         self._stderr_lock = threading.Lock()
         self._stderr_events = queue.Queue()
 
+    @property
+    def is_local(self):
+        return session_is_local(self.session)
+
     def _default_name(self):
+        if self.is_local:
+            left = os.path.basename(self.local_dir.rstrip(os.sep)) or self.local_dir
+            right = os.path.basename(self.other_local_dir.rstrip(os.sep)) or self.other_local_dir
+            return "%s \u2194 %s" % (left, right)
         host = self.session.get("host") or "localhost"
         user = self.session.get("username") or ""
         return "%s@%s" % (user, host) if user else host
@@ -1344,6 +1412,8 @@ class CoreSession(object):
     # -- process management ------------------------------------------------
 
     def start(self):
+        if self.is_local:
+            return True, ""
         with self.lock:
             if self.proc is not None and self.proc.poll() is None:
                 return True, ""
@@ -1384,6 +1454,30 @@ class CoreSession(object):
                     return True, ""
 
     def connect(self):
+        if self.is_local:
+            error = validate_local_panes(self.local_dir, self.other_local_dir)
+            if error:
+                self.connected = False
+                self.error = error
+                return False, error
+            self.local_dir = os.path.abspath(self.local_dir)
+            self.other_local_dir = os.path.abspath(self.other_local_dir)
+            self.remote_dir = self.other_local_dir
+            # A local browser has no server to log in to: there is no host,
+            # user, password, key or tunnel. Clearing them keeps a session
+            # created from the site-manager form (which fills in its last
+            # protocol's fields) from looking like a connection that could
+            # be made, or storing credentials it never used.
+            for key in ("host", "username", "password", "keyfile",
+                        "hostkey", "tunnel_host", "tunnel_username",
+                        "tunnel_password", "tunnel_private_key",
+                        "tunnel_passphrase", "tunnel_hostkey", "tunnel_error"):
+                self.session[key] = ""
+            self.session["tunnel"] = False
+            self.session["port"] = 0
+            self.connected = True
+            self.error = ""
+            return True, ""
         ok, error = self.start()
         if not ok:
             self.connected = False
@@ -1490,6 +1584,8 @@ class CoreSession(object):
             return list(self._stderr)
 
     def alive(self):
+        if self.is_local:
+            return self.connected
         return self.proc is not None and self.proc.poll() is None
 
     def run(self, command, timeout=120):
@@ -1499,6 +1595,8 @@ class CoreSession(object):
 
     def run_capture(self, command, timeout=120):
         """Run one command, also reporting what the core wrote to stderr."""
+        if self.is_local:
+            return 1, ["The local panel has no server session."], []
         with self.lock:
             if not self.alive():
                 if not self.connected:
@@ -1585,10 +1683,13 @@ class CoreSession(object):
             "id": self.id,
             "name": self.name,
             "connected": self.connected and self.alive(),
+            "is_local": self.is_local,
             "session": {key: value for key, value in self.session.items()
                         if key not in ("password", "tunnel_password", "tunnel_passphrase")},
             "remote_dir": self.remote_dir,
             "local_dir": self.local_dir,
+            "other_local_dir": self.other_local_dir,
+            "site": self.site_name,
             "observed_hostkey": self.observed_hostkey,
             "error": self.error,
         }
@@ -1615,6 +1716,308 @@ def require_tab(tab_id=None):
     if tab is None or not tab.connected:
         return None
     return tab
+
+
+# ---------------------------------------------------------------------------
+# Named workspaces (upstream TStoredSessionList's NewWorkspace/GetWorkspaces)
+# ---------------------------------------------------------------------------
+#
+# A workspace is a named, ordered group of tabs with both pane paths and the
+# active tab. It is not a stored-session folder: a folder groups sites, while
+# a workspace restores what the Commander was showing. The file holds no
+# passwords and no tunnel credentials. A tab opened from a stored site
+# records that site's name and reopens the site from sessions.ini, so the
+# site's own password encryption, host-key pin and credential policy are the
+# ones that apply. An ad-hoc tab records a sanitized session without secrets;
+# on restore it may need a password again, and a host-key decision is still
+# required if the key was never pinned.
+
+WORKSPACE_VERSION = 1
+WORKSPACE_LOCK = threading.RLock()
+
+
+class WorkspaceExists(ValueError):
+    pass
+
+
+def workspace_store_path():
+    return os.path.join(os.path.dirname(session_store_path()), "workspaces.json")
+
+
+def validate_workspace_name(name):
+    if not isinstance(name, str):
+        raise ValueError("The workspace name must be text.")
+    name = name.strip()
+    if not name:
+        raise ValueError("A workspace name is required.")
+    if len(name) > 128:
+        raise ValueError("The workspace name is too long (maximum 128 characters).")
+    if any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise ValueError("The workspace name must not contain control characters.")
+    if "/" in name or "\\" in name:
+        raise ValueError("A workspace name cannot contain a path separator.")
+    if name in (".", ".."):
+        raise ValueError("That is not a workspace name.")
+    return name
+
+
+def _empty_workspace_store():
+    return {"version": WORKSPACE_VERSION, "workspaces": {}}
+
+
+def read_workspace_store():
+    path = workspace_store_path()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return _empty_workspace_store()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError("Cannot read the workspace file: %s" % exc)
+    if not isinstance(data, dict) or not isinstance(data.get("workspaces"), dict):
+        raise ValueError("The workspace file is not a valid workspace collection.")
+    return data
+
+
+def write_workspace_store(data):
+    path = workspace_store_path()
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=directory, prefix=".workspaces-",
+        delete=False)
+    temporary = handle.name
+    try:
+        os.chmod(temporary, 0o600)
+        with handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _workspace_session_snapshot(session):
+    """A session that may be written down: every credential removed."""
+    snapshot = dict(session or {})
+    for secret in ("password", "tunnel_password", "tunnel_passphrase"):
+        snapshot.pop(secret, None)
+    snapshot.pop("site", None)
+    return snapshot
+
+
+def capture_workspace_tabs():
+    """The current tabs as workspace entries, in tab order."""
+    with STATE_LOCK:
+        tabs = list(STATE["tabs"])
+        active = STATE["active_tab"]
+    stored = {item["name"]: item for item in read_stored_sessions()}
+    entries = []
+    active_index = 0
+    for index, tab in enumerate(tabs):
+        if str(tab.id) == str(active):
+            active_index = index
+        if getattr(tab, "is_local", False):
+            entries.append({
+                "kind": "local",
+                "name": tab.name,
+                "local_dir": tab.local_dir,
+                "other_local_dir": tab.other_local_dir,
+            })
+            continue
+        entry = {
+            "kind": "remote",
+            "name": tab.name,
+            "local_dir": tab.local_dir,
+            "remote_dir": tab.remote_dir,
+        }
+        if tab.site_name and tab.site_name in stored:
+            entry["site"] = tab.site_name
+        else:
+            entry["session"] = _workspace_session_snapshot(tab.session)
+        entries.append(entry)
+    return {"tabs": entries, "active": active_index}
+
+
+def list_workspaces():
+    data = read_workspace_store()
+    result = []
+    for name, record in data["workspaces"].items():
+        if not isinstance(record, dict):
+            continue
+        tabs = record.get("tabs") if isinstance(record.get("tabs"), list) else []
+        result.append({
+            "name": name,
+            "tab_count": len(tabs),
+            "active": record.get("active", 0),
+            "updated": record.get("updated", 0),
+            "tabs": [{
+                "name": tab.get("name", ""),
+                "kind": tab.get("kind", "remote"),
+                "site": tab.get("site", ""),
+                "local_dir": tab.get("local_dir", ""),
+                "remote_dir": tab.get("remote_dir", ""),
+            } for tab in tabs if isinstance(tab, dict)],
+        })
+    result.sort(key=lambda item: item["name"].lower())
+    return result
+
+
+def save_workspace(name, overwrite=False):
+    name = validate_workspace_name(name)
+    captured = capture_workspace_tabs()
+    if not captured["tabs"]:
+        raise ValueError("There are no open tabs to save.")
+    with WORKSPACE_LOCK:
+        data = read_workspace_store()
+        if name in data["workspaces"] and not overwrite:
+            raise WorkspaceExists(
+                "A workspace named \"%s\" already exists." % name)
+        data["workspaces"][name] = {
+            "tabs": captured["tabs"],
+            "active": captured["active"],
+            "updated": int(time.time()),
+        }
+        write_workspace_store(data)
+    add_log("Saved workspace '%s' (%d tab(s))." %
+            (name, len(captured["tabs"])), "success")
+    return {"name": name, "tab_count": len(captured["tabs"]),
+            "active": captured["active"]}
+
+
+def delete_workspace(name):
+    name = validate_workspace_name(name)
+    with WORKSPACE_LOCK:
+        data = read_workspace_store()
+        if name not in data["workspaces"]:
+            raise ValueError("No workspace named \"%s\" exists." % name)
+        del data["workspaces"][name]
+        write_workspace_store(data)
+    add_log("Deleted workspace '%s'." % name, "info")
+    return True
+
+
+def _workspace_tab_session(entry, stored):
+    """Build one tab's session from a workspace entry.
+
+    Returns (session, site_name, error). A site reference is resolved from
+    sessions.ini every time, never from a copy saved in the workspace file:
+    that is what keeps a stored password, a pinned host key and a changed
+    site definition authoritative after a restart.
+    """
+    if not isinstance(entry, dict):
+        return None, "", "The workspace entry is not an object."
+    if entry.get("kind") == "local":
+        session = dict(new_session())
+        session["protocol"] = "local"
+        session["local_dir"] = entry.get("local_dir") or ""
+        session["other_local_dir"] = entry.get("other_local_dir") or ""
+        session["initial_dir"] = session["other_local_dir"]
+        session["host"] = ""
+        return session, "", ""
+    site_name = entry.get("site") or ""
+    if site_name:
+        site = stored.get(site_name)
+        if site is None:
+            return None, site_name, ("The stored site \"%s\" used by this "
+                                     "workspace no longer exists." % site_name)
+        session = dict(site)
+        session["site"] = site_name
+        session["local_dir"] = entry.get("local_dir") or session.get("local_dir") or ""
+        session["initial_dir"] = entry.get("remote_dir") or session.get("initial_dir") or "/"
+        return session, site_name, ""
+    snapshot = entry.get("session")
+    if not isinstance(snapshot, dict):
+        return None, "", "The workspace entry has no site or session."
+    session = dict(snapshot)
+    session["local_dir"] = entry.get("local_dir") or session.get("local_dir") or ""
+    session["initial_dir"] = entry.get("remote_dir") or session.get("initial_dir") or "/"
+    return session, "", ""
+
+
+def restore_workspace(name):
+    """Open the tabs of a named workspace, in order and independently.
+
+    A tab that cannot connect does not stop the others: the caller gets the
+    tabs that opened and the failures by name. A stored site that was
+    deleted or renamed is a failure, not a reason to connect somewhere with
+    stale credentials. A host-key challenge is parked in the normal
+    challenge table, so the user can verify it exactly as after 'Connect'.
+    """
+    name = validate_workspace_name(name)
+    with WORKSPACE_LOCK:
+        data = read_workspace_store()
+    record = data["workspaces"].get(name)
+    if not isinstance(record, dict):
+        raise ValueError("No workspace named \"%s\" exists." % name)
+    entries = record.get("tabs")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("The workspace has no tabs.")
+    stored = {item["name"]: item for item in read_stored_sessions()}
+    opened = []
+    failed = []
+    active_opened = None
+    saved_active = record.get("active", 0)
+    try:
+        saved_active = int(saved_active)
+    except (TypeError, ValueError):
+        saved_active = 0
+    for index, entry in enumerate(entries):
+        session, site_name, error = _workspace_tab_session(entry, stored)
+        label = (entry.get("name") if isinstance(entry, dict) else "") or             site_name or ("tab %d" % (index + 1))
+        if error:
+            failed.append({"name": label, "site": site_name, "error": error})
+            continue
+        error = validate_session_data(session, require_host=not session_is_local(session))
+        if error:
+            failed.append({"name": label, "site": site_name, "error": error})
+            continue
+        with STATE_LOCK:
+            tab_id = STATE["next_tab"]
+            STATE["next_tab"] += 1
+        tab = CoreSession(tab_id, session, name=entry.get("name") or None)
+        ok, error = tab.connect()
+        if not ok:
+            challenge = None
+            if tab.observed_hostkey:
+                challenge = tab.hostkey_challenge()
+                with STATE_LOCK:
+                    STATE["challenges"][tab.id] = tab
+                add_log("Host key offered by %s: %s" %
+                        (session.get("host"), tab.observed_hostkey), "info")
+            else:
+                tab.terminate()
+            failed.append({"name": label, "site": site_name,
+                           "error": error, "challenge": challenge})
+            continue
+        opened.append(tab)
+        if index == saved_active:
+            active_opened = tab.id
+    with STATE_LOCK:
+        for tab in opened:
+            if tab not in STATE["tabs"]:
+                STATE["tabs"].append(tab)
+        if active_opened is not None:
+            STATE["active_tab"] = active_opened
+        elif opened:
+            STATE["active_tab"] = opened[0].id
+        elif STATE["tabs"]:
+            STATE["active_tab"] = STATE["tabs"][0].id
+    add_log("Opened workspace '%s': %d tab(s) opened, %d failed." %
+            (name, len(opened), len(failed)), "success" if not failed else "error")
+    return {
+        "name": name,
+        "opened": [tab.id for tab in opened],
+        "failed": failed,
+        "active_tab": active_opened if active_opened is not None else (
+            opened[0].id if opened else None),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1808,7 +2211,9 @@ def pop_challenge(tab_id):
 class Task(object):
     def __init__(self, task_id, kind, command, session, source, destination,
                  tab_id, progress_path=None, progress_remote=None, move_source=None,
-                 cleanup_path=None):
+                 cleanup_path=None, native=None, local_source=None,
+                 local_target=None, local_policy="ask", local_move=False,
+                 local_root=None):
         self.id = task_id
         self.kind = kind
         self.command = command
@@ -1831,6 +2236,15 @@ class Task(object):
         # Browser-originated uploads use a private temporary source file; keep
         # it available for retry, then remove it on completion or queue clear.
         self.cleanup_path = cleanup_path
+        # A local-to-local entry has no core process: it runs this callable
+        # in the queue worker instead of a command line.
+        self.native = native
+        self.local_source = local_source
+        self.local_target = local_target
+        self.local_policy = local_policy
+        self.local_move = local_move
+        self.local_root = local_root
+        self.skipped = 0
 
     def as_dict(self):
         percent = 0
@@ -1846,6 +2260,7 @@ class Task(object):
             "bytes_done": self.bytes_done,
             "bytes_total": self.bytes_total,
             "percent": percent,
+            "skipped": self.skipped,
             "detail": self.detail,
             "start_time": self.started,
             "end_time": self.finished,
@@ -1879,11 +2294,16 @@ class TaskManager(object):
 
     def submit(self, kind, command, session, source, destination, tab_id,
                progress_path=None, progress_remote=None, move_source=None,
-               cleanup_path=None, priority=False):
+               cleanup_path=None, priority=False, native=None,
+               local_source=None, local_target=None, local_policy="ask",
+               local_move=False, local_root=None):
         with STATE_LOCK:
             task = Task(STATE["next_task"], kind, command, session, source,
                         destination, tab_id, progress_path, progress_remote,
-                        move_source=move_source, cleanup_path=cleanup_path)
+                        move_source=move_source, cleanup_path=cleanup_path,
+                        native=native, local_source=local_source,
+                        local_target=local_target, local_policy=local_policy,
+                        local_move=local_move, local_root=local_root)
             STATE["next_task"] += 1
             if priority:
                 STATE["tasks"].append(task)
@@ -1916,6 +2336,8 @@ class TaskManager(object):
         task.status = "Running"
         task.started = time.strftime("%H:%M:%S")
         task.error = ""
+        if task.native is not None:
+            return self._run_native(task)
         add_log("%s started: %s" %
                 (task.kind, redact_command_for_log(task.command)), "cmd")
         # Each task has its own connection so it can be interrupted without
@@ -1996,13 +2418,71 @@ class TaskManager(object):
                 "success" if code == 0 else "error")
         # Refresh the panes of the tab this task belongs to.
         tab = get_tab(task.tab_id)
-        if tab is not None and tab.connected:
+        if tab is not None and tab.connected and not getattr(tab, "is_local", False):
             code, lines = tab.run("pwd")
             if code == 0:
                 for line in lines:
                     if line.startswith("/"):
                         tab.remote_dir = line.strip()
                         break
+
+    def _run_native(self, task):
+        """Run a local copy in the queue worker.
+
+        The operation updates ``task.bytes_done`` as it copies and raises
+        LocalTransferCancelled when the queue entry is cancelled. Nothing
+        here starts a subprocess or opens a socket.
+        """
+        add_log("%s started: %s -> %s" % (task.kind, task.source,
+                                          task.destination), "cmd")
+        failure = ""
+        try:
+            task.native(task)
+        except LocalTransferCancelled:
+            task.status = "Cancelled"
+            task.finished = time.strftime("%H:%M:%S")
+            add_log("%s cancelled: %s" % (task.kind, task.source), "info")
+            return
+        except (OSError, ValueError, shutil.Error) as exc:
+            failure = str(exc)
+        except Exception as exc:
+            failure = str(exc)
+        if task.status == "Cancelling":
+            task.status = "Cancelled"
+            task.finished = time.strftime("%H:%M:%S")
+            add_log("%s cancelled: %s" % (task.kind, task.source), "info")
+            return
+        if failure:
+            task.status = "Failed"
+            task.error = failure
+            task.finished = time.strftime("%H:%M:%S")
+            add_log("%s failed: %s" % (task.kind, failure), "error")
+            return
+        task.status = "Completed"
+        task.finished = time.strftime("%H:%M:%S")
+        add_log("%s completed: %s" % (task.kind, task.destination), "success")
+
+    def submit_local(self, kind, source, destination, tab_id, policy,
+                     move=False, root=None, bytes_total=0, priority=False):
+        """Queue a local copy/move that needs no server connection."""
+        def operation(entry):
+            local_copy_task(entry)
+
+        with STATE_LOCK:
+            task = Task(STATE["next_task"], kind, "", {}, source,
+                        destination, tab_id, native=operation,
+                        local_source=source, local_target=destination,
+                        local_policy=policy, local_move=move, local_root=root)
+            task.bytes_total = bytes_total
+            STATE["next_task"] += 1
+            if priority:
+                STATE["tasks"].append(task)
+            else:
+                STATE["tasks"].insert(0, task)
+        with self.condition:
+            self.condition.notify_all()
+        add_log("Queued %s: %s -> %s" % (kind, source, destination), "info")
+        return task
 
     def _remove_move_source(self, task):
         """Remove a moved file only if its source still matches the queued file."""
@@ -2162,6 +2642,35 @@ class TaskManager(object):
 
 
 TASKS = TaskManager()
+
+
+def queue_local_transfers(tab, direction, names, policy="ask", move=False,
+                          priority=False):
+    """Queue copies between the two local panes of a local-to-local tab.
+
+    'upload' means left pane to right pane and 'download' the reverse,
+    exactly as the same two words mean for a remote tab, so the Commander
+    keys F5/F6 keep their meaning when there is no server.
+    """
+    if tab is None or not getattr(tab, "is_local", False):
+        raise ValueError("This tab is not a local-to-local session.")
+    if direction not in ("upload", "download"):
+        raise ValueError("The direction must be upload or download.")
+    if direction == "upload":
+        source_dir, destination_dir = tab.local_dir, tab.remote_dir
+    else:
+        source_dir, destination_dir = tab.remote_dir, tab.local_dir
+    plans = plan_local_transfers(source_dir, destination_dir, names, policy)
+    tasks = []
+    for source, target in plans:
+        total, _files = _local_source_size(source)
+        kind = "Move (local)" if move else "Copy (local)"
+        task = TASKS.submit_local(
+            kind, source, target, tab.id, policy, move=move,
+            root=os.path.realpath(destination_dir), bytes_total=total,
+            priority=priority)
+        tasks.append(task)
+    return tasks
 
 
 # ---------------------------------------------------------------------------
@@ -2588,6 +3097,20 @@ def browser_destination(remote_dir, relative_path):
 
 def queue_browser_directory(tab, remote_dir, relative_path):
     """Queue even empty folders, without treating an existing folder as an error."""
+    if getattr(tab, "is_local", False):
+        # The right-hand pane is a local directory on disk, so a dropped
+        # folder is created here rather than sent as a remote command.
+        destination = save_local_browser_directory(remote_dir, relative_path)
+        with STATE_LOCK:
+            task = Task(STATE["next_task"], "Create directory", "", {},
+                        "Browser: " + relative_path, destination, tab.id)
+            STATE["next_task"] += 1
+            STATE["tasks"].insert(0, task)
+        task.status = "Completed"
+        task.started = time.strftime("%H:%M:%S")
+        task.finished = task.started
+        task.detail = "Created " + destination
+        return task
     destination = browser_destination(remote_dir, relative_path)
     return TASKS.submit("Create directory",
                         "mkdir -parents " + quote_remote(destination),
@@ -2850,6 +3373,536 @@ def list_local_directory(path):
     return entries, None
 
 
+
+def local_stat_info(path):
+    """The attributes the properties dialog shows for a local pane entry."""
+    info = os.lstat(path)
+    is_link = stat.S_ISLNK(info.st_mode)
+    is_dir = stat.S_ISDIR(info.st_mode)
+    target_type = "Symbolic link" if is_link else ("Directory" if is_dir else "File")
+    permissions = stat.filemode(info.st_mode)
+    mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(info.st_mtime))
+    raw = "\n".join([
+        "Path: %s" % path,
+        "Type: %s" % target_type,
+        "SizeBytes: %d" % info.st_size,
+        "Permissions: %s" % permissions,
+        "Modified: %s" % mtime,
+        "Owner: %d:%d" % (info.st_uid, info.st_gid),
+    ])
+    return {"path": path, "size": info.st_size, "mtime": info.st_mtime,
+            "is_dir": is_dir, "is_link": is_link, "permissions": permissions,
+            "modified": mtime, "owner": "%d:%d" % (info.st_uid, info.st_gid),
+            "raw": raw}
+
+
+def local_checksum(path, algorithm):
+    """Hash one local file with the algorithm names the client accepts."""
+    if os.path.isdir(path) and not os.path.islink(path):
+        raise ValueError("A checksum is computed for files, not directories.")
+    if not os.path.isfile(path):
+        raise ValueError("That is not a regular file.")
+    algorithm = str(algorithm).lower()
+    if algorithm == "crc32":
+        value = 0
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                value = zlib.crc32(chunk, value)
+        return "%08x" % (value & 0xffffffff)
+    names = {"sha-256": "sha256", "sha-1": "sha1", "md5": "md5"}
+    if algorithm not in names:
+        raise ValueError("The algorithm must be one of: sha-256, sha-1, md5 "
+                         "or crc32.")
+    digest = hashlib.new(names[algorithm])
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def local_search(start, pattern, limit=500, case_sensitive=False,
+                 content_query=None, stats=None):
+    """Find local files by name and optionally by contents.
+
+    The result shape is the one /api/remote/search already returns, so the
+    same browser dialog can search either pane of a local-to-local tab.
+    """
+    start = os.path.abspath(start)
+    if not os.path.isdir(start):
+        raise ValueError("The search directory is not a directory.")
+    match_name = fnmatch if case_sensitive else (
+        lambda name, mask: fnmatch(name.lower(), mask.lower()))
+    matches = []
+    scanned = 0
+    skipped = 0
+    bytes_scanned = 0
+    truncated = False
+    for root, directories, names in os.walk(start, followlinks=False):
+        directories.sort()
+        names.sort()
+        for name in names + directories:
+            if len(matches) >= limit:
+                truncated = True
+                break
+            path = os.path.join(root, name)
+            relative = os.path.relpath(path, start).replace(os.sep, "/")
+            if not match_name(relative, pattern) and not match_name(name, pattern):
+                continue
+            info = None
+            try:
+                info = os.lstat(path)
+            except OSError:
+                skipped += 1
+                continue
+            is_dir = stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+            if os.path.islink(path):
+                skipped += 1
+                continue
+            if content_query is not None and not is_dir:
+                try:
+                    if info.st_size > 8 * 1024 * 1024:
+                        skipped += 1
+                        continue
+                    with open(path, "rb") as handle:
+                        data = handle.read()
+                    bytes_scanned += len(data)
+                    if content_query.encode("utf-8") not in data:
+                        continue
+                except OSError:
+                    skipped += 1
+                    continue
+            scanned += 1
+            matches.append({
+                "path": path,
+                "name": name,
+                "is_dir": is_dir,
+                "size": 0 if is_dir else info.st_size,
+                "date": time.strftime("%Y-%m-%d %H:%M",
+                                      time.localtime(info.st_mtime)),
+                "permissions": stat.filemode(info.st_mode),
+            })
+        if truncated:
+            break
+    if stats is not None:
+        stats.update({"scanned": scanned, "skipped": skipped,
+                      "bytes_scanned": bytes_scanned, "truncated": truncated})
+    return matches
+
+
+# ---------------------------------------------------------------------------
+# Local-to-local copies (no server, no core process)
+# ---------------------------------------------------------------------------
+#
+# Upstream's local browser session has two local directories and no remote
+# side. The copy engine here is deliberately independent of the console
+# client: there is no command stream, no quote parser and no SSH state to
+# disturb, and a local operation cannot accidentally become a remote one.
+#
+# The policy is part of the API, because a browser cannot answer an overwrite
+# prompt from a background queue thread. A caller that did not state a policy
+# gets "ask": if a destination entry exists the request is refused with the
+# list of conflicts and nothing is copied, so the page can confirm once and
+# retry with an explicit decision. "skip", "overwrite" and "rename" are the
+# three answers WinSCP's copy dialog offers.
+
+LOCAL_OVERWRITE_POLICIES = ("ask", "overwrite", "skip", "rename")
+
+
+class LocalTransferCancelled(Exception):
+    """The queue entry was cancelled while a local copy was running."""
+
+
+class LocalTransferConflict(ValueError):
+    """A destination entry exists and the caller did not decide what to do."""
+
+    def __init__(self, conflicts):
+        self.conflicts = list(conflicts)
+        super().__init__(
+            "The destination already contains: %s." % ", ".join(self.conflicts))
+
+
+def _local_control_characters(path):
+    return any(ord(char) < 32 or ord(char) == 127 for char in path)
+
+
+def check_local_pane_directory(path, label="directory"):
+    """Return a local pane path as an absolute directory, or raise."""
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("The %s is required." % label)
+    if _local_control_characters(path):
+        raise ValueError("The %s must not contain control characters." % label)
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        raise ValueError("The %s does not exist or is not a directory." % label)
+    return path
+
+
+def _local_lexical_real(path):
+    """Resolve the parent of ``path`` but not a symbolic link at its end.
+
+    Copying a symbolic link copies the link itself, so resolving its target
+    would compare the wrong two paths for overlap and could make a safe copy
+    look recursive (or the reverse).
+    """
+    parent = os.path.dirname(os.path.abspath(path))
+    name = os.path.basename(os.path.abspath(path))
+    return os.path.join(os.path.realpath(parent), name)
+
+
+def _local_within(parent, child):
+    try:
+        return os.path.commonpath([parent, child]) == parent
+    except ValueError:
+        return False
+
+
+def local_transfer_overlap_error(source, destination):
+    """Refuse a copy whose destination is the source or lies inside it."""
+    source_real = _local_lexical_real(source)
+    destination_real = os.path.realpath(destination)
+    if source_real == destination_real:
+        return "The source and the destination are the same path."
+    if _local_within(source_real, destination_real):
+        return ("The destination is inside the source directory; copying it "
+                "would repeat for ever.")
+    if _local_within(destination_real, source_real):
+        return ("The source is inside the destination directory; the copy "
+                "would overwrite its own input.")
+    return ""
+
+
+def _local_unique_target(target):
+    """A free name next to ``target``: 'name (2).ext', 'name (3).ext', ..."""
+    base, extension = os.path.splitext(target)
+    counter = 2
+    while os.path.lexists("%s (%d)%s" % (base, counter, extension)):
+        counter += 1
+    return "%s (%d)%s" % (base, counter, extension)
+
+
+def _local_source_size(source):
+    """Bytes and regular-file count below one source entry, without links."""
+    if os.path.islink(source):
+        return 0, 1
+    if os.path.isfile(source):
+        return os.path.getsize(source), 1
+    if not os.path.isdir(source):
+        raise ValueError("Only regular files, directories and symbolic links "
+                         "can be copied locally.")
+    total = 0
+    files = 0
+    for root, directories, names in os.walk(source, followlinks=False):
+        # os.walk lists a symlink to a directory in 'directories' even
+        # though it does not descend into it; it is still one entry.
+        for name in directories:
+            path = os.path.join(root, name)
+            if os.path.islink(path):
+                files += 1
+        for name in names:
+            path = os.path.join(root, name)
+            if os.path.islink(path):
+                files += 1
+            elif os.path.isfile(path):
+                try:
+                    total += os.path.getsize(path)
+                except OSError:
+                    pass
+                files += 1
+            else:
+                raise ValueError("Only regular files, directories and "
+                                 "symbolic links can be copied locally.")
+    return total, files
+
+
+def _local_remove_target(target):
+    """Remove one destination entry without following a symbolic link."""
+    if os.path.islink(target) or os.path.isfile(target):
+        os.unlink(target)
+    elif os.path.isdir(target):
+        # An empty directory can be replaced by a file or a link. A
+        # non-empty one is a tree the caller did not ask to merge, so it is
+        # reported rather than deleted.
+        os.rmdir(target)
+    else:
+        raise ValueError("The destination contains an entry this client "
+                         "cannot replace.")
+
+
+def _local_prepare_parent(base, target):
+    """Create the parent of ``target`` below ``base``, refusing links.
+
+    A directory in the destination that is a symbolic link is not followed:
+    a copy could otherwise create files outside the pane through a link that
+    was already there.
+    """
+    base = os.path.realpath(base)
+    parent = os.path.dirname(os.path.abspath(target))
+    try:
+        relative = os.path.relpath(parent, base)
+    except ValueError:
+        raise ValueError("The destination escapes the local pane.")
+    if relative == ".." or relative.startswith(".." + os.sep):
+        raise ValueError("The destination escapes the local pane.")
+    current = base
+    for part in relative.split(os.sep):
+        if part in ("", "."):
+            continue
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            raise ValueError("The destination contains a symbolic link in a "
+                             "directory that would have to be entered.")
+        if os.path.exists(current):
+            if not os.path.isdir(current):
+                raise ValueError("A file is in the way of the destination "
+                                 "directory.")
+        else:
+            os.mkdir(current, 0o755)
+
+
+def _local_check_cancel(task):
+    if task is not None and getattr(task, "status", "") == "Cancelling":
+        raise LocalTransferCancelled()
+
+
+def _local_copy_symlink(source, target, task):
+    if os.path.lexists(target):
+        if os.path.isdir(target) and not os.path.islink(target):
+            raise ValueError("A directory is in the way of a symbolic link.")
+        os.unlink(target)
+    os.symlink(os.readlink(source), target)
+    try:
+        source_stat = os.lstat(source)
+        os.utime(target, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+                 follow_symlinks=False)
+    except OSError:
+        pass
+
+
+def _local_copy_file(source, target, task):
+    if os.path.isdir(target) and not os.path.islink(target):
+        raise ValueError("A directory is in the way of a file.")
+    _local_check_cancel(task)
+    parent = os.path.dirname(target)
+    temp = os.path.join(parent, ".linscp-part-%s" % secrets.token_hex(8))
+    handle = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(handle, "wb") as output:
+            with open(source, "rb") as input_file:
+                while True:
+                    _local_check_cancel(task)
+                    chunk = input_file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    if task is not None:
+                        task.bytes_done += len(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        shutil.copystat(source, temp)
+        os.replace(temp, target)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
+def _local_copy_directory(source, target, policy, task, root):
+    """Copy one directory tree, merging into an existing directory."""
+    if os.path.lexists(target) and (os.path.islink(target) or
+                                    not os.path.isdir(target)):
+        if policy == "skip":
+            if task is not None:
+                task.skipped = getattr(task, "skipped", 0) + 1
+            return
+        if policy != "overwrite":
+            raise ValueError("The destination is not a directory.")
+        _local_remove_target(target)
+    if not os.path.isdir(target):
+        os.mkdir(target, 0o755)
+    with os.scandir(source) as scan:
+        entries = sorted(scan, key=lambda item: item.name)
+    for entry in entries:
+        _local_check_cancel(task)
+        child_source = entry.path
+        child_target = os.path.join(target, entry.name)
+        if entry.is_symlink():
+            if os.path.lexists(child_target):
+                if policy == "skip":
+                    if task is not None:
+                        task.skipped = getattr(task, "skipped", 0) + 1
+                    continue
+                if policy == "rename":
+                    child_target = _local_unique_target(child_target)
+                elif policy != "overwrite":
+                    raise LocalTransferConflict([entry.name])
+            _local_prepare_parent(root, child_target)
+            _local_copy_symlink(child_source, child_target, task)
+        elif entry.is_dir(follow_symlinks=False):
+            _local_prepare_parent(root, child_target)
+            _local_copy_directory(child_source, child_target, policy, task, root)
+        elif entry.is_file(follow_symlinks=False):
+            if os.path.lexists(child_target):
+                if policy == "skip":
+                    if task is not None:
+                        task.skipped = getattr(task, "skipped", 0) + 1
+                    continue
+                if policy == "rename":
+                    child_target = _local_unique_target(child_target)
+                elif not os.path.isdir(child_target) or os.path.islink(child_target):
+                    if policy != "overwrite":
+                        raise LocalTransferConflict([entry.name])
+            _local_prepare_parent(root, child_target)
+            _local_copy_file(child_source, child_target, task)
+        else:
+            raise ValueError("Only regular files, directories and symbolic "
+                             "links can be copied locally.")
+    try:
+        shutil.copystat(source, target, follow_symlinks=False)
+    except OSError:
+        pass
+
+
+def copy_local_entry(source, target, policy="ask", task=None, move=False,
+                     root=None):
+    """Copy one local entry; returns a short result description.
+
+    ``task`` is the queue entry being updated, or None for a synchronous
+    caller. Cancellation is checked between chunks and between directory
+    entries; an interrupted file leaves no half-written destination because
+    bytes go to a temporary file in the destination directory first.
+    """
+    if policy not in LOCAL_OVERWRITE_POLICIES:
+        raise ValueError("The overwrite policy must be one of: %s." %
+                         ", ".join(LOCAL_OVERWRITE_POLICIES))
+    if not os.path.lexists(source):
+        raise ValueError("The source no longer exists.")
+    overlap = local_transfer_overlap_error(source, target)
+    if overlap:
+        raise ValueError(overlap)
+    root = os.path.realpath(root or os.path.dirname(os.path.abspath(target)))
+    # A direct caller (not the queue) has no Task to count skipped entries
+    # on. Moves use the same object so a directory whose child was skipped
+    # never loses its source just because there was no queue entry to ask.
+    counter = task
+    if counter is None:
+        counter = type("LocalSkipCounter", (object,), {"skipped": 0,
+                                                        "status": ""})()
+    if os.path.lexists(target):
+        if policy == "skip":
+            if task is not None:
+                task.skipped = getattr(task, "skipped", 0) + 1
+            else:
+                counter.skipped += 1
+            return "skipped"
+        if policy == "rename":
+            target = _local_unique_target(target)
+        elif policy == "ask":
+            raise LocalTransferConflict([os.path.basename(target)])
+        # 'overwrite' is the only policy left; the type of the existing
+        # entry is handled by the copy helper.
+    _local_prepare_parent(root, target)
+    if os.path.islink(source):
+        if os.path.lexists(target) and policy == "overwrite":
+            _local_remove_target(target)
+        _local_copy_symlink(source, target, counter)
+    elif os.path.isdir(source):
+        _local_copy_directory(source, target, policy, counter, root)
+    elif os.path.isfile(source):
+        if os.path.lexists(target) and policy == "overwrite" and \
+                (os.path.islink(target) or not os.path.isdir(target)):
+            # _local_copy_file replaces a regular file atomically; a
+            # symbolic link is removed first so the link target is never
+            # written through.
+            if os.path.islink(target):
+                os.unlink(target)
+        _local_copy_file(source, target, counter)
+    else:
+        raise ValueError("Only regular files, directories and symbolic links "
+                         "can be copied locally.")
+    if move:
+        if counter.skipped:
+            return "copied; the source was kept because an entry was skipped"
+        _local_check_cancel(counter)
+        if os.path.isdir(source) and not os.path.islink(source):
+            shutil.rmtree(source)
+        else:
+            os.unlink(source)
+        return "moved"
+    return "copied"
+
+
+def plan_local_transfers(source_dir, destination_dir, names, policy="ask"):
+    """Resolve the names of one pane against the other, before copying.
+
+    Returns ``[(source, target), ...]`` with skip entries marked by their
+    target being unchanged; raises LocalTransferConflict for an undecided
+    overwrite and ValueError for a name that is not one entry of the pane.
+    """
+    if policy not in LOCAL_OVERWRITE_POLICIES:
+        raise ValueError("The overwrite policy must be one of: %s." %
+                         ", ".join(LOCAL_OVERWRITE_POLICIES))
+    if not isinstance(names, list) or not names:
+        raise ValueError("Select one or more entries to copy.")
+    source_dir = check_local_pane_directory(source_dir, "source directory")
+    destination_dir = check_local_pane_directory(destination_dir,
+                                                 "destination directory")
+    plans = []
+    conflicts = []
+    reserved = set()
+    for name in names:
+        source, containment = contained_local_path(source_dir, name)
+        if containment:
+            raise ValueError(containment)
+        if not os.path.lexists(source):
+            raise ValueError("The source %s no longer exists." % name)
+        overlap = local_transfer_overlap_error(source, destination_dir)
+        if overlap:
+            raise ValueError(overlap)
+        target = os.path.join(os.path.realpath(destination_dir), name)
+        if os.path.lexists(target) or target in reserved:
+            if policy == "ask":
+                conflicts.append(name)
+            elif policy == "rename":
+                target = _local_unique_target(target)
+                while target in reserved:
+                    target = _local_unique_target(target)
+            elif policy == "skip":
+                pass
+            # overwrite keeps the target
+        reserved.add(target)
+        plans.append((source, target))
+    if conflicts:
+        raise LocalTransferConflict(conflicts)
+    return plans
+
+
+def local_copy_task(task):
+    """The queue worker body of one local copy/move entry."""
+    source = task.local_source
+    target = task.local_target
+    policy = task.local_policy
+    total, _files = _local_source_size(source)
+    task.bytes_total = total
+    task.bytes_done = 0
+    task.detail = "Copying %s" % os.path.basename(source)
+    result = copy_local_entry(source, target, policy, task=task,
+                              move=task.local_move, root=task.local_root)
+    if result == "skipped":
+        task.detail = "Skipped an existing destination: %s" % target
+    elif task.local_move:
+        task.detail = "Moved %s" % os.path.basename(source)
+    else:
+        task.detail = "Copied %s" % os.path.basename(source)
+
+
 # ---------------------------------------------------------------------------
 # Synchronization plans (the console client does the comparison)
 # ---------------------------------------------------------------------------
@@ -2932,6 +3985,94 @@ def parse_sync_preview(output):
 # ---------------------------------------------------------------------------
 # HTTP API
 # ---------------------------------------------------------------------------
+
+def save_local_stored_session(name, session):
+    """Save a local-to-local site without starting the console client.
+
+    The console client has no local transport, so 'savesession' cannot write
+    this kind of site. It is still a stored session for this GUI: two local
+    directories, no host and no secret. The other sections of sessions.ini
+    are copied through byte for byte, so a site written by the console client
+    keeps its encrypted password and every setting this function does not
+    know about.
+    """
+    if not isinstance(name, str):
+        return False, "The session name must be text."
+    name = name.strip()
+    if not name:
+        return False, "A session name is required."
+    if len(name) > 256 or any(ord(char) < 32 or ord(char) == 127
+                              for char in name):
+        return False, "The session name is not usable."
+    error = validate_local_panes(session.get("local_dir") or "",
+                                 session.get("other_local_dir") or "")
+    if error:
+        return False, error
+    block = [
+        "[%s]" % _escape(name),
+        "protocol=local",
+        "local_directory=%s" % _escape(os.path.abspath(session["local_dir"])),
+        "other_local_directory=%s" % _escape(
+            os.path.abspath(session["other_local_dir"])),
+        "last_used=%d" % int(time.time()),
+    ]
+    path = session_store_path()
+    directory = os.path.dirname(path)
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except FileNotFoundError:
+            lines = []
+        preamble = []
+        sections = []
+        current = None
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                current = {"header": line, "lines": [line], "name": stripped[1:-1]}
+                sections.append(current)
+            elif current is None:
+                preamble.append(line)
+            else:
+                current["lines"].append(line)
+        replaced = False
+        output = list(preamble)
+        for section in sections:
+            if _unescape(section["name"]) == name:
+                if not replaced:
+                    output.extend(block)
+                    replaced = True
+                continue
+            output.extend(section["lines"])
+        if not replaced:
+            if output and output[-1].strip():
+                output.append("")
+            output.extend(block)
+        handle = tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=directory, prefix=".sessions-",
+            delete=False)
+        temporary = handle.name
+        try:
+            os.chmod(temporary, 0o600)
+            with handle:
+                handle.write("\n".join(output).rstrip("\n") + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        add_log("Cannot save the local session: %s" % exc, "error")
+        return False, "Cannot write the session file: %s" % exc
+    add_log("Saved local session '%s'" % name, "success")
+    return True, ""
+
 
 def save_stored_session(name, session, pin_hostkey=False, preserve_tunnel_credentials=False):
     """Write a session through 'savesession', so sessions.ini stays the only
@@ -3262,6 +4403,8 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 "session": session,
                 "local_dir": tab.local_dir if tab else os.path.expanduser("~"),
                 "remote_dir": tab.remote_dir if tab else "/",
+                "other_local_dir": tab.other_local_dir if tab else "",
+                "is_local": bool(tab and getattr(tab, "is_local", False)),
                 "binary": LINSCP_BIN,
                 "tabs": tabs,
                 "active_tab": active,
@@ -3307,6 +4450,17 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                             "file": session_store_path()})
             return
 
+        if path == "/api/workspaces":
+            try:
+                workspaces = list_workspaces()
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
+            self.send_json({"success": True, "workspaces": workspaces,
+                            "file": workspace_store_path()})
+            return
+
         if path == "/api/local/list":
             req_path = query.get("path", [None])[0]
             tab = get_tab(query.get("tab", [None])[0])
@@ -3347,6 +4501,22 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if tab is None:
                 self.send_json({"success": False, "error": "Not connected"}, status=400)
                 return
+            if getattr(tab, "is_local", False):
+                req_path = (query.get("path", [None])[0] or
+                            tab.remote_dir or tab.other_local_dir)
+                if not os.path.isabs(req_path):
+                    req_path = os.path.abspath(os.path.join(
+                        tab.remote_dir or tab.other_local_dir, req_path))
+                entries, err = list_local_directory(req_path)
+                if err:
+                    self.send_json({"success": False, "error": err},
+                                   status=400)
+                    return
+                tab.remote_dir = req_path
+                tab.other_local_dir = req_path
+                self.send_json({"success": True, "path": req_path,
+                                "entries": entries})
+                return
             req_path = query.get("path", [None])[0] or tab.remote_dir
             code, lines = tab.run_many(["cd " + quote_remote(req_path), "pwd", "ls -la"])
             if code != 0:
@@ -3372,6 +4542,21 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             remote_path = query.get("path", [""])[0]
             if not remote_path:
                 self.send_json({"success": False, "error": "No file given"}, status=400)
+                return
+            if getattr(tab, "is_local", False):
+                local_path, path_error = resolve_local_pane_file(
+                    tab, remote_path, "remote")
+                if path_error:
+                    self.send_json({"success": False, "error": path_error},
+                                   status=400)
+                    return
+                content, info, error = read_local_text(local_path)
+                if error:
+                    self.send_json({"success": False, "error": error},
+                                   status=400)
+                else:
+                    self.send_json({"success": True, "path": local_path,
+                                    "content": content, "info": info})
                 return
             content, info, error = download_remote_text(tab, remote_path)
             if error:
@@ -3477,6 +4662,23 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             filename = query.get("name", [""])[0]
             remote_dir = query.get("remote_dir", [tab.remote_dir])[0]
             relative_path = query.get("relative_path", [filename])[0]
+            if getattr(tab, "is_local", False):
+                # The "remote" pane of a local-to-local tab is a directory
+                # on this machine. The bytes are written exactly where a
+                # drop onto that pane means, through the same containment
+                # check the local pane uses.
+                try:
+                    destination = save_local_browser_upload(
+                        remote_dir, filename, self.rfile, content_length,
+                        relative_path)
+                except (IOError, OSError, ValueError) as exc:
+                    self.close_connection = True
+                    self.send_json({"success": False,
+                                    "error": "Could not save the file: %s" % exc},
+                                   status=400)
+                    return
+                self.send_json({"success": True, "path": destination})
+                return
             try:
                 task = queue_browser_upload(tab, remote_dir, filename,
                                             self.rfile, content_length,
@@ -3584,12 +4786,14 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 return
             for key in ("protocol", "host", "port", "username", "password",
                         "keyfile", "hostkey", "initial_dir", "local_dir",
+                        "other_local_dir", "site",
                         "tunnel", "tunnel_host", "tunnel_port", "tunnel_username",
                         "tunnel_private_key", "tunnel_hostkey", "tunnel_password",
                         "tunnel_passphrase", "tunnel_error"):
                 if key in given:
                     session[key] = given[key]
-            error = validate_session_data(session, require_host=True)
+            error = validate_session_data(
+                session, require_host=not session_is_local(session))
             requested_name = body.get("name")
             given_name = given.get("name")
             name = requested_name or given_name
@@ -3602,8 +4806,14 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             with STATE_LOCK:
                 tab = CoreSession(STATE["next_tab"], session, name=name)
                 STATE["next_tab"] += 1
-            add_log("Connecting to %s (%s)..." % (session.get("host"), session.get("protocol")),
-                    "info")
+            if session_is_local(session):
+                add_log("Opening local panes %s and %s..." %
+                        (session.get("local_dir"), session.get("other_local_dir")),
+                        "info")
+            else:
+                add_log("Connecting to %s (%s)..." % (session.get("host"),
+                                                     session.get("protocol")),
+                        "info")
             ok, error = tab.connect()
             with STATE_LOCK:
                 if ok:
@@ -3812,8 +5022,12 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 self.send_json({"success": False, "error": "A session name is required"},
                                status=400)
                 return
-            ok, message = save_stored_session(name, session or new_session(),
-                                              pin_hostkey=bool(body.get("pin_hostkey")))
+            if session_is_local(session):
+                ok, message = save_local_stored_session(name, session)
+            else:
+                ok, message = save_stored_session(
+                    name, session or new_session(),
+                    pin_hostkey=bool(body.get("pin_hostkey")))
             if ok:
                 self.send_json({"success": True, "sessions": read_stored_sessions()})
             else:
@@ -3835,6 +5049,41 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             else:
                 message = stderr.strip() or stdout.strip() or "Cannot remove the session"
                 self.send_json({"success": False, "error": message}, status=400)
+            return
+
+        if path == "/api/workspaces/save":
+            try:
+                saved = save_workspace(body.get("name") or "",
+                                       overwrite=bool(body.get("overwrite")))
+            except WorkspaceExists as exc:
+                self.send_json({"success": False, "error": str(exc),
+                                "exists": True}, status=409)
+                return
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
+            self.send_json({"success": True, "workspace": saved})
+            return
+
+        if path == "/api/workspaces/open":
+            try:
+                result = restore_workspace(body.get("name") or "")
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
+            self.send_json(dict(result, success=True))
+            return
+
+        if path == "/api/workspaces/delete":
+            try:
+                delete_workspace(body.get("name") or "")
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
+            self.send_json({"success": True})
             return
 
         if path == "/api/local/mkdir":
@@ -3950,6 +5199,20 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if name_error:
                 self.send_json({"success": False, "error": name_error}, status=400)
                 return
+            if getattr(tab, "is_local", False):
+                target, contain_error = contained_local_path(tab.remote_dir, name)
+                if contain_error:
+                    self.send_json({"success": False, "error": contain_error},
+                                   status=400)
+                    return
+                try:
+                    os.makedirs(target, exist_ok=True)
+                    add_log("Created local directory: %s" % target, "success")
+                    self.send_json({"success": True})
+                except OSError as exc:
+                    self.send_json({"success": False, "error": str(exc)},
+                                   status=400)
+                return
             code, lines = tab.run_many(["cd " + quote_remote(tab.remote_dir),
                                         "mkdir " + quote_remote(name)])
             if code == 0:
@@ -3974,6 +5237,22 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                     errors.append(name_error)
                     continue
                 is_dir = item.get("is_dir", False) if isinstance(item, dict) else False
+                if getattr(tab, "is_local", False):
+                    target, contain_error = contained_local_path(tab.remote_dir,
+                                                                 name or "")
+                    if contain_error:
+                        errors.append("%s: %s" % (name, contain_error))
+                        continue
+                    try:
+                        if os.path.isdir(target) and not os.path.islink(target):
+                            shutil.rmtree(target)
+                        else:
+                            os.remove(target)
+                        deleted.append(name)
+                        add_log("Deleted local item: %s" % name, "success")
+                    except OSError as exc:
+                        errors.append("%s: %s" % (name, exc))
+                    continue
                 code, lines = tab.run_many([
                     "cd " + quote_remote(tab.remote_dir),
                     ("rmdir" if is_dir else "rm") + " " + quote_remote(name or "")])
@@ -4000,6 +5279,24 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if name_error:
                 self.send_json({"success": False, "error": name_error}, status=400)
                 return
+            if getattr(tab, "is_local", False):
+                source, contain_error = contained_local_path(tab.remote_dir,
+                                                             old_name)
+                if not contain_error:
+                    target, contain_error = contained_local_path(tab.remote_dir,
+                                                                 new_name)
+                if contain_error:
+                    self.send_json({"success": False, "error": contain_error},
+                                   status=400)
+                    return
+                try:
+                    os.rename(source, target)
+                    add_log("Renamed %s to %s" % (old_name, new_name), "success")
+                    self.send_json({"success": True})
+                except OSError as exc:
+                    self.send_json({"success": False, "error": str(exc)},
+                                   status=400)
+                return
             code, lines = tab.run_many([
                 "cd " + quote_remote(tab.remote_dir),
                 "mv " + quote_remote(old_name) + " " + quote_remote(new_name)])
@@ -4022,6 +5319,25 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 self.send_json({"success": False, "error": name_error}, status=400)
                 return
             mode_text = str(body.get("permissions") or "644")
+            if getattr(tab, "is_local", False):
+                target, contain_error = contained_local_path(tab.remote_dir, name)
+                if contain_error:
+                    self.send_json({"success": False, "error": contain_error},
+                                   status=400)
+                    return
+                mode_error = check_permission_mode(mode_text)
+                if mode_error:
+                    self.send_json({"success": False, "error": mode_error},
+                                   status=400)
+                    return
+                try:
+                    apply_local_mode(target, mode_text)
+                    add_log("Changed local permissions: %s" % name, "success")
+                    self.send_json({"success": True})
+                except OSError as exc:
+                    self.send_json({"success": False, "error": str(exc)},
+                                   status=400)
+                return
             try:
                 commands = build_chmod_command(tab.remote_dir, mode_text, name)
             except ValueError as exc:
@@ -4063,9 +5379,16 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             stats = {"scanned": 0, "skipped": 0, "bytes_scanned": 0,
                      "truncated": False}
             try:
-                matches = remote_search(tab, start, pattern, limit,
-                    case_sensitive, content_query=content_query if search_contents else None,
-                    stats=stats)
+                if getattr(tab, "is_local", False):
+                    matches = local_search(
+                        start, pattern, limit, case_sensitive,
+                        content_query=content_query if search_contents else None,
+                        stats=stats)
+                else:
+                    matches = remote_search(tab, start, pattern, limit,
+                        case_sensitive,
+                        content_query=content_query if search_contents else None,
+                        stats=stats)
             except Exception as exc:
                 self.send_json({"success": False, "error": str(exc)}, status=400)
                 return
@@ -4086,6 +5409,23 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 self.send_json({"success": False, "error": "A path and content are required"},
                                status=400)
                 return
+            if getattr(tab, "is_local", False):
+                local_path, path_error = resolve_local_pane_file(
+                    tab, remote_path, "remote")
+                if path_error:
+                    self.send_json({"success": False, "error": path_error},
+                                   status=400)
+                    return
+                ok, message, info = write_local_text(
+                    local_path, content, body.get("base_mtime_ns") or
+                    body.get("base_mtime"))
+                if ok:
+                    add_log("Saved local file: %s" % local_path, "success")
+                    self.send_json({"success": True, "info": info})
+                else:
+                    self.send_json({"success": False, "error": message},
+                                   status=400)
+                return
             ok, error = upload_remote_text(tab, remote_path, content,
                                            body.get("base_mtime"))
             if ok:
@@ -4101,6 +5441,22 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 self.send_json({"success": False, "error": "Not connected"}, status=400)
                 return
             names = body.get("names") or []
+            if getattr(tab, "is_local", False):
+                try:
+                    queue_local_transfers(
+                        tab, "download", names,
+                        body.get("overwrite") or "ask",
+                        priority=bool(body.get("priority")))
+                except LocalTransferConflict as exc:
+                    self.send_json({"success": False, "error": str(exc),
+                                    "conflicts": exc.conflicts}, status=409)
+                    return
+                except ValueError as exc:
+                    self.send_json({"success": False, "error": str(exc)},
+                                   status=400)
+                    return
+                self.send_json({"success": True})
+                return
             local_dir = body.get("local_dir") or tab.local_dir
             switches = transfer_switches(body)
             priority = bool(body.get("priority"))
@@ -4130,6 +5486,22 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 self.send_json({"success": False, "error": "Not connected"}, status=400)
                 return
             names = body.get("names") or []
+            if getattr(tab, "is_local", False):
+                try:
+                    queue_local_transfers(
+                        tab, "upload", names,
+                        body.get("overwrite") or "ask",
+                        priority=bool(body.get("priority")))
+                except LocalTransferConflict as exc:
+                    self.send_json({"success": False, "error": str(exc),
+                                    "conflicts": exc.conflicts}, status=409)
+                    return
+                except ValueError as exc:
+                    self.send_json({"success": False, "error": str(exc)},
+                                   status=400)
+                    return
+                self.send_json({"success": True})
+                return
             remote_dir = body.get("remote_dir") or tab.remote_dir
             switches = transfer_switches(body)
             priority = bool(body.get("priority"))
@@ -4170,6 +5542,22 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if not isinstance(names, list) or not names:
                 self.send_json({"success": False, "error": "Select one or more files to move."},
                                status=400)
+                return
+            if getattr(tab, "is_local", False):
+                try:
+                    queue_local_transfers(
+                        tab, direction, names,
+                        body.get("overwrite") or "ask", move=True,
+                        priority=bool(body.get("priority")))
+                except LocalTransferConflict as exc:
+                    self.send_json({"success": False, "error": str(exc),
+                                    "conflicts": exc.conflicts}, status=409)
+                    return
+                except ValueError as exc:
+                    self.send_json({"success": False, "error": str(exc)},
+                                   status=400)
+                    return
+                self.send_json({"success": True})
                 return
             local_dir = os.path.abspath(body.get("local_dir") or tab.local_dir)
             remote_dir = body.get("remote_dir") or tab.remote_dir
@@ -4348,6 +5736,23 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if operand_error:
                 self.send_json({"success": False, "error": operand_error}, status=400)
                 return
+            if getattr(tab, "is_local", False):
+                target, contain_error = contained_local_path(tab.remote_dir,
+                                                             name or "")
+                if contain_error:
+                    self.send_json({"success": False, "error": contain_error},
+                                   status=400)
+                    return
+                try:
+                    info = local_stat_info(target)
+                except OSError as exc:
+                    self.send_json({"success": False, "error": str(exc)},
+                                   status=400)
+                    return
+                self.send_json({"success": True, "name": operand,
+                                "listing": info.get("raw", ""),
+                                "attributes": info})
+                return
             code, lines, errors = tab.run_many_capture(
                 ["stat " + quote_remote(operand), "attr " + quote_remote(operand)])
             if code != 0:
@@ -4372,6 +5777,30 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if error:
                 self.send_json({"success": False, "error": error}, status=400)
                 return
+            if getattr(tab, "is_local", False):
+                link_name = body.get("name") or ""
+                target_text = body.get("target") or ""
+                link_path, contain_error = contained_local_path(tab.remote_dir,
+                                                                link_name)
+                if contain_error:
+                    self.send_json({"success": False, "error": contain_error},
+                                   status=400)
+                    return
+                if not isinstance(target_text, str) or not target_text or \
+                        any(ord(char) < 32 or ord(char) == 127 for char in target_text):
+                    self.send_json({"success": False,
+                                    "error": "A link target is required."},
+                                   status=400)
+                    return
+                try:
+                    os.symlink(target_text, link_path)
+                    add_log("Created local link '%s' -> '%s'" %
+                            (link_name, target_text), "success")
+                    self.send_json({"success": True})
+                except OSError as exc:
+                    self.send_json({"success": False, "error": str(exc)},
+                                   status=400)
+                return
             code, lines = tab.run_many([
                 "cd " + quote_remote(tab.remote_dir),
                 "ln %s %s" % (quote_remote(target), quote_remote(name))])
@@ -4394,6 +5823,28 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 destination, error = single_remote_name(tab, body.get("destination"))
             if error:
                 self.send_json({"success": False, "error": error}, status=400)
+                return
+            if getattr(tab, "is_local", False):
+                source_name = body.get("source") or ""
+                destination_name = body.get("destination") or ""
+                source_path, contain_error = contained_local_path(
+                    tab.remote_dir, source_name)
+                if not contain_error:
+                    destination_path, contain_error = contained_local_path(
+                        tab.remote_dir, destination_name)
+                if contain_error:
+                    self.send_json({"success": False, "error": contain_error},
+                                   status=400)
+                    return
+                try:
+                    copy_local_entry(source_path, destination_path,
+                                     "overwrite", root=tab.remote_dir)
+                    add_log("Copied local '%s' to '%s'" %
+                            (source_name, destination_name), "success")
+                    self.send_json({"success": True})
+                except (OSError, ValueError) as exc:
+                    self.send_json({"success": False, "error": str(exc)},
+                                   status=400)
                 return
             code, lines = tab.run_many([
                 "cd " + quote_remote(tab.remote_dir),
@@ -4428,6 +5879,26 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 self.send_json({"success": False,
                                 "error": "Too many files selected (maximum 200)."},
                                status=400)
+                return
+            if getattr(tab, "is_local", False):
+                results = []
+                for name in names:
+                    operand, operand_error = single_remote_name(tab, name)
+                    if operand_error:
+                        results.append({"name": str(name), "error": operand_error})
+                        continue
+                    target, contain_error = contained_local_path(
+                        tab.remote_dir, name)
+                    if contain_error:
+                        results.append({"name": operand, "error": contain_error})
+                        continue
+                    try:
+                        results.append({"name": operand,
+                                        "checksum": local_checksum(target, algorithm)})
+                    except (OSError, ValueError) as exc:
+                        results.append({"name": operand, "error": str(exc)})
+                self.send_json({"success": True, "algorithm": algorithm,
+                                "results": results})
                 return
             results = []
             for name in names:
@@ -5082,9 +6553,17 @@ def temp_path_for(remote_path):
 MAX_GUI_EDIT_BYTES = 8 * 1024 * 1024
 
 
-def resolve_local_file(tab, path):
-    """Resolve a local edit path beneath the active local panel directory."""
-    base = tab.local_dir if tab else os.path.expanduser("~")
+def resolve_local_pane_file(tab, path, side="local"):
+    """Resolve an edit path beneath one of a tab's local pane directories.
+
+    A local-to-local tab has two local roots and the right-hand one is not
+    the remote panel, so the containment check has to use the directory of
+    the pane the request names rather than always tab.local_dir.
+    """
+    if side == "remote" and tab is not None and getattr(tab, "is_local", False):
+        base = tab.remote_dir or tab.other_local_dir
+    else:
+        base = tab.local_dir if tab else os.path.expanduser("~")
     candidate = path if os.path.isabs(path) else os.path.join(base, path)
     candidate = os.path.abspath(candidate)
     real_base = os.path.realpath(base)
@@ -5095,6 +6574,11 @@ def resolve_local_file(tab, path):
     except ValueError:
         return "", "The file is outside the current local panel directory."
     return candidate, ""
+
+
+def resolve_local_file(tab, path):
+    """Resolve a local edit path beneath the active local panel directory."""
+    return resolve_local_pane_file(tab, path, "local")
 
 
 def read_local_text(local_path, max_size=MAX_GUI_EDIT_BYTES):

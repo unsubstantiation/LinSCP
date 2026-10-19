@@ -133,6 +133,8 @@ if(Python3_Interpreter_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/DesktopUriTest.py)
   add_test(NAME gui-security-tests COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/SecurityTest.py)
+  add_test(NAME gui-local-workspace-tests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/LocalWorkspaceTest.py)
   add_test(NAME gui-terminal-tests COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/TerminalTest.py)
   # The PowerShell module harness: static checks always run, while the

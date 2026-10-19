@@ -2,7 +2,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-9 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+7 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -92,30 +92,6 @@ The XML action log emits structured command, message and transfer actions with s
 
 - [ ] Compare schema-valid fixtures for command results, transfer errors, cancellation and session lifecycle against the pinned upstream format.
 - [ ] Test at least one upstream-compatible parser and prove secret redaction preserves a valid document.
-
-## gui.local-to-local
-
-**Area:** GUI · **Status:** missing
-
-Upstream SessionData exposes IsLocalBrowser and OtherLocalDirectory for two-local-directory sessions. LinSCP can manage its local pane and accept local browser drops, but its opposite pane and cross-panel transfer routes require a remote session; there is no local-to-local session mode.
-
-**Next:** Implement a no-network two-local-pane mode; local uploads into one pane are not local-to-local transfer parity.
-
-**Acceptance criteria:**
-
-- [ ] Open two independent local panes without a remote connection and test recursive copies/moves, overwrite decisions, metadata and symlink policy, queue progress/cancellation and safe handling of source/destination overlap.
-
-## sessions.workspaces
-
-**Area:** Sessions/configuration · **Status:** missing
-
-Upstream TStoredSessionList implements named workspaces (NewWorkspace, GetWorkspaces, SaveWorkspaceData). LinSCP stores individual sites/folders and has live tabs, but no save/restore of a named group of tabs with their navigation state.
-
-**Next:** Add named workspace save/restore rather than treating stored-session folders or in-memory tabs as workspace support.
-
-**Acceptance criteria:**
-
-- [ ] Persist and restore named workspaces with tab order, active tab and both pane paths; test partial connection failures, renamed/deleted sites, process restart and preservation of host-key and credential-storage policies.
 
 ## Cross-cutting release gate
 

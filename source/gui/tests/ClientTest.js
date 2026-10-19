@@ -84,6 +84,12 @@ const responses = {
   '/api/remote/search': { success: true, matches: [
     { path: '/tmp/slowremote/keep.txt', name: 'keep.txt', is_dir: false, size: 22,
       date: 'Oct 13 07:07', permissions: '-rw-r--r--' }], truncated: false },
+  '/api/workspaces': { success: true, file: '/tmp/cfg/workspaces.json',
+    workspaces: [
+      { name: 'stored', tab_count: 2, active: 1, tabs: [
+        { name: 'one', kind: 'local', local_dir: '/tmp/slowlocal', remote_dir: '/tmp/slowremote' },
+        { name: 'two', kind: 'sftp', site: 'GUI/test' }] }
+    ] },
   '/api/command/exec': { success: true, exit_code: 0, stdout: '/tmp/slowremote\n', stderr: '' },
   /* A new site has no host key, so the backend asks instead of connecting. */
   '/api/tabs/open': {
@@ -144,6 +150,17 @@ const dom = new JSDOM(html, {
       let body = responses[path];
       if (path === '/api/custom-commands') {
         body = customCommandsBody(options);
+      }
+      if (path === '/api/workspaces/save') {
+        let request = {};
+        try { request = JSON.parse(options.body || '{}'); } catch (error) {}
+        body = { success: true, workspace: { name: request.name || 'demo', tab_count: 2 } };
+      }
+      if (path === '/api/workspaces/open') {
+        body = { success: true, opened: [3, 4], failed: [], active_tab: 4 };
+      }
+      if (path === '/api/workspaces/delete') {
+        body = { success: true };
       }
       if (path === '/api/remote/search') {
         let request = {};
@@ -858,6 +875,42 @@ function options(id) {
   check('leaving explorer mode shows both panes again',
     !main.classList.contains('explorer-mode') &&
       doc.getElementById('remotePane').style.display !== 'none');
+
+  // A local-to-local tab form has two directories and hides every server
+  // field; the workspace dialog lists, saves, opens and deletes named groups.
+  window.fillSiteForm({ name: 'local pair', protocol: 'local',
+    local_dir: '/tmp/slowlocal', other_local_dir: '/tmp/slowremote' });
+  window.siteProtocolChanged();
+  const localForm = window.currentSiteForm();
+  check('the site form offers a two-local-directory mode',
+    localForm.protocol === 'local' && localForm.local_dir === '/tmp/slowlocal' &&
+      localForm.other_local_dir === '/tmp/slowremote');
+  check('local mode hides the server fields and offers Open',
+    doc.getElementById('siteHost').closest('.form-row').style.display === 'none' &&
+      doc.getElementById('siteOtherLocalDir').closest('.form-row').style.display !== 'none' &&
+      text('siteConnectBtn') === 'Open');
+
+  await window.openWorkspaces();
+  check('workspace dialog lists stored workspaces',
+    doc.getElementById('workspacesModal').className.indexOf('open') >= 0 &&
+      doc.getElementById('workspaceList').children.length === 1 &&
+      text('workspaceList').indexOf('stored') >= 0, text('workspaceList'));
+  doc.getElementById('workspaceName').value = 'demo';
+  await window.saveWorkspaceFromModal();
+  const wsSave = calls.filter(call => call.path === '/api/workspaces/save').pop();
+  check('saving a workspace posts its name',
+    wsSave && JSON.parse(wsSave.options.body).name === 'demo');
+  confirmResult = true;
+  await window.openWorkspace('stored');
+  const wsOpen = calls.filter(call => call.path === '/api/workspaces/open').pop();
+  check('opening a workspace posts its name and adopts its active tab',
+    wsOpen && JSON.parse(wsOpen.options.body).name === 'stored' &&
+      calls.some(call => call.path === '/api/status'));
+  await window.deleteWorkspace('stored');
+  const wsDelete = calls.filter(call => call.path === '/api/workspaces/delete').pop();
+  check('deleting a workspace posts its name',
+    wsDelete && JSON.parse(wsDelete.options.body).name === 'stored');
+  window.closeModal('workspacesModal');
 
   // Custom commands are persisted, preview their remote target, and run
   // only on the selected entry after confirmation.
