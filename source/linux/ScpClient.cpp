@@ -1601,11 +1601,9 @@ int ScpClient::Get(const SessionOptions & options,
 
     if (preserveTime && mtime != 0)
     {
-        const bool touched = SetFileTimes(destination,
-            atime != 0 ? atime : mtime, mtime);
-        Console::Instance().LogAction("touch",
-            "filename=\"" + Console::EscapeActionText(destination) +
-            "\" result=\"" + (touched ? "ok" : "failed") + "\"");
+        /* A local time set after a download is not a remote operation,
+         * so the XML log has no '<touch>' for it. */
+        SetFileTimes(destination, atime != 0 ? atime : mtime, mtime);
     }
     if (size != NULL)
     {

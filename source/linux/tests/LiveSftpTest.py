@@ -1248,8 +1248,18 @@ class LiveSftpTests(unittest.TestCase):
 
     def test_remote_edit_and_xml_action_log(self):
         """'edit' downloads, edits with line-ending preservation, and
-        re-uploads a remote file, and '-xmllog' records structured XML
-        elements for file and session operations."""
+        re-uploads a remote file, and '-xmllog' records the upstream
+        XML log: the session named for the connection, one group per
+        command, and for every physical operation its element with
+        'value' parameters and a result - upload/download with sizes,
+        touch with the preserved time, chmod as permission letters,
+        mv/cp, call with its captured output and exit code, ls with
+        its file entries, stat, checksum, cwd, rm - which is what an
+        upstream-compatible consumer (and the schema of
+        docs/winscp-session-1.0.xsd) reads back."""
+        import hashlib
+        import xml.etree.ElementTree as ET
+        ns = "{http://winscp.net/schema/session/1.0}"
         (self.root / "config.ini").write_bytes(b"\xef\xbb\xbfkey=old\r\n")
         editor_sh = self.local / "edit-helper.sh"
         editor_sh.write_text(
@@ -1267,6 +1277,12 @@ class LiveSftpTests(unittest.TestCase):
             "mv /xml-dir/item.sh /xml-dir/renamed.sh ; "
             "get -preservetime /xml-dir/renamed.sh %s ; "
             "call echo xml-call ; "
+            "ls /xml-dir ; "
+            "stat /xml-dir/renamed.sh ; "
+            "checksum sha-256 /xml-dir/renamed.sh ; "
+            "cp /xml-dir/renamed.sh /xml-dir/copied.sh ; "
+            "cd /xml-dir ; "
+            "rm /xml-dir/copied.sh ; "
             "rm /xml-dir/renamed.sh ; "
             "exit" % (
                 editor_sh, editor_sh, self.local / "downloaded.sh"),
@@ -1278,9 +1294,94 @@ class LiveSftpTests(unittest.TestCase):
             b"\xef\xbb\xbfkey=new\r\n")
 
         xml_text = xmllog.read_text(encoding="utf-8")
-        for tag in ("<upload ", "<download ", "<mkdir ", "<mv ",
-                    "<chmod ", "<touch ", "<call ", "<rm "):
-            self.assertIn(tag, xml_text)
+        self.assertNotIn(PASSWORD, xml_text)
+        root = ET.parse(xmllog).getroot()
+        self.assertEqual(root.tag, ns + "session")
+        self.assertEqual(root.get("name"), "%s@127.0.0.1" % USER)
+
+        def params(action):
+            found = {}
+            for child in action:
+                if child.tag == ns + "result":
+                    found["__success__"] = child.get("success")
+                else:
+                    found[child.tag[len(ns):]] = child
+            return found
+
+        actions = {}
+        for group in root.iter(ns + "group"):
+            for action in group:
+                if action.tag != ns + "failure":
+                    actions.setdefault(action.tag[len(ns):], []).append(
+                        (group.get("name"), params(action), action))
+
+        def one(tag, **want):
+            for _group, found, action in actions.get(tag, []):
+                if all(found[key].get("value") == value
+                       for key, value in want.items()):
+                    return found, action
+            self.fail("no <%s> with %r in %r" % (tag, want, list(actions)))
+
+        size = str(len(editor_sh.read_bytes()))
+        found, _ = one("upload", destination="/xml-dir/item.sh")
+        self.assertTrue(found["filename"].get("value").endswith(
+            "edit-helper.sh"))
+        self.assertEqual(found["size"].get("value"), size)
+        self.assertEqual(found["__success__"], "true")
+
+        found, _ = one("touch", filename="/xml-dir/item.sh")
+        self.assertRegex(found["modification"].get("value"),
+                         r"^\d{4}-\d{2}-\d{2}T.*\.000Z$")
+        found, _ = one("chmod", filename="/xml-dir/item.sh",
+                       permissions="rwxr-xr-x")
+        one("mv", filename="/xml-dir/item.sh",
+            destination="/xml-dir/renamed.sh")
+        found, _ = one("download", filename="/xml-dir/renamed.sh")
+        self.assertEqual(found["size"].get("value"), size)
+        one("mkdir", filename="/xml-dir")
+        one("rm", filename="/xml-dir/renamed.sh")
+        one("cp", filename="/xml-dir/renamed.sh",
+            destination="/xml-dir/copied.sh")
+        found, _ = one("cwd")
+        self.assertEqual(found["cwd"].get("value"), "/xml-dir")
+
+        found, _ = one("call", command="echo xml-call")
+        self.assertIn("xml-call", found["output"].get("value"))
+        self.assertEqual(found["exitcode"].get("value"), "0")
+        self.assertEqual(found["destination"].get("value"), "/")
+
+        found, _ = one("checksum", filename="/xml-dir/renamed.sh",
+                       algorithm="sha-256")
+        digest = hashlib.sha256(editor_sh.read_bytes()).hexdigest()
+        self.assertEqual(found["checksum"].get("value"), digest)
+
+        found, action = one("ls", destination="/xml-dir")
+        entries = dict((entry.find(ns + "filename").get("value"), entry)
+                       for entry in action.iter(ns + "file"))
+        self.assertIn("renamed.sh", entries)
+        renamed = entries["renamed.sh"]
+        self.assertEqual(renamed.find(ns + "type").get("value"), "-")
+        self.assertEqual(renamed.find(ns + "size").get("value"), size)
+        self.assertEqual(
+            renamed.find(ns + "permissions").get("value"), "rwxr-xr-x")
+
+        found, action = one("stat", filename="/xml-dir/renamed.sh")
+        stat_file = action.find(ns + "file")
+        self.assertIsNotNone(stat_file)
+        # A 'stat' file carries no '<filename>' of its own, as upstream.
+        self.assertIsNone(stat_file.find(ns + "filename"))
+        self.assertEqual(stat_file.find(ns + "size").get("value"), size)
+
+        try:
+            import xmlschema
+        except ImportError:
+            print("xmlschema not installed; skipping the schema "
+                  "validation of the live XML log")
+        else:
+            repo = pathlib.Path(__file__).resolve().parents[3]
+            xmlschema.XMLSchema(
+                str(repo / "docs" / "winscp-session-1.0.xsd")).validate(
+                    str(xmllog))
 
     def test_s3_version_switches_are_refused_on_native_sftp(self):
         """Version IDs are an S3 operation and must not be silently

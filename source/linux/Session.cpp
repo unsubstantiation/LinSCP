@@ -3140,6 +3140,16 @@ void ExecOutputSink(void * ctx, const char * data, size_t len)
     Console::Instance().Write(std::string(data, len));
 }
 
+void ExecCapturingSink(void * ctx, const char * data, size_t len)
+{
+    std::string * kept = static_cast<std::string *>(ctx);
+    if (kept != NULL)
+    {
+        kept->append(data, len);
+    }
+    Console::Instance().Write(std::string(data, len));
+}
+
 } // namespace
 
 int Session::ExitCode() const
@@ -3196,6 +3206,58 @@ bool Session::ExecRemote(const SessionOptions & options,
     {
         error = "Command '" + command + "' failed with return code " +
             std::to_string(exitCode) + ".";
+        return false;
+    }
+    return true;
+}
+
+bool Session::ExecRemoteCaptured(const SessionOptions & options,
+    const std::string & command, std::string & error,
+    ExecCaptured & captured)
+{
+    captured.exitCode = INT_MAX;
+    captured.output.clear();
+    captured.errorOutput.clear();
+    if (!UseNativeSftp(options.protocol) && !UseNativeScp(options.protocol))
+    {
+        error = "Remote command execution needs an SSH (sftp:// or scp://) session.";
+        return false;
+    }
+    Session exec;
+    exec.SetOutputSink(ExecCapturingSink, &captured.output);
+    exec.CaptureStderr(true);
+    if (!exec.Connect(options, command.c_str(), false, false, error))
+    {
+        return false;
+    }
+    while (exec.IsAlive())
+    {
+        if (!exec.Pump())
+        {
+            break;
+        }
+    }
+    captured.exitCode = exec.ExitCode();
+    captured.errorOutput = exec.CapturedStderr();
+    exec.Close();
+    if (!captured.errorOutput.empty())
+    {
+        Console::Instance().Write(captured.errorOutput);
+    }
+    if (!exec.ConnectionError().empty())
+    {
+        error = exec.ConnectionError();
+        return false;
+    }
+    if (captured.exitCode == INT_MAX)
+    {
+        error = Texts::Translate("The remote command ended without an exit status.");
+        return false;
+    }
+    if (captured.exitCode > 0)
+    {
+        error = "Command '" + command + "' failed with return code " +
+            std::to_string(captured.exitCode) + ".";
         return false;
     }
     return true;

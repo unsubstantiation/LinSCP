@@ -128,7 +128,7 @@ linscp -batch -command="open sftp://user@example.com/; cd /data; ls; get * /tmp"
 | `-port=<number>` | port (default 22) |
 | `-timeout=<secs>` | connection timeout (default 15) |
 | `-log=<file>` | write the session log to a file |
-| `-xmllog=<file>` | write an XML action log of every command, message and transfer, with passwords masked |
+| `-xmllog=<file>` | write an XML log in the upstream session format (`http://winscp.net/schema/session/1.0`, pinned as [winscp-session-1.0.xsd](winscp-session-1.0.xsd)): one `<group>` per command and one element per operation, with passwords masked |
 | `-parameter <value>...` | script parameters, for `%1%` to `%9%` |
 | `-batch` | never ask; fail instead |
 | `-server` | read one command per line on standard input and answer each with `LSCP-RESULT`; the GUI drives the client this way |

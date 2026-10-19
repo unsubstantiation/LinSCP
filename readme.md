@@ -47,7 +47,8 @@ ctest --test-dir build --output-on-failure
 ```
 
 The live suites use optional Python packages: `paramiko` (SFTP),
-`botocore` (S3 signature reference), and `pyftpdlib` with `pyOpenSSL`
+`botocore` (S3 signature reference), `xmlschema` (XML log schema
+validation), and `pyftpdlib` with `pyOpenSSL`
 (FTP/FTPS). The SCP suite needs `openssh-server`; it starts its own `sshd` on a
 free port. A suite that skips a case says so on its evidence line.
 

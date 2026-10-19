@@ -337,6 +337,25 @@ public:
     static bool ExecRemote(const SessionOptions & options,
         const std::string & command, std::string & error);
 
+    /* What a captured ExecRemote made of the command: its exit code
+     * (INT_MAX when the server sent none) and the two output streams
+     * kept apart. */
+    struct ExecCaptured
+    {
+        int exitCode;
+        std::string output;
+        std::string errorOutput;
+    };
+
+    /* ExecRemote that also keeps the output: stdout is printed as it
+     * arrives and saved, stderr is saved and printed when the command
+     * ends (so the two streams a caller records, as the XML log does,
+     * are the server's own and not an interleaving). The result says
+     * how the command ended even when it failed. */
+    static bool ExecRemoteCaptured(const SessionOptions & options,
+        const std::string & command, std::string & error,
+        ExecCaptured & captured);
+
     /*
      * The one-shot exec channel the native SCP engine drives: the command
      * runs in a session of its own (never the one the SFTP transport glue

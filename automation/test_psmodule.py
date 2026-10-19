@@ -144,10 +144,9 @@ class LivePesterTests(unittest.TestCase):
                    LSCP_TEST_PASSWORD=PASSWORD,
                    LSCP_TEST_ROOT=str(self.root))
         proc = subprocess.run(
-            [self.pwsh, "-NoProfile", "-NonInteractive", "-Command",
-             "Invoke-Pester -Path '%s' -OutputFormat NUnitXml "
-             "-OutputFile '%s' -PassThru | "
-             "Select-Object -ExpandProperty FailedCount" % (PESTER, results)],
+            [self.pwsh, "-NoProfile", "-NonInteractive",
+             "-File", str(PESTER_RUNNER),
+             "-TestPath", str(PESTER), "-ResultsPath", str(results)],
             capture_output=True, text=True, timeout=300, env=env)
         self.assertEqual(proc.returncode, 0,
                          "pwsh failed:\n%s\n%s" % (proc.stdout, proc.stderr))
@@ -156,8 +155,14 @@ class LivePesterTests(unittest.TestCase):
         total = int(suite.get("total", "0"))
         failures = int(suite.get("failures", "0"))
         errors = int(suite.get("errors", "0"))
-        skipped = int(suite.get("skipped", "0"))
+        skipped = int(suite.get("skipped", suite.get("not-run", "0")))
         self.assertGreater(total, 0, "Pester ran no tests")
+        # No case in LinSCP.Tests.ps1 is skippable: a skip here would
+        # mean the suite did less than the evidence line below claims.
+        ignored = [case.get("name") for case in suite.iter("test-case")
+                   if case.get("result") in ("Ignored", "Skipped", "Pending")]
+        self.assertEqual(skipped, 0, "Pester skipped tests: %s" % ignored)
+        self.assertEqual(ignored, [], "Pester ignored tests")
         failed_names = [
             "%s :: %s" % (case.get("classname"), case.get("name"))
             for case in suite.iter("test-case")

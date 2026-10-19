@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <sys/time.h>
 
 namespace linscp {
 
@@ -16,15 +17,16 @@ Console & Console::Instance()
     return console;
 }
 
-namespace {
-
 /*
- * Text of the log, with the characters that would end an element early
- * replaced by their entity. Control characters other than a tab cannot
- * appear in XML at all, so they are dropped: a server may put them in a file
- * name and the log must stay readable by an XML parser.
+ * XML log escaping, in upstream's two spellings. An attribute value has
+ * its newline written as a character reference, because an XML reader
+ * folds a literal one to a space and a '<call>' output would lose its
+ * lines; element text keeps the newline. A carriage return is dropped
+ * by both (upstream deletes it), and so are the control characters XML
+ * cannot represent at all: a server may put them in a file name and the
+ * log must stay readable by an XML parser.
  */
-std::string EscapeXml(const std::string & text)
+static std::string EscapeXml(const std::string & text, bool attribute)
 {
     std::string result;
     for (size_t i = 0; i < text.size(); i++)
@@ -35,12 +37,19 @@ std::string EscapeXml(const std::string & text)
             case '&': result += "&amp;"; break;
             case '<': result += "&lt;"; break;
             case '>': result += "&gt;"; break;
-            case '"': result += "&quot;"; break;
-            case '\'': result += "&apos;"; break;
-            case '\t': result += "\t"; break;
-            case '\r': result += "&#13;"; break;
+            case '"':
+                result += attribute ? "&quot;" : "\"";
+                break;
+            case '\r':
+                break;
+            case '\n':
+                result += attribute ? "&#10;" : "\n";
+                break;
+            case '\t':
+                result += "\t";
+                break;
             default:
-                if (c >= 0x20 || c == 0x0a)
+                if (c >= 0x20)
                 {
                     result += static_cast<char>(c);
                 }
@@ -50,26 +59,49 @@ std::string EscapeXml(const std::string & text)
     return result;
 }
 
-std::string Timestamp()
+std::string Console::EscapeXmlAttr(const std::string & text)
 {
-    char buffer[64];
-    const std::time_t now = std::time(NULL);
+    return EscapeXml(text, true);
+}
+
+std::string Console::EscapeXmlText(const std::string & text)
+{
+    return EscapeXml(text, false);
+}
+
+std::string Console::XmlTimestamp(unsigned long epochSeconds)
+{
+    char buffer[48];
+    const std::time_t when = static_cast<std::time_t>(epochSeconds);
     struct tm tmResult;
-    if (!LocalTime(now, tmResult))
+    if (gmtime_r(&when, &tmResult) == NULL)
     {
-        return "unknown";
+        return "1970-01-01T00:00:00.000Z";
     }
-    strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", &tmResult);
+    strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S.000Z", &tmResult);
     return buffer;
 }
 
-} // namespace
+std::string Console::XmlTimestampNow()
+{
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    std::string stamp = XmlTimestamp(static_cast<unsigned long>(now.tv_sec));
+    char millis[8];
+    snprintf(millis, sizeof(millis), ".%03dZ",
+        static_cast<int>(now.tv_usec / 1000));
+    stamp.replace(stamp.size() - 5, 5, millis);
+    return stamp;
+}
 
 Console::Console() :
     mBatchMode(false),
     mVerbose(false),
     mLog(NULL),
     mActionLog(NULL),
+    mXmlHeaderWritten(false),
+    mXmlInGroup(false),
+    mXmlSessionName("nosession"),
     mTransferSize(0),
     mLastPermille(0)
 {
@@ -97,10 +129,8 @@ void Console::WriteLine(const std::string & text)
     fputs(text.c_str(), stdout);
     fputc('\n', stdout);
     fflush(stdout);
-    if (mActionLog != NULL)
-    {
-        LogAction("message", "type=\"output\"", text);
-    }
+    /* Console output is not part of the XML log format: upstream records
+     * operations and failures there, never the text it printed. */
 }
 
 void Console::Status(const std::string & text)
@@ -115,7 +145,9 @@ void Console::Error(const std::string & text)
     fflush(stderr);
     if (mActionLog != NULL)
     {
-        LogAction("message", "type=\"error\"", text);
+        /* Kept for the '<failure>' of the command that is running; the
+         * script engine collects and masks them when the group closes. */
+        mXmlErrors.push_back(text);
     }
 }
 
@@ -271,37 +303,253 @@ bool Console::SetActionLogFile(const std::string & path, std::string & error)
         error = std::strerror(errno);
         return false;
     }
-    fprintf(mActionLog, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    fprintf(mActionLog, "<log_session client=\"%s\" created=\"%s\">\n",
-        EscapeXml(linscp::Texts::VersionLine()).c_str(), Timestamp().c_str());
-    fflush(mActionLog);
+    /* Nothing is written yet: the '<session>' header carries the name of
+     * the connection, which is only known when 'open' succeeds, so it is
+     * written by XmlEnsureHeader() at the first group that needs it. */
+    mXmlHeaderWritten = false;
+    mXmlInGroup = false;
+    mXmlPendingGroup.clear();
+    mXmlSessionName = "nosession";
+    mXmlErrors.clear();
     return true;
 }
 
-std::string Console::EscapeActionText(const std::string & text)
+void Console::XmlSessionName(const std::string & name)
 {
-    return EscapeXml(text);
+    if (!name.empty() && !mXmlHeaderWritten)
+    {
+        mXmlSessionName = name;
+    }
+    /* A held-back '<group>' can go out now under the right name. */
+    if (!mXmlPendingGroup.empty())
+    {
+        XmlEnsureHeader();
+    }
 }
 
-void Console::LogAction(const std::string & element,
-    const std::string & attributes, const std::string & text)
+void Console::XmlEnsureHeader()
+{
+    if (mActionLog == NULL || mXmlHeaderWritten)
+    {
+        return;
+    }
+    fprintf(mActionLog, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    fprintf(mActionLog,
+        "<session xmlns=\"http://winscp.net/schema/session/1.0\" "
+        "name=\"%s\" start=\"%s\">\n",
+        EscapeXmlAttr(mXmlSessionName).c_str(), XmlTimestampNow().c_str());
+    fflush(mActionLog);
+    mXmlHeaderWritten = true;
+    if (!mXmlPendingGroup.empty())
+    {
+        XmlWriteLine(1, mXmlPendingGroup);
+        fflush(mActionLog);
+        mXmlPendingGroup.clear();
+    }
+}
+
+void Console::XmlWriteLine(int depth, const std::string & text)
+{
+    fprintf(mActionLog, "%*s%s\n", depth * 2, "", text.c_str());
+}
+
+void Console::XmlBeginGroup(const std::string & name)
 {
     if (mActionLog == NULL)
     {
         return;
     }
-    fprintf(mActionLog, "  <%s time=\"%s\"%s", element.c_str(),
-        Timestamp().c_str(), attributes.empty() ? "" : (" " + attributes).c_str());
-    if (text.empty())
+    if (mXmlInGroup)
     {
-        fputs("/>\n", mActionLog);
+        /* Groups do not nest; a command that starts another (an editor
+         * round trip inside 'edit') belongs to the group already open. */
+        return;
+    }
+    mXmlErrors.clear();
+    const std::string line = "<group name=\"" + EscapeXmlAttr(name) +
+        "\" start=\"" + XmlTimestampNow() + "\">";
+    mXmlInGroup = true;
+    if (mXmlHeaderWritten)
+    {
+        XmlWriteLine(1, line);
+        fflush(mActionLog);
     }
     else
     {
-        fputs(">", mActionLog);
-        fputs(EscapeXml(text).c_str(), mActionLog);
-        fprintf(mActionLog, "</%s>\n", element.c_str());
+        /* Hold this first group back: if it is the 'open' that creates
+         * the session, XmlSessionName() is about to name the header.
+         * Anything else that writes (an action, the failure, the end of
+         * the group, closing the file) flushes it as 'nosession'. */
+        mXmlPendingGroup = line;
     }
+}
+
+void Console::XmlEndGroup()
+{
+    if (mActionLog == NULL || !mXmlInGroup)
+    {
+        return;
+    }
+    XmlEnsureHeader();
+    XmlWriteLine(1, "</group>");
+    fflush(mActionLog);
+    mXmlInGroup = false;
+    mXmlErrors.clear();
+}
+
+std::vector<std::string> Console::TakeActionErrors()
+{
+    std::vector<std::string> errors;
+    errors.swap(mXmlErrors);
+    return errors;
+}
+
+void Console::XmlFailure(const std::vector<std::string> & messages)
+{
+    if (mActionLog == NULL || messages.empty())
+    {
+        return;
+    }
+    XmlEnsureHeader();
+    const int depth = mXmlInGroup ? 2 : 1;
+    XmlWriteLine(depth, "<failure>");
+    for (size_t i = 0; i < messages.size(); i++)
+    {
+        XmlWriteLine(depth + 1, "<message>" + EscapeXmlText(messages[i]) +
+            "</message>");
+    }
+    XmlWriteLine(depth, "</failure>");
+    fflush(mActionLog);
+}
+
+void Console::XmlWriteParams(int depth, const XmlParams & params)
+{
+    for (size_t i = 0; i < params.size(); i++)
+    {
+        if (params[i].second.empty())
+        {
+            XmlWriteLine(depth, "<" + params[i].first + " />");
+        }
+        else
+        {
+            XmlWriteLine(depth, "<" + params[i].first + " value=\"" +
+                EscapeXmlAttr(params[i].second) + "\" />");
+        }
+    }
+}
+
+void Console::XmlWriteResult(int depth, bool success, const std::string & error)
+{
+    if (success)
+    {
+        XmlWriteLine(depth, "<result success=\"true\" />");
+    }
+    else if (error.empty())
+    {
+        XmlWriteLine(depth, "<result success=\"false\" />");
+    }
+    else
+    {
+        XmlWriteLine(depth, "<result success=\"false\">");
+        XmlWriteLine(depth + 1, "<message>" + EscapeXmlText(error) +
+            "</message>");
+        XmlWriteLine(depth, "</result>");
+    }
+}
+
+void Console::XmlWriteFile(int depth, const XmlFileInfo & file, bool withName)
+{
+    XmlWriteLine(depth, "<file>");
+    XmlParams params;
+    if (withName)
+    {
+        params.push_back(std::make_pair("filename", file.name));
+    }
+    params.push_back(std::make_pair("type", std::string(1, file.type)));
+    if (file.hasSize)
+    {
+        params.push_back(std::make_pair("size",
+            std::to_string(file.size)));
+    }
+    if (file.hasModification)
+    {
+        params.push_back(std::make_pair("modification",
+            XmlTimestamp(file.modification)));
+    }
+    if (!file.permissions.empty())
+    {
+        params.push_back(std::make_pair("permissions", file.permissions));
+    }
+    if (!file.owner.empty())
+    {
+        params.push_back(std::make_pair("owner", file.owner));
+    }
+    if (!file.group.empty())
+    {
+        params.push_back(std::make_pair("group", file.group));
+    }
+    XmlWriteParams(depth + 1, params);
+    XmlWriteLine(depth, "</file>");
+}
+
+void Console::XmlAction(const std::string & element, const XmlParams & params,
+    bool success, const std::string & error, bool recursive)
+{
+    if (mActionLog == NULL)
+    {
+        return;
+    }
+    XmlEnsureHeader();
+    const int depth = mXmlInGroup ? 2 : 1;
+    XmlWriteLine(depth, "<" + element +
+        (recursive ? " recursive=\"true\"" : "") + ">");
+    XmlWriteParams(depth + 1, params);
+    XmlWriteResult(depth + 1, success, error);
+    XmlWriteLine(depth, "</" + element + ">");
+    fflush(mActionLog);
+}
+
+void Console::XmlActionFiles(const std::string & element,
+    const XmlParams & params, const std::vector<XmlFileInfo> & files,
+    bool success, const std::string & error)
+{
+    if (mActionLog == NULL)
+    {
+        return;
+    }
+    XmlEnsureHeader();
+    const int depth = mXmlInGroup ? 2 : 1;
+    XmlWriteLine(depth, "<" + element + ">");
+    XmlWriteParams(depth + 1, params);
+    XmlWriteLine(depth + 1, "<files>");
+    for (size_t i = 0; i < files.size(); i++)
+    {
+        XmlWriteFile(depth + 2, files[i], true);
+    }
+    XmlWriteLine(depth + 1, "</files>");
+    XmlWriteResult(depth + 1, success, error);
+    XmlWriteLine(depth, "</" + element + ">");
+    fflush(mActionLog);
+}
+
+void Console::XmlActionFile(const std::string & element,
+    const XmlParams & params, const XmlFileInfo & file, bool success,
+    const std::string & error)
+{
+    if (mActionLog == NULL)
+    {
+        return;
+    }
+    XmlEnsureHeader();
+    const int depth = mXmlInGroup ? 2 : 1;
+    XmlWriteLine(depth, "<" + element + ">");
+    XmlWriteParams(depth + 1, params);
+    if (success)
+    {
+        XmlWriteFile(depth + 1, file, false);
+    }
+    XmlWriteResult(depth + 1, success, error);
+    XmlWriteLine(depth, "</" + element + ">");
     fflush(mActionLog);
 }
 
@@ -309,9 +557,14 @@ void Console::CloseActionLogFile()
 {
     if (mActionLog != NULL)
     {
-        fprintf(mActionLog, "</log_session>\n");
+        /* A log of a run that never got as far as a command is still one
+         * complete document, not a half element. */
+        XmlEnsureHeader();
+        XmlEndGroup();
+        fprintf(mActionLog, "</session>\n");
         fclose(mActionLog);
         mActionLog = NULL;
+        mXmlHeaderWritten = false;
     }
 }
 
@@ -373,11 +626,9 @@ void Console::TransferProgress(uint64_t transferred)
 
 void Console::TransferEnd(bool success)
 {
-    if (mActionLog != NULL)
-    {
-        LogAction("transfer", "file=\"" + EscapeXml(mTransferName) + "\" status=\"" +
-            std::string(success ? "ok" : "failed") + "\"", std::string());
-    }
+    /* The transfer itself is an '<upload>'/'<download>' element the
+     * script engine writes with its paths; the progress display has no
+     * element of its own in the format. */
     mTransferName.clear();
     if (mBatchMode || !StdOutIsTerminal() || mTransferSize == 0)
     {

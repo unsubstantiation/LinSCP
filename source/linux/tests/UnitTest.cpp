@@ -3031,6 +3031,21 @@ void TestServerReplyHardening()
         std::string("a&lt;b&gt;&amp;&quot;c&quot;"));
     CHECK_EQ(Console::EscapeActionText("a\x01" "b"),
         std::string("ab"));
+    /* The two upstream escapes of the XML log: an attribute value writes
+     * a newline as a character reference (a reader would fold a literal
+     * one to a space and a 'call' output would lose its lines), element
+     * text keeps it, and both drop the carriage return. */
+    CHECK_EQ(Console::EscapeXmlAttr("a\nb\rc"),
+        std::string("a&#10;bc"));
+    CHECK_EQ(Console::EscapeXmlText("a\nb\rc"),
+        std::string("a\nbc"));
+    CHECK_EQ(Console::EscapeXmlText("x <&> \"y\""),
+        std::string("x &lt;&amp;&gt; \"y\""));
+    /* One timestamp spelling, in UTC with the millisecond field. */
+    CHECK_EQ(Console::XmlTimestamp(0),
+        std::string("1970-01-01T00:00:00.000Z"));
+    CHECK_EQ(Console::XmlTimestamp(1760000000UL),
+        std::string("2025-10-09T08:53:20.000Z"));
 }
 
 /* The command, option and value tables resolve unambiguous prefixes. */

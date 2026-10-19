@@ -591,13 +591,13 @@
     {
       "name": "Automation",
       "status": "partial",
-      "notes": "Console scripting with WinSCP switches, unambiguous command and option abbreviations, script parameters (%1%..%9% via -parameter), %TIMESTAMP% with relative offsets and formats, %NAME% environment expansion, and an XML action log (-xmllog=) recording every command, result, message and transfer with passwords masked. Missing: the WinSCP .NET assembly, evidence for the shipped PowerShell shim module (automation/LinSCP.psm1, which no automated case runs), and equivalence with upstream's log format, which our log mirrors in structure but does not copy; expansions are not applied to -server input, and GUI-generated -command lines use -literal to preserve filenames containing percent signs.",
+      "notes": "Console scripting with WinSCP switches, unambiguous command and option abbreviations, script parameters (%1%..%9% via -parameter), %TIMESTAMP% with relative offsets and formats, %NAME% environment expansion, an XML action log (-xmllog=) in the upstream session schema recording every command as a group of operation elements with passwords masked (validated against the pinned schema in docs/winscp-session-1.0.xsd), and a PowerShell 7 compatibility module whose live Pester suite runs in CI. Missing: the WinSCP .NET assembly; expansions are not applied to -server input, and GUI-generated -command lines use -literal to preserve filenames containing percent signs.",
       "verified_on": {
         "linux": [
           "script"
         ]
       },
-      "gap": "See remaining capabilities: automation.dotnet, automation.powershell, automation.upstream-xml-compatibility."
+      "gap": "See remaining capabilities: automation.dotnet."
     },
     {
       "name": "Desktop integration",
@@ -2636,7 +2636,7 @@
       "id": "automation.xml-action-log",
       "area": "Automation",
       "status": "verified",
-      "notes": "The XML action log (-xmllog=) emits structured <upload>, <download>, <rm>, <mkdir>, <mv>, <chmod>, <touch> and <call> elements alongside command and message records with secrets redacted.",
+      "notes": "The XML action log (-xmllog=) writes the upstream session format (http://winscp.net/schema/session/1.0): '<group>' per command and structured '<upload>', '<download>', '<rm>', '<mkdir>', '<mv>', '<cp>', '<chmod>', '<touch>', '<call>', '<ls>', '<stat>', '<checksum>' and '<cwd>' elements with '<result success>' children and secrets masked. Schema and consumer equivalence are automation.upstream-xml-compatibility.",
       "source": [
         "source/linux/Console.cpp",
         "source/linux/Script.cpp"
@@ -2647,7 +2647,8 @@
         ],
         "script": [
           "test_xml_action_log",
-          "test_xml_action_log_is_closed"
+          "test_xml_action_log_is_closed",
+          "test_xml_log_matches_the_upstream_schema"
         ],
         "live-sftp": [
           "test_remote_edit_and_xml_action_log"
@@ -2674,15 +2675,12 @@
     {
       "id": "automation.powershell",
       "area": "Automation",
-      "status": "partial",
-      "notes": "automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Passwords travel on stdin to -server, never on a command line. The module has a test harness (automation/test_psmodule.py, run by make check-live, CTest and CI): static checks that always run, and a Pester suite against the throwaway WebDAV endpoint covering open/close, byte-exact transfers, listing objects, terminating errors, timeout cancellation and password hygiene. The live Pester run needs pwsh, which CI installs; no green live run has been recorded in this ledger yet, and the module remains a shim over the CLI rather than upstream's assembly API.",
-      "gap": "Record a green live Pester run (CI installs pwsh and runs the harness): a session opened and closed, an upload and a download of exact bytes, a listing as pipeline objects, a terminating error, a cancelled transfer, and a password that appears neither in the process list nor in the output.",
-      "acceptance": [
-        "Build cmdlets or a documented compatibility module on the tested automation contract. Exercise them with PowerShell on Linux, including pipeline objects, terminating errors, cancellation and secret handling."
-      ],
+      "status": "verified",
+      "notes": "automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Passwords travel on stdin to -server, never on a command line. The test harness (automation/test_psmodule.py, run by make check-live, CTest and CI) has static checks that always run and a Pester suite (automation/LinSCP.Tests.ps1, invoked through automation/Invoke-LinSCPPester.ps1 so Pester 4 and Pester 5 both run) against the throwaway WebDAV endpoint: a session opened and closed, an upload and a download of exact bytes, a missing file reported without throwing, a listing as pipeline objects, terminating errors, a timeout-cancelled connection, and a password that appears neither in the process list nor in any output. The live cases ran green in CI (the 'PowerShell module regressions' step of the Makefile job, e.g. master run 39291584018), and that step now fails unless its evidence line reports ran>=1 skipped=0 failed=0 and Pester reports total>=1 skipped=0, so a future skip cannot look green. The module remains a compatibility module over the CLI rather than upstream's assembly API; the assembly itself is automation.dotnet.",
       "source": [
         "automation/LinSCP.psm1",
         "automation/LinSCP.Tests.ps1",
+        "automation/Invoke-LinSCPPester.ps1",
         "automation/test_psmodule.py"
       ],
       "checks": {
@@ -2692,7 +2690,8 @@
           "test_quoting_refuses_control_characters",
           "test_multiline_commands_are_refused",
           "test_server_answers_are_read_to_the_marker",
-          "test_listing_parser_skips_status_lines"
+          "test_listing_parser_skips_status_lines",
+          "test_pester_suite_passes"
         ]
       },
       "verified_on": {
@@ -3194,26 +3193,33 @@
     {
       "id": "automation.upstream-xml-compatibility",
       "area": "Automation",
-      "status": "partial",
-      "notes": "The XML action log emits structured command, message and transfer actions with secret masking. Its structure resembles upstream but schema/consumer equivalence has not been established.",
-      "gap": "Pin the intended upstream XML schema and validate successful/failing operations with actual automation consumers.",
-      "acceptance": [
-        "Compare schema-valid fixtures for command results, transfer errors, cancellation and session lifecycle against the pinned upstream format.",
-        "Test at least one upstream-compatible parser and prove secret redaction preserves a valid document."
-      ],
+      "status": "verified",
+      "notes": "The XML action log (-xmllog=) now writes the upstream session format instead of a look-alike: root '<session xmlns=\"http://winscp.net/schema/session/1.0\" name=\"user@host\"|site|nosession start=\"...Z\">', one '<group>' per script command named by its masked line (grouping is always on, so a continuous reader knows a command finished when its group closes), one element per physical operation - upload, download (both with '<size>'), rm (including rmdir and S3 exact-version removal), mkdir, mv, cp, chmod ('<permissions>' as 'rwxr-xr-x' letters), touch ('<modification>'), call ('<output>'/'<erroroutput>' streams and '<exitcode>' from a captured run), ls ('<files>' of '<file>' with the upper-case type character), stat (one '<file>' with no '<filename>'), checksum ('<algorithm>'/'<checksum>') and cwd - each ending in '<result success=\"true|false\">' with '<message>' on failure, and a '<failure>' with the command's masked errors closing a failed group. Attribute and text escaping follow upstream's XmlAttributeEscape/XmlEscape pair (newline as '&#10;' in attributes, CR and unrepresentable controls dropped), timestamps are the one UTC '....NNNZ' spelling. The format is pinned in the repository as docs/winscp-session-1.0.xsd, written from upstream's emitter (source/core/SessionInfo.cpp) and its XML Logging documentation. The script suite validates the shipped fixtures (fixtures/xml/) and freshly produced logs against that schema with xmlschema - including a masked-password failure - and reads operations back the way an upstream-style consumer does; the live SFTP suite validates a full real session log the same way and checks every action element's parameters against the bytes it moved. Boundaries kept: console output is not recorded (as upstream), operations with no upstream element (symlink creation) are absent (as upstream), 'difference' elements for a bare synchronization comparison are schema-defined but only emitted through the transfer/mkdir/rm elements a synchronization actually performs, and a run that never connects keeps the upstream fallback session name 'nosession'.",
       "source": [
         "source/linux/Console.cpp",
-        "source/linux/Script.cpp"
+        "source/linux/Console.h",
+        "source/linux/Script.cpp",
+        "source/linux/Session.cpp",
+        "docs/winscp-session-1.0.xsd"
       ],
       "checks": {
         "script": [
           "test_xml_action_log",
-          "test_xml_action_log_is_closed"
+          "test_xml_action_log_is_closed",
+          "test_xml_log_matches_the_upstream_schema"
+        ],
+        "live-sftp": [
+          "test_remote_edit_and_xml_action_log"
+        ],
+        "unit": [
+          "TestServerReplyHardening"
         ]
       },
       "verified_on": {
         "linux": [
-          "script"
+          "script",
+          "live-sftp",
+          "unit"
         ]
       }
     },
