@@ -3,7 +3,7 @@ Section: net
 Priority: optional
 Maintainer: nuipona <nuipona@users.noreply.github.com>
 Build-Depends: dpkg-dev (>= 1.20), g++ | c++-compiler, make, pkg-config,
- libssh-dev (>= 0.10), libssl-dev, zlib1g-dev
+ libssh-dev (>= 0.10), libssl-dev, libargon2-dev, zlib1g-dev
 Standards-Version: 4.7.4
 Rules-Requires-Root: no
 
@@ -12,7 +12,7 @@ Architecture: any
 Depends: ${shlibs:Depends}, python3
 Recommends: curl
 Description: graphical and console file transfer client for Linux
- LinSCP is a native open-source file transfer client for Linux, inspired
+ LinSCP is a native noncommercial file transfer client for Linux, inspired
  by WinSCP. It provides an interactive command-line client (linscp) and
  a dual-pane Commander graphical client (linscp-gui) in the browser.
  .

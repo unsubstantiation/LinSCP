@@ -57,6 +57,7 @@ set(FRONTEND_SOURCES
   ${FRONTEND}/Texts.cpp
   ${FRONTEND}/TextMode.cpp
   ${FRONTEND}/SshKeys.cpp
+  ${FRONTEND}/PpkKey.cpp
   ${FRONTEND}/SftpClient.cpp
   ${FRONTEND}/HashUtil.c
 )
@@ -127,6 +128,8 @@ if(Python3_Interpreter_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/DesktopUriTest.py)
   add_test(NAME gui-security-tests COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/SecurityTest.py)
+  add_test(NAME gui-terminal-tests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/TerminalTest.py)
   # The PowerShell module harness: static checks always run, while the
   # live Pester cases skip themselves without pwsh (the suite still
   # reports ran>0, so no ran=0 guard is needed here).
@@ -170,7 +173,10 @@ endif()
 find_package(ZLIB REQUIRED)
 find_package(libssh REQUIRED)
 find_package(OpenSSL REQUIRED)
-target_link_libraries(linscp-frontend PUBLIC ssh OpenSSL::Crypto)
+find_path(ARGON2_INCLUDE_DIR argon2.h REQUIRED)
+find_library(ARGON2_LIBRARY NAMES argon2 REQUIRED)
+target_include_directories(linscp-frontend PRIVATE ${ARGON2_INCLUDE_DIR})
+target_link_libraries(linscp-frontend PUBLIC ssh OpenSSL::Crypto ${ARGON2_LIBRARY})
 
 # GSSAPI stays compiled out, as in the Makefile build: libssh may have
 # it, but this client's settings refuse it by name (see SshTunnel.cpp).

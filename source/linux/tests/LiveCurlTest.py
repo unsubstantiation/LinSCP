@@ -13,8 +13,8 @@ active (PORT arrives at the server). FTPS is the curl path: implicit
 a private CA, a pinned public key, the TLS version bounds, and the refusal of
 a certificate fingerprint this build cannot check.
 
-Neither SSH protocol is here any more. sftp:// is served by the PuTTY SFTP
-engine (LiveSftpTest.py) and scp:// by the client's own SCP engine
+Neither SSH protocol is here any more. sftp:// is served by libssh
+(LiveSftpTest.py) and scp:// by the client's own SCP engine
 (LiveScpTest.py), so no part of an SSH session depends on which SSH library
 the installed curl happens to link - which is what the SCP test in this file
 used to have to work around.

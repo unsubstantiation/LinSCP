@@ -23,7 +23,7 @@
 #include <sys/inotify.h>
 #include <sys/stat.h>
 
-/* The public half of a key file, which only the bundled PuTTY core can
+/* The public half of a key file, which only libssh can
  * read on POSIX. */
 #include "SshKeys.h"
 
@@ -7678,9 +7678,9 @@ std::string KeyIdentity(const std::string & line)
 
 /*
  * 'copyid [<privatekey>]': installs the public half of a key on the server,
- * which is upstream's 'copyid'. The key is read with the bundled PuTTY core,
- * so a PuTTY .ppk, an OpenSSH public key and an OpenSSH private key all work;
- * the line is appended to ~/.ssh/authorized_keys unless that file already
+ * which is upstream's 'copyid'. OpenSSH key files are read with libssh;
+ * PPK v2/v3 public sections are parsed natively. The line is appended unless
+ * the file already
  * holds the key. The permissions matter to sshd, which ignores a key under a
  * group-writable directory, so both are set as the server expects.
  */
@@ -7739,13 +7739,22 @@ bool Script::CopyPublicKey(const std::vector<std::string> & args)
             "There is no private key: connect with -privatekey=<file>, "
             "or give the key file to the command."));
     }
+    const std::string expandedKeyFile = ExpandTilde(keyFile);
     std::string keyLine;
     std::string error;
-    if (!PublicKeyAuthorizedLine(ExpandTilde(keyFile), keyLine, error,
-            passphrase))
+    for (int attempt = 0; attempt < 3; ++attempt)
     {
-        return SwitchError("copyid", error);
+        if (PublicKeyAuthorizedLine(expandedKeyFile, keyLine, error, passphrase))
+            break;
+        if (!IsPpkKeyFile(expandedKeyFile) ||
+            error.find("integrity check failed") == std::string::npos ||
+            !passphrase.empty() || !Console::Instance().IsInteractive() || attempt == 2)
+            return SwitchError("copyid", error);
+        if (!Console::Instance().ReadPassword(
+                Texts::Translate("PPK key passphrase: "), passphrase))
+            return SwitchError("copyid", error);
     }
+    if (keyLine.empty()) return SwitchError("copyid", error);
     if (mHomeDirectory.empty())
     {
         return SwitchError("copyid", Texts::Translate(
@@ -8169,7 +8178,7 @@ void Script::OpenTerminal(const std::vector<std::string> & args)
         userName = options.userName;
     }
 
-    /* A PuTTY key file cannot be read by the system ssh client, so the
+    /* A PPK-format key file cannot be read by the system ssh client, so the
      * terminal can only use the agent (or ask for a password). */
     const std::string key = ExpandTilde(options.privateKeyFile);
     if (key.size() >= 4)
@@ -8182,7 +8191,7 @@ void Script::OpenTerminal(const std::vector<std::string> & args)
         if (extension == ".ppk")
         {
             Console::Instance().LogEvent(Texts::Translate(
-                "The PuTTY key file '{key}' is not passed to the system ssh "
+                "The PPK-format key file '{key}' is not passed to the system ssh "
                 "client; the terminal will use the agent or ask for a "
                 "password.", {{"key", key}}));
         }

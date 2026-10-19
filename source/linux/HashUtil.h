@@ -1,7 +1,6 @@
 /*
- * HashUtil: file digests for 'checksum', using the hash algorithms of
- * the shared PuTTY core (plus CRC-32). Compiled as C for the same
- * reason as SftpClient.c: the core headers are C.
+ * HashUtil: file digests for 'checksum', using OpenSSL EVP plus CRC-32.
+ * Compiled as C to keep its small crypto API easy to use from C modules.
  */
 
 #ifndef LINSCP_HASHUTIL_H
@@ -24,13 +23,13 @@ int lscp_hash_file(const char * algorithm, const char * path,
     char * hex, size_t hexSize);
 const char * lscp_hash_error(void);
 
-/* HMAC-SHA256 of 'data' under 'key' through the PuTTY core (the PRF the
- * sessions-file password encryption is built from). Writes 32 bytes to
- * 'out'; 'outSize' must be at least 32. Returns 0 on success. */
+/* HMAC-SHA256 of 'data' under 'key' through OpenSSL (the PRF used for
+ * sessions-file password encryption). Writes 32 bytes to 'out'; 'outSize'
+ * must be at least 32. Returns 0 on success. */
 int lscp_hmac_sha256(const void * key, size_t keyLen,
     const void * data, size_t dataLen, unsigned char * out, size_t outSize);
 
-/* One-shot SHA-256 of 'data' through the PuTTY core: writes 32 bytes to
+/* One-shot SHA-256 of 'data' through OpenSSL: writes 32 bytes to
  * 'out'; 'outSize' must be at least 32. Returns 0 on success. */
 int lscp_sha256(const void * data, size_t dataLen,
     unsigned char * out, size_t outSize);

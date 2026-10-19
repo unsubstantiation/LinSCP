@@ -266,9 +266,8 @@ bool ApplyGssapiSetting(const std::string & value, std::string & error)
             "to enable it.";
         return false;
     }
-    /* When GSSAPI is available, the PuTTY core handles it natively
-     * through the gssapi import.  The setting is accepted here so that
-     * '-rawsettings Gssapi=1' passes validation. */
+    /* When the build enables libssh GSSAPI support, libssh handles the
+     * authentication exchange. This setting only validates the request. */
     return true;
 }
 

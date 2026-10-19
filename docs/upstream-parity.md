@@ -1,8 +1,9 @@
 # WinSCP parity audit and inventory guide
 
 **Full feature parity is not achieved.** LinSCP is a Linux-only client using
-part of WinSCP's PuTTY code, not a build of the complete upstream application.
-A supported URL, similar GUI or passing build is not proof of behavioral parity.
+an independent implementation with libssh for SSH transport, not a build of
+the complete upstream application. A supported URL, similar GUI or passing
+build is not proof of behavioral parity.
 
 ## Baseline and scope
 
@@ -100,9 +101,8 @@ executable, a Windows path, a file of another platform, an installer that
 does not ship what the other installers ship, and an error message whose
 wording contradicts the template it is filled into. It runs in
 `make -C source/linux check`, as the CTest case `platform-conversion-check`,
-and in CI. The vendored PuTTY tree is not scanned: it is upstream's code
-and keeps upstream's Windows comments, while the platform layer this
-project owns is.
+and in CI. Third-party library sources are not vendored in this repository; the
+platform layer and protocol integration maintained here are checked directly.
 
 ## Evidence and status rules
 

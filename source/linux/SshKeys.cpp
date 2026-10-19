@@ -4,6 +4,7 @@
 
 #include "SshKeys.h"
 
+#include "PpkKey.h"
 #include "PathUtil.h"
 #include "Platform.h"
 
@@ -176,32 +177,14 @@ void StoreHostKey(const char * hostname, int port,
     }
 }
 
-bool IsPuttyKeyFile(const std::string & keyFile)
-{
-    if (keyFile.size() < 4)
-    {
-        return false;
-    }
-    std::string extension = keyFile.substr(keyFile.size() - 4);
-    for (size_t i = 0; i < extension.size(); i++)
-    {
-        extension[i] = static_cast<char>(
-            tolower(static_cast<unsigned char>(extension[i])));
-    }
-    return extension == ".ppk";
-}
-
 bool PublicKeyAuthorizedLine(const std::string & keyFile, std::string & line,
     std::string & error, const std::string & suppliedPassphrase)
 {
     line.clear();
     error.clear();
-    if (IsPuttyKeyFile(keyFile))
+    if (IsPpkKeyFile(keyFile))
     {
-        error = "The PuTTY key file '" + keyFile + "' cannot be read by "
-            "this build; convert it to an OpenSSH key first, for example "
-            "with 'puttygen " + keyFile + " -O private-openssh'.";
-        return false;
+        return PpkPublicAuthorizedLine(keyFile, suppliedPassphrase, line, error);
     }
 
     ssh_key key = NULL;

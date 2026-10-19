@@ -41,12 +41,15 @@ PYTHON ?= python3
 OPT ?= -O2
 WARN ?= -Wall
 
-# libssh (SSH/SFTP/SCP transport) and OpenSSL libcrypto (hashes, and the
-# crypto libssh itself uses). pkg-config finds them where the distro (or
-# a local prefix, in a build sandbox) put them; the flags can also be
-# given on the command line.
+# libssh (SSH/SFTP/SCP transport), OpenSSL libcrypto (hashes and PPK key
+# handling), and libargon2 (encrypted PPK v3 keys). pkg-config finds them
+# where the distro (or a local prefix) put them; flags can be overridden.
 SSH_CFLAGS ?= $(shell pkg-config --cflags libssh libcrypto 2>/dev/null)
 SSH_LIBS ?= $(shell pkg-config --libs libssh libcrypto 2>/dev/null || echo -lssh -lcrypto)
+ARGON2_CFLAGS ?= $(shell pkg-config --cflags libargon2 2>/dev/null)
+ARGON2_LIBS ?= $(shell pkg-config --libs libargon2 2>/dev/null || echo -largon2)
+CFLAGS_APP += $(ARGON2_CFLAGS)
+CXXFLAGS_APP += $(ARGON2_CFLAGS)
 
 # -MMD -MP: write a .d file next to every object, so that a change to a
 # header rebuilds the sources that include it.
@@ -73,6 +76,7 @@ APP_SRCS := \
 	S3Client.cpp \
 	SshTunnel.cpp \
 	SshKeys.cpp \
+	PpkKey.cpp \
 	Script.cpp \
 	ScriptParams.cpp \
 	SyncPlanner.cpp \
@@ -101,7 +105,7 @@ all: $(BINDIR)/linscp
 
 $(BINDIR)/linscp: $(APP_OBJS)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS_APP) -o $@ $(APP_OBJS) $(LDFLAGS) $(SSH_LIBS) $(LIBS)
+	$(CXX) $(CXXFLAGS_APP) -o $@ $(APP_OBJS) $(LDFLAGS) $(SSH_LIBS) $(ARGON2_LIBS) $(LIBS)
 
 # Catalogs are compiled into Texts.cpp; regenerate the table with
 # tools/compile_translations.py after editing locales/*.json.
@@ -121,7 +125,7 @@ $(OBJDIR)/linux/tests/%.o: tests/%.cpp
 
 $(BINDIR)/unittest: $(TEST_OBJS) $(APP_LIB_OBJS)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS_APP) -Itests -o $@ $(TEST_OBJS) $(APP_LIB_OBJS) $(LDFLAGS) $(SSH_LIBS) $(LIBS)
+	$(CXX) $(CXXFLAGS_APP) -Itests -o $@ $(TEST_OBJS) $(APP_LIB_OBJS) $(LDFLAGS) $(SSH_LIBS) $(ARGON2_LIBS) $(LIBS)
 
 check: $(BINDIR)/unittest
 	$(BINDIR)/unittest
@@ -156,6 +160,7 @@ check-live: $(BINDIR)/linscp
 	$(PYTHON) ../../source/gui/tests/BrowserUploadTest.py
 	$(PYTHON) ../../source/gui/tests/DesktopUriTest.py
 	$(PYTHON) ../../source/gui/tests/SecurityTest.py
+	$(PYTHON) ../../source/gui/tests/TerminalTest.py
 	$(PYTHON) ../../automation/test_psmodule.py $(BINDIR)/linscp
 
 # Pull in the generated dependencies, if this is not the first build.

@@ -43,7 +43,7 @@ public:
     bool ReadPassword(const std::string & prompt, std::string & password);
     bool Confirm(const std::string & prompt, bool defaultYes);
 
-    /* Session log file (PuTTY style). */
+    /* Session log file (line-oriented text format). */
     bool SetLogFile(const std::string & path, std::string & error);
     void LogTraffic(const void * data, size_t len, bool incoming);
     void CloseLogFile();

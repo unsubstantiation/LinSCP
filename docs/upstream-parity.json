@@ -124,7 +124,7 @@
     },
     "copyid": {
       "status": "verified",
-      "notes": "Reads the session's private key (or the given key file: an OpenSSH public key, an OpenSSH private key or a PuTTY .ppk, foreign formats imported through the bundled PuTTY core, with optional -passphrase= for encrypted keys) and appends its authorized_keys line to ~/.ssh/authorized_keys, creating the directory 0700 and the file 0600 and leaving an already installed key alone. Needs an sftp:// or scp:// session; covered by live-sftp with public and encrypted private keys, exact ~/.ssh and authorized_keys permissions, and duplicate suppression.",
+      "notes": "Reads the session's private key or a supplied OpenSSH public/private key or PPK v2/v3 key, then appends its authorized_keys line to ~/.ssh/authorized_keys, creating the directory 0700 and the file 0600 and leaving an already installed key alone. PPK files are parsed natively and their MAC is verified; -passphrase= supports encrypted keys. Needs an sftp:// or scp:// session; covered by live-sftp with public and encrypted private keys, exact ~/.ssh and authorized_keys permissions, and duplicate suppression.",
       "verified_on": {
         "linux": [
           "live-sftp"
@@ -433,7 +433,7 @@
     {
       "name": "SFTP",
       "status": "verified",
-      "notes": "Native PuTTY transport rather than a curl session: directory and file CRUD, SYMLINK, chmod (octal, symbolic and recursive), bidirectional file and directory timestamp preservation, .filepart resume, copy-data (with a streamed fallback) and check-file-name (with a local hash fallback), covered by unit and live-sftp.",
+      "notes": "Native libssh transport rather than a curl session: directory and file CRUD, SYMLINK, chmod (octal, symbolic and recursive), bidirectional file and directory timestamp preservation, .filepart resume, copy-data (with a streamed fallback) and check-file-name (with a local hash fallback), covered by unit and live-sftp.",
       "verified_on": {
         "linux": [
           "unit",
@@ -811,7 +811,7 @@
     {
       "name": "S3 object versions",
       "status": "verified",
-      "notes": "The LinSCP-only `versions` command lists S3 version history and delete markers. The upstream get/rm commands also accept LinSCP `-versionid=` switches for exact-version download/removal; the per-version resumable staging path prevents mixing partial downloads from different immutable IDs.",
+      "notes": "The LinSCP-only `versions` command lists S3 version history and delete markers. The upstream get/rm commands also accept LinSCP `-versionid=` switches for exact-version download/removal; the per-version resumable staging path prevents mixing partial downloads from different immutable IDs. Covered by live-s3.",
       "source": [
         "source/linux/S3Client.cpp",
         "source/linux/S3Client.h",
@@ -840,7 +840,7 @@
       "id": "sftp.native-session",
       "area": "SFTP",
       "status": "verified",
-      "notes": "Native PuTTY SFTP session refuses bad credentials and unexpected SSH host keys.",
+      "notes": "Native libssh SFTP session refuses bad credentials and unexpected SSH host keys.",
       "source": [
         "source/linux/SshKeys.cpp",
         "source/linux/SftpClient.cpp"
@@ -2742,7 +2742,7 @@
       "id": "platform.make-linux",
       "area": "Packaging/platforms",
       "status": "verified",
-      "notes": "source/linux/Makefile builds the native Linux/PuTTY client, refuses non-Linux hosts and provides an install target staged under DESTDIR/PREFIX.",
+      "notes": "source/linux/Makefile builds the native Linux/libssh client, refuses non-Linux hosts and provides an install target staged under DESTDIR/PREFIX.",
       "source": [
         "source/linux/Makefile",
         "source/linux/Makefile"

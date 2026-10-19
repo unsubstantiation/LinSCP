@@ -6,7 +6,7 @@
 
 # LinSCP
 
-LinSCP is a free, open-source file transfer client for Debian GNU/Linux. It has
+LinSCP is a noncommercial file transfer client for Debian GNU/Linux. It has
 a command-line client with a WinSCP-style scripting language, and a
 browser-based dual-pane Commander (`linscp-gui`).
 
@@ -16,13 +16,15 @@ parity**: see [Protocols](#protocols) and the [parity audit](docs/upstream-parit
 ## Requirements
 
 - Debian 13 (trixie) or newer, with a GCC or Clang toolchain.
+- Build dependencies: `libssh-dev`, `libssl-dev`, `libargon2-dev`, `zlib1g-dev` and `pkg-config`.
 - `curl` at run time, for FTP transfers, FTPS, WebDAV and S3.
 - Python 3, for the graphical client.
 - Node 20.19 or newer with `npm`, for the optional browser test suites
   (`npm install jsdom@29`). Not needed to build or use the client.
 
 ```sh
-sudo apt install build-essential dpkg-dev curl python3
+sudo apt install build-essential dpkg-dev pkg-config \
+  libssh-dev libssl-dev libargon2-dev zlib1g-dev curl python3
 ```
 
 LinSCP is Linux-only. The Makefile refuses to build on other systems.
@@ -98,6 +100,10 @@ it can be pinned.
   `-speed=` limits; `-preservetime`; transfer presets.
 - **Synchronization:** `synchronize` in one or both directions, and
   `keepuptodate`, which watches the local tree with inotify.
+- **SSH keys:** native PPK v2/v3 parsing for authentication and `copyid`,
+  including encrypted keys (Argon2 for encrypted v3), plus
+  `linscp -convertkey=input.ppk -output=output.pem` for a validated PEM copy;
+  encrypted inputs stay encrypted with the same passphrase.
 - **Remote operations:** `chmod` (octal and symbolic), `cp`, `mv`, `ln`,
   `rm`, `mkdir`, `stat`, `checksum`, `edit`, `call`, and `copyid`.
 - **Scripting:** unambiguous command and option abbreviations, `%1%`..`%9%`

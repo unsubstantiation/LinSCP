@@ -17,16 +17,14 @@ Third-party components
 
 SSH, SFTP and SCP transport, authentication and host-key handling are
 provided by libssh (https://www.libssh.org, LGPL-2.1-or-later), linked
-dynamically from the system. Hashing uses OpenSSL's libcrypto
-(Apache-2.0). Neither is vendored into this tree.
+dynamically from the system. Hashing and PPK key conversion use OpenSSL's libcrypto
+(Apache-2.0). Argon2 key derivation for encrypted PPK v3 files uses the
+system libargon2 (CC0 1.0 or Apache-2.0, at the user's option). Neither
+library is vendored into this tree.
 
 The browser terminal in the graphical client embeds xterm.js 6.0.0 and
 its FitAddon (source/gui/web/vendor/, MIT licence; the full notice is in
 source/gui/web/vendor/LICENSE-xterm.txt).
-
-The vendored PuTTY core that earlier versions carried was removed with
-the move to libssh; it survives only in the git history.
-
 
 Artwork
 

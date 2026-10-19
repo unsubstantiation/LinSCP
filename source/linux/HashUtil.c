@@ -1,7 +1,6 @@
 /*
  * HashUtil: file digests for 'checksum', through OpenSSL's EVP API (the
- * crypto library libssh already links), plus CRC-32. This replaces the
- * hash algorithms of the old shared PuTTY core.
+ * crypto library libssh already links), plus a local CRC-32 implementation.
  */
 
 #include "HashUtil.h"

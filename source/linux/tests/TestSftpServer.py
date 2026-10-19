@@ -236,7 +236,7 @@ class CopyDataSFTPServer(SFTPServer):
 
     def _check_file_name(self, request_number, path, algorithm, offset,
                          length, block_size):
-        """Implement the PuTTY/OpenSSH check-file-name extension for tests."""
+        """Implement the SFTP check-file-name extension for tests."""
         algorithms = {"sha-256": "sha256", "sha-1": "sha1", "md5": "md5"}
         digest_name = algorithms.get(algorithm.lower())
         if digest_name is None or block_size != 0 or offset < 0 or length < 0:
@@ -269,6 +269,7 @@ class CopyDataSFTPServer(SFTPServer):
 class Server(paramiko.ServerInterface):
     def __init__(self):
         self.exec_threads = []
+        self.shell_threads = []
 
     def check_auth_password(self, username, password):
         return paramiko.AUTH_SUCCESSFUL if (username == USER and password == PASSWORD) else paramiko.AUTH_FAILED
@@ -309,8 +310,39 @@ class Server(paramiko.ServerInterface):
         thread.start()
         return True
 
+    def check_channel_pty_request(self, channel, term, width, height,
+                                  pixelwidth, pixelheight, modes):
+        return True
+
     def check_channel_shell_request(self, channel):
-        return False
+        def run_shell():
+            try:
+                channel.sendall(b"TEST-SHELL> ")
+                pending = bytearray()
+                while True:
+                    chunk = channel.recv(4096)
+                    if not chunk:
+                        break
+                    pending.extend(chunk)
+                    while b"\n" in pending:
+                        line, _, rest = pending.partition(b"\n")
+                        pending = bytearray(rest)
+                        command = line.rstrip(b"\r").decode("utf-8", "replace")
+                        if command == "pwd":
+                            response = os.getcwd().encode("utf-8") + b"\r\n"
+                        elif command == "exit":
+                            channel.send_exit_status(0)
+                            channel.close()
+                            return
+                        else:
+                            response = ("unknown command: " + command).encode() + b"\r\n"
+                        channel.sendall(response + b"TEST-SHELL> ")
+            except (EOFError, OSError):
+                pass
+        thread = threading.Thread(target=run_shell, daemon=True)
+        self.shell_threads.append(thread)
+        thread.start()
+        return True
     # No subsystem override: paramiko's default starts the handler that
     # was registered with Transport.set_subsystem_handler.
 
