@@ -241,9 +241,27 @@ jobs:
           exit $status
       - name: GUI integration regression tests
         run: |
-          python3 source/gui/tests/BrowserUploadTest.py
-          python3 source/gui/tests/DesktopUriTest.py
-          python3 source/gui/tests/SecurityTest.py
+          # Each suite prints one evidence line. They are surfaced as
+          # annotations and the local-to-local suite is required to have
+          # run cases: it skips itself when its server cannot start, and a
+          # skip is not a pass.
+          set -o pipefail
+          status=0
+          for suite in BrowserUploadTest DesktopUriTest SecurityTest \
+                       LocalWorkspaceTest; do
+            python3 "source/gui/tests/$suite.py" 2>&1 |
+              tee "$RUNNER_TEMP/gui-$suite.log" || status=$?
+          done
+          cat "$RUNNER_TEMP"/gui-*.log |
+            grep '^evidence: ' |
+            { while IFS= read -r line; do
+              printf '::notice::%s\n' "${line//]/%5D}"; done; } || :
+          grep -E 'evidence: suite=gui-local .*ran=[1-9]' \
+            "$RUNNER_TEMP/gui-LocalWorkspaceTest.log" > /dev/null || {
+            echo "::error::the local-to-local suite ran no tests"
+            exit 1
+          }
+          exit $status
       - name: PowerShell module regressions
         run: |
           # The harness runs its static checks everywhere; the live Pester
@@ -341,9 +359,12 @@ jobs:
         run: |
           set -o pipefail
           sudo apt-get update
-          # build-essential is what the Build-Depends line actually asks
-          # for: g++ and make, plus dpkg-dev for the tools rules calls.
-          sudo apt-get install -y dpkg-dev build-essential
+          # dpkg-buildpackage runs dpkg-checkbuilddeps first and aborts on
+          # any unmet Build-Depends. Those dependencies are what the build
+          # actually links against, so they are installed here rather than
+          # assumed to be on the runner image.
+          sudo apt-get install -y dpkg-dev build-essential pkg-config \
+            libssh-dev libssl-dev libargon2-dev zlib1g-dev
           log="$RUNNER_TEMP/dpkg-build.log"
           # An unsatisfied build dependency aborts dpkg-buildpackage with
           # exit code 3 and names it only in the job log, which is hosted
@@ -377,6 +398,7 @@ jobs:
                       usr/share/linscp/gui/linscp_crypto.py \
                       usr/share/linscp/gui/explorer-commands.json \
                       usr/share/linscp/gui/web/index.html \
+                      usr/share/linscp/gui/web/vendor/xterm.js \
                       usr/share/linscp/automation/LinSCP.psm1 \
                       usr/share/applications/linscp.desktop \
                       usr/share/pixmaps/linscp.png \

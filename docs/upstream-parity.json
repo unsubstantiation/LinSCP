@@ -38,7 +38,8 @@
           "gui-security": "source/gui/tests/SecurityTest.py - offline boundary tests for the browser GUI: operand quoting for the client's command splitter (blanks, quotes, backslashes, control-character refusal), sync/chmod command building from fixed vocabularies, permission-mode validation, local panel containment and remote name validation, single-line server command stream, custom-command template validation/persistence/substitution/execution (local/remote scope, multiple selections, hostile names), PBKDF2 account hashing with per-session CSRF tokens and login throttling, queue staging cleanup, browser upload mode validation, and Host/token/CORS guards.",
           "powershell": "automation/test_psmodule.py - static checks of the PowerShell module that always run (every exported cmdlet defined, no password on a process command line, control-character and multiline refusal, marker-driven server reads, listing-parser status skipping) plus the live Pester suite (automation/LinSCP.Tests.ps1) against the throwaway WebDAV endpoint when pwsh is installed: open/close, byte-exact upload/download, listing objects, terminating errors, timeout cancellation and password hygiene. Without pwsh the live cases skip loudly.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
-          "live-tunnel": "source/linux/tests/LiveTunnelTest.py uses two independently keyed Paramiko endpoints and a destination name resolvable only by the jump fixture. It verifies SFTP/SCP transfer bytes, one-shot exec, embedded-shell defaults, separate host-key failures before authentication, jump password/encrypted-key authentication, forwarding refusal without a direct fallback, inherited SOCKS5 settings applied to the jump host, interrupted download staging, repeated close/failure socket and thread cleanup, encrypted stored credentials and HTTP GUI verification of both hops plus background command routing. Requires paramiko; SCP transfers also require the OpenSSH scp program. No real Kerberos realm or external SSH server is certified by these fixtures. Also covers slow/backpressured upload/download bytes, forwarding timeout, cancelled download staging, no implicit global pin caching and all independent GUI Remember combinations without implicit credential storage."
+          "live-tunnel": "source/linux/tests/LiveTunnelTest.py uses two independently keyed Paramiko endpoints and a destination name resolvable only by the jump fixture. It verifies SFTP/SCP transfer bytes, one-shot exec, embedded-shell defaults, separate host-key failures before authentication, jump password/encrypted-key authentication, forwarding refusal without a direct fallback, inherited SOCKS5 settings applied to the jump host, interrupted download staging, repeated close/failure socket and thread cleanup, encrypted stored credentials and HTTP GUI verification of both hops plus background command routing. Requires paramiko; SCP transfers also require the OpenSSH scp program. No real Kerberos realm or external SSH server is certified by these fixtures. Also covers slow/backpressured upload/download bytes, forwarding timeout, cancelled download staging, no implicit global pin caching and all independent GUI Remember combinations without implicit credential storage.",
+          "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store."
         }
       }
     }
@@ -527,18 +528,18 @@
     },
     {
       "name": "Sessions/configuration",
-      "status": "partial",
-      "notes": "Shared `sessions.ini` site manager with `sessions.key` password encryption, folder trees (`sessions folders`, `sessions [folder/]`, `rmsession -folder` and GUI folder headers), transfer presets, and stored proxy, FTP/TLS and S3 raw settings. Covered by the unit, script, live-sftp, live-curl and gui suites. Tunnel connection policy and encrypted jump credentials are shared with the GUI. Named multi-tab workspaces are missing; stored folders are not workspace parity.",
+      "status": "verified",
+      "notes": "Shared `sessions.ini` site manager with `sessions.key` password encryption, folder trees (`sessions folders`, `sessions [folder/]`, `rmsession -folder` and GUI folder headers), transfer presets, stored proxy, FTP/TLS and S3 raw settings, and named workspaces in workspaces.json that restore tab order, the active tab and both pane paths. Covered by the unit, script, live-sftp, live-curl, gui and gui-local suites. Tunnel connection policy and encrypted jump credentials are shared with the GUI.",
       "verified_on": {
         "linux": [
           "unit",
           "script",
           "live-sftp",
           "live-curl",
-          "gui"
+          "gui",
+          "gui-local"
         ]
-      },
-      "gap": "Named workspace persistence/restore is not implemented."
+      }
     },
     {
       "name": "Security/authentication",
@@ -559,8 +560,8 @@
     },
     {
       "name": "GUI",
-      "status": "partial",
-      "notes": "Browser Commander provides persistent session tabs, dual panes, an Explorer-style single-panel view with persisted custom-command templates (explicit confirmation, safe per-file substitution, local/remote scope), transfer queue controls, synchronization preview/conflict controls, UTF-8 editing/search, synchronized browsing and host-key verification. Local and remote panes accept files/folders through FileSystemEntry, FileSystemHandle and plain File APIs with path validation; English/Spanish interface localization is implemented. These behaviors are covered by gui, gui-localization, gui-browser-upload, gui-local-editor, gui-search and gui-security. Automated browser API fixtures are not a real-world browser/file-manager compatibility certification. SSH tunnel settings and separate hop-key confirmation are implemented. Upstream local-to-local sessions are missing; local pane CRUD/drop support does not provide a second local pane.",
+      "status": "verified",
+      "notes": "Browser Commander provides persistent session tabs, dual panes, an Explorer-style single-panel view with persisted custom-command templates (explicit confirmation, safe per-file substitution, local/remote scope), transfer queue controls, synchronization preview/conflict controls, UTF-8 editing/search, synchronized browsing and host-key verification. Local and remote panes accept files/folders through FileSystemEntry, FileSystemHandle and plain File APIs with path validation; English/Spanish interface localization is implemented. A local-to-local tab opens two local directories without a server or core process and queues recursive copies/moves with overwrite decisions, metadata/symlink policy, overlap refusal and cancellation. These behaviors are covered by gui, gui-localization, gui-browser-upload, gui-local-editor, gui-search, gui-security and gui-local. Automated browser API fixtures are not a real-world browser/file-manager compatibility certification. SSH tunnel settings and separate hop-key confirmation are implemented.",
       "verified_on": {
         "linux": [
           "gui",
@@ -568,10 +569,10 @@
           "gui-browser-upload",
           "gui-local-editor",
           "gui-search",
-          "gui-security"
+          "gui-security",
+          "gui-local"
         ]
-      },
-      "gap": "Upstream local-to-local sessions are not implemented."
+      }
     },
     {
       "name": "Editing/search",
@@ -3219,26 +3220,56 @@
     {
       "id": "gui.local-to-local",
       "area": "GUI",
-      "status": "missing",
-      "notes": "Upstream SessionData exposes IsLocalBrowser and OtherLocalDirectory for two-local-directory sessions. LinSCP can manage its local pane and accept local browser drops, but its opposite pane and cross-panel transfer routes require a remote session; there is no local-to-local session mode.",
-      "gap": "Implement a no-network two-local-pane mode; local uploads into one pane are not local-to-local transfer parity.",
-      "acceptance": [
-        "Open two independent local panes without a remote connection and test recursive copies/moves, overwrite decisions, metadata and symlink policy, queue progress/cancellation and safe handling of source/destination overlap."
+      "status": "verified",
+      "notes": "A local-to-local session is a tab whose protocol is 'local' and which names two absolute local directories (the upstream IsLocalBrowser/OtherLocalDirectory shape). CoreSession.start, connect and alive never spawn the core and never open a socket; the right pane lists its directory through the same API the remote pane uses. Copies and moves are planned and run in-process on the queue with byte progress and cancellation: recursive trees, merge into an existing directory, atomic per-file replacement through a temporary file, timestamps and modes preserved, symbolic links copied as links, and ask/skip/overwrite/rename decisions (the browser answers 'ask' once and retries). Source equal to or inside the destination is refused before queueing. The second pane also supports mkdir, rename, delete, chmod, properties, checksums, editor save and find. The server-only terminal, synchronization and remote transfer dialogs are not offered in this mode.",
+      "source": [
+        "source/gui/linscp_gui.py",
+        "source/gui/web/index.html"
       ],
-      "source": [],
-      "checks": {}
+      "checks": {
+        "gui-local": [
+          "test_a_local_tab_opens_two_independent_panes_without_a_core",
+          "test_recursive_copy_preserves_tree_metadata_and_symlinks",
+          "test_overwrite_ask_reports_conflicts_then_overwrite_replaces",
+          "test_skip_and_rename_are_distinct_overwrite_decisions",
+          "test_move_removes_the_source_only_after_a_complete_copy",
+          "test_source_and_destination_overlap_is_refused_before_queueing",
+          "test_the_queue_reports_bytes_and_a_cancel_leaves_no_partial_file",
+          "test_second_local_pane_supports_crud_properties_and_checksums",
+          "test_browser_drops_land_in_the_second_local_pane"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "gui-local"
+        ]
+      }
     },
     {
       "id": "sessions.workspaces",
       "area": "Sessions/configuration",
-      "status": "missing",
-      "notes": "Upstream TStoredSessionList implements named workspaces (NewWorkspace, GetWorkspaces, SaveWorkspaceData). LinSCP stores individual sites/folders and has live tabs, but no save/restore of a named group of tabs with their navigation state.",
-      "gap": "Add named workspace save/restore rather than treating stored-session folders or in-memory tabs as workspace support.",
-      "acceptance": [
-        "Persist and restore named workspaces with tab order, active tab and both pane paths; test partial connection failures, renamed/deleted sites, process restart and preservation of host-key and credential-storage policies."
+      "status": "verified",
+      "notes": "Named workspaces are stored in workspaces.json beside sessions.ini (0600, fsynced and atomically replaced) and restore the tabs in order with the saved active tab and both pane paths. An entry is either a local tab with its two directories or a remote tab; a tab that came from a stored site records only the site name and is resolved from sessions.ini on every open, so the site's password encryption, pinned host key and tunnel policy stay authoritative. An ad-hoc tab is saved as a snapshot with password, tunnel password, tunnel passphrase and site name removed. Each tab opens independently: a deleted or renamed site, a missing local directory or a host-key challenge is reported in 'failed' without stopping the others, and a challenge is parked in the normal host-key table for the user to verify. A local site can be saved directly, since the console client has no local transport.",
+      "source": [
+        "source/gui/linscp_gui.py",
+        "source/gui/web/index.html"
       ],
-      "source": [],
-      "checks": {}
+      "checks": {
+        "gui-local": [
+          "test_workspace_round_trip_preserves_order_active_tab_and_panes",
+          "test_a_duplicate_workspace_needs_explicit_overwrite",
+          "test_a_failed_tab_does_not_stop_the_rest_of_the_workspace",
+          "test_the_workspace_file_is_private_and_contains_no_credentials",
+          "test_a_deleted_site_is_resolved_from_sessions_ini_every_time",
+          "test_a_workspace_survives_a_restart_and_key_policies_are_kept",
+          "test_a_local_site_is_saved_without_the_console_client"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "gui-local"
+        ]
+      }
     }
   ],
   "scope": {

@@ -94,10 +94,15 @@ plan.
 - Changed host keys have a distinct GUI warning. A tab-only approval no longer
   implicitly enters the global cache. Remembering one hop neither remembers the
   other hop nor implicitly saves connection passwords/passphrases.
-- Upstream `SessionData` exposes `IsLocalBrowser`/`OtherLocalDirectory` and
-  named workspace operations. LinSCP's local pane, saved sites/folders and live
-  tabs do not implement these workflows. `gui.local-to-local` and
-  `sessions.workspaces` are now explicit protected gaps in the ledger.
+- Upstream `SessionData` exposes `IsLocalBrowser`/`OtherLocalDirectory`, and
+  its stored-session list implements named workspaces. Both are now
+  implemented and evidenced in `gui-local`: a `protocol=local` tab owns two
+  local directories, starts no core process and queues recursive copies/moves
+  with overwrite decisions, metadata/symlink policy, overlap refusal and
+  cancellation; named workspaces in `workspaces.json` restore tab order, the
+  active tab and both pane paths without storing credentials, resolving stored
+  sites live from `sessions.ini`. The remaining gaps are the ones listed
+  below and in the [remaining parity plan](remaining-parity-plan.md).
 - GUI sign-in has tested password hashing, expiry, throttling and CSRF tokens,
   but no per-user isolation of resources or OS privileges. It is a partially
   implemented LinSCP deployment extension, not an upstream desktop capability.
