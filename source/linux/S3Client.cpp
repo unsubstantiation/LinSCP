@@ -725,6 +725,7 @@ bool InvokeCurl(const S3Site & site, const SessionOptions & options,
     {
         args.push_back("--insecure");
     }
+    AddCurlTunnelArgs(options, args);
     if (options.timeoutSecs > 0)
     {
         args.push_back("--connect-timeout");

@@ -367,16 +367,157 @@ def find_linscp_binary():
 LINSCP_BIN = find_linscp_binary()
 
 STATE_LOCK = threading.RLock()
-STATE = {
-    "logs": [],
-    "tabs": [],          # list of CoreSession
-    "active_tab": None,
-    "tasks": [],         # newest first
-    "paused": False,
-    "next_tab": 1,
-    "next_task": 1,
-    "challenges": {},   # tab id -> CoreSession waiting for a host key decision
-}
+_TLS = threading.local()
+_USER_WORKSPACES = {}
+_USER_WORKSPACES_LOCK = threading.Lock()
+
+
+def empty_workspace(username="", home_dir="", config_dir=""):
+    """One signed-in user's tabs, queue, logs, terminals and config root.
+
+    The GUI process still runs as a single OS user; this is application-level
+    isolation for --accounts-file deployments, not a substitute for separate
+    OS accounts when callers are mutually hostile.
+    """
+    return {
+        "logs": [],
+        "tabs": [],          # list of CoreSession
+        "active_tab": None,
+        "tasks": [],         # newest first
+        "paused": False,
+        "next_tab": 1,
+        "next_task": 1,
+        "challenges": {},   # tab id -> CoreSession waiting for a host key decision
+        "terminals": {},
+        "username": username,
+        "home_dir": home_dir or "",
+        "config_dir": config_dir or "",
+        "task_manager": None,
+    }
+
+
+_DEFAULT_WORKSPACE = empty_workspace()
+
+
+def _current_workspace():
+    return getattr(_TLS, "workspace", None) or _DEFAULT_WORKSPACE
+
+
+class _StateView(object):
+    """Dict-like view of the workspace bound to this thread.
+
+    Existing call sites keep writing STATE['tabs']; with accounts enabled a
+    request thread is bound to that login's workspace so two users never share
+    tabs, queues, logs or terminals.
+    """
+
+    def __getitem__(self, key):
+        return _current_workspace()[key]
+
+    def __setitem__(self, key, value):
+        _current_workspace()[key] = value
+
+    def get(self, key, default=None):
+        return _current_workspace().get(key, default)
+
+    def __contains__(self, key):
+        return key in _current_workspace()
+
+
+STATE = _StateView()
+
+
+def _accounts_users_root():
+    if ACCOUNTS_FILE:
+        return os.path.join(os.path.dirname(os.path.abspath(ACCOUNTS_FILE)),
+                            "users")
+    override = os.environ.get("LINSCP_CONFIG_DIR")
+    if override:
+        return os.path.join(override, "users")
+    return os.path.join(_default_config_root(), "users")
+
+
+def _default_config_root():
+    override = os.environ.get("LINSCP_CONFIG_DIR")
+    if override:
+        return override
+    root = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config")
+    return os.path.join(root, "LinSCP")
+
+
+def workspace_for_user(username, home_dir=""):
+    """The isolated workspace owned by one account name."""
+    username = str(username or "")
+    if not username:
+        return _DEFAULT_WORKSPACE
+    with _USER_WORKSPACES_LOCK:
+        ws = _USER_WORKSPACES.get(username)
+        if ws is None:
+            config_dir = os.path.join(_accounts_users_root(), username)
+            ws = empty_workspace(username=username, home_dir=home_dir or "",
+                                 config_dir=config_dir)
+            _USER_WORKSPACES[username] = ws
+        elif home_dir and ws.get("home_dir") != home_dir:
+            ws["home_dir"] = home_dir
+        return ws
+
+
+def bind_workspace(workspace):
+    _TLS.workspace = workspace
+    return workspace
+
+
+def unbind_workspace():
+    _TLS.workspace = None
+
+
+def account_home_dir():
+    return str(_current_workspace().get("home_dir") or "").strip()
+
+
+def confined_local_path(path):
+    """Resolve a local path, jailed to this login's home when accounts are on.
+
+    An account without a home_dir cannot touch the server filesystem at all:
+    login is not an invitation to browse the process owner's files.
+    """
+    if path is None or path == "":
+        return "", "No path given."
+    path = str(path)
+    if ACCOUNTS_FILE:
+        home = account_home_dir()
+        if not home:
+            return "", "This account has no home directory."
+        if not os.path.isabs(path):
+            path = os.path.join(home, path)
+        path = os.path.abspath(path)
+        home_abs = os.path.abspath(home)
+        try:
+            if os.path.commonpath([home_abs, path]) != home_abs:
+                return "", "The path is outside this account's home directory."
+        except ValueError:
+            return "", "The path is outside this account's home directory."
+        if os.path.lexists(path):
+            home_real = os.path.realpath(home_abs)
+            real = os.path.realpath(path)
+            try:
+                if os.path.commonpath([home_real, real]) != home_real:
+                    return "", "The path is outside this account's home directory."
+            except ValueError:
+                return "", "The path is outside this account's home directory."
+        return path, ""
+    if not os.path.isabs(path):
+        path = os.path.abspath(os.path.join(os.path.expanduser("~"), path))
+    else:
+        path = os.path.abspath(path)
+    return path, ""
+
+
+def default_local_dir():
+    if ACCOUNTS_FILE:
+        return account_home_dir() or ""
+    return os.path.expanduser("~")
 
 
 def add_log(message, level="info"):
@@ -396,7 +537,15 @@ def add_log(message, level="info"):
 # ---------------------------------------------------------------------------
 
 def session_store_path():
-    """The sessions.ini the console client and this server share."""
+    """The sessions.ini the console client and this server share.
+
+    With --accounts-file each login keeps its own file under users/<name>/,
+    so one account cannot read or overwrite another's stored sites.
+    """
+    ws = _current_workspace()
+    if ws.get("config_dir"):
+        os.makedirs(ws["config_dir"], mode=0o700, exist_ok=True)
+        return os.path.join(ws["config_dir"], "sessions.ini")
     override = os.environ.get("LINSCP_CONFIG_DIR")
     if override:
         return os.path.join(override, "sessions.ini")
@@ -972,7 +1121,7 @@ def new_session():
         # it has to be asked for.
         "hostkey": "",
         "initial_dir": "/",
-        "local_dir": os.path.expanduser("~"),
+        "local_dir": default_local_dir() or os.path.expanduser("~"),
         "other_local_dir": "",
         "tunnel": False, "tunnel_host": "", "tunnel_port": 22,
         "tunnel_username": "", "tunnel_password": "", "tunnel_passphrase": "",
@@ -1439,7 +1588,12 @@ class CoreSession(object):
         self.id = tab_id
         self.session = dict(session)
         self.remote_dir = session.get("initial_dir") or "/"
-        self.local_dir = session.get("local_dir") or os.path.expanduser("~")
+        self.local_dir = session.get("local_dir") or default_local_dir() or os.path.expanduser("~")
+        jailed, jail_error = confined_local_path(self.local_dir)
+        if not jail_error:
+            self.local_dir = jailed
+        elif ACCOUNTS_FILE and account_home_dir():
+            self.local_dir = account_home_dir()
         self.other_local_dir = session.get("other_local_dir") or ""
         self.site_name = session.get("site") or ""
         # A local tab's default name is built from both pane directories,
@@ -2194,8 +2348,11 @@ class TerminalProcess:
             self.thread.join(timeout=1)
 
 
-TERMINALS = {}
 TERMINALS_LOCK = threading.Lock()
+
+
+def _terminals():
+    return _current_workspace().setdefault("terminals", {})
 
 
 def start_terminal(tab):
@@ -2210,28 +2367,29 @@ def start_terminal(tab):
     term = TerminalProcess(argv, env)
     terminal_id = secrets.token_hex(8)
     with TERMINALS_LOCK:
-        TERMINALS[terminal_id] = (str(tab.id), term)
+        _terminals()[terminal_id] = (str(tab.id), term)
     return terminal_id
 
 
 def get_terminal(terminal_id):
     with TERMINALS_LOCK:
-        entry = TERMINALS.get(str(terminal_id or ""))
+        entry = _terminals().get(str(terminal_id or ""))
     return entry[1] if entry else None
 
 
 def close_terminal(terminal_id):
     with TERMINALS_LOCK:
-        entry = TERMINALS.pop(str(terminal_id or ""), None)
+        entry = _terminals().pop(str(terminal_id or ""), None)
     if entry:
         entry[1].close()
 
 
 def close_tab_terminals(tab_id):
     with TERMINALS_LOCK:
-        doomed = [key for key, (owner, _term) in TERMINALS.items()
+        table = _terminals()
+        doomed = [key for key, (owner, _term) in table.items()
                   if owner == str(tab_id)]
-        terms = [TERMINALS.pop(key)[1] for key in doomed]
+        terms = [table.pop(key)[1] for key in doomed]
     for term in terms:
         term.close()
 
@@ -2349,9 +2507,21 @@ class Task(object):
 
 
 class TaskManager(object):
-    def __init__(self):
+    def __init__(self, workspace=None):
+        self.workspace = workspace if workspace is not None else _DEFAULT_WORKSPACE
         self.condition = threading.Condition()
         threading.Thread(target=self._worker, daemon=True).start()
+
+    def _bind(self):
+        previous = getattr(_TLS, "workspace", None)
+        _TLS.workspace = getattr(self, "workspace", None) or _DEFAULT_WORKSPACE
+        return previous
+
+    def _unbind(self, previous):
+        _TLS.workspace = previous
+
+    def _ws(self):
+        return getattr(self, "workspace", None) or _DEFAULT_WORKSPACE
 
     def submit(self, kind, command, session, source, destination, tab_id,
                progress_path=None, progress_remote=None, move_source=None,
@@ -2359,27 +2529,33 @@ class TaskManager(object):
                local_source=None, local_target=None, local_policy="ask",
                local_move=False, local_root=None):
         with STATE_LOCK:
-            task = Task(STATE["next_task"], kind, command, session, source,
+            ws = getattr(self, "workspace", None) or _DEFAULT_WORKSPACE
+            task = Task(ws["next_task"], kind, command, session, source,
                         destination, tab_id, progress_path, progress_remote,
                         move_source=move_source, cleanup_path=cleanup_path,
                         native=native, local_source=local_source,
                         local_target=local_target, local_policy=local_policy,
                         local_move=local_move, local_root=local_root)
-            STATE["next_task"] += 1
+            ws["next_task"] += 1
             if priority:
-                STATE["tasks"].append(task)
+                ws["tasks"].append(task)
             else:
-                STATE["tasks"].insert(0, task)
+                ws["tasks"].insert(0, task)
         with self.condition:
             self.condition.notify_all()
-        add_log("Queued %s: %s -> %s" % (kind, source, destination), "info")
+        previous = self._bind()
+        try:
+            add_log("Queued %s: %s -> %s" % (kind, source, destination), "info")
+        finally:
+            self._unbind(previous)
         return task
 
     def _next(self):
         with STATE_LOCK:
-            if STATE["paused"]:
+            ws = getattr(self, "workspace", None) or _DEFAULT_WORKSPACE
+            if ws["paused"]:
                 return None
-            for task in reversed(STATE["tasks"]):
+            for task in reversed(ws["tasks"]):
                 if task.status == "Queued":
                     return task
         return None
@@ -2394,6 +2570,13 @@ class TaskManager(object):
             self._run(task)
 
     def _run(self, task):
+        previous = self._bind()
+        try:
+            self._run_bound(task)
+        finally:
+            self._unbind(previous)
+
+    def _run_bound(self, task):
         task.status = "Running"
         task.started = time.strftime("%H:%M:%S")
         task.error = ""
@@ -2530,19 +2713,24 @@ class TaskManager(object):
             local_copy_task(entry)
 
         with STATE_LOCK:
-            task = Task(STATE["next_task"], kind, "", {}, source,
+            ws = self._ws()
+            task = Task(ws["next_task"], kind, "", {}, source,
                         destination, tab_id, native=operation,
                         local_source=source, local_target=destination,
                         local_policy=policy, local_move=move, local_root=root)
             task.bytes_total = bytes_total
-            STATE["next_task"] += 1
+            ws["next_task"] += 1
             if priority:
-                STATE["tasks"].append(task)
+                ws["tasks"].append(task)
             else:
-                STATE["tasks"].insert(0, task)
+                ws["tasks"].insert(0, task)
         with self.condition:
             self.condition.notify_all()
-        add_log("Queued %s: %s -> %s" % (kind, source, destination), "info")
+        previous = self._bind()
+        try:
+            add_log("Queued %s: %s -> %s" % (kind, source, destination), "info")
+        finally:
+            self._unbind(previous)
         return task
 
     def _remove_move_source(self, task):
@@ -2566,7 +2754,7 @@ class TaskManager(object):
 
         if side == "remote":
             with STATE_LOCK:
-                tab = next((candidate for candidate in STATE["tabs"]
+                tab = next((candidate for candidate in self._ws()["tabs"]
                             if str(candidate.id) == str(task.tab_id)), None)
             if tab is None or not tab.connected:
                 return "The transfer completed, but its session closed; the remote source was kept."
@@ -2600,7 +2788,7 @@ class TaskManager(object):
 
     def cancel(self, task_id):
         with STATE_LOCK:
-            for task in STATE["tasks"]:
+            for task in self._ws()["tasks"]:
                 if str(task.id) == str(task_id):
                     if task.status == "Queued":
                         task.status = "Cancelled"
@@ -2612,7 +2800,7 @@ class TaskManager(object):
 
     def retry(self, task_id):
         with STATE_LOCK:
-            for task in STATE["tasks"]:
+            for task in self._ws()["tasks"]:
                 if str(task.id) == str(task_id):
                     if task.status not in ("Failed", "Cancelled"):
                         return False
@@ -2630,7 +2818,7 @@ class TaskManager(object):
     def prioritize(self, task_id, position="top"):
         """Reorder a queued task ('top' runs next; 'up'/'down' shifts one slot)."""
         with STATE_LOCK:
-            tasks = STATE["tasks"]
+            tasks = self._ws()["tasks"]
             idx = next((i for i, t in enumerate(tasks)
                         if str(t.id) == str(task_id)), None)
             if idx is None or tasks[idx].status != "Queued":
@@ -2655,33 +2843,41 @@ class TaskManager(object):
 
     def pause(self):
         with STATE_LOCK:
-            STATE["paused"] = True
-        add_log("Queue paused; queued transfers wait.", "info")
+            self._ws()["paused"] = True
+        previous = self._bind()
+        try:
+            add_log("Queue paused; queued transfers wait.", "info")
+        finally:
+            self._unbind(previous)
 
     def resume(self):
         with STATE_LOCK:
-            STATE["paused"] = False
+            self._ws()["paused"] = False
         with self.condition:
             self.condition.notify_all()
-        add_log("Queue resumed.", "info")
+        previous = self._bind()
+        try:
+            add_log("Queue resumed.", "info")
+        finally:
+            self._unbind(previous)
 
     def clear_finished(self):
         with STATE_LOCK:
             kept = []
             removed = []
-            for task in STATE["tasks"]:
+            for task in self._ws()["tasks"]:
                 if task.status in ("Queued", "Running", "Cancelling"):
                     kept.append(task)
                 else:
                     removed.append(task)
-            STATE["tasks"] = kept
+            self._ws()["tasks"] = kept
         for task in removed:
             self.cleanup_source(task)
 
     def cancel_all(self):
         staged = []
         with STATE_LOCK:
-            for task in STATE["tasks"]:
+            for task in self._ws()["tasks"]:
                 if task.status == "Queued":
                     task.status = "Cancelled"
                     # Nothing is reading the staged file of a task that
@@ -2702,7 +2898,30 @@ class TaskManager(object):
             self.cleanup_source(task)
 
 
-TASKS = TaskManager()
+_DEFAULT_TASKS = TaskManager(_DEFAULT_WORKSPACE)
+_DEFAULT_WORKSPACE["task_manager"] = _DEFAULT_TASKS
+
+
+class _TasksProxy(object):
+    """Route queue operations to the workspace bound to this thread.
+
+    Tests may replace the module-level TASKS object; request handlers then
+    talk to that stand-in. Isolation uses the per-login TaskManager.
+    """
+
+    def _manager(self):
+        ws = _current_workspace()
+        manager = ws.get("task_manager")
+        if manager is None:
+            manager = TaskManager(ws)
+            ws["task_manager"] = manager
+        return manager
+
+    def __getattr__(self, name):
+        return getattr(self._manager(), name)
+
+
+TASKS = _TasksProxy()
 
 
 def queue_local_transfers(tab, direction, names, policy="ask", move=False,
@@ -2961,6 +3180,10 @@ def contained_local_path(base, name):
         return None, "The file name is too long."
     if not isinstance(base, str) or not base or not os.path.isabs(base):
         return None, "The local directory of this panel is not set."
+    jailed_base, jail_error = confined_local_path(base)
+    if jail_error:
+        return None, jail_error
+    base = jailed_base
     # Use realpath to prevent a symlink in the base directory from
     # escaping containment via string-prefix checks alone.
     try:
@@ -2973,7 +3196,10 @@ def contained_local_path(base, name):
             return None, "That name escapes the directory the panel is showing."
     except ValueError:
         return None, "That name escapes the directory the panel is showing."
-    return target, ""
+    confined, jail_error = confined_local_path(target)
+    if jail_error:
+        return None, jail_error
+    return confined, ""
 
 
 def check_remote_entry_name(name):
@@ -4611,7 +4837,8 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             path = self.path.split("?")[0]
             if path != "/api/login":
                 sid = _extract_login_cookie(self)
-                username = _validate_login_session(sid)
+                record = _login_session_record(sid)
+                username = record.get("username") if record else None
                 if not username:
                     self.send_json({"success": False,
                                     "error": "Login required.",
@@ -4626,6 +4853,8 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                                              "invalid.",
                                     "login_required": True}, status=403)
                     return False
+                bind_workspace(workspace_for_user(
+                    username, record.get("home_dir") or ""))
         return True
 
     def serve_client(self):
@@ -4746,6 +4975,8 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             # the connection with a traceback and no answer at all.
             return self.send_json({"success": False, "error": str(exc)},
                                   status=400)
+        finally:
+            unbind_workspace()
 
     def do_POST(self):
         try:
@@ -4758,6 +4989,8 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             self.close_connection = True
             return self.send_json({"success": False, "error": str(exc)},
                                   status=400)
+        finally:
+            unbind_workspace()
 
     def _dispatch_get(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -4804,7 +5037,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             self.send_json({
                 "connected": tab is not None and tab.connected,
                 "session": session,
-                "local_dir": tab.local_dir if tab else os.path.expanduser("~"),
+                "local_dir": tab.local_dir if tab else default_local_dir(),
                 "remote_dir": tab.remote_dir if tab else "/",
                 "other_local_dir": tab.other_local_dir if tab else "",
                 "is_local": bool(tab and getattr(tab, "is_local", False)),
@@ -4874,10 +5107,12 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             req_path = query.get("path", [None])[0]
             tab = get_tab(query.get("tab", [None])[0])
             if not req_path:
-                req_path = tab.local_dir if tab else os.path.expanduser("~")
-            if not os.path.isabs(req_path):
-                base = tab.local_dir if tab else os.path.expanduser("~")
-                req_path = os.path.abspath(os.path.join(base, req_path))
+                req_path = tab.local_dir if tab else default_local_dir()
+            req_path, jail_error = confined_local_path(req_path)
+            if jail_error:
+                self.send_json({"success": False, "error": jail_error},
+                               status=403)
+                return
             entries, err = list_local_directory(req_path)
             if err:
                 self.send_json({"success": False, "error": err}, status=400)
@@ -4913,9 +5148,11 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if getattr(tab, "is_local", False):
                 req_path = (query.get("path", [None])[0] or
                             tab.remote_dir or tab.other_local_dir)
-                if not os.path.isabs(req_path):
-                    req_path = os.path.abspath(os.path.join(
-                        tab.remote_dir or tab.other_local_dir, req_path))
+                req_path, jail_error = confined_local_path(req_path)
+                if jail_error:
+                    self.send_json({"success": False, "error": jail_error},
+                                   status=403)
+                    return
                 entries, err = list_local_directory(req_path)
                 if err:
                     self.send_json({"success": False, "error": err},
@@ -5497,7 +5734,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/local/mkdir":
             tab = get_tab(body.get("tab"))
-            base = tab.local_dir if tab else os.path.expanduser("~")
+            base = tab.local_dir if tab else default_local_dir()
             target, contain_error = contained_local_path(base, body.get("name") or "")
             if contain_error:
                 self.send_json({"success": False, "error": contain_error}, status=400)
@@ -5512,7 +5749,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/local/delete":
             tab = get_tab(body.get("tab"))
-            base = tab.local_dir if tab else os.path.expanduser("~")
+            base = tab.local_dir if tab else default_local_dir()
             names = body.get("names") or ([body["name"]] if body.get("name") else [])
             errors = []
             for name in names:
@@ -5536,7 +5773,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/local/rename":
             tab = get_tab(body.get("tab"))
-            base = tab.local_dir if tab else os.path.expanduser("~")
+            base = tab.local_dir if tab else default_local_dir()
             old, new = body.get("old_name"), body.get("new_name")
             if not old or not new:
                 self.send_json({"success": False, "error": "Both names are required"},
@@ -5558,7 +5795,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/local/chmod":
             tab = get_tab(body.get("tab"))
-            base = tab.local_dir if tab else os.path.expanduser("~")
+            base = tab.local_dir if tab else default_local_dir()
             name = body.get("name") or ""
             mode_text = str(body.get("permissions") or "")
             mode_error = check_permission_mode(mode_text)
@@ -5867,6 +6104,11 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 self.send_json({"success": True})
                 return
             local_dir = body.get("local_dir") or tab.local_dir
+            local_dir, jail_error = confined_local_path(local_dir)
+            if jail_error:
+                self.send_json({"success": False, "error": jail_error},
+                               status=403)
+                return
             switches = transfer_switches(body)
             priority = bool(body.get("priority"))
             for name in names:
@@ -6083,9 +6325,15 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if tab is None:
                 self.send_json({"success": False, "error": "Not connected"}, status=400)
                 return
+            local_dir, jail_error = confined_local_path(
+                body.get("local_dir") or tab.local_dir)
+            if jail_error:
+                self.send_json({"success": False, "error": jail_error},
+                               status=403)
+                return
             command = build_sync_command(
                 body.get("mode") or "local",
-                body.get("local_dir") or tab.local_dir,
+                local_dir,
                 body.get("remote_dir") or tab.remote_dir,
                 delete=bool(body.get("delete")),
                 criteria=body.get("criteria") or "time",
@@ -6114,6 +6362,11 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 self.send_json({"success": False, "error": "Not connected"}, status=400)
                 return
             local_dir = body.get("local_dir") or tab.local_dir
+            local_dir, jail_error = confined_local_path(local_dir)
+            if jail_error:
+                self.send_json({"success": False, "error": jail_error},
+                               status=403)
+                return
             remote_dir = body.get("remote_dir") or tab.remote_dir
             command = build_sync_command(
                 body.get("mode") or "local", local_dir, remote_dir,
@@ -6384,7 +6637,12 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if tab is None:
                 self.send_json({"success": False, "error": "Not connected"}, status=400)
                 return
-            local_dir = os.path.abspath(str(body.get("local_dir") or tab.local_dir))
+            local_dir, jail_error = confined_local_path(
+                body.get("local_dir") or tab.local_dir)
+            if jail_error:
+                self.send_json({"success": False, "error": jail_error},
+                               status=403)
+                return
             remote_dir = str(body.get("remote_dir") or tab.remote_dir)
             if not os.path.isdir(local_dir):
                 self.send_json({"success": False,
@@ -6456,6 +6714,12 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 self.send_json({"success": code == 0, "exit_code": code,
                                 "stdout": "\n".join(lines),
                                 "stderr": "\n".join(errors)})
+                return
+            if ACCOUNTS_FILE:
+                self.send_json({"success": False,
+                                "error": "A connected tab of this login is "
+                                         "required to run a command."},
+                               status=403)
                 return
             code, stdout, stderr = run_linscp(cmd_text)
             self.send_json({"success": code == 0, "exit_code": code,
@@ -6562,13 +6826,14 @@ def _config_root():
     fall back to ~/.config, so a run started with its own LINSCP_CONFIG_DIR
     still shared them with the user's real configuration - and a test that
     pointed the variable at a temporary directory wrote to the home one.
+    With accounts enabled this is the login's private directory, not the
+    process-wide one.
     """
-    override = os.environ.get("LINSCP_CONFIG_DIR")
-    if override:
-        return override
-    root = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
-        os.path.expanduser("~"), ".config")
-    return os.path.join(root, "LinSCP")
+    ws = _current_workspace()
+    if ws.get("config_dir"):
+        os.makedirs(ws["config_dir"], mode=0o700, exist_ok=True)
+        return ws["config_dir"]
+    return _default_config_root()
 
 
 def _custom_commands_path():
@@ -7011,7 +7276,10 @@ def resolve_local_pane_file(tab, path, side="local"):
             return "", "The file is outside the current local panel directory."
     except ValueError:
         return "", "The file is outside the current local panel directory."
-    return candidate, ""
+    confined, jail_error = confined_local_path(candidate)
+    if jail_error:
+        return "", jail_error
+    return confined, ""
 
 
 def resolve_local_file(tab, path):

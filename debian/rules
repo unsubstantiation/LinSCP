@@ -22,8 +22,9 @@ build-stamp:
 # The tree this package installs is the tree 'make -C source/linux install'
 # and 'cmake --install' produce: the client in bin/, the graphical client's
 # modules, its command templates and its web client under share/linscp/gui/,
-# the PowerShell module under share/linscp/automation/, the manual page, the
-# desktop entry and the icons. The command templates are listed because
+# the PowerShell module under share/linscp/automation/, the .NET assembly
+# sources under share/linscp/dotnet/, the manual page, the desktop entry
+# and the icons. The command templates are listed because
 # without them an installed client starts with an empty command list, where
 # a run from the source tree offers the shipped ones.
 binary: build
@@ -36,6 +37,7 @@ binary: build
 	install -d $(destdir)/usr/share/icons/hicolor/scalable/apps
 	install -d $(destdir)/usr/share/linscp/gui/web
 	install -d $(destdir)/usr/share/linscp/automation
+	install -d $(destdir)/usr/share/linscp/dotnet
 	install -d $(destdir)/DEBIAN
 	install -m 0755 source/linux/build/linscp $(destdir)/usr/bin/linscp
 	install -m 0755 source/gui/linscp-gui $(destdir)/usr/bin/linscp-gui
@@ -47,6 +49,10 @@ binary: build
 	install -d $(destdir)/usr/share/linscp/gui/web/vendor
 	install -m 0644 source/gui/web/vendor/* $(destdir)/usr/share/linscp/gui/web/vendor/
 	install -m 0644 automation/LinSCP.psm1 $(destdir)/usr/share/linscp/automation/
+	install -m 0644 automation/dotnet/LinSCP/LinSCP.csproj \
+		automation/dotnet/LinSCP/Session.cs \
+		automation/dotnet/LinSCP/WinSCPCompat.cs \
+		$(destdir)/usr/share/linscp/dotnet/
 	install -m 0644 debian/linscp.desktop $(destdir)/usr/share/applications/linscp.desktop
 	install -m 0644 debian/linscp.png $(destdir)/usr/share/pixmaps/linscp.png
 	install -m 0644 debian/linscp.svg $(destdir)/usr/share/icons/hicolor/scalable/apps/linscp.svg

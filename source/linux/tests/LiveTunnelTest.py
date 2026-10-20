@@ -110,7 +110,7 @@ class JumpEndpoint:
                     endpoint.stop.wait(10)
                     return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
                 host, port = destination
-                if endpoint.reject_forward or port != endpoint.destination_port or host not in (
+                if endpoint.reject_forward or host not in (
                         "destination.internal.invalid", "127.0.0.1"):
                     return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
                 targets[chanid] = socket.create_connection(("127.0.0.1", port), timeout=5)
@@ -119,16 +119,36 @@ class JumpEndpoint:
         transport = paramiko.Transport(client)
         self.transports.append(transport)
         transport.add_server_key(self.key)
+        relays = []
         try:
             transport.start_server(server=Server())
-            channel = transport.accept(10)
-            if channel is None:
-                return
-            target = targets[channel.get_id()]
-            # A full-duplex relay with half-close support for channel EOF.
-            readable = [channel, target]
-            returned = 0
-            while readable and transport.is_active() and not self.stop.is_set():
+            while transport.is_active() and not self.stop.is_set():
+                channel = transport.accept(0.2)
+                if channel is None:
+                    continue
+                target = targets.get(channel.get_id())
+                if target is None:
+                    channel.close()
+                    continue
+                worker = threading.Thread(target=self.relay, args=(channel, target),
+                                          daemon=True)
+                relays.append(worker)
+                self.workers.append(worker)
+                worker.start()
+            for worker in relays:
+                worker.join(timeout=3)
+        except (EOFError, OSError, paramiko.SSHException):
+            pass  # Expected when the client refuses a key or cancels.
+        finally:
+            for target in targets.values():
+                target.close()
+            transport.close()
+
+    def relay(self, channel, target):
+        readable = [channel, target]
+        returned = 0
+        try:
+            while readable and not self.stop.is_set():
                 ready, _, _ = select.select(readable, [], [], 0.2)
                 for source in ready:
                     data = source.recv(32768)
@@ -148,12 +168,17 @@ class JumpEndpoint:
                     if self.relay_delay:
                         self.stop.wait(self.relay_delay)
                     sink.sendall(data)
-        except (EOFError, OSError, paramiko.SSHException):
-            pass  # Expected when the client refuses a key or cancels.
+        except (EOFError, OSError):
+            pass
         finally:
-            for target in targets.values():
+            try:
                 target.close()
-            transport.close()
+            except OSError:
+                pass
+            try:
+                channel.close()
+            except Exception:
+                pass
 
     def close(self):
         self.stop.set()
@@ -623,6 +648,192 @@ class LiveTunnelTests(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
                 worker.join(timeout=5)
+
+    def start_dav_server(self):
+        env = dict(os.environ, LSCP_TEST_PORT="0")
+        server = subprocess.Popen(
+            [sys.executable, str(HERE / "TestDavServer.py")],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        port = None
+        timer = threading.Timer(30.0, server.kill)
+        timer.start()
+        try:
+            for line in server.stdout:
+                line = line.strip()
+                if line.startswith("READY "):
+                    port = int(line.split()[1])
+                    break
+        finally:
+            timer.cancel()
+        if port is None:
+            server.kill()
+            self.fail("the WebDAV test server did not report a port")
+        self.addCleanup(self.stop_process, server)
+        return server, port
+
+    def start_s3_server(self):
+        env = dict(os.environ, LSCP_TEST_PORT="0")
+        server = subprocess.Popen(
+            [sys.executable, str(HERE / "TestS3Server.py")],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        port = None
+        timer = threading.Timer(30.0, server.kill)
+        timer.start()
+        try:
+            for line in server.stdout:
+                line = line.strip()
+                if line.startswith("READY "):
+                    port = int(line.split()[1])
+                    break
+                if line.startswith("MISSING-FIXTURES"):
+                    server.kill()
+                    self.skipTest(line)
+        finally:
+            timer.cancel()
+        if port is None:
+            server.kill()
+            self.fail("the S3 test server did not report a port")
+        self.addCleanup(self.stop_process, server)
+        return server, port
+
+    def start_ftp_server(self):
+        try:
+            from pyftpdlib.authorizers import DummyAuthorizer
+            from pyftpdlib.handlers import FTPHandler
+            from pyftpdlib.servers import FTPServer
+        except ImportError as exc:
+            self.skipTest("pyftpdlib is not installed: %s" % exc)
+        root = pathlib.Path(self.workdir.name) / "ftp-root"
+        root.mkdir(exist_ok=True)
+        authorizer = DummyAuthorizer()
+        authorizer.add_user("test", "test", str(root), perm="elradfmwMT")
+        FTPHandler.authorizer = authorizer
+        FTPHandler.passive_ports = range(42100, 42121)
+        ftp_server = FTPServer(("127.0.0.1", 0), FTPHandler)
+        worker = threading.Thread(target=ftp_server.serve_forever, daemon=True)
+        worker.start()
+        port = ftp_server.socket.getsockname()[1]
+
+        def stop():
+            ftp_server.close_all()
+            worker.join(timeout=5)
+
+        self.addCleanup(stop)
+        return root, port
+
+    def stop_process(self, process):
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    def run_protocol_through_jump(self, dest_port, url, commands, extra=()):
+        jump = JumpEndpoint(dest_port)
+        self.addCleanup(jump.stop)
+        argv = [BINARY, "-batch", "-hostkey=*", "-timeout=20"] + list(extra)
+        argv.append("-command=open %s -rawsettings TunnelHostName=127.0.0.1 "
+                    "TunnelPortNumber=%d TunnelUserName=jump TunnelPassword=%s "
+                    "TunnelHostKey=%s ; %s" %
+                    (url, jump.port, quote(jump.password),
+                     fingerprint(jump.key), commands))
+        result = subprocess.run(
+            argv, cwd=self.local, capture_output=True, text=True, timeout=90,
+            env=dict(os.environ, LINSCP_CONFIG_DIR=str(self.config)))
+        return jump, result
+
+    def test_webdav_transfer_uses_the_jump_and_keeps_the_hostname(self):
+        _, dav_port = self.start_dav_server()
+        payload = b"webdav through a jump\n" * 64
+        (self.local / "dav-upload.txt").write_bytes(payload)
+        jump, result = self.run_protocol_through_jump(
+            dav_port,
+            "dav://testuser:testpass@destination.internal.invalid:%d/" % dav_port,
+            "put dav-upload.txt /dav-upload.txt ; get /dav-upload.txt dav-download.txt ; exit")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.local / "dav-download.txt").read_bytes(), payload)
+        self.assertTrue(jump.forwards)
+        self.assertTrue(all(host == "destination.internal.invalid"
+                            for host, _ in jump.forwards), jump.forwards)
+        self.assertIn(dav_port, [port for _, port in jump.forwards])
+
+    def test_ftp_control_and_data_use_the_jump(self):
+        root, ftp_port = self.start_ftp_server()
+        payload = b"ftp through a jump\n" * 128
+        (self.local / "ftp-upload.txt").write_bytes(payload)
+        jump, result = self.run_protocol_through_jump(
+            ftp_port,
+            "ftp://test:test@destination.internal.invalid:%d/" % ftp_port,
+            "put ftp-upload.txt /ftp-upload.txt ; get /ftp-upload.txt ftp-download.txt ; exit")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.local / "ftp-download.txt").read_bytes(), payload)
+        self.assertEqual((root / "ftp-upload.txt").read_bytes(), payload)
+        self.assertGreaterEqual(len(jump.forwards), 2, jump.forwards)
+        self.assertTrue(all(host == "destination.internal.invalid"
+                            for host, _ in jump.forwards), jump.forwards)
+        self.assertIn(ftp_port, [port for _, port in jump.forwards])
+        data_ports = [port for _, port in jump.forwards if port != ftp_port]
+        self.assertTrue(data_ports, jump.forwards)
+
+    def test_s3_transfer_uses_the_jump_and_original_host(self):
+        _, s3_port = self.start_s3_server()
+        payload = b"s3 through a jump\n" * 64
+        (self.local / "s3-upload.txt").write_bytes(payload)
+        jump, result = self.run_protocol_through_jump(
+            s3_port,
+            "s3://AKIDTEST:testsecret42@destination.internal.invalid:%d/" % s3_port,
+            "mkdir /jump-bucket ; put s3-upload.txt /jump-bucket/s3-upload.txt ; "
+            "get /jump-bucket/s3-upload.txt s3-download.txt ; exit")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.local / "s3-download.txt").read_bytes(), payload)
+        self.assertTrue(jump.forwards)
+        self.assertTrue(all(host == "destination.internal.invalid"
+                            for host, _ in jump.forwards), jump.forwards)
+        self.assertIn(s3_port, [port for _, port in jump.forwards])
+
+    def test_socks_tunnel_does_not_connect_directly_when_the_jump_refuses(self):
+        _, dav_port = self.start_dav_server()
+        jump = JumpEndpoint(dav_port)
+        jump.reject_forward = True
+        self.addCleanup(jump.stop)
+        result = subprocess.run(
+            [BINARY, "-batch", "-hostkey=*", "-timeout=20",
+             "-command=open dav://testuser:testpass@destination.internal.invalid:%d/ "
+             "-rawsettings TunnelHostName=127.0.0.1 TunnelPortNumber=%d "
+             "TunnelUserName=jump TunnelPassword=%s TunnelHostKey=%s ; ls / ; exit" %
+             (dav_port, jump.port, quote(jump.password), fingerprint(jump.key))],
+            cwd=self.local, capture_output=True, text=True, timeout=60,
+            env=dict(os.environ, LINSCP_CONFIG_DIR=str(self.config)))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertRegex(result.stdout + result.stderr,
+                         r"Could not connect|Connection failed|tunnel|SOCKS|refused",
+                         result.stdout + result.stderr)
+
+    def test_socks_local_port_collision_is_reported(self):
+        holder = socket.socket()
+        holder.bind(("127.0.0.1", 0))
+        self.addCleanup(holder.close)
+        occupied = holder.getsockname()[1]
+        _, dav_port = self.start_dav_server()
+        jump = JumpEndpoint(dav_port)
+        self.addCleanup(jump.stop)
+        result = subprocess.run(
+            [BINARY, "-batch", "-hostkey=*", "-timeout=20",
+             "-command=open dav://testuser:testpass@destination.internal.invalid:%d/ "
+             "-rawsettings TunnelHostName=127.0.0.1 TunnelPortNumber=%d "
+             "TunnelUserName=jump TunnelPassword=%s TunnelHostKey=%s "
+             "TunnelLocalPortNumber=%d ; ls / ; exit" %
+             (dav_port, jump.port, quote(jump.password), fingerprint(jump.key),
+              occupied)],
+            cwd=self.local, capture_output=True, text=True, timeout=60,
+            env=dict(os.environ, LINSCP_CONFIG_DIR=str(self.config)))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Could not listen on tunnel port", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

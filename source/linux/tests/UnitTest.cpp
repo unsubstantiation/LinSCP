@@ -3933,16 +3933,10 @@ void TestSshJumpSettings()
     CHECK_FALSE(ValidateSessionSettings(options, error));
     CHECK_TRUE(ApplySessionRawSetting("TunnelHostName", "jump.example", options, error));
     CHECK_TRUE(ValidateSessionSettings(options, error));
-    for (const char * protocol : {"sftp", "scp", "ssh"})
+    for (const char * protocol : {"sftp", "scp", "ssh", "ftp", "ftps", "dav", "webdav", "s3"})
     {
         options.protocol = protocol;
         CHECK_TRUE(ValidateSessionSettings(options, error));
-    }
-    for (const char * protocol : {"ftp", "ftps", "dav", "webdav", "s3"})
-    {
-        options.protocol = protocol;
-        CHECK_FALSE(ValidateSessionSettings(options, error));
-        CHECK_TRUE(error.find("tunnel") != std::string::npos);
     }
     options.protocol = "sftp";
     for (const char * host : {"", "two hosts", "host\ncommand", "host\tname"})
@@ -3986,6 +3980,36 @@ void TestSshJumpSettings()
     CHECK_TRUE(ApplySessionRawSetting("Tunnel", "0", options, error));
     options.protocol = "ftp";
     CHECK_TRUE(ValidateSessionSettings(options, error));
+}
+
+void TestSocks5Helpers()
+{
+    std::string host, error;
+    int port = 0;
+    unsigned char ipv4[] = {5, 1, 0, 1, 127, 0, 0, 1, 0, 80};
+    CHECK_TRUE(ParseSocks5ConnectRequest(ipv4, sizeof(ipv4), host, port, error));
+    CHECK_EQ(host, std::string("127.0.0.1"));
+    CHECK_TRUE(port == 80);
+    unsigned char domain[] = {5, 1, 0, 3, 11,
+        'e','x','a','m','p','l','e','.','c','o','m', 1, 187};
+    CHECK_TRUE(ParseSocks5ConnectRequest(domain, sizeof(domain), host, port, error));
+    CHECK_EQ(host, std::string("example.com"));
+    CHECK_TRUE(port == 443);
+    unsigned char truncated[] = {5, 1, 0, 1, 127};
+    CHECK_FALSE(ParseSocks5ConnectRequest(truncated, sizeof(truncated), host, port, error));
+    unsigned char bindReq[] = {5, 2, 0, 1, 127, 0, 0, 1, 0, 80};
+    CHECK_FALSE(ParseSocks5ConnectRequest(bindReq, sizeof(bindReq), host, port, error));
+    std::vector<unsigned char> built;
+    CHECK_TRUE(BuildSocks5ConnectRequest("example.com", 443, built, error));
+    CHECK_TRUE(ParseSocks5ConnectRequest(built.data(), built.size(), host, port, error));
+    CHECK_EQ(host, std::string("example.com"));
+    CHECK_TRUE(port == 443);
+    CHECK_TRUE(BuildSocks5ConnectRequest("127.0.0.1", 21, built, error));
+    CHECK_TRUE(ParseSocks5ConnectRequest(built.data(), built.size(), host, port, error));
+    CHECK_EQ(host, std::string("127.0.0.1"));
+    CHECK_TRUE(port == 21);
+    CHECK_FALSE(BuildSocks5ConnectRequest("*", 80, built, error));
+    CHECK_FALSE(BuildSocks5ConnectRequest("example.com", 0, built, error));
 }
 
 void TestSshTunnelParsing()
@@ -4537,6 +4561,7 @@ int main()
     TestNonUnixListingFormats();
     TestEncodingHelpers();
     TestSshTunnelParsing();
+    TestSocks5Helpers();
     TestSshJumpSettings();
     TestDavEtagHelpers();
     TestScpEngine();

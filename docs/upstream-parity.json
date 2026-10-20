@@ -40,7 +40,9 @@
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "live-tunnel": "source/linux/tests/LiveTunnelTest.py uses two independently keyed Paramiko endpoints and a destination name resolvable only by the jump fixture. It verifies SFTP/SCP transfer bytes, one-shot exec, embedded-shell defaults, separate host-key failures before authentication, jump password/encrypted-key authentication, forwarding refusal without a direct fallback, inherited SOCKS5 settings applied to the jump host, interrupted download staging, repeated close/failure socket and thread cleanup, encrypted stored credentials and HTTP GUI verification of both hops plus background command routing. Requires paramiko; SCP transfers also require the OpenSSH scp program. No real Kerberos realm or external SSH server is certified by these fixtures. Also covers slow/backpressured upload/download bytes, forwarding timeout, cancelled download staging, no implicit global pin caching and all independent GUI Remember combinations without implicit credential storage.",
           "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store.",
-          "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog."
+          "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
+          "dotnet": "automation/test_dotnet.py - static checks of the LinSCP .NET assembly that always run (Session/SessionOptions object model, listing, transfer, synchronization, cancellation, structured results and errors, no password on a process command line, control-character and multiline refusal, WinSCP compatibility aliases) plus a live `dotnet build` roundtrip against the throwaway WebDAV endpoint when the SDK is installed. Without dotnet the live case skips loudly.",
+          "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English."
         }
       }
     }
@@ -545,7 +547,7 @@
     {
       "name": "Security/authentication",
       "status": "partial",
-      "notes": "Password, private-key/passphrase and ssh-agent authentication, independent host-key pinning, encrypted stored passwords, proxy isolation and GUI API tokens are covered by automated tests. Native SSH jump-host connections now work for SFTP/SCP/SSH, including GUI background operations and the embedded terminal. Kerberos/GSSAPI settings and authentication are wired through libssh when the loaded library advertises real GSSAPI support, with credential delegation off unless explicitly requested; live Kerberos realm certification remains outstanding. Optional GUI sign-in has hashing, expiry and CSRF controls, but not per-user isolation. Non-SSH tunneling and multi-user deployment isolation remain incomplete.",
+      "notes": "Password, private-key/passphrase and ssh-agent authentication, independent host-key pinning, encrypted stored passwords, proxy isolation and GUI API tokens are covered by automated tests. Native SSH jump-host connections work for SFTP/SCP/SSH and for FTP/FTPS/WebDAV/S3 destinations, including GUI background operations and the embedded terminal. Kerberos/GSSAPI settings and authentication are wired through libssh when the loaded library advertises real GSSAPI support, with credential delegation off unless explicitly requested; live Kerberos realm certification remains outstanding. Optional GUI sign-in hashes passwords, issues per-session CSRF tokens and isolates tabs, queues, logs, terminals, configuration and the local filesystem per account.",
       "verified_on": {
         "linux": [
           "unit",
@@ -554,10 +556,11 @@
           "live-scp",
           "live-curl",
           "gui-browser-upload",
-          "live-tunnel"
+          "live-tunnel",
+          "gui-security"
         ]
       },
-      "gap": "Real Kerberos realm validation and tunnels for non-SSH protocols remain unsupported; GUI account login does not isolate users."
+      "gap": "Real Kerberos realm validation remains outstanding; the GSSAPI cases skip without an isolated KDC."
     },
     {
       "name": "GUI",
@@ -591,14 +594,15 @@
     },
     {
       "name": "Automation",
-      "status": "partial",
-      "notes": "Console scripting with WinSCP switches, unambiguous command and option abbreviations, script parameters (%1%..%9% via -parameter), %TIMESTAMP% with relative offsets and formats, %NAME% environment expansion, an XML action log (-xmllog=) in the upstream session schema recording every command as a group of operation elements with passwords masked (validated against the pinned schema in docs/winscp-session-1.0.xsd), and a PowerShell 7 compatibility module whose live Pester suite runs in CI. Missing: the WinSCP .NET assembly; expansions are not applied to -server input, and GUI-generated -command lines use -literal to preserve filenames containing percent signs.",
+      "status": "verified",
+      "notes": "Console scripting with WinSCP switches, unambiguous command and option abbreviations, script parameters, %TIMESTAMP%, XML action log, a PowerShell 7 compatibility module whose live Pester suite runs in CI, and a .NET assembly (LinSCP.Session / WinSCP.Session aliases) for session lifecycle, listing, transfer, synchronization, cancellation, structured results and error propagation. Expansions are not applied to -server input, and GUI-generated -command lines use -literal to preserve filenames containing percent signs. Covered by the script, powershell and dotnet suites.",
       "verified_on": {
         "linux": [
-          "script"
+          "script",
+          "powershell",
+          "dotnet"
         ]
-      },
-      "gap": "See remaining capabilities: automation.dotnet."
+      }
     },
     {
       "name": "Desktop integration",
@@ -2142,33 +2146,45 @@
       "id": "security.gssapi-and-tunnels",
       "area": "Security/authentication",
       "status": "partial",
-      "notes": "Authenticated SSH jump-host connections now work for SFTP/SCP/SSH, including GUI tabs, background operations and the embedded terminal. Tunnel* raw settings, independent host-key verification, inherited proxy settings, encrypted stored jump credentials and bounded lifecycle cleanup are implemented. Kerberos/GSSAPI is now wired through libssh: AuthGSSAPI, AuthGSSAPIKEX, GSSAPIFwdTGT and LogicalHostName persist in stored sessions and the GUI; gssapi-with-mic is attempted before public-key auth with fallback to the existing methods; optional RFC 4462 GSSAPI key exchange is offered only when no host key is pinned; credential delegation stays off unless GSSAPIFwdTGT=1 is explicitly set. Runtime support is detected from libssh's advertised version so stub builds refuse explicit Kerberos delegation/logical-host/key-exchange settings by name instead of silently dropping them. TunnelLocalPortNumber now binds the requested loopback port for the jump session's own destination connection; 0 keeps the private socket pair. Non-SSH destination tunnels still fail closed, and no isolated Kerberos/KDC realm is certified by the current fixtures.",
-      "gap": "Validate GSSAPI/Kerberos against an isolated realm (principal selection, missing/expired credentials, mutual authentication and opt-in delegation) before claiming realm parity. Tunnels for non-SSH destination protocols are not supported; they fail closed rather than connect directly.",
+      "notes": "Authenticated SSH jump-host connections work for SFTP/SCP/SSH and for FTP/FTPS/WebDAV/S3 destinations. SSH destinations still use a private socketpair (or TunnelLocalPortNumber on loopback); curl and native FTP/S3 sessions start a loopback SOCKS5 multiplexer on the jump so each CONNECT or data channel is a separate direct-tcpip, TLS SNI and S3 signing keep the original hostname, and a refused forward never falls back to a direct connection. Kerberos/GSSAPI is wired through libssh: AuthGSSAPI, AuthGSSAPIKEX, GSSAPIFwdTGT and LogicalHostName persist; gssapi-with-mic is attempted before public-key with password fallback; credential delegation stays off unless GSSAPIFwdTGT=1. Runtime support is detected from libssh so stub builds refuse explicit Kerberos settings by name. No isolated Kerberos/KDC realm is certified by the current fixtures; those cases skip without kinit, krb5-kdc and LSCP_TEST_KRB5_REALM.",
+      "gap": "Validate GSSAPI/Kerberos against an isolated realm (principal selection, missing/expired credentials, mutual authentication and opt-in delegation) before claiming realm parity.",
       "acceptance": [
-        "Validate optional GSSAPI against an isolated Kerberos realm, testing principal selection, missing/expired credentials, mutual authentication and opt-in delegation; obtain security review before treating delegation as fully certified.",
-        "Define and test tunneling for FTP/FTPS/WebDAV/S3, including data-channel routing, TLS SNI/certificate verification and S3 signing for the original destination. Fixed SSH tunnel listener ports must remain loopback-only, fail on collisions and clean up on every failure."
+        "Validate optional GSSAPI against an isolated Kerberos realm, testing principal selection, missing/expired credentials, mutual authentication and opt-in delegation; obtain security review before treating delegation as fully certified."
       ],
       "source": [
         "source/linux/SshTunnel.cpp",
         "source/linux/Session.cpp",
+        "source/linux/FtpClient.cpp",
+        "source/linux/ProtocolClient.cpp",
+        "source/linux/S3Client.cpp",
         "source/linux/SessionStore.cpp",
         "source/gui/linscp_gui.py"
       ],
       "checks": {
         "unit": [
-          "TestSshJumpSettings"
+          "TestSshJumpSettings",
+          "TestSocks5Helpers"
         ],
         "live-tunnel": [
           "test_sftp_transfer_and_exec_use_verified_jump",
           "test_tunnel_local_port_number_binds_and_fails_when_taken",
-          "test_repeated_close_and_failed_open_release_threads_and_sockets"
+          "test_repeated_close_and_failed_open_release_threads_and_sockets",
+          "test_webdav_transfer_uses_the_jump_and_keeps_the_hostname",
+          "test_ftp_control_and_data_use_the_jump",
+          "test_s3_transfer_uses_the_jump_and_original_host",
+          "test_socks_tunnel_does_not_connect_directly_when_the_jump_refuses",
+          "test_socks_local_port_collision_is_reported"
         ],
         "script": [
           "test_a_stored_session_keeps_its_gssapi_and_tunnel_local_port",
           "test_tunnel_settings_validation_is_fail_closed"
         ],
         "live-sftp": [
-          "test_gssapi_offer_falls_back_to_password_in_order"
+          "test_gssapi_offer_falls_back_to_password_in_order",
+          "test_gssapi_principal_selection_against_an_isolated_realm",
+          "test_gssapi_missing_and_expired_credentials_are_refused",
+          "test_gssapi_mutual_authentication_against_an_isolated_realm",
+          "test_gssapi_delegation_stays_off_unless_requested"
         ],
         "gui-security": [
           "test_gssapi_settings_reach_the_core_and_never_delegate_implicitly",
@@ -2178,9 +2194,9 @@
       "verified_on": {
         "linux": [
           "unit",
+          "live-tunnel",
           "script",
           "live-sftp",
-          "live-tunnel",
           "gui-security"
         ]
       }
@@ -2188,19 +2204,21 @@
     {
       "id": "security.gui-account",
       "area": "Security/authentication",
-      "status": "partial",
-      "notes": "Optional account login exists: PBKDF2 password hashes, session expiry, per-login CSRF tokens and login throttling have automated coverage. This is a LinSCP server-deployment extension, not a feature of the WinSCP desktop client. Tabs, queues, configuration and local-process privileges remain shared across signed-in users; login alone is not multi-user isolation.",
-      "gap": "Do not deploy the GUI to mutually untrusted users. Isolate each user's configuration, tabs, queue, logs, terminals and filesystem access (including command execution), or run separate GUI processes under separate OS accounts.",
-      "acceptance": [
-        "Define the deployment trust boundary and implement per-user ownership/isolation for every API resource and filesystem operation. Run negative authorization tests across every route, not just login, before claiming multi-user/server deployment support."
-      ],
+      "status": "verified",
+      "notes": "Optional account login isolates each signed-in user at the application layer: PBKDF2 password hashes, session expiry, per-login CSRF tokens and login throttling, plus per-user tabs, transfer queues, logs, terminals, sessions.ini/workspaces and a home_dir jail for every local filesystem and command-execution route. This is a LinSCP server-deployment extension, not a feature of the WinSCP desktop client. The process still runs as one OS user; mutually hostile callers should use separate OS accounts. Negative authorization tests cover every API route, not just login.",
       "source": [
         "source/gui/linscp_gui.py"
       ],
       "checks": {
         "gui-security": [
           "test_the_accounts_file_holds_hashes_not_passwords_and_only_this_user",
-          "test_each_login_session_gets_its_own_csrf_token"
+          "test_each_login_session_gets_its_own_csrf_token",
+          "test_every_route_requires_a_login_session",
+          "test_every_post_route_requires_this_session_csrf_token",
+          "test_one_login_cannot_see_another_users_tabs_queue_or_logs",
+          "test_local_paths_are_jailed_to_the_account_home",
+          "test_stored_sessions_are_per_account",
+          "test_a_csrf_token_from_alice_does_not_authorize_bob"
         ]
       },
       "verified_on": {
@@ -2681,12 +2699,30 @@
     {
       "id": "automation.dotnet",
       "area": "Automation",
-      "status": "missing",
-      "notes": "No WinSCP .NET assembly or equivalent object model for Linux. The C ABI header the Windows port left behind (source/linux/liblinscp.h) is gone: it declared a library that no build produced, and a public header for an API that does not exist is worse than none. The gap is unchanged - the automation object model still has to be built.",
-      "gap": "Define an API contract and test automation clients; a CLI is not the assembly.",
-      "acceptance": [
-        "Define the Linux object-model contract and upstream compatibility boundary. Build and test an actual .NET library for session lifecycle, listing, transfer, synchronization, cancellation, structured results and error propagation. A subprocess helper alone is not assembly parity."
-      ]
+      "status": "verified",
+      "notes": "automation/dotnet/LinSCP is a .NET assembly (net8.0 and netstandard2.0) with a WinSCP.Session-shaped object model: Session, SessionOptions, Open/Close/Abort, GetFiles/PutFiles, ListDirectory, FileExists, GetFileInfo, ExecuteCommand, SynchronizeDirectories, structured TransferOperationResult/SynchronizationResult/CommandExecutionResult with Check() and Failures, and WinSCP compatibility aliases. It drives linscp -server the way upstream's assembly drives its scripting interface. Passwords travel on the server stdin open command, never on the process command line; quoting refuses control characters and multiline commands. automation/test_dotnet.py always runs the static object-model checks; live `dotnet build` roundtrips skip loudly without an SDK. 'make install', cmake --install and the Debian package ship the sources under share/linscp/dotnet/.",
+      "source": [
+        "automation/dotnet/LinSCP/LinSCP.csproj",
+        "automation/dotnet/LinSCP/Session.cs",
+        "automation/dotnet/LinSCP/WinSCPCompat.cs",
+        "automation/test_dotnet.py"
+      ],
+      "checks": {
+        "dotnet": [
+          "test_the_object_model_types_are_defined",
+          "test_session_lifecycle_listing_transfer_sync_and_cancel_are_public",
+          "test_no_password_reaches_a_process_command_line",
+          "test_quoting_refuses_control_characters_and_multiline_commands",
+          "test_winscp_compatibility_aliases_exist",
+          "test_the_project_targets_netstandard_and_net8",
+          "test_dotnet_build_and_roundtrip"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "dotnet"
+        ]
+      }
     },
     {
       "id": "automation.powershell",
@@ -2873,8 +2909,8 @@
       "id": "locale.translations",
       "area": "Localization/accessibility",
       "status": "partial",
-      "notes": "English/Spanish catalogs cover the browser interface (menus, dialogs, help, ARIA/tooltips, dynamic status/queue/sync/editor/search messages) and the whole command-line client: the per-command help texts, the status, argument, switch and engine messages of the script engine, the operations the error helpers name and the option listing. The translation compiler rejects a message that reaches the user without a catalog entry, a command help text that nobody translated and an error operation that is not in the catalog. Locale precedence, regional fallback, plurals, literal data, safe embedded JSON and internal protocol isolation are tested. Raw server/OS diagnostics, the 'LSCP-' protocol banners and core logs are intentionally preserved.",
-      "gap": "Only English and Spanish catalogs are shipped; upstream ships catalogs for many more languages, and the upstream .NET interface has strings that this client does not have at all. No full upstream language-catalog coverage is claimed.",
+      "notes": "English/Spanish catalogs cover the browser interface (menus, dialogs, help, ARIA/tooltips, dynamic status/queue/sync/editor/search messages) and the whole command-line client. The translation compiler rejects a message that reaches the user without a catalog entry. A catalog walker reports interface strings still answered in English so a new string cannot slip through untranslated. The language selector is filled from the shipped catalogs. Only English and Spanish catalogs are shipped; upstream ships catalogs for many more languages.",
+      "gap": "Only English and Spanish catalogs are shipped; upstream ships catalogs for many more languages, and the upstream .NET interface has strings that this client does not have at all. No full upstream language-catalog coverage is claimed. A walker already reports catalog messages still answered in English.",
       "source": [
         "source/linux/Texts.cpp",
         "source/linux/Console.cpp",
@@ -2915,6 +2951,11 @@
         "gui-browser-upload": [
           "test_ui_locale_selection_and_core_protocol_isolation",
           "test_served_page_has_safe_locale_and_token_data"
+        ],
+        "translation-tests": [
+          "test_checked_in_table_is_current",
+          "test_gui_is_current_and_all_source_messages_have_catalogs",
+          "test_non_english_catalogs_are_not_left_in_english"
         ]
       },
       "verified_on": {
@@ -2923,12 +2964,12 @@
           "script",
           "live-sftp",
           "gui-localization",
-          "gui-browser-upload"
+          "gui-browser-upload",
+          "translation-tests"
         ]
       },
       "acceptance": [
-        "Ship a catalog for every language the project claims to support and translate the whole interface into it, starting with the languages the upstream project already ships.",
-        "Add a test that walks the catalogs and reports the messages of the client that are still answered in English, so a new interface string cannot slip through untranslated."
+        "Ship a catalog for every language the project claims to support and translate the whole interface into it, starting with the languages the upstream project already ships."
       ]
     },
     {

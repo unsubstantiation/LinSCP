@@ -13,9 +13,10 @@
 # 'make install' lays out the same tree as 'cmake --install' and the
 # Debian package: the client in bin/, the graphical client's modules and
 # command templates under share/linscp/gui/, the PowerShell module under
-# share/linscp/automation/, the manual page, the desktop entry and the
-# icons. Nothing else is installed: this client has no library, no
-# header and no other platform's surface.
+# share/linscp/automation/, the .NET assembly sources under
+# share/linscp/dotnet/, the manual page, the desktop entry and the
+# icons. There is no C ABI header: the automation object model is the
+# C# assembly and the PowerShell module.
 #
 # See ../../docs/debian.md for the Debian package build.
 
@@ -177,6 +178,7 @@ check-live: $(BINDIR)/linscp
 	$(PYTHON) ../../source/gui/tests/LocalWorkspaceTest.py
 	$(PYTHON) ../../source/gui/tests/TerminalTest.py
 	$(PYTHON) ../../automation/test_psmodule.py $(BINDIR)/linscp
+	$(PYTHON) ../../automation/test_dotnet.py $(BINDIR)/linscp
 
 # Pull in the generated dependencies, if this is not the first build.
 -include $(APP_OBJS:.o=.d) $(TEST_OBJS:.o=.d)
@@ -189,6 +191,7 @@ install: $(BINDIR)/linscp
 	install -d $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps
 	install -d $(DESTDIR)$(PREFIX)/share/linscp/gui/web
 	install -d $(DESTDIR)$(PREFIX)/share/linscp/automation
+	install -d $(DESTDIR)$(PREFIX)/share/linscp/dotnet
 	install -m 0755 $(BINDIR)/linscp $(DESTDIR)$(PREFIX)/bin/linscp
 	install -m 0755 $(TOP)/source/gui/linscp-gui $(DESTDIR)$(PREFIX)/bin/linscp-gui
 	install -m 0644 $(TOP)/source/gui/linscp_gui.py $(TOP)/source/gui/linscp_crypto.py \
@@ -203,6 +206,10 @@ install: $(BINDIR)/linscp
 	install -m 0644 $(TOP)/debian/linscp.svg $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/linscp.svg
 	install -m 0644 $(TOP)/docs/linscp.1 $(DESTDIR)$(PREFIX)/share/man/man1/linscp.1
 	install -m 0644 $(TOP)/automation/LinSCP.psm1 $(DESTDIR)$(PREFIX)/share/linscp/automation/
+	install -m 0644 $(TOP)/automation/dotnet/LinSCP/LinSCP.csproj \
+		$(TOP)/automation/dotnet/LinSCP/Session.cs \
+		$(TOP)/automation/dotnet/LinSCP/WinSCPCompat.cs \
+		$(DESTDIR)$(PREFIX)/share/linscp/dotnet/
 
 clean:
 	rm -rf $(BUILD)

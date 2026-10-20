@@ -164,8 +164,6 @@
       <label class="language-control">Language
         <select id="languageSelect" aria-label="Language" onchange="changeLanguage(this.value)">
           <option value="">System default</option>
-          <option value="en" lang="en">English</option>
-          <option value="es" lang="es">Español</option>
         </select>
       </label>
       <div id="statusBadge" class="badge-disconnected" role="status" aria-live="polite">Disconnected</div>
@@ -912,7 +910,28 @@
   }
   function sideLabel(side) { return side === 'local' ? t('Local') : t('Remote'); }
 
+  const LANGUAGE_NAMES = {en:'English', es:'Español', de:'Deutsch', fr:'Français',
+    it:'Italiano', pt:'Português', pt_BR:'Português (Brasil)', nl:'Nederlands',
+    pl:'Polski', cs:'Čeština', ru:'Русский', ja:'日本語', zh:'中文（简体）',
+    zh_TW:'中文（繁體）', ko:'한국어', sv:'Svenska', da:'Dansk', fi:'Suomi',
+    hu:'Magyar', ro:'Română', tr:'Türkçe', uk:'Українська', ca:'Català',
+    hr:'Hrvatski', sk:'Slovenčina', sl:'Slovenščina', lt:'Lietuvių',
+    be:'Беларуская', mk:'Македонски', sr:'Српски', ta:'தமிழ்', nb:'Norsk'};
+  function fillLanguageSelect() {
+    const select = document.getElementById('languageSelect');
+    const kept = select.value;
+    while (select.options.length > 1) select.remove(1);
+    Object.keys(GUI_CATALOGS).sort().forEach(code => {
+      const option = document.createElement('option');
+      option.value = code;
+      option.lang = code.replace(/_/g, '-');
+      option.textContent = LANGUAGE_NAMES[code] || code;
+      select.appendChild(option);
+    });
+    select.value = kept;
+  }
   function localizeStaticPage() {
+    fillLanguageSelect();
     document.documentElement.lang = languageTag;
     const walker = document.createTreeWalker(document, NodeFilter.SHOW_TEXT);
     while (walker.nextNode()) {
@@ -933,7 +952,7 @@
     document.getElementById('languageSelect').value = languagePreference;
   }
   function changeLanguage(value) {
-    if (!['', 'en', 'es'].includes(value)) return;
+    if (value && !Object.prototype.hasOwnProperty.call(GUI_CATALOGS, value)) return;
     if (state.editor.dirty && !confirm(t('Close without saving your changes?'))) {
       document.getElementById('languageSelect').value = languagePreference;
       return;

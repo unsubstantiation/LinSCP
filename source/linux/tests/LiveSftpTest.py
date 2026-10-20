@@ -19,6 +19,7 @@ import hashlib
 import importlib.util
 import os
 import pathlib
+import shutil
 import signal
 import subprocess
 import sys
@@ -1469,6 +1470,47 @@ class LiveSftpTests(unittest.TestCase):
         self.assertIn("WROTE", written.stdout)
         self.assertEqual((self.root / "etag-refused.txt").read_bytes(),
                          source.read_bytes())
+
+
+def isolated_kerberos_realm():
+    """True only when an isolated KDC is provisioned for this run.
+
+    Principal selection, missing/expired tickets, mutual authentication and
+    opt-in delegation need a realm this suite does not start. Without
+    kinit, a KDC and LSCP_TEST_KRB5_REALM the cases skip instead of
+    pretending a password fallback is realm certification.
+    """
+    return bool(shutil.which("kinit") and shutil.which("krb5-kdc") and
+                os.environ.get("LSCP_TEST_KRB5_REALM"))
+
+
+class LiveGssapiRealmTests(unittest.TestCase):
+    """Optional GSSAPI against an isolated Kerberos realm.
+
+    The offer/fallback order is covered by LiveSftpTests. These cases are
+    the realm itself, and they skip without one.
+    """
+
+    def require_realm(self):
+        if not isolated_kerberos_realm():
+            self.skipTest("no isolated Kerberos realm (need kinit, krb5-kdc "
+                          "and LSCP_TEST_KRB5_REALM)")
+
+    def test_gssapi_principal_selection_against_an_isolated_realm(self):
+        self.require_realm()
+        self.fail("realm fixture did not run a principal-selection case")
+
+    def test_gssapi_missing_and_expired_credentials_are_refused(self):
+        self.require_realm()
+        self.fail("realm fixture did not run a missing/expired-credential case")
+
+    def test_gssapi_mutual_authentication_against_an_isolated_realm(self):
+        self.require_realm()
+        self.fail("realm fixture did not run a mutual-authentication case")
+
+    def test_gssapi_delegation_stays_off_unless_requested(self):
+        self.require_realm()
+        self.fail("realm fixture did not run an opt-in delegation case")
 
 
 def run_and_report():

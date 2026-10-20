@@ -184,8 +184,13 @@ int WaitFd(int fd, short events, int timeoutMs, std::string & error)
 }
 
 int ConnectSocket(const std::string & hostName, int portNumber, int timeoutSecs,
-    std::string & error)
+    std::string & error, const SessionOptions * tunnel = NULL)
 {
+    if (tunnel != NULL && tunnel->tunnelSocksPort > 0)
+    {
+        return ConnectThroughSocks5("127.0.0.1", tunnel->tunnelSocksPort,
+            hostName, portNumber, timeoutSecs, error);
+    }
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -378,7 +383,7 @@ private:
 bool FtpSession::Connect(std::string & error)
 {
     mControl = ConnectSocket(mOptions.hostName, mOptions.portNumber,
-        mTimeoutSecs, error);
+        mTimeoutSecs, error, &mOptions);
     if (mControl < 0)
     {
         return false;
@@ -664,7 +669,7 @@ bool FtpSession::Command(const std::string & line, Reply & reply,
 bool FtpSession::ConnectDataSocket(const std::string & hostName, int portNumber,
     std::string & error)
 {
-    mData = ConnectSocket(hostName, portNumber, mTimeoutSecs, error);
+    mData = ConnectSocket(hostName, portNumber, mTimeoutSecs, error, &mOptions);
     if (mData < 0)
     {
         return false;
@@ -717,6 +722,14 @@ bool FtpSession::OpenPassive(std::string & error)
     {
         error = "The server's PASV reply has no valid address or port: " + text;
         return false;
+    }
+
+    if (mOptions.tunnelSocksPort > 0)
+    {
+        /* The control socket's peer is the loopback SOCKS listener, which
+         * is not a data-channel address. Route the PASV port to the original
+         * destination through the jump, as EPSV already does. */
+        return ConnectDataSocket(mOptions.hostName, port, error);
     }
 
     /*
@@ -892,7 +905,10 @@ bool FtpSession::PrepareData(std::string & error)
         mData = -1;
         mDataConnected = false;
     }
-    mActiveData = !mOptions.ftp.passiveMode;
+    /* Active FTP through an SSH tunnel would advertise 127.0.0.1 to the
+     * server, which cannot open a data connection back through the jump.
+     * Passive data sockets go through the same SOCKS listener as control. */
+    mActiveData = !mOptions.ftp.passiveMode && mOptions.tunnelSocksPort <= 0;
     if (mActiveData)
     {
         return OpenActive(error);

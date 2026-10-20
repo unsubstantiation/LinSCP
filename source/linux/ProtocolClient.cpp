@@ -497,6 +497,23 @@ void AddTlsCurlArgs(const SessionOptions & options, std::vector<std::string> & a
     }
 }
 
+void AddCurlTunnelArgs(const SessionOptions & options, std::vector<std::string> & args)
+{
+    if (options.tunnelSocksPort <= 0)
+    {
+        return;
+    }
+    /* socks5h leaves the destination name to the jump host, which is
+     * what keeps TLS SNI, HTTP Host and S3 SigV4 on the original
+     * hostname while the TCP connection is 127.0.0.1. --noproxy '*'
+     * stops a parent proxy exclusion from sending the destination
+     * around the tunnel. */
+    args.push_back("--socks5-hostname");
+    args.push_back("127.0.0.1:" + std::to_string(options.tunnelSocksPort));
+    args.push_back("--noproxy");
+    args.push_back("*");
+}
+
 void BuildCommonCurlArgs(const SessionOptions & options, std::vector<std::string> & args,
     bool failOnError = true, bool showProgress = false)
 {
@@ -570,6 +587,7 @@ void BuildCommonCurlArgs(const SessionOptions & options, std::vector<std::string
     }
 
     AddTlsCurlArgs(options, args);
+    AddCurlTunnelArgs(options, args);
 
     if (!options.privateKeyFile.empty())
     {
@@ -588,9 +606,11 @@ void BuildCommonCurlArgs(const SessionOptions & options, std::vector<std::string
      * speaks are translated here; a telnet or local-command proxy is refused
      * before a connection is attempted (ProxyUsableByCurl), because going
      * direct when the session asked for a proxy would send traffic where the
-     * user did not want it.
+     * user did not want it. A destination tunnel already applied the parent
+     * proxy to the jump host; curl then speaks only to the loopback SOCKS
+     * listener.
      */
-    if (options.proxy.Active())
+    if (options.tunnelSocksPort <= 0 && options.proxy.Active())
     {
         const ProxySettings & proxy = options.proxy;
         const char * scheme = NULL;
