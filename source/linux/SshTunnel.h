@@ -46,6 +46,12 @@ public:
     /* Returns one owned socket, or -1. The caller must close it after
      * disconnecting its libssh session. Stop() joins the forwarding worker. */
     int Start(const SessionOptions & destination, std::string & error);
+    /* SOCKS5 listener on 127.0.0.1 for curl/FTP/WebDAV/S3 destinations.
+     * Returns the bound loopback port, or -1. TunnelLocalPortNumber binds
+     * that port and fails if it is taken; 0 picks an ephemeral port.
+     * Each SOCKS CONNECT opens a fresh direct-tcpip channel. */
+    int StartSocks(const SessionOptions & destination, std::string & error);
+    int SocksPort() const;
     void Stop();
 
 private:
@@ -54,6 +60,24 @@ private:
     SshJumpTunnel(const SshJumpTunnel &) = delete;
     SshJumpTunnel & operator=(const SshJumpTunnel &) = delete;
 };
+
+/* SOCKS5 CONNECT helpers shared by the jump listener and FTP data
+ * connections. ATYP 1/3/4 (IPv4, domain, IPv6) are accepted; '*' and
+ * empty destinations are refused. */
+bool ParseSocks5ConnectRequest(const unsigned char * data, size_t length,
+    std::string & host, int & port, std::string & error);
+bool BuildSocks5ConnectRequest(const std::string & host, int port,
+    std::vector<unsigned char> & out, std::string & error);
+/* Connects to destHost:destPort through a SOCKS5 proxy that already
+ * accepted the TCP connection on socksFd. Returns false and closes
+ * nothing: the caller owns the fd. */
+bool Socks5ConnectOn(int socksFd, const std::string & destHost, int destPort,
+    std::string & error);
+/* Opens a TCP connection to destHost:destPort through the loopback
+ * SOCKS5 listener. Returns an owned socket, or -1. */
+int ConnectThroughSocks5(const std::string & socksHost, int socksPort,
+    const std::string & destHost, int destPort, int timeoutSecs,
+    std::string & error);
 
 /*
  * SSH tunnel specification, as the user would write it on the ssh(1)

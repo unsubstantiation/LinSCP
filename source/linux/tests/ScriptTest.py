@@ -1805,7 +1805,14 @@ class ScriptTests(unittest.TestCase):
         for protocol in ("ftp", "ftps", "dav", "webdav", "s3"):
             result = self.run_commands("open %s://127.0.0.1:1/ -rawsettings Tunnel=1 TunnelHostName=jump" % protocol)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("will not be connected directly", result.stderr)
+            # A destination tunnel is opened rather than refused by name: the
+            # jump host is not there, so the open fails closed instead of
+            # connecting to 127.0.0.1:1 directly.
+            self.assertNotIn("opened", result.stdout.lower())
+            self.assertTrue("tunnel" in result.stderr.lower() or
+                            "jump" in result.stderr.lower() or
+                            "host key" in result.stderr.lower() or
+                            "HOSTKEY" in result.stderr, result.stderr)
 
     def test_global_rawsettings_have_counted_operands(self):
         for args, expected in ((["-rawsettings=1", "Tunnel=0"], 0),

@@ -58,6 +58,8 @@ CASE_SOURCES = {
     "gui-security": "source/gui/tests/SecurityTest.py",
     "gui-local": "source/gui/tests/LocalWorkspaceTest.py",
     "powershell": "automation/test_psmodule.py",
+    "dotnet": "automation/test_dotnet.py",
+    "translation-tests": "tools/tests/test_translations.py",
     "gui-desktop-uri": "source/gui/tests/DesktopUriTest.py",
     "gui-shell": "source/gui/tests/ShellIntegrationTest.py",
     "platform-conversion": "tools/tests/test_platform_conversion.py",

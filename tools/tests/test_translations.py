@@ -1,6 +1,7 @@
 """Catalog compiler regressions; no gettext or installed locales required."""
 import json
 import pathlib
+import re
 import sys
 import tempfile
 import unittest
@@ -52,6 +53,45 @@ class TranslationTests(unittest.TestCase):
                     (directory / 'es.json').write_text(text)
                     with self.assertRaises(ValueError):
                         generate(directory)
+
+    def test_non_english_catalogs_are_not_left_in_english(self):
+        """Walk every catalog and report messages still answered in English.
+
+        Proper nouns, protocol tokens and identical technical words are
+        allowed to match the English key; a newly added interface string
+        that nobody translated is not.
+        """
+        allow = {
+            "LinSCP", "SFTP", "SCP", "FTP", "FTPS", "WebDAV", "Amazon S3",
+            "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10",
+            "Ctrl+A", "Ctrl+L", "Ctrl+N", "Ctrl+R", "KiB", "ASCII", "Binary",
+            "0", "lscp>", "path/to/key", "Servers/web1", "English", "Español",
+            "{mode} {path}", "LinSCP Commander", "Kerberos (GSSAPI)",
+            "SFTP (SSH)", "WebDAV (HTTPS)", " [{size} bytes]", "[{size} bytes]",
+        }
+        leftover = []
+        for directory in (ROOT / "source/linux/locales", GUI_DIRECTORY):
+            catalogs = load_catalogs(directory)
+            for locale, catalog in catalogs.items():
+                if locale == "en":
+                    continue
+                for key, value in catalog.items():
+                    if value != key:
+                        continue
+                    if key in allow:
+                        continue
+                    if re.fullmatch(r"[A-Za-z0-9_./:+-]+", key) and len(key) <= 8:
+                        continue
+                    # Machine tokens and placeholder-only templates stay English
+                    # on purpose so parsers and logs keep a stable spelling.
+                    stripped = re.sub(r"\{[a-z]+\}", "", key)
+                    stripped = re.sub(r"[0-9\s\[\]:'\"=._/-]", "", stripped)
+                    if not stripped:
+                        continue
+                    if re.fullmatch(r"[A-Za-z]+", stripped) and stripped[0].isupper():
+                        continue
+                    leftover.append("%s:%s" % (locale, key[:80]))
+        self.assertEqual(leftover, [], leftover[:20])
 
     def test_cpp_strings_are_escaped(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -50,6 +50,12 @@ int RunCurlCaptureWithProgress(const std::vector<std::string> & args,
     std::string & out, std::string & error, LscpProgressFn progress,
     void * progressCtx, bool upload);
 
+/* SOCKS5h to the jump listener so TLS SNI, the Host header and S3
+ * signing keep the original destination name. Empty when the session
+ * has no destination tunnel. */
+void AddCurlTunnelArgs(const SessionOptions & options,
+    std::vector<std::string> & args);
+
 class ProtocolClient
 {
 public:

@@ -83,6 +83,7 @@ install these paths:
 | `/usr/bin/linscp-gui` | the graphical client launcher |
 | `/usr/share/linscp/gui/` | the GUI's Python modules, its command templates and its web client |
 | `/usr/share/linscp/automation/LinSCP.psm1` | the PowerShell 7 wrapper over the console client |
+| `/usr/share/linscp/dotnet/` | the LinSCP .NET assembly sources (`LinSCP.csproj`, `Session.cs`) |
 | `/usr/share/man/man1/linscp.1.gz` | the manual page |
 | `/usr/share/applications/linscp.desktop` | the desktop entry, with `sftp://`, `ftp://` and `ftps://` handlers |
 | `/usr/share/pixmaps/linscp.png`, `/usr/share/icons/hicolor/scalable/apps/linscp.svg` | the icons |

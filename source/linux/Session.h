@@ -233,6 +233,10 @@ struct SessionOptions
     ProxySettings proxy;
     /* An authenticated SSH jump host, separate from the destination. */
     SshTunnelSettings tunnel;
+    /* Runtime only: loopback SOCKS5 port of an active jump for a
+     * curl/FTP destination. 0 means the session has no SOCKS listener.
+     * Never persisted; Open() fills it when a non-SSH tunnel starts. */
+    int tunnelSocksPort;
     /* Kerberos/GSSAPI authentication policy. */
     GssapiSettings gssapi;
     /* The FTP engine's policy, the TLS policy and S3 object policy. */

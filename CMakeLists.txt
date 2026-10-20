@@ -145,6 +145,9 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME powershell-tests COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/automation/test_psmodule.py
     $<TARGET_FILE:linscp>)
+  add_test(NAME dotnet-tests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/automation/test_dotnet.py
+    $<TARGET_FILE:linscp>)
   add_test(NAME translation-tests COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_translations.py)
   add_test(NAME parity-checker-tests COMMAND ${Python3_EXECUTABLE}
@@ -208,9 +211,10 @@ target_compile_options(linscp-frontend PRIVATE -Wall)
 # The same layout the Debian package and 'make -C source/linux install'
 # produce: the console client and the GUI launcher in bin/, the GUI's
 # Python modules, command templates and web client under share/linscp/gui/,
-# the PowerShell module under share/linscp/automation/, the manual page,
-# the desktop entry and the icons. Nothing else is installed: this client
-# has no library, no header and no other platform's surface.
+# the PowerShell module under share/linscp/automation/, the .NET assembly
+# sources under share/linscp/dotnet/, the manual page, the desktop entry
+# and the icons. There is no C ABI header: the automation object model is
+# the C# assembly and the PowerShell module.
 install(TARGETS linscp RUNTIME DESTINATION bin)
 install(PROGRAMS source/gui/linscp-gui DESTINATION bin)
 install(FILES docs/linscp.1 DESTINATION share/man/man1)
@@ -227,3 +231,7 @@ install(FILES source/gui/linscp_gui.py source/gui/linscp_crypto.py
 install(FILES source/gui/explorer-commands.json DESTINATION share/linscp/gui)
 install(DIRECTORY source/gui/web/ DESTINATION share/linscp/gui/web)
 install(FILES automation/LinSCP.psm1 DESTINATION share/linscp/automation)
+install(FILES automation/dotnet/LinSCP/LinSCP.csproj
+              automation/dotnet/LinSCP/Session.cs
+              automation/dotnet/LinSCP/WinSCPCompat.cs
+        DESTINATION share/linscp/dotnet)

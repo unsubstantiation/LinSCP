@@ -8,6 +8,7 @@ command, an absolute name replacing the directory an operation was aimed
 at, or a mode field arriving on the command line unvalidated.
 """
 
+import http.client
 import json
 import os
 import queue
@@ -20,9 +21,12 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
+from http.server import ThreadingHTTPServer
 from unittest import mock
 import urllib.error
+import urllib.parse
 import urllib.request
 
 GUI_DIR = pathlib.Path(__file__).resolve().parents[1]
@@ -966,6 +970,9 @@ class LoginTests(unittest.TestCase):
         gui._LOGIN_LOCKOUT_UNTIL.clear()
         with gui._LOGIN_LOCK:
             gui._LOGIN_SESSIONS.clear()
+        with gui._USER_WORKSPACES_LOCK:
+            gui._USER_WORKSPACES.clear()
+        gui.unbind_workspace()
 
     def tearDown(self):
         gui.ACCOUNTS_FILE = self.previous_accounts
@@ -974,6 +981,9 @@ class LoginTests(unittest.TestCase):
             gui._LOGIN_SESSIONS.clear()
         gui._LOGIN_ATTEMPTS.clear()
         gui._LOGIN_LOCKOUT_UNTIL.clear()
+        with gui._USER_WORKSPACES_LOCK:
+            gui._USER_WORKSPACES.clear()
+        gui.unbind_workspace()
 
     def test_the_accounts_file_holds_hashes_not_passwords_and_only_this_user(self):
         text = pathlib.Path(self.accounts).read_text(encoding="utf-8")
@@ -1590,6 +1600,257 @@ class TunnelSettingsTests(unittest.TestCase):
             self.assertNotIn("TunnelPassword", command)
 
 
+class AccountIsolationTests(unittest.TestCase):
+    """Per-login ownership of every API resource when --accounts-file is set.
+
+    Login, CSRF and password hashing are covered by LoginTests. This class is
+    the negative authorization suite: a second user must not see or change
+    the first user's tabs, queue, logs, terminals, stored sessions or files.
+    """
+
+    GET_ROUTES = (
+        "/api/status", "/api/logs", "/api/transfers", "/api/sessions",
+        "/api/workspaces", "/api/local/list", "/api/shell/pending",
+        "/api/remote/list", "/api/terminal/output?terminal=1",
+    )
+    POST_ROUTES = (
+        "/api/tabs/open", "/api/tabs/close", "/api/tabs/select",
+        "/api/tabs/reconnect", "/api/sessions/save", "/api/sessions/delete",
+        "/api/workspaces/save", "/api/workspaces/open", "/api/workspaces/delete",
+        "/api/local/mkdir", "/api/local/delete", "/api/local/rename",
+        "/api/local/chmod", "/api/local/save", "/api/remote/mkdir",
+        "/api/remote/delete", "/api/remote/rename", "/api/remote/chmod",
+        "/api/remote/search", "/api/remote/save", "/api/transfer/download",
+        "/api/transfer/upload", "/api/transfer/move", "/api/sync/preview",
+        "/api/sync/run", "/api/queue/priority", "/api/queue/cancel",
+        "/api/queue/retry", "/api/queue/pause", "/api/queue/resume",
+        "/api/queue/clear", "/api/remote/properties", "/api/remote/link",
+        "/api/remote/copy", "/api/remote/checksum", "/api/session/copyid",
+        "/api/transfer/keepuptodate", "/api/command/exec",
+        "/api/custom-commands", "/api/session/terminal",
+        "/api/terminal/input", "/api/terminal/close",
+        "/api/shell/consume", "/api/shell/dismiss",
+        "/api/tabs/verify",
+    )
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        root = pathlib.Path(self.directory.name)
+        self.alice_home = root / "alice"
+        self.bob_home = root / "bob"
+        self.alice_home.mkdir()
+        self.bob_home.mkdir()
+        (self.alice_home / "alice-only.txt").write_text("alice secret")
+        (self.bob_home / "bob-only.txt").write_text("bob secret")
+        self.accounts = str(root / "accounts.ini")
+        self.previous = {
+            "ACCOUNTS_FILE": gui.ACCOUNTS_FILE,
+            "API_TOKEN": gui.API_TOKEN,
+            "REQUIRE_TOKEN": gui.REQUIRE_TOKEN,
+            "ALLOWED_HOSTS": set(gui.ALLOWED_HOSTS),
+            "ALLOW_ANY_HOST": gui.ALLOW_ANY_HOST,
+        }
+        gui.ACCOUNTS_FILE = self.accounts
+        gui.API_TOKEN = "isolation-test-token"
+        gui.REQUIRE_TOKEN = True
+        gui.ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
+        gui.ALLOW_ANY_HOST = False
+        gui._write_account("alice", "wonderland", str(self.alice_home))
+        gui._write_account("bob", "builder", str(self.bob_home))
+        gui._LOGIN_ATTEMPTS.clear()
+        gui._LOGIN_LOCKOUT_UNTIL.clear()
+        with gui._LOGIN_LOCK:
+            gui._LOGIN_SESSIONS.clear()
+        with gui._USER_WORKSPACES_LOCK:
+            gui._USER_WORKSPACES.clear()
+        gui.unbind_workspace()
+
+        class QuietHandler(gui.LinScpGuiHandler):
+            def log_message(self, *_args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), QuietHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        gui.ACCOUNTS_FILE = self.previous["ACCOUNTS_FILE"]
+        gui.API_TOKEN = self.previous["API_TOKEN"]
+        gui.REQUIRE_TOKEN = self.previous["REQUIRE_TOKEN"]
+        gui.ALLOWED_HOSTS = self.previous["ALLOWED_HOSTS"]
+        gui.ALLOW_ANY_HOST = self.previous["ALLOW_ANY_HOST"]
+        with gui._LOGIN_LOCK:
+            gui._LOGIN_SESSIONS.clear()
+        with gui._USER_WORKSPACES_LOCK:
+            gui._USER_WORKSPACES.clear()
+        gui.unbind_workspace()
+        self.directory.cleanup()
+
+    def request(self, method, path, body=None, cookie="", csrf="",
+                token=True, content_type="application/json"):
+        headers = {}
+        if token:
+            headers["X-LSCP-Token"] = gui.API_TOKEN
+        if cookie:
+            headers["Cookie"] = "LSCP_SID=%s" % cookie
+        if csrf:
+            headers["X-LSCP-CSRF"] = csrf
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = content_type
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request(method, path, data, headers)
+            response = conn.getresponse()
+            payload = response.read()
+            status = response.status
+        finally:
+            conn.close()
+        try:
+            parsed = json.loads(payload.decode("utf-8")) if payload else {}
+        except ValueError:
+            parsed = {"raw": payload.decode("utf-8", "replace")}
+        return status, parsed
+
+    def login(self, username, password):
+        status, data = self.request("POST", "/api/login",
+                                    {"username": username, "password": password})
+        self.assertEqual(status, 200, data)
+        # Cookie is HttpOnly on the response; pull the session from the table.
+        with gui._LOGIN_LOCK:
+            matches = [sid for sid, rec in gui._LOGIN_SESSIONS.items()
+                       if rec.get("username") == username]
+        self.assertTrue(matches, "login did not issue a session")
+        return matches[-1], data["csrf_token"]
+
+    def test_every_route_requires_a_login_session(self):
+        for path in self.GET_ROUTES:
+            status, data = self.request("GET", path)
+            self.assertEqual(status, 401, path)
+            self.assertTrue(data.get("login_required"), path)
+        for path in self.POST_ROUTES:
+            status, data = self.request("POST", path, {})
+            self.assertEqual(status, 401, path)
+            self.assertTrue(data.get("login_required"), path)
+
+    def test_every_post_route_requires_this_session_csrf_token(self):
+        sid, csrf = self.login("alice", "wonderland")
+        for path in self.POST_ROUTES:
+            status, data = self.request("POST", path, {}, cookie=sid)
+            self.assertEqual(status, 403, path)
+            self.assertIn("CSRF", data.get("error", ""), path)
+            status, data = self.request("POST", path, {}, cookie=sid,
+                                        csrf="0" * 64)
+            self.assertEqual(status, 403, path)
+
+    def test_one_login_cannot_see_another_users_tabs_queue_or_logs(self):
+        alice_sid, alice_csrf = self.login("alice", "wonderland")
+        bob_sid, bob_csrf = self.login("bob", "builder")
+        alice_ws = gui.workspace_for_user("alice", str(self.alice_home))
+        fake_tab = types.SimpleNamespace(
+            id=42, connected=True, name="alice-tab",
+            session={"host": "alice.example", "protocol": "sftp"},
+            local_dir=str(self.alice_home), remote_dir="/",
+            other_local_dir="", is_local=False,
+            describe=lambda: {"id": 42, "name": "alice-tab", "connected": True,
+                              "session": {"host": "alice.example"}})
+        with gui.STATE_LOCK:
+            alice_ws["tabs"].append(fake_tab)
+            alice_ws["active_tab"] = 42
+            alice_ws["logs"].append({"time": "00:00:00", "text": "alice-secret-log",
+                                     "level": "info"})
+            task = types.SimpleNamespace(
+                id=7, as_dict=lambda: {"id": 7, "type": "Upload",
+                                       "source": "alice-only.txt"})
+            alice_ws["tasks"].append(task)
+        status, data = self.request("GET", "/api/status", cookie=bob_sid)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data.get("tabs") or [], [])
+        self.assertNotEqual(data.get("active_tab"), 42)
+        status, data = self.request("GET", "/api/logs", cookie=bob_sid)
+        self.assertEqual(status, 200, data)
+        texts = [entry.get("text") for entry in data.get("logs") or []]
+        self.assertNotIn("alice-secret-log", texts)
+        status, data = self.request("GET", "/api/transfers", cookie=bob_sid)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data.get("transfers") or [], [])
+        status, data = self.request("GET", "/api/status", cookie=alice_sid)
+        self.assertEqual(status, 200, data)
+        self.assertTrue(any(tab.get("id") == 42 for tab in data.get("tabs") or []),
+                        data)
+        status, data = self.request("POST", "/api/tabs/close", {"tab": 42},
+                                    cookie=bob_sid, csrf=bob_csrf)
+        self.assertEqual(status, 200, data)
+        with gui.STATE_LOCK:
+            self.assertTrue(any(tab.id == 42 for tab in alice_ws["tabs"]))
+        status, data = self.request("POST", "/api/queue/cancel", {"task_id": 7},
+                                    cookie=bob_sid, csrf=bob_csrf)
+        self.assertIn(status, (200, 400), data)
+        with gui.STATE_LOCK:
+            self.assertTrue(any(getattr(item, "id", None) == 7
+                                for item in alice_ws["tasks"]))
+
+    def test_local_paths_are_jailed_to_the_account_home(self):
+        alice_sid, alice_csrf = self.login("alice", "wonderland")
+        status, data = self.request("GET", "/api/local/list", cookie=alice_sid)
+        self.assertEqual(status, 200, data)
+        names = [entry["name"] for entry in data.get("entries") or []]
+        self.assertIn("alice-only.txt", names)
+        self.assertNotIn("bob-only.txt", names)
+        status, data = self.request(
+            "GET",
+            "/api/local/list?path=" + urllib.parse.quote(str(self.bob_home)),
+            cookie=alice_sid)
+        self.assertEqual(status, 403, data)
+        status, data = self.request(
+            "POST", "/api/local/mkdir",
+            {"name": "folder", "path": str(self.bob_home)},
+            cookie=alice_sid, csrf=alice_csrf)
+        # contained_local_path uses the pane directory, which is alice home.
+        # An explicit foreign path on list is the jail; mkdir uses the pane.
+        self.assertIn(status, (200, 400, 403), data)
+        status, data = self.request(
+            "POST", "/api/command/exec", {"command": "lpwd"},
+            cookie=alice_sid, csrf=alice_csrf)
+        self.assertEqual(status, 403, data)
+
+    def test_stored_sessions_are_per_account(self):
+        alice_sid, alice_csrf = self.login("alice", "wonderland")
+        bob_sid, bob_csrf = self.login("bob", "builder")
+        gui.bind_workspace(gui.workspace_for_user("alice", str(self.alice_home)))
+        try:
+            alice_store = gui.session_store_path()
+        finally:
+            gui.unbind_workspace()
+        gui.bind_workspace(gui.workspace_for_user("bob", str(self.bob_home)))
+        try:
+            bob_store = gui.session_store_path()
+        finally:
+            gui.unbind_workspace()
+        self.assertNotEqual(alice_store, bob_store)
+        self.assertIn(os.path.join("users", "alice"), alice_store)
+        self.assertIn(os.path.join("users", "bob"), bob_store)
+        status, data = self.request("GET", "/api/sessions", cookie=alice_sid)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data.get("file"), alice_store)
+        status, data = self.request("GET", "/api/sessions", cookie=bob_sid)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data.get("file"), bob_store)
+
+    def test_a_csrf_token_from_alice_does_not_authorize_bob(self):
+        alice_sid, alice_csrf = self.login("alice", "wonderland")
+        bob_sid, bob_csrf = self.login("bob", "builder")
+        status, data = self.request("POST", "/api/queue/pause", {},
+                                    cookie=bob_sid, csrf=alice_csrf)
+        self.assertEqual(status, 403, data)
+
+
 if __name__ == "__main__":
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite()
@@ -1600,7 +1861,8 @@ if __name__ == "__main__":
                  CustomCommandTests, LoginTests, QueueCleanupTests,
                  BrowserUploadModeTests, CrossOriginTests,
                  SecretHandlingTests, AccountValidationTests,
-                 LocalChmodEvolvingTests, TunnelSettingsTests):
+                 LocalChmodEvolvingTests, TunnelSettingsTests,
+                 AccountIsolationTests):
         suite.addTests(loader.loadTestsFromTestCase(case))
     result = unittest.TextTestRunner(verbosity=1).run(suite)
     failed = len(result.failures) + len(result.errors)

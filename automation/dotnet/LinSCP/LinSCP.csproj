@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;netstandard2.0</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>LinSCP</RootNamespace>
+    <AssemblyName>LinSCP</AssemblyName>
+    <Description>LinSCP .NET assembly: WinSCP.Session-shaped object model over linscp -server.</Description>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+</Project>

@@ -508,7 +508,8 @@ SessionOptions::SessionOptions() :
     portNumber(22),
     cachePinnedHostKeys(true),
     timeoutSecs(15),
-    verbose(false)
+    verbose(false),
+    tunnelSocksPort(0)
 {
 }
 
@@ -1568,12 +1569,6 @@ bool ValidateSessionSettings(const SessionOptions & options, std::string & error
     }
     if (options.tunnel.enabled)
     {
-        if (!UseNativeSftp(options.protocol) && !UseNativeScp(options.protocol))
-        {
-            error = Texts::Translate("SSH tunnels currently support sftp://, scp:// and ssh:// "
-                "sessions only; this protocol will not be connected directly.");
-            return false;
-        }
         if (options.tunnel.hostName.empty() ||
             HasWhitespaceOrControl(options.tunnel.hostName))
         {
@@ -2894,20 +2889,35 @@ bool Session::Open(const SessionOptions & options, std::string & error)
         {
             return false;
         }
+        SessionOptions routed = options;
+        routed.tunnelSocksPort = 0;
+        std::unique_ptr<SshJumpTunnel> destTunnel;
+        if (options.tunnel.enabled && !UseNativeScp(options.protocol))
+        {
+            destTunnel.reset(new SshJumpTunnel());
+            const int port = destTunnel->StartSocks(options, error);
+            if (port < 0)
+            {
+                return false;
+            }
+            routed.tunnelSocksPort = port;
+        }
         /*
          * Nothing here proves the host is there, so ask it once, now: an
          * 'open' of a dead port or a misspelled host has to fail here, as a
          * real connection does, and not turn into a puzzle for the first
          * command. Only an endpoint that cannot be reached counts against
          * us; a directory the server refuses to list is the command's
-         * business.
+         * business. A tunneled curl/FTP open is probed through the SOCKS
+         * listener, so a refused jump never becomes a direct connection.
          */
-        if (!ProtocolClient::CheckEndpoint(options, options.initialDirectory, error))
+        if (!ProtocolClient::CheckEndpoint(routed, options.initialDirectory, error))
         {
             return false;
         }
         Close();
-        mOptions = options;
+        mTunnel = std::move(destTunnel);
+        mOptions = routed;
         mUserName = options.userName;
         mPasswordUsed = false;
         mAlive = true;
