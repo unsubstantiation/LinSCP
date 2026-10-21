@@ -3,7 +3,7 @@
 ## Supported languages and coverage
 
 English (`en`) and Spanish (`es`) catalogs ship with the application. There
-are 434 CLI catalog entries and 563 browser entries, including whole help
+are 434 CLI catalog entries and 656 browser entries, including whole help
 messages and plural variants. They are embedded at build time; there are no
 runtime downloads, gettext dependencies or installed OS locale requirements.
 A catalog walker reports interface strings still answered in English so a new

@@ -65,7 +65,9 @@ import pty
 import struct
 import termios
 import zlib
-from fnmatch import fnmatch
+import shlex
+import xml.etree.ElementTree as ElementTree
+from fnmatch import fnmatch, fnmatchcase
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 import linscp_crypto
@@ -596,6 +598,7 @@ SESSION_KEYS = {
     "other_local_directory": "other_local_dir",
     "otherlocaldir": "other_local_dir",
     "password": "password",
+    "ftps": "ftps",
     "last_used": "last_used",
 }
 
@@ -820,6 +823,8 @@ def read_stored_sessions():
                 current["port"] = int(value)
             except ValueError:
                 current["port"] = 22
+        elif field == "ftps":
+            current["ftps"] = int(value) if value.isascii() and value.isdigit() else value
         elif field == "last_used":
             try:
                 current["last_used"] = int(value)
@@ -830,6 +835,11 @@ def read_stored_sessions():
     if current:
         sessions.append(current)
     for item in sessions:
+        # A stored FTP site carries its TLS mode in 'ftps'; the Commander
+        # shows and connects with the scheme that mode means. 'ftps://' is
+        # implicit TLS, 'ftpes://' explicit TLS on port 21.
+        item["protocol"] = session_protocol_name(
+            item.get("protocol"), item.get("ftps"))
         # A site without a port, and one written with the SSH port by an
         # earlier version that defaulted every protocol to 22, takes the
         # port of its protocol: the console client reads the file the
@@ -880,10 +890,10 @@ def read_stored_sessions():
 
 
 def parse_desktop_site_url(uri):
-    """Convert a registered Linux sftp://, ftp:// or ftps:// URL to a site."""
+    """Convert a registered Linux sftp://, ftp://, ftps:// or ftpes:// URL."""
     parsed = urllib.parse.urlsplit(uri)
     protocol = parsed.scheme.lower()
-    if protocol not in ("sftp", "ftp", "ftps"):
+    if protocol not in ("sftp", "ftp", "ftps", "ftpes"):
         raise ValueError("Only sftp://, ftp:// and ftps:// URLs can be opened.")
     if not parsed.hostname:
         raise ValueError("The site URL has no host name.")
@@ -902,7 +912,7 @@ def parse_desktop_site_url(uri):
         port = parsed.port
     except ValueError:
         raise ValueError("The site URL has an invalid port.")
-    defaults = {"sftp": 22, "ftp": 21, "ftps": 990}
+    defaults = {"sftp": 22, "ftp": 21, "ftps": 990, "ftpes": 21}
     session = new_session()
     session["protocol"] = protocol
     session["host"] = parsed.hostname
@@ -1111,6 +1121,7 @@ def open_in_browser(url, environment=None):
 def new_session():
     return {
         "protocol": "sftp",
+        "ftps": 0,
         "host": "localhost",
         "port": 22,
         "username": os.environ.get("USERNAME") or os.environ.get("USER") or _default_user(),
@@ -1132,6 +1143,28 @@ def new_session():
     }
 
 
+def session_protocol_name(protocol, ftps_mode=None):
+    """The spelling of a session's protocol, including the TLS mode.
+
+    'ftps://' is implicit TLS and 'ftpes://' is FTP with explicit TLS, as
+    upstream spells them. A stored site keeps the upstream shape - protocol
+    'ftp' with an 'ftps' mode beside it - because that is what the console
+    client writes; the Commander shows and connects with the scheme, so the
+    user sees which kind of TLS a site uses instead of a bare 'FTP'.
+    """
+    protocol = (protocol or "sftp").strip().lower()
+    if protocol == "ftp" and ftps_mode not in (None, "", 0):
+        try:
+            mode = int(ftps_mode)
+        except (TypeError, ValueError):
+            return protocol
+        if mode == 1:
+            return "ftps"
+        if mode in (2, 3):
+            return "ftpes"
+    return protocol
+
+
 def session_url(session, path=None, include_password=False):
     """The site URL of a session, without its password by default.
 
@@ -1143,7 +1176,8 @@ def session_url(session, path=None, include_password=False):
     include_password=True only for a URL that stays inside this process
     (never one placed on a command line).
     """
-    proto = session.get("protocol") or "sftp"
+    proto = session_protocol_name(
+        session.get("protocol") or "sftp", session.get("ftps"))
     host = session.get("host") or "localhost"
     port = int(session.get("port") or default_port(proto))
     user = session.get("username") or ""
@@ -2236,6 +2270,1341 @@ def restore_workspace(name):
 
 
 # ---------------------------------------------------------------------------
+# Directory bookmarks (upstream TBookmarks / TBookmarkList)
+# ---------------------------------------------------------------------------
+#
+# Upstream keeps a separate bookmark list for each panel and for each scope
+# (local and remote), with a name, a directory and an optional shortcut. The
+# Commander stores the same two lists beside sessions.ini, one file for this
+# user, with no credentials and no host data: a bookmark names a directory,
+# nothing else. A path is validated when it is written and again when it is
+# used, so a file edited by hand cannot make the local pane leave its jail.
+
+BOOKMARK_VERSION = 1
+BOOKMARK_SIDES = ("local", "remote")
+BOOKMARK_MAX_NAME = 128
+BOOKMARK_MAX_PATH = 4096
+BOOKMARK_LOCK = threading.RLock()
+
+
+def bookmark_store_path():
+    return os.path.join(os.path.dirname(session_store_path()),
+                        "bookmarks.json")
+
+
+def _empty_bookmark_store():
+    return {"version": BOOKMARK_VERSION,
+            "bookmarks": {side: [] for side in BOOKMARK_SIDES}}
+
+
+def _bookmark_entry(value):
+    """One stored bookmark, or None when the record is not usable."""
+    if not isinstance(value, dict):
+        return None
+    name = value.get("name")
+    path = value.get("path")
+    if not isinstance(name, str) or not isinstance(path, str):
+        return None
+    # A control character is refused before trimming: a trailing newline is
+    # still a character no directory name contains, and silently trimming it
+    # would hide the fact that the file says something else than it means.
+    if any(ord(char) < 32 or ord(char) == 127 for char in name + path):
+        return None
+    name = name.strip()
+    path = path.strip()
+    if not name or not path:
+        return None
+    if len(name) > BOOKMARK_MAX_NAME or len(path) > BOOKMARK_MAX_PATH:
+        return None
+    return {"name": name, "path": path}
+
+
+def read_bookmark_store():
+    """The bookmark file, with every unusable record left out.
+
+    A hand-edited or truncated entry is skipped rather than failing the
+    whole list: one bad line must not hide the bookmarks that are fine.
+    """
+    path = bookmark_store_path()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return _empty_bookmark_store()
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("Cannot read the bookmark file: %s" % exc)
+    if not isinstance(data, dict):
+        raise ValueError("The bookmark file is not a bookmark collection.")
+    bookmarks = data.get("bookmarks")
+    if not isinstance(bookmarks, dict):
+        raise ValueError("The bookmark file has no bookmark lists.")
+    result = _empty_bookmark_store()
+    for side in BOOKMARK_SIDES:
+        entries = bookmarks.get(side)
+        if not isinstance(entries, list):
+            continue
+        seen = set()
+        for value in entries:
+            entry = _bookmark_entry(value)
+            if entry is None or entry["name"].lower() in seen:
+                continue
+            seen.add(entry["name"].lower())
+            result["bookmarks"][side].append(entry)
+        result["bookmarks"][side].sort(
+            key=lambda item: item["name"].lower())
+    return result
+
+
+def write_bookmark_store(data):
+    path = bookmark_store_path()
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=directory, prefix=".bookmarks-",
+        delete=False)
+    temporary = handle.name
+    try:
+        os.chmod(temporary, 0o600)
+        with handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2,
+                      sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def validate_bookmark(side, name, path):
+    """A bookmark as it may be stored. Returns (side, name, path)."""
+    side = str(side or "").strip().lower()
+    if side not in BOOKMARK_SIDES:
+        raise ValueError("A bookmark belongs to the local or the remote panel.")
+    if not isinstance(name, str):
+        raise ValueError("The bookmark name must be text.")
+    if not isinstance(path, str):
+        raise ValueError("The bookmark path must be text.")
+    if any(ord(char) < 32 or ord(char) == 127 for char in name + path):
+        raise ValueError("The bookmark must not contain control characters.")
+    name = name.strip()
+    path = path.strip()
+    if not name:
+        raise ValueError("A bookmark name is required.")
+    if len(name) > BOOKMARK_MAX_NAME:
+        raise ValueError("The bookmark name is too long (maximum %d characters)."
+                         % BOOKMARK_MAX_NAME)
+    if not path:
+        raise ValueError("A bookmark path is required.")
+    if len(path) > BOOKMARK_MAX_PATH:
+        raise ValueError("The bookmark path is too long.")
+    if side == "local":
+        # The local pane is confined to the signed-in account's home (or the
+        # whole file system when no accounts are configured); a bookmark that
+        # names somewhere else would have to be refused when it was used, so
+        # it is refused when it is stored.
+        path, error = confined_local_path(path)
+        if error:
+            raise ValueError(error)
+    else:
+        if not path.startswith("/"):
+            raise ValueError("A remote bookmark needs an absolute path.")
+    return side, name, path
+
+
+def list_bookmarks(side=None):
+    data = read_bookmark_store()
+    if side:
+        side = str(side).strip().lower()
+        if side not in BOOKMARK_SIDES:
+            raise ValueError("There is no %s bookmark list." % side)
+        return list(data["bookmarks"][side])
+    return data["bookmarks"]
+
+
+def add_bookmark(side, name, path):
+    side, name, path = validate_bookmark(side, name, path)
+    with BOOKMARK_LOCK:
+        data = read_bookmark_store()
+        entries = data["bookmarks"][side]
+        replaced = False
+        for entry in entries:
+            if entry["name"].lower() == name.lower():
+                entry["name"] = name
+                entry["path"] = path
+                replaced = True
+                break
+        if not replaced:
+            entries.append({"name": name, "path": path})
+        entries.sort(key=lambda item: item["name"].lower())
+        write_bookmark_store(data)
+    add_log("Saved the %s bookmark '%s'." % (side, name), "success")
+    return {"side": side, "name": name, "path": path,
+            "bookmarks": data["bookmarks"]}
+
+
+def delete_bookmark(side, name):
+    side = str(side or "").strip().lower()
+    if side not in BOOKMARK_SIDES:
+        raise ValueError("There is no %s bookmark list." % side)
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("A bookmark name is required.")
+    name = name.strip()
+    if any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise ValueError("The bookmark name is not usable.")
+    with BOOKMARK_LOCK:
+        data = read_bookmark_store()
+        entries = data["bookmarks"][side]
+        kept = [entry for entry in entries
+                if entry["name"].lower() != name.lower()]
+        if len(kept) == len(entries):
+            raise ValueError("No %s bookmark named \"%s\" exists."
+                             % (side, name))
+        data["bookmarks"][side] = kept
+        write_bookmark_store(data)
+    add_log("Deleted the %s bookmark '%s'." % (side, name), "info")
+    return {"side": side, "name": name, "bookmarks": data["bookmarks"]}
+
+
+# ---------------------------------------------------------------------------
+# Session URLs and transfer code (upstream Generate URL dialog)
+# ---------------------------------------------------------------------------
+
+def generate_session_url(tab, include_password=False, path=""):
+    """The site URL and a safe 'open' line for the active tab.
+
+    A password is included only when the caller asks for it explicitly, and
+    the answer says so, because a URL with a password is a secret to copy
+    somewhere else. Nothing here writes the URL to the log: the log is
+    shared, the dialog is not.
+    """
+    if tab is None:
+        raise ValueError("Not connected.")
+    if getattr(tab, "is_local", False):
+        raise ValueError("A local tab has no session URL.")
+    session = dict(tab.session or {})
+    target = (path or tab.remote_dir or session.get("initial_dir") or "/")
+    if not isinstance(target, str) or any(
+            ord(char) < 32 or ord(char) == 127 for char in target):
+        raise ValueError("The path is not usable in a URL.")
+    url = session_url(session, target, bool(include_password))
+    safe_url = session_url(session, target, False)
+    result = {
+        "success": True,
+        "url": url,
+        "open_command": "open " + safe_url,
+        "path": target,
+        "include_password": bool(include_password and session.get("password")),
+        "has_password": bool(session.get("password")),
+        "protocol": session.get("protocol") or "sftp",
+        "host": session.get("host") or "",
+    }
+    add_log("Generated a session URL for %s." %
+            (session.get("host") or "the active site"), "cmd")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Importing sessions from other clients (upstream Import Sessions)
+# ---------------------------------------------------------------------------
+#
+# Upstream offers PuTTY, KiTTY, FileZilla, OpenSSH, its own .ini export and
+# known_hosts. On Linux the two sources that exist are an OpenSSH client
+# configuration and FileZilla's sitemanager.xml, so those are the two this
+# server reads. The file is parsed here, not handed to the console client:
+# a password from another client is encrypted with sessions.key before it is
+# written, and an entry this build cannot represent is reported instead of
+# being imported as something it is not.
+
+IMPORT_MAX_BYTES = 4 * 1024 * 1024
+IMPORT_MAX_ENTRIES = 1000
+IMPORT_SOURCES = ("openssh", "filezilla")
+
+
+def _import_source_paths(source):
+    home = os.path.expanduser("~")
+    if source == "openssh":
+        return [os.path.join(home, ".ssh", "config")]
+    if source == "filezilla":
+        return [os.path.join(home, ".config", "filezilla",
+                             "sitemanager.xml"),
+                os.path.join(home, ".filezilla", "sitemanager.xml")]
+    return []
+
+
+def _read_import_file(path):
+    path, error = confined_local_path(path)
+    if error:
+        raise ValueError(error)
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        raise ValueError("Cannot read '%s': %s" % (path, exc))
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("'%s' is not a regular file." % path)
+    if info.st_size > IMPORT_MAX_BYTES:
+        raise ValueError("'%s' is larger than the import limit (%d bytes)."
+                         % (path, IMPORT_MAX_BYTES))
+    try:
+        with open(path, "r", encoding="utf-8", errors="strict") as handle:
+            return path, handle.read(IMPORT_MAX_BYTES + 1)
+    except UnicodeDecodeError:
+        raise ValueError("'%s' is not UTF-8 text." % path)
+    except OSError as exc:
+        raise ValueError("Cannot read '%s': %s" % (path, exc))
+
+
+def _import_entry(name, host, port, username="", password="", keyfile="",
+                  protocol="sftp", local_dir="", remote_dir=""):
+    """One candidate session, normalized and safe to put in sessions.ini."""
+    name = (name or "").strip()
+    host = (host or "").strip()
+    username = (username or "").strip()
+    keyfile = (keyfile or "").strip()
+    local_dir = (local_dir or "").strip()
+    remote_dir = (remote_dir or "").strip()
+    if not name:
+        name = host
+    if not name:
+        raise ValueError("The entry has no name.")
+    if len(name) > 256:
+        raise ValueError("The entry name is too long.")
+    if not host:
+        raise ValueError("The entry has no host name.")
+    if any(ord(char) < 32 or ord(char) == 127
+           for char in name + host + username + keyfile + local_dir +
+           remote_dir + password):
+        raise ValueError("The entry contains a control character.")
+    if protocol not in ("sftp", "ftp", "ftps", "ftpes"):
+        raise ValueError("The entry's protocol is not supported.")
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        port = default_port(protocol)
+    if port < 1 or port > 65535:
+        raise ValueError("The entry has an invalid port.")
+    if protocol == "ftp" and not username:
+        username = "anonymous"
+    return {
+        "name": name,
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+        "keyfile": keyfile,
+        "protocol": protocol,
+        "local_dir": local_dir,
+        "remote_dir": remote_dir or "/",
+    }
+
+
+def parse_openssh_config(text):
+    """Hosts of an OpenSSH client configuration.
+
+    Returns (entries, skipped). Only a block whose 'Host' line names one
+    plain alias is read: a wildcard, a negated pattern or a 'Match' block
+    describes a rule rather than a site, and importing it would invent a
+    host name nobody configured. 'Include' is reported instead of followed,
+    so an import never walks to a file the caller did not name.
+    """
+    entries = []
+    skipped = []
+    current = None
+
+    def finish():
+        nonlocal current
+        if current is not None:
+            try:
+                entries.append(_import_entry(
+                    current["name"], current.get("hostname") or current["name"],
+                    current.get("port", 22),
+                    username=current.get("user", ""),
+                    keyfile=current.get("identityfile", ""),
+                    protocol="sftp"))
+            except ValueError as exc:
+                skipped.append({"name": current["name"],
+                                "reason": str(exc)})
+        current = None
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split(None, 1)
+        keyword = parts[0].lower()
+        value = parts[1].strip() if len(parts) > 1 else ""
+        if keyword in ("host", "match"):
+            finish()
+            if keyword == "match":
+                skipped.append({"name": "Match block",
+                                "reason": "Match blocks do not name a site."})
+                continue
+            try:
+                patterns = shlex.split(value)
+            except ValueError:
+                patterns = value.split()
+            if len(patterns) != 1 or any(
+                    char in patterns[0] for char in "*?!") or not patterns[0]:
+                skipped.append({
+                    "name": value or "(empty Host)",
+                    "reason": "Only a Host line with one plain alias is "
+                              "imported."})
+                continue
+            current = {"name": patterns[0]}
+            continue
+        if keyword == "include":
+            skipped.append({"name": "Include " + value,
+                            "reason": "Included files are not followed."})
+            continue
+        if current is None:
+            # A setting before the first Host applies to every host; it is
+            # not a site of its own.
+            continue
+        if keyword == "hostname" and value:
+            current["hostname"] = value
+        elif keyword == "user" and value:
+            current["user"] = value
+        elif keyword == "port" and value:
+            try:
+                port = int(value)
+            except ValueError:
+                skipped.append({"name": current["name"],
+                                "reason": "The port is not a number."})
+                continue
+            if port < 1 or port > 65535:
+                skipped.append({"name": current["name"],
+                                "reason": "The port is out of range."})
+                continue
+            current["port"] = port
+        elif keyword == "identityfile" and value:
+            if "%" in value:
+                skipped.append({"name": current["name"],
+                                "reason": "An IdentityFile with a % token "
+                                          "is not imported."})
+                continue
+            current["identityfile"] = os.path.expanduser(value)
+    finish()
+    return entries, skipped
+
+
+def _xml_text(element, tag):
+    for child in element:
+        if child.tag.split("}")[-1].lower() == tag.lower():
+            return (child.text or "").strip()
+    return ""
+
+
+def parse_filezilla_xml(text):
+    """Sites of a FileZilla sitemanager.xml.
+
+    Returns (entries, skipped). A DOCTYPE or entity declaration is refused
+    before parsing, so a crafted file cannot expand entities, and every
+    field is checked for control characters. FileZilla's FileZilla3 and the
+    older FileZillaServer root are both accepted.
+    """
+    lowered = text.lower()
+    if "<!doctype" in lowered or "<!entity" in lowered:
+        raise ValueError("The FileZilla file must not declare a DOCTYPE or "
+                         "an entity.")
+    try:
+        root = ElementTree.fromstring(text)
+    except ElementTree.ParseError as exc:
+        raise ValueError("The FileZilla file is not valid XML: %s" % exc)
+    servers = [element for element in root.iter()
+               if element.tag.split("}")[-1].lower() == "server"]
+    entries = []
+    skipped = []
+    for element in servers:
+        name = _xml_text(element, "name")
+        host = _xml_text(element, "host")
+        protocol = _xml_text(element, "protocol")
+        if protocol not in ("", "0", "1", "3", "4"):
+            skipped.append({"name": name or host,
+                            "reason": "The FileZilla protocol is not "
+                                      "supported."})
+            continue
+        password = ""
+        encoded = _xml_text(element, "pass")
+        if encoded:
+            try:
+                password = base64.b64decode(encoded.encode("ascii"),
+                                            validate=True).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                skipped.append({"name": name or host,
+                                "reason": "The stored FileZilla password is "
+                                          "not valid base64 text."})
+                continue
+        remote_dir = _xml_text(element, "remotedir")
+        if remote_dir and not remote_dir.startswith("/"):
+            # FileZilla writes a small "0 0 4 1 1" prefix before the path in
+            # some versions; the last token is the path it means.
+            candidate = remote_dir.split()[-1]
+            remote_dir = candidate if candidate.startswith("/") else ""
+        local_dir = _xml_text(element, "localdir")
+        if local_dir and not local_dir.startswith("/"):
+            local_dir = ""
+        try:
+            if protocol == "1":
+                entry_protocol, default_import_port = "sftp", 22
+            elif protocol == "3":
+                # FileZilla's explicit TLS is upstream's 'ftpes://'.
+                entry_protocol, default_import_port = "ftpes", 21
+            elif protocol == "4":
+                entry_protocol, default_import_port = "ftps", 990
+            else:
+                entry_protocol, default_import_port = "ftp", 21
+            entries.append(_import_entry(
+                name, host,
+                _xml_text(element, "port") or default_import_port,
+                username=_xml_text(element, "user"),
+                password=password,
+                keyfile=os.path.expanduser(_xml_text(element, "keyfile")),
+                protocol=entry_protocol,
+                local_dir=local_dir, remote_dir=remote_dir))
+        except ValueError as exc:
+            skipped.append({"name": name or host, "reason": str(exc)})
+        if len(entries) >= IMPORT_MAX_ENTRIES:
+            skipped.append({"name": "(further entries)",
+                            "reason": "The import limit of %d sites was "
+                                      "reached." % IMPORT_MAX_ENTRIES})
+            break
+    return entries, skipped
+
+
+def scan_import_source(source, path=""):
+    """One import source as the dialog lists it, without any password."""
+    source = str(source or "").strip().lower()
+    if source not in IMPORT_SOURCES:
+        raise ValueError("Unknown import source '%s'." % source)
+    candidates = [path] if path else _import_source_paths(source)
+    errors = []
+    for candidate in candidates:
+        try:
+            resolved, text = _read_import_file(candidate)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        try:
+            if source == "openssh":
+                entries, skipped = parse_openssh_config(text)
+            else:
+                entries, skipped = parse_filezilla_xml(text)
+        except ValueError as exc:
+            # A source that exists but cannot be read is reported in the
+            # dialog with the reason, not as an endpoint failure: the user
+            # can point the dialog at another file.
+            return {"source": source, "path": resolved, "exists": True,
+                    "entries": [], "skipped": [], "error": str(exc)}
+        public = [{"name": entry["name"], "host": entry["host"],
+                   "port": entry["port"],
+                   "username": entry["username"],
+                   "protocol": entry["protocol"],
+                   "has_password": bool(entry["password"]),
+                   "keyfile": entry["keyfile"]} for entry in entries]
+        return {"source": source, "path": resolved, "exists": True,
+                "entries": public, "skipped": skipped, "error": ""}
+    return {"source": source, "path": candidates[0] if candidates else "",
+            "exists": False, "entries": [], "skipped": [],
+            "error": "; ".join(errors) or "The file does not exist."}
+
+
+def scan_import_sources():
+    """Every default source, including the ones that are not there."""
+    return [scan_import_source(source) for source in IMPORT_SOURCES]
+
+
+def _session_ini_block(entry, ini_path):
+    """The [section] an imported entry becomes, password encrypted."""
+    protocol = entry["protocol"]
+    tls_mode = ""
+    if protocol == "ftpes":
+        # The console client stores explicit TLS as FTP with mode 3; that
+        # is also how it reads the site back.
+        protocol, tls_mode = "ftp", "ftps=3"
+    elif protocol == "ftps":
+        tls_mode = "ftps=1"
+    lines = ["[%s]" % _escape(entry["name"]),
+             "protocol=%s" % protocol]
+    if tls_mode:
+        lines.append(tls_mode)
+    lines += ["host=%s" % _escape(entry["host"]),
+              "port=%d" % entry["port"]]
+    for key, field in (("username", "username"), ("private_key", "keyfile"),
+                       ("remote_directory", "remote_dir"),
+                       ("local_directory", "local_dir")):
+        value = entry.get(field) or ""
+        if value:
+            lines.append("%s=%s" % (key, _escape(value)))
+    password = entry.get("password") or ""
+    if password:
+        lines.append("password=%s" % _encrypt_stored_password(
+            password, ini_path))
+    lines.append("last_used=%d" % int(time.time()))
+    return lines
+
+
+def _encrypt_stored_password(password, ini_path):
+    """Encrypt for sessions.ini, creating sessions.key exactly as the core does."""
+    key_path = linscp_crypto.key_path_for(ini_path)
+    try:
+        key = linscp_crypto.load_key(key_path)
+    except linscp_crypto.PasswordError as exc:
+        if "does not exist" not in str(exc):
+            raise ValueError(str(exc))
+        # The console client creates the same 32 random bytes, base64 and
+        # newline, mode 0600, and never overwrites a key another process
+        # created at the same moment.
+        os.makedirs(os.path.dirname(key_path) or ".", mode=0o700,
+                    exist_ok=True)
+        content = (base64.b64encode(os.urandom(32)).decode("ascii") +
+                   "\n").encode("ascii")
+        try:
+            handle = os.open(key_path,
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(handle, "wb") as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+        key = linscp_crypto.load_key(key_path)
+    return linscp_crypto.encrypt(password, key)
+
+
+def _write_imported_sessions(imported, overwrite):
+    """Merge imported sections into sessions.ini atomically.
+
+    Existing sites are kept unless 'overwrite' says otherwise; the rest of
+    the file - comments, folders, settings this module does not know - is
+    copied through. Returns (imported names, skipped records).
+    """
+    path = session_store_path()
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    preamble = []
+    sections = []
+    current = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current = {"name": _unescape(stripped[1:-1]),
+                       "lines": [line]}
+            sections.append(current)
+        elif current is None:
+            preamble.append(line)
+        else:
+            current["lines"].append(line)
+    existing = {section["name"].lower() for section in sections}
+    output = list(preamble)
+    added = []
+    skipped = []
+    for entry in imported:
+        block = _session_ini_block(entry, path)
+        replaced = False
+        for section in sections:
+            if section["name"].lower() != entry["name"].lower():
+                continue
+            if not overwrite:
+                skipped.append({"name": entry["name"],
+                                "reason": "A site with this name already "
+                                          "exists."})
+                replaced = True
+                break
+            section["lines"] = block
+            replaced = True
+            break
+        if not replaced:
+            if entry["name"].lower() in existing and not overwrite:
+                skipped.append({"name": entry["name"],
+                                "reason": "A site with this name already "
+                                          "exists."})
+                continue
+            sections.append({"name": entry["name"], "lines": block})
+            existing.add(entry["name"].lower())
+            added.append(entry["name"])
+        elif overwrite:
+            added.append(entry["name"])
+    for section in sections:
+        output.extend(section["lines"])
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=directory, prefix=".sessions-",
+        delete=False)
+    temporary = handle.name
+    try:
+        os.chmod(temporary, 0o600)
+        with handle:
+            handle.write("\n".join(output).rstrip("\n") + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return added, skipped
+
+
+def import_sessions(source, path="", names=None, overwrite=False):
+    """Import the named (or all) entries of one source into sessions.ini."""
+    scanned = scan_import_source(source, path)
+    if not scanned["exists"]:
+        raise ValueError(scanned["error"] or "The import source does not exist.")
+    resolved, text = _read_import_file(scanned["path"])
+    if scanned["source"] == "openssh":
+        entries, skipped = parse_openssh_config(text)
+    else:
+        entries, skipped = parse_filezilla_xml(text)
+    wanted = None
+    if names is not None:
+        if not isinstance(names, list) or not all(
+                isinstance(name, str) for name in names):
+            raise ValueError("The selected sites must be a list of names.")
+        wanted = {name.strip().lower() for name in names if name.strip()}
+        if not wanted:
+            raise ValueError("Select at least one site to import.")
+    selected = [entry for entry in entries
+                if wanted is None or entry["name"].lower() in wanted]
+    if not selected:
+        raise ValueError("No site of that source was selected.")
+    added, merge_skipped = _write_imported_sessions(selected, bool(overwrite))
+    add_log("Imported %d site(s) from %s." %
+            (len(added), scanned["path"]), "success" if added else "info")
+    return {"success": True, "source": scanned["source"],
+            "path": resolved, "imported": added,
+            "skipped": skipped + merge_skipped,
+            "sessions": read_stored_sessions(),
+            "file": session_store_path()}
+
+
+# ---------------------------------------------------------------------------
+# Preferences: the defaults a transfer and a confirmation start from
+# ---------------------------------------------------------------------------
+
+# The keys the dialog offers and the value each one may hold. The defaults
+# are used as they are by the page until the user saves something else, so
+# a first run behaves exactly as it did before the dialog existed.
+PREFERENCE_DEFAULTS = {
+    "transfer": "",            # '' = automatic, otherwise 'binary' or 'ascii'
+    "filemask": "",
+    "speed": 0,                # KiB/s, 0 = unlimited
+    "resumesupport": "",       # '' = protocol default, 'on', 'off' or KiB
+    "resume": True,
+    "preserve_time": True,
+    "newer_only": False,
+    "append": False,
+    "no_permissions": False,
+    "priority": False,
+    "confirm_overwrite": True,
+    "confirm_delete": True,
+}
+
+PREFERENCE_TEXT_LIMITS = {"filemask": 1024, "resumesupport": 32}
+PREFERENCE_SWITCHES = ("resume", "preserve_time", "newer_only", "append",
+                       "no_permissions", "priority", "confirm_overwrite",
+                       "confirm_delete")
+MAX_PREFERENCES_BYTES = 64 * 1024
+
+
+def preferences_path():
+    return os.path.join(_config_root(), "preferences.json")
+
+
+def _preference_error(key, message):
+    return "The preference '%s' %s" % (key, message)
+
+
+def check_preference(key, value):
+    """Validate one preference value, or raise ValueError with the reason.
+
+    A boolean is not a number here: 'true' stored where a speed belongs, or
+    1 stored where a switch belongs, is refused rather than read as one of
+    them, because either reading would be a guess about what was meant.
+    """
+    if key in PREFERENCE_SWITCHES:
+        if not isinstance(value, bool):
+            raise ValueError(_preference_error(key, "must be true or false."))
+        return value
+    if key == "transfer":
+        if value not in ("", "automatic", "binary", "ascii"):
+            raise ValueError(_preference_error(
+                key, "must be automatic, binary or ascii."))
+        return value
+    if key == "speed":
+        if isinstance(value, bool) or not isinstance(value, int) or \
+                not 0 <= value <= 100000000:
+            raise ValueError(_preference_error(
+                key, "must be a whole number of KiB/s from 0 through 100000000."))
+        return value
+    if key in PREFERENCE_TEXT_LIMITS:
+        if not isinstance(value, str):
+            raise ValueError(_preference_error(key, "must be text."))
+        if len(value) > PREFERENCE_TEXT_LIMITS[key]:
+            raise ValueError(_preference_error(
+                key, "must be at most %d characters long."
+                % PREFERENCE_TEXT_LIMITS[key]))
+        if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError(_preference_error(
+                key, "must not contain control characters."))
+        if key == "resumesupport" and value not in ("", "on", "off") and \
+                not re.fullmatch(r"\d{1,9}", value):
+            raise ValueError(_preference_error(
+                key, "must be 'on', 'off', a size in KiB or empty."))
+        return value
+    raise ValueError("The preference '%s' is not known." % key)
+
+
+def check_preferences(values):
+    """Validate a whole preferences document and return a clean copy."""
+    if not isinstance(values, dict):
+        raise ValueError("The preferences must be a JSON object.")
+    clean = {}
+    for key, value in values.items():
+        if key not in PREFERENCE_DEFAULTS:
+            raise ValueError("The preference '%s' is not known." % key)
+        clean[key] = check_preference(key, value)
+    return clean
+
+
+def read_preferences():
+    """The stored preferences, with anything unusable left at its default.
+
+    A hand-edited file must not stop the client: an unknown key or a value
+    of the wrong type is ignored here, while saving through the dialog
+    refuses it. The result always has every key, so callers read a value
+    without asking whether the file has it.
+    """
+    preferences = dict(PREFERENCE_DEFAULTS)
+    path = preferences_path()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read(MAX_PREFERENCES_BYTES + 1)
+    except FileNotFoundError:
+        return preferences
+    except OSError as exc:
+        add_log("Cannot read the preferences: %s" % exc, "error")
+        return preferences
+    if len(text) > MAX_PREFERENCES_BYTES:
+        add_log("The preferences file is too large; using the defaults.", "error")
+        return preferences
+    try:
+        stored = json.loads(text)
+    except ValueError:
+        add_log("The preferences file is not valid JSON; using the defaults.",
+                "error")
+        return preferences
+    if not isinstance(stored, dict):
+        add_log("The preferences file is not an object; using the defaults.",
+                "error")
+        return preferences
+    for key, value in stored.items():
+        if key not in PREFERENCE_DEFAULTS:
+            continue
+        try:
+            preferences[key] = check_preference(key, value)
+        except ValueError:
+            continue
+    return preferences
+
+
+def write_preferences(values):
+    """Validate and store the preferences atomically, readable by the owner."""
+    clean = check_preferences(values)
+    path = preferences_path()
+    os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+    temporary = path + ".tmp-%d" % os.getpid()
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(clean, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    add_log("Stored the preferences.", "success")
+    return clean
+
+
+# ---------------------------------------------------------------------------
+# Cleanup: remove the data this client stores, one named location at a time
+# ---------------------------------------------------------------------------
+
+def _session_key_path(ini_path):
+    """The key file that belongs to an ini path, as the core names it.
+
+    'sessions.ini' pairs with 'sessions.key'; any other name gains '.key'.
+    """
+    stem, suffix = os.path.splitext(ini_path)
+    if suffix.lower() == ".ini":
+        return stem + ".key"
+    return ini_path + ".key"
+
+
+def _cleanup_candidates():
+    """Every stored location, keyed by a stable id, in the order shown.
+
+    The paths are computed here and never come from the request: the page
+    names an id, and this table is the only thing that turns an id into a
+    path, so a request cannot name a file to delete.
+    """
+    ini = session_store_path()
+    directory = os.path.dirname(ini)
+    return [
+        ("sessions", "Stored sessions (sites, user names and host keys)",
+         ini, "file"),
+        ("passwords", "Stored passwords (sessions.key)",
+         _session_key_path(ini), "file"),
+        ("hostkeys", "Cached SSH host keys",
+         os.path.join(directory, "sshhostkeys"), "file"),
+        ("workspaces", "Saved workspaces", workspace_store_path(), "file"),
+        ("bookmarks", "Saved bookmarks", bookmark_store_path(), "file"),
+        ("commands", "Custom commands", _custom_commands_path(), "file"),
+        ("preferences", "Preferences", preferences_path(), "file"),
+        # These two directories are normally created on first use, so the
+        # paths are built here rather than asked of the helpers: listing the
+        # stored data must not create the data it is about to report.
+        ("shell", "Pending file-manager uploads",
+         os.path.join(_config_root(), "shell-manifests"), "directory"),
+        ("editing", "Temporary copies of edited files",
+         os.path.join(tempfile.gettempdir(), "linscp-gui-edit"), "directory"),
+    ]
+
+
+def cleanup_locations():
+    """What the Cleanup dialog lists: id, caption, path and whether it exists."""
+    locations = []
+    for location_id, caption, path, kind in _cleanup_candidates():
+        absolute = os.path.abspath(path)
+        locations.append({"id": location_id, "caption": caption,
+                          "path": absolute, "kind": kind,
+                          "exists": os.path.lexists(absolute)})
+    return locations
+
+
+def _remove_cleanup_path(path, kind):
+    """Remove one enumerated location; returns whether anything was removed."""
+    if kind == "directory":
+        if os.path.islink(path):
+            os.unlink(path)
+            return True
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+            return True
+        return False
+    if os.path.lexists(path):
+        os.unlink(path)
+        return True
+    return False
+
+
+def cleanup_data(ids):
+    """Remove the selected stored locations.
+
+    Removing data is not undoable, so the caller has to say which ids it
+    means and the ids are matched against the table above. A location that
+    is already gone is not an error - asking to remove it twice is not a
+    failure - and the result reports each id so the page can say what
+    happened to which.
+    """
+    if not isinstance(ids, list) or not ids:
+        raise ValueError("Select at least one item to remove.")
+    if any(not isinstance(item, str) or not item.strip() for item in ids):
+        raise ValueError("The cleanup items must be named by id.")
+    table = {entry["id"]: entry for entry in cleanup_locations()}
+    root = os.path.realpath(_config_root())
+    results = []
+    for location_id in dict.fromkeys(ids):
+        entry = table.get(location_id)
+        if entry is None:
+            raise ValueError("The cleanup item '%s' is not known." % location_id)
+        path = entry["path"]
+        if os.path.abspath(path) == root:
+            raise ValueError("The configuration directory itself cannot be removed.")
+        removed = False
+        error = ""
+        try:
+            removed = _remove_cleanup_path(path, entry["kind"])
+        except OSError as exc:
+            error = str(exc)
+        results.append({"id": location_id, "caption": entry["caption"],
+                        "path": entry["path"], "removed": removed,
+                        "error": error})
+        if removed:
+            add_log("Removed %s (%s)." % (entry["caption"], entry["path"]),
+                    "success")
+        elif error:
+            add_log("Cannot remove %s: %s" % (entry["path"], error), "error")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Properties and rights
+# ---------------------------------------------------------------------------
+
+def local_properties(path):
+    """The properties dialog's rows for a local entry."""
+    info = local_stat_info(path)
+    permissions = info.get("permissions") or ""
+    owner, _, group = (info.get("owner") or "").partition(":")
+    link_target = ""
+    if info.get("is_link"):
+        try:
+            link_target = os.readlink(path)
+        except OSError:
+            link_target = ""
+    return {
+        "name": os.path.basename(path.rstrip("/")) or path,
+        "path": path,
+        "is_dir": bool(info.get("is_dir")),
+        "is_link": bool(info.get("is_link")),
+        "size": info.get("size") or 0,
+        "mtime": info.get("mtime") or 0,
+        "permissions": permissions,
+        "mode": permissions_to_mode(permissions),
+        "owner": owner,
+        "group": group,
+        "link_target": link_target,
+    }
+
+
+def _parse_remote_attributes(raw, path):
+    """Read the key/value lines 'attr' prints into a properties row."""
+    row = {"name": os.path.basename(path.rstrip("/")) or path, "path": path,
+           "is_dir": False, "is_link": False, "size": 0, "mtime": 0,
+           "permissions": "", "mode": 0, "owner": "", "group": "",
+           "link_target": ""}
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Permissions:"):
+            row["permissions"] = stripped.split(":", 1)[1].strip()
+            row["is_dir"] = row["permissions"].startswith("d")
+            row["is_link"] = row["permissions"].startswith("l")
+        elif stripped.startswith("SizeBytes:"):
+            try:
+                row["size"] = int(stripped.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+        elif stripped.startswith("ModifiedEpoch:"):
+            try:
+                row["mtime"] = int(stripped.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+        elif stripped.startswith("Owner:"):
+            owner = stripped.split(":", 1)[1].strip()
+            if owner and owner != "unknown" and ":" in owner:
+                row["owner"], row["group"] = owner.split(":", 1)
+            elif owner and owner != "unknown":
+                row["owner"] = owner
+    if row["permissions"]:
+        row["mode"] = permissions_to_mode(row["permissions"])
+    return row
+
+
+def permissions_to_mode(permissions):
+    """The octal mode of an ls-style permission string, or 0 if it has none."""
+    if not permissions or len(permissions) < 10:
+        return 0
+    mode = 0
+    for index, letter in enumerate(permissions[1:10]):
+        if letter in "- ":
+            continue
+        mode |= 1 << (8 - index)
+        if letter in "sS":
+            mode |= 0o4000 if index < 3 else 0o2000
+        elif letter in "tT":
+            mode |= 0o1000
+    return mode
+
+
+def remote_properties(tab, names):
+    """Read the attributes of one or more entries of the tab's directory."""
+    if tab is None or not tab.connected:
+        raise ValueError("Not connected.")
+    if not isinstance(names, list) or not names or not all(
+            isinstance(name, str) and name for name in names):
+        raise ValueError("Name at least one entry to read.")
+    rows = []
+    for name in names:
+        operand, operand_error = single_remote_name(tab, name)
+        if operand_error:
+            raise ValueError(operand_error)
+        if getattr(tab, "is_local", False):
+            target, contain_error = contained_local_path(tab.remote_dir, name)
+            if contain_error:
+                raise ValueError(contain_error)
+            rows.append(local_properties(target))
+            continue
+        code, lines, errors = tab.run_many_capture(
+            ["stat " + quote_remote(operand), "attr " + quote_remote(operand)])
+        if code != 0:
+            raise ValueError("\n".join(lines + errors) or
+                             "Cannot read the properties of '%s'." % operand)
+        row = _parse_remote_attributes("\n".join(lines), operand)
+        rows.append(row)
+    return rows
+
+
+def set_rights(tab, names, mode_text, recursive=False):
+    """Change the permissions of each named entry, reporting each result."""
+    if tab is None or not tab.connected:
+        raise ValueError("Not connected.")
+    mode_error = check_permission_mode(mode_text)
+    if mode_error:
+        raise ValueError(mode_error)
+    if not isinstance(names, list) or not names:
+        raise ValueError("Select at least one entry to change.")
+    if recursive and not getattr(tab, "is_local", False):
+        raise ValueError("The server applies a recursive change to a "
+                         "directory only; select the entries instead.")
+    results = []
+    for name in names:
+        operand, operand_error = single_remote_name(tab, name)
+        if operand_error:
+            raise ValueError(operand_error)
+        if getattr(tab, "is_local", False):
+            target, contain_error = contained_local_path(tab.remote_dir, name)
+            if contain_error:
+                raise ValueError(contain_error)
+            targets = [target]
+            if recursive and os.path.isdir(target) and \
+                    not os.path.islink(target):
+                targets = [target]
+                for current, directories, files in os.walk(target):
+                    targets.extend(os.path.join(current, name)
+                                   for name in sorted(directories + files))
+            try:
+                for changed in targets:
+                    apply_local_mode(changed, mode_text)
+                results.append({"name": operand, "success": True, "error": ""})
+            except (OSError, ValueError) as exc:
+                results.append({"name": operand, "success": False,
+                                "error": str(exc)})
+            continue
+        commands = build_chmod_command(tab.remote_dir, mode_text, operand)
+        code, lines, errors = tab.run_many_capture(commands)
+        results.append({"name": operand, "success": code == 0,
+                        "error": "" if code == 0 else
+                        ("\n".join(errors or lines) or
+                         "Cannot change the permissions.")})
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Remote-to-remote transfer: one server's file to another server
+# ---------------------------------------------------------------------------
+
+def remote_transfer_targets(tab):
+    """The sessions a remote-to-remote copy can target.
+
+    The session the copy starts in is listed first and marked as the
+    current one: copying inside it is the one case the server itself can
+    do, so it runs as a plain 'cp'. Every other open remote tab and every
+    stored site can be targeted too, and those run through a private
+    local copy.
+    """
+    if tab is None or not getattr(tab, "connected", False) or tab.is_local:
+        raise ValueError("A remote-to-remote copy starts in a connected "
+                         "remote tab.")
+    targets = [{"id": "tab:%s" % tab.id, "kind": "tab", "tab": tab.id,
+                "label": tab.name, "host": tab.session.get("host", ""),
+                "protocol": tab.session.get("protocol", ""),
+                "current": True, "connected": True}]
+    for other in list(_current_workspace().get("tabs") or []):
+        if other is tab or getattr(other, "is_local", False):
+            continue
+        targets.append({"id": "tab:%s" % other.id, "kind": "tab",
+                        "tab": other.id, "label": other.name,
+                        "host": other.session.get("host", ""),
+                        "protocol": other.session.get("protocol", ""),
+                        "current": False, "connected": bool(other.connected)})
+    known = {target["label"] for target in targets}
+    for site in read_stored_sessions():
+        if site.get("protocol") == "local":
+            continue
+        label = site["name"]
+        if label in known:
+            continue
+        targets.append({"id": "site:%s" % label, "kind": "site",
+                        "site": label, "label": label,
+                        "host": site.get("host", ""),
+                        "protocol": site.get("protocol", ""),
+                        "current": False, "connected": False})
+    return targets
+
+
+def _remote_transfer_target(target):
+    """Resolve a target id from the dialog into (, session, label) parts."""
+    if not isinstance(target, str) or not target:
+        raise ValueError("Choose where the files are copied to.")
+    kind, _, value = target.partition(":")
+    if kind == "tab":
+        for candidate in _current_workspace().get("tabs") or []:
+            if str(getattr(candidate, "id", "")) == value:
+                return candidate, dict(candidate.session), candidate.name
+        raise ValueError("That tab is no longer open.")
+    if kind == "site":
+        for site in read_stored_sessions():
+            if site["name"] == value:
+                session = dict(site)
+                session["site"] = value
+                return None, session, value
+        raise ValueError("The stored site '%s' no longer exists." % value)
+    raise ValueError("The copy target is not known.")
+
+
+def filter_remote_names(names, filemask):
+    """Apply the dialog's file mask to the selected names."""
+    if not filemask:
+        return list(names)
+    patterns = [part.strip() for part in filemask.split("|") if part.strip()]
+    if not patterns:
+        return list(names)
+    return [name for name in names
+            if any(fnmatchcase(name, pattern) for pattern in patterns)]
+
+
+def check_remote_directory(directory):
+    if not isinstance(directory, str) or not directory.strip():
+        raise ValueError("A destination directory is required.")
+    if any(ord(char) < 32 or ord(char) == 127 for char in directory):
+        raise ValueError("The destination directory must not contain control "
+                         "characters.")
+    if not directory.startswith("/"):
+        raise ValueError("The destination directory must be an absolute path.")
+    return directory
+
+
+def remote_copy_task(task):
+    """Copy files from one remote session into another through a local copy.
+
+    Two servers cannot be made to talk to each other without one of them
+    accepting a connection from the other, so each file is downloaded into
+    a private directory and uploaded from there. The directory is removed
+    whatever happens, and an interruption leaves no partial file in the
+    destination: the upload writes its own temporary file first.
+    """
+    source = get_tab(task.tab_id)
+    if source is None or not getattr(source, "connected", False) or source.is_local:
+        raise ValueError("The source session is no longer connected.")
+    extra = task.extra or {}
+    destination_session = extra.get("destination") or {}
+    destination_dir = extra.get("directory") or "/"
+    names = list(extra.get("names") or [])
+    if not names:
+        raise ValueError("No file was selected for the copy.")
+    directory = tempfile.mkdtemp(prefix="linscp-remote-copy-")
+    destination = CoreSession("remote-copy-%d" % task.id, destination_session,
+                              extra.get("label") or None)
+    try:
+        ok, error = destination.start()
+        if not ok:
+            raise ValueError(error or "The destination session did not start.")
+        ok, error = destination.connect()
+        if not ok:
+            raise ValueError(error or "The destination session did not connect.")
+        for index, name in enumerate(names):
+            if task.status == "Cancelling":
+                raise LocalTransferCancelled()
+            local_path = os.path.join(directory, "%d-copy" % index)
+            code, lines, errors = source.run_many_capture(
+                ["get -transfer=binary %s %s" % (quote_remote(name),
+                                                 quote_local(local_path))],
+                timeout=600)
+            if code != 0:
+                raise ValueError("Cannot read '%s' from the source: %s" % (
+                    name, "\n".join(errors or lines) or "the transfer failed."))
+            try:
+                task.bytes_done += os.path.getsize(local_path)
+            except OSError:
+                pass
+            command = "put %s %s" % (
+                quote_local(local_path),
+                quote_remote(_join_remote(destination_dir, name)))
+            code, lines, errors = destination.run_many_capture([command],
+                                                               timeout=600)
+            if code != 0:
+                raise ValueError("Cannot write '%s' to the destination: %s" % (
+                    name, "\n".join(errors or lines) or "the transfer failed."))
+            task.detail = "%d of %d copied" % (index + 1, len(names))
+        destination.run("pwd")
+    finally:
+        destination.close()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _join_remote(directory, name):
+    if directory.endswith("/"):
+        return directory + name
+    return directory + "/" + name
+
+
+def queue_remote_transfer(tab, names, target, directory, filemask="",
+                          policy="ask", priority=False):
+    """Queue a copy between two remote sessions.
+
+    The current session copies on the server itself - one 'cp' per file,
+    which never moves the bytes over the network. Any other target is a
+    second connection, so the copy is queued as a job that downloads and
+    uploads each file, and the queue reports it like any other transfer.
+    """
+    if tab is None or not getattr(tab, "connected", False) or tab.is_local:
+        raise ValueError("A remote-to-remote copy starts in a connected "
+                         "remote tab.")
+    if not isinstance(names, list) or not names:
+        raise ValueError("Select at least one file to copy.")
+    destination_dir = check_remote_directory(directory)
+    selected = filter_remote_names(names, filemask)
+    if not selected:
+        raise ValueError("No selected file matches the file mask.")
+    destination_tab, destination_session, label = _remote_transfer_target(target)
+    for name in selected:
+        _, name_error = single_remote_name(tab, name)
+        if name_error:
+            raise ValueError(name_error)
+    direct = destination_tab is tab
+    if direct:
+        # One connection, so the server copies the bytes itself: the files
+        # never travel over the network and no temporary copy is written.
+        commands = ["cd " + quote_remote(tab.remote_dir)]
+        commands.extend(
+            "cp %s %s" % (quote_remote(name),
+                          quote_remote(_join_remote(destination_dir, name)))
+            for name in selected)
+        task = TASKS.submit(
+            "Copy (remote)", "\n".join(commands), tab.session,
+            tab.remote_dir, destination_dir, tab.id, priority=priority)
+        return [task]
+    task = TASKS.submit(
+        "Copy (remote)", "", tab.session, tab.remote_dir, destination_dir,
+        tab.id, priority=priority, native=remote_copy_task)
+    task.extra = {"destination": destination_session, "label": label,
+                  "directory": destination_dir, "names": selected}
+    task.bytes_total = 0
+    return [task]
+
+
+# ---------------------------------------------------------------------------
 # Embedded terminal (xterm.js in the page, 'linscp -shell' behind a pty)
 # ---------------------------------------------------------------------------
 
@@ -2432,7 +3801,7 @@ class Task(object):
                  tab_id, progress_path=None, progress_remote=None, move_source=None,
                  cleanup_path=None, native=None, local_source=None,
                  local_target=None, local_policy="ask", local_move=False,
-                 local_root=None):
+                 local_root=None, extra=None):
         self.id = task_id
         self.kind = kind
         self.command = command
@@ -2463,6 +3832,9 @@ class Task(object):
         self.local_policy = local_policy
         self.local_move = local_move
         self.local_root = local_root
+        # A job that is not one command line - a copy between two servers -
+        # keeps what it needs here instead of in the command text.
+        self.extra = dict(extra or {})
         self.skipped = 0
 
     def as_dict(self):
@@ -2527,7 +3899,7 @@ class TaskManager(object):
                progress_path=None, progress_remote=None, move_source=None,
                cleanup_path=None, priority=False, native=None,
                local_source=None, local_target=None, local_policy="ask",
-               local_move=False, local_root=None):
+               local_move=False, local_root=None, extra=None):
         with STATE_LOCK:
             ws = getattr(self, "workspace", None) or _DEFAULT_WORKSPACE
             task = Task(ws["next_task"], kind, command, session, source,
@@ -2535,7 +3907,8 @@ class TaskManager(object):
                         move_source=move_source, cleanup_path=cleanup_path,
                         native=native, local_source=local_source,
                         local_target=local_target, local_policy=local_policy,
-                        local_move=local_move, local_root=local_root)
+                        local_move=local_move, local_root=local_root,
+                        extra=extra)
             ws["next_task"] += 1
             if priority:
                 ws["tasks"].append(task)
@@ -4364,6 +5737,13 @@ def save_local_stored_session(name, session):
 def save_stored_session(name, session, pin_hostkey=False, preserve_tunnel_credentials=False):
     """Write a session through 'savesession', so sessions.ini stays the only
     copy of it. Returns (ok, message)."""
+    protocol = str(session.get("protocol") or "sftp").lower()
+    protocol_flag = protocol
+    tls_settings = []
+    if protocol == "ftpes":
+        protocol_flag, tls_settings = "ftp", ["Ftps=3"]
+    elif protocol == "ftps":
+        tls_settings = ["Ftps=1"]
     command = "savesession %s" % quote_remote(name)
     for key, flag in (("host", "-host"), ("port", "-port"), ("username", "-username"),
                       ("protocol", "-protocol"), ("keyfile", "-privatekey"),
@@ -4376,6 +5756,8 @@ def save_stored_session(name, session, pin_hostkey=False, preserve_tunnel_creden
         # setting: only pin it when the caller insists.
         if key == "hostkey" and str(value).strip() == "*" and not pin_hostkey:
             continue
+        if key == "protocol":
+            value = protocol_flag
         text = str(value)
         # A control character in a session field would become a second
         # command when the core reads one command per line in -server mode.
@@ -4395,26 +5777,31 @@ def save_stored_session(name, session, pin_hostkey=False, preserve_tunnel_creden
         if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
             return False, "The password contains a control character and cannot be saved."
         command += " -password"
-    if "tunnel" in session:
+    if "tunnel" in session or tls_settings:
         error = validate_session_data(session)
         if error:
             return False, error
         settings = []
-        for field, raw_name in TUNNEL_RAW_FIELDS.items():
-            if preserve_tunnel_credentials and field in ("tunnel_password", "tunnel_passphrase"):
-                continue
-            default = 22 if field == "tunnel_port" else (
-                0 if field == "tunnel_local_port" else "")
-            value = ("1" if session.get("tunnel") else "0") if field == "tunnel" else session.get(field, default)
-            if field != "tunnel" and not session.get("tunnel"):
-                continue
-            if field == "tunnel_hostkey" and value == "*" and not pin_hostkey:
-                value = ""  # Never persist a one-connection trust bypass.
-            settings.append(raw_name + "=" + quote_remote(str(value)))
+        # Only a session that carries the tunnel flag has tunnel settings to
+        # write: a TLS-only session must not gain 'Tunnel=0' it never had.
+        if "tunnel" in session:
+            for field, raw_name in TUNNEL_RAW_FIELDS.items():
+                if preserve_tunnel_credentials and field in ("tunnel_password", "tunnel_passphrase"):
+                    continue
+                default = 22 if field == "tunnel_port" else (
+                    0 if field == "tunnel_local_port" else "")
+                value = ("1" if session.get("tunnel") else "0") if field == "tunnel" else session.get(field, default)
+                if field != "tunnel" and not session.get("tunnel"):
+                    continue
+                if field == "tunnel_hostkey" and value == "*" and not pin_hostkey:
+                    value = ""  # Never persist a one-connection trust bypass.
+                settings.append(raw_name + "=" + quote_remote(str(value)))
         settings += [setting.split("=", 1)[0] + "=" +
                      quote_remote(setting.split("=", 1)[1])
                      for setting in gssapi_raw_settings(session)]
-        command += " -rawsettings " + " ".join(settings)
+        settings += tls_settings
+        if settings:
+            command += " -rawsettings " + " ".join(settings)
     code, stdout, stderr = run_linscp(command, session)
     if code == 0:
         add_log("Saved session '%s'" % name, "success")
@@ -5103,6 +6490,77 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                             "file": workspace_store_path()})
             return
 
+        if path == "/api/bookmarks":
+            try:
+                side = query.get("side", [None])[0]
+                bookmarks = list_bookmarks(side)
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
+            self.send_json({"success": True,
+                            "bookmarks": bookmarks if side else
+                            {"local": bookmarks["local"],
+                             "remote": bookmarks["remote"]},
+                            "file": bookmark_store_path()})
+            return
+
+        if path == "/api/session/url":
+            tab = require_tab(query.get("tab", [None])[0])
+            if tab is None:
+                tab = get_tab()
+            include_password = str(
+                query.get("password", ["0"])[0]).strip().lower() in (
+                    "1", "true", "on", "yes")
+            try:
+                result = generate_session_url(
+                    tab, include_password,
+                    query.get("path", [""])[0])
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
+            self.send_json(result)
+            return
+
+        if path == "/api/sessions/import":
+            source = query.get("source", [None])[0]
+            path_arg = query.get("path", [""])[0]
+            try:
+                if source:
+                    result = scan_import_source(source, path_arg)
+                    self.send_json({"success": True, "sources": [result]})
+                else:
+                    self.send_json({"success": True,
+                                    "sources": scan_import_sources()})
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+            return
+
+        if path == "/api/preferences":
+            self.send_json({"success": True,
+                            "preferences": read_preferences(),
+                            "defaults": PREFERENCE_DEFAULTS,
+                            "file": preferences_path()})
+            return
+
+        if path == "/api/cleanup":
+            locations = cleanup_locations()
+            self.send_json({"success": True, "locations": locations,
+                            "any": any(item["exists"] for item in locations)})
+            return
+
+        if path == "/api/remote/transfer/targets":
+            tab = require_tab(query.get("tab", [None])[0])
+            try:
+                self.send_json({"success": True,
+                                "targets": remote_transfer_targets(tab)})
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+            return
+
         if path == "/api/local/list":
             req_path = query.get("path", [None])[0]
             tab = get_tab(query.get("tab", [None])[0])
@@ -5730,6 +7188,134 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                                status=400)
                 return
             self.send_json({"success": True})
+            return
+
+        if path == "/api/bookmarks/save":
+            try:
+                result = add_bookmark(body.get("side") or "",
+                                      body.get("name") or "",
+                                      body.get("path") or "")
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
+            self.send_json({"success": True, "bookmark": result,
+                            "file": bookmark_store_path()})
+            return
+
+        if path == "/api/bookmarks/delete":
+            try:
+                result = delete_bookmark(body.get("side") or "",
+                                         body.get("name") or "")
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
+            self.send_json({"success": True, "bookmark": result,
+                            "file": bookmark_store_path()})
+            return
+
+        if path == "/api/sessions/import":
+            try:
+                names = body.get("names")
+                result = import_sessions(body.get("source") or "",
+                                         body.get("path") or "",
+                                         names,
+                                         bool(body.get("overwrite")))
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
+            self.send_json(result)
+            return
+
+        if path == "/api/preferences":
+            action = str(body.get("action") or "save")
+            if action == "reset":
+                values = dict(PREFERENCE_DEFAULTS)
+            elif action == "save":
+                supplied = body.get("preferences")
+                if not isinstance(supplied, dict):
+                    self.send_json({"success": False,
+                                    "error": "The preferences must be a JSON "
+                                             "object."}, status=400)
+                    return
+                # A save is a whole document: every key the dialog shows is
+                # written, so leaving one out cannot silently reset it.
+                values = dict(PREFERENCE_DEFAULTS)
+                values.update(supplied)
+            else:
+                self.send_json({"success": False,
+                                "error": "The preference action is not known."},
+                               status=400)
+                return
+            try:
+                stored = write_preferences(values)
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
+            self.send_json({"success": True, "preferences": stored,
+                            "file": preferences_path()})
+            return
+
+        if path == "/api/cleanup":
+            if body.get("confirm") is not True:
+                self.send_json({"success": False,
+                                "error": "Removing stored data has to be "
+                                         "confirmed."}, status=400)
+                return
+            try:
+                results = cleanup_data(body.get("ids"))
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
+            remaining = cleanup_locations()
+            self.send_json({"success": True, "removed": results,
+                            "locations": remaining,
+                            "any": any(item["exists"] for item in remaining)})
+            return
+
+        if path == "/api/remote/rights":
+            tab = require_tab(body.get("tab"))
+            names = body.get("names")
+            if names is None and body.get("name"):
+                names = [body["name"]]
+            try:
+                results = set_rights(tab, names or [], str(body.get("mode") or ""),
+                                     bool(body.get("recursive")))
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
+            failures = [item for item in results if not item["success"]]
+            add_log("Changed the permissions of %d entr%s." %
+                    (len(results) - len(failures),
+                     "y" if len(results) - len(failures) == 1 else "ies"),
+                    "success" if not failures else "error")
+            self.send_json({"success": not failures, "results": results,
+                            "changed": len(results) - len(failures),
+                            "error": failures[0]["error"] if failures else ""})
+            return
+
+        if path == "/api/remote/transfer":
+            tab = require_tab(body.get("tab"))
+            names = body.get("names")
+            if names is None and body.get("name"):
+                names = [body["name"]]
+            try:
+                tasks = queue_remote_transfer(
+                    tab, names or [], str(body.get("target") or ""),
+                    str(body.get("directory") or ""),
+                    str(body.get("filemask") or ""),
+                    priority=bool(body.get("priority")))
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
+            self.send_json({"success": True,
+                            "tasks": [task.as_dict() for task in tasks]})
             return
 
         if path == "/api/local/mkdir":
@@ -6420,41 +8006,27 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
         if path == "/api/remote/properties":
             tab = require_tab(body.get("tab"))
             if tab is None:
-                self.send_json({"success": False, "error": "Not connected"}, status=400)
+                self.send_json({"success": False, "error": "Not connected"},
+                               status=400)
                 return
-            name = body.get("name")
-            operand, operand_error = single_remote_name(tab, name)
-            if operand_error:
-                self.send_json({"success": False, "error": operand_error}, status=400)
+            # One name keeps the single-entry answer the dialog used
+            # before; a list answers with one row per entry, so several
+            # selected files can be shown together and their shared facts
+            # compared instead of opening them one at a time.
+            names = body.get("names")
+            if names is None:
+                names = [body.get("name")] if body.get("name") else []
+            try:
+                rows = remote_properties(tab, names)
+            except (ValueError, OSError) as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
                 return
-            if getattr(tab, "is_local", False):
-                target, contain_error = contained_local_path(tab.remote_dir,
-                                                             name or "")
-                if contain_error:
-                    self.send_json({"success": False, "error": contain_error},
-                                   status=400)
-                    return
-                try:
-                    info = local_stat_info(target)
-                except OSError as exc:
-                    self.send_json({"success": False, "error": str(exc)},
-                                   status=400)
-                    return
-                self.send_json({"success": True, "name": operand,
-                                "listing": info.get("raw", ""),
-                                "attributes": info})
-                return
-            code, lines, errors = tab.run_many_capture(
-                ["stat " + quote_remote(operand), "attr " + quote_remote(operand)])
-            if code != 0:
-                self.send_json({"success": False,
-                                "error": "\n".join(lines + errors) or
-                                         "Cannot read the properties."}, status=400)
-                return
-            info = remote_stat(tab, operand) or {}
-            self.send_json({"success": True, "name": operand,
-                            "listing": "\n".join(lines),
-                            "attributes": info})
+            answer = {"success": True, "properties": rows,
+                      "name": rows[0]["name"] if rows else ""}
+            if len(rows) == 1:
+                answer["attributes"] = rows[0]
+            self.send_json(answer)
             return
 
         if path == "/api/remote/link":
@@ -7439,7 +9011,7 @@ def main():
         argv = argv[:cut]
     for arg in argv:
         if (startup_url is None and arg.lower().startswith(
-                ("sftp://", "ftp://", "ftps://"))):
+                ("sftp://", "ftp://", "ftps://", "ftpes://"))):
             startup_url = arg
             continue
         if arg.startswith("--port="):

@@ -58,6 +58,31 @@ const responses = {
     ],
     paused: false
   },
+  '/api/preferences': {
+    success: true, file: '/tmp/cfg/preferences.json', defaults: {},
+    preferences: { transfer: 'binary', filemask: '*.txt', speed: 0,
+      resumesupport: '', resume: true, preserve_time: true, newer_only: false,
+      append: false, no_permissions: false, priority: false,
+      confirm_overwrite: true, confirm_delete: true }
+  },
+  '/api/cleanup': {
+    success: true, any: true,
+    locations: [
+      { id: 'sessions', caption: 'Stored sessions (sites, user names and host keys)',
+        path: '/tmp/cfg/sessions.ini', kind: 'file', exists: true },
+      { id: 'bookmarks', caption: 'Saved bookmarks',
+        path: '/tmp/cfg/bookmarks.json', kind: 'file', exists: false }
+    ]
+  },
+  '/api/remote/transfer/targets': {
+    success: true,
+    targets: [
+      { id: 'tab:1', kind: 'tab', tab: 1, label: 'local test', host: '127.0.0.1',
+        protocol: 'sftp', current: true, connected: true },
+      { id: 'tab:2', kind: 'tab', tab: 2, label: 'mirror', host: 'mirror.test',
+        protocol: 'sftp', current: false, connected: true }
+    ]
+  },
   '/api/logs': { logs: [{ time: '07:00', level: 'info', text: 'Connected' }] },
   '/api/sessions': {
     file: '/tmp/cfg/sessions.ini',
@@ -95,6 +120,21 @@ const responses = {
         { name: 'two', kind: 'sftp', site: 'GUI/test' }] }
     ] },
   '/api/command/exec': { success: true, exit_code: 0, stdout: '/tmp/slowremote\n', stderr: '' },
+  '/api/bookmarks': { success: true, file: '/tmp/cfg/bookmarks.json', bookmarks: {
+    local: [{ name: 'home', path: '/tmp/slowlocal' },
+            { name: 'scratch', path: '/tmp' }],
+    remote: [{ name: 'logs', path: '/var/log' }] } },
+  '/api/bookmarks/save': { success: true, file: '/tmp/cfg/bookmarks.json' },
+  '/api/bookmarks/delete': { success: true, file: '/tmp/cfg/bookmarks.json' },
+  '/api/sessions/import': { success: true, sources: [{
+    source: 'openssh', path: '/home/user/.ssh/config', exists: true,
+    error: '', skipped: [{ name: '*', reason: 'Only a Host line with one plain alias is imported.' }],
+    entries: [
+      { name: 'prod', host: 'prod.example.test', port: 2222, username: 'deploy',
+        protocol: 'sftp', has_password: false, keyfile: '/home/user/.ssh/id_ed25519' },
+      { name: 'staging', host: 'staging.example.test', port: 22, username: 'deploy',
+        protocol: 'sftp', has_password: false, keyfile: '' }
+    ] }] },
   /* A new site has no host key, so the backend asks instead of connecting. */
   '/api/tabs/open': {
     success: false,
@@ -134,6 +174,41 @@ function customCommandsBody(options) {
   return { success: true, commands: stored };
 }
 
+function preferencesBody(options) {
+  const stored = responses['/api/preferences'].preferences;
+  if ((options.method || 'GET').toUpperCase() !== 'POST') {
+    return responses['/api/preferences'];
+  }
+  let request = {};
+  try { request = JSON.parse(options.body || '{}'); } catch (error) {}
+  const values = request.action === 'reset' ? stored
+    : Object.assign({}, stored, request.preferences || {});
+  return { success: true, file: '/tmp/cfg/preferences.json', preferences: values };
+}
+
+function cleanupBody(options) {
+  if ((options.method || 'GET').toUpperCase() !== 'POST') {
+    return responses['/api/cleanup'];
+  }
+  let request = {};
+  try { request = JSON.parse(options.body || '{}'); } catch (error) {}
+  const ids = request.ids || [];
+  const locations = responses['/api/cleanup'].locations.map(item =>
+    Object.assign({}, item, { exists: item.exists && ids.indexOf(item.id) < 0 }));
+  return { success: true, removed: ids.map(id => ({ id: id, removed: true, error: '' })),
+    locations: locations, any: locations.some(item => item.exists) };
+}
+
+function propertiesBody(options) {
+  let request = {};
+  try { request = JSON.parse(options.body || '{}'); } catch (error) {}
+  const names = request.names || (request.name ? [request.name] : []);
+  return { success: true, properties: names.map(name => ({
+    name: name, path: '/tmp/slowremote/' + name, is_dir: false, is_link: false,
+    size: 22, mtime: 1791875271, permissions: '-rw-r--r--', mode: 420,
+    owner: '1000', group: '1000' })) };
+}
+
 const TOKEN = 'test-token-0123456789abcdef';
 
 const calls = [];
@@ -155,6 +230,21 @@ const dom = new JSDOM(html, {
       if (path === '/api/custom-commands') {
         body = customCommandsBody(options);
       }
+      if (path === '/api/preferences') {
+        body = preferencesBody(options);
+      }
+      if (path === '/api/cleanup') {
+        body = cleanupBody(options);
+      }
+      if (path === '/api/remote/properties') {
+        body = propertiesBody(options);
+      }
+      if (path === '/api/remote/rights') {
+        body = { success: true, changed: 1, results: [], error: '' };
+      }
+      if (path === '/api/remote/transfer') {
+        body = { success: true, tasks: [{ id: 9, type: 'Copy (remote)', status: 'Queued' }] };
+      }
       if (path === '/api/workspaces/save') {
         let request = {};
         try { request = JSON.parse(options.body || '{}'); } catch (error) {}
@@ -165,6 +255,31 @@ const dom = new JSDOM(html, {
       }
       if (path === '/api/workspaces/delete') {
         body = { success: true };
+      }
+      if (path === '/api/bookmarks') {
+        const side = /[?&]side=([a-z]+)/.exec(String(url));
+        const stored = responses['/api/bookmarks'].bookmarks;
+        body = { success: true, file: '/tmp/cfg/bookmarks.json',
+          bookmarks: side ? stored[side[1]] : stored };
+      }
+      if (path === '/api/session/url') {
+        const include = /[?&]password=1(?:&|$)/.test(String(url));
+        body = { success: true,
+          url: include
+            ? 'sftp://user:secret%20word@127.0.0.1:2222/tmp/slowremote/'
+            : 'sftp://user@127.0.0.1:2222/tmp/slowremote/',
+          open_command: 'open sftp://user@127.0.0.1:2222/tmp/slowremote/',
+          path: '/tmp/slowremote', include_password: include,
+          has_password: true, protocol: 'sftp', host: '127.0.0.1' };
+      }
+      if (path === '/api/sessions/import' &&
+          (options.method || 'GET').toUpperCase() === 'POST') {
+        let request = {};
+        try { request = JSON.parse(options.body || '{}'); } catch (error) {}
+        body = { success: true, source: request.source, path: '/home/user/.ssh/config',
+          imported: request.names || [], skipped: [],
+          sessions: (responses['/api/sessions'] || {}).sessions || [],
+          file: '/tmp/cfg/sessions.ini' };
       }
       if (path === '/api/remote/search') {
         let request = {};
@@ -500,6 +615,54 @@ function options(id) {
     if (path === '/api/custom-commands') {
       return Promise.resolve(
         { ok: true, json: () => Promise.resolve(customCommandsBody(options)) });
+    }
+    if (path === '/api/preferences') {
+      return Promise.resolve(
+        { ok: true, json: () => Promise.resolve(preferencesBody(options)) });
+    }
+    if (path === '/api/cleanup') {
+      return Promise.resolve(
+        { ok: true, json: () => Promise.resolve(cleanupBody(options)) });
+    }
+    if (path === '/api/remote/properties') {
+      return Promise.resolve(
+        { ok: true, json: () => Promise.resolve(propertiesBody(options)) });
+    }
+    if (path === '/api/remote/rights') {
+      return Promise.resolve(
+        { ok: true, json: () => Promise.resolve({ success: true, changed: 1, results: [], error: '' }) });
+    }
+    if (path === '/api/remote/transfer') {
+      return Promise.resolve(
+        { ok: true, json: () => Promise.resolve({ success: true,
+          tasks: [{ id: 9, type: 'Copy (remote)', status: 'Queued' }] }) });
+    }
+    if (path === '/api/bookmarks') {
+      const stored = responses['/api/bookmarks'].bookmarks;
+      const body = { success: true, file: '/tmp/cfg/bookmarks.json',
+        bookmarks: params.has('side') ? stored[params.get('side')] : stored };
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+    }
+    if (path === '/api/session/url') {
+      const include = params.get('password') === '1';
+      const body = { success: true,
+        url: include
+          ? 'sftp://user:secret%20word@127.0.0.1:2222/tmp/slowremote/'
+          : 'sftp://user@127.0.0.1:2222/tmp/slowremote/',
+        open_command: 'open sftp://user@127.0.0.1:2222/tmp/slowremote/',
+        path: '/tmp/slowremote', include_password: include,
+        has_password: true, protocol: 'sftp', host: '127.0.0.1' };
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+    }
+    if (path === '/api/sessions/import' &&
+        (options.method || 'GET').toUpperCase() === 'POST') {
+      let request = {};
+      try { request = JSON.parse(options.body || '{}'); } catch (error) {}
+      const body = { success: true, source: request.source,
+        path: '/home/user/.ssh/config', imported: request.names || [],
+        skipped: [], sessions: (responses['/api/sessions'] || {}).sessions || [],
+        file: '/tmp/cfg/sessions.ini' };
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
     }
     const body = responses[path];
     if (body === undefined) {
@@ -860,6 +1023,17 @@ function options(id) {
   check('a stored site without a port shows the port of its protocol',
     doc.getElementById('sitePort').value === '990' &&
       window.currentSiteForm().port === 990);
+  // Upstream keeps explicit TLS ('ftpes://') and implicit TLS ('ftps://')
+  // apart, so a site says which one it uses instead of a bare 'FTP'.
+  const protocolOptions = Array.from(doc.getElementById('siteProtocol').options)
+    .map(option => option.value);
+  check('the site form offers both TLS schemes',
+    protocolOptions.includes('ftpes') && protocolOptions.includes('ftps'));
+  window.fillSiteForm({ name: 'explicit', protocol: 'ftpes', host: 'h', port: 0 });
+  window.siteProtocolChanged();
+  check('a stored explicit-TLS site opens on FTP port 21',
+    doc.getElementById('sitePort').value === '21' &&
+      window.currentSiteForm().protocol === 'ftpes');
 
   // Synchronize conflict policy selector and resolution bar.
   window.openSynchronize();
@@ -1013,6 +1187,202 @@ function options(id) {
     JSON.stringify(shellPayload));
   check('confirmed shell upload closes the dialog',
     !doc.getElementById('shellUploadModal').classList.contains('open'));
+
+  /* Directory bookmarks: one list per panel, stored by the backend; the
+   * dialog jumps to a saved directory and never treats a name as markup. */
+  await window.openBookmarks('remote');
+  check('bookmark dialog lists the selected panel bookmarks',
+    doc.getElementById('bookmarksModal').classList.contains('open') &&
+      doc.getElementById('bookmarkList').children.length === 1 &&
+      text('bookmarkList').includes('logs') &&
+      text('bookmarkStatus').includes('1 bookmark in the Remote panel'),
+    text('bookmarkList') + ' / ' + text('bookmarkStatus'));
+  const localListBefore = calls.filter(call => call.path === '/api/local/list').length;
+  await window.goBookmark('local', '/tmp/slowlocal');
+  check('a local bookmark loads its directory in the local panel',
+    calls.filter(call => call.path === '/api/local/list').length ===
+      localListBefore + 1 &&
+      !doc.getElementById('bookmarksModal').classList.contains('open'));
+  window.prompt = () => 'work';
+  await window.addBookmark('local');
+  const bookmarkSave = calls.filter(call => call.path === '/api/bookmarks/save').pop();
+  const bookmarkPayload = bookmarkSave ? JSON.parse(bookmarkSave.options.body) : {};
+  check('adding a bookmark posts the panel, name and directory',
+    bookmarkPayload.side === 'local' && bookmarkPayload.name === 'work' &&
+      bookmarkPayload.path === '/tmp/slowlocal',
+    JSON.stringify(bookmarkPayload));
+  await window.deleteBookmark('local', 'home');
+  const bookmarkDelete = calls.filter(call => call.path === '/api/bookmarks/delete').pop();
+  check('deleting a bookmark posts its panel and name',
+    bookmarkDelete && JSON.parse(bookmarkDelete.options.body).side === 'local' &&
+      JSON.parse(bookmarkDelete.options.body).name === 'home');
+  check('bookmark names are inserted as text, not markup',
+    doc.getElementById('bookmarkList').innerHTML.includes('home') &&
+      !doc.getElementById('bookmarkList').innerHTML.includes('<script'));
+  check('a bookmark list is rendered from the panel the request named',
+    !doc.getElementById('bookmarkList').innerHTML.includes('logs'));
+  window.closeModal('bookmarksModal');
+
+  /* Generate URL: password omitted by default, included only on request. */
+  await window.openSessionUrl();
+  check('the session URL dialog shows a URL without the password',
+    doc.getElementById('sessionUrlModal').classList.contains('open') &&
+      value('sessionUrlText') === 'sftp://user@127.0.0.1:2222/tmp/slowremote/' &&
+      !doc.getElementById('urlIncludePassword').checked,
+    value('sessionUrlText'));
+  check('the dialog offers the stored password explicitly',
+    text('sessionUrlStatus').includes('Tick the box'));
+  doc.getElementById('urlIncludePassword').checked = true;
+  await window.loadSessionUrl();
+  const urlCall = calls.filter(call => call.path === '/api/session/url').pop();
+  check('asking for the password asks the backend for it',
+    urlCall && urlCall.url.includes('password=1') &&
+      value('sessionUrlText').includes('secret%20word') &&
+      text('sessionUrlStatus').includes('Treat it as a secret'),
+    urlCall && urlCall.url);
+  window.closeModal('sessionUrlModal');
+
+  /* Import sessions: the scan lists names without passwords; only ticked
+   * sites are posted, and the site list is reloaded afterwards. */
+  await window.openImportSessions();
+  check('import dialog scans the chosen source',
+    doc.getElementById('importSessionsModal').classList.contains('open') &&
+      doc.getElementById('importList').children.length === 2 &&
+      text('importList').includes('prod') && text('importList').includes('staging'),
+    text('importList'));
+  check('a skipped import entry says why',
+    text('importStatus').includes('Only a Host line with one plain alias'),
+    text('importStatus'));
+  check('the import scan never lists a password',
+    !text('importList').includes('secret') &&
+      !text('importStatus').includes('secret'));
+  doc.querySelectorAll('#importList input[type="checkbox"]')[1].checked = false;
+  const sessionsBefore = calls.filter(call => call.path === '/api/sessions').length;
+  doc.getElementById('importOverwrite').checked = true;
+  await window.runSessionImport();
+  const importCall = calls.filter(call => call.path === '/api/sessions/import' &&
+    (call.options.method || 'GET').toUpperCase() === 'POST').pop();
+  const importPayload = importCall ? JSON.parse(importCall.options.body) : {};
+  check('importing posts only the ticked sites and the overwrite choice',
+    importPayload.source === 'openssh' &&
+      JSON.stringify(importPayload.names) === JSON.stringify(['prod']) &&
+      importPayload.overwrite === true, JSON.stringify(importPayload));
+  check('a finished import reloads the stored site list',
+    calls.filter(call => call.path === '/api/sessions').length > sessionsBefore);
+  window.closeModal('importSessionsModal');
+
+  /* Preferences: the defaults come from the backend, a save posts the whole
+   * document, and the confirmation switches reach the copy and delete paths. */
+  await window.openPreferences();
+  check('the preferences dialog opens with the stored values',
+    doc.getElementById('preferencesModal').classList.contains('open') &&
+      value('prefTransfer') === 'binary' && value('prefFilemask') === '*.txt',
+    value('prefTransfer') + ' / ' + value('prefFilemask'));
+  doc.getElementById('prefConfirmOverwrite').checked = false;
+  doc.getElementById('prefSpeed').value = '128';
+  await window.savePreferences();
+  const prefSave = calls.filter(call => call.path === '/api/preferences' &&
+    (call.options.method || 'GET').toUpperCase() === 'POST').pop();
+  const prefPayload = prefSave ? JSON.parse(prefSave.options.body) : {};
+  check('saving preferences posts the whole document',
+    prefPayload.action === 'save' &&
+      prefPayload.preferences.confirm_overwrite === false &&
+      prefPayload.preferences.speed === 128 &&
+      prefPayload.preferences.transfer === 'binary',
+    JSON.stringify(prefPayload));
+  check('a saved preference is the default the transfer dialog shows',
+    (window.openTransferSettings(), value('transferSpeed') === '128'),
+    value('transferSpeed'));
+  window.closeModal('transferModal');
+  await window.resetPreferences();
+  const prefReset = calls.filter(call => call.path === '/api/preferences' &&
+    (call.options.method || 'GET').toUpperCase() === 'POST').pop();
+  check('restoring the defaults asks the backend to reset them',
+    prefReset && JSON.parse(prefReset.options.body).action === 'reset');
+
+  /* Cleanup: the list is the data this client stores, only ticked entries
+   * are removed, and a location that is gone cannot be ticked or removed. */
+  await window.openCleanup();
+  const cleanupBoxes = () =>
+    Array.from(doc.querySelectorAll('#cleanupList input[type="checkbox"]'));
+  check('the cleanup dialog lists every stored location',
+    doc.getElementById('cleanupModal').classList.contains('open') &&
+      cleanupBoxes().length === 2 &&
+      text('cleanupList').includes('/tmp/cfg/sessions.ini'),
+    text('cleanupList'));
+  check('a location that is not there cannot be ticked',
+    cleanupBoxes()[0].checked === true && cleanupBoxes()[1].disabled === true);
+  window.toggleCleanupAll();
+  check('check all clears the ticked locations first',
+    cleanupBoxes()[0].checked === false);
+  window.toggleCleanupAll();
+  confirmResult = true;
+  await window.runCleanup();
+  const cleanupCall = calls.filter(call => call.path === '/api/cleanup' &&
+    (call.options.method || 'GET').toUpperCase() === 'POST').pop();
+  const cleanupPayload = cleanupCall ? JSON.parse(cleanupCall.options.body) : {};
+  check('removing stored data posts the ticked ids and a confirmation',
+    cleanupPayload.confirm === true &&
+      JSON.stringify(cleanupPayload.ids) === JSON.stringify(['sessions']),
+    JSON.stringify(cleanupPayload));
+  check('a removed location stays listed but can no longer be ticked',
+    cleanupBoxes()[0].disabled === true && text('cleanupStatus').length > 0,
+    text('cleanupStatus'));
+  window.closeModal('cleanupModal');
+
+  /* Copy between two servers: the dialog lists the other sessions, a copy
+   * inside the current session is direct, and any other target is a local
+   * copy that is queued as a job. */
+  window.focusPane('remote');
+  doc.getElementById('remoteFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  await window.openRemoteTransfer();
+  check('the copy dialog lists the other sessions as targets',
+    doc.getElementById('remoteTransferModal').classList.contains('open') &&
+      doc.getElementById('remoteTransferTarget').options.length === 2 &&
+      text('remoteTransferTarget').includes('(this session)'),
+    text('remoteTransferTarget'));
+  check('the copy dialog starts at the current directory and mask',
+    value('remoteTransferDirectory') === '/tmp/slowremote' &&
+      value('remoteTransferMask') === '*.txt',
+    value('remoteTransferDirectory') + ' / ' + value('remoteTransferMask'));
+  check('a copy inside the current session is done by the server',
+    text('remoteTransferHint').includes('by the server itself'),
+    text('remoteTransferHint'));
+  doc.getElementById('remoteTransferTarget').value = 'tab:2';
+  window.remoteTransferTargetChanged();
+  check('another session is copied through a temporary directory',
+    text('remoteTransferHint').includes('temporary directory'),
+    text('remoteTransferHint'));
+  await window.runRemoteTransfer();
+  const remoteCopy = calls.filter(call => call.path === '/api/remote/transfer').pop();
+  const remoteCopyPayload = remoteCopy ? JSON.parse(remoteCopy.options.body) : {};
+  check('the copy posts the target, the directory and the mask',
+    remoteCopyPayload.tab === 1 && remoteCopyPayload.target === 'tab:2' &&
+      remoteCopyPayload.directory === '/tmp/slowremote' &&
+      remoteCopyPayload.filemask === '*.txt' &&
+      JSON.stringify(remoteCopyPayload.names) === JSON.stringify(['keep.txt']),
+    JSON.stringify(remoteCopyPayload));
+
+  /* Properties: every selected entry is read at once, and the dialog can
+   * change the rights of the whole selection from the same place. */
+  await window.openProperties();
+  check('the properties dialog names every selected entry',
+    doc.getElementById('propertiesModal').classList.contains('open') &&
+      text('propertiesBody').includes('/tmp/slowremote/keep.txt') &&
+      text('propertiesBody').includes('Owner'),
+    text('propertiesBody'));
+  check('the properties dialog offers a rights editor',
+    doc.getElementById('propertiesMode') !== null);
+  doc.getElementById('propertiesMode').value = '640';
+  await window.applyPropertiesRights('remote', ['keep.txt']);
+  const rightsCall = calls.filter(call => call.path === '/api/remote/rights').pop();
+  const rightsPayload = rightsCall ? JSON.parse(rightsCall.options.body) : {};
+  check('changing the rights posts the mode for the entry',
+    rightsPayload.mode === '640' &&
+      JSON.stringify(rightsPayload.names) === JSON.stringify(['keep.txt']),
+    JSON.stringify(rightsPayload));
+  window.closeModal('propertiesModal');
 
   check('no script errors', errors.length === 0, errors.join(' | '));
   window.close();

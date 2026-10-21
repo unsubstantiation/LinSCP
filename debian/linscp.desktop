@@ -13,8 +13,8 @@ TryExec=linscp-gui
 Icon=linscp
 Terminal=false
 Categories=Network;FileTransfer;
-Keywords=sftp;ftp;ftps;webdav;s3;scp;winscp;commander;
-MimeType=x-scheme-handler/sftp;x-scheme-handler/ftp;x-scheme-handler/ftps;
+Keywords=sftp;ftp;ftps;ftpes;webdav;s3;scp;winscp;commander;
+MimeType=x-scheme-handler/sftp;x-scheme-handler/ftp;x-scheme-handler/ftps;x-scheme-handler/ftpes;
 # Startup notification is not for this entry: it starts a server and prints an
 # address, and the window that opens belongs to a browser this launcher does not
 # own. A compositor waiting for a window from here waits until it gives up.

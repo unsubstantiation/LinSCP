@@ -85,7 +85,7 @@ install these paths:
 | `/usr/share/linscp/automation/LinSCP.psm1` | the PowerShell 7 wrapper over the console client |
 | `/usr/share/linscp/dotnet/` | the LinSCP .NET assembly sources (`LinSCP.csproj`, `Session.cs`) |
 | `/usr/share/man/man1/linscp.1.gz` | the manual page |
-| `/usr/share/applications/linscp.desktop` | the desktop entry, with `sftp://`, `ftp://` and `ftps://` handlers |
+| `/usr/share/applications/linscp.desktop` | the desktop entry, with `sftp://`, `ftp://`, `ftps://` and `ftpes://` handlers |
 | `/usr/share/pixmaps/linscp.png`, `/usr/share/icons/hicolor/scalable/apps/linscp.svg` | the icons |
 | `/usr/share/doc/linscp/` | the copyright, the licence and this document as `README.Debian` |
 
@@ -504,9 +504,14 @@ watch cannot be set up, the client falls back to timer polling. It runs in the
 foreground until Ctrl-C, or until `-count=` passes complete, so a
 non-interactive script must give `-count=`.
 
-Not implemented: the .NET assembly API, multi-user GUI isolation and broader
-localization beyond English/Spanish. Local-to-local sessions and named
-workspaces are implemented. SSH jump hosts work for SFTP/SCP/SSH;
+The .NET-compatible assembly (`LinSCP.Session`, with `WinSCP.Session` aliases)
+implements session lifecycle, listing, transfers, synchronization, cancellation
+and structured errors, but it is not the complete upstream object model.
+Optional account sign-in isolates users at the application layer while the
+backend still runs as one OS user. Broader localization beyond English/Spanish
+and complete upstream .NET object-model compatibility are not implemented.
+Local-to-local sessions, named workspaces, directory bookmarks, session import
+from OpenSSH/FileZilla and session-URL generation are implemented. SSH jump hosts work for SFTP/SCP/SSH;
 non-SSH tunnels do not, and live Kerberos-realm certification remains open. S3 version-aware operations are implemented as described above; S3 and
 WebDAV still cover documented subsets rather than every upstream extension.
 See the [parity audit](upstream-parity.md) for the full list of verified

@@ -39,6 +39,9 @@ REQUIRED_GAP_IDS = {
     "s3.versioned-objects", "editing.non-utf8-encodings",
     "automation.upstream-xml-compatibility",
     "gui.local-to-local", "sessions.workspaces",
+    "gui.bookmarks", "gui.generate-url", "sessions.import",
+    "sessions.tls-schemes", "gui.preferences", "gui.cleanup",
+    "gui.remote-transfer", "gui.properties-and-rights",
 }
 
 CASE_SOURCES = {

@@ -99,7 +99,8 @@ Run `linscp -help` for the options and `man linscp` for the full reference.
 | `sftp://` | native SFTP v3 over libssh (copy-data / check-file-name extensions included) | full command set |
 | `scp://`, `ssh://` | the client's SSH code: the server's shell for directory work, rcp for bytes | no resume; the protocol has no offset |
 | `ftp://` | native FTP engine for listing and metadata; curl for transfers | |
-| `ftps://` | curl, implicit TLS; `ftp://` with explicit TLS settings also uses curl | |
+| `ftps://` | curl, implicit TLS | |
+| `ftpes://` | curl, explicit TLS on FTP (upstream's spelling; the same session as `ftp://` with `Ftps=2` or `3`) | |
 | `dav://`, `webdav://` | curl, with PROPFIND, MOVE, COPY, locks, dead properties and ETag preconditions | |
 | `s3://` | curl, with SigV4 signing and multipart transfers | partial |
 
@@ -132,9 +133,12 @@ it can be pinned.
   for configuration and limits.
 - **Graphical client:** dual-pane layout, transfer queue with pause, retry and
   priority reordering, transfer settings, sync preview, `keepuptodate`, remote
-  search, checksums, properties, saved command templates, multi-user sign-in,
-  local file editing and drag-and-drop in both panes. Sign-in does not isolate
-  users' tabs, files or commands: do not share one backend among untrusted users.
+  search, checksums, session bookmarks, a session URL, session import, cleanup
+  of stored data, a copy between two servers, properties with a rights editor,
+  preferences stored by the backend, saved command templates, multi-user
+  sign-in, local file editing and drag-and-drop in both panes. Sign-in does not
+  isolate users' tabs, files or commands: do not share one backend among
+  untrusted users.
 - **Localization:** English and Spanish, for the CLI and the GUI.
 - **Desktop sessions:** works on Wayland and on X11 alike. The clients draw no
   window of their own; the terminal `terminal` opens is chosen among the ones
@@ -143,13 +147,19 @@ it can be pinned.
   `xdotool`, `wmctrl` or `xrandr`, which is what makes a Linux application
   X11-only.
 
-Full WinSCP parity is **not** implemented. Remaining gaps include the .NET
-assembly API, multi-user GUI isolation, broader localization beyond
+Full WinSCP parity is **not** implemented. Remaining gaps include complete
+compatibility with the upstream .NET object model, broader localization beyond
 English/Spanish, and further live Kerberos-realm validation of GSSAPI. Local-to-local sessions with two
-local panes and named multi-tab workspaces are implemented and covered by the
-`gui-local` suite.
+local panes, named multi-tab workspaces, directory bookmarks, session import
+from OpenSSH/FileZilla and session-URL generation are implemented and covered
+by the `gui-local` and `gui` suites.
+The .NET-compatible assembly (`LinSCP.Session`, with `WinSCP.Session` aliases)
+covers session lifecycle, listing, transfers, synchronization, cancellation and
+structured errors; it is not every type of the upstream object model.
 `automation/LinSCP.psm1` is a PowerShell 7 CLI wrapper with static tests and
-optional live Pester tests, not the WinSCP .NET API. See the
+optional live Pester tests, not the WinSCP .NET API. Optional account sign-in
+isolates users at the application layer; the backend still runs as one OS user.
+See the
 [remaining parity plan](docs/remaining-parity-plan.md) for scope and acceptance
 criteria; passing the inventory checker is not a full-parity certification.
 

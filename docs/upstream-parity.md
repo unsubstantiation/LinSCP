@@ -12,7 +12,7 @@ The inventory is pinned to [winscp/winscp at
 It is a development snapshot, not a claim about the latest release. The initial
 source review compared upstream `source/core/Script.cpp`, `Script.h`,
 `CopyParam.h`, `Terminal.h`, and core/forms inventories with the Linux client,
-build configuration and GUI. Linux inventory reconciliation: **2026-10-19**.
+build configuration and GUI. Linux inventory reconciliation: **2026-10-20**.
 
 The 2026-10-19 command-registration review also compared upstream master
 [`24e7b4ec1001406cc2edf2b8c88483d66d4449d8`](https://github.com/winscp/winscp/tree/24e7b4ec1001406cc2edf2b8c88483d66d4449d8)
@@ -79,15 +79,27 @@ The review corrected stale claims without upgrading unimplemented work:
   now fails unless the evidence line reports the live cases actually ran.
 - `?`, `delsession`, `terminal`, `presets`, `savepreset` and `rmspreset` are
   explicitly inventoried rather than left outside the command ledger.
+- The upstream GUI surfaces that had no Linux equivalent are implemented and
+  evidenced rather than merely listed: per-panel directory bookmarks
+  (`gui.bookmarks`), the Generate URL dialog as a session URL with an opt-in
+  password and a safe `open` line (`gui.generate-url`), and session import from
+  an OpenSSH client configuration or FileZilla's `sitemanager.xml`
+  (`sessions.import`). An imported FileZilla password is encrypted with
+  `sessions.key`; a wildcard `Host`, `Match`/`Include` block, malformed XML,
+  DOCTYPE/entity declaration or FileZilla FTPS site is reported instead of
+  imported as something it is not.
 - `scp://` (and `ssh://`) sessions use this client's own SSH code, not curl, so
   a host-key pin does not depend on which SSH library the curl build links.
   The rcp protocol has no offset, so a resume is refused by name and a stale
   staging file is discarded.
 
-Upstream Windows VCL forms and .NET assemblies do not have full Linux
-equivalents. Live Kerberos-realm certification, broader non-SSH tunnel
-policy, multi-user GUI isolation and a .NET-compatible automation API remain
-in the plan.
+Upstream Windows VCL forms do not have one-to-one Linux equivalents: the
+Commander is a browser interface and the automation surface is a
+.NET-compatible assembly that covers session lifecycle, listing, transfers and
+synchronization rather than every type of the upstream object model. Optional
+account sign-in isolates users at the application layer, but the backend still
+runs as one OS user. Live Kerberos-realm certification and broader localization
+remain in the plan; the ledger records both as tracked gaps.
 
 ### SSH jump-host implementation and newly identified gaps
 
