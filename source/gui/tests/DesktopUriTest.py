@@ -73,6 +73,20 @@ class DesktopUriTests(unittest.TestCase):
         self.assertEqual((ftp["protocol"], ftp["port"]), ("ftp", 21))
         self.assertEqual((ftps["protocol"], ftps["port"]), ("ftps", 990))
         self.assertEqual(ftp["initial_dir"], "/pub")
+        # 'ftpes://' is FTP with explicit TLS, upstream's other spelling:
+        # the scheme survives the round trip and its port is FTP's 21.
+        explicit = gui.parse_desktop_site_url(
+            "ftpes://alice@files.example.org:2121/pub")
+        self.assertEqual((explicit["protocol"], explicit["port"]),
+                         ("ftpes", 2121))
+        self.assertEqual(explicit["initial_dir"], "/pub")
+        self.assertEqual(gui.session_url(explicit, explicit["initial_dir"]),
+                         "ftpes://alice@files.example.org:2121/pub")
+        default = gui.parse_desktop_site_url("ftpes://files.example.org/")
+        self.assertEqual((default["protocol"], default["port"]), ("ftpes", 21))
+        # new_session() names the default user, which the URL then carries.
+        self.assertEqual(gui.session_url(default),
+                         "ftpes://user@files.example.org/")
 
     def test_session_url_writes_the_port_the_protocol_does_not_imply(self):
         # The port used to be written whenever it was not 22, whatever the
