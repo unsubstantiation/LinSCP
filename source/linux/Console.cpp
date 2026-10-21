@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <sys/stat.h>
 #include <sys/time.h>
 
 namespace linscp {
@@ -97,6 +98,7 @@ std::string Console::XmlTimestampNow()
 Console::Console() :
     mBatchMode(false),
     mVerbose(false),
+    mQuiet(false),
     mLog(NULL),
     mActionLog(NULL),
     mXmlHeaderWritten(false),
@@ -135,7 +137,10 @@ void Console::WriteLine(const std::string & text)
 
 void Console::Status(const std::string & text)
 {
-    WriteLine(text);
+    if (!mQuiet)
+    {
+        WriteLine(text);
+    }
 }
 
 void Console::Error(const std::string & text)
@@ -259,9 +264,42 @@ bool Console::Confirm(const std::string & prompt, bool defaultYes)
          Texts::Translate("yes") == "sí"));
 }
 
-bool Console::SetLogFile(const std::string & path, std::string & error)
+bool Console::SetLogFile(const std::string & path, std::string & error,
+    unsigned long long maxBytes, int maxCount)
 {
     CloseLogFile();
+    /*
+     * Upstream's '/logsize=' rotation: when the file has reached its
+     * limit, the old files move one slot down and the current one
+     * becomes '<path>.1'. A rotation that cannot rename a file is left
+     * alone - the log opening below then reports the real problem - so
+     * that a read-only directory is not reported as a wrong size.
+     */
+    if (maxBytes > 0 && maxCount > 0)
+    {
+        struct stat info;
+        if (stat(path.c_str(), &info) == 0 &&
+            info.st_size >= static_cast<off_t>(maxBytes))
+        {
+            char name[4096];
+            snprintf(name, sizeof(name), "%s.%d", path.c_str(), maxCount);
+            remove(name);
+            for (int index = maxCount - 1; index >= 1; index--)
+            {
+                char from[4096];
+                char to[4096];
+                snprintf(from, sizeof(from), "%s.%d", path.c_str(), index);
+                snprintf(to, sizeof(to), "%s.%d", path.c_str(), index + 1);
+                if (rename(from, to) != 0 && errno != ENOENT)
+                {
+                    break;
+                }
+            }
+            char first[4096];
+            snprintf(first, sizeof(first), "%s.1", path.c_str());
+            rename(path.c_str(), first);
+        }
+    }
     /* Binary append: the log also records raw traffic (LogTraffic),
      * which a text-mode stream would corrupt. */
     mLog = fopen(path.c_str(), "ab");

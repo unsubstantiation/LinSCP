@@ -64,6 +64,9 @@ public:
     /* Event log entries from the SSH layer (only with -verbose). */
     void LogEvent(const std::string & text);
     void SetVerbose(bool verbose) { mVerbose = verbose; }
+    /* '-loglevel=-1': only errors and command output reach the terminal,
+     * the status lines that narrate ordinary progress stay out of it. */
+    void SetQuiet(bool quiet) { mQuiet = quiet; }
     bool IsVerbose() const { return mVerbose; }
 
     /* Reads one line from stdin; returns false at end of file. */
@@ -72,7 +75,12 @@ public:
     bool Confirm(const std::string & prompt, bool defaultYes);
 
     /* Session log file (line-oriented text format). */
-    bool SetLogFile(const std::string & path, std::string & error);
+    /* Opens the session log. A positive 'maxBytes' rotates the file
+     * first when it has reached that size: up to 'maxCount' older files
+     * are kept as '<path>.1' .. '<path>.<maxCount>', newest first, which
+     * is upstream's '/logsize=[<count>*]<size>' policy. */
+    bool SetLogFile(const std::string & path, std::string & error,
+        unsigned long long maxBytes = 0, int maxCount = 1);
     void LogTraffic(const void * data, size_t len, bool incoming);
     void CloseLogFile();
 
@@ -163,6 +171,7 @@ private:
 
     bool mBatchMode;
     bool mVerbose;
+    bool mQuiet;
     FILE * mLog;
     FILE * mActionLog;
     bool mXmlHeaderWritten;

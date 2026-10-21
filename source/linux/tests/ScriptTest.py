@@ -576,7 +576,7 @@ class ScriptTests(unittest.TestCase):
         # up front instead of being silently ignored.
         for command in ("get", "recv", "mget", "put", "send", "mput"):
             for switch in ("-resumegarbage", "-resume=off", "-speed=x", "-speed=1K",
-                           "-unknown", "-latest", "-criteria=time",
+                           "-unknown", "-criteria=time",
                            "-transfer=garbage", "-filemask=",
                            "-filemask=*.txt|*.a|*.b", "-permissions=999",
                            "-preservetime=hours", "-resumesupport=maybe",
@@ -589,6 +589,102 @@ class ScriptTests(unittest.TestCase):
                                     result.stderr)
                     self.assertNotIn("Not connected", result.stderr)
 
+    def test_latest_cannot_be_combined_with_versionid(self):
+        # Both name which object is meant, in two incompatible ways; the
+        # command says so before it asks for the connection it does not
+        # need to see the contradiction.
+        result = self.run_commands("get -latest -versionid=abc source dest")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("'-latest' cannot be combined with '-versionid'", result.stderr)
+        self.assertNotIn("Not connected", result.stderr)
+
+    def test_open_switch_values_are_validated(self):
+        # Upstream's on/off grammar: empty, 'on', 'off' without case, and a
+        # whole number that means on unless it is zero. Anything else is a
+        # refusal, never a silent default.
+        for switch in ("-timeout=abc", "-timeout=0", "-timeout=-1",
+                       "-timeout=99999999999", "-implicit=maybe",
+                       "-explicit=maybe", "-passive=maybe"):
+            with self.subTest(switch=switch):
+                result = self.run_commands(
+                    "open sftp://user@127.0.0.1:1 " + switch)
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("Connecting", result.stdout)
+        # The accepted spellings reach the connection attempt instead.
+        for switch, url in (("-passive=2", "sftp"), ("-passive=off", "sftp"),
+                            ("-implicit=off", "sftp"), ("-explicit=1", "ftp"),
+                            ("-timeout=5", "sftp"), ("-TIMEOUT=5", "sftp")):
+            with self.subTest(switch=switch):
+                result = self.run_commands(
+                    "open %s://user@127.0.0.1:1 %s" % (url, switch))
+                self.assertIn("Cannot open session", result.stderr)
+
+    def test_cli_accepts_slash_marks_and_colon_delimiters(self):
+        # The command line takes '/' as an option mark and ':' as a value
+        # delimiter, as upstream does.
+        result = subprocess.run([BINARY, "/loglevel:1", "-command=echo HI"],
+                                capture_output=True, text=True, timeout=10,
+                                env=self.environment())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("HI", result.stdout)
+
+        # A token after the bare '--' terminator is not an option any more.
+        result = subprocess.run([BINARY, "--", "-help"],
+                                capture_output=True, text=True, timeout=10,
+                                env=self.environment())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Options:", result.stdout)
+
+        # A POSIX path is not an option even though it starts with '/'.
+        result = subprocess.run([BINARY, "/tmp"],
+                                capture_output=True, text=True, timeout=10,
+                                env=self.environment())
+        self.assertNotIn("Unknown option", result.stderr)
+        self.assertNotIn("Options:", result.stdout)
+
+    def test_cli_log_level_and_log_size_are_validated(self):
+        result = subprocess.run([BINARY, "/loglevel=3", "-command=echo HI"],
+                                capture_output=True, text=True, timeout=10,
+                                env=self.environment())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Invalid log level", result.stderr)
+        result = subprocess.run([BINARY, "/loglevel=abc", "-command=echo HI"],
+                                capture_output=True, text=True, timeout=10,
+                                env=self.environment())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Invalid log level", result.stderr)
+        for value in ("0", "2*0", "2*", "*10M", "0*1M", "101*1M", "2*10X"):
+            with self.subTest(value=value):
+                result = subprocess.run(
+                    [BINARY, "/logsize=" + value, "-command=echo HI"],
+                    capture_output=True, text=True, timeout=10,
+                    env=self.environment())
+                self.assertEqual(result.returncode, 1, value)
+                self.assertIn("'-logsize'", result.stderr)
+
+        # A log at the limit is rotated to '<path>.1' before the next run
+        # writes it, and a later generation overwrites the oldest one
+        # instead of growing without bound.
+        with tempfile.TemporaryDirectory(prefix="linscp-log-") as temp:
+            log = pathlib.Path(temp) / "session.log"
+            for _ in range(2):
+                result = subprocess.run(
+                    [BINARY, "/log=" + str(log), "/logsize=1",
+                     "-command=echo HI"],
+                    capture_output=True, text=True, timeout=20,
+                    env=self.environment())
+                self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(log.exists())
+            self.assertTrue(pathlib.Path(str(log) + ".1").exists())
+            for _ in range(2):
+                subprocess.run(
+                    [BINARY, "/log=" + str(log), "/logsize=2*1",
+                     "-command=echo HI"],
+                    capture_output=True, text=True, timeout=20,
+                    env=self.environment())
+            self.assertTrue(pathlib.Path(str(log) + ".1").exists())
+            self.assertTrue(pathlib.Path(str(log) + ".2").exists())
+
     def test_transfer_switches_are_accepted(self):
         for command in ("get", "recv", "mget", "put", "send", "mput"):
             for switch in ("-filemask=*.txt|*.bak",
@@ -598,7 +694,7 @@ class ScriptTests(unittest.TestCase):
                            "-speed=10", "-speed=0", "-resumesupport=on",
                            "-resumesupport=off", "-resumesupport=1024",
                            "-preservetime=all", "-noneweronly", "-append",
-                           "-nopreservetime", "-neweronly"):
+                           "-nopreservetime", "-neweronly", "-latest"):
                 with self.subTest(command=command, switch=switch):
                     result = self.run_commands(f"{command} {switch} source destination")
                     self.assertEqual(result.returncode, 1)
