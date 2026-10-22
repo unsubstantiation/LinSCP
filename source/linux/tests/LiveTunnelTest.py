@@ -739,7 +739,7 @@ class LiveTunnelTests(unittest.TestCase):
         jump = JumpEndpoint(dest_port)
         self.addCleanup(jump.close)
         argv = [BINARY, "-batch", "-hostkey=*", "-timeout=20"] + list(extra)
-        argv.append("-command=open %s -rawsettings TunnelHostName=127.0.0.1 "
+        argv.append("-command=open %s -rawsettings Tunnel=1 TunnelHostName=127.0.0.1 "
                     "TunnelPortNumber=%d TunnelUserName=jump TunnelPassword=%s "
                     "TunnelHostKey=%s ; %s" %
                     (url, jump.port, quote(jump.password),
@@ -806,7 +806,7 @@ class LiveTunnelTests(unittest.TestCase):
         result = subprocess.run(
             [BINARY, "-batch", "-hostkey=*", "-timeout=20",
              "-command=open dav://testuser:testpass@destination.internal.invalid:%d/ "
-             "-rawsettings TunnelHostName=127.0.0.1 TunnelPortNumber=%d "
+             "-rawsettings Tunnel=1 TunnelHostName=127.0.0.1 TunnelPortNumber=%d "
              "TunnelUserName=jump TunnelPassword=%s TunnelHostKey=%s ; ls / ; exit" %
              (dav_port, jump.port, quote(jump.password), fingerprint(jump.key))],
             cwd=self.local, capture_output=True, text=True, timeout=60,
@@ -827,7 +827,7 @@ class LiveTunnelTests(unittest.TestCase):
         result = subprocess.run(
             [BINARY, "-batch", "-hostkey=*", "-timeout=20",
              "-command=open dav://testuser:testpass@destination.internal.invalid:%d/ "
-             "-rawsettings TunnelHostName=127.0.0.1 TunnelPortNumber=%d "
+             "-rawsettings Tunnel=1 TunnelHostName=127.0.0.1 TunnelPortNumber=%d "
              "TunnelUserName=jump TunnelPassword=%s TunnelHostKey=%s "
              "TunnelLocalPortNumber=%d ; ls / ; exit" %
              (dav_port, jump.port, quote(jump.password), fingerprint(jump.key),
