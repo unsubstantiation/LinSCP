@@ -155,9 +155,11 @@ check-wayland:
 
 # Transfers against the servers in tests/, which take seconds rather than
 # milliseconds: ScriptTest is server-free, LiveSftpTest skips its SFTP cases
-# without paramiko and its isolated Kerberos realm cases without kinit,
-# krb5-kdc, sshd/ssh-keygen or GSSAPI-enabled libssh. LiveScpTest starts a
-# throwaway sshd of its own and skips without sshd/ssh-keygen, LiveS3Test is
+# without paramiko and its isolated Kerberos realm cases without
+# kinit/klist, kdb5_util/kadmin.local/krb5kdc, sshd/ssh-keygen or a
+# GSSAPI-enabled libssh (krb5-user, krb5-kdc, krb5-admin-server).
+# LiveScpTest starts its own throwaway sshd and skips without sshd/ssh-keygen;
+# LiveS3Test is
 # standard-library-only (botocore is an optional extra one test skips without),
 # LiveCurlTest uses optional pyftpdlib/pyOpenSSL when available, the GUI search
 # test uses a fake session, and the PowerShell harness always runs its static

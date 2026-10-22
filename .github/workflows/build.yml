@@ -16,7 +16,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             build-essential cmake pkg-config libssh-dev libssl-dev \
             libargon2-dev zlib1g-dev curl libkrb5-dev krb5-kdc krb5-user \
-            openssh-server
+            krb5-admin-server openssh-server
       - name: Build and run unit tests
         run: |
           set -o pipefail
@@ -313,7 +313,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             build-essential cmake pkg-config libssh-dev libssl-dev \
             libargon2-dev zlib1g-dev curl libkrb5-dev krb5-kdc krb5-user \
-            openssh-server
+            krb5-admin-server openssh-server
       - name: Configure and build
         run: |
           # ctest runs the same live suites as the Makefile

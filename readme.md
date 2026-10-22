@@ -49,10 +49,11 @@ ctest --test-dir build --output-on-failure
 The live suites use optional Python packages: `paramiko` (SFTP),
 `botocore` (S3 signature reference), `xmlschema` (XML log schema
 validation), and `pyftpdlib` with `pyOpenSSL`
-(FTP/FTPS). The GSSAPI cases in the SFTP suite need `krb5-kdc`, `krb5-user`,
-`openssh-server` and a GSSAPI-enabled libssh; they start an isolated KDC and
-`sshd` bound to loopback. The SCP suite also needs `openssh-server`; it starts
-its own `sshd` on a free port. A suite that skips a case says so on its evidence line.
+(FTP/FTPS). The GSSAPI cases in the SFTP suite need `krb5-kdc`,
+`krb5-admin-server`, `krb5-user`, `openssh-server` and a GSSAPI-enabled libssh;
+they start an isolated KDC and `sshd` bound to loopback. The SCP suite also
+needs `openssh-server`; it starts its own `sshd` on a free port. A suite that
+skips a case says so on its evidence line.
 
 The GUI suites (`source/gui/tests/`) run separately, as in CI. The two browser
 suites (`ClientTest.js`, `LocalizationTest.js`) are the ones that need Node and

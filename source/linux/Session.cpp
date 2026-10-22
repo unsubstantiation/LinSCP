@@ -1552,31 +1552,6 @@ std::string GssapiKeyExchangeList(const SessionOptions & options)
 bool ValidateSessionSettings(const SessionOptions & options, std::string & error)
 {
     error.clear();
-    if ((UseNativeSftp(options.protocol) || UseNativeScp(options.protocol)) &&
-        options.gssapi.authKex && !options.hostKey.empty() &&
-        options.hostKey != "*")
-    {
-        error = Texts::Translate("AuthGSSAPIKEX cannot be used with a pinned "
-            "host key because GSSAPI key exchange does not present a host key.");
-        return false;
-    }
-    if ((UseNativeSftp(options.protocol) || UseNativeScp(options.protocol)) &&
-        !IsGssapiSupported() &&
-        (options.gssapi.authKex || options.gssapi.forwardTgt ||
-         !options.gssapi.logicalHost.empty()))
-    {
-        error = Texts::Translate("This build's libssh cannot use GSSAPI, so the session's "
-            "Kerberos settings (AuthGSSAPIKEX, GSSAPIFwdTGT, LogicalHostName) "
-            "would be dropped.");
-        return false;
-    }
-    if ((UseNativeSftp(options.protocol) || UseNativeScp(options.protocol)) &&
-        options.gssapi.authKex && !IsGssapiKeyExchangeSupported())
-    {
-        error = Texts::Translate("This build's libssh does not support GSSAPI key "
-            "exchange, so AuthGSSAPIKEX cannot be honored.");
-        return false;
-    }
     if (!ValidateProxySettings(options.proxy, error))
     {
         return false;
@@ -1645,6 +1620,38 @@ bool ValidateSessionSettings(const SessionOptions & options, std::string & error
             "no TLS library is linked. Pin the public key instead "
             "(-rawsettings PinnedPublicKey=sha256//BASE64, or a PEM/DER "
             "file), or accept any certificate with -hostkey=\"*\".";
+        return false;
+    }
+    return true;
+}
+
+bool ValidateSessionCapabilities(const SessionOptions & options,
+    std::string & error)
+{
+    error.clear();
+    const bool nativeSsh = UseNativeSftp(options.protocol) ||
+        UseNativeScp(options.protocol);
+    if (nativeSsh && options.gssapi.authKex &&
+        !options.hostKey.empty() && options.hostKey != "*")
+    {
+        error = Texts::Translate("AuthGSSAPIKEX cannot be used with a pinned "
+            "host key because GSSAPI key exchange does not present a host key.");
+        return false;
+    }
+    if (nativeSsh && !IsGssapiSupported() &&
+        (options.gssapi.authKex || options.gssapi.forwardTgt ||
+         !options.gssapi.logicalHost.empty()))
+    {
+        error = Texts::Translate("This build's libssh cannot use GSSAPI, so the session's "
+            "Kerberos settings (AuthGSSAPIKEX, GSSAPIFwdTGT, LogicalHostName) "
+            "would be dropped.");
+        return false;
+    }
+    if (nativeSsh && options.gssapi.authKex &&
+        !IsGssapiKeyExchangeSupported())
+    {
+        error = Texts::Translate("This build's libssh does not support GSSAPI key "
+            "exchange, so AuthGSSAPIKEX cannot be honored.");
         return false;
     }
     return true;
@@ -2964,7 +2971,8 @@ bool Session::Connect(const SessionOptions & options, const char * program,
         error = "The connection timeout must be a positive number of seconds.";
         return false;
     }
-    if (!ValidateSessionSettings(options, error))
+    if (!ValidateSessionSettings(options, error) ||
+        !ValidateSessionCapabilities(options, error))
     {
         return false;
     }

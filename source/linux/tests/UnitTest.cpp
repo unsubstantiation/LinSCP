@@ -4197,17 +4197,22 @@ void TestSshTunnelParsing()
             !kexWithoutMic.empty() : kexWithoutMic.empty());
         SessionOptions kexSettings;
         kexSettings.gssapi.authKex = true;
+        std::string settingsError;
+        CHECK_TRUE(ValidateSessionSettings(kexSettings, settingsError));
         std::string kexError;
         const bool kexSettingsValid =
-            ValidateSessionSettings(kexSettings, kexError);
+            ValidateSessionCapabilities(kexSettings, kexError);
         CHECK_TRUE(IsGssapiKeyExchangeSupported() ? kexSettingsValid :
             (!kexSettingsValid &&
              kexError.find("AuthGSSAPIKEX") != std::string::npos));
         SessionOptions pinnedKexSettings;
         pinnedKexSettings.gssapi.authKex = true;
         pinnedKexSettings.hostKey = "SHA256:abc";
+        std::string pinnedSettingsError;
+        CHECK_TRUE(ValidateSessionSettings(pinnedKexSettings,
+            pinnedSettingsError));
         std::string pinnedKexError;
-        CHECK_FALSE(ValidateSessionSettings(pinnedKexSettings,
+        CHECK_FALSE(ValidateSessionCapabilities(pinnedKexSettings,
             pinnedKexError));
         CHECK_TRUE(pinnedKexError.find("pinned host key") != std::string::npos);
         options.hostKey = "SHA256:abc";

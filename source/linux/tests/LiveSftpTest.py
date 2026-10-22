@@ -8,8 +8,9 @@ resume across a connection that died half way through.
 The server is TestSftpServer.py, started per test on a port the kernel picks,
 so a run cannot collide with a server somebody else is using. Most cases need
 optional `paramiko`. The GSSAPI cases independently start a temporary MIT KDC
-and OpenSSH server and need `krb5-kdc`, `krb5-user`, `sshd`, `ssh-keygen` and a
-GSSAPI-enabled libssh. Both groups skip loudly when their local dependencies
+and OpenSSH server and need `krb5-kdc`, `krb5-admin-server`, `krb5-user`,
+`sshd`, `ssh-keygen` and a GSSAPI-enabled libssh. Both groups skip loudly
+when their local dependencies
 are absent; CI sets `LSCP_REQUIRE_GSSAPI_REALM=1` so realm coverage cannot
 silently become a skip.
 
@@ -1545,7 +1546,8 @@ class LiveGssapiRealmTests(unittest.TestCase):
         if missing:
             cls.dependency_error = (
                 "Kerberos realm test needs " + ", ".join(missing) +
-                " (install krb5-kdc, krb5-user and openssh-server)")
+                " (install krb5-kdc, krb5-admin-server, krb5-user "
+                "and openssh-server)")
             if cls.REQUIRE:
                 raise RuntimeError(cls.dependency_error)
             return
