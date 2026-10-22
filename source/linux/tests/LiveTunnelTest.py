@@ -707,7 +707,7 @@ class LiveTunnelTests(unittest.TestCase):
             from pyftpdlib.servers import FTPServer
         except ImportError as exc:
             self.skipTest("pyftpdlib is not installed: %s" % exc)
-        root = pathlib.Path(self.workdir.name) / "ftp-root"
+        root = self.root / "ftp-root"
         root.mkdir(exist_ok=True)
         authorizer = DummyAuthorizer()
         authorizer.add_user("test", "test", str(root), perm="elradfmwMT")
@@ -740,7 +740,7 @@ class LiveTunnelTests(unittest.TestCase):
         self.addCleanup(jump.close)
         argv = [BINARY, "-batch", "-hostkey=*", "-timeout=20"] + list(extra)
         argv.append("-command=open %s -rawsettings Tunnel=1 TunnelHostName=127.0.0.1 "
-                    "TunnelPortNumber=%d TunnelUserName=jump TunnelPassword=%s "
+                    "TunnelPortNumber=%d TunnelUserName=jump-user TunnelPassword=%s "
                     "TunnelHostKey=%s ; %s" %
                     (url, jump.port, quote(jump.password),
                      fingerprint(jump.key), commands))
@@ -807,7 +807,7 @@ class LiveTunnelTests(unittest.TestCase):
             [BINARY, "-batch", "-hostkey=*", "-timeout=20",
              "-command=open dav://testuser:testpass@destination.internal.invalid:%d/ "
              "-rawsettings Tunnel=1 TunnelHostName=127.0.0.1 TunnelPortNumber=%d "
-             "TunnelUserName=jump TunnelPassword=%s TunnelHostKey=%s ; ls / ; exit" %
+             "TunnelUserName=jump-user TunnelPassword=%s TunnelHostKey=%s ; ls / ; exit" %
              (dav_port, jump.port, quote(jump.password), fingerprint(jump.key))],
             cwd=self.local, capture_output=True, text=True, timeout=60,
             env=dict(os.environ, LINSCP_CONFIG_DIR=str(self.config)))
@@ -828,7 +828,7 @@ class LiveTunnelTests(unittest.TestCase):
             [BINARY, "-batch", "-hostkey=*", "-timeout=20",
              "-command=open dav://testuser:testpass@destination.internal.invalid:%d/ "
              "-rawsettings Tunnel=1 TunnelHostName=127.0.0.1 TunnelPortNumber=%d "
-             "TunnelUserName=jump TunnelPassword=%s TunnelHostKey=%s "
+             "TunnelUserName=jump-user TunnelPassword=%s TunnelHostKey=%s "
              "TunnelLocalPortNumber=%d ; ls / ; exit" %
              (dav_port, jump.port, quote(jump.password), fingerprint(jump.key),
               occupied)],
