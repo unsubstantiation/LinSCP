@@ -86,7 +86,7 @@ class DesktopUriTests(unittest.TestCase):
         self.assertEqual((default["protocol"], default["port"]), ("ftpes", 21))
         # new_session() names the default user, which the URL then carries.
         self.assertEqual(gui.session_url(default),
-                         "ftpes://user@files.example.org/")
+                         "ftpes://%s@files.example.org/" % default["username"])
 
     def test_session_url_writes_the_port_the_protocol_does_not_imply(self):
         # The port used to be written whenever it was not 22, whatever the

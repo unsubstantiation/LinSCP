@@ -205,6 +205,8 @@ class LiveTunnelTests(unittest.TestCase):
         self.remote.mkdir()
         self.config = self.root / "config"
         self.config.mkdir()
+        self.local = self.root / "local"
+        self.local.mkdir()
         self.server = subprocess.Popen(
             [sys.executable, str(HERE / "TestSftpServer.py")],
             env=dict(os.environ, LSCP_TEST_PORT="0", LSCP_TEST_ROOT=str(self.remote)),
@@ -735,7 +737,7 @@ class LiveTunnelTests(unittest.TestCase):
 
     def run_protocol_through_jump(self, dest_port, url, commands, extra=()):
         jump = JumpEndpoint(dest_port)
-        self.addCleanup(jump.stop)
+        self.addCleanup(jump.close)
         argv = [BINARY, "-batch", "-hostkey=*", "-timeout=20"] + list(extra)
         argv.append("-command=open %s -rawsettings TunnelHostName=127.0.0.1 "
                     "TunnelPortNumber=%d TunnelUserName=jump TunnelPassword=%s "
@@ -800,7 +802,7 @@ class LiveTunnelTests(unittest.TestCase):
         _, dav_port = self.start_dav_server()
         jump = JumpEndpoint(dav_port)
         jump.reject_forward = True
-        self.addCleanup(jump.stop)
+        self.addCleanup(jump.close)
         result = subprocess.run(
             [BINARY, "-batch", "-hostkey=*", "-timeout=20",
              "-command=open dav://testuser:testpass@destination.internal.invalid:%d/ "
@@ -821,7 +823,7 @@ class LiveTunnelTests(unittest.TestCase):
         occupied = holder.getsockname()[1]
         _, dav_port = self.start_dav_server()
         jump = JumpEndpoint(dav_port)
-        self.addCleanup(jump.stop)
+        self.addCleanup(jump.close)
         result = subprocess.run(
             [BINARY, "-batch", "-hostkey=*", "-timeout=20",
              "-command=open dav://testuser:testpass@destination.internal.invalid:%d/ "
