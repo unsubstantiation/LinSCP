@@ -815,6 +815,9 @@ class LiveTunnelTests(unittest.TestCase):
         self.assertRegex(result.stdout + result.stderr,
                          r"Could not connect|Connection failed|tunnel|SOCKS|refused",
                          result.stdout + result.stderr)
+        self.assertTrue(jump.forwards, "the failed destination must be attempted through the jump")
+        self.assertTrue(all(host == "destination.internal.invalid"
+                            for host, _ in jump.forwards), jump.forwards)
 
     def test_socks_local_port_collision_is_reported(self):
         holder = socket.socket()
@@ -835,7 +838,7 @@ class LiveTunnelTests(unittest.TestCase):
             cwd=self.local, capture_output=True, text=True, timeout=60,
             env=dict(os.environ, LINSCP_CONFIG_DIR=str(self.config)))
         self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn("Could not listen on tunnel port", result.stdout + result.stderr)
+        self.assertIn("Cannot listen on the tunnel local port", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

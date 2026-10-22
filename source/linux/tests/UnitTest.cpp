@@ -3988,6 +3988,25 @@ void TestSshJumpSettings()
     CHECK_TRUE(ValidateSessionSettings(options, error));
 }
 
+void TestCurlTunnelArgs()
+{
+    SessionOptions options;
+    std::vector<std::string> args;
+    AddCurlTunnelArgs(options, args);
+    CHECK_TRUE(args.empty());
+
+    options.tunnelSocksPort = 43123;
+    AddCurlTunnelArgs(options, args);
+    CHECK_TRUE(args.size() == 4);
+    if (args.size() == 4)
+    {
+        CHECK_EQ(args[0], std::string("--socks5-hostname"));
+        CHECK_EQ(args[1], std::string("127.0.0.1:43123"));
+        CHECK_EQ(args[2], std::string("--noproxy"));
+        CHECK_EQ(args[3], std::string());
+    }
+}
+
 void TestSocks5Helpers()
 {
     std::string host, error;
@@ -4595,6 +4614,7 @@ int main()
     TestNonUnixListingFormats();
     TestEncodingHelpers();
     TestSshTunnelParsing();
+    TestCurlTunnelArgs();
     TestSocks5Helpers();
     TestSshJumpSettings();
     TestDavEtagHelpers();
