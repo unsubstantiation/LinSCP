@@ -512,8 +512,12 @@ backend still runs as one OS user. Broader localization beyond English/Spanish
 and complete upstream .NET object-model compatibility are not implemented.
 Local-to-local sessions, named workspaces, directory bookmarks, session import
 from OpenSSH/FileZilla and session-URL generation are implemented. SSH jump hosts work for SFTP/SCP/SSH;
-non-SSH tunnels do not, and live Kerberos-realm certification remains open. S3 version-aware operations are implemented as described above; S3 and
-WebDAV still cover documented subsets rather than every upstream extension.
+non-SSH tunnels do not. The live SFTP suite provisions a loopback-only Kerberos
+realm for GSSAPI authentication, including principal selection, credential
+expiry, service identity and opt-in delegation; broader production-realm
+validation and an independent delegation security review remain open. S3
+version-aware operations are implemented as described above; S3 and WebDAV
+still cover documented subsets rather than every upstream extension.
 See the [parity audit](upstream-parity.md) for the full list of verified
 capabilities and remaining gaps.
 

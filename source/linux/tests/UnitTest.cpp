@@ -19,6 +19,12 @@
 #include <filesystem>
 #include <map>
 #include <sys/stat.h>
+#include <libssh/libssh.h>
+
+/* The GSSAPI-specific public helper is absent from libssh builds without
+ * WITH_GSSAPI. Mirror the production weak probe to verify the build-time
+ * capability, including in CI builds that do not provide Kerberos. */
+#pragma weak ssh_gssapi_set_creds
 
 #include "PathUtil.h"
 #include "ScriptParams.h"
@@ -4135,13 +4141,12 @@ void TestSshTunnelParsing()
         tunnel.bindPort = 1080;
         CHECK_EQ(TunnelSshFlags(tunnel), std::string("-D 0.0.0.0:1080"));
     }
-    /* Library detection alone must never claim an authentication feature:
-     * the answer tracks what the loaded libssh advertises, and the
-     * settings are real either way. */
+    /* ssh_version() does not list optional features. The GSSAPI entry point
+     * is present only when the loaded libssh was built with WITH_GSSAPI, and
+     * the weak reference keeps the no-GSSAPI build linkable. */
     {
-        const std::string version = Texts::VersionLine();
         CHECK_TRUE(IsGssapiSupported() ==
-            (version.find("gssapi") != std::string::npos));
+            (ssh_gssapi_set_creds != NULL));
         std::string error;
         SessionOptions options;
         /* Upstream's defaults: gssapi-with-mic on, key exchange and
@@ -4152,7 +4157,7 @@ void TestSshTunnelParsing()
         CHECK_TRUE(IsSessionRawSettingName("AuthGSSAPI"));
         CHECK_TRUE(ApplySessionRawSetting("AuthGSSAPI", "0", options, error));
         CHECK_FALSE(options.gssapi.auth);
-        /* No key-exchange list while the method itself is off. */
+        /* No key-exchange list while AuthGSSAPIKEX itself is off. */
         CHECK_TRUE(GssapiKeyExchangeList(options).empty());
         CHECK_TRUE(ApplySessionRawSetting("AuthGSSAPI", "1", options, error));
         CHECK_TRUE(ApplySessionRawSetting("AuthGSSAPIKEX", "1", options, error));
@@ -4172,7 +4177,7 @@ void TestSshTunnelParsing()
          * can use them, and a pinned host key suppresses it entirely:
          * a pin must be checked, and GSSAPI key exchange has no key. */
         const std::string kex = GssapiKeyExchangeList(options);
-        if (IsGssapiSupported())
+        if (IsGssapiKeyExchangeSupported())
         {
             CHECK_TRUE(kex.rfind("gss-group14-sha256-", 0) == 0);
             CHECK_TRUE(kex.find("curve25519-sha256") != std::string::npos);
@@ -4181,6 +4186,30 @@ void TestSshTunnelParsing()
         {
             CHECK_TRUE(kex.empty());
         }
+        /* AuthGSSAPI controls user authentication; a supported server-auth
+         * KEX is independent of that switch. */
+        SessionOptions authDisabled;
+        authDisabled.gssapi.auth = false;
+        authDisabled.gssapi.authKex = true;
+        const std::string kexWithoutMic =
+            GssapiKeyExchangeList(authDisabled);
+        CHECK_TRUE(IsGssapiKeyExchangeSupported() ?
+            !kexWithoutMic.empty() : kexWithoutMic.empty());
+        SessionOptions kexSettings;
+        kexSettings.gssapi.authKex = true;
+        std::string kexError;
+        const bool kexSettingsValid =
+            ValidateSessionSettings(kexSettings, kexError);
+        CHECK_TRUE(IsGssapiKeyExchangeSupported() ? kexSettingsValid :
+            (!kexSettingsValid &&
+             kexError.find("AuthGSSAPIKEX") != std::string::npos));
+        SessionOptions pinnedKexSettings;
+        pinnedKexSettings.gssapi.authKex = true;
+        pinnedKexSettings.hostKey = "SHA256:abc";
+        std::string pinnedKexError;
+        CHECK_FALSE(ValidateSessionSettings(pinnedKexSettings,
+            pinnedKexError));
+        CHECK_TRUE(pinnedKexError.find("pinned host key") != std::string::npos);
         options.hostKey = "SHA256:abc";
         CHECK_TRUE(GssapiKeyExchangeList(options).empty());
         options.hostKey = "*";

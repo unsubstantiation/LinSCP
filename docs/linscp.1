@@ -1158,8 +1158,10 @@ are implemented. A .NET-compatible session assembly covers session lifecycle,
 listing, transfers, synchronization and cancellation, but not the complete
 upstream object model; optional account sign-in isolates users at the
 application layer. Complete upstream .NET object-model compatibility, broader
-localization and live Kerberos-realm certification remain incomplete;
-local-to-local panes, named multi-tab workspaces, directory bookmarks, session
+localization and broader production-realm validation plus an independent
+security review of delegated Kerberos credentials remain incomplete. The live
+SFTP suite exercises GSSAPI against an isolated loopback KDC and OpenSSH server.
+Local-to-local panes, named multi-tab workspaces, directory bookmarks, session
 import from OpenSSH/FileZilla and session-URL generation are implemented. A
 PowerShell 7 CLI wrapper exists with static and optional live Pester tests;
 it is not the WinSCP .NET object model.

@@ -6,9 +6,12 @@ refused open, operations the server denies, an interrupted transfer and a
 resume across a connection that died half way through.
 
 The server is TestSftpServer.py, started per test on a port the kernel picks,
-so a run cannot collide with a server somebody else is using. paramiko is the
-only external requirement and it is optional: without it the whole module
-skips, loudly, rather than pretending to pass.
+so a run cannot collide with a server somebody else is using. Most cases need
+optional `paramiko`. The GSSAPI cases independently start a temporary MIT KDC
+and OpenSSH server and need `krb5-kdc`, `krb5-user`, `sshd`, `ssh-keygen` and a
+GSSAPI-enabled libssh. Both groups skip loudly when their local dependencies
+are absent; CI sets `LSCP_REQUIRE_GSSAPI_REALM=1` so realm coverage cannot
+silently become a skip.
 
 A test that cannot run says so per test instead of taking the whole suite
 with it, because a run that silently does less is worth more than one that
@@ -19,8 +22,10 @@ import hashlib
 import importlib.util
 import os
 import pathlib
+import pwd
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1472,45 +1477,510 @@ class LiveSftpTests(unittest.TestCase):
                          source.read_bytes())
 
 
-def isolated_kerberos_realm():
-    """True only when an isolated KDC is provisioned for this run.
+def _test_program(*names):
+    """Return an executable, including Debian's administrative sbin paths."""
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+        for directory in ("/usr/sbin", "/usr/bin", "/sbin", "/bin"):
+            candidate = os.path.join(directory, name)
+            if os.access(candidate, os.X_OK):
+                return candidate
+    return None
 
-    Principal selection, missing/expired tickets, mutual authentication and
-    opt-in delegation need a realm this suite does not start. Without
-    kinit, a KDC and LSCP_TEST_KRB5_REALM the cases skip instead of
-    pretending a password fallback is realm certification.
-    """
-    return bool(shutil.which("kinit") and shutil.which("krb5-kdc") and
-                os.environ.get("LSCP_TEST_KRB5_REALM"))
+
+def _test_free_port(udp=False):
+    """Choose an unused loopback port; KDC tests reserve UDP and TCP alike."""
+    for _ in range(20):
+        tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tcp.bind(("127.0.0.1", 0))
+        port = tcp.getsockname()[1]
+        sockets = [tcp]
+        if udp:
+            datagram = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                datagram.bind(("127.0.0.1", port))
+            except OSError:
+                tcp.close()
+                datagram.close()
+                continue
+            sockets.append(datagram)
+        for sock in sockets:
+            sock.close()
+        return port
+    raise RuntimeError("could not reserve a loopback test port")
 
 
 class LiveGssapiRealmTests(unittest.TestCase):
-    """Optional GSSAPI against an isolated Kerberos realm.
+    """Run GSSAPI against a private MIT Kerberos realm and throwaway sshd.
 
-    The offer/fallback order is covered by LiveSftpTests. These cases are
-    the realm itself, and they skip without one.
+    The KDC, key database, keytab, client caches and SSH server live under one
+    temporary directory. The KDC and sshd listen only on loopback; the server
+    process is not given the client's credential-cache environment variable.
+    These tests are optional for local builds, but CI sets
+    LSCP_REQUIRE_GSSAPI_REALM=1 so missing dependencies or a libssh without
+    real GSSAPI support cannot silently turn the certification into skips.
     """
 
+    REALM = "LINSCP.TEST"
+    USER_PASSWORD = "linscp-test-user-password"
+    OTHER_PASSWORD = "linscp-test-other-password"
+    MASTER_PASSWORD = "linscp-test-master-password"
+    REQUIRE = os.environ.get("LSCP_REQUIRE_GSSAPI_REALM") == "1"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dependency_error = ""
+        cls.gssapi_supported = False
+        cls.workdir = None
+        cls.kdc = None
+        cls.sshd = None
+        cls.kdc_log_file = None
+        cls.sshd_log_file = None
+        required = ("kdb5_util", "kadmin.local", "krb5kdc", "kinit", "klist",
+                    "sshd", "ssh-keygen")
+        cls.programs = {name: _test_program(name) for name in required}
+        missing = [name for name, path in cls.programs.items() if path is None]
+        if missing:
+            cls.dependency_error = (
+                "Kerberos realm test needs " + ", ".join(missing) +
+                " (install krb5-kdc, krb5-user and openssh-server)")
+            if cls.REQUIRE:
+                raise RuntimeError(cls.dependency_error)
+            return
+
+        cls.workdir = tempfile.TemporaryDirectory(prefix="linscp-gssapi-")
+        cls.base = pathlib.Path(cls.workdir.name)
+        cls.user = pwd.getpwuid(os.getuid()).pw_name
+        cls.client_home = cls.base / "client-home"
+        cls.client_home.mkdir(mode=0o700)
+        cls.client_config = cls.base / "client-config"
+        cls.client_config.mkdir(mode=0o700)
+        cls.remote_file = cls.base / "remote-data.bin"
+        cls.remote_file.write_bytes(os.urandom(32771))
+        cls.remote_probe = cls.base / "check-delegated-tgt.sh"
+        cls.remote_probe.write_text(
+            "#!/bin/sh\n"
+            "if [ -z \"${KRB5CCNAME:-}\" ]; then\n"
+            "  echo NO_KRB5CCNAME; exit 21\n"
+            "fi\n"
+            "if ! klist -s -c \"$KRB5CCNAME\" 2>/dev/null; then\n"
+            "  echo NO_VALID_TICKET; exit 22\n"
+            "fi\n"
+            "if ! klist -c \"$KRB5CCNAME\" 2>/dev/null | "
+            "grep -F 'krbtgt/LINSCP.TEST@LINSCP.TEST' >/dev/null; then\n"
+            "  echo NO_DELEGATED_TGT; exit 23\n"
+            "fi\n"
+            "echo DELEGATED_TGT\n", encoding="utf-8")
+        cls.remote_probe.chmod(0o700)
+
+        cls.kdc_port = _test_free_port(udp=True)
+        cls.ssh_port = _test_free_port()
+        cls.krb_conf = cls.base / "krb5.conf"
+        cls.kdc_conf = cls.base / "kdc.conf"
+        cls.database = cls.base / "principal"
+        cls.keytab = cls.base / "host.keytab"
+        cls.krb_conf.write_text("\n".join([
+            "[libdefaults]",
+            " default_realm = " + cls.REALM,
+            " dns_lookup_kdc = false",
+            " dns_lookup_realm = false",
+            " rdns = false",
+            " forwardable = true",
+            " ticket_lifetime = 10m",
+            " default_ccache_name = FILE:" + str(cls.base / "no-default-cache"),
+            "",
+            "[realms]",
+            " " + cls.REALM + " = {",
+            "  kdc = 127.0.0.1:" + str(cls.kdc_port),
+            " }",
+            "",
+            "[domain_realm]",
+            " localhost = " + cls.REALM,
+            " 127.0.0.1 = " + cls.REALM,
+            " .linscp.test = " + cls.REALM,
+            "",
+        ]), encoding="utf-8")
+        cls.kdc_conf.write_text("\n".join([
+            "[kdcdefaults]",
+            " kdc_listen = 127.0.0.1:" + str(cls.kdc_port),
+            " kdc_tcp_listen = 127.0.0.1:" + str(cls.kdc_port),
+            "",
+            "[realms]",
+            " " + cls.REALM + " = {",
+            "  database_name = " + str(cls.database),
+            "  key_stash_file = " + str(cls.base / "stash"),
+            "  acl_file = " + str(cls.base / "kadm5.acl"),
+            "  max_life = 10m",
+            "  max_renewable_life = 1d",
+            "  default_principal_flags = +preauth",
+            " }",
+            "",
+        ]), encoding="utf-8")
+        (cls.base / "kadm5.acl").write_text(
+            "*/admin@" + cls.REALM + " *\n", encoding="utf-8")
+
+        # Avoid accidentally inheriting the caller's realm, credential cache,
+        # keytab or tracing policy. Only this fixture's config is used.
+        cls.krb_env = dict(os.environ)
+        for name in ("KRB5_CONFIG", "KRB5_KDC_PROFILE", "KRB5_KTNAME",
+                     "KRB5CCNAME", "KRB5_TRACE"):
+            cls.krb_env.pop(name, None)
+        cls.krb_env["KRB5_CONFIG"] = str(cls.krb_conf)
+        cls.krb_env["KRB5_KDC_PROFILE"] = str(cls.kdc_conf)
+        cls.krb_env["HOME"] = str(cls.client_home)
+
+        try:
+            cls._provision_realm()
+            cls._start_kdc()
+            cls._wait_for_kdc()
+            cls._start_sshd()
+            cls._probe_gssapi()
+        except Exception:
+            cls._stop_process("sshd")
+            cls._stop_process("kdc")
+            cls._close_logs()
+            if cls.workdir is not None:
+                cls.workdir.cleanup()
+                cls.workdir = None
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._stop_process("sshd")
+        cls._stop_process("kdc")
+        cls._close_logs()
+        if cls.workdir is not None:
+            cls.workdir.cleanup()
+            cls.workdir = None
+
+    @classmethod
+    def _close_logs(cls):
+        for name in ("sshd_log_file", "kdc_log_file"):
+            handle = getattr(cls, name, None)
+            if handle is not None:
+                handle.close()
+                setattr(cls, name, None)
+
+    @classmethod
+    def _stop_process(cls, name):
+        proc = getattr(cls, name, None)
+        if proc is None:
+            return
+        if proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+        setattr(cls, name, None)
+
+    @classmethod
+    def _run_checked(cls, argv, *, env=None, input_text=None, timeout=30):
+        result = subprocess.run(argv, input=input_text, env=env or cls.krb_env,
+                                capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            raise RuntimeError("command failed: %s\n%s%s" %
+                               (" ".join(argv), result.stdout, result.stderr))
+        return result
+
+    @classmethod
+    def _provision_realm(cls):
+        cls._run_checked([
+            cls.programs["kdb5_util"], "create", "-s", "-P",
+            cls.MASTER_PASSWORD, "-r", cls.REALM], timeout=30)
+        principal = cls.user + "@" + cls.REALM
+        other = "otherprincipal@" + cls.REALM
+        commands = "\n".join([
+            "addprinc -pw %s %s" % (cls.USER_PASSWORD, principal),
+            "addprinc -pw %s %s" % (cls.OTHER_PASSWORD, other),
+            "addprinc -randkey host/localhost@" + cls.REALM,
+            "ktadd -k %s host/localhost@%s" % (cls.keytab, cls.REALM),
+            "quit",
+            "",
+        ])
+        cls._run_checked([cls.programs["kadmin.local"], "-r", cls.REALM],
+                         input_text=commands, timeout=30)
+        if not cls.keytab.is_file():
+            raise RuntimeError("kadmin.local did not create the host keytab")
+        cls.keytab.chmod(0o600)
+
+    @classmethod
+    def _start_kdc(cls):
+        cls.kdc_log_file = open(cls.base / "krb5kdc.log", "w",
+                                encoding="utf-8")
+        cls.kdc = subprocess.Popen(
+            [cls.programs["krb5kdc"], "-n", "-r", cls.REALM],
+            env=cls.krb_env, stdout=cls.kdc_log_file,
+            stderr=subprocess.STDOUT, start_new_session=True)
+        time.sleep(0.2)
+        if cls.kdc.poll() is not None:
+            raise RuntimeError("the isolated KDC exited at startup: " +
+                               (cls.base / "krb5kdc.log").read_text(
+                                   encoding="utf-8", errors="replace"))
+
+    @classmethod
+    def _wait_for_kdc(cls):
+        cache = cls.base / "startup.ccache"
+        last = None
+        for _ in range(40):
+            env = dict(cls.krb_env, KRB5CCNAME="FILE:" + str(cache))
+            result = subprocess.run(
+                [cls.programs["kinit"], "-f", "-l", "10m",
+                 cls.user + "@" + cls.REALM], input=cls.USER_PASSWORD + "\n",
+                env=env, capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                cache.unlink(missing_ok=True)
+                return
+            last = result.stdout + result.stderr
+            if cls.kdc.poll() is not None:
+                break
+            time.sleep(0.1)
+        raise RuntimeError("could not obtain a ticket from the isolated KDC: " +
+                           str(last) + "\n" + (cls.base / "krb5kdc.log").read_text(
+                               encoding="utf-8", errors="replace"))
+
+    @classmethod
+    def _start_sshd(cls):
+        host_key = cls.base / "ssh-host-ed25519"
+        cls._run_checked([cls.programs["ssh-keygen"], "-q", "-t", "ed25519",
+                          "-N", "", "-f", str(host_key)], timeout=30)
+        config = cls.base / "sshd_config"
+        config.write_text("\n".join([
+            "Port " + str(cls.ssh_port),
+            "ListenAddress 127.0.0.1",
+            "HostKey " + str(host_key),
+            "PidFile " + str(cls.base / "sshd.pid"),
+            "AuthorizedKeysFile none",
+            "PubkeyAuthentication no",
+            "PasswordAuthentication no",
+            "KbdInteractiveAuthentication no",
+            "GSSAPIAuthentication yes",
+            "GSSAPICleanupCredentials yes",
+            "GSSAPIStrictAcceptorCheck no",
+            "GSSAPIKeyExchange yes",
+            "UsePAM no",
+            "UseDNS no",
+            "StrictModes no",
+            "PermitRootLogin yes",
+            "AllowUsers " + cls.user,
+            "Subsystem sftp internal-sftp",
+            "LogLevel VERBOSE",
+            "",
+        ]), encoding="utf-8")
+        checked = subprocess.run(
+            [cls.programs["sshd"], "-t", "-f", str(config)],
+            capture_output=True, text=True, env=cls.krb_env, timeout=15)
+        if checked.returncode != 0:
+            raise RuntimeError("sshd rejected the isolated GSSAPI config: " +
+                               checked.stdout + checked.stderr)
+
+        server_env = dict(cls.krb_env, KRB5_KTNAME="FILE:" + str(cls.keytab))
+        # A server must not see the cache from which the client authenticates;
+        # only sshd's explicitly delegated cache can make the remote check pass.
+        server_env.pop("KRB5CCNAME", None)
+        cls.sshd_log_file = open(cls.base / "sshd.log", "w", encoding="utf-8")
+        cls.sshd = subprocess.Popen(
+            [cls.programs["sshd"], "-D", "-e", "-f", str(config)],
+            env=server_env, stdout=cls.sshd_log_file,
+            stderr=subprocess.STDOUT, start_new_session=True)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if cls.sshd.poll() is not None:
+                break
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.2)
+            try:
+                sock.connect(("127.0.0.1", cls.ssh_port))
+                sock.close()
+                return
+            except OSError:
+                sock.close()
+                time.sleep(0.05)
+        log = (cls.base / "sshd.log").read_text(encoding="utf-8",
+                                                errors="replace")
+        raise RuntimeError("isolated sshd did not listen: " + log)
+
+    @classmethod
+    def _obtain_ticket(cls, cache, principal=None, password=None,
+                       lifetime="10m", forwardable=True):
+        principal = principal or (cls.user + "@" + cls.REALM)
+        password = password or cls.USER_PASSWORD
+        env = dict(cls.krb_env, KRB5CCNAME="FILE:" + str(cache))
+        command = [cls.programs["kinit"]]
+        if forwardable:
+            command.append("-f")
+        if lifetime:
+            command.extend(["-l", lifetime])
+        command.append(principal)
+        result = subprocess.run(command, input=password + "\n", env=env,
+                                capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            raise AssertionError("kinit failed for %s: %s%s" %
+                                 (principal, result.stdout, result.stderr))
+        return "FILE:" + str(cache)
+
+    @classmethod
+    def _run_client(cls, cache, command="ls /", rawsettings=(), label="gssapi"):
+        log = cls.base / (label + "-" + str(time.time_ns()) + ".log")
+        url = "sftp://%s@localhost:%d/" % (cls.user, cls.ssh_port)
+        open_command = "open " + url
+        if rawsettings:
+            open_command += " -rawsettings " + " ".join(rawsettings)
+        script = open_command + " ; " + command + " ; exit"
+        env = dict(cls.krb_env, KRB5CCNAME=(
+            "FILE:" + str(cache) if cache is not None else
+            "FILE:" + str(cls.base / "missing.ccache")))
+        env["HOME"] = str(cls.client_home)
+        env["LINSCP_CONFIG_DIR"] = str(cls.client_config)
+        env.pop("SSH_AUTH_SOCK", None)
+        argv = [BINARY, "-batch", "-hostkey=*", "-log=" + str(log),
+                "-command=" + script]
+        result = subprocess.run(argv, env=env, capture_output=True, text=True,
+                                timeout=40)
+        text = log.read_text(encoding="utf-8", errors="replace") \
+            if log.exists() else ""
+        return result, text
+
+    @classmethod
+    def _probe_gssapi(cls):
+        cache = cls.base / "probe.ccache"
+        cls._obtain_ticket(cache)
+        local_copy = cls.base / "probe-download.bin"
+        result, log = cls._run_client(
+            cache, "get %s %s" % (cls.remote_file, local_copy), label="probe")
+        if "The server offers GSSAPI, but this build's libssh cannot use it" in log:
+            cls.gssapi_supported = False
+            if cls.REQUIRE:
+                raise RuntimeError(
+                    "the linked libssh has no GSSAPI support; install a "
+                    "WITH_GSSAPI-enabled libssh build")
+            return
+        if (result.returncode != 0 or
+                "Authenticated with GSSAPI" not in log or
+                not local_copy.is_file() or
+                sha256_of(local_copy) != sha256_of(cls.remote_file)):
+            raise RuntimeError("GSSAPI realm smoke test failed: " +
+                               result.stdout + result.stderr + "\n" + log +
+                               "\nsshd:\n" + (cls.base / "sshd.log").read_text(
+                                   encoding="utf-8", errors="replace"))
+        cls.gssapi_supported = True
+
     def require_realm(self):
-        if not isolated_kerberos_realm():
-            self.skipTest("no isolated Kerberos realm (need kinit, krb5-kdc "
-                          "and LSCP_TEST_KRB5_REALM)")
+        if self.dependency_error:
+            self.skipTest(self.dependency_error)
+        if not self.gssapi_supported:
+            self.skipTest("the loaded libssh was built without GSSAPI support")
 
     def test_gssapi_principal_selection_against_an_isolated_realm(self):
         self.require_realm()
-        self.fail("realm fixture did not run a principal-selection case")
+        cache = self.base / "selected.ccache"
+        self._obtain_ticket(cache)
+        destination = self.base / "selected-download.bin"
+        result, log = self._run_client(
+            cache, "get %s %s" % (self.remote_file, destination),
+            label="principal-selected")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr + log)
+        self.assertIn("Authenticated with GSSAPI", log)
+        self.assertEqual(sha256_of(self.remote_file), sha256_of(destination))
+
+        other_cache = self.base / "other-principal.ccache"
+        self._obtain_ticket(other_cache, "otherprincipal@" + self.REALM,
+                            self.OTHER_PASSWORD)
+        refused, refused_log = self._run_client(
+            other_cache, label="principal-mismatch")
+        self.assertNotEqual(refused.returncode, 0,
+                            refused.stdout + refused.stderr + refused_log)
+        self.assertIn("Attempting GSSAPI authentication", refused_log)
+        self.assertNotIn("Authenticated with GSSAPI", refused_log)
 
     def test_gssapi_missing_and_expired_credentials_are_refused(self):
         self.require_realm()
-        self.fail("realm fixture did not run a missing/expired-credential case")
+        missing, missing_log = self._run_client(None, label="missing-ticket")
+        self.assertNotEqual(missing.returncode, 0,
+                            missing.stdout + missing.stderr + missing_log)
+        self.assertIn("Attempting GSSAPI authentication", missing_log)
+        self.assertNotIn("Authenticated with GSSAPI", missing_log)
+
+        expired_cache = self.base / "expired.ccache"
+        self._obtain_ticket(expired_cache, lifetime="1s", forwardable=False)
+        time.sleep(2)
+        cache_name = "FILE:" + str(expired_cache)
+        expired_env = dict(self.krb_env, KRB5CCNAME=cache_name)
+        still_valid = subprocess.run(
+            [self.programs["klist"], "-s", "-c", cache_name], env=expired_env,
+            capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(still_valid.returncode, 0,
+                            "the deliberately short-lived ticket did not expire")
+        expired, expired_log = self._run_client(
+            expired_cache, label="expired-ticket")
+        self.assertNotEqual(expired.returncode, 0,
+                            expired.stdout + expired.stderr + expired_log)
+        self.assertIn("Attempting GSSAPI authentication", expired_log)
+        self.assertNotIn("Authenticated with GSSAPI", expired_log)
 
     def test_gssapi_mutual_authentication_against_an_isolated_realm(self):
         self.require_realm()
-        self.fail("realm fixture did not run a mutual-authentication case")
+        cache = self.base / "mutual.ccache"
+        self._obtain_ticket(cache)
+        result, log = self._run_client(cache, label="mutual-valid-service")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr + log)
+        self.assertIn("Authenticated with GSSAPI", log)
+
+        # A valid user TGT is not enough: changing the service identity must
+        # make Kerberos reject the host even though the SSH host-key policy is
+        # the test-only wildcard. This exercises the server side of mutual
+        # authentication instead of merely checking a successful login.
+        wrong, wrong_log = self._run_client(
+            cache, rawsettings=("LogicalHostName=not-registered.invalid",),
+            label="mutual-wrong-service")
+        self.assertNotEqual(wrong.returncode, 0,
+                            wrong.stdout + wrong.stderr + wrong_log)
+        self.assertNotIn("Authenticated with GSSAPI", wrong_log)
+
+        # If this libssh supports RFC 4462 KEX, exercise it. Older supported
+        # libssh builds provide gssapi-with-mic but not GSSAPI KEX; those
+        # builds must reject the explicit setting rather than quietly fall
+        # back to an unauthenticated ordinary KEX.
+        kex, kex_log = self._run_client(
+            cache, rawsettings=("AuthGSSAPIKEX=1",), label="gssapi-kex")
+        if "cannot be honored" in (kex.stdout + kex.stderr + kex_log):
+            self.assertNotEqual(kex.returncode, 0,
+                                "unsupported GSSAPI KEX was silently accepted")
+        else:
+            self.assertEqual(kex.returncode, 0, kex.stdout + kex.stderr + kex_log)
+            self.assertIn("The server is authenticated by Kerberos (GSSAPI key "
+                          "exchange", kex_log)
 
     def test_gssapi_delegation_stays_off_unless_requested(self):
         self.require_realm()
-        self.fail("realm fixture did not run an opt-in delegation case")
+        cache = self.base / "delegation.ccache"
+        self._obtain_ticket(cache, forwardable=True)
+        remote_command = "call " + str(self.remote_probe)
+
+        default_result, default_log = self._run_client(
+            cache, remote_command, label="no-delegation")
+        self.assertNotEqual(default_result.returncode, 0,
+                            "a default GSSAPI session delegated a usable TGT")
+        self.assertNotIn("DELEGATED_TGT", default_result.stdout)
+        self.assertTrue("NO_KRB5CCNAME" in default_result.stdout or
+                        "NO_VALID_TICKET" in default_result.stdout or
+                        "NO_DELEGATED_TGT" in default_result.stdout,
+                        default_result.stdout + default_result.stderr + default_log)
+
+        delegated, delegated_log = self._run_client(
+            cache, remote_command, rawsettings=("GSSAPIFwdTGT=1",),
+            label="explicit-delegation")
+        self.assertEqual(delegated.returncode, 0,
+                         delegated.stdout + delegated.stderr + delegated_log)
+        self.assertIn("DELEGATED_TGT", delegated.stdout)
+        self.assertIn("Kerberos credentials will be delegated to the server",
+                      delegated_log)
 
 
 def run_and_report():

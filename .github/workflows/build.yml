@@ -13,8 +13,10 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential cmake pkg-config \
-            libssh-dev libssl-dev libargon2-dev zlib1g-dev curl
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            build-essential cmake pkg-config libssh-dev libssl-dev \
+            libargon2-dev zlib1g-dev curl libkrb5-dev krb5-kdc krb5-user \
+            openssh-server
       - name: Build and run unit tests
         run: |
           set -o pipefail
@@ -37,18 +39,20 @@ jobs:
               printf '::notice::%s\n' "${line//]/%5D}"; done; } || :
       - name: Live SFTP regressions
         run: |
-          # The live suite needs a server; paramiko goes in a venv because
-          # the runner's system Python is externally managed. Without it the
-          # suite skips, which is why the skip count is printed.
+          # Paramiko goes in a venv because the runner's system Python is
+          # externally managed. The isolated Kerberos test uses the loopback
+          # KDC/sshd installed above; CI must run it with a GSSAPI-capable
+          # libssh rather than treating dependency or support skips as passes.
           set -o pipefail
           python3 -m venv "$RUNNER_TEMP/live-test-venv"
           "$RUNNER_TEMP/live-test-venv/bin/pip" install --quiet paramiko botocore pyftpdlib pyOpenSSL xmlschema
-          "$RUNNER_TEMP/live-test-venv/bin/python" \
-            -u source/linux/tests/LiveSftpTest.py source/linux/build/linscp 2>&1 |
+          LSCP_REQUIRE_GSSAPI_REALM=1 \
+            "$RUNNER_TEMP/live-test-venv/bin/python" \
+              -u source/linux/tests/LiveSftpTest.py source/linux/build/linscp 2>&1 |
             tee "$RUNNER_TEMP/live-tests.log"
-          grep -E 'evidence: suite=live-sftp .*ran=[1-9]' \
+          grep -E 'evidence: suite=live-sftp .*ran=[1-9][0-9]* skipped=0 failed=0' \
             "$RUNNER_TEMP/live-tests.log" > /dev/null || {
-            echo "::error::the live SFTP suite ran no tests"
+            echo "::error::the live SFTP/Kerberos suite skipped or failed tests"
             exit 1
           }
           grep '^evidence: ' "$RUNNER_TEMP/live-tests.log" |
@@ -306,8 +310,10 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential cmake pkg-config \
-            libssh-dev libssl-dev libargon2-dev zlib1g-dev curl
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            build-essential cmake pkg-config libssh-dev libssl-dev \
+            libargon2-dev zlib1g-dev curl libkrb5-dev krb5-kdc krb5-user \
+            openssh-server
       - name: Configure and build
         run: |
           # ctest runs the same live suites as the Makefile
@@ -328,15 +334,15 @@ jobs:
           cmake --build build -j
       - name: Test
         run: |
-          # The SCP suite drives a real sshd, which the runner
-          # image has; install it rather than let the suite skip
-          # every case and trip the ran=0 guard in ctest.
+          # CTest runs the isolated Kerberos realm suite too. Require all
+          # realm cases to run against the system libssh/sshd packages.
           if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
             sudo apt-get update -qq
             sudo apt-get install -y -qq openssh-server
           fi
           set -o pipefail
-          if ! ctest --test-dir build --output-on-failure 2>&1 | tee "$RUNNER_TEMP/ctest.log"; then
+          if ! LSCP_REQUIRE_GSSAPI_REALM=1 \
+               ctest --test-dir build --output-on-failure 2>&1 | tee "$RUNNER_TEMP/ctest.log"; then
             # Surface diagnostics through the checks API as well as hosted
             # logs, so failures remain reviewable in restricted environments.
             python3 - "$RUNNER_TEMP/ctest.log" <<'PY'

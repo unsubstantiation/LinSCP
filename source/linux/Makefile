@@ -154,13 +154,14 @@ check-wayland:
 	$(PYTHON) $(TOP)/tools/tests/test_wayland_compatibility.py
 
 # Transfers against the servers in tests/, which take seconds rather than
-# milliseconds: ScriptTest is server-free, LiveSftpTest skips itself without
-# paramiko, LiveScpTest starts a throwaway sshd of its own and skips itself
-# without sshd/ssh-keygen, LiveS3Test is standard-library-only (botocore is an
-# optional extra one test skips without), LiveCurlTest uses optional pyftpdlib/
-# pyOpenSSL when available, the GUI search test uses a fake session, and the
-# PowerShell harness always runs its static checks while its live Pester run
-# skips itself without pwsh.
+# milliseconds: ScriptTest is server-free, LiveSftpTest skips its SFTP cases
+# without paramiko and its isolated Kerberos realm cases without kinit,
+# krb5-kdc, sshd/ssh-keygen or GSSAPI-enabled libssh. LiveScpTest starts a
+# throwaway sshd of its own and skips without sshd/ssh-keygen, LiveS3Test is
+# standard-library-only (botocore is an optional extra one test skips without),
+# LiveCurlTest uses optional pyftpdlib/pyOpenSSL when available, the GUI search
+# test uses a fake session, and the PowerShell harness always runs its static
+# checks while its live Pester run skips itself without pwsh.
 check-live: $(BINDIR)/linscp
 	$(PYTHON) tests/ScriptTest.py $(BINDIR)/linscp
 	$(PYTHON) tests/LiveSftpTest.py $(BINDIR)/linscp

@@ -10,10 +10,16 @@ Any configured parent proxy is used to reach the **jump host**, not to bypass
 it and reach the destination directly.
 
 This is a supported subset, **not full WinSCP tunnel or authentication parity**.
-Kerberos/GSSAPI settings are supported through libssh when it advertises real
-GSSAPI support, but live realm certification remains open; tunneling to
-curl-backed FTP/FTPS/WebDAV/S3 destinations is not implemented. Unsupported or malformed
-settings fail rather than silently make a direct connection. See the
+Kerberos/GSSAPI authentication uses libssh when its public GSSAPI capability is
+present; GSSAPI key exchange is probed separately and `AuthGSSAPIKEX` is refused
+if the loaded libssh cannot honor it or a host-key pin is configured, rather
+than falling back to an ordinary exchange or silently skipping the pin. The
+live SFTP suite provisions an isolated loopback Kerberos
+realm and OpenSSH server to test principal selection, missing/expired tickets,
+server identity and opt-in TGT delegation. Broader production-realm validation
+and an independent security review of delegation remain open. Tunneling to
+curl-backed FTP/FTPS/WebDAV/S3 destinations is not implemented. Unsupported or
+malformed settings fail rather than silently make a direct connection. See the
 [remaining parity plan](remaining-parity-plan.md).
 
 ## Command line

@@ -84,7 +84,9 @@ if(Python3_Interpreter_FOUND)
   # missing, but a suite that skips every case has checked
   # nothing, which is the failure mode this repository guards
   # against (see the ran=0 properties below and the Makefile
-  # workflow's greps).
+  # workflow's greps). The same suite includes a private loopback
+  # Kerberos realm with principal, expiry, service-identity and
+  # opt-in-delegation cases; CI makes those cases mandatory.
   add_test(NAME live-sftp-tests COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/${FRONTEND}/tests/LiveSftpTest.py
     $<TARGET_FILE:linscp>)
