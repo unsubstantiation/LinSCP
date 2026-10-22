@@ -1830,10 +1830,16 @@ class LiveGssapiRealmTests(unittest.TestCase):
     @classmethod
     def _run_client(cls, cache, command="ls /", rawsettings=(), label="gssapi"):
         log = cls.base / (label + "-" + str(time.time_ns()) + ".log")
-        url = "sftp://%s@localhost:%d/" % (cls.user, cls.ssh_port)
+        # Use IPv4 explicitly: localhost can resolve to ::1 on newer runners,
+        # while this private sshd is intentionally bound only to 127.0.0.1.
+        url = "sftp://%s@127.0.0.1:%d/" % (cls.user, cls.ssh_port)
         open_command = "open " + url
-        if rawsettings:
-            open_command += " -rawsettings " + " ".join(rawsettings)
+        settings = list(rawsettings)
+        if not any(setting.startswith("LogicalHostName=")
+                   for setting in settings):
+            settings.insert(0, "LogicalHostName=localhost")
+        if settings:
+            open_command += " -rawsettings " + " ".join(settings)
         script = open_command + " ; " + command + " ; exit"
         env = dict(cls.krb_env, KRB5CCNAME=(
             "FILE:" + str(cache) if cache is not None else
