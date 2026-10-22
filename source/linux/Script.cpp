@@ -675,6 +675,34 @@ bool ApplyRawSettings(const std::vector<RawSetting> & settings,
 }
 
 /*
+ * A switch that carries on/off: upstream's TOptions::SwitchValue. No value
+ * means on, "on" and "off" are accepted in any case, and so is a whole
+ * number whose zero means off. Anything else is refused rather than read
+ * as one of the two by accident.
+ */
+bool ParseSwitchBool(const std::string & text, bool & value)
+{
+    if (text.empty() || ToLower(text) == "on")
+    {
+        value = true;
+        return true;
+    }
+    if (ToLower(text) == "off")
+    {
+        value = false;
+        return true;
+    }
+    char * end = NULL;
+    const long number = strtol(text.c_str(), &end, 10);
+    if (end != NULL && *end == '\0')
+    {
+        value = number != 0;
+        return true;
+    }
+    return false;
+}
+
+/*
  * The switches of 'open' onto the options of the site they open, whether
  * that site came from a URL or from the store. Only a switch that was given
  * changes anything, so the defaults of the command line and the settings a
@@ -702,6 +730,33 @@ bool ApplyOpenSwitches(const OpenSwitches & switches, SessionOptions & options,
     if (switches.passphraseGiven)
     {
         options.keyPassphrase = switches.passphrase;
+    }
+    /* The connection's own timeout, TLS mode, FTP data policy and TLS
+     * client certificate. Upstream reads the same four switches from the
+     * 'open' command line and applies them to a stored site as well. */
+    if (switches.timeoutGiven)
+    {
+        options.timeoutSecs = switches.timeoutSecs;
+    }
+    if (switches.implicitGiven)
+    {
+        options.tls.ftpsMode = switches.implicitValue ? 1 : 0;
+    }
+    if (switches.explicitGiven)
+    {
+        /* TFtps 2 is explicit SSL, 3 explicit TLS; upstream keeps the
+         * deprecated '-explicitssl' spelling on 2 and maps '-explicit' to
+         * explicit TLS. */
+        options.tls.ftpsMode = switches.explicitValue ?
+            (switches.explicitSsl ? 2 : 3) : 0;
+    }
+    if (switches.passiveGiven)
+    {
+        options.ftp.passiveMode = switches.passiveValue;
+    }
+    if (switches.clientCertGiven)
+    {
+        options.tls.clientCertificate = ExpandTilde(switches.clientCertificate);
     }
     return ApplyRawSettings(switches.rawSettings, options, error);
 }
@@ -1389,33 +1444,122 @@ bool Script::OpenSite(const std::vector<std::string> & args)
     OpenSwitches switches;
     for (size_t i = 0; i < args.size(); i++)
     {
-        if (StartsWith(args[i], "-hostkey="))
+        /* Upstream reads a switch name without regard to case, so
+         * '-HOSTKEY=' is the same switch as '-hostkey='. */
+        const std::string lower = ToLower(args[i]);
+        if (StartsWith(lower, "-hostkey="))
         {
             switches.hostKey = args[i].substr(strlen("-hostkey="));
             switches.hostKeyGiven = true;
         }
-        else if (StartsWith(args[i], "-password="))
+        else if (StartsWith(lower, "-password="))
         {
             switches.password = args[i].substr(strlen("-password="));
             switches.passwordGiven = true;
         }
-        else if (StartsWith(args[i], "-username="))
+        else if (StartsWith(lower, "-username="))
         {
             switches.userName = args[i].substr(strlen("-username="));
             switches.userNameGiven = true;
         }
-        else if (StartsWith(args[i], "-privatekey="))
+        else if (StartsWith(lower, "-privatekey="))
         {
             switches.privateKeyFile = args[i].substr(strlen("-privatekey="));
             switches.privateKeyGiven = true;
         }
-        else if (StartsWith(args[i], "-passphrase="))
+        else if (StartsWith(lower, "-passphrase="))
         {
             switches.passphrase = args[i].substr(strlen("-passphrase="));
             switches.passphraseGiven = true;
         }
-        else if (args[i] == "-rawsettings" ||
-            StartsWith(args[i], "-rawsettings="))
+        else if (StartsWith(lower, "-timeout="))
+        {
+            /* The server response timeout of this connection, in
+             * seconds, like upstream's '-timeout='. */
+            const std::string value = args[i].substr(strlen("-timeout="));
+            char * end = NULL;
+            const long seconds = value.empty() ? 0 : strtol(value.c_str(), &end, 10);
+            if (value.empty() || end == NULL || *end != '\0' || seconds <= 0 ||
+                seconds > INT_MAX)
+            {
+                Console::Instance().Error(Texts::WrongArguments("open",
+                    Texts::Translate(
+                        "The value of '-timeout' is the server response timeout in "
+                        "seconds, a positive whole number.")));
+                mErrors++;
+                return false;
+            }
+            switches.timeoutSecs = static_cast<int>(seconds);
+            switches.timeoutGiven = true;
+        }
+        else if (lower == "-implicit" || StartsWith(lower, "-implicit="))
+        {
+            bool enabled = true;
+            if (!ParseSwitchBool(args[i].substr(strlen("-implicit") +
+                    (lower.size() > strlen("-implicit") ? 1 : 0)), enabled))
+            {
+                Console::Instance().Error(Texts::WrongArguments("open",
+                    Texts::Translate(
+                        "The value of '-implicit' must be on or off (a number "
+                        "other than zero means on).")));
+                mErrors++;
+                return false;
+            }
+            switches.implicitGiven = true;
+            switches.implicitValue = enabled;
+            switches.explicitGiven = false;
+        }
+        else if (lower == "-explicit" || StartsWith(lower, "-explicit=") ||
+            lower == "-explicittls" || StartsWith(lower, "-explicittls=") ||
+            lower == "-explicitssl" || StartsWith(lower, "-explicitssl="))
+        {
+            const bool ssl = StartsWith(lower, "-explicitssl");
+            const std::string name = ssl ? "-explicitssl" :
+                StartsWith(lower, "-explicittls") ? "-explicittls" : "-explicit";
+            bool enabled = true;
+            if (lower.size() > name.size() &&
+                !ParseSwitchBool(args[i].substr(name.size() + 1), enabled))
+            {
+                Console::Instance().Error(Texts::WrongArguments("open",
+                    Texts::Translate(
+                        "The value of '{switch}' must be on or off (a number "
+                        "other than zero means on).", {{"switch", name}})));
+                mErrors++;
+                return false;
+            }
+            switches.explicitGiven = true;
+            switches.explicitValue = enabled;
+            switches.explicitSsl = ssl;
+            switches.implicitGiven = false;
+        }
+        else if (lower == "-passive" || StartsWith(lower, "-passive="))
+        {
+            bool enabled = true;
+            if (!ParseSwitchBool(args[i].substr(strlen("-passive") +
+                    (lower.size() > strlen("-passive") ? 1 : 0)), enabled))
+            {
+                Console::Instance().Error(Texts::WrongArguments("open",
+                    Texts::Translate(
+                        "The value of '-passive' must be on or off (a number "
+                        "other than zero means on).")));
+                mErrors++;
+                return false;
+            }
+            switches.passiveGiven = true;
+            switches.passiveValue = enabled;
+        }
+        else if (StartsWith(lower, "-clientcert="))
+        {
+            switches.clientCertificate = args[i].substr(strlen("-clientcert="));
+            switches.clientCertGiven = true;
+        }
+        else if (StartsWith(lower, "-sessionname="))
+        {
+            switches.sessionName = args[i].substr(strlen("-sessionname="));
+            switches.sessionNameGiven = true;
+        }
+        else if (lower == "-rawsettings" ||
+            StartsWith(lower, "-rawsettings="))
         {
             std::string rawError;
             if (!CollectRawSettings(args, i, switches.rawSettings, rawError))
@@ -1556,23 +1700,18 @@ bool Script::OpenSite(const std::vector<std::string> & args)
     }
 
     /* The XML log's '<session>' root is named after the connection, the
-     * way upstream names it: 'user@host' for an ad-hoc URL. It records
-     * where the session went, never how it was authenticated: no
-     * password is part of the format. */
-    Console::Instance().XmlSessionName(options.userName.empty() ?
-        options.hostName : options.userName + "@" + options.hostName);
+     * way upstream names it: 'user@host' for an ad-hoc URL, or the name
+     * '-sessionname=' gave it. It records where the session went, never
+     * how it was authenticated: no password is part of the format. */
+    mSessionDisplayName = switches.sessionNameGiven ? switches.sessionName :
+        (options.hostName.empty() ? std::string("session") : options.hostName);
+    Console::Instance().XmlSessionName(switches.sessionNameGiven ?
+        switches.sessionName :
+        (options.userName.empty() ? options.hostName :
+            options.userName + "@" + options.hostName));
 
     Console::Instance().Status(Texts::Translate("Connected, the remote directory is {path}", {{"path", mRemoteDirectory}}));
     return true;
-}
-
-/*
- * The session name of the open connection, the way upstream's session
- * listing identifies a connection opened from a URL: its host.
- */
-static std::string SessionDisplayNameFor(const SessionOptions & options)
-{
-    return options.hostName.empty() ? std::string("session") : options.hostName;
 }
 
 void Script::CloseSite(const std::vector<std::string> & args)
@@ -1600,10 +1739,14 @@ void Script::CloseSite(const std::vector<std::string> & args)
         mErrors++;
         return;
     }
-    const std::string name = SessionDisplayNameFor(mSession.Options());
+    const std::string name = mSessionDisplayName.empty() ?
+        (mSession.Options().hostName.empty() ? std::string("session") :
+            mSession.Options().hostName) : mSessionDisplayName;
     mSession.Close();
     mRemoteDirectory.clear();
     mHomeDirectory.clear();
+    mSessionDisplayName.clear();
+    mStoredSessionName.clear();
     /* The XML log has no element for closing: the '<group>' of this
      * command closing is the record, as it is upstream. */
     Console::Instance().WriteLine(Texts::SessionClosed(name));
@@ -3392,11 +3535,17 @@ bool Script::ParseTransferSwitches(const std::string & command, bool uploads,
         if (a == "-delete" || a == "-r" || a == "-resume" ||
             a == "-neweronly" || a == "-noneweronly" || a == "-preservetime" ||
             a == "-nopreservetime" || a == "-append" || a == "-nopermissions" ||
-            a == "-permissions")
+            a == "-permissions" || a == "-latest")
         {
             if (a == "-delete")
             {
                 flags.deleteSource = true;
+            }
+            else if (a == "-latest")
+            {
+                /* Transfer only the newest file the command selected,
+                 * which is upstream's '-latest' for get and put. */
+                flags.latest = true;
             }
             else if (a == "-neweronly")
             {
@@ -3803,6 +3952,17 @@ bool Script::GetFiles(const std::vector<std::string> & args)
     {
         return false;
     }
+    /*
+     * Naming the newest object and naming an exact version are two
+     * different answers to one question; say so before asking for the
+     * connection the rest of the switches may need.
+     */
+    if (flags.latest && flags.versionIdGiven)
+    {
+        return SwitchError("get", Texts::Translate(
+            "'-latest' cannot be combined with '-versionid': one names the "
+            "newest object, the other one exact version."));
+    }
     if (!RequireConnection())
     {
         return false;
@@ -3877,6 +4037,76 @@ bool Script::GetFiles(const std::vector<std::string> & args)
     std::vector<std::string> sourcePatterns = paths.size() >= 2 ?
         std::vector<std::string>(paths.begin(), paths.end() - 1) :
         std::vector<std::string>(paths.begin(), paths.end());
+
+    /*
+     * '-latest': upstream first builds the whole file list and then keeps
+     * the one file with the newest modification time, so a mask and
+     * several file parameters compete with one another instead of each
+     * choosing its own. The comparison is on the source side, before a
+     * mask preset narrows the file.
+     */
+    if (flags.latest)
+    {
+        std::string newestPath;
+        unsigned long newestTime = 0;
+        bool haveNewest = false;
+        for (size_t i = 0; i < sourcePatterns.size(); i++)
+        {
+            std::vector<std::string> expanded;
+            std::string error;
+            if (!ExpandRemote(sourcePatterns[i], expanded, error))
+            {
+                Console::Instance().Error(Texts::RemoteError("read",
+                    sourcePatterns[i], error));
+                mErrors++;
+                return false;
+            }
+            for (size_t n = 0; n < expanded.size(); n++)
+            {
+                LscpAttrs attrs = {};
+                std::string statError;
+                if (RemoteStat(expanded[n], &attrs, statError) !=
+                    LSCP_SFTP_STAT_EXISTS)
+                {
+                    continue;
+                }
+                const unsigned long when =
+                    (attrs.flags & LSCP_ATTR_ACMODTIME) != 0 ? attrs.mtime : 0;
+                if (!haveNewest || when > newestTime)
+                {
+                    newestPath = expanded[n];
+                    newestTime = when;
+                    haveNewest = true;
+                }
+            }
+        }
+        if (!haveNewest)
+        {
+            /* Nothing matched: report it the way the ordinary loop does,
+             * and transfer nothing. */
+            for (size_t i = 0; i < sourcePatterns.size(); i++)
+            {
+                if (HasWildcard(sourcePatterns[i]))
+                {
+                    Console::Instance().Status(Texts::Translate(
+                        "No file matching '{pattern}' was found.",
+                        {{"pattern", sourcePatterns[i]}}));
+                    if (mFailOnNoMatch)
+                    {
+                        mErrors++;
+                    }
+                }
+                else
+                {
+                    Console::Instance().Error(Texts::RemoteError("find",
+                        sourcePatterns[i], "No such file."));
+                    mErrors++;
+                }
+            }
+            return false;
+        }
+        sourcePatterns.assign(1, newestPath);
+    }
 
     LocalFileInfo destinationInfo = StatLocal(ExpandTilde(destination));
     bool destinationIsDir = destinationInfo.isDir;
@@ -4232,6 +4462,79 @@ bool Script::PutFiles(const std::vector<std::string> & args)
     std::vector<std::string> sourcePatterns = paths.size() >= 2 ?
         std::vector<std::string>(paths.begin(), paths.end() - 1) :
         std::vector<std::string>(paths.begin(), paths.end());
+
+    /*
+     * '-latest': the newest of everything the command selected, chosen on
+     * the local side before the destination is looked at, so that a
+     * single file is uploaded under the destination's name instead of
+     * the mask's.
+     */
+    if (flags.latest)
+    {
+        std::string newestPath;
+        unsigned long newestTime = 0;
+        bool haveNewest = false;
+        std::string localError;
+        const std::string current = GetLocalDirectory(localError);
+        if (current.empty())
+        {
+            Console::Instance().Error(localError);
+            mErrors++;
+            return false;
+        }
+        for (size_t i = 0; i < sourcePatterns.size(); i++)
+        {
+            std::vector<std::string> expanded;
+            std::string error;
+            if (!ExpandLocalWildcard(ResolveLocalPath(current,
+                    sourcePatterns[i]), expanded, error))
+            {
+                Console::Instance().Error(Texts::LocalError(
+                    "expand the file name", sourcePatterns[i], error));
+                mErrors++;
+                return false;
+            }
+            for (size_t n = 0; n < expanded.size(); n++)
+            {
+                const LocalFileInfo info = StatLocal(expanded[n]);
+                if (!info.exists)
+                {
+                    continue;
+                }
+                if (!haveNewest || info.mtime > newestTime)
+                {
+                    newestPath = expanded[n];
+                    newestTime = info.mtime;
+                    haveNewest = true;
+                }
+            }
+        }
+        if (!haveNewest)
+        {
+            for (size_t i = 0; i < sourcePatterns.size(); i++)
+            {
+                if (HasWildcard(sourcePatterns[i]))
+                {
+                    Console::Instance().Status(Texts::Translate(
+                        "No file matching '{pattern}' was found.",
+                        {{"pattern", sourcePatterns[i]}}));
+                    if (mFailOnNoMatch)
+                    {
+                        mErrors++;
+                    }
+                }
+                else
+                {
+                    Console::Instance().Error(Texts::LocalError(
+                        "expand the file name", sourcePatterns[i],
+                        "No such file."));
+                    mErrors++;
+                }
+            }
+            return false;
+        }
+        sourcePatterns.assign(1, newestPath);
+    }
 
     std::string destination = ResolveRemotePath(mRemoteDirectory, destinationArg);
     LscpAttrs destinationAttrs = {};
@@ -5787,7 +6090,9 @@ bool Script::SessionCommand(const std::vector<std::string> & args)
         mErrors++;
         return false;
     }
-    const std::string name = SessionDisplayNameFor(mSession.Options());
+    const std::string name = mSessionDisplayName.empty() ?
+        (mSession.Options().hostName.empty() ? std::string("session") :
+            mSession.Options().hostName) : mSessionDisplayName;
     if (args.empty())
     {
         char index[8];
@@ -6105,9 +6410,12 @@ bool Script::OpenStoredSite(const std::string & name,
     }
 
     mStoredSessionName = stored->name;
+    mSessionDisplayName = switches.sessionNameGiven ? switches.sessionName :
+        stored->name;
     /* A stored site names the XML log's '<session>' root, as upstream's
      * stored sessions name theirs. */
-    console.XmlSessionName(stored->name);
+    console.XmlSessionName(switches.sessionNameGiven ? switches.sessionName :
+        stored->name);
     console.Status(Texts::Translate("Connected, the remote directory is {path}", {{"path", mRemoteDirectory}}));
 
     /* Remember when this session was last used; a failure to record it
@@ -8956,10 +9264,12 @@ const struct ScriptCommandHelpEntry
         { "get", "get [ <switches> ] <file> [ <file>... ] [ <target> ]\n"
             "  Downloads files. Switches: -delete, -resume, -append,\n"
             "  -resumesupport=on|off|<KB>, -speed=<KB/s>, -neweronly,\n"
-            "  -noneweronly, -preservetime, -preservetime=all,\n"
+            "  -noneweronly, -latest, -preservetime, -preservetime=all,\n"
             "  -nopreservetime, -r, -transfer=binary|ascii|automatic,\n"
             "  -permissions[=<mode>], -nopermissions, -versionid=<ID>,\n"
             "  -rawtransfersettings[=<count>], -filemask=<mask>.\n"
+            "  -latest transfers only the newest file the command named,\n"
+            "  by the source's modification time.\n"
             "  For S3, -versionid downloads that exact object version; it\n"
             "  stages separately per version so resumes never mix versions.\n"
             "  Without a value, -permissions gives the downloaded file\n"
@@ -8990,9 +9300,18 @@ const struct ScriptCommandHelpEntry
             "  Moves or renames remote files; with several sources the\n"
             "  target must be an existing directory." },
         { "open", "open <site> [-hostkey=KEY] [-password=PWD] [-username=NAME]\n"
-            "        [-privatekey=FILE] [-rawsettings NAME=VALUE...]\n"
+            "        [-privatekey=FILE] [-passphrase=PHR] [-clientcert=FILE]\n"
+            "        [-timeout=SEC] [-implicit[=on|off]] [-explicit[=on|off]]\n"
+            "        [-passive[=on|off]] [-sessionname=NAME]\n"
+            "        [-rawsettings NAME=VALUE...]\n"
             "  Connects to a site given as a URL or a stored session name;\n"
             "  the switches apply to a stored site as well as to a URL.\n"
+            "  -timeout is the server response timeout in seconds.\n"
+            "  -implicit and -explicit choose the TLS mode of an FTP\n"
+            "  session (implicit TLS uses port 990 when the URL names no\n"
+            "  port); -passive turns the FTP data connection policy on or\n"
+            "  off; -clientcert is the TLS client certificate file;\n"
+            "  -sessionname is the name this connection is logged under.\n"
             "  -rawsettings sets session settings by upstream's names. This\n"
             "  build applies the proxy ones (ProxyMethod=None|SOCKS4|SOCKS5|\n"
             "  HTTP|Telnet|Cmd, ProxyHost, ProxyPort, ProxyUsername,\n"
@@ -9026,7 +9345,8 @@ const struct ScriptCommandHelpEntry
             "  -permissions without a value keeps the local file's own\n"
             "  mode on the server); -append adds to the remote file\n"
             "  instead of replacing it (native SFTP only, and not\n"
-            "  together with -resume)." },
+            "  together with -resume); -latest uploads only the newest\n"
+            "  local file the command named." },
         { "pwd", "pwd\n"
             "  Prints the remote working directory." },
         { "rm", "rm [ -onlyfile ] [ -versionid=ID ] <file> [ <file>... ]\n"

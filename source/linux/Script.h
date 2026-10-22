@@ -52,6 +52,27 @@ struct OpenSwitches
     bool userNameGiven;
     bool privateKeyGiven;
     bool passphraseGiven;
+    /* '-timeout=': this connection's server response timeout. */
+    bool timeoutGiven;
+    int timeoutSecs;
+    /* '-implicit[=on|off]' and '-explicit[=on|off]' (with upstream's
+     * '-explicittls'/'-explicitssl' spellings): the TLS mode of an FTP
+     * session. 'explicitSsl' tells the deprecated spelling apart, since
+     * upstream maps it to a different TFtps value. */
+    bool implicitGiven;
+    bool implicitValue;
+    bool explicitGiven;
+    bool explicitValue;
+    bool explicitSsl;
+    /* '-passive[=on|off]': the FTP data connection policy. */
+    bool passiveGiven;
+    bool passiveValue;
+    /* '-clientcert=': the TLS client certificate file. */
+    bool clientCertGiven;
+    std::string clientCertificate;
+    /* '-sessionname=': the name this session is logged under. */
+    bool sessionNameGiven;
+    std::string sessionName;
     std::string hostKey;
     std::string password;
     std::string userName;
@@ -61,7 +82,11 @@ struct OpenSwitches
 
     OpenSwitches() : hostKeyGiven(false), passwordGiven(false),
         userNameGiven(false), privateKeyGiven(false),
-        passphraseGiven(false) {}
+        passphraseGiven(false), timeoutGiven(false), timeoutSecs(0),
+        implicitGiven(false), implicitValue(false), explicitGiven(false),
+        explicitValue(false), explicitSsl(false), passiveGiven(false),
+        passiveValue(false), clientCertGiven(false), sessionNameGiven(false)
+        {}
 };
 
 struct TransferFlags
@@ -106,6 +131,9 @@ struct TransferFlags
     unsigned speedKBytesPerSecond;
     /* '-append': add to the destination instead of replacing it. */
     bool append;
+    /* '-latest': transfer only the newest of everything the command
+     * selected, which is how upstream chooses among a mask's matches. */
+    bool latest;
     /* '-preservetime=all': also give the transferred directories the
      * timestamps of their source, not just the files. */
     bool preserveTimeDirs;
@@ -122,8 +150,8 @@ struct TransferFlags
         resume(false), versionIdGiven(false),
         transferMode(TransferMode::Binary), permissions(-1),
         maskGiven(false), resumeSupport(ResumeUnset), resumeThreshold(0),
-        speedKBytesPerSecond(0), append(false), preserveTimeDirs(false),
-        explicitSettings(0) {}
+        speedKBytesPerSecond(0), append(false), latest(false),
+        preserveTimeDirs(false), explicitSettings(0) {}
 };
 
 class Script
@@ -472,6 +500,10 @@ private:
     /* Name of the stored session that was opened, so that 'savesession'
      * keeps it and 'open' can report it. */
     std::string mStoredSessionName;
+    /* The name this connection is listed, closed and logged under:
+     * upstream's '-sessionname=' when the command gave one, the stored
+     * site's name for a site, and the host for an ad-hoc URL. */
+    std::string mSessionDisplayName;
     enum class BatchMode { Off, On, Abort, Continue };
     BatchMode mBatchMode;
     bool mBatchConfigured;

@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <strings.h>
+
 #include "Console.h"
 #include "PathUtil.h"
 #include "Platform.h"
@@ -39,6 +41,154 @@ bool StartsWith(const char * text, const char * prefix, const char ** value)
         *value = text + len;
     }
     return true;
+}
+
+/*
+ * Upstream's command line takes '/' as an option mark as well as '-', and
+ * ':' as a value delimiter as well as '='. A token that looks like an
+ * option is rewritten to the '-name=value' spelling the parser below
+ * reads. '/home/user' is not an option: after a slash mark the name is
+ * letters (and '-' or '?') only, and a slash-named option without a value
+ * is accepted only when this client has one by that name, so that a POSIX
+ * path or site name keeps its meaning. '--' ends option parsing, as it
+ * does upstream.
+ */
+bool IsOptionNameChar(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '?' || c == '_';
+}
+
+std::string NormalizeOptionToken(const char * raw, bool & noMoreOptions)
+{
+    if (noMoreOptions || raw == NULL || raw[0] == '\0')
+    {
+        return raw == NULL ? std::string() : std::string(raw);
+    }
+    if (strcmp(raw, "--") == 0)
+    {
+        noMoreOptions = true;
+        return std::string();
+    }
+    if (raw[0] != '-' && raw[0] != '/')
+    {
+        return std::string(raw);
+    }
+    size_t index = 1;
+    while (raw[index] != '\0' && IsOptionNameChar(raw[index]))
+    {
+        index++;
+    }
+    const std::string name(raw + 1, index - 1);
+    if (name.empty())
+    {
+        return std::string(raw);
+    }
+    if (raw[index] == '=' || raw[index] == ':')
+    {
+        return "-" + name + "=" + std::string(raw + index + 1);
+    }
+    if (raw[0] == '-')
+    {
+        return std::string(raw);
+    }
+    /* The value-less options this client has; anything else keeps the
+     * path meaning it had. */
+    static const char * const valueLess[] = {
+        "batch", "gui", "h", "help", "literal", "server", "shell",
+        "verbose", "version"
+    };
+    for (size_t i = 0; i < sizeof(valueLess) / sizeof(valueLess[0]); i++)
+    {
+        if (name == valueLess[i])
+        {
+            return "-" + name;
+        }
+    }
+    return std::string(raw);
+}
+
+/*
+ * A size as '/logsize=' spells it: a whole number of bytes, optionally
+ * followed by K, M, G or T (with an optional 'B'), in either case.
+ * Returns false rather than wrapping a value the field cannot hold.
+ */
+bool ParseLogSize(const char * text, unsigned long long * result)
+{
+    if (text == NULL || text[0] == '\0')
+    {
+        return false;
+    }
+    unsigned long long value = 0;
+    size_t index = 0;
+    while (text[index] >= '0' && text[index] <= '9')
+    {
+        const unsigned digit = static_cast<unsigned>(text[index] - '0');
+        if (value > (ULLONG_MAX - digit) / 10ULL)
+        {
+            return false;
+        }
+        value = value * 10ULL + digit;
+        index++;
+    }
+    if (index == 0)
+    {
+        return false;
+    }
+    switch (text[index])
+    {
+    case '\0':
+        break;
+    case 'k': case 'K': value *= 1024ULL; index++; break;
+    case 'm': case 'M': value *= 1024ULL * 1024ULL; index++; break;
+    case 'g': case 'G': value *= 1024ULL * 1024ULL * 1024ULL; index++; break;
+    case 't': case 'T':
+        value *= 1024ULL * 1024ULL * 1024ULL * 1024ULL; index++; break;
+    default:
+        return false;
+    }
+    if (text[index] == 'b' || text[index] == 'B')
+    {
+        index++;
+    }
+    if (text[index] != '\0' || value == 0)
+    {
+        return false;
+    }
+    *result = value;
+    return true;
+}
+
+/*
+ * An on/off switch value, upstream's TOptions::SwitchValue: no value means
+ * on, "on" and "off" compare without case, and a whole number means on
+ * when it is not zero.
+ */
+bool ParseOnOff(const char * text, bool & enabled)
+{
+    if (text == NULL || text[0] == '\0')
+    {
+        enabled = true;
+        return true;
+    }
+    if (strcasecmp(text, "on") == 0)
+    {
+        enabled = true;
+        return true;
+    }
+    if (strcasecmp(text, "off") == 0)
+    {
+        enabled = false;
+        return true;
+    }
+    char * end = NULL;
+    const long number = strtol(text, &end, 10);
+    if (end != NULL && *end == '\0')
+    {
+        enabled = number != 0;
+        return true;
+    }
+    return false;
 }
 
 bool ParsePositiveInteger(const char * text, int maximum, int * result)
@@ -226,18 +376,47 @@ int main(int argc, char ** argv)
     bool literalCommand = false;
     bool convertKeySpecified = false;
     bool convertOutputSpecified = false;
+    int logLevel = 0;
+    bool logLevelGiven = false;
+    unsigned long long logMaxBytes = 0;
+    int logMaxCount = 1;
+    bool noMoreOptions = false;
     const char * value = NULL;
 
     for (int i = 1; i < argc; i++)
     {
-        const char * arg = argv[i];
         if (collectingParameters)
         {
             /* WinSCP takes the script parameters after a bare '/parameter';
              * they are not the site URL, however they look. */
-            parameters.push_back(arg);
+            parameters.push_back(argv[i]);
             continue;
         }
+        const std::string normalized = NormalizeOptionToken(argv[i],
+            noMoreOptions);
+        if (normalized.empty())
+        {
+            /* The lone '--' that ends option parsing. */
+            continue;
+        }
+        if (noMoreOptions)
+        {
+            /* Everything after '--' is an argument, even when it looks
+             * like an option. */
+            if (url.empty())
+            {
+                url = normalized;
+            }
+            else
+            {
+                console.Error(linscp::Texts::Translate(
+                    "Unexpected argument '{argument}'.",
+                    {{"argument", normalized}}));
+                return 1;
+            }
+            continue;
+        }
+        const char * arg = normalized.c_str();
         if (strcmp(arg, "-parameter") == 0 || strcmp(arg, "--parameter") == 0 ||
             strcmp(arg, "-parameters") == 0)
         {
@@ -346,6 +525,99 @@ int main(int argc, char ** argv)
         else if (StartsWith(arg, "-log=", &value))
         {
             logFile = linscp::ExpandTilde(value);
+        }
+        else if (StartsWith(arg, "-clientcert=", &value))
+        {
+            options.tls.clientCertificate = linscp::ExpandTilde(value);
+        }
+        else if (strcmp(arg, "-implicit") == 0 || StartsWith(arg, "-implicit=", &value))
+        {
+            /* '/implicit[=on|off]': the TLS mode of the FTP session this
+             * command line opens. No value means on. */
+            bool enabled = true;
+            if (!ParseOnOff(value, enabled))
+            {
+                console.Error(linscp::Texts::Translate(
+                    "The value of '-implicit' must be on or off (a number "
+                    "other than zero means on)."));
+                return 1;
+            }
+            options.tls.ftpsMode = enabled ? 1 : 0;
+        }
+        else if (strcmp(arg, "-explicit") == 0 || StartsWith(arg, "-explicit=", &value) ||
+            strcmp(arg, "-explicittls") == 0 || StartsWith(arg, "-explicittls=", &value))
+        {
+            bool enabled = true;
+            if (!ParseOnOff(value, enabled))
+            {
+                console.Error(linscp::Texts::Translate(
+                    "The value of '-explicit' must be on or off (a number "
+                    "other than zero means on)."));
+                return 1;
+            }
+            options.tls.ftpsMode = enabled ? 3 : 0;
+        }
+        else if (strcmp(arg, "-passive") == 0 || StartsWith(arg, "-passive=", &value))
+        {
+            bool enabled = true;
+            if (!ParseOnOff(value, enabled))
+            {
+                console.Error(linscp::Texts::Translate(
+                    "The value of '-passive' must be on or off (a number "
+                    "other than zero means on)."));
+                return 1;
+            }
+            options.ftp.passiveMode = enabled;
+        }
+        else if (StartsWith(arg, "-loglevel=", &value))
+        {
+            /* Upstream's logging levels: -1 reduced, 0 normal, 1 debug,
+             * 2 debug2. This client prints the SSH event lines from level
+             * 1 on and keeps status narration out of the terminal at -1;
+             * errors, results and transfer output are never suppressed. */
+            char * end = NULL;
+            const long level = strtol(value, &end, 10);
+            if (end == NULL || *end != '\0' || level < -1 || level > 2)
+            {
+                console.Error(linscp::Texts::Translate(
+                    "Invalid log level '{value}' (expected -1, 0, 1 or 2).",
+                    {{"value", value}}));
+                return 1;
+            }
+            logLevel = static_cast<int>(level);
+            logLevelGiven = true;
+        }
+        else if (StartsWith(arg, "-logsize=", &value))
+        {
+            /* '[<count>*]<size>', as upstream: '2*10M' keeps up to two
+             * older logs of ten megabytes each. */
+            const char * star = strchr(value, '*');
+            unsigned long long bytes = 0;
+            int count = 1;
+            if (star != NULL)
+            {
+                std::string countText(value, star - value);
+                char * end = NULL;
+                long parsed = countText.empty() ? 0 :
+                    strtol(countText.c_str(), &end, 10);
+                if (end == NULL || *end != '\0' || parsed < 1 || parsed > 100)
+                {
+                    console.Error(linscp::Texts::Translate(
+                        "The value of '-logsize' is [<count>*]<size>, with "
+                        "the count from 1 through 100."));
+                    return 1;
+                }
+                count = static_cast<int>(parsed);
+            }
+            if (!ParseLogSize(star != NULL ? star + 1 : value, &bytes))
+            {
+                console.Error(linscp::Texts::Translate(
+                    "The value of '-logsize' is [<count>*]<size>, with a size "
+                    "in bytes and an optional K, M, G or T suffix."));
+                return 1;
+            }
+            logMaxBytes = bytes;
+            logMaxCount = count;
         }
         else if (StartsWith(arg, "-xmllog=", &value))
         {
@@ -535,7 +807,7 @@ int main(int argc, char ** argv)
     if (!logFile.empty())
     {
         std::string error;
-        if (!console.SetLogFile(logFile, error))
+        if (!console.SetLogFile(logFile, error, logMaxBytes, logMaxCount))
         {
             console.Error(linscp::Texts::Translate("Cannot open the log file '{path}': {reason}", {{"path", logFile}, {"reason", error}}));
             return 1;
@@ -552,7 +824,10 @@ int main(int argc, char ** argv)
     }
 
     console.SetBatchMode(batch);
-    console.SetVerbose(options.verbose);
+    /* '-verbose' is upstream's level 1; an explicit '-loglevel=' wins over
+     * it, and level -1 keeps the status narration out of the terminal. */
+    console.SetVerbose(options.verbose || (logLevelGiven && logLevel >= 1));
+    console.SetQuiet(logLevelGiven && logLevel < 0);
 
     linscp::Script script;
     script.SetDefaults(options);

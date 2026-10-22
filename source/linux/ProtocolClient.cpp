@@ -19,6 +19,30 @@
 
 namespace linscp {
 
+/*
+ * SOCKS5h to the jump listener so TLS SNI, the Host header and S3 signing
+ * keep the original destination name. Empty when the session has no
+ * destination tunnel. Defined here, in the public namespace, because the
+ * curl-backed engines in this file and S3Client.cpp both call it.
+ */
+void AddCurlTunnelArgs(const SessionOptions & options,
+    std::vector<std::string> & args)
+{
+    if (options.tunnelSocksPort <= 0)
+    {
+        return;
+    }
+    /* socks5h leaves the destination name to the jump host, which is
+     * what keeps TLS SNI, HTTP Host and S3 SigV4 on the original
+     * hostname while the TCP connection is 127.0.0.1. --noproxy '*'
+     * stops a parent proxy exclusion from sending the destination
+     * around the tunnel. */
+    args.push_back("--socks5-hostname");
+    args.push_back("127.0.0.1:" + std::to_string(options.tunnelSocksPort));
+    args.push_back("--noproxy");
+    args.push_back("*");
+}
+
 /* The lock token this session holds for a path, or an empty string: the
  * If header that makes the server enforce the lock. */
 std::string DavTokenFor(const SessionOptions & options,
@@ -495,23 +519,6 @@ void AddTlsCurlArgs(const SessionOptions & options, std::vector<std::string> & a
         args.push_back("--pinnedpubkey");
         args.push_back(options.tls.pinnedPublicKey);
     }
-}
-
-void AddCurlTunnelArgs(const SessionOptions & options, std::vector<std::string> & args)
-{
-    if (options.tunnelSocksPort <= 0)
-    {
-        return;
-    }
-    /* socks5h leaves the destination name to the jump host, which is
-     * what keeps TLS SNI, HTTP Host and S3 SigV4 on the original
-     * hostname while the TCP connection is 127.0.0.1. --noproxy '*'
-     * stops a parent proxy exclusion from sending the destination
-     * around the tunnel. */
-    args.push_back("--socks5-hostname");
-    args.push_back("127.0.0.1:" + std::to_string(options.tunnelSocksPort));
-    args.push_back("--noproxy");
-    args.push_back("*");
 }
 
 void BuildCommonCurlArgs(const SessionOptions & options, std::vector<std::string> & args,
