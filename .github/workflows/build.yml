@@ -61,9 +61,20 @@ jobs:
       - name: Live SSH tunnel regressions
         run: |
           set -o pipefail
-          "$RUNNER_TEMP/live-test-venv/bin/python" \
-            -u source/linux/tests/LiveTunnelTest.py source/linux/build/linscp 2>&1 |
-            tee "$RUNNER_TEMP/live-tunnel-tests.log"
+          if ! "$RUNNER_TEMP/live-test-venv/bin/python" \
+              -u source/linux/tests/LiveTunnelTest.py source/linux/build/linscp 2>&1 |
+              tee "$RUNNER_TEMP/live-tunnel-tests.log"; then
+            python3 - "$RUNNER_TEMP/live-tunnel-tests.log" <<'PY'
+          import pathlib
+          import sys
+          text = pathlib.Path(sys.argv[1]).read_text()
+          start = text.rfind(chr(10) + "ERROR:")
+          text = text[start + 1:] if start >= 0 else text[-3000:]
+          text = text[-2800:].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A')
+          print('::error::' + text)
+          PY
+            exit 1
+          fi
           grep -E 'evidence: suite=live-tunnel .*ran=[1-9]' \
             "$RUNNER_TEMP/live-tunnel-tests.log" > /dev/null || {
             echo "::error::the live SSH tunnel suite ran no tests"
@@ -343,16 +354,25 @@ jobs:
           set -o pipefail
           if ! LSCP_REQUIRE_GSSAPI_REALM=1 \
                ctest --test-dir build --output-on-failure 2>&1 | tee "$RUNNER_TEMP/ctest.log"; then
-            # Surface diagnostics through the checks API as well as hosted
-            # logs, so failures remain reviewable in restricted environments.
-            python3 - "$RUNNER_TEMP/ctest.log" <<'PY'
+            # Re-run only failed cases so their tracebacks are visible. The
+            # Actions API truncates a single large annotation, so emit one
+            # bounded annotation per failed test.
+            LSCP_REQUIRE_GSSAPI_REALM=1 \
+              ctest --test-dir build --rerun-failed --output-on-failure \
+              > "$RUNNER_TEMP/ctest-failed.log" 2>&1 || :
+            python3 - "$RUNNER_TEMP/ctest-failed.log" <<'PY'
           import pathlib
+          import re
           import sys
-          # GitHub truncates large command annotations; keep the final
-          # failure details visible, where CTest prints its summary.
-          text = pathlib.Path(sys.argv[1]).read_text()[-3000:]
-          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-          print('::error::' + text)
+          text = pathlib.Path(sys.argv[1]).read_text()
+          blocks = re.split(r'(?=^\s*Start\s+\d+:)', text, flags=re.MULTILINE)
+          failed = [block for block in blocks if re.search(r'\*\*\*Failed', block)]
+          if not failed:
+              failed = [text[-3000:]]
+          for block in failed:
+              message = block[-2800:]
+              message = message.replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A')
+              print('::error::' + message)
           PY
             exit 1
           fi
