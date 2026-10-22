@@ -1533,8 +1533,7 @@ bool LooksLikeCertificateFingerprint(const std::string & text)
 
 std::string GssapiKeyExchangeList(const SessionOptions & options)
 {
-    if (!options.gssapi.auth || !options.gssapi.authKex ||
-        !IsGssapiSupported())
+    if (!options.gssapi.authKex || !IsGssapiKeyExchangeSupported())
     {
         return std::string();
     }
@@ -1553,16 +1552,6 @@ std::string GssapiKeyExchangeList(const SessionOptions & options)
 bool ValidateSessionSettings(const SessionOptions & options, std::string & error)
 {
     error.clear();
-    if ((UseNativeSftp(options.protocol) || UseNativeScp(options.protocol)) &&
-        options.gssapi.auth && !IsGssapiSupported() &&
-        (options.gssapi.authKex || options.gssapi.forwardTgt ||
-         !options.gssapi.logicalHost.empty()))
-    {
-        error = Texts::Translate("This build's libssh cannot use GSSAPI, so the session's "
-            "Kerberos settings (AuthGSSAPIKEX, GSSAPIFwdTGT, LogicalHostName) "
-            "would be dropped.");
-        return false;
-    }
     if (!ValidateProxySettings(options.proxy, error))
     {
         return false;
@@ -1631,6 +1620,38 @@ bool ValidateSessionSettings(const SessionOptions & options, std::string & error
             "no TLS library is linked. Pin the public key instead "
             "(-rawsettings PinnedPublicKey=sha256//BASE64, or a PEM/DER "
             "file), or accept any certificate with -hostkey=\"*\".";
+        return false;
+    }
+    return true;
+}
+
+bool ValidateSessionCapabilities(const SessionOptions & options,
+    std::string & error)
+{
+    error.clear();
+    const bool nativeSsh = UseNativeSftp(options.protocol) ||
+        UseNativeScp(options.protocol);
+    if (nativeSsh && options.gssapi.authKex &&
+        !options.hostKey.empty() && options.hostKey != "*")
+    {
+        error = Texts::Translate("AuthGSSAPIKEX cannot be used with a pinned "
+            "host key because GSSAPI key exchange does not present a host key.");
+        return false;
+    }
+    if (nativeSsh && !IsGssapiSupported() &&
+        (options.gssapi.authKex || options.gssapi.forwardTgt ||
+         !options.gssapi.logicalHost.empty()))
+    {
+        error = Texts::Translate("This build's libssh cannot use GSSAPI, so the session's "
+            "Kerberos settings (AuthGSSAPIKEX, GSSAPIFwdTGT, LogicalHostName) "
+            "would be dropped.");
+        return false;
+    }
+    if (nativeSsh && options.gssapi.authKex &&
+        !IsGssapiKeyExchangeSupported())
+    {
+        error = Texts::Translate("This build's libssh does not support GSSAPI key "
+            "exchange, so AuthGSSAPIKEX cannot be honored.");
         return false;
     }
     return true;
@@ -2950,7 +2971,8 @@ bool Session::Connect(const SessionOptions & options, const char * program,
         error = "The connection timeout must be a positive number of seconds.";
         return false;
     }
-    if (!ValidateSessionSettings(options, error))
+    if (!ValidateSessionSettings(options, error) ||
+        !ValidateSessionCapabilities(options, error))
     {
         return false;
     }
@@ -2997,7 +3019,8 @@ bool Session::Connect(const SessionOptions & options, const char * program,
     // the session asks for it by name, and the logical host name only
     // changes which service ticket is requested, never where the
     // connection goes.
-    if (IsGssapiSupported() && mOptions.gssapi.auth)
+    if (IsGssapiSupported() &&
+        (mOptions.gssapi.auth || mOptions.gssapi.authKex))
     {
         int delegate = mOptions.gssapi.forwardTgt ? 1 : 0;
         ssh_options_set(ssh, SSH_OPTIONS_GSSAPI_DELEGATE_CREDENTIALS,
@@ -3019,9 +3042,13 @@ bool Session::Connect(const SessionOptions & options, const char * program,
         ssh_options_set(ssh, SSH_OPTIONS_KEY_EXCHANGE, kexList.c_str()) !=
             SSH_OK)
     {
-        Console::Instance().LogEvent(Texts::Translate(
-            "This libssh cannot offer GSSAPI key exchange; using its "
-            "default key exchange"));
+        /* AuthGSSAPIKEX is an explicit server-authentication policy. Falling
+         * back to an ordinary host-key exchange here could turn it into an
+         * unauthenticated connection when the host-key policy is '*'. */
+        error = Texts::Translate("This build's libssh does not support GSSAPI key "
+            "exchange, so AuthGSSAPIKEX cannot be honored.");
+        Close();
+        return false;
     }
 
     /*

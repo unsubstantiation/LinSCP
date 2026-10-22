@@ -98,8 +98,10 @@ Commander is a browser interface and the automation surface is a
 .NET-compatible assembly that covers session lifecycle, listing, transfers and
 synchronization rather than every type of the upstream object model. Optional
 account sign-in isolates users at the application layer, but the backend still
-runs as one OS user. Live Kerberos-realm certification and broader localization
-remain in the plan; the ledger records both as tracked gaps.
+runs as one OS user. The live SFTP suite now provisions an isolated loopback
+Kerberos realm for GSSAPI cases, but broader production-realm validation and
+independent delegation review, as well as broader localization, remain in the
+plan.
 
 ### SSH jump-host implementation and newly identified gaps
 
@@ -133,10 +135,35 @@ remain in the plan; the ledger records both as tracked gaps.
   implemented LinSCP deployment extension, not an upstream desktop capability.
 
 The combined GSSAPI/tunnel row remains partial; SSH jumps, an optional
-loopback `TunnelLocalPortNumber` and libssh-backed GSSAPI wiring are
-implemented, but real Kerberos-realm certification and non-SSH tunnels do not
-close that gap. The full-parity gate must continue to fail until the
-remaining capabilities are implemented and independently evidenced.
+loopback `TunnelLocalPortNumber` and libssh-backed GSSAPI authentication are
+implemented. The live SFTP suite now builds an isolated loopback KDC and
+OpenSSH service to exercise principal selection, expired/missing credentials,
+server identity and explicit delegation; CI requires a GSSAPI-enabled libssh
+and no skipped realm cases. `AuthGSSAPIKEX` is separately probed and refused
+when libssh lacks RFC 4462 algorithms rather than silently falling back to an
+ordinary key exchange, and also rejects the incompatible combination with a
+pinned host key. Cross-realm/production-KDC coverage and an independent review
+of delegated TGT handling remain open; so do non-SSH tunnels. The
+full-parity gate must continue to fail until the remaining capabilities are
+implemented and independently evidenced.
+
+## Local verification on 2026-10-22
+
+These checks cover the GSSAPI capability, validation and test-fixture edits in
+this checkout; they do not establish full WinSCP parity.
+
+| Check | Result |
+| --- | --- |
+| `python3 tools/check_upstream_parity.py --write-report` | Passed; reports refreshed, 167/171 inventory entries verified, with two tracked broad gaps and two tracked capability gaps. |
+| Translation compiler and `tools/tests/test_translations.py` | Passed; 6 tests. |
+| Python syntax for `LiveSftpTest.py` | Passed. |
+| Local live SFTP suite invoked with `/bin/true` | 4 tests discovered, 5 skipped, 0 failures; the local environment lacks the Kerberos/OpenSSH and Python dependencies, so no live realm test ran. |
+| Native build and real KDC/sshd realm run | Not run locally; required build/runtime dependencies are absent. CI is configured to require all GSSAPI realm cases with zero skips. |
+
+`python3 tools/check_upstream_parity.py --list-gaps` lists the documented
+GSSAPI/tunnel and localization gaps after validating the generated reports;
+`--require-full` remains the gate that exits nonzero while those gaps remain.
+The checker validates the ledger, not behavioral parity.
 
 ## Local verification on 2026-10-19
 

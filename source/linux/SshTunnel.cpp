@@ -19,6 +19,13 @@
 #include <sys/time.h>
 #include <libssh/libssh.h>
 
+/* libssh exports this public GSSAPI helper only in builds configured with
+ * WITH_GSSAPI. Its version string describes the crypto backend, not optional
+ * features (stock libssh does not append "/gssapi"), so a weak reference is
+ * the runtime-safe capability probe. Keep the reference weak so the same
+ * client still links against a build without Kerberos support. */
+#pragma weak ssh_gssapi_set_creds
+
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -537,12 +544,38 @@ std::string TunnelSshFlags(const SshTunnel & tunnel)
 
 bool IsGssapiSupported()
 {
-    /* A libssh built with real GSSAPI names it in its version string
-     * (".../gssapi"); a stub build still links ssh_userauth_gssapi but
-     * cannot use it, and must not be mistaken for support. */
-    const char * version = ssh_version(0);
-    return version != NULL &&
-        std::string(version).find("gssapi") != std::string::npos;
+    /* ssh_version() identifies libssh's crypto/compression backend; it does
+     * not advertise optional GSSAPI support. libssh's public
+     * ssh_gssapi_set_creds entry point is compiled only when WITH_GSSAPI was
+     * enabled. The weak reference above distinguishes that build from the
+     * always-present auth stub without making GSSAPI a hard link dependency. */
+    return ssh_gssapi_set_creds != NULL;
+}
+
+bool IsGssapiKeyExchangeSupported()
+{
+    /* GSSAPI authentication is available in older libssh releases than
+     * RFC 4462 key exchange. Probe a GSSAPI-only KEX list on an unconnected
+     * session: ssh_options_set filters the list against this library's
+     * compiled algorithms and rejects it when none are implemented. */
+    static const bool supported = []() {
+        if (!IsGssapiSupported())
+        {
+            return false;
+        }
+        ssh_session probe = ssh_new();
+        if (probe == NULL)
+        {
+            return false;
+        }
+        const char * gssapiKex = "gss-group14-sha256-,gss-group16-sha512-,"
+            "gss-nistp256-sha256-,gss-curve25519-sha256-";
+        const bool result = ssh_options_set(probe, SSH_OPTIONS_KEY_EXCHANGE,
+            gssapiKex) == SSH_OK;
+        ssh_free(probe);
+        return result;
+    }();
+    return supported;
 }
 
 struct Relay

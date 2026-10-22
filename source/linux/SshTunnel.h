@@ -111,11 +111,14 @@ bool ParseTunnelSpec(const std::string & spec, TunnelType type,
 /* Builds the ssh(1) command-line flags for one tunnel. */
 std::string TunnelSshFlags(const SshTunnel & tunnel);
 
-/* Whether the libssh this process loaded can really speak GSSAPI: the
- * library advertises it in ssh_version(), which a stub build does not.
- * Authentication code must ask this rather than assuming the symbol
- * that linked is an implementation. */
+/* Whether the loaded libssh was built with GSSAPI. The public
+ * ssh_gssapi_set_creds symbol is absent from no-GSSAPI builds; checking it
+ * through a weak reference works even though the common auth function also
+ * exists as a stub. */
 bool IsGssapiSupported();
+/* Whether this libssh build actually implements the RFC 4462 GSSAPI key
+ * exchange algorithms (GSSAPI authentication alone is not sufficient). */
+bool IsGssapiKeyExchangeSupported();
 
 } // namespace linscp
 

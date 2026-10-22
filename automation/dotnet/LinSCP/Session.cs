@@ -432,7 +432,7 @@ namespace LinSCP
 
         void OnFailed(SessionRemoteException error)
         {
-            Failed?.Invoke(this, error);
+            Failed?.Invoke(this, new FailedEventArgs(error));
         }
 
         void EnsureOpen()

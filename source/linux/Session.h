@@ -280,6 +280,11 @@ bool IsSessionRawSettingName(const std::string & name);
  * saying so beats connecting without verification) and the FTP settings.
  */
 bool ValidateSessionSettings(const SessionOptions & options, std::string & error);
+/* Checks runtime SSH capabilities and setting combinations immediately
+ * before a connection; saved preferences may retain settings this build
+ * cannot use so they can be carried to a compatible libssh build. */
+bool ValidateSessionCapabilities(const SessionOptions & options,
+    std::string & error);
 /* The key-exchange list to offer when GSSAPI key exchange is on: the
  * RFC 4462 algorithms first, then this client's ordinary ones. Empty
  * when it is off, when the loaded libssh cannot use GSSAPI, or when a
