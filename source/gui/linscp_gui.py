@@ -56,6 +56,7 @@ import posixpath
 import subprocess
 import tempfile
 import threading
+import traceback
 import urllib.parse
 import base64
 import fcntl
@@ -4600,15 +4601,19 @@ def contained_local_path(base, name):
     """
     if not isinstance(name, str) or not name:
         return None, "Select an item first."
-    # Reject path separators, NUL and control characters. A backslash is
-    # not a separator on POSIX but is rejected for consistency with the
-    # browser drop handlers that treat it as a separator attempt.
-    if name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
+    # Reject path separators, NUL and control characters. A backslash is not
+    # a separator here: it is an ordinary character of a POSIX file name, so
+    # a file that has one could not be deleted or renamed from the panel.
+    # The browser drop handlers, which do receive file names from another
+    # platform, normalise separators before they get here.
+    if name in (".", "..") or "/" in name or "\x00" in name:
         return None, ("\"%s\" is not a single file name in this directory."
                       % name)
     if any(ord(char) < 32 or ord(char) == 127 for char in name):
         return None, "A file name must not contain a control character."
-    if len(name.encode("utf-8")) > 255:
+    # 'surrogateescape' round-trips a name the local file system holds in
+    # bytes that are not UTF-8: the panel has to be able to act on it.
+    if len(name.encode("utf-8", "surrogateescape")) > 255:
         return None, "The file name is too long."
     if not isinstance(base, str) or not base or not os.path.isabs(base):
         return None, "The local directory of this panel is not set."
@@ -4647,11 +4652,11 @@ def check_remote_entry_name(name):
     """
     if not isinstance(name, str) or not name:
         return "Select an item first."
-    if name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
+    if name in (".", "..") or "/" in name or "\x00" in name:
         return ("\"%s\" is not a single file name in this directory." % name)
     if any(ord(char) < 32 or ord(char) == 127 for char in name):
         return "A file name must not contain a control character."
-    if len(name.encode("utf-8")) > 255:
+    if len(name.encode("utf-8", "surrogateescape")) > 255:
         return "The file name is too long."
     return ""
 
@@ -6277,6 +6282,75 @@ def consume_shell_upload(manifest_id, tab):
     return {"queued": queued, "missing": missing, "remote_dir": remote_dir}
 
 
+def command_failure_text(lines, errors, fallback):
+    """What a remote command that failed told the user.
+
+    The core writes the reason a command failed to stderr and the output of
+    the commands that did run to stdout. A caller that reported only stdout
+    showed the echo of the 'cd' the operation started with - whose output is
+    the directory it entered - so a delete that could not remove a directory
+    said its error was '/', and a listing of a missing directory reported
+    '/no-such-dir' as the reason. The stderr text is the error; stdout is
+    only a fallback for a core that wrote nothing there.
+    """
+    reason = "\n".join(text for text in list(errors) if text.strip()).strip()
+    if reason:
+        return reason
+    output = [text for text in list(lines) if text.strip()]
+    if output:
+        return output[-1].strip()
+    return fallback
+
+
+def json_text(body, key, default=""):
+    """A string field of a JSON request body.
+
+    The browser client sends strings for these fields, so a number, a list
+    or an object is a malformed request and not a value to guess at: str()
+    of a dict reached os.path and the command line, where it raised inside
+    the handler and the request was answered with a closed connection and a
+    traceback rather than an error.
+    """
+    value = body.get(key) if isinstance(body, dict) else None
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ValueError("The '%s' field must be a string." % key)
+    return value
+
+
+def json_tab_ref(body, key="tab"):
+    """A tab identifier from a JSON body: a number or a string, or None.
+
+    A tab id is a dictionary key in the interface and in the challenge
+    table, so a list or an object arrived as an unhashable key and raised
+    where the tab was looked up.
+    """
+    value = body.get(key) if isinstance(body, dict) else None
+    if value is None or (isinstance(value, (int, str)) and
+                         not isinstance(value, bool)):
+        return value
+    raise ValueError("The '%s' field must be a tab number." % key)
+
+
+def json_names(body, key="names"):
+    """The entry names of a request body: a list of strings, or one string.
+
+    Returns the items unchanged; each one is validated where it is resolved
+    (a remote delete accepts a name or an object that also carries is_dir),
+    but the container itself has to be iterable, which a JSON boolean or
+    object is not.
+    """
+    value = body.get(key) if isinstance(body, dict) else None
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return value
+    raise ValueError("The '%s' field must be a list of names." % key)
+
+
 class LinScpGuiHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=WEB_DIR, **kwargs)
@@ -6473,8 +6547,24 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             # the connection with a traceback and no answer at all.
             return self.send_json({"success": False, "error": str(exc)},
                                   status=400)
+        except Exception as exc:
+            # Nothing a request can hold may end the answer: a handler that
+            # raised used to close the connection with a traceback on this
+            # run's stderr, which the page can only report as a network
+            # failure. The traceback still goes to the log, and the caller
+            # gets an answer it can show.
+            return self.internal_error(exc)
         finally:
             unbind_workspace()
+
+    def internal_error(self, exc):
+        """Answer 500 for an unexpected failure, and log where it happened."""
+        traceback.print_exc()
+        self.close_connection = True
+        return self.send_json({"success": False,
+                               "error": "The server failed to handle this "
+                                        "request (%s)." % type(exc).__name__},
+                              status=500)
 
     def do_POST(self):
         try:
@@ -6487,13 +6577,18 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             self.close_connection = True
             return self.send_json({"success": False, "error": str(exc)},
                                   status=400)
+        except Exception as exc:
+            return self.internal_error(exc)
         finally:
             unbind_workspace()
 
     def _dispatch_get(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
-        query = urllib.parse.parse_qs(parsed.query)
+        # A query value may name a file the local file system holds in bytes
+        # that are not UTF-8; the page sends those bytes as %XX escapes, and
+        # 'surrogateescape' turns them back into the name the file has.
+        query = urllib.parse.parse_qs(parsed.query, errors="surrogateescape")
 
         if path in ("/", "/index.html"):
             return self.serve_client()
@@ -6733,10 +6828,12 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                                 "entries": entries})
                 return
             req_path = query.get("path", [None])[0] or tab.remote_dir
-            code, lines = tab.run_many(["cd " + quote_remote(req_path), "pwd", "ls -la"])
+            code, lines, errors = tab.run_many_capture(
+                ["cd " + quote_remote(req_path), "pwd", "ls -la"])
             if code != 0:
                 self.send_json({"success": False,
-                                "error": "\n".join(lines) or "Directory read failed"},
+                                "error": command_failure_text(lines, errors,
+                                                              "Directory read failed")},
                                status=400)
                 return
             resolved = req_path
@@ -6842,7 +6939,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
         if path.startswith("/api/") and not self.guarded():
             return
         if path == "/api/transfer/drop":
-            query = urllib.parse.parse_qs(parsed.query)
+            query = urllib.parse.parse_qs(parsed.query, errors="surrogateescape")
             try:
                 tab_id = int(query.get("tab", [""])[0])
                 content_length = self.request_content_length()
@@ -6908,7 +7005,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/local/drop":
-            query = urllib.parse.parse_qs(parsed.query)
+            query = urllib.parse.parse_qs(parsed.query, errors="surrogateescape")
             try:
                 content_length = self.request_content_length()
             except (TypeError, ValueError):
@@ -7117,7 +7214,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/tabs/close":
-            tab_id = body.get("tab")
+            tab_id = json_tab_ref(body)
             # A connection that is waiting for a host-key decision lives in
             # 'challenges', not in the tab list. The id arrives from JSON as
             # a number or a string, and a lookup that missed on the type
@@ -7258,7 +7355,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/sessions/delete":
-            name = (body.get("name") or "").strip()
+            name = json_text(body, "name").strip()
             is_folder = bool(body.get("folder"))
             if not name:
                 self.send_json({"success": False, "error": "A session name is required"},
@@ -7455,7 +7552,8 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
         if path == "/api/local/delete":
             tab = get_tab(body.get("tab"))
             base = tab.local_dir if tab else default_local_dir()
-            names = body.get("names") or ([body["name"]] if body.get("name") else [])
+            names = json_names(body) or (
+                [json_text(body, "name")] if body.get("name") else [])
             errors = []
             for name in names:
                 target, contain_error = contained_local_path(base, name)
@@ -7479,7 +7577,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
         if path == "/api/local/rename":
             tab = get_tab(body.get("tab"))
             base = tab.local_dir if tab else default_local_dir()
-            old, new = body.get("old_name"), body.get("new_name")
+            old, new = json_text(body, "old_name"), json_text(body, "new_name")
             if not old or not new:
                 self.send_json({"success": False, "error": "Both names are required"},
                                status=400)
@@ -7501,7 +7599,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
         if path == "/api/local/chmod":
             tab = get_tab(body.get("tab"))
             base = tab.local_dir if tab else default_local_dir()
-            name = body.get("name") or ""
+            name = json_text(body, "name")
             mode_text = str(body.get("permissions") or "")
             mode_error = check_permission_mode(mode_text)
             if not name or mode_error:
@@ -7523,7 +7621,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/local/save":
             tab = get_tab(body.get("tab"))
-            local_path = body.get("path") or ""
+            local_path = json_text(body, "path")
             if not local_path:
                 self.send_json({"success": False, "error": "No file given"}, status=400)
                 return
@@ -7545,7 +7643,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if tab is None:
                 self.send_json({"success": False, "error": "Not connected"}, status=400)
                 return
-            name = body.get("name") or ""
+            name = json_text(body, "name")
             name_error = check_remote_entry_name(name)
             if name_error:
                 self.send_json({"success": False, "error": name_error}, status=400)
@@ -7564,14 +7662,17 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                     self.send_json({"success": False, "error": str(exc)},
                                    status=400)
                 return
-            code, lines = tab.run_many(["cd " + quote_remote(tab.remote_dir),
-                                        "mkdir " + quote_remote(name)])
+            code, lines, errors = tab.run_many_capture(
+                ["cd " + quote_remote(tab.remote_dir),
+                 "mkdir " + quote_remote(name)])
             if code == 0:
                 add_log("Created remote directory: %s" % name, "success")
                 self.send_json({"success": True})
             else:
                 self.send_json({"success": False,
-                                "error": "\n".join(lines) or "mkdir failed"}, status=400)
+                                "error": command_failure_text(lines, errors,
+                                                              "mkdir failed")},
+                               status=400)
             return
 
         if path == "/api/remote/delete":
@@ -7579,15 +7680,20 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if tab is None:
                 self.send_json({"success": False, "error": "Not connected"}, status=400)
                 return
-            names = body.get("names") or []
+            names = json_names(body)
             errors, deleted = [], []
             for item in names:
-                name = item if isinstance(item, str) else item.get("name")
+                if isinstance(item, str):
+                    name, is_dir = item, False
+                elif isinstance(item, dict) and isinstance(item.get("name"), str):
+                    name, is_dir = item["name"], bool(item.get("is_dir"))
+                else:
+                    errors.append("An entry name must be text.")
+                    continue
                 name_error = check_remote_entry_name(name or "")
                 if name_error:
                     errors.append(name_error)
                     continue
-                is_dir = item.get("is_dir", False) if isinstance(item, dict) else False
                 if getattr(tab, "is_local", False):
                     target, contain_error = contained_local_path(tab.remote_dir,
                                                                  name or "")
@@ -7604,13 +7710,14 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                     except OSError as exc:
                         errors.append("%s: %s" % (name, exc))
                     continue
-                code, lines = tab.run_many([
+                code, lines, error_lines = tab.run_many_capture([
                     "cd " + quote_remote(tab.remote_dir),
                     ("rmdir" if is_dir else "rm") + " " + quote_remote(name or "")])
                 if code == 0:
                     deleted.append(name)
                 else:
-                    errors.append("\n".join(lines))
+                    errors.append(command_failure_text(
+                        lines, error_lines, "Cannot delete '%s'." % (name or "")))
             if errors:
                 self.send_json({"success": False, "error": "; ".join(errors)}, status=400)
             else:
@@ -7623,8 +7730,8 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if tab is None:
                 self.send_json({"success": False, "error": "Not connected"}, status=400)
                 return
-            old_name = body.get("old_name") or ""
-            new_name = body.get("new_name") or ""
+            old_name = json_text(body, "old_name")
+            new_name = json_text(body, "new_name")
             name_error = (check_remote_entry_name(old_name) or
                           check_remote_entry_name(new_name))
             if name_error:
@@ -7648,7 +7755,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                     self.send_json({"success": False, "error": str(exc)},
                                    status=400)
                 return
-            code, lines = tab.run_many([
+            code, lines, errors = tab.run_many_capture([
                 "cd " + quote_remote(tab.remote_dir),
                 "mv " + quote_remote(old_name) + " " + quote_remote(new_name)])
             if code == 0:
@@ -7656,7 +7763,9 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 self.send_json({"success": True})
             else:
                 self.send_json({"success": False,
-                                "error": "\n".join(lines) or "Rename failed"}, status=400)
+                                "error": command_failure_text(lines, errors,
+                                                              "Rename failed")},
+                               status=400)
             return
 
         if path == "/api/remote/chmod":
@@ -7694,13 +7803,15 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             except ValueError as exc:
                 self.send_json({"success": False, "error": str(exc)}, status=400)
                 return
-            code, lines = tab.run_many(commands)
+            code, lines, errors = tab.run_many_capture(commands)
             if code == 0:
                 add_log("Changed remote permissions: %s" % body.get("name"), "success")
                 self.send_json({"success": True})
             else:
                 self.send_json({"success": False,
-                                "error": "\n".join(lines) or "chmod failed"}, status=400)
+                                "error": command_failure_text(lines, errors,
+                                                              "chmod failed")},
+                               status=400)
             return
 
         if path == "/api/remote/search":
@@ -7708,8 +7819,8 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if tab is None:
                 self.send_json({"success": False, "error": "Not connected"}, status=400)
                 return
-            pattern = body.get("pattern") or "*"
-            start = body.get("path") or tab.remote_dir
+            pattern = json_text(body, "pattern", "*") or "*"
+            start = json_text(body, "path") or tab.remote_dir
             try:
                 limit = max(1, min(1000, int(body.get("limit") or 500)))
             except (TypeError, ValueError):
@@ -7743,6 +7854,12 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"success": False, "error": str(exc)}, status=400)
                 return
+            finally:
+                restore_remote_directory(tab)
+            if stats.get("error"):
+                self.send_json({"success": False, "error": stats["error"]},
+                               status=400)
+                return
             self.send_json({"success": True, "matches": matches,
                 "truncated": stats["truncated"], "scanned": stats["scanned"],
                 "skipped": stats["skipped"],
@@ -7754,7 +7871,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
             if tab is None:
                 self.send_json({"success": False, "error": "Not connected"}, status=400)
                 return
-            remote_path = body.get("path") or ""
+            remote_path = json_text(body, "path")
             content = body.get("content")
             if not remote_path or content is None:
                 self.send_json({"success": False, "error": "A path and content are required"},
@@ -8206,7 +8323,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                     self.send_json({"success": False, "error": str(exc)},
                                    status=400)
                 return
-            code, lines = tab.run_many([
+            code, lines, errors = tab.run_many_capture([
                 "cd " + quote_remote(tab.remote_dir),
                 "ln %s %s" % (quote_remote(target), quote_remote(name))])
             if code == 0:
@@ -8214,7 +8331,8 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 self.send_json({"success": True})
             else:
                 self.send_json({"success": False,
-                                "error": "\n".join(lines) or "Cannot create the link."},
+                                "error": command_failure_text(
+                                    lines, errors, "Cannot create the link.")},
                                status=400)
             return
 
@@ -8251,7 +8369,7 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                     self.send_json({"success": False, "error": str(exc)},
                                    status=400)
                 return
-            code, lines = tab.run_many([
+            code, lines, errors = tab.run_many_capture([
                 "cd " + quote_remote(tab.remote_dir),
                 "cp %s %s" % (quote_remote(source), quote_remote(destination))])
             if code == 0:
@@ -8259,7 +8377,8 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 self.send_json({"success": True})
             else:
                 self.send_json({"success": False,
-                                "error": "\n".join(lines) or "Cannot copy."},
+                                "error": command_failure_text(lines, errors,
+                                                              "Cannot copy.")},
                                status=400)
             return
 
@@ -8311,15 +8430,15 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 if operand_error:
                     results.append({"name": str(name), "error": operand_error})
                     continue
-                code, lines = tab.run("checksum %s %s" % (
+                code, lines, errors = tab.run_capture("checksum %s %s" % (
                     algorithm, quote_remote(operand)))
                 if code == 0:
                     results.append({"name": operand,
                                     "checksum": "\n".join(lines).strip()})
                 else:
                     results.append({"name": operand,
-                                    "error": "\n".join(lines).strip() or
-                                             "Cannot read the checksum."})
+                                    "error": command_failure_text(
+                                        lines, errors, "Cannot read the checksum.")})
             self.send_json({"success": True, "algorithm": algorithm,
                             "results": results})
             return
@@ -8854,6 +8973,22 @@ def _content_match_in_remote_file(tab, remote_path, query, case_sensitive):
         shutil.rmtree(directory, ignore_errors=True)
 
 
+def restore_remote_directory(tab):
+    """Put the core session back where the tab says it is.
+
+    The search walks a remote tree with 'cd', and the core process keeps the
+    directory it entered: a custom command run after a search started in the
+    last directory the search looked at instead of the one the panel shows.
+    Nothing is reported when the session is gone - the next command says so.
+    """
+    if tab is None or getattr(tab, "is_local", False):
+        return
+    try:
+        tab.run("cd " + quote_remote(tab.remote_dir), timeout=30)
+    except Exception:
+        pass
+
+
 def remote_search(tab, start, pattern, limit=500, case_sensitive=False,
                   depth=0, matches=None, content_query=None, stats=None,
                   _budget=None):
@@ -8875,8 +9010,15 @@ def remote_search(tab, start, pattern, limit=500, case_sensitive=False,
     if len(matches) >= limit:
         stats["truncated"] = True
         return matches
-    code, lines = tab.run_many(["cd " + quote_remote(start), "ls -la"], timeout=30)
+    code, lines, errors = tab.run_many_capture(
+        ["cd " + quote_remote(start), "ls -la"], timeout=30)
     if code != 0:
+        # A directory the search cannot read is not an empty result: at the
+        # top level this is why the search found nothing at all, and the
+        # caller has to be able to say so.
+        if depth == 0:
+            stats["error"] = command_failure_text(
+                lines, errors, "Cannot read the directory '%s'." % start)
         return matches
     entries = parse_ls_output(lines)
     needle = pattern if case_sensitive else pattern.casefold()

@@ -606,11 +606,69 @@ class PanelContainmentTests(unittest.TestCase):
             self.assertIsNone(path, name)
             self.assertTrue(error, name)
 
+    def test_a_backslash_is_part_of_the_name_not_a_separator(self):
+        # A backslash separates nothing on this platform. Refusing it left a
+        # file that has one in its name impossible to delete, rename or chmod
+        # from the panel, while the console client handled it.
+        path, error = gui.contained_local_path("/srv/panel", "back\\slash.txt")
+        self.assertEqual(error, "")
+        self.assertEqual(path, "/srv/panel/back\\slash.txt")
+        self.assertEqual(gui.check_remote_entry_name("back\\slash.txt"), "")
+
     def test_an_unusable_panel_directory_is_reported_not_guessed(self):
         for base in ("", None, "relative/dir", 7):
             path, error = gui.contained_local_path(base, "file")
             self.assertIsNone(path, base)
             self.assertTrue(error, base)
+
+
+class RequestFieldTests(unittest.TestCase):
+    """A body field of the wrong type is a bad request, not a crash.
+
+    The browser sends strings for these fields, so a number, a list or an
+    object is malformed. Reading it with str() or iterating it raised inside
+    the handler, which closed the connection with a traceback and left the
+    page with a network error and no message.
+    """
+
+    def test_a_string_field_refuses_every_other_type(self):
+        self.assertEqual(gui.json_text({"path": "/tmp/a"}, "path"), "/tmp/a")
+        self.assertEqual(gui.json_text({}, "path"), "")
+        self.assertEqual(gui.json_text({"path": None}, "path", "default"), "default")
+        for value in (1, 1.5, True, [], {}, ["a"]):
+            with self.assertRaises(ValueError):
+                gui.json_text({"path": value}, "path")
+
+    def test_a_tab_reference_is_a_number_or_a_string(self):
+        self.assertEqual(gui.json_tab_ref({"tab": 3}), 3)
+        self.assertEqual(gui.json_tab_ref({"tab": "3"}), "3")
+        self.assertIsNone(gui.json_tab_ref({}))
+        for value in ([], {}, True, 1.5):
+            with self.assertRaises(ValueError):
+                gui.json_tab_ref({"tab": value})
+
+    def test_a_name_list_is_a_list_or_one_string(self):
+        self.assertEqual(gui.json_names({"names": ["a"]}), ["a"])
+        self.assertEqual(gui.json_names({"names": "a"}), ["a"])
+        self.assertEqual(gui.json_names({}), [])
+        for value in (5, True, {"name": "a"}):
+            with self.assertRaises(ValueError):
+                gui.json_names({"names": value})
+
+    def test_a_failed_command_reports_what_the_core_wrote_to_stderr(self):
+        # stdout held the echo of the 'cd' the command started with, so the
+        # error of a failed delete was reported as '/' and a missing
+        # directory was reported with the line it printed while failing.
+        self.assertEqual(
+            gui.command_failure_text(["/"], ["Cannot remove '/x': No such file"],
+                                     "fallback"),
+            "Cannot remove '/x': No such file")
+        self.assertEqual(gui.command_failure_text([], [], "fallback"), "fallback")
+        # A core that wrote nothing to stderr still gives the caller
+        # something better than its own generic sentence.
+        self.assertEqual(gui.command_failure_text(["/", "Reading directory /"],
+                                                  [], "fallback"),
+                         "Reading directory /")
 
 
 class FakeTab:
@@ -1880,12 +1938,153 @@ class AccountIsolationTests(unittest.TestCase):
                          "-r -preservetime")
 
 
+class RequestBodyTests(unittest.TestCase):
+    """Every request gets an answer, whatever its body holds.
+
+    A handler that raised on a body of the wrong shape closed the connection
+    with a traceback on this run's stderr, so the page could only report a
+    network failure. The fields the browser sends as strings, lists or tab
+    numbers are checked before they are used, and anything else is answered.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.mkdtemp(prefix="linscp-body-")
+        environment = dict(os.environ)
+        environment["LINSCP_CONFIG_DIR"] = cls.directory
+        environment["PYTHONPATH"] = str(GUI_DIR)
+        cls.process = subprocess.Popen(
+            [sys.executable, str(GUI_DIR / "linscp_gui.py"),
+             "--host=127.0.0.1", "--port=0", "--print-token"],
+            cwd=str(GUI_DIR), env=environment, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        cls.output = []
+
+        def collect():
+            try:
+                for line in cls.process.stdout:
+                    cls.output.append(line.rstrip("\n"))
+            except (OSError, ValueError):
+                pass
+
+        cls.reader = threading.Thread(target=collect, daemon=True)
+        cls.reader.start()
+        cls.port = None
+        cls.token = None
+        deadline = time.time() + 45
+        while time.time() < deadline and not (cls.port and cls.token):
+            if cls.process.poll() is not None:
+                break
+            for line in list(cls.output):
+                match = re.search(r"http://[^/]*?(?::)(\d+)/", line)
+                if match and cls.port is None:
+                    cls.port = int(match.group(1))
+                if line.startswith("Token: ") and cls.token is None:
+                    cls.token = line.split(":", 1)[1].strip()
+            time.sleep(0.1)
+        if not (cls.port and cls.token):
+            cls.process.kill()
+            cls.process.wait(timeout=10)
+            if cls.process.stdout:
+                cls.process.stdout.close()
+            cls.reader.join(timeout=2)
+            raise unittest.SkipTest(
+                "the GUI server did not report its address: %s"
+                % " | ".join(cls.output[-6:]))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.process.terminate()
+        try:
+            cls.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            cls.process.kill()
+            cls.process.wait(timeout=10)
+        cls.reader.join(timeout=2)
+        if cls.process.stdout:
+            cls.process.stdout.close()
+        import shutil
+        shutil.rmtree(cls.directory, ignore_errors=True)
+
+    def request(self, method, path, body=None):
+        """Answer (status, parsed JSON) for one request.
+
+        A dropped connection is a failure of the test rather than a status:
+        that was the behaviour this class exists to catch.
+        """
+        connection = http.client.HTTPConnection("127.0.0.1", self.port,
+                                                timeout=20)
+        headers = {"X-LSCP-Token": self.token}
+        payload = None
+        if body is not None:
+            payload = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        try:
+            connection.request(method, path, payload, headers)
+            response = connection.getresponse()
+            raw = response.read()
+            status = response.status
+        finally:
+            connection.close()
+        return status, json.loads(raw.decode("utf-8"))
+
+    def test_a_field_of_the_wrong_type_is_refused_with_an_answer(self):
+        cases = [
+            ("/api/tabs/close", {"tab": []}),
+            ("/api/tabs/select", {"tab": {}}),
+            ("/api/sessions/delete", {"name": {"a": 1}}),
+            ("/api/local/delete", {"names": True}),
+            ("/api/local/save", {"path": 1, "content": "x"}),
+            ("/api/local/rename", {"old_name": 1, "new_name": 2}),
+            ("/api/remote/rename", {"old_name": [], "new_name": "b"}),
+            ("/api/remote/search", {"pattern": ["*"]}),
+            ("/api/remote/save", {"path": 7, "content": "x"}),
+            ("/api/remote/delete", {"names": 5}),
+        ]
+        for path, body in cases:
+            status, document = self.request("POST", path, body)
+            self.assertEqual(status, 400, (path, body, document))
+            self.assertFalse(document.get("success"), (path, document))
+            self.assertTrue(document.get("error"), (path, document))
+        # The message names the field, so a hand-written client can fix it.
+        _, document = self.request("POST", "/api/sessions/delete",
+                                   {"name": {"a": 1}})
+        self.assertIn("name", document["error"])
+
+    def test_a_body_that_is_not_json_is_answered(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port,
+                                                timeout=20)
+        try:
+            connection.request("POST", "/api/preferences", b"{not json",
+                               {"X-LSCP-Token": self.token,
+                                "Content-Type": "application/json"})
+            response = connection.getresponse()
+            raw = response.read()
+            status = response.status
+        finally:
+            connection.close()
+        self.assertEqual(status, 400)
+        self.assertFalse(json.loads(raw.decode("utf-8")).get("success"))
+
+    def test_a_query_path_the_file_system_cannot_decode_is_answered(self):
+        # A name held in bytes that are not UTF-8 arrives as %XX escapes; the
+        # server turns them back into the name instead of failing on it.
+        status, document = self.request(
+            "GET", "/api/local/list?path=%2Ftmp%2Flinscp-%FF-not-here")
+        self.assertEqual(status, 400, document)
+        self.assertFalse(document.get("success"))
+
+    def test_a_request_that_reaches_no_endpoint_is_answered(self):
+        status, document = self.request("POST", "/api/not-an-endpoint", {})
+        self.assertIn(status, (400, 404), document)
+
+
 if __name__ == "__main__":
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite()
     for case in (OperandQuotingTests, TabLookupTests, CoreCredentialTests,
                  CommandBuildingTests, PermissionModeTests, PanelContainmentTests,
-                 RemoteNameTests,
+                 RemoteNameTests, RequestFieldTests, RequestBodyTests,
                  ServerCommandStreamTests, LocalListingTests,
                  CustomCommandTests, LoginTests, QueueCleanupTests,
                  BrowserUploadModeTests, CrossOriginTests,

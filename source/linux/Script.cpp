@@ -2859,6 +2859,25 @@ bool Script::SwitchError(const std::string & command, const std::string & hint)
     return false;
 }
 
+bool Script::CheckNameOperands(const std::string & command,
+    const std::vector<std::string> & args, size_t first)
+{
+    for (size_t i = first; i < args.size(); i++)
+    {
+        /* A single '-' is a file name, not a switch, and '--' is not
+         * special either: the transfer commands read it the same way. */
+        if (args[i].size() < 2 || args[i][0] != '-')
+        {
+            continue;
+        }
+        return SwitchError(command, Texts::Translate(
+            "Unsupported switch '{switch}'; it will not be ignored. "
+            "Prefix a filename beginning with '-' with './'.",
+            {{"switch", args[i]}}));
+    }
+    return true;
+}
+
 /*
  * The parameters of this run, expanded exactly as the upstream console
  * expands them, before the line is split into words.
@@ -3883,6 +3902,13 @@ bool Script::ListLocal(const std::vector<std::string> & args)
         Console::Instance().Error(Texts::WrongArguments("lls",
             Texts::Translate("Syntax: lls [<directory>[/<mask>]]")));
         mErrors++;
+        return false;
+    }
+    /* 'lls -l' looked for a file called '-l' and reported "no files found",
+     * which reads as an empty directory rather than as a switch this
+     * command does not have. */
+    if (!CheckNameOperands("lls", args))
+    {
         return false;
     }
     std::string error;
@@ -6983,6 +7009,10 @@ bool Script::RemoveRemote(const std::vector<std::string> & args)
         }
         files.push_back(args[i]);
     }
+    if (!CheckNameOperands("rm", files))
+    {
+        return false;
+    }
     if (files.empty())
     {
         Console::Instance().Error(Texts::WrongArguments("rm",
@@ -7124,6 +7154,10 @@ bool Script::RemoveRemoteDirectory(const std::vector<std::string> & args)
         mErrors++;
         return false;
     }
+    if (!CheckNameOperands("rmdir", args))
+    {
+        return false;
+    }
     bool ok = true;
     for (size_t i = 0; i < args.size(); i++)
     {
@@ -7196,6 +7230,10 @@ bool Script::MoveRemote(const std::vector<std::string> & args)
         Console::Instance().Error(Texts::WrongArguments("mv",
             Texts::Translate("Syntax: mv <source> [ <source>... ] <target>")));
         mErrors++;
+        return false;
+    }
+    if (!CheckNameOperands("mv", args))
+    {
         return false;
     }
     std::string error;
@@ -7420,6 +7458,10 @@ bool Script::CopyRemote(const std::vector<std::string> & args)
         Console::Instance().Error(Texts::WrongArguments("cp",
             Texts::Translate("Syntax: cp <source> [ <source>... ] <target>")));
         mErrors++;
+        return false;
+    }
+    if (!CheckNameOperands("cp", args))
+    {
         return false;
     }
 

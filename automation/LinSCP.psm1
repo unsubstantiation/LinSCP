@@ -202,6 +202,9 @@ function Read-LScpResponse {
             throw $detail
         }
         if ($line -match '^LSCP-RESULT (\d+)') {
+            # Read the code before anything else runs: a -match anywhere in
+            # between would replace $Matches with its own result.
+            $code = [int]$Matches[1]
             # The marker won the race with stderr: a diagnostic line that
             # arrived just after it would otherwise be lost, leaving a
             # failure with nothing saying why. Collect what already
@@ -213,7 +216,7 @@ function Read-LScpResponse {
                 elseif ($trailing) { $errors.Add($trailing) }
             }
             return [PSCustomObject]@{
-                Code   = [int]$Matches[1]
+                Code   = $code
                 Output = $lines.ToArray()
                 Errors = $errors.ToArray()
             }
@@ -259,7 +262,11 @@ function Stop-LScpProcess {
             [void]$Session.Process.WaitForExit(2000)
         }
     } catch {}
-    foreach ($stream in @($Session.Stdin, $Session.Stdout, $Session.Stderr, $Session.Process)) {
+    # The streams are disposed to release the pipes; the Process object is
+    # not, because a caller checks whether the session ended by asking it
+    # for HasExited, and a disposed Process answers that with an error that
+    # PowerShell turns into $null.
+    foreach ($stream in @($Session.Stdin, $Session.Stdout, $Session.Stderr)) {
         try { if ($null -ne $stream) { $stream.Dispose() } } catch {}
     }
     if ($Session.Id -and $Script:Sessions.ContainsKey($Session.Id)) {
@@ -472,13 +479,17 @@ function ConvertFrom-LScpListing {
         if ($raw -notmatch '^\s*(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s(.*)$') {
             continue
         }
+        # Every field has to be read before the mode is checked: a
+        # -match/-notmatch that succeeds replaces $Matches with its own
+        # result, so checking the mode first left the owner, the size and
+        # the name empty and every entry came back without a name.
         $perms = $Matches[1]
-        if ($perms -notmatch $Script:ListingMode) { continue }
         $owner = $Matches[3]
         $group = $Matches[4]
         $sizeText = $Matches[5]
         $modified = "$($Matches[6]) $($Matches[7]) $($Matches[8])"
         $name = $Matches[9]
+        if ($perms -notmatch $Script:ListingMode) { continue }
         $target = ""
         $isLink = $perms.StartsWith("l")
         if ($isLink) {

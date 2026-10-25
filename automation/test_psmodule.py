@@ -86,6 +86,45 @@ class StaticModuleTests(unittest.TestCase):
     def test_listing_parser_skips_status_lines(self):
         self.assertIn("Reading directory", self.text)
 
+    def function_body(self, name):
+        """The text of one function, without the next one."""
+        start = self.text.index("function %s {" % name)
+        following = self.text.find("\nfunction ", start + 1)
+        return self.text[start:following if following != -1 else len(self.text)]
+
+    def test_listing_fields_are_read_before_the_mode_check(self):
+        """$Matches has to be read before another -match replaces it.
+
+        A -match/-notmatch that succeeds replaces $Matches with its own
+        result. The listing line's fields were read after the mode check,
+        which is such a match, so the owner, the size and the name of every
+        entry came back empty and the parser returned objects without a name.
+        """
+        body = self.function_body("ConvertFrom-LScpListing")
+        check = body.find("-notmatch $Script:ListingMode")
+        self.assertGreater(check, 0, "the mode check is gone")
+        self.assertNotIn("$Matches", body[check:],
+                         "a listing field is read after $Matches was replaced")
+
+    def test_a_result_code_is_read_before_anything_else_runs(self):
+        """The code of 'LSCP-RESULT n' is read from its own match."""
+        body = self.function_body("Read-LScpResponse")
+        match = body.find("-match '^LSCP-RESULT")
+        self.assertGreater(match, 0, "the result marker is not read here")
+        after = body[match:]
+        self.assertIn("$code = [int]$Matches[1]", after,
+                      "the result code has to be taken from the marker line")
+        self.assertNotIn("[int]$Matches[1]", body[body.find("$code = [int]$Matches[1]")
+                                                 + len("$code = [int]$Matches[1]"):],
+                         "the result code is read again after other commands")
+
+    def test_closing_a_session_leaves_its_process_readable(self):
+        """A caller checks HasExited, which a disposed Process cannot answer."""
+        body = self.function_body("Stop-LScpProcess")
+        self.assertNotIn("$Session.Process)", body,
+                         "the Process object must not be disposed")
+        self.assertNotIn("$Session.Process.Dispose", body)
+
 
 class LivePesterTests(unittest.TestCase):
     """The Pester suite, when pwsh exists."""

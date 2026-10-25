@@ -12,15 +12,20 @@ import linscp_gui as gui  # noqa: E402
 
 
 class FakeTab:
-    def __init__(self, directories, files):
+    def __init__(self, directories, files, remote_dir="/docs"):
         self.directories = directories
         self.files = files
         self.downloads = []
+        self.remote_dir = remote_dir
+        self.is_local = False
+        self.commands = []
 
-    def run_many(self, commands, timeout=120):
+    def _list(self, commands):
+        self.commands.extend(commands)
         path = shlex.split(commands[0])[1]
         if path not in self.directories:
-            return 1, ["No such directory."]
+            return 1, ["Reading directory %s..." % path], \
+                ["Cannot read directory '%s'. No such file" % path]
         entries = self.directories[path]
         lines = ["Reading directory %s..." % path,
                  "%d entries" % len(entries)]
@@ -34,10 +39,20 @@ class FakeTab:
                 size = len(self.files[remote])
             lines.append("%s 1 user group %d Jan 01 00:00 %s" %
                          (permissions, size, name))
-        return 0, lines
+        return 0, lines, []
+
+    def run_many_capture(self, commands, timeout=120):
+        return self._list(commands)
+
+    def run_many(self, commands, timeout=120):
+        code, lines, _ = self._list(commands)
+        return code, lines
 
     def run(self, command, timeout=120):
+        self.commands.append(command)
         args = shlex.split(command)
+        if args[0] == "cd":
+            return 0, []
         remote = args[1]
         if remote in self.directories:
             permissions = "drwxr-xr-x"
@@ -164,8 +179,55 @@ class RemoteSearchTests(unittest.TestCase):
         self.assertTrue(stats["truncated"])
 
 
+class SearchFailureTests(unittest.TestCase):
+    def test_a_directory_the_search_cannot_read_says_why(self):
+        # A search that could not list its start directory reported no
+        # matches, which reads exactly like an empty directory.
+        tab = make_tab()
+        stats = {"scanned": 0, "skipped": 0, "bytes_scanned": 0,
+                 "truncated": False}
+        matches = gui.remote_search(tab, "/missing", "*", 500, False,
+                                    stats=stats)
+        self.assertEqual(matches, [])
+        self.assertIn("No such file", stats["error"])
+        self.assertIn("/missing", stats["error"])
+
+    def test_a_layer_below_the_start_is_not_an_error_for_the_whole_search(self):
+        # Permission to read one subdirectory is not a reason to call a
+        # search that found results elsewhere a failure.
+        tab = make_tab()
+        stats = {"scanned": 0, "skipped": 0, "bytes_scanned": 0,
+                 "truncated": False}
+        matches = gui.remote_search(tab, "/docs", "*.txt", 500, False,
+                                    stats=stats)
+        self.assertTrue(matches)
+        self.assertNotIn("error", stats)
+
+    def test_the_search_puts_the_session_back_in_the_panel_directory(self):
+        # The tree is walked with 'cd', and the core keeps the directory it
+        # entered: a custom command run after a search used to start in the
+        # last directory the search looked at.
+        tab = make_tab()
+        tab.commands.clear()
+        gui.remote_search(tab, "/docs", "*", 500, False)
+        self.assertNotEqual(tab.commands[-1], "cd /docs",
+                            "the search is expected to walk with cd")
+        tab.commands.clear()
+        gui.restore_remote_directory(tab)
+        self.assertEqual(tab.commands, ["cd /docs"])
+
+    def test_a_local_tab_has_no_core_process_to_move(self):
+        tab = make_tab()
+        tab.is_local = True
+        tab.commands.clear()
+        gui.restore_remote_directory(tab)
+        self.assertEqual(tab.commands, [])
+
+
 if __name__ == "__main__":
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(RemoteSearchTests)
+    suite = unittest.TestSuite()
+    for case in (RemoteSearchTests, SearchFailureTests):
+        suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(case))
     result = unittest.TextTestRunner(verbosity=1).run(suite)
     failed = len(result.failures) + len(result.errors)
     print("evidence: suite=gui-search platform=linux ran=%d skipped=%d failed=%d" %
