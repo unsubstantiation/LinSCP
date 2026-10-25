@@ -22,6 +22,39 @@ from paramiko.sftp_attr import SFTPAttributes
 from paramiko.sftp_handle import SFTPHandle
 from paramiko.sftp_server import SFTPServer
 
+# A file name on the server is a byte string, and not every one is valid
+# UTF-8. paramiko encodes a name with plain 'utf-8' in both directions, so one
+# such byte raised inside the request handler and the server answered the
+# whole request with a bare failure: the directory could not be listed at all,
+# and no test could reach the file. Encoding and decoding with
+# 'surrogateescape' keeps the bytes the file really has and changes nothing
+# for a name that is already valid text.
+_original_message_get_text = Message.get_text
+_original_message_add_string = Message.add_string
+_original_attributes_asbytes = SFTPAttributes.asbytes
+
+
+def _surrogateescape_get_text(self):
+    return self.get_string().decode("utf-8", "surrogateescape")
+
+
+def _surrogateescape_add_string(self, value):
+    if isinstance(value, str):
+        value = value.encode("utf-8", "surrogateescape")
+    return _original_message_add_string(self, value)
+
+
+def _surrogateescape_asbytes(self):
+    # What paramiko's own asbytes() does, with the byte-preserving codec.
+    return str(self).encode("utf-8", "surrogateescape")
+
+
+if not getattr(Message, "_linscp_surrogateescape", False):
+    Message.get_text = _surrogateescape_get_text
+    Message.add_string = _surrogateescape_add_string
+    SFTPAttributes.asbytes = _surrogateescape_asbytes
+    Message._linscp_surrogateescape = True
+
 HOST = "127.0.0.1"
 # A test runner that does not want to collide with another one, or that
 # wants its own jail, sets these; port 0 asks the kernel for a free one.

@@ -1295,6 +1295,29 @@
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
+  function encodePath(value) {
+    /* encodeURIComponent throws a URIError on a lone surrogate, which is what
+       a file name the file system holds in bytes that are not UTF-8 looks
+       like after JSON.parse. One such name threw out of the click handler and
+       left the whole page unusable; the server decodes these escapes with
+       'surrogateescape' and gets the same name back. */
+    const text = String(value === null || value === undefined ? '' : value);
+    try {
+      return encodeURIComponent(text);
+    } catch (err) {
+      let out = '';
+      for (const ch of text) {
+        const code = ch.codePointAt(0);
+        if (code >= 0xDC80 && code <= 0xDCFF) {
+          out += '%' + (code - 0xDC00).toString(16).toUpperCase().padStart(2, '0');
+        } else {
+          out += encodeURIComponent(ch);
+        }
+      }
+      return out;
+    }
+  }
+
   function joinPath(base, name) {
     // Stripping the trailing slashes first and then adding one back is what
     // keeps the root from producing '//name': at '/', the stripped base is
@@ -1482,7 +1505,7 @@
    * ------------------------------------------------------------------ */
 
   async function loadLocal(path) {
-    const query = path ? '?path=' + encodeURIComponent(path) : '';
+    const query = path ? '?path=' + encodePath(path) : '';
     const data = await apiGet('/api/local/list' + query + (query ? '&' : '?') + 'tab=' + tabId());
     if (!data || !data.success) {
       if (data && data.error) toast(errorMessage(data.error, t('Cannot read the directory.')), true);
@@ -1503,7 +1526,7 @@
       renderPane('remote');
       return false;
     }
-    const query = path ? '?path=' + encodeURIComponent(path) : '';
+    const query = path ? '?path=' + encodePath(path) : '';
     const data = await apiGet('/api/remote/list' + query + (query ? '&' : '?') + 'tab=' + tabId());
     if (!data || !data.success) {
       if (data && data.error) toast(errorMessage(data.error, t('Cannot read the directory.')), true);
@@ -2850,7 +2873,7 @@
     side = side || 'remote';
     readOnly = !!readOnly;
     const endpoint = side === 'local' ? '/api/local/edit' : '/api/remote/edit';
-    const data = await apiGet(endpoint + '?tab=' + tabId() + '&path=' + encodeURIComponent(path));
+    const data = await apiGet(endpoint + '?tab=' + tabId() + '&path=' + encodePath(path));
     if (!data || !data.success) { toast(errorMessage(data && data.error, t("Cannot open the file.")), true); return; }
     state.editor = {
       path: path,

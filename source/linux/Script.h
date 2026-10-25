@@ -320,6 +320,18 @@ private:
     /* Reports a switch 'get' or 'put' cannot honour and counts an error;
      * always returns false, so that a parser can 'return SwitchError(...)'. */
     bool SwitchError(const std::string & command, const std::string & hint);
+    /*
+     * True when 'args[first]' (and every argument after it) is a name rather
+     * than a switch, i.e. when the command may go on. A command whose
+     * operands are all names calls this before it touches the file system:
+     * an argument that begins with '-' is a switch the command does not
+     * have, and using it as a file name - which is what happened before,
+     * so 'rm -r dir' removed a file called '-r' and then failed on 'dir' -
+     * is exactly the silent mistake the transfer commands already refuse.
+     * A name that really begins with '-' is written './-name'.
+     */
+    bool CheckNameOperands(const std::string & command,
+        const std::vector<std::string> & args, size_t first = 0);
     bool ListLocal(const std::vector<std::string> & args);
     bool OpenSite(const std::vector<std::string> & args);
     void CloseSite(const std::vector<std::string> & args);
