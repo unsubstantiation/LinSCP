@@ -13,6 +13,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <string>
 #include <vector>
@@ -44,6 +45,11 @@
 #include "Editor.h"
 #include "ScpClient.h"
 #include "FtpClient.h"
+#include "HashUtil.h"
+#include "ListingParse.h"
+#include "PpkKey.h"
+#include "TextMode.h"
+#include "TransferPresets.h"
 
 namespace {
 
@@ -4567,6 +4573,209 @@ void TestScpEngine()
     CHECK_FALSE(ScpClient::Handles(options));
 }
 
+void TestAuditRegressions()
+{
+    using namespace linscp;
+
+    /* HashUtil: hashing a directory must fail rather than report an empty file. */
+    const std::string tempDir = "/tmp/linscp-audit-" +
+        std::to_string(static_cast<unsigned long>(getpid()));
+    std::string fsErr;
+    CHECK_TRUE(CreateLocalDirectoryRecursive(tempDir, fsErr));
+    char hex[LSCP_HASH_HEX_SIZE];
+    CHECK_TRUE(lscp_hash_file("sha-256", tempDir.c_str(), hex, sizeof(hex)) != 0);
+
+    /* TextMode: lone CR and CRLF both become LF cleanly without corruption. */
+    const std::string crPath = tempDir + "/mac.txt";
+    FILE * f = fopen(crPath.c_str(), "wb");
+    CHECK_TRUE(f != NULL);
+    if (f != NULL)
+    {
+        fwrite("one\rtwo\r\nthree\r", 1, 15, f);
+        fclose(f);
+    }
+    unsigned long long convBytes = 0;
+    CHECK_TRUE(ConvertToUnixLineEndings(crPath, convBytes, fsErr));
+    CHECK_EQ(std::to_string(convBytes), std::string("14"));
+    std::string crlfTemp;
+    CHECK_TRUE(MakeCRLFUploadCopy(crPath, crlfTemp, fsErr));
+    CHECK_FALSE(crlfTemp.empty());
+    remove(crlfTemp.c_str());
+
+    /* PathUtil: trailing standalone backslash in SplitCommands, iterative
+     * pathological wildcard matching, and FileMask size/time overflow guards. */
+    std::vector<std::string> cmds = SplitCommands("echo a\\");
+    CHECK_EQ(std::to_string(cmds.size()), std::string("1"));
+    CHECK_EQ(cmds[0], std::string("echo a\\"));
+    CHECK_FALSE(MatchesMask(
+        "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaac"));
+    FileMask badMask;
+    CHECK_FALSE(badMask.Parse("*>=999999999999999999999999", fsErr));
+    CHECK_FALSE(badMask.Parse("*>=999999999999999999999999d", fsErr));
+
+    /* Console XML escaping: scrub invalid UTF-8 and UTF-16 surrogates while
+     * preserving valid multi-byte UTF-8 and tabs. */
+    CHECK_EQ(Console::EscapeXmlText(std::string("ok\t\xc3\xa9") + "\xff" + "\xed\xa0\x80!"),
+        std::string("ok\t\xc3\xa9\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd!"));
+
+    /* ListingParse: DOS filenames with spaces, symlinks with ' -> ' inside
+     * target, and integer overflow on file sizes. */
+    ListingEntry entry;
+    CHECK_TRUE(ParseDosListingLine(
+        "03-25-23  11:22AM       <DIR>          Program Files (x86)", entry));
+    CHECK_TRUE(entry.isDir);
+    CHECK_EQ(entry.name, std::string("Program Files (x86)"));
+    CHECK_TRUE(ParseDosListingLine(
+        "07-14-22  04:00PM             12345    my report final.txt", entry));
+    CHECK_FALSE(entry.isDir);
+    CHECK_EQ(entry.name, std::string("my report final.txt"));
+    CHECK_EQ(std::to_string(entry.size), std::string("12345"));
+    CHECK_TRUE(ParseUnixListingLine(
+        "lrwxrwxrwx 1 u g 12 Oct 25 12:00 link -> a -> b", entry));
+    CHECK_EQ(entry.name, std::string("link"));
+    CHECK_FALSE(ParseUnixListingLine(
+        "-rw-r--r-- 1 u g 99999999999999999999999999 Oct 25 12:00 huge", entry));
+
+    /* TransferPresets: unset (-3) vs explicit off (-1) vs octal mode. */
+    TransferPreset preset;
+    CHECK_EQ(std::to_string(preset.permissions), std::string("-3"));
+    TransferFlags flags;
+    flags.permissions = 0640;
+    preset.ApplyTo(flags);
+    CHECK_EQ(std::to_string(flags.permissions), std::string(std::to_string(0640)));
+    CHECK_TRUE(TransferPresetStore::ParseSetting("permissions", "off", preset, fsErr));
+    CHECK_EQ(std::to_string(preset.permissions), std::string("-1"));
+    preset.ApplyTo(flags);
+    CHECK_EQ(std::to_string(flags.permissions), std::string("-1"));
+
+    /* ParseSiteUrl: s3:// default port 443 and port overflow guard. */
+    SessionOptions s3Opts;
+    CHECK_TRUE(ParseSiteUrl("s3://mybucket/prefix", s3Opts, fsErr));
+    CHECK_EQ(std::to_string(s3Opts.portNumber), std::string("443"));
+    CHECK_FALSE(ParseSiteUrl("sftp://example.com:99999999999/", s3Opts, fsErr));
+
+    /* SessionStore: empty secret round-trip, corrupt base64 rejection, and
+     * tab escaping in INI fields. */
+    const std::string key32(32, 'K');
+    std::string enc;
+    std::string dec = "nonempty";
+    CHECK_TRUE(SessionStore::EncryptPassword("", key32, enc, fsErr));
+    CHECK_TRUE(enc.find("lscp1$") == 0);
+    CHECK_TRUE(SessionStore::DecryptPassword(enc, key32, dec, fsErr));
+    CHECK_EQ(dec, std::string(""));
+    CHECK_FALSE(SessionStore::DecryptPassword("lscp1$!!!notbase64!!!", key32, dec, fsErr));
+
+    const std::string storePath = tempDir + "/sessions.ini";
+    {
+        SessionStore store(storePath);
+        StoredSession s;
+        s.name = "tab\tsite";
+        s.protocol = "sftp";
+        s.hostName = "example.com";
+        s.portNumber = 22;
+        s.remoteDirectory = "/dir\twith\ttab";
+        CHECK_FALSE(store.AddOrUpdate(s, fsErr));
+        s.name = "tabsite";
+        CHECK_TRUE(store.AddOrUpdate(s, fsErr));
+        CHECK_TRUE(store.Save(fsErr));
+    }
+    {
+        SessionStore reloaded(storePath);
+        CHECK_TRUE(reloaded.Load(fsErr));
+        const StoredSession * foundSite = reloaded.Find("tabsite");
+        CHECK_TRUE(foundSite != NULL);
+        if (foundSite != NULL)
+        {
+            CHECK_EQ(foundSite->remoteDirectory, std::string("/dir\twith\ttab"));
+        }
+    }
+
+    /* PpkKey: reject excessive Argon2-Memory headers before allocation. */
+    const std::string ppkPath = tempDir + "/huge.ppk";
+    f = fopen(ppkPath.c_str(), "wb");
+    if (f != NULL)
+    {
+        const char * badPpk =
+            "PuTTY-User-Key-File-3: ssh-ed25519\n"
+            "Encryption: aes256-cbc\n"
+            "Comment: test\n"
+            "Public-Lines: 1\n"
+            "AAAAC3NzaC1lZDI1NTE5AAAAIA==\n"
+            "Key-Derivation: Argon2id\n"
+            "Argon2-Memory: 4194304\n"
+            "Argon2-Passes: 1\n"
+            "Argon2-Parallelism: 1\n"
+            "Argon2-Salt: 0011223344556677\n"
+            "Private-Lines: 1\n"
+            "AAAA\n"
+            "Private-MAC: 00\n";
+        fwrite(badPpk, 1, strlen(badPpk), f);
+        fclose(f);
+    }
+    std::string pemOut;
+    CHECK_FALSE(PpkPrivateKeyPem(ppkPath, "pass", pemOut, fsErr));
+
+    /* ScpParseHeaderLine: reject non-octal mode, size overflow, and control chars. */
+    char kind = 0;
+    unsigned int scpMode = 0;
+    unsigned long long scpSize = 0;
+    std::string scpName;
+    unsigned long scpMtime = 0, scpAtime = 0;
+    CHECK_FALSE(ScpParseHeaderLine("C0999 10 badmode", kind, scpMode, scpSize, scpName, scpMtime, scpAtime));
+    CHECK_FALSE(ScpParseHeaderLine("C0644 99999999999999999999999999 huge", kind, scpMode, scpSize, scpName, scpMtime, scpAtime));
+    CHECK_FALSE(ScpParseHeaderLine(std::string("C0644 10 bad\x01name"), kind, scpMode, scpSize, scpName, scpMtime, scpAtime));
+
+    /* DavPropertyValueFromXml: skip 404 propstat and read 200 propstat. */
+    std::string davVal;
+    bool davFound = true;
+    CHECK_FALSE(DavPropertyValueFromXml(
+        "<d:multistatus xmlns:d=\"DAV:\" xmlns:lscp=\"urn:linscp:properties\">"
+        "<d:response><d:propstat><d:prop><lscp:missing/></d:prop>"
+        "<d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>"
+        "</d:response></d:multistatus>",
+        "missing", davVal, davFound));
+    CHECK_FALSE(davFound);
+
+    /* S3SigV4: UriEncode encodes UTF-8 and control bytes as uppercase %XX. */
+    CHECK_EQ(s3sig::UriEncode("/a b/\xc3\xa9", true), std::string("/a%20b/%C3%A9"));
+
+    /* SyncState: 0600 permissions and >8 KiB path round-trip. */
+    const std::string statePath = tempDir + "/sync.state";
+    const std::string longRel(9000, 'x');
+    SyncState stateOut;
+    SyncStateEntry rec;
+    rec.localTime = 12345;
+    rec.remoteTime = 12345;
+    rec.size = 42;
+    stateOut.Update(longRel, rec);
+    CHECK_TRUE(stateOut.Save(statePath, fsErr));
+    struct stat stBuf;
+    CHECK_TRUE(stat(statePath.c_str(), &stBuf) == 0);
+    CHECK_EQ(std::to_string(stBuf.st_mode & 0777), std::to_string(0600));
+    SyncState stateIn;
+    SyncStateEntry outRec;
+    CHECK_TRUE(stateIn.Load(statePath, fsErr));
+    CHECK_TRUE(stateIn.Lookup(longRel, outRec));
+    CHECK_EQ(std::to_string(outRec.size), std::string("42"));
+
+    /* Script option validation: 'option exclude *.bak' without '|',
+     * 'option include a|b' rejected, 'option echo maybe' rejected, and
+     * 'option editmaxsize' overflow rejected. */
+    Script script;
+    CHECK_TRUE(script.ExecuteLine("option exclude *.bak"));
+    CHECK_FALSE(script.LastCommandFailed());
+    script.ExecuteLine("option include *.txt|*.bak");
+    CHECK_TRUE(script.LastCommandFailed());
+    script.ExecuteLine("option echo maybe");
+    CHECK_TRUE(script.LastCommandFailed());
+    script.ExecuteLine("option editmaxsize 999999999999999999999999");
+    CHECK_TRUE(script.LastCommandFailed());
+
+    std::error_code ec;
+    std::filesystem::remove_all(tempDir, ec);
+}
+
 int main()
 {
     TestLocalization();
@@ -4619,6 +4828,7 @@ int main()
     TestSshJumpSettings();
     TestDavEtagHelpers();
     TestScpEngine();
+    TestAuditRegressions();
 
     if (gFailures != 0)
     {

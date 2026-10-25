@@ -49,18 +49,16 @@ SSH_CFLAGS ?= $(shell pkg-config --cflags libssh libcrypto 2>/dev/null)
 SSH_LIBS ?= $(shell pkg-config --libs libssh libcrypto 2>/dev/null || echo -lssh -lcrypto)
 ARGON2_CFLAGS ?= $(shell pkg-config --cflags libargon2 2>/dev/null)
 ARGON2_LIBS ?= $(shell pkg-config --libs libargon2 2>/dev/null || echo -largon2)
-CFLAGS_APP += $(ARGON2_CFLAGS)
-CXXFLAGS_APP += $(ARGON2_CFLAGS)
 
 # -MMD -MP: write a .d file next to every object, so that a change to a
 # header rebuilds the sources that include it.
 DEPFLAGS := -MMD -MP
 
 CFLAGS_APP := -std=gnu99 $(OPT) -g $(WARN) -Wno-unused-parameter $(DEPFLAGS) \
-	-D_FILE_OFFSET_BITS=64 $(SSH_CFLAGS) -pthread $(CFLAGS)
+	-D_FILE_OFFSET_BITS=64 $(SSH_CFLAGS) $(ARGON2_CFLAGS) -pthread $(CFLAGS)
 
 CXXFLAGS_APP := -std=gnu++17 $(OPT) -g $(WARN) -pthread $(DEPFLAGS) \
-	-D_FILE_OFFSET_BITS=64 $(SSH_CFLAGS) -I. $(CXXFLAGS)
+	-D_FILE_OFFSET_BITS=64 $(SSH_CFLAGS) $(ARGON2_CFLAGS) -I. $(CXXFLAGS)
 
 # Front end (this directory).
 APP_SRCS := \

@@ -15,6 +15,7 @@ using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace LinSCP
 {
@@ -72,8 +73,13 @@ namespace LinSCP
             switch (Protocol)
             {
                 case Protocol.Scp: scheme = "scp"; break;
-                case Protocol.Ftp: scheme = FtpSecure == FtpSecure.Implicit ? "ftps" : "ftp"; break;
-                case Protocol.Webdav: scheme = "dav"; break;
+                case Protocol.Ftp:
+                    scheme = FtpSecure == FtpSecure.Implicit ? "ftps" :
+                             FtpSecure == FtpSecure.Explicit ? "ftpes" : "ftp";
+                    break;
+                case Protocol.Webdav:
+                    scheme = FtpSecure == FtpSecure.Implicit ? "davs" : "dav";
+                    break;
                 case Protocol.S3: scheme = "s3"; break;
                 default: scheme = "sftp"; break;
             }
@@ -81,13 +87,15 @@ namespace LinSCP
             if (port <= 0)
             {
                 if (Protocol == Protocol.Ftp) port = FtpSecure == FtpSecure.Implicit ? 990 : 21;
-                else if (Protocol == Protocol.Webdav) port = 80;
+                else if (Protocol == Protocol.Webdav) port = FtpSecure == FtpSecure.Implicit ? 443 : 80;
                 else if (Protocol == Protocol.S3) port = 443;
                 else port = 22;
             }
             var user = Uri.EscapeDataString(UserName ?? "");
             var host = HostName ?? "";
-            if (host.IndexOf(':') >= 0 && !host.StartsWith("[")) host = "[" + host + "]";
+            if (host.IndexOf(':') >= 0 && !host.StartsWith("[", StringComparison.Ordinal)) host = "[" + host + "]";
+            if (string.IsNullOrEmpty(user))
+                return string.Format(CultureInfo.InvariantCulture, "{0}://{1}:{2}/", scheme, host, port);
             return string.Format(CultureInfo.InvariantCulture, "{0}://{1}@{2}:{3}/", scheme, user, host, port);
         }
     }
@@ -182,12 +190,16 @@ namespace LinSCP
     public class Session : IDisposable
     {
         static readonly Regex ListingMode = new Regex(@"^[-a-zA-Z?][-rwxsStTlL]{9}[+@.]?$", RegexOptions.Compiled);
+        static readonly Regex ListingLine = new Regex(@"^\s*(\S+)\s+\S+\s+\S+\s+\S+\s+(\S+)\s+(\S+\s+\S+\s+\S+)\s(.*)$", RegexOptions.Compiled);
         static readonly Regex ResultMarker = new Regex(@"^LSCP-RESULT (\d+)\s*$", RegexOptions.Compiled);
 
         Process? _process;
         StreamWriter? _stdin;
         StreamReader? _stdout;
         StreamReader? _stderr;
+        Task<string?>? _stdoutTask;
+        Task<string?>? _stderrTask;
+        bool _stderrClosed;
         readonly object _gate = new object();
         volatile bool _aborting;
         SessionOptions? _options;
@@ -226,10 +238,13 @@ namespace LinSCP
             _stdin = new StreamWriter(_process.StandardInput.BaseStream, new UTF8Encoding(false)) { AutoFlush = true };
             _stdout = new StreamReader(_process.StandardOutput.BaseStream, Encoding.UTF8);
             _stderr = new StreamReader(_process.StandardError.BaseStream, Encoding.UTF8);
-            var banner = ReadLine(_stdout, TimeSpan.FromSeconds(15));
+            _stdoutTask = null;
+            _stderrTask = null;
+            _stderrClosed = false;
+            var banner = ReadStdoutLine(TimeSpan.FromSeconds(15));
             if (banner == null || !banner.StartsWith("LSCP-SERVER", StringComparison.Ordinal))
             {
-                var detail = Drain(_stderr);
+                var detail = DrainStderr();
                 DisposeProcess();
                 throw new SessionLocalException(
                     string.IsNullOrEmpty(detail) ? "LinSCP server did not start correctly." : detail);
@@ -247,6 +262,8 @@ namespace LinSCP
                 open += " -privatekey=" + Quote(sessionOptions.SshPrivateKeyPath);
             if (!string.IsNullOrEmpty(sessionOptions.SshPrivateKeyPassphrase))
                 open += " -passphrase=" + Quote(sessionOptions.SshPrivateKeyPassphrase);
+            if (!string.IsNullOrEmpty(sessionOptions.TlsHostCertificateFingerprint))
+                open += " -certificate=" + Quote(sessionOptions.TlsHostCertificateFingerprint);
             var opened = Run(open, sessionOptions.Timeout);
             if (opened.Code != 0)
             {
@@ -395,6 +412,7 @@ namespace LinSCP
         {
             EnsureOpen();
             var command = new StringBuilder(verb);
+            if (remove) command.Append(" -delete");
             if (options != null && options.PreserveTimestamp) command.Append(" -preservetime");
             if (options != null && options.ResumeSupport) command.Append(" -resume");
             if (options != null && options.SpeedLimit > 0)
@@ -411,19 +429,6 @@ namespace LinSCP
                 transfer.Error = error;
                 result.Failures.Add(error);
                 OnFailed(error);
-            }
-            else if (remove)
-            {
-                var rm = download ? Run("rm " + Quote(source), Timeout)
-                                  : Run("rm " + Quote(source), Timeout);
-                // Local delete of an uploaded source is the caller's, matching WinSCP's
-                // TransferOptions. The remote side is removed only for GetFiles.
-                if (download && rm.Code != 0)
-                {
-                    var error = new SessionRemoteException(Failure(rm, "The source could not be removed."));
-                    result.Failures.Add(error);
-                    OnFailed(error);
-                }
             }
             result.Transfers.Add(transfer);
             FileTransferred?.Invoke(this, transfer);
@@ -458,20 +463,47 @@ namespace LinSCP
                 _stdin!.WriteLine(command);
                 var output = new List<string>();
                 var errors = new List<string>();
-                var deadline = DateTime.UtcNow + (timeout <= TimeSpan.Zero ? Timeout : timeout);
+                var effective = timeout <= TimeSpan.Zero ? Timeout : timeout;
+                var deadline = effective <= TimeSpan.Zero ? DateTime.MaxValue : DateTime.UtcNow + effective;
                 while (true)
                 {
                     if (_aborting) throw new SessionLocalException("The session was aborted.");
-                    var remaining = deadline - DateTime.UtcNow;
-                    if (remaining <= TimeSpan.Zero)
+                    if (_stdoutTask == null) _stdoutTask = _stdout!.ReadLineAsync();
+                    if (_stderrTask == null && !_stderrClosed) _stderrTask = _stderr!.ReadLineAsync();
+
+                    int waitMs = 250;
+                    if (deadline != DateTime.MaxValue)
                     {
-                        Abort();
-                        throw new SessionLocalException("The LinSCP command did not answer in time; the session was closed.");
+                        var remaining = deadline - DateTime.UtcNow;
+                        if (remaining <= TimeSpan.Zero)
+                        {
+                            Abort();
+                            throw new SessionLocalException("The LinSCP command did not answer in time; the session was closed.");
+                        }
+                        if (remaining.TotalMilliseconds < waitMs)
+                            waitMs = Math.Max(1, (int)Math.Ceiling(remaining.TotalMilliseconds));
                     }
-                    var line = ReadLine(_stdout!, remaining);
+
+                    var tasks = _stderrTask != null
+                        ? new Task[] { _stdoutTask, _stderrTask }
+                        : new Task[] { _stdoutTask };
+                    var index = Task.WaitAny(tasks, waitMs);
+                    if (index < 0) continue;
+
+                    if (_stderrTask != null && tasks[index] == _stderrTask)
+                    {
+                        var errLine = _stderrTask.GetAwaiter().GetResult();
+                        _stderrTask = null;
+                        if (errLine == null) _stderrClosed = true;
+                        else if (errLine.Length > 0) errors.Add(errLine);
+                        continue;
+                    }
+
+                    var line = _stdoutTask.GetAwaiter().GetResult();
+                    _stdoutTask = null;
                     if (line == null)
                     {
-                        var detail = Drain(_stderr!);
+                        var detail = DrainStderr(errors);
                         DisposeProcess();
                         throw new SessionLocalException(string.IsNullOrEmpty(detail)
                             ? "The LinSCP server process ended unexpectedly."
@@ -480,6 +512,13 @@ namespace LinSCP
                     var match = ResultMarker.Match(line);
                     if (match.Success)
                     {
+                        if (_stderrTask != null && _stderrTask.IsCompleted)
+                        {
+                            var trailing = _stderrTask.GetAwaiter().GetResult();
+                            _stderrTask = null;
+                            if (trailing == null) _stderrClosed = true;
+                            else if (trailing.Length > 0) errors.Add(trailing);
+                        }
                         var code = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
                         Output = string.Join("\n", output);
                         return new Response { Code = code, Output = output, Errors = errors };
@@ -498,15 +537,24 @@ namespace LinSCP
 
         static IEnumerable<RemoteFileInfo> ParseListing(IEnumerable<string> lines, string directory)
         {
+            string[] dateFormats = {
+                "MMM d HH:mm", "MMM dd HH:mm",
+                "MMM d yyyy", "MMM dd yyyy",
+                "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm"
+            };
             foreach (var raw in lines)
             {
-                var text = (raw ?? "").Trim();
-                if (text.Length == 0) continue;
-                var parts = text.Split((char[])null, 9, StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length < 9 || !ListingMode.IsMatch(parts[0])) continue;
-                var name = parts[8];
+                var trimmed = (raw ?? "").TrimEnd('\r', '\n');
+                if (trimmed.Trim().Length == 0) continue;
+                var lineMatch = ListingLine.Match(trimmed);
+                if (!lineMatch.Success) continue;
+                var perms = lineMatch.Groups[1].Value;
+                if (!ListingMode.IsMatch(perms)) continue;
+                var sizeText = lineMatch.Groups[2].Value;
+                var dateText = Regex.Replace(lineMatch.Groups[3].Value.Trim(), @"\s+", " ");
+                var name = lineMatch.Groups[4].Value;
                 var target = "";
-                var isLink = parts[0].StartsWith("l", StringComparison.Ordinal);
+                var isLink = perms.StartsWith("l", StringComparison.Ordinal);
                 if (isLink)
                 {
                     var arrow = name.IndexOf(" -> ", StringComparison.Ordinal);
@@ -518,8 +566,15 @@ namespace LinSCP
                 }
                 if (name == "." || name == "..") continue;
                 long size;
-                if (!long.TryParse(parts[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out size))
+                if (!long.TryParse(sizeText, NumberStyles.Integer, CultureInfo.InvariantCulture, out size))
                     size = 0;
+                DateTime mtime = DateTime.MinValue;
+                DateTime parsedDate;
+                if (DateTime.TryParseExact(dateText, dateFormats, CultureInfo.InvariantCulture,
+                        DateTimeStyles.AssumeLocal, out parsedDate))
+                {
+                    mtime = parsedDate;
+                }
                 var full = directory;
                 if (string.IsNullOrEmpty(full) || full == ".") full = name;
                 else if (full.EndsWith("/", StringComparison.Ordinal)) full += name;
@@ -529,9 +584,10 @@ namespace LinSCP
                     Name = name,
                     FullName = full,
                     Length = size,
-                    IsDirectory = parts[0].StartsWith("d", StringComparison.Ordinal),
-                    FilePermissions = parts[0],
-                    FileType = parts[0].Substring(0, 1),
+                    IsDirectory = perms.StartsWith("d", StringComparison.Ordinal),
+                    LastWriteTime = mtime,
+                    FilePermissions = perms,
+                    FileType = perms.Substring(0, 1),
                     LinkTarget = target
                 };
             }
@@ -583,20 +639,60 @@ namespace LinSCP
             return "\"" + escaped + "\"";
         }
 
-        static string? ReadLine(StreamReader reader, TimeSpan timeout)
+        string? ReadStdoutLine(TimeSpan timeout)
         {
-            var result = reader.ReadLineAsync();
+            if (_stdoutTask == null)
+                _stdoutTask = _stdout!.ReadLineAsync();
             if (timeout <= TimeSpan.Zero)
-                return result.GetAwaiter().GetResult();
-            if (result.Wait(timeout))
-                return result.GetAwaiter().GetResult();
+            {
+                var line = _stdoutTask.GetAwaiter().GetResult();
+                _stdoutTask = null;
+                return line;
+            }
+            if (_stdoutTask.Wait(timeout))
+            {
+                var line = _stdoutTask.GetAwaiter().GetResult();
+                _stdoutTask = null;
+                return line;
+            }
             return null;
         }
 
-        static string Drain(StreamReader reader)
+        string DrainStderr(List<string>? collected = null)
         {
-            try { return reader.ReadToEnd(); }
-            catch { return ""; }
+            var lines = collected != null ? new List<string>(collected) : new List<string>();
+            try
+            {
+                if (_stderrTask != null)
+                {
+                    if (_stderrTask.Wait(500))
+                    {
+                        var pending = _stderrTask.GetAwaiter().GetResult();
+                        _stderrTask = null;
+                        if (pending == null) _stderrClosed = true;
+                        else if (pending.Length > 0) lines.Add(pending);
+                    }
+                    else
+                    {
+                        return string.Join("\n", lines).Trim();
+                    }
+                }
+                if (!_stderrClosed && _stderr != null)
+                {
+                    var rest = _stderr.ReadToEnd();
+                    _stderrClosed = true;
+                    if (!string.IsNullOrEmpty(rest))
+                    {
+                        foreach (var part in rest.Split('\n'))
+                        {
+                            var trimmed = part.TrimEnd('\r');
+                            if (trimmed.Length > 0) lines.Add(trimmed);
+                        }
+                    }
+                }
+            }
+            catch { }
+            return string.Join("\n", lines).Trim();
         }
 
         void DisposeProcess()
@@ -617,6 +713,9 @@ namespace LinSCP
             _stdin = null;
             _stdout = null;
             _stderr = null;
+            _stdoutTask = null;
+            _stderrTask = null;
+            _stderrClosed = false;
             _process = null;
         }
     }

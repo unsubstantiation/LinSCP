@@ -456,7 +456,12 @@ def workspace_for_user(username, home_dir=""):
     with _USER_WORKSPACES_LOCK:
         ws = _USER_WORKSPACES.get(username)
         if ws is None:
-            config_dir = os.path.join(_accounts_users_root(), username)
+            safe_dir = username
+            if ("/" in safe_dir or "\\" in safe_dir or
+                    safe_dir in (".", "..") or "\x00" in safe_dir):
+                safe_dir = "user-" + hashlib.sha256(
+                    username.encode("utf-8")).hexdigest()[:16]
+            config_dir = os.path.join(_accounts_users_root(), safe_dir)
             ws = empty_workspace(username=username, home_dir=home_dir or "",
                                  config_dir=config_dir)
             _USER_WORKSPACES[username] = ws
@@ -500,14 +505,13 @@ def confined_local_path(path):
                 return "", "The path is outside this account's home directory."
         except ValueError:
             return "", "The path is outside this account's home directory."
-        if os.path.lexists(path):
-            home_real = os.path.realpath(home_abs)
-            real = os.path.realpath(path)
-            try:
-                if os.path.commonpath([home_real, real]) != home_real:
-                    return "", "The path is outside this account's home directory."
-            except ValueError:
+        home_real = os.path.realpath(home_abs)
+        real = os.path.realpath(path)
+        try:
+            if os.path.commonpath([home_real, real]) != home_real:
                 return "", "The path is outside this account's home directory."
+        except ValueError:
+            return "", "The path is outside this account's home directory."
         return path, ""
     if not os.path.isabs(path):
         path = os.path.abspath(os.path.join(os.path.expanduser("~"), path))
@@ -752,7 +756,7 @@ def validate_session_data(session, require_host=False):
     if "tunnel" in session and not isinstance(session["tunnel"], bool):
         return "The SSH tunnel setting must be true or false."
     if session.get("tunnel"):
-        if protocol not in ("sftp", "scp", "ssh"):
+        if protocol.lower() not in ("sftp", "scp", "ssh"):
             return "SSH tunnels require an SFTP or SCP session."
         tunnel_host = session.get("tunnel_host") or ""
         if not tunnel_host or any(char.isspace() for char in tunnel_host):
@@ -804,30 +808,31 @@ def read_stored_sessions():
             continue
         if current is None or "=" not in text:
             continue
-        key, value = text.split("=", 1)
+        key, raw_val = line.rstrip("\r\n").split("=", 1)
         field = SESSION_KEYS.get(key.strip().lower())
         if field is None:
             continue
-        value = _unescape(value.strip())
+        trimmed = _unescape(raw_val.strip())
+        value = _unescape(raw_val)
         if field == "tunnel":
             # Keep malformed values invalid rather than silently connecting directly.
-            current[field] = value == "1" if value in ("0", "1") else value
+            current[field] = trimmed == "1" if trimmed in ("0", "1") else trimmed
         elif field == "tunnel_port":
-            current[field] = int(value) if value.isascii() and value.isdigit() and len(value) <= 5 else value
+            current[field] = int(trimmed) if trimmed.isascii() and trimmed.isdigit() and len(trimmed) <= 5 else trimmed
         elif field in ("auth_gssapi", "auth_gssapi_kex", "gssapi_fwd_tgt"):
-            current[field] = value == "1" if value in ("0", "1") else value
+            current[field] = trimmed == "1" if trimmed in ("0", "1") else trimmed
         elif field == "tunnel_local_port":
-            current[field] = int(value) if value.isascii() and value.isdigit() and len(value) <= 5 else value
+            current[field] = int(trimmed) if trimmed.isascii() and trimmed.isdigit() and len(trimmed) <= 5 else trimmed
         elif field == "port":
             try:
-                current["port"] = int(value)
+                current["port"] = int(trimmed)
             except ValueError:
                 current["port"] = 22
         elif field == "ftps":
-            current["ftps"] = int(value) if value.isascii() and value.isdigit() else value
+            current["ftps"] = int(trimmed) if trimmed.isascii() and trimmed.isdigit() else trimmed
         elif field == "last_used":
             try:
-                current["last_used"] = int(value)
+                current["last_used"] = int(trimmed)
             except ValueError:
                 pass
         else:
@@ -1850,11 +1855,18 @@ class CoreSession(object):
             if not self.alive():
                 if not self.connected:
                     return 1, ["Not connected."], []
-                started, error = self.start()
-                if not started:
+                prev_remote = self.remote_dir
+                reconnected, error = self.connect()
+                if not reconnected or not self.alive():
                     self.connected = False
                     return 1, [error or "The session process is gone."], []
-                self.connected = True
+                if prev_remote and prev_remote != self.remote_dir:
+                    try:
+                        self.run_capture("cd " + quote_remote(prev_remote),
+                                         timeout=30)
+                        self.remote_dir = prev_remote
+                    except ValueError:
+                        pass
             with self._stderr_lock:
                 self._stderr.clear()
             # The core reads one command per line, so a command that holds
@@ -1872,9 +1884,9 @@ class CoreSession(object):
                 self.connected = False
                 return 1, ["The session process is gone."], []
             lines = []
-            deadline = time.time() + timeout
+            deadline = time.monotonic() + timeout
             while True:
-                remaining = deadline - time.time()
+                remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self.terminate()
                     self._settle_stderr()
@@ -1919,6 +1931,8 @@ class CoreSession(object):
                         pass
             self.proc = None
             self.connected = False
+
+    close = terminate
 
     def hostkey_challenge(self):
         prefix = "tunnel_" if self.hostkey_role == "tunnel" else ""
@@ -2638,7 +2652,7 @@ def parse_openssh_config(text):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        parts = stripped.split(None, 1)
+        parts = re.split(r"(?:\s*=\s*|\s+)", stripped, maxsplit=1)
         keyword = parts[0].lower()
         value = parts[1].strip() if len(parts) > 1 else ""
         if keyword in ("host", "match"):
@@ -2668,11 +2682,18 @@ def parse_openssh_config(text):
             # A setting before the first Host applies to every host; it is
             # not a site of its own.
             continue
+        if value and value[0] in ("'", '"'):
+            try:
+                unquoted = shlex.split(value)
+                if len(unquoted) == 1:
+                    value = unquoted[0]
+            except ValueError:
+                pass
         if keyword == "hostname" and value:
-            current["hostname"] = value
+            current.setdefault("hostname", value)
         elif keyword == "user" and value:
-            current["user"] = value
-        elif keyword == "port" and value:
+            current.setdefault("user", value)
+        elif keyword == "port" and value and "port" not in current:
             try:
                 port = int(value)
             except ValueError:
@@ -2684,7 +2705,7 @@ def parse_openssh_config(text):
                                 "reason": "The port is out of range."})
                 continue
             current["port"] = port
-        elif keyword == "identityfile" and value:
+        elif keyword == "identityfile" and value and "identityfile" not in current:
             if "%" in value:
                 skipped.append({"name": current["name"],
                                 "reason": "An IdentityFile with a % token "
@@ -2732,22 +2753,55 @@ def parse_filezilla_xml(text):
                                       "supported."})
             continue
         password = ""
-        encoded = _xml_text(element, "pass")
+        pass_elem = next(
+            (child for child in element
+             if child.tag.split("}")[-1].lower() == "pass"), None)
+        encoded = (pass_elem.text or "").strip() if pass_elem is not None else ""
+        pass_encoding = (pass_elem.attrib.get("encoding", "")
+                         if pass_elem is not None else "").strip().lower()
         if encoded:
-            try:
-                password = base64.b64decode(encoded.encode("ascii"),
-                                            validate=True).decode("utf-8")
-            except (ValueError, UnicodeDecodeError):
-                skipped.append({"name": name or host,
-                                "reason": "The stored FileZilla password is "
-                                          "not valid base64 text."})
-                continue
+            if pass_encoding == "plain":
+                password = encoded
+            elif pass_encoding == "crypt":
+                password = ""
+            else:
+                try:
+                    password = base64.b64decode(encoded.encode("ascii"),
+                                                validate=True).decode("utf-8")
+                except (ValueError, UnicodeDecodeError):
+                    skipped.append({"name": name or host,
+                                    "reason": "The stored FileZilla password is "
+                                              "not valid base64 text."})
+                    continue
         remote_dir = _xml_text(element, "remotedir")
         if remote_dir and not remote_dir.startswith("/"):
-            # FileZilla writes a small "0 0 4 1 1" prefix before the path in
-            # some versions; the last token is the path it means.
-            candidate = remote_dir.split()[-1]
-            remote_dir = candidate if candidate.startswith("/") else ""
+            # FileZilla writes length-prefixed segments ("1 0 3 srv 4 data")
+            # or a prefix before a literal path; decode both cleanly.
+            decoded_dir = ""
+            tokens = remote_dir.split()
+            if len(tokens) >= 2 and tokens[0].isdigit() and tokens[1].isdigit():
+                try:
+                    pos = 2
+                    if int(tokens[1]) > 0:
+                        pos += 1
+                    segs = []
+                    valid_fz = pos <= len(tokens)
+                    while valid_fz and pos < len(tokens):
+                        seg_len = int(tokens[pos])
+                        if pos + 1 >= len(tokens) or len(tokens[pos + 1]) != seg_len:
+                            valid_fz = False
+                            break
+                        segs.append(tokens[pos + 1])
+                        pos += 2
+                    if valid_fz and segs:
+                        decoded_dir = "/" + "/".join(segs)
+                except ValueError:
+                    decoded_dir = ""
+            if decoded_dir:
+                remote_dir = decoded_dir
+            else:
+                candidate = tokens[-1] if tokens else ""
+                remote_dir = candidate if candidate.startswith("/") else ""
         local_dir = _xml_text(element, "localdir")
         if local_dir and not local_dir.startswith("/"):
             local_dir = ""
@@ -3514,9 +3568,12 @@ def remote_copy_task(task):
     if not names:
         raise ValueError("No file was selected for the copy.")
     directory = tempfile.mkdtemp(prefix="linscp-remote-copy-")
-    destination = CoreSession("remote-copy-%d" % task.id, destination_session,
-                              extra.get("label") or None)
+    destination = None
+    source_dir = task.source or source.remote_dir or "/"
     try:
+        destination = CoreSession("remote-copy-%d" % task.id,
+                                  destination_session,
+                                  extra.get("label") or None)
         ok, error = destination.start()
         if not ok:
             raise ValueError(error or "The destination session did not start.")
@@ -3528,8 +3585,9 @@ def remote_copy_task(task):
                 raise LocalTransferCancelled()
             local_path = os.path.join(directory, "%d-copy" % index)
             code, lines, errors = source.run_many_capture(
-                ["get -transfer=binary %s %s" % (quote_remote(name),
-                                                 quote_local(local_path))],
+                ["get -transfer=binary %s %s" % (
+                    quote_remote(_join_remote(source_dir, name)),
+                    quote_local(local_path))],
                 timeout=600)
             if code != 0:
                 raise ValueError("Cannot read '%s' from the source: %s" % (
@@ -3538,7 +3596,7 @@ def remote_copy_task(task):
                 task.bytes_done += os.path.getsize(local_path)
             except OSError:
                 pass
-            command = "put %s %s" % (
+            command = "put -transfer=binary %s %s" % (
                 quote_local(local_path),
                 quote_remote(_join_remote(destination_dir, name)))
             code, lines, errors = destination.run_many_capture([command],
@@ -3549,7 +3607,8 @@ def remote_copy_task(task):
             task.detail = "%d of %d copied" % (index + 1, len(names))
         destination.run("pwd")
     finally:
-        destination.close()
+        if destination is not None:
+            destination.close()
         shutil.rmtree(directory, ignore_errors=True)
 
 
@@ -3592,7 +3651,7 @@ def queue_remote_transfer(tab, names, target, directory, filemask="",
                           quote_remote(_join_remote(destination_dir, name)))
             for name in selected)
         task = TASKS.submit(
-            "Copy (remote)", "\n".join(commands), tab.session,
+            "Copy (remote)", " ; ".join(commands), tab.session,
             tab.remote_dir, destination_dir, tab.id, priority=priority)
         return [task]
     task = TASKS.submit(
@@ -4822,6 +4881,10 @@ def local_browser_destination(local_dir, relative_path):
     if not isinstance(local_dir, str) or not os.path.isabs(local_dir) or \
             not isinstance(relative_path, str) or not relative_path:
         raise ValueError("The drop destination must be an absolute local directory and a relative path.")
+    jailed_dir, jail_error = confined_local_path(local_dir)
+    if jail_error:
+        raise ValueError(jail_error)
+    local_dir = jailed_dir
     segments = relative_path.split("/")
     try:
         too_long = (len(relative_path.encode("utf-8")) > 4096 or
@@ -4932,8 +4995,9 @@ def parse_ls_output(stdout):
     entries = []
     lines = stdout.splitlines() if isinstance(stdout, str) else list(stdout)
     in_listing = False
-    for line in lines:
-        line = line.strip()
+    for raw_line in lines:
+        raw_line = raw_line.rstrip("\r\n")
+        line = raw_line.strip()
         if line.startswith("Reading directory"):
             in_listing = True
             continue
@@ -4943,7 +5007,7 @@ def parse_ls_output(stdout):
         if not in_listing or not line:
             continue
 
-        parts = line.split(None, 8)
+        parts = raw_line.lstrip().split(None, 8)
         # The status line that closes a listing ('3 entries') used to be
         # recognised by its word, anywhere in the line, so a file called
         # 'entries.txt' or a directory called 'log-entries' was not shown
@@ -5097,12 +5161,15 @@ def local_search(start, pattern, limit=500, case_sensitive=False,
     if not os.path.isdir(start):
         raise ValueError("The search directory is not a directory.")
     match_name = fnmatch if case_sensitive else (
-        lambda name, mask: fnmatch(name.lower(), mask.lower()))
+        lambda name, mask: fnmatch(name.casefold(), mask.casefold()))
     matches = []
     scanned = 0
     skipped = 0
     bytes_scanned = 0
     truncated = False
+    wanted = None
+    if content_query is not None:
+        wanted = content_query if case_sensitive else content_query.casefold()
     for root, directories, names in os.walk(start, followlinks=False):
         directories.sort()
         names.sort()
@@ -5124,21 +5191,60 @@ def local_search(start, pattern, limit=500, case_sensitive=False,
             if os.path.islink(path):
                 skipped += 1
                 continue
-            if content_query is not None and not is_dir:
+            hit = None
+            if content_query is not None:
+                if is_dir:
+                    continue
+                if info.st_size <= 0:
+                    continue
+                if info.st_size > MAX_CONTENT_SEARCH_FILE_BYTES:
+                    skipped += 1
+                    continue
+                if scanned >= MAX_CONTENT_SEARCH_FILES or \
+                        bytes_scanned + info.st_size > MAX_CONTENT_SEARCH_TOTAL_BYTES:
+                    truncated = True
+                    break
                 try:
-                    if info.st_size > 8 * 1024 * 1024:
-                        skipped += 1
-                        continue
                     with open(path, "rb") as handle:
-                        data = handle.read()
-                    bytes_scanned += len(data)
-                    if content_query.encode("utf-8") not in data:
-                        continue
+                        data = handle.read(MAX_CONTENT_SEARCH_FILE_BYTES + 1)
                 except OSError:
                     skipped += 1
                     continue
-            scanned += 1
-            matches.append({
+                scanned += 1
+                if len(data) > MAX_CONTENT_SEARCH_FILE_BYTES or b"\0" in data:
+                    skipped += 1
+                    if len(data) <= MAX_CONTENT_SEARCH_TOTAL_BYTES:
+                        bytes_scanned += len(data)
+                    continue
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    skipped += 1
+                    bytes_scanned += len(data)
+                    continue
+                bytes_scanned += len(data)
+                for line_number, line in enumerate(text.splitlines(), 1):
+                    candidate = line if case_sensitive else line.casefold()
+                    position = candidate.find(wanted)
+                    if position < 0:
+                        continue
+                    snippet = " ".join(line.split())
+                    if len(snippet) > 240:
+                        folded = snippet if case_sensitive else snippet.casefold()
+                        position = max(0, folded.find(wanted))
+                        left = max(0, min(position - 80, len(snippet) - 234))
+                        right = left + 234
+                        snippet = ("..." if left else "") + snippet[left:right] + \
+                            ("..." if right < len(snippet) else "")
+                    snippet = "".join(ch if ch >= " " or ch == "\t" else " "
+                                       for ch in snippet)
+                    hit = {"line": line_number, "snippet": snippet}
+                    break
+                if hit is None:
+                    continue
+            else:
+                scanned += 1
+            entry_match = {
                 "path": path,
                 "name": name,
                 "is_dir": is_dir,
@@ -5146,7 +5252,11 @@ def local_search(start, pattern, limit=500, case_sensitive=False,
                 "date": time.strftime("%Y-%m-%d %H:%M",
                                       time.localtime(info.st_mtime)),
                 "permissions": stat.filemode(info.st_mode),
-            })
+            }
+            if hit is not None:
+                entry_match["line"] = hit["line"]
+                entry_match["snippet"] = hit["snippet"]
+            matches.append(entry_match)
         if truncated:
             break
     if stats is not None:
@@ -6153,7 +6263,8 @@ def consume_shell_upload(manifest_id, tab):
         remote_target = posixpath.join(remote_dir, name)
         command = "lcd %s ; cd %s ; put %s %s" % (
             quote_local(os.path.dirname(path)), quote_remote(remote_dir),
-            transfer_switches({}), quote_local(name))
+            transfer_switches({}, protocol=tab.session.get("protocol")),
+            quote_local(name))
         task = TASKS.submit("Upload", command, tab.session, path,
                             remote_target, tab.id,
                             progress_remote=(tab.id, remote_target))
@@ -6888,12 +6999,14 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                                 "error": "The session must be a JSON object."},
                                status=400)
                 return
-            for key in ("protocol", "host", "port", "username", "password",
+            for key in ("protocol", "ftps", "host", "port", "username", "password",
                         "keyfile", "hostkey", "initial_dir", "local_dir",
                         "other_local_dir", "site",
                         "tunnel", "tunnel_host", "tunnel_port", "tunnel_username",
                         "tunnel_private_key", "tunnel_hostkey", "tunnel_password",
-                        "tunnel_passphrase", "tunnel_error"):
+                        "tunnel_passphrase", "tunnel_error", "tunnel_local_port",
+                        "auth_gssapi", "auth_gssapi_kex", "gssapi_fwd_tgt",
+                        "logical_host"):
                 if key in given:
                     session[key] = given[key]
             error = validate_session_data(
@@ -7085,8 +7198,14 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                                 "error": "Terminal input was not base64."},
                                status=400)
                 return
-            cols = int(body.get("cols") or 0)
-            rows = int(body.get("rows") or 0)
+            try:
+                cols = int(body.get("cols") or 0)
+                rows = int(body.get("rows") or 0)
+            except (TypeError, ValueError):
+                self.send_json({"success": False,
+                                "error": "Terminal size must be numbers."},
+                               status=400)
+                return
             if cols and rows:
                 term.resize(cols, rows)
             try:
@@ -7695,7 +7814,13 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 self.send_json({"success": False, "error": jail_error},
                                status=403)
                 return
-            switches = transfer_switches(body)
+            try:
+                switches = transfer_switches(
+                    body, protocol=tab.session.get("protocol"))
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
             priority = bool(body.get("priority"))
             for name in names:
                 name_error = check_remote_entry_name(name or "")
@@ -7740,7 +7865,13 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 self.send_json({"success": True})
                 return
             remote_dir = body.get("remote_dir") or tab.remote_dir
-            switches = transfer_switches(body)
+            try:
+                switches = transfer_switches(
+                    body, protocol=tab.session.get("protocol"))
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
             priority = bool(body.get("priority"))
             for name in names:
                 # A local upload name must also be a single entry: the
@@ -7825,7 +7956,13 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                     return
                 self.send_json({"success": True})
                 return
-            local_dir = os.path.abspath(body.get("local_dir") or tab.local_dir)
+            local_dir, jail_error = confined_local_path(
+                body.get("local_dir") or tab.local_dir)
+            if jail_error:
+                self.send_json({"success": False, "error": jail_error},
+                               status=403)
+                return
+            local_dir = os.path.abspath(local_dir)
             remote_dir = body.get("remote_dir") or tab.remote_dir
             if not os.path.isdir(local_dir):
                 self.send_json({"success": False, "error": "The local directory no longer exists."},
@@ -7869,11 +8006,16 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                                     "source_info": source_info,
                                     "destination": os.path.join(local_dir, name)})
 
-            switches = transfer_switches({
-                "resume": body.get("resume", True),
-                "recursive": False,
-                "preserve_time": body.get("preserve_time", True),
-            })
+            try:
+                switches = transfer_switches({
+                    "resume": body.get("resume", True),
+                    "recursive": False,
+                    "preserve_time": body.get("preserve_time", True),
+                }, protocol=tab.session.get("protocol"))
+            except ValueError as exc:
+                self.send_json({"success": False, "error": str(exc)},
+                               status=400)
+                return
             for record in records:
                 name = record["name"]
                 if direction == "upload":
@@ -8557,7 +8699,7 @@ def execute_custom_command(template, filenames, tab):
 TRANSFER_MODES = ("binary", "ascii", "automatic")
 
 
-def transfer_switches(body):
+def transfer_switches(body, protocol=None):
     """The get/put switches a transfer dialog asked for.
 
     Every value is checked against what the console client accepts before
@@ -8565,8 +8707,9 @@ def transfer_switches(body):
     through unquoted would have been the start of a new command rather
     than an argument.
     """
+    is_scp = str(protocol or "").strip().lower() == "scp"
     switches = []
-    if body.get("resume", True):
+    if body.get("resume", True) and not is_scp:
         switches.append("-resume")
     if body.get("recursive", True):
         switches.append("-r")
@@ -8815,14 +8958,22 @@ def remote_search(tab, start, pattern, limit=500, case_sensitive=False,
 
 
 def edit_temp_root():
-    root = os.path.join(tempfile.gettempdir(), "linscp-gui-edit")
-    os.makedirs(root, exist_ok=True)
+    root = os.path.join(_config_root(), "edit-tmp")
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    if not os.path.islink(root):
+        try:
+            os.chmod(root, 0o700)
+        except OSError:
+            pass
     return root
 
 
 def temp_path_for(remote_path):
     safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in remote_path)
-    return os.path.join(edit_temp_root(), "%d-%s" % (int(time.time()), safe[-64:]))
+    fd, path = tempfile.mkstemp(prefix="edit-", suffix="-" + safe[-48:],
+                                dir=edit_temp_root())
+    os.close(fd)
+    return path
 
 
 MAX_GUI_EDIT_BYTES = 8 * 1024 * 1024
@@ -8935,33 +9086,43 @@ def write_local_text(local_path, content, base_mtime_ns,
 
 def download_remote_text(tab, remote_path, max_size=8 * 1024 * 1024):
     """Download a remote file for the editor. Returns (content, info, error)."""
-    info = remote_stat(tab, remote_path)
-    if info is None:
+    stat_info = remote_stat(tab, remote_path)
+    if stat_info is None:
         return None, {}, "Cannot read the file."
-    if info["is_dir"]:
+    if stat_info["is_dir"]:
         return None, {}, "That is a directory, not a file."
-    size = info["size"]
+    size = stat_info["size"]
     if size and size > max_size:
         return None, {}, "The file is %d bytes, too large for the editor (limit %d)." % (
             size, max_size)
     local = temp_path_for(remote_path)
-    code, lines = tab.run("get -preservetime %s \"%s\"" % (
-        quote_remote(remote_path), local), timeout=300)
-    if code != 0:
-        return None, {}, "\n".join(lines) or "Cannot download the file."
     try:
-        with open(local, "rb") as handle:
-            data = handle.read()
-    except OSError as exc:
-        return None, {}, str(exc)
-    if b"\0" in data:
-        return None, {}, "The file is binary; the editor can only edit text files."
-    info = {"size": len(data), "mtime": int(os.path.getmtime(local)),
-            "temp": local, "path": remote_path}
-    try:
-        return data.decode("utf-8"), info, ""
-    except UnicodeDecodeError:
-        return data.decode("utf-8", "replace"), info, ""
+        code, lines = tab.run("get -transfer=binary -preservetime %s %s" % (
+            quote_remote(remote_path), quote_local(local)), timeout=300)
+        if code != 0:
+            return None, {}, "\n".join(lines) or "Cannot download the file."
+        try:
+            with open(local, "rb") as handle:
+                data = handle.read(max_size + 1)
+            local_mtime = int(os.path.getmtime(local))
+        except OSError as exc:
+            return None, {}, str(exc)
+        if len(data) > max_size:
+            return None, {}, "The file is too large for the editor (limit %d)." % max_size
+        if b"\0" in data:
+            return None, {}, "The file is binary; the editor can only edit text files."
+        info = {"size": len(data),
+                "mtime": int(stat_info.get("mtime") or local_mtime),
+                "path": remote_path}
+        try:
+            return data.decode("utf-8"), info, ""
+        except UnicodeDecodeError:
+            return data.decode("utf-8", "replace"), info, ""
+    finally:
+        try:
+            os.unlink(local)
+        except OSError:
+            pass
 
 
 def upload_remote_text(tab, remote_path, content, base_mtime=None):
@@ -8976,18 +9137,20 @@ def upload_remote_text(tab, remote_path, content, base_mtime=None):
                                "(reload it before saving, or save it under a new name).")
     local = temp_path_for(remote_path)
     try:
-        with open(local, "wb") as handle:
-            handle.write(content.encode("utf-8"))
-    except OSError as exc:
-        return False, str(exc)
-    code, lines = tab.run("put \"%s\" %s" % (local, quote_remote(remote_path)),
-                          timeout=300)
-    if code != 0:
-        return False, "\n".join(lines) or "Cannot upload the file."
-    try:
-        os.remove(local)
-    except OSError:
-        pass
+        try:
+            with open(local, "wb") as handle:
+                handle.write(content.encode("utf-8"))
+        except OSError as exc:
+            return False, str(exc)
+        code, lines = tab.run("put -transfer=binary %s %s" % (
+            quote_local(local), quote_remote(remote_path)), timeout=300)
+        if code != 0:
+            return False, "\n".join(lines) or "Cannot upload the file."
+    finally:
+        try:
+            os.unlink(local)
+        except OSError:
+            pass
     add_log("Saved %s" % remote_path, "success")
     return True, ""
 

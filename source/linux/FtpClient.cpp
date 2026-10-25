@@ -525,6 +525,13 @@ bool FtpSession::Send(const std::string & line, std::string & error)
         error = "The FTP control connection is not open.";
         return false;
     }
+    if (line.find('\r') != std::string::npos ||
+        line.find('\n') != std::string::npos ||
+        line.find('\0') != std::string::npos)
+    {
+        error = "Refusing to send an FTP command containing a control newline or NUL byte.";
+        return false;
+    }
     const std::string text = line + "\r\n";
     size_t sent = 0;
     while (sent < text.size())
@@ -795,6 +802,11 @@ bool FtpSession::OpenPassive(std::string & error)
 bool FtpSession::OpenActive(std::string & error)
 {
     mActiveData = true;
+    if (mListener >= 0)
+    {
+        close(mListener);
+        mListener = -1;
+    }
 
     /* The listener sits on the address the control connection uses, so a
      * multi-homed machine advertises the interface the server already
@@ -839,6 +851,8 @@ bool FtpSession::OpenActive(std::string & error)
         &boundLength) != 0)
     {
         error = "Could not read the listener's address.";
+        close(mListener);
+        mListener = -1;
         return false;
     }
 
@@ -851,6 +865,8 @@ bool FtpSession::OpenActive(std::string & error)
             sizeof(addressText)) == NULL)
         {
             error = "Could not format the listener's address.";
+            close(mListener);
+            mListener = -1;
             return false;
         }
         std::string dotted = addressText;
@@ -866,11 +882,15 @@ bool FtpSession::OpenActive(std::string & error)
             std::to_string(port / 256) + "," + std::to_string(port % 256);
         if (!Command(command, reply, error))
         {
+            close(mListener);
+            mListener = -1;
             return false;
         }
         if (reply.code != 200)
         {
             error = "Active mode was refused: " + reply.Text();
+            close(mListener);
+            mListener = -1;
             return false;
         }
         return true;
@@ -882,16 +902,23 @@ bool FtpSession::OpenActive(std::string & error)
         sizeof(addressText)) == NULL)
     {
         error = "Could not format the listener's address.";
+        close(mListener);
+        mListener = -1;
         return false;
     }
-    const std::string command = "EPRT |||" + std::to_string(ntohs(ipv6->sin6_port)) + "|";
+    const std::string command = std::string("EPRT |2|") + addressText + "|" +
+        std::to_string(ntohs(ipv6->sin6_port)) + "|";
     if (!Command(command, reply, error))
     {
+        close(mListener);
+        mListener = -1;
         return false;
     }
     if (reply.code != 200)
     {
         error = "Active mode was refused: " + reply.Text();
+        close(mListener);
+        mListener = -1;
         return false;
     }
     return true;
@@ -946,6 +973,15 @@ bool FtpSession::ReceiveData(std::string & out, std::string & error)
             char text[INET_ADDRSTRLEN];
             struct sockaddr_in * ipv4 = reinterpret_cast<struct sockaddr_in *>(&peer);
             if (inet_ntop(AF_INET, &ipv4->sin_addr, text, sizeof(text)) != NULL)
+            {
+                mDataPeerAddress = text;
+            }
+        }
+        else if (peer.ss_family == AF_INET6)
+        {
+            char text[INET6_ADDRSTRLEN];
+            struct sockaddr_in6 * ipv6 = reinterpret_cast<struct sockaddr_in6 *>(&peer);
+            if (inet_ntop(AF_INET6, &ipv6->sin6_addr, text, sizeof(text)) != NULL)
             {
                 mDataPeerAddress = text;
             }
@@ -1123,12 +1159,16 @@ bool ParseFactsLine(const std::string & line, FtpFacts & facts)
         }
         else if (name == "size")
         {
-            char * end = NULL;
-            const unsigned long long parsed = strtoull(value.c_str(), &end, 10);
-            if (end != NULL && *end == '\0')
+            if (!value.empty() && value[0] >= '0' && value[0] <= '9')
             {
-                facts.hasSize = true;
-                facts.size = parsed;
+                errno = 0;
+                char * end = NULL;
+                const unsigned long long parsed = strtoull(value.c_str(), &end, 10);
+                if (errno == 0 && end != NULL && *end == '\0')
+                {
+                    facts.hasSize = true;
+                    facts.size = parsed;
+                }
             }
         }
         else if (name == "modify")
@@ -1142,17 +1182,26 @@ bool ParseFactsLine(const std::string & line, FtpFacts & facts)
         }
         else if (name == "unix.mode")
         {
-            unsigned long mode = strtoul(value.c_str(), NULL, 8);
-            if (mode != 0)
+            if (!value.empty() && value[0] >= '0' && value[0] <= '7')
             {
-                facts.hasMode = true;
-                facts.permissions = mode;
+                errno = 0;
+                char * end = NULL;
+                const unsigned long mode = strtoul(value.c_str(), &end, 8);
+                if (errno == 0 && end != NULL && *end == '\0')
+                {
+                    facts.hasMode = true;
+                    facts.permissions = mode;
+                }
             }
         }
     }
     if (pos < line.size())
     {
-        facts.name = TrimAscii(line.substr(pos));
+        if (line[pos] == ' ')
+        {
+            pos++;
+        }
+        facts.name = line.substr(pos);
     }
     return true;
 }
@@ -1289,13 +1338,19 @@ bool MlstFacts(const Reply & reply, FtpFacts & facts)
         {
             line.erase(0, 4);
         }
-        const std::string trimmed = TrimAscii(line);
-        /* The fact list is the single line of a multi-line 250 reply and
-         * is the only line that has '=' and ';' in it. */
-        if (trimmed.find('=') != std::string::npos &&
-            trimmed.find(';') != std::string::npos)
+        const size_t firstNonSpace = line.find_first_not_of(" \t");
+        if (firstNonSpace == std::string::npos)
         {
-            return ParseFactsLine(TrimAscii(trimmed), facts);
+            continue;
+        }
+        const std::string stripped = line.substr(firstNonSpace);
+        /* The fact list is the single line of a multi-line 250 reply and
+         * is the only line that has '=' and ';' in it. Keep trailing spaces
+         * intact because they belong to the entry's filename. */
+        if (stripped.find('=') != std::string::npos &&
+            stripped.find(';') != std::string::npos)
+        {
+            return ParseFactsLine(stripped, facts);
         }
     }
     return false;
@@ -1569,7 +1624,11 @@ int FtpClient::Stat(const SessionOptions & options, const std::string & remotePa
         {
             if (sizeReply.code == 213)
             {
-                const std::string text = TrimAscii(sizeReply.Text());
+                std::string text = TrimAscii(sizeReply.Text());
+                if (text.compare(0, 4, "213 ") == 0)
+                {
+                    text = TrimAscii(text.substr(4));
+                }
                 unsigned long long size = 0;
                 bool numeric = !text.empty();
                 for (size_t i = 0; i < text.size(); i++)
@@ -1597,8 +1656,12 @@ int FtpClient::Stat(const SessionOptions & options, const std::string & remotePa
                     if (session.Command("MDTM " + path, timeReply, timeError) &&
                         timeReply.code == 213)
                     {
-                        const unsigned long stamp =
-                            ParseMlsdTime(TrimAscii(timeReply.Text()));
+                        std::string mdtmText = TrimAscii(timeReply.Text());
+                        if (mdtmText.compare(0, 4, "213 ") == 0)
+                        {
+                            mdtmText = TrimAscii(mdtmText.substr(4));
+                        }
+                        const unsigned long stamp = ParseMlsdTime(mdtmText);
                         if (stamp != 0 && attrs != NULL)
                         {
                             attrs->flags |= LSCP_ATTR_ACMODTIME;

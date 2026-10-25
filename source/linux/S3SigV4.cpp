@@ -188,19 +188,38 @@ std::string CanonicalRequest(const std::string & method,
         }
         sorted[i].second = NormalizeHeaderValue(sorted[i].second);
     }
-    std::sort(sorted.begin(), sorted.end());
+    std::stable_sort(sorted.begin(), sorted.end(),
+        [](const std::pair<std::string, std::string> & a,
+           const std::pair<std::string, std::string> & b) {
+            return a.first < b.first;
+        });
+
+    /* Fold duplicate header names into a single comma-separated canonical
+     * header line, as AWS Signature Version 4 specifies. */
+    std::vector<std::pair<std::string, std::string> > folded;
+    for (size_t i = 0; i < sorted.size(); i++)
+    {
+        if (!folded.empty() && folded.back().first == sorted[i].first)
+        {
+            folded.back().second += "," + sorted[i].second;
+        }
+        else
+        {
+            folded.push_back(sorted[i]);
+        }
+    }
 
     std::string canonical = method + "\n" + uri + "\n" +
         CanonicalQuery(query) + "\n";
     std::string names;
-    for (size_t i = 0; i < sorted.size(); i++)
+    for (size_t i = 0; i < folded.size(); i++)
     {
         if (i > 0)
         {
             names += ';';
         }
-        names += sorted[i].first;
-        canonical += sorted[i].first + ":" + sorted[i].second + "\n";
+        names += folded[i].first;
+        canonical += folded[i].first + ":" + folded[i].second + "\n";
     }
     canonical += "\n" + names + "\n" + payloadHash;
     return canonical;
@@ -330,7 +349,11 @@ SignedRequest Sign(const std::string & method, const std::string & uri,
     std::string names;
     for (size_t i = 0; i < named.size(); i++)
     {
-        if (i > 0)
+        if (i > 0 && named[i].first == named[i - 1].first)
+        {
+            continue;
+        }
+        if (!names.empty())
         {
             names += ';';
         }

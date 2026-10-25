@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <mutex>
 #include <thread>
 #include <system_error>
 #include <poll.h>
@@ -417,17 +418,54 @@ bool ParseTunnelSpec(const std::string & spec, TunnelType type,
         return false;
     }
 
-    /* Split on colons.  The formats are:
-     *   port:host:hostport    (local/remote)
-     *   bind:port:host:hostport (local/remote with bind)
-     *   port                  (dynamic)
-     *   bind:port             (dynamic with bind) */
+    /* Split on colons outside '[...]' IPv6 brackets, preserving trailing
+     * empty segments so '8080:' is rejected instead of truncated to '8080'. */
     std::vector<std::string> parts;
-    std::istringstream stream(spec);
-    std::string part;
-    while (std::getline(stream, part, ':'))
     {
-        parts.push_back(part);
+        std::string current;
+        bool inBrackets = false;
+        for (size_t i = 0; i < spec.size(); i++)
+        {
+            const char c = spec[i];
+            if (c == '[')
+            {
+                if (inBrackets || !current.empty())
+                {
+                    error = "Malformed bracketed IPv6 address in tunnel specification.";
+                    return false;
+                }
+                inBrackets = true;
+            }
+            else if (c == ']')
+            {
+                if (!inBrackets || current.empty())
+                {
+                    error = "Malformed bracketed IPv6 address in tunnel specification.";
+                    return false;
+                }
+                inBrackets = false;
+                if (i + 1 < spec.size() && spec[i + 1] != ':')
+                {
+                    error = "Malformed bracketed IPv6 address in tunnel specification.";
+                    return false;
+                }
+            }
+            else if (c == ':' && !inBrackets)
+            {
+                parts.push_back(current);
+                current.clear();
+            }
+            else
+            {
+                current += c;
+            }
+        }
+        if (inBrackets)
+        {
+            error = "Malformed bracketed IPv6 address in tunnel specification.";
+            return false;
+        }
+        parts.push_back(current);
     }
 
     if (type == TunnelType::Dynamic)
@@ -443,6 +481,12 @@ bool ParseTunnelSpec(const std::string & spec, TunnelType type,
         }
         else if (parts.size() == 2)
         {
+            if (parts[0].empty())
+            {
+                error = "Dynamic tunnel format: [bind_address:]port, with a "
+                    "port from 1 to 65535.";
+                return false;
+            }
             tunnel.bindAddress = parts[0];
             if (!ParsePort(parts[1], tunnel.bindPort))
             {
@@ -477,6 +521,12 @@ bool ParseTunnelSpec(const std::string & spec, TunnelType type,
         }
         else if (parts.size() == 4)
         {
+            if (parts[0].empty())
+            {
+                error = "Tunnel format: [bind_address:]port:host:hostport, "
+                    "with ports from 1 to 65535.";
+                return false;
+            }
             tunnel.bindAddress = parts[0];
             if (!ParsePort(parts[1], tunnel.bindPort))
             {
@@ -529,15 +579,19 @@ std::string TunnelSshFlags(const SshTunnel & tunnel)
     case TunnelType::Remote:  flag = "-R"; break;
     case TunnelType::Dynamic: flag = "-D"; break;
     }
+    auto formatHost = [](const std::string & h) -> std::string {
+        return h.find(':') != std::string::npos ? ("[" + h + "]") : h;
+    };
     std::string spec;
     if (!tunnel.bindAddress.empty())
     {
-        spec = tunnel.bindAddress + ":";
+        spec = formatHost(tunnel.bindAddress) + ":";
     }
     spec += std::to_string(tunnel.bindPort);
     if (tunnel.type != TunnelType::Dynamic)
     {
-        spec += ":" + tunnel.remoteHost + ":" + std::to_string(tunnel.remotePort);
+        spec += ":" + formatHost(tunnel.remoteHost) + ":" +
+            std::to_string(tunnel.remotePort);
     }
     return flag + " " + spec;
 }
@@ -600,6 +654,7 @@ struct SshJumpTunnel::Impl
     int listener = -1;
     int socksPort = 0;
     bool socksMode = false;
+    std::mutex relaysMutex;
     std::vector<Relay> relays;
     std::atomic<bool> stop{false};
     std::thread worker;
@@ -732,6 +787,7 @@ struct SshJumpTunnel::Impl
         Relay relay;
         relay.channel = channel;
         relay.sock = client;
+        std::lock_guard<std::mutex> lock(relaysMutex);
         relays.push_back(relay);
     }
 
@@ -854,20 +910,6 @@ struct SshJumpTunnel::Impl
             if (ssh_event_dopoll(event, 0) == SSH_ERROR || !ssh_is_connected(ssh))
                 break;
             AcceptSocks();
-            for (size_t i = 0; i < relays.size(); i++)
-                PumpRelay(relays[i], ssh);
-            for (size_t i = relays.size(); i-- > 0; )
-            {
-                Relay & relay = relays[i];
-                if ((relay.localEof && relay.remoteEof &&
-                     relay.channelBegin == relay.channelEnd &&
-                     relay.socketBegin == relay.socketEnd) ||
-                    relay.sock < 0)
-                {
-                    CloseRelay(relay);
-                    relays.erase(relays.begin() + static_cast<std::ptrdiff_t>(i));
-                }
-            }
             std::vector<pollfd> fds;
             if (listener >= 0)
             {
@@ -877,19 +919,39 @@ struct SshJumpTunnel::Impl
             pollfd sshfd = {ssh_get_fd(ssh), POLLIN, 0};
             if (ssh_get_poll_flags(ssh) & SSH_WRITE_PENDING) sshfd.events |= POLLOUT;
             fds.push_back(sshfd);
-            for (size_t i = 0; i < relays.size(); i++)
             {
-                pollfd ready = {relays[i].sock, 0, 0};
-                if (!relays[i].localEof && relays[i].channelBegin == relays[i].channelEnd)
-                    ready.events |= POLLIN;
-                if (relays[i].socketBegin < relays[i].socketEnd)
-                    ready.events |= POLLOUT;
-                if (ready.events != 0) fds.push_back(ready);
+                std::lock_guard<std::mutex> lock(relaysMutex);
+                for (size_t i = 0; i < relays.size(); i++)
+                    PumpRelay(relays[i], ssh);
+                for (size_t i = relays.size(); i-- > 0; )
+                {
+                    Relay & relay = relays[i];
+                    if ((relay.localEof && relay.remoteEof &&
+                         relay.channelBegin == relay.channelEnd &&
+                         relay.socketBegin == relay.socketEnd) ||
+                        relay.sock < 0)
+                    {
+                        CloseRelay(relay);
+                        relays.erase(relays.begin() + static_cast<std::ptrdiff_t>(i));
+                    }
+                }
+                for (size_t i = 0; i < relays.size(); i++)
+                {
+                    pollfd ready = {relays[i].sock, 0, 0};
+                    if (!relays[i].localEof && relays[i].channelBegin == relays[i].channelEnd)
+                        ready.events |= POLLIN;
+                    if (relays[i].socketBegin < relays[i].socketEnd)
+                        ready.events |= POLLOUT;
+                    if (ready.events != 0) fds.push_back(ready);
+                }
             }
             if (poll(fds.data(), fds.size(), 100) < 0 && errno != EINTR) break;
         }
-        for (size_t i = 0; i < relays.size(); i++) CloseRelay(relays[i]);
-        relays.clear();
+        {
+            std::lock_guard<std::mutex> lock(relaysMutex);
+            for (size_t i = 0; i < relays.size(); i++) CloseRelay(relays[i]);
+            relays.clear();
+        }
     }
 
     void Run()
@@ -1225,10 +1287,13 @@ void SshJumpTunnel::Stop()
     mImpl->stop.store(true);
     if (mImpl->bridge >= 0) shutdown(mImpl->bridge, SHUT_RDWR);
     if (mImpl->listener >= 0) shutdown(mImpl->listener, SHUT_RDWR);
-    for (size_t i = 0; i < mImpl->relays.size(); i++)
     {
-        if (mImpl->relays[i].sock >= 0)
-            shutdown(mImpl->relays[i].sock, SHUT_RDWR);
+        std::lock_guard<std::mutex> lock(mImpl->relaysMutex);
+        for (size_t i = 0; i < mImpl->relays.size(); i++)
+        {
+            if (mImpl->relays[i].sock >= 0)
+                shutdown(mImpl->relays[i].sock, SHUT_RDWR);
+        }
     }
     if (mImpl->worker.joinable()) mImpl->worker.join();
     if (mImpl->event != NULL)
@@ -1246,9 +1311,12 @@ void SshJumpTunnel::Stop()
     }
     if (mImpl->bridge >= 0) { close(mImpl->bridge); mImpl->bridge = -1; }
     if (mImpl->listener >= 0) { close(mImpl->listener); mImpl->listener = -1; }
-    for (size_t i = 0; i < mImpl->relays.size(); i++)
-        mImpl->CloseRelay(mImpl->relays[i]);
-    mImpl->relays.clear();
+    {
+        std::lock_guard<std::mutex> lock(mImpl->relaysMutex);
+        for (size_t i = 0; i < mImpl->relays.size(); i++)
+            mImpl->CloseRelay(mImpl->relays[i]);
+        mImpl->relays.clear();
+    }
     mImpl->socksPort = 0;
     mImpl->socksMode = false;
     mImpl->jump.Close();

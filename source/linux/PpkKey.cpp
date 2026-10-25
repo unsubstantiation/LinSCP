@@ -1,3 +1,5 @@
+#define OPENSSL_SUPPRESS_DEPRECATED 1
+
 #include "PpkKey.h"
 
 #include <openssl/bio.h>
@@ -85,8 +87,14 @@ bool Base64Decode(const std::string & text, Bytes & out)
 {
     if (text.empty() || text.size() > kMaxField || (text.size() % 4) != 0)
         return false;
-    for (unsigned char c : text) {
-        if (!(std::isalnum(c) || c == '+' || c == '/' || c == '=')) return false;
+    for (size_t i = 0; i < text.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        if (c == '=') {
+            if (i < text.size() - 2) return false;
+            if (i == text.size() - 2 && text.back() != '=') return false;
+            continue;
+        }
+        if (!(std::isalnum(c) || c == '+' || c == '/')) return false;
     }
     out.resize((text.size() / 4) * 3);
     const int n = EVP_DecodeBlock(out.data(),
@@ -298,9 +306,15 @@ bool GetMpint(const Bytes & in, size_t & pos, BIGNUM ** bn)
 {
     Bytes value;
     if (!GetString(in, pos, value) || value.empty()) return false;
-    if (value[0] & 0x80) return false; // PPK keys use non-negative mpints.
-    while (value.size() > 1 && value[0] == 0) value.erase(value.begin());
-    *bn = BN_bin2bn(value.data(), static_cast<int>(value.size()), nullptr);
+    if (value[0] & 0x80) {
+        OPENSSL_cleanse(value.data(), value.size());
+        return false; // PPK keys use non-negative mpints.
+    }
+    size_t start = 0;
+    while (start + 1 < value.size() && value[start] == 0) ++start;
+    *bn = BN_bin2bn(value.data() + start,
+        static_cast<int>(value.size() - start), nullptr);
+    OPENSSL_cleanse(value.data(), value.size());
     return *bn != nullptr;
 }
 
@@ -669,7 +683,8 @@ bool ConvertPpkToOpenSsh(const std::string & input, const std::string & output,
     Bytes plain;
     if (!DecryptAndVerify(ppk, passphrase, plain, error)) return false;
     std::string pem;
-    const std::string * outputPassphrase = ppk.encryption == "aes256-cbc" ?
+    const std::string * outputPassphrase =
+        (ppk.encryption == "aes256-cbc" && !passphrase.empty()) ?
         &passphrase : nullptr;
     const bool encoded = BuildPem(ppk, plain, pem, error, outputPassphrase);
     OPENSSL_cleanse(plain.data(), plain.size());

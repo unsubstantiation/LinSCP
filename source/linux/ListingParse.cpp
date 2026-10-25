@@ -7,6 +7,8 @@
 
 #include "ListingParse.h"
 
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <sstream>
@@ -156,13 +158,33 @@ bool ParseUnixListingLine(const std::string & line, ListingEntry & entry)
          * path, which is neither the entry's size nor a directory's. */
         entry.isDir = false;
     }
-    try
-    {
-        entry.size = std::stoull(fields[4]);
-    }
-    catch (...)
+    const unsigned long fileType = entry.permissions & 0170000UL;
+    if (fileType == 0020000UL || fileType == 0060000UL)
     {
         entry.size = 0;
+    }
+    else
+    {
+        if (fields[4].empty())
+        {
+            return false;
+        }
+        for (size_t i = 0; i < fields[4].size(); ++i)
+        {
+            if (fields[4][i] < '0' || fields[4][i] > '9')
+            {
+                return false;
+            }
+        }
+        errno = 0;
+        char * end = NULL;
+        const unsigned long long parsedSize =
+            strtoull(fields[4].c_str(), &end, 10);
+        if (errno != 0 || end == NULL || *end != '\0')
+        {
+            return false;
+        }
+        entry.size = parsedSize;
     }
     entry.mtime = ParseListingDate(fields[5], fields[6], fields[7]);
     entry.timeKnown = entry.mtime != 0;
@@ -303,7 +325,7 @@ bool ParseDosDate(const std::string & dateStr, const std::string & timeStr,
     bool isPM = false;
     bool haveMeridiem = false;
     const char * ts = timeStr.c_str();
-    if (timeStr.size() >= 4)
+    if (timeStr.size() >= 5)
     {
         if (ts[0] < '0' || ts[0] > '9' || ts[1] < '0' || ts[1] > '9' ||
             ts[3] < '0' || ts[3] > '9' || ts[4] < '0' || ts[4] > '9')
@@ -752,7 +774,7 @@ bool ParseVmsListingLine(const std::string & line, ListingEntry & entry)
      * hands mktime() letters as digits and it folds them into some other
      * moment, which then drives a 'synchronize -criteria=time' decision. */
     pos = dateEnd + 1;
-    int hour = 0, minute = 0;
+    int hour = 0, minute = 0, second = 0;
     bool haveTime = false;
     if (pos + 5 <= line.size() && line[pos + 2] == ':' &&
         AllDigits(line.substr(pos, 2)) && AllDigits(line.substr(pos + 3, 2)))
@@ -762,10 +784,8 @@ bool ParseVmsListingLine(const std::string & line, ListingEntry & entry)
         if (pos + 8 <= line.size() && line[pos + 5] == ':' &&
             AllDigits(line.substr(pos + 6, 2)))
         {
-            /* Seconds are read for validation; a mode has no place for
-             * them and mktime() truncates to the minute anyway. */
-            haveTime = hour <= 23 && minute <= 59 &&
-                (line[pos + 6] - '0') * 10 + (line[pos + 7] - '0') <= 59;
+            second = (line[pos + 6] - '0') * 10 + (line[pos + 7] - '0');
+            haveTime = hour <= 23 && minute <= 59 && second <= 59;
         }
         else
         {
@@ -782,6 +802,7 @@ bool ParseVmsListingLine(const std::string & line, ListingEntry & entry)
         tm.tm_mday = day;
         tm.tm_hour = hour;
         tm.tm_min = minute;
+        tm.tm_sec = second;
         tm.tm_isdst = -1;
         time_t t = mktime(&tm);
         if (t != static_cast<time_t>(-1))

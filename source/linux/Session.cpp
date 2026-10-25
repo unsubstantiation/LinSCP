@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -23,8 +24,11 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#include "Platform.h"
 
 #include <libssh/libssh.h>
 #include <libssh/callbacks.h>
@@ -240,7 +244,11 @@ bool SendAll(int fd, const char * data, size_t length)
     size_t sent = 0;
     while (sent < length)
     {
-        const ssize_t n = send(fd, data + sent, length - sent, 0);
+        const ssize_t n = send(fd, data + sent, length - sent, MSG_NOSIGNAL);
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
         if (n <= 0)
         {
             return false;
@@ -250,16 +258,41 @@ bool SendAll(int fd, const char * data, size_t length)
     return true;
 }
 
-bool RecvSome(int fd, std::string & chunk)
+bool RecvExact(int fd, unsigned char * buffer, size_t length)
 {
-    char buffer[4096];
-    const ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
-    if (n <= 0)
+    size_t got = 0;
+    while (got < length)
+    {
+        const ssize_t n = recv(fd, buffer + got, length - got, 0);
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (n <= 0)
+        {
+            return false;
+        }
+        got += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool HttpStatusLineIs200(const std::string & headers)
+{
+    const size_t eol = headers.find("\r\n");
+    const std::string line = eol == std::string::npos ?
+        headers : headers.substr(0, eol);
+    if (line.size() < 12 || line.compare(0, 5, "HTTP/") != 0)
     {
         return false;
     }
-    chunk.append(buffer, static_cast<size_t>(n));
-    return true;
+    const size_t sp = line.find(' ', 5);
+    if (sp == std::string::npos || sp + 4 > line.size())
+    {
+        return false;
+    }
+    return line.compare(sp + 1, 3, "200") == 0 &&
+        (sp + 4 == line.size() || line[sp + 4] == ' ');
 }
 
 /* Resolves 'host' to an IPv4 address in network order, for SOCKS4. */
@@ -281,6 +314,44 @@ bool ResolveIpv4(const std::string & host, unsigned char bytes[4])
             reinterpret_cast<const struct sockaddr_in *>(ai->ai_addr);
         memcpy(bytes, &sin->sin_addr.s_addr, 4);
         found = true;
+    }
+    freeaddrinfo(addresses);
+    return found;
+}
+
+/* Resolves 'host' to IPv4 (atyp=1, 4 bytes) or IPv6 (atyp=4, 16 bytes). */
+bool ResolveIpAny(const std::string & host, unsigned char & atyp,
+    std::string & rawAddr)
+{
+    rawAddr.clear();
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo * addresses = NULL;
+    if (getaddrinfo(host.c_str(), NULL, &hints, &addresses) != 0)
+    {
+        return false;
+    }
+    bool found = false;
+    for (struct addrinfo * ai = addresses; ai != NULL && !found; ai = ai->ai_next)
+    {
+        if (ai->ai_family == AF_INET)
+        {
+            const struct sockaddr_in * sin =
+                reinterpret_cast<const struct sockaddr_in *>(ai->ai_addr);
+            atyp = 1;
+            rawAddr.assign(reinterpret_cast<const char *>(&sin->sin_addr.s_addr), 4);
+            found = true;
+        }
+        else if (ai->ai_family == AF_INET6)
+        {
+            const struct sockaddr_in6 * sin6 =
+                reinterpret_cast<const struct sockaddr_in6 *>(ai->ai_addr);
+            atyp = 4;
+            rawAddr.assign(reinterpret_cast<const char *>(&sin6->sin6_addr.s6_addr), 16);
+            found = true;
+        }
     }
     freeaddrinfo(addresses);
     return found;
@@ -310,6 +381,11 @@ int ProxySocket(const SessionOptions & options, std::string & error)
     {
     case ProxyMethod::Socks5:
     {
+        if (proxy.userName.size() > 255 || proxy.password.size() > 255)
+        {
+            error = "The SOCKS5 proxy user name or password exceeds 255 bytes.";
+            break;
+        }
         std::string greeting;
         greeting += '\x05';
         if (proxy.userName.empty())
@@ -323,15 +399,14 @@ int ProxySocket(const SessionOptions & options, std::string & error)
             greeting += '\x00';
             greeting += '\x02';
         }
-        std::string reply;
+        unsigned char reply[4];
         if (!SendAll(fd, greeting.data(), greeting.size()) ||
-            !RecvSome(fd, reply) || reply.size() < 2 ||
-            static_cast<unsigned char>(reply[0]) != 5)
+            !RecvExact(fd, reply, 2) || reply[0] != 5)
         {
             error = "The SOCKS5 proxy did not answer the greeting.";
             break;
         }
-        if (static_cast<unsigned char>(reply[1]) == 2)
+        if (reply[1] == 2)
         {
             std::string auth;
             auth += '\x01';
@@ -339,15 +414,14 @@ int ProxySocket(const SessionOptions & options, std::string & error)
             auth += proxy.userName;
             auth += static_cast<char>(proxy.password.size());
             auth += proxy.password;
-            reply.clear();
             if (!SendAll(fd, auth.data(), auth.size()) ||
-                !RecvSome(fd, reply) || reply.size() < 2 || reply[1] != 0)
+                !RecvExact(fd, reply, 2) || reply[1] != 0)
             {
                 error = "The SOCKS5 proxy refused the user name and password.";
                 break;
             }
         }
-        else if (static_cast<unsigned char>(reply[1]) != 0)
+        else if (reply[1] != 0)
         {
             error = "The SOCKS5 proxy refused the authentication method.";
             break;
@@ -356,30 +430,71 @@ int ProxySocket(const SessionOptions & options, std::string & error)
         request += '\x05';
         request += '\x01'; /* CONNECT */
         request += '\x00';
-        if (remoteDns)
+        in_addr lit4;
+        in6_addr lit6;
+        if (inet_pton(AF_INET, target.c_str(), &lit4) == 1)
         {
+            request += '\x01';
+            request.append(reinterpret_cast<const char *>(&lit4), 4);
+        }
+        else if (inet_pton(AF_INET6, target.c_str(), &lit6) == 1)
+        {
+            request += '\x04';
+            request.append(reinterpret_cast<const char *>(&lit6), 16);
+        }
+        else if (remoteDns)
+        {
+            if (target.empty() || target.size() > 255)
+            {
+                error = "The SOCKS5 destination host name exceeds 255 bytes.";
+                break;
+            }
             request += '\x03';
             request += static_cast<char>(target.size());
             request += target;
         }
         else
         {
-            unsigned char bytes[4];
-            if (!ResolveIpv4(target, bytes))
+            unsigned char atyp = 0;
+            std::string rawAddr;
+            if (!ResolveIpAny(target, atyp, rawAddr))
             {
                 error = "Cannot resolve '" + target + "'.";
                 break;
             }
-            request += '\x01';
-            request.append(reinterpret_cast<char *>(bytes), 4);
+            request += static_cast<char>(atyp);
+            request += rawAddr;
         }
         request += static_cast<char>((targetPort >> 8) & 0xff);
         request += static_cast<char>(targetPort & 0xff);
-        reply.clear();
         if (!SendAll(fd, request.data(), request.size()) ||
-            !RecvSome(fd, reply) || reply.size() < 2 || reply[1] != 0)
+            !RecvExact(fd, reply, 4) || reply[0] != 5 || reply[1] != 0)
         {
             error = "The SOCKS5 proxy refused the connection to " + target + ".";
+            break;
+        }
+        size_t boundTail = 0;
+        if (reply[3] == 1) boundTail = 4 + 2;
+        else if (reply[3] == 4) boundTail = 16 + 2;
+        else if (reply[3] == 3)
+        {
+            unsigned char lenByte = 0;
+            if (!RecvExact(fd, &lenByte, 1))
+            {
+                error = "The SOCKS5 proxy returned a truncated reply.";
+                break;
+            }
+            boundTail = static_cast<size_t>(lenByte) + 2;
+        }
+        else
+        {
+            error = "The SOCKS5 proxy returned an unknown address type.";
+            break;
+        }
+        std::vector<unsigned char> discard(boundTail);
+        if (boundTail > 0 && !RecvExact(fd, discard.data(), boundTail))
+        {
+            error = "The SOCKS5 proxy returned a truncated reply.";
             break;
         }
         return fd;
@@ -416,10 +531,9 @@ int ProxySocket(const SessionOptions & options, std::string & error)
             request += target;
             request += '\x00';
         }
-        std::string reply;
+        unsigned char reply[8];
         if (!SendAll(fd, request.data(), request.size()) ||
-            !RecvSome(fd, reply) || reply.size() < 8 ||
-            static_cast<unsigned char>(reply[1]) != 90)
+            !RecvExact(fd, reply, 8) || reply[1] != 90)
         {
             error = "The SOCKS4 proxy refused the connection to " + target + ".";
             break;
@@ -428,9 +542,10 @@ int ProxySocket(const SessionOptions & options, std::string & error)
     }
     case ProxyMethod::Http:
     {
-        std::string request = "CONNECT " + target + ":" +
-            std::to_string(targetPort) + " HTTP/1.1\r\nHost: " + target +
-            ":" + std::to_string(targetPort) + "\r\n";
+        const std::string authority = (target.find(':') != std::string::npos ?
+            ("[" + target + "]") : target) + ":" + std::to_string(targetPort);
+        std::string request = "CONNECT " + authority +
+            " HTTP/1.1\r\nHost: " + authority + "\r\n";
         if (!proxy.userName.empty())
         {
             const std::string credentials = proxy.userName + ":" + proxy.password;
@@ -445,17 +560,22 @@ int ProxySocket(const SessionOptions & options, std::string & error)
             error = "Cannot write to the HTTP proxy.";
             break;
         }
+        /* Read one byte at a time up to \r\n\r\n so we never consume SSH
+         * banner bytes that arrive immediately after the HTTP response. */
         while (reply.find("\r\n\r\n") == std::string::npos &&
             reply.size() < 16384)
         {
-            if (!RecvSome(fd, reply))
+            unsigned char byte = 0;
+            if (!RecvExact(fd, &byte, 1))
             {
                 error = "The HTTP proxy closed the connection.";
                 break;
             }
+            reply += static_cast<char>(byte);
         }
         if (error.empty() &&
-            reply.find(" 200") == std::string::npos)
+            (reply.find("\r\n\r\n") == std::string::npos ||
+             !HttpStatusLineIs200(reply)))
         {
             error = "The HTTP proxy refused the connection to " + target + ".";
             break;
@@ -924,7 +1044,7 @@ bool ParseTlsVersion(const std::string & text, int & version)
     }
     else
     {
-        if (lower.substr(0, dot) != "1" || dot + 1 >= lower.size())
+        if (lower.substr(0, dot) != "1" || dot + 2 != lower.size())
         {
             return false;
         }
@@ -1354,10 +1474,21 @@ bool Base64ToBytes(const std::string & text, std::string & out)
         const char c = text[i];
         if (c == '=')
         {
+            for (size_t k = i + 1; k < text.size(); k++)
+            {
+                if (text[k] != '=')
+                {
+                    return false;
+                }
+            }
+            if (text.size() - i > 2)
+            {
+                return false;
+            }
             break;
         }
         const char * found = strchr(alphabet, c);
-        if (found == NULL)
+        if (found == NULL || c == '\0')
         {
             return false;
         }
@@ -1988,7 +2119,7 @@ bool ParseSiteUrl(const std::string & url, SessionOptions & options, std::string
     if (!explicitPort)
     {
         if (hadScheme && (scheme == "ftp" || scheme == "ftps" || scheme == "ftpes" ||
-                          scheme == "http" || scheme == "https" ||
+                          scheme == "http" || scheme == "https" || scheme == "s3" ||
                           scheme == "dav" || scheme == "webdav"))
         {
             parsed.portNumber = defaultPort;
@@ -2555,7 +2686,8 @@ bool VerifyServerKey(Session & session, ssh_session ssh, std::string & error)
         error = "The server did not present a host key.";
         return false;
     }
-    const std::string keytype = ssh_key_type_to_char(ssh_key_type(key));
+    const char * rawKeyType = ssh_key_type_to_char(ssh_key_type(key));
+    const std::string keytype = rawKeyType != NULL ? rawKeyType : "unknown";
     const std::string fingerprint = Sha256Fingerprint(key);
     const std::string md5Fingerprint = Md5Fingerprint(key);
     char * base64 = NULL;
@@ -2574,9 +2706,14 @@ bool VerifyServerKey(Session & session, ssh_session ssh, std::string & error)
      * per process. */
     const std::string hostkeyLine = std::string(session.IsTunnelTransport() ?
         "TUNNELHOSTKEY " : "HOSTKEY ") + keytype + " " + fingerprint;
+    static std::mutex reportedMutex;
     static std::set<std::string> reportedHostKeys;
-    const bool hostKeyAlreadyReported = !reportedHostKeys.insert(
-        host + ":" + std::to_string(port) + " " + hostkeyLine).second;
+    bool hostKeyAlreadyReported = false;
+    {
+        std::lock_guard<std::mutex> lock(reportedMutex);
+        hostKeyAlreadyReported = !reportedHostKeys.insert(
+            host + ":" + std::to_string(port) + " " + hostkeyLine).second;
+    }
 
     if (session.ExpectHostKey())
     {
@@ -2660,14 +2797,25 @@ bool ImportPrivateKeyFile(const std::string & keyFile, const char * passphrase,
     std::string pem;
     if (!PpkPrivateKeyPem(keyFile, passphrase != NULL ? passphrase : "", pem, error))
         return false;
-    char tempPath[] = "/tmp/linscp-ppk-XXXXXX";
-    const int fd = mkstemp(tempPath);
+    std::string tempDir = TempDirectory() + "/linscp-ppk-" +
+        std::to_string(static_cast<unsigned long>(getuid()));
+    std::string dirError;
+    if (!CreatePrivateDirectory(tempDir, dirError))
+    {
+        tempDir = TempDirectory();
+    }
+    std::string tempPattern = tempDir + "/linscp-ppk-XXXXXX";
+    std::vector<char> tempBuf(tempPattern.begin(), tempPattern.end());
+    tempBuf.push_back('\0');
+    const int fd = mkstemp(tempBuf.data());
     if (fd < 0)
     {
         OPENSSL_cleanse(pem.data(), pem.size());
         error = "Cannot create a secure temporary file to import the PPK key.";
         return false;
     }
+    (void)fchmod(fd, 0600);
+    const std::string tempPath(tempBuf.data());
     size_t written = 0;
     while (written < pem.size())
     {
@@ -2681,12 +2829,12 @@ bool ImportPrivateKeyFile(const std::string & keyFile, const char * passphrase,
     OPENSSL_cleanse(pem.data(), pem.size());
     if (!fileReady)
     {
-        unlink(tempPath);
+        unlink(tempPath.c_str());
         error = "Cannot write the temporary PPK key for libssh.";
         return false;
     }
-    const int rc = ssh_pki_import_privkey_file(tempPath, NULL, NULL, NULL, key);
-    unlink(tempPath);
+    const int rc = ssh_pki_import_privkey_file(tempPath.c_str(), NULL, NULL, NULL, key);
+    unlink(tempPath.c_str());
     if (rc != SSH_OK)
     {
         error = "The PPK key was decoded but could not be imported by libssh.";

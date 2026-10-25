@@ -5,10 +5,15 @@
 #include "Script.h"
 
 #include <cctype>
+#include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
+
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace linscp {
 
@@ -78,8 +83,9 @@ bool ParseLong(const std::string & text, long long & value)
         return false;
     }
     char * end = NULL;
+    errno = 0;
     const long long parsed = strtoll(text.c_str(), &end, 10);
-    if (end == NULL || *end != '\0')
+    if (errno == ERANGE || end == NULL || end == text.c_str() || *end != '\0')
     {
         return false;
     }
@@ -87,31 +93,141 @@ bool ParseLong(const std::string & text, long long & value)
     return true;
 }
 
+std::string StripHostAndPort(const std::string & value)
+{
+    std::string trimmed = TrimCopy(value);
+    if (trimmed.empty())
+    {
+        return trimmed;
+    }
+    if (trimmed[0] == '[')
+    {
+        const size_t close = trimmed.find(']');
+        if (close != std::string::npos)
+        {
+            return trimmed.substr(1, close - 1);
+        }
+    }
+    const size_t colon = trimmed.rfind(':');
+    if (colon != std::string::npos && trimmed.find(':') == colon)
+    {
+        bool portDigits = colon + 1 < trimmed.size();
+        for (size_t i = colon + 1; portDigits && i < trimmed.size(); i++)
+        {
+            portDigits = std::isdigit(static_cast<unsigned char>(trimmed[i])) != 0;
+        }
+        if (portDigits)
+        {
+            return trimmed.substr(0, colon);
+        }
+    }
+    return trimmed;
+}
+
 /* 'host:port' or '[v6]:port' against the stored host rule, where the
- * rule may itself carry a port. */
+ * rule may itself carry a port, wildcard, domain suffix ('.example.com'),
+ * or short hostname ('dev' matching 'dev.corp.example' on a label boundary). */
 bool HostRuleMatches(const std::string & rule, const std::string & host)
 {
     if (rule.empty())
     {
         return true;
     }
-    std::string ruleHost = rule;
-    const size_t colon = rule.rfind(':');
-    if (colon != std::string::npos && rule.find(':') == colon)
+    const std::string ruleHost = LowerCopy(StripHostAndPort(rule));
+    const std::string connHost = LowerCopy(StripHostAndPort(host));
+    if (ruleHost.empty() || connHost.empty())
     {
-        bool portDigits = colon + 1 < rule.size();
-        for (size_t i = colon + 1; portDigits && i < rule.size(); i++)
-        {
-            portDigits = std::isdigit(static_cast<unsigned char>(rule[i])) != 0;
-        }
-        if (portDigits)
-        {
-            ruleHost = rule.substr(0, colon);
-        }
+        return false;
     }
-    /* The connection host may be an IP or name the rule shortens to. */
-    return LowerCopy(ruleHost) == LowerCopy(host) ||
-        LowerCopy(host).find(LowerCopy(ruleHost)) == 0;
+    if (ruleHost.find_first_of("*?") != std::string::npos)
+    {
+        return MatchesMask(ruleHost, connHost);
+    }
+    if (ruleHost[0] == '.')
+    {
+        const std::string bare = ruleHost.substr(1);
+        if (connHost == bare)
+        {
+            return true;
+        }
+        return connHost.size() > ruleHost.size() &&
+            connHost.compare(connHost.size() - ruleHost.size(),
+                ruleHost.size(), ruleHost) == 0;
+    }
+    if (ruleHost == connHost)
+    {
+        return true;
+    }
+    /* A short hostname ('dev') matches 'dev.corp.example' at a '.' label
+     * boundary, never an IPv4 prefix ('10.0.0.1' vs '10.0.0.100') or an
+     * unrelated prefix ('dev' vs 'devops.corp.example'). */
+    if (ruleHost.find('.') == std::string::npos &&
+        ruleHost.find(':') == std::string::npos &&
+        connHost.size() > ruleHost.size() &&
+        connHost.compare(0, ruleHost.size(), ruleHost) == 0 &&
+        connHost[ruleHost.size()] == '.')
+    {
+        return true;
+    }
+    return false;
+}
+
+bool PresetMaskListMatches(const std::string & listText,
+    const std::string & leaf, const std::string & full)
+{
+    size_t pos = 0;
+    while (pos <= listText.size())
+    {
+        const size_t semi = listText.find(';', pos);
+        const std::string token = TrimCopy(semi == std::string::npos ?
+            listText.substr(pos) : listText.substr(pos, semi - pos));
+        if (!token.empty())
+        {
+            const bool hasSlash = token.find('/') != std::string::npos;
+            if (MatchesMask(token, hasSlash ? full : leaf))
+            {
+                return true;
+            }
+        }
+        if (semi == std::string::npos)
+        {
+            break;
+        }
+        pos = semi + 1;
+    }
+    return false;
+}
+
+bool PresetFileMaskMatches(const std::string & mask, const std::string & fileName)
+{
+    if (mask.empty() || fileName.empty())
+    {
+        return false;
+    }
+    std::string leaf = fileName;
+    const size_t slash = leaf.find_last_of("/\\");
+    if (slash != std::string::npos)
+    {
+        leaf = leaf.substr(slash + 1);
+    }
+    if (leaf.empty())
+    {
+        return false;
+    }
+    const size_t bar = mask.find('|');
+    const std::string includes = TrimCopy(bar == std::string::npos ?
+        mask : mask.substr(0, bar));
+    const std::string excludes = bar == std::string::npos ?
+        std::string() : TrimCopy(mask.substr(bar + 1));
+    if (!excludes.empty() && PresetMaskListMatches(excludes, leaf, fileName))
+    {
+        return false;
+    }
+    if (includes.empty())
+    {
+        return !excludes.empty();
+    }
+    return PresetMaskListMatches(includes, leaf, fileName);
 }
 
 bool FieldMatches(const std::string & rule, const std::string & value)
@@ -183,7 +299,8 @@ void TransferPreset::ApplyTo(TransferFlags & flags) const
     }
     if (speedLimit >= 0)
     {
-        flags.speedKBytesPerSecond = static_cast<unsigned>(speedLimit);
+        flags.speedKBytesPerSecond = speedLimit > static_cast<long long>(UINT_MAX) ?
+            UINT_MAX : static_cast<unsigned>(speedLimit);
     }
 }
 
@@ -230,7 +347,12 @@ std::string TransferPreset::Describe() const
             text += std::string("resumesupport=") + (resumeSupport == 0 ? "on" : "off");
         }
     }
-    if (permissions == -2)
+    if (permissions == -1)
+    {
+        if (!text.empty()) text += " ";
+        text += "permissions=off";
+    }
+    else if (permissions == -2)
     {
         if (!text.empty()) text += " ";
         text += "permissions=fromfile";
@@ -363,9 +485,22 @@ bool TransferPresetStore::Save(std::string & error) const
             return false;
         }
     }
-    std::ofstream file(mPath.c_str(), std::ios::trunc);
+    std::string tempPattern = mPath + ".tmp.XXXXXX";
+    std::vector<char> tempBuf(tempPattern.begin(), tempPattern.end());
+    tempBuf.push_back('\0');
+    const int fd = mkstemp(tempBuf.data());
+    if (fd < 0)
+    {
+        error = "The preset file '" + mPath + "' cannot be written.";
+        return false;
+    }
+    (void)fchmod(fd, 0600);
+    const std::string tempPath(tempBuf.data());
+    close(fd);
+    std::ofstream file(tempPath.c_str(), std::ios::trunc);
     if (!file.is_open())
     {
+        remove(tempPath.c_str());
         error = "The preset file '" + mPath + "' cannot be written.";
         return false;
     }
@@ -407,7 +542,11 @@ bool TransferPresetStore::Save(std::string & error) const
                 file << "resumesupport = " << (p.resumeSupport == 0 ? "on" : "off") << "\n";
             }
         }
-        if (p.permissions == -2)
+        if (p.permissions == -1)
+        {
+            file << "permissions = off\n";
+        }
+        else if (p.permissions == -2)
         {
             file << "permissions = fromfile\n";
         }
@@ -421,11 +560,22 @@ bool TransferPresetStore::Save(std::string & error) const
         if (!p.localDirectory.empty()) file << "localdir = " << p.localDirectory << "\n";
         if (!p.mask.empty()) file << "mask = " << p.mask << "\n";
     }
+    file.flush();
     if (!file.good())
     {
+        file.close();
+        remove(tempPath.c_str());
         error = "Writing the preset file '" + mPath + "' failed.";
         return false;
     }
+    file.close();
+    if (rename(tempPath.c_str(), mPath.c_str()) != 0)
+    {
+        remove(tempPath.c_str());
+        error = "Writing the preset file '" + mPath + "' failed.";
+        return false;
+    }
+    (void)chmod(mPath.c_str(), 0600);
     return true;
 }
 
@@ -516,7 +666,7 @@ const TransferPreset * TransferPresetStore::MatchMask(const std::string & fileNa
         {
             continue;
         }
-        if (MatchesMask(p.mask, fileName))
+        if (PresetFileMaskMatches(p.mask, fileName))
         {
             return &p;
         }
@@ -576,7 +726,8 @@ bool TransferPresetStore::ParseSetting(const std::string & rawKey,
     if (key == "speed")
     {
         long long kib = 0;
-        if (!ParseLong(value, kib) || kib < 0)
+        if (!ParseLong(value, kib) || kib < 0 ||
+            kib > static_cast<long long>(UINT_MAX))
         {
             error = "the value of 'speed' must be a whole number of kibibytes "
                 "per second (0 removes the limit).";
@@ -599,7 +750,7 @@ bool TransferPresetStore::ParseSetting(const std::string & rawKey,
             return true;
         }
         long long kib = 0;
-        if (!ParseLong(v, kib) || kib < 0)
+        if (!ParseLong(v, kib) || kib < 0 || kib > LLONG_MAX / 1024LL)
         {
             error = "the value of 'resumesupport' must be on, off or a number "
                 "of kibibytes a file must reach to be resumed.";

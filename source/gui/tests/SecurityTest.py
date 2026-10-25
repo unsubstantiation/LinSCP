@@ -1850,6 +1850,35 @@ class AccountIsolationTests(unittest.TestCase):
                                     cookie=bob_sid, csrf=alice_csrf)
         self.assertEqual(status, 403, data)
 
+    def test_symlinked_parent_cannot_escape_account_jail_for_new_files(self):
+        outside = tempfile.mkdtemp(prefix="linscp-outside-")
+        try:
+            escape_link = os.path.join(self.alice_home, "escape")
+            os.symlink(outside, escape_link)
+            self.login("alice", "wonderland")
+            ws = gui.workspace_for_user("alice", self.alice_home)
+            gui.bind_workspace(ws)
+            try:
+                resolved, error = gui.confined_local_path("escape/newfile.txt")
+                self.assertEqual(resolved, "")
+                self.assertIn("outside", error)
+            finally:
+                gui.unbind_workspace()
+        finally:
+            gui.shutil.rmtree(outside, ignore_errors=True)
+
+    def test_empty_password_roundtrips_and_scp_switches_omit_resume(self):
+        import linscp_crypto
+        key = b"K" * 32
+        token = linscp_crypto.encrypt("", key)
+        self.assertTrue(token.startswith("lscp1$"))
+        self.assertEqual(linscp_crypto.decrypt(token, key), "")
+        with self.assertRaises(linscp_crypto.PasswordError):
+            linscp_crypto.decrypt("lscp1$!!!bad!!!", key)
+        self.assertEqual(gui.transfer_switches({}), "-resume -r -preservetime")
+        self.assertEqual(gui.transfer_switches({}, protocol="scp"),
+                         "-r -preservetime")
+
 
 if __name__ == "__main__":
     loader = unittest.defaultTestLoader

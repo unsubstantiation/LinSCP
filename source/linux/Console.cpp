@@ -30,31 +30,92 @@ Console & Console::Instance()
 static std::string EscapeXml(const std::string & text, bool attribute)
 {
     std::string result;
-    for (size_t i = 0; i < text.size(); i++)
+    size_t i = 0;
+    while (i < text.size())
     {
         const unsigned char c = static_cast<unsigned char>(text[i]);
         switch (c)
         {
-            case '&': result += "&amp;"; break;
-            case '<': result += "&lt;"; break;
-            case '>': result += "&gt;"; break;
+            case '&': result += "&amp;"; i++; continue;
+            case '<': result += "&lt;"; i++; continue;
+            case '>': result += "&gt;"; i++; continue;
             case '"':
                 result += attribute ? "&quot;" : "\"";
-                break;
+                i++;
+                continue;
             case '\r':
-                break;
+                i++;
+                continue;
             case '\n':
                 result += attribute ? "&#10;" : "\n";
-                break;
+                i++;
+                continue;
             case '\t':
                 result += "\t";
-                break;
+                i++;
+                continue;
             default:
-                if (c >= 0x20)
-                {
-                    result += static_cast<char>(c);
-                }
                 break;
+        }
+        if (c < 0x20 || c == 0x7f)
+        {
+            i++;
+            continue;
+        }
+        if (c < 0x80)
+        {
+            result += static_cast<char>(c);
+            i++;
+            continue;
+        }
+        /* Validate UTF-8 and XML 1.0 legal scalar values so arbitrary
+         * filenames or server output cannot produce malformed XML. */
+        size_t len = 0;
+        uint32_t cp = 0;
+        if ((c & 0xE0u) == 0xC0u && c >= 0xC2u)
+        {
+            len = 2;
+            cp = c & 0x1Fu;
+        }
+        else if ((c & 0xF0u) == 0xE0u)
+        {
+            len = 3;
+            cp = c & 0x0Fu;
+        }
+        else if ((c & 0xF8u) == 0xF0u && c <= 0xF4u)
+        {
+            len = 4;
+            cp = c & 0x07u;
+        }
+        bool valid = len > 0 && i + len <= text.size();
+        for (size_t k = 1; valid && k < len; k++)
+        {
+            const unsigned char cont = static_cast<unsigned char>(text[i + k]);
+            if ((cont & 0xC0u) != 0x80u)
+            {
+                valid = false;
+                break;
+            }
+            cp = (cp << 6) | (cont & 0x3Fu);
+        }
+        if (valid)
+        {
+            if ((len == 3 && cp < 0x800u) || (len == 4 && cp < 0x10000u) ||
+                cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu) ||
+                cp == 0xFFFEu || cp == 0xFFFFu)
+            {
+                valid = false;
+            }
+        }
+        if (valid)
+        {
+            result.append(text, i, len);
+            i += len;
+        }
+        else
+        {
+            result += "\xEF\xBF\xBD";
+            i++;
         }
     }
     return result;
@@ -278,8 +339,8 @@ bool Console::SetLogFile(const std::string & path, std::string & error,
     if (maxBytes > 0 && maxCount > 0)
     {
         struct stat info;
-        if (stat(path.c_str(), &info) == 0 &&
-            info.st_size >= static_cast<off_t>(maxBytes))
+        if (stat(path.c_str(), &info) == 0 && info.st_size >= 0 &&
+            static_cast<unsigned long long>(info.st_size) >= maxBytes)
         {
             char name[4096];
             snprintf(name, sizeof(name), "%s.%d", path.c_str(), maxCount);

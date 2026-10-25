@@ -12,6 +12,7 @@
 #include "SyncPlanner.h"
 
 #include <cctype>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -19,6 +20,8 @@
 
 #include <algorithm>
 #include <set>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "LocalFs.h"
 #include "PathUtil.h"
@@ -545,12 +548,14 @@ bool ParseCriterionValue(const std::string & text, size_t begin, size_t end,
     unsigned long long bytes = 0;
     for (size_t i = 0; i < digits; i++)
     {
-        bytes = bytes * 10ULL + static_cast<unsigned long long>(value[i] - '0');
-        if (bytes > (1ULL << 40))
+        const unsigned long long digit =
+            static_cast<unsigned long long>(value[i] - '0');
+        if (bytes > (ULLONG_MAX - digit) / 10ULL)
         {
-            bytes = (1ULL << 40);
-            break;
+            error = "The size '" + value + "' in a file mask is too large.";
+            return false;
         }
+        bytes = bytes * 10ULL + digit;
     }
     std::string suffix = value.substr(digits);
     if (!suffix.empty())
@@ -558,17 +563,18 @@ bool ParseCriterionValue(const std::string & text, size_t begin, size_t end,
         const char unit = static_cast<char>(toupper(
             static_cast<unsigned char>(suffix[0])));
         if (suffix.size() != 1 ||
-            (unit != 'K' && unit != 'M' && unit != 'G'))
+            (unit != 'K' && unit != 'M' && unit != 'G' && unit != 'T'))
         {
             error = "The size suffix '" + suffix + "' in a file mask is "
-                "not supported (use K, M or G).";
+                "not supported (use K, M, G or T).";
             return false;
         }
         const unsigned long long shift = unit == 'K' ? 10ULL :
-            unit == 'M' ? 20ULL : 30ULL;
-        if (bytes > ((1ULL << 50) >> shift))
+            unit == 'M' ? 20ULL : unit == 'G' ? 30ULL : 40ULL;
+        if (bytes > (ULLONG_MAX >> shift))
         {
-            bytes = (1ULL << 50) >> shift;
+            error = "The size '" + value + "' in a file mask is too large.";
+            return false;
         }
         bytes <<= shift;
     }
@@ -1020,14 +1026,21 @@ private:
              * an error for a synchronization that only uploads. */
             if (mOptions.mode == SyncMode::Remote)
             {
+                error = "Cannot read the local directory '" +
+                    LocalPathForRelative(mLocalRoot, relative) + "'" +
+                    (localError.empty() ? std::string(".") : (" (" + localError + ")."));
+                return false;
+            }
+            if (!relative.empty())
+            {
                 SyncItem item;
-                item.action = SyncAction::Upload;
+                item.action = SyncAction::Download;
                 item.path = relative;
                 item.isDirectory = true;
                 item.reason = "the local directory does not exist yet";
                 mPlan.items.push_back(item);
             }
-            else if (!remoteEntries.empty())
+            if (!remoteEntries.empty() && (relative.empty() || mOptions.recursive))
             {
                 AddSubtree(mRemoteFs, relative, SyncAction::Download,
                     RemotePathForRelative(mRemoteRoot, relative), error);
@@ -1038,14 +1051,21 @@ private:
         {
             if (mOptions.mode == SyncMode::Local)
             {
+                error = "Cannot read the remote directory '" +
+                    RemotePathForRelative(mRemoteRoot, relative) + "'" +
+                    (remoteError.empty() ? std::string(".") : (" (" + remoteError + ")."));
+                return false;
+            }
+            if (!relative.empty())
+            {
                 SyncItem item;
-                item.action = SyncAction::Download;
+                item.action = SyncAction::Upload;
                 item.path = relative;
                 item.isDirectory = true;
                 item.reason = "the remote directory does not exist yet";
                 mPlan.items.push_back(item);
             }
-            else if (!localEntries.empty())
+            if (!localEntries.empty() && (relative.empty() || mOptions.recursive))
             {
                 AddSubtree(mLocalFs, relative, SyncAction::Upload,
                     LocalPathForRelative(mLocalRoot, relative), error);
@@ -1089,10 +1109,13 @@ private:
                 (haveRemote && remote.isDirectory);
             const std::string child = relative.empty() ? name : relative + "/" + name;
 
-            const unsigned long long entrySize =
+            const bool preferRemote = mOptions.mode == SyncMode::Local;
+            const unsigned long long entrySize = preferRemote ?
+                (haveRemote ? remote.size : local.size) :
                 (haveLocal ? local.size : remote.size);
-            const unsigned long entryTime =
-                (haveLocal && local.mtime != 0) ? local.mtime : remote.mtime;
+            const unsigned long entryTime = preferRemote ?
+                ((haveRemote && remote.mtime != 0) ? remote.mtime : local.mtime) :
+                ((haveLocal && local.mtime != 0) ? local.mtime : remote.mtime);
             if (!mOptions.mask.Accepts(name, isDirectory, entrySize, entryTime,
                 child))
             {
@@ -1709,10 +1732,28 @@ bool SyncState::Load(const std::string & path, std::string & error)
     {
         return true; /* no previous synchronization, not an error */
     }
-    char buffer[8192];
-    while (fgets(buffer, sizeof(buffer), file) != NULL)
+    for (;;)
     {
-        std::string line(buffer);
+        std::string line;
+        char buffer[8192];
+        bool anyRead = false;
+        while (fgets(buffer, sizeof(buffer), file) != NULL)
+        {
+            anyRead = true;
+            line.append(buffer);
+            if (!line.empty() && line.back() == '\n')
+            {
+                break;
+            }
+            if (line.size() > 1024 * 1024)
+            {
+                break;
+            }
+        }
+        if (!anyRead)
+        {
+            break;
+        }
         while (!line.empty() && (line[line.size() - 1] == '\n' || line[line.size() - 1] == '\r'))
         {
             line.erase(line.size() - 1);
@@ -1767,9 +1808,22 @@ bool SyncState::Save(const std::string & path, std::string & error) const
             return false;
         }
     }
-    FILE * file = fopen(path.c_str(), "wb");
+    std::string tempPattern = path + ".tmp.XXXXXX";
+    std::vector<char> tempBuf(tempPattern.begin(), tempPattern.end());
+    tempBuf.push_back('\0');
+    const int tempFd = mkstemp(tempBuf.data());
+    if (tempFd < 0)
+    {
+        error = std::string("Cannot write the synchronization state '") + path + "'.";
+        return false;
+    }
+    (void)fchmod(tempFd, 0600);
+    const std::string tempPath(tempBuf.data());
+    FILE * file = fdopen(tempFd, "wb");
     if (file == NULL)
     {
+        close(tempFd);
+        remove(tempPath.c_str());
         error = std::string("Cannot write the synchronization state '") + path + "'.";
         return false;
     }
@@ -1780,7 +1834,15 @@ bool SyncState::Save(const std::string & path, std::string & error) const
         fprintf(file, "%s\t%lu\t%lu\t%llu\n", EscapeValue(it->first).c_str(),
             it->second.localTime, it->second.remoteTime, it->second.size);
     }
-    fclose(file);
+    const bool writeFailed = fflush(file) != 0 || ferror(file) != 0;
+    const int closeRc = fclose(file);
+    if (writeFailed || closeRc != 0 || rename(tempPath.c_str(), path.c_str()) != 0)
+    {
+        remove(tempPath.c_str());
+        error = std::string("Cannot write the synchronization state '") + path + "'.";
+        return false;
+    }
+    RestrictFileToUser(path);
     return true;
 }
 

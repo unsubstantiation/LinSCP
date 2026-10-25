@@ -169,7 +169,7 @@ struct PacketReader
     std::string str()
     {
         const uint32_t size = u32();
-        if (!ok || pos + size > length)
+        if (!ok || size > length - pos)
         {
             ok = false;
             return std::string();
@@ -180,7 +180,7 @@ struct PacketReader
     }
     void skip(size_t count)
     {
-        if (pos + count > length)
+        if (count > length - pos)
         {
             ok = false;
             pos = length;
@@ -368,17 +368,28 @@ bool request(unsigned int type, const PacketBuilder & body,
     if (responseType == SSH_FXP_STATUS)
     {
         const uint32_t responseId = reader.u32();
-        if (responseId != id)
+        if (!reader.ok || responseId != id)
         {
             set_error("Received a packet that does not belong to any request.");
             return false;
         }
-        g_last_status = static_cast<int>(reader.u32());
-        statusMessage = reader.str();
+        const uint32_t rawStatus = reader.u32();
+        if (!reader.ok)
+        {
+            set_error("Received a truncated SFTP status packet.");
+            return false;
+        }
+        g_last_status = static_cast<int>(rawStatus);
+        /* SFTP v2 servers omit the message string in SSH_FXP_STATUS; keep
+         * status valid even when no message follows. */
+        if (reader.pos < reader.length)
+        {
+            statusMessage = reader.str();
+        }
         return true;
     }
     const uint32_t responseId = reader.u32();
-    if (responseId != id)
+    if (!reader.ok || responseId != id)
     {
         set_error("Received a packet that does not belong to any request.");
         return false;
@@ -924,10 +935,20 @@ extern "C" int lscp_sftp_checksum(const char * algorithm, const char * path,
     const size_t digestLength = digest.size();
     if (usedAlgorithm != NULL && usedAlgorithmSize > 0)
     {
+        if (used.size() + 1 > usedAlgorithmSize)
+        {
+            set_error("The server returned a checksum algorithm name that exceeds the caller's buffer.");
+            return -1;
+        }
         snprintf(usedAlgorithm, usedAlgorithmSize, "%s", used.c_str());
     }
     if (hex != NULL && hexSize > 0)
     {
+        if (digestLength * 2 + 1 > hexSize)
+        {
+            set_error("The server returned a checksum digest that exceeds the caller's buffer.");
+            return -1;
+        }
         static const char digits[] = "0123456789abcdef";
         size_t out = 0;
         for (size_t i = 0; i < digestLength && out + 2 < hexSize; i++)
@@ -997,15 +1018,29 @@ int get_transfer(const char * remotePath, const char * localPath,
     }
     else
     {
-        /* Keep what is already there and write over or after it. */
-        file = fopen(localPath, localOffset > 0 ? "r+b" : "ab");
-        if (file == NULL)
+        /* Keep what is already there and write over or after it. Never fall
+         * back to "ab" when localOffset > 0, because POSIX "a" ignores
+         * fseeko() and appends every write at EOF; if the file is missing,
+         * create it with "w+b" and seek to localOffset. */
+        if (localOffset > 0)
+        {
+            file = fopen(localPath, "r+b");
+            if (file == NULL && errno == ENOENT)
+            {
+                file = fopen(localPath, "w+b");
+            }
+            if (file != NULL &&
+                fseeko(file, static_cast<off_t>(localOffset), SEEK_SET) != 0)
+            {
+                set_system_error("Seeking in the local file", localPath);
+                fclose(file);
+                close_handle(handle);
+                return -1;
+            }
+        }
+        else
         {
             file = fopen(localPath, "ab");
-        }
-        if (file != NULL && localOffset > 0)
-        {
-            fseeko(file, static_cast<off_t>(localOffset), SEEK_SET);
         }
     }
     if (file == NULL)
@@ -1132,9 +1167,12 @@ int put_transfer(const char * localPath, const char * remotePath,
         return -1;
     }
     const unsigned long long total = local_file_size(file);
-    if (localOffset > 0)
+    if (localOffset > 0 &&
+        fseeko(file, static_cast<off_t>(localOffset), SEEK_SET) != 0)
     {
-        fseeko(file, static_cast<off_t>(localOffset), SEEK_SET);
+        set_system_error("Seeking in the local file", localPath);
+        fclose(file);
+        return -1;
     }
 
     WireAttrs attrs;

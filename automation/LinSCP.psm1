@@ -40,15 +40,18 @@ function Find-LinScpBinary {
         Locates the linscp binary on PATH, or in the usual install locations.
     #>
     if ($Script:LinScpBin) { return $Script:LinScpBin }
+    $homeDir = if ($env:HOME) { $env:HOME } else { [Environment]::GetFolderPath('UserProfile') }
     $candidates = @(
         "linscp",
         "/usr/bin/linscp",
-        "/usr/local/bin/linscp",
-        (Join-Path $env:HOME ".local/bin/linscp"),
-        # PREFIX/share/linscp/automation/LinSCP.psm1 -> PREFIX/bin/linscp,
-        # whatever prefix 'make install' or 'cmake --install' used.
-        (Join-Path $PSScriptRoot "../../../bin/linscp")
+        "/usr/local/bin/linscp"
     )
+    if ($homeDir) {
+        $candidates += (Join-Path $homeDir ".local/bin/linscp")
+    }
+    # PREFIX/share/linscp/automation/LinSCP.psm1 -> PREFIX/bin/linscp,
+    # whatever prefix 'make install' or 'cmake --install' used.
+    $candidates += (Join-Path $PSScriptRoot "../../../bin/linscp")
     foreach ($c in $candidates) {
         $command = Get-Command $c -CommandType Application -ErrorAction SilentlyContinue
         if ($command) {
@@ -253,8 +256,12 @@ function Stop-LScpProcess {
     try {
         if ($null -ne $Session.Process -and -not $Session.Process.HasExited) {
             $Session.Process.Kill()
+            [void]$Session.Process.WaitForExit(2000)
         }
     } catch {}
+    foreach ($stream in @($Session.Stdin, $Session.Stdout, $Session.Stderr, $Session.Process)) {
+        try { if ($null -ne $stream) { $stream.Dispose() } } catch {}
+    }
     if ($Session.Id -and $Script:Sessions.ContainsKey($Session.Id)) {
         $Script:Sessions.Remove($Session.Id)
     }
@@ -380,9 +387,8 @@ function Close-LScpSession {
         }
     } catch {
         try { $Session.Process.Kill() } catch {}
-    }
-    if ($Session.Id -and $Script:Sessions.ContainsKey($Session.Id)) {
-        $Script:Sessions.Remove($Session.Id)
+    } finally {
+        Stop-LScpProcess -Session $Session
     }
 }
 
@@ -461,13 +467,20 @@ function ConvertFrom-LScpListing {
     )
     $entries = @()
     foreach ($line in $Lines) {
-        $text = $line.Trim()
-        if (-not $text) { continue }
-        $parts = $text -split '\s+', 9
-        if ($parts.Count -lt 9 -or $parts[0] -notmatch $Script:ListingMode) { continue }
-        $name = $parts[8]
+        $raw = $line -replace '[\r\n]+$', ''
+        if (-not $raw.Trim()) { continue }
+        if ($raw -notmatch '^\s*(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s(.*)$') {
+            continue
+        }
+        $perms = $Matches[1]
+        if ($perms -notmatch $Script:ListingMode) { continue }
+        $owner = $Matches[3]
+        $group = $Matches[4]
+        $sizeText = $Matches[5]
+        $modified = "$($Matches[6]) $($Matches[7]) $($Matches[8])"
+        $name = $Matches[9]
         $target = ""
-        $isLink = $parts[0].StartsWith("l")
+        $isLink = $perms.StartsWith("l")
         if ($isLink) {
             $arrow = $name.IndexOf(" -> ")
             if ($arrow -ge 0) {
@@ -477,19 +490,19 @@ function ConvertFrom-LScpListing {
         }
         if ($name -eq "." -or $name -eq "..") { continue }
         $size = 0L
-        [void][long]::TryParse($parts[4], [ref]$size)
+        [void][long]::TryParse($sizeText, [ref]$size)
         $fullName = if ($Directory) { $Directory.TrimEnd('/') + '/' + $name } else { $name }
         $entries += [PSCustomObject]@{
             Name        = $name
             FullName    = $fullName
-            IsDirectory = $parts[0].StartsWith("d")
+            IsDirectory = $perms.StartsWith("d")
             IsLink      = $isLink
             LinkTarget  = $target
             Length      = $size
-            Permissions = $parts[0]
-            Owner       = $parts[2]
-            Group       = $parts[3]
-            Modified    = "$($parts[5]) $($parts[6]) $($parts[7])"
+            Permissions = $perms
+            Owner       = $owner
+            Group       = $group
+            Modified    = $modified
         }
     }
     return $entries
