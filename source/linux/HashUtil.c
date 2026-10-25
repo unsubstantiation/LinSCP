@@ -7,6 +7,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -91,6 +92,11 @@ int lscp_hash_file(const char * algorithm, const char * path,
         return -1;
     }
     hex[0] = '\0';
+    if (algorithm == NULL || path == NULL)
+    {
+        set_hash_error("Invalid checksum arguments.");
+        return -1;
+    }
 
     if (algorithm_matches(algorithm, "sha256"))
     {
@@ -204,13 +210,16 @@ int lscp_hash_file(const char * algorithm, const char * path,
 int lscp_hmac_sha256(const void * key, size_t keyLen,
     const void * data, size_t dataLen, unsigned char * out, size_t outSize)
 {
+    static const unsigned char empty = 0;
     unsigned int len = 0;
-    if (out == NULL || outSize < SHA256_DIGEST_LENGTH)
+    if (out == NULL || outSize < SHA256_DIGEST_LENGTH || keyLen > (size_t)INT_MAX ||
+        (key == NULL && keyLen > 0) || (data == NULL && dataLen > 0))
     {
         return -1;
     }
-    if (HMAC(EVP_sha256(), key, (int)keyLen,
-            (const unsigned char *)data, dataLen, out, &len) == NULL ||
+    if (HMAC(EVP_sha256(), key != NULL ? key : &empty, (int)keyLen,
+            data != NULL ? (const unsigned char *)data : &empty,
+            dataLen, out, &len) == NULL ||
         len != SHA256_DIGEST_LENGTH)
     {
         return -1;
@@ -221,11 +230,14 @@ int lscp_hmac_sha256(const void * key, size_t keyLen,
 int lscp_sha256(const void * data, size_t dataLen,
     unsigned char * out, size_t outSize)
 {
-    if (out == NULL || outSize < SHA256_DIGEST_LENGTH)
+    static const unsigned char empty = 0;
+    if (out == NULL || outSize < SHA256_DIGEST_LENGTH ||
+        (data == NULL && dataLen > 0))
     {
         return -1;
     }
-    if (SHA256((const unsigned char *)data, dataLen, out) == NULL)
+    if (SHA256(data != NULL ? (const unsigned char *)data : &empty,
+            dataLen, out) == NULL)
     {
         return -1;
     }

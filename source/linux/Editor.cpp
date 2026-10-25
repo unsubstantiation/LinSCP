@@ -46,13 +46,13 @@ std::string SanitizeForFileName(const std::string & text)
             (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_';
         result += safe ? c : '_';
     }
-    if (result.empty())
-    {
-        result = "file";
-    }
     if (result.size() > 64)
     {
         result = result.substr(result.size() - 64);
+    }
+    if (result.empty() || result == "." || result == "..")
+    {
+        result = "file";
     }
     return result;
 }
@@ -130,8 +130,13 @@ std::string ConvertNewlinesToLf(const std::string & bytes)
     out.reserve(bytes.size());
     for (size_t i = 0; i < bytes.size(); i++)
     {
-        if (bytes[i] == '\r' && i + 1 < bytes.size() && bytes[i + 1] == '\n')
+        if (bytes[i] == '\r')
         {
+            if (i + 1 < bytes.size() && bytes[i + 1] == '\n')
+            {
+                continue;
+            }
+            out += '\n';
             continue;
         }
         out += bytes[i];
@@ -145,10 +150,13 @@ std::string ConvertNewlinesToCrlf(const std::string & bytes)
     out.reserve(bytes.size() + 32);
     for (size_t i = 0; i < bytes.size(); i++)
     {
-        if (bytes[i] == '\r' && i + 1 < bytes.size() && bytes[i + 1] == '\n')
+        if (bytes[i] == '\r')
         {
             out += "\r\n";
-            i++;
+            if (i + 1 < bytes.size() && bytes[i + 1] == '\n')
+            {
+                i++;
+            }
         }
         else if (bytes[i] == '\n')
         {
@@ -438,7 +446,11 @@ bool RemoteEditor::Edit(const std::string & remotePath, const EditOptions & opti
         {
             return true;
         }
-        WriteWholeFile(tempPath, editedBytes);
+        if (!WriteWholeFile(tempPath, editedBytes))
+        {
+            error = "Cannot write the normalized file '" + tempPath + "'.";
+            return false;
+        }
 
         /* The remote file may have changed while the editor was open. */
         LscpAttrs nowAttrs = {};
@@ -537,6 +549,7 @@ bool RemoteEditor::Edit(const std::string & remotePath, const EditOptions & opti
 
     if (options.monitor)
     {
+        ClearInterrupt();
         InstallInterruptHandler();
         unsigned completedPasses = 0;
         const unsigned targetPasses = options.monitorPasses == 0 ? 1 :
@@ -553,6 +566,7 @@ bool RemoteEditor::Edit(const std::string & remotePath, const EditOptions & opti
             bool passUploaded = false;
             if (!uploadIfChanged(passUploaded))
             {
+                ClearInterrupt();
                 return false;
             }
             if (passUploaded)
@@ -565,6 +579,7 @@ bool RemoteEditor::Edit(const std::string & remotePath, const EditOptions & opti
                 break;
             }
         }
+        ClearInterrupt();
     }
 
     if (!options.keepTempFile)
@@ -655,6 +670,7 @@ namespace {
 std::string IconvConvert(const std::string & data,
     const char * fromEnc, const char * toEnc, std::string & error)
 {
+    error.clear();
     iconv_t cd = iconv_open(toEnc, fromEnc);
     if (cd == reinterpret_cast<iconv_t>(-1))
     {

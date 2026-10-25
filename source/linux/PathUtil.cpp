@@ -327,7 +327,7 @@ std::string ResolveLocalPath(const std::string & cwd, const std::string & path)
     std::string expanded = ExpandTilde(path);
     if (!expanded.empty() && expanded[0] == '/')
     {
-        return expanded;
+        return ResolveRemotePath("/", expanded);
     }
     if (expanded == ".")
     {

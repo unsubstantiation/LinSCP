@@ -394,7 +394,15 @@ bool Base64Decode(const std::string & text, std::string & data)
         const char c = text[i];
         if (c == '=')
         {
-            continue; /* padding: the bits it carries are zero anyway */
+            if (i < text.size() - 2)
+            {
+                return false;
+            }
+            if (i == text.size() - 2 && text[text.size() - 1] != '=')
+            {
+                return false;
+            }
+            continue; /* trailing padding */
         }
         const char * found = strchr(b64Digits, c);
         if (found == NULL || c == '\0')
@@ -513,6 +521,11 @@ KeyReadResult ReadKeyFile(const std::string & path, std::string & key,
     {
         error = "The encryption key file '" + path + "' cannot be read.";
         return KeyReadInvalid;
+    }
+    if (content.size() == kKeyBytes)
+    {
+        key = content;
+        return KeyReadOk;
     }
     const std::string trimmed = Trim(content);
     if (trimmed.size() == kKeyBytes)
@@ -873,22 +886,43 @@ bool SessionStore::Rename(const std::string & from, const std::string & to,
         error = "The session name '" + to + "' is not valid.";
         return false;
     }
-    const StoredSession * existing = Find(from);
-    if (existing == NULL)
+    size_t targetIndex = mSessions.size();
+    for (size_t i = 0; i < mSessions.size(); i++)
+    {
+        if (mSessions[i].name == from)
+        {
+            targetIndex = i;
+            break;
+        }
+    }
+    if (targetIndex == mSessions.size())
+    {
+        const std::string wanted = Lower(Trim(from));
+        for (size_t i = 0; i < mSessions.size(); i++)
+        {
+            if (Lower(mSessions[i].name) == wanted)
+            {
+                targetIndex = i;
+                break;
+            }
+        }
+    }
+    if (targetIndex == mSessions.size())
     {
         error = "There is no stored session named '" + from + "'.";
         return false;
     }
+    const std::string lowerTo = Lower(to);
     for (size_t i = 0; i < mSessions.size(); i++)
     {
-        if (&mSessions[i] == existing)
+        if (i != targetIndex && Lower(mSessions[i].name) == lowerTo)
         {
-            mSessions[i].name = to;
-            return true;
+            error = "A stored session named '" + to + "' already exists.";
+            return false;
         }
     }
-    error = "There is no stored session named '" + from + "'.";
-    return false;
+    mSessions[targetIndex].name = to;
+    return true;
 }
 
 std::vector<std::string> SessionStore::Folders() const
@@ -997,10 +1031,28 @@ bool SessionStore::Load(std::string & error)
 
     StoredSession current;
     bool inSection = false;
-    char buffer[8192];
-    while (fgets(buffer, sizeof(buffer), file) != NULL)
+    for (;;)
     {
-        std::string line(buffer);
+        std::string line;
+        char buffer[8192];
+        bool anyRead = false;
+        while (fgets(buffer, sizeof(buffer), file) != NULL)
+        {
+            anyRead = true;
+            line.append(buffer);
+            if (!line.empty() && line.back() == '\n')
+            {
+                break;
+            }
+            if (line.size() > 1024 * 1024)
+            {
+                break;
+            }
+        }
+        if (!anyRead)
+        {
+            break;
+        }
         while (!line.empty() && (line[line.size() - 1] == '\n' || line[line.size() - 1] == '\r'))
         {
             line.erase(line.size() - 1);
@@ -1021,8 +1073,8 @@ bool SessionStore::Load(std::string & error)
             inSection = true;
             continue;
         }
-        const size_t equals = trimmed.find('=');
-        if (equals == std::string::npos)
+        const size_t rawEquals = line.find('=');
+        if (rawEquals == std::string::npos)
         {
             continue; /* not a line this format understands: ignore it */
         }
@@ -1030,8 +1082,32 @@ bool SessionStore::Load(std::string & error)
         {
             continue; /* a value outside any section */
         }
-        const std::string key = Lower(Trim(trimmed.substr(0, equals)));
-        const std::string value = UnescapeValue(Trim(trimmed.substr(equals + 1)));
+        const std::string rawKey = line.substr(0, rawEquals);
+        const std::string key = Lower(Trim(rawKey));
+        std::string rawVal = line.substr(rawEquals + 1);
+        /* Save() writes 'key=value' with no space around '='; preserve
+         * significant leading/trailing spaces in credentials and paths when
+         * written without spaces around '=', while still allowing hand-edited
+         * 'key = value' lines. */
+        const bool spacedEquals = !rawKey.empty() &&
+            (rawKey.back() == ' ' || rawKey.back() == '\t');
+        std::string value;
+        if (key == "password" || key == "proxy_password" ||
+            key == "tunnel_password" || key == "tunnel_passphrase" ||
+            key == "proxy_command" || key == "remote_directory" ||
+            key == "local_directory")
+        {
+            if (spacedEquals && !rawVal.empty() &&
+                (rawVal[0] == ' ' || rawVal[0] == '\t'))
+            {
+                rawVal.erase(0, 1);
+            }
+            value = UnescapeValue(rawVal);
+        }
+        else
+        {
+            value = UnescapeValue(Trim(rawVal));
+        }
         if (key == "port")
         {
             /* A stored port is a number the file states, not one the user
@@ -1381,9 +1457,22 @@ bool SessionStore::Save(std::string & error) const
         }
     }
 
-    FILE * file = fopen(mPath.c_str(), "wb");
+    std::string tempPattern = mPath + ".tmp.XXXXXX";
+    std::vector<char> tempBuf(tempPattern.begin(), tempPattern.end());
+    tempBuf.push_back('\0');
+    const int tempFd = mkstemp(tempBuf.data());
+    if (tempFd < 0)
+    {
+        error = std::string("Cannot write the session file '") + mPath + "'.";
+        return false;
+    }
+    (void)fchmod(tempFd, 0600);
+    const std::string tempPath(tempBuf.data());
+    FILE * file = fdopen(tempFd, "wb");
     if (file == NULL)
     {
+        close(tempFd);
+        remove(tempPath.c_str());
         error = std::string("Cannot write the session file '") + mPath + "'.";
         return false;
     }
@@ -1453,11 +1542,22 @@ bool SessionStore::Save(std::string & error) const
             (void)isNumber;
         }
     }
-    fclose(file);
-    if (anyPassword)
+    const bool writeFailed = fflush(file) != 0 || ferror(file) != 0;
+    const int closeRc = fclose(file);
+    if (writeFailed || closeRc != 0)
     {
-        RestrictFileToUser(mPath);
+        remove(tempPath.c_str());
+        error = std::string("Cannot write the session file '") + mPath + "'.";
+        return false;
     }
+    if (rename(tempPath.c_str(), mPath.c_str()) != 0)
+    {
+        remove(tempPath.c_str());
+        error = std::string("Cannot write the session file '") + mPath + "'.";
+        return false;
+    }
+    RestrictFileToUser(mPath);
+    (void)anyPassword;
     return true;
 }
 
@@ -1494,6 +1594,16 @@ int SessionStore::ImportFile(const std::string & path, bool merge, std::string &
 bool SessionStore::ExportFile(const std::string & path, std::string & error)
 {
     SessionStore copy(path);
+    /* Start from an empty store even when 'path' already exists on disk, so
+     * exporting overwrites the target rather than merging stale sections. */
+    while (!copy.Sessions().empty())
+    {
+        std::string ignore;
+        if (!copy.Remove(copy.Sessions()[0].name, ignore))
+        {
+            break;
+        }
+    }
     for (size_t i = 0; i < mSessions.size(); i++)
     {
         std::string addError;

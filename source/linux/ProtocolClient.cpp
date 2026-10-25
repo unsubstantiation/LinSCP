@@ -525,6 +525,7 @@ void BuildCommonCurlArgs(const SessionOptions & options, std::vector<std::string
     bool failOnError = true, bool showProgress = false)
 {
     args.push_back(CurlExecutable());
+    args.push_back("-g");
     if (!showProgress)
     {
         args.push_back("-s");
@@ -634,8 +635,12 @@ void BuildCommonCurlArgs(const SessionOptions & options, std::vector<std::string
         }
         if (scheme != NULL)
         {
+            const bool proxyIpv6 = proxy.host.find(':') != std::string::npos &&
+                (proxy.host.empty() || proxy.host[0] != '[');
+            const std::string proxyHost = proxyIpv6 ?
+                ("[" + proxy.host + "]") : proxy.host;
             args.push_back("--proxy");
-            args.push_back(std::string(scheme) + "://" + proxy.host + ":" +
+            args.push_back(std::string(scheme) + "://" + proxyHost + ":" +
                 std::to_string(proxy.EffectivePort()));
         }
         if (!proxy.userName.empty())
@@ -1149,7 +1154,14 @@ bool DavInvoke(const SessionOptions & options, const std::string & method,
     if (!ifToken.empty())
     {
         args.push_back("-H");
-        args.push_back("If: (" + ifToken + ")");
+        if (ifToken[0] == '(')
+        {
+            args.push_back("If: " + ifToken);
+        }
+        else
+        {
+            args.push_back("If: (" + ifToken + ")");
+        }
     }
     for (size_t i = 0; i < headers.size(); i++)
     {
@@ -1432,6 +1444,13 @@ int DavDelete(const SessionOptions & options, const std::string & remotePath,
     }
     error = DavHttpFailure(deleted, "Delete");
     return -1;
+}
+
+bool HasControlNewline(const std::string & text)
+{
+    return text.find('\r') != std::string::npos ||
+        text.find('\n') != std::string::npos ||
+        text.find('\0') != std::string::npos;
 }
 
 } // namespace
@@ -1859,6 +1878,10 @@ int ProtocolClient::Stat(const SessionOptions & options, const std::string & rem
     if (rc != 0)
     {
         error = errStr;
+        if (IsEndpointUnreachable(rc))
+        {
+            return LSCP_SFTP_STAT_ERROR;
+        }
         return LSCP_SFTP_STAT_MISSING;
     }
 
@@ -2078,6 +2101,11 @@ int ProtocolClient::Remove(const SessionOptions & options, const std::string & r
     BuildCommonCurlArgs(options, args);
 
     std::string proto = ToLower(options.protocol);
+    if (HasControlNewline(remotePath))
+    {
+        error = "Remote path contains a control newline or NUL byte.";
+        return -1;
+    }
     if (proto == "ftp" || proto == "ftps")
     {
         args.push_back("-Q");
@@ -2141,6 +2169,11 @@ int ProtocolClient::RemoveDir(const SessionOptions & options, const std::string 
     BuildCommonCurlArgs(options, args);
 
     std::string proto = ToLower(options.protocol);
+    if (HasControlNewline(remotePath))
+    {
+        error = "Remote path contains a control newline or NUL byte.";
+        return -1;
+    }
     if (proto == "ftp" || proto == "ftps")
     {
         args.push_back("-Q");
@@ -2237,6 +2270,11 @@ int ProtocolClient::MakeDir(const SessionOptions & options, const std::string & 
     BuildCommonCurlArgs(options, args);
 
     std::string proto = ToLower(options.protocol);
+    if (HasControlNewline(remotePath))
+    {
+        error = "Remote path contains a control newline or NUL byte.";
+        return -1;
+    }
     if (proto == "ftp" || proto == "ftps")
     {
         args.push_back("-Q");
@@ -2394,6 +2432,11 @@ int ProtocolClient::Move(const SessionOptions & options, const std::string & fro
     BuildCommonCurlArgs(options, args);
 
     std::string proto = ToLower(options.protocol);
+    if (HasControlNewline(fromPath) || HasControlNewline(toPath))
+    {
+        error = "Remote path contains a control newline or NUL byte.";
+        return -1;
+    }
     if (proto == "ftp" || proto == "ftps")
     {
         args.push_back("-Q");
@@ -2407,7 +2450,7 @@ int ProtocolClient::Move(const SessionOptions & options, const std::string & fro
         args.push_back("-X");
         args.push_back("MOVE");
         args.push_back("-H");
-        args.push_back("Destination: " + toPath);
+        args.push_back("Destination: " + BuildUrl(options, toPath));
         args.push_back(BuildUrl(options, fromPath));
     }
 
@@ -2437,6 +2480,11 @@ int ProtocolClient::SetPermissions(const SessionOptions & options,
     BuildCommonCurlArgs(options, args);
 
     std::string proto = ToLower(options.protocol);
+    if (HasControlNewline(remotePath))
+    {
+        error = "Remote path contains a control newline or NUL byte.";
+        return -1;
+    }
     if (proto == "ftp" || proto == "ftps")
     {
         args.push_back("-Q");
@@ -2478,9 +2526,9 @@ int ProtocolClient::SetPermissions(const SessionOptions & options,
 bool DavLockTokenFromXml(const std::string & xml, std::string & token)
 {
     token.clear();
-    const std::string key = "locktoken";
-    const size_t at = xml.find(key);
-    if (at == std::string::npos)
+    size_t lockStart = 0;
+    std::string lockFull;
+    if (!DavScanElement(xml, "locktoken", 0, lockStart, lockFull))
     {
         const std::string text = DavTrimmed(xml);
         if (!text.empty() && text.find('<') == std::string::npos)
@@ -2490,24 +2538,24 @@ bool DavLockTokenFromXml(const std::string & xml, std::string & token)
         }
         return false;
     }
-    size_t cursor = xml.find('>', at + key.size());
-    if (cursor == std::string::npos)
+    size_t bodyStart = 0, bodyEnd = 0, after = 0;
+    if (!DavElementBody(xml, lockStart, lockFull, bodyStart, bodyEnd, after) ||
+        bodyStart >= bodyEnd)
     {
         return false;
     }
-    const size_t textStart = xml.find('>', cursor + 1);
-    if (textStart == std::string::npos)
+    const std::string lockBody = xml.substr(bodyStart, bodyEnd - bodyStart);
+    if (DavFindText(lockBody, "href", 0, token))
     {
-        return false;
+        token = DavTrimmed(token);
+        return !token.empty();
     }
-    const size_t end = xml.find('<', textStart + 1);
-    if (end == std::string::npos)
+    if (lockBody.find('<') == std::string::npos)
     {
-        return false;
+        token = DavTrimmed(DavXmlUnescape(lockBody));
+        return !token.empty();
     }
-    token = DavTrimmed(DavXmlUnescape(
-        xml.substr(textStart + 1, end - textStart - 1)));
-    return !token.empty();
+    return false;
 }
 
 /* An XML element name has to start with a letter or '_' and hold no
@@ -2560,6 +2608,36 @@ bool DavPropertyValueFromXml(const std::string & xml, const std::string & name,
 {
     value.clear();
     found = false;
+    size_t ppos = 0;
+    size_t pTag = 0;
+    std::string pFull;
+    bool hadPropstat = false;
+    while (DavScanElement(xml, "propstat", ppos, pTag, pFull))
+    {
+        hadPropstat = true;
+        size_t pBody = 0, pBodyEnd = 0, pAfter = 0;
+        if (!DavElementBody(xml, pTag, pFull, pBody, pBodyEnd, pAfter))
+        {
+            break;
+        }
+        ppos = pAfter;
+        const std::string propstat = xml.substr(pBody, pBodyEnd - pBody);
+        std::string status;
+        if (DavFindText(propstat, "status", 0, status) &&
+            status.find(" 200") == std::string::npos)
+        {
+            continue;
+        }
+        if (DavFindText(propstat, name, 0, value))
+        {
+            found = true;
+            return true;
+        }
+    }
+    if (hadPropstat)
+    {
+        return false;
+    }
     if (!DavFindText(xml, name, 0, value))
     {
         return false;

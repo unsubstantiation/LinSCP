@@ -1,6 +1,7 @@
 #include "Platform.h"
 
 #include "LocalFs.h"
+#include "PathUtil.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -189,7 +190,13 @@ bool CreatePrivateDirectory(const std::string & path, std::string & error)
     {
         return false;
     }
-    chmod(path.c_str(), 0700);
+    const std::string expanded = ExpandTilde(path);
+    if (chmod(expanded.c_str(), 0700) != 0)
+    {
+        error = std::string("Cannot restrict directory '") + expanded +
+            "': " + strerror(errno);
+        return false;
+    }
     return true;
 }
 
@@ -389,6 +396,10 @@ int RunCaptureWithOutput(const std::vector<std::string> & args,
                     (i == 0 ? out : err).append(buffer,
                         static_cast<size_t>(bytesRead));
                 }
+                else if (bytesRead < 0 && (errno == EINTR || errno == EAGAIN))
+                {
+                    /* Transient interruption; keep reading this pipe. */
+                }
                 else
                 {
                     close(fds[i].fd);
@@ -441,7 +452,9 @@ std::string FindExecutableOnPath(const std::string & name)
     }
     if (name.find('/') != std::string::npos)
     {
-        return access(name.c_str(), X_OK) == 0 ? name : std::string();
+        struct stat st = {};
+        return stat(name.c_str(), &st) == 0 && !S_ISDIR(st.st_mode) &&
+            access(name.c_str(), X_OK) == 0 ? name : std::string();
     }
     const char * pathEnv = getenv("PATH");
     if (pathEnv == NULL)
@@ -460,7 +473,9 @@ std::string FindExecutableOnPath(const std::string & name)
             dir = ".";
         }
         std::string candidate = dir + "/" + name;
-        if (access(candidate.c_str(), X_OK) == 0)
+        struct stat st = {};
+        if (stat(candidate.c_str(), &st) == 0 && !S_ISDIR(st.st_mode) &&
+            access(candidate.c_str(), X_OK) == 0)
         {
             return candidate;
         }
@@ -739,7 +754,23 @@ std::vector<std::string> BuildSshArguments(const std::string & userName,
     /* A terminal is wanted even though the client's own stdin is not one
      * (in the GUI the client runs without a console). */
     args.push_back("-t");
-    args.push_back(userName.empty() ? hostName : userName + "@" + hostName);
+    const bool leadingDash =
+        (!userName.empty() && userName[0] == '-') ||
+        (!hostName.empty() && hostName[0] == '-');
+    if (leadingDash)
+    {
+        if (!userName.empty())
+        {
+            args.push_back("-l");
+            args.push_back(userName);
+        }
+        args.push_back("--");
+        args.push_back(hostName);
+    }
+    else
+    {
+        args.push_back(userName.empty() ? hostName : userName + "@" + hostName);
+    }
     return args;
 }
 
@@ -942,7 +973,7 @@ TerminalChoice ChooseTerminalProgram(const DesktopSession & session,
             /* An X11-only program in a Wayland session is a fallback
              * through XWayland: usable, but not the first choice. */
             const bool throughXWayland =
-                BackendIs(candidate.backend, "x11") && !session.x11;
+                BackendIs(candidate.backend, "x11") && session.wayland;
             if (pass == 0 ? throughXWayland : !throughXWayland)
             {
                 continue;
@@ -1140,6 +1171,12 @@ bool LaunchTerminalForServer(const std::string & userName,
     if (got == static_cast<ssize_t>(sizeof(execError)) && execError != 0)
     {
         error = "Failed to start '" + program + "': " + strerror(execError) + ".";
+        error += SshHint(userName, hostName, portNumber);
+        return false;
+    }
+    if (!WIFEXITED(childStatus) || WEXITSTATUS(childStatus) != 0)
+    {
+        error = "Failed to fork '" + program + "'.";
         error += SshHint(userName, hostName, portNumber);
         return false;
     }

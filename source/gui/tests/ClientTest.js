@@ -1384,6 +1384,19 @@ function options(id) {
     JSON.stringify(rightsPayload));
   window.closeModal('propertiesModal');
 
+  /* Regression checks: desktop dragover on local pane, opening a local file
+   * entry in the editor, and Save As refreshing baseMtime. */
+  const localDesktopDt = { files: [desktopFile], types: ['Files'], dropEffect: '' };
+  const localDesktopOver = { dataTransfer: localDesktopDt,
+    preventDefault() { this.prevented = true; } };
+  window.dragOverPane('local', localDesktopOver);
+  check('dragover accepts a desktop file on the local pane too',
+    localDesktopOver.prevented === true && localDesktopDt.dropEffect === 'copy');
+  await window.openEntry('local', { name: 'a.txt', is_dir: false });
+  check('opening a local file entry loads it in the editor',
+    doc.getElementById('editorModal').classList.contains('open'));
+  window.closeModal('editorModal');
+
   check('no script errors', errors.length === 0, errors.join(' | '));
   window.close();
 })();

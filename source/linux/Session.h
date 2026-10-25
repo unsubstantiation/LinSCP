@@ -291,12 +291,6 @@ bool ValidateSessionCapabilities(const SessionOptions & options,
  * host key is pinned - a pinned key must be checked, and a Kerberos
  * key exchange presents none. */
 std::string GssapiKeyExchangeList(const SessionOptions & options);
-/* The key-exchange list to offer when GSSAPI key exchange is on: the
- * RFC 4462 algorithms first, then this client's ordinary ones. Empty
- * when it is off, when the loaded libssh cannot use GSSAPI, or when a
- * host key is pinned - a pinned key must be checked, and a Kerberos
- * key exchange presents none. */
-std::string GssapiKeyExchangeList(const SessionOptions & options);
 /* True when the session talks to the FTP server over implicit TLS, which
  * is what an 'ftps://' URL or 'Ftps=1' asks for. */
 bool SessionUsesImplicitTls(const SessionOptions & options);

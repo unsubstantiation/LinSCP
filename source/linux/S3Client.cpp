@@ -203,7 +203,9 @@ S3Site S3SiteOf(const SessionOptions & options)
     {
         site.region = "us-east-1";
     }
-    site.authority = options.hostName;
+    const bool ipv6 = options.hostName.find(':') != std::string::npos &&
+        (options.hostName.empty() || options.hostName[0] != '[');
+    site.authority = ipv6 ? ("[" + options.hostName + "]") : options.hostName;
     if (options.portNumber > 0 && options.portNumber != 443)
     {
         site.authority += ":" + std::to_string(options.portNumber);
@@ -322,6 +324,32 @@ int SplitWriteOut(const std::string & out, std::string & body)
     return atoi(codeText.c_str());
 }
 
+void AppendUtf8CodePoint(std::string & out, unsigned long cp)
+{
+    if (cp <= 0x7Fu)
+    {
+        out += static_cast<char>(cp);
+    }
+    else if (cp <= 0x7FFu)
+    {
+        out += static_cast<char>(0xC0u | (cp >> 6));
+        out += static_cast<char>(0x80u | (cp & 0x3Fu));
+    }
+    else if (cp <= 0xFFFFu)
+    {
+        out += static_cast<char>(0xE0u | (cp >> 12));
+        out += static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu));
+        out += static_cast<char>(0x80u | (cp & 0x3Fu));
+    }
+    else if (cp <= 0x10FFFFu)
+    {
+        out += static_cast<char>(0xF0u | (cp >> 18));
+        out += static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu));
+        out += static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu));
+        out += static_cast<char>(0x80u | (cp & 0x3Fu));
+    }
+}
+
 std::string XmlUnescape(const std::string & text)
 {
     std::string out;
@@ -333,7 +361,7 @@ std::string XmlUnescape(const std::string & text)
             continue;
         }
         const size_t semi = text.find(';', i);
-        if (semi == std::string::npos || semi - i > 10)
+        if (semi == std::string::npos || semi - i > 12)
         {
             out += text[i];
             continue;
@@ -344,6 +372,26 @@ std::string XmlUnescape(const std::string & text)
         else if (entity == "gt") { out += '>'; i = semi; }
         else if (entity == "quot") { out += '"'; i = semi; }
         else if (entity == "apos") { out += '\''; i = semi; }
+        else if (entity.size() >= 2 && entity[0] == '#')
+        {
+            const bool hex = entity.size() >= 3 &&
+                (entity[1] == 'x' || entity[1] == 'X');
+            const std::string digits = entity.substr(hex ? 2 : 1);
+            char * end = NULL;
+            errno = 0;
+            const unsigned long cp = !digits.empty() ?
+                strtoul(digits.c_str(), &end, hex ? 16 : 10) : 0;
+            if (!digits.empty() && errno == 0 && end != NULL && *end == '\0' &&
+                cp > 0 && cp <= 0x10FFFFu && !(cp >= 0xD800u && cp <= 0xDFFFu))
+            {
+                AppendUtf8CodePoint(out, cp);
+                i = semi;
+            }
+            else
+            {
+                out += text[i];
+            }
+        }
         else { out += text[i]; }
     }
     return out;
@@ -707,6 +755,7 @@ bool InvokeCurl(const S3Site & site, const SessionOptions & options,
 
     std::vector<std::string> args;
     args.push_back(CurlExecutable());
+    args.push_back("-g");
     if (progress == NULL)
     {
         args.push_back("-s");
@@ -725,7 +774,74 @@ bool InvokeCurl(const S3Site & site, const SessionOptions & options,
     {
         args.push_back("--insecure");
     }
+    static const char * const kVersionFlags[4] = {
+        "--tlsv1.0", "--tlsv1.1", "--tlsv1.2", "--tlsv1.3"
+    };
+    static const char * const kMaxValues[4] = { "1.0", "1.1", "1.2", "1.3" };
+    if (options.tls.minVersion >= 10 && options.tls.minVersion <= 13)
+    {
+        args.push_back(kVersionFlags[options.tls.minVersion - 10]);
+    }
+    if (options.tls.maxVersion >= 10 && options.tls.maxVersion <= 13)
+    {
+        args.push_back("--tls-max");
+        args.push_back(kMaxValues[options.tls.maxVersion - 10]);
+    }
+    if (!options.tls.clientCertificate.empty())
+    {
+        args.push_back("--cert");
+        args.push_back(options.tls.clientCertificate);
+    }
+    if (!options.tls.clientKey.empty())
+    {
+        args.push_back("--key");
+        args.push_back(options.tls.clientKey);
+    }
+    if (!options.tls.caFile.empty())
+    {
+        args.push_back("--cacert");
+        args.push_back(options.tls.caFile);
+    }
+    if (!options.tls.caDirectory.empty())
+    {
+        args.push_back("--capath");
+        args.push_back(options.tls.caDirectory);
+    }
+    if (!options.tls.pinnedPublicKey.empty())
+    {
+        args.push_back("--pinnedpubkey");
+        args.push_back(options.tls.pinnedPublicKey);
+    }
     AddCurlTunnelArgs(options, args);
+    if (options.tunnelSocksPort <= 0 && options.proxy.Active())
+    {
+        const ProxySettings & proxy = options.proxy;
+        const char * scheme = NULL;
+        switch (proxy.method)
+        {
+        case ProxyMethod::Socks4: scheme = "socks4"; break;
+        case ProxyMethod::Socks5:
+            scheme = proxy.ResolvesRemotely() ? "socks5h" : "socks5";
+            break;
+        case ProxyMethod::Http: scheme = "http"; break;
+        default: break;
+        }
+        if (scheme != NULL)
+        {
+            const bool proxyIpv6 = proxy.host.find(':') != std::string::npos &&
+                (proxy.host.empty() || proxy.host[0] != '[');
+            const std::string proxyHost = proxyIpv6 ?
+                ("[" + proxy.host + "]") : proxy.host;
+            args.push_back("--proxy");
+            args.push_back(std::string(scheme) + "://" + proxyHost + ":" +
+                std::to_string(proxy.EffectivePort()));
+        }
+        if (!proxy.userName.empty())
+        {
+            args.push_back("--proxy-user");
+            args.push_back(proxy.userName + ":" + proxy.password);
+        }
+    }
     if (options.timeoutSecs > 0)
     {
         args.push_back("--connect-timeout");
@@ -1876,28 +1992,36 @@ int StatRequest(const S3Site & site, const SessionOptions & options,
         attrs->size = 0;
         attrs->atime = 0;
         attrs->mtime = 0;
-        /* The HEAD header block, lowercased for the search. */
-        const std::string headers = ToLower(response.out);
-        const size_t length = headers.find("content-length:");
-        if (length != std::string::npos)
+        /* The HEAD header block, matched line by line so custom headers
+         * such as x-amz-meta-content-length never shadow Content-Length. */
+        std::istringstream headerStream(response.out);
+        std::string headerLine;
+        while (std::getline(headerStream, headerLine))
         {
-            attrs->size = strtoull(headers.c_str() + length +
-                strlen("content-length:"), NULL, 10);
-        }
-        const size_t modified = headers.find("last-modified:");
-        if (modified != std::string::npos)
-        {
-            const size_t value = headers.find_first_not_of(" \t\r",
-                modified + strlen("last-modified:"));
-            if (value != std::string::npos)
+            if (!headerLine.empty() && headerLine.back() == '\r')
             {
-                const unsigned long stamp =
-                    ParseHttpDate(response.out.substr(value));
-                if (stamp != 0)
+                headerLine.pop_back();
+            }
+            const std::string lowerLine = ToLower(headerLine);
+            if (StartsWith(lowerLine, "content-length:"))
+            {
+                attrs->size = strtoull(
+                    headerLine.c_str() + strlen("content-length:"), NULL, 10);
+            }
+            else if (StartsWith(lowerLine, "last-modified:"))
+            {
+                const size_t value = headerLine.find_first_not_of(" \t\r",
+                    strlen("last-modified:"));
+                if (value != std::string::npos)
                 {
-                    attrs->flags |= LSCP_ATTR_ACMODTIME;
-                    attrs->atime = stamp;
-                    attrs->mtime = stamp;
+                    const unsigned long stamp =
+                        ParseHttpDate(headerLine.substr(value));
+                    if (stamp != 0)
+                    {
+                        attrs->flags |= LSCP_ATTR_ACMODTIME;
+                        attrs->atime = stamp;
+                        attrs->mtime = stamp;
+                    }
                 }
             }
         }
@@ -2479,7 +2603,7 @@ int S3Client::RemoveDir(const SessionOptions & options,
         return -1;
     }
     S3Response response;
-    if (!InvokeCurl(site, options, "DELETE", EncodePath(prefix),
+    if (!InvokeCurl(site, options, "DELETE", EncodePath(path) + "/",
             std::string(),
             std::vector<std::pair<std::string, std::string> >(),
             kEmptySha256, std::vector<std::string>(), std::string(),

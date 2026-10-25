@@ -1377,6 +1377,66 @@ class RemoteCopyTaskTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 gui.remote_copy_task(self._task())
 
+    def test_same_server_remote_copy_and_import_edge_cases(self):
+        tab = gui.CoreSession(99, {"protocol": "sftp", "host": "h"})
+        tab.connected = True
+        tab.remote_dir = "/src"
+        self.assertTrue(callable(getattr(tab, "close", None)))
+        submitted = []
+        with mock.patch.object(gui, "_remote_transfer_target",
+                               return_value=(tab, tab.session, "same")), \
+                mock.patch.object(gui.TASKS, "submit",
+                                  side_effect=lambda *a, **kw: submitted.append((a, kw)) or mock.Mock()):
+            gui.queue_remote_transfer(tab, ["a.txt", "b.txt"], "tab:99", "/dst")
+        self.assertEqual(len(submitted), 1)
+        cmd_script = submitted[0][0][1]
+        self.assertNotIn("\n", cmd_script)
+        self.assertEqual(len(gui.split_linscp_commands(cmd_script)), 3)
+
+        # OpenSSH '=' syntax, quoted IdentityFile, and first-match-wins
+        entries, _ = gui.parse_openssh_config(
+            'Host mybox\n'
+            '  HostName=first.example.test\n'
+            '  HostName second.example.test\n'
+            '  Port=2200\n'
+            '  IdentityFile="~/.ssh/my key"\n')
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["host"], "first.example.test")
+        self.assertEqual(entries[0]["port"], 2200)
+        self.assertTrue(entries[0]["keyfile"].endswith("/.ssh/my key"))
+
+        # FileZilla length-prefixed RemoteDir and plain/crypt Pass attributes
+        fz_entries, _ = gui.parse_filezilla_xml(
+            '<?xml version="1.0"?>'
+            '<FileZilla3><Servers>'
+            '<Server><Name>plain</Name><Host>a.test</Host><Port>22</Port>'
+            '<Protocol>1</Protocol><User>u</User>'
+            '<Pass encoding="plain">cleartext</Pass>'
+            '<RemoteDir>1 0 3 srv 4 logs</RemoteDir></Server>'
+            '<Server><Name>crypt</Name><Host>b.test</Host><Port>22</Port>'
+            '<Protocol>1</Protocol><User>u</User>'
+            '<Pass encoding="crypt">opaque</Pass></Server>'
+            '</Servers></FileZilla3>')
+        self.assertEqual(len(fz_entries), 2)
+        self.assertEqual(fz_entries[0]["password"], "cleartext")
+        self.assertEqual(fz_entries[0]["remote_dir"], "/srv/logs")
+        self.assertEqual(fz_entries[1]["password"], "")
+
+        # local_search content mode skips directories and matches case-insensitively
+        search_root = tempfile.mkdtemp(prefix="linscp-lsearch-")
+        try:
+            os.makedirs(os.path.join(search_root, "needle_dir"))
+            with open(os.path.join(search_root, "hit.txt"), "w", encoding="utf-8") as fh:
+                fh.write("Hello NEEDLE world\n")
+            stats = {}
+            hits = gui.local_search(search_root, "*", case_sensitive=False,
+                                    content_query="needle", stats=stats)
+            self.assertEqual([h["name"] for h in hits], ["hit.txt"])
+            self.assertEqual(hits[0]["line"], 1)
+            self.assertIn("NEEDLE", hits[0]["snippet"])
+        finally:
+            shutil.rmtree(search_root, ignore_errors=True)
+
 
 if __name__ == "__main__":
     suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])

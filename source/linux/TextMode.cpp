@@ -12,6 +12,9 @@
 #include <string>
 #include <vector>
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "PathUtil.h"
 #include "Platform.h"
 
@@ -116,16 +119,34 @@ std::string TempError(const std::string & path, const char * what)
 bool ConvertToUnixLineEndings(const std::string & path,
     unsigned long long & bytes, std::string & error)
 {
+    struct stat originalStat = {};
+    const bool haveOriginalStat = stat(path.c_str(), &originalStat) == 0;
     FILE * file = fopen(path.c_str(), "rb");
     if (file == NULL)
     {
         error = TempError(path, "Cannot open");
         return false;
     }
-    std::string temp = path + ".lscp-ascii-tmp";
-    FILE * out = fopen(temp.c_str(), "wb");
+    std::string tempPattern = path + ".lscp-ascii-XXXXXX";
+    std::vector<char> tempBuf(tempPattern.begin(), tempPattern.end());
+    tempBuf.push_back('\0');
+    const int tempFd = mkstemp(tempBuf.data());
+    if (tempFd < 0)
+    {
+        fclose(file);
+        error = TempError(path, "Cannot create the conversion file");
+        return false;
+    }
+    if (haveOriginalStat)
+    {
+        (void)fchmod(tempFd, originalStat.st_mode & 07777);
+    }
+    std::string temp(tempBuf.data());
+    FILE * out = fdopen(tempFd, "wb");
     if (out == NULL)
     {
+        close(tempFd);
+        remove(temp.c_str());
         fclose(file);
         error = TempError(temp, "Cannot create the conversion file");
         return false;
@@ -206,7 +227,7 @@ bool ConvertToUnixLineEndings(const std::string & path,
         remove(temp.c_str());
         return false;
     }
-    if (remove(path.c_str()) != 0 || rename(temp.c_str(), path.c_str()) != 0)
+    if (rename(temp.c_str(), path.c_str()) != 0)
     {
         error = TempError(path, "Cannot replace");
         remove(temp.c_str());
@@ -225,12 +246,40 @@ bool MakeCRLFUploadCopy(const std::string & source, std::string & tempPath,
         error = TempError(source, "Cannot open");
         return false;
     }
-    tempPath = source + ".lscp-crlf-tmp";
-    FILE * out = fopen(tempPath.c_str(), "wb");
-    if (out == NULL)
+    std::string tempDir = TempDirectory() + "/linscp-crlf-" +
+        std::to_string(static_cast<unsigned long>(getuid()));
+    std::string dirError;
+    if (!CreatePrivateDirectory(tempDir, dirError))
+    {
+        tempDir = LocalDirName(source);
+    }
+    std::string pattern = JoinLocalPath(tempDir, "lscp-crlf-XXXXXX");
+    std::vector<char> patternBuf(pattern.begin(), pattern.end());
+    patternBuf.push_back('\0');
+    int tempFd = mkstemp(patternBuf.data());
+    if (tempFd < 0 && tempDir != LocalDirName(source))
+    {
+        pattern = source + ".lscp-crlf-XXXXXX";
+        patternBuf.assign(pattern.begin(), pattern.end());
+        patternBuf.push_back('\0');
+        tempFd = mkstemp(patternBuf.data());
+    }
+    if (tempFd < 0)
     {
         fclose(file);
-        error = TempError(tempPath, "Cannot create the conversion file");
+        error = TempError(source, "Cannot create the conversion file");
+        return false;
+    }
+    (void)fchmod(tempFd, 0600);
+    tempPath.assign(patternBuf.data());
+    FILE * out = fdopen(tempFd, "wb");
+    if (out == NULL)
+    {
+        close(tempFd);
+        remove(tempPath.c_str());
+        tempPath.clear();
+        fclose(file);
+        error = TempError(source, "Cannot create the conversion file");
         return false;
     }
 

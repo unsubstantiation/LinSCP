@@ -71,6 +71,8 @@ def load_key(key_path):
             "The encryption key file '%s' cannot be read (%s)." %
             (key_path, exc)) from None
 
+    if len(content) == KEY_BYTES:
+        return content
     trimmed = content.strip()
     if len(trimmed) == KEY_BYTES:
         return trimmed

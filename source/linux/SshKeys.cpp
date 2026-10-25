@@ -8,12 +8,14 @@
 #include "PathUtil.h"
 #include "Platform.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 #include <libssh/libssh.h>
@@ -27,11 +29,43 @@ std::string HostKeyPath()
     return ConfigDirectory() + "/sshhostkeys";
 }
 
+bool HasInvalidHostKeyFieldChars(const char * text)
+{
+    if (text == NULL || text[0] == '\0')
+    {
+        return true;
+    }
+    for (const char * p = text; *p != '\0'; ++p)
+    {
+        const unsigned char c = static_cast<unsigned char>(*p);
+        if (c <= 0x20 || c == 0x7f)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string LowerHost(const char * hostname)
+{
+    if (hostname == NULL)
+    {
+        return std::string();
+    }
+    std::string result(hostname);
+    for (size_t i = 0; i < result.size(); i++)
+    {
+        result[i] = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(result[i])));
+    }
+    return result;
+}
+
 std::string HostKeyPrefix(const char * hostname, int port)
 {
     char buffer[32];
     snprintf(buffer, sizeof(buffer), "%d", port);
-    return std::string(hostname) + "@" + buffer;
+    return LowerHost(hostname) + "@" + buffer;
 }
 
 bool ReadLines(const std::string & path, std::vector<std::string> & lines)
@@ -119,14 +153,23 @@ void EnsureConfigDirectory()
 int CheckCachedHostKey(const char * hostname, int port,
     const char * keytype, const char * key)
 {
+    if (hostname == NULL || hostname[0] == '\0')
+    {
+        return 0;
+    }
     std::vector<std::string> lines;
     ReadLines(HostKeyPath(), lines);
-    const std::string prefix = HostKeyPrefix(hostname, port);
+    const std::string lowerPrefix = HostKeyPrefix(hostname, port);
+    char portBuf[32];
+    snprintf(portBuf, sizeof(portBuf), "%d", port);
+    const std::string rawPrefix = std::string(hostname) + "@" + portBuf;
     for (size_t i = 0; i < lines.size(); i++)
     {
         std::string type;
         std::string value;
-        if (!ParseHostKeyLine(lines[i], prefix, type, value))
+        if (!ParseHostKeyLine(lines[i], lowerPrefix, type, value) &&
+            (rawPrefix == lowerPrefix ||
+             !ParseHostKeyLine(lines[i], rawPrefix, type, value)))
         {
             continue;
         }
@@ -142,21 +185,31 @@ int CheckCachedHostKey(const char * hostname, int port,
 void StoreHostKey(const char * hostname, int port,
     const char * keytype, const char * key)
 {
-    if (ConfigDirectory().empty())
+    if (ConfigDirectory().empty() ||
+        HasInvalidHostKeyFieldChars(hostname) ||
+        HasInvalidHostKeyFieldChars(keytype) ||
+        HasInvalidHostKeyFieldChars(key))
     {
         return;
     }
     EnsureConfigDirectory();
+    const std::string path = HostKeyPath();
     std::vector<std::string> lines;
-    ReadLines(HostKeyPath(), lines);
-    std::string prefix = HostKeyPrefix(hostname, port);
-    std::string entry = prefix + " " + keytype + " " + key;
+    ReadLines(path, lines);
+    const std::string prefix = HostKeyPrefix(hostname, port);
+    char portBuf[32];
+    snprintf(portBuf, sizeof(portBuf), "%d", port);
+    const std::string rawPrefix = std::string(hostname) + "@" + portBuf;
+    const std::string entry = prefix + " " + keytype + " " + key;
     bool replaced = false;
     for (size_t i = 0; i < lines.size(); i++)
     {
         std::string type;
         std::string value;
-        if (ParseHostKeyLine(lines[i], prefix, type, value) && type == keytype)
+        if ((ParseHostKeyLine(lines[i], prefix, type, value) ||
+             (rawPrefix != prefix &&
+              ParseHostKeyLine(lines[i], rawPrefix, type, value))) &&
+            type == keytype)
         {
             lines[i] = entry;
             replaced = true;
@@ -166,15 +219,41 @@ void StoreHostKey(const char * hostname, int port,
     {
         lines.push_back(entry);
     }
-    std::ofstream out(HostKeyPath().c_str(), std::ios::trunc);
+    std::string tempPattern = path + ".tmp.XXXXXX";
+    std::vector<char> tempBuf(tempPattern.begin(), tempPattern.end());
+    tempBuf.push_back('\0');
+    const int fd = mkstemp(tempBuf.data());
+    if (fd < 0)
+    {
+        return;
+    }
+    (void)fchmod(fd, 0600);
+    const std::string tempPath(tempBuf.data());
+    close(fd);
+    std::ofstream out(tempPath.c_str(), std::ios::trunc);
     if (!out)
     {
+        remove(tempPath.c_str());
         return;
     }
     for (size_t i = 0; i < lines.size(); i++)
     {
         out << lines[i] << "\n";
     }
+    out.flush();
+    if (!out.good())
+    {
+        out.close();
+        remove(tempPath.c_str());
+        return;
+    }
+    out.close();
+    if (rename(tempPath.c_str(), path.c_str()) != 0)
+    {
+        remove(tempPath.c_str());
+        return;
+    }
+    (void)chmod(path.c_str(), 0600);
 }
 
 bool PublicKeyAuthorizedLine(const std::string & keyFile, std::string & line,
@@ -202,13 +281,20 @@ bool PublicKeyAuthorizedLine(const std::string & keyFile, std::string & line,
     }
 
     char * base64 = NULL;
-    if (ssh_pki_export_pubkey_base64(key, &base64) != SSH_OK)
+    const char * keyType = ssh_key_type_to_char(ssh_key_type(key));
+    if (keyType == NULL ||
+        ssh_pki_export_pubkey_base64(key, &base64) != SSH_OK ||
+        base64 == NULL)
     {
+        if (base64 != NULL)
+        {
+            ssh_string_free_char(base64);
+        }
         ssh_key_free(key);
         error = "Cannot export the public key of '" + keyFile + "'.";
         return false;
     }
-    line = std::string(ssh_key_type_to_char(ssh_key_type(key))) + " " + base64;
+    line = std::string(keyType) + " " + base64;
     ssh_string_free_char(base64);
     ssh_key_free(key);
     return true;

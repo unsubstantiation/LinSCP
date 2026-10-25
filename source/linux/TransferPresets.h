@@ -55,8 +55,8 @@ struct TransferPreset
     int preserveTime;
     int preserveTimeDirs;
     int newerOnly;
-    /* Octal mode for uploads, -1 unset; -2 means "the file's own
-     * permissions" for downloads. */
+    /* Octal mode for uploads, -3 unset, -1 explicit off (leave server
+     * default), -2 means "the file's own permissions" for downloads. */
     int permissions;
     int resumeSupport;
     /* Bytes for the threshold, kibibytes per second for the limit. */
@@ -73,7 +73,7 @@ struct TransferPreset
 
     TransferPreset()
         : transferMode(-1), preserveTime(-1), preserveTimeDirs(-1),
-          newerOnly(-1), permissions(-1), resumeSupport(-1),
+          newerOnly(-1), permissions(-3), resumeSupport(-1),
           resumeThreshold(-1), speedLimit(-1)
     {
     }

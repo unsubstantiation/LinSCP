@@ -1326,14 +1326,18 @@
     const data = await apiGet('/api/status');
     if (!data) return;
     state.tabs = data.tabs || [];
-    if (data.active_tab) state.activeTab = data.active_tab;
+    state.activeTab = data.active_tab !== undefined ? data.active_tab : null;
     const tab = activeTab();
     if (tab) {
       state.local.path = tab.local_dir || state.local.path;
       state.remote.path = tab.remote_dir || state.remote.path;
       if (tab.observed_hostkey && (!tab.session || tab.session.hostkey === '*')) {
         showHostKeyBar(tab);
+      } else if ($('hostKeyBar')) {
+        $('hostKeyBar').style.display = 'none';
       }
+    } else if ($('hostKeyBar')) {
+      $('hostKeyBar').style.display = 'none';
     }
     state.paused = !!data.paused;
     // The right pane is not always remote: a local-to-local tab has two
@@ -1616,12 +1620,12 @@
       if (state.syncBrowse) {
         await navigateSync(side, { name: entry.name, path: path });
       } else if (side === 'local') {
-        loadLocal(path);
+        await loadLocal(path);
       } else {
-        loadRemote(path);
+        await loadRemote(path);
       }
-    } else if (side === 'remote') {
-      openEditor(joinPath(state.remote.path, entry.name, true));
+    } else {
+      await openEditor(joinPath(state[side].path, entry.name, side === 'remote'), side);
     }
   }
 
@@ -1689,9 +1693,9 @@
        (transfer.items && Array.from(transfer.items).some(item => item.kind === 'file')));
     if (externalFiles) {
       event.preventDefault();
-      if (transfer) transfer.dropEffect = side === 'remote' ? 'copy' : 'none';
+      if (transfer) transfer.dropEffect = 'copy';
       const pane = $(side + 'Pane');
-      if (pane && side === 'remote') pane.classList.add('drop-target');
+      if (pane) pane.classList.add('drop-target');
       return;
     }
     if (!state.dragSide || state.dragSide === side) return;
@@ -2919,13 +2923,17 @@
     }
     const name = prompt(t("Save as (remote path):"), state.editor.path);
     if (!name) return;
+    const content = $('editorText').value;
     const result = await apiPost('/api/remote/save', {
-      tab: tabId(), path: name, content: $('editorText').value
+      tab: tabId(), path: name, content: content
     });
     if (!result.success) { toast(errorMessage(result.error, t("Cannot save.")), true); return; }
     state.editor.path = name;
-    state.editor.original = $('editorText').value;
+    state.editor.content = content;
+    state.editor.original = content;
     state.editor.dirty = false;
+    state.editor.baseMtime = result.info ? result.info.mtime : null;
+    state.editor.baseMtimeNs = result.info ? result.info.mtime_ns : null;
     $('editorTitle').textContent = t("Editing {path}", {path: name});
     toast(t("Saved as {path}", {path: name}));
     await refreshPanes('remote');
@@ -3220,8 +3228,24 @@
   document.addEventListener('keydown', async (event) => {
     const inField = /^(INPUT|TEXTAREA|SELECT)$/.test(event.target.tagName);
     if (event.key === 'Escape') {
+      if (event.target && event.target.closest && event.target.closest('#terminalModal')) {
+        return;
+      }
       closeMenus();
-      document.querySelectorAll('.modal-overlay.open').forEach(node => node.classList.remove('open'));
+      if ($('editorModal') && $('editorModal').classList.contains('open')) {
+        closeEditor();
+      }
+      if ($('hostKeyModal') && $('hostKeyModal').classList.contains('open')) {
+        await cancelHostKey();
+      }
+      if ($('terminalModal') && $('terminalModal').classList.contains('open')) {
+        closeTerminal();
+      }
+      document.querySelectorAll('.modal-overlay.open').forEach(node => {
+        if (node.id === 'editorModal' || node.id === 'hostKeyModal' || node.id === 'terminalModal') return;
+        if (node.id === 'loginModal' && accountsEnabled && !signedInAs) return;
+        node.classList.remove('open');
+      });
       return;
     }
     if (event.ctrlKey && event.key.toLowerCase() === 's' && $('editorModal').classList.contains('open')) {
@@ -3236,12 +3260,14 @@
     }
     if (event.ctrlKey && event.key.toLowerCase() === 'l') {
       event.preventDefault();
+      focusPane('local');
       $('localPathInput').focus();
       $('localPathInput').select();
       return;
     }
     if (event.ctrlKey && event.key.toLowerCase() === 'r') {
       event.preventDefault();
+      focusPane('remote');
       $('remotePathInput').focus();
       $('remotePathInput').select();
       return;
@@ -3560,7 +3586,9 @@
       setAccountMenu();
       closeModal('loginModal');
       toast(t('Signed in as {name}.', { name: signedInAs }));
+      await loadTransferSettings();
       await refreshAll();
+      checkShellPending();
       return;
     }
     errorBox.textContent = data.retry_after
@@ -4314,18 +4342,20 @@
    * ------------------------------------------------------------------ */
 
   async function boot() {
-    await loadTransferSettings();
     applyExplorerMode();
     await checkAccounts();
-    await refreshStatus();
-    await loadLocal(state.local.path || '');
-    await loadRemote(state.remote.path);
-    refreshQueue();
-    checkShellPending();
-    setInterval(checkShellPending, 15000);
-    setInterval(refreshQueue, 2000);
-    setInterval(refreshLogs, 4000);
-    setInterval(refreshStatus, 15000);
+    if (!accountsEnabled || signedInAs) {
+      await loadTransferSettings();
+      await refreshStatus();
+      await loadLocal(state.local.path || '');
+      await loadRemote(state.remote.path);
+      refreshQueue();
+      checkShellPending();
+    }
+    setInterval(() => { if (!accountsEnabled || signedInAs) checkShellPending(); }, 15000);
+    setInterval(() => { if (!accountsEnabled || signedInAs) refreshQueue(); }, 2000);
+    setInterval(() => { if (!accountsEnabled || signedInAs) refreshLogs(); }, 4000);
+    setInterval(() => { if (!accountsEnabled || signedInAs) refreshStatus(); }, 15000);
     // A signed-in session has a lifetime; when it ends the next call says
     // so and the dialog comes back rather than the page going silent.
     if (accountsEnabled) setInterval(checkAccounts, 60000);

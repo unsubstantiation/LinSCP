@@ -135,18 +135,24 @@ bool ParseLogSize(const char * text, unsigned long long * result)
     {
         return false;
     }
+    unsigned long long multiplier = 1ULL;
     switch (text[index])
     {
     case '\0':
         break;
-    case 'k': case 'K': value *= 1024ULL; index++; break;
-    case 'm': case 'M': value *= 1024ULL * 1024ULL; index++; break;
-    case 'g': case 'G': value *= 1024ULL * 1024ULL * 1024ULL; index++; break;
+    case 'k': case 'K': multiplier = 1024ULL; index++; break;
+    case 'm': case 'M': multiplier = 1024ULL * 1024ULL; index++; break;
+    case 'g': case 'G': multiplier = 1024ULL * 1024ULL * 1024ULL; index++; break;
     case 't': case 'T':
-        value *= 1024ULL * 1024ULL * 1024ULL * 1024ULL; index++; break;
+        multiplier = 1024ULL * 1024ULL * 1024ULL * 1024ULL; index++; break;
     default:
         return false;
     }
+    if (value > ULLONG_MAX / multiplier)
+    {
+        return false;
+    }
+    value *= multiplier;
     if (text[index] == 'b' || text[index] == 'B')
     {
         index++;
@@ -322,7 +328,11 @@ int RunShell(linscp::SessionOptions options, const std::string & url,
         {
             char buffer[4096];
             const ssize_t got = read(STDIN_FILENO, buffer, sizeof(buffer));
-            if (got <= 0)
+            if (got < 0 && (errno == EINTR || errno == EAGAIN))
+            {
+                /* SIGWINCH or transient wake-up; stdin is still open. */
+            }
+            else if (got <= 0)
             {
                 inputOpen = false;
                 session.SendEof();

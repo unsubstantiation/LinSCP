@@ -384,16 +384,35 @@ std::string CensoredForLog(const std::string & line)
         const std::string token = result.substr(begin, at - begin);
         const std::vector<std::string> words = SplitCommandLine(token);
         bool secret = false;
+        auto isSecretKey = [](const std::string & name) -> bool {
+            return name == "-password" || name == "-passphrase" ||
+                name == "proxypassword" || name == "tunnelpassword" ||
+                name == "tunnelpassphrase" || name == "tunnelpasswordplain" ||
+                name == "tunnelpassphraseplain" || name == "proxypasswordplain";
+        };
         if (words.size() == 1)
         {
             const size_t eq = words[0].find('=');
             const std::string name = ToLower(words[0].substr(0, eq));
-            secret = eq != std::string::npos && (name == "-password" ||
-                name == "-passphrase" || name == "proxypassword" ||
-                name == "tunnelpassword" || name == "tunnelpassphrase" ||
-                name == "tunnelpasswordplain" || name == "tunnelpassphraseplain" ||
-                name == "proxypasswordplain");
+            secret = eq != std::string::npos && isSecretKey(name);
             if (secret) censored += words[0].substr(0, eq + 1) + "***";
+        }
+        else
+        {
+            /* Unclosed quotes make SplitCommandLine return empty; still
+             * mask secret switches so broken command lines never leak. */
+            std::string stripped = token;
+            while (!stripped.empty() && (stripped[0] == '"' || stripped[0] == '\''))
+            {
+                stripped.erase(0, 1);
+            }
+            const size_t eq = stripped.find('=');
+            if (eq != std::string::npos &&
+                isSecretKey(ToLower(stripped.substr(0, eq))))
+            {
+                secret = true;
+                censored += stripped.substr(0, eq + 1) + "***";
+            }
         }
         if (!secret) censored += token;
     }
@@ -1167,7 +1186,8 @@ int Script::RemoteGetMode(const std::string & remote, const std::string & local,
          (mResumeMode == ResumeMode::Automatic &&
           sourceSize >= kDefaultResumeThreshold));
     TransferStage stage;
-    if (!ResolveStage(eligible, false, local, sourceSize, stage, error))
+    if (!ResolveStage(eligible, false, local, sourceSize, stage, error) ||
+        !PrepareStage(stage, error))
     {
         return -1;
     }
@@ -1217,7 +1237,8 @@ int Script::RemotePutMode(const std::string & local, const std::string & remote,
             (mResumeMode == ResumeMode::Automatic &&
              sourceSize >= kDefaultResumeThreshold);
         TransferStage stage;
-        if (!ResolveStage(eligible, true, remote, sourceSize, stage, error))
+        if (!ResolveStage(eligible, true, remote, sourceSize, stage, error) ||
+            !PrepareStage(stage, error))
         {
             return -1;
         }
@@ -1624,6 +1645,13 @@ bool Script::OpenSite(const std::vector<std::string> & args)
         options.userName = CurrentUserName();
     }
 
+    if (mSession.IsOpen())
+    {
+        CloseSite(std::vector<std::string>());
+    }
+    mHomeDirectory.clear();
+    mStoredSessionName.clear();
+
     Console::Instance().Status(Texts::Translate("Connecting to {host}...", {{"host", options.hostName}}));
     if (!mSession.Open(options, error))
     {
@@ -1693,10 +1721,7 @@ bool Script::OpenSite(const std::vector<std::string> & args)
     {
         mRemoteDirectory = options.initialDirectory.empty() ?
             std::string("/") : options.initialDirectory;
-        if (options.initialDirectory.empty())
-        {
-            mHomeDirectory = mRemoteDirectory;
-        }
+        mHomeDirectory = mRemoteDirectory;
     }
 
     /* The XML log's '<session>' root is named after the connection, the
@@ -1932,10 +1957,6 @@ bool Script::ListRemote(const std::vector<std::string> & args)
         {
             mask = leaf;
             target = RemoteDirName(target);
-            if (target.empty() || target == "/")
-            {
-                target.clear();
-            }
         }
     }
     std::string path = target.empty() ? mRemoteDirectory :
@@ -2393,8 +2414,9 @@ bool Script::DownloadDirectoryRecursive(const std::string & remoteDir,
             unsigned long long size = 0;
             unsigned long long totalSize = (names->names[i].attrs.flags & LSCP_ATTR_SIZE) != 0 ?
                 names->names[i].attrs.size : 0;
+            const bool convertsAscii = WantsAsciiConversion(flags.transferMode, name);
             TransferStage stage;
-            if (!ResolveStage(!flags.append && Resumes(flags, totalSize), false,
+            if (!ResolveStage(!convertsAscii && !flags.append && Resumes(flags, totalSize), false,
                     childLocal, totalSize, stage, dirErr))
             {
                 Console::Instance().Error(Texts::LocalError(
@@ -2527,7 +2549,16 @@ bool Script::DownloadDirectoryRecursive(const std::string & remoteDir,
                 continue;
             }
             const std::string obsolete = JoinLocalPath(localDir, localEntries[i]);
-            const bool obsoleteIsDir = StatLocal(obsolete).isDir;
+            const LocalFileInfo obsoleteInfo = StatLocal(obsolete);
+            const bool obsoleteIsDir = obsoleteInfo.isDir;
+            const std::string obsoleteRel = relPrefix.empty() ?
+                localEntries[i] : relPrefix + "/" + localEntries[i];
+            if (!flags.mask.empty() &&
+                !flags.mask.Accepts(localEntries[i], obsoleteIsDir,
+                    obsoleteInfo.size, obsoleteInfo.mtime, obsoleteRel))
+            {
+                continue;
+            }
             if (!ConfirmObsolete("local", obsolete, obsoleteIsDir))
             {
                 success = false;
@@ -2633,8 +2664,9 @@ bool Script::UploadDirectoryRecursive(const std::string & localDir,
             {
                 continue;
             }
+            const bool convertsAscii = WantsAsciiConversion(flags.transferMode, name);
             TransferStage stage;
-            if (!ResolveStage(!flags.append && Resumes(flags, info.size), true,
+            if (!ResolveStage(!convertsAscii && !flags.append && Resumes(flags, info.size), true,
                     childRemote, info.size, stage, error))
             {
                 Console::Instance().Error(Texts::RemoteError(
@@ -2772,6 +2804,20 @@ bool Script::UploadDirectoryRecursive(const std::string & localDir,
             const bool obsoleteIsDir =
                 (remoteNames->names[i].attrs.flags & LSCP_ATTR_PERMISSIONS) != 0 &&
                 (remoteNames->names[i].attrs.permissions & 0040000) != 0;
+            const std::string obsoleteRel = relPrefix.empty() ?
+                name : relPrefix + "/" + name;
+            const unsigned long long obsoleteSize =
+                (remoteNames->names[i].attrs.flags & LSCP_ATTR_SIZE) != 0 ?
+                remoteNames->names[i].attrs.size : 0;
+            const unsigned long obsoleteMtime =
+                (remoteNames->names[i].attrs.flags & LSCP_ATTR_ACMODTIME) != 0 ?
+                remoteNames->names[i].attrs.mtime : 0;
+            if (!flags.mask.empty() &&
+                !flags.mask.Accepts(name, obsoleteIsDir, obsoleteSize,
+                    obsoleteMtime, obsoleteRel))
+            {
+                continue;
+            }
             if (!ConfirmObsolete("remote", obsolete, obsoleteIsDir))
             {
                 success = false;
@@ -3230,13 +3276,14 @@ bool RawBool(const std::string & text, bool & value)
 
 bool RawInteger(const std::string & text, long long & value)
 {
-    if (text.empty())
+    if (text.empty() || isspace(static_cast<unsigned char>(text[0])))
     {
         return false;
     }
+    errno = 0;
     char * end = NULL;
     const long long parsed = strtoll(text.c_str(), &end, 10);
-    if (end == NULL || *end != '\0')
+    if (errno != 0 || end == NULL || *end != '\0')
     {
         return false;
     }
@@ -3494,7 +3541,7 @@ void Script::ApplyMaskPreset(const std::string & fileName, TransferFlags & flags
         masked.resumeSupport = -1;
         masked.resumeThreshold = -1;
     }
-    if (flags.explicitSettings & 16) masked.permissions = -1;
+    if (flags.explicitSettings & 16) masked.permissions = -3;
     masked.speedLimit = -1;
     masked.ApplyTo(flags);
 }
@@ -4278,12 +4325,14 @@ bool Script::GetFiles(const std::vector<std::string> & args)
             /* Resolve the '.filepart' staging: read-only, so the
              * confirmation below still runs before anything is removed
              * or written. */
+            const bool convertsAscii = WantsAsciiConversion(
+                flags.transferMode, RemoteFileName(sources[n]));
             TransferStage stage;
             const std::string stageSuffix = versioned ?
                 std::string(".filepart.v") +
                     s3sig::Sha256Hex(flags.versionId) :
                 std::string(".filepart");
-            if (!ResolveStage(!flags.append && Resumes(flags, totalSize), false,
+            if (!ResolveStage(!convertsAscii && !flags.append && Resumes(flags, totalSize), false,
                     localPath, totalSize, stage, error, stageSuffix))
             {
                 Console::Instance().Error(Texts::LocalError(
@@ -4690,8 +4739,10 @@ bool Script::PutFiles(const std::vector<std::string> & args)
             /* Resolve the '.filepart' staging: read-only, so the
              * confirmation below still runs before anything is removed
              * or written. */
+            const bool convertAscii =
+                WantsAsciiConversion(flags.transferMode, LocalFileName(sources[n]));
             TransferStage stage;
-            if (!ResolveStage(!flags.append && Resumes(flags, info.size), true,
+            if (!ResolveStage(!convertAscii && !flags.append && Resumes(flags, info.size), true,
                     remotePath, info.size, stage, error))
             {
                 Console::Instance().Error(Texts::RemoteError(
@@ -4728,8 +4779,6 @@ bool Script::PutFiles(const std::vector<std::string> & args)
              * is never modified. */
             std::string uploadPath = sources[n];
             std::string asciiTemp;
-            const bool convertAscii =
-                WantsAsciiConversion(flags.transferMode, LocalFileName(sources[n]));
             if (convertAscii)
             {
                 if (!MakeCRLFUploadCopy(sources[n], asciiTemp, error))
@@ -6371,6 +6420,7 @@ bool Script::OpenStoredSite(const std::string & name,
         return false;
     }
 
+    mHomeDirectory.clear();
     if (UseNativeSftp(mSession.Options().protocol))
     {
         if (lscp_sftp_init() != 0)
@@ -6379,6 +6429,12 @@ bool Script::OpenStoredSite(const std::string & name,
             mSession.Close();
             mErrors++;
             return false;
+        }
+        char * home = lscp_sftp_realpath(".");
+        if (home != NULL)
+        {
+            mHomeDirectory = home;
+            free(home);
         }
         std::string initial = options.initialDirectory.empty() ?
             std::string(".") : options.initialDirectory;
@@ -6393,10 +6449,26 @@ bool Script::OpenStoredSite(const std::string & name,
         mRemoteDirectory = canonical;
         free(canonical);
     }
+    else if (UseNativeScp(mSession.Options().protocol))
+    {
+        std::string home;
+        std::string resolved;
+        if (!ScpClient::ResolveHomeAndInitial(mSession.Options(),
+                options.initialDirectory, home, resolved, error))
+        {
+            console.Error(Texts::CannotOpenSession(options.hostName, error));
+            mSession.Close();
+            mErrors++;
+            return false;
+        }
+        mHomeDirectory = home;
+        mRemoteDirectory = resolved;
+    }
     else
     {
         mRemoteDirectory = options.initialDirectory.empty() ?
             std::string("/") : options.initialDirectory;
+        mHomeDirectory = mRemoteDirectory;
     }
 
     if (!stored->localDirectory.empty())
@@ -8314,7 +8386,6 @@ bool Script::CopyPublicKey(const std::vector<std::string> & args)
         std::string makeError;
         if (RemoteMakeDir(sshDirectory, 0700, makeError) != 0)
         {
-            mErrors++;
             return SwitchError("copyid", Texts::Translate("Cannot create '{path}': {reason}",
                 {{"path", sshDirectory}, {"reason", makeError}}));
         }
@@ -8341,10 +8412,10 @@ bool Script::CopyPublicKey(const std::vector<std::string> & args)
         if (RemoteGet(authorizedKeys, temp, 0, false, NULL, NULL, NULL, getError) != 0)
         {
             remove(temp.c_str());
-            mErrors++;
             return SwitchError("copyid", Texts::Translate("Cannot read '{path}': {reason}",
                 {{"path", authorizedKeys}, {"reason", getError}}));
         }
+        RestrictFileToUser(temp);
         FILE * file = fopen(temp.c_str(), "rb");
         if (file != NULL)
         {
@@ -8386,12 +8457,19 @@ bool Script::CopyPublicKey(const std::vector<std::string> & args)
         return SwitchError("copyid", Texts::Translate(
             "Cannot write a temporary file for the authorized keys."));
     }
+    RestrictFileToUser(temp);
     for (size_t i = 0; i < kept.size(); i++)
     {
         fprintf(file, "%s\n", kept[i].c_str());
     }
     fprintf(file, "%s\n", keyLine.c_str());
-    fclose(file);
+    const bool writeBad = fflush(file) != 0 || ferror(file) != 0;
+    if (fclose(file) != 0 || writeBad)
+    {
+        remove(temp.c_str());
+        return SwitchError("copyid", Texts::Translate(
+            "Cannot write a temporary file for the authorized keys."));
+    }
 
     std::string putError;
     if (RemotePut(temp, authorizedKeys, 0600, 0, false, NULL, NULL, NULL,
@@ -8584,14 +8662,13 @@ bool Script::ChangeRemotePermissions(const std::vector<std::string> & args)
  */
 bool Script::AttrRemote(const std::vector<std::string> & args)
 {
-
     if (!RequireConnection())
     {
         return false;
     }
     if (args.size() != 1)
     {
-        Console::Instance().Error(Texts::WrongArguments("stat", Texts::Translate("Syntax: stat <file>")));
+        Console::Instance().Error(Texts::WrongArguments("attr", "Syntax: attr <file>"));
         mErrors++;
         return false;
     }
@@ -8956,9 +9033,16 @@ bool Script::SetOption(const std::vector<std::string> & args)
     }
     const bool isOn = value == "on";
     const bool isToggle = isOn || value == "off";
-    if ((name == "echo" || name == "failonnomatch" || name == "synchdelete") &&
-        isToggle)
+    if (name == "echo" || name == "failonnomatch" || name == "synchdelete" ||
+        name == "confirm")
     {
+        if (!isToggle)
+        {
+            Console::Instance().Error(Texts::WrongArguments("option",
+                "The value of '" + name + "' must be 'on' or 'off'."));
+            mErrors++;
+            return false;
+        }
         if (name == "echo")
         {
             mEchoCommands = isOn;
@@ -8967,15 +9051,14 @@ bool Script::SetOption(const std::vector<std::string> & args)
         {
             mFailOnNoMatch = isOn;
         }
-        else
+        else if (name == "synchdelete")
         {
             mSyncDeleteDefault = isOn;
         }
-        return true;
-    }
-    if (name == "confirm" && isToggle)
-    {
-        mConfirm = isOn;
+        else
+        {
+            mConfirm = isOn;
+        }
         return true;
     }
     if (name == "resume")
@@ -9063,6 +9146,14 @@ bool Script::SetOption(const std::vector<std::string> & args)
             mErrors++;
             return false;
         }
+        if (!parsed.include.empty() && !parsed.exclude.empty())
+        {
+            Console::Instance().Error(Texts::WrongArguments("option",
+                "Do not use '|' in 'option " + name +
+                "'; set 'include' or 'exclude' separately."));
+            mErrors++;
+            return false;
+        }
         /* Setting one half replaces the whole mask, like upstream:
          * 'option exclude *.bak' forgets a previous 'option include'. */
         FileMask combined;
@@ -9072,7 +9163,8 @@ bool Script::SetOption(const std::vector<std::string> & args)
         }
         else
         {
-            combined.exclude = parsed.exclude;
+            combined.exclude = !parsed.exclude.empty() ?
+                parsed.exclude : parsed.include;
         }
         mOptionMask = combined;
         mOptionMaskUsed = true;
@@ -9148,6 +9240,13 @@ bool Script::SetOption(const std::vector<std::string> & args)
     }
     if (name == "editmaxsize")
     {
+        if (args[1].empty())
+        {
+            Console::Instance().Error(Texts::WrongArguments("option",
+                Texts::Translate("The value of 'editmaxsize' must be a number of bytes.")));
+            mErrors++;
+            return false;
+        }
         unsigned long long bytes = 0;
         for (size_t i = 0; i < args[1].size(); i++)
         {
@@ -9158,11 +9257,16 @@ bool Script::SetOption(const std::vector<std::string> & args)
                 mErrors++;
                 return false;
             }
-            bytes = bytes * 10ULL + static_cast<unsigned long long>(args[1][i] - '0');
-            if (bytes > (1ULL << 40))
+            const unsigned long long digit =
+                static_cast<unsigned long long>(args[1][i] - '0');
+            if (bytes > ((1ULL << 40) - digit) / 10ULL)
             {
-                break;
+                Console::Instance().Error(Texts::WrongArguments("option",
+                    "The value of 'editmaxsize' exceeds the maximum supported size (1 TiB)."));
+                mErrors++;
+                return false;
             }
+            bytes = bytes * 10ULL + digit;
         }
         if (bytes == 0)
         {

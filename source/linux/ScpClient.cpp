@@ -396,6 +396,12 @@ bool PrepareRemotePath(const std::string & remotePath, std::string & path,
     {
         path = ".";
     }
+    else if (path[0] == '-')
+    {
+        /* Prefix './' so a relative name starting with '-' is never parsed as
+         * a flag by remote shell commands ('ls', 'rm', 'scp', 'touch', ...). */
+        path = "./" + path;
+    }
     return true;
 }
 
@@ -657,6 +663,13 @@ unsigned long ScpParseFullTime(const std::string & dateText,
     {
         return 0;
     }
+    /* Reject non-existent calendar dates such as 2026-02-31 that timegm()
+     * normalizes into the next month. */
+    if (parts.tm_year != year - 1900 || parts.tm_mon != month - 1 ||
+        parts.tm_mday != day)
+    {
+        return 0;
+    }
     /* A timestamp printed in a zone ahead of UTC names a moment earlier
      * than the same reading in UTC, so the offset is taken off. */
     const long long seconds = static_cast<long long>(utc) -
@@ -755,20 +768,30 @@ bool ScpParseHeaderLine(const std::string & line, char & kind,
     }
     if (first == 'E')
     {
+        if (!body.empty())
+        {
+            return false;
+        }
         kind = 'E';
         return true;
     }
     if (first == 'T')
     {
         /* 'T<mtime> 0 <atime> 0': the two zero fields are the sub-second
-         * parts the protocol leaves unused. */
+         * parts the protocol leaves unused. Reject negative tokens and
+         * trailing non-whitespace junk. */
+        if (body.find('-') != std::string::npos)
+        {
+            return false;
+        }
         std::istringstream stream(body);
         unsigned long long firstValue = 0;
         unsigned long long firstFraction = 0;
         unsigned long long secondValue = 0;
         unsigned long long secondFraction = 0;
+        std::string extra;
         if (!(stream >> firstValue >> firstFraction >> secondValue >>
-              secondFraction))
+              secondFraction) || (stream >> extra))
         {
             return false;
         }
@@ -780,7 +803,8 @@ bool ScpParseHeaderLine(const std::string & line, char & kind,
     if (first == 'C' || first == 'D')
     {
         /* 'C0644 512 name' - the name is the rest of the line and may
-         * hold spaces. */
+         * hold spaces, but never '/', '.', '..', or NUL/control bytes
+         * (CVE-2019-6111). */
         std::string modeText;
         unsigned long long sizeValue = 0;
         const std::string::size_type firstSpace = body.find(' ');
@@ -801,6 +825,25 @@ bool ScpParseHeaderLine(const std::string & line, char & kind,
         {
             return false;
         }
+        if (modeText[0] < '0' || modeText[0] > '7' ||
+            sizeText[0] < '0' || sizeText[0] > '9')
+        {
+            return false;
+        }
+        if (name == "." || name == ".." ||
+            name.find('/') != std::string::npos ||
+            name.find('\0') != std::string::npos)
+        {
+            return false;
+        }
+        for (size_t i = 0; i < name.size(); ++i)
+        {
+            const unsigned char ch = static_cast<unsigned char>(name[i]);
+            if (ch < 0x20U || ch == 0x7fU)
+            {
+                return false;
+            }
+        }
         errno = 0;
         char * end = NULL;
         const unsigned long modeValue = strtoul(modeText.c_str(), &end, 8);
@@ -808,6 +851,7 @@ bool ScpParseHeaderLine(const std::string & line, char & kind,
         {
             return false;
         }
+        errno = 0;
         end = NULL;
         sizeValue = strtoull(sizeText.c_str(), &end, 10);
         if (errno != 0 || end == NULL || *end != '\0')
@@ -1475,7 +1519,19 @@ int ScpClient::Get(const SessionOptions & options,
     }
     /* The mode in the header is the server's, and a download does not
      * apply it: what the local file's permissions are is the local side's
-     * business, and '-permissions=' sets them explicitly when asked. */
+     * business, and '-permissions=' sets them explicitly when asked.
+     * Guard against CVE-2019-6111: the server-supplied header filename
+     * must match the requested remote basename (when specific) and must
+     * never traverse directories. */
+    const std::string expectedLeaf = RemoteFileName(path);
+    if (!expectedLeaf.empty() && expectedLeaf != "." &&
+        !HasWildcard(expectedLeaf) && name != expectedLeaf)
+    {
+        error = "The server's scp offered '" + name +
+            "' instead of the requested file '" + expectedLeaf + "'.";
+        channel.Close();
+        return -1;
+    }
     if (localIsDirectory)
     {
         destination = localPath + name;

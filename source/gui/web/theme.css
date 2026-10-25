@@ -798,8 +798,7 @@ table.file-table tr.selected td { color: var(--selection-text); }
 .properties-table th { color: var(--muted); font-weight: 600; width: 34%; }
 
 /* ---- Panel modes ------------------------------------------------------ */
-.commander-main.explorer-mode .pane.remote-pane { display: none; }
-.commander-main.explorer-mode .pane.local-pane { display: none; }
+.commander-main.explorer-mode .pane { flex: 1 1 100%; max-width: 100%; }
 .explorer-hint {
   display: flex; align-items: center; gap: 8px; padding: 5px 10px;
   color: var(--muted); font-size: 11px;
