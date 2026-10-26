@@ -158,6 +158,20 @@ paths, threat model, evidence and checklist for that review. The full-parity
 gate must continue to fail until the remaining capabilities are implemented
 and independently evidenced.
 
+## Verification on 2026-10-26
+
+These results cover the cross-realm Kerberos case, the delegation review brief
+and the French catalogs; they do not establish full WinSCP parity.
+
+| Check | Result |
+| --- | --- |
+| GitHub Actions run 40400360550 (commit 27fda42) | All three jobs passed. With `LSCP_REQUIRE_GSSAPI_REALM=1`, the Makefile job's live suite reported `live-sftp ran=43 skipped=0 failed=0`. That includes `test_gssapi_cross_realm_trust_against_an_isolated_realm`, run against a real MIT KDC and OpenSSH server. |
+| `python3 tools/compile_translations.py --check` and `tools/tests/test_translations.py` (local) | Passed with the French catalogs; 9 tests. |
+| Browser tests `ClientTest.js` and `LocalizationTest.js` (local) | Passed. The localization test now also boots the real page in French (177 checks). |
+| Python GUI suites (local) | 258 tests passed. |
+| Harness linking `Texts.cpp` (local) | `LANG=fr_FR.UTF-8` and `LANG=fr_CA.UTF-8` print French operation errors, prompts and hints; `LANG=C` prints English. |
+| `python3 tools/check_upstream_parity.py --require-full` | Exits 1, as intended, while the two tracked capability gaps remain. |
+
 ## Local verification on 2026-10-22
 
 These checks cover the GSSAPI capability, validation and test-fixture edits in

@@ -628,7 +628,7 @@
   "Copy to another server...": "Copy to another server...",
   "Directory:": "Directory:",
   "Do not copy the permissions": "Do not copy the permissions",
-  "Each item is one file or directory this client writes. Removing it cannot be undone, and the parts you leave ticked are not touched.": "Each item is one file or directory this client writes. Removing it cannot be undone, and the parts you leave ticked are not touched.",
+  "Each item is one file or directory this client writes. Removing it cannot be undone, and the parts you leave unticked are not touched.": "Each item is one file or directory this client writes. Removing it cannot be undone, and the parts you leave unticked are not touched.",
   "Group": "Group",
   "Open a connected remote tab first.": "Open a connected remote tab first.",
   "Preferences": "Preferences",

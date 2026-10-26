@@ -2911,8 +2911,8 @@
       "id": "locale.translations",
       "area": "Localization/accessibility",
       "status": "partial",
-      "notes": "English, Spanish and German catalogs cover the browser interface (menus, dialogs, help, ARIA/tooltips, dynamic status/queue/sync/editor/search messages) and the whole command-line client, including the external-editor prompts. The translation compiler rejects a message that reaches the user without a catalog entry. A catalog walker reports interface strings still answered in English so a new string cannot slip through untranslated, and the translation tests keep switches, values, command names and protocol words literal in every catalog. The language selector and the backend's locale selection are filled from the shipped catalogs, and a confirmation accepts the yes letter its translated hint shows. Only English, Spanish and German catalogs are shipped; upstream ships catalogs for many more languages.",
-      "gap": "Only English, Spanish and German catalogs are shipped; upstream ships catalogs for many more languages, and the upstream .NET interface has strings that this client does not have at all. No full upstream language-catalog coverage is claimed. A walker already reports catalog messages still answered in English.",
+      "notes": "English, Spanish, German and French catalogs cover the browser interface (menus, dialogs, help, ARIA/tooltips, dynamic status/queue/sync/editor/search messages) and the whole command-line client, including the external-editor prompts. The translation compiler rejects a message that reaches the user without a catalog entry. A catalog walker reports interface strings still answered in English so a new string cannot slip through untranslated, and the translation tests keep switches, values, command names and protocol words literal in every catalog. The language selector and the backend's locale selection are filled from the shipped catalogs, and a confirmation accepts the yes letter its translated hint shows. Only English, Spanish, German and French catalogs are shipped; upstream ships catalogs for many more languages.",
+      "gap": "Only English, Spanish, German and French catalogs are shipped; upstream ships catalogs for many more languages, and the upstream .NET interface has strings that this client does not have at all. No full upstream language-catalog coverage is claimed. A walker already reports catalog messages still answered in English.",
       "source": [
         "source/linux/Texts.cpp",
         "source/linux/Console.cpp",
@@ -2924,11 +2924,13 @@
         "source/linux/locales/en.json",
         "source/linux/locales/es.json",
         "source/linux/locales/de.json",
+        "source/linux/locales/fr.json",
         "source/gui/web/index.html",
         "source/gui/linscp_gui.py",
         "source/gui/locales/en.json",
         "source/gui/locales/es.json",
         "source/gui/locales/de.json",
+        "source/gui/locales/fr.json",
         "tools/compile_translations.py"
       ],
       "checks": {
@@ -2948,6 +2950,8 @@
         ],
         "gui-localization": [
           "Spanish selected",
+          "French selected",
+          "French zero is singular",
           "security warning translated",
           "save bytes unchanged",
           "API selections unchanged",

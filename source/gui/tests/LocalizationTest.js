@@ -1,4 +1,4 @@
-/* Real-page English/Spanish localization workflows, with a fake backend. */
+/* Real-page English/Spanish/French localization workflows, with a fake backend. */
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -50,7 +50,7 @@ async function page({ saved, server, browsers = ['en-US'], blocked = false } = {
 
 async function run() {
   for (const options of [
-    {saved: 'es'}, {browsers: ['fr', 'es-MX']}, {server: 'es'},
+    {saved: 'es'}, {browsers: ['eo', 'es-MX']}, {server: 'es'},
     {saved: 'es', server: 'en'}, {saved: 'es', blocked: true, server: 'es'}
   ]) {
     const p = await page(options), w = p.window, doc = w.document;
@@ -92,6 +92,31 @@ async function run() {
       const transfer = p.calls.find(call => call.url === '/api/transfer/upload');
       check('API selections unchanged', JSON.parse(transfer.options.body).names[0] === 'Delete');
       check('API token preserved', transfer.options.headers['X-LSCP-Token'] === 'private-token');
+      check(String(p.errors), p.errors.length === 0);
+    } finally { await pause(); p.dom.window.close(); }
+  }
+  for (const options of [{saved: 'fr'}, {browsers: ['fr-CA', 'en']}, {server: 'fr'}]) {
+    const p = await page(options), w = p.window, doc = w.document;
+    try {
+      check('French selected', doc.documentElement.lang === 'fr');
+      check('French title', doc.querySelector('title').textContent.includes('Transfert de fichiers sécurisé'));
+      check('French ARIA', doc.querySelector('#localPane').getAttribute('aria-label') === 'Panneau local');
+      check('French toolbar', doc.querySelector('[onclick="openSiteManager()"] .tool-label').textContent === 'Nouvelle session');
+      check('French no-break space before a colon',
+        doc.querySelector('#statusBadge').textContent === 'Connecté\u00a0: Delete');
+      check('French transfer type and status', doc.querySelector('#queueList').textContent.includes('Envoyer') &&
+        doc.querySelector('#queueList').textContent.includes('En attente'));
+      check('French display decimals', w.formatBytes(1536) === '1,5 KB');
+      check('French zero is singular', w.tn('{count} match', '{count} matches', 0) === '0 résultat');
+      check('French singular', w.tn('{count} match', '{count} matches', 1) === '1 résultat');
+      check('French plural', w.tn('{count} match', '{count} matches', 2) === '2 résultats');
+      check('French interpolation stays literal', w.t('Line {line}: {snippet}', {line: 1, snippet: '{line} $&'}) ===
+        'Ligne 1\u00a0: {line} $&');
+      await w.openEditor('/Remote/Save', 'remote', false);
+      check('French editor title', doc.querySelector('#editorTitle').textContent === 'Édition /Remote/Save');
+      w.openSynchronize();
+      await w.previewSynchronization();
+      check('French sync summary', doc.querySelector('#syncSummary').textContent.includes('1 à envoyer'));
       check(String(p.errors), p.errors.length === 0);
     } finally { await pause(); p.dom.window.close(); }
   }

@@ -628,7 +628,7 @@
   "Copy to another server...": "Copiar a otro servidor...",
   "Directory:": "Directorio:",
   "Do not copy the permissions": "No copiar los permisos",
-  "Each item is one file or directory this client writes. Removing it cannot be undone, and the parts you leave ticked are not touched.": "Cada elemento es un archivo o directorio que este cliente escribe. Eliminarlo no se puede deshacer, y las partes que deje marcadas no se tocan.",
+  "Each item is one file or directory this client writes. Removing it cannot be undone, and the parts you leave unticked are not touched.": "Cada elemento es un archivo o directorio que este cliente escribe. Eliminarlo no se puede deshacer, y las partes que deje sin marcar no se tocan.",
   "Group": "Grupo",
   "Open a connected remote tab first.": "Abra primero una pestaña remota conectada.",
   "Preferences": "Preferencias",

@@ -112,7 +112,9 @@ CI (`.github/workflows/build.yml`, the **Linux (Makefile)** and **Linux (CMake)*
 jobs) installs MIT krb5 (`krb5-kdc`, `krb5-admin-server`, `krb5-user`) and
 `openssh-server`. It runs `source/linux/tests/LiveSftpTest.py` with
 `LSCP_REQUIRE_GSSAPI_REALM=1`, and fails unless the evidence line reports
-`skipped=0 failed=0`.
+`skipped=0 failed=0`. GitHub Actions run 40400360550, for commit 27fda42 (the
+commit that added the cross-realm case), reported
+`live-sftp ran=43 skipped=0 failed=0`.
 
 `LiveGssapiRealmTests` builds two loopback-only MIT realms in one `krb5kdc`:
 
