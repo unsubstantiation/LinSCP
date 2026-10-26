@@ -1022,16 +1022,50 @@ identifies the jump's fingerprint, while
 .B HOSTKEY
 identifies the destination's. Verify both independently before accepting them.
 .PP
-The transport uses a private socket pair, not a TCP listener.
+An SSH destination is reached through a private socket pair, not a TCP
+listener, unless
 .B TunnelLocalPortNumber
-accepts only 0. Non-SSH destination protocols and GSSAPI are unsupported and
-fail closed. The site manager, queue and embedded terminal share this policy.
+selects a loopback port for this session's own connection. FTP, FTPS, WebDAV
+and S3 destinations go through a SOCKS5 relay on 127.0.0.1, which opens a
+separate channel through the jump for each connection; TLS SNI and S3 signing
+keep the original host name. If the jump refuses a forward, the session fails;
+it never falls back to a direct connection.
+.PP
+The jump session uses the destination's Kerberos settings except
+.BR LogicalHostName ,
+as upstream does. With
+.BR GSSAPIFwdTGT=1 ,
+the jump host therefore receives the delegated ticket too.
+.PP
+The site manager, queue and embedded terminal share this policy.
 Each GUI host-key Remember choice is independent and does not implicitly store
 passwords or the other hop's transient pin. Changed keys carry a distinct warning.
 .SH AUTHENTICATION
 The keys held by a running ssh-agent are offered automatically when
 .B SSH_AUTH_SOCK
 is set, which is the simplest way to authenticate with an OpenSSH key.
+.PP
+Kerberos single sign-on (gssapi-with-mic) is tried first when the server
+offers it and the loaded libssh supports GSSAPI. It uses the default principal
+of the credential cache named by
+.BR KRB5CCNAME .
+A principal of another, trusted realm is used the same way; the server decides
+whether it may log in.
+.PP
+The raw settings
+.BR AuthGSSAPI ,
+.BR AuthGSSAPIKEX ,
+.B GSSAPIFwdTGT
+and
+.B LogicalHostName
+keep upstream's names. Kerberos settings the loaded libssh cannot honour are
+refused rather than ignored.
+.PP
+The ticket-granting ticket is delegated only when
+.B GSSAPIFwdTGT=1
+is given. It then goes to the destination and, through a jump host, to the
+jump host too. The server receives it before it decides whether to accept the
+login.
 .TP
 .B LINSCP_PASSWORD
 Password to use when
@@ -1158,9 +1192,10 @@ are implemented. A .NET-compatible session assembly covers session lifecycle,
 listing, transfers, synchronization and cancellation, but not the complete
 upstream object model; optional account sign-in isolates users at the
 application layer. Complete upstream .NET object-model compatibility, broader
-localization and broader production-realm validation plus an independent
-security review of delegated Kerberos credentials remain incomplete. The live
-SFTP suite exercises GSSAPI against an isolated loopback KDC and OpenSSH server.
+localization, production-KDC validation and an independent security review of
+delegated Kerberos credentials remain incomplete. The live SFTP suite exercises
+GSSAPI against an isolated loopback KDC, including a directly trusted second
+realm, and an OpenSSH server.
 Local-to-local panes, named multi-tab workspaces, directory bookmarks, session
 import from OpenSSH/FileZilla and session-URL generation are implemented. A
 PowerShell 7 CLI wrapper exists with static and optional live Pester tests;

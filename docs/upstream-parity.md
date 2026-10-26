@@ -60,8 +60,10 @@ The review corrected stale claims without upgrading unimplemented work:
   a tag nothing matches, a protocol with no entity tags is refused by name, and
   a precondition guards the path it was recorded for rather than everything
   below a collection.
-- English/Spanish GUI and shared CLI localization exists. Remaining
-  human-facing script/engine diagnostics keep localization partial.
+- The GUI and the CLI share one localization layer; the shipped catalogs are
+  listed in [Localization](localization.md). Core/OS diagnostic details stay
+  verbatim by policy. Catalogs for the rest of upstream's languages keep
+  localization partial.
 - Non-UTF-8 editor transcoding and upstream XML consumer/schema compatibility
   are now explicit capability rows rather than prose-only limitations.
 - The XML action log (`-xmllog=`) now writes the upstream session format
@@ -99,9 +101,9 @@ Commander is a browser interface and the automation surface is a
 synchronization rather than every type of the upstream object model. Optional
 account sign-in isolates users at the application layer, but the backend still
 runs as one OS user. The live SFTP suite now provisions an isolated loopback
-Kerberos realm for GSSAPI cases, but broader production-realm validation and
-independent delegation review, as well as broader localization, remain in the
-plan.
+Kerberos realm and a directly trusted second realm for GSSAPI cases.
+Production-KDC validation and an independent delegation review, as well as
+broader localization, remain in the plan.
 
 ### SSH jump-host implementation and newly identified gaps
 
@@ -142,10 +144,19 @@ server identity and explicit delegation; CI requires a GSSAPI-enabled libssh
 and no skipped realm cases. `AuthGSSAPIKEX` is separately probed and refused
 when libssh lacks RFC 4462 algorithms rather than silently falling back to an
 ordinary key exchange, and also rejects the incompatible combination with a
-pinned host key. Cross-realm/production-KDC coverage and an independent review
-of delegated TGT handling remain open; so do non-SSH tunnels. The
-full-parity gate must continue to fail until the remaining capabilities are
-implemented and independently evidenced.
+pinned host key. A second realm trusted through
+`krbtgt/LINSCP.TEST@PARTNER.TEST` covers cross-realm login, refusal of an
+unmapped principal of the trusted realm, and default-off versus opt-in
+delegation of the partner realm's TGT.
+
+FTP, FTPS, WebDAV and S3 destinations now reach the jump through a loopback
+SOCKS5 relay.
+
+Production-KDC validation and an independent review of delegated TGT handling
+remain open; the [review brief](gssapi-delegation-review.md) records the code
+paths, threat model, evidence and checklist for that review. The full-parity
+gate must continue to fail until the remaining capabilities are implemented
+and independently evidenced.
 
 ## Local verification on 2026-10-22
 

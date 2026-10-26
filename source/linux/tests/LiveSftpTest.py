@@ -1525,6 +1525,10 @@ class LiveGssapiRealmTests(unittest.TestCase):
     """
 
     REALM = "LINSCP.TEST"
+    # A second realm the service realm trusts directly: its principals reach
+    # host/localhost@LINSCP.TEST through krbtgt/LINSCP.TEST@PARTNER.TEST.
+    PARTNER_REALM = "PARTNER.TEST"
+    CROSS_REALM_PASSWORD = "linscp-test-cross-realm-password"
     USER_PASSWORD = "linscp-test-user-password"
     OTHER_PASSWORD = "linscp-test-other-password"
     MASTER_PASSWORD = "linscp-test-master-password"
@@ -1539,6 +1543,7 @@ class LiveGssapiRealmTests(unittest.TestCase):
         cls.sshd = None
         cls.kdc_log_file = None
         cls.sshd_log_file = None
+        cls.partner_error = ""
         required = ("kdb5_util", "kadmin.local", "krb5kdc", "kinit", "klist",
                     "sshd", "ssh-keygen")
         cls.programs = {name: _test_program(name) for name in required}
@@ -1576,6 +1581,26 @@ class LiveGssapiRealmTests(unittest.TestCase):
             "fi\n"
             "echo DELEGATED_TGT\n", encoding="utf-8")
         cls.remote_probe.chmod(0o700)
+        cls.remote_partner_probe = cls.base / "check-delegated-partner-tgt.sh"
+        cls.remote_partner_probe.write_text(
+            "#!/bin/sh\n"
+            "if [ -z \"${KRB5CCNAME:-}\" ]; then\n"
+            "  echo NO_KRB5CCNAME; exit 21\n"
+            "fi\n"
+            "if ! klist -s -c \"$KRB5CCNAME\" 2>/dev/null; then\n"
+            "  echo NO_VALID_TICKET; exit 22\n"
+            "fi\n"
+            "if ! klist -c \"$KRB5CCNAME\" 2>/dev/null | "
+            "grep -F 'krbtgt/PARTNER.TEST@PARTNER.TEST' >/dev/null; then\n"
+            "  echo NO_DELEGATED_TGT; exit 23\n"
+            "fi\n"
+            "if ! klist -c \"$KRB5CCNAME\" 2>/dev/null | "
+            "grep -F 'Default principal: " + cls.user + "@PARTNER.TEST' "
+            ">/dev/null; then\n"
+            "  echo WRONG_DELEGATED_PRINCIPAL; exit 24\n"
+            "fi\n"
+            "echo DELEGATED_PARTNER_TGT\n", encoding="utf-8")
+        cls.remote_partner_probe.chmod(0o700)
 
         cls.kdc_port = _test_free_port(udp=True)
         cls.ssh_port = _test_free_port()
@@ -1596,6 +1621,22 @@ class LiveGssapiRealmTests(unittest.TestCase):
             "[realms]",
             " " + cls.REALM + " = {",
             "  kdc = 127.0.0.1:" + str(cls.kdc_port),
+            # Only this one partner principal is the local account; any other
+            # principal of the trusted realm must not map to it.
+            "  auth_to_local = RULE:[1:$1@$0](^%s@PARTNER\\.TEST$)"
+            "s/@PARTNER\\.TEST$//" % cls.user.replace(".", "\\."),
+            "  auth_to_local = DEFAULT",
+            " }",
+            " " + cls.PARTNER_REALM + " = {",
+            "  kdc = 127.0.0.1:" + str(cls.kdc_port),
+            " }",
+            "",
+            "[capaths]",
+            " " + cls.PARTNER_REALM + " = {",
+            "  " + cls.REALM + " = .",
+            " }",
+            " " + cls.REALM + " = {",
+            "  " + cls.PARTNER_REALM + " = .",
             " }",
             "",
             "[domain_realm]",
@@ -1618,6 +1659,14 @@ class LiveGssapiRealmTests(unittest.TestCase):
             "  max_renewable_life = 1d",
             "  default_principal_flags = +preauth",
             " }",
+            " " + cls.PARTNER_REALM + " = {",
+            "  database_name = " + str(cls.base / "partner-principal"),
+            "  key_stash_file = " + str(cls.base / "partner-stash"),
+            "  acl_file = " + str(cls.base / "kadm5.acl"),
+            "  max_life = 10m",
+            "  max_renewable_life = 1d",
+            "  default_principal_flags = +preauth",
+            " }",
             "",
         ]), encoding="utf-8")
         (cls.base / "kadm5.acl").write_text(
@@ -1635,6 +1684,12 @@ class LiveGssapiRealmTests(unittest.TestCase):
 
         try:
             cls._provision_realm()
+            try:
+                cls._provision_partner_realm()
+            except Exception as exc:
+                # Only the cross-realm case depends on it; it reports this
+                # as a failure under LSCP_REQUIRE_GSSAPI_REALM=1.
+                cls.partner_error = "partner realm setup failed: " + str(exc)
             cls._start_kdc()
             cls._wait_for_kdc()
             cls._start_sshd()
@@ -1713,11 +1768,35 @@ class LiveGssapiRealmTests(unittest.TestCase):
         cls.keytab.chmod(0o600)
 
     @classmethod
+    def _provision_partner_realm(cls):
+        cls._run_checked([
+            cls.programs["kdb5_util"], "create", "-s", "-P",
+            cls.MASTER_PASSWORD, "-r", cls.PARTNER_REALM], timeout=30)
+        trust = "krbtgt/%s@%s" % (cls.REALM, cls.PARTNER_REALM)
+        # The trust key must be identical in both databases: same principal
+        # name (so the same salt), same password, same default enctypes.
+        cls._run_checked([cls.programs["kadmin.local"], "-r", cls.PARTNER_REALM],
+                         input_text="\n".join([
+            "addprinc -pw %s %s@%s" % (cls.USER_PASSWORD, cls.user,
+                                       cls.PARTNER_REALM),
+            "addprinc -pw %s otherprincipal@%s" % (cls.OTHER_PASSWORD,
+                                                   cls.PARTNER_REALM),
+            "addprinc -pw %s %s" % (cls.CROSS_REALM_PASSWORD, trust),
+            "quit", ""]), timeout=30)
+        cls._run_checked([cls.programs["kadmin.local"], "-r", cls.REALM],
+                         input_text="\n".join([
+            "addprinc -pw %s %s" % (cls.CROSS_REALM_PASSWORD, trust),
+            "quit", ""]), timeout=30)
+
+    @classmethod
     def _start_kdc(cls):
         cls.kdc_log_file = open(cls.base / "krb5kdc.log", "w",
                                 encoding="utf-8")
+        realms = ["-r", cls.REALM]
+        if not cls.partner_error:
+            realms += ["-r", cls.PARTNER_REALM]
         cls.kdc = subprocess.Popen(
-            [cls.programs["krb5kdc"], "-n", "-r", cls.REALM],
+            [cls.programs["krb5kdc"], "-n"] + realms,
             env=cls.krb_env, stdout=cls.kdc_log_file,
             stderr=subprocess.STDOUT, start_new_session=True)
         time.sleep(0.2)
@@ -1989,6 +2068,65 @@ class LiveGssapiRealmTests(unittest.TestCase):
         self.assertIn("DELEGATED_TGT", delegated.stdout)
         self.assertIn("Kerberos credentials will be delegated to the server",
                       delegated_log)
+
+    def test_gssapi_cross_realm_trust_against_an_isolated_realm(self):
+        """A principal of a directly trusted realm reaches the service realm.
+
+        The client holds USER@PARTNER.TEST; sshd's host principal lives in
+        LINSCP.TEST, and the KDC keeps the krbtgt/LINSCP.TEST@PARTNER.TEST
+        trust key in both realms. sshd maps exactly that partner principal
+        to the local account, so another principal of the same trusted realm
+        is still refused, and delegation forwards the partner realm's TGT
+        only when it is requested.
+        """
+        self.require_realm()
+        if self.partner_error:
+            if self.REQUIRE:
+                self.fail(self.partner_error)
+            self.skipTest(self.partner_error)
+        cache = self.base / "partner.ccache"
+        self._obtain_ticket(cache, self.user + "@" + self.PARTNER_REALM)
+        destination = self.base / "partner-download.bin"
+        result, log = self._run_client(
+            cache, "get %s %s" % (self.remote_file, destination),
+            label="cross-realm")
+        server_log = (self.base / "sshd.log").read_text(encoding="utf-8",
+                                                         errors="replace")
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr + log + server_log)
+        self.assertIn("Authenticated with GSSAPI", log)
+        self.assertEqual(sha256_of(self.remote_file), sha256_of(destination))
+        # The service ticket really came through the trust path.
+        listing = subprocess.run(
+            [self.programs["klist"], "-c", "FILE:" + str(cache)],
+            env=self.krb_env, capture_output=True, text=True, timeout=10)
+        self.assertIn("krbtgt/%s@%s" % (self.REALM, self.PARTNER_REALM),
+                      listing.stdout)
+        # (MIT may file the service ticket under its referral name.)
+        self.assertIn("host/localhost@", listing.stdout)
+
+        other_cache = self.base / "partner-other.ccache"
+        self._obtain_ticket(other_cache, "otherprincipal@" + self.PARTNER_REALM,
+                            self.OTHER_PASSWORD)
+        refused, refused_log = self._run_client(
+            other_cache, label="cross-realm-unmapped")
+        self.assertNotEqual(refused.returncode, 0,
+                            refused.stdout + refused.stderr + refused_log)
+        self.assertIn("Attempting GSSAPI authentication", refused_log)
+        self.assertNotIn("Authenticated with GSSAPI", refused_log)
+
+        remote_command = "call " + str(self.remote_partner_probe)
+        default_result, default_log = self._run_client(
+            cache, remote_command, label="cross-realm-no-delegation")
+        self.assertNotEqual(default_result.returncode, 0,
+                            "a default cross-realm session delegated a TGT")
+        self.assertNotIn("DELEGATED_PARTNER_TGT", default_result.stdout)
+        delegated, delegated_log = self._run_client(
+            cache, remote_command, rawsettings=("GSSAPIFwdTGT=1",),
+            label="cross-realm-delegation")
+        self.assertEqual(delegated.returncode, 0,
+                         delegated.stdout + delegated.stderr + delegated_log)
+        self.assertIn("DELEGATED_PARTNER_TGT", delegated.stdout)
 
 
 def run_and_report():
