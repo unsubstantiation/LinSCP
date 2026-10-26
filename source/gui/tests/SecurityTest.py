@@ -1984,6 +1984,48 @@ class AccountIsolationTests(unittest.TestCase):
             cookie=alice_sid, csrf=alice_csrf)
         self.assertEqual(status, 403, data)
 
+    def test_search_cannot_leave_the_account_home(self):
+        """Searching a local-to-local pane must not read outside the jail.
+
+        /api/local/list and every other local route answer 403 for a path
+        outside the login's home; the search endpoint reads file names and
+        matching lines, so it has to answer the same way rather than walking
+        another account's home or the whole file system.
+        """
+        alice_sid, alice_csrf = self.login("alice", "wonderland")
+        status, data = self.request(
+            "POST", "/api/tabs/open",
+            {"session": {"protocol": "local",
+                         "local_dir": str(self.alice_home),
+                         "other_local_dir": str(self.alice_home)},
+             "name": "alice-panes"},
+            cookie=alice_sid, csrf=alice_csrf)
+        self.assertEqual(status, 200, data)
+        tab = data["tab"]["id"]
+        for path in (str(self.bob_home), "/etc"):
+            status, data = self.request(
+                "POST", "/api/remote/search",
+                {"tab": tab, "path": path, "pattern": "*"},
+                cookie=alice_sid, csrf=alice_csrf)
+            self.assertEqual(status, 403, (path, data))
+            self.assertEqual(data.get("matches"), None, data)
+        status, data = self.request(
+            "POST", "/api/remote/search",
+            {"tab": tab, "path": str(self.bob_home), "pattern": "*",
+             "search_contents": True, "content_query": "secret"},
+            cookie=alice_sid, csrf=alice_csrf)
+        self.assertEqual(status, 403, data)
+        # The account's own home still searches, so the jail is a jail and
+        # not an off switch.
+        status, data = self.request(
+            "POST", "/api/remote/search",
+            {"tab": tab, "path": str(self.alice_home), "pattern": "*"},
+            cookie=alice_sid, csrf=alice_csrf)
+        self.assertEqual(status, 200, data)
+        names = [match["name"] for match in data.get("matches") or []]
+        self.assertIn("alice-only.txt", names)
+        self.assertNotIn("bob-only.txt", names)
+
     def test_stored_sessions_are_per_account(self):
         alice_sid, alice_csrf = self.login("alice", "wonderland")
         bob_sid, bob_csrf = self.login("bob", "builder")

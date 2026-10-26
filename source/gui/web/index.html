@@ -3709,7 +3709,13 @@
       newer_only: !!settings.newerOnly,
       append: !!settings.append,
       no_permissions: !!settings.noPermissions,
-      priority: !!settings.priority
+      priority: !!settings.priority,
+      // The transfer dialog does not edit these two, and a save writes the
+      // whole document: without them a save made before /api/preferences
+      // answered would store the backend's defaults over what the account
+      // had chosen.
+      confirm_overwrite: !preferences || preferences.confirm_overwrite !== false,
+      confirm_delete: !preferences || preferences.confirm_delete !== false
     });
   }
 
@@ -3737,8 +3743,17 @@
     $('transferMode').value = transferSettings.transfer || '';
     $('transferMask').value = transferSettings.filemask || '';
     $('transferSpeed').value = transferSettings.speed || 0;
-    $('transferResumeSupport').value = transferSettings.resumesupport || '';
-    $('transferResumeSize').value = transferSettings.resumeSize || 0;
+    // The threshold is stored as a number of KiB, but the select has no
+    // option of that name: writing "2048" into it matched nothing, so the
+    // browser reset it to the first option, the size row stayed hidden and
+    // saving wrote the empty value back - one save of this dialog silently
+    // threw away a stored resume threshold. A number now selects the size
+    // option and fills the field it belongs to.
+    const resumeSupport = String(transferSettings.resumesupport || '');
+    const numericSupport = /^[0-9]+$/.test(resumeSupport);
+    $('transferResumeSupport').value = numericSupport ? 'size' : resumeSupport;
+    $('transferResumeSize').value = numericSupport ?
+      parseInt(resumeSupport, 10) : (transferSettings.resumeSize || 0);
     $('transferResume').checked = transferSettings.resume !== false;
     $('transferPreserveTime').checked = transferSettings.preserveTime !== false;
     $('transferNewerOnly').checked = !!transferSettings.newerOnly;
