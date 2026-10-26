@@ -342,7 +342,8 @@ bool RemoteEditor::Edit(const std::string & remotePath, const EditOptions & opti
 
     if (mConsole != NULL)
     {
-        mConsole->Status("Downloading '" + remotePath + "' for editing...");
+        mConsole->Status(Texts::Translate("Downloading '{path}' for editing...",
+            {{"path", remotePath}}));
     }
     if (mAccess.Download(remotePath, tempPath, true, error) != 0)
     {
@@ -387,8 +388,9 @@ bool RemoteEditor::Edit(const std::string & remotePath, const EditOptions & opti
 
     if (mConsole != NULL)
     {
-        mConsole->Status("Editing '" + tempPath + "'. Save and close the editor "
-            "to upload the file back to '" + remotePath + "'.");
+        mConsole->Status(Texts::Translate("Editing '{path}'. Save and close the editor "
+            "to upload the file back to '{remote}'.",
+            {{"path", tempPath}, {"remote", remotePath}}));
     }
     const int exitCode = RunInteractive(command, error);
     if (exitCode < 0)
@@ -475,9 +477,9 @@ bool RemoteEditor::Edit(const std::string & remotePath, const EditOptions & opti
             bool overwrite = false;
             if (confirmUpload && mConsole != NULL && mConsole->IsInteractive())
             {
-                overwrite = mConsole->Confirm("'" + remotePath +
-                    "' changed on the server while it was open in the editor. "
-                    "Overwrite it with your changes?", false);
+                overwrite = mConsole->Confirm(Texts::Translate(
+                    "'{path}' changed on the server while it was open in the editor. "
+                    "Overwrite it with your changes?", {{"path", remotePath}}), false);
             }
             if (!overwrite)
             {
@@ -489,19 +491,22 @@ bool RemoteEditor::Edit(const std::string & remotePath, const EditOptions & opti
         }
 
         if (confirmUpload && mConsole != NULL && mConsole->IsInteractive() &&
-            !mConsole->Confirm("Upload the changes to '" + remotePath + "'?", true))
+            !mConsole->Confirm(Texts::Translate("Upload the changes to '{path}'?",
+                {{"path", remotePath}}), true))
         {
             if (mConsole != NULL)
             {
-                mConsole->Status("Cancelled. The edited copy is kept at '" +
-                    tempPath + "'.");
+                mConsole->Status(Texts::Translate(
+                    "Cancelled. The edited copy is kept at '{path}'.",
+                    {{"path", tempPath}}));
             }
             return true;
         }
 
         if (mConsole != NULL)
         {
-            mConsole->Status("Uploading '" + remotePath + "'...");
+            mConsole->Status(Texts::Translate("Uploading '{path}'...",
+                {{"path", remotePath}}));
         }
         if (mAccess.Upload(tempPath, remotePath, false, error) != 0)
         {
@@ -514,7 +519,8 @@ bool RemoteEditor::Edit(const std::string & remotePath, const EditOptions & opti
         }
         if (mConsole != NULL)
         {
-            mConsole->Status("Uploaded '" + remotePath + "'.");
+            mConsole->Status(Texts::Translate("Uploaded '{path}'.",
+                {{"path", remotePath}}));
         }
         lastUploadedBytes = editedBytes;
         uploadedOut = true;
@@ -537,8 +543,9 @@ bool RemoteEditor::Edit(const std::string & remotePath, const EditOptions & opti
     {
         if (mConsole != NULL)
         {
-            mConsole->Status("No changes to upload; '" + remotePath +
-                "' is unchanged.");
+            mConsole->Status(Texts::Translate(
+                "No changes to upload; '{path}' is unchanged.",
+                {{"path", remotePath}}));
         }
         if (!options.keepTempFile)
         {
@@ -556,7 +563,8 @@ bool RemoteEditor::Edit(const std::string & remotePath, const EditOptions & opti
             options.monitorPasses;
         if (mConsole != NULL)
         {
-            mConsole->Status("Monitoring '" + tempPath + "' for local saves...");
+            mConsole->Status(Texts::Translate("Monitoring '{path}' for local saves...",
+                {{"path", tempPath}}));
         }
         unsigned elapsedPolls = 0;
         while (!Interrupted() && completedPasses < targetPasses)

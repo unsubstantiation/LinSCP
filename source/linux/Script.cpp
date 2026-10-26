@@ -6232,7 +6232,7 @@ bool Script::StoredSessionsCommand(const std::vector<std::string> & args)
             console.Error(Texts::Translate(
                 "No sessions were imported from '{path}'; {reason}",
                 {{"path", args[1]},
-                {"reason", error.empty() ? std::string("the file has none.") :
+                {"reason", error.empty() ? Texts::Translate("the file has none.") :
                 error}}));
             mErrors++;
             return false;
@@ -8917,7 +8917,8 @@ bool Script::SetOption(const std::vector<std::string> & args)
     if (name != "clear")
     {
         std::string resolved;
-        if (!ResolveAbbreviation(OptionNames(), name, "option name", resolved))
+        if (!ResolveAbbreviation(OptionNames(), name,
+            Texts::Translate("option name"), resolved))
         {
             return false;
         }
@@ -9064,7 +9065,8 @@ bool Script::SetOption(const std::vector<std::string> & args)
         }
         std::string resolved;
         if (!ResolveAbbreviation(vocabulary, value,
-            "value of the option '" + name + "'", resolved))
+            Texts::Translate("value of the option '{name}'", {{"name", name}}),
+            resolved))
         {
             return false;
         }
@@ -9719,7 +9721,8 @@ bool Script::ExecuteCommand(const std::string & line)
     if (!IsKnownCommand(command))
     {
         std::string resolved;
-        if (ResolveAbbreviation(CommandNames(), command, "command", resolved))
+        if (ResolveAbbreviation(CommandNames(), command,
+            Texts::Translate("command"), resolved))
         {
             if (!resolved.empty())
             {

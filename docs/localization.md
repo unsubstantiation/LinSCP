@@ -2,9 +2,9 @@
 
 ## Supported languages and coverage
 
-English (`en`) and Spanish (`es`) catalogs ship with the application. There
-are 434 CLI catalog entries and 656 browser entries, including whole help
-messages and plural variants. They are embedded at build time; there are no
+English (`en`), Spanish (`es`) and German (`de`) catalogs ship with the
+application. There are 456 CLI catalog entries and 656 browser entries,
+including whole help messages and plural variants. They are embedded at build time; there are no
 runtime downloads, gettext dependencies or installed OS locale requirements.
 A catalog walker reports interface strings still answered in English so a new
 message cannot slip through untranslated. The language selector is filled from
@@ -23,8 +23,8 @@ Translated surfaces:
 - Browser plural forms and decimal/date presentation. CLI/protocol numbers
   remain locale independent.
 
-**This is not complete upstream language coverage.** Only English and
-Spanish are shipped, while upstream ships catalogs for many more languages.
+**This is not complete upstream language coverage.** Only English, Spanish
+and German are shipped, while upstream ships catalogs for many more languages.
 The inventory therefore retains `locale.translations` as **partial**, now for
 the missing languages alone: every message the client prints in this build
 goes through a catalog, and the compiler refuses a new one that does not.
@@ -38,29 +38,32 @@ names and API enum values must never be translated.
 
 ```sh
 LINSCP_LANGUAGE=es linscp -help
-LINSCP_LANGUAGE=es linscp -batch -command='nosuchcommand'
+LANG=de_DE.UTF-8 linscp -batch -command='nosuchcommand'
 ```
 
 The first nonempty variable wins: `LINSCP_LANGUAGE`, `LC_ALL`, `LC_MESSAGES`,
 then `LANG`. An exact catalog is preferred; `es_MX.UTF-8` and `es_ES@formal`
-fall back to `es`. Unknown locales and `C`/`POSIX` use English. Selection changes
+fall back to `es`, `de_AT.UTF-8` to `de`. Unknown locales and `C`/`POSIX` use English. Selection changes
 messages only, not the process's numeric locale or protocol serialization.
 
-Spanish confirmation hints use `[S/n]` or `[s/N]`. `s`/`S` are accepted in
-Spanish, with `y`/`Y` retained for compatibility. Noninteractive destructive
-actions still fail closed; translating a prompt does not authorize an action.
+Confirmation hints are translated: `[S/n]`/`[s/N]` in Spanish, `[J/n]`/`[j/N]`
+in German. The client accepts the letter a hint shows for yes, in either case,
+and always `y`/`Y` for compatibility; any other answer is no. Noninteractive
+destructive actions still fail closed; translating a prompt does not authorize
+an action.
 
 ## Browser selection
 
-Use the **Language / Idioma** selector on the toolbar to choose English,
-Spanish, or the system default. The preference is saved in browser local
+Use the **Language** selector on the toolbar to choose a shipped language
+(English, Español, Deutsch) or the system default. The preference is saved in browser local
 storage. A change reloads only the page: backend sessions and queued transfers
 continue. Unsaved editor changes require confirmation before reloading.
 
 Without a saved preference, the served page uses the backend's locale selection
-(the same environment precedence as the CLI). A standalone page without backend
+(the same environment precedence as the CLI, resolved against the catalogs the
+page ships, so `de_DE.UTF-8` selects German). A standalone page without backend
 configuration chooses the first supported browser language, then English.
-Browser region tags such as `es-MX` are supported. When storage is unavailable,
+Browser region tags such as `es-MX` and `de-AT` are supported. When storage is unavailable,
 the default still works; a preference change reports the storage failure rather
 than silently losing it.
 
@@ -71,8 +74,8 @@ machine protocol, parsed sync plans, progress reports or error handling.
 
 ## Catalog development
 
-1. Edit `source/linux/locales/{en,es}.json` for CLI messages, or
-   `source/gui/locales/{en,es}.json` for browser messages. Both are UTF-8 JSON
+1. Edit `source/linux/locales/*.json` for CLI messages, or
+   `source/gui/locales/*.json` for browser messages. Both are UTF-8 JSON
    objects; English is an identity catalog and every language must have the
    same keys.
 2. Use named placeholders such as `{path}`. Preserve spelling and occurrence
@@ -86,8 +89,17 @@ machine protocol, parsed sync plans, progress reports or error handling.
    never walked or translated.
    A message that the command-line client prints has to go through
    `Texts::Translate`: the compiler rejects a `Console` call that prints a
-   plain literal, a command help text that nobody translated and an error
-   operation that is not in the catalog.
+   plain literal (including `Confirm` and `ReadPassword` prompts and the
+   editor's `mConsole` calls), a command help text that nobody translated
+   and an error operation that is not in the catalog.
+   Switch names, enumerated values (`on|off`, `binary|ascii|automatic`),
+   command and option names, quoted commands such as `'option preset off'`
+   and protocol words (`LSCP-RESULT`, `SizeBytes`, `ModifiedEpoch`) stay
+   verbatim, because users type them and programs read them. Metavariables
+   such as `<file>` or `FILE` may be translated. The translation tests
+   enforce this, check that each catalog's `-help` lists every option and
+   command in the English order, and check that both confirmation hints
+   offer one consistent yes letter.
 4. Run `python3 tools/compile_translations.py`. Commit the catalogs together
    with `source/linux/Translations.inc` and the generated inline catalog block
    in `source/gui/web/index.html`. Do not hand-edit generated blocks.
@@ -99,8 +111,10 @@ placeholders. Inline JSON escapes HTML-significant characters and Unicode line
 separators so catalog text cannot close a script tag. Translated dynamic markup
 is escaped separately; ordinary translated text uses text nodes.
 
-Adding languages beyond English/Spanish also requires reviewing plural rules,
-confirmation answers and the supported-language selector. These Linux catalogs
+Adding a language also requires reviewing plural rules (the browser's `tn`
+takes one singular and one plural form) and choosing the confirmation hint
+letters. The selector and the backend's locale selection are filled from the
+shipped catalogs, so a new catalog needs no code change. These Linux catalogs
 are independent of upstream's Windows resource catalogs; they do not claim to
 reproduce all upstream translations.
 

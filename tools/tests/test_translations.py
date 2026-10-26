@@ -93,6 +93,62 @@ class TranslationTests(unittest.TestCase):
                     leftover.append("%s:%s" % (locale, key[:80]))
         self.assertEqual(leftover, [], leftover[:20])
 
+    def test_cli_literals_survive_translation(self):
+        """Switches, values, commands and protocol words stay verbatim.
+
+        A translated '-filemask' or 'on|off' would tell the user to type
+        something the client rejects, and 'LSCP-RESULT' or 'SizeBytes' are
+        read by programs. Metavariables such as <file> and FILE may be
+        translated, including inside a quoted command such as 'lock <file>'.
+        """
+        switch = re.compile(r"(?<![A-Za-z0-9<_])-[a-z][a-z0-9]*(?![A-Za-z])")
+        values = re.compile(r"(?<![A-Za-z])[a-z0-9]+(?:\|[a-z0-9]+)+(?![A-Za-z])")
+        protocol = re.compile(r"\b(?:LSCP-RESULT|SizeBytes|ModifiedEpoch|AccessedEpoch)\b")
+        quoted = re.compile(r"'([^'\n]+)'")
+        commands = {"option", "savepreset", "rmspreset", "help", "lock", "etag",
+                    "open", "savesession", "sessions", "both", "local", "remote",
+                    "time", "size", "checksum", "none", "either", "!", "ln"}
+        problems = []
+        for locale, catalog in sorted(load_catalogs(ROOT / "source/linux/locales").items()):
+            if locale == "en":
+                continue
+            for key, value in catalog.items():
+                wanted = (set(switch.findall(key)) | set(values.findall(key)) |
+                          set(protocol.findall(key)))
+                missing = sorted(token for token in wanted if token not in value)
+                for literal in quoted.findall(key):
+                    if not literal.startswith("-") and literal.split()[0] not in commands:
+                        continue
+                    pattern = re.sub(r"<[^>]*>", "<[^>]+>", re.escape(literal))
+                    if not re.search("'" + pattern + "'", value):
+                        missing.append("'%s'" % literal)
+                if missing:
+                    problems.append("%s:%s: %s" % (locale, key[:60], missing))
+        self.assertEqual(problems, [], problems[:10])
+
+    def test_cli_help_keeps_every_option_and_command(self):
+        """Each catalog's main help lists the same options and commands in order."""
+        def entries(text):
+            return [re.match(r"[-a-z/]+", line[2:]).group(0)
+                    for line in text.split("\n") if re.match(r"  [-a-z]", line)]
+        catalogs = load_catalogs(ROOT / "source/linux/locales")
+        key = next(k for k in catalogs["en"] if k.startswith("LinSCP {version} - "))
+        self.assertIn("-shell", entries(key))
+        for locale, catalog in sorted(catalogs.items()):
+            with self.subTest(locale=locale):
+                self.assertEqual(entries(catalog[key]), entries(key))
+
+    def test_yes_no_prompts_offer_one_yes_letter(self):
+        """Console::Confirm accepts the letter each prompt shows after '['."""
+        for locale, catalog in sorted(load_catalogs(ROOT / "source/linux/locales").items()):
+            with self.subTest(locale=locale):
+                upper = re.fullmatch(r" \[(.)/(.)\]: ", catalog[" [Y/n]: "])
+                lower = re.fullmatch(r" \[(.)/(.)\]: ", catalog[" [y/N]: "])
+                self.assertTrue(upper and lower)
+                self.assertEqual(upper.group(1).lower(), lower.group(1).lower())
+                self.assertEqual(upper.group(2).lower(), lower.group(2).lower())
+                self.assertNotEqual(upper.group(1).lower(), upper.group(2).lower())
+
     def test_cpp_strings_are_escaped(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = pathlib.Path(tmp)

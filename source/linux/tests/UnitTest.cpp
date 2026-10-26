@@ -3698,6 +3698,20 @@ void TestLocalization()
     CHECK_EQ(Texts::Translate("Overwrite remote file '{path}'?", {{"path", "{path}%n"}}),
         std::string("¿Sobrescribir el archivo remoto '{path}%n'?"));
     CHECK_EQ(Texts::Translate(" [y/N]: "), std::string(" [s/N]: "));
+    /* German, through a regional locale that falls back to 'de'. Switches
+     * stay literal while their metavariables are translated. */
+    setenv("LINSCP_LANGUAGE", "de_AT.UTF-8", 1);
+    CHECK_EQ(Texts::DirectoryRead(1), std::string("1 Eintrag"));
+    CHECK_EQ(Texts::DirectoryRead(2), std::string("2 Einträge"));
+    CHECK_TRUE(Texts::Usage().find("Befehle:") != std::string::npos);
+    CHECK_TRUE(Texts::Usage().find("-filemask=MASKE") != std::string::npos);
+    CHECK_TRUE(Texts::Usage().find("{version}") == std::string::npos);
+    CHECK_TRUE(Texts::HostKeyUnknown("host.example", 22, "ed25519", fingerprint)
+        .find("nicht zwischengespeichert") != std::string::npos);
+    CHECK_EQ(Texts::PasswordPrompt("user", "host"), std::string("Passwort für user@host: "));
+    CHECK_EQ(Texts::RemoteError("read", "{path}%n", "x"),
+        std::string("Lesen von '{path}%n' nicht möglich. x"));
+    CHECK_EQ(Texts::Translate(" [y/N]: "), std::string(" [j/N]: "));
     setenv("LINSCP_LANGUAGE", "unsupported", 1);
     CHECK_EQ(Texts::ConnectionClosed(), std::string("Connection has been unexpectedly closed."));
     setenv("LINSCP_LANGUAGE", "C", 1);

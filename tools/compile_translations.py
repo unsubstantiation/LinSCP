@@ -147,7 +147,8 @@ def check_cli_coverage(catalogs):
 
 
 OUTPUT_CALL = re.compile(
-    r'(?:Console::Instance\(\)|console)\.(?:Status|Error|WriteLine|LogEvent)\(\s*"')
+    r'(?:Console::Instance\(\)\.|console\.|mConsole->)'
+    r'(?:Status|Error|WriteLine|LogEvent|Confirm|ReadPassword)\(\s*"')
 
 
 def output_messages(source):

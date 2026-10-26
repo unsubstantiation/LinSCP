@@ -1258,14 +1258,43 @@ def _censored_command(text):
 # Running the console client
 # ---------------------------------------------------------------------------
 
+_GUI_LANGUAGES = None
+
+
+def gui_languages():
+    """The languages whose catalogs are generated into the served page."""
+    global _GUI_LANGUAGES
+    if _GUI_LANGUAGES is None:
+        languages = {"en"}
+        try:
+            with open(os.path.join(WEB_DIR, "index.html"), encoding="utf-8") as page:
+                text = page.read()
+            data = text.split("const GUI_CATALOGS = ", 1)[1].split(";\n", 1)[0]
+            languages.update(json.loads(data))
+        except (OSError, IndexError, ValueError):
+            pass
+        _GUI_LANGUAGES = sorted(languages)
+    return _GUI_LANGUAGES
+
+
 def ui_language(environment=None):
-    """Messages only: never call setlocale or change protocol number formats."""
+    """Messages only: never call setlocale or change protocol number formats.
+
+    The result is always a language the page has a catalog for: 'de_AT'
+    uses 'de', a regional catalog such as 'pt_BR' wins over its base
+    language, and a locale without a catalog (C and POSIX included) is
+    English.
+    """
     environment = os.environ if environment is None else environment
     value = next((environment.get(key) for key in
                   ("LINSCP_LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG")
                   if environment.get(key)), "en")
-    base = re.split(r"[-_.@]", value.lower())[0]
-    return "es" if base == "es" else "en"
+    locale = re.split(r"[.@]", value)[0].replace("-", "_").lower()
+    available = {code.lower(): code for code in gui_languages()}
+    for candidate in (locale, locale.split("_")[0]):
+        if candidate in available:
+            return available[candidate]
+    return "en"
 
 
 def popen_kwargs(password=None, session=None):

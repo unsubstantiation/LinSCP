@@ -2910,21 +2910,24 @@
       "id": "locale.translations",
       "area": "Localization/accessibility",
       "status": "partial",
-      "notes": "English/Spanish catalogs cover the browser interface (menus, dialogs, help, ARIA/tooltips, dynamic status/queue/sync/editor/search messages) and the whole command-line client. The translation compiler rejects a message that reaches the user without a catalog entry. A catalog walker reports interface strings still answered in English so a new string cannot slip through untranslated. The language selector is filled from the shipped catalogs. Only English and Spanish catalogs are shipped; upstream ships catalogs for many more languages.",
-      "gap": "Only English and Spanish catalogs are shipped; upstream ships catalogs for many more languages, and the upstream .NET interface has strings that this client does not have at all. No full upstream language-catalog coverage is claimed. A walker already reports catalog messages still answered in English.",
+      "notes": "English, Spanish and German catalogs cover the browser interface (menus, dialogs, help, ARIA/tooltips, dynamic status/queue/sync/editor/search messages) and the whole command-line client, including the external-editor prompts. The translation compiler rejects a message that reaches the user without a catalog entry. A catalog walker reports interface strings still answered in English so a new string cannot slip through untranslated, and the translation tests keep switches, values, command names and protocol words literal in every catalog. The language selector and the backend's locale selection are filled from the shipped catalogs, and a confirmation accepts the yes letter its translated hint shows. Only English, Spanish and German catalogs are shipped; upstream ships catalogs for many more languages.",
+      "gap": "Only English, Spanish and German catalogs are shipped; upstream ships catalogs for many more languages, and the upstream .NET interface has strings that this client does not have at all. No full upstream language-catalog coverage is claimed. A walker already reports catalog messages still answered in English.",
       "source": [
         "source/linux/Texts.cpp",
         "source/linux/Console.cpp",
         "source/linux/Script.cpp",
         "source/linux/Session.cpp",
         "source/linux/SshKeys.cpp",
+        "source/linux/Editor.cpp",
         "source/linux/main.cpp",
         "source/linux/locales/en.json",
         "source/linux/locales/es.json",
+        "source/linux/locales/de.json",
         "source/gui/web/index.html",
         "source/gui/linscp_gui.py",
         "source/gui/locales/en.json",
         "source/gui/locales/es.json",
+        "source/gui/locales/de.json",
         "tools/compile_translations.py"
       ],
       "checks": {
@@ -2956,7 +2959,10 @@
         "translation-tests": [
           "test_checked_in_table_is_current",
           "test_gui_is_current_and_all_source_messages_have_catalogs",
-          "test_non_english_catalogs_are_not_left_in_english"
+          "test_non_english_catalogs_are_not_left_in_english",
+          "test_cli_literals_survive_translation",
+          "test_cli_help_keeps_every_option_and_command",
+          "test_yes_no_prompts_offer_one_yes_letter"
         ]
       },
       "verified_on": {
