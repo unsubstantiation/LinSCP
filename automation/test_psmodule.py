@@ -106,6 +106,60 @@ class StaticModuleTests(unittest.TestCase):
         self.assertNotIn("$Matches", body[check:],
                          "a listing field is read after $Matches was replaced")
 
+    def test_a_device_entry_keeps_its_name(self):
+        """'major, minor' takes the size column, and the pattern follows it.
+
+        A character or block device line carries one field more than any
+        other, so the ordinary pattern read the minor number as the day and
+        the time as the name: the panel showed '20:00 null' and the real
+        entry was never listed. The device pattern is read here with the same
+        regular-expression syntax PowerShell uses.
+        """
+        pattern = re.search(r"\$Script:ListingDevice = '([^']+)'", self.text)
+        self.assertIsNotNone(pattern, "no device pattern")
+        regex = re.compile(pattern.group(1))
+        cases = [
+            ("crw-rw-rw-   1 root root      1,   3 Oct 25 20:00 null",
+             "crw-rw-rw-", "Oct 25 20:00", "null"),
+            ("brw-rw----   1 root disk      8,   0 Oct 25 20:00 sda",
+             "brw-rw----", "Oct 25 20:00", "sda"),
+            ("brw-rw----   1 root disk    259,   0 Oct 25 20:00 nvme0n1",
+             "brw-rw----", "Oct 25 20:00", "nvme0n1"),
+            ("crw-rw-rw- 1 root root 1, 3 Jan  1  2020 dev-old",
+             "crw-rw-rw-", "Jan  1  2020", "dev-old"),
+        ]
+        for line, perms, date, name in cases:
+            match = regex.match(line)
+            self.assertIsNotNone(match, line)
+            self.assertEqual(match.group(1), perms, line)
+            self.assertEqual(match.group(2), "root", line)
+            self.assertEqual(match.group(6).strip(), date.strip(), line)
+            self.assertEqual(match.group(7), name, line)
+            self.assertTrue(match.group(4).endswith(","), line)
+        for line in ("-rw-r--r-- 1 user group 12 Oct 25 20:00 a.txt",
+                     "lrwxrwxrwx 1 u g 9 Oct 16 05:33 link -> t"):
+            self.assertIsNone(regex.match(line), line)
+
+    def test_the_quoting_doubles_backslashes_literally(self):
+        """'-replace' searched for one backslash and put one back.
+
+        The pattern and the replacement were both a single backslash, so the
+        call was a no-op and a value holding one went out undoubled: the
+        client's splitter reads '\\' inside double quotes as one backslash,
+        so a lone backslash was dropped - and one that ended a value escaped
+        the closing quote and swallowed the rest of the command. The
+        escaping is a literal String.Replace now.
+        """
+        body = self.function_body("ConvertTo-LScpArgument")
+        slash = chr(92)
+        quote = chr(34)
+        self.assertIn("$Value.Replace('" + slash + "', '" + slash * 2 + "')", body,
+                      "the backslash is not doubled literally")
+        self.assertIn(".Replace('" + quote + "', '" + slash + quote + "')", body,
+                      "the double quote is not escaped literally")
+        quoting = body.split("param([string]$Value)")[1].split("# String.Replace")[0]
+        self.assertNotIn("-replace", quoting, "the quoting still uses -replace")
+
     def test_a_result_code_is_read_before_anything_else_runs(self):
         """The code of 'LSCP-RESULT n' is read from its own match."""
         body = self.function_body("Read-LScpResponse")

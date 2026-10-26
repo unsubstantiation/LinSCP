@@ -13,7 +13,6 @@ import sys
 import tempfile
 import threading
 import time
-import types
 import unittest
 import urllib.parse
 from unittest import mock

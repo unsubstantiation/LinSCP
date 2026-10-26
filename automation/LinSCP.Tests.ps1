@@ -56,6 +56,25 @@ Describe 'Listing parser' {
         $entries[1].IsDirectory | Should -Be $true
     }
 
+    It 'keeps the name of a device entry and reports no size' {
+        # A device line carries 'major, minor' where every other line has a
+        # size, so it has one field more: parsed with the ordinary pattern
+        # the entry came back as '20:00 null'. The permission marker is what
+        # tells the two apart.
+        $lines = @(
+            'crw-rw-rw- 1 root root 1, 3 Oct 13 07:07 null',
+            'brw-rw---- 1 root disk 8, 0 Oct 13 07:07 sda'
+        )
+        $entries = ConvertFrom-LScpListing -Lines $lines -Directory '/dev'
+        $entries.Count | Should -Be 2
+        $entries[0].Name | Should -Be 'null'
+        $entries[0].FullName | Should -Be '/dev/null'
+        $entries[0].Length | Should -Be 0
+        $entries[0].Owner | Should -Be 'root'
+        $entries[1].Name | Should -Be 'sda'
+        $entries[1].IsDirectory | Should -Be $false
+    }
+
     It 'reads link targets and skips dot entries' {
         $lines = @(
             'lrwxrwxrwx 1 o g 7 Oct 13 07:07 link -> target',

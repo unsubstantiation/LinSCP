@@ -501,6 +501,25 @@ class PermissionModeTests(unittest.TestCase):
             gui.apply_local_mode(target, "755")
             self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o755)
 
+    def test_a_mode_it_cannot_read_is_refused_rather_than_partly_applied(self):
+        # The parser stops at the first character it does not know, so a
+        # mode it does not understand used to be half-done: 'u+x644' set the
+        # owner's execute bit and dropped the rest, and 'u+q' changed
+        # nothing while the caller was told the change had been made. The
+        # mode is now checked with the same validator the chmod endpoints
+        # use, and one it would refuse is refused here as well.
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, "file")
+            with open(target, "w") as handle:
+                handle.write("x")
+            for mode in ("u+q", "x", "rwx", "644u+x", "u+x644", "+x", "-w",
+                         "u + x", "", "999"):
+                os.chmod(target, 0o644)
+                with self.assertRaises(ValueError, msg=mode):
+                    gui.apply_local_mode(target, mode)
+                self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o644,
+                                 mode)
+
     def test_a_directory_takes_execute_from_capital_x(self):
         with tempfile.TemporaryDirectory() as directory:
             target = os.path.join(directory, "dir")
@@ -620,6 +639,61 @@ class PanelContainmentTests(unittest.TestCase):
             path, error = gui.contained_local_path(base, "file")
             self.assertIsNone(path, base)
             self.assertTrue(error, base)
+
+    def test_a_panel_reached_through_a_symlink_still_acts_on_its_entries(self):
+        # A home directory on another volume or a folder linked into place
+        # is an ordinary layout. The containment check compared the resolved
+        # panel directory with the unresolved entry, so every rename, delete,
+        # mkdir and chmod in that pane was refused as an escape while the
+        # listing of the same pane worked.
+        with tempfile.TemporaryDirectory() as directory:
+            real = os.path.join(directory, "real")
+            os.makedirs(real)
+            with open(os.path.join(real, "file.txt"), "w") as handle:
+                handle.write("x")
+            link = os.path.join(directory, "link")
+            os.symlink(real, link)
+            for base in (real, link):
+                path, error = gui.contained_local_path(base, "file.txt")
+                self.assertEqual(error, "", base)
+                self.assertEqual(path, os.path.join(base, "file.txt"))
+            # A symlink in front of the panel directory, not just at it.
+            deep = os.path.join(directory, "deep")
+            os.makedirs(deep)
+            os.symlink(real, os.path.join(deep, "mid"))
+            path, error = gui.contained_local_path(
+                os.path.join(deep, "mid"), "file.txt")
+            self.assertEqual(error, "")
+            self.assertEqual(path, os.path.join(deep, "mid", "file.txt"))
+
+    def test_a_symlinked_panel_entry_is_still_the_link_not_its_target(self):
+        # Resolving the entry would send a delete or a chmod to the file the
+        # link points at instead of to the link the panel shows.
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "outside"), "w") as handle:
+                handle.write("x")
+            os.symlink("/etc/passwd", os.path.join(directory, "escape"))
+            path, error = gui.contained_local_path(directory, "escape")
+            self.assertEqual(error, "")
+            self.assertEqual(path, os.path.join(directory, "escape"))
+
+    def test_a_drop_lands_in_a_panel_reached_through_a_symlink(self):
+        # The drop target refused a symlinked panel directory outright, with
+        # a message that claimed the directory did not exist.
+        with tempfile.TemporaryDirectory() as directory:
+            real = os.path.join(directory, "real")
+            os.makedirs(real)
+            link = os.path.join(directory, "link")
+            os.symlink(real, link)
+            self.assertEqual(gui.local_browser_destination(link, "dropped.txt"),
+                             os.path.join(real, "dropped.txt"))
+            self.assertEqual(gui.local_browser_destination(link, "a/b.txt"),
+                             os.path.join(real, "a", "b.txt"))
+            # A symbolic link in a segment the drop would enter is still
+            # refused: that is what keeps a drop inside the pane.
+            os.symlink("/etc", os.path.join(real, "escape"))
+            with self.assertRaises(ValueError):
+                gui.local_browser_destination(link, "escape/passwd")
 
 
 class RequestFieldTests(unittest.TestCase):
@@ -831,6 +905,38 @@ class LocalListingTests(unittest.TestCase):
             good = next(e for e in entries if e["name"] == "good")
             self.assertTrue(good["is_link"])
             self.assertFalse(good["is_broken"])
+
+    def test_a_device_entry_keeps_its_name_and_drops_its_device_number(self):
+        # A character or block device has no size: 'ls -l' writes
+        # 'major, minor' in the size column. The extra column shifted every
+        # field after it, so the panel showed an entry called '20:00 null'
+        # - a name no rename, delete or download could ever find - and the
+        # real 'null' never appeared at all.
+        lines = [
+            "Reading directory /dev...",
+            "crw-rw-rw-   1 root root      1,   3 Oct 25 20:00 null",
+            "brw-rw----   1 root disk      8,   0 Oct 25 20:00 sda",
+            "brw-rw----   1 root disk    259,   0 Oct 25 20:00 nvme0n1",
+            "crw-rw-rw-   1 root root   10, 200 Oct 25 20:00 tun",
+        ]
+        entries = gui.parse_ls_output(lines)
+        self.assertEqual([entry["name"] for entry in entries],
+                         ["null", "nvme0n1", "sda", "tun"])
+        for entry in entries:
+            self.assertEqual(entry["size"], 0, entry)
+            self.assertEqual(entry["date"], "Oct 25 20:00", entry)
+            self.assertFalse(entry["is_dir"], entry)
+
+    def test_a_fifo_or_socket_keeps_the_ordinary_size_column(self):
+        # These have a real size column and must not be re-split.
+        lines = [
+            "Reading directory /run...",
+            "prw-r--r--   1 root root        0 Oct 25 20:00 fifo",
+            "srw-rw-rw-   1 root root        0 Oct 25 20:00 sock",
+        ]
+        entries = gui.parse_ls_output(lines)
+        self.assertEqual([entry["name"] for entry in entries], ["fifo", "sock"])
+        self.assertEqual(entries[0]["date"], "Oct 25 20:00")
 
     def test_a_symlink_target_is_reported_from_a_long_listing(self):
         lines = [
@@ -1448,7 +1554,7 @@ class AccountValidationTests(unittest.TestCase):
 
     def test_a_corrupted_record_is_a_failed_login_not_an_error(self):
         gui._write_account("dave", "password", "")
-        accounts = gui._read_accounts()
+        self.assertIn("dave", gui._read_accounts())
         self.assertTrue(gui._authenticate_user("dave", "password"))
         # Corrupt the salt and the hash in the file: the login must
         # answer False rather than raise.

@@ -765,31 +765,12 @@ bool FtpSession::OpenPassive(std::string & error)
     const bool sameAddress = !peerAddress.empty() && peerAddress == address;
     if (!sameAddress && !peerAddress.empty())
     {
-        /* RFC 1918, loopback and link-local addresses are the ones a NAT
-         * server reports about itself instead of about the destination. */
-        const bool unroutable =
-            strncmp(address.c_str(), "10.", 3) == 0 ||
-            strncmp(address.c_str(), "192.168.", 8) == 0 ||
-            strncmp(address.c_str(), "172.16.", 7) == 0 ||
-            strncmp(address.c_str(), "172.17.", 7) == 0 ||
-            strncmp(address.c_str(), "172.18.", 7) == 0 ||
-            strncmp(address.c_str(), "172.19.", 7) == 0 ||
-            strncmp(address.c_str(), "172.20.", 7) == 0 ||
-            strncmp(address.c_str(), "172.21.", 7) == 0 ||
-            strncmp(address.c_str(), "172.22.", 7) == 0 ||
-            strncmp(address.c_str(), "172.23.", 7) == 0 ||
-            strncmp(address.c_str(), "172.24.", 7) == 0 ||
-            strncmp(address.c_str(), "172.25.", 7) == 0 ||
-            strncmp(address.c_str(), "172.26.", 7) == 0 ||
-            strncmp(address.c_str(), "172.27.", 7) == 0 ||
-            strncmp(address.c_str(), "172.28.", 7) == 0 ||
-            strncmp(address.c_str(), "172.29.", 7) == 0 ||
-            strncmp(address.c_str(), "172.30.", 7) == 0 ||
-            strncmp(address.c_str(), "172.31.", 7) == 0 ||
-            strncmp(address.c_str(), "127.", 4) == 0 ||
-            strncmp(address.c_str(), "169.254.", 8) == 0;
+        /* An address the server reports about itself, not about the data
+         * endpoint, is replaced by the one the control connection reached,
+         * which is where the data connection must go too. */
         if (mOptions.ftp.forcePasvIp == 0 ||
-            (mOptions.ftp.forcePasvIp == 1 && unroutable))
+            (mOptions.ftp.forcePasvIp == 1 &&
+             FtpClient::IsUnroutablePasvAddress(address)))
         {
             useAddress = peerAddress;
         }
@@ -1473,6 +1454,51 @@ bool FtpClient::ParsePasvReply(const std::string & replyText,
     address = addressText;
     port = parsedPort;
     return true;
+}
+
+bool FtpClient::IsUnroutablePasvAddress(const std::string & address)
+{
+    /* Only a dotted quad can arrive here; anything else was refused by
+     * ParsePasvReply() already, so an unparsable value is not 'unroutable'
+     * and is left for the connection attempt to report. */
+    std::vector<std::string> parts;
+    size_t position = 0;
+    for (;;)
+    {
+        const size_t end = address.find('.', position);
+        if (end == std::string::npos)
+        {
+            parts.push_back(address.substr(position));
+            break;
+        }
+        parts.push_back(address.substr(position, end - position));
+        if (parts.size() > 4) return false;
+        position = end + 1;
+    }
+    if (parts.size() != 4)
+    {
+        return false;
+    }
+    unsigned int octets[4] = { 0, 0, 0, 0 };
+    for (size_t i = 0; i < 4; i++)
+    {
+        int value = 0;
+        if (!ParseFtpReplyNumber(parts[i], 0, 255, value))
+        {
+            return false;
+        }
+        octets[i] = static_cast<unsigned int>(value);
+    }
+    /* 'this network' (0.0.0.0/8), including the 0.0.0.0 a PASV reply uses
+     * to say 'the control connection's host'. */
+    if (octets[0] == 0) return true;
+    /* Loopback, RFC 1918, link-local and carrier-grade NAT (100.64/10). */
+    if (octets[0] == 10 || octets[0] == 127) return true;
+    if (octets[0] == 169 && octets[1] == 254) return true;
+    if (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31) return true;
+    if (octets[0] == 192 && octets[1] == 168) return true;
+    if (octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127) return true;
+    return false;
 }
 
 bool FtpClient::Handles(const SessionOptions & options)

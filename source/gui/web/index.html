@@ -1063,7 +1063,12 @@
 
   function t(message, values) {
     const catalog = GUI_CATALOGS[language] || GUI_CATALOGS.en;
-    const template = Object.prototype.hasOwnProperty.call(catalog, message) ? catalog[message] : message;
+    // Most callers pass a literal or a catalog key, but a few translate a
+    // value that came from a payload - a transfer's type or status, say.
+    // 'undefined.replace' threw out of the render that was drawing it, so
+    // one undescribed task emptied the whole transfer queue.
+    const text = message === null || message === undefined ? '' : String(message);
+    const template = Object.prototype.hasOwnProperty.call(catalog, text) ? catalog[text] : text;
     // Replacement values are literal data, never HTML, code or more templates.
     return template.replace(/\{([a-z]+)\}/g, (token, key) =>
       values && Object.prototype.hasOwnProperty.call(values, key) ? String(values[key]) : token);
@@ -1334,7 +1339,10 @@
   }
 
   function activeTab() {
-    return state.tabs.find(tab => tab.id === state.activeTab) || null;
+    // state.tabs comes from a JSON response, so an entry that is not an
+    // object is possible; reading '.id' off one threw out of the status
+    // poll and left the page with no tabs at all.
+    return state.tabs.find(tab => tab && tab.id === state.activeTab) || null;
   }
   function tabId() {
     const tab = activeTab();
@@ -1348,7 +1356,15 @@
   async function refreshStatus() {
     const data = await apiGet('/api/status');
     if (!data) return;
-    state.tabs = data.tabs || [];
+    // 'data.tabs || []' handed back any truthy value, so an object or a
+    // string reached state.tabs and the first activeTab() threw
+    // 'state.tabs.find is not a function' out of an async poll: the tab
+    // strip and the status bar stopped updating and nothing said why.
+    // An entry that is not an object is dropped for the same reason: the
+    // tab strip read '.id' off it and threw.
+    state.tabs = Array.isArray(data.tabs)
+      ? data.tabs.filter(tab => tab && typeof tab === 'object')
+      : [];
     state.activeTab = data.active_tab !== undefined ? data.active_tab : null;
     const tab = activeTab();
     if (tab) {
@@ -1504,6 +1520,16 @@
    * Directory listings                                                 *
    * ------------------------------------------------------------------ */
 
+  /* Entries from a listing, with anything that is not an object dropped and
+   * a non-array answered with an empty list. The row builder reads '.name'
+   * off each entry; a null entry threw out of the listing, which left the
+   * pane showing the previous directory's rows under the new path. */
+  function listingEntries(value) {
+    return Array.isArray(value)
+      ? value.filter(entry => entry && typeof entry === 'object')
+      : [];
+  }
+
   async function loadLocal(path) {
     const query = path ? '?path=' + encodePath(path) : '';
     const data = await apiGet('/api/local/list' + query + (query ? '&' : '?') + 'tab=' + tabId());
@@ -1512,7 +1538,7 @@
       return false;
     }
     state.local.path = data.path;
-    state.local.entries = data.entries || [];
+    state.local.entries = listingEntries(data.entries);
     state.local.selection.clear();
     $('localPathInput').value = data.path;
     renderPane('local');
@@ -1533,7 +1559,7 @@
       return false;
     }
     state.remote.path = data.path;
-    state.remote.entries = data.entries || [];
+    state.remote.entries = listingEntries(data.entries);
     state.remote.selection.clear();
     $('remotePathInput').value = data.path;
     renderPane('remote');
@@ -3040,7 +3066,9 @@
   async function refreshQueue() {
     const data = await apiGet('/api/transfers');
     if (!data) return;
-    state.queue = data.transfers || [];
+    state.queue = Array.isArray(data.transfers)
+      ? data.transfers.filter(task => task && typeof task === 'object')
+      : [];
     state.paused = !!data.paused;
     $('pauseBtn').textContent = state.paused ? t("Resume") : t("Pause");
     $('tabQueueBtn').textContent = t("Transfer Queue ({count})", {count: state.queue.length});
@@ -3052,6 +3080,9 @@
     }
     for (const task of state.queue) {
       const row = document.createElement('tr');
+      // A task with no status would throw out of the queue refresh, which
+      // stopped every later transfer from being listed at all.
+      const status = String(task.status === undefined || task.status === null ? '' : task.status);
       const percent = task.percent || 0;
       const bar = task.bytes_total
         ? '<div class="progress"><div class="progress-bar" style="width:' + percent + '%"></div></div>' +
@@ -3059,18 +3090,18 @@
           formatBytes(task.bytes_total) + '</span>'
         : '<span class="progress-text">' + escapeHtml(task.detail || '') + '</span>';
       const actions = [];
-      if (task.status === 'Queued') {
+      if (status === 'Queued') {
         actions.push(("<button class=\"btn tiny\" title=\"" + escapeHtml(t("Move to front of queue")) + "\" onclick=\"prioritizeTask(") + task.id + (", 'top')\">" + escapeHtml(t("Top")) + "</button>"));
       }
-      if (task.status === 'Running' || task.status === 'Queued') actions.push('<button class="btn tiny" onclick="cancelTask(' + task.id + (")\">" + escapeHtml(t("Cancel")) + "</button>"));
-      if (task.status === 'Failed' || task.status === 'Cancelled') actions.push('<button class="btn tiny" onclick="retryTask(' + task.id + (")\">" + escapeHtml(t("Retry")) + "</button>"));
+      if (status === 'Running' || status === 'Queued') actions.push('<button class="btn tiny" onclick="cancelTask(' + task.id + (")\">" + escapeHtml(t("Cancel")) + "</button>"));
+      if (status === 'Failed' || status === 'Cancelled') actions.push('<button class="btn tiny" onclick="retryTask(' + task.id + (")\">" + escapeHtml(t("Retry")) + "</button>"));
       row.innerHTML =
         '<td>' + escapeHtml(t(task.type)) + '</td>' +
         '<td title="' + escapeHtml(task.source) + '">' + escapeHtml(task.source) + '</td>' +
         '<td title="' + escapeHtml(task.destination) + '">' + escapeHtml(task.destination) + '</td>' +
         '<td>' + bar + '</td>' +
-        '<td><span class="status status-' + task.status.toLowerCase().replace(/[^a-z]/g, '') + '">' +
-        escapeHtml(t(task.status)) + '</span><br>' + actions.join(' ') + '</td>';
+        '<td><span class="status status-' + status.toLowerCase().replace(/[^a-z]/g, '') + '">' +
+        escapeHtml(t(status)) + '</span><br>' + actions.join(' ') + '</td>';
       if (task.error) {
         row.title = task.error;
       }
@@ -3101,7 +3132,13 @@
     if (!data) return;
     const box = $('logOutput');
     box.innerHTML = '';
-    for (const entry of data.logs) {
+    // The same shape check the queue and the listings make: this runs on a
+    // timer, and a null list or a null entry threw out of it every four
+    // seconds with nothing on screen to say so.
+    const entries = Array.isArray(data.logs)
+      ? data.logs.filter(entry => entry && typeof entry === 'object')
+      : [];
+    for (const entry of entries) {
       const div = document.createElement('div');
       div.className = 'log-line';
       // The level names a style, so it is reduced to one before it is put
