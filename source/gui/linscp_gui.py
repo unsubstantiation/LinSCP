@@ -3241,8 +3241,13 @@ def _cleanup_candidates():
         # stored data must not create the data it is about to report.
         ("shell", "Pending file-manager uploads",
          os.path.join(_config_root(), "shell-manifests"), "directory"),
+        # The editor writes its copies under the configuration directory
+        # (edit_temp_directory()), not under the system temporary directory:
+        # this entry used to name $TMPDIR/linscp-gui-edit, so Cleanup always
+        # reported "not there" for copies this build had made and would have
+        # removed a same-named directory it never wrote.
         ("editing", "Temporary copies of edited files",
-         os.path.join(tempfile.gettempdir(), "linscp-gui-edit"), "directory"),
+         edit_temp_directory(), "directory"),
     ]
 
 
@@ -7875,6 +7880,19 @@ class LinScpGuiHandler(SimpleHTTPRequestHandler):
                 return
             stats = {"scanned": 0, "skipped": 0, "bytes_scanned": 0,
                      "truncated": False}
+            if getattr(tab, "is_local", False):
+                # The "remote" pane of a local-to-local tab is a directory on
+                # this machine, and 'path' comes from the request. Searching
+                # it is reading files, so it has to pass the same jail
+                # /api/local/list uses; otherwise a signed-in account could
+                # walk another account's home (or the whole file system)
+                # through this one endpoint and see both the names and the
+                # matching lines.
+                start, jail_error = confined_local_path(start)
+                if jail_error:
+                    self.send_json({"success": False, "error": jail_error},
+                                   status=403)
+                    return
             try:
                 if getattr(tab, "is_local", False):
                     matches = local_search(
@@ -9134,8 +9152,18 @@ def remote_search(tab, start, pattern, limit=500, case_sensitive=False,
     return matches
 
 
+def edit_temp_directory():
+    """Where the editor keeps its copies, without creating anything.
+
+    The Cleanup dialog lists this directory and has to name the one the
+    editor really writes to, while listing must not create the data it is
+    about to report; both use this, and only edit_temp_root() makes it.
+    """
+    return os.path.join(_config_root(), "edit-tmp")
+
+
 def edit_temp_root():
-    root = os.path.join(_config_root(), "edit-tmp")
+    root = edit_temp_directory()
     os.makedirs(root, mode=0o700, exist_ok=True)
     if not os.path.islink(root):
         try:

@@ -1302,6 +1302,33 @@ function options(id) {
     (window.openTransferSettings(), value('transferSpeed') === '128'),
     value('transferSpeed'));
   window.closeModal('transferModal');
+
+  /* A resume threshold is stored as a number of KiB, which is not one of the
+   * select's own values: opening the dialog has to show it as "resume above
+   * a size" with the number in the field, and saving must keep it rather
+   * than write the empty option back over it. */
+  const storedPreferences = responses['/api/preferences'].preferences;
+  responses['/api/preferences'].preferences =
+    Object.assign({}, storedPreferences, { resumesupport: '2048' });
+  await window.loadTransferSettings();
+  window.openTransferSettings();
+  check('a numeric resume threshold opens as the size option',
+    value('transferResumeSupport') === 'size' && value('transferResumeSize') === '2048',
+    value('transferResumeSupport') + ' / ' + value('transferResumeSize'));
+  check('the resume size field is shown for a stored threshold',
+    window.document.getElementById('transferResumeSizeRow').style.display === 'flex',
+    window.document.getElementById('transferResumeSizeRow').style.display);
+  await window.saveTransferSettings();
+  const thresholdSave = calls.filter(call => call.path === '/api/preferences' &&
+    (call.options.method || 'GET').toUpperCase() === 'POST').pop();
+  const thresholdPayload = thresholdSave ? JSON.parse(thresholdSave.options.body) : {};
+  check('saving the dialog keeps the resume threshold',
+    thresholdPayload.preferences &&
+      thresholdPayload.preferences.resumesupport === '2048',
+    JSON.stringify(thresholdPayload.preferences));
+  responses['/api/preferences'].preferences = storedPreferences;
+  await window.loadTransferSettings();
+  window.closeModal('transferModal');
   await window.resetPreferences();
   const prefReset = calls.filter(call => call.path === '/api/preferences' &&
     (call.options.method || 'GET').toUpperCase() === 'POST').pop();

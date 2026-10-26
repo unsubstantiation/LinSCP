@@ -1161,6 +1161,29 @@ class CleanupFunctionTests(unittest.TestCase):
                          os.path.join(self.directory, "sessions.key"))
         self.assertEqual(locations["hostkeys"]["path"],
                          os.path.join(self.directory, "sshhostkeys"))
+        # The editor keeps its copies under the configuration directory, so
+        # this entry has to name that directory. It used to name
+        # $TMPDIR/linscp-gui-edit, which this build never writes: Cleanup
+        # offered to remove leftovers that could not exist and never removed
+        # the ones the editor really left behind.
+        self.assertEqual(locations["editing"]["path"],
+                         os.path.join(self.directory, "edit-tmp"))
+        self.assertFalse(locations["editing"]["exists"])
+
+    def test_the_editor_copies_cleanup_removes_are_the_ones_it_writes(self):
+        root = gui.edit_temp_root()
+        self.assertEqual(root, os.path.join(self.directory, "edit-tmp"))
+        copied = gui.temp_path_for("/srv/data/report.txt")
+        self.assertEqual(os.path.dirname(copied), root)
+        self.assertTrue(os.path.isfile(copied))
+        locations = {item["id"]: item for item in gui.cleanup_locations()}
+        self.assertTrue(locations["editing"]["exists"])
+        self.assertEqual(locations["editing"]["path"], root)
+        results = gui.cleanup_data(["editing"])
+        self.assertTrue(results[0]["removed"])
+        self.assertFalse(os.path.exists(root))
+        self.assertTrue(os.path.exists(os.path.join(self.directory,
+                                                    "sessions.ini")))
 
     def test_only_the_selected_location_is_removed(self):
         results = gui.cleanup_data(["sessions"])
