@@ -4621,15 +4621,22 @@ def contained_local_path(base, name):
     if jail_error:
         return None, jail_error
     base = jailed_base
-    # Use realpath to prevent a symlink in the base directory from
-    # escaping containment via string-prefix checks alone.
+    # Compare the directory the entry lives in, resolved, with the resolved
+    # panel directory: a symlink in the base directory must not escape
+    # containment through a string-prefix check alone.
+    #
+    # Resolving the entry itself would resolve a symlink entry and hide the
+    # fact that the operation acts on the link rather than on its target, so
+    # only the parent is resolved. Not resolving the panel directory at all
+    # refused every operation in a pane that is reached through a symlink -
+    # a home directory or a folder linked to another volume is often laid
+    # out that way - while the listing of the same pane worked, so the panel
+    # showed entries that every action then refused.
+    target = os.path.join(base, name)
     try:
         real_base = os.path.realpath(base)
-        target = os.path.join(base, name)
-        # The target itself may be a symlink; realpath would resolve it and
-        # hide the fact that the operation would act on the link itself.
-        # For containment we only need to ensure the parent is inside base.
-        if os.path.commonpath([real_base, os.path.abspath(target)]) != real_base:
+        real_parent = os.path.realpath(os.path.dirname(os.path.abspath(target)))
+        if os.path.commonpath([real_base, real_parent]) != real_base:
             return None, "That name escapes the directory the panel is showing."
     except ValueError:
         return None, "That name escapes the directory the panel is showing."
@@ -4685,8 +4692,16 @@ def apply_local_mode(path, mode_text):
     this needs it: the console client already parses the same modes for
     the remote side, and a local panel that only understood octal could
     not offer the one the user typed for the other side.
+
+    A mode this cannot read in full is refused rather than partly applied:
+    the parser below stops at the first character it does not know, so
+    'u+x644' used to set the owner's execute bit and drop the rest, and
+    'u+q' changed nothing at all while the caller reported success.
     """
     text = str(mode_text).strip()
+    mode_error = check_permission_mode(text)
+    if mode_error:
+        raise ValueError(mode_error)
     if all(ch in "01234567" for ch in text) and text:
         os.chmod(path, int(text, 8))
         return
@@ -4902,7 +4917,11 @@ def local_browser_destination(local_dir, relative_path):
             any(ord(char) < 32 or ord(char) == 127 for char in segment)
             for segment in segments):
         raise ValueError("The drop path contains an invalid name or escapes the local directory.")
-    if not os.path.isdir(local_dir) or os.path.islink(local_dir):
+    # The panel directory itself may be a symlink (a home directory or a
+    # folder linked to another volume); isdir() follows it, and the loop
+    # below still refuses a symbolic link in any segment the drop would
+    # enter, which is what protects the destination.
+    if not os.path.isdir(local_dir):
         raise ValueError("The target local directory does not exist.")
     real_base = os.path.realpath(local_dir)
     current = real_base
@@ -5020,6 +5039,22 @@ def parse_ls_output(stdout):
         # line is its mode string, so that is what is checked.
         if len(parts) >= 9 and LISTING_MODE.match(parts[0]):
             perms, links, owner, group, size_str, m1, m2, m3, name = parts
+            if size_str.endswith(",") or (
+                    parts[0][:1] in ("c", "b") and len(parts) >= 9 and
+                    parts[4].rstrip(",").isdigit() and parts[5].isdigit()):
+                # A character or block device has no size: 'ls -l' writes
+                # 'major, minor' in that column instead
+                # (crw-rw-rw- 1 root root 1, 3 Oct 25 20:00 null). The
+                # nine-field split above then took the minor number for the
+                # first date column and part of the date for the name, so
+                # the panel showed an entry called '20:00 null' that no
+                # operation could ever find. Re-split for the two columns
+                # the device number added.
+                fields = raw_line.lstrip().split(None, 9)
+                if len(fields) < 10:
+                    continue
+                perms, links, owner, group, _major, _minor, m1, m2, m3, name = fields
+                size_str = "0"
             is_link = perms.startswith("l")
             is_dir = perms.startswith("d")
             # A server that supplies its own 'ls -l' text writes a link as
@@ -9298,8 +9333,9 @@ def upload_remote_text(tab, remote_path, content, base_mtime=None):
 
 
 def main():
-    global PORT, HOST, API_TOKEN, REQUIRE_TOKEN, ALLOWED_HOSTS, ALLOW_ANY_HOST
-    global ACCOUNTS_FILE, ALLOWED_ORIGINS
+    # Only the names main() assigns need a global statement; reading the
+    # others does not, and pyflakes says so.
+    global API_TOKEN, REQUIRE_TOKEN, ALLOW_ANY_HOST, ACCOUNTS_FILE
     port = PORT
     host = HOST
     fixed_token = None

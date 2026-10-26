@@ -88,6 +88,69 @@ class StaticAssemblyTests(unittest.TestCase):
                      "class TransferOperationResult", "class RemoteDirectoryInfo"):
             self.assertIn(name, self.compat, name)
 
+    def test_every_url_scheme_it_builds_is_one_the_client_knows(self):
+        # BuildUrl put 'davs://' in front of a secure WebDAV session, which
+        # this client has never accepted: its scheme table knows 'dav' and
+        # 'webdav' only, so every TLS WebDAV session through the assembly
+        # failed to open. Read both tables and compare them, so a scheme
+        # invented here cannot drift from the client's own list again.
+        session_cpp = (ROOT / "source" / "linux" / "Session.cpp").read_text(
+            encoding="utf-8")
+        table = session_cpp.split("kSchemes[] = {", 1)[1].split("};", 1)[0]
+        known = set(re.findall(r'\{ "([a-z0-9+]+)"', table))
+        self.assertTrue(known)
+        build = self.session.split("public string BuildUrl()", 1)[1].split(
+            "public class TransferOptions", 1)[0]
+        built = {word for word in re.findall(r'"([a-z][a-z0-9+]*)"', build)}
+        self.assertEqual(sorted(built), ["dav", "ftp", "ftpes", "ftps", "s3",
+                                         "scp", "sftp", "webdav"])
+        self.assertEqual(sorted(built - known), [],
+                         "schemes no client version accepts: %s" % sorted(built - known))
+
+    def test_the_compatibility_exception_types_catch_what_is_thrown(self):
+        # A script carried over from WinSCP writes
+        # 'catch (SessionRemoteException)' with the WinSCP namespace
+        # imported. When that name was a subclass of the thrown LinSCP type
+        # the clause never matched, so the error escaped the script. The
+        # WinSCP name has to be the base of the thrown type instead.
+        self.assertIn("class SessionRemoteException : WinSCP.SessionRemoteException",
+                      self.session)
+        self.assertIn("class SessionLocalException : WinSCP.SessionLocalException",
+                      self.session)
+        self.assertIn("public class SessionRemoteException : System.Exception",
+                      self.compat)
+        self.assertNotIn("WinSCP.SessionRemoteException : LinSCP", self.compat)
+
+    def test_a_device_line_keeps_its_name_and_loses_its_device_number(self):
+        """'major, minor' takes the size column of a character/block device.
+
+        Parsed with the ordinary pattern, 'crw-rw-rw- 1 root root 1, 3 Oct
+        25 20:00 null' came back as a file called '20:00 null' dated '3 Oct
+        25'. The device pattern is read here with the same regular-expression
+        syntax .NET uses.
+        """
+        match = re.search(r'ListingDeviceLine = new Regex\(@"([^"]+)"', self.session)
+        self.assertIsNotNone(match, "no device pattern")
+        regex = re.compile(match.group(1))
+        cases = [
+            ("crw-rw-rw-   1 root root      1,   3 Oct 25 20:00 null",
+             "Oct 25 20:00", "null"),
+            ("brw-rw----   1 root disk      8,   0 Oct 25 20:00 sda",
+             "Oct 25 20:00", "sda"),
+            ("brw-rw----   1 root disk    259,   0 Oct 25 20:00 nvme0n1",
+             "Oct 25 20:00", "nvme0n1"),
+        ]
+        for line, date, name in cases:
+            found = regex.match(line)
+            self.assertIsNotNone(found, line)
+            self.assertEqual(found.group(1)[0], line[0], line)
+            self.assertTrue(found.group(2).endswith(","), line)
+            self.assertEqual(found.group(4).strip(), date, line)
+            self.assertEqual(found.group(5), name, line)
+        for line in ("-rw-r--r-- 1 user group 12 Oct 25 20:00 a.txt",
+                     "prw-r--r-- 1 root root 0 Oct 25 20:00 fifo"):
+            self.assertIsNone(regex.match(line), line)
+
     def test_the_project_targets_netstandard_and_net8(self):
         self.assertIn("net8.0", self.project)
         self.assertIn("netstandard2.0", self.project)

@@ -223,6 +223,60 @@ class LocalPanesTests(GuiApiBase, unittest.TestCase):
         self.assertIn("left", tab.name)
         self.assertIn("right", tab.name)
 
+    def test_a_pane_opened_through_a_symlink_can_change_its_entries(self):
+        # A home directory on another volume, or a folder linked into place,
+        # is reached through a symlink. The listing of such a pane worked
+        # while mkdir, rename, delete and chmod refused every entry as an
+        # escape, because containment compared the resolved directory with
+        # an unresolved entry.
+        with open(os.path.join(self.left, "file.txt"), "w") as handle:
+            handle.write("x")
+        link = os.path.join(self.root, "linked-left")
+        os.symlink(self.left, link)
+        status, payload = self.server.post("/api/tabs/open", {
+            "session": {"protocol": "local", "local_dir": link,
+                        "other_local_dir": self.right},
+            "name": "linked-%s" % uuid.uuid4().hex[:8]})
+        self.assertEqual(status, 200, payload)
+        tab = payload["tab"]
+        self.tabs.append(tab["id"])
+        status, listing = self.server.get("/api/local/list?tab=%s" % tab["id"])
+        self.assertEqual(status, 200, listing)
+        self.assertEqual([entry["name"] for entry in listing["entries"]],
+                         ["file.txt"])
+        status, payload = self.server.post("/api/local/mkdir", {
+            "tab": tab["id"], "name": "created"})
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(os.path.isdir(os.path.join(self.left, "created")))
+        status, payload = self.server.post("/api/local/rename", {
+            "tab": tab["id"], "old_name": "file.txt",
+            "new_name": "renamed.txt"})
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(os.path.isfile(os.path.join(self.left, "renamed.txt")))
+        status, payload = self.server.post("/api/local/chmod", {
+            "tab": tab["id"], "name": "renamed.txt", "permissions": "600"})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(stat.S_IMODE(os.stat(
+            os.path.join(self.left, "renamed.txt")).st_mode), 0o600)
+        status, payload = self.server.post("/api/local/delete", {
+            "tab": tab["id"], "name": "renamed.txt"})
+        self.assertEqual(status, 200, payload)
+        self.assertFalse(os.path.exists(os.path.join(self.left, "renamed.txt")))
+        # A dropped file lands in the pane as well, and its bytes are not
+        # written through a symbolic link the pane already holds.
+        os.symlink("/etc", os.path.join(self.left, "escape"))
+        status, payload = self.server.request(
+            "/api/local/drop?tab=%s&name=dropped.txt" % tab["id"],
+            raw=b"payload", method="POST")
+        self.assertEqual(status, 200, payload)
+        with open(os.path.join(self.left, "dropped.txt"), "rb") as handle:
+            self.assertEqual(handle.read(), b"payload")
+        status, payload = self.server.request(
+            "/api/local/drop?tab=%s&name=passwd&relative_path=escape/passwd"
+            % tab["id"], raw=b"payload", method="POST")
+        self.assertEqual(status, 400, payload)
+        self.assertFalse(os.path.exists("/etc/passwd.dropped"))
+
     def test_recursive_copy_preserves_tree_metadata_and_symlinks(self):
         source = os.path.join(self.left, "tree")
         os.makedirs(os.path.join(source, "sub"))

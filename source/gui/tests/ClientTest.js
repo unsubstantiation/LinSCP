@@ -583,6 +583,14 @@ function options(id) {
     '/tmp/slowlocal/sub': [
       { name: 'inner.txt', size: 3, is_dir: false, date: 'Oct 13 08:00',
         permissions: '-rw-r--r--' }
+    ],
+    // What a listing looks like when the backend could not describe every
+    // entry: the page has to draw the ones it can and must not throw.
+    '/tmp/slowlocal/partial': [
+      null,
+      1,
+      { name: 'keep.txt', size: 3, is_dir: false, date: 'Oct 13 08:00',
+        permissions: '-rw-r--r--' }
     ]
   };
   const REMOTE_DIRS = {
@@ -1396,6 +1404,63 @@ function options(id) {
   check('opening a local file entry loads it in the editor',
     doc.getElementById('editorModal').classList.contains('open'));
   window.closeModal('editorModal');
+
+  /* Payload shapes. The backend is the only source of these objects, so a
+   * field that is missing or of the wrong type has to be survivable: each
+   * of these used to throw out of a render or a poll, which left the page
+   * silently stale - no tabs, no queue, no logs - with the error only in
+   * the browser console. */
+  check('a message that is not a string is translated to nothing',
+    window.t(undefined) === '' && window.t(null) === '');
+
+  const savedStatus = responses['/api/status'];
+  responses['/api/status'] = { tabs: { not: 'a list' }, active_tab: 1 };
+  await window.refreshStatus();
+  check('a status answer whose tabs are not a list draws no rows',
+    doc.getElementById('tabStrip').children.length === 0,
+    String(doc.getElementById('tabStrip').children.length));
+
+  responses['/api/status'] = { tabs: [null, 1, { id: 1, name: 'kept' }],
+    active_tab: 1 };
+  await window.refreshStatus();
+  check('a status answer with unusable tab entries keeps the usable one',
+    doc.getElementById('tabStrip').children.length === 1 &&
+      text('tabStrip').includes('kept'),
+    text('tabStrip'));
+
+  responses['/api/status'] = savedStatus;
+  await window.refreshStatus();
+  check('the tab strip comes back when the answer does',
+    doc.getElementById('tabStrip').children.length === savedStatus.tabs.length,
+    String(doc.getElementById('tabStrip').children.length));
+
+  await window.loadLocal('/tmp/slowlocal/partial');
+  check('a listing with unusable entries still shows the usable ones',
+    text('localFileList').includes('keep.txt') &&
+      doc.getElementById('localFileList').children.length === 1,
+    text('localFileList'));
+  await window.loadLocal('/tmp/slowlocal');
+  check('the local pane comes back to the whole directory',
+    text('localFileList').includes('a.txt'), text('localFileList'));
+
+  const savedTransfers = responses['/api/transfers'];
+  responses['/api/transfers'] = { transfers: [null, { id: 1 },
+    { id: 2, type: 'Copy', status: 'Running' }], paused: false };
+  await window.refreshQueue();
+  check('a task with no type or status does not empty the queue',
+    doc.getElementById('queueList').children.length === 2,
+    String(doc.getElementById('queueList').children.length));
+  responses['/api/transfers'] = savedTransfers;
+  await window.refreshQueue();
+
+  const savedLogs = responses['/api/logs'];
+  responses['/api/logs'] = { logs: [null, { level: 'error', text: 'kept line' }] };
+  await window.refreshLogs();
+  check('a log answer with an unusable entry keeps the usable one',
+    doc.getElementById('logOutput').children.length === 1 &&
+      text('logOutput').includes('kept line'),
+    text('logOutput'));
+  responses['/api/logs'] = savedLogs;
 
   check('no script errors', errors.length === 0, errors.join(' | '));
   window.close();

@@ -63,6 +63,15 @@ public:
     static bool ParsePasvReply(const std::string & replyText,
         std::string & address, int & port);
 
+    /* True when a PASV reply's address cannot be the data endpoint: the
+     * RFC 1918 ranges, loopback, link-local, 'this network' (0.0.0.0/8)
+     * and carrier-grade NAT. '0.0.0.0' in particular is what several
+     * servers answer to mean 'the host of the control connection' - the
+     * convention Python's ftplib reads the same way - and connecting to
+     * it would reach this machine's own loopback instead of the server.
+     * Exposed for the connection-free tests. */
+    static bool IsUnroutablePasvAddress(const std::string & address);
+
     /* MLSD when the server offers it and FtpUseMlsd allows it, LIST
      * otherwise, with the 'ls -l' parser shared with the curl backend. */
     static bool List(const SessionOptions & options, const std::string & remotePath,

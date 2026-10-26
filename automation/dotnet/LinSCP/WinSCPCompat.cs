@@ -43,12 +43,18 @@ namespace WinSCP
     public class CommandExecutionResult : LinSCP.CommandExecutionResult { }
     public class RemoteFileInfo : LinSCP.RemoteFileInfo { }
     public class RemoteDirectoryInfo : LinSCP.RemoteDirectoryInfo { }
-    public class SessionRemoteException : LinSCP.SessionRemoteException
+    // The exception types are the bases of the LinSCP ones, not subclasses of
+    // them: a script carried over from WinSCP writes
+    // 'catch (SessionRemoteException)' with this namespace imported, and a
+    // subclass here would never match the exception the assembly throws, which
+    // is a LinSCP one. Declaring the WinSCP name as the base makes both
+    // spellings catch it.
+    public class SessionRemoteException : System.Exception
     {
         public SessionRemoteException(string message) : base(message) { }
         public SessionRemoteException(string message, System.Exception inner) : base(message, inner) { }
     }
-    public class SessionLocalException : LinSCP.SessionLocalException
+    public class SessionLocalException : System.Exception
     {
         public SessionLocalException(string message) : base(message) { }
     }

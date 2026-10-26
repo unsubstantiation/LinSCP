@@ -78,7 +78,12 @@ namespace LinSCP
                              FtpSecure == FtpSecure.Explicit ? "ftpes" : "ftp";
                     break;
                 case Protocol.Webdav:
-                    scheme = FtpSecure == FtpSecure.Implicit ? "davs" : "dav";
+                    // This client spells WebDAV over TLS 'webdav://' (port
+                    // 443) and plain WebDAV 'dav://' (port 80); there is no
+                    // 'davs'. The old spelling produced a URL 'open' refused
+                    // as an unknown protocol, so every secure WebDAV session
+                    // through this assembly failed before it started.
+                    scheme = FtpSecure == FtpSecure.Implicit ? "webdav" : "dav";
                     break;
                 case Protocol.S3: scheme = "s3"; break;
                 default: scheme = "sftp"; break;
@@ -170,7 +175,11 @@ namespace LinSCP
         public List<RemoteFileInfo> Files { get; } = new List<RemoteFileInfo>();
     }
 
-    public class SessionRemoteException : Exception
+    /* Derived from the compatibility types in WinSCPCompat.cs, not the other
+     * way round, so that a script written against WinSCP.Session and catching
+     * its own SessionRemoteException/SessionLocalException still catches what
+     * this assembly throws. */
+    public class SessionRemoteException : WinSCP.SessionRemoteException
     {
         public SessionRemoteException(string message) : base(message) { }
         public SessionRemoteException(string message, Exception inner) : base(message, inner) { }
@@ -182,7 +191,7 @@ namespace LinSCP
         public SessionRemoteException Error { get; }
     }
 
-    public class SessionLocalException : Exception
+    public class SessionLocalException : WinSCP.SessionLocalException
     {
         public SessionLocalException(string message) : base(message) { }
     }
@@ -191,6 +200,12 @@ namespace LinSCP
     {
         static readonly Regex ListingMode = new Regex(@"^[-a-zA-Z?][-rwxsStTlL]{9}[+@.]?$", RegexOptions.Compiled);
         static readonly Regex ListingLine = new Regex(@"^\s*(\S+)\s+\S+\s+\S+\s+\S+\s+(\S+)\s+(\S+\s+\S+\s+\S+)\s(.*)$", RegexOptions.Compiled);
+        // A character or block device has no size: ls -l writes "major, minor"
+        // in that column instead, so the line has one field more and the
+        // ordinary pattern reads the minor number as part of the date and the
+        // time as part of the name ("20:00 null"). Group layout: permissions,
+        // major, minor, date, name.
+        static readonly Regex ListingDeviceLine = new Regex(@"^\s*(\S+)\s+\S+\s+\S+\s+\S+\s+(\d+,)\s*(\d+)\s+(\S+\s+\S+\s+\S+)\s(.*)$", RegexOptions.Compiled);
         static readonly Regex ResultMarker = new Regex(@"^LSCP-RESULT (\d+)\s*$", RegexOptions.Compiled);
 
         Process? _process;
@@ -550,9 +565,13 @@ namespace LinSCP
                 if (!lineMatch.Success) continue;
                 var perms = lineMatch.Groups[1].Value;
                 if (!ListingMode.IsMatch(perms)) continue;
-                var sizeText = lineMatch.Groups[2].Value;
-                var dateText = Regex.Replace(lineMatch.Groups[3].Value.Trim(), @"\s+", " ");
-                var name = lineMatch.Groups[4].Value;
+                var deviceMatch = ListingDeviceLine.Match(trimmed);
+                var isDevice = deviceMatch.Success;
+                var sizeText = isDevice ? "0" : lineMatch.Groups[2].Value;
+                var dateText = Regex.Replace(
+                    (isDevice ? deviceMatch.Groups[4].Value : lineMatch.Groups[3].Value).Trim(),
+                    @"\s+", " ");
+                var name = isDevice ? deviceMatch.Groups[5].Value : lineMatch.Groups[4].Value;
                 var target = "";
                 var isLink = perms.StartsWith("l", StringComparison.Ordinal);
                 if (isLink)

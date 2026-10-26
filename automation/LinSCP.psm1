@@ -88,7 +88,13 @@ function ConvertTo-LScpArgument {
         throw "Value contains a control character and cannot be safely quoted."
     }
     if ($Value -notmatch '[ \t\"'';\\]') { return $Value }
-    $escaped = $Value -replace '\\', '\\' -replace '"', '\"'
+    # String.Replace, not -replace: the old '-replace '\\', '\\'' searched
+    # for one backslash and put one back, so it changed nothing and a value
+    # holding a backslash went out undoubled. The splitter in the client
+    # reads '\\' inside double quotes as one backslash, so an undoubled one
+    # was dropped - and the one that ended a value escaped the closing
+    # quote, which made the rest of the command part of the name.
+    $escaped = $Value.Replace('\', '\\').Replace('"', '\"')
     return '"' + $escaped + '"'
 }
 
@@ -463,6 +469,12 @@ function Send-LScpItem {
 # it ('Reading directory /x...' and '3 entries').
 $Script:ListingMode = '^[-a-zA-Z?][-rwxsStTlL]{9}[+@.]?$'
 
+# A character or block device has no size: the column holds 'major, minor',
+# which is one field more than any other line, so the ordinary pattern read
+# the minor number as the day and the time as the name ('20:00 null'). The
+# layout is permissions, owner, group, major, minor, date, name.
+$Script:ListingDevice = '^\s*(\S+)\s+\S+\s+(\S+)\s+(\S+)\s+(\d+,)\s*(\d+)\s+(\S+\s+\S+\s+\S+)\s(.*)$'
+
 function ConvertFrom-LScpListing {
     <#
     .SYNOPSIS
@@ -476,19 +488,33 @@ function ConvertFrom-LScpListing {
     foreach ($line in $Lines) {
         $raw = $line -replace '[\r\n]+$', ''
         if (-not $raw.Trim()) { continue }
-        if ($raw -notmatch '^\s*(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s(.*)$') {
+        $isDevice = $false
+        if ($raw -match $Script:ListingDevice) {
+            $isDevice = $true
+        }
+        elseif ($raw -notmatch '^\s*(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s(.*)$') {
             continue
         }
         # Every field has to be read before the mode is checked: a
         # -match/-notmatch that succeeds replaces $Matches with its own
         # result, so checking the mode first left the owner, the size and
-        # the name empty and every entry came back without a name.
+        # the name empty and every entry came back without a name. The
+        # device pattern has its own group layout - permissions, owner,
+        # group, major, minor, date, name - and no size at all.
         $perms = $Matches[1]
-        $owner = $Matches[3]
-        $group = $Matches[4]
-        $sizeText = $Matches[5]
-        $modified = "$($Matches[6]) $($Matches[7]) $($Matches[8])"
-        $name = $Matches[9]
+        if ($isDevice) {
+            $owner = $Matches[2]
+            $group = $Matches[3]
+            $sizeText = '0'
+            $modified = $Matches[6]
+            $name = $Matches[7]
+        } else {
+            $owner = $Matches[3]
+            $group = $Matches[4]
+            $sizeText = $Matches[5]
+            $modified = "$($Matches[6]) $($Matches[7]) $($Matches[8])"
+            $name = $Matches[9]
+        }
         if ($perms -notmatch $Script:ListingMode) { continue }
         $target = ""
         $isLink = $perms.StartsWith("l")

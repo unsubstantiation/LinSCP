@@ -129,6 +129,41 @@ unsigned long PermissionsFromString(const std::string & text)
     return mode;
 }
 
+namespace {
+
+/*
+ * Splits a long listing into 'limit - 1' columns plus the rest of the line.
+ * SplitLongListing() is the nine-column form used everywhere else; a
+ * character or block device line carries one column more ('major, minor'
+ * in place of the size), and taking that apart is what this is for.
+ */
+bool SplitLongListingInto(const std::string & line, size_t limit,
+    std::vector<std::string> & fields)
+{
+    fields.clear();
+    std::istringstream stream(line);
+    std::string field;
+    while (fields.size() + 1 < limit && (stream >> field))
+    {
+        fields.push_back(field);
+    }
+    if (fields.size() + 1 < limit)
+    {
+        return false;
+    }
+    std::string rest;
+    std::getline(stream, rest);
+    const size_t first = rest.find_first_not_of(" \t");
+    if (first == std::string::npos)
+    {
+        return false;
+    }
+    fields.push_back(rest.substr(first));
+    return true;
+}
+
+} // namespace
+
 bool ParseUnixListingLine(const std::string & line, ListingEntry & entry)
 {
     std::vector<std::string> fields;
@@ -161,31 +196,50 @@ bool ParseUnixListingLine(const std::string & line, ListingEntry & entry)
     const unsigned long fileType = entry.permissions & 0170000UL;
     if (fileType == 0020000UL || fileType == 0060000UL)
     {
+        /*
+         * A device has no size: 'ls -l' writes 'major, minor' in that
+         * column instead
+         * (crw-rw-rw- 1 root root 1, 3 Oct 25 20:00 null). The nine-column
+         * split above then took the minor number for the first date column
+         * and part of the date for the name, so the console listed an entry
+         * called '20:00 null' that no later 'get', 'rm' or 'cd' could find,
+         * and the real entry never appeared at all. Re-split for the two
+         * columns the device number occupies; the date then sits one
+         * column further along than it does on any other line.
+         */
+        std::vector<std::string> deviceFields;
+        if (SplitLongListingInto(line, 10, deviceFields) &&
+            LooksLikePermissions(deviceFields[0]))
+        {
+            entry.name = deviceFields[9];
+            entry.permissions = PermissionsFromString(deviceFields[0]);
+            entry.mtime = ParseListingDate(deviceFields[6], deviceFields[7],
+                deviceFields[8]);
+            entry.timeKnown = entry.mtime != 0;
+        }
         entry.size = 0;
+        return true;
     }
-    else
+    if (fields[4].empty())
     {
-        if (fields[4].empty())
-        {
-            return false;
-        }
-        for (size_t i = 0; i < fields[4].size(); ++i)
-        {
-            if (fields[4][i] < '0' || fields[4][i] > '9')
-            {
-                return false;
-            }
-        }
-        errno = 0;
-        char * end = NULL;
-        const unsigned long long parsedSize =
-            strtoull(fields[4].c_str(), &end, 10);
-        if (errno != 0 || end == NULL || *end != '\0')
-        {
-            return false;
-        }
-        entry.size = parsedSize;
+        return false;
     }
+    for (size_t i = 0; i < fields[4].size(); ++i)
+    {
+        if (fields[4][i] < '0' || fields[4][i] > '9')
+        {
+            return false;
+        }
+    }
+    errno = 0;
+    char * end = NULL;
+    const unsigned long long parsedSize =
+        strtoull(fields[4].c_str(), &end, 10);
+    if (errno != 0 || end == NULL || *end != '\0')
+    {
+        return false;
+    }
+    entry.size = parsedSize;
     entry.mtime = ParseListingDate(fields[5], fields[6], fields[7]);
     entry.timeKnown = entry.mtime != 0;
     return true;

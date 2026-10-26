@@ -70,7 +70,7 @@ class WaylandCheckTests(unittest.TestCase):
         text = (check.ROOT / TERMINAL_TABLE).read_text()
         rows = terminal_rows(text)
         self.assertTrue(len(rows) >= 13)
-        for name, leading, backend in rows:
+        for name, _leading, backend in rows:
             self.assertIn(backend, ('', 'wayland', 'x11'), name)
         # A session has to have something to be offered: at least one program
         # that draws on Wayland, one that draws on X11 and one that does both.

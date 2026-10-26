@@ -3344,6 +3344,38 @@ void TestFtpPassiveReplyParsing()
         CHECK_TRUE(address.empty());
         CHECK_TRUE(port == 0);
     }
+
+    /* Which addresses a PASV reply may steer the data connection to.
+     * FtpForcePasvIp=1 (the default) replaces an unroutable address with
+     * the one the control connection reached. '0,0,0,0' is the one that
+     * matters in practice: several servers answer it to mean 'the host of
+     * the control connection' (Python's ftplib reads it the same way), and
+     * on Linux connecting to 0.0.0.0 reaches this machine's own loopback,
+     * so a transfer to a remote server failed as if nothing were listening
+     * on the server's own machine. */
+    const char * unroutable[] = {
+        "0.0.0.0", "0.1.2.3", "10.0.0.1", "127.0.0.1", "169.254.1.1",
+        "172.16.0.1", "172.31.255.255", "192.168.1.1", "100.64.0.1",
+        "100.127.255.255"
+    };
+    for (size_t i = 0; i < sizeof(unroutable) / sizeof(unroutable[0]); i++)
+    {
+        CHECK_TRUE(FtpClient::IsUnroutablePasvAddress(unroutable[i]));
+    }
+    const char * routable[] = {
+        "8.8.8.8", "1.2.3.4", "172.32.0.1", "100.128.0.1", "192.169.1.1",
+        "11.0.0.1", "172.15.255.1", "255.255.255.255"
+    };
+    for (size_t i = 0; i < sizeof(routable) / sizeof(routable[0]); i++)
+    {
+        CHECK_FALSE(FtpClient::IsUnroutablePasvAddress(routable[i]));
+    }
+    /* Not a dotted quad: nothing to say it is unroutable. */
+    CHECK_FALSE(FtpClient::IsUnroutablePasvAddress(""));
+    CHECK_FALSE(FtpClient::IsUnroutablePasvAddress("abc"));
+    CHECK_FALSE(FtpClient::IsUnroutablePasvAddress("1.2.3"));
+    CHECK_FALSE(FtpClient::IsUnroutablePasvAddress("1.2.3.4.5"));
+    CHECK_FALSE(FtpClient::IsUnroutablePasvAddress("1.2.3.256"));
 }
 
 void TestFtpAndTlsSettings()
@@ -3888,6 +3920,39 @@ void TestNonUnixListingFormats()
             "-rw-r--r-- 1 user group 4 Jun 25 11:22 odd -> name.txt", entry));
         CHECK_EQ(entry.name, std::string("odd -> name.txt"));
         CHECK_EQ(std::to_string(entry.permissions), std::to_string(0100644UL));
+    }
+
+    /* A character or block device has 'major, minor' in the size column.
+     * The extra column shifted the date and the name by one, so the entry
+     * was listed as '20:00 null' - a name no 'get', 'rm' or 'cd' could
+     * find - and its date was lost. */
+    {
+        ListingEntry entry;
+        CHECK_TRUE(ParseUnixListingLine(
+            "crw-rw-rw-   1 root root      1,   3 Oct 25 20:00 null", entry));
+        CHECK_EQ(entry.name, std::string("null"));
+        CHECK_FALSE(entry.isDir);
+        CHECK_TRUE(entry.typeKnown);
+        CHECK_EQ(std::to_string(entry.size), std::string("0"));
+        CHECK_EQ(std::to_string(entry.permissions), std::to_string(0020666UL));
+        CHECK_TRUE(entry.timeKnown);
+    }
+    {
+        ListingEntry entry;
+        CHECK_TRUE(ParseAnyListingLine(
+            "brw-rw----   1 root disk    259,   0 Oct 25 20:00 nvme0n1", entry));
+        CHECK_EQ(entry.name, std::string("nvme0n1"));
+        CHECK_EQ(std::to_string(entry.size), std::string("0"));
+        CHECK_EQ(std::to_string(entry.permissions), std::to_string(0060660UL));
+        CHECK_TRUE(entry.timeKnown);
+    }
+    /* A device listed with a year instead of a time. */
+    {
+        ListingEntry entry;
+        CHECK_TRUE(ParseUnixListingLine(
+            "crw-rw-rw- 1 root root 1, 3 Jan  1  2020 dev-old", entry));
+        CHECK_EQ(entry.name, std::string("dev-old"));
+        CHECK_TRUE(entry.timeKnown);
     }
 }
 
