@@ -326,9 +326,12 @@ The parent proxy reaches the jump, and a private socket pair replaces a local
 TCP listener by default. A nonzero `TunnelLocalPortNumber` binds that
 loopback port for this session's own tunneled connection. GSSAPI/Kerberos
 uses libssh when the loaded library advertises it; credential delegation is
-off unless `GSSAPIFwdTGT=1` is set. Curl-backed destination protocols over an
-SSH tunnel are refused. See [SSH tunnels](ssh-tunnels.md)
-for secure examples, storage policy and regression commands.
+off unless `GSSAPIFwdTGT=1` is set. The jump session uses the destination's
+Kerberos settings, as upstream does, so a delegated ticket reaches the jump
+host too. FTP, FTPS, WebDAV and S3 destinations reach the jump through a SOCKS5
+relay on 127.0.0.1; a refused forward never falls back to a direct connection.
+See [SSH tunnels](ssh-tunnels.md) for secure examples, storage policy and
+regression commands.
 
 The GUI challenges each hop separately. Remembering a key stores only that
 hop's pin, not transient credentials or an unchecked key on the other hop.
@@ -508,14 +511,18 @@ The .NET-compatible assembly (`LinSCP.Session`, with `WinSCP.Session` aliases)
 implements session lifecycle, listing, transfers, synchronization, cancellation
 and structured errors, but it is not the complete upstream object model.
 Optional account sign-in isolates users at the application layer while the
-backend still runs as one OS user. Broader localization beyond English/Spanish
-and complete upstream .NET object-model compatibility are not implemented.
+backend still runs as one OS user. Catalogs for every language upstream ships
+(the shipped ones are listed in [Localization](localization.md)) and complete
+upstream .NET object-model compatibility are not implemented.
 Local-to-local sessions, named workspaces, directory bookmarks, session import
-from OpenSSH/FileZilla and session-URL generation are implemented. SSH jump hosts work for SFTP/SCP/SSH;
-non-SSH tunnels do not. The live SFTP suite provisions a loopback-only Kerberos
-realm for GSSAPI authentication, including principal selection, credential
-expiry, service identity and opt-in delegation; broader production-realm
-validation and an independent delegation security review remain open. S3
+from OpenSSH/FileZilla and session-URL generation are implemented. SSH jump hosts work for SFTP/SCP/SSH
+and, through a loopback SOCKS5 relay, for FTP/FTPS/WebDAV/S3.
+
+The live SFTP suite provisions a loopback-only Kerberos realm, with a second,
+directly trusted realm. It tests principal selection, credential expiry, the
+service identity, cross-realm login and opt-in delegation. Production-KDC
+validation and an independent delegation security review remain open; see the
+[review brief](gssapi-delegation-review.md). S3
 version-aware operations are implemented as described above; S3 and WebDAV
 still cover documented subsets rather than every upstream extension.
 See the [parity audit](upstream-parity.md) for the full list of verified

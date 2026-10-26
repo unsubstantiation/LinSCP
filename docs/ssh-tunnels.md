@@ -4,22 +4,42 @@ LinSCP supports one authenticated SSH jump host for an SFTP, SCP or SSH
 session. It opens an SSH `direct-tcpip` channel to the destination and connects
 the destination's independent SSH transport through a private socket pair.
 No local TCP listener is opened unless `TunnelLocalPortNumber` selects a
-loopback port for this session's own connection. The jump host resolves the destination name;
-the destination retains its own username, credentials and host-key identity.
-Any configured parent proxy is used to reach the **jump host**, not to bypass
-it and reach the destination directly.
+loopback port for this session's own connection.
+
+FTP, FTPS, WebDAV and S3 sessions use the jump host too. The session starts a
+SOCKS5 relay on 127.0.0.1, and the relay opens a separate `direct-tcpip`
+channel through the jump for each connection; FTP data connections are
+passive. TLS SNI and S3 request signing keep the original host name.
+
+In every case, the jump host resolves the destination name, and the
+destination keeps its own username, credentials and host-key identity. Any
+configured parent proxy is used to reach the **jump host**, not to bypass it
+and reach the destination directly. If the jump refuses a forward, the session
+fails; it never falls back to a direct connection.
 
 This is a supported subset, **not full WinSCP tunnel or authentication parity**.
 Kerberos/GSSAPI authentication uses libssh when its public GSSAPI capability is
 present; GSSAPI key exchange is probed separately and `AuthGSSAPIKEX` is refused
 if the loaded libssh cannot honor it or a host-key pin is configured, rather
-than falling back to an ordinary exchange or silently skipping the pin. The
-live SFTP suite provisions an isolated loopback Kerberos
-realm and OpenSSH server to test principal selection, missing/expired tickets,
-server identity and opt-in TGT delegation. Broader production-realm validation
-and an independent security review of delegation remain open. Tunneling to
-curl-backed FTP/FTPS/WebDAV/S3 destinations is not implemented. Unsupported or
-malformed settings fail rather than silently make a direct connection. See the
+than falling back to an ordinary exchange or silently skipping the pin.
+
+The live SFTP suite provisions an isolated loopback Kerberos realm, a second
+directly trusted realm, and an OpenSSH server. It tests:
+
+- principal selection;
+- missing and expired tickets;
+- the server identity;
+- cross-realm login;
+- opt-in TGT delegation.
+
+The jump session uses the destination's Kerberos settings except
+`LogicalHostName`, as upstream does. So with `GSSAPIFwdTGT=1`, the **jump host
+receives the delegated ticket too**.
+
+Production-KDC validation and an independent security review of delegation
+remain open; the [review brief](gssapi-delegation-review.md) lists what a
+reviewer should check. Unsupported or malformed settings fail rather than
+silently make a direct connection. See the
 [remaining parity plan](remaining-parity-plan.md).
 
 ## Command line
@@ -117,7 +137,9 @@ full stdout/stderr delivery and rejection of a status without EOF), password and
 encrypted-key authentication, independent pin failures, inherited proxy routing,
 slow/backpressured transfers, forwarding timeout, cancellation/interruption,
 repeated socket/thread cleanup, encrypted storage and the actual GUI HTTP
-challenge/remember flow. Offline unit, script, GUI security and jsdom tests
+challenge/remember flow. They also cover the SOCKS relay: WebDAV, FTP and S3
+transfers through the jump, no direct connection when the jump refuses a
+forward, and a reported local-port collision. Offline unit, script, GUI security and jsdom tests
 cover validation, credential handling and form behavior too.
 
 These local fixtures are reproducible evidence for that scope, not certification

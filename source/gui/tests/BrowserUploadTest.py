@@ -57,6 +57,14 @@ class BrowserUploadTests(unittest.TestCase):
         self.assertEqual(gui.ui_language({"LC_ALL": "", "LC_MESSAGES": "es"}), "es")
         self.assertEqual(gui.ui_language({"LINSCP_LANGUAGE": "en", "LANG": "es"}), "en")
         self.assertEqual(gui.ui_language({"LANG": "xx"}), "en")
+        # Every shipped catalog is selectable, not only Spanish.
+        self.assertEqual(gui.ui_language({"LANG": "de_DE.UTF-8"}), "de")
+        self.assertEqual(gui.ui_language({"LC_MESSAGES": "de_AT@euro"}), "de")
+        self.assertEqual(gui.ui_language({"LANG": "fr_CA.UTF-8"}), "fr")
+        self.assertEqual(gui.ui_language({"LC_ALL": "fr_FR@euro"}), "fr")
+        self.assertEqual(gui.ui_language({"LANG": "POSIX"}), "en")
+        for language in gui.gui_languages():
+            self.assertEqual(gui.ui_language({"LINSCP_LANGUAGE": language}), language)
         with mock.patch.dict(os.environ, {"LINSCP_LANGUAGE": "es", "LC_ALL": "es_ES.UTF-8"}):
             kwargs = gui.popen_kwargs()
             self.assertEqual(kwargs["env"]["LINSCP_LANGUAGE"], "en")

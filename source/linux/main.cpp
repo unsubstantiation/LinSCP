@@ -734,7 +734,8 @@ int main(int argc, char ** argv)
             if (error.find("integrity check failed") == std::string::npos ||
                 !passphrase.empty() || batch || !console.IsInteractive() || attempt == 2)
                 break;
-            if (!console.ReadPassword("PPK key passphrase: ", passphrase))
+            if (!console.ReadPassword(
+                    linscp::Texts::Translate("PPK key passphrase: "), passphrase))
                 break;
         }
         console.Error(error);

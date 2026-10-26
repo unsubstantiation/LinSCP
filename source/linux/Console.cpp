@@ -302,6 +302,44 @@ bool Console::ReadPassword(const std::string & prompt, std::string & password)
     return result;
 }
 
+namespace {
+
+/* The first UTF-8 character of 'text', or nothing for an empty string. */
+std::string FirstCharacter(const std::string & text)
+{
+    if (text.empty())
+    {
+        return std::string();
+    }
+    const unsigned char lead = static_cast<unsigned char>(text[0]);
+    size_t length = 1;
+    if ((lead & 0xE0) == 0xC0)
+    {
+        length = 2;
+    }
+    else if ((lead & 0xF0) == 0xE0)
+    {
+        length = 3;
+    }
+    else if ((lead & 0xF8) == 0xF0)
+    {
+        length = 4;
+    }
+    return text.substr(0, length);
+}
+
+/* The letter a translated ' [Y/n]: ' prompt shows for yes: the character
+ * right after its '['. */
+std::string PromptYesLetter(const char * prompt)
+{
+    const std::string text = Texts::Translate(prompt);
+    const size_t open = text.find('[');
+    return open == std::string::npos ? std::string() :
+        FirstCharacter(text.substr(open + 1));
+}
+
+} // namespace
+
 bool Console::Confirm(const std::string & prompt, bool defaultYes)
 {
     /* Never consume stdin from a script or silently approve a destructive
@@ -320,9 +358,16 @@ bool Console::Confirm(const std::string & prompt, bool defaultYes)
     {
         return defaultYes;
     }
-    return (answer[0] == 'y' || answer[0] == 'Y' ||
-        ((answer[0] == 's' || answer[0] == 'S') &&
-         Texts::Translate("yes") == "sí"));
+    /* 'y' always means yes. A translated prompt also accepts the letter it
+     * offers for yes, in either case: ' [S/n]: ' and ' [s/N]: ' take 's',
+     * ' [J/n]: ' and ' [j/N]: ' take 'j'. */
+    if (answer[0] == 'y' || answer[0] == 'Y')
+    {
+        return true;
+    }
+    const std::string first = FirstCharacter(answer);
+    return first == PromptYesLetter(" [Y/n]: ") ||
+        first == PromptYesLetter(" [y/N]: ");
 }
 
 bool Console::SetLogFile(const std::string & path, std::string & error,
