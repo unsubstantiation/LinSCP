@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use linscp_crypto::ppk::convert_private_key_to_openssh;
 use linscp_engine::script::{
-    BatchMode, ScriptInterpreter, ScriptRunConfig, run_pty_shell_session,
+    BatchMode, CliSessionDefaults, ScriptInterpreter, ScriptRunConfig, run_pty_shell_session,
     select_cli_locale_from_env,
 };
 use linscp_engine::session_store::SessionStore;
@@ -26,6 +26,7 @@ use linscp_platform::terminal::{
 };
 use linscp_platform::write_exclusive_private_file;
 use linscp_service::CommanderService;
+use linscp_types::ProtocolScheme;
 
 const PRODUCT_VERSION: &str = "1.0";
 
@@ -422,10 +423,30 @@ async fn run_cli() -> i32 {
                 if next_s.is_empty() || next_s.starts_with('-') || !next_s.contains('=') {
                     break;
                 }
-                // Validate immediately on a probe spec so invalid settings fail right away
-                let mut probe = ParsedSiteSpec::default();
-                if let Err(err) = apply_raw_settings(&mut probe, std::slice::from_ref(next_s)) {
-                    print_err(&err);
+                // Validate immediately across protocol families so unknown keys or bad values
+                // fail right away while protocol-specific settings (e.g. Ftps=1) remain usable
+                // with `open ftp://...` inside `-command`/`-script`.
+                let mut valid_on_any = false;
+                let mut first_err = String::new();
+                for proto in [
+                    ProtocolScheme::Sftp,
+                    ProtocolScheme::Ftp,
+                    ProtocolScheme::Dav,
+                    ProtocolScheme::S3,
+                ] {
+                    let mut probe = ParsedSiteSpec::default();
+                    probe.session.protocol = proto;
+                    match apply_raw_settings(&mut probe, std::slice::from_ref(next_s)) {
+                        Ok(()) => {
+                            valid_on_any = true;
+                            break;
+                        }
+                        Err(err) if first_err.is_empty() => first_err = err,
+                        Err(_) => {}
+                    }
+                }
+                if !valid_on_any {
+                    print_err(&first_err);
                     return 1;
                 }
                 defaults_raw_pairs.push(next_s.clone());
@@ -896,6 +917,18 @@ async fn run_cli() -> i32 {
         BatchMode::Off
     };
 
+    let cli_defaults = CliSessionDefaults {
+        hostkey: (!defaults_hostkey.is_empty()).then_some(defaults_hostkey.clone()),
+        password: defaults_password.clone(),
+        privatekey: defaults_privatekey.clone(),
+        passphrase: defaults_passphrase.clone(),
+        username: defaults_username.clone(),
+        port: defaults_port,
+        timeout_secs: defaults_timeout,
+        clientcert: defaults_clientcert.clone(),
+        raw_pairs: defaults_raw_pairs.clone(),
+    };
+
     let run_cfg = ScriptRunConfig {
         config_dir: config_dir.clone(),
         locale: locale.clone(),
@@ -905,9 +938,33 @@ async fn run_cli() -> i32 {
         log_level: effective_log_level,
         server_mode,
         parameters,
+        cli_defaults,
     };
 
     let mut interp = ScriptInterpreter::new(run_cfg, logger);
+
+    if !url.is_empty() && !server_mode {
+        match resolve_site_arg(&url, &config_dir) {
+            Ok(mut spec) => {
+                if let Err(e) = apply_cli_defaults(&mut spec) {
+                    print_err(&e);
+                    interp.shutdown().await;
+                    return 1;
+                }
+                if interp.connect_initial_site(spec).await.is_err()
+                    && initial_batch_mode.aborts_script()
+                {
+                    interp.shutdown().await;
+                    return 1;
+                }
+            }
+            Err(e) => {
+                print_err(&e);
+                interp.shutdown().await;
+                return 1;
+            }
+        }
+    }
 
     let exit_code = if server_mode {
         interp.run_server_loop().await
@@ -943,28 +1000,6 @@ async fn run_cli() -> i32 {
         print_err(&format_usage(&locale));
         1
     } else {
-        if !url.is_empty() {
-            match resolve_site_arg(&url, &config_dir) {
-                Ok(mut spec) => {
-                    if let Err(e) = apply_cli_defaults(&mut spec) {
-                        print_err(&e);
-                        interp.shutdown().await;
-                        return 1;
-                    }
-                    if interp.connect_initial_site(spec).await.is_err()
-                        && initial_batch_mode.aborts_script()
-                    {
-                        interp.shutdown().await;
-                        return 1;
-                    }
-                }
-                Err(e) => {
-                    print_err(&e);
-                    interp.shutdown().await;
-                    return 1;
-                }
-            }
-        }
         interp.run_interactive_repl().await
     };
 

@@ -268,8 +268,8 @@ pub fn parse_site_url(url: &str) -> Result<ParsedSiteSpec, String> {
             (ProtocolScheme::Ftpes, 21u16)
         }
         "dav" | "http" => (ProtocolScheme::Dav, 80u16),
-        "webdav" => (ProtocolScheme::Webdav, 80u16),
-        "davs" | "https" => (ProtocolScheme::Davs, 443u16),
+        "webdav" | "https" => (ProtocolScheme::Webdav, 443u16),
+        "davs" => (ProtocolScheme::Davs, 443u16),
         "webdavs" => (ProtocolScheme::Webdavs, 443u16),
         "s3" => {
             raw_fields.insert("s3_protocol".to_string(), "1".to_string());
@@ -478,6 +478,62 @@ pub fn site_spec_from_stored(site: &StoredSite) -> Result<ParsedSiteSpec, String
     Ok(spec)
 }
 
+/// Converts an existing `StoredSite` into a baseline `ParsedSiteSpec` for `savesession`
+/// updates without failing on unreadable encrypted secrets (`sessions.key` missing),
+/// so unrelated `savesession` edits preserve opaque ciphertexts via `SessionStore::upsert`.
+pub fn site_spec_from_stored_for_resave(site: &StoredSite) -> ParsedSiteSpec {
+    let mut spec = ParsedSiteSpec {
+        session: site.to_session_config(),
+        raw_fields: site.extra_fields.clone(),
+        explicit_port: site.port != 0,
+        preset_name: site.preset.clone(),
+        session_label: site.name.clone(),
+        passphrase: None,
+        timeout_secs: 30,
+    };
+    if !site.proxy_method.is_empty() {
+        spec.raw_fields
+            .insert("proxy_method".to_string(), site.proxy_method.clone());
+    }
+    if !site.proxy_host.is_empty() {
+        spec.raw_fields
+            .insert("proxy_host".to_string(), site.proxy_host.clone());
+    }
+    if site.proxy_port != 0 {
+        spec.raw_fields
+            .insert("proxy_port".to_string(), site.proxy_port.to_string());
+    }
+    if !site.proxy_username.is_empty() {
+        spec.raw_fields
+            .insert("proxy_username".to_string(), site.proxy_username.clone());
+    }
+    if let Some(ref ppw) = site.proxy_password {
+        spec.raw_fields
+            .insert("proxy_password".to_string(), ppw.clone());
+    }
+    if !site.proxy_command.is_empty() {
+        spec.raw_fields
+            .insert("proxy_command".to_string(), site.proxy_command.clone());
+    }
+    if !site.proxy_exclude.is_empty() {
+        spec.raw_fields
+            .insert("proxy_exclude".to_string(), site.proxy_exclude.clone());
+    }
+    if !site.proxy_dns.is_empty() {
+        spec.raw_fields
+            .insert("proxy_dns".to_string(), site.proxy_dns.clone());
+    }
+    if site.proxy_localhost {
+        spec.raw_fields
+            .insert("proxy_localhost".to_string(), "1".to_string());
+    }
+    if let Some(ref tp) = site.tunnel_passphrase {
+        spec.raw_fields
+            .insert("tunnel_passphrase".to_string(), tp.clone());
+    }
+    spec
+}
+
 fn validate_stored_extra_fields(fields: &BTreeMap<String, String>) -> Result<(), String> {
     for (k, v) in fields {
         match k.as_str() {
@@ -486,22 +542,12 @@ fn validate_stored_extra_fields(fields: &BTreeMap<String, String>) -> Result<(),
                 if parse_zero_one(v).is_none() {
                     return Err(format!("Invalid stored setting '{k}' value '{v}'."));
                 }
-                if k == "auth_gssapi_kex" && parse_zero_one(v) == Some(true) {
-                    return Err(
-                        "AuthGSSAPIKEX=1 cannot be honored by this build; use userauth GSSAPI (AuthGSSAPI=1)."
-                            .to_string(),
-                    );
-                }
             }
-            "ftp_force_pasv_ip" | "ftp_use_mlsd" => {
-                if !matches!(v.trim(), "0" | "1" | "2") {
-                    return Err(format!("Invalid stored setting '{k}' value '{v}'."));
-                }
+            "ftp_force_pasv_ip" | "ftp_use_mlsd" if !matches!(v.trim(), "0" | "1" | "2") => {
+                return Err(format!("Invalid stored setting '{k}' value '{v}'."));
             }
-            "ftps" => {
-                if !matches!(v.trim(), "0" | "1" | "2" | "3") {
-                    return Err(format!("Invalid stored setting 'ftps' value '{v}'."));
-                }
+            "ftps" if !matches!(v.trim(), "0" | "1" | "2" | "3") => {
+                return Err(format!("Invalid stored setting 'ftps' value '{v}'."));
             }
             _ => {}
         }
@@ -562,10 +608,10 @@ pub fn apply_raw_settings(spec: &mut ParsedSiteSpec, pairs: &[String]) -> Result
         match key_lc.as_str() {
             "proxymethod" => {
                 let norm = match val.to_ascii_lowercase().as_str() {
-                    "none" | "0" => "none",
-                    "socks4" | "1" => "socks4",
-                    "socks5" | "socks" | "2" => "socks5",
-                    "http" | "3" => "http",
+                    "none" | "0" => "",
+                    "socks4" | "1" => "SOCKS4",
+                    "socks5" | "socks" | "2" => "SOCKS5",
+                    "http" | "3" => "HTTP",
                     "telnet" | "4" => {
                         if !is_ssh {
                             return Err(
@@ -573,7 +619,7 @@ pub fn apply_raw_settings(spec: &mut ParsedSiteSpec, pairs: &[String]) -> Result
                                     .to_string(),
                             );
                         }
-                        "telnet"
+                        "Telnet"
                     }
                     "cmd" | "local" | "command" | "5" => {
                         if !is_ssh {
@@ -582,18 +628,20 @@ pub fn apply_raw_settings(spec: &mut ParsedSiteSpec, pairs: &[String]) -> Result
                                     .to_string(),
                             );
                         }
-                        "cmd"
+                        "Local"
                     }
                     _ => {
                         return Err(format!(
-                            "Unknown ProxyMethod '{val}' (expected None, SOCKS4, SOCKS5, HTTP, Telnet or Cmd)."
+                            "Unknown proxy method '{val}' in ProxyMethod (expected None, SOCKS4, SOCKS5, HTTP, Telnet or Cmd)."
                         ));
                     }
                 };
-                spec.raw_fields
-                    .insert("proxy_method".to_string(), norm.to_string());
-                if norm == "none" {
+                if norm.is_empty() {
+                    spec.raw_fields.remove("proxy_method");
                     spec.raw_fields.remove("proxy_password");
+                } else {
+                    spec.raw_fields
+                        .insert("proxy_method".to_string(), norm.to_string());
                 }
             }
             "proxyhost" => {
@@ -605,7 +653,9 @@ pub fn apply_raw_settings(spec: &mut ParsedSiteSpec, pairs: &[String]) -> Result
                     .parse()
                     .ok()
                     .filter(|&p| p > 0)
-                    .ok_or_else(|| format!("Invalid ProxyPort '{val}' (expected 1..65535)."))?;
+                    .ok_or_else(|| {
+                        format!("Invalid proxy port '{val}' in ProxyPort (expected 1..65535).")
+                    })?;
                 spec.raw_fields
                     .insert("proxy_port".to_string(), p.to_string());
             }
@@ -652,6 +702,12 @@ pub fn apply_raw_settings(spec: &mut ParsedSiteSpec, pairs: &[String]) -> Result
                 tun.enabled = b;
             }
             "tunnelhostname" | "tunnelhost" => {
+                if val.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                    return Err(
+                        "TunnelHostName must be a nonempty host name without whitespace or control characters."
+                            .to_string(),
+                    );
+                }
                 let tun = spec.session.tunnel.get_or_insert_with(TunnelConfig::default);
                 tun.host = val.to_string();
                 tun.enabled = !val.is_empty() || tun.enabled;
@@ -719,14 +775,10 @@ pub fn apply_raw_settings(spec: &mut ParsedSiteSpec, pairs: &[String]) -> Result
                 }
                 let b = parse_zero_one(val)
                     .ok_or_else(|| format!("Invalid AuthGSSAPIKEX '{val}' (expected 0 or 1)."))?;
-                if b {
-                    return Err(
-                        "AuthGSSAPIKEX=1 cannot be honored by this build; use userauth GSSAPI (AuthGSSAPI=1)."
-                            .to_string(),
-                    );
-                }
-                spec.raw_fields
-                    .insert("auth_gssapi_kex".to_string(), "0".to_string());
+                spec.raw_fields.insert(
+                    "auth_gssapi_kex".to_string(),
+                    if b { "1" } else { "0" }.to_string(),
+                );
             }
             "gssapifwdtgt" => {
                 if !is_ssh {
@@ -748,7 +800,7 @@ pub fn apply_raw_settings(spec: &mut ParsedSiteSpec, pairs: &[String]) -> Result
                     ));
                 }
                 spec.raw_fields
-                    .insert("logical_hostname".to_string(), val.to_string());
+                    .insert("logical_host".to_string(), val.to_string());
             }
 
             // FTP settings
@@ -1065,9 +1117,51 @@ pub fn apply_raw_settings(spec: &mut ParsedSiteSpec, pairs: &[String]) -> Result
 
             _ => {
                 return Err(format!(
-                    "Unsupported raw session setting '{key_trimmed}'; refusing to ignore it."
+                    "Unsupported raw session setting '{key_trimmed}'; supported settings include ProxyMethod, ProxyHost, ProxyPort, Tunnel, Ftps, S3UrlStyle, and AuthGSSAPI."
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Validates cross-field session constraints (such as `ProxyMethod` requiring `ProxyHost`
+/// and `Tunnel=1` requiring `TunnelHostName`) before saving or opening a session.
+pub fn validate_session_settings(spec: &ParsedSiteSpec) -> Result<(), String> {
+    if let Some(pm) = spec
+        .raw_fields
+        .get("proxy_method")
+        .map(|s| s.trim().to_ascii_lowercase())
+    {
+        if !pm.is_empty() && pm != "none" && pm != "0" {
+            if matches!(pm.as_str(), "cmd" | "local" | "command" | "5") {
+                if spec
+                    .raw_fields
+                    .get("proxy_command")
+                    .is_none_or(|c| c.trim().is_empty())
+                {
+                    return Err("ProxyMethod=Cmd requires ProxyLocalCommand.".to_string());
+                }
+            } else if spec
+                .raw_fields
+                .get("proxy_host")
+                .is_none_or(|h| h.trim().is_empty())
+            {
+                return Err(
+                    "ProxyMethod requires a non-empty ProxyHost.".to_string(),
+                );
+            }
+        }
+    }
+    if let Some(ref tun) = spec.session.tunnel {
+        if tun.enabled
+            && (tun.host.trim().is_empty()
+                || tun.host.chars().any(|c| c.is_whitespace() || c.is_control()))
+        {
+            return Err(
+                "TunnelHostName must be a nonempty host name without whitespace or control characters."
+                    .to_string(),
+            );
         }
     }
     Ok(())
@@ -1464,6 +1558,11 @@ fn build_ssh_configs(
         .get("auth_gssapi")
         .and_then(|v| parse_zero_one(v))
         .unwrap_or(true);
+    let request_gssapi_kex = spec
+        .raw_fields
+        .get("auth_gssapi_kex")
+        .and_then(|v| parse_zero_one(v))
+        .unwrap_or(false);
     let gss_delegate = spec
         .raw_fields
         .get("gssapi_fwd_tgt")
@@ -1471,7 +1570,8 @@ fn build_ssh_configs(
         .unwrap_or(false);
     let service_host = spec
         .raw_fields
-        .get("logical_hostname")
+        .get("logical_host")
+        .or_else(|| spec.raw_fields.get("logical_hostname"))
         .cloned()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| spec.session.host.clone());
@@ -1525,7 +1625,7 @@ fn build_ssh_configs(
         keyboard_interactive: kbd.clone(),
         try_gssapi,
         request_gssapi: false,
-        request_gssapi_kex: false,
+        request_gssapi_kex,
         gssapi_provider,
         event_logger: event_logger.clone(),
         proxy: proxy.clone(),
@@ -1950,11 +2050,7 @@ fn make_ssh_host_key_callback(
                 return Ok(());
             }
             println!("{prefix} {} {}", obs.key_type, obs.sha256_fingerprint);
-            if let Some(ref c) = cached_fp {
-                if c != &obs.sha256_fingerprint {
-                    println!("HOSTKEYSTATE {role} changed");
-                }
-            }
+            println!("HOSTKEYSTATE {role} changed");
             let _ = std::io::stdout().flush();
             return Err(ProtoError::Transport(format!(
                 "Host key does not match configured key '{pin}'! Server offered {} {}.",

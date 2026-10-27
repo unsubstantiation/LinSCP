@@ -213,8 +213,9 @@ impl StoredSite {
     pub fn needs_encryption_key(&self) -> bool {
         self.password.as_deref().is_some_and(|s| !s.is_empty())
             || self.proxy_password.as_deref().is_some_and(|s| !s.is_empty())
-            || self.tunnel.password.as_deref().is_some_and(|s| !s.is_empty())
-            || self.tunnel_passphrase.as_deref().is_some_and(|s| !s.is_empty())
+            || (self.tunnel.enabled
+                && (self.tunnel.password.as_deref().is_some_and(|s| !s.is_empty())
+                    || self.tunnel_passphrase.as_deref().is_some_and(|s| !s.is_empty())))
     }
 }
 
@@ -610,53 +611,53 @@ impl SessionStore {
 
             if site.tunnel.enabled {
                 out.push_str("tunnel=1\n");
-            }
-            if !site.tunnel.host.is_empty() {
-                out.push_str(&format!(
-                    "tunnel_host={}\n",
-                    escape_ini_value(&site.tunnel.host)
-                ));
-            }
-            if site.tunnel.port != 0 {
-                out.push_str(&format!("tunnel_port={}\n", site.tunnel.port));
-            }
-            if !site.tunnel.username.is_empty() {
-                out.push_str(&format!(
-                    "tunnel_username={}\n",
-                    escape_ini_value(&site.tunnel.username)
-                ));
-            }
-            if let Some(enc_tpw) = encode_secret_field(
-                site.tunnel.password.as_deref(),
-                site.tunnel_password_raw.as_deref(),
-                master_key,
-            )? {
-                out.push_str(&format!(
-                    "tunnel_password={}\n",
-                    escape_ini_value(&enc_tpw)
-                ));
-            }
-            if let Some(tpk) = site.tunnel.keyfile.as_deref().filter(|s| !s.is_empty()) {
-                out.push_str(&format!("tunnel_private_key={}\n", escape_ini_value(tpk)));
-            }
-            if let Some(enc_tpass) = encode_secret_field(
-                site.tunnel_passphrase.as_deref(),
-                site.tunnel_passphrase_raw.as_deref(),
-                master_key,
-            )? {
-                out.push_str(&format!(
-                    "tunnel_passphrase={}\n",
-                    escape_ini_value(&enc_tpass)
-                ));
-            }
-            if !site.tunnel.hostkey.is_empty() {
-                out.push_str(&format!(
-                    "tunnel_hostkey={}\n",
-                    escape_ini_value(&site.tunnel.hostkey)
-                ));
-            }
-            if site.tunnel.local_port != 0 {
-                out.push_str(&format!("tunnel_local_port={}\n", site.tunnel.local_port));
+                if !site.tunnel.host.is_empty() {
+                    out.push_str(&format!(
+                        "tunnel_host={}\n",
+                        escape_ini_value(&site.tunnel.host)
+                    ));
+                }
+                if site.tunnel.port != 0 {
+                    out.push_str(&format!("tunnel_port={}\n", site.tunnel.port));
+                }
+                if !site.tunnel.username.is_empty() {
+                    out.push_str(&format!(
+                        "tunnel_username={}\n",
+                        escape_ini_value(&site.tunnel.username)
+                    ));
+                }
+                if let Some(enc_tpw) = encode_secret_field(
+                    site.tunnel.password.as_deref(),
+                    site.tunnel_password_raw.as_deref(),
+                    master_key,
+                )? {
+                    out.push_str(&format!(
+                        "tunnel_password={}\n",
+                        escape_ini_value(&enc_tpw)
+                    ));
+                }
+                if let Some(tpk) = site.tunnel.keyfile.as_deref().filter(|s| !s.is_empty()) {
+                    out.push_str(&format!("tunnel_private_key={}\n", escape_ini_value(tpk)));
+                }
+                if let Some(enc_tpass) = encode_secret_field(
+                    site.tunnel_passphrase.as_deref(),
+                    site.tunnel_passphrase_raw.as_deref(),
+                    master_key,
+                )? {
+                    out.push_str(&format!(
+                        "tunnel_passphrase={}\n",
+                        escape_ini_value(&enc_tpass)
+                    ));
+                }
+                if !site.tunnel.hostkey.is_empty() {
+                    out.push_str(&format!(
+                        "tunnel_hostkey={}\n",
+                        escape_ini_value(&site.tunnel.hostkey)
+                    ));
+                }
+                if site.tunnel.local_port != 0 {
+                    out.push_str(&format!("tunnel_local_port={}\n", site.tunnel.local_port));
+                }
             }
 
             for (extra_k, extra_v) in &site.extra_fields {

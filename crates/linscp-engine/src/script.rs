@@ -14,7 +14,7 @@ use linscp_platform::terminal::{
 };
 use linscp_proto::RemoteSession;
 use linscp_proto::ssh::{ChannelMsg, SshConnection, extract_openssh_public_key_line};
-use linscp_proto::webdav::DavEtagPrecondition;
+use linscp_proto::webdav::{DavEtagPrecondition, dav_entity_tag};
 use linscp_types::{FileEntry, ProtocolScheme, TransferMode};
 
 use crate::editor::{EditOptions, edit_remote_file};
@@ -41,7 +41,8 @@ use crate::transfer::{
 use crate::url_and_raw::{
     DefaultOsVault, ParsedSiteSpec, apply_env_credential_fallbacks, apply_raw_settings,
     connect_site_spec, connect_ssh_for_shell, is_ssh_scheme, is_webdav_scheme, parse_site_url,
-    site_spec_from_stored, stored_site_from_spec,
+    site_spec_from_stored, site_spec_from_stored_for_resave, stored_site_from_spec,
+    validate_session_settings,
 };
 use crate::xml_log::SessionLogger;
 
@@ -338,6 +339,22 @@ struct ConnectedSlot {
     remote_cwd: String,
 }
 
+/// Session defaults passed on the top-level CLI (`-hostkey=`, `-privatekey=`,
+/// `-timeout=`, `-rawsettings`, etc.) that apply to every `open` in `-script` /
+/// `-command` / `-server` unless overridden by `open`'s own arguments.
+#[derive(Debug, Clone, Default)]
+pub struct CliSessionDefaults {
+    pub hostkey: Option<String>,
+    pub password: Option<String>,
+    pub privatekey: Option<String>,
+    pub passphrase: Option<String>,
+    pub username: Option<String>,
+    pub port: Option<u16>,
+    pub timeout_secs: Option<u64>,
+    pub clientcert: Option<String>,
+    pub raw_pairs: Vec<String>,
+}
+
 pub struct ScriptRunConfig {
     pub config_dir: PathBuf,
     pub locale: String,
@@ -347,6 +364,7 @@ pub struct ScriptRunConfig {
     pub log_level: i32,
     pub server_mode: bool,
     pub parameters: Vec<String>,
+    pub cli_defaults: CliSessionDefaults,
 }
 
 impl Default for ScriptRunConfig {
@@ -360,6 +378,7 @@ impl Default for ScriptRunConfig {
             log_level: 0,
             server_mode: false,
             parameters: Vec::new(),
+            cli_defaults: CliSessionDefaults::default(),
         }
     }
 }
@@ -469,6 +488,53 @@ impl ScriptInterpreter {
             && stdin_is_terminal()
     }
 
+    fn apply_cli_defaults(&self, spec: &mut ParsedSiteSpec) -> Result<(), String> {
+        let d = &self.cfg.cli_defaults;
+        if let Some(ref hk) = d.hostkey.as_ref().filter(|s| !s.is_empty()) {
+            if spec.session.hostkey.is_empty() {
+                spec.session.hostkey = (*hk).clone();
+            }
+        }
+        if let Some(ref pw) = d.password {
+            if spec.session.password.is_none() {
+                spec.session.password = Some(pw.clone());
+            }
+        }
+        if let Some(ref pk) = d.privatekey {
+            if spec.session.keyfile.is_none() {
+                spec.session.keyfile = Some(expand_tilde(pk));
+            }
+        }
+        if let Some(ref pp) = d.passphrase {
+            if spec.passphrase.is_none() {
+                spec.passphrase = Some(pp.clone());
+            }
+        }
+        if let Some(ref u) = d.username {
+            if spec.session.username.is_empty() {
+                spec.session.username = u.clone();
+            }
+        }
+        if let Some(p) = d.port {
+            if !spec.explicit_port {
+                spec.session.port = p;
+                spec.explicit_port = true;
+            }
+        }
+        if let Some(t) = d.timeout_secs {
+            spec.timeout_secs = t;
+        }
+        if let Some(ref cc) = d.clientcert {
+            spec.raw_fields
+                .entry("tls_certificate_file".to_string())
+                .or_insert_with(|| expand_tilde(cc));
+        }
+        if !d.raw_pairs.is_empty() {
+            apply_raw_settings(spec, &d.raw_pairs)?;
+        }
+        Ok(())
+    }
+
     pub async fn connect_initial_site(&mut self, mut spec: ParsedSiteSpec) -> Result<(), String> {
         apply_env_credential_fallbacks(&mut spec);
         let log_res = self.open_slot_from_spec(spec).await;
@@ -499,7 +565,13 @@ impl ScriptInterpreter {
             self.cfg.log_level,
             None,
         )
-        .await?;
+        .await
+        .map_err(|err| {
+            self.trp(
+                "Cannot open session to {host}: {reason}",
+                &[("host", &spec.session.host), ("reason", &err)],
+            )
+        })?;
 
         let remote_cwd = if !spec.session.initial_dir.is_empty() {
             let want = resolve_remote_path("/", &spec.session.initial_dir);
@@ -1375,7 +1447,9 @@ impl ScriptInterpreter {
                 ));
             };
             let mut spec = site_spec_from_stored(&site)?;
+            self.apply_cli_defaults(&mut spec)?;
             apply_env_credential_fallbacks(&mut spec);
+            validate_session_settings(&spec)?;
             return self.open_slot_from_spec(spec).await;
         }
 
@@ -1384,36 +1458,192 @@ impl ScriptInterpreter {
 
     fn cmd_savesession(&mut self, args: &[String]) -> Result<(), String> {
         if args.is_empty() {
-            return Err("Syntax: savesession <name> [ <site-url> ] [ options ]".to_string());
+            return Err(self.wrong_args(
+                "savesession",
+                "Syntax: savesession <name> [ <site-url> ] [ options ]",
+            ));
         }
         let name = args[0].trim();
-        if name.is_empty() || name.starts_with('/') || name.ends_with('/') || name.contains("//") {
-            return Err(format!("Invalid session name '{name}'."));
+        if name.is_empty()
+            || name.starts_with('/')
+            || name.ends_with('/')
+            || name.contains("//")
+            || name.chars().any(|c| c.is_control())
+        {
+            let h = self.trp("The session name '{name}' is not valid.", &[("name", name)]);
+            return Err(self.wrong_args("savesession", &h));
         }
 
         let vault = DefaultOsVault;
         let mut store = SessionStore::load_from_dir(&self.cfg.config_dir, &vault)?;
 
+        let connected = !self.slots.is_empty();
         let mut rest_idx = 1usize;
+        let mut url_had_password = false;
         let mut spec = if args.get(1).is_some_and(|a| !a.starts_with('-')) {
             rest_idx = 2;
-            parse_site_url(&args[1])?
+            let parsed =
+                parse_site_url(&args[1]).map_err(|e| self.wrong_args("savesession", &e))?;
+            url_had_password = parsed.session.password.is_some();
+            parsed
+        } else if connected {
+            self.slots[self.active_slot].spec.clone()
         } else if let Some(existing) = store.find(name) {
-            if let Ok(slot) = self.active_slot() {
-                slot.spec.clone()
-            } else {
-                ParsedSiteSpec {
-                    session: existing.to_session_config(),
-                    raw_fields: existing.extra_fields.clone(),
-                    preset_name: existing.preset.clone(),
-                    ..ParsedSiteSpec::default()
-                }
-            }
+            site_spec_from_stored_for_resave(existing)
         } else {
-            self.active_slot()?.spec.clone()
+            let mut blank = ParsedSiteSpec::default();
+            blank.session.host.clear();
+            blank.session.initial_dir.clear();
+            blank
         };
 
-        apply_open_switches(&mut spec, &args[rest_idx..], true, &self.cfg.locale)?;
+        let mut save_password = url_had_password;
+        let mut explicit_password: Option<String> = None;
+        let mut port_given = false;
+        let mut protocol_given = false;
+        let mut switch_tokens: Vec<String> = Vec::new();
+        let tail = &args[rest_idx..];
+        let mut i = 0usize;
+        while i < tail.len() {
+            let a = &tail[i];
+            let norm = normalize_switch_prefix(a);
+            let low = norm.to_ascii_lowercase();
+            if low == "-rawsettings" || low.starts_with("-rawsettings=") {
+                let explicit_count = if let Some(cs) = low.strip_prefix("-rawsettings=") {
+                    let cnt: usize = cs.parse().ok().filter(|&c| c > 0).ok_or_else(|| {
+                        self.wrong_args(
+                            "savesession",
+                            &format!("Invalid '{a}' count (expected positive integer)."),
+                        )
+                    })?;
+                    Some(cnt)
+                } else {
+                    None
+                };
+                let mut pairs = Vec::new();
+                while i + 1 < tail.len() && explicit_count.is_none_or(|c| pairs.len() < c) {
+                    let next_s = &tail[i + 1];
+                    if next_s.is_empty() || next_s.starts_with('-') || !next_s.contains('=') {
+                        break;
+                    }
+                    pairs.push(next_s.clone());
+                    i += 1;
+                }
+                if pairs.is_empty() || explicit_count.is_some_and(|c| pairs.len() != c) {
+                    return Err(self.wrong_args(
+                        "savesession",
+                        &format!("'{a}' requires matching NAME=VALUE arguments."),
+                    ));
+                }
+                apply_raw_settings(&mut spec, &pairs)
+                    .map_err(|e| self.wrong_args("savesession", &e))?;
+            } else if low.starts_with("-host=") {
+                spec.session.host = norm["-host=".len()..].to_string();
+            } else if low.starts_with("-port=") {
+                let val = &norm["-port=".len()..];
+                let p: u16 = val.parse().ok().filter(|&p| p >= 1).ok_or_else(|| {
+                    let h = self.trp(
+                        "Invalid port number '{value}' (expected 1 through 65535).",
+                        &[("value", val)],
+                    );
+                    self.wrong_args("savesession", &h)
+                })?;
+                spec.session.port = p;
+                spec.explicit_port = true;
+                port_given = true;
+            } else if low.starts_with("-username=") {
+                spec.session.username = norm["-username=".len()..].to_string();
+            } else if low.starts_with("-protocol=") {
+                let val = norm["-protocol=".len()..].trim().to_ascii_lowercase();
+                let proto = match val.as_str() {
+                    "sftp" | "ssh" => ProtocolScheme::Sftp,
+                    "scp" => ProtocolScheme::Scp,
+                    "ftp" => ProtocolScheme::Ftp,
+                    "ftps" => {
+                        spec.raw_fields.insert("ftps".to_string(), "1".to_string());
+                        ProtocolScheme::Ftps
+                    }
+                    "ftpes" => {
+                        spec.raw_fields.insert("ftps".to_string(), "3".to_string());
+                        ProtocolScheme::Ftpes
+                    }
+                    "dav" | "http" => ProtocolScheme::Dav,
+                    "webdav" | "https" => ProtocolScheme::Webdav,
+                    "davs" => ProtocolScheme::Davs,
+                    "webdavs" => ProtocolScheme::Webdavs,
+                    "s3" => {
+                        spec.raw_fields
+                            .insert("s3_protocol".to_string(), "1".to_string());
+                        ProtocolScheme::S3
+                    }
+                    _ => {
+                        let h = self.trp(
+                            "Unsupported protocol '{protocol}'.",
+                            &[("protocol", &val)],
+                        );
+                        return Err(self.wrong_args("savesession", &h));
+                    }
+                };
+                spec.session.protocol = proto;
+                protocol_given = true;
+            } else if low.starts_with("-remotedir=") {
+                spec.session.initial_dir = norm["-remotedir=".len()..].to_string();
+            } else if low.starts_with("-localdir=") {
+                spec.session.local_dir = expand_tilde(&norm["-localdir=".len()..]);
+            } else if low == "-password" {
+                save_password = true;
+            } else if low.starts_with("-password=") {
+                save_password = true;
+                explicit_password = Some(norm["-password=".len()..].to_string());
+            } else {
+                switch_tokens.push(a.clone());
+            }
+            i += 1;
+        }
+
+        if !switch_tokens.is_empty() {
+            apply_open_switches(&mut spec, &switch_tokens, true, &self.cfg.locale)
+                .map_err(|e| self.wrong_args("savesession", &e))?;
+        }
+
+        if spec.session.host.trim().is_empty() {
+            return Err(self.wrong_args(
+                "savesession",
+                "Savesession requires a host name (connect first, pass a site URL, or pass -host=HOST).",
+            ));
+        }
+
+        if !port_given && ((!connected && !spec.explicit_port) || protocol_given) {
+            let default_p = if matches!(
+                spec.session.protocol,
+                ProtocolScheme::Ftp | ProtocolScheme::Ftps
+            ) && spec.raw_fields.get("ftps").map(String::as_str) == Some("1")
+            {
+                990
+            } else {
+                spec.session.protocol.default_port()
+            };
+            spec.session.port = default_p;
+        }
+
+        if save_password {
+            let pw = explicit_password
+                .or_else(|| spec.session.password.clone())
+                .or_else(|| self.cfg.cli_defaults.password.clone())
+                .or_else(|| std::env::var("LINSCP_PASSWORD").ok().filter(|s| !s.is_empty()));
+            let Some(secret) = pw.filter(|s| !s.is_empty()) else {
+                return Err(self.wrong_args(
+                    "savesession",
+                    self.tr("The password of this connection is not known (it was typed or taken from a key or an agent), so it cannot be stored."),
+                ));
+            };
+            spec.session.password = Some(secret);
+        } else if !url_had_password {
+            spec.session.password = None;
+        }
+
+        validate_session_settings(&spec).map_err(|e| self.wrong_args("savesession", &e))?;
+
         let site = stored_site_from_spec(name, &spec);
         store.upsert(site);
         store.save_to_dir(&self.cfg.config_dir, &vault)?;
@@ -1484,16 +1714,33 @@ impl ScriptInterpreter {
     async fn cmd_open(&mut self, args: &[String]) -> Result<(), String> {
         let mut positional = Vec::new();
         let mut switch_tokens = Vec::new();
-        let mut in_raw = false;
+        let mut raw_remaining: Option<usize> = None;
+        let mut in_unbounded_raw = false;
         for tok in args {
-            if in_raw {
+            if let Some(rem) = raw_remaining {
+                if rem > 0 {
+                    switch_tokens.push(tok.clone());
+                    raw_remaining = Some(rem - 1);
+                    continue;
+                }
+                raw_remaining = None;
+            }
+            if in_unbounded_raw {
                 switch_tokens.push(tok.clone());
                 continue;
             }
-            if tok.eq_ignore_ascii_case("-rawsettings") || tok.eq_ignore_ascii_case("/rawsettings")
-            {
-                in_raw = true;
+            let norm = normalize_switch_prefix(tok);
+            let low = norm.to_ascii_lowercase();
+            if low == "-rawsettings" {
+                in_unbounded_raw = true;
                 switch_tokens.push(tok.clone());
+            } else if let Some(cs) = low.strip_prefix("-rawsettings=") {
+                switch_tokens.push(tok.clone());
+                if let Ok(cnt) = cs.parse::<usize>() {
+                    raw_remaining = Some(cnt);
+                } else {
+                    in_unbounded_raw = true;
+                }
             } else if tok.starts_with('-') || is_slash_switch(tok) {
                 switch_tokens.push(tok.clone());
             } else {
@@ -1510,7 +1757,6 @@ impl ScriptInterpreter {
         let mut spec = if target.contains("://") {
             parse_site_url(target)?
         } else {
-            // Validate switches first even if stored session lookup fails, so `open sftp://host -nonsense` or unknown switches report cleanly
             let mut probe = ParsedSiteSpec::default();
             apply_open_switches(&mut probe, &switch_tokens, false, &self.cfg.locale)?;
             let vault = DefaultOsVault;
@@ -1522,8 +1768,10 @@ impl ScriptInterpreter {
             };
             site_spec_from_stored(site)?
         };
+        self.apply_cli_defaults(&mut spec)?;
         apply_open_switches(&mut spec, &switch_tokens, false, &self.cfg.locale)?;
         apply_env_credential_fallbacks(&mut spec);
+        validate_session_settings(&spec)?;
         self.open_slot_from_spec(spec).await?;
         let label = self.slots[self.active_slot].spec.session_label.clone();
         self.emit_status(&self.trp("Session '{host}' opened.", &[("host", &label)]));
@@ -1646,6 +1894,8 @@ impl ScriptInterpreter {
             (cwd, None)
         };
 
+        self.emit_status(&self.trp("Reading directory {path}...", &[("path", &dir_path)]));
+
         let raw_entries = match self.slots[self.active_slot]
             .session
             .list_dir(&dir_path)
@@ -1659,10 +1909,11 @@ impl ScriptInterpreter {
             }
         };
 
+        let _ = show_all;
         let mut filtered: Vec<FileEntry> = raw_entries
             .into_iter()
             .filter(|e| {
-                if !show_all && e.name.starts_with('.') {
+                if e.name == "." || e.name == ".." {
                     return false;
                 }
                 if let Some(ref m) = mask_opt {
@@ -1689,6 +1940,22 @@ impl ScriptInterpreter {
             }
         }
         self.logger.record_ls(&dir_path, Some(&filtered), Ok(()));
+        if let Some(ref m) = mask_opt {
+            if filtered.is_empty() {
+                let msg = format!("No files found matching '{m}'.");
+                if self.fail_on_nomatch {
+                    return Err(msg);
+                }
+                println!("{msg}");
+            }
+        }
+        let count_str = filtered.len().to_string();
+        let summary_key = if filtered.len() == 1 {
+            "{count} entry"
+        } else {
+            "{count} entries"
+        };
+        self.emit_status(&self.trp(summary_key, &[("count", &count_str)]));
         Ok(())
     }
 
@@ -2051,9 +2318,14 @@ impl ScriptInterpreter {
             }
         }
         if positional.len() < 2 {
-            return Err("Syntax: chmod <mode> <file>... [-recursive]".to_string());
+            return Err(self.wrong_args(
+                "chmod",
+                "Syntax: chmod <mode> <file>... [-recursive]",
+            ));
         }
         let mode_expr = &positional[0];
+        parse_permissions_expr(mode_expr, 0o644, false)
+            .map_err(|e| self.wrong_args("chmod", &e))?;
         let cwd = self.active_slot()?.remote_cwd.clone();
         let mut changed = 0usize;
 
@@ -2291,8 +2563,14 @@ impl ScriptInterpreter {
     }
 
     fn base_transfer_flags(&self, sample_filename: Option<&str>) -> Result<TransferFlags, String> {
+        let resume_forced = matches!(self.resume_support, ResumeSupportMode::On);
         let mut flags = TransferFlags {
-            transfer_mode: self.transfer_mode,
+            transfer_mode: if resume_forced {
+                TransferMode::Binary
+            } else {
+                self.transfer_mode
+            },
+            resume: resume_forced,
             resume_support: self.resume_support,
             ..TransferFlags::default()
         };
@@ -2587,7 +2865,11 @@ impl ScriptInterpreter {
         args: &[String],
         is_upload: bool,
     ) -> Result<(TransferFlags, Vec<String>), String> {
-        let mut flags = self.base_transfer_flags(None)?;
+        let mut flags = self
+            .base_transfer_flags(None)
+            .map_err(|e| self.wrong_args(cmd_name, &e))?;
+        let mut resume_forced = flags.resume;
+        let mut explicit_resume = false;
         let mut paths = Vec::new();
         let mut i = 0usize;
         while i < args.len() {
@@ -2605,7 +2887,11 @@ impl ScriptInterpreter {
             let low = norm.to_ascii_lowercase();
             match low.as_str() {
                 "-delete" => flags.delete_source = true,
-                "-resume" => flags.resume = true,
+                "-resume" => {
+                    flags.resume = true;
+                    resume_forced = true;
+                    explicit_resume = true;
+                }
                 "-append" => flags.append = true,
                 "-neweronly" => flags.newer_only = true,
                 "-noneweronly" => flags.newer_only = false,
@@ -2636,51 +2922,90 @@ impl ScriptInterpreter {
                     } else if v.eq_ignore_ascii_case("fromfile") {
                         flags.permissions = PresetPermissions::FromFile;
                     } else {
-                        let mode = parse_permissions_expr(v, 0o644, false)?;
+                        let mode = parse_permissions_expr(v, 0o644, false)
+                            .map_err(|e| self.wrong_args(cmd_name, &e))?;
                         flags.permissions = PresetPermissions::Mode(mode);
                     }
                 }
                 _ if low.starts_with("-transfer=") => {
                     let v = &norm["-transfer=".len()..];
                     flags.transfer_mode = parse_transfer_mode(v).ok_or_else(|| {
-                        format!(
-                            "Invalid '-transfer' mode '{v}' (expected binary, ascii or automatic)."
+                        self.wrong_args(
+                            cmd_name,
+                            &format!(
+                                "Invalid '-transfer' mode '{v}' (expected binary, ascii or automatic)."
+                            ),
                         )
                     })?;
                 }
                 _ if low.starts_with("-eol=") => {
                     let v = &norm["-eol=".len()..];
                     flags.eol_override = Some(EolStyle::parse(v).ok_or_else(|| {
-                        format!("Invalid '-eol' style '{v}' (expected lf, crlf or cr).")
+                        self.wrong_args(
+                            cmd_name,
+                            &format!("Invalid '-eol' style '{v}' (expected lf, crlf or cr)."),
+                        )
                     })?);
                 }
                 _ if low.starts_with("-speed=") => {
                     let v = &norm["-speed=".len()..];
-                    let kb: u64 = v
-                        .parse()
-                        .map_err(|_| format!("Invalid '-speed' value '{v}' (expected KB/s)."))?;
+                    let kb: u64 = v.parse().map_err(|_| {
+                        self.wrong_args(
+                            cmd_name,
+                            &format!("Invalid '-speed' value '{v}' (expected KB/s)."),
+                        )
+                    })?;
                     flags.speed_kbytes_per_sec = if kb == 0 { None } else { Some(kb) };
                 }
                 _ if low.starts_with("-resumesupport=") => {
                     let v = &norm["-resumesupport=".len()..];
                     match v.to_ascii_lowercase().as_str() {
-                        "on" => flags.resume_support = ResumeSupportMode::On,
-                        "off" => flags.resume_support = ResumeSupportMode::Off,
-                        "default" => flags.resume_support = ResumeSupportMode::Smart(100 * 1024),
+                        "on" => {
+                            flags.resume_support = ResumeSupportMode::On;
+                            resume_forced = true;
+                        }
+                        "off" => {
+                            flags.resume_support = ResumeSupportMode::Off;
+                            if !explicit_resume {
+                                resume_forced = false;
+                                flags.resume = false;
+                            }
+                        }
+                        "default" => {
+                            flags.resume_support = ResumeSupportMode::Smart(100 * 1024);
+                            if !explicit_resume {
+                                resume_forced = false;
+                                flags.resume = false;
+                            }
+                        }
                         _ => {
                             let kb: u64 = v.parse().map_err(|_| {
-                                format!(
-                                    "Invalid '-resumesupport' value '{v}' (expected on, off, default or KB)."
+                                self.wrong_args(
+                                    cmd_name,
+                                    &format!(
+                                        "Invalid '-resumesupport' value '{v}' (expected on, off, default or KB)."
+                                    ),
                                 )
                             })?;
                             flags.resume_support =
                                 ResumeSupportMode::Smart(kb.saturating_mul(1024));
+                            if !explicit_resume {
+                                resume_forced = false;
+                                flags.resume = false;
+                            }
                         }
                     }
                 }
                 _ if low.starts_with("-filemask=") => {
                     let v = &norm["-filemask=".len()..];
-                    flags.file_mask = FileMask::parse(v)?;
+                    if v.trim().is_empty() {
+                        return Err(self.wrong_args(
+                            cmd_name,
+                            "The value of '-filemask' cannot be empty.",
+                        ));
+                    }
+                    flags.file_mask =
+                        FileMask::parse(v).map_err(|e| self.wrong_args(cmd_name, &e))?;
                 }
                 _ if low.starts_with("-versionid=") => {
                     if is_upload {
@@ -2751,6 +3076,18 @@ impl ScriptInterpreter {
                 }
             }
             i += 1;
+        }
+        if flags.append && explicit_resume {
+            return Err(self.wrong_args(
+                cmd_name,
+                self.tr("'-append' and '-resume' cannot be used together: one continues at the end of the destination, the other at a shared offset in it."),
+            ));
+        }
+        if resume_forced && flags.transfer_mode != TransferMode::Binary {
+            return Err(self.wrong_args(
+                cmd_name,
+                self.tr("Resuming a transfer is binary only: an ASCII transfer converts line endings, so byte offsets do not survive."),
+            ));
         }
         if flags.version_id.is_some() {
             if flags.delete_source || flags.append {
@@ -3056,8 +3393,8 @@ impl ScriptInterpreter {
                 opts.allow_binary = true;
             } else if low.starts_with("-editor=") {
                 opts.editor = a["-editor=".len()..].to_string();
-            } else if low.starts_with("-eol=") {
-                let e = low["-eol=".len()..].to_string();
+            } else if let Some(rest) = low.strip_prefix("-eol=") {
+                let e = rest.to_string();
                 if !matches!(e.as_str(), "preserve" | "lf" | "crlf") {
                     return Err("The value of '-eol' must be preserve, lf or crlf.".to_string());
                 }
@@ -3122,15 +3459,15 @@ impl ScriptInterpreter {
             } else if low.starts_with("-match=") {
                 let v = &a["-match=".len()..];
                 if v.is_empty() {
-                    return Err("'-match=' requires a non-empty ETag.".to_string());
+                    return Err(self.wrong_args("etag", "'-match=' requires a non-empty ETag."));
                 }
-                match_etag = Some(v.to_string());
+                match_etag = Some(dav_entity_tag(v));
             } else if low.starts_with("-nomatch=") {
                 let v = &a["-nomatch=".len()..];
                 if v.is_empty() {
-                    return Err("'-nomatch=' requires a non-empty ETag.".to_string());
+                    return Err(self.wrong_args("etag", "'-nomatch=' requires a non-empty ETag."));
                 }
-                nomatch_etag = Some(v.to_string());
+                nomatch_etag = Some(dav_entity_tag(v));
             } else if a.starts_with('-') {
                 let h = self.trp("Unknown switch '{switch}'.", &[("switch", a)]);
                 return Err(self.wrong_args("etag", &h));
@@ -3139,11 +3476,24 @@ impl ScriptInterpreter {
             }
         }
 
+        if paths.len() != 1 {
+            return Err(self.wrong_args(
+                "etag",
+                self.tr("Syntax: etag <file> -match=ETAG | -nomatch=ETAG | -get | -clear"),
+            ));
+        }
+        if match_etag.as_deref() == Some("*") || nomatch_etag.as_deref() == Some("*") {
+            return Err(self.wrong_args(
+                "etag",
+                self.tr("'*' is not an entity tag. Give the tag 'etag <file> -get' prints, which a path that is not there answers with."),
+            ));
+        }
+
         let mode_count = usize::from(get_given)
             + usize::from(clear_given)
             + usize::from(match_etag.is_some())
             + usize::from(nomatch_etag.is_some());
-        if paths.len() != 1 || mode_count != 1 {
+        if mode_count != 1 {
             return Err(self.wrong_args(
                 "etag",
                 self.tr("Give exactly one of -match=ETAG, -nomatch=ETAG, -get or -clear."),
@@ -3719,7 +4069,21 @@ pub fn apply_open_switches(
         let norm = normalize_switch_prefix(raw);
         let low = norm.to_ascii_lowercase();
 
-        if low == "-rawsettings" {
+        if low == "-rawsettings" || low.starts_with("-rawsettings=") {
+            if let Some(cs) = low.strip_prefix("-rawsettings=") {
+                let cnt: usize = cs.parse().ok().filter(|&c| c > 0).ok_or_else(|| {
+                    format!("'{raw}' requires a positive setting count.")
+                })?;
+                if i + cnt >= switches.len() {
+                    return Err(format!(
+                        "'{raw}' requires {cnt} NAME=VALUE setting(s), but fewer were given."
+                    ));
+                }
+                let raw_pairs: Vec<String> = switches[i + 1..=i + cnt].to_vec();
+                apply_raw_settings(spec, &raw_pairs)?;
+                i += cnt + 1;
+                continue;
+            }
             let raw_pairs: Vec<String> = switches[i + 1..].to_vec();
             if raw_pairs.is_empty() {
                 return Err("'-rawsettings' requires at least one NAME=VALUE setting.".to_string());

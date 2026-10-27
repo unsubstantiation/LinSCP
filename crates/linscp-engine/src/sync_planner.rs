@@ -567,11 +567,7 @@ pub async fn plan_synchronization(
                             opts.mirror,
                         )
                         .await?;
-                        if let Some(reason) = diff {
-                            Some((SyncAction::Download, reason))
-                        } else {
-                            None
-                        }
+                        diff.map(|reason| (SyncAction::Download, reason))
                     }
                     SyncMode::Remote => {
                         let diff = one_way_differs_upload(
@@ -584,11 +580,7 @@ pub async fn plan_synchronization(
                             opts.mirror,
                         )
                         .await?;
-                        if let Some(reason) = diff {
-                            Some((SyncAction::Upload, reason))
-                        } else {
-                            None
-                        }
+                        diff.map(|reason| (SyncAction::Upload, reason))
                     }
                     SyncMode::Both => decide_both_existing(l, r, state.lookup(&rel), opts),
                 };

@@ -322,6 +322,7 @@ pub struct SshConnection {
     handle: tokio::sync::Mutex<Handle<SshClientHandler>>,
     observed_key_type: String,
     observed_fingerprint: String,
+    timeout: Duration,
 }
 
 impl SshConnection {
@@ -417,6 +418,7 @@ impl SshConnection {
             handle: tokio::sync::Mutex::new(handle),
             observed_key_type,
             observed_fingerprint,
+            timeout: cfg.connect_timeout.max(Duration::from_secs(1)),
         })
     }
 
@@ -644,18 +646,18 @@ impl SshConnection {
     /// Opens a fresh SSH session channel.
     pub async fn open_session_channel(&self) -> Result<Channel<client::Msg>, ProtoError> {
         let guard = self.handle.lock().await;
-        guard
-            .channel_open_session()
+        tokio::time::timeout(self.timeout, guard.channel_open_session())
             .await
+            .map_err(|_| ProtoError::Transport("Timed out opening SSH session channel.".to_string()))?
             .map_err(|e| ProtoError::Transport(format!("Failed to open SSH session channel: {e}")))
     }
 
     /// Opens an SFTP subsystem channel and returns its bidirectional byte stream.
     pub async fn open_sftp_stream(&self) -> Result<ChannelStream<client::Msg>, ProtoError> {
         let channel = self.open_session_channel().await?;
-        channel
-            .request_subsystem(true, "sftp")
+        tokio::time::timeout(self.timeout, channel.request_subsystem(true, "sftp"))
             .await
+            .map_err(|_| ProtoError::Transport("Timed out starting SFTP subsystem.".to_string()))?
             .map_err(|e| ProtoError::Transport(format!("Failed to start SFTP subsystem: {e}")))?;
         Ok(channel.into_stream())
     }
@@ -668,14 +670,21 @@ impl SshConnection {
         dest_port: u16,
     ) -> Result<ChannelStream<client::Msg>, ProtoError> {
         let guard = self.handle.lock().await;
-        let channel = guard
-            .channel_open_direct_tcpip(dest_host, u32::from(dest_port), "127.0.0.1", 0)
-            .await
-            .map_err(|e| {
-                ProtoError::Transport(format!(
-                    "SSH jump-host direct-tcpip to {dest_host}:{dest_port} failed: {e}"
-                ))
-            })?;
+        let channel = tokio::time::timeout(
+            self.timeout,
+            guard.channel_open_direct_tcpip(dest_host, u32::from(dest_port), "127.0.0.1", 0),
+        )
+        .await
+        .map_err(|_| {
+            ProtoError::Transport(format!(
+                "SSH tunnel forwarding to {dest_host}:{dest_port} failed: timed out."
+            ))
+        })?
+        .map_err(|e| {
+            ProtoError::Transport(format!(
+                "SSH tunnel forwarding to {dest_host}:{dest_port} failed: {e}"
+            ))
+        })?;
         Ok(channel.into_stream())
     }
 

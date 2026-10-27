@@ -438,21 +438,28 @@ pub async fn download_single_file(
         None
     };
 
+    let can_resume_proto = session.scheme() != ProtocolScheme::Scp;
     let (write_path, resume_offset) = if let Some(ref sp) = stage_opt {
         let sp_meta = stat_local_path(sp);
-        if sp_meta.exists && sp_meta.is_regular {
+        if can_resume_proto && sp_meta.exists && sp_meta.is_regular {
             if sp_meta.size < info.size {
                 (sp.clone(), sp_meta.size)
             } else {
                 let _ = std::fs::remove_file(sp);
                 (sp.clone(), 0u64)
             }
-        } else if flags.resume && local_stat.exists && local_stat.is_regular && local_stat.size < info.size {
+        } else if can_resume_proto
+            && flags.resume
+            && local_stat.exists
+            && local_stat.is_regular
+            && local_stat.size < info.size
+        {
             // Adopt existing partial target into stage path or resume directly
             let _ = std::fs::rename(local_dest, sp);
             let moved = stat_local_path(sp);
             (sp.clone(), if moved.exists { moved.size } else { 0 })
         } else {
+            let _ = std::fs::remove_file(sp);
             (sp.clone(), 0u64)
         }
     } else if flags.append && local_stat.exists && local_stat.is_regular {

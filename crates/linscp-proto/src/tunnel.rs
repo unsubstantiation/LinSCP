@@ -222,7 +222,13 @@ pub struct SshJumpTunnel {
 impl SshJumpTunnel {
     pub async fn connect(mut bastion_cfg: SshConnectConfig) -> Result<Self, ProtoError> {
         bastion_cfg.role = "tunnel".to_string();
-        let ssh = SshConnection::connect(&bastion_cfg).await?;
+        let ssh = SshConnection::connect(&bastion_cfg)
+            .await
+            .map_err(|err| match err {
+                ProtoError::HostKeyChallengeRequired { .. }
+                | ProtoError::WeakHostKeyPolicy(_) => err,
+                other => ProtoError::Transport(format!("SSH tunnel: {other}")),
+            })?;
         Ok(Self { ssh: Arc::new(ssh) })
     }
 
@@ -250,7 +256,7 @@ impl SshJumpTunnel {
             .await
             .map_err(|e| {
                 ProtoError::Transport(format!(
-                    "Failed to bind TunnelLocalPortNumber 127.0.0.1:{local_port}: {e}"
+                    "SSH tunnel forwarding to {dest_host}:{dest_port} failed: cannot bind TunnelLocalPortNumber 127.0.0.1:{local_port}: {e}"
                 ))
             })?;
         let bound_addr = listener.local_addr().map_err(|e| {

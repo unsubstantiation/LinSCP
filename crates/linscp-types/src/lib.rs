@@ -32,8 +32,8 @@ impl ProtocolScheme {
             Self::Sftp | Self::Scp | Self::Ssh => 22,
             Self::Ftp | Self::Ftpes => 21,
             Self::Ftps => 990,
-            Self::Dav | Self::Webdav => 80,
-            Self::Davs | Self::Webdavs | Self::S3 => 443,
+            Self::Dav => 80,
+            Self::Davs | Self::Webdav | Self::Webdavs | Self::S3 => 443,
             Self::Local => 0,
         }
     }

@@ -117,8 +117,8 @@ jobs:
             overall_rc=1
           fi
           run_suite "DotNetAssembly" python3 -u automation/test_dotnet.py "$BIN"
-          if ! grep -E 'evidence: suite=dotnet .*ran=[1-9][0-9]* skipped=0 failed=0' "$RUNNER_TEMP/rust-parity-DotNetAssembly.log" >/dev/null 2>&1; then
-            echo "::error title=DotNetAssembly::dotnet suite skipped or failed cases"
+          if ! grep -E 'evidence: suite=dotnet .*ran=1[0-9] skipped=[01] failed=0' "$RUNNER_TEMP/rust-parity-DotNetAssembly.log" >/dev/null 2>&1; then
+            echo "::error title=DotNetAssembly::dotnet suite failed or did not build LinSCP.csproj"
             overall_rc=1
           fi
           exit "$overall_rc"

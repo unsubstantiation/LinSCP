@@ -450,7 +450,7 @@ impl WebDavSession {
 
     fn http_scheme(&self) -> &'static str {
         match self.cfg.scheme {
-            ProtocolScheme::Davs | ProtocolScheme::Webdavs => "https",
+            ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs => "https",
             _ => "http",
         }
     }

@@ -1,7 +1,7 @@
 //! Remote file editing workflow (`edit [-force] [-keep] [-binary] [-editor=CMD]
 //! [-eol=preserve|lf|crlf] [-encoding=NAME] [-monitor[=PASSES]] <remotefile>`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use linscp_platform::create_private_dir;
 use linscp_platform::terminal::{
@@ -282,8 +282,8 @@ where
 async fn upload_edited_if_changed<E>(
     session: &dyn RemoteSession,
     remote_path: &str,
-    temp_path: &PathBuf,
-    work_dir: &PathBuf,
+    temp_path: &Path,
+    work_dir: &Path,
     force: bool,
     encode_edited: &E,
     last_wire: &mut Vec<u8>,
