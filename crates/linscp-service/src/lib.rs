@@ -8,10 +8,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use linscp_engine::{parse_ini_sections, serialize_ini_sections};
-use linscp_platform::{config_dir, write_private_file_atomic, LocalFs, NativeLocalFs};
+use linscp_engine::{
+    parse_filezilla_xml, parse_openssh_config, PreferencesStore, SessionStore, StoredSite,
+};
+use linscp_platform::{
+    config_dir, write_private_file_atomic, LocalFs, NativeLocalFs, NativeSecretVault, SecretVault,
+};
 use linscp_types::{
-    ApiEnvelope, ApiReply, TabSummary, TransferQueueItem, UserPreferences,
+    ApiEnvelope, ApiReply, SessionConfig, TabSummary, TransferQueueItem, UserPreferences,
 };
 use serde_json::{json, Value};
 
@@ -29,6 +33,7 @@ struct InnerState {
 #[derive(Clone)]
 pub struct CommanderService {
     local_fs: Arc<dyn LocalFs>,
+    secret_vault: Arc<dyn SecretVault>,
     state: Arc<Mutex<InnerState>>,
 }
 
@@ -40,11 +45,20 @@ impl Default for CommanderService {
 
 impl CommanderService {
     pub fn new(config_root: PathBuf, local_fs: Arc<dyn LocalFs>) -> Self {
-        let preferences = load_json_or_default(&config_root.join("preferences.json"));
+        Self::with_secret_vault(config_root, local_fs, Arc::new(NativeSecretVault::new()))
+    }
+
+    pub fn with_secret_vault(
+        config_root: PathBuf,
+        local_fs: Arc<dyn LocalFs>,
+        secret_vault: Arc<dyn SecretVault>,
+    ) -> Self {
+        let preferences = PreferencesStore::load(&config_root).unwrap_or_default();
         let bookmarks = load_json_value(&config_root.join("bookmarks.json"), json!({}));
         let workspaces = load_json_value(&config_root.join("workspaces.json"), json!({}));
         Self {
             local_fs,
+            secret_vault,
             state: Arc::new(Mutex::new(InnerState {
                 config_root,
                 next_tab_id: 1,
@@ -75,6 +89,10 @@ impl CommanderService {
             ("GET", "/api/preferences") => self.handle_get_preferences(),
             ("POST", "/api/preferences") => self.handle_save_preferences(req.body),
             ("GET", "/api/sessions") => self.handle_list_sessions(),
+            ("POST", "/api/sessions/save") => self.handle_save_session(req.body),
+            ("POST", "/api/sessions/delete") => self.handle_delete_session(req.body),
+            ("POST", "/api/import/openssh") => self.handle_import_openssh(req.body),
+            ("POST", "/api/import/filezilla") => self.handle_import_filezilla(req.body),
             ("GET", "/api/bookmarks") => self.handle_get_bookmarks(),
             ("POST", "/api/bookmarks") => self.handle_save_bookmarks(req.body),
             ("GET", "/api/workspaces") => self.handle_get_workspaces(),
@@ -169,12 +187,10 @@ impl CommanderService {
             }
         };
         let mut guard = self.state.lock().expect("state mutex");
-        let target = guard.config_root.join("preferences.json");
-        let serialized = serde_json::to_vec_pretty(&parsed).unwrap_or_default();
-        if let Err(err) = write_private_file_atomic(&target, &serialized) {
+        if let Err(err) = PreferencesStore::save(&guard.config_root, &parsed) {
             return ApiReply {
                 status: 500,
-                payload: json!({ "error": err.to_string() }),
+                payload: json!({ "error": err }),
             };
         }
         guard.preferences = parsed;
@@ -186,26 +202,125 @@ impl CommanderService {
 
     fn handle_list_sessions(&self) -> ApiReply {
         let guard = self.state.lock().expect("state mutex");
-        let ini_path = guard.config_root.join("sessions.ini");
-        let content = std::fs::read_to_string(&ini_path).unwrap_or_default();
-        let parsed = parse_ini_sections(&content);
-        let sessions: Vec<Value> = parsed
-            .into_iter()
-            .map(|(name, fields)| {
-                json!({
-                    "name": name,
-                    "protocol": fields.get("protocol").cloned().unwrap_or_else(|| "sftp".to_string()),
-                    "host": fields.get("host").cloned().unwrap_or_default(),
-                    "port": fields.get("port").and_then(|p| p.parse::<u16>().ok()).unwrap_or(22),
-                    "username": fields.get("username").cloned().unwrap_or_default(),
-                    "has_password": fields.get("password").map(|p| !p.is_empty()).unwrap_or(false),
-                })
-            })
-            .collect();
-        let _ = serialize_ini_sections;
+        match SessionStore::load_from_dir(&guard.config_root, self.secret_vault.as_ref()) {
+            Ok(store) => {
+                let summaries: Vec<_> = store.sites().iter().map(StoredSite::summary).collect();
+                ApiReply {
+                    status: 200,
+                    payload: json!({
+                        "sessions": summaries,
+                        "folders": store.folders(),
+                    }),
+                }
+            }
+            Err(err) => ApiReply {
+                status: 500,
+                payload: json!({ "error": err }),
+            },
+        }
+    }
+
+    fn handle_save_session(&self, body: Value) -> ApiReply {
+        let cfg: SessionConfig = match serde_json::from_value(body) {
+            Ok(s) => s,
+            Err(err) => {
+                return ApiReply {
+                    status: 400,
+                    payload: json!({ "error": format!("Invalid session payload: {err}") }),
+                };
+            }
+        };
+        if cfg.name.trim().is_empty() {
+            return ApiReply {
+                status: 400,
+                payload: json!({ "error": "Session name is required" }),
+            };
+        }
+        let guard = self.state.lock().expect("state mutex");
+        let mut store =
+            match SessionStore::load_from_dir(&guard.config_root, self.secret_vault.as_ref()) {
+                Ok(s) => s,
+                Err(err) => {
+                    return ApiReply {
+                        status: 500,
+                        payload: json!({ "error": err }),
+                    };
+                }
+            };
+        let site = StoredSite::from_session_config(&cfg);
+        let summary = site.summary();
+        store.upsert(site);
+        if let Err(err) = store.save_to_dir(&guard.config_root, self.secret_vault.as_ref()) {
+            return ApiReply {
+                status: 500,
+                payload: json!({ "error": err }),
+            };
+        }
         ApiReply {
             status: 200,
-            payload: json!({ "sessions": sessions }),
+            payload: json!({ "ok": true, "session": summary }),
+        }
+    }
+
+    fn handle_delete_session(&self, body: Value) -> ApiReply {
+        let name = body
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if name.is_empty() {
+            return ApiReply {
+                status: 400,
+                payload: json!({ "error": "Session name is required" }),
+            };
+        }
+        let guard = self.state.lock().expect("state mutex");
+        let mut store =
+            match SessionStore::load_from_dir(&guard.config_root, self.secret_vault.as_ref()) {
+                Ok(s) => s,
+                Err(err) => {
+                    return ApiReply {
+                        status: 500,
+                        payload: json!({ "error": err }),
+                    };
+                }
+            };
+        let removed = store.remove(name);
+        if removed {
+            if let Err(err) = store.save_to_dir(&guard.config_root, self.secret_vault.as_ref()) {
+                return ApiReply {
+                    status: 500,
+                    payload: json!({ "error": err }),
+                };
+            }
+        }
+        ApiReply {
+            status: 200,
+            payload: json!({ "ok": true, "removed": removed }),
+        }
+    }
+
+    fn handle_import_openssh(&self, body: Value) -> ApiReply {
+        let text = body.get("content").and_then(Value::as_str).unwrap_or("");
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let report = parse_openssh_config(text, home.as_deref());
+        ApiReply {
+            status: 200,
+            payload: serde_json::to_value(report).unwrap_or_else(|_| json!({})),
+        }
+    }
+
+    fn handle_import_filezilla(&self, body: Value) -> ApiReply {
+        let text = body.get("content").and_then(Value::as_str).unwrap_or("");
+        match parse_filezilla_xml(text) {
+            Ok(report) => ApiReply {
+                status: 200,
+                payload: serde_json::to_value(report).unwrap_or_else(|_| json!({})),
+            },
+            Err(err) => ApiReply {
+                status: 400,
+                payload: json!({ "error": err }),
+            },
         }
     }
 
@@ -305,16 +420,6 @@ impl CommanderService {
     }
 }
 
-fn load_json_or_default<T>(path: &Path) -> T
-where
-    T: serde::de::DeserializeOwned + Default,
-{
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
-}
-
 fn load_json_value(path: &Path, fallback: Value) -> Value {
     std::fs::read_to_string(path)
         .ok()
@@ -367,9 +472,10 @@ fn parse_query(query: &str) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use linscp_types::ProtocolScheme;
 
     #[test]
-    fn service_dispatches_status_roots_and_local_tab() {
+    fn service_dispatches_status_roots_sessions_and_importers() {
         let tmp = std::env::temp_dir().join(format!("linscp-svc-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let svc = CommanderService::new(tmp.clone(), Arc::new(NativeLocalFs::new()));
@@ -382,13 +488,44 @@ mod tests {
         assert_eq!(roots_reply.status, 200);
         assert!(!roots_reply.payload["roots"].as_array().unwrap().is_empty());
 
-        let open_reply = svc.dispatch(ApiEnvelope {
+        let save_reply = svc.dispatch(ApiEnvelope {
             method: "POST".to_string(),
-            path: "/api/tabs/local".to_string(),
+            path: "/api/sessions/save".to_string(),
+            body: serde_json::to_value(SessionConfig {
+                name: "prod/web".to_string(),
+                protocol: ProtocolScheme::Sftp,
+                host: "10.0.0.8".to_string(),
+                port: 22,
+                username: "deploy".to_string(),
+                password: Some("vault-secret".to_string()),
+                keyfile: None,
+                hostkey: "SHA256:xyz".to_string(),
+                initial_dir: "/srv/www".to_string(),
+                local_dir: String::new(),
+                tunnel: None,
+            })
+            .unwrap(),
+        });
+        assert_eq!(save_reply.status, 200);
+        assert!(tmp.join("sessions.key").exists());
+
+        let list_reply = svc.dispatch(ApiEnvelope {
+            method: "GET".to_string(),
+            path: "/api/sessions".to_string(),
             body: json!({}),
         });
-        assert_eq!(open_reply.status, 200);
-        assert_eq!(open_reply.payload["tab"]["name"], "local");
+        assert_eq!(list_reply.status, 200);
+        assert_eq!(list_reply.payload["sessions"][0]["name"], "prod/web");
+        assert_eq!(list_reply.payload["sessions"][0]["has_password"], true);
+        assert_eq!(list_reply.payload["folders"][0], "prod");
+
+        let ssh_import = svc.dispatch(ApiEnvelope {
+            method: "POST".to_string(),
+            path: "/api/import/openssh".to_string(),
+            body: json!({ "content": "Host bastion\n  HostName 192.0.2.10\n  User ops\n" }),
+        });
+        assert_eq!(ssh_import.status, 200);
+        assert_eq!(ssh_import.payload["imported"][0]["name"], "bastion");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

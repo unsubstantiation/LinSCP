@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Supported transport schemes, keeping explicit (`ftpes`) and implicit
 /// (`ftps`) FTP-over-TLS distinct as well as local-to-local tabs (`local`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProtocolScheme {
     Sftp,
@@ -37,6 +37,42 @@ impl ProtocolScheme {
             Self::Local => 0,
         }
     }
+
+    /// Parses a protocol scheme token case-insensitively (`"sftp"`, `"ftpes"`, `"s3"`).
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "sftp" => Some(Self::Sftp),
+            "scp" => Some(Self::Scp),
+            "ssh" => Some(Self::Ssh),
+            "ftp" => Some(Self::Ftp),
+            "ftps" => Some(Self::Ftps),
+            "ftpes" => Some(Self::Ftpes),
+            "dav" | "http" => Some(Self::Dav),
+            "davs" | "https" => Some(Self::Davs),
+            "webdav" => Some(Self::Webdav),
+            "webdavs" => Some(Self::Webdavs),
+            "s3" | "s3s" => Some(Self::S3),
+            "local" => Some(Self::Local),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sftp => "sftp",
+            Self::Scp => "scp",
+            Self::Ssh => "ssh",
+            Self::Ftp => "ftp",
+            Self::Ftps => "ftps",
+            Self::Ftpes => "ftpes",
+            Self::Dav => "dav",
+            Self::Davs => "davs",
+            Self::Webdav => "webdav",
+            Self::Webdavs => "webdavs",
+            Self::S3 => "s3",
+            Self::Local => "local",
+        }
+    }
 }
 
 /// Independent SSH jump-host (tunnel) configuration.
@@ -46,6 +82,8 @@ pub struct TunnelConfig {
     pub host: String,
     pub port: u16,
     pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyfile: Option<String>,
     #[serde(default)]
@@ -63,6 +101,8 @@ pub struct SessionConfig {
     pub port: u16,
     pub username: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyfile: Option<String>,
     #[serde(default)]
     pub hostkey: String,
@@ -70,8 +110,85 @@ pub struct SessionConfig {
     pub initial_dir: String,
     #[serde(default)]
     pub local_dir: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<TunnelConfig>,
+}
+
+/// Non-secret summary of a saved session returned to Commander session lists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredSessionSummary {
+    pub name: String,
+    pub folder: String,
+    pub leaf_name: String,
+    pub protocol: ProtocolScheme,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub has_password: bool,
+    pub has_unreadable_secret: bool,
+    pub initial_dir: String,
+    pub local_dir: String,
+}
+
+/// Session candidate parsed from OpenSSH `~/.ssh/config` or FileZilla XML.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedSite {
+    pub source: String,
+    pub name: String,
+    pub protocol: ProtocolScheme,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    #[serde(default)]
+    pub remote_directory: String,
+    #[serde(default)]
+    pub local_directory: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedImportEntry {
+    pub label: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportReport {
+    pub imported: Vec<ImportedSite>,
+    pub skipped: Vec<SkippedImportEntry>,
+}
+
+/// Saved directory bookmark pair (`bookmarks.json`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BookmarkEntry {
+    pub name: String,
+    #[serde(default)]
+    pub session_name: String,
+    #[serde(default)]
+    pub remote_dir: String,
+    #[serde(default)]
+    pub local_dir: String,
+}
+
+/// Saved tab inside a multi-session workspace (`workspaces.json`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceTabSnapshot {
+    pub session_name: String,
+    #[serde(default)]
+    pub remote_dir: String,
+    #[serde(default)]
+    pub local_dir: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSnapshot {
+    pub name: String,
+    pub tabs: Vec<WorkspaceTabSnapshot>,
+    #[serde(default)]
+    pub active_index: usize,
 }
 
 /// File or directory entry returned to either Commander panel.

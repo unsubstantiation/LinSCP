@@ -1,5 +1,5 @@
-//! Unified localization lookup and single-pass placeholder interpolation for
-//! CLI and GUI messages (`locales/{de,en,es,fr}.json`).
+//! Unified localization lookup, single-pass placeholder interpolation, catalog
+//! parity walker, and localized CLI confirmation helpers (`locales/{de,en,es,fr}.json`).
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -35,6 +35,16 @@ fn catalogs() -> &'static BTreeMap<&'static str, UnifiedCatalogFile> {
         }
         map
     })
+}
+
+fn domain_table(
+    bundle: &UnifiedCatalogFile,
+    domain: CatalogDomain,
+) -> &BTreeMap<String, String> {
+    match domain {
+        CatalogDomain::Cli => &bundle.cli,
+        CatalogDomain::Gui => &bundle.gui,
+    }
 }
 
 /// Available shipped locale codes in sorted order.
@@ -76,11 +86,129 @@ pub fn translate<'a>(domain: CatalogDomain, locale: &str, message: &'a str) -> &
     let Some(bundle) = catalogs().get(normalized) else {
         return message;
     };
-    let table = match domain {
-        CatalogDomain::Cli => &bundle.cli,
-        CatalogDomain::Gui => &bundle.gui,
+    domain_table(bundle, domain)
+        .get(message)
+        .map(String::as_str)
+        .unwrap_or(message)
+}
+
+/// Extracts sorted unique `{placeholder}` tokens from a template string.
+pub fn extract_placeholders(template: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    let bytes = template.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'{' {
+            if let Some(rel_end) = bytes[index + 1..].iter().position(|&b| b == b'}') {
+                let end = index + 1 + rel_end;
+                let key = &template[index + 1..end];
+                if !key.is_empty() && key.bytes().all(|b| b.is_ascii_lowercase()) {
+                    found.push(key);
+                    index = end + 1;
+                    continue;
+                }
+            }
+        }
+        let ch = template[index..].chars().next().expect("valid UTF-8");
+        index += ch.len_utf8();
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// Walks every shipped locale and domain to verify that all `{placeholder}`
+/// tokens in the English source survive intact in every translation, and that
+/// every English key is present in every locale catalog.
+pub fn verify_catalog_parity() -> Vec<String> {
+    let map = catalogs();
+    let Some(en_bundle) = map.get("en") else {
+        return vec!["Missing English reference catalog".to_string()];
     };
-    table.get(message).map(String::as_str).unwrap_or(message)
+    let mut issues = Vec::new();
+    for (domain_name, domain) in [("cli", CatalogDomain::Cli), ("gui", CatalogDomain::Gui)] {
+        let en_table = domain_table(en_bundle, domain);
+        for (&locale, bundle) in map {
+            if locale == "en" {
+                continue;
+            }
+            let target_table = domain_table(bundle, domain);
+            for (en_key, en_val) in en_table {
+                let Some(translated) = target_table.get(en_key) else {
+                    issues.push(format!("{locale}/{domain_name}: missing key {en_key:?}"));
+                    continue;
+                };
+                let expected_ph = extract_placeholders(en_val);
+                let actual_ph = extract_placeholders(translated);
+                if expected_ph != actual_ph {
+                    issues.push(format!(
+                        "{locale}/{domain_name}: placeholder mismatch for {en_key:?}: expected {expected_ph:?}, got {actual_ph:?}"
+                    ));
+                }
+            }
+        }
+    }
+    issues
+}
+
+/// Reports keys in `domain` whose translation in `locale` is missing or still
+/// identical to English (used by the localization completeness walker).
+pub fn identical_to_english_keys(domain: CatalogDomain, locale: &str) -> Vec<&'static str> {
+    let normalized = normalize_locale(locale);
+    let map = catalogs();
+    let (Some(en_bundle), Some(loc_bundle)) = (map.get("en"), map.get(normalized)) else {
+        return Vec::new();
+    };
+    let en_table = domain_table(en_bundle, domain);
+    let loc_table = domain_table(loc_bundle, domain);
+    en_table
+        .keys()
+        .filter(|key| loc_table.get(*key).map(String::as_str) == Some(key.as_str()))
+        .map(String::as_str)
+        .collect()
+}
+
+/// Extracts `(yes_char, no_char)` (lowercased) from a translated `" [y/N]: "`
+/// or `" [Y/n]: "` prompt suffix.
+pub fn yes_no_letters(locale: &str, default_yes: bool) -> (char, char) {
+    let prompt_key = if default_yes { " [Y/n]: " } else { " [y/N]: " };
+    let rendered = translate(CatalogDomain::Cli, locale, prompt_key);
+    if let Some(open) = rendered.find('[') {
+        let after = &rendered[open + 1..];
+        let mut chars = after.chars();
+        if let (Some(yes_c), Some('/'), Some(no_c)) = (chars.next(), chars.next(), chars.next()) {
+            return (yes_c.to_ascii_lowercase(), no_c.to_ascii_lowercase());
+        }
+    }
+    ('y', 'n')
+}
+
+/// Evaluates an interactive confirmation answer in `locale`, accepting the
+/// localized yes letter (`s` in `es`, `j` in `de`, `o` in `fr`, `y` in `en`),
+/// `"y"`/`"yes"` when unambiguous, or empty input when `default_yes` is true.
+pub fn parse_confirmation_answer(locale: &str, default_yes: bool, raw_input: &str) -> Option<bool> {
+    let trimmed = raw_input.trim();
+    if trimmed.is_empty() {
+        return Some(default_yes);
+    }
+    let (yes_char, no_char) = yes_no_letters(locale, default_yes);
+    let mut chars = trimmed.chars();
+    let first = chars.next()?.to_ascii_lowercase();
+    if chars.next().is_none() {
+        if first == yes_char || (first == 'y' && no_char != 'y') {
+            return Some(true);
+        }
+        if first == no_char || (first == 'n' && yes_char != 'n') {
+            return Some(false);
+        }
+    }
+    if trimmed.eq_ignore_ascii_case("yes") {
+        return Some(true);
+    }
+    if trimmed.eq_ignore_ascii_case("no") {
+        return Some(false);
+    }
+    None
 }
 
 /// Single-pass `{placeholder}` interpolation. Replacement values are treated
@@ -201,5 +329,24 @@ mod tests {
             &[("line", "1"), ("snippet", "{line} $& %n <img>")],
         );
         assert_eq!(rendered, "L\u{00ed}nea 1: {line} $& %n <img>");
+    }
+
+    #[test]
+    fn all_shipped_catalogs_pass_placeholder_and_key_parity() {
+        assert_eq!(verify_catalog_parity(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn localized_yes_no_letters_match_shipped_cli_prompts() {
+        assert_eq!(yes_no_letters("en", false), ('y', 'n'));
+        assert_eq!(yes_no_letters("es", false), ('s', 'n'));
+        assert_eq!(yes_no_letters("de", false), ('j', 'n'));
+        assert_eq!(yes_no_letters("fr", false), ('o', 'n'));
+
+        assert_eq!(parse_confirmation_answer("es", false, "s"), Some(true));
+        assert_eq!(parse_confirmation_answer("de", false, "J"), Some(true));
+        assert_eq!(parse_confirmation_answer("fr", false, "o"), Some(true));
+        assert_eq!(parse_confirmation_answer("fr", false, ""), Some(false));
+        assert_eq!(parse_confirmation_answer("fr", true, ""), Some(true));
     }
 }

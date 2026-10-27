@@ -1,50 +1,50 @@
-//! Linux platform implementation (XDG paths, POSIX root, Wayland + X11 session detection).
+//! Linux-specific filesystem roots, POSIX `0600`/`0700` permission helpers,
+//! and Wayland/X11 desktop session detection.
 
+use std::fs::{File, OpenOptions, Permissions};
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use linscp_types::LocalRootEntry;
 
+use crate::PlatformError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinuxDisplaySession {
+pub enum DesktopSessionKind {
     Wayland,
     X11,
     Headless,
 }
 
-pub fn default_config_dir() -> PathBuf {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("LinSCP");
-        }
+/// Detects the active Linux display session without hardcoding X11 assumptions.
+pub fn detect_desktop_session() -> DesktopSessionKind {
+    if std::env::var_os("WAYLAND_DISPLAY")
+        .filter(|v| !v.is_empty())
+        .is_some()
+        || std::env::var("XDG_SESSION_TYPE")
+            .map(|v| v.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false)
+    {
+        return DesktopSessionKind::Wayland;
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home).join(".config").join("LinSCP");
-        }
+    if std::env::var_os("DISPLAY")
+        .filter(|v| !v.is_empty())
+        .is_some()
+    {
+        return DesktopSessionKind::X11;
     }
-    std::env::temp_dir().join("LinSCP")
+    DesktopSessionKind::Headless
 }
 
-/// Detects the active Linux graphical session, consulting Wayland sockets
-/// (`WAYLAND_DISPLAY` and `$XDG_RUNTIME_DIR/wayland-0`) before `$DISPLAY` so
-/// pure-Wayland sessions without XWayland are never misclassified as headless.
-pub fn detect_display_session() -> LinuxDisplaySession {
-    if let Some(wayland) = std::env::var_os("WAYLAND_DISPLAY") {
-        if !wayland.is_empty() {
-            return LinuxDisplaySession::Wayland;
-        }
+pub fn default_config_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(xdg).join("linscp");
     }
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        if !runtime_dir.is_empty() && Path::new(&runtime_dir).join("wayland-0").exists() {
-            return LinuxDisplaySession::Wayland;
-        }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(home).join(".config").join("linscp");
     }
-    if let Some(x11_display) = std::env::var_os("DISPLAY") {
-        if !x11_display.is_empty() {
-            return LinuxDisplaySession::X11;
-        }
-    }
-    LinuxDisplaySession::Headless
+    std::env::temp_dir().join("linscp")
 }
 
 pub fn list_roots() -> Vec<LocalRootEntry> {
@@ -54,16 +54,70 @@ pub fn list_roots() -> Vec<LocalRootEntry> {
         kind: "posix".to_string(),
         read_only: false,
     }];
-    if let Some(home) = std::env::var_os("HOME") {
-        let home_str = home.to_string_lossy().into_owned();
-        if !home_str.is_empty() && home_str != "/" {
-            roots.push(LocalRootEntry {
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        let home_str = PathBuf::from(home).to_string_lossy().into_owned();
+        roots.insert(
+            0,
+            LocalRootEntry {
                 path: home_str,
                 label: "Home (~)".to_string(),
                 kind: "posix".to_string(),
                 read_only: false,
-            });
-        }
+            },
+        );
     }
     roots
+}
+
+pub fn format_permissions(meta: &std::fs::Metadata) -> String {
+    format!("{:04o}", meta.mode() & 0o7777)
+}
+
+pub fn set_mode(path: &Path, mode: u32) -> Result<(), PlatformError> {
+    std::fs::set_permissions(path, Permissions::from_mode(mode & 0o7777))?;
+    Ok(())
+}
+
+pub fn ensure_private_dir(dir: &Path) -> Result<(), PlatformError> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+pub fn open_private_temp_file(path: &Path) -> Result<File, PlatformError> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    Ok(file)
+}
+
+pub fn create_exclusive_private_file(path: &Path, content: &[u8]) -> Result<(), PlatformError> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                PlatformError::AlreadyExists(path.display().to_string())
+            } else {
+                PlatformError::Io(err)
+            }
+        })?;
+    if let Err(err) = file.write_all(content).and_then(|()| file.sync_all()) {
+        let _ = std::fs::remove_file(path);
+        return Err(PlatformError::Io(err));
+    }
+    Ok(())
+}
+
+pub fn atomic_replace(temp_path: &Path, target_path: &Path) -> Result<(), PlatformError> {
+    std::fs::rename(temp_path, target_path)?;
+    Ok(())
 }

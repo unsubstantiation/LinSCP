@@ -1,6 +1,13 @@
 //! Pure-Rust cryptography shared across CLI, HTTP server, and Tauri apps:
 //! - Byte-compatible `lscp1$` encrypted passwords for `sessions.ini` / `sessions.key`
 //! - 300,000-iteration PBKDF2-HMAC-SHA256 account password hashing
+//! - `SHA-256`, `SHA-1`, `MD5`, and `CRC32` digests (`digests`)
+//! - AWS Signature Version 4 signing (`sigv4`)
+//! - PuTTY `.ppk` v2 & v3 + Argon2 parser and OpenSSH converter (`ppk`)
+
+pub mod digests;
+pub mod ppk;
+pub mod sigv4;
 
 use std::path::Path;
 
@@ -57,6 +64,10 @@ pub enum CryptoError {
 pub struct SessionMasterKey([u8; KEY_BYTES]);
 
 impl SessionMasterKey {
+    pub const fn from_array(raw: [u8; KEY_BYTES]) -> Self {
+        Self(raw)
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
         let array: [u8; KEY_BYTES] = bytes.try_into().map_err(|_| CryptoError::InvalidKeyLength)?;
         Ok(Self(array))
@@ -174,6 +185,11 @@ fn xor_keystream(enc_key: &[u8; 32], nonce: &[u8; NONCE_BYTES], input: &[u8]) ->
         counter += 1;
     }
     out
+}
+
+/// Returns true if `value` carries the `lscp1$` encrypted-password prefix.
+pub fn is_encrypted_password(value: &str) -> bool {
+    value.starts_with(LSCP1_PREFIX)
 }
 
 /// Encrypts `plain` into a `lscp1$...` token using fresh OS randomness.

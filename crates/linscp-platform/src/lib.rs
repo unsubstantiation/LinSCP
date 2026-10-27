@@ -1,247 +1,562 @@
-//! Cross-platform OS abstractions for LinSCP (`linux`, `windows`, `android`).
+//! OS-isolated local filesystem, configuration directory, secret-vault, and
+//! directory-watcher abstractions (`linux`, `windows`, and `android`).
 //!
-//! All OS-specific conditional compilation (`#[cfg(windows)]`,
-//! `#[cfg(target_os = "android")]`, `#[cfg(unix)]`) is isolated in this crate
-//! so upper crates (`linscp-proto`, `linscp-engine`, `linscp-service`,
-//! `linscp-http`, `linscp-cli`) remain 100% portable Rust.
+//! No crate outside `linscp-platform` and `linscp-tauri` may depend directly
+//! on Win32, POSIX, or Android platform APIs.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::UNIX_EPOCH;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use filetime::{set_file_mtime, FileTime};
 use linscp_types::{FileEntry, LocalRootEntry};
+use rand::RngCore;
 use thiserror::Error;
+use zeroize::Zeroizing;
+
+pub mod watcher;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
-#[cfg(windows)]
+#[cfg(target_os = "linux")]
+use linux as sys;
+
+#[cfg(target_os = "windows")]
 pub mod windows;
+#[cfg(target_os = "windows")]
+use windows as sys;
+
 #[cfg(target_os = "android")]
 pub mod android;
+#[cfg(target_os = "android")]
+use android as sys;
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
+mod fallback_unix {
+    use std::fs::{File, OpenOptions};
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+
+    use linscp_types::LocalRootEntry;
+
+    use crate::PlatformError;
+
+    pub fn default_config_dir() -> PathBuf {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(".config")
+            .join("linscp")
+    }
+
+    pub fn list_roots() -> Vec<LocalRootEntry> {
+        vec![LocalRootEntry {
+            path: "/".to_string(),
+            label: "/".to_string(),
+            kind: "posix".to_string(),
+            read_only: false,
+        }]
+    }
+
+    pub fn format_permissions(_meta: &std::fs::Metadata) -> String {
+        String::new()
+    }
+
+    pub fn set_mode(_path: &Path, _mode: u32) -> Result<(), PlatformError> {
+        Ok(())
+    }
+
+    pub fn ensure_private_dir(dir: &Path) -> Result<(), PlatformError> {
+        std::fs::create_dir_all(dir)?;
+        Ok(())
+    }
+
+    pub fn open_private_temp_file(path: &Path) -> Result<File, PlatformError> {
+        Ok(OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?)
+    }
+
+    pub fn create_exclusive_private_file(path: &Path, content: &[u8]) -> Result<(), PlatformError> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|err| {
+                if err.kind() == std::io::ErrorKind::AlreadyExists {
+                    PlatformError::AlreadyExists(path.display().to_string())
+                } else {
+                    PlatformError::Io(err)
+                }
+            })?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    pub fn atomic_replace(temp_path: &Path, target_path: &Path) -> Result<(), PlatformError> {
+        std::fs::rename(temp_path, target_path)?;
+        Ok(())
+    }
+}
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
+use fallback_unix as sys;
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+const MASTER_KEY_LEN: usize = 32;
+const DPAPI_KEY_PREFIX: &str = "dpapi1$";
+#[cfg(target_os = "android")]
+const ANDROID_KEYSTORE_PREFIX: &str = "aks1$";
 
 #[derive(Debug, Error)]
 pub enum PlatformError {
-    #[error("{0}")]
+    #[error("Filesystem error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Storage root '{0}' requires an Android SAF provider")]
-    UnsupportedSafUri(String),
+    #[error("Target file already exists: {0}")]
+    AlreadyExists(String),
+    #[error("Unsupported local URI or path: {0}")]
+    UnsupportedUri(String),
+    #[error("Secret vault error: {0}")]
+    SecretVault(String),
+    #[error("Directory watcher error: {0}")]
+    Watch(String),
 }
 
-/// Platform-neutral local filesystem contract consumed by `linscp-engine` and
-/// `linscp-service`.
+/// Platform-neutral local filesystem contract consumed by the transfer engine,
+/// synchronizer, CLI, and Commander UI.
 pub trait LocalFs: Send + Sync {
-    /// Enumerates selectable local roots (`/` on Linux, `C:\`/`D:\` on Windows,
-    /// app-private + SAF document trees on Android).
     fn list_roots(&self) -> Result<Vec<LocalRootEntry>, PlatformError>;
-
-    /// Lists a local directory or Android SAF document tree URI.
     fn list_dir(&self, path: &str) -> Result<Vec<FileEntry>, PlatformError>;
-
-    /// Atomically replaces `destination` with `staging` (`.filepart` commit).
-    fn atomic_replace(&self, staging: &Path, destination: &Path) -> Result<(), PlatformError>;
-
-    /// Whether filename mask matching defaults to case-insensitive on this OS.
-    fn default_case_insensitive_masks(&self) -> bool;
+    fn stat(&self, path: &str) -> Result<FileEntry, PlatformError>;
+    fn mkdir_all(&self, path: &str) -> Result<(), PlatformError>;
+    fn remove_file(&self, path: &str) -> Result<(), PlatformError>;
+    fn remove_dir_all(&self, path: &str) -> Result<(), PlatformError>;
+    fn rename(&self, from: &str, to: &str) -> Result<(), PlatformError>;
+    fn read_bytes(&self, path: &str) -> Result<Vec<u8>, PlatformError>;
+    fn write_bytes_atomic(&self, path: &str, data: &[u8]) -> Result<(), PlatformError>;
+    fn set_mtime(&self, path: &str, mtime: i64) -> Result<(), PlatformError>;
+    fn set_permissions_mode(&self, path: &str, mode: u32) -> Result<(), PlatformError>;
 }
 
-/// Default local filesystem implementation for the active host OS.
-#[derive(Debug, Default, Clone)]
-pub struct NativeLocalFs;
+/// Platform-neutral `sessions.key` master-key vault (`0600` private file on
+/// Linux, optional DPAPI wrapping on Windows, optional Keystore wrapping on Android).
+pub trait SecretVault: Send + Sync {
+    fn load_master_key(&self, config_dir: &Path) -> Result<Option<Zeroizing<[u8; 32]>>, PlatformError>;
+    fn load_or_create_master_key(&self, config_dir: &Path) -> Result<Zeroizing<[u8; 32]>, PlatformError>;
+}
+
+#[derive(Default)]
+pub struct NativeLocalFs {
+    #[cfg(target_os = "android")]
+    saf: Option<std::sync::Arc<dyn android::SafBridge>>,
+}
 
 impl NativeLocalFs {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
-}
 
-/// Resolves the active LinSCP configuration directory:
-/// - `$LINSCP_CONFIG_DIR` / `%LINSCP_CONFIG_DIR%` override on every OS
-/// - Linux: `$XDG_CONFIG_HOME/LinSCP` or `$HOME/.config/LinSCP`
-/// - Windows: `%APPDATA%\LinSCP`
-/// - Android: `$LINSCP_ANDROID_FILES_DIR/LinSCP` or `$HOME/.config/LinSCP`
-pub fn config_dir() -> PathBuf {
-    if let Some(explicit) = std::env::var_os("LINSCP_CONFIG_DIR") {
-        if !explicit.is_empty() {
-            return PathBuf::from(explicit);
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        linux::default_config_dir()
-    }
-    #[cfg(windows)]
-    {
-        windows::default_config_dir()
-    }
     #[cfg(target_os = "android")]
-    {
-        android::default_config_dir()
-    }
-    #[cfg(not(any(target_os = "linux", windows, target_os = "android")))]
-    {
-        std::env::temp_dir().join("LinSCP")
+    pub fn with_saf(saf: std::sync::Arc<dyn android::SafBridge>) -> Self {
+        Self { saf: Some(saf) }
     }
 }
 
-/// Creates a private configuration directory (`0700` on Unix/Android).
-pub fn ensure_private_dir(path: &Path) -> Result<(), PlatformError> {
-    std::fs::create_dir_all(path)?;
-    #[cfg(unix)]
+fn resolve_os_path(path: &str) -> PathBuf {
+    #[cfg(target_os = "windows")]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        windows::to_extended_length_path(Path::new(path))
     }
-    Ok(())
+    #[cfg(not(target_os = "windows"))]
+    {
+        PathBuf::from(path)
+    }
 }
 
-/// Writes `contents` atomically via a sibling temporary file with owner-only
-/// permissions (`0600` on Unix/Android).
-pub fn write_private_file_atomic(path: &Path, contents: &[u8]) -> Result<(), PlatformError> {
-    if let Some(parent) = path.parent() {
-        ensure_private_dir(parent)?;
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("linscp.tmp");
-    let staging = path.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
-    std::fs::write(&staging, contents)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600))?;
-    }
-    NativeLocalFs.atomic_replace(&staging, path)
-}
-
-pub(crate) fn system_time_epoch_secs(time: Result<SystemTime, std::io::Error>) -> i64 {
-    time.ok()
+fn entry_from_symlink_meta(
+    name: String,
+    full_path: &Path,
+    meta: &std::fs::Metadata,
+) -> FileEntry {
+    let file_type = meta.file_type();
+    let is_symlink = file_type.is_symlink();
+    let (is_dir, broken_link) = if is_symlink {
+        match std::fs::metadata(full_path) {
+            Ok(target_meta) => (target_meta.is_dir(), false),
+            Err(_) => (false, true),
+        }
+    } else {
+        (file_type.is_dir(), false)
+    };
+    let mtime = meta
+        .modified()
+        .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-pub(crate) fn read_standard_dir_entries(dir: &Path) -> Result<Vec<FileEntry>, PlatformError> {
-    let mut entries = Vec::new();
-    for item in std::fs::read_dir(dir)? {
-        let item = item?;
-        let name = item.file_name().to_string_lossy().into_owned();
-        if name == "." || name == ".." {
-            continue;
-        }
-        let symlink_meta = std::fs::symlink_metadata(item.path())?;
-        let is_symlink = symlink_meta.file_type().is_symlink();
-        let (effective_meta, broken_link) = if is_symlink {
-            match std::fs::metadata(item.path()) {
-                Ok(target) => (target, false),
-                Err(_) => (symlink_meta.clone(), true),
-            }
-        } else {
-            (symlink_meta.clone(), false)
-        };
-        let is_dir = !broken_link && effective_meta.is_dir();
-        let size = if is_dir { 0 } else { effective_meta.len() };
-        let mtime = system_time_epoch_secs(effective_meta.modified());
-        let permissions = format_permissions(&symlink_meta, is_dir, is_symlink);
-        entries.push(FileEntry {
-            name,
-            size,
-            is_dir,
-            is_symlink,
-            broken_link,
-            date: String::new(),
-            mtime,
-            permissions,
-            owner: None,
-            group: None,
-        });
-    }
-    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
-    Ok(entries)
-}
-
-fn format_permissions(meta: &std::fs::Metadata, is_dir: bool, is_symlink: bool) -> String {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = meta.permissions().mode();
-        let kind = if is_symlink {
-            'l'
-        } else if is_dir {
-            'd'
-        } else {
-            '-'
-        };
-        let mut s = String::with_capacity(10);
-        s.push(kind);
-        for shift in [6u32, 3, 0] {
-            let bits = (mode >> shift) & 0o7;
-            s.push(if bits & 0o4 != 0 { 'r' } else { '-' });
-            s.push(if bits & 0o2 != 0 { 'w' } else { '-' });
-            s.push(if bits & 0o1 != 0 { 'x' } else { '-' });
-        }
-        s
-    }
-    #[cfg(not(unix))]
-    {
-        let kind = if is_symlink {
-            'l'
-        } else if is_dir {
-            'd'
-        } else {
-            '-'
-        };
-        let writable = if meta.permissions().readonly() { '-' } else { 'w' };
-        format!("{kind}r{writable}-r--r--")
+        .unwrap_or(0);
+    FileEntry {
+        name,
+        size: if is_dir { 0 } else { meta.len() },
+        is_dir,
+        is_symlink,
+        broken_link,
+        date: String::new(),
+        mtime,
+        permissions: sys::format_permissions(meta),
+        owner: None,
+        group: None,
     }
 }
 
 impl LocalFs for NativeLocalFs {
     fn list_roots(&self) -> Result<Vec<LocalRootEntry>, PlatformError> {
-        #[cfg(target_os = "linux")]
-        {
-            Ok(linux::list_roots())
-        }
-        #[cfg(windows)]
-        {
-            Ok(windows::list_roots())
-        }
         #[cfg(target_os = "android")]
         {
-            Ok(android::list_roots())
+            sys::list_roots(self.saf.as_deref())
         }
-        #[cfg(not(any(target_os = "linux", windows, target_os = "android")))]
+        #[cfg(not(target_os = "android"))]
         {
-            Ok(vec![LocalRootEntry {
-                path: "/".to_string(),
-                label: "/".to_string(),
-                kind: "posix".to_string(),
-                read_only: false,
-            }])
+            Ok(sys::list_roots())
         }
     }
 
     fn list_dir(&self, path: &str) -> Result<Vec<FileEntry>, PlatformError> {
+        if path.starts_with("content://") {
+            #[cfg(target_os = "android")]
+            if let Some(bridge) = self.saf.as_deref() {
+                return bridge.list_tree(path);
+            }
+            return Err(PlatformError::UnsupportedUri(path.to_string()));
+        }
+
+        let resolved = resolve_os_path(path);
+        let mut entries = Vec::new();
+        for item in std::fs::read_dir(&resolved)? {
+            let item = item?;
+            let item_path = item.path();
+            let meta = std::fs::symlink_metadata(&item_path)?;
+            let name = item.file_name().to_string_lossy().into_owned();
+            entries.push(entry_from_symlink_meta(name, &item_path, &meta));
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
+    }
+
+    fn stat(&self, path: &str) -> Result<FileEntry, PlatformError> {
+        if path.starts_with("content://") {
+            #[cfg(target_os = "android")]
+            if let Some(bridge) = self.saf.as_deref() {
+                return bridge.stat_uri(path);
+            }
+            return Err(PlatformError::UnsupportedUri(path.to_string()));
+        }
+        let resolved = resolve_os_path(path);
+        let meta = std::fs::symlink_metadata(&resolved)?;
+        let name = Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string());
+        Ok(entry_from_symlink_meta(name, &resolved, &meta))
+    }
+
+    fn mkdir_all(&self, path: &str) -> Result<(), PlatformError> {
+        if path.starts_with("content://") {
+            return Err(PlatformError::UnsupportedUri(path.to_string()));
+        }
+        std::fs::create_dir_all(resolve_os_path(path))?;
+        Ok(())
+    }
+
+    fn remove_file(&self, path: &str) -> Result<(), PlatformError> {
+        if path.starts_with("content://") {
+            #[cfg(target_os = "android")]
+            if let Some(bridge) = self.saf.as_deref() {
+                return bridge.delete_uri(path);
+            }
+            return Err(PlatformError::UnsupportedUri(path.to_string()));
+        }
+        std::fs::remove_file(resolve_os_path(path))?;
+        Ok(())
+    }
+
+    fn remove_dir_all(&self, path: &str) -> Result<(), PlatformError> {
+        if path.starts_with("content://") {
+            #[cfg(target_os = "android")]
+            if let Some(bridge) = self.saf.as_deref() {
+                return bridge.delete_uri(path);
+            }
+            return Err(PlatformError::UnsupportedUri(path.to_string()));
+        }
+        std::fs::remove_dir_all(resolve_os_path(path))?;
+        Ok(())
+    }
+
+    fn rename(&self, from: &str, to: &str) -> Result<(), PlatformError> {
+        if from.starts_with("content://") || to.starts_with("content://") {
+            return Err(PlatformError::UnsupportedUri(from.to_string()));
+        }
+        sys::atomic_replace(Path::new(from), Path::new(to))
+    }
+
+    fn read_bytes(&self, path: &str) -> Result<Vec<u8>, PlatformError> {
+        if path.starts_with("content://") {
+            #[cfg(target_os = "android")]
+            if let Some(bridge) = self.saf.as_deref() {
+                return bridge.read_uri_bytes(path);
+            }
+            return Err(PlatformError::UnsupportedUri(path.to_string()));
+        }
+        Ok(std::fs::read(resolve_os_path(path))?)
+    }
+
+    fn write_bytes_atomic(&self, path: &str, data: &[u8]) -> Result<(), PlatformError> {
+        if path.starts_with("content://") {
+            return Err(PlatformError::UnsupportedUri(path.to_string()));
+        }
+        let target = Path::new(path);
+        let parent = target
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(resolve_os_path(&parent.to_string_lossy()))?;
+        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_name = format!(
+            ".{}.tmp.{}.{}",
+            target
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default(),
+            std::process::id(),
+            seq
+        );
+        let temp_path = parent.join(temp_name);
+        {
+            let mut f = std::fs::File::create(resolve_os_path(&temp_path.to_string_lossy()))?;
+            f.write_all(data)?;
+            f.sync_all()?;
+        }
+        if let Err(err) = sys::atomic_replace(&temp_path, target) {
+            let _ = std::fs::remove_file(resolve_os_path(&temp_path.to_string_lossy()));
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn set_mtime(&self, path: &str, mtime: i64) -> Result<(), PlatformError> {
+        if path.starts_with("content://") {
+            return Err(PlatformError::UnsupportedUri(path.to_string()));
+        }
+        set_file_mtime(resolve_os_path(path), FileTime::from_unix_time(mtime, 0))?;
+        Ok(())
+    }
+
+    fn set_permissions_mode(&self, path: &str, mode: u32) -> Result<(), PlatformError> {
+        if path.starts_with("content://") {
+            return Err(PlatformError::UnsupportedUri(path.to_string()));
+        }
+        sys::set_mode(Path::new(path), mode)
+    }
+}
+
+/// Default per-user configuration directory (`~/.config/linscp` on Linux,
+/// `%APPDATA%\LinSCP` on Windows, app-private `config` on Android).
+pub fn default_config_dir() -> PathBuf {
+    if let Some(override_dir) = std::env::var_os("LINSCP_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(override_dir);
+    }
+    sys::default_config_dir()
+}
+
+/// Alias used by `CommanderService` for the active per-user config directory.
+pub fn config_dir() -> PathBuf {
+    default_config_dir()
+}
+
+/// Atomically writes sensitive configuration files (`sessions.ini`,
+/// `sessions.key`, `sshhostkeys`) with owner-only permissions.
+pub fn write_private_file_atomic(target: &Path, content: &[u8]) -> Result<(), PlatformError> {
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    sys::ensure_private_dir(parent)?;
+
+    let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = target
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "linscp".to_string());
+    let temp_path = parent.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
+
+    {
+        let mut file = sys::open_private_temp_file(&temp_path)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+    }
+
+    if let Err(err) = sys::atomic_replace(&temp_path, target) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Creates a brand-new owner-only file (`O_CREAT | O_EXCL`, `0600` on Unix),
+/// refusing to overwrite an existing file (used by `ConvertPpkToOpenSsh`).
+pub fn write_exclusive_private_file(target: &Path, content: &[u8]) -> Result<(), PlatformError> {
+    sys::create_exclusive_private_file(target, content)
+}
+
+#[derive(Default)]
+pub struct NativeSecretVault {
+    #[cfg(target_os = "windows")]
+    wrap_new_keys_with_dpapi: bool,
+    #[cfg(target_os = "android")]
+    keystore: Option<std::sync::Arc<dyn android::KeystoreBridge>>,
+}
+
+impl NativeSecretVault {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn with_windows_dpapi() -> Self {
+        Self {
+            wrap_new_keys_with_dpapi: true,
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn with_android_keystore(keystore: std::sync::Arc<dyn android::KeystoreBridge>) -> Self {
+        Self {
+            keystore: Some(keystore),
+        }
+    }
+}
+
+fn decode_stored_master_key(
+    raw_bytes: &[u8],
+    #[cfg(target_os = "android")] keystore: Option<&dyn android::KeystoreBridge>,
+) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
+    if raw_bytes.len() == MASTER_KEY_LEN {
+        let mut out = Zeroizing::new([0u8; 32]);
+        out.copy_from_slice(raw_bytes);
+        return Ok(out);
+    }
+    let text = std::str::from_utf8(raw_bytes)
+        .map_err(|_| PlatformError::SecretVault("Invalid master key encoding".to_string()))?
+        .trim();
+
+    if let Some(dpapi_b64) = text.strip_prefix(DPAPI_KEY_PREFIX) {
+        #[cfg(target_os = "windows")]
+        {
+            let blob = BASE64
+                .decode(dpapi_b64.as_bytes())
+                .map_err(|_| PlatformError::SecretVault("Corrupted DPAPI master key".to_string()))?;
+            let unwrapped = windows::dpapi_unprotect(&blob)?;
+            if unwrapped.len() != MASTER_KEY_LEN {
+                return Err(PlatformError::SecretVault(
+                    "Invalid DPAPI master key length".to_string(),
+                ));
+            }
+            let mut out = Zeroizing::new([0u8; 32]);
+            out.copy_from_slice(&unwrapped);
+            return Ok(out);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = dpapi_b64;
+            return Err(PlatformError::SecretVault(
+                "DPAPI-protected sessions.key can only be unlocked on Windows".to_string(),
+            ));
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    if let Some(aks_b64) = text.strip_prefix(ANDROID_KEYSTORE_PREFIX) {
+        let Some(bridge) = keystore else {
+            return Err(PlatformError::SecretVault(
+                "Android Keystore bridge is required to unlock sessions.key".to_string(),
+            ));
+        };
+        let blob = BASE64
+            .decode(aks_b64.as_bytes())
+            .map_err(|_| PlatformError::SecretVault("Corrupted Keystore master key".to_string()))?;
+        return bridge.unwrap_master_key(&blob);
+    }
+
+    let decoded = Zeroizing::new(
+        BASE64
+            .decode(text.as_bytes())
+            .map_err(|_| PlatformError::SecretVault("Invalid base64 master key".to_string()))?,
+    );
+    if decoded.len() != MASTER_KEY_LEN {
+        return Err(PlatformError::SecretVault(
+            "Invalid sessions.key length".to_string(),
+        ));
+    }
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(&decoded);
+    Ok(out)
+}
+
+impl SecretVault for NativeSecretVault {
+    fn load_master_key(
+        &self,
+        config_dir: &Path,
+    ) -> Result<Option<Zeroizing<[u8; 32]>>, PlatformError> {
+        let key_path = config_dir.join("sessions.key");
+        let raw = match std::fs::read(&key_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(PlatformError::Io(err)),
+        };
         #[cfg(target_os = "android")]
-        if android::is_saf_uri(path) {
-            return android::list_saf_dir(path);
-        }
-        read_standard_dir_entries(Path::new(path))
+        let key = decode_stored_master_key(&raw, self.keystore.as_deref())?;
+        #[cfg(not(target_os = "android"))]
+        let key = decode_stored_master_key(&raw)?;
+        Ok(Some(key))
     }
 
-    fn atomic_replace(&self, staging: &Path, destination: &Path) -> Result<(), PlatformError> {
-        #[cfg(windows)]
-        {
-            windows::atomic_replace(staging, destination)
+    fn load_or_create_master_key(
+        &self,
+        config_dir: &Path,
+    ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
+        if let Some(existing) = self.load_master_key(config_dir)? {
+            return Ok(existing);
         }
-        #[cfg(not(windows))]
-        {
-            std::fs::rename(staging, destination)?;
-            Ok(())
-        }
-    }
+        let mut generated = Zeroizing::new([0u8; 32]);
+        rand::thread_rng().fill_bytes(&mut *generated);
+        let key_path = config_dir.join("sessions.key");
 
-    fn default_case_insensitive_masks(&self) -> bool {
-        cfg!(windows)
+        #[cfg(target_os = "windows")]
+        if self.wrap_new_keys_with_dpapi {
+            let wrapped = windows::dpapi_protect(&*generated)?;
+            let encoded = format!("{DPAPI_KEY_PREFIX}{}\n", BASE64.encode(wrapped));
+            write_private_file_atomic(&key_path, encoded.as_bytes())?;
+            return Ok(generated);
+        }
+
+        #[cfg(target_os = "android")]
+        if let Some(bridge) = self.keystore.as_deref() {
+            let wrapped = bridge.wrap_master_key(&generated)?;
+            let encoded = format!("{ANDROID_KEYSTORE_PREFIX}{}\n", BASE64.encode(wrapped));
+            write_private_file_atomic(&key_path, encoded.as_bytes())?;
+            return Ok(generated);
+        }
+
+        write_private_file_atomic(&key_path, &*generated)?;
+        Ok(generated)
     }
 }
 
@@ -250,20 +565,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_local_fs_lists_roots_and_temp_dir() {
+    fn atomic_private_write_and_local_fs_operations_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "linscp-platform-test-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         let fs = NativeLocalFs::new();
-        let roots = fs.list_roots().expect("roots");
-        assert!(!roots.is_empty());
+        fs.mkdir_all(&dir.to_string_lossy()).unwrap();
 
-        let temp = std::env::temp_dir().join(format!("linscp-platform-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
-        ensure_private_dir(&temp).expect("create private dir");
+        let target = dir.join("sessions.ini");
+        write_private_file_atomic(&target, b"[demo]\nhost=example.com\n").expect("write v1");
+        write_private_file_atomic(&target, b"[demo]\nhost=updated.example.com\n")
+            .expect("replace v2");
 
-        let target = temp.join("sessions.ini");
-        write_private_file_atomic(&target, b"[demo]\nhost=example.com\n").expect("atomic write");
-        let entries = fs.list_dir(&temp.to_string_lossy()).expect("list temp dir");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "sessions.ini");
-        let _ = std::fs::remove_dir_all(&temp);
+        let body = fs.read_bytes(&target.to_string_lossy()).expect("read back");
+        assert_eq!(body, b"[demo]\nhost=updated.example.com\n");
+
+        fs.set_mtime(&target.to_string_lossy(), 1_700_000_000)
+            .expect("set mtime");
+        let st = fs.stat(&target.to_string_lossy()).expect("stat");
+        assert_eq!(st.mtime, 1_700_000_000);
+
+        // Exclusive private write refuses to overwrite an existing file
+        let excl_err = write_exclusive_private_file(&target, b"clobber").unwrap_err();
+        assert!(matches!(excl_err, PlatformError::AlreadyExists(_)));
+
+        // SecretVault round-trip
+        let vault = NativeSecretVault::new();
+        let k1 = vault.load_or_create_master_key(&dir).expect("create master key");
+        let k2 = vault.load_master_key(&dir).expect("load master key").unwrap();
+        assert_eq!(*k1, *k2);
+
+        fs.remove_dir_all(&dir.to_string_lossy()).unwrap();
     }
 }
