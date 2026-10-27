@@ -293,7 +293,7 @@ impl SshJumpTunnel {
             .await
             .map_err(|e| {
                 ProtoError::Transport(format!(
-                    "SSH tunnel forwarding to {dest_host}:{dest_port} failed: cannot bind TunnelLocalPortNumber 127.0.0.1:{local_port}: {e}"
+                    "Cannot listen on the tunnel local port 127.0.0.1:{local_port}: {e}"
                 ))
             })?;
         let bound_addr = listener.local_addr().map_err(|e| {
@@ -324,7 +324,7 @@ impl SshJumpTunnel {
             .await
             .map_err(|e| {
                 ProtoError::Transport(format!(
-                    "Failed to bind loopback SOCKS5 jump relay on 127.0.0.1:{local_port}: {e}"
+                    "Cannot listen on the tunnel local port 127.0.0.1:{local_port}: {e}"
                 ))
             })?;
         let actual_port = listener

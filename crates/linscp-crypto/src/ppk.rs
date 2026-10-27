@@ -6,13 +6,15 @@ use std::path::Path;
 
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
-use aes::Aes256;
+use aes::{Aes128, Aes192, Aes256};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use ed25519_dalek::SigningKey as Ed25519SigningKey;
 use hmac::{Hmac, Mac};
+use md5::Md5;
 use num_bigint::BigUint;
+use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
@@ -793,6 +795,444 @@ pub fn ppk_to_openssh_pem(
     Ok(pem)
 }
 
+fn der_tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+    let len = body.len();
+    let mut out = Vec::with_capacity(6 + len);
+    out.push(tag);
+    if len < 0x80 {
+        out.push(len as u8);
+    } else if len <= 0xff {
+        out.push(0x81);
+        out.push(len as u8);
+    } else if len <= 0xffff {
+        out.push(0x82);
+        out.push((len >> 8) as u8);
+        out.push((len & 0xff) as u8);
+    } else {
+        out.push(0x83);
+        out.push((len >> 16) as u8);
+        out.push(((len >> 8) & 0xff) as u8);
+        out.push((len & 0xff) as u8);
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+fn der_int_be(be_bytes: &[u8]) -> Vec<u8> {
+    let stripped = match be_bytes.iter().position(|&b| b != 0) {
+        Some(idx) => &be_bytes[idx..],
+        None => &[0u8],
+    };
+    let mut body = Vec::with_capacity(stripped.len() + 1);
+    if (stripped[0] & 0x80) != 0 {
+        body.push(0x00);
+    }
+    body.extend_from_slice(stripped);
+    der_tlv(0x02, &body)
+}
+
+fn der_int_u32(val: u32) -> Vec<u8> {
+    der_int_be(&val.to_be_bytes())
+}
+
+fn aes256_cbc_encrypt_pkcs7(key: &[u8; 32], iv: &[u8; 16], plain: &[u8]) -> Vec<u8> {
+    let cipher = Aes256::new_from_slice(key).expect("32-byte AES-256 key");
+    let pad_len = 16 - (plain.len() % 16);
+    let mut padded = Zeroizing::new(Vec::with_capacity(plain.len() + pad_len));
+    padded.extend_from_slice(plain);
+    padded.extend(std::iter::repeat_n(pad_len as u8, pad_len));
+
+    let mut prev = *iv;
+    let mut out = Vec::with_capacity(padded.len());
+    for chunk in padded.chunks_exact(16) {
+        let mut xored = [0u8; 16];
+        for ((dst, &p), &iv_b) in xored.iter_mut().zip(chunk.iter()).zip(prev.iter()) {
+            *dst = p ^ iv_b;
+        }
+        let mut block = GenericArray::from(xored);
+        cipher.encrypt_block(&mut block);
+        prev.copy_from_slice(&block);
+        out.extend_from_slice(&block);
+    }
+    prev.zeroize();
+    out
+}
+
+fn wrap_pem_64(label: &str, der: &[u8]) -> Zeroizing<String> {
+    let b64 = Zeroizing::new(BASE64.encode(der));
+    let mut pem = Zeroizing::new(String::with_capacity(b64.len() + label.len() * 2 + 40));
+    pem.push_str("-----BEGIN ");
+    pem.push_str(label);
+    pem.push_str("-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).expect("ASCII base64"));
+        pem.push('\n');
+    }
+    pem.push_str("-----END ");
+    pem.push_str(label);
+    pem.push_str("-----\n");
+    pem
+}
+
+/// Converts `.ppk` text into an OpenSSL-compatible PKCS#8 PEM private key:
+/// - `-----BEGIN PRIVATE KEY-----` when `output_passphrase` is `None` or empty
+/// - `-----BEGIN ENCRYPTED PRIVATE KEY-----` (PBES2 + PBKDF2-HMAC-SHA256 + AES-256-CBC)
+///   when `output_passphrase` is `Some(non_empty)`, matching `PpkKey.cpp`.
+pub fn ppk_to_pkcs8_pem(
+    ppk_text: &str,
+    input_passphrase: &str,
+    output_passphrase: Option<&str>,
+) -> Result<Zeroizing<String>, PpkError> {
+    let ppk = parse_ppk_str(ppk_text)?;
+    let plain = decrypt_and_verify_ppk(&ppk, input_passphrase)?;
+    // Reuse full cryptographic keypair consistency checks first
+    let _ = build_validated_openssh_keypair_payload(&ppk, &plain)?;
+
+    let mut pub_pos = 0usize;
+    let _ = get_ssh_bytes(&ppk.public_blob, &mut pub_pos).ok_or(PpkError::InvalidKeyComponents)?;
+    let mut priv_pos = 0usize;
+
+    let pkcs8_der: Zeroizing<Vec<u8>> = match ppk.algorithm.as_str() {
+        "ssh-rsa" => {
+            let e_bytes = get_non_negative_mpint(&ppk.public_blob, &mut pub_pos)
+                .ok_or(PpkError::InvalidKeyComponents)?;
+            let n_bytes = get_non_negative_mpint(&ppk.public_blob, &mut pub_pos)
+                .ok_or(PpkError::InvalidKeyComponents)?;
+            let d_bytes =
+                get_non_negative_mpint(&plain, &mut priv_pos).ok_or(PpkError::InvalidKeyComponents)?;
+            let p_bytes =
+                get_non_negative_mpint(&plain, &mut priv_pos).ok_or(PpkError::InvalidKeyComponents)?;
+            let q_bytes =
+                get_non_negative_mpint(&plain, &mut priv_pos).ok_or(PpkError::InvalidKeyComponents)?;
+            let iqmp_bytes =
+                get_non_negative_mpint(&plain, &mut priv_pos).ok_or(PpkError::InvalidKeyComponents)?;
+
+            let one = BigUint::from(1u32);
+            let d = BigUint::from_bytes_be(d_bytes);
+            let p = BigUint::from_bytes_be(p_bytes);
+            let q = BigUint::from_bytes_be(q_bytes);
+            let dmp1 = (&d % (&p - &one)).to_bytes_be();
+            let dmq1 = (&d % (&q - &one)).to_bytes_be();
+
+            let mut rsa_seq = Vec::new();
+            rsa_seq.extend_from_slice(&der_int_u32(0));
+            rsa_seq.extend_from_slice(&der_int_be(n_bytes));
+            rsa_seq.extend_from_slice(&der_int_be(e_bytes));
+            rsa_seq.extend_from_slice(&der_int_be(d_bytes));
+            rsa_seq.extend_from_slice(&der_int_be(p_bytes));
+            rsa_seq.extend_from_slice(&der_int_be(q_bytes));
+            rsa_seq.extend_from_slice(&der_int_be(&dmp1));
+            rsa_seq.extend_from_slice(&der_int_be(&dmq1));
+            rsa_seq.extend_from_slice(&der_int_be(iqmp_bytes));
+            let rsa_der = Zeroizing::new(der_tlv(0x30, &rsa_seq));
+            rsa_seq.zeroize();
+
+            let mut alg_id = der_tlv(0x06, &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]);
+            alg_id.extend_from_slice(&[0x05, 0x00]);
+            let mut pki = Vec::new();
+            pki.extend_from_slice(&der_int_u32(0));
+            pki.extend_from_slice(&der_tlv(0x30, &alg_id));
+            pki.extend_from_slice(&der_tlv(0x04, &rsa_der));
+            let out = Zeroizing::new(der_tlv(0x30, &pki));
+            pki.zeroize();
+            out
+        }
+        "ssh-ed25519" => {
+            let pub_key = get_ssh_bytes(&ppk.public_blob, &mut pub_pos)
+                .ok_or(PpkError::InvalidKeyComponents)?;
+            let raw_secret =
+                get_ssh_bytes(&plain, &mut priv_pos).ok_or(PpkError::InvalidKeyComponents)?;
+            let seed_slice: &[u8] = if raw_secret.len() == 33 && raw_secret[0] == 0 {
+                &raw_secret[1..]
+            } else if raw_secret.len() == 64 && bool::from(raw_secret[32..].ct_eq(pub_key)) {
+                &raw_secret[..32]
+            } else {
+                raw_secret
+            };
+            let curve_priv = Zeroizing::new(der_tlv(0x04, seed_slice));
+            let alg_id = der_tlv(0x06, &[0x2b, 0x65, 0x70]);
+            let mut pki = Vec::new();
+            pki.extend_from_slice(&der_int_u32(0));
+            pki.extend_from_slice(&der_tlv(0x30, &alg_id));
+            pki.extend_from_slice(&der_tlv(0x04, &curve_priv));
+            let out = Zeroizing::new(der_tlv(0x30, &pki));
+            pki.zeroize();
+            out
+        }
+        alg if alg.starts_with("ecdsa-sha2-") => {
+            let curve_bytes = get_ssh_bytes(&ppk.public_blob, &mut pub_pos)
+                .ok_or(PpkError::InvalidKeyComponents)?;
+            let point_bytes = get_ssh_bytes(&ppk.public_blob, &mut pub_pos)
+                .ok_or(PpkError::InvalidKeyComponents)?;
+            let scalar_be =
+                get_non_negative_mpint(&plain, &mut priv_pos).ok_or(PpkError::InvalidKeyComponents)?;
+            let curve = std::str::from_utf8(curve_bytes)
+                .map_err(|_| PpkError::InvalidKeyComponents)?;
+            let (scalar_len, curve_oid): (usize, &[u8]) = match curve {
+                "nistp256" => (32, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]),
+                "nistp384" => (48, &[0x2b, 0x81, 0x04, 0x00, 0x22]),
+                "nistp521" => (66, &[0x2b, 0x81, 0x04, 0x00, 0x23]),
+                _ => return Err(PpkError::UnsupportedAlgorithm(ppk.algorithm.clone())),
+            };
+            let padded_scalar =
+                left_pad_scalar(scalar_be, scalar_len).ok_or(PpkError::InvalidKeyComponents)?;
+
+            let mut bit_str_body = Vec::with_capacity(1 + point_bytes.len());
+            bit_str_body.push(0x00);
+            bit_str_body.extend_from_slice(point_bytes);
+            let pub_bit_str = der_tlv(0x03, &bit_str_body);
+
+            let mut ec_seq = Vec::new();
+            ec_seq.extend_from_slice(&der_int_u32(1));
+            ec_seq.extend_from_slice(&der_tlv(0x04, &padded_scalar));
+            ec_seq.extend_from_slice(&der_tlv(0xa1, &pub_bit_str));
+            let ec_der = Zeroizing::new(der_tlv(0x30, &ec_seq));
+            ec_seq.zeroize();
+
+            let mut alg_id = der_tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]);
+            alg_id.extend_from_slice(&der_tlv(0x06, curve_oid));
+            let mut pki = Vec::new();
+            pki.extend_from_slice(&der_int_u32(0));
+            pki.extend_from_slice(&der_tlv(0x30, &alg_id));
+            pki.extend_from_slice(&der_tlv(0x04, &ec_der));
+            let out = Zeroizing::new(der_tlv(0x30, &pki));
+            pki.zeroize();
+            out
+        }
+        "ssh-dss" => {
+            let p_bytes = get_non_negative_mpint(&ppk.public_blob, &mut pub_pos)
+                .ok_or(PpkError::InvalidKeyComponents)?;
+            let q_bytes = get_non_negative_mpint(&ppk.public_blob, &mut pub_pos)
+                .ok_or(PpkError::InvalidKeyComponents)?;
+            let g_bytes = get_non_negative_mpint(&ppk.public_blob, &mut pub_pos)
+                .ok_or(PpkError::InvalidKeyComponents)?;
+            let _y_bytes = get_non_negative_mpint(&ppk.public_blob, &mut pub_pos)
+                .ok_or(PpkError::InvalidKeyComponents)?;
+            let x_bytes =
+                get_non_negative_mpint(&plain, &mut priv_pos).ok_or(PpkError::InvalidKeyComponents)?;
+
+            let mut dsa_params = Vec::new();
+            dsa_params.extend_from_slice(&der_int_be(p_bytes));
+            dsa_params.extend_from_slice(&der_int_be(q_bytes));
+            dsa_params.extend_from_slice(&der_int_be(g_bytes));
+
+            let mut alg_id = der_tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x01]);
+            alg_id.extend_from_slice(&der_tlv(0x30, &dsa_params));
+
+            let x_der = Zeroizing::new(der_int_be(x_bytes));
+            let mut pki = Vec::new();
+            pki.extend_from_slice(&der_int_u32(0));
+            pki.extend_from_slice(&der_tlv(0x30, &alg_id));
+            pki.extend_from_slice(&der_tlv(0x04, &x_der));
+            let out = Zeroizing::new(der_tlv(0x30, &pki));
+            pki.zeroize();
+            out
+        }
+        other => return Err(PpkError::UnsupportedAlgorithm(other.to_string())),
+    };
+
+    let Some(pw) = output_passphrase.filter(|s| !s.is_empty()) else {
+        return Ok(wrap_pem_64("PRIVATE KEY", &pkcs8_der));
+    };
+
+    let mut rng = rand::thread_rng();
+    let mut salt = [0u8; 16];
+    let mut iv = [0u8; 16];
+    rng.fill_bytes(&mut salt);
+    rng.fill_bytes(&mut iv);
+
+    const PBES2_ITERS: u32 = 2048;
+    let mut dk = Zeroizing::new([0u8; 32]);
+    pbkdf2_hmac::<Sha256>(pw.as_bytes(), &salt, PBES2_ITERS, &mut *dk);
+    let ciphertext = aes256_cbc_encrypt_pkcs7(&dk, &iv, &pkcs8_der);
+
+    let mut prf_seq = der_tlv(0x06, &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x09]);
+    prf_seq.extend_from_slice(&[0x05, 0x00]);
+    let mut pbkdf2_params = der_tlv(0x04, &salt);
+    pbkdf2_params.extend_from_slice(&der_int_u32(PBES2_ITERS));
+    pbkdf2_params.extend_from_slice(&der_tlv(0x30, &prf_seq));
+
+    let mut kdf_func = der_tlv(0x06, &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x05, 0x0c]);
+    kdf_func.extend_from_slice(&der_tlv(0x30, &pbkdf2_params));
+
+    let mut enc_scheme = der_tlv(0x06, &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2a]);
+    enc_scheme.extend_from_slice(&der_tlv(0x04, &iv));
+
+    let mut pbes2_params = der_tlv(0x30, &kdf_func);
+    pbes2_params.extend_from_slice(&der_tlv(0x30, &enc_scheme));
+
+    let mut enc_alg = der_tlv(0x06, &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x05, 0x0d]);
+    enc_alg.extend_from_slice(&der_tlv(0x30, &pbes2_params));
+
+    let mut epki = der_tlv(0x30, &enc_alg);
+    epki.extend_from_slice(&der_tlv(0x04, &ciphertext));
+    let epki_der = der_tlv(0x30, &epki);
+
+    Ok(wrap_pem_64("ENCRYPTED PRIVATE KEY", &epki_der))
+}
+
+fn evp_bytes_to_key_md5(passphrase: &[u8], salt8: &[u8; 8], key_len: usize) -> Zeroizing<Vec<u8>> {
+    let mut derived = Zeroizing::new(Vec::with_capacity(key_len + 16));
+    let mut prev = Zeroizing::new(Vec::<u8>::new());
+    while derived.len() < key_len {
+        let mut h = Md5::new();
+        if !prev.is_empty() {
+            h.update(&*prev);
+        }
+        h.update(passphrase);
+        h.update(salt8);
+        let d: [u8; 16] = h.finalize().into();
+        prev.clear();
+        prev.extend_from_slice(&d);
+        derived.extend_from_slice(&d);
+    }
+    derived.truncate(key_len);
+    derived
+}
+
+/// Decrypts an OpenSSL RFC 1421 `Proc-Type: 4,ENCRYPTED` PEM private key
+/// (`DEK-Info: AES-{128,192,256}-CBC,<IV>`) into an unencrypted PEM string so
+/// downstream parsers (`russh::keys::decode_secret_key`) that only implement
+/// OpenSSH / PKCS#8 encryption can load Paramiko/OpenSSL traditional PEM keys.
+/// Returns `Ok(None)` when `pem_text` does not carry `Proc-Type: 4,ENCRYPTED`.
+pub fn decrypt_legacy_encrypted_pem(
+    pem_text: &str,
+    passphrase: &str,
+) -> Result<Option<Zeroizing<String>>, PpkError> {
+    if !pem_text.contains("Proc-Type:") || !pem_text.contains("DEK-Info:") {
+        return Ok(None);
+    }
+    let mut lines = pem_text.lines().map(|l| l.trim_end_matches('\r'));
+    let mut label_opt: Option<String> = None;
+    for l in lines.by_ref() {
+        let trimmed = l.trim();
+        if let Some(rest) = trimmed.strip_prefix("-----BEGIN ") {
+            if let Some(lbl) = rest.strip_suffix("-----") {
+                label_opt = Some(lbl.to_string());
+                break;
+            }
+        }
+    }
+    let Some(label) = label_opt else {
+        return Ok(None);
+    };
+    let end_marker = format!("-----END {label}-----");
+
+    let mut is_encrypted = false;
+    let mut dek_cipher = String::new();
+    let mut dek_iv_hex = String::new();
+    let mut b64_body = String::new();
+    let mut in_headers = true;
+
+    for l in lines {
+        let trimmed = l.trim();
+        if trimmed == end_marker {
+            break;
+        }
+        if in_headers {
+            if trimmed.is_empty() {
+                in_headers = false;
+                continue;
+            }
+            if let Some((k, v)) = trimmed.split_once(':') {
+                let k_low = k.trim().to_ascii_lowercase();
+                let v_trim = v.trim();
+                if k_low == "proc-type" && v_trim.to_ascii_uppercase().contains("ENCRYPTED") {
+                    is_encrypted = true;
+                } else if k_low == "dek-info" {
+                    if let Some((alg, ivh)) = v_trim.split_once(',') {
+                        dek_cipher = alg.trim().to_ascii_uppercase();
+                        dek_iv_hex = ivh.trim().to_string();
+                    }
+                }
+                continue;
+            }
+            in_headers = false;
+        }
+        b64_body.push_str(trimmed);
+    }
+
+    if !is_encrypted {
+        return Ok(None);
+    }
+    if passphrase.is_empty() {
+        return Err(PpkError::IntegrityCheckFailed);
+    }
+    let iv_vec = hex_decode(&dek_iv_hex)
+        .ok_or_else(|| PpkError::InvalidFormat("Invalid hex IV in DEK-Info header".to_string()))?;
+    let iv: [u8; 16] = iv_vec
+        .try_into()
+        .map_err(|_| PpkError::InvalidFormat("Unsupported DEK-Info IV length".to_string()))?;
+    let salt8: [u8; 8] = iv[..8].try_into().expect("8-byte salt");
+
+    let ciphertext = BASE64
+        .decode(b64_body.as_bytes())
+        .map_err(|_| PpkError::InvalidFormat("Invalid base64 in encrypted PEM".to_string()))?;
+    if ciphertext.is_empty() || (ciphertext.len() % 16) != 0 {
+        return Err(PpkError::InvalidFormat(
+            "Invalid ciphertext block length in encrypted PEM".to_string(),
+        ));
+    }
+
+    let mut plain = Zeroizing::new(vec![0u8; ciphertext.len()]);
+    match dek_cipher.as_str() {
+        "AES-128-CBC" => {
+            let key = evp_bytes_to_key_md5(passphrase.as_bytes(), &salt8, 16);
+            let cipher = Aes128::new_from_slice(&key).expect("16-byte key");
+            let mut prev = iv;
+            for (c_blk, p_blk) in ciphertext.chunks_exact(16).zip(plain.chunks_exact_mut(16)) {
+                let mut blk = GenericArray::clone_from_slice(c_blk);
+                cipher.decrypt_block(&mut blk);
+                for ((dst, &b), &iv_b) in p_blk.iter_mut().zip(blk.iter()).zip(prev.iter()) {
+                    *dst = b ^ iv_b;
+                }
+                prev.copy_from_slice(c_blk);
+                blk.zeroize();
+            }
+        }
+        "AES-192-CBC" => {
+            let key = evp_bytes_to_key_md5(passphrase.as_bytes(), &salt8, 24);
+            let cipher = Aes192::new_from_slice(&key).expect("24-byte key");
+            let mut prev = iv;
+            for (c_blk, p_blk) in ciphertext.chunks_exact(16).zip(plain.chunks_exact_mut(16)) {
+                let mut blk = GenericArray::clone_from_slice(c_blk);
+                cipher.decrypt_block(&mut blk);
+                for ((dst, &b), &iv_b) in p_blk.iter_mut().zip(blk.iter()).zip(prev.iter()) {
+                    *dst = b ^ iv_b;
+                }
+                prev.copy_from_slice(c_blk);
+                blk.zeroize();
+            }
+        }
+        "AES-256-CBC" => {
+            let key = evp_bytes_to_key_md5(passphrase.as_bytes(), &salt8, 32);
+            let aes_key: &[u8; 32] = (&key[..32]).try_into().expect("32-byte key");
+            plain = aes256_cbc_decrypt_nopad(aes_key, &iv, &ciphertext)?;
+        }
+        other => {
+            return Err(PpkError::UnsupportedAlgorithm(format!(
+                "Unsupported PEM DEK-Info cipher: {other}"
+            )));
+        }
+    }
+
+    let pad_len = *plain.last().unwrap_or(&0) as usize;
+    if pad_len == 0 || pad_len > 16 || pad_len > plain.len() {
+        return Err(PpkError::IntegrityCheckFailed);
+    }
+    let msg_len = plain.len() - pad_len;
+    for &b in &plain[msg_len..] {
+        if b as usize != pad_len {
+            return Err(PpkError::IntegrityCheckFailed);
+        }
+    }
+    if msg_len < 4 || plain[0] != 0x30 {
+        return Err(PpkError::IntegrityCheckFailed);
+    }
+
+    Ok(Some(wrap_pem_64(&label, &plain[..msg_len])))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,6 +1350,43 @@ Private-MAC: 1459a716b2ebdea871aa101e3a6fe0801798df2f
         assert_eq!(
             parse_ppk_str(&unsafe_ppk).unwrap_err(),
             PpkError::UnsafeArgon2Parameters
+        );
+    }
+
+    #[test]
+    fn ppk_to_pkcs8_pem_and_legacy_encrypted_pem_round_trip() {
+        let plain_pkcs8 = ppk_to_pkcs8_pem(ED25519_V3_NONE, "", None).expect("ed25519 pkcs8");
+        assert!(plain_pkcs8.starts_with("-----BEGIN PRIVATE KEY-----\n"));
+        assert!(plain_pkcs8.ends_with("-----END PRIVATE KEY-----\n"));
+
+        let enc_pkcs8 = ppk_to_pkcs8_pem(ED25519_V2_ENCRYPTED, "secret-ppk", Some("new-pass"))
+            .expect("ed25519 encrypted pkcs8");
+        assert!(enc_pkcs8.starts_with("-----BEGIN ENCRYPTED PRIVATE KEY-----\n"));
+        assert!(enc_pkcs8.ends_with("-----END ENCRYPTED PRIVATE KEY-----\n"));
+
+        // Construct an RFC 1421 `Proc-Type: 4,ENCRYPTED` `AES-256-CBC` PEM and decrypt it
+        let dummy_der = der_tlv(0x30, &[0x02, 0x01, 0x00]);
+        let iv = [0x11u8; 16];
+        let salt8: [u8; 8] = iv[..8].try_into().unwrap();
+        let dk = evp_bytes_to_key_md5(b"pem-pass", &salt8, 32);
+        let aes_key: &[u8; 32] = (&dk[..32]).try_into().unwrap();
+        let ct = aes256_cbc_encrypt_pkcs7(aes_key, &iv, &dummy_der);
+        let legacy_pem = format!(
+            "-----BEGIN RSA PRIVATE KEY-----\n\
+             Proc-Type: 4,ENCRYPTED\n\
+             DEK-Info: AES-256-CBC,{}\n\n\
+             {}\n\
+             -----END RSA PRIVATE KEY-----\n",
+            hex_encode(&iv),
+            BASE64.encode(&ct)
+        );
+        let decrypted = decrypt_legacy_encrypted_pem(&legacy_pem, "pem-pass")
+            .expect("decrypt ok")
+            .expect("was legacy encrypted");
+        assert_eq!(&*decrypted, &*wrap_pem_64("RSA PRIVATE KEY", &dummy_der));
+        assert_eq!(
+            decrypt_legacy_encrypted_pem(&legacy_pem, "wrong-pass"),
+            Err(PpkError::IntegrityCheckFailed)
         );
     }
 }

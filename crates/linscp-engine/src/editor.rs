@@ -137,7 +137,6 @@ where
     let mut had_utf8_bom = false;
     let editor_initial_bytes = if !opts.encoding.trim().is_empty() || !opts.allow_binary {
         let enc_label = if opts.encoding.trim().is_empty() {
-            // Only enforce strict transcoding when an explicit encoding was requested
             ""
         } else {
             opts.encoding.trim()
@@ -147,10 +146,18 @@ where
                 .inspect_err(|_| cleanup_temp(&temp_path, &work_dir, opts.keep_temp_file))?;
             had_utf8_bom = bom;
             convert_eol_bytes(utf8_text.as_bytes(), EolStyle::Lf)
-        } else if original_was_crlf {
-            convert_eol_bytes(&original_wire_bytes, EolStyle::Lf)
         } else {
-            original_wire_bytes.clone()
+            let body = if let Some(rest) = original_wire_bytes.strip_prefix(b"\xEF\xBB\xBF") {
+                had_utf8_bom = true;
+                rest
+            } else {
+                original_wire_bytes.as_slice()
+            };
+            if original_was_crlf {
+                convert_eol_bytes(body, EolStyle::Lf)
+            } else {
+                body.to_vec()
+            }
         }
     } else {
         original_wire_bytes.clone()
@@ -206,6 +213,11 @@ where
                 format!("Edited file is not valid UTF-8 for re-encoding: {e}")
             })?;
             encode_from_utf8_strict(utf8_str, opts.encoding.trim(), had_utf8_bom)
+        } else if had_utf8_bom && !eol_adjusted.starts_with(b"\xEF\xBB\xBF") {
+            let mut with_bom = Vec::with_capacity(3 + eol_adjusted.len());
+            with_bom.extend_from_slice(b"\xEF\xBB\xBF");
+            with_bom.extend_from_slice(&eol_adjusted);
+            Ok(with_bom)
         } else {
             Ok(eol_adjusted)
         }

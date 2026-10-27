@@ -498,7 +498,7 @@ pub async fn connect_session(
     };
 
     match session.protocol {
-        ProtocolScheme::Sftp | ProtocolScheme::Ssh => {
+        ProtocolScheme::Sftp => {
             let dest_cfg = ssh::SshConnectConfig {
                 tab_id,
                 role: "destination".to_string(),
@@ -526,7 +526,7 @@ pub async fn connect_session(
             .await?;
             Ok(Box::new(sftp))
         }
-        ProtocolScheme::Scp => {
+        ProtocolScheme::Scp | ProtocolScheme::Ssh => {
             let dest_cfg = ssh::SshConnectConfig {
                 tab_id,
                 role: "destination".to_string(),

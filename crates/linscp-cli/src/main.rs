@@ -2,12 +2,12 @@
 //! `-server` automation, `-shell` interactive SSH PTYs, `-convertkey` PPK->OpenSSH
 //! conversion, `-gui` desktop launcher, and `--serve-http` standalone browser mode.
 
-use std::io::{Read, Write};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use linscp_crypto::ppk::convert_private_key_to_openssh;
+use linscp_crypto::ppk::ppk_to_pkcs8_pem;
 use linscp_engine::script::{
     BatchMode, CliSessionDefaults, ScriptInterpreter, ScriptRunConfig, run_pty_shell_session,
     select_cli_locale_from_env,
@@ -315,6 +315,8 @@ async fn run_cli() -> i32 {
     let mut defaults_port: Option<u16> = None;
     let mut defaults_timeout: Option<u64> = None;
     let mut defaults_clientcert: Option<String> = None;
+    let mut defaults_ftps_mode: Option<u8> = None;
+    let mut defaults_ftp_pasv_mode: Option<bool> = None;
     let mut defaults_raw_pairs: Vec<String> = Vec::new();
 
     let mut script_specified = false;
@@ -541,7 +543,7 @@ async fn run_cli() -> i32 {
                 ));
                 return 1;
             };
-            defaults_raw_pairs.push(format!("Ftps={}", if enabled { 1 } else { 0 }));
+            defaults_ftps_mode = Some(if enabled { 1 } else { 0 });
         } else if arg == "-explicit"
             || arg.starts_with("-explicit=")
             || arg == "-explicittls"
@@ -558,7 +560,7 @@ async fn run_cli() -> i32 {
                 ));
                 return 1;
             };
-            defaults_raw_pairs.push(format!("Ftps={}", if enabled { 3 } else { 0 }));
+            defaults_ftps_mode = Some(if enabled { 3 } else { 0 });
         } else if arg == "-passive" || arg.starts_with("-passive=") {
             let val = arg.strip_prefix("-passive=");
             let Some(enabled) = parse_on_off_switch(val) else {
@@ -569,7 +571,7 @@ async fn run_cli() -> i32 {
                 ));
                 return 1;
             };
-            defaults_raw_pairs.push(format!("FtpPasvMode={}", if enabled { 1 } else { 0 }));
+            defaults_ftp_pasv_mode = Some(enabled);
         } else if let Some(val) = arg.strip_prefix("-loglevel=") {
             let Some((lvl, sens)) = parse_loglevel(val) else {
                 print_err(&translate_with(
@@ -587,7 +589,7 @@ async fn run_cli() -> i32 {
             match LogRotationPolicy::parse(val) {
                 Ok(pol) => log_rotation = Some(pol),
                 Err(err) => {
-                    print_err(&err);
+                    print_err(translate(CatalogDomain::Cli, &locale, &err));
                     return 1;
                 }
             }
@@ -833,6 +835,16 @@ async fn run_cli() -> i32 {
             spec.raw_fields
                 .insert("tls_certificate_file".to_string(), cc.clone());
         }
+        if let Some(ftps) = defaults_ftps_mode {
+            spec.raw_fields
+                .insert("ftps".to_string(), ftps.to_string());
+        }
+        if let Some(pasv) = defaults_ftp_pasv_mode {
+            spec.raw_fields.insert(
+                "ftp_pasv_mode".to_string(),
+                (if pasv { "1" } else { "0" }).to_string(),
+            );
+        }
         if !defaults_raw_pairs.is_empty() {
             apply_raw_settings(spec, &defaults_raw_pairs)?;
         }
@@ -936,6 +948,8 @@ async fn run_cli() -> i32 {
         port: defaults_port,
         timeout_secs: defaults_timeout,
         clientcert: defaults_clientcert.clone(),
+        ftps_mode: defaults_ftps_mode,
+        ftp_pasv_mode: defaults_ftp_pasv_mode,
         raw_pairs: defaults_raw_pairs.clone(),
     };
 
@@ -979,26 +993,25 @@ async fn run_cli() -> i32 {
     let exit_code = if server_mode {
         interp.run_server_loop().await
     } else if script_specified {
-        let content = if script_file == "-" {
-            let mut s = String::new();
-            if let Err(e) = std::io::stdin().read_to_string(&mut s) {
-                print_err(&format!("Cannot read standard input: {e}"));
-                interp.shutdown().await;
-                return 1;
-            }
-            s
+        if script_file == "-" {
+            interp.run_reader(BufReader::new(std::io::stdin())).await
         } else {
-            match std::fs::read_to_string(&script_file) {
-                Ok(s) => s,
+            let file = match std::fs::File::open(&script_file) {
+                Ok(f) => f,
                 Err(e) => {
-                    print_err(&format!("Cannot open script file '{script_file}': {e}"));
+                    let reason = e.to_string();
+                    print_err(&translate_with(
+                        CatalogDomain::Cli,
+                        &locale,
+                        "Cannot open the script file '{path}': {reason}",
+                        &[("path", &script_file), ("reason", &reason)],
+                    ));
                     interp.shutdown().await;
                     return 1;
                 }
-            }
-        };
-        let lines: Vec<String> = content.lines().map(ToOwned::to_owned).collect();
-        interp.run_lines(&lines).await
+            };
+            interp.run_reader(BufReader::new(file)).await
+        }
     } else if command_specified {
         interp.run_command_string(&command_text, literal_command).await
     } else if !stdin_is_terminal() && url.is_empty() {
@@ -1062,9 +1075,9 @@ fn run_convert_key(
         } else {
             Some(pass.as_str())
         };
-        match convert_private_key_to_openssh(&raw, pass_opt) {
-            Ok(openssh_pem) => {
-                if let Err(e) = write_exclusive_private_file(out_p, openssh_pem.as_bytes()) {
+        match ppk_to_pkcs8_pem(&raw, pass_opt) {
+            Ok(pkcs8_pem) => {
+                if let Err(e) = write_exclusive_private_file(out_p, pkcs8_pem.as_bytes()) {
                     print_err(&format!("Cannot write '{output_path}': {e}"));
                     return 1;
                 }

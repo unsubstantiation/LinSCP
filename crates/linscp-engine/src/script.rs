@@ -2,17 +2,17 @@
 //! (`LSCP-SERVER 1 ready` / `LSCP-RESULT 0|1`), and interactive SSH PTY `-shell`
 //! runner (`xterm-256color`, `SIGWINCH`, strict `EOF` + `exit-status` check).
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use linscp_i18n::{CatalogDomain, translate, translate_with};
 use linscp_platform::terminal::{
-    RawTerminalGuard, expand_tilde, launch_desktop_ssh_terminal, read_stdin_chunk, stat_local_path,
-    stdin_is_terminal, take_window_resized, terminal_size,
+    RawTerminalGuard, expand_tilde, launch_desktop_ssh_terminal, prompt_yes_no_tty,
+    read_stdin_chunk, stat_local_path, stdin_is_terminal, take_window_resized, terminal_size,
 };
-use linscp_proto::RemoteSession;
+use linscp_proto::{ProgressCallback, RemoteSession};
 use linscp_proto::ssh::{ChannelMsg, SshConnection, extract_openssh_public_key_line};
 use linscp_proto::webdav::{DavEtagPrecondition, dav_entity_tag};
 use linscp_types::{FileEntry, ProtocolScheme, TransferMode};
@@ -352,6 +352,8 @@ pub struct CliSessionDefaults {
     pub port: Option<u16>,
     pub timeout_secs: Option<u64>,
     pub clientcert: Option<String>,
+    pub ftps_mode: Option<u8>,
+    pub ftp_pasv_mode: Option<bool>,
     pub raw_pairs: Vec<String>,
 }
 
@@ -544,6 +546,16 @@ impl ScriptInterpreter {
                 .entry("tls_certificate_file".to_string())
                 .or_insert_with(|| expand_tilde(cc));
         }
+        if let Some(ftps) = d.ftps_mode {
+            spec.raw_fields
+                .entry("ftps".to_string())
+                .or_insert_with(|| ftps.to_string());
+        }
+        if let Some(pasv) = d.ftp_pasv_mode {
+            spec.raw_fields
+                .entry("ftp_pasv_mode".to_string())
+                .or_insert_with(|| (if pasv { "1" } else { "0" }).to_string());
+        }
         if !d.raw_pairs.is_empty() {
             apply_raw_settings(spec, &d.raw_pairs)?;
         }
@@ -613,13 +625,20 @@ impl ScriptInterpreter {
         } else {
             session.pwd().await.unwrap_or_else(|_| "/".to_string())
         };
+        let label = spec.session_label.clone();
+        self.logger.set_session_name(&label);
         spec.timeout_secs = self.reconnect_time_secs.max(spec.timeout_secs);
         self.slots.push(ConnectedSlot {
             spec,
             session,
-            remote_cwd,
+            remote_cwd: remote_cwd.clone(),
         });
         self.active_slot = self.slots.len() - 1;
+        self.emit_status(&self.trp("Session '{host}' opened.", &[("host", &label)]));
+        self.emit_status(&self.trp(
+            "Connected, the remote directory is {path}",
+            &[("path", &remote_cwd)],
+        ));
         Ok(())
     }
 
@@ -649,25 +668,47 @@ impl ScriptInterpreter {
         if self.errors == 0 { 0 } else { 1 }
     }
 
-    /// Executes a script file's lines (`-script=...`). Each line may also contain `;`-separated commands.
+    /// Streams and executes a script line-by-line from any `BufRead` (`-script=FILE`
+    /// including `/dev/stdin` / `-`).
+    pub async fn run_reader<R: BufRead>(&mut self, mut reader: R) -> i32 {
+        let mut raw = String::new();
+        loop {
+            raw.clear();
+            let n = match reader.read_line(&mut raw) {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if n == 0 {
+                break;
+            }
+            let trimmed = raw.trim_end_matches(['\r', '\n']).trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+                continue;
+            }
+            let ok = self.execute_line_with_mode(trimmed, false).await;
+            if self.should_exit {
+                return if self.errors == 0 { 0 } else { 1 };
+            }
+            if !ok && self.cfg.batch_mode.aborts_script() {
+                return if self.errors == 0 { 0 } else { 1 };
+            }
+        }
+        if self.errors == 0 { 0 } else { 1 }
+    }
+
+    /// Executes a script file's lines (`-script=...`).
     pub async fn run_lines(&mut self, lines: &[String]) -> i32 {
         for raw in lines {
             let trimmed = raw.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
                 continue;
             }
-            for sub in split_semicolon_commands(trimmed) {
-                let s = sub.trim();
-                if s.is_empty() || s.starts_with('#') {
-                    continue;
-                }
-                let ok = self.execute_line_with_mode(s, false).await;
-                if self.should_exit {
-                    return if self.errors == 0 { 0 } else { 1 };
-                }
-                if !ok && self.cfg.batch_mode.aborts_script() {
-                    return if self.errors == 0 { 0 } else { 1 };
-                }
+            let ok = self.execute_line_with_mode(trimmed, false).await;
+            if self.should_exit {
+                return if self.errors == 0 { 0 } else { 1 };
+            }
+            if !ok && self.cfg.batch_mode.aborts_script() {
+                return if self.errors == 0 { 0 } else { 1 };
             }
         }
         if self.errors == 0 { 0 } else { 1 }
@@ -1251,69 +1292,138 @@ impl ScriptInterpreter {
         Ok(())
     }
 
+    fn emit_no_match(&self, mask: &str, detail: &str) -> Result<(), String> {
+        let mut msg = format!("No files found matching '{mask}'.");
+        if !detail.is_empty() {
+            msg.push(' ');
+            msg.push_str(detail);
+        }
+        if self.fail_on_nomatch {
+            Err(msg)
+        } else {
+            println!("{msg}");
+            Ok(())
+        }
+    }
+
     fn cmd_lls(&self, args: &[String]) -> Result<(), String> {
-        let mut target_dir = self.local_cwd.clone();
-        let mut mask_opt: Option<String> = None;
-        for a in args {
-            if a.starts_with('-') {
-                continue;
-            }
-            let expanded = expand_tilde(a);
-            let p = if Path::new(&expanded).is_absolute() {
-                PathBuf::from(&expanded)
-            } else {
-                self.local_cwd.join(&expanded)
-            };
-            if p.is_dir() {
-                target_dir = p;
-            } else if has_wildcard(&expanded) {
-                target_dir = p
-                    .parent()
-                    .filter(|d| !d.as_os_str().is_empty())
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| self.local_cwd.clone());
-                mask_opt = p.file_name().map(|s| s.to_string_lossy().into_owned());
-            } else if p.exists() {
-                let info = stat_local_path(&p);
-                let name = p
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or(expanded);
-                println!(
-                    "{} {:>10} {} {} {}",
-                    format_permissions_10(info.mode, info.is_dir, info.is_symlink),
-                    info.size,
-                    format_file_date(info.mtime),
-                    format_file_clock(info.mtime),
-                    name
+        if args.len() > 1 {
+            let h = self.tr("Syntax: lls [<directory>[/<mask>]]");
+            return Err(self.wrong_args("lls", h));
+        }
+        if let Some(first) = args.first() {
+            if first.starts_with('-') {
+                let h = self.trp(
+                    "Unsupported switch '{switch}'; it will not be ignored. Prefix a filename beginning with '-' with './'.",
+                    &[("switch", first)],
                 );
-                return Ok(());
-            } else {
-                return Err(format!("Local path '{a}' does not exist."));
+                return Err(self.wrong_args("lls", &h));
             }
         }
-        let rd = std::fs::read_dir(&target_dir)
-            .map_err(|e| format!("Cannot read local directory '{}': {e}", target_dir.display()))?;
-        let mut rows = Vec::new();
-        for item in rd.flatten() {
-            let name = item.file_name().to_string_lossy().into_owned();
-            if let Some(ref m) = mask_opt {
-                if !matches_wildcard(m, &name) {
-                    continue;
+
+        let raw_arg = args.first().map(|s| expand_tilde(s));
+        let path = match &raw_arg {
+            Some(expanded) => resolve_local_against(&self.local_cwd, expanded),
+            None => self.local_cwd.clone(),
+        };
+        let mut message_mask = "*.*".to_string();
+        if raw_arg.is_some() {
+            if let Some(leaf) = path.file_name().map(|s| s.to_string_lossy().into_owned()) {
+                if has_wildcard(&leaf) {
+                    message_mask = leaf;
                 }
             }
-            let info = stat_local_path(&item.path());
-            rows.push((name, info));
         }
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, info) in rows {
+
+        let mut matched_paths: Vec<PathBuf> = Vec::new();
+        let top_info = stat_local_path(&path);
+        if top_info.exists && top_info.is_dir && !has_wildcard(&path.display().to_string()) {
+            let rd = match std::fs::read_dir(&path) {
+                Ok(rd) => rd,
+                Err(e) => return self.emit_no_match(&message_mask, &e.to_string()),
+            };
+            for item in rd.flatten() {
+                let name = item.file_name().to_string_lossy().into_owned();
+                if name != "." && name != ".." {
+                    matched_paths.push(item.path());
+                }
+            }
+        } else if has_wildcard(&path.display().to_string()) {
+            let dir = path
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or(&self.local_cwd);
+            let leaf_pat = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let rd = match std::fs::read_dir(dir) {
+                Ok(rd) => rd,
+                Err(e) => return self.emit_no_match(&message_mask, &e.to_string()),
+            };
+            for item in rd.flatten() {
+                let name = item.file_name().to_string_lossy().into_owned();
+                if name != "." && name != ".." && matches_wildcard(&leaf_pat, &name) {
+                    matched_paths.push(item.path());
+                }
+            }
+        } else if top_info.exists {
+            matched_paths.push(path);
+        } else {
+            return self.emit_no_match(&message_mask, "No such file or directory.");
+        }
+
+        matched_paths.sort();
+
+        struct LlsRow {
+            date: String,
+            time: String,
+            size: String,
+            name: String,
+        }
+
+        let mut rows = Vec::with_capacity(matched_paths.len());
+        let mut date_len = 0usize;
+        let mut time_len = 0usize;
+        for entry_path in matched_paths {
+            let name = entry_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry_path.display().to_string());
+            if name == "." {
+                continue;
+            }
+            let info = stat_local_path(&entry_path);
+            let date = format_file_date(info.mtime);
+            let time = format_file_clock(info.mtime);
+            let size = if info.is_dir {
+                format!("{:<14}", "<DIR>")
+            } else {
+                format!("{:>14}", info.size)
+            };
+            date_len = date_len.max(date.len());
+            time_len = time_len.max(time.len());
+            rows.push(LlsRow {
+                date,
+                time,
+                size,
+                name,
+            });
+        }
+
+        if rows.is_empty() {
+            return self.emit_no_match(&message_mask, "");
+        }
+
+        for r in rows {
             println!(
-                "{} {:>10} {} {} {}",
-                format_permissions_10(info.mode, info.is_dir, info.is_symlink),
-                info.size,
-                format_file_date(info.mtime),
-                format_file_clock(info.mtime),
-                name
+                "{:<dw$}  {:<tw$}    {} {}",
+                r.date,
+                r.time,
+                r.size,
+                r.name,
+                dw = date_len,
+                tw = time_len
             );
         }
         Ok(())
@@ -1590,7 +1700,8 @@ impl ScriptInterpreter {
             } else if low.starts_with("-protocol=") {
                 let val = norm["-protocol=".len()..].trim().to_ascii_lowercase();
                 let proto = match val.as_str() {
-                    "sftp" | "ssh" => ProtocolScheme::Sftp,
+                    "sftp" => ProtocolScheme::Sftp,
+                    "ssh" => ProtocolScheme::Ssh,
                     "scp" => ProtocolScheme::Scp,
                     "ftp" => ProtocolScheme::Ftp,
                     "ftps" => {
@@ -1678,10 +1789,23 @@ impl ScriptInterpreter {
 
         validate_session_settings(&spec).map_err(|e| self.wrong_args("savesession", &e))?;
 
+        let stored_non_empty_pw = spec
+            .session
+            .password
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
         let site = stored_site_from_spec(name, &spec);
         store.upsert(site);
         store.save_to_dir(&self.cfg.config_dir, &vault)?;
         println!("Saved session '{name}'.");
+        if stored_non_empty_pw {
+            let key_path = self.cfg.config_dir.join("sessions.key");
+            let loc = format!(" under '{}'", key_path.display());
+            self.emit_status(&self.trp(
+                "Warning: the password was stored encrypted in the session file{location}. It is readable by this account only; remove it with 'savesession {name}' after connecting with a key or an agent.",
+                &[("location", &loc), ("name", name)],
+            ));
+        }
         Ok(())
     }
 
@@ -1807,8 +1931,6 @@ impl ScriptInterpreter {
         apply_env_credential_fallbacks(&mut spec);
         validate_session_settings(&spec)?;
         self.open_slot_from_spec(spec).await?;
-        let label = self.slots[self.active_slot].spec.session_label.clone();
-        self.emit_status(&self.trp("Session '{host}' opened.", &[("host", &label)]));
         Ok(())
     }
 
@@ -2143,19 +2265,28 @@ impl ScriptInterpreter {
                 for seg in path.split('/').filter(|s| !s.is_empty()) {
                     cur.push('/');
                     cur.push_str(seg);
-                    if self.slots[self.active_slot]
+                    match self.slots[self.active_slot]
                         .session
                         .stat(&cur)
                         .await
                         .map_err(|e| e.to_string())?
-                        .is_none()
                     {
-                        if let Err(e) = self.slots[self.active_slot].session.mkdir(&cur).await {
-                            let msg = e.to_string();
+                        Some(existing) if existing.is_dir => {}
+                        Some(_) => {
+                            let msg = format!(
+                                "Cannot create the directory '{cur}': that name already exists."
+                            );
                             self.logger.record_mkdir(&cur, Err(&msg));
                             return Err(msg);
                         }
-                        self.logger.record_mkdir(&cur, Ok(()));
+                        None => {
+                            if let Err(e) = self.slots[self.active_slot].session.mkdir(&cur).await {
+                                let msg = e.to_string();
+                                self.logger.record_mkdir(&cur, Err(&msg));
+                                return Err(msg);
+                            }
+                            self.logger.record_mkdir(&cur, Ok(()));
+                        }
                     }
                 }
             } else {
@@ -2306,10 +2437,153 @@ impl ScriptInterpreter {
             .map_err(|e| e.to_string())
     }
 
+    async fn confirm_overwrite_remote(&self, dest_path: &str) -> Result<bool, String> {
+        if !self.cfg.confirm || self.cfg.server_mode {
+            return Ok(true);
+        }
+        let exists = self.slots[self.active_slot]
+            .session
+            .stat(dest_path)
+            .await
+            .map_err(|e| self.remote_error("inspect target", dest_path, &e.to_string()))?
+            .is_some();
+        if !exists {
+            return Ok(true);
+        }
+        if !self.is_interactive_confirm() {
+            return Err(self
+                .tr("Cannot confirm this action without a terminal; run interactively or use 'option confirm off' in a trusted script.")
+                .to_string());
+        }
+        let q = self.trp(
+            "Overwrite remote file '{path}'?",
+            &[("path", dest_path)],
+        );
+        if prompt_yes_no_tty(&format!("{q} (y/n): "), &self.cfg.locale) {
+            Ok(true)
+        } else {
+            self.emit_status(self.tr("Cancelled."));
+            Ok(false)
+        }
+    }
+
+    async fn copy_remote_one_file(
+        &mut self,
+        src_path: &str,
+        src_entry: &FileEntry,
+        dest_path: &str,
+    ) -> Result<(), String> {
+        if !self.confirm_overwrite_remote(dest_path).await? {
+            return Ok(());
+        }
+        match self.slots[self.active_slot]
+            .session
+            .copy_file(src_path, dest_path)
+            .await
+        {
+            Ok(()) => {
+                self.logger
+                    .record_mv_or_cp(true, src_path, dest_path, Ok(()));
+                self.emit_status(&self.trp(
+                    "Copied '{from}' to '{to}' on the server.",
+                    &[("from", src_path), ("to", dest_path)],
+                ));
+                Ok(())
+            }
+            Err(linscp_proto::ProtoError::UnsupportedCapability(..)) => {
+                self.emit_status(
+                    self.tr("The server cannot copy files by itself; copying through this client."),
+                );
+                match self.stream_remote_copy(src_path, src_entry, dest_path).await {
+                    Ok(()) => {
+                        self.logger
+                            .record_mv_or_cp(true, src_path, dest_path, Ok(()));
+                        self.emit_status(&self.trp(
+                            "Copied '{from}' to '{to}'.",
+                            &[("from", src_path), ("to", dest_path)],
+                        ));
+                        Ok(())
+                    }
+                    Err(msg) => {
+                        let full = self.remote_error("copy", src_path, &msg);
+                        self.logger
+                            .record_mv_or_cp(true, src_path, dest_path, Err(&full));
+                        Err(full)
+                    }
+                }
+            }
+            Err(e) => {
+                let full = self.remote_error("copy", src_path, &e.to_string());
+                self.logger
+                    .record_mv_or_cp(true, src_path, dest_path, Err(&full));
+                Err(full)
+            }
+        }
+    }
+
+    async fn ensure_remote_dir_recursive(&mut self, dir_path: &str) -> Result<(), String> {
+        let mut cur = String::new();
+        for seg in dir_path.split('/').filter(|s| !s.is_empty()) {
+            cur.push('/');
+            cur.push_str(seg);
+            match self.slots[self.active_slot]
+                .session
+                .stat(&cur)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                Some(e) if e.is_dir => {}
+                Some(_) => {
+                    return Err(format!(
+                        "Cannot create the directory '{cur}': that name already exists."
+                    ));
+                }
+                None => {
+                    self.slots[self.active_slot]
+                        .session
+                        .mkdir(&cur)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    self.logger.record_mkdir(&cur, Ok(()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn copy_remote_tree(
+        &mut self,
+        src_path: &str,
+        src_entry: &FileEntry,
+        dest_path: &str,
+    ) -> Result<(), String> {
+        if !src_entry.is_dir {
+            return self.copy_remote_one_file(src_path, src_entry, dest_path).await;
+        }
+        self.ensure_remote_dir_recursive(dest_path)
+            .await
+            .map_err(|e| self.remote_error("create the directory", dest_path, &e))?;
+        let mut entries = self.slots[self.active_slot]
+            .session
+            .list_dir(src_path)
+            .await
+            .map_err(|e| self.remote_error("read directory", src_path, &e.to_string()))?;
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        for child in entries {
+            if child.name == "." || child.name == ".." {
+                continue;
+            }
+            let csrc = join_remote_path(src_path, &child.name);
+            let cdst = join_remote_path(dest_path, &child.name);
+            Box::pin(self.copy_remote_tree(&csrc, &child, &cdst)).await?;
+        }
+        Ok(())
+    }
+
     async fn cmd_mv_or_cp(&mut self, args: &[String], is_copy: bool) -> Result<(), String> {
         let name = if is_copy { "cp" } else { "mv" };
         if args.len() < 2 || args.iter().any(|a| a.starts_with('-')) {
-            return Err(format!("Syntax: {name} <source>... <target>"));
+            return Err(self.wrong_args(name, &format!("Syntax: {name} <source>... <target>")));
         }
         let cwd = self.active_slot()?.remote_cwd.clone();
         let raw_target = &args[args.len() - 1];
@@ -2321,14 +2595,16 @@ impl ScriptInterpreter {
             .await
             .ok()
             .flatten();
-        let target_is_dir = target_ends_slash || target_stat.as_ref().is_some_and(|e| e.is_dir);
+        let target_exists = target_stat.is_some();
+        let mut target_is_dir =
+            target_ends_slash || target_stat.as_ref().is_some_and(|e| e.is_dir);
 
         let mut expanded_sources = Vec::new();
         for src in &args[..args.len() - 1] {
             let resolved_src = resolve_remote_path(&cwd, src);
             let matches = self.expand_remote_pattern(&resolved_src).await?;
             if matches.is_empty() {
-                let msg = format!("Source '{src}' does not exist.");
+                let msg = self.remote_error("find", src, "No matching files.");
                 self.logger
                     .record_mv_or_cp(is_copy, &resolved_src, &target_resolved, Err(&msg));
                 return Err(msg);
@@ -2336,46 +2612,52 @@ impl ScriptInterpreter {
             expanded_sources.extend(matches);
         }
 
-        if expanded_sources.len() > 1 && !target_is_dir {
-            return Err(format!(
-                "Target '{raw_target}' must be an existing directory when moving/copying multiple sources."
-            ));
+        if expanded_sources.len() > 1 {
+            if target_exists && !target_is_dir {
+                return Err(self.remote_error(
+                    if is_copy { "copy to" } else { "move to" },
+                    &target_resolved,
+                    "A directory is required for multiple source files.",
+                ));
+            }
+            if is_copy && !target_exists {
+                self.ensure_remote_dir_recursive(&target_resolved)
+                    .await
+                    .map_err(|e| self.remote_error("create the directory", &target_resolved, &e))?;
+                target_is_dir = true;
+            } else if !target_is_dir {
+                return Err(format!(
+                    "Target '{raw_target}' must be an existing directory when moving multiple sources."
+                ));
+            }
         }
 
         for (src_path, src_entry) in expanded_sources {
-            let dest_path = if target_is_dir {
+            let dest_path = if target_is_dir && (!src_entry.is_dir || target_exists || args.len() > 2) {
                 join_remote_path(&target_resolved, &src_entry.name)
             } else {
                 target_resolved.clone()
             };
-            let op_res = if is_copy {
-                match self.slots[self.active_slot]
-                    .session
-                    .copy_file(&src_path, &dest_path)
-                    .await
-                {
-                    Err(linscp_proto::ProtoError::UnsupportedCapability(..)) => {
-                        self.stream_remote_copy(&src_path, &src_entry, &dest_path)
-                            .await
-                            .map_err(linscp_proto::ProtoError::Transport)
-                    }
-                    other => other,
-                }
+            if is_copy {
+                self.copy_remote_tree(&src_path, &src_entry, &dest_path).await?;
             } else {
-                self.slots[self.active_slot]
+                if !self.confirm_overwrite_remote(&dest_path).await? {
+                    continue;
+                }
+                match self.slots[self.active_slot]
                     .session
                     .rename(&src_path, &dest_path)
                     .await
-            };
-            match op_res {
-                Ok(()) => self
-                    .logger
-                    .record_mv_or_cp(is_copy, &src_path, &dest_path, Ok(())),
-                Err(e) => {
-                    let msg = e.to_string();
-                    self.logger
-                        .record_mv_or_cp(is_copy, &src_path, &dest_path, Err(&msg));
-                    return Err(msg);
+                {
+                    Ok(()) => self
+                        .logger
+                        .record_mv_or_cp(false, &src_path, &dest_path, Ok(())),
+                    Err(e) => {
+                        let msg = self.remote_error("move", &src_path, &e.to_string());
+                        self.logger
+                            .record_mv_or_cp(false, &src_path, &dest_path, Err(&msg));
+                        return Err(msg);
+                    }
                 }
             }
         }
@@ -2882,6 +3164,10 @@ impl ScriptInterpreter {
                 .as_ref()
                 .is_some_and(|p| p != Path::new("-") && p.is_dir());
 
+        let show_tty_progress = !self.cfg.server_mode
+            && self.cfg.batch_mode == BatchMode::Off
+            && std::io::stdout().is_terminal();
+
         for (rpath, rentry) in matched_items {
             if !flags.file_mask.accepts(
                 &rentry.name,
@@ -2918,17 +3204,62 @@ impl ScriptInterpreter {
                 .await
                 .map_err(|e| self.transfer_failed(&rpath, &e))?;
             } else {
-                download_single_file(
+                let is_synthetic_missing = rentry.permissions.is_empty() && rentry.date.is_empty();
+                let entry_ref = if is_synthetic_missing {
+                    None
+                } else {
+                    Some(&rentry)
+                };
+                let draw_prog = show_tty_progress && local_dest != Path::new("-");
+                if draw_prog && !is_synthetic_missing {
+                    print!("{}", rentry.name);
+                    if rentry.size > 0 {
+                        let pad = 24usize.saturating_sub(rentry.name.len()).max(1);
+                        print!("{:pad$}|          0.0%", "", pad = pad);
+                    }
+                    let _ = std::io::stdout().flush();
+                }
+                let last_permille = std::sync::atomic::AtomicU64::new(0);
+                let prog_fn = |done: u64, tot: u64| {
+                    if !draw_prog || tot == 0 {
+                        return;
+                    }
+                    let permille = ((done.saturating_mul(1000)) / tot).min(1000);
+                    let prev = last_permille.swap(permille, std::sync::atomic::Ordering::Relaxed);
+                    if permille != prev {
+                        print!("\r|  {:3}.{}%    ", permille / 10, permille % 10);
+                        let _ = std::io::stdout().flush();
+                    }
+                };
+                let prog_ref: Option<&ProgressCallback> = if draw_prog {
+                    Some(&prog_fn as &ProgressCallback)
+                } else {
+                    None
+                };
+                let dl_res = download_single_file(
                     self.slots[self.active_slot].session.as_ref(),
                     &rpath,
-                    Some(&rentry),
+                    entry_ref,
                     &local_dest,
                     &flags,
                     &mut self.logger,
-                    None,
+                    prog_ref,
                 )
-                .await
-                .map_err(|e| self.transfer_failed(&rpath, &e))?;
+                .await;
+                if draw_prog && !is_synthetic_missing {
+                    if dl_res.is_ok() {
+                        print!("\r|  100.0%    \n");
+                    } else {
+                        println!();
+                    }
+                    let _ = std::io::stdout().flush();
+                }
+                dl_res.map_err(|e| self.transfer_failed(&rpath, &e))?;
+                if dl_res == Ok(true) && !self.cfg.server_mode && local_dest != Path::new("-") {
+                    let dst_disp = local_dest.display().to_string();
+                    let sz = stat_local_path(&local_dest).size;
+                    self.emit_status(&format!("Downloaded '{dst_disp}' ({sz} bytes)."));
+                }
             }
         }
         Ok(())
@@ -3010,19 +3341,21 @@ impl ScriptInterpreter {
             }
         }
 
-        let remote_target_is_dir = target_trailing_slash
-            || local_items.len() > 1
-            || if let Some(ref rt) = explicit_remote_target {
-                self.slots[self.active_slot]
-                    .session
-                    .stat(rt)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|e| e.is_dir)
-            } else {
-                true
-            };
+        let existing_remote_is_dir = if let Some(ref rt) = explicit_remote_target {
+            self.slots[self.active_slot]
+                .session
+                .stat(rt)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|e| e.is_dir)
+        } else {
+            true
+        };
+        let multi_source = local_items.len() > 1 || sources.len() > 1;
+        let show_tty_progress = !self.cfg.server_mode
+            && self.cfg.batch_mode == BatchMode::Off
+            && std::io::stdout().is_terminal();
 
         for (lpath, lname, _, is_dir, sz) in local_items {
             if lpath != Path::new("-") && !flags.file_mask.accepts(&lname, is_dir, sz, 0, &lname) {
@@ -3035,8 +3368,11 @@ impl ScriptInterpreter {
                     }
                 }
             }
+            let item_target_is_dir = existing_remote_is_dir
+                || multi_source
+                || (!is_dir && target_trailing_slash);
             let rdest = match &explicit_remote_target {
-                Some(rt) if remote_target_is_dir => join_remote_path(rt, &lname),
+                Some(rt) if item_target_is_dir => join_remote_path(rt, &lname),
                 Some(rt) => rt.clone(),
                 None => join_remote_path(&cwd, &lname),
             };
@@ -3054,16 +3390,50 @@ impl ScriptInterpreter {
                 .await
                 .map_err(|e| self.transfer_failed(&src_disp, &e))?;
             } else {
-                upload_single_file(
+                let draw_prog = show_tty_progress && lpath != Path::new("-");
+                if draw_prog {
+                    print!("{lname}");
+                    if sz > 0 {
+                        let pad = 24usize.saturating_sub(lname.len()).max(1);
+                        print!("{:pad$}|          0.0%", "", pad = pad);
+                    }
+                    let _ = std::io::stdout().flush();
+                }
+                let last_permille = std::sync::atomic::AtomicU64::new(0);
+                let prog_fn = |done: u64, tot: u64| {
+                    if !draw_prog || tot == 0 {
+                        return;
+                    }
+                    let permille = ((done.saturating_mul(1000)) / tot).min(1000);
+                    let prev = last_permille.swap(permille, std::sync::atomic::Ordering::Relaxed);
+                    if permille != prev {
+                        print!("\r|  {:3}.{}%    ", permille / 10, permille % 10);
+                        let _ = std::io::stdout().flush();
+                    }
+                };
+                let prog_ref: Option<&ProgressCallback> = if draw_prog {
+                    Some(&prog_fn as &ProgressCallback)
+                } else {
+                    None
+                };
+                let up_res = upload_single_file(
                     self.slots[self.active_slot].session.as_ref(),
                     &lpath,
                     &rdest,
                     &flags,
                     &mut self.logger,
-                    None,
+                    prog_ref,
                 )
-                .await
-                .map_err(|e| self.transfer_failed(&src_disp, &e))?;
+                .await;
+                if draw_prog {
+                    if up_res.is_ok() {
+                        print!("\r|  100.0%    \n");
+                    } else {
+                        println!();
+                    }
+                    let _ = std::io::stdout().flush();
+                }
+                up_res.map_err(|e| self.transfer_failed(&src_disp, &e))?;
             }
         }
         Ok(())
@@ -3168,6 +3538,7 @@ impl ScriptInterpreter {
                     flags.speed_kbytes_per_sec = if kb == 0 { None } else { Some(kb) };
                 }
                 _ if low.starts_with("-resumesupport=") => {
+                    flags.explicit_resume_support = true;
                     let v = &norm["-resumesupport=".len()..];
                     match v.to_ascii_lowercase().as_str() {
                         "on" => {
@@ -4119,7 +4490,26 @@ impl ScriptInterpreter {
                     }
                     Ok(vec![(resolved_pattern.to_string(), entry)])
                 }
-                None => Ok(Vec::new()),
+                None => {
+                    let (_, leaf) = remote_parent_and_name(resolved_pattern);
+                    let fallback = FileEntry {
+                        name: if leaf.is_empty() {
+                            resolved_pattern.to_string()
+                        } else {
+                            leaf
+                        },
+                        size: 0,
+                        is_dir: false,
+                        is_symlink: false,
+                        broken_link: false,
+                        date: String::new(),
+                        mtime: 0,
+                        permissions: String::new(),
+                        owner: None,
+                        group: None,
+                    };
+                    Ok(vec![(resolved_pattern.to_string(), fallback)])
+                }
             }
         }
     }
@@ -4286,6 +4676,22 @@ pub async fn run_pty_shell_session(conn: &SshConnection) -> Result<i32, String> 
     }
 }
 
+pub fn parse_open_switch_bool(val: Option<&str>) -> Option<bool> {
+    let Some(s) = val else {
+        return Some(true);
+    };
+    if s.is_empty() || s.eq_ignore_ascii_case("on") {
+        return Some(true);
+    }
+    if s.eq_ignore_ascii_case("off") {
+        return Some(false);
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        return Some(n != 0);
+    }
+    None
+}
+
 pub fn apply_open_switches(
     spec: &mut ParsedSiteSpec,
     switches: &[String],
@@ -4353,18 +4759,53 @@ pub fn apply_open_switches(
                 .filter(|&s| s > 0)
                 .ok_or_else(|| "'-timeout=' must be a positive number of seconds.".to_string())?;
             spec.timeout_secs = secs;
-        } else if low == "-implicit" || low == "-implicit=on" {
-            apply_raw_settings(spec, &["Ftps=1".to_string()])?;
-        } else if low == "-implicit=off" {
-            apply_raw_settings(spec, &["Ftps=0".to_string()])?;
-        } else if low == "-explicit" || low == "-explicit=on" {
-            apply_raw_settings(spec, &["Ftps=3".to_string()])?;
-        } else if low == "-explicit=off" {
-            apply_raw_settings(spec, &["Ftps=0".to_string()])?;
-        } else if low == "-passive" || low == "-passive=on" {
-            apply_raw_settings(spec, &["FtpPasvMode=1".to_string()])?;
-        } else if low == "-passive=off" {
-            apply_raw_settings(spec, &["FtpPasvMode=0".to_string()])?;
+        } else if low == "-implicit" || low.starts_with("-implicit=") {
+            let val = norm.split_once('=').map(|(_, v)| v);
+            let Some(on) = parse_open_switch_bool(val) else {
+                let sw_err = format!("Invalid value for '{raw}' (expected on, off, 1 or 0).");
+                return Err(translate_with(
+                    CatalogDomain::Cli,
+                    locale,
+                    "Wrong arguments of '{command}' command. {hint}",
+                    &[("command", "open"), ("hint", &sw_err)],
+                ));
+            };
+            spec.raw_fields
+                .insert("ftps".to_string(), (if on { "1" } else { "0" }).to_string());
+        } else if low == "-explicit"
+            || low.starts_with("-explicit=")
+            || low == "-explicittls"
+            || low.starts_with("-explicittls=")
+            || low == "-explicitssl"
+            || low.starts_with("-explicitssl=")
+        {
+            let val = norm.split_once('=').map(|(_, v)| v);
+            let Some(on) = parse_open_switch_bool(val) else {
+                let sw_err = format!("Invalid value for '{raw}' (expected on, off, 1 or 0).");
+                return Err(translate_with(
+                    CatalogDomain::Cli,
+                    locale,
+                    "Wrong arguments of '{command}' command. {hint}",
+                    &[("command", "open"), ("hint", &sw_err)],
+                ));
+            };
+            spec.raw_fields
+                .insert("ftps".to_string(), (if on { "3" } else { "0" }).to_string());
+        } else if low == "-passive" || low.starts_with("-passive=") {
+            let val = norm.split_once('=').map(|(_, v)| v);
+            let Some(on) = parse_open_switch_bool(val) else {
+                let sw_err = format!("Invalid value for '{raw}' (expected on, off, 1 or 0).");
+                return Err(translate_with(
+                    CatalogDomain::Cli,
+                    locale,
+                    "Wrong arguments of '{command}' command. {hint}",
+                    &[("command", "open"), ("hint", &sw_err)],
+                ));
+            };
+            spec.raw_fields.insert(
+                "ftp_pasv_mode".to_string(),
+                (if on { "1" } else { "0" }).to_string(),
+            );
         } else if low.starts_with("-sessionname=") {
             spec.session_label = norm["-sessionname=".len()..].to_string();
         } else if allow_preset_switch && low.starts_with("-preset=") {

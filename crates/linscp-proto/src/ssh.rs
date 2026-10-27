@@ -182,8 +182,8 @@ pub fn compute_ssh_fingerprints(
     Ok((alg, sha256_fp, md5_fp))
 }
 
-/// Decodes an SSH private key from OpenSSH PEM, PKCS#8 PEM, or PuTTY `.ppk`
-/// v2/v3 text (converting `.ppk` through `linscp_crypto::ppk`).
+/// Decodes an SSH private key from OpenSSH PEM, PKCS#8 PEM, RFC 1421
+/// `Proc-Type: 4,ENCRYPTED` PEM, or PuTTY `.ppk` v2/v3 text.
 pub fn load_private_key_text(
     raw_key_text: &str,
     passphrase: Option<&str>,
@@ -197,16 +197,39 @@ pub fn load_private_key_text(
             .map_err(|e| ProtoError::Transport(format!("Failed to decode converted PPK key: {e}")));
     }
 
+    if let Some(plain_pem) =
+        linscp_crypto::ppk::decrypt_legacy_encrypted_pem(trimmed, passphrase.unwrap_or(""))
+            .map_err(|e| ProtoError::Transport(format!("Failed to decrypt SSH private key: {e}")))?
+    {
+        return decode_secret_key(plain_pem.as_str(), None)
+            .map_err(|e| ProtoError::Transport(format!("Failed to decode SSH private key: {e}")));
+    }
+
     decode_secret_key(trimmed, passphrase)
         .map_err(|e| ProtoError::Transport(format!("Failed to decode SSH private key: {e}")))
 }
 
-/// Extracts an OpenSSH `authorized_keys` public-key line from an OpenSSH PEM,
-/// PKCS#8 PEM, or PuTTY `.ppk` v2/v3 private key.
+/// Extracts an OpenSSH `authorized_keys` public-key line from an OpenSSH `.pub`
+/// file, OpenSSH PEM, PKCS#8 PEM, RFC 1421 PEM, or PuTTY `.ppk` v2/v3 key.
 pub fn extract_openssh_public_key_line(
     raw_key_text: &str,
     passphrase: Option<&str>,
 ) -> Result<String, ProtoError> {
+    let trimmed = raw_key_text.trim_start_matches('\u{feff}').trim_start();
+    if !trimmed.starts_with("-----BEGIN ") && !trimmed.starts_with("PuTTY-User-Key-File-") {
+        for line in trimmed.lines() {
+            let candidate = line.trim();
+            if candidate.is_empty() || candidate.starts_with('#') {
+                continue;
+            }
+            if let Ok(pk) = PublicKey::from_openssh(candidate) {
+                return pk.to_openssh().map_err(|e| {
+                    ProtoError::Transport(format!("Failed to format OpenSSH public key: {e}"))
+                });
+            }
+            break;
+        }
+    }
     let priv_key = load_private_key_text(raw_key_text, passphrase)?;
     priv_key
         .public_key()
@@ -654,11 +677,39 @@ impl SshConnection {
 
     /// Opens an SFTP subsystem channel and returns its bidirectional byte stream.
     pub async fn open_sftp_stream(&self) -> Result<ChannelStream<client::Msg>, ProtoError> {
-        let channel = self.open_session_channel().await?;
+        let mut channel = self.open_session_channel().await?;
         tokio::time::timeout(self.timeout, channel.request_subsystem(true, "sftp"))
             .await
             .map_err(|_| ProtoError::Transport("Timed out starting SFTP subsystem.".to_string()))?
             .map_err(|e| ProtoError::Transport(format!("Failed to start SFTP subsystem: {e}")))?;
+
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            match tokio::time::timeout_at(deadline, channel.wait()).await {
+                Ok(Some(ChannelMsg::Success)) => break,
+                Ok(Some(ChannelMsg::WindowAdjusted { .. } | ChannelMsg::ExtendedData { .. })) => {}
+                Ok(Some(ChannelMsg::Failure)) => {
+                    return Err(ProtoError::Transport(
+                        "The server refused to start the SFTP subsystem.".to_string(),
+                    ));
+                }
+                Ok(Some(ChannelMsg::Eof | ChannelMsg::Close)) | Ok(None) => {
+                    return Err(ProtoError::Transport(
+                        "SSH channel closed while starting the SFTP subsystem.".to_string(),
+                    ));
+                }
+                Ok(Some(other)) => {
+                    return Err(ProtoError::Transport(format!(
+                        "Unexpected SSH channel reply while starting SFTP subsystem: {other:?}"
+                    )));
+                }
+                Err(_) => {
+                    return Err(ProtoError::Transport(
+                        "Timed out waiting for SFTP subsystem confirmation.".to_string(),
+                    ));
+                }
+            }
+        }
         Ok(channel.into_stream())
     }
 

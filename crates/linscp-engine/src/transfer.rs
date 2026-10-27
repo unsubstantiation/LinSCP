@@ -31,6 +31,7 @@ pub struct TransferFlags {
     pub append: bool,
     pub recursive: bool,
     pub resume_support: ResumeSupportMode,
+    pub explicit_resume_support: bool,
     pub permissions: PresetPermissions,
     pub speed_kbytes_per_sec: Option<u64>,
     pub version_id: Option<String>,
@@ -51,6 +52,7 @@ impl Default for TransferFlags {
             append: false,
             recursive: false,
             resume_support: ResumeSupportMode::Smart(100 * 1024),
+            explicit_resume_support: false,
             permissions: PresetPermissions::Off,
             speed_kbytes_per_sec: None,
             version_id: None,
@@ -247,18 +249,18 @@ fn validate_protocol_transfer_flags(
                 "'-append' on 'get' is supported only when appending to a local file.".to_string(),
             );
         }
-        if scheme != ProtocolScheme::Sftp
-            && scheme != ProtocolScheme::Ssh
-            && !is_ftp_scheme(scheme)
-        {
+        if scheme != ProtocolScheme::Sftp && !is_ftp_scheme(scheme) {
             return Err(format!(
                 "'-append' is not supported for {} protocol.",
                 scheme.as_str().to_uppercase()
             ));
         }
     }
-    if scheme == ProtocolScheme::Scp
-        && (flags.resume || matches!(flags.resume_support, ResumeSupportMode::On))
+    if matches!(scheme, ProtocolScheme::Scp | ProtocolScheme::Ssh)
+        && (flags.resume
+            || matches!(flags.resume_support, ResumeSupportMode::On)
+            || (flags.explicit_resume_support
+                && matches!(flags.resume_support, ResumeSupportMode::Smart(_))))
     {
         return Err("The SCP protocol cannot resume transfers.".to_string());
     }
@@ -435,7 +437,7 @@ pub async fn download_single_file(
         None
     };
 
-    let can_resume_proto = session.scheme() != ProtocolScheme::Scp;
+    let can_resume_proto = !matches!(session.scheme(), ProtocolScheme::Scp | ProtocolScheme::Ssh);
     let (write_path, resume_offset) = if let Some(ref sp) = stage_opt {
         let sp_meta = stat_local_path(sp);
         if can_resume_proto && sp_meta.exists && sp_meta.is_regular {
@@ -670,6 +672,9 @@ pub async fn upload_single_file(
             return Err(msg);
         }
         logger.record_transfer(true, &src_label, remote_dest, Some(total), Ok(()));
+        if let Some(mt) = desired_mtime.filter(|_| session.scheme() != ProtocolScheme::S3) {
+            logger.record_touch(remote_dest, mt, Ok(()));
+        }
         if flags.delete_source {
             std::fs::remove_file(local_src)
                 .map_err(|e| format!("Cannot remove source '{src_label}': {e}"))?;
@@ -684,7 +689,7 @@ pub async fn upload_single_file(
         None
     };
 
-    let can_resume_proto = session.scheme() != ProtocolScheme::Scp;
+    let can_resume_proto = !matches!(session.scheme(), ProtocolScheme::Scp | ProtocolScheme::Ssh);
     let (upload_path, resume_offset) = if let Some(ref sp) = stage_opt {
         if let Ok(Some(st)) = session.stat(sp).await {
             if can_resume_proto && !st.is_dir && st.size < local_info.size {
@@ -778,6 +783,9 @@ pub async fn upload_single_file(
     }
 
     logger.record_transfer(true, &src_label, remote_dest, Some(local_info.size), Ok(()));
+    if let Some(mt) = desired_mtime.filter(|_| session.scheme() != ProtocolScheme::S3) {
+        logger.record_touch(remote_dest, mt, Ok(()));
+    }
     if flags.delete_source {
         std::fs::remove_file(local_src)
             .map_err(|e| format!("Cannot remove source '{src_label}': {e}"))?;
@@ -852,6 +860,13 @@ pub async fn download_directory_recursive(
             count += 1;
         }
     }
+    if rel_prefix.is_empty() && flags.preserve_time && flags.preserve_time_dirs {
+        if let Ok(Some(st)) = session.stat(remote_dir).await {
+            if st.mtime > 0 {
+                let _ = set_local_file_times(local_dir, st.mtime, st.mtime);
+            }
+        }
+    }
     if flags.delete_source {
         let _ = session.remove_dir(remote_dir).await;
     }
@@ -924,6 +939,12 @@ pub async fn upload_directory_recursive(
         } else if upload_single_file(session, &path, &child_remote, flags, logger, progress).await?
         {
             count += 1;
+        }
+    }
+    if rel_prefix.is_empty() && flags.preserve_time && flags.preserve_time_dirs {
+        let info = stat_local_path(local_dir);
+        if info.mtime > 0 {
+            let _ = session.set_mtime(remote_dir, info.mtime).await;
         }
     }
     if flags.delete_source {

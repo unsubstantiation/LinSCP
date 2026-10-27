@@ -67,9 +67,10 @@ impl LogRotationPolicy {
                     .to_string(),
             );
         }
-        let base: u64 = size_part[..digits]
-            .parse()
-            .map_err(|_| format!("Size overflow in '-logsize={trimmed}'."))?;
+        let base: u64 = size_part[..digits].parse().map_err(|_| {
+            "The value of '-logsize' is [<count>*]<size>, with a size in bytes and an optional K, M, G or T suffix."
+                .to_string()
+        })?;
         let suffix = &size_part[digits..];
         let shift = match suffix.to_ascii_uppercase().as_str() {
             "" | "B" => 0u32,
@@ -84,10 +85,10 @@ impl LogRotationPolicy {
                 );
             }
         };
-        let max_bytes = base
-            .checked_shl(shift)
-            .filter(|&b| b > 0)
-            .ok_or_else(|| format!("Log size in '-logsize={trimmed}' must be positive."))?;
+        let max_bytes = base.checked_shl(shift).filter(|&b| b > 0).ok_or_else(|| {
+            "The value of '-logsize' is [<count>*]<size>, with a size in bytes and an optional K, M, G or T suffix."
+                .to_string()
+        })?;
         Ok(Self {
             max_files,
             max_bytes,
@@ -164,6 +165,9 @@ pub struct SessionLogger {
     rotation: Option<LogRotationPolicy>,
 
     xml_file: Option<File>,
+    xml_session_name: String,
+    xml_header_written: bool,
+    pending_group_line: Option<String>,
     xml_groups: bool,
     group_open: bool,
     xml_closed: bool,
@@ -177,6 +181,9 @@ impl Default for SessionLogger {
             text_log_sensitive: false,
             rotation: None,
             xml_file: None,
+            xml_session_name: "nosession".to_string(),
+            xml_header_written: false,
+            pending_group_line: None,
             xml_groups: true,
             group_open: false,
             xml_closed: true,
@@ -215,27 +222,18 @@ impl SessionLogger {
                     format!("Cannot create XML log directory '{}': {e}", parent.display())
                 })?;
             }
-            let mut f = File::create(xp)
+            let f = File::create(xp)
                 .map_err(|e| format!("Cannot open XML log file '{}': {e}", xp.display()))?;
-            let safe_name = xml_escape_attr(&mask_url_credentials_inline(
-                if initial_session_name.is_empty() {
-                    "session"
-                } else {
-                    initial_session_name
-                },
-            ));
-            let start = now_utc_iso();
-            let header = format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                 <session xmlns=\"{SESSION_XML_NAMESPACE}\" name=\"{safe_name}\" start=\"{start}\">\n"
-            );
-            f.write_all(header.as_bytes())
-                .and_then(|_| f.flush())
-                .map_err(|e| format!("Cannot write XML log header '{}': {e}", xp.display()))?;
             let _ = linscp_platform::terminal::set_local_permissions(xp, 0o600);
             xml_file = Some(f);
             xml_closed = false;
         }
+
+        let xml_session_name = if initial_session_name.is_empty() || initial_session_name == "session" {
+            "nosession".to_string()
+        } else {
+            initial_session_name.to_string()
+        };
 
         let logger = Self {
             text_path: text_log_path.map(Path::to_path_buf),
@@ -243,12 +241,44 @@ impl SessionLogger {
             text_log_sensitive,
             rotation,
             xml_file,
+            xml_session_name,
+            xml_header_written: false,
+            pending_group_line: None,
             xml_groups,
             group_open: false,
             xml_closed,
         };
         logger.log_text(0, "LinSCP session log started.");
         Ok(logger)
+    }
+
+    pub fn set_session_name(&mut self, name: &str) {
+        if !name.is_empty() && !self.xml_header_written {
+            self.xml_session_name = name.to_string();
+        }
+        if self.pending_group_line.is_some() {
+            self.ensure_xml_header();
+        }
+    }
+
+    fn ensure_xml_header(&mut self) {
+        if self.xml_file.is_none() || self.xml_header_written {
+            return;
+        }
+        let safe_name = xml_escape_attr(&mask_url_credentials_inline(&self.xml_session_name));
+        let start = now_utc_iso();
+        let mut header = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <session xmlns=\"{SESSION_XML_NAMESPACE}\" name=\"{safe_name}\" start=\"{start}\">\n"
+        );
+        if let Some(pg) = self.pending_group_line.take() {
+            header.push_str(&pg);
+        }
+        self.xml_header_written = true;
+        if let Some(ref mut f) = self.xml_file {
+            let _ = f.write_all(header.as_bytes());
+            let _ = f.flush();
+        }
     }
 
     pub fn log_event(&self, message: &str) {
@@ -286,8 +316,13 @@ impl SessionLogger {
         self.end_command_group();
         let safe_cmd = xml_escape_attr(&censored_for_log(raw_command_line));
         let start = now_utc_iso();
-        self.write_xml(&format!("  <group name=\"{safe_cmd}\" start=\"{start}\">\n"));
+        let line = format!("  <group name=\"{safe_cmd}\" start=\"{start}\">\n");
         self.group_open = true;
+        if self.xml_header_written {
+            self.write_xml(&line);
+        } else {
+            self.pending_group_line = Some(line);
+        }
     }
 
     pub fn record_group_failure(&mut self, message: &str) {
@@ -324,6 +359,10 @@ impl SessionLogger {
     }
 
     fn write_xml(&mut self, chunk: &str) {
+        if self.xml_file.is_none() {
+            return;
+        }
+        self.ensure_xml_header();
         if let Some(ref mut f) = self.xml_file {
             let _ = f.write_all(chunk.as_bytes());
             let _ = f.flush();

@@ -254,7 +254,12 @@ impl SftpTransport {
             .await
             .map_err(|e| ProtoError::Transport(format!("SFTP INIT flush failed: {e}")))?;
 
-        let (pkt_type, payload) = Self::read_raw_packet(&mut stream).await?;
+        let (pkt_type, payload) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            Self::read_raw_packet(&mut stream),
+        )
+        .await
+        .map_err(|_| ProtoError::Transport("Timed out waiting for SFTP SSH_FXP_VERSION.".to_string()))??;
         if pkt_type != SSH_FXP_VERSION {
             return Err(ProtoError::Transport(format!(
                 "Expected SSH_FXP_VERSION (2), got packet type {pkt_type}."
@@ -524,9 +529,11 @@ impl SftpClientSession {
             (Arc::new(SshConnection::connect(dest_cfg).await?), None)
         };
 
+        let ssh_cleanup = Arc::clone(&ssh);
         let mut session = match Self::from_ssh_connection(scheme, ssh, jump_tunnel.clone()).await {
             Ok(s) => s,
             Err(e) => {
+                let _ = ssh_cleanup.disconnect().await;
                 if let Some(j) = jump_tunnel {
                     let _ = j.close().await;
                 }
@@ -624,8 +631,8 @@ impl SftpClientSession {
         remote_path: &str,
     ) -> Result<Option<(String, String)>, ProtoError> {
         let sftp_alg = match DigestAlgorithm::parse(algorithm) {
-            Some(DigestAlgorithm::Sha256) => "sha256",
-            Some(DigestAlgorithm::Sha1) => "sha1",
+            Some(DigestAlgorithm::Sha256) => "sha-256",
+            Some(DigestAlgorithm::Sha1) => "sha-1",
             Some(DigestAlgorithm::Md5) => "md5",
             Some(DigestAlgorithm::Crc32) => "crc32",
             None => algorithm.trim(),

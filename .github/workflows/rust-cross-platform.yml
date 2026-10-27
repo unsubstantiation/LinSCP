@@ -52,6 +52,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            libssh-dev libcurl4-openssl-dev libssl-dev \
             krb5-kdc krb5-user krb5-admin-server libkrb5-dev openssh-server curl
           python3 -m venv "$RUNNER_TEMP/live-test-venv"
           "$RUNNER_TEMP/live-test-venv/bin/pip" install --quiet \
@@ -78,19 +79,22 @@ jobs:
             if ! "$@" >"$log" 2>&1; then
               cat "$log"
               python3 - "$label" "$log" <<'PYEOF'
-          import pathlib, sys
+          import pathlib, re, sys
           label, path = sys.argv[1], sys.argv[2]
           text = pathlib.Path(path).read_text(errors="replace")
-          idx = -1
-          for marker in ("\nFAIL:", "\nERROR:", "Traceback (most recent call last):"):
-              found = text.find(marker)
-              if found >= 0 and (idx < 0 or found < idx):
-                  idx = found
-          snippet = text[idx:] if idx >= 0 else text[-3500:]
-          for chunk_idx in range(0, min(len(snippet), 5600), 2800):
-              part = snippet[chunk_idx:chunk_idx + 2800]
+          blocks = re.split(r"\n={60,}\n", text)
+          summaries = []
+          for b in blocks[1:]:
+              lines = [ln for ln in b.strip().splitlines() if ln.strip()]
+              if lines:
+                  head = lines[0]
+                  tail = "\n".join(lines[-8:])
+                  summaries.append(f"{head}\n{tail}")
+          snippet = "\n---\n".join(summaries) if summaries else text[-3500:]
+          chunks = [snippet[i:i + 3400] for i in range(0, len(snippet), 3400)]
+          for idx, part in enumerate(chunks[:2], 1):
               esc = part.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-              print(f"::error title={label}::{esc}")
+              print(f"::error title={label} ({idx}/{min(len(chunks), 2)})::{esc}")
           PYEOF
               overall_rc=1
               return 0

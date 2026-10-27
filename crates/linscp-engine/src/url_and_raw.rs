@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use linscp_i18n::{CatalogDomain, translate_with};
 use linscp_platform::SecretVault;
 use linscp_platform::gssapi_sys::{
     PlatformGssStep, SystemGssapiContext, is_system_gssapi_available,
@@ -376,8 +377,10 @@ pub fn parse_site_url(url: &str) -> Result<ParsedSiteSpec, String> {
         return Err(format!("Invalid host name '{host}' in session URL '{url}'."));
     }
 
-    let initial_dir = if raw_path.is_empty() || raw_path == "/" {
+    let initial_dir = if raw_path.is_empty() {
         String::new()
+    } else if raw_path == "/" {
+        "/".to_string()
     } else {
         let decoded = percent_decode_strict(raw_path, "path")?;
         if decoded.len() > 1 {
@@ -1788,7 +1791,7 @@ pub async fn connect_site_spec(
     };
 
     let session: Box<dyn RemoteSession> = match spec.session.protocol {
-        ProtocolScheme::Sftp | ProtocolScheme::Ssh => {
+        ProtocolScheme::Sftp => {
             let sftp = SftpClientSession::connect(
                 spec.session.protocol,
                 &dest_ssh_cfg,
@@ -1799,7 +1802,7 @@ pub async fn connect_site_spec(
             .map_err(|e| e.to_string())?;
             Box::new(sftp)
         }
-        ProtocolScheme::Scp => {
+        ProtocolScheme::Scp | ProtocolScheme::Ssh => {
             let scp = ScpSession::connect(
                 &dest_ssh_cfg,
                 tunnel_ssh_cfg.as_ref(),
@@ -2132,10 +2135,20 @@ fn make_ssh_host_key_callback(
             println!("{prefix} {} {}", obs.key_type, obs.sha256_fingerprint);
             println!("HOSTKEYSTATE {role} changed");
             let _ = std::io::stdout().flush();
-            return Err(ProtoError::Transport(format!(
-                "Host key does not match configured key '{pin}'! Server offered {} {}.",
-                obs.key_type, obs.sha256_fingerprint
-            )));
+            let port_s = obs.port.to_string();
+            let msg = translate_with(
+                CatalogDomain::Cli,
+                &locale,
+                "The host key of {host} (port {port}) is not the expected one.\n  {type} key fingerprint: {fingerprint}\n  expected fingerprint:           {expected}\nThe connection may be intercepted; refusing to continue.",
+                &[
+                    ("host", &obs.host),
+                    ("port", &port_s),
+                    ("type", &obs.key_type),
+                    ("fingerprint", &obs.sha256_fingerprint),
+                    ("expected", pin),
+                ],
+            );
+            return Err(ProtoError::Transport(msg));
         }
 
         match cached_fp {
@@ -2160,13 +2173,19 @@ fn make_ssh_host_key_callback(
                         return Ok(());
                     }
                 }
-                Err(ProtoError::HostKeyChallengeRequired {
-                    role: role.to_string(),
-                    state: "changed".to_string(),
-                    host: obs.host.clone(),
-                    port: obs.port,
-                    fingerprint: obs.sha256_fingerprint.clone(),
-                })
+                let port_s = obs.port.to_string();
+                let msg = translate_with(
+                    CatalogDomain::Cli,
+                    &locale,
+                    "The host key of {host} (port {port}) does not match the cached key.\n  {type} key fingerprint: {fingerprint}\nThe connection may be intercepted; refusing to continue.",
+                    &[
+                        ("host", &obs.host),
+                        ("port", &port_s),
+                        ("type", &obs.key_type),
+                        ("fingerprint", &obs.sha256_fingerprint),
+                    ],
+                );
+                Err(ProtoError::Transport(msg))
             }
             None => {
                 println!("{prefix} {} {}", obs.key_type, obs.sha256_fingerprint);

@@ -105,8 +105,25 @@ where
     let mut total_applied = 0usize;
     let mut passes = 1u32;
 
+    let watcher = if opts.max_passes == 1 {
+        None
+    } else {
+        LocalDirWatcher::watch(local_root, true).ok()
+    };
+    let _sig_guard = if opts.max_passes == 1 {
+        None
+    } else {
+        Some(SignalHandlerGuard::acquire())
+    };
+    if opts.max_passes != 1 {
+        on_status(&format!(
+            "Watching '{}' -> '{remote_root}' for changes...",
+            local_root.display()
+        ));
+    }
+
     // Initial catch-up pass (Pass 1)
-    match plan_synchronization(session, local_root, remote_root, &sync_opts, &dummy_state).await {
+    let pass1_status = match plan_synchronization(session, local_root, remote_root, &sync_opts, &dummy_state).await {
         Ok(plan) if !plan.is_empty() => {
             match apply_sync_plan(
                 session,
@@ -121,42 +138,56 @@ where
             {
                 Ok((applied, _)) => {
                     total_applied += applied;
-                    on_status(&format!("Pass {passes}: synchronized {applied} item(s)."));
+                    format!("Pass {passes}: synchronized {applied} item(s).")
                 }
-                Err(e) if opts.continue_on_error => on_status(&format!("Error: {e}")),
+                Err(e) if opts.continue_on_error => format!("Error: {e}"),
                 Err(e) => return Err(e),
             }
         }
-        Ok(_) => {
-            on_status(&format!(
-                "Pass {passes}: nothing to do (every file is up to date)."
-            ));
-        }
-        Err(e) if opts.continue_on_error => on_status(&format!("Error: {e}")),
+        Ok(_) => format!("Pass {passes}: nothing to do (every file is up to date)."),
+        Err(e) if opts.continue_on_error => format!("Error: {e}"),
         Err(e) => return Err(e),
+    };
+    if let Some(ref w) = watcher {
+        let _ = w.drain_changed_paths();
     }
+    on_status(&pass1_status);
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 
     if opts.max_passes > 0 && passes >= opts.max_passes {
         return Ok(total_applied);
     }
 
-    let watcher = LocalDirWatcher::watch(local_root, true).ok();
-    let _sig_guard = SignalHandlerGuard::acquire();
-    on_status(&format!(
-        "Watching '{}' -> '{remote_root}' for changes...",
-        local_root.display()
-    ));
-
     let wait_dur = Duration::from_millis(opts.interval_ms.max(50));
+    let slice_dur = Duration::from_millis(200);
 
     while !is_interrupted() {
         if opts.max_passes > 0 && passes >= opts.max_passes {
             break;
         }
         if let Some(ref w) = watcher {
-            let _ = w.recv_timeout(wait_dur);
+            let deadline = std::time::Instant::now() + wait_dur;
+            while !is_interrupted() {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let rem = (deadline - now).min(slice_dur);
+                if w.recv_timeout(rem).is_some() {
+                    // Brief quiet settle so multi-step writes/renames coalesce into one pass
+                    let _ = w.recv_timeout(Duration::from_millis(50));
+                    break;
+                }
+            }
         } else {
-            tokio::time::sleep(wait_dur).await;
+            let deadline = tokio::time::Instant::now() + wait_dur;
+            while !is_interrupted() {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                tokio::time::sleep((deadline - now).min(slice_dur)).await;
+            }
         }
         if is_interrupted() {
             break;

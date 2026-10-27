@@ -21,8 +21,10 @@ impl LocalDirWatcher {
         let (tx, rx) = mpsc::channel();
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| {
-                if let Some(paths) = res.ok().map(|e| e.paths).filter(|p| !p.is_empty()) {
-                    let _ = tx.send(paths);
+                if let Ok(ev) = res {
+                    if !matches!(ev.kind, notify::EventKind::Access(_)) && !ev.paths.is_empty() {
+                        let _ = tx.send(ev.paths);
+                    }
                 }
             },
             Config::default().with_poll_interval(Duration::from_millis(250)),
