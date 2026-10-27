@@ -225,7 +225,7 @@ fn decode_secret_field(
                 Some("Missing sessions.key needed to decrypt saved password".to_string()),
             );
         };
-        match decrypt_password(key, raw_value) {
+        match decrypt_password(raw_value, key) {
             Ok(plain) => (Some(plain), None, None),
             Err(err) => (None, Some(raw_value.to_string()), Some(err.to_string())),
         }
@@ -242,7 +242,8 @@ fn encode_secret_field(
     if let Some(plain) = plaintext.filter(|s| !s.is_empty()) {
         let key = master_key
             .ok_or_else(|| "Master key is required to encrypt saved passwords".to_string())?;
-        return Ok(Some(encrypt_password(key, plain)));
+        let encrypted = encrypt_password(plain, key).map_err(|e| e.to_string())?;
+        return Ok(Some(encrypted));
     }
     if let Some(raw) = preserved_raw.filter(|s| !s.is_empty()) {
         return Ok(Some(raw.to_string()));
@@ -566,7 +567,7 @@ impl SessionStore {
             .load_master_key(config_dir)
             .ok()
             .flatten()
-            .map(|z| SessionMasterKey::from_bytes(*z));
+            .map(|z| SessionMasterKey::from_array(*z));
         Self::parse_ini(&text, master.as_ref())
     }
 
@@ -576,12 +577,12 @@ impl SessionStore {
             let z = vault
                 .load_or_create_master_key(config_dir)
                 .map_err(|e| e.to_string())?;
-            Some(SessionMasterKey::from_bytes(*z))
+            Some(SessionMasterKey::from_array(*z))
         } else {
             vault
                 .load_master_key(config_dir)
                 .map_err(|e| e.to_string())?
-                .map(|z| SessionMasterKey::from_bytes(*z))
+                .map(|z| SessionMasterKey::from_array(*z))
         };
         let rendered = self.serialize_ini(master.as_ref())?;
         write_private_file_atomic(&config_dir.join("sessions.ini"), rendered.as_bytes())
@@ -653,8 +654,8 @@ mod tests {
 
     #[test]
     fn ini_escaping_and_unreadable_secret_preservation_match_cpp_store() {
-        let key_a = SessionMasterKey::from_bytes([0x11; 32]);
-        let key_b = SessionMasterKey::from_bytes([0x22; 32]);
+        let key_a = SessionMasterKey::from_array([0x11; 32]);
+        let key_b = SessionMasterKey::from_array([0x22; 32]);
 
         let mut store = SessionStore::new();
         let mut prod = StoredSite::new("prod/app", ProtocolScheme::Sftp, "10.0.0.5");

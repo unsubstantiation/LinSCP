@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn sessions_ini_round_trips_encrypted_passwords() {
-        let key = SessionMasterKey::from_bytes([9u8; 32]);
+        let key = SessionMasterKey::from_array([9u8; 32]);
         let sample = vec![SessionConfig {
             name: "prod-sftp".to_string(),
             protocol: ProtocolScheme::Sftp,
