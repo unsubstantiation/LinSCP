@@ -85,7 +85,7 @@ pub(crate) mod russh_bridge {
         pub provider: &'a mut dyn GssapiTokenProvider,
     }
 
-    impl russh::auth::GssapiAuthenticator for ProviderAdapter<'_> {
+    impl russh::GssapiAuthenticator for ProviderAdapter<'_> {
         type Error = RusshGssError;
 
         async fn gssapi_step(
@@ -93,17 +93,17 @@ pub(crate) mod russh_bridge {
             selected_mechanism: Option<Vec<u8>>,
             input_token: Option<Vec<u8>>,
             mic_data: Vec<u8>,
-        ) -> Result<russh::auth::GssapiStep, Self::Error> {
+        ) -> Result<russh::GssapiStep, Self::Error> {
             match self
                 .provider
                 .step(selected_mechanism, input_token, mic_data)
                 .await?
             {
                 GssapiExchangeStep::Continue(token) => {
-                    Ok(russh::auth::GssapiStep::Continue { token })
+                    Ok(russh::GssapiStep::Continue { token })
                 }
                 GssapiExchangeStep::Complete { token, mic } => {
-                    Ok(russh::auth::GssapiStep::Complete { token, mic })
+                    Ok(russh::GssapiStep::Complete { token, mic })
                 }
             }
         }
