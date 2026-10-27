@@ -118,6 +118,13 @@ pub fn build_router(state: Arc<HttpAppState>) -> Router {
         .with_state(state)
 }
 
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    state: Arc<HttpAppState>,
+) -> std::io::Result<()> {
+    axum::serve(listener, build_router(state)).await
+}
+
 async fn index_handler(State(state): State<Arc<HttpAppState>>, headers: HeaderMap) -> Response {
     if let Err(reason) = check_host_and_origin(&headers, &state.config.allowed_hosts) {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": reason }))).into_response();

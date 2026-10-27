@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use linscp_http::{build_router, HttpAppState, HttpServerConfig};
+use linscp_http::{serve, HttpAppState, HttpServerConfig};
 use linscp_i18n::{supported_locales, translate, CatalogDomain};
 use linscp_service::CommanderService;
 
@@ -103,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config: cfg,
         });
         println!("LinSCP HTTP server listening on http://{local_addr}/ (X-LSCP-Token: {token})");
-        axum::serve(listener, build_router(state)).await?;
+        serve(listener, state).await?;
     }
 
     Ok(())
