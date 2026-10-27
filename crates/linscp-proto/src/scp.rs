@@ -797,6 +797,28 @@ impl RemoteSession for ScpSession {
         Ok(transferred)
     }
 
+    async fn realpath(&self, remote_path: &str) -> Result<String, ProtoError> {
+        let target = if remote_path.is_empty() || remote_path == "." {
+            return Ok(self.home_dir.clone());
+        } else {
+            remote_path
+        };
+        scp_valid_remote_path(target)?;
+        let cmd = format!("cd -- {} && pwd", scp_shell_quote(target));
+        let out = self.run_shell_checked(&cmd).await?;
+        Ok(out
+            .lines()
+            .last()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("/")
+            .to_string())
+    }
+
+    async fn exec_command(&self, command: &str) -> Result<crate::ssh::ExecOutput, ProtoError> {
+        self.ssh.exec_command(command).await
+    }
+
     async fn close(&self) -> Result<(), ProtoError> {
         let res = self.ssh.disconnect().await;
         if let Some(jump) = &self.jump_tunnel {

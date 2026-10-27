@@ -1092,6 +1092,29 @@ impl RemoteSession for SftpClientSession {
         Ok(bytes)
     }
 
+    async fn realpath(&self, remote_path: &str) -> Result<String, ProtoError> {
+        SftpClientSession::realpath(self, remote_path).await
+    }
+
+    async fn readlink(&self, link_path: &str) -> Result<String, ProtoError> {
+        SftpClientSession::readlink(self, link_path).await
+    }
+
+    async fn exec_command(&self, command: &str) -> Result<crate::ssh::ExecOutput, ProtoError> {
+        self.ssh.exec_command(command).await
+    }
+
+    async fn checksum_server_only(
+        &self,
+        algorithm: &str,
+        remote_path: &str,
+    ) -> Result<Option<String>, ProtoError> {
+        Ok(self
+            .checksum_extension_only(algorithm, remote_path)
+            .await?
+            .map(|(_alg, hex)| hex))
+    }
+
     async fn close(&self) -> Result<(), ProtoError> {
         let res = self.ssh.disconnect().await;
         if let Some(jump) = &self.jump_tunnel {

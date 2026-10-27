@@ -241,6 +241,16 @@ pub(crate) fn build_reqwest_proxy(proxy: &ProxyConfig) -> Result<Option<Proxy>, 
             format!("{scheme}://{}:{}", proxy.host, proxy.port)
         }
         ProxyKind::HttpConnect => format!("http://{}:{}", proxy.host, proxy.port),
+        ProxyKind::Telnet => {
+            return Err(ProtoError::Transport(
+                "This protocol connects through curl, which cannot run a telnet proxy; use SOCKS4, SOCKS5 or HTTP, or a protocol this build serves with its own transport.".to_string(),
+            ));
+        }
+        ProxyKind::LocalCommand => {
+            return Err(ProtoError::Transport(
+                "This protocol connects through curl, which cannot run a local command proxy; use SOCKS4, SOCKS5 or HTTP, or a protocol this build serves with its own transport.".to_string(),
+            ));
+        }
     };
     let mut p = Proxy::all(&url)
         .map_err(|e| ProtoError::Transport(format!("Invalid proxy URL '{url}': {e}")))?;
@@ -613,6 +623,48 @@ impl WebDavSession {
     pub async fn get_etag(&self, remote_path: &str) -> Result<Option<String>, ProtoError> {
         let (_, etag_opt) = self.propfind_single(remote_path).await?;
         Ok(etag_opt)
+    }
+
+    /// Queries `(etag, path_missing)` for `etag <file> -get`.
+    pub async fn get_etag_with_existence(
+        &self,
+        remote_path: &str,
+    ) -> Result<(Option<String>, bool), ProtoError> {
+        let (entry_opt, etag_opt) = self.propfind_single(remote_path).await?;
+        Ok((etag_opt, entry_opt.is_none()))
+    }
+
+    /// Verifies that the WebDAV endpoint is reachable and credentials are accepted.
+    pub async fn check_endpoint(&self, initial_dir: &str) -> Result<(), ProtoError> {
+        let method = Method::from_bytes(b"PROPFIND")
+            .map_err(|e| ProtoError::Transport(format!("Invalid PROPFIND method: {e}")))?;
+        let target = if initial_dir.is_empty() {
+            "/"
+        } else {
+            initial_dir
+        };
+        let body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+            <D:propfind xmlns:D=\"DAV:\"><D:prop><D:resourcetype/></D:prop></D:propfind>";
+        let resp = self
+            .apply_auth(self.client.request(method, self.url_for(target, false)))
+            .header("Depth", "0")
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| ProtoError::Transport(format!("WebDAV endpoint probe failed: {e}")))?;
+        let code = resp.status().as_u16();
+        if code == 401 {
+            return Err(ProtoError::Transport(
+                "Authentication failed: WebDAV server rejected credentials (HTTP 401).".to_string(),
+            ));
+        }
+        if code == 405 {
+            return Err(ProtoError::Transport(
+                "The server does not support WebDAV: PROPFIND is not allowed.".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Sets a custom dead property in `urn:linscp:properties` via `PROPPATCH`.
@@ -1145,6 +1197,48 @@ impl RemoteSession for WebDavSession {
             )));
         }
         Ok(transferred)
+    }
+
+    async fn probe_endpoint(&self, initial_dir: &str) -> Result<(), ProtoError> {
+        self.check_endpoint(initial_dir).await
+    }
+
+    async fn dav_lock(&self, remote_path: &str, timeout_secs: u32) -> Result<String, ProtoError> {
+        self.lock(remote_path, timeout_secs).await
+    }
+
+    async fn dav_unlock(&self, remote_path: &str, token: Option<&str>) -> Result<(), ProtoError> {
+        self.unlock(remote_path, token).await
+    }
+
+    async fn dav_get_etag(&self, remote_path: &str) -> Result<(Option<String>, bool), ProtoError> {
+        self.get_etag_with_existence(remote_path).await
+    }
+
+    async fn dav_set_etag_precondition(
+        &self,
+        remote_path: &str,
+        precondition: Option<DavEtagPrecondition>,
+    ) -> Result<(), ProtoError> {
+        self.set_etag_precondition(remote_path, precondition).await;
+        Ok(())
+    }
+
+    async fn dav_set_property(
+        &self,
+        remote_path: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<(), ProtoError> {
+        self.set_property(remote_path, name, value).await
+    }
+
+    async fn dav_get_property(
+        &self,
+        remote_path: &str,
+        name: &str,
+    ) -> Result<Option<String>, ProtoError> {
+        self.get_property(remote_path, name).await
     }
 
     async fn close(&self) -> Result<(), ProtoError> {

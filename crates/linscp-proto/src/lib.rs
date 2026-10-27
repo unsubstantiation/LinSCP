@@ -333,6 +333,91 @@ pub trait RemoteSession: Send + Sync {
         total_size: Option<u64>,
         progress: Option<&ProgressCallback>,
     ) -> Result<u64, ProtoError>;
+    async fn probe_endpoint(&self, _initial_dir: &str) -> Result<(), ProtoError> {
+        Ok(())
+    }
+    async fn realpath(&self, remote_path: &str) -> Result<String, ProtoError> {
+        Ok(remote_path.to_string())
+    }
+    async fn readlink(&self, _link_path: &str) -> Result<String, ProtoError> {
+        Err(ProtoError::UnsupportedCapability("readlink", self.scheme()))
+    }
+    async fn exec_command(&self, _command: &str) -> Result<ssh::ExecOutput, ProtoError> {
+        Err(ProtoError::UnsupportedCapability("exec", self.scheme()))
+    }
+    async fn checksum_server_only(
+        &self,
+        _algorithm: &str,
+        _remote_path: &str,
+    ) -> Result<Option<String>, ProtoError> {
+        Ok(None)
+    }
+    async fn dav_lock(&self, _remote_path: &str, _timeout_secs: u32) -> Result<String, ProtoError> {
+        Err(ProtoError::UnsupportedCapability("dav_lock", self.scheme()))
+    }
+    async fn dav_unlock(&self, _remote_path: &str, _token: Option<&str>) -> Result<(), ProtoError> {
+        Err(ProtoError::UnsupportedCapability("dav_unlock", self.scheme()))
+    }
+    async fn dav_get_etag(&self, _remote_path: &str) -> Result<(Option<String>, bool), ProtoError> {
+        Err(ProtoError::UnsupportedCapability("dav_etag", self.scheme()))
+    }
+    async fn dav_set_etag_precondition(
+        &self,
+        _remote_path: &str,
+        _precondition: Option<webdav::DavEtagPrecondition>,
+    ) -> Result<(), ProtoError> {
+        Err(ProtoError::UnsupportedCapability("dav_etag", self.scheme()))
+    }
+    async fn dav_set_property(
+        &self,
+        _remote_path: &str,
+        _name: &str,
+        _value: &str,
+    ) -> Result<(), ProtoError> {
+        Err(ProtoError::UnsupportedCapability(
+            "dav_property",
+            self.scheme(),
+        ))
+    }
+    async fn dav_get_property(
+        &self,
+        _remote_path: &str,
+        _name: &str,
+    ) -> Result<Option<String>, ProtoError> {
+        Err(ProtoError::UnsupportedCapability(
+            "dav_property",
+            self.scheme(),
+        ))
+    }
+    async fn s3_list_versions(
+        &self,
+        _remote_path: &str,
+    ) -> Result<Vec<s3::S3ObjectVersion>, ProtoError> {
+        Err(ProtoError::UnsupportedCapability(
+            "s3_versions",
+            self.scheme(),
+        ))
+    }
+    async fn s3_stat_version(
+        &self,
+        _remote_path: &str,
+        _version_id: &str,
+    ) -> Result<Option<FileEntry>, ProtoError> {
+        Err(ProtoError::UnsupportedCapability(
+            "s3_versions",
+            self.scheme(),
+        ))
+    }
+    async fn s3_remove_version(
+        &self,
+        _remote_path: &str,
+        _version_id: &str,
+    ) -> Result<(), ProtoError> {
+        Err(ProtoError::UnsupportedCapability(
+            "s3_versions",
+            self.scheme(),
+        ))
+    }
     async fn close(&self) -> Result<(), ProtoError> {
         Ok(())
     }

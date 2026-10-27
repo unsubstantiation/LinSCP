@@ -17,6 +17,8 @@ use rand::RngCore;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+pub mod gssapi_sys;
+pub mod terminal;
 pub mod watcher;
 
 #[cfg(target_os = "linux")]

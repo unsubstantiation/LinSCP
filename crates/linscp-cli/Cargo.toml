@@ -7,7 +7,7 @@ license-file.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "linscp-rs"
+name = "linscp"
 path = "src/main.rs"
 
 [dependencies]
@@ -16,7 +16,7 @@ linscp-engine.workspace = true
 linscp-http.workspace = true
 linscp-i18n.workspace = true
 linscp-platform.workspace = true
-linscp-proto.workspace = true
+linscp-proto = { workspace = true, features = ["gssapi"] }
 linscp-service.workspace = true
 linscp-types.workspace = true
 tokio.workspace = true

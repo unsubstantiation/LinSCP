@@ -7,15 +7,19 @@ license-file.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 base64.workspace = true
+encoding_rs.workspace = true
 linscp-crypto = { path = "../linscp-crypto" }
+linscp-i18n = { path = "../linscp-i18n" }
 linscp-platform = { path = "../linscp-platform" }
-linscp-proto = { path = "../linscp-proto" }
+linscp-proto = { path = "../linscp-proto", features = ["gssapi"] }
 linscp-types = { path = "../linscp-types" }
 roxmltree.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 zeroize.workspace = true
 
 [lints]

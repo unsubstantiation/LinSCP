@@ -128,6 +128,8 @@ pub struct S3ConnectConfig {
     pub abort_multipart_on_error: bool,
     pub resume_store: Arc<MultipartResumeStore>,
     pub extra_signed_headers: BTreeMap<String, String>,
+    /// Headers signed and sent exclusively on object write operations (`PUT`, `CreateMultipartUpload`, `CopyObject`).
+    pub object_write_headers: BTreeMap<String, String>,
     pub tls: TlsSettings,
     pub proxy: Option<ProxyConfig>,
     pub timeout: Duration,
@@ -150,6 +152,7 @@ impl Default for S3ConnectConfig {
             abort_multipart_on_error: true,
             resume_store: MultipartResumeStore::new_in_memory(),
             extra_signed_headers: BTreeMap::new(),
+            object_write_headers: BTreeMap::new(),
             tls: TlsSettings::default(),
             proxy: None,
             timeout: Duration::from_secs(30),
@@ -499,6 +502,8 @@ impl S3Session {
         let mut versions = Vec::new();
         let mut key_marker: Option<String> = None;
         let mut ver_marker: Option<String> = None;
+        let mut seen_markers: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
 
         loop {
             let mut qp = vec![
@@ -579,21 +584,38 @@ impl S3Session {
             if !is_truncated {
                 break;
             }
-            key_marker = doc
+            let next_km = doc
                 .descendants()
                 .find(|n| n.is_element() && n.tag_name().name() == "NextKeyMarker")
                 .and_then(|n| n.text())
                 .map(|s| s.to_string())
-                .filter(|s| !s.is_empty());
-            ver_marker = doc
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    ProtoError::Transport(
+                        "Truncated S3 ListObjectVersions response has no next key marker."
+                            .to_string(),
+                    )
+                })?;
+            let next_vm = doc
                 .descendants()
                 .find(|n| n.is_element() && n.tag_name().name() == "NextVersionIdMarker")
                 .and_then(|n| n.text())
                 .map(|s| s.to_string())
-                .filter(|s| !s.is_empty());
-            if key_marker.is_none() {
-                break;
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    ProtoError::Transport(
+                        "Truncated S3 ListObjectVersions response has no next version ID marker."
+                            .to_string(),
+                    )
+                })?;
+            if !seen_markers.insert((next_km.clone(), next_vm.clone())) {
+                return Err(ProtoError::Transport(
+                    "Truncated S3 ListObjectVersions response repeated its pagination marker."
+                        .to_string(),
+                ));
             }
+            key_marker = Some(next_km);
+            ver_marker = Some(next_vm);
         }
         Ok(versions)
     }
@@ -780,7 +802,7 @@ impl S3Session {
                         .unwrap_or("")
                         .to_string();
                     let body_txt = resp.text().await.unwrap_or_default();
-                    if !status.is_success() {
+                    if !status.is_success() || body_txt.contains("<Error>") {
                         return Err(parse_s3_error_xml(status, &body_txt));
                     }
                     if etag.is_empty() {
@@ -841,15 +863,56 @@ impl S3Session {
             .await?;
         let status = resp.status();
         let xml = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            if self.cfg.abort_multipart_on_error {
-                self.abort_multipart(bucket, key, &checkpoint.upload_id).await;
-                self.cfg.resume_store.remove(&store_id).await;
-            }
+        if !status.is_success() || xml.contains("<Error>") {
+            self.abort_multipart(bucket, key, &checkpoint.upload_id).await;
+            self.cfg.resume_store.remove(&store_id).await;
             return Err(parse_s3_error_xml(status, &xml));
         }
         self.cfg.resume_store.remove(&store_id).await;
         Ok(transferred)
+    }
+
+    fn write_headers_vec(&self) -> Vec<(String, String)> {
+        self.cfg
+            .object_write_headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    pub async fn check_endpoint(&self) -> Result<(), ProtoError> {
+        let resp = self
+            .send_signed(Method::GET, None, "", &[], &[], Vec::new())
+            .await?;
+        let status = resp.status();
+        let xml = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 403 {
+            if reject_xxe_declarations(&xml).is_ok() {
+                if let Ok(doc) = roxmltree::Document::parse(&xml) {
+                    if let Some(code) = doc
+                        .descendants()
+                        .find(|n| n.is_element() && n.tag_name().name() == "Code")
+                        .and_then(|n| n.text())
+                        .map(str::trim)
+                    {
+                        if matches!(
+                            code,
+                            "SignatureDoesNotMatch"
+                                | "InvalidAccessKeyId"
+                                | "ExpiredToken"
+                                | "InvalidToken"
+                        ) {
+                            return Err(parse_s3_error_xml(status, &xml));
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if status.is_server_error() {
+            return Err(parse_s3_error_xml(status, &xml));
+        }
+        Ok(())
     }
 
     async fn initiate_multipart(
@@ -860,8 +923,9 @@ impl S3Session {
         part_size: u64,
     ) -> Result<MultipartCheckpoint, ProtoError> {
         let qp = vec![("uploads".to_string(), String::new())];
+        let write_hdrs = self.write_headers_vec();
         let resp = self
-            .send_signed(Method::POST, Some(bucket), key, &qp, &[], Vec::new())
+            .send_signed(Method::POST, Some(bucket), key, &qp, &write_hdrs, Vec::new())
             .await?;
         let status = resp.status();
         let xml = resp.text().await.unwrap_or_default();
@@ -1102,15 +1166,25 @@ impl RemoteSession for S3Session {
             if !is_truncated {
                 break;
             }
-            continuation_token = doc
+            let next_tok = doc
                 .descendants()
                 .find(|n| n.is_element() && n.tag_name().name() == "NextContinuationToken")
                 .and_then(|n| n.text())
                 .map(|s| s.to_string())
-                .filter(|s| !s.is_empty());
-            if continuation_token.is_none() {
-                break;
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    ProtoError::Transport(
+                        "Truncated S3 ListObjectsV2 response has no continuation token."
+                            .to_string(),
+                    )
+                })?;
+            if continuation_token.as_deref() == Some(next_tok.as_str()) {
+                return Err(ProtoError::Transport(
+                    "Truncated S3 ListObjectsV2 response repeated a continuation token."
+                        .to_string(),
+                ));
             }
+            continuation_token = Some(next_tok);
         }
         Ok(by_name.into_values().collect())
     }
@@ -1122,6 +1196,15 @@ impl RemoteSession for S3Session {
             ));
         };
         if raw_key.is_empty() {
+            // Check whether bucket already exists via HEAD /bucket
+            let head = self
+                .send_signed(Method::HEAD, Some(&bucket), "", &[], &[], Vec::new())
+                .await?;
+            if head.status().is_success() {
+                return Err(ProtoError::Transport(format!(
+                    "Cannot create the directory '/{bucket}': that name already exists."
+                )));
+            }
             // CreateBucket (`PUT /bucket`)
             let resp = self
                 .send_signed(Method::PUT, Some(&bucket), "", &[], &[], Vec::new())
@@ -1132,6 +1215,11 @@ impl RemoteSession for S3Session {
                 return Err(parse_s3_error_xml(status, &body));
             }
             return Ok(());
+        }
+        if self.stat(remote_path).await?.is_some() {
+            return Err(ProtoError::Transport(format!(
+                "Cannot create the directory '{remote_path}': that name already exists."
+            )));
         }
         let marker = format!("{}/", raw_key.trim_end_matches('/'));
         let resp = self
@@ -1150,22 +1238,23 @@ impl RemoteSession for S3Session {
     }
 
     async fn remove_dir(&self, remote_path: &str) -> Result<(), ProtoError> {
+        let (Some(bucket), raw_key) = self.split_bucket_and_key(remote_path)? else {
+            return Err(ProtoError::Transport(
+                "Cannot remove S3 root.".to_string(),
+            ));
+        };
+        if raw_key.is_empty() {
+            return Err(ProtoError::Transport(
+                "The bucket itself cannot be removed with rmdir; use 'rm -r' on its contents (or the S3 console).".to_string(),
+            ));
+        }
         let children = self.list_dir(remote_path).await?;
         if !children.is_empty() {
             return Err(ProtoError::Transport(format!(
                 "S3 directory '{remote_path}' is not empty."
             )));
         }
-        let (Some(bucket), raw_key) = self.split_bucket_and_key(remote_path)? else {
-            return Err(ProtoError::Transport(
-                "Cannot remove S3 root.".to_string(),
-            ));
-        };
-        let key = if raw_key.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", raw_key.trim_end_matches('/'))
-        };
+        let key = format!("{}/", raw_key.trim_end_matches('/'));
         let resp = self
             .send_signed(Method::DELETE, Some(&bucket), &key, &[], &[], Vec::new())
             .await?;
@@ -1194,7 +1283,115 @@ impl RemoteSession for S3Session {
             ));
         };
         let copy_source = s3_uri_encode_path(&format!("/{src_bucket}/{src_key}"));
-        let headers = vec![("x-amz-copy-source".to_string(), copy_source)];
+
+        // Objects exceeding `multipart_threshold` (except `.filepart` stage renames)
+        // copy via Multipart `UploadPartCopy` (`x-amz-copy-source-range`).
+        if !from.ends_with(".filepart") {
+            if let Ok(Some(src_info)) = self.stat_version(from, "").await {
+                if src_info.size > self.cfg.multipart_threshold {
+                    let min_part = self.cfg.min_part_size.max(5 * 1024);
+                    let part_size = if src_info.size > min_part * 9_999 {
+                        src_info.size.div_ceil(9_999)
+                    } else {
+                        min_part
+                    };
+                    let cp = self
+                        .initiate_multipart(&dst_bucket, &dst_key, src_info.size, part_size)
+                        .await?;
+                    let mut parts_etags: Vec<(u32, String)> = Vec::new();
+                    let mut offset = 0u64;
+                    let mut part_num = 1u32;
+                    let copy_res: Result<(), ProtoError> = async {
+                        while offset < src_info.size {
+                            let end = (offset + part_size).min(src_info.size) - 1;
+                            let qp = vec![
+                                ("partNumber".to_string(), part_num.to_string()),
+                                ("uploadId".to_string(), cp.upload_id.clone()),
+                            ];
+                            let hdrs = vec![
+                                ("x-amz-copy-source".to_string(), copy_source.clone()),
+                                (
+                                    "x-amz-copy-source-range".to_string(),
+                                    format!("bytes={offset}-{end}"),
+                                ),
+                            ];
+                            let resp = self
+                                .send_signed(
+                                    Method::PUT,
+                                    Some(&dst_bucket),
+                                    &dst_key,
+                                    &qp,
+                                    &hdrs,
+                                    Vec::new(),
+                                )
+                                .await?;
+                            let st = resp.status();
+                            let xml = resp.text().await.unwrap_or_default();
+                            if !st.is_success() || xml.contains("<Error>") {
+                                return Err(parse_s3_error_xml(st, &xml));
+                            }
+                            reject_xxe_declarations(&xml)?;
+                            let doc = roxmltree::Document::parse(&xml).map_err(|e| {
+                                ProtoError::Transport(format!("Malformed UploadPartCopy XML: {e}"))
+                            })?;
+                            let etag = doc
+                                .descendants()
+                                .find(|n| n.is_element() && n.tag_name().name() == "ETag")
+                                .and_then(|n| n.text())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .ok_or_else(|| {
+                                    ProtoError::Transport(
+                                        "UploadPartCopy XML missing ETag.".to_string(),
+                                    )
+                                })?
+                                .to_string();
+                            parts_etags.push((part_num, etag));
+                            offset = end + 1;
+                            part_num += 1;
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    if let Err(err) = copy_res {
+                        self.abort_multipart(&dst_bucket, &dst_key, &cp.upload_id)
+                            .await;
+                        return Err(err);
+                    }
+                    let mut complete_xml = String::from("<CompleteMultipartUpload>");
+                    for (pn, etag) in &parts_etags {
+                        complete_xml.push_str(&format!(
+                            "<Part><PartNumber>{pn}</PartNumber><ETag>{}</ETag></Part>",
+                            xml_escape(etag)
+                        ));
+                    }
+                    complete_xml.push_str("</CompleteMultipartUpload>");
+                    let qp = vec![("uploadId".to_string(), cp.upload_id.clone())];
+                    let hdrs = vec![("content-type".to_string(), "application/xml".to_string())];
+                    let resp = self
+                        .send_signed(
+                            Method::POST,
+                            Some(&dst_bucket),
+                            &dst_key,
+                            &qp,
+                            &hdrs,
+                            complete_xml.into_bytes(),
+                        )
+                        .await?;
+                    let st = resp.status();
+                    let xml = resp.text().await.unwrap_or_default();
+                    if !st.is_success() || xml.contains("<Error>") {
+                        self.abort_multipart(&dst_bucket, &dst_key, &cp.upload_id)
+                            .await;
+                        return Err(parse_s3_error_xml(st, &xml));
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        let mut headers = self.write_headers_vec();
+        headers.push(("x-amz-copy-source".to_string(), copy_source));
         let resp = self
             .send_signed(
                 Method::PUT,
@@ -1340,8 +1537,9 @@ impl RemoteSession for S3Session {
             .await
             .map_err(|e| ProtoError::Transport(format!("Reading S3 upload source failed: {e}")))?;
         let total = payload.len() as u64;
+        let write_hdrs = self.write_headers_vec();
         let resp = self
-            .send_signed(Method::PUT, Some(&bucket), &key, &[], &[], payload)
+            .send_signed(Method::PUT, Some(&bucket), &key, &[], &write_hdrs, payload)
             .await?;
         let status = resp.status();
         if !status.is_success() {
@@ -1352,6 +1550,30 @@ impl RemoteSession for S3Session {
             cb(total, total);
         }
         Ok(total)
+    }
+
+    async fn probe_endpoint(&self, _initial_dir: &str) -> Result<(), ProtoError> {
+        self.check_endpoint().await
+    }
+
+    async fn s3_list_versions(&self, remote_path: &str) -> Result<Vec<S3ObjectVersion>, ProtoError> {
+        self.list_versions(remote_path).await
+    }
+
+    async fn s3_stat_version(
+        &self,
+        remote_path: &str,
+        version_id: &str,
+    ) -> Result<Option<FileEntry>, ProtoError> {
+        self.stat_version(remote_path, version_id).await
+    }
+
+    async fn s3_remove_version(
+        &self,
+        remote_path: &str,
+        version_id: &str,
+    ) -> Result<(), ProtoError> {
+        self.remove_version(remote_path, version_id).await
     }
 
     async fn close(&self) -> Result<(), ProtoError> {
