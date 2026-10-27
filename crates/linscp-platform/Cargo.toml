@@ -13,6 +13,7 @@ linscp-types = { path = "../linscp-types" }
 notify.workspace = true
 rand.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]

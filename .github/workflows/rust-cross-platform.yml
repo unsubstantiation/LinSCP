@@ -41,10 +41,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run pure-Rust workspace unit tests
-        run: python3 tools/run_cargo_ci.py cargo test --workspace
+        run: |
+          python3 tools/run_cargo_ci.py cargo test --workspace
+          python3 tools/run_cargo_ci.py cargo test -p linscp-proto --features gssapi
 
       - name: Lint workspace with Clippy
-        run: python3 tools/run_cargo_ci.py cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          python3 tools/run_cargo_ci.py cargo clippy --workspace --all-targets -- -D warnings
+          python3 tools/run_cargo_ci.py cargo clippy -p linscp-proto --features gssapi --all-targets -- -D warnings
 
       - name: Install Linux Tauri WebKit2GTK headers
         run: |
@@ -76,10 +80,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run pure-Rust workspace unit tests on Windows
-        run: python tools/run_cargo_ci.py cargo test --workspace
+        run: |
+          python tools/run_cargo_ci.py cargo test --workspace
+          python tools/run_cargo_ci.py cargo test -p linscp-proto --features gssapi
 
       - name: Lint workspace with Clippy on Windows
-        run: python tools/run_cargo_ci.py cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          python tools/run_cargo_ci.py cargo clippy --workspace --all-targets -- -D warnings
+          python tools/run_cargo_ci.py cargo clippy -p linscp-proto --features gssapi --all-targets -- -D warnings
 
       - name: Check Tauri v2 native shell crate on Windows
         run: python tools/run_cargo_ci.py cargo check -p linscp-tauri --features native-shell

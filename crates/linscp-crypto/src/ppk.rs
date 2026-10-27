@@ -372,13 +372,13 @@ fn aes256_cbc_decrypt_nopad(
     let cipher = Aes256::new_from_slice(key).expect("32-byte AES key");
     let mut out = Zeroizing::new(Vec::with_capacity(ciphertext.len()));
     let mut prev = *iv;
-    for chunk in ciphertext.chunks_exact(16) {
+    for chunk in ciphertext.as_chunks::<16>().0 {
         let mut block = GenericArray::clone_from_slice(chunk);
         cipher.decrypt_block(&mut block);
         for (&dec_byte, &prev_byte) in block.iter().zip(prev.iter()) {
             out.push(dec_byte ^ prev_byte);
         }
-        prev.copy_from_slice(chunk);
+        prev = *chunk;
         block.zeroize();
     }
     prev.zeroize();
@@ -838,7 +838,7 @@ Private-MAC: 1459a716b2ebdea871aa101e3a6fe0801798df2f
         let cipher = Aes256::new_from_slice(&km[..32]).unwrap();
         let mut prev: [u8; 16] = km[32..48].try_into().unwrap();
         let mut enc_priv = Vec::new();
-        for chunk in padded_plain.chunks_exact(16) {
+        for chunk in padded_plain.as_chunks::<16>().0 {
             let mut xored = [0u8; 16];
             for ((dst, &p), &iv_b) in xored.iter_mut().zip(chunk.iter()).zip(prev.iter()) {
                 *dst = p ^ iv_b;

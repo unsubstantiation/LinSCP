@@ -81,6 +81,27 @@ impl StreamingHasher {
     }
 }
 
+/// Alias used across streaming protocol engines (`sftp`, `scp`, `webdav`, `s3`, `ftp`).
+pub type DigestHasher = StreamingHasher;
+
+pub fn compute_digest(algorithm: DigestAlgorithm, data: &[u8]) -> Vec<u8> {
+    match algorithm {
+        DigestAlgorithm::Sha256 => sha256_bytes(data).to_vec(),
+        DigestAlgorithm::Sha1 => sha1_bytes(data).to_vec(),
+        DigestAlgorithm::Md5 => md5_bytes(data).to_vec(),
+        DigestAlgorithm::Crc32 => crc32_u32(data).to_be_bytes().to_vec(),
+    }
+}
+
+pub fn compute_digest_hex(algorithm: DigestAlgorithm, data: &[u8]) -> String {
+    match algorithm {
+        DigestAlgorithm::Sha256 => sha256_hex(data),
+        DigestAlgorithm::Sha1 => sha1_hex(data),
+        DigestAlgorithm::Md5 => md5_hex(data),
+        DigestAlgorithm::Crc32 => crc32_hex(data),
+    }
+}
+
 pub fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -92,11 +113,11 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 }
 
 pub fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    if (text.len() & 1) != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(text.len() / 2);
-    for pair in text.as_bytes().chunks_exact(2) {
+    for pair in text.as_bytes().as_chunks::<2>().0 {
         let hi = (pair[0] as char).to_digit(16)?;
         let lo = (pair[1] as char).to_digit(16)?;
         out.push(((hi << 4) | lo) as u8);
