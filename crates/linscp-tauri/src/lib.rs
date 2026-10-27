@@ -24,19 +24,25 @@ impl TauriBridge {
 }
 
 #[cfg(feature = "native-shell")]
-#[tauri::command]
-pub async fn linscp_invoke(
-    state: tauri::State<'_, TauriBridge>,
-    envelope: ApiEnvelope,
-) -> Result<ApiReply, String> {
-    Ok(state.invoke(envelope))
+pub mod commands {
+    use linscp_types::{ApiEnvelope, ApiReply};
+
+    use super::TauriBridge;
+
+    #[tauri::command]
+    pub async fn linscp_invoke(
+        state: tauri::State<'_, TauriBridge>,
+        envelope: ApiEnvelope,
+    ) -> Result<ApiReply, String> {
+        Ok(state.invoke(envelope))
+    }
 }
 
 #[cfg(feature = "native-shell")]
 pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .manage(TauriBridge::default())
-        .invoke_handler(tauri::generate_handler![linscp_invoke])
+        .invoke_handler(tauri::generate_handler![commands::linscp_invoke])
 }
 
 #[cfg(feature = "native-shell")]
