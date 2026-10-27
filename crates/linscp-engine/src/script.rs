@@ -1196,7 +1196,6 @@ impl ScriptInterpreter {
                     continue;
                 }
             }
-            }
             let info = stat_local_path(&item.path());
             rows.push((name, info));
         }
