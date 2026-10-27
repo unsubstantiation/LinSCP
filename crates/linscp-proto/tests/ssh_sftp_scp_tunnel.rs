@@ -1057,7 +1057,7 @@ async fn serve_mock_sftp(
     }
 }
 
-pub async fn start_mock_ssh_server(
+async fn start_mock_ssh_server(
     host_seed: u8,
     user_pubkey: PublicKey,
     allow_forwarding: bool,
