@@ -26,7 +26,10 @@ impl LogRotationPolicy {
     pub fn parse(spec: &str) -> Result<Self, String> {
         let trimmed = spec.trim();
         if trimmed.is_empty() {
-            return Err("Log size specification must not be empty.".to_string());
+            return Err(
+                "The value of '-logsize' is [<count>*]<size>, with a size in bytes and an optional K, M, G or T suffix."
+                    .to_string(),
+            );
         }
         let (count_part, size_part) = match trimmed.split_once('*') {
             Some((c, s)) => (Some(c.trim()), s.trim()),
@@ -214,8 +217,6 @@ impl SessionLogger {
             }
             let mut f = File::create(xp)
                 .map_err(|e| format!("Cannot open XML log file '{}': {e}", xp.display()))?;
-            #[cfg(any())]
-            let _ = &f;
             let safe_name = xml_escape_attr(&mask_url_credentials_inline(
                 if initial_session_name.is_empty() {
                     "session"

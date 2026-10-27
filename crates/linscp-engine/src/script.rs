@@ -454,6 +454,21 @@ impl ScriptInterpreter {
         )
     }
 
+    fn remote_error(&self, operation: &str, path: &str, reason: &str) -> String {
+        let op_tr = self.tr(operation);
+        self.trp(
+            "Cannot {operation} '{path}'. {reason}",
+            &[("operation", op_tr), ("path", path), ("reason", reason)],
+        )
+    }
+
+    fn transfer_failed(&self, name: &str, reason: &str) -> String {
+        self.trp(
+            "Transfer of '{name}' failed. {reason}",
+            &[("name", name), ("reason", reason)],
+        )
+    }
+
     pub async fn shutdown(&mut self) {
         for slot in self.slots.drain(..) {
             let _ = slot.session.close().await;
@@ -490,9 +505,9 @@ impl ScriptInterpreter {
 
     fn apply_cli_defaults(&self, spec: &mut ParsedSiteSpec) -> Result<(), String> {
         let d = &self.cfg.cli_defaults;
-        if let Some(ref hk) = d.hostkey.as_ref().filter(|s| !s.is_empty()) {
+        if let Some(hk) = d.hostkey.as_deref().filter(|s| !s.is_empty()) {
             if spec.session.hostkey.is_empty() {
-                spec.session.hostkey = (*hk).clone();
+                spec.session.hostkey = hk.to_string();
             }
         }
         if let Some(ref pw) = d.password {
@@ -556,17 +571,36 @@ impl ScriptInterpreter {
             self.presets_disabled = false;
         }
 
-        let session = connect_site_spec(
+        let collected_events: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&collected_events);
+        let ssh_sink: linscp_proto::ssh::SshEventLogger = Arc::new(move |msg: &str| {
+            sink_events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(msg.to_string());
+        });
+
+        let connect_res = connect_site_spec(
             &spec,
             &self.cfg.config_dir,
             self.is_interactive_confirm(),
             self.is_interactive_auth(),
             &self.cfg.locale,
             self.cfg.log_level,
-            None,
+            Some(ssh_sink),
         )
-        .await
-        .map_err(|err| {
+        .await;
+
+        for ev in collected_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            self.logger.log_event(&ev);
+        }
+
+        let session = connect_res.map_err(|err| {
             self.trp(
                 "Cannot open session to {host}: {reason}",
                 &[("host", &spec.session.host), ("reason", &err)],
@@ -764,7 +798,7 @@ impl ScriptInterpreter {
         let canonical = match resolve_prefixed_name(COMMAND_NAMES, cmd_raw) {
             PrefixMatch::ExactOrUnique(name) => canonical_alias(name),
             PrefixMatch::Ambiguous(candidates) => {
-                let msg = format!("Ambiguous command '{cmd_raw}' (matches: {candidates}).");
+                let msg = format!("Command '{cmd_raw}' is ambiguous (matches: {candidates}).");
                 self.emit_error(&msg);
                 self.logger.end_command_group();
                 return false;
@@ -1006,7 +1040,7 @@ impl ScriptInterpreter {
         let opt_name = match resolve_prefixed_name(OPTIONS, &args[0]) {
             PrefixMatch::ExactOrUnique(n) => n,
             PrefixMatch::Ambiguous(m) => {
-                return Err(format!("Ambiguous option '{}' (matches: {m}).", args[0]));
+                return Err(format!("Option '{}' is ambiguous (matches: {m}).", args[0]));
             }
             PrefixMatch::None => {
                 let hint = self.trp(
@@ -1824,23 +1858,47 @@ impl ScriptInterpreter {
         }
         let slot = self.active_slot()?;
         let next = if args.is_empty() {
-            slot.session.pwd().await.map_err(|e| e.to_string())?
+            slot.session
+                .pwd()
+                .await
+                .map_err(|e| self.remote_error("change directory to", "~", &e.to_string()))?
         } else {
-            let candidate = resolve_remote_path(&slot.remote_cwd, &args[0]);
-            if candidate != "/" {
-                if let Some(info) = slot
+            let candidate = if args[0] == "~" || args[0].starts_with("~/") {
+                let home = slot
                     .session
-                    .stat(&candidate)
+                    .pwd()
                     .await
-                    .map_err(|e| e.to_string())?
-                {
+                    .unwrap_or_else(|_| "/".to_string());
+                if args[0] == "~" {
+                    home
+                } else {
+                    resolve_remote_path(&home, &args[0][2..])
+                }
+            } else {
+                resolve_remote_path(&slot.remote_cwd, &args[0])
+            };
+            if candidate != "/" {
+                let st_opt = slot.session.stat(&candidate).await.map_err(|e| {
+                    let msg = self.remote_error("change directory to", &candidate, &e.to_string());
+                    self.logger.record_cwd(&candidate, Err(&msg));
+                    msg
+                })?;
+                if let Some(info) = st_opt {
                     if !info.is_dir && !info.is_symlink {
-                        let msg = format!("'{candidate}' is not a directory.");
+                        let msg = self.remote_error(
+                            "change directory to",
+                            &candidate,
+                            "Not a directory.",
+                        );
                         self.logger.record_cwd(&candidate, Err(&msg));
                         return Err(msg);
                     }
                 } else if slot.session.scheme() != ProtocolScheme::S3 {
-                    let msg = format!("Remote directory '{candidate}' does not exist.");
+                    let msg = self.remote_error(
+                        "change directory to",
+                        &candidate,
+                        self.tr("There is no such file or directory."),
+                    );
                     self.logger.record_cwd(&candidate, Err(&msg));
                     return Err(msg);
                 }
@@ -1903,7 +1961,7 @@ impl ScriptInterpreter {
         {
             Ok(v) => v,
             Err(e) => {
-                let msg = e.to_string();
+                let msg = self.remote_error("read directory", &dir_path, &e.to_string());
                 self.logger.record_ls(&dir_path, None, Err(&msg));
                 return Err(msg);
             }
@@ -1977,12 +2035,16 @@ impl ScriptInterpreter {
                 Ok(())
             }
             Ok(None) => {
-                let msg = format!("Remote path '{path}' does not exist.");
+                let msg = self.remote_error(
+                    "read the attributes of",
+                    &path,
+                    self.tr("There is no such file or directory."),
+                );
                 self.logger.record_stat(&path, None, Err(&msg));
                 Err(msg)
             }
             Err(e) => {
-                let msg = e.to_string();
+                let msg = self.remote_error("read the attributes of", &path, &e.to_string());
                 self.logger.record_stat(&path, None, Err(&msg));
                 Err(msg)
             }
@@ -2104,7 +2166,7 @@ impl ScriptInterpreter {
         for raw in args {
             let path = resolve_remote_path(&cwd, raw);
             if let Err(e) = self.slots[self.active_slot].session.remove_dir(&path).await {
-                let msg = e.to_string();
+                let msg = self.remote_error("remove the directory", &path, &e.to_string());
                 self.logger.record_rm(&path, false, Err(&msg));
                 return Err(msg);
             }
@@ -2275,10 +2337,18 @@ impl ScriptInterpreter {
                 target_resolved.clone()
             };
             let op_res = if is_copy {
-                self.slots[self.active_slot]
+                match self.slots[self.active_slot]
                     .session
                     .copy_file(&src_path, &dest_path)
                     .await
+                {
+                    Err(linscp_proto::ProtoError::UnsupportedCapability(..)) => {
+                        self.stream_remote_copy(&src_path, &src_entry, &dest_path)
+                            .await
+                            .map_err(linscp_proto::ProtoError::Transport)
+                    }
+                    other => other,
+                }
             } else {
                 self.slots[self.active_slot]
                     .session
@@ -2298,6 +2368,63 @@ impl ScriptInterpreter {
             }
         }
         Ok(())
+    }
+
+    async fn stream_remote_copy(
+        &mut self,
+        src_path: &str,
+        src_entry: &FileEntry,
+        dest_path: &str,
+    ) -> Result<(), String> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "linscp-cp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        linscp_platform::create_private_dir(&tmp_dir).map_err(|e| e.to_string())?;
+        let tmp_file = tmp_dir.join("copy.bin");
+        let res = async {
+            let mut sink = tokio::fs::File::create(&tmp_file)
+                .await
+                .map_err(|e| format!("Cannot create temporary copy file: {e}"))?;
+            self.slots[self.active_slot]
+                .session
+                .download(src_path, linscp_proto::TransferRequest::default(), &mut sink, None)
+                .await
+                .map_err(|e| e.to_string())?;
+            tokio::io::AsyncWriteExt::flush(&mut sink)
+                .await
+                .map_err(|e| format!("Flushing temporary copy failed: {e}"))?;
+            drop(sink);
+            let sz = std::fs::metadata(&tmp_file)
+                .map(|m| m.len())
+                .unwrap_or(src_entry.size);
+            let mut src_f = tokio::fs::File::open(&tmp_file)
+                .await
+                .map_err(|e| format!("Opening temporary copy failed: {e}"))?;
+            let req = linscp_proto::TransferRequest {
+                preserve_time: src_entry.mtime > 0,
+                mtime: (src_entry.mtime > 0).then_some(src_entry.mtime),
+                permissions: {
+                    let m = mode_from_permissions_str(&src_entry.permissions);
+                    (m != 0).then_some(m)
+                },
+                ..linscp_proto::TransferRequest::default()
+            };
+            self.slots[self.active_slot]
+                .session
+                .upload(dest_path, req, &mut src_f, Some(sz), None)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        }
+        .await;
+        let _ = std::fs::remove_file(&tmp_file);
+        let _ = std::fs::remove_dir(&tmp_dir);
+        res
     }
 
     async fn cmd_chmod(&mut self, args: &[String]) -> Result<(), String> {
@@ -2411,29 +2538,95 @@ impl ScriptInterpreter {
     }
 
     async fn cmd_checksum(&mut self, args: &[String]) -> Result<(), String> {
+        let slot = self.active_slot()?;
         if args.len() != 2 {
-            return Err("Syntax: checksum <algorithm> <file>".to_string());
+            let h = self.tr("Syntax: checksum <algorithm> <file> (algorithm: sha-256, sha-1, md5 or crc32)");
+            return Err(self.wrong_args("checksum", h));
         }
         let alg = &args[0];
-        let cwd = self.active_slot()?.remote_cwd.clone();
+        let cwd = slot.remote_cwd.clone();
+        let scheme = slot.session.scheme();
         let path = resolve_remote_path(&cwd, &args[1]);
-        match self.slots[self.active_slot]
-            .session
-            .checksum(alg, &path)
-            .await
-        {
-            Ok(hex) => {
-                println!("{hex}  {path}");
-                self.logger
-                    .record_checksum(&path, alg, Some(&hex), Ok(()));
-                Ok(())
+
+        let st = match self.slots[self.active_slot].session.stat(&path).await {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                let msg = self.remote_error(
+                    "read the attributes of",
+                    &path,
+                    self.tr("There is no such file or directory."),
+                );
+                self.logger.record_checksum(&path, alg, None, Err(&msg));
+                return Err(msg);
             }
             Err(e) => {
-                let msg = e.to_string();
+                let msg = self.remote_error("read the attributes of", &path, &e.to_string());
                 self.logger.record_checksum(&path, alg, None, Err(&msg));
-                Err(msg)
+                return Err(msg);
             }
+        };
+        if st.is_dir {
+            let h = self.trp("'{path}' is a directory, not a file.", &[("path", &path)]);
+            return Err(self.wrong_args("checksum", &h));
         }
+
+        if linscp_crypto::digests::DigestAlgorithm::parse(alg).is_none() {
+            let h = format!(
+                "Unsupported checksum algorithm '{alg}' (expected sha-256, sha-1, md5 or crc32)."
+            );
+            return Err(self.wrong_args("checksum", &h));
+        }
+
+        let srv_res = self.slots[self.active_slot]
+            .session
+            .checksum_server_only(alg, &path)
+            .await;
+
+        let (hex, note) = match srv_res {
+            Ok(Some(h)) => (h, None),
+            Ok(None) => {
+                let note_msg = if alg.eq_ignore_ascii_case("crc32") {
+                    format!(
+                        "'{alg}' is not a server-side algorithm; it is computed from the downloaded file."
+                    )
+                } else if matches!(scheme, ProtocolScheme::Sftp | ProtocolScheme::Ssh) {
+                    format!(
+                        "The server cannot calculate checksums; '{alg}' is computed from the downloaded file."
+                    )
+                } else {
+                    format!(
+                        "The '{}' backend cannot run a server-side checksum; '{alg}' is computed from the downloaded file.",
+                        scheme.as_str()
+                    )
+                };
+                match self.slots[self.active_slot]
+                    .session
+                    .checksum(alg, &path)
+                    .await
+                {
+                    Ok(h) => (h, Some(note_msg)),
+                    Err(e) => {
+                        let msg = self.transfer_failed(&path, &e.to_string());
+                        self.logger.record_checksum(&path, alg, None, Err(&msg));
+                        return Err(msg);
+                    }
+                }
+            }
+            Err(e) => {
+                let msg =
+                    self.remote_error("calculate the checksum of", &path, &e.to_string());
+                self.logger.record_checksum(&path, alg, None, Err(&msg));
+                return Err(msg);
+            }
+        };
+
+        if let Some(n) = note {
+            self.emit_status(&n);
+        }
+        println!("{hex} {path}");
+        self.logger
+            .record_checksum(&path, alg, Some(&hex), Ok(()));
+        Ok(())
     }
 
     async fn cmd_call(&mut self, raw_line: &str, args: &[String]) -> Result<(), String> {
@@ -2710,7 +2903,8 @@ impl ScriptInterpreter {
                     &mut self.logger,
                     None,
                 )
-                .await?;
+                .await
+                .map_err(|e| self.transfer_failed(&rpath, &e))?;
             } else {
                 download_single_file(
                     self.slots[self.active_slot].session.as_ref(),
@@ -2721,7 +2915,8 @@ impl ScriptInterpreter {
                     &mut self.logger,
                     None,
                 )
-                .await?;
+                .await
+                .map_err(|e| self.transfer_failed(&rpath, &e))?;
             }
         }
         Ok(())
@@ -2833,6 +3028,7 @@ impl ScriptInterpreter {
                 Some(rt) => rt.clone(),
                 None => join_remote_path(&cwd, &lname),
             };
+            let src_disp = lpath.display().to_string();
             if is_dir {
                 upload_directory_recursive(
                     self.slots[self.active_slot].session.as_ref(),
@@ -2843,7 +3039,8 @@ impl ScriptInterpreter {
                     &mut self.logger,
                     None,
                 )
-                .await?;
+                .await
+                .map_err(|e| self.transfer_failed(&src_disp, &e))?;
             } else {
                 upload_single_file(
                     self.slots[self.active_slot].session.as_ref(),
@@ -2853,7 +3050,8 @@ impl ScriptInterpreter {
                     &mut self.logger,
                     None,
                 )
-                .await?;
+                .await
+                .map_err(|e| self.transfer_failed(&src_disp, &e))?;
             }
         }
         Ok(())
@@ -3307,12 +3505,19 @@ impl ScriptInterpreter {
             match low.as_str() {
                 "-delete" => opts.delete_obsolete = true,
                 "-continue" => opts.continue_on_error = true,
+                "-once" => opts.max_passes = 1,
                 _ if low.starts_with("-interval=") => {
-                    let secs: f64 = norm["-interval=".len()..]
+                    let raw_iv = &norm["-interval=".len()..];
+                    let secs: f64 = raw_iv
                         .parse()
                         .ok()
-                        .filter(|&v: &f64| v > 0.0)
-                        .ok_or_else(|| "Invalid '-interval' value.".to_string())?;
+                        .filter(|&v: &f64| v > 0.0 && v <= 86_400.0)
+                        .ok_or_else(|| {
+                            self.wrong_args(
+                                "keepuptodate",
+                                "The value of '-interval' must be between 1 and 86400 seconds.",
+                            )
+                        })?;
                     opts.interval_ms = ((secs * 1000.0) as u64).max(50);
                 }
                 _ if low.starts_with("-count=") || low.starts_with("-iterations=") => {
@@ -3321,16 +3526,27 @@ impl ScriptInterpreter {
                         .parse()
                         .ok()
                         .filter(|&n| n > 0)
-                        .ok_or_else(|| "Invalid '-count' value.".to_string())?;
+                        .ok_or_else(|| {
+                            self.wrong_args(
+                                "keepuptodate",
+                                "The value of '-count' must be a positive number of passes.",
+                            )
+                        })?;
                     opts.max_passes = n;
                 }
+                _ if low.starts_with("-criteria=") => {
+                    let _ = SyncCriteria::parse(&norm["-criteria=".len()..])
+                        .map_err(|e| self.wrong_args("keepuptodate", &e))?;
+                }
                 _ if low.starts_with("-filemask=") => {
-                    opts.file_mask = FileMask::parse(&norm["-filemask=".len()..])?;
+                    opts.file_mask = FileMask::parse(&norm["-filemask=".len()..])
+                        .map_err(|e| self.wrong_args("keepuptodate", &e))?;
                 }
                 _ if low.starts_with("-transfer=") => {
                     let v = &norm["-transfer=".len()..];
-                    opts.transfer_mode = parse_transfer_mode(v)
-                        .ok_or_else(|| format!("Invalid '-transfer' mode '{v}'."))?;
+                    opts.transfer_mode = parse_transfer_mode(v).ok_or_else(|| {
+                        self.wrong_args("keepuptodate", &format!("Invalid '-transfer' mode '{v}'."))
+                    })?;
                 }
                 _ => {
                     let h = self.trp(
@@ -3342,9 +3558,10 @@ impl ScriptInterpreter {
             }
         }
         if positional.len() > 2 {
-            return Err(
-                "Syntax: keepuptodate [ <localdir> [ <remotedir> ] ] [ switches ]".to_string(),
-            );
+            return Err(self.wrong_args(
+                "keepuptodate",
+                "Syntax: keepuptodate [ <localdir> [ <remotedir> ] ] [ switches ]",
+            ));
         }
         let local_root = if let Some(ld) = positional.first() {
             resolve_local_against(&self.local_cwd, &expand_tilde(ld))
@@ -4002,8 +4219,8 @@ pub async fn run_pty_shell_session(conn: &SshConnection) -> Result<i32, String> 
                         let _ = std::io::stdout().flush();
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
-                        let _ = std::io::stderr().write_all(&data);
-                        let _ = std::io::stderr().flush();
+                        let _ = std::io::stdout().write_all(&data);
+                        let _ = std::io::stdout().flush();
                     }
                     Some(ChannelMsg::Eof) => {
                         saw_eof = true;

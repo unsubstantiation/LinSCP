@@ -379,10 +379,22 @@ pub fn expand_script_parameters(line: &str, parameters: &[String]) -> Result<Str
     Ok(expanded)
 }
 
+/// Returns `true` when `token` begins with a Windows drive prefix (`C:\...`, `D:/...`)
+/// or a CLI/script switch whose value starts with a Windows drive prefix (`-keyfile=D:\...`).
+fn looks_like_windows_drive_token(token: &str) -> bool {
+    let val = match token.split_once('=') {
+        Some((lhs, rhs)) if lhs.starts_with('-') || lhs.starts_with('/') => rhs,
+        _ => token,
+    };
+    let bytes = val.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
 /// Splits a script command line into tokens matching `PathUtil::SplitCommandLine`:
 /// `'...'` is literal; `"..."` keeps whitespace while treating `\"` and `\\` as escapes
 /// and preserving any other `\` literally; `""` is an empty argument; outside quotes `\`
-/// escapes the next character.
+/// escapes the next character (except inside unquoted `<Drive>:\...` Windows paths where
+/// `\` not followed by whitespace or quotes is preserved as a path separator).
 pub fn tokenize_script_line(line: &str) -> Result<Vec<String>, String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -418,7 +430,13 @@ pub fn tokenize_script_line(line: &str) -> Result<Vec<String>, String> {
             in_token = true;
         } else if c == '\\' {
             in_token = true;
-            if let Some(next_c) = chars.next() {
+            if looks_like_windows_drive_token(&current)
+                && chars
+                    .peek()
+                    .is_some_and(|nc| !nc.is_ascii_whitespace() && *nc != '"' && *nc != '\'')
+            {
+                current.push('\\');
+            } else if let Some(next_c) = chars.next() {
                 current.push(next_c);
             } else {
                 current.push('\\');

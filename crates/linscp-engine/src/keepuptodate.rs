@@ -4,7 +4,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use linscp_platform::terminal::{clear_interrupted, install_cli_signal_handlers, is_interrupted};
+use linscp_platform::terminal::{
+    clear_interrupted, install_cli_signal_handlers, is_interrupted, restore_default_signal_handlers,
+};
 use linscp_platform::watcher::LocalDirWatcher;
 use linscp_proto::RemoteSession;
 use linscp_types::TransferMode;
@@ -13,6 +15,23 @@ use crate::filemask::FileMask;
 use crate::presets::PresetPermissions;
 use crate::sync_planner::{SyncCriteria, SyncMode, SyncOptions, SyncState, apply_sync_plan, plan_synchronization};
 use crate::xml_log::SessionLogger;
+
+struct SignalHandlerGuard;
+
+impl SignalHandlerGuard {
+    fn acquire() -> Self {
+        install_cli_signal_handlers();
+        clear_interrupted();
+        Self
+    }
+}
+
+impl Drop for SignalHandlerGuard {
+    fn drop(&mut self) {
+        clear_interrupted();
+        restore_default_signal_handlers();
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct KeepUpToDateOptions {
@@ -84,8 +103,9 @@ where
 
     let mut dummy_state = SyncState::default();
     let mut total_applied = 0usize;
+    let mut passes = 1u32;
 
-    // Initial catch-up pass
+    // Initial catch-up pass (Pass 1)
     match plan_synchronization(session, local_root, remote_root, &sync_opts, &dummy_state).await {
         Ok(plan) if !plan.is_empty() => {
             match apply_sync_plan(
@@ -99,26 +119,35 @@ where
             )
             .await
             {
-                Ok((applied, _)) => total_applied += applied,
+                Ok((applied, _)) => {
+                    total_applied += applied;
+                    on_status(&format!("Pass {passes}: synchronized {applied} item(s)."));
+                }
                 Err(e) if opts.continue_on_error => on_status(&format!("Error: {e}")),
                 Err(e) => return Err(e),
             }
         }
-        Ok(_) => {}
+        Ok(_) => {
+            on_status(&format!(
+                "Pass {passes}: nothing to do (every file is up to date)."
+            ));
+        }
         Err(e) if opts.continue_on_error => on_status(&format!("Error: {e}")),
         Err(e) => return Err(e),
     }
 
+    if opts.max_passes > 0 && passes >= opts.max_passes {
+        return Ok(total_applied);
+    }
+
     let watcher = LocalDirWatcher::watch(local_root, true).ok();
-    install_cli_signal_handlers();
-    clear_interrupted();
+    let _sig_guard = SignalHandlerGuard::acquire();
     on_status(&format!(
         "Watching '{}' -> '{remote_root}' for changes...",
         local_root.display()
     ));
 
     let wait_dur = Duration::from_millis(opts.interval_ms.max(50));
-    let mut passes = 0u32;
 
     while !is_interrupted() {
         if opts.max_passes > 0 && passes >= opts.max_passes {
@@ -150,24 +179,21 @@ where
                 {
                     Ok((applied, _)) => {
                         total_applied += applied;
-                        on_status(&format!("Synchronized {applied} item(s)."));
+                        on_status(&format!("Pass {passes}: synchronized {applied} item(s)."));
                     }
                     Err(e) if opts.continue_on_error => on_status(&format!("Error: {e}")),
-                    Err(e) => {
-                        clear_interrupted();
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 }
             }
-            Ok(_) => {}
-            Err(e) if opts.continue_on_error => on_status(&format!("Error: {e}")),
-            Err(e) => {
-                clear_interrupted();
-                return Err(e);
+            Ok(_) => {
+                on_status(&format!(
+                    "Pass {passes}: nothing to do (every file is up to date)."
+                ));
             }
+            Err(e) if opts.continue_on_error => on_status(&format!("Error: {e}")),
+            Err(e) => return Err(e),
         }
     }
 
-    clear_interrupted();
     Ok(total_applied)
 }

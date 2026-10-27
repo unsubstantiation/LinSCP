@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use linscp_platform::create_private_dir;
 use linscp_platform::terminal::{
     clear_interrupted, install_cli_signal_handlers, is_interrupted, resolve_default_editor,
-    spawn_editor_process,
+    restore_default_signal_handlers, spawn_editor_process,
 };
 use linscp_proto::RemoteSession;
 
@@ -235,19 +235,28 @@ where
         return Ok(());
     }
 
+    struct MonitorSignalGuard;
+    impl Drop for MonitorSignalGuard {
+        fn drop(&mut self) {
+            clear_interrupted();
+            restore_default_signal_handlers();
+        }
+    }
     install_cli_signal_handlers();
     clear_interrupted();
+    let _sig_guard = MonitorSignalGuard;
     let target_passes = opts.monitor_passes.max(1);
     let mut completed_passes = u32::from(first_uploaded);
     let mut idle_polls = 0u32;
     on_status(&format!("Monitoring '{}' for local saves...", temp_path.display()));
 
+    let mut monitor_err: Option<String> = None;
     while !is_interrupted() && completed_passes < target_passes {
         tokio::time::sleep(std::time::Duration::from_millis(
             opts.monitor_interval_ms.max(25),
         ))
         .await;
-        if upload_edited_if_changed(
+        match upload_edited_if_changed(
             session,
             remote_path,
             &temp_path,
@@ -258,22 +267,31 @@ where
             &mut expected_remote_mtime,
             logger,
         )
-        .await?
+        .await
         {
-            on_status(&format!("Uploaded '{remote_path}'."));
-            completed_passes += 1;
-            idle_polls = 0;
-        } else {
-            idle_polls += 1;
-            // If editor process already exited and no new saves arrive within ~10s, exit cleanly
-            if child.try_wait().ok().flatten().is_some() && idle_polls > 200 {
+            Ok(true) => {
+                on_status(&format!("Uploaded '{remote_path}'."));
+                completed_passes += 1;
+                idle_polls = 0;
+            }
+            Ok(false) => {
+                idle_polls += 1;
+                // If editor process already exited and no new saves arrive within ~10s, exit cleanly
+                if child.try_wait().ok().flatten().is_some() && idle_polls > 200 {
+                    break;
+                }
+            }
+            Err(e) => {
+                monitor_err = Some(e);
                 break;
             }
         }
     }
     let _ = child.kill();
     let _ = child.wait();
-    clear_interrupted();
+    if let Some(e) = monitor_err {
+        return Err(e);
+    }
     cleanup_temp(&temp_path, &work_dir, opts.keep_temp_file);
     Ok(())
 }

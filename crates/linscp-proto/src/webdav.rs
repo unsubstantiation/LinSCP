@@ -498,6 +498,12 @@ impl WebDavSession {
         }
     }
 
+    async fn has_etag_precondition(&self, remote_path: &str) -> bool {
+        let key = self.resolve_remote_path(remote_path);
+        let guard = self.state.lock().await;
+        guard.etags.contains_key(&key)
+    }
+
     async fn if_header_for(&self, remote_path: &str) -> Option<String> {
         let key = self.resolve_remote_path(remote_path);
         let guard = self.state.lock().await;
@@ -973,6 +979,7 @@ impl RemoteSession for WebDavSession {
 
     async fn remove_file(&self, remote_path: &str) -> Result<(), ProtoError> {
         let mut req = self.apply_auth(self.client.delete(self.url_for(remote_path, false)));
+        let has_etag = self.has_etag_precondition(remote_path).await;
         if let Some(if_hdr) = self.if_header_for(remote_path).await {
             req = req.header("If", if_hdr);
         }
@@ -981,6 +988,12 @@ impl RemoteSession for WebDavSession {
             .await
             .map_err(|e| ProtoError::Transport(format!("WebDAV DELETE failed: {e}")))?;
         if !resp.status().is_success() {
+            if resp.status().as_u16() == 412 && has_etag {
+                return Err(ProtoError::Transport(format!(
+                    "WebDAV DELETE '{remote_path}' failed with HTTP {} (ETag precondition not satisfied).",
+                    resp.status()
+                )));
+            }
             return Err(ProtoError::Transport(format!(
                 "WebDAV DELETE '{remote_path}' failed with HTTP {}.",
                 resp.status()
@@ -991,6 +1004,7 @@ impl RemoteSession for WebDavSession {
 
     async fn remove_dir(&self, remote_path: &str) -> Result<(), ProtoError> {
         let mut req = self.apply_auth(self.client.delete(self.url_for(remote_path, true)));
+        let has_etag = self.has_etag_precondition(remote_path).await;
         if let Some(if_hdr) = self.if_header_for(remote_path).await {
             req = req.header("If", if_hdr);
         }
@@ -999,6 +1013,12 @@ impl RemoteSession for WebDavSession {
             .await
             .map_err(|e| ProtoError::Transport(format!("WebDAV DELETE collection failed: {e}")))?;
         if !resp.status().is_success() {
+            if resp.status().as_u16() == 412 && has_etag {
+                return Err(ProtoError::Transport(format!(
+                    "WebDAV DELETE '{remote_path}' failed with HTTP {} (ETag precondition not satisfied).",
+                    resp.status()
+                )));
+            }
             return Err(ProtoError::Transport(format!(
                 "WebDAV DELETE '{remote_path}' failed with HTTP {}.",
                 resp.status()
@@ -1015,6 +1035,7 @@ impl RemoteSession for WebDavSession {
             .apply_auth(self.client.request(method, self.url_for(from, false)))
             .header("Destination", dest_url)
             .header("Overwrite", "T");
+        let has_etag = self.has_etag_precondition(from).await;
         if let Some(if_hdr) = self.if_header_for(from).await {
             req = req.header("If", if_hdr);
         }
@@ -1023,6 +1044,12 @@ impl RemoteSession for WebDavSession {
             .await
             .map_err(|e| ProtoError::Transport(format!("WebDAV MOVE failed: {e}")))?;
         if !resp.status().is_success() {
+            if resp.status().as_u16() == 412 && has_etag {
+                return Err(ProtoError::Transport(format!(
+                    "WebDAV MOVE '{from}' -> '{to}' failed with HTTP {} (ETag precondition not satisfied).",
+                    resp.status()
+                )));
+            }
             return Err(ProtoError::Transport(format!(
                 "WebDAV MOVE '{from}' -> '{to}' failed with HTTP {}.",
                 resp.status()
@@ -1047,6 +1074,9 @@ impl RemoteSession for WebDavSession {
             .await
             .map_err(|e| ProtoError::Transport(format!("WebDAV COPY failed: {e}")))?;
         if !resp.status().is_success() {
+            if matches!(resp.status().as_u16(), 405 | 501) {
+                return Err(ProtoError::UnsupportedCapability("COPY", self.cfg.scheme));
+            }
             return Err(ProtoError::Transport(format!(
                 "WebDAV COPY '{from}' -> '{to}' failed with HTTP {}.",
                 resp.status()
@@ -1125,6 +1155,11 @@ impl RemoteSession for WebDavSession {
             if let Some(cb) = progress {
                 cb(opts.resume_offset + transferred, total);
             }
+            if opts.speed_kbytes_per_sec > 0 {
+                sink.flush()
+                    .await
+                    .map_err(|e| ProtoError::Transport(format!("Flushing download sink failed: {e}")))?;
+            }
             limiter.consume(chunk.len()).await;
         }
         sink.flush()
@@ -1152,6 +1187,7 @@ impl RemoteSession for WebDavSession {
         if let Some(sz) = total_size {
             req = req.header("Content-Length", sz.to_string());
         }
+        let has_etag = self.has_etag_precondition(remote_path).await;
         if let Some(if_hdr) = self.if_header_for(remote_path).await {
             req = req.header("If", if_hdr);
         }
@@ -1191,6 +1227,12 @@ impl RemoteSession for WebDavSession {
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 412 && has_etag {
+                return Err(ProtoError::Transport(format!(
+                    "WebDAV PUT '{remote_path}' failed with HTTP {status} (ETag precondition not satisfied): {}",
+                    detail.trim()
+                )));
+            }
             return Err(ProtoError::Transport(format!(
                 "WebDAV PUT '{remote_path}' failed with HTTP {status}: {}",
                 detail.trim()

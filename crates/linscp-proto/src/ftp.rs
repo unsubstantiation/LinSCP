@@ -1148,6 +1148,11 @@ impl RemoteSession for FtpSession {
             if let Some(cb) = progress {
                 cb(opts.resume_offset + transferred, total_size);
             }
+            if opts.speed_kbytes_per_sec > 0 {
+                sink.flush()
+                    .await
+                    .map_err(|e| ProtoError::Transport(format!("Flushing FTP sink failed: {e}")))?;
+            }
             limiter.consume(n).await;
         }
         drop(data);

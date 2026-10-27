@@ -315,6 +315,16 @@ mod linux_impl {
             input_token: Option<&[u8]>,
             mic_data: &[u8],
         ) -> Result<PlatformGssStep, String> {
+            if input_token.is_none() && !self.ctx.is_null() {
+                // SAFETY: Releases any prior established security context so a shared
+                // `GssapiTokenProvider` can authenticate fresh one-shot SSH connections.
+                unsafe {
+                    let mut del_min: OmUint32 = 0;
+                    let _ =
+                        (self.api.delete_sec_context)(&mut del_min, &mut self.ctx, std::ptr::null_mut());
+                }
+                self.ctx = std::ptr::null_mut();
+            }
             let mut mech_bytes = KRB5_MECH_OID_BYTES.to_vec();
             let mut mech_oid = GssOidDesc {
                 length: mech_bytes.len() as u32,

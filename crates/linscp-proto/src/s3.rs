@@ -1489,6 +1489,11 @@ impl RemoteSession for S3Session {
             if let Some(cb) = progress {
                 cb(opts.resume_offset + transferred, total);
             }
+            if opts.speed_kbytes_per_sec > 0 {
+                sink.flush()
+                    .await
+                    .map_err(|e| ProtoError::Transport(format!("S3 sink flush failed: {e}")))?;
+            }
             limiter.consume(chunk.len()).await;
         }
         sink.flush()

@@ -130,11 +130,6 @@ pub fn should_use_filepart(
     if effective_ascii || flags.append {
         return false;
     }
-    // SCP never supports byte-range resume (`-resume` is refused separately),
-    // and in `Smart` mode only stages if explicitly turned `On`.
-    if scheme == ProtocolScheme::Scp {
-        return matches!(flags.resume_support, ResumeSupportMode::On);
-    }
     // S3 uploads have native multipart checkpoints (`s3_multipart_resume.json`),
     // while S3 `CopyObject` for `.filepart` rename would double object writes unless requested.
     if is_upload && scheme == ProtocolScheme::S3 {
@@ -262,8 +257,10 @@ fn validate_protocol_transfer_flags(
             ));
         }
     }
-    if flags.resume && scheme == ProtocolScheme::Scp {
-        return Err("SCP protocol does not support resuming transfers ('-resume').".to_string());
+    if scheme == ProtocolScheme::Scp
+        && (flags.resume || matches!(flags.resume_support, ResumeSupportMode::On))
+    {
+        return Err("The SCP protocol cannot resume transfers.".to_string());
     }
     Ok(())
 }
@@ -574,7 +571,7 @@ pub async fn upload_single_file(
             .map_err(|e| format!("Reading stdin for upload failed: {e}"))?;
         let leaf = remote_dest.rsplit('/').next().unwrap_or(remote_dest);
         let payload = if wants_ascii_conversion(flags.transfer_mode, leaf) {
-            let eol = flags.eol_override.unwrap_or(EolStyle::Lf);
+            let eol = flags.eol_override.unwrap_or(EolStyle::Crlf);
             convert_eol_bytes(&buf, eol)
         } else {
             buf
@@ -649,8 +646,8 @@ pub async fn upload_single_file(
     if effective_ascii {
         let raw = std::fs::read(local_src)
             .map_err(|e| format!("Cannot read local file '{src_label}': {e}"))?;
-        // Default server newline target on upload: LF unless overridden (`-eol=crlf`)
-        let target_eol = flags.eol_override.unwrap_or(EolStyle::Lf);
+        // Default server newline target on upload: CRLF unless overridden (`-eol=lf`)
+        let target_eol = flags.eol_override.unwrap_or(EolStyle::Crlf);
         let converted = convert_eol_bytes(&raw, target_eol);
         let total = converted.len() as u64;
         let mut cursor = std::io::Cursor::new(converted);
@@ -687,15 +684,16 @@ pub async fn upload_single_file(
         None
     };
 
+    let can_resume_proto = session.scheme() != ProtocolScheme::Scp;
     let (upload_path, resume_offset) = if let Some(ref sp) = stage_opt {
         if let Ok(Some(st)) = session.stat(sp).await {
-            if !st.is_dir && st.size < local_info.size {
+            if can_resume_proto && !st.is_dir && st.size < local_info.size {
                 (sp.clone(), st.size)
             } else {
                 let _ = session.remove_file(sp).await;
                 (sp.clone(), 0u64)
             }
-        } else if flags.resume {
+        } else if can_resume_proto && flags.resume {
             if let Ok(Some(dst_st)) = session.stat(remote_dest).await {
                 if !dst_st.is_dir && dst_st.size < local_info.size {
                     if session.rename(remote_dest, sp).await.is_ok() {
@@ -712,7 +710,7 @@ pub async fn upload_single_file(
         } else {
             (sp.clone(), 0u64)
         }
-    } else if flags.resume {
+    } else if can_resume_proto && flags.resume {
         if let Ok(Some(dst_st)) = session.stat(remote_dest).await {
             if !dst_st.is_dir && dst_st.size < local_info.size {
                 (remote_dest.to_string(), dst_st.size)

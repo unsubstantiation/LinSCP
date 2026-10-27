@@ -21,7 +21,7 @@ use linscp_engine::xml_log::{LogRotationPolicy, SessionLogger};
 use linscp_http::{HttpAppState, HttpServerConfig, serve};
 use linscp_i18n::{CatalogDomain, supported_locales, translate, translate_with};
 use linscp_platform::terminal::{
-    expand_tilde, install_cli_signal_handlers, launch_gui_application, read_password_no_echo,
+    ensure_default_sigint, expand_tilde, launch_gui_application, read_password_no_echo,
     stdin_is_terminal,
 };
 use linscp_platform::write_exclusive_private_file;
@@ -253,7 +253,7 @@ fn print_err(msg: &str) {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    install_cli_signal_handlers();
+    ensure_default_sigint();
     let code = run_cli().await;
     if code == 0 {
         ExitCode::SUCCESS
@@ -769,26 +769,6 @@ async fn run_cli() -> i32 {
         0
     };
 
-    if let Some(ref lf) = log_file {
-        if let Err(reason) = SessionLogger::open(
-            Some(lf),
-            effective_log_level,
-            log_sensitive,
-            log_rotation,
-            None,
-            true,
-            &url,
-        ) {
-            let p_str = lf.display().to_string();
-            print_err(&translate_with(
-                CatalogDomain::Cli,
-                &locale,
-                "Cannot open the log file '{path}': {reason}",
-                &[("path", &p_str), ("reason", &reason)],
-            ));
-            return 1;
-        }
-    }
     let mut logger = match SessionLogger::open(
         log_file.as_deref(),
         effective_log_level,
@@ -800,16 +780,29 @@ async fn run_cli() -> i32 {
     ) {
         Ok(l) => l,
         Err(reason) => {
-            let p_str = xml_log_file
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            print_err(&translate_with(
-                CatalogDomain::Cli,
-                &locale,
-                "Cannot open the XML log file '{path}': {reason}",
-                &[("path", &p_str), ("reason", &reason)],
-            ));
+            if reason.contains("XML") {
+                let p_str = xml_log_file
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                print_err(&translate_with(
+                    CatalogDomain::Cli,
+                    &locale,
+                    "Cannot open the XML log file '{path}': {reason}",
+                    &[("path", &p_str), ("reason", &reason)],
+                ));
+            } else {
+                let p_str = log_file
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                print_err(&translate_with(
+                    CatalogDomain::Cli,
+                    &locale,
+                    "Cannot open the log file '{path}': {reason}",
+                    &[("path", &p_str), ("reason", &reason)],
+                ));
+            }
             return 1;
         }
     };
@@ -871,19 +864,36 @@ async fn run_cli() -> i32 {
         }
         let is_batch = batch.unwrap_or(false);
         let interactive = !is_batch && stdin_is_terminal();
-        let (conn, jump) = match connect_ssh_for_shell(
+        let collected_events: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&collected_events);
+        let ssh_sink: linscp_proto::ssh::SshEventLogger = Arc::new(move |msg: &str| {
+            sink_events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(msg.to_string());
+        });
+        let connect_res = connect_ssh_for_shell(
             &spec,
             &config_dir,
             interactive,
             interactive,
             &locale,
             effective_log_level,
-            None,
+            Some(ssh_sink),
         )
-        .await
+        .await;
+        for ev in collected_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
         {
+            logger.log_event(&ev);
+        }
+        let (conn, jump) = match connect_res {
             Ok(pair) => pair,
             Err(e) => {
+                logger.finish();
                 print_err(&e);
                 return 1;
             }

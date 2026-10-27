@@ -519,6 +519,12 @@ fn decode_stored_master_key(
         return bridge.unwrap_master_key(&blob);
     }
 
+    if raw.len() == MASTER_KEY_LEN {
+        let mut out = Zeroizing::new([0u8; 32]);
+        out.copy_from_slice(raw);
+        return Ok(out);
+    }
+
     let decoded = Zeroizing::new(
         BASE64
             .decode(text.as_bytes())
@@ -579,7 +585,8 @@ impl SecretVault for NativeSecretVault {
             return Ok(generated);
         }
 
-        write_private_file_atomic(&key_path, &*generated)?;
+        let encoded = format!("{}\n", BASE64.encode(*generated));
+        write_private_file_atomic(&key_path, encoded.as_bytes())?;
         Ok(generated)
     }
 }

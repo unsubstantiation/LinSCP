@@ -40,19 +40,47 @@ unsafe extern "system" fn windows_ctrl_handler(ctrl_type: u32) -> i32 {
     0
 }
 
+/// Restores `SIG_DFL` on `SIGINT` / `SIGTERM` if a parent supervisor process
+/// spawned `linscp` with `SIG_IGN`, while keeping fatal default termination
+/// active for ordinary commands and transfers.
+pub fn ensure_default_sigint() {
+    INTERRUPTED.store(false, Ordering::SeqCst);
+    #[cfg(unix)]
+    // SAFETY: Queries current signal dispositions with `sigaction` and resets
+    // `SIG_IGN` to `SIG_DFL` using valid zeroed `sigaction` structs.
+    unsafe {
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(sig, std::ptr::null(), &mut old) == 0
+                && old.sa_sigaction == libc::SIG_IGN
+            {
+                let mut dfl: libc::sigaction = std::mem::zeroed();
+                dfl.sa_sigaction = libc::SIG_DFL;
+                libc::sigemptyset(&mut dfl.sa_mask);
+                let _ = libc::sigaction(sig, &dfl, std::ptr::null_mut());
+            }
+        }
+        let mut sa_winch: libc::sigaction = std::mem::zeroed();
+        sa_winch.sa_sigaction = handle_winch_signal as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut sa_winch.sa_mask);
+        sa_winch.sa_flags = libc::SA_RESTART;
+        let _ = libc::sigaction(libc::SIGWINCH, &sa_winch, std::ptr::null_mut());
+    }
+}
+
 /// Installs process-wide `SIGINT` / `SIGTERM` (and `SIGWINCH` on Unix,
-/// `SetConsoleCtrlHandler` on Windows) handlers, explicitly overriding any
-/// inherited `SIG_IGN` disposition from a parent supervisor process.
+/// `SetConsoleCtrlHandler` on Windows) handlers for long-running watch loops
+/// (`keepuptodate`, `edit -monitor`), explicitly overriding any inherited `SIG_IGN`.
 pub fn install_cli_signal_handlers() {
     INTERRUPTED.store(false, Ordering::SeqCst);
     #[cfg(unix)]
     // SAFETY: Zeroed `sigaction` with async-signal-safe `AtomicBool::store`
-    // handlers and empty signal masks is valid across all POSIX targets.
+    // handlers and `SA_RESTART` is valid across all POSIX targets.
     unsafe {
         let mut sa_int: libc::sigaction = std::mem::zeroed();
         sa_int.sa_sigaction = handle_interrupt_signal as *const () as libc::sighandler_t;
         libc::sigemptyset(&mut sa_int.sa_mask);
-        sa_int.sa_flags = 0;
+        sa_int.sa_flags = libc::SA_RESTART;
         let _ = libc::sigaction(libc::SIGINT, &sa_int, std::ptr::null_mut());
         let _ = libc::sigaction(libc::SIGTERM, &sa_int, std::ptr::null_mut());
 
@@ -64,11 +92,34 @@ pub fn install_cli_signal_handlers() {
     }
 
     #[cfg(windows)]
-    // SAFETY: Registers a `system` ABI console control callback for process lifetime.
+    // SAFETY: Registers a `system` ABI console control callback for watch loops.
     unsafe {
         let _ = windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
             Some(windows_ctrl_handler),
             1,
+        );
+    }
+}
+
+/// Restores default `SIGINT` / `SIGTERM` termination after a watching command finishes.
+pub fn restore_default_signal_handlers() {
+    INTERRUPTED.store(false, Ordering::SeqCst);
+    #[cfg(unix)]
+    // SAFETY: Restores `SIG_DFL` using valid zeroed `sigaction` structs.
+    unsafe {
+        let mut dfl: libc::sigaction = std::mem::zeroed();
+        dfl.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut dfl.sa_mask);
+        let _ = libc::sigaction(libc::SIGINT, &dfl, std::ptr::null_mut());
+        let _ = libc::sigaction(libc::SIGTERM, &dfl, std::ptr::null_mut());
+    }
+
+    #[cfg(windows)]
+    // SAFETY: Unregisters previously registered console control callback.
+    unsafe {
+        let _ = windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+            Some(windows_ctrl_handler),
+            0,
         );
     }
 }

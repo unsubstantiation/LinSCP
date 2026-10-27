@@ -100,20 +100,36 @@ pub fn matches_extended_ssh_pin(pin_list: &str, observed: &ObservedServerHostKey
             }
         }
         if !observed.md5_fingerprint.is_empty() {
-            let norm_md5 = fp_tok
+            let norm_md5: String = fp_tok
                 .strip_prefix("MD5:")
                 .or_else(|| fp_tok.strip_prefix("md5:"))
-                .unwrap_or(fp_tok);
-            if observed
+                .unwrap_or(fp_tok)
+                .chars()
+                .filter(|&c| c != ':' && c != '-')
+                .collect();
+            let obs_md5: String = observed
                 .md5_fingerprint
                 .strip_prefix("MD5:")
-                .is_some_and(|obs| obs.eq_ignore_ascii_case(norm_md5))
+                .unwrap_or(&observed.md5_fingerprint)
+                .chars()
+                .filter(|&c| c != ':' && c != '-')
+                .collect();
+            if norm_md5.len() == 32
+                && norm_md5.bytes().all(|b| b.is_ascii_hexdigit())
+                && obs_md5.eq_ignore_ascii_case(&norm_md5)
             {
                 return true;
             }
         }
-        if fp_tok.len() == 64 && fp_tok.bytes().all(|b| b.is_ascii_hexdigit()) {
-            if let Ok(raw_bytes) = hex_decode(fp_tok) {
+        let hex_candidate: String = fp_tok
+            .strip_prefix("SHA256:")
+            .or_else(|| fp_tok.strip_prefix("sha256:"))
+            .unwrap_or(fp_tok)
+            .chars()
+            .filter(|&c| c != ':' && c != '-')
+            .collect();
+        if hex_candidate.len() == 64 && hex_candidate.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if let Ok(raw_bytes) = hex_decode(&hex_candidate) {
                 let b64_unpadded = BASE64
                     .encode(&raw_bytes)
                     .trim_end_matches('=')
@@ -1522,6 +1538,47 @@ fn build_tls_settings(spec: &ParsedSiteSpec) -> Result<TlsSettings, String> {
     Ok(tls)
 }
 
+fn validate_ssh_gssapi_policy(spec: &ParsedSiteSpec) -> Result<(), String> {
+    if !is_ssh_scheme(spec.session.protocol) {
+        return Ok(());
+    }
+    let auth_kex = spec
+        .raw_fields
+        .get("auth_gssapi_kex")
+        .and_then(|v| parse_zero_one(v))
+        .unwrap_or(false);
+    let gss_delegate = spec
+        .raw_fields
+        .get("gssapi_fwd_tgt")
+        .and_then(|v| parse_zero_one(v))
+        .unwrap_or(false);
+    let has_logical_host = spec
+        .raw_fields
+        .get("logical_host")
+        .or_else(|| spec.raw_fields.get("logical_hostname"))
+        .is_some_and(|s| !s.trim().is_empty());
+    let hk = spec.session.hostkey.trim();
+    if auth_kex && !hk.is_empty() && hk != "*" {
+        return Err(
+            "AuthGSSAPIKEX cannot be used with a pinned host key because GSSAPI key exchange does not present a host key."
+                .to_string(),
+        );
+    }
+    if !is_system_gssapi_available() && (auth_kex || gss_delegate || has_logical_host) {
+        return Err(
+            "This build's libssh cannot use GSSAPI, so the session's Kerberos settings (AuthGSSAPIKEX, GSSAPIFwdTGT, LogicalHostName) would be dropped."
+                .to_string(),
+        );
+    }
+    if auth_kex {
+        return Err(
+            "This build's libssh does not support GSSAPI key exchange, so AuthGSSAPIKEX cannot be honored."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_ssh_configs(
     spec: &ParsedSiteSpec,
@@ -1578,6 +1635,11 @@ fn build_ssh_configs(
 
     let gssapi_provider: Option<Arc<tokio::sync::Mutex<Box<dyn GssapiTokenProvider>>>> =
         if try_gssapi && is_system_gssapi_available() {
+            if gss_delegate {
+                if let Some(ref log) = event_logger {
+                    log("Kerberos credentials will be delegated to the server (GSSAPIFwdTGT)");
+                }
+            }
             Some(Arc::new(tokio::sync::Mutex::new(Box::new(
                 LazyDlopenKrb5Provider {
                     service_host,
@@ -1704,6 +1766,7 @@ pub async fn connect_site_spec(
     log_level: i32,
     ssh_log_sink: Option<SshEventLogger>,
 ) -> Result<Box<dyn RemoteSession>, String> {
+    validate_ssh_gssapi_policy(spec)?;
     let proxy = build_proxy_config(spec)?;
     let tls = build_tls_settings(spec)?;
     let (dest_ssh_cfg, tunnel_ssh_cfg, tunnel_local_port) = build_ssh_configs(
@@ -1934,6 +1997,7 @@ pub async fn connect_ssh_for_shell(
             spec.session.protocol.as_str().to_uppercase()
         ));
     }
+    validate_ssh_gssapi_policy(spec)?;
     let proxy = build_proxy_config(spec)?;
     let (mut dest_ssh_cfg, tunnel_ssh_cfg, tunnel_local_port) = build_ssh_configs(
         spec,
@@ -1951,13 +2015,23 @@ pub async fn connect_ssh_for_shell(
             .await
             .map_err(|e| e.to_string())?;
         dest_ssh_cfg.proxy = None;
-        let stream = jump
+        let stream = match jump
             .open_destination_stream(&dest_ssh_cfg.host, dest_ssh_cfg.port, tunnel_local_port)
             .await
-            .map_err(|e| e.to_string())?;
-        let conn = SshConnection::connect_over_stream(&dest_ssh_cfg, stream)
-            .await
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = jump.close().await;
+                return Err(e.to_string());
+            }
+        };
+        let conn = match SshConnection::connect_over_stream(&dest_ssh_cfg, stream).await {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = jump.close().await;
+                return Err(e.to_string());
+            }
+        };
         Ok((conn, Some(jump)))
     } else {
         let conn = SshConnection::connect(&dest_ssh_cfg)
@@ -2032,6 +2106,12 @@ fn make_ssh_host_key_callback(
             if should_emit_wildcard_hostkey(prefix, &obs.host, obs.port, &obs.sha256_fingerprint) {
                 println!("{prefix} {} {}", obs.key_type, obs.sha256_fingerprint);
                 let _ = std::io::stdout().flush();
+                if cached_fp.is_none() {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "WARNING! Giving up security and accepting any host key as configured!"
+                    );
+                }
             }
             return Ok(());
         }

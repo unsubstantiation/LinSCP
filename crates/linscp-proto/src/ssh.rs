@@ -742,10 +742,20 @@ impl SshConnection {
 
     pub async fn disconnect(&self) -> Result<(), ProtoError> {
         let guard = self.handle.lock().await;
-        guard
+        if guard.is_closed() {
+            return Ok(());
+        }
+        let res = guard
             .disconnect(Disconnect::ByApplication, "", "en")
             .await
-            .map_err(|e| ProtoError::Transport(format!("SSH disconnect error: {e}")))
+            .map_err(|e| ProtoError::Transport(format!("SSH disconnect error: {e}")));
+        for _ in 0..40 {
+            if guard.is_closed() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        res
     }
 }
 

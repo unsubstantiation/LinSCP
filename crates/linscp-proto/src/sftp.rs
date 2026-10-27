@@ -487,6 +487,7 @@ fn wire_attrs_to_file_entry(
 pub struct SftpClientSession {
     scheme: ProtocolScheme,
     ssh: Arc<SshConnection>,
+    dest_cfg: Option<SshConnectConfig>,
     jump_tunnel: Option<Arc<SshJumpTunnel>>,
     sftp: Mutex<SftpTransport>,
     home_dir: String,
@@ -501,16 +502,44 @@ impl SftpClientSession {
     ) -> Result<Self, ProtoError> {
         let (ssh, jump_tunnel) = if let Some(tcfg) = tunnel_cfg {
             let jump = Arc::new(SshJumpTunnel::connect(tcfg.clone()).await?);
-            let stream = jump
+            let stream = match jump
                 .open_destination_stream(&dest_cfg.host, dest_cfg.port, tunnel_local_port)
-                .await?;
-            let conn = SshConnection::connect_over_stream(dest_cfg, stream).await?;
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = jump.close().await;
+                    return Err(e);
+                }
+            };
+            let conn = match SshConnection::connect_over_stream(dest_cfg, stream).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = jump.close().await;
+                    return Err(e);
+                }
+            };
             (Arc::new(conn), Some(jump))
         } else {
             (Arc::new(SshConnection::connect(dest_cfg).await?), None)
         };
 
-        Self::from_ssh_connection(scheme, ssh, jump_tunnel).await
+        let mut session = match Self::from_ssh_connection(scheme, ssh, jump_tunnel.clone()).await {
+            Ok(s) => s,
+            Err(e) => {
+                if let Some(j) = jump_tunnel {
+                    let _ = j.close().await;
+                }
+                return Err(e);
+            }
+        };
+        let mut stored_cfg = dest_cfg.clone();
+        stored_cfg.host_key_decision = None;
+        stored_cfg.event_logger = None;
+        stored_cfg.danger_accept_any_host_key = false;
+        stored_cfg.pinned_host_key = Some(session.ssh.observed_fingerprint().to_string());
+        session.dest_cfg = Some(stored_cfg);
+        Ok(session)
     }
 
     pub async fn from_ssh_connection(
@@ -527,6 +556,7 @@ impl SftpClientSession {
         Ok(Self {
             scheme,
             ssh,
+            dest_cfg: None,
             jump_tunnel,
             sftp: Mutex::new(transport),
             home_dir,
@@ -982,6 +1012,11 @@ impl RemoteSession for SftpClientSession {
                     if let Some(cb) = progress {
                         cb(opts.resume_offset + transferred, total_size);
                     }
+                    if opts.speed_kbytes_per_sec > 0 {
+                        sink.flush().await.map_err(|e| {
+                            ProtoError::Transport(format!("Flushing download sink failed: {e}"))
+                        })?;
+                    }
                     limiter.consume(chunk.len()).await;
                 } else if rtype == SSH_FXP_STATUS {
                     let (code, msg) = SftpTransport::parse_status(&rbody)?;
@@ -1101,6 +1136,13 @@ impl RemoteSession for SftpClientSession {
     }
 
     async fn exec_command(&self, command: &str) -> Result<crate::ssh::ExecOutput, ProtoError> {
+        if let (Some(jump), Some(cfg)) = (&self.jump_tunnel, &self.dest_cfg) {
+            let stream = jump.open_destination_stream(&cfg.host, cfg.port, 0).await?;
+            let conn = SshConnection::connect_over_stream(cfg, stream).await?;
+            let res = conn.exec_command(command).await;
+            let _ = conn.disconnect().await;
+            return res;
+        }
         self.ssh.exec_command(command).await
     }
 

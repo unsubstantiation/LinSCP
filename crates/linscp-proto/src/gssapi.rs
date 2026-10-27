@@ -27,7 +27,7 @@ pub const fn is_gssapi_kex_supported() -> bool {
 pub fn ensure_gssapi_available(require_kex: bool) -> Result<(), ProtoError> {
     if require_kex && !is_gssapi_kex_supported() {
         return Err(ProtoError::Transport(
-            "GSSAPI key exchange (RFC 4462 KEX) is not supported in the pure-Rust SSH engine."
+            "This build's libssh does not support GSSAPI key exchange, so AuthGSSAPIKEX cannot be honored."
                 .to_string(),
         ));
     }

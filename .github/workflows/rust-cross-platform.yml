@@ -158,25 +158,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run pure-Rust workspace unit tests on Windows
+        shell: bash
         run: |
+          set -euo pipefail
           python tools/run_cargo_ci.py cargo test --workspace
           python tools/run_cargo_ci.py cargo test -p linscp-proto --features gssapi
 
       - name: Lint workspace with Clippy on Windows
+        shell: bash
         run: |
+          set -euo pipefail
           python tools/run_cargo_ci.py cargo clippy --workspace --all-targets --keep-going -- -D warnings
           python tools/run_cargo_ci.py cargo clippy -p linscp-proto --features gssapi --all-targets --keep-going -- -D warnings
 
       - name: Check Tauri v2 native shell crate on Windows
-        run: python tools/run_cargo_ci.py cargo check -p linscp-tauri --features native-shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_cargo_ci.py cargo check -p linscp-tauri --features native-shell
 
       - name: Build and smoke-test release Rust CLI on Windows
         shell: bash
         run: |
+          set -euo pipefail
           python tools/run_cargo_ci.py cargo build --release -p linscp-cli
+          BIN_WIN="$(cygpath -m "$PWD/target/release/linscp.exe")"
           ./target/release/linscp.exe -version
           ./target/release/linscp.exe -batch -command="option batch; option transfer; sessions list; presets; exit"
-          python -u source/linux/tests/LiveDavTest.py "$PWD/target/release/linscp.exe"
+          python -u source/linux/tests/LiveDavTest.py "$BIN_WIN"
+          python -u source/linux/tests/LiveS3Test.py "$BIN_WIN"
 
   rust-android:
     name: Rust Core & Android SAF Platform Target (Android NDK)
