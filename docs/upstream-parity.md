@@ -8,18 +8,38 @@ build is not proof of behavioral parity.
 ## Baseline and scope
 
 The inventory is pinned to [the upstream repository at
-69edabbe2dc2c62661a7d3fc7e2396b5f42d504d](https://github.com/winscp/winscp/tree/69edabbe2dc2c62661a7d3fc7e2396b5f42d504d).
+246bbd42342c4443bd9ff806e91dc0bca9f83869](https://github.com/winscp/winscp/tree/246bbd42342c4443bd9ff806e91dc0bca9f83869).
 It is a development snapshot, not a claim about the latest release. The initial
 source review compared upstream `source/core/Script.cpp`, `Script.h`,
 `CopyParam.h`, `Terminal.h`, and core/forms inventories with the Linux client,
-build configuration and GUI. Linux inventory reconciliation: **2026-10-20**.
+build configuration and GUI. Linux inventory reconciliation: **2026-10-26**.
 
-The 2026-10-19 command-registration review also compared upstream master
-[`24e7b4ec1001406cc2edf2b8c88483d66d4449d8`](https://github.com/winscp/winscp/tree/24e7b4ec1001406cc2edf2b8c88483d66d4449d8)
-with the pin: its `Script.cpp`/`Script.h` still register the same 40 commands.
-The pin is deliberately unchanged: reviewing registrations and the
-[13 intervening commits](https://github.com/winscp/winscp/compare/69edabbe2dc2c62661a7d3fc7e2396b5f42d504d...24e7b4ec1001406cc2edf2b8c88483d66d4449d8)
-is not an exhaustive behavioral review of upstream master.
+The 2026-10-26 review compared upstream master
+[`246bbd42342c4443bd9ff806e91dc0bca9f83869`](https://github.com/winscp/winscp/tree/246bbd42342c4443bd9ff806e91dc0bca9f83869)
+with the previous pin: `Script.cpp`/`Script.h` still register the same 40
+commands. The [16 intervening commits](https://github.com/winscp/winscp/compare/69edabbe2dc2c62661a7d3fc7e2396b5f42d504d...246bbd42342c4443bd9ff806e91dc0bca9f83869)
+were reviewed individually. Two change behavior relevant to this client:
+upstream now gives script `rmdir` directory entries a full path
+([`8f67d22`](https://github.com/winscp/winscp/commit/8f67d22382b88b1cb266bb393c393addbb1d881f)),
+and it refuses SCP header names that are not real files at every recursion
+level ([`3b3f024`](https://github.com/winscp/winscp/commit/3b3f024794ff3386137ef0fa457de07901d4607c)).
+LinSCP already resolved relative `rmdir` operands and now also rejects both
+path separators in rcp header names; both fixes have named regression tests.
+The other commits touch Windows/PuTTY/neon internals (including a neon
+OpenSSL handle leak that does not affect this curl-based client), version
+metadata, unused code or a filename-case rename. This is a scoped drift
+review, not an exhaustive behavioral certification of upstream master.
+
+## Current parity status
+
+Command-registration parity is current with the pinned upstream master.
+**Full feature parity is still not achieved.** Two tracked capability gaps
+remain: `security.gssapi-and-tunnels` needs an independent delegation review
+and production-KDC validation, and `locale.translations` needs the remaining
+upstream language catalogs. `python3 tools/check_upstream_parity.py --require-full`
+therefore still fails. The checker validates inventory consistency, not
+behavioral equivalence. The weekly upstream workflow checks command
+registrations at master and warns when the pinned baseline needs review.
 
 The source of truth is [upstream-parity.json](upstream-parity.json). Its generated
 [complete ledger view](linux-feature-inventory.md) includes:

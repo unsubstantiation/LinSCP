@@ -803,8 +803,9 @@ bool ScpParseHeaderLine(const std::string & line, char & kind,
     if (first == 'C' || first == 'D')
     {
         /* 'C0644 512 name' - the name is the rest of the line and may
-         * hold spaces, but never '/', '.', '..', or NUL/control bytes
-         * (CVE-2019-6111). */
+         * hold spaces, but never a dot entry, a path separator or
+         * NUL/control bytes (CVE-2019-6111 and the upstream traversal
+         * hardening for nested headers). */
         std::string modeText;
         unsigned long long sizeValue = 0;
         const std::string::size_type firstSpace = body.find(' ');
@@ -832,6 +833,7 @@ bool ScpParseHeaderLine(const std::string & line, char & kind,
         }
         if (name == "." || name == ".." ||
             name.find('/') != std::string::npos ||
+            name.find('\\') != std::string::npos ||
             name.find('\0') != std::string::npos)
         {
             return false;

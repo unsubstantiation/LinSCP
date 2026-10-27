@@ -27,6 +27,12 @@ jobs:
             gh api "repos/winscp/winscp/contents/source/core/$file?ref=$revision" \
               --jq .content | base64 --decode > "build/upstream-parity/$file"
           done
+          pinned=$(python3 -c 'import json; print(json.load(open("docs/upstream-parity.json"))["upstream"]["commit"])')
+          if [ "$pinned" != "$revision" ]; then
+            echo "::warning::Upstream master is $revision; review and update the pinned baseline $pinned."
+          else
+            echo "Pinned parity baseline is current."
+          fi
       - name: Check registrations (not behavioral parity)
         run: |
           python3 tools/check_upstream_parity.py \

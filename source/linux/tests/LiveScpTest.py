@@ -595,6 +595,18 @@ class LiveScpTests(unittest.TestCase):
         self.assertIn("No such file or directory",
                       missing.stdout + missing.stderr)
 
+    def test_rmdir_resolves_relative_directory_after_cd(self):
+        """Upstream issue: rmdir directory entries need a full path.
+
+        A script that changes directory and then names a child by its
+        leaf must remove that child, not a same-named directory in the
+        login home (or nothing at all).
+        """
+        (self.root / "parent" / "leaf").mkdir(parents=True)
+        self.succeed("option confirm off ; cd parent ; rmdir leaf ; exit")
+        self.assertFalse((self.root / "parent" / "leaf").exists())
+        self.assertTrue((self.root / "parent").is_dir())
+
     def test_symlink_times_and_upload_permissions_are_set_on_the_server(self):
         """The metadata the shell can set and 'ls -l' can read back: a
         symbolic link, an mtime carried by the rcp timestamp header and by
