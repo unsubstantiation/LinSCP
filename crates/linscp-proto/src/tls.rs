@@ -55,7 +55,9 @@ pub struct TlsSettings {
     pub accept_invalid_certs: bool,
 }
 
-fn read_der_tlv(input: &[u8]) -> Result<(u8, &[u8], &[u8], &[u8]), ProtoError> {
+type DerTlv<'a> = (u8, &'a [u8], &'a [u8], &'a [u8]);
+
+fn read_der_tlv(input: &[u8]) -> Result<DerTlv<'_>, ProtoError> {
     if input.len() < 2 {
         return Err(ProtoError::Transport(
             "Truncated ASN.1 DER certificate element.".to_string(),

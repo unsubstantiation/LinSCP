@@ -335,10 +335,8 @@ pub fn parse_full_time_columns(date_text: &str, time_text: &str, offset_text: &s
     }
     let (sign, digits) = if let Some(rest) = off.strip_prefix('+') {
         (1i64, rest)
-    } else if let Some(rest) = off.strip_prefix('-') {
-        (-1i64, rest)
     } else {
-        return None;
+        (-1i64, off.strip_prefix('-')?)
     };
     let clean_digits: String = digits.chars().filter(|c| *c != ':').collect();
     if clean_digits.len() != 4 || !all_digits(&clean_digits) {
@@ -805,10 +803,8 @@ pub fn parse_mlsx_line(line: &str) -> Result<Option<ParsedListingEntry>, String>
                     is_symlink = true;
                 }
             }
-            "size" | "sizd" => {
-                if all_digits(v) {
-                    size = v.parse::<u64>().unwrap_or(0);
-                }
+            "size" | "sizd" if all_digits(v) => {
+                size = v.parse::<u64>().unwrap_or(0);
             }
             "modify" => {
                 if let Some(ts) = parse_ftp_compact_utc(v) {
@@ -821,15 +817,11 @@ pub fn parse_mlsx_line(line: &str) -> Result<Option<ParsedListingEntry>, String>
                     unix_mode = Some(m & 0o7777);
                 }
             }
-            "unix.owner" | "unix.uid" => {
-                if !v.is_empty() && owner.is_none() {
-                    owner = Some(v.to_string());
-                }
+            "unix.owner" | "unix.uid" if !v.is_empty() && owner.is_none() => {
+                owner = Some(v.to_string());
             }
-            "unix.group" | "unix.gid" => {
-                if !v.is_empty() && group.is_none() {
-                    group = Some(v.to_string());
-                }
+            "unix.group" | "unix.gid" if !v.is_empty() && group.is_none() => {
+                group = Some(v.to_string());
             }
             _ => {}
         }

@@ -1,6 +1,6 @@
 //! Pure-Rust WebDAV / HTTP(S) client (`WebDavSession` implementing
-//! `RemoteSession`) built on `reqwest` + custom `rustls::ClientConfig` (`tls.rs`)
-//! + XXE-safe `roxmltree` multistatus/property parsing, porting all WebDAV
+//! `RemoteSession`) built on `reqwest`, custom `rustls::ClientConfig` (`tls.rs`),
+//! and XXE-safe `roxmltree` multistatus/property parsing, porting all WebDAV
 //! operations and extensions (`LOCK`/`UNLOCK`, `PROPPATCH`/`PROPFIND`, RFC 4918
 //! `If` ETag/lock-token preconditions) from `ProtocolClient.{h,cpp}`.
 

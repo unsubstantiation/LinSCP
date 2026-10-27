@@ -84,7 +84,7 @@ fn norm_ftp(p: &str) -> String {
 
 enum ServerCtrl {
     Plain(BufReader<TcpStream>),
-    Tls(BufReader<ServerTlsStream<TcpStream>>),
+    Tls(Box<BufReader<ServerTlsStream<TcpStream>>>),
     Empty,
 }
 
@@ -123,7 +123,7 @@ impl ServerCtrl {
         let prev = std::mem::replace(self, Self::Empty);
         if let Self::Plain(br) = prev {
             let tls = acceptor.accept(br.into_inner()).await?;
-            *self = Self::Tls(BufReader::new(tls));
+            *self = Self::Tls(Box::new(BufReader::new(tls)));
         }
         Ok(())
     }
@@ -217,7 +217,7 @@ async fn run_mock_ftp_client(
     let acceptor = tls_cfg.map(TlsAcceptor::from);
     let mut ctrl = if implicit_tls {
         let tls = acceptor.as_ref().unwrap().accept(tcp).await?;
-        ServerCtrl::Tls(BufReader::new(tls))
+        ServerCtrl::Tls(Box::new(BufReader::new(tls)))
     } else {
         ServerCtrl::Plain(BufReader::new(tcp))
     };

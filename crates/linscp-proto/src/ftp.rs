@@ -191,7 +191,7 @@ impl Default for FtpConnectConfig {
 
 enum ControlStream {
     Plain(BufReader<TcpStream>),
-    Tls(BufReader<TlsStream<TcpStream>>),
+    Tls(Box<BufReader<TlsStream<TcpStream>>>),
     Transitioning,
 }
 
@@ -324,7 +324,7 @@ impl ControlStream {
             .connect(server_name, raw_tcp)
             .await
             .map_err(|e| ProtoError::Transport(format!("FTPES AUTH TLS handshake failed: {e}")))?;
-        *self = Self::Tls(BufReader::new(tls_stream));
+        *self = Self::Tls(Box::new(BufReader::new(tls_stream)));
         Ok(())
     }
 }
@@ -503,7 +503,7 @@ impl FtpSession {
                 .connect(sname, raw_tcp)
                 .await
                 .map_err(|e| ProtoError::Transport(format!("Implicit FTPS handshake failed: {e}")))?;
-            ControlStream::Tls(BufReader::new(tls_stream))
+            ControlStream::Tls(Box::new(BufReader::new(tls_stream)))
         } else {
             ControlStream::Plain(BufReader::new(raw_tcp))
         };
@@ -603,7 +603,6 @@ impl FtpSession {
             let mut has_utf8 = false;
             for line in &feat.lines {
                 let tok = line
-                    .trim()
                     .split_whitespace()
                     .next()
                     .unwrap_or("")
