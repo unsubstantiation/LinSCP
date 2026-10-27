@@ -165,7 +165,7 @@ impl RawTerminalGuard {
             if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSADRAIN, &raw) != 0 {
                 return None;
             }
-            return Some(Self { saved });
+            Some(Self { saved })
         }
 
         #[cfg(windows)]
@@ -184,9 +184,9 @@ impl RawTerminalGuard {
             if SetConsoleMode(h_in, raw_mode) == 0 {
                 return None;
             }
-            return Some(Self {
+            Some(Self {
                 saved_in: (h_in, mode),
-            });
+            })
         }
     }
 }
@@ -706,7 +706,7 @@ pub fn resolve_default_editor(explicit: &str) -> Result<String, String> {
     }
     #[cfg(windows)]
     {
-        return Ok("notepad".to_string());
+        Ok("notepad".to_string())
     }
     #[cfg(not(windows))]
     {
@@ -803,7 +803,7 @@ pub fn launch_desktop_ssh_terminal(
                 return Ok(());
             }
         }
-        return Err("No supported desktop terminal emulator was found on PATH.".to_string());
+        Err("No supported desktop terminal emulator was found on PATH.".to_string())
     }
 
     #[cfg(target_os = "windows")]
@@ -818,7 +818,7 @@ pub fn launch_desktop_ssh_terminal(
             .args(["/C", "start", "ssh", "-p", &port.to_string(), &target])
             .spawn()
             .map_err(|e| format!("Failed to launch Windows SSH terminal: {e}"))?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
