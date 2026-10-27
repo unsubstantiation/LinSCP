@@ -519,12 +519,6 @@ fn decode_stored_master_key(
         return bridge.unwrap_master_key(&blob);
     }
 
-    if raw.len() == MASTER_KEY_LEN {
-        let mut out = Zeroizing::new([0u8; 32]);
-        out.copy_from_slice(raw);
-        return Ok(out);
-    }
-
     let decoded = Zeroizing::new(
         BASE64
             .decode(text.as_bytes())
