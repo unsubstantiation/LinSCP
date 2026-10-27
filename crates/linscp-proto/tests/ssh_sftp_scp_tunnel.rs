@@ -36,7 +36,7 @@ use linscp_proto::sftp::{
 use linscp_proto::ssh::{SshAgentConnector, SshConnectConfig};
 use linscp_proto::{download_bytes, upload_bytes, ProtoError, RemoteSession, TransferRequest};
 use linscp_types::ProtocolScheme;
-use russh::keys::PublicKey;
+use russh::keys::{PrivateKey, PublicKey};
 use russh::server::{Auth, ChannelOpenHandle, Msg, Server as _, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId, ChannelStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -254,7 +254,7 @@ impl russh::server::Handler for MockSshSession {
         user: &str,
         key: VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        if user == self.server.allowed_user && key.public_key() == &self.server.allowed_pubkey {
+        if user == self.server.allowed_user && key.public_key == &self.server.allowed_pubkey {
             Ok(Auth::Accept)
         } else {
             Ok(Auth::reject())
