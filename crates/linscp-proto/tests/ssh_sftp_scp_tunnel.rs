@@ -254,7 +254,9 @@ impl russh::server::Handler for MockSshSession {
         user: &str,
         key: VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        if user == self.server.allowed_user && key.public_key == &self.server.allowed_pubkey {
+        if user == self.server.allowed_user
+            && key.public_key.key_data() == self.server.allowed_pubkey.key_data()
+        {
             Ok(Auth::Accept)
         } else {
             Ok(Auth::reject())
