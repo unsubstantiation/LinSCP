@@ -121,3 +121,22 @@ pub fn atomic_replace(temp_path: &Path, target_path: &Path) -> Result<(), Platfo
     std::fs::rename(temp_path, target_path)?;
     Ok(())
 }
+
+pub async fn connect_ssh_agent() -> Result<Option<Box<dyn crate::AsyncStream>>, PlatformError> {
+    let Some(sock) = std::env::var_os("SSH_AUTH_SOCK").filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    match tokio::net::UnixStream::connect(sock).await {
+        Ok(stream) => Ok(Some(Box::new(stream))),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(PlatformError::Io(err)),
+    }
+}
+

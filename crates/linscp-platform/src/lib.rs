@@ -106,6 +106,10 @@ mod fallback_unix {
         std::fs::rename(temp_path, target_path)?;
         Ok(())
     }
+
+    pub async fn connect_ssh_agent() -> Result<Option<Box<dyn crate::AsyncStream>>, PlatformError> {
+        Ok(None)
+    }
 }
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
 use fallback_unix as sys;
@@ -129,6 +133,19 @@ pub enum PlatformError {
     SecretVault(String),
     #[error("Directory watcher error: {0}")]
     Watch(String),
+}
+
+/// Bidirectional async byte stream (e.g. Unix `SSH_AUTH_SOCK`, Windows
+/// `\\.\pipe\openssh-ssh-agent`, or an in-memory duplex channel) usable by
+/// platform-neutral protocol crates without exposing OS socket types.
+pub trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+impl<T> AsyncStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+/// Connects to the host OS SSH agent if one is reachable (`SSH_AUTH_SOCK` on
+/// Linux, `\\.\pipe\openssh-ssh-agent` on Windows, `None` on Android).
+pub async fn connect_system_ssh_agent() -> Result<Option<Box<dyn AsyncStream>>, PlatformError> {
+    sys::connect_ssh_agent().await
 }
 
 /// Platform-neutral local filesystem contract consumed by the transfer engine,

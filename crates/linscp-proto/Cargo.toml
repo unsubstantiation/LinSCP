@@ -6,10 +6,41 @@ rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+gssapi = []
+
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+futures-core.workspace = true
+http.workspace = true
+linscp-crypto.workspace = true
+linscp-platform.workspace = true
 linscp-types.workspace = true
+md-5.workspace = true
+reqwest.workspace = true
+roxmltree.workspace = true
+russh.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+sha2.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+ed25519-dalek.workspace = true
+p256 = { workspace = true, features = ["ecdsa", "pkcs8"] }
+rand.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

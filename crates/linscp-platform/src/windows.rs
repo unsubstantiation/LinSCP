@@ -157,6 +157,17 @@ pub fn atomic_replace(temp_path: &Path, target_path: &Path) -> Result<(), Platfo
     Ok(())
 }
 
+pub async fn connect_ssh_agent() -> Result<Option<Box<dyn crate::AsyncStream>>, PlatformError> {
+    let pipe_path = std::env::var_os("SSH_AUTH_SOCK")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| std::ffi::OsString::from(r"\\.\pipe\openssh-ssh-agent"));
+    match tokio::net::windows::named_pipe::ClientOptions::new().open(pipe_path) {
+        Ok(client) => Ok(Some(Box::new(client))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(PlatformError::Io(err)),
+    }
+}
+
 /// Encrypts `secret` under the current Windows user's DPAPI credential.
 pub fn dpapi_protect(secret: &[u8]) -> Result<Vec<u8>, PlatformError> {
     let mut input_copy = Zeroizing::new(secret.to_vec());

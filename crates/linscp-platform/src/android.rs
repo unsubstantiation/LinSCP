@@ -110,3 +110,8 @@ pub fn atomic_replace(temp_path: &Path, target_path: &Path) -> Result<(), Platfo
     std::fs::rename(temp_path, target_path)?;
     Ok(())
 }
+
+pub async fn connect_ssh_agent() -> Result<Option<Box<dyn crate::AsyncStream>>, PlatformError> {
+    Ok(None)
+}
+
