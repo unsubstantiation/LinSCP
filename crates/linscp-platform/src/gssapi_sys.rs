@@ -146,7 +146,7 @@ mod linux_impl {
         status_string: *mut GssBufferDesc,
     ) -> OmUint32;
 
-    struct GssSymbols {
+    pub(super) struct GssSymbols {
         import_name: FnImportName,
         init_sec_context: FnInitSecContext,
         get_mic: FnGetMic,

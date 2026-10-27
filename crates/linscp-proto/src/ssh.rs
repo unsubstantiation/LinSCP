@@ -417,7 +417,7 @@ impl SshConnection {
             Ok(AuthResult::Success) => return Ok(()),
             Ok(AuthResult::Failure {
                 remaining_methods, ..
-            }) => remaining_methods.contains(&MethodKind::Gssapi),
+            }) => remaining_methods.contains(&MethodKind::GssapiWithMic),
             Err(_) => false,
         };
 
