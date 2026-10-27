@@ -21,7 +21,7 @@ use linscp_engine::xml_log::{LogRotationPolicy, SessionLogger};
 use linscp_http::{HttpAppState, HttpServerConfig, serve};
 use linscp_i18n::{CatalogDomain, supported_locales, translate, translate_with};
 use linscp_platform::terminal::{
-    expand_tilde, install_cli_signal_handlers, launch_gui_application, read_password_prompt,
+    expand_tilde, install_cli_signal_handlers, launch_gui_application, read_password_no_echo,
     stdin_is_terminal,
 };
 use linscp_platform::write_exclusive_private_file;
@@ -289,7 +289,10 @@ async fn run_cli() -> i32 {
         };
         println!("LINSCP_HTTP_URL=http://{local_addr}");
         println!("LINSCP_HTTP_TOKEN={token}");
-        let state = HttpAppState::new(Arc::new(CommanderService::new()), cfg);
+        let state = Arc::new(HttpAppState {
+            service: CommanderService::default(),
+            config: cfg,
+        });
         if let Err(e) = serve(listener, state).await {
             print_err(&format!("HTTP server error: {e}"));
             return 1;
@@ -329,7 +332,7 @@ async fn run_cli() -> i32 {
     let mut log_level_given = false;
     let mut log_sensitive = false;
     let mut verbose = false;
-    let mut log_rotation = LogRotationPolicy::default();
+    let mut log_rotation: Option<LogRotationPolicy> = None;
 
     let mut batch: Option<bool> = None;
     let mut launch_gui = false;
@@ -561,7 +564,7 @@ async fn run_cli() -> i32 {
             log_sensitive = sens;
         } else if let Some(val) = arg.strip_prefix("-logsize=") {
             match LogRotationPolicy::parse(val) {
-                Ok(pol) => log_rotation = pol,
+                Ok(pol) => log_rotation = Some(pol),
                 Err(err) => {
                     print_err(&err);
                     return 1;
@@ -745,11 +748,16 @@ async fn run_cli() -> i32 {
         0
     };
 
-    let mut logger = SessionLogger::new();
     if let Some(ref lf) = log_file {
-        if let Err(reason) =
-            logger.open_text_log(lf, log_rotation, effective_log_level, log_sensitive)
-        {
+        if let Err(reason) = SessionLogger::open(
+            Some(lf),
+            effective_log_level,
+            log_sensitive,
+            log_rotation,
+            None,
+            true,
+            &url,
+        ) {
             let p_str = lf.display().to_string();
             print_err(&translate_with(
                 CatalogDomain::Cli,
@@ -760,9 +768,21 @@ async fn run_cli() -> i32 {
             return 1;
         }
     }
-    if let Some(ref xf) = xml_log_file {
-        if let Err(reason) = logger.open_xml_log(xf) {
-            let p_str = xf.display().to_string();
+    let mut logger = match SessionLogger::open(
+        log_file.as_deref(),
+        effective_log_level,
+        log_sensitive,
+        log_rotation,
+        xml_log_file.as_deref(),
+        true,
+        &url,
+    ) {
+        Ok(l) => l,
+        Err(reason) => {
+            let p_str = xml_log_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
             print_err(&translate_with(
                 CatalogDomain::Cli,
                 &locale,
@@ -771,7 +791,7 @@ async fn run_cli() -> i32 {
             ));
             return 1;
         }
-    }
+    };
 
     let apply_cli_defaults = |spec: &mut ParsedSiteSpec| -> Result<(), String> {
         if !defaults_hostkey.is_empty() && spec.session.hostkey.is_empty() {
@@ -1029,7 +1049,7 @@ fn run_convert_key(
                     break;
                 }
                 let prompt = translate(CatalogDomain::Cli, locale, "PPK key passphrase: ");
-                match read_password_prompt(prompt) {
+                match read_password_no_echo(prompt).ok().flatten() {
                     Some(entered) => pass = entered,
                     None => break,
                 }
