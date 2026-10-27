@@ -163,8 +163,11 @@ fn xor_keystream(enc_key: &[u8; 32], nonce: &[u8; NONCE_BYTES], input: &[u8]) ->
         let counter_be = counter.to_be_bytes();
         let mut block = hmac_sha256(enc_key, &[nonce, &counter_be]);
         let take = (input.len() - offset).min(block.len());
-        for i in 0..take {
-            out.push(input[offset + i] ^ block[i]);
+        for (&in_byte, &mask_byte) in input[offset..offset + take]
+            .iter()
+            .zip(block[..take].iter())
+        {
+            out.push(in_byte ^ mask_byte);
         }
         block.zeroize();
         offset += take;

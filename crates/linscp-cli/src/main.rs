@@ -66,8 +66,10 @@ fn print_help(locale: &str) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    let args: Vec<String> = raw_args.iter().map(|a| normalize_cli_switch(a)).collect();
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .map(|a| normalize_cli_switch(&a))
+        .collect();
     let locale = std::env::var("LINSCP_LANG")
         .or_else(|_| std::env::var("LC_ALL"))
         .or_else(|_| std::env::var("LANG"))

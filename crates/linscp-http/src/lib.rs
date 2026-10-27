@@ -7,6 +7,7 @@
 //! - Optional `X-LSCP-CSRF` enforcement for authenticated browser sessions
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -36,7 +37,7 @@ impl HttpServerConfig {
         rand::thread_rng().fill_bytes(&mut raw);
         let mut token = String::with_capacity(48);
         for b in raw {
-            token.push_str(&format!("{b:02x}"));
+            let _ = write!(token, "{b:02x}");
         }
         let mut allowed_hosts = HashSet::new();
         for host in ["localhost", "127.0.0.1", "[::1]", "::1"] {

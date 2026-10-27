@@ -110,18 +110,13 @@ pub struct LocalRootEntry {
     pub read_only: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransferMode {
+    #[default]
     Binary,
     Ascii,
     Automatic,
-}
-
-impl Default for TransferMode {
-    fn default() -> Self {
-        Self::Binary
-    }
 }
 
 /// Persisted Commander user preferences (`preferences.json` shape).

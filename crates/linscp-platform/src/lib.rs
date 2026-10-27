@@ -66,15 +66,15 @@ pub fn config_dir() -> PathBuf {
     }
     #[cfg(target_os = "linux")]
     {
-        return linux::default_config_dir();
+        linux::default_config_dir()
     }
     #[cfg(windows)]
     {
-        return windows::default_config_dir();
+        windows::default_config_dir()
     }
     #[cfg(target_os = "android")]
     {
-        return android::default_config_dir();
+        android::default_config_dir()
     }
     #[cfg(not(any(target_os = "linux", windows, target_os = "android")))]
     {
@@ -199,15 +199,15 @@ impl LocalFs for NativeLocalFs {
     fn list_roots(&self) -> Result<Vec<LocalRootEntry>, PlatformError> {
         #[cfg(target_os = "linux")]
         {
-            return Ok(linux::list_roots());
+            Ok(linux::list_roots())
         }
         #[cfg(windows)]
         {
-            return Ok(windows::list_roots());
+            Ok(windows::list_roots())
         }
         #[cfg(target_os = "android")]
         {
-            return Ok(android::list_roots());
+            Ok(android::list_roots())
         }
         #[cfg(not(any(target_os = "linux", windows, target_os = "android")))]
         {
@@ -231,7 +231,7 @@ impl LocalFs for NativeLocalFs {
     fn atomic_replace(&self, staging: &Path, destination: &Path) -> Result<(), PlatformError> {
         #[cfg(windows)]
         {
-            return windows::atomic_replace(staging, destination);
+            windows::atomic_replace(staging, destination)
         }
         #[cfg(not(windows))]
         {

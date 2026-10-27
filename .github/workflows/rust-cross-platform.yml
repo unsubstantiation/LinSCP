@@ -40,10 +40,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Test and lint pure-Rust workspace
-        run: |
-          cargo test --workspace
-          cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run pure-Rust workspace unit tests
+        run: cargo test --workspace --message-format=github
+
+      - name: Lint workspace with Clippy
+        run: cargo clippy --workspace --all-targets --message-format=github -- -D warnings
 
       - name: Install Linux Tauri WebKit2GTK headers
         run: |
@@ -60,7 +61,7 @@ jobs:
             patchelf
 
       - name: Check Tauri v2 native shell crate on Linux
-        run: cargo check -p linscp-tauri --features native-shell
+        run: cargo check -p linscp-tauri --features native-shell --message-format=github
 
   rust-windows:
     name: Rust Workspace & Tauri Host (Windows)
@@ -74,11 +75,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Test and lint pure-Rust workspace on Windows
-        run: |
-          cargo test --workspace
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo check -p linscp-tauri --features native-shell
+      - name: Run pure-Rust workspace unit tests on Windows
+        run: cargo test --workspace --message-format=github
+
+      - name: Lint workspace with Clippy on Windows
+        run: cargo clippy --workspace --all-targets --message-format=github -- -D warnings
+
+      - name: Check Tauri v2 native shell crate on Windows
+        run: cargo check -p linscp-tauri --features native-shell --message-format=github
 
   rust-android:
     name: Rust Core & Android SAF Platform Target (Android NDK)
@@ -93,14 +97,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-ndk
-        uses: taiki-e/install-action@cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
 
       - name: Check workspace for Android arm64-v8a and x86_64
         run: |
           if [ -z "${ANDROID_NDK_HOME:-}" ] && [ -d /usr/local/lib/android/sdk/ndk ]; then
             export ANDROID_NDK_HOME="$(ls -d /usr/local/lib/android/sdk/ndk/* | sort -V | tail -n 1)"
           fi
-          cargo ndk -t arm64-v8a -t x86_64 check \
+          cargo ndk -t arm64-v8a -t x86_64 check --message-format=github \
             -p linscp-types \
             -p linscp-i18n \
             -p linscp-crypto \

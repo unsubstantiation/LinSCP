@@ -5,7 +5,7 @@
 //! `CommanderService::dispatch`.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use linscp_engine::{parse_ini_sections, serialize_ini_sections};
@@ -305,7 +305,7 @@ impl CommanderService {
     }
 }
 
-fn load_json_or_default<T>(path: &PathBuf) -> T
+fn load_json_or_default<T>(path: &Path) -> T
 where
     T: serde::de::DeserializeOwned + Default,
 {
@@ -315,7 +315,7 @@ where
         .unwrap_or_default()
 }
 
-fn load_json_value(path: &PathBuf, fallback: Value) -> Value {
+fn load_json_value(path: &Path, fallback: Value) -> Value {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
@@ -380,7 +380,7 @@ mod tests {
             body: json!({}),
         });
         assert_eq!(roots_reply.status, 200);
-        assert!(roots_reply.payload["roots"].as_array().unwrap().len() >= 1);
+        assert!(!roots_reply.payload["roots"].as_array().unwrap().is_empty());
 
         let open_reply = svc.dispatch(ApiEnvelope {
             method: "POST".to_string(),
