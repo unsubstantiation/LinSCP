@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { JSDOM, VirtualConsole } = require(require.resolve('jsdom', {paths: [process.cwd(), __dirname]}));
-const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+const html = fs.readFileSync(process.argv[2] || path.join(__dirname, '../web/index.html'), 'utf8');
 const pause = () => new Promise(resolve => setTimeout(resolve, 30));
 let checks = 0;
 function check(message, value) { assert.ok(value, message); checks++; }

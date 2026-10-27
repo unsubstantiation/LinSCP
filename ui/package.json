@@ -1,0 +1,17 @@
+{
+  "name": "@linscp/ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared dual-mode TypeScript frontend for LinSCP (Tauri v2 + standalone HTTP browser server)",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "node scripts/build.mjs",
+    "test": "npm run typecheck && npm run build && node --test tests/*.test.mjs && node ../source/gui/tests/ClientTest.js dist/index.html && node ../source/gui/tests/LocalizationTest.js dist/index.html"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.2",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.7.2"
+  }
+}

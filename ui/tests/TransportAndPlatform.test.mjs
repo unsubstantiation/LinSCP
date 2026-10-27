@@ -1,0 +1,271 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { JSDOM } from 'jsdom';
+
+import {
+  EXTRA_KEYS,
+  HttpTransport,
+  I18nCatalog,
+  LocalRootSwitcher,
+  MobileShellController,
+  TauriTransport,
+  TransportError,
+  applyCtrlModifier,
+  createTransport,
+  detectTransportMode,
+  normalizeLocale,
+} from '../dist/linscp-core.mjs';
+
+const testsDir = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(testsDir, '..', '..');
+
+function loadUnifiedGuiBundles() {
+  const bundles = {};
+  for (const code of ['de', 'en', 'es', 'fr']) {
+    const raw = fs.readFileSync(path.join(repoRoot, 'locales', `${code}.json`), 'utf8');
+    bundles[code] = JSON.parse(raw).gui;
+  }
+  return bundles;
+}
+
+test('detectTransportMode and createTransport select Tauri vs HTTP automatically', async () => {
+  assert.equal(detectTransportMode({}), 'http');
+  assert.equal(
+    detectTransportMode({ __TAURI_INTERNALS__: { invoke: async () => ({}) } }),
+    'tauri',
+  );
+
+  const calls = [];
+  const tauriClient = createTransport({
+    host: {
+      __TAURI_INTERNALS__: {
+        invoke: async (cmd, args) => {
+          calls.push({ cmd, args });
+          return {
+            status: 200,
+            payload: { connected: false, local_roots: [{ path: 'C:\\', label: 'C:\\', kind: 'drive', read_only: false }] },
+          };
+        },
+      },
+    },
+  });
+  assert.equal(tauriClient.mode, 'tauri');
+  assert.ok(tauriClient instanceof TauriTransport);
+
+  const status = await tauriClient.get('/api/status');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].cmd, 'linscp_invoke');
+  assert.deepEqual(calls[0].args.envelope, {
+    method: 'GET',
+    path: '/api/status',
+    body: {},
+  });
+  assert.equal(status.local_roots[0].path, 'C:\\');
+});
+
+test('HttpTransport attaches X-LSCP-Token and X-LSCP-CSRF and surfaces login_required', async () => {
+  const seen = [];
+  let authPrompted = 0;
+
+  const client = new HttpTransport({
+    baseUrl: 'http://127.0.0.1:8765',
+    bearerToken: 'tok-secret-123',
+    onAuthRequired: () => {
+      authPrompted += 1;
+    },
+    fetchImpl: async (url, init) => {
+      seen.push({ url, init });
+      if (String(url).endsWith('/api/protected')) {
+        return {
+          ok: false,
+          status: 401,
+          json: async () => ({ login_required: true, error: 'Session expired' }),
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ saved: true }),
+      };
+    },
+  });
+
+  client.setCsrfToken('csrf-abc');
+  const res = await client.post('/api/preferences', { resume: true });
+  assert.deepEqual(res, { saved: true });
+  assert.equal(seen[0].init.headers['X-LSCP-Token'], 'tok-secret-123');
+  assert.equal(seen[0].init.headers['X-LSCP-CSRF'], 'csrf-abc');
+
+  await assert.rejects(
+    () => client.get('/api/protected'),
+    (err) => {
+      assert.ok(err instanceof TransportError);
+      assert.equal(err.status, 401);
+      assert.equal(err.loginRequired, true);
+      return true;
+    },
+  );
+  assert.equal(authPrompted, 1);
+});
+
+test('I18nCatalog consumes unified locales/*.json with CLDR plurals and single-pass safety', () => {
+  const catalog = new I18nCatalog(loadUnifiedGuiBundles());
+  assert.equal(normalizeLocale('fr-CA.UTF-8'), 'fr');
+
+  catalog.setLocale('fr-CA');
+  assert.equal(catalog.tn('{count} match', '{count} matches', 0), '0 résultat');
+
+  catalog.setLocale('es-MX');
+  assert.equal(catalog.tn('{count} match', '{count} matches', 0), '0 coincidencias');
+  assert.equal(
+    catalog.t('Line {line}: {snippet}', { line: 4, snippet: '{line} $&' }),
+    'Línea 4: {line} $&',
+  );
+});
+
+test('LocalRootSwitcher renders Windows drives and Android SAF folder picker without raw fetch', async () => {
+  const dom = new JSDOM('<!doctype html><select id="roots"></select>');
+  const selectEl = dom.window.document.getElementById('roots');
+
+  let roots = [
+    { path: 'C:\\', label: 'C:\\', kind: 'drive', read_only: false },
+    { path: 'D:\\', label: 'D:\\', kind: 'drive', read_only: false },
+  ];
+  const navigated = [];
+
+  const mockTransport = new TauriTransport({
+    invoke: async (_cmd, { envelope }) => {
+      if (envelope.path === '/api/local/roots') {
+        return { status: 200, payload: { roots } };
+      }
+      if (envelope.path.startsWith('/api/local/list?path=')) {
+        const decoded = decodeURIComponent(envelope.path.split('=')[1]);
+        return {
+          status: 200,
+          payload: { path: decoded, entries: [{ name: 'Projects', size: 0, is_dir: true }] },
+        };
+      }
+      return { status: 404, payload: { error: 'not found' } };
+    },
+  });
+
+  const switcher = new LocalRootSwitcher({
+    transport: mockTransport,
+    selectElement: selectEl,
+    onNavigate: (listing) => navigated.push(listing),
+    onRequestAndroidSafTree: async () => {
+      const safRoot = {
+        path: 'content://com.android.externalstorage.documents/tree/primary%3ADownload',
+        label: 'Downloads (SAF)',
+        kind: 'saf_tree',
+        read_only: false,
+      };
+      roots = [...roots, safRoot];
+      return safRoot;
+    },
+  });
+
+  await switcher.refreshRoots('D:\\work');
+  assert.equal(selectEl.hidden, false);
+  assert.equal(selectEl.options.length, 3); // C:\, D:\, + Grant Folder Access...
+  assert.equal(selectEl.value, 'D:\\');
+
+  // Switch to C:\
+  selectEl.value = 'C:\\';
+  selectEl.dispatchEvent(new dom.window.Event('change'));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(navigated.length, 1);
+  assert.equal(navigated[0].path, 'C:\\');
+
+  // Trigger Android SAF tree grant option
+  selectEl.value = '__linscp_add_saf_tree__';
+  selectEl.dispatchEvent(new dom.window.Event('change'));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(navigated.length, 2);
+  assert.ok(navigated[1].path.startsWith('content://'));
+});
+
+test('MobileShellController handles touch pane switching and terminal extra-key sequences', () => {
+  const dom = new JSDOM('<!doctype html><div id="app"></div>');
+  const root = dom.window.document.getElementById('app');
+  const emitted = [];
+
+  const mobile = new MobileShellController({
+    rootElement: root,
+    onTerminalInput: (seq) => emitted.push(seq),
+  });
+
+  assert.equal(EXTRA_KEYS.length, 12);
+  assert.equal(mobile.pane, 'local');
+  mobile.setActivePane('terminal');
+  assert.equal(root.dataset.mobilePane, 'terminal');
+
+  mobile.pressExtraKey('esc');
+  mobile.pressExtraKey('up');
+  assert.deepEqual(emitted, ['\x1b', '\x1b[A']);
+
+  // Sticky Ctrl latch + 'c' => SIGINT (\x03) and auto-unlatches
+  assert.equal(mobile.pressExtraKey('ctrl'), null);
+  assert.equal(mobile.isCtrlLatched, true);
+  assert.equal(mobile.transformTextInput('c'), '\x03');
+  assert.equal(mobile.isCtrlLatched, false);
+  assert.equal(applyCtrlModifier('d'), '\x04');
+});
+
+test('Built ui/dist/index.html boots inside Tauri IPC mode with zero HTTP calls', async () => {
+  const distHtml = fs.readFileSync(path.join(repoRoot, 'ui', 'dist', 'index.html'), 'utf8');
+  const ipcCalls = [];
+
+  const dom = new JSDOM(distHtml, {
+    url: 'http://ipc.localhost/',
+    runScripts: 'dangerously',
+    pretendToBeVisual: true,
+    beforeParse(window) {
+      window.fetch = async () => {
+        throw new Error('fetch() must never be called when Tauri IPC is active');
+      };
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd, args) => {
+          ipcCalls.push({ cmd, path: args.envelope.path });
+          const p = args.envelope.path;
+          if (p === '/api/status') {
+            return {
+              status: 200,
+              payload: { connected: false, active_tab: null, tabs: [], local_dir: 'C:\\Users\\Alice' },
+            };
+          }
+          if (p.startsWith('/api/local/list')) {
+            return {
+              status: 200,
+              payload: { path: 'C:\\Users\\Alice', entries: [{ name: 'Documents', size: 0, is_dir: true, permissions: 'drwx------', date: '' }] },
+            };
+          }
+          if (p === '/api/preferences') {
+            return { status: 200, payload: { confirm_overwrite: true, confirm_delete: true } };
+          }
+          if (p === '/api/sessions') {
+            return { status: 200, payload: { sessions: [] } };
+          }
+          if (p === '/api/bookmarks') {
+            return { status: 200, payload: { bookmarks: {} } };
+          }
+          if (p === '/api/workspaces') {
+            return { status: 200, payload: { workspaces: {} } };
+          }
+          if (p === '/api/transfers') {
+            return { status: 200, payload: { transfers: [] } };
+          }
+          return { status: 200, payload: {} };
+        },
+      };
+    },
+  });
+
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(dom.window.LinSCPTransport.mode, 'tauri');
+  assert.ok(ipcCalls.some((c) => c.cmd === 'linscp_invoke' && c.path === '/api/status'));
+  dom.window.close();
+});

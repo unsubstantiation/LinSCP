@@ -1,0 +1,20 @@
+[package]
+name = "linscp-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[dependencies]
+linscp-crypto.workspace = true
+linscp-engine.workspace = true
+linscp-i18n.workspace = true
+linscp-platform.workspace = true
+linscp-proto.workspace = true
+linscp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
