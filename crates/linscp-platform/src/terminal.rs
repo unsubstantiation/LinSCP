@@ -382,7 +382,7 @@ pub fn stat_local_path(path: &Path) -> LocalMetadataInfo {
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false);
 
-    let meta = match std::fs::metadata(&target).or(sym_meta) {
+    let meta = match std::fs::metadata(&target).ok().or(sym_meta) {
         Some(m) => m,
         None => return LocalMetadataInfo::default(),
     };
