@@ -1,0 +1,17 @@
+[package]
+name = "linscp-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[dependencies]
+linscp-crypto.workspace = true
+linscp-platform.workspace = true
+linscp-proto.workspace = true
+linscp-types.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

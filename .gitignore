@@ -26,3 +26,11 @@ source/gui/tests/package-lock.json
 
 # Optional browser regression-test dependencies
 node_modules/
+
+# Rust Cargo build output
+/target/
+
+# Modular TypeScript UI dependencies and build artifacts
+ui/node_modules/
+ui/dist/
+

@@ -57,7 +57,15 @@ SCAN_FILES = [
     'readme.md',
 ]
 SKIP_DIRECTORIES = {'build', 'node_modules', '__pycache__', '.git', '.venv', 'venv',
-                    'vendor'}
+                    'vendor', 'target', 'dist'}
+
+# Cross-platform workflows for the Rust/Tauri/TypeScript migration
+# intentionally target Windows and Android runners alongside Linux; the
+# Linux-only packaging rules below still guard the legacy build.yml,
+# CMakeLists.txt, Makefile, and debian/ packaging.
+CROSS_PLATFORM_WORKFLOWS = {
+    '.github/workflows/rust-cross-platform.yml',
+}
 
 # Only these external identifiers may retain the upstream product name:
 # upstream repository/API paths, XML namespaces, compatibility API names,
@@ -248,6 +256,8 @@ def rule_scope(rule_scope_name, path, root=ROOT):
         return (relative.startswith('source/') or
                 relative.startswith('automation/'))
     if rule_scope_name == 'packaging':
+        if relative in CROSS_PLATFORM_WORKFLOWS:
+            return False
         return (relative.startswith('debian/') or
                 relative.startswith('.github/') or
                 relative in INSTALLERS.values() or

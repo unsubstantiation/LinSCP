@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/linscp-types",
+    "crates/linscp-i18n",
+    "crates/linscp-crypto",
+    "crates/linscp-platform",
+    "crates/linscp-proto",
+    "crates/linscp-engine",
+    "crates/linscp-service",
+    "crates/linscp-http",
+    "crates/linscp-cli",
+    "crates/linscp-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license-file = "../../LICENSE"
+publish = false
+
+[workspace.dependencies]
+linscp-types = { path = "crates/linscp-types" }
+linscp-i18n = { path = "crates/linscp-i18n" }
+linscp-crypto = { path = "crates/linscp-crypto" }
+linscp-platform = { path = "crates/linscp-platform" }
+linscp-proto = { path = "crates/linscp-proto" }
+linscp-engine = { path = "crates/linscp-engine" }
+linscp-service = { path = "crates/linscp-service" }
+linscp-http = { path = "crates/linscp-http" }
+
+async-trait = "0.1"
+axum = { version = "0.7", features = ["json", "ws"] }
+base64 = "0.22"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+subtle = "2.6"
+thiserror = "2.0"
+tokio = { version = "1.40", features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "time", "fs"] }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"

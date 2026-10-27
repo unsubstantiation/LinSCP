@@ -45,6 +45,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCAN_ROOTS = [
     'source/linux',
     'source/gui',
+    'crates/linscp-platform',
     'automation',
     'debian',
     'docs',
@@ -55,13 +56,14 @@ SCAN_FILES = [
     'CMakeLists.txt',
     'readme.md',
 ]
-SKIP_DIRECTORIES = {'build', 'node_modules', '__pycache__', '.git', '.venv', 'venv'}
+SKIP_DIRECTORIES = {'build', 'node_modules', '__pycache__', '.git', '.venv', 'venv',
+                    'vendor', 'target', 'dist'}
 # A directory whose files are fixtures rather than the client's own
 # code: a test has to be able to hold an environment of one display server
 # alone - that is what it is testing - and a fixture may name anything.
 FIXTURE_DIRECTORIES = ('tests', 'fixtures')
 
-TEXT_SUFFIXES = {'.c', '.h', '.cpp', '.py', '.psm1', '.md', '.txt', '.json',
+TEXT_SUFFIXES = {'.c', '.h', '.cpp', '.rs', '.py', '.psm1', '.md', '.txt', '.json',
                  '.yml', '.yaml', '.mk', '.in', '.desktop', '.rules', '.1'}
 EXTRA_TEXT_FILES = {'Makefile', 'CMakeLists.txt', 'rules', 'linscp-gui',
                     'linscp.desktop'}
@@ -170,7 +172,9 @@ def is_fixture(path, root=ROOT):
 def rule_scope(scope, path, root=ROOT):
     relative = path.relative_to(root).as_posix()
     if scope == 'code':
-        return relative.startswith('source/') or relative.startswith('automation/')
+        return (relative.startswith('source/') or
+                relative.startswith('crates/linscp-platform/') or
+                relative.startswith('automation/'))
     if scope == 'packaging':
         return (relative.startswith('debian/') or relative.startswith('.github/')
                 or relative == 'CMakeLists.txt'
@@ -204,7 +208,7 @@ def strip_comments(path, text):
     include is not a comment.
     """
     suffix = path.suffix
-    if suffix in ('.c', '.h', '.cpp'):
+    if suffix in ('.c', '.h', '.cpp', '.rs'):
         text = LINE_COMMENT.sub('', text)
         return BLOCK_COMMENT.sub(blank_out, text)
     if suffix in ('.py', '.psm1'):
@@ -245,11 +249,13 @@ def check_display_reads(root=ROOT):
     findings = []
     for path in scanned_files(root):
         relative = path.relative_to(root).as_posix()
-        if not (relative.startswith('source/') or relative.startswith('automation/')):
+        if not (relative.startswith('source/') or
+                relative.startswith('crates/linscp-platform/') or
+                relative.startswith('automation/')):
             continue
         if is_fixture(path, root):
             continue
-        if path.suffix not in ('.c', '.cpp', '.h', '.py', '.psm1'):
+        if path.suffix not in ('.c', '.cpp', '.h', '.rs', '.py', '.psm1'):
             continue
         try:
             text = strip_comments(path, path.read_text(encoding='utf-8'))
