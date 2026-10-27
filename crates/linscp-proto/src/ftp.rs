@@ -290,7 +290,7 @@ impl ControlStream {
     fn local_addr(&self) -> Option<SocketAddr> {
         match self {
             Self::Plain(r) => r.get_ref().local_addr().ok(),
-            Self::Tls(r) => r.get_ref().0.local_addr().ok(),
+            Self::Tls(r) => r.get_ref().get_ref().0.local_addr().ok(),
             Self::Transitioning => None,
         }
     }
@@ -298,7 +298,7 @@ impl ControlStream {
     fn peer_addr(&self) -> Option<SocketAddr> {
         match self {
             Self::Plain(r) => r.get_ref().peer_addr().ok(),
-            Self::Tls(r) => r.get_ref().0.peer_addr().ok(),
+            Self::Tls(r) => r.get_ref().get_ref().0.peer_addr().ok(),
             Self::Transitioning => None,
         }
     }

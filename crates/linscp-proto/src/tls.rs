@@ -279,6 +279,11 @@ impl ServerCertVerifier for CustomServerVerifier {
     }
 }
 
+static VERSIONS_BOTH: &[&SupportedProtocolVersion] =
+    &[&rustls::version::TLS13, &rustls::version::TLS12];
+static VERSIONS_12_ONLY: &[&SupportedProtocolVersion] = &[&rustls::version::TLS12];
+static VERSIONS_13_ONLY: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
+
 fn select_protocol_versions(
     min_ver: Option<TlsVersion>,
     max_ver: Option<TlsVersion>,
@@ -291,11 +296,9 @@ fn select_protocol_versions(
         )));
     }
     match (min_v, max_v) {
-        (TlsVersion::Tls12, TlsVersion::Tls13) => {
-            Ok(&[&rustls::version::TLS13, &rustls::version::TLS12])
-        }
-        (TlsVersion::Tls12, TlsVersion::Tls12) => Ok(&[&rustls::version::TLS12]),
-        (TlsVersion::Tls13, TlsVersion::Tls13) => Ok(&[&rustls::version::TLS13]),
+        (TlsVersion::Tls12, TlsVersion::Tls13) => Ok(VERSIONS_BOTH),
+        (TlsVersion::Tls12, TlsVersion::Tls12) => Ok(VERSIONS_12_ONLY),
+        (TlsVersion::Tls13, TlsVersion::Tls13) => Ok(VERSIONS_13_ONLY),
         (TlsVersion::Tls13, TlsVersion::Tls12) => unreachable!(),
     }
 }
