@@ -17,12 +17,15 @@ documentation - and refuses:
   * an installed file that the Makefile, CMake or the Debian package
     installs and the others do not, and the other way round,
   * an error message whose wording contradicts the template it is
-    filled into.
+    filled into, and
+  * an upstream product name outside the documented external-identifier
+    allowlist.
 
-Comments and test fixtures are not searched: a comment may name a
-Windows path to say what the client does with one, and a test has to
-be able to hold a name that a POSIX file system allows and a Windows
-one does not.
+The Windows-construct rules do not search comments or test fixtures:
+a comment may name a Windows path to say what the client does with one,
+and a test has to be able to hold a name that a POSIX file system allows
+and a Windows one does not. The product-name rule searches them, subject
+to the external-identifier allowlist below.
 
 The vendored xterm.js files (source/gui/web/vendor) are upstream code
 that is not scanned; everything else in the tree is this project's own.
@@ -53,7 +56,27 @@ SCAN_FILES = [
     'CMakeLists.txt',
     'readme.md',
 ]
-SKIP_DIRECTORIES = {'build', 'node_modules', '__pycache__', '.git', '.venv', 'venv'}
+SKIP_DIRECTORIES = {'build', 'node_modules', '__pycache__', '.git', '.venv', 'venv',
+                    'vendor'}
+
+# Only these external identifiers may retain the upstream product name:
+# upstream repository/API paths, XML namespaces, compatibility API names,
+# external documentation URLs, Windows executable patterns and the fork
+# notice. The name is assembled so this checker adds no reference.
+UPSTREAM_PRODUCT = 'win' + 'scp'
+BRAND_REFERENCE = re.compile(UPSTREAM_PRODUCT, re.I)
+ALLOWED_BRAND_SPANS = tuple(re.compile(pattern, re.I) for pattern in (
+    re.escape('http://' + UPSTREAM_PRODUCT + '.net/schema/session/1.0'),
+    re.escape(UPSTREAM_PRODUCT + '/' + UPSTREAM_PRODUCT),
+    re.escape(UPSTREAM_PRODUCT + '.net/eng/docs/logging_xml'),
+    re.escape(UPSTREAM_PRODUCT + r'\.exe'),
+    re.escape(UPSTREAM_PRODUCT + r'\.com'),
+    re.escape('namespace ' + UPSTREAM_PRODUCT),
+    re.escape('using ' + UPSTREAM_PRODUCT + ';'),
+    re.escape(UPSTREAM_PRODUCT + '.sessionremoteexception'),
+    re.escape(UPSTREAM_PRODUCT + '.sessionlocalexception'),
+    re.escape('LinSCP began as a fork of ' + UPSTREAM_PRODUCT + '.'),
+))
 
 # A directory whose files are fixtures rather than the client's own
 # code: a test may hold any name a file system allows.
@@ -163,7 +186,10 @@ RULES = [
      'a Windows CI runner'),
 
     # --- Documentation that tells the reader to use Windows ---------
-    ('win32-doc-instruction', 'docs', r'\b(?:winscp\.exe|winscp\.com|'
+    # The two executable names here are external Windows program names;
+    # keep them so instructions to run them are still detected.
+    ('win32-doc-instruction', 'docs',
+     r'\b(?:' + UPSTREAM_PRODUCT + r'\.exe|' + UPSTREAM_PRODUCT + r'\.com|'
      r'regedit\.exe|C:\\Program Files(?: \(x86\))?)\b',
      'an instruction to use a Windows program'),
 ]
@@ -193,7 +219,7 @@ INSTALLED_FILES = [
     'automation/LinSCP.psm1',
     'automation/dotnet/LinSCP/LinSCP.csproj',
     'automation/dotnet/LinSCP/Session.cs',
-    'automation/dotnet/LinSCP/WinSCPCompat.cs',
+    'automation/dotnet/LinSCP/LinSCPCompat.cs',
     'docs/linscp.1',
     'debian/linscp.desktop',
     'debian/linscp.png',
@@ -351,6 +377,36 @@ def check_error_templates(root=ROOT):
     return findings
 
 
+def check_brand_references(root=ROOT):
+    """Only allowlisted external identifiers may retain the upstream name."""
+    findings = []
+    for path in sorted(root.rglob('*')):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if any(part in SKIP_DIRECTORIES for part in relative.parts):
+            continue
+        try:
+            text = path.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError):
+            continue
+        if not BRAND_REFERENCE.search(text):
+            continue
+        allowed = []
+        for pattern in ALLOWED_BRAND_SPANS:
+            for span in pattern.finditer(text):
+                allowed.append((span.start(), span.end()))
+        for match in BRAND_REFERENCE.finditer(text):
+            if any(start <= match.start() and match.end() <= end
+                   for start, end in allowed):
+                continue
+            line = text.count('\n', 0, match.start()) + 1
+            findings.append((path, line, 'brand-reference',
+                             'an upstream name outside the allowlist',
+                             match.group(0)))
+    return findings
+
+
 def collect(root=ROOT):
     """Every problem this check finds, as a list of findings."""
     findings = []
@@ -365,13 +421,15 @@ def collect(root=ROOT):
     findings.extend(check_removed_artefacts(root))
     findings.extend(check_installed_files(root))
     findings.extend(check_error_templates(root))
+    findings.extend(check_brand_references(root))
     return findings
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--list', action='store_true',
-                        help='list the files this check reads')
+                        help='list the files the Windows-construct '
+                             'rules read')
     args = parser.parse_args()
 
     if args.list:
@@ -381,8 +439,10 @@ def main():
 
     findings = collect()
     if not findings:
-        print('The Windows-to-Linux conversion is complete: %d files read, '
-              'no Windows construct left.' % len(scanned_files()))
+        print('The Windows-to-Linux conversion is complete: '
+              '%d conversion files read, '
+              'no Windows construct or unlisted upstream name left.'
+              % len(scanned_files()))
         return 0
     for path, line, name, description, text in findings:
         where = '%s:%d' % (path.relative_to(ROOT), line) if line else \

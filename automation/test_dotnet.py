@@ -7,7 +7,7 @@ Two layers, because a .NET SDK may or may not be installed:
   SessionOptions, listing, transfer, synchronization, cancellation,
   structured results and errors) is defined, passwords never reach a
   process command line, quoting refuses control characters and
-  multiline commands, and the WinSCP compatibility aliases exist.
+  multiline commands, and the upstream compatibility aliases exist.
 * Live `dotnet test` / a scripted session against the throwaway WebDAV
   endpoint, when `dotnet` is installed. Without it the live cases skip
   loudly instead of passing quietly.
@@ -31,7 +31,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 DOTNET_DIR = HERE / "dotnet" / "LinSCP"
 SESSION_CS = DOTNET_DIR / "Session.cs"
-COMPAT_CS = DOTNET_DIR / "WinSCPCompat.cs"
+COMPAT_CS = DOTNET_DIR / "LinSCPCompat.cs"
 PROJECT = DOTNET_DIR / "LinSCP.csproj"
 DAV_SERVER = ROOT / "source" / "linux" / "tests" / "TestDavServer.py"
 BINARY = str(pathlib.Path(sys.argv.pop(1)).resolve()) \
@@ -82,7 +82,7 @@ class StaticAssemblyTests(unittest.TestCase):
                       self.session)
         self.assertIn("A LinSCP command must be a single line.", self.session)
 
-    def test_winscp_compatibility_aliases_exist(self):
+    def test_linscp_compatibility_aliases_exist(self):
         self.assertIn("namespace WinSCP", self.compat)
         for name in ("class Session", "class SessionOptions",
                      "class TransferOperationResult", "class RemoteDirectoryInfo"):
@@ -108,11 +108,10 @@ class StaticAssemblyTests(unittest.TestCase):
                          "schemes no client version accepts: %s" % sorted(built - known))
 
     def test_the_compatibility_exception_types_catch_what_is_thrown(self):
-        # A script carried over from WinSCP writes
-        # 'catch (SessionRemoteException)' with the WinSCP namespace
-        # imported. When that name was a subclass of the thrown LinSCP type
-        # the clause never matched, so the error escaped the script. The
-        # WinSCP name has to be the base of the thrown type instead.
+        # A script carried over from upstream imports the compatibility
+        # namespace and catches SessionRemoteException. A subclass here
+        # would never match the LinSCP exception actually thrown, so the
+        # upstream compatibility name must be the base of the thrown type.
         self.assertIn("class SessionRemoteException : WinSCP.SessionRemoteException",
                       self.session)
         self.assertIn("class SessionLocalException : WinSCP.SessionLocalException",

@@ -1360,7 +1360,7 @@ class ScriptTests(unittest.TestCase):
     def test_xml_log_matches_the_upstream_schema(self):
         """The committed fixtures and a log this run produces both
         validate against the pinned upstream schema
-        (docs/winscp-session-1.0.xsd), secret masking included, and an
+        (docs/linscp-session-1.0.xsd), secret masking included, and an
         upstream-style consumer (namespace-aware, 'value'-attribute
         parameters, 'result success') reads the operations back."""
         import xml.etree.ElementTree as ET
@@ -1372,7 +1372,7 @@ class ScriptTests(unittest.TestCase):
         ns = "{http://winscp.net/schema/session/1.0}"
         repo = pathlib.Path(__file__).resolve().parent.parent.parent.parent
         schema = xmlschema.XMLSchema(
-            str(repo / "docs" / "winscp-session-1.0.xsd"))
+            str(repo / "docs" / "linscp-session-1.0.xsd"))
         fixtures = [repo / "fixtures" / "xml" / "action-log-success.xml",
                     repo / "fixtures" / "xml" / "action-log-error.xml"]
         for fixture in fixtures:

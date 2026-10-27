@@ -1295,7 +1295,7 @@ class LiveSftpTests(unittest.TestCase):
         mv/cp, call with its captured output and exit code, ls with
         its file entries, stat, checksum, cwd, rm - which is what an
         upstream-compatible consumer (and the schema of
-        docs/winscp-session-1.0.xsd) reads back."""
+        docs/linscp-session-1.0.xsd) reads back."""
         import hashlib
         import xml.etree.ElementTree as ET
         ns = "{http://winscp.net/schema/session/1.0}"
@@ -1419,7 +1419,7 @@ class LiveSftpTests(unittest.TestCase):
         else:
             repo = pathlib.Path(__file__).resolve().parents[3]
             xmlschema.XMLSchema(
-                str(repo / "docs" / "winscp-session-1.0.xsd")).validate(
+                str(repo / "docs" / "linscp-session-1.0.xsd")).validate(
                     str(xmllog))
 
     def test_s3_version_switches_are_refused_on_native_sftp(self):

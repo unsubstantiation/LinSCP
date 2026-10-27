@@ -712,19 +712,15 @@ unsigned long ParseListingDate(const std::string & monthName,
 
 
 /* ----------------------------------------------------------------------
- * An interactive terminal on the connected server
+ * An interactive SSH terminal
  *
- * WinSCP's "Open Terminal" opens the desktop's terminal program on the
- * server that the session is using. The console client cannot make its
- * own terminal window, so it hands the same job to the system ssh client
- * in a terminal emulator.
+ * "Open Terminal" starts a local terminal emulator running the system ssh
+ * client for the connected server. The console client cannot create its
+ * own window, so the platform layer launches the terminal.
  *
- * A window belongs to a display server, and a Linux desktop runs either
- * Wayland or X11 - so the choice of program has to be made against the
- * session this process is in, and not against X11 alone: a client that
- * only asks for $DISPLAY finds no display on a Wayland session where
- * XWayland is not running, and a terminal that only speaks Wayland exits
- * before it maps anything when run under X11.
+ * The choice depends on the active display server: asking only $DISPLAY
+ * misses a Wayland session without XWayland, while a Wayland-only terminal
+ * exits before mapping a window under X11.
  */
 
 std::vector<std::string> BuildSshArguments(const std::string & userName,

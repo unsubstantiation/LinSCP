@@ -625,9 +625,10 @@ line with the number of uploads, downloads, deletions, conflicts and bytes.
 .RE
 .TP
 .BI keepuptodate " [" options "] [" localdir " [" remotedir ]]"
-Reflect changes in the local directory on the remote directory, as upstream
-WinSCP does. The first synchronization pass runs immediately. A recursive
-inotify watcher starts another pass when a local change is reported. The
+Reflect changes in the local directory on the remote directory, as the
+upstream client does. The first synchronization pass runs immediately. A
+recursive inotify watcher starts another pass when a local change is reported.
+The
 .BI \-interval= seconds
 (10 by default, from 1 to 86400) also triggers a full comparison as a safety
 rescan; timer polling is used when the watch cannot be set up. Give
@@ -1145,7 +1146,7 @@ linscp \-gui
 .fi
 .RE
 .SH LIMITATIONS
-LinSCP does not implement full WinSCP feature parity, and Linux is the only
+LinSCP does not implement full upstream feature parity, and Linux is the only
 platform it is built, packaged and tested on. Native SFTP and native SCP
 through libssh, basic recursive transfers/resume,
 synchronization, persistent sessions, a remote editor and a browser-based
@@ -1182,7 +1183,7 @@ delete adds a delete marker. Multipart uploads for files larger than 16 MiB
 resume matching local files from a private sidecar containing the upload ID
 and completed part ETags. S3 session settings include storage class, ACL,
 server-side encryption, KMS key ID, request payer and object metadata. SCP is
-WinSCP's remote-shell implementation - listings, stat, directory and metadata
+LinSCP's remote-shell implementation - listings, stat, directory and metadata
 commands over the server's shell, transfers over its own
 .B scp
 - and the one thing it cannot do is continue a partial transfer, because the
@@ -1199,7 +1200,7 @@ realm, and an OpenSSH server.
 Local-to-local panes, named multi-tab workspaces, directory bookmarks, session
 import from OpenSSH/FileZilla and session-URL generation are implemented. A
 PowerShell 7 CLI wrapper exists with static and optional live Pester tests;
-it is not the WinSCP .NET object model.
+it is not the upstream .NET object model.
 .PP
 .B keepuptodate
 reflects local changes on the remote side and runs in the foreground. A

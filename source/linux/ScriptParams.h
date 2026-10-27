@@ -1,5 +1,5 @@
 /*
- * ScriptParams: the expansions the WinSCP console applies to a command line
+ * ScriptParams: the expansions the LinSCP console applies to a command line
  * before the script interpreter sees it, plus the name resolution its command
  * table uses.
  *
@@ -50,7 +50,7 @@ std::string ResolvePrefixedName(const std::vector<std::string> & names,
     const std::string & text, std::string & ambiguous);
 
 /*
- * Formats a broken-down local time with the date format tokens WinSCP's
+ * Formats a broken-down local time with the date format tokens LinSCP's
  * %TIMESTAMP#...% accepts: the quoted literal, 'c', 'yyyy', 'yy', 'mmmm',
  * 'mmm', 'mm', 'm', 'dddd', 'ddd', 'dd', 'd', 'hh', 'h', 'nn', 'n', 'ss',
  * 's', 'am/pm' and 'a/p'. A token that is not supported is copied verbatim,

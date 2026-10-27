@@ -80,7 +80,7 @@ textarea:focus-visible, [tabindex]:focus-visible {
 }
 button:disabled { opacity: .48; cursor: not-allowed; }
 
-/* WinSCP-style menu and command bands. */
+/* Commander-style menu and command bands. */
 .app-shell { flex: none; position: relative; z-index: 5; }
 .menu-bar {
   display: flex;
@@ -502,7 +502,7 @@ table.file-table tr.selected td { color: var(--selection-text); }
 #cliInput { flex: 1; min-width: 0; background: #111a24; color: #e4edf5; border: 1px solid #344458; padding: 6px 8px; border-radius: 5px; font-family: "Cascadia Code", Consolas, monospace; }
 .cli-run { background: #202d3a; color: var(--text); border-color: #405267; }
 
-/* The classic F1-F10 strip used by WinSCP Commander. */
+/* The classic F1-F10 strip used by the LinSCP Commander. */
 .function-keys {
   flex: none;
   display: grid;

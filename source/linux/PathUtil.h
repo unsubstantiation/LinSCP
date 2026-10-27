@@ -72,7 +72,7 @@ std::string FormatFileClock(unsigned long time);
  * while mode_t on the local side is only the twelve permission bits.
  */
 
-/* A WinSCP-style octal permission value: '600', '0600', '00600'. */
+/* An octal permission value accepted by chmod: '600', '0600', '00600'. */
 bool ParseOctalMode(const std::string & text, unsigned long & result);
 
 /* A symbolic permission expression ('u+x', 'go-w', 'a=r,u+s') applied to

@@ -1,4 +1,4 @@
-# WinSCP parity audit and inventory guide
+# Upstream parity audit and inventory guide
 
 **Full feature parity is not achieved.** LinSCP is a Linux-only client using
 an independent implementation with libssh for SSH transport, not a build of
@@ -7,7 +7,7 @@ build is not proof of behavioral parity.
 
 ## Baseline and scope
 
-The inventory is pinned to [winscp/winscp at
+The inventory is pinned to [the upstream repository at
 69edabbe2dc2c62661a7d3fc7e2396b5f42d504d](https://github.com/winscp/winscp/tree/69edabbe2dc2c62661a7d3fc7e2396b5f42d504d).
 It is a development snapshot, not a claim about the latest release. The initial
 source review compared upstream `source/core/Script.cpp`, `Script.h`,
@@ -72,7 +72,7 @@ The review corrected stale claims without upgrading unimplemented work:
   `<group>` per command (always grouped), operation elements with
   `value`-attribute parameters and `<result success>` children, `<failure>`
   for a failed command, upstream's escape pair and UTC timestamp spelling.
-  The schema is pinned in the repository (`docs/winscp-session-1.0.xsd`,
+  The schema is pinned in the repository (`docs/linscp-session-1.0.xsd`,
   written from upstream's emitter and its XML Logging documentation), the
   shipped fixtures and freshly produced logs validate against it, and the
   live SFTP suite reads a real session's operations back the way an
@@ -161,7 +161,7 @@ and independently evidenced.
 ## Verification on 2026-10-26
 
 These results cover the cross-realm Kerberos case, the delegation review brief
-and the French catalogs; they do not establish full WinSCP parity.
+and the French catalogs; they do not establish full upstream parity.
 
 | Check | Result |
 | --- | --- |
@@ -175,7 +175,7 @@ and the French catalogs; they do not establish full WinSCP parity.
 ## Local verification on 2026-10-22
 
 These checks cover the GSSAPI capability, validation and test-fixture edits in
-this checkout; they do not establish full WinSCP parity.
+this checkout; they do not establish full upstream parity.
 
 | Check | Result |
 | --- | --- |

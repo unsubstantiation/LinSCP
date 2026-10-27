@@ -14,6 +14,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Download upstream script sources at one revision
+        # This GitHub API path is an external upstream repository
+        # identifier; keep it verbatim so the workflow tracks the real
+        # baseline.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

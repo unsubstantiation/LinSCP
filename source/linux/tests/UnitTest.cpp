@@ -966,7 +966,7 @@ void TestScriptCommands()
     CHECK_TRUE(script.ExecuteLine("option transfer"));
     CHECK_TRUE(script.ExecuteLine("ascii"));
     CHECK_TRUE(script.ExecuteLine("binary"));
-    /* include/exclude are one WinSCP mask: setting one clears the other. */
+    /* include/exclude are one LinSCP mask: setting one clears the other. */
     CHECK_TRUE(script.ExecuteLine("option include *.txt"));
     CHECK_TRUE(script.ExecuteLine("option exclude *.bak;*.tmp"));
     CHECK_TRUE(script.ExecuteLine("option failonnomatch on"));

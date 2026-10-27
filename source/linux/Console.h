@@ -88,7 +88,7 @@ public:
      * Structured action log ('-xmllog=<file>', the equivalent of the upstream
      * '/xmllog=' switch). The document follows the upstream XML logging
      * schema, http://winscp.net/schema/session/1.0 (see
-     * docs/winscp-session-1.0.xsd for the pinned description): one
+     * docs/linscp-session-1.0.xsd for the pinned description): one
      * '<session>' root, one '<group>' per script command (grouping is
      * always on, so a reader that follows the file knows a command has
      * finished when its group closes), one element per physical operation

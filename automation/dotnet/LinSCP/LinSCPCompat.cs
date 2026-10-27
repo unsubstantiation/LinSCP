@@ -1,5 +1,6 @@
-// Compatibility aliases so a script written against WinSCP.Session can
-// retarget this assembly. The types are the LinSCP object model.
+// Compatibility aliases for scripts written against the upstream .NET API.
+// The namespace keeps its upstream name as an API contract; implementations
+// are LinSCP types. New code should use the LinSCP namespace.
 
 namespace WinSCP
 {
@@ -43,12 +44,10 @@ namespace WinSCP
     public class CommandExecutionResult : LinSCP.CommandExecutionResult { }
     public class RemoteFileInfo : LinSCP.RemoteFileInfo { }
     public class RemoteDirectoryInfo : LinSCP.RemoteDirectoryInfo { }
-    // The exception types are the bases of the LinSCP ones, not subclasses of
-    // them: a script carried over from WinSCP writes
-    // 'catch (SessionRemoteException)' with this namespace imported, and a
-    // subclass here would never match the exception the assembly throws, which
-    // is a LinSCP one. Declaring the WinSCP name as the base makes both
-    // spellings catch it.
+    // These exceptions are bases of the LinSCP ones, not subclasses: a script
+    // importing this namespace catches SessionRemoteException, and a subclass
+    // here would never match the LinSCP exception actually thrown. Keeping
+    // the upstream name as the base makes both spellings work.
     public class SessionRemoteException : System.Exception
     {
         public SessionRemoteException(string message) : base(message) { }

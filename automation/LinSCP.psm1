@@ -11,9 +11,8 @@
     structured PowerShell objects for session management, file transfer,
     directory listing and synchronization.
 
-    This is a compatibility shim for the WinSCP .NET assembly API,
-    implemented through the LinSCP CLI with -server mode for persistent
-    sessions.
+    These cmdlets are a CLI compatibility layer, not the upstream .NET
+    assembly API: they drive `linscp -server` for persistent sessions.
 
     The -server protocol is one command per line on the client's stdin.
     The client answers with any number of output lines on stdout, then

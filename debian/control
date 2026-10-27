@@ -13,8 +13,9 @@ Depends: ${shlibs:Depends}, python3
 Recommends: curl, xdg-utils
 Description: graphical and console file transfer client for Linux
  LinSCP is a native noncommercial file transfer client for Linux, inspired
- by WinSCP. It provides an interactive command-line client (linscp) and
- a dual-pane Commander graphical client (linscp-gui) in the browser.
+ by the upstream Windows client. It provides an interactive
+ command-line client (linscp) and a dual-pane Commander graphical client
+ (linscp-gui) in the browser.
  .
  The desktop entry starts the graphical client through xdg-utils, so
  the browser window is asked for the way a Wayland session expects; without
@@ -26,8 +27,9 @@ Description: graphical and console file transfer client for Linux
  transfer protocol; ftp, ftps, WebDAV and S3 go through curl, which is why
  it is recommended. The client provides transfer resume and recursive
  synchronization, public-key, ssh-agent and password authentication,
- host-key verification, stored sessions and a subset of WinSCP scripting.
+ host-key verification, stored sessions and a subset of the upstream
+ scripting language.
  Protocol support depends on the backend; WebDAV and Amazon S3 support are
  incomplete, and an SCP transfer cannot be resumed, because the rcp
- protocol has no offset to continue from. Full WinSCP feature parity is
+ protocol has no offset to continue from. Full upstream feature parity is
  not provided.

@@ -3,7 +3,7 @@
  *
  * 'edit' downloads a remote file into a private temporary directory,
  * starts an editor on it and uploads the file back when the editor
- * exits, which is how WinSCP's internal editor works from the console.
+ * exits, which is how LinSCP's internal editor works from the console.
  * The file access is an interface so that every protocol backend can be
  * edited with the same code, and so the workflow can be tested without
  * a server.
