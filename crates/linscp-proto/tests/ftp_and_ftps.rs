@@ -241,9 +241,9 @@ async fn run_mock_ftp_client(
 
         match verb.as_str() {
             "AUTH" if arg.eq_ignore_ascii_case("TLS") => {
-                if acceptor.is_some() {
+                if let Some(acc) = &acceptor {
                     ctrl.send("234 Proceed with TLS negotiation\r\n").await?;
-                    ctrl.upgrade(acceptor.as_ref().unwrap()).await?;
+                    ctrl.upgrade(acc).await?;
                 } else {
                     ctrl.send("502 TLS not configured\r\n").await?;
                 }

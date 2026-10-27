@@ -287,16 +287,15 @@ impl russh::server::Handler for MockSshSession {
         if !self.server.allow_forwarding {
             return Ok(());
         }
-        match TcpStream::connect((host_to_connect, port_to_connect as u16)).await {
-            Ok(mut target_tcp) => {
-                let _ = target_tcp.set_nodelay(true);
-                reply.accept().await;
-                let mut ssh_stream = channel.into_stream();
-                tokio::spawn(async move {
-                    let _ = tokio::io::copy_bidirectional(&mut ssh_stream, &mut target_tcp).await;
-                });
-            }
-            Err(_) => {}
+        if let Ok(mut target_tcp) =
+            TcpStream::connect((host_to_connect, port_to_connect as u16)).await
+        {
+            let _ = target_tcp.set_nodelay(true);
+            reply.accept().await;
+            let mut ssh_stream = channel.into_stream();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy_bidirectional(&mut ssh_stream, &mut target_tcp).await;
+            });
         }
         Ok(())
     }
