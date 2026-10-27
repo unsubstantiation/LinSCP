@@ -12,7 +12,9 @@ browser-based dual-pane Commander (`linscp-gui`).
 
 LinSCP implements a subset of the upstream feature set. It does **not**
 provide full upstream parity: see [Protocols](#protocols) and the
-[parity audit](docs/upstream-parity.md).
+[parity audit](docs/upstream-parity.md). The inventory tracks upstream master
+as of 2026-10-26; command registrations are current, but two capability gaps
+remain.
 
 ## Requirements
 
@@ -142,7 +144,7 @@ it can be pinned.
   sign-in, local file editing and drag-and-drop in both panes. Sign-in does not
   isolate users' tabs, files or commands: do not share one backend among
   untrusted users.
-- **Localization:** English and Spanish, for the CLI and the GUI.
+- **Localization:** English, Spanish, German and French, for the CLI and the GUI.
 - **Desktop sessions:** works on Wayland and on X11 alike. The clients draw no
   window of their own; the terminal `terminal` opens is chosen among the ones
   that can draw on this display server, and `--open-browser` asks the desktop's
@@ -152,7 +154,7 @@ it can be pinned.
 
 Full upstream parity is **not** implemented. Remaining gaps include complete
 compatibility with the upstream .NET object model, broader localization beyond
-English/Spanish, and an independent security review plus broader production-realm
+English/Spanish/German/French, and an independent security review plus broader production-realm
 validation of GSSAPI. The live SFTP suite exercises GSSAPI against a throwaway
 Kerberos realm; this does not certify every KDC deployment. Local-to-local sessions with two
 local panes, named multi-tab workspaces, directory bookmarks, session import

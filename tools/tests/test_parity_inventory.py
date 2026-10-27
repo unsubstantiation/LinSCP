@@ -188,6 +188,36 @@ class InventoryTests(unittest.TestCase):
                 self.assertIn("Pinned upstream gap was dropped from the inventory: " + capability,
                               errors)
 
+    def test_baseline_review_is_recorded_with_evidence(self):
+        inventory = json.loads((ROOT / "docs/upstream-parity.json").read_text())
+        upstream = inventory["upstream"]
+        self.assertEqual(upstream["commit"],
+                         upstream["latest_command_review"]["commit"])
+        review = upstream["behavioral_drift_review"]
+        self.assertGreater(review["compared_commits"], 0)
+        self.assertTrue(review["relevant_changes"])
+        evidence = set()
+        for row in inventory["capabilities"]:
+            for suite, cases in row.get("checks", {}).items():
+                evidence.update("%s: %s" % (suite, case) for case in cases)
+        for change in review["relevant_changes"]:
+            self.assertRegex(change["commit"], r"^[0-9a-f]{40}$")
+            self.assertTrue(change["evidence"])
+            self.assertTrue(change["linscp"])
+            for item in change["evidence"]:
+                self.assertIn(item, evidence)
+
+    def test_pinned_gap_guard_survives_a_baseline_update(self):
+        inventory = json.loads((ROOT / "docs/upstream-parity.json").read_text())
+        inventory["upstream"]["commit"] = "f" * 40
+        candidate = copy.deepcopy(inventory)
+        candidate["capabilities"] = [row for row in candidate["capabilities"]
+                                     if row["id"] != "dav.locks"]
+        errors = []
+        check_capabilities(candidate, errors)
+        self.assertIn("Pinned upstream gap was dropped from the inventory: dav.locks",
+                      errors)
+
     def test_every_dispatcher_name_is_in_exactly_one_group(self):
         inventory = json.loads((ROOT / "docs/upstream-parity.json").read_text())
         dispatched = checker.command_table((ROOT / "source/linux/Script.cpp").read_text())

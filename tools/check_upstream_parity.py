@@ -19,7 +19,7 @@ PLAN_REPORT = ROOT / "docs/remaining-parity-plan.md"
 # A suite name in the ledger must resolve to the test source it claims to
 # run. These are test files, not implementation files. A method/check quoted
 # in the capability matrix must still exist there when the code changes.
-# A pinned baseline must not become 'full' by deleting known missing rows.
+# Any pinned baseline must not become 'full' by deleting known missing rows.
 # New capabilities may be added freely; removing one of these requires a
 # deliberate review of the checker and the upstream scope together.
 REQUIRED_GAP_IDS = {
@@ -262,8 +262,7 @@ def check_capabilities(inventory, errors, root=ROOT):
                     errors.append(f"{label}: {suite} has no test case {case}")
     for area in sorted(areas - found.keys()):
         errors.append(f"Feature area has no capability rows: {area}")
-    if inventory.get("upstream", {}).get("commit") == \
-            "69edabbe2dc2c62661a7d3fc7e2396b5f42d504d":
+    if inventory.get("upstream", {}).get("commit"):
         for id in sorted(REQUIRED_GAP_IDS - seen):
             errors.append(f"Pinned upstream gap was dropped from the inventory: {id}")
     return rows

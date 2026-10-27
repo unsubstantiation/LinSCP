@@ -4652,6 +4652,33 @@ void TestScpEngine()
     CHECK_FALSE(ScpClient::Handles(options));
 }
 
+void TestScpHeaderNamesCannotTraverse()
+{
+    /* Upstream issue 2477: a nested rcp header must not be able to turn
+     * a server-supplied name into a local path traversal. On Linux a
+     * backslash is a legal filename byte, but refusing it too keeps the
+     * two clients from accepting different remote names. */
+    char kind = 0;
+    unsigned int mode = 0;
+    unsigned long long size = 0;
+    std::string name;
+    unsigned long mtime = 0, atime = 0;
+    const char * refused[] = { ".", "..", "../evil", "sub/evil",
+                              "/etc/passwd", "..\\evil" };
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); ++i)
+    {
+        CHECK_FALSE(ScpParseHeaderLine(
+            std::string("C0644 1 ") + refused[i], kind, mode, size, name,
+            mtime, atime));
+        CHECK_FALSE(ScpParseHeaderLine(
+            std::string("D0755 0 ") + refused[i], kind, mode, size, name,
+            mtime, atime));
+    }
+    CHECK_TRUE(ScpParseHeaderLine("C0644 1 safe-name.txt", kind, mode,
+                                 size, name, mtime, atime));
+    CHECK_EQ(name, std::string("safe-name.txt"));
+}
+
 void TestAuditRegressions()
 {
     using namespace linscp;
@@ -4907,6 +4934,7 @@ int main()
     TestSshJumpSettings();
     TestDavEtagHelpers();
     TestScpEngine();
+    TestScpHeaderNamesCannotTraverse();
     TestAuditRegressions();
 
     if (gFailures != 0)
