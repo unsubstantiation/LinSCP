@@ -676,7 +676,7 @@ mod tests {
 
         // Add an unrelated site and re-save under `key_b`: `prod/app`'s original
         // ciphertext MUST survive intact and still decrypt under `key_a`!
-        let staging = StoredSite::new("staging/web", ProtocolScheme::Https, "example.org");
+        let staging = StoredSite::new("staging/web", ProtocolScheme::Webdavs, "example.org");
         loaded_wrong_key.upsert(staging);
         let resaved_ini = loaded_wrong_key.serialize_ini(Some(&key_b)).unwrap();
 
