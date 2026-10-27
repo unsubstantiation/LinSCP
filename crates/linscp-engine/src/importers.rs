@@ -439,14 +439,16 @@ mod tests {
               IdentityFile ~/.ssh/id_ed25519\n\
             Match host *.corp\n\
               User jump\n";
-        let report = parse_openssh_config(cfg, Some(Path::new("/home/alice")));
+        let home = Path::new("/home/alice");
+        let report = parse_openssh_config(cfg, Some(home));
         assert_eq!(report.imported.len(), 1);
         let site = &report.imported[0];
         assert_eq!(site.name, "prod-db");
         assert_eq!(site.host, "10.20.30.40");
         assert_eq!(site.port, 2222);
         assert_eq!(site.username, "postgres");
-        assert_eq!(site.private_key.as_deref(), Some("/home/alice/.ssh/id_ed25519"));
+        let expected_key = home.join(".ssh/id_ed25519").to_string_lossy().into_owned();
+        assert_eq!(site.private_key.as_deref(), Some(expected_key.as_str()));
         assert_eq!(report.skipped.len(), 3);
     }
 
