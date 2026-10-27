@@ -1,6 +1,13 @@
 //! Pure-Rust cryptography shared across CLI, HTTP server, and Tauri apps:
 //! - Byte-compatible `lscp1$` encrypted passwords for `sessions.ini` / `sessions.key`
 //! - 300,000-iteration PBKDF2-HMAC-SHA256 account password hashing
+//! - `SHA-256`, `SHA-1`, `MD5`, and `CRC32` digests (`digests`)
+//! - AWS Signature Version 4 signing (`sigv4`)
+//! - PuTTY `.ppk` v2 & v3 + Argon2 parser and OpenSSH converter (`ppk`)
+
+pub mod digests;
+pub mod ppk;
+pub mod sigv4;
 
 use std::path::Path;
 

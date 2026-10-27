@@ -7,11 +7,16 @@ license-file.workspace = true
 publish.workspace = true
 
 [dependencies]
-linscp-crypto.workspace = true
-linscp-platform.workspace = true
-linscp-proto.workspace = true
-linscp-types.workspace = true
+base64.workspace = true
+linscp-crypto = { path = "../linscp-crypto" }
+linscp-platform = { path = "../linscp-platform" }
+linscp-proto = { path = "../linscp-proto" }
+linscp-types = { path = "../linscp-types" }
+roxmltree.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true
