@@ -1462,6 +1462,7 @@ async fn scp_engine_jump_tunnel_and_proxy_dialers_work_end_to_end() {
         username: Some("proxyuser".to_string()),
         password: Some("proxypass".to_string()),
         remote_dns: true,
+        command: None,
     });
     let proxied_sftp = SftpClientSession::connect(ProtocolScheme::Sftp, &via_http_proxy, None, 0)
         .await
