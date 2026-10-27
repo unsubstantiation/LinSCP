@@ -456,7 +456,7 @@ pub fn decrypt_and_verify_ppk(
         } else {
             Zeroizing::new(PPK_MAC_LABEL.to_vec())
         };
-        let mut mac = HmacSha1::new_from_slice(&mac_key).expect("HMAC key");
+        let mut mac = <HmacSha1 as Mac>::new_from_slice(&mac_key).expect("HMAC key");
         mac.update(&mac_data);
         let actual: [u8; 20] = mac.finalize().into_bytes().into();
         bool::from(actual.ct_eq(ppk.mac.as_slice()))
@@ -466,7 +466,7 @@ pub fn decrypt_and_verify_ppk(
         } else {
             PPK_MAC_LABEL
         };
-        let mut mac = HmacSha256::new_from_slice(mac_key).expect("HMAC key");
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(mac_key).expect("HMAC key");
         mac.update(&mac_data);
         let actual: [u8; 32] = mac.finalize().into_bytes().into();
         bool::from(actual.ct_eq(ppk.mac.as_slice()))
@@ -855,7 +855,7 @@ Private-MAC: 1459a716b2ebdea871aa101e3a6fe0801798df2f
         put_ssh_bytes(&mut mac_data, b"argon-v3");
         put_ssh_bytes(&mut mac_data, &base_ppk.public_blob);
         put_ssh_bytes(&mut mac_data, &padded_plain);
-        let mut mac = HmacSha256::new_from_slice(&km[48..80]).unwrap();
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&km[48..80]).unwrap();
         mac.update(&mac_data);
         let mac_hex = hex_encode(&mac.finalize().into_bytes());
 
