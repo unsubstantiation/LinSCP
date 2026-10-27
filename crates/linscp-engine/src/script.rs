@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use linscp_i18n::{CatalogDomain, translate, translate_with};
 use linscp_platform::terminal::{
-    RawTerminalGuard, expand_tilde, launch_desktop_ssh_terminal, prompt_yes_no_tty,
-    read_stdin_chunk, stat_local_path, stdin_is_terminal, take_window_resized, terminal_size,
+    RawTerminalGuard, expand_tilde, launch_desktop_ssh_terminal, read_stdin_chunk,
+    stat_local_path, stdin_is_terminal, take_window_resized, terminal_size,
 };
 use linscp_proto::{ProgressCallback, RemoteSession};
 use linscp_proto::ssh::{ChannelMsg, SshConnection, extract_openssh_public_key_line};
@@ -41,8 +41,8 @@ use crate::transfer::{
 use crate::url_and_raw::{
     DefaultOsVault, ParsedSiteSpec, apply_env_credential_fallbacks, apply_raw_settings,
     connect_site_spec, connect_ssh_for_shell, is_ssh_scheme, is_webdav_scheme, parse_site_url,
-    site_spec_from_stored, site_spec_from_stored_for_resave, stored_site_from_spec,
-    validate_session_settings,
+    prompt_yes_no_tty, site_spec_from_stored, site_spec_from_stored_for_resave,
+    stored_site_from_spec, validate_session_settings,
 };
 use crate::xml_log::SessionLogger;
 
@@ -2459,7 +2459,8 @@ impl ScriptInterpreter {
             "Overwrite remote file '{path}'?",
             &[("path", dest_path)],
         );
-        if prompt_yes_no_tty(&format!("{q} (y/n): "), &self.cfg.locale) {
+        let yn = self.tr(" [y/N]: ");
+        if prompt_yes_no_tty(&format!("{q}{yn}"), &self.cfg.locale) {
             Ok(true)
         } else {
             self.emit_status(self.tr("Cancelled."));
@@ -3219,8 +3220,8 @@ impl ScriptInterpreter {
                     }
                     let _ = std::io::stdout().flush();
                 }
-                let last_permille = std::sync::atomic::AtomicU64::new(0);
-                let prog_fn = |done: u64, tot: u64| {
+                let last_permille = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let prog_fn = move |done: u64, tot: u64| {
                     if !draw_prog || tot == 0 {
                         return;
                     }
@@ -3254,11 +3255,12 @@ impl ScriptInterpreter {
                     }
                     let _ = std::io::stdout().flush();
                 }
-                dl_res.map_err(|e| self.transfer_failed(&rpath, &e))?;
-                if dl_res == Ok(true) && !self.cfg.server_mode && local_dest != Path::new("-") {
+                let downloaded = dl_res.map_err(|e| self.transfer_failed(&rpath, &e))?;
+                if downloaded && !self.cfg.server_mode && local_dest != Path::new("-") {
                     let dst_disp = local_dest.display().to_string();
                     let sz = stat_local_path(&local_dest).size;
-                    self.emit_status(&format!("Downloaded '{dst_disp}' ({sz} bytes)."));
+                    let suffix = self.trp(" [{size} bytes]", &[("size", &sz.to_string())]);
+                    self.emit_status(&format!("{dst_disp}{suffix}"));
                 }
             }
         }
@@ -3399,8 +3401,8 @@ impl ScriptInterpreter {
                     }
                     let _ = std::io::stdout().flush();
                 }
-                let last_permille = std::sync::atomic::AtomicU64::new(0);
-                let prog_fn = |done: u64, tot: u64| {
+                let last_permille = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let prog_fn = move |done: u64, tot: u64| {
                     if !draw_prog || tot == 0 {
                         return;
                     }
@@ -3433,7 +3435,11 @@ impl ScriptInterpreter {
                     }
                     let _ = std::io::stdout().flush();
                 }
-                up_res.map_err(|e| self.transfer_failed(&src_disp, &e))?;
+                let uploaded = up_res.map_err(|e| self.transfer_failed(&src_disp, &e))?;
+                if uploaded && !self.cfg.server_mode {
+                    let suffix = self.trp(" [{size} bytes]", &[("size", &sz.to_string())]);
+                    self.emit_status(&format!("{rdest}{suffix}"));
+                }
             }
         }
         Ok(())

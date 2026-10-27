@@ -2222,7 +2222,7 @@ fn make_ssh_host_key_callback(
     })
 }
 
-fn prompt_yes_no_tty(prompt: &str, locale: &str) -> bool {
+pub fn prompt_yes_no_tty(prompt: &str, locale: &str) -> bool {
     eprint!("{prompt}");
     let _ = std::io::stderr().flush();
     let mut line = String::new();
