@@ -1041,7 +1041,9 @@ mod tests {
     fn sync_state_hash_and_tsv_match_cpp_planner() {
         let key = SyncState::make_key("example.com:22", "/local", "/remote");
         assert_eq!(SyncState::hash_key(&key).len(), 16);
-        let tmp = std::env::temp_dir().join(format!("linscp_syncstate_{}.state", std::process::id()));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("linscp_syncstate_dir_{}", std::process::id()));
+        let tmp = tmp_dir.join("sync.state");
         let mut st = SyncState::default();
         st.update(
             "dir/a\tb.txt".to_string(),
@@ -1053,7 +1055,7 @@ mod tests {
         );
         st.save(&tmp).unwrap();
         let loaded = SyncState::load(&tmp).unwrap();
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
         assert_eq!(loaded.lookup("dir/a\tb.txt").unwrap().size, 42);
     }
 }
