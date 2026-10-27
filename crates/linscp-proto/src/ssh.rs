@@ -159,6 +159,8 @@ pub fn load_private_key_text(
         .map_err(|e| ProtoError::Transport(format!("Failed to decode SSH private key: {e}")))
 }
 
+type ObservedSshFingerprint = Arc<Mutex<Option<(String, String)>>>;
+
 struct SshClientHandler {
     tab_id: u64,
     role: String,
@@ -167,7 +169,7 @@ struct SshClientHandler {
     pinned_host_key: Option<String>,
     known_host_key: Option<String>,
     rejection: Arc<Mutex<Option<ProtoError>>>,
-    observed_fingerprint: Arc<Mutex<Option<(String, String)>>>,
+    observed_fingerprint: ObservedSshFingerprint,
 }
 
 impl client::Handler for SshClientHandler {
@@ -289,7 +291,7 @@ impl SshConnection {
         });
 
         let rejection: Arc<Mutex<Option<ProtoError>>> = Arc::new(Mutex::new(None));
-        let observed: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+        let observed: ObservedSshFingerprint = Arc::new(Mutex::new(None));
 
         let handler = SshClientHandler {
             tab_id: cfg.tab_id,

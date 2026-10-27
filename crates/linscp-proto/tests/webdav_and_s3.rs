@@ -564,6 +564,27 @@ impl MockS3State {
     }
 }
 
+fn percent_decode_str(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn parse_query_map(query: Option<&str>) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let Some(q) = query else {
@@ -572,10 +593,10 @@ fn parse_query_map(query: Option<&str>) -> HashMap<String, String> {
     for pair in q.split('&').filter(|s| !s.is_empty()) {
         match pair.split_once('=') {
             Some((k, v)) => {
-                map.insert(k.to_string(), v.to_string());
+                map.insert(percent_decode_str(k), percent_decode_str(v));
             }
             None => {
-                map.insert(pair.to_string(), String::new());
+                map.insert(percent_decode_str(pair), String::new());
             }
         }
     }
@@ -607,7 +628,8 @@ async fn handle_mock_s3(
     }
 
     let qmap = parse_query_map(uri.query());
-    let path = uri.path().trim_start_matches('/');
+    let decoded_path = percent_decode_str(uri.path());
+    let path = decoded_path.trim_start_matches('/');
     if path.is_empty() && method == Method::GET {
         let guard = state.lock().await;
         let mut xml = String::from("<ListAllMyBucketsResult><Buckets>");
@@ -779,7 +801,8 @@ async fn handle_mock_s3(
             let data = if let Some(copy_src) =
                 headers.get("x-amz-copy-source").and_then(|v| v.to_str().ok())
             {
-                let clean = copy_src.trim_start_matches('/');
+                let decoded_copy = percent_decode_str(copy_src);
+                let clean = decoded_copy.trim_start_matches('/');
                 let (sb, sk) = clean.split_once('/').unwrap_or(("", ""));
                 let Some(src_bytes) = guard
                     .buckets
