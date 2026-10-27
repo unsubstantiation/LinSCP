@@ -219,6 +219,10 @@ impl TransferPresetStore {
         config_dir.join("transfer-presets.ini")
     }
 
+    pub fn presets_path(config_dir: &Path) -> PathBuf {
+        Self::default_path(config_dir)
+    }
+
     pub fn presets(&self) -> &[TransferPreset] {
         &self.presets
     }

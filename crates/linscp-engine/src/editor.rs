@@ -211,61 +211,18 @@ where
         }
     };
 
-    let mut upload_if_changed = async |last_wire: &mut Vec<u8>,
-                                       exp_mtime: &mut i64|
-           -> Result<bool, String> {
-        let cur_local = std::fs::read(&temp_path)
-            .map_err(|e| format!("Cannot read edited file '{}': {e}", temp_path.display()))?;
-        let cur_wire = encode_edited(&cur_local)?;
-        if cur_wire == *last_wire {
-            return Ok(false);
-        }
-
-        // Check concurrent remote modification unless `-force`
-        let now_stat = session
-            .stat(remote_path)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| {
-                format!(
-                    "'{remote_path}' no longer exists; the edited copy is kept at '{}'.",
-                    temp_path.display()
-                )
-            })?;
-        if !opts.force && *exp_mtime != 0 && now_stat.mtime != 0 && now_stat.mtime != *exp_mtime {
-            return Err(format!(
-                "'{remote_path}' changed on the server while it was being edited, so it was not overwritten. Your copy is kept at '{}'.",
-                temp_path.display()
-            ));
-        }
-
-        let upload_stage_file = work_dir.join(".linscp-upload-wire.tmp");
-        std::fs::write(&upload_stage_file, &cur_wire)
-            .map_err(|e| format!("Cannot stage encoded upload: {e}"))?;
-        let up_flags = TransferFlags {
-            preserve_time: false,
-            ..TransferFlags::default()
-        };
-        upload_single_file(
-            session,
-            &upload_stage_file,
-            remote_path,
-            &up_flags,
-            logger,
-            None,
-        )
-        .await?;
-        let _ = std::fs::remove_file(&upload_stage_file);
-        if let Ok(Some(updated)) = session.stat(remote_path).await {
-            if updated.mtime != 0 {
-                *exp_mtime = updated.mtime;
-            }
-        }
-        *last_wire = cur_wire;
-        Ok(true)
-    };
-
-    let first_uploaded = upload_if_changed(&mut last_uploaded_wire, &mut expected_remote_mtime).await?;
+    let first_uploaded = upload_edited_if_changed(
+        session,
+        remote_path,
+        &temp_path,
+        &work_dir,
+        opts.force,
+        &encode_edited,
+        &mut last_uploaded_wire,
+        &mut expected_remote_mtime,
+        logger,
+    )
+    .await?;
     if first_uploaded {
         on_status(&format!("Uploaded '{remote_path}'."));
     }
@@ -290,7 +247,19 @@ where
             opts.monitor_interval_ms.max(25),
         ))
         .await;
-        if upload_if_changed(&mut last_uploaded_wire, &mut expected_remote_mtime).await? {
+        if upload_edited_if_changed(
+            session,
+            remote_path,
+            &temp_path,
+            &work_dir,
+            opts.force,
+            &encode_edited,
+            &mut last_uploaded_wire,
+            &mut expected_remote_mtime,
+            logger,
+        )
+        .await?
+        {
             on_status(&format!("Uploaded '{remote_path}'."));
             completed_passes += 1;
             idle_polls = 0;
@@ -307,6 +276,71 @@ where
     clear_interrupted();
     cleanup_temp(&temp_path, &work_dir, opts.keep_temp_file);
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_edited_if_changed<E>(
+    session: &dyn RemoteSession,
+    remote_path: &str,
+    temp_path: &PathBuf,
+    work_dir: &PathBuf,
+    force: bool,
+    encode_edited: &E,
+    last_wire: &mut Vec<u8>,
+    exp_mtime: &mut i64,
+    logger: &mut SessionLogger,
+) -> Result<bool, String>
+where
+    E: Fn(&[u8]) -> Result<Vec<u8>, String>,
+{
+    let cur_local = std::fs::read(temp_path)
+        .map_err(|e| format!("Cannot read edited file '{}': {e}", temp_path.display()))?;
+    let cur_wire = encode_edited(&cur_local)?;
+    if cur_wire == *last_wire {
+        return Ok(false);
+    }
+
+    let now_stat = session
+        .stat(remote_path)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "'{remote_path}' no longer exists; the edited copy is kept at '{}'.",
+                temp_path.display()
+            )
+        })?;
+    if !force && *exp_mtime != 0 && now_stat.mtime != 0 && now_stat.mtime != *exp_mtime {
+        return Err(format!(
+            "'{remote_path}' changed on the server while it was being edited, so it was not overwritten. Your copy is kept at '{}'.",
+            temp_path.display()
+        ));
+    }
+
+    let upload_stage_file = work_dir.join(".linscp-upload-wire.tmp");
+    std::fs::write(&upload_stage_file, &cur_wire)
+        .map_err(|e| format!("Cannot stage encoded upload: {e}"))?;
+    let up_flags = TransferFlags {
+        preserve_time: false,
+        ..TransferFlags::default()
+    };
+    upload_single_file(
+        session,
+        &upload_stage_file,
+        remote_path,
+        &up_flags,
+        logger,
+        None,
+    )
+    .await?;
+    let _ = std::fs::remove_file(&upload_stage_file);
+    if let Ok(Some(updated)) = session.stat(remote_path).await {
+        if updated.mtime != 0 {
+            *exp_mtime = updated.mtime;
+        }
+    }
+    *last_wire = cur_wire;
+    Ok(true)
 }
 
 fn cleanup_temp(temp_path: &PathBuf, work_dir: &PathBuf, keep: bool) {

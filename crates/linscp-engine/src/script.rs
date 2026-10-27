@@ -7,17 +7,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use linscp_crypto::ppk::convert_private_key_to_openssh;
 use linscp_i18n::{CatalogDomain, translate, translate_with};
 use linscp_platform::terminal::{
     RawTerminalGuard, expand_tilde, launch_desktop_ssh_terminal, read_stdin_chunk, stat_local_path,
     stdin_is_terminal, take_window_resized, terminal_size,
 };
 use linscp_proto::RemoteSession;
-use linscp_proto::ssh::SshConnection;
+use linscp_proto::ssh::{ChannelMsg, SshConnection, extract_openssh_public_key_line};
 use linscp_proto::webdav::DavEtagPrecondition;
 use linscp_types::{FileEntry, ProtocolScheme, TransferMode};
-use russh::ChannelMsg;
 
 use crate::editor::{EditOptions, edit_remote_file};
 use crate::filemask::{
@@ -853,25 +851,25 @@ impl ScriptInterpreter {
                 .clone()
                 .unwrap_or_else(|| "off".to_string()),
             "include" => {
-                if self.option_mask.includes.is_empty() {
+                if self.option_mask.include.is_empty() {
                     "(none)".to_string()
                 } else {
                     self.option_mask
-                        .includes
+                        .include
                         .iter()
-                        .map(|r| r.pattern.as_str())
+                        .map(|r| r.text.as_str())
                         .collect::<Vec<_>>()
                         .join(";")
                 }
             }
             "exclude" => {
-                if self.option_mask.excludes.is_empty() {
+                if self.option_mask.exclude.is_empty() {
                     "(none)".to_string()
                 } else {
                     self.option_mask
-                        .excludes
+                        .exclude
                         .iter()
-                        .map(|r| r.pattern.as_str())
+                        .map(|r| r.text.as_str())
                         .collect::<Vec<_>>()
                         .join(";")
                 }
@@ -1027,7 +1025,7 @@ impl ScriptInterpreter {
                 } else {
                     let parsed =
                         FileMask::parse(val).map_err(|e| self.wrong_args("option", &e))?;
-                    if (!parsed.includes.is_empty() && !parsed.excludes.is_empty())
+                    if (!parsed.include.is_empty() && !parsed.exclude.is_empty())
                         || val.contains('|')
                     {
                         return Err(self.wrong_args(
@@ -1039,12 +1037,12 @@ impl ScriptInterpreter {
                     }
                     let mut combined = FileMask::default();
                     if opt_name == "include" {
-                        combined.includes = parsed.includes;
+                        combined.include = parsed.include;
                     } else {
-                        combined.excludes = if !parsed.excludes.is_empty() {
-                            parsed.excludes
+                        combined.exclude = if !parsed.exclude.is_empty() {
+                            parsed.exclude
                         } else {
-                            parsed.includes
+                            parsed.include
                         };
                     }
                     self.option_mask = combined;
@@ -1193,10 +1191,11 @@ impl ScriptInterpreter {
         let mut rows = Vec::new();
         for item in rd.flatten() {
             let name = item.file_name().to_string_lossy().into_owned();
-            if let Some(ref m) = mask_opt
-                && !matches_wildcard(m, &name)
-            {
-                continue;
+            if let Some(ref m) = mask_opt {
+                if !matches_wildcard(m, &name) {
+                    continue;
+                }
+            }
             }
             let info = stat_local_path(&item.path());
             rows.push((name, info));
@@ -1667,10 +1666,10 @@ impl ScriptInterpreter {
                 if !show_all && e.name.starts_with('.') {
                     return false;
                 }
-                if let Some(ref m) = mask_opt
-                    && !matches_wildcard(m, &e.name)
-                {
-                    return false;
+                if let Some(ref m) = mask_opt {
+                    if !matches_wildcard(m, &e.name) {
+                        return false;
+                    }
                 }
                 true
             })
@@ -2216,7 +2215,7 @@ impl ScriptInterpreter {
             }
             let _ = std::io::stderr().flush();
         }
-        let code = out.exit_status.map(|c| c as i32).unwrap_or(0);
+        let code = out.exit_code.map(|c| c as i32).unwrap_or(0);
         if code == 0 {
             self.logger
                 .record_call(&command_str, &cwd, &stdout_txt, &stderr_txt, 0, Ok(()));
@@ -2262,17 +2261,10 @@ impl ScriptInterpreter {
                 .trim()
                 .to_string()
         } else {
-            let raw_priv = std::fs::read(&key_path)
+            let raw_priv = std::fs::read_to_string(&key_path)
                 .map_err(|e| format!("Cannot read '{key_path}': {e}"))?;
-            let openssh_pem =
-                convert_private_key_to_openssh(&raw_priv, slot.spec.passphrase.as_deref())
-                    .map_err(|e| format!("Cannot decode private key '{key_path}': {e}"))?;
-            let priv_key = russh::keys::decode_secret_key(&openssh_pem, None)
-                .map_err(|e| format!("Cannot parse OpenSSH private key '{key_path}': {e}"))?;
-            priv_key
-                .public_key()
-                .to_openssh()
-                .map_err(|e| format!("Cannot format public key: {e}"))?
+            extract_openssh_public_key_line(&raw_priv, slot.spec.passphrase.as_deref())
+                .map_err(|e| format!("Cannot decode private key '{key_path}': {e}"))?
         };
         let escaped = pub_line.replace('\'', "'\\''");
         let install_sh = format!(
@@ -2283,7 +2275,7 @@ impl ScriptInterpreter {
             .exec_command(&install_sh)
             .await
             .map_err(|e| e.to_string())?;
-        if out.exit_status.unwrap_or(0) != 0 {
+        if out.exit_code.unwrap_or(0) != 0 {
             return Err(format!(
                 "Installing public key failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
@@ -2306,27 +2298,27 @@ impl ScriptInterpreter {
             ..TransferFlags::default()
         };
 
-        if !self.presets_disabled
-            && let Ok(store) = TransferPresetStore::load_from_dir(&self.cfg.config_dir)
-        {
-            if let Some(ref explicit_name) = self.active_preset_name {
-                if let Some(p) = store.find(explicit_name) {
-                    flags.apply_preset(p);
-                }
-            } else if let Ok(slot) = self.active_slot() {
-                let hostport = format!("{}:{}", slot.spec.session.host, slot.spec.session.port);
-                if let Some(p) = store.match_session(
-                    &hostport,
-                    &slot.spec.session.username,
-                    &slot.remote_cwd,
-                    &self.local_cwd.display().to_string(),
-                ) {
-                    flags.apply_preset(p);
-                }
-                if let Some(fname) = sample_filename
-                    && let Some(mp) = store.match_mask(fname)
-                {
-                    flags.apply_preset(mp);
+        if !self.presets_disabled {
+            if let Ok(store) = TransferPresetStore::load_from_dir(&self.cfg.config_dir) {
+                if let Some(ref explicit_name) = self.active_preset_name {
+                    if let Some(p) = store.find(explicit_name) {
+                        flags.apply_preset(p);
+                    }
+                } else if let Ok(slot) = self.active_slot() {
+                    let hostport = format!("{}:{}", slot.spec.session.host, slot.spec.session.port);
+                    if let Some(p) = store.match_session(
+                        &hostport,
+                        &slot.spec.session.username,
+                        &slot.remote_cwd,
+                        &self.local_cwd.display().to_string(),
+                    ) {
+                        flags.apply_preset(p);
+                    }
+                    if let Some(fname) = sample_filename {
+                        if let Some(mp) = store.match_mask(fname) {
+                            flags.apply_preset(mp);
+                        }
+                    }
                 }
             }
         }
@@ -2397,11 +2389,10 @@ impl ScriptInterpreter {
             }
         }
 
-        if flags.latest_only
-            && matched_items.len() > 1
-            && let Some(newest) = matched_items.iter().max_by_key(|(_, e)| e.mtime).cloned()
-        {
-            matched_items = vec![newest];
+        if flags.latest_only && matched_items.len() > 1 {
+            if let Some(newest) = matched_items.iter().max_by_key(|(_, e)| e.mtime).cloned() {
+                matched_items = vec![newest];
+            }
         }
 
         let target_must_be_dir = matched_items.len() > 1
@@ -2419,12 +2410,12 @@ impl ScriptInterpreter {
             ) {
                 continue;
             }
-            if !self.presets_disabled
-                && self.active_preset_name.is_none()
-                && let Ok(store) = TransferPresetStore::load_from_dir(&self.cfg.config_dir)
-                && let Some(mp) = store.match_mask(&rentry.name)
-            {
-                flags.apply_preset(mp);
+            if !self.presets_disabled && self.active_preset_name.is_none() {
+                if let Ok(store) = TransferPresetStore::load_from_dir(&self.cfg.config_dir) {
+                    if let Some(mp) = store.match_mask(&rentry.name) {
+                        flags.apply_preset(mp);
+                    }
+                }
             }
             let local_dest = match &explicit_local_target {
                 Some(p) if p == Path::new("-") => PathBuf::from("-"),
@@ -2529,11 +2520,10 @@ impl ScriptInterpreter {
             }
         }
 
-        if flags.latest_only
-            && local_items.len() > 1
-            && let Some(newest) = local_items.iter().max_by_key(|t| t.2).cloned()
-        {
-            local_items = vec![newest];
+        if flags.latest_only && local_items.len() > 1 {
+            if let Some(newest) = local_items.iter().max_by_key(|t| t.2).cloned() {
+                local_items = vec![newest];
+            }
         }
 
         let remote_target_is_dir = target_trailing_slash
@@ -2554,12 +2544,12 @@ impl ScriptInterpreter {
             if lpath != Path::new("-") && !flags.file_mask.accepts(&lname, is_dir, sz, 0, &lname) {
                 continue;
             }
-            if !self.presets_disabled
-                && self.active_preset_name.is_none()
-                && let Ok(store) = TransferPresetStore::load_from_dir(&self.cfg.config_dir)
-                && let Some(mp) = store.match_mask(&lname)
-            {
-                flags.apply_preset(mp);
+            if !self.presets_disabled && self.active_preset_name.is_none() {
+                if let Ok(store) = TransferPresetStore::load_from_dir(&self.cfg.config_dir) {
+                    if let Some(mp) = store.match_mask(&lname) {
+                        flags.apply_preset(mp);
+                    }
+                }
             }
             let rdest = match &explicit_remote_target {
                 Some(rt) if remote_target_is_dir => join_remote_path(rt, &lname),
@@ -2873,7 +2863,7 @@ impl ScriptInterpreter {
                     self.tr("'-criteria=checksum' cannot be combined with the 'both' direction, which compares the record of the previous synchronization instead of the files; synchronize 'local' or 'remote' to compare contents."),
                 ));
             }
-            if opts.criteria.none {
+            if !opts.criteria.time && !opts.criteria.size && !opts.criteria.checksum {
                 return Err(self.wrong_args(
                     "synchronize",
                     self.tr("'-criteria=none' cannot be combined with the 'both' direction: with nothing compared there is no way to tell which side changed."),
@@ -3487,10 +3477,9 @@ impl ScriptInterpreter {
                 spec.session.username.clone()
             };
             return launch_desktop_ssh_terminal(
-                &user,
                 &spec.session.host,
                 spec.session.port,
-                spec.session.keyfile.as_deref().unwrap_or(""),
+                &user,
                 &self.slots[self.active_slot].remote_cwd,
             );
         }

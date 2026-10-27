@@ -18,7 +18,8 @@ use russh::keys::agent::client::AgentClient;
 use russh::keys::agent::AgentIdentity;
 use russh::keys::ssh_encoding::Encode;
 use russh::keys::{decode_secret_key, PrivateKey, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate};
-use russh::{Channel, ChannelMsg, ChannelStream, Disconnect, MethodKind};
+pub use russh::ChannelMsg;
+use russh::{Channel, ChannelStream, Disconnect, MethodKind};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use zeroize::Zeroizing;
@@ -198,6 +199,19 @@ pub fn load_private_key_text(
 
     decode_secret_key(trimmed, passphrase)
         .map_err(|e| ProtoError::Transport(format!("Failed to decode SSH private key: {e}")))
+}
+
+/// Extracts an OpenSSH `authorized_keys` public-key line from an OpenSSH PEM,
+/// PKCS#8 PEM, or PuTTY `.ppk` v2/v3 private key.
+pub fn extract_openssh_public_key_line(
+    raw_key_text: &str,
+    passphrase: Option<&str>,
+) -> Result<String, ProtoError> {
+    let priv_key = load_private_key_text(raw_key_text, passphrase)?;
+    priv_key
+        .public_key()
+        .to_openssh()
+        .map_err(|e| ProtoError::Transport(format!("Failed to format OpenSSH public key: {e}")))
 }
 
 type ObservedSshFingerprint = Arc<Mutex<Option<(String, String)>>>;

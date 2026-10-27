@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use linscp_crypto::sha256_hex;
+use linscp_crypto::digests::sha256_hex;
 use linscp_platform::terminal::stat_local_path;
 use linscp_platform::write_private_file_atomic;
 use linscp_proto::RemoteSession;

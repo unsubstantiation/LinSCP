@@ -1332,10 +1332,9 @@ fn build_proxy_config(spec: &ParsedSiteSpec) -> Result<Option<ProxyConfig>, Stri
             .raw_fields
             .get("proxy_password")
             .cloned()
-            .filter(|s| !s.is_empty())
-            .map(Zeroizing::new),
+            .filter(|s| !s.is_empty()),
         remote_dns,
-        command: p_cmd,
+        command: (!p_cmd.is_empty()).then_some(p_cmd),
     }))
 }
 
@@ -1847,18 +1846,13 @@ pub async fn connect_ssh_for_shell(
         proxy,
     );
 
-    if let Some(ref tun_cfg) = tunnel_ssh_cfg {
-        let jump = SshJumpTunnel::connect(
-            tun_cfg,
-            &dest_ssh_cfg.host,
-            dest_ssh_cfg.port,
-            tunnel_local_port,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Some(tun_cfg) = tunnel_ssh_cfg {
+        let jump = SshJumpTunnel::connect(tun_cfg)
+            .await
+            .map_err(|e| e.to_string())?;
         dest_ssh_cfg.proxy = None;
         let stream = jump
-            .open_direct_stream(&dest_ssh_cfg.host, dest_ssh_cfg.port)
+            .open_destination_stream(&dest_ssh_cfg.host, dest_ssh_cfg.port, tunnel_local_port)
             .await
             .map_err(|e| e.to_string())?;
         let conn = SshConnection::connect_over_stream(&dest_ssh_cfg, stream)
@@ -2041,7 +2035,7 @@ fn prompt_yes_no_tty(prompt: &str, locale: &str) -> bool {
         return false;
     }
     matches!(
-        linscp_i18n::parse_cli_confirmation(locale, &line),
+        linscp_i18n::parse_confirmation_answer(locale, false, &line),
         Some(true)
     )
 }
@@ -2086,14 +2080,14 @@ impl SecretVault for DefaultOsVault {
         &self,
         config_dir: &Path,
     ) -> Result<Option<Zeroizing<[u8; 32]>>, linscp_platform::PlatformError> {
-        linscp_platform::OsSecretVault.load_master_key(config_dir)
+        linscp_platform::NativeSecretVault::new().load_master_key(config_dir)
     }
 
     fn load_or_create_master_key(
         &self,
         config_dir: &Path,
     ) -> Result<Zeroizing<[u8; 32]>, linscp_platform::PlatformError> {
-        linscp_platform::OsSecretVault.load_or_create_master_key(config_dir)
+        linscp_platform::NativeSecretVault::new().load_or_create_master_key(config_dir)
     }
 }
 

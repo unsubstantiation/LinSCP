@@ -709,6 +709,25 @@ pub fn ppk_authorized_keys_line(ppk_text: &str, passphrase: &str) -> Result<Stri
     Ok(line)
 }
 
+/// Converts raw PuTTY `.ppk` v2/v3 bytes into an unencrypted OpenSSH PEM string
+/// (or validates and passes through UTF-8 OpenSSH/PEM private key text).
+pub fn convert_private_key_to_openssh(
+    raw: &[u8],
+    input_passphrase: Option<&str>,
+) -> Result<Zeroizing<String>, PpkError> {
+    let text = std::str::from_utf8(raw)
+        .map_err(|_| PpkError::InvalidFormat("Key file is not valid UTF-8 text".to_string()))?;
+    if is_ppk_bytes(raw) {
+        ppk_to_openssh_pem(text, input_passphrase.unwrap_or(""), None)
+    } else if text.contains("-----BEGIN ") {
+        Ok(Zeroizing::new(text.to_string()))
+    } else {
+        Err(PpkError::InvalidFormat(
+            "Input is not a PuTTY .ppk v2/v3 private key".to_string(),
+        ))
+    }
+}
+
 /// Converts `.ppk` text into an OpenSSH `-----BEGIN OPENSSH PRIVATE KEY-----`
 /// PEM string. When `output_passphrase` is `Some(non_empty)`, encrypts the
 /// private section with `aes256-ctr` + `bcrypt` KDF.

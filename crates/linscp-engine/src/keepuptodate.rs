@@ -1,11 +1,11 @@
 //! Continuous local-to-remote directory mirroring (`keepuptodate`), combining
-//! `linscp_platform::watcher::DirectoryWatcher` with deterministic tree snapshots.
+//! `linscp_platform::watcher::LocalDirWatcher` with deterministic tree snapshots.
 
 use std::path::Path;
 use std::time::Duration;
 
 use linscp_platform::terminal::{clear_interrupted, install_cli_signal_handlers, is_interrupted};
-use linscp_platform::watcher::DirectoryWatcher;
+use linscp_platform::watcher::LocalDirWatcher;
 use linscp_proto::RemoteSession;
 use linscp_types::TransferMode;
 
@@ -109,7 +109,7 @@ where
         Err(e) => return Err(e),
     }
 
-    let watcher = DirectoryWatcher::start(local_root).ok();
+    let watcher = LocalDirWatcher::watch(local_root, true).ok();
     install_cli_signal_handlers();
     clear_interrupted();
     on_status(&format!(

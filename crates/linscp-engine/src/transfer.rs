@@ -5,7 +5,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use linscp_crypto::sha256_hex;
+use linscp_crypto::digests::sha256_hex;
 use linscp_platform::terminal::{
     is_interrupted, set_local_file_times, set_local_permissions, stat_local_path,
 };

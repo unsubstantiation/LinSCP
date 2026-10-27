@@ -429,6 +429,11 @@ pub fn write_private_file_atomic(target: &Path, content: &[u8]) -> Result<(), Pl
     Ok(())
 }
 
+/// Creates `path` (and missing parent directories) with owner-only (`0700` on Unix) permissions.
+pub fn create_private_dir(path: &Path) -> Result<(), PlatformError> {
+    sys::ensure_private_dir(path)
+}
+
 /// Creates a brand-new owner-only file (`O_CREAT | O_EXCL`, `0600` on Unix),
 /// refusing to overwrite an existing file (used by `ConvertPpkToOpenSsh`).
 pub fn write_exclusive_private_file(target: &Path, content: &[u8]) -> Result<(), PlatformError> {

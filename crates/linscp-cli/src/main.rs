@@ -24,7 +24,7 @@ use linscp_platform::terminal::{
     expand_tilde, install_cli_signal_handlers, launch_gui_application, read_password_prompt,
     stdin_is_terminal,
 };
-use linscp_platform::write_private_file_atomic;
+use linscp_platform::write_exclusive_private_file;
 use linscp_service::CommanderService;
 
 const PRODUCT_VERSION: &str = "1.0";
@@ -746,30 +746,31 @@ async fn run_cli() -> i32 {
     };
 
     let mut logger = SessionLogger::new();
-    if let Some(ref lf) = log_file
-        && let Err(reason) =
+    if let Some(ref lf) = log_file {
+        if let Err(reason) =
             logger.open_text_log(lf, log_rotation, effective_log_level, log_sensitive)
-    {
-        let p_str = lf.display().to_string();
-        print_err(&translate_with(
-            CatalogDomain::Cli,
-            &locale,
-            "Cannot open the log file '{path}': {reason}",
-            &[("path", &p_str), ("reason", &reason)],
-        ));
-        return 1;
+        {
+            let p_str = lf.display().to_string();
+            print_err(&translate_with(
+                CatalogDomain::Cli,
+                &locale,
+                "Cannot open the log file '{path}': {reason}",
+                &[("path", &p_str), ("reason", &reason)],
+            ));
+            return 1;
+        }
     }
-    if let Some(ref xf) = xml_log_file
-        && let Err(reason) = logger.open_xml_log(xf)
-    {
-        let p_str = xf.display().to_string();
-        print_err(&translate_with(
-            CatalogDomain::Cli,
-            &locale,
-            "Cannot open the XML log file '{path}': {reason}",
-            &[("path", &p_str), ("reason", &reason)],
-        ));
-        return 1;
+    if let Some(ref xf) = xml_log_file {
+        if let Err(reason) = logger.open_xml_log(xf) {
+            let p_str = xf.display().to_string();
+            print_err(&translate_with(
+                CatalogDomain::Cli,
+                &locale,
+                "Cannot open the XML log file '{path}': {reason}",
+                &[("path", &p_str), ("reason", &reason)],
+            ));
+            return 1;
+        }
     }
 
     let apply_cli_defaults = |spec: &mut ParsedSiteSpec| -> Result<(), String> {
@@ -998,7 +999,7 @@ fn run_convert_key(
         };
         match convert_private_key_to_openssh(&raw, pass_opt) {
             Ok(openssh_pem) => {
-                if let Err(e) = write_private_file_atomic(out_p, openssh_pem.as_bytes()) {
+                if let Err(e) = write_exclusive_private_file(out_p, openssh_pem.as_bytes()) {
                     print_err(&format!("Cannot write '{output_path}': {e}"));
                     return 1;
                 }
