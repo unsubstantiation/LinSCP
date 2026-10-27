@@ -1066,16 +1066,25 @@ fn run_convert_key(
             return 1;
         }
     };
+    let Ok(raw_text) = std::str::from_utf8(&raw) else {
+        print_err(&format!(
+            "Invalid PPK key file '{input_path}': not valid UTF-8 text."
+        ));
+        return 1;
+    };
+    let source_is_encrypted = raw_text
+        .lines()
+        .any(|l| l.trim_end_matches('\r') == "Encryption: aes256-cbc");
 
     let mut pass = initial_passphrase.unwrap_or("").to_string();
     let mut last_err = String::new();
     for attempt in 0..3 {
-        let pass_opt = if pass.is_empty() {
-            None
-        } else {
+        let out_pass = if source_is_encrypted && !pass.is_empty() {
             Some(pass.as_str())
+        } else {
+            None
         };
-        match ppk_to_pkcs8_pem(&raw, pass_opt) {
+        match ppk_to_pkcs8_pem(raw_text, &pass, out_pass) {
             Ok(pkcs8_pem) => {
                 if let Err(e) = write_exclusive_private_file(out_p, pkcs8_pem.as_bytes()) {
                     print_err(&format!("Cannot write '{output_path}': {e}"));
