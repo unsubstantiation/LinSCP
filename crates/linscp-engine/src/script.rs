@@ -1856,15 +1856,19 @@ impl ScriptInterpreter {
         if args.len() > 1 {
             return Err("Syntax: cd [ <directory> ]".to_string());
         }
-        let slot = self.active_slot()?;
+        let (remote_cwd, scheme) = {
+            let slot = self.active_slot()?;
+            (slot.remote_cwd.clone(), slot.session.scheme())
+        };
         let next = if args.is_empty() {
-            slot.session
+            self.slots[self.active_slot]
+                .session
                 .pwd()
                 .await
                 .map_err(|e| self.remote_error("change directory to", "~", &e.to_string()))?
         } else {
             let candidate = if args[0] == "~" || args[0].starts_with("~/") {
-                let home = slot
+                let home = self.slots[self.active_slot]
                     .session
                     .pwd()
                     .await
@@ -1875,14 +1879,18 @@ impl ScriptInterpreter {
                     resolve_remote_path(&home, &args[0][2..])
                 }
             } else {
-                resolve_remote_path(&slot.remote_cwd, &args[0])
+                resolve_remote_path(&remote_cwd, &args[0])
             };
             if candidate != "/" {
-                let st_opt = slot.session.stat(&candidate).await.map_err(|e| {
-                    let msg = self.remote_error("change directory to", &candidate, &e.to_string());
-                    self.logger.record_cwd(&candidate, Err(&msg));
-                    msg
-                })?;
+                let st_opt = match self.slots[self.active_slot].session.stat(&candidate).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let msg =
+                            self.remote_error("change directory to", &candidate, &e.to_string());
+                        self.logger.record_cwd(&candidate, Err(&msg));
+                        return Err(msg);
+                    }
+                };
                 if let Some(info) = st_opt {
                     if !info.is_dir && !info.is_symlink {
                         let msg = self.remote_error(
@@ -1893,7 +1901,7 @@ impl ScriptInterpreter {
                         self.logger.record_cwd(&candidate, Err(&msg));
                         return Err(msg);
                     }
-                } else if slot.session.scheme() != ProtocolScheme::S3 {
+                } else if scheme != ProtocolScheme::S3 {
                     let msg = self.remote_error(
                         "change directory to",
                         &candidate,
@@ -1903,7 +1911,11 @@ impl ScriptInterpreter {
                     return Err(msg);
                 }
             }
-            slot.session.realpath(&candidate).await.unwrap_or(candidate)
+            self.slots[self.active_slot]
+                .session
+                .realpath(&candidate)
+                .await
+                .unwrap_or(candidate)
         };
         self.slots[self.active_slot].remote_cwd = next.clone();
         println!("{next}");

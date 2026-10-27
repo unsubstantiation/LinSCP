@@ -251,6 +251,10 @@ impl SessionLogger {
         Ok(logger)
     }
 
+    pub fn log_event(&self, message: &str) {
+        self.log_text(0, message);
+    }
+
     pub fn log_text(&self, min_level: i32, message: &str) {
         if self.text_level < min_level {
             return;
