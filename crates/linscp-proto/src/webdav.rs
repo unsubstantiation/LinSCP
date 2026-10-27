@@ -264,9 +264,7 @@ impl Stream for ChannelBodyStream {
 
 fn percent_encode_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 8);
-    if !path.starts_with('/') {
-        out.push('/');
-    }
+    out.push('/');
     for (idx, seg) in path.trim_start_matches('/').split('/').enumerate() {
         if idx > 0 {
             out.push('/');

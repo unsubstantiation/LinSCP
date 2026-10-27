@@ -159,9 +159,7 @@ impl Default for S3ConnectConfig {
 
 fn s3_uri_encode_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 8);
-    if !path.starts_with('/') {
-        out.push('/');
-    }
+    out.push('/');
     for (i, seg) in path.trim_start_matches('/').split('/').enumerate() {
         if i > 0 {
             out.push('/');
