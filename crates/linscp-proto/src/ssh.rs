@@ -148,13 +148,10 @@ pub fn load_private_key_text(
 ) -> Result<PrivateKey, ProtoError> {
     let trimmed = raw_key_text.trim_start_matches('\u{feff}');
     if trimmed.trim_start().starts_with("PuTTY-User-Key-File-") {
-        let parsed = linscp_crypto::ppk::parse_ppk(trimmed, passphrase)
-            .map_err(|e| ProtoError::Transport(format!("Failed to load PPK private key: {e}")))?;
-        let openssh_pem = parsed
-            .key
-            .to_openssh_pem(&parsed.comment)
-            .map_err(|e| ProtoError::Transport(format!("Failed to encode PPK as OpenSSH key: {e}")))?;
-        return decode_secret_key(&openssh_pem, None)
+        let openssh_pem =
+            linscp_crypto::ppk::ppk_to_openssh_pem(trimmed, passphrase.unwrap_or(""), None)
+                .map_err(|e| ProtoError::Transport(format!("Failed to load PPK private key: {e}")))?;
+        return decode_secret_key(openssh_pem.as_str(), None)
             .map_err(|e| ProtoError::Transport(format!("Failed to decode converted PPK key: {e}")));
     }
 
@@ -181,7 +178,7 @@ impl client::Handler for SshClientHandler {
         server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         let pubkey = server_public_key.public_key();
-        let (key_type, sha256_fp, md5_fp) = match compute_ssh_fingerprints(pubkey.as_ref()) {
+        let (key_type, sha256_fp, md5_fp) = match compute_ssh_fingerprints(&pubkey) {
             Ok(v) => v,
             Err(err) => {
                 if let Ok(mut guard) = self.rejection.lock() {
@@ -603,5 +600,33 @@ impl SshConnection {
             .disconnect(Disconnect::ByApplication, "", "en")
             .await
             .map_err(|e| ProtoError::Transport(format!("SSH disconnect error: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ED25519_V2_ENCRYPTED_PPK: &str = "\
+PuTTY-User-Key-File-2: ssh-ed25519
+Encryption: aes256-cbc
+Comment: ed25519-v2
+Public-Lines: 1
+AAAAC3NzaC1lZDI1NTE5AAAAIHm1Vi6P5lT5QHixEuipi6eQH4U65pW+1+DjkQutBJZk
+Private-Lines: 1
+Y9f+qSB5FZfq2THk/c3+YDp7WUUEInGl7poCWM0H3hZSKKSrhvXEZOFcav7qc/bk
+Private-MAC: 1459a716b2ebdea871aa101e3a6fe0801798df2f
+";
+
+    #[test]
+    fn load_private_key_text_decodes_encrypted_ppk_and_computes_fingerprints() {
+        assert!(load_private_key_text(ED25519_V2_ENCRYPTED_PPK, Some("wrong")).is_err());
+        let key =
+            load_private_key_text(ED25519_V2_ENCRYPTED_PPK, Some("secret-ppk")).expect("load PPK");
+        let (alg, sha256_fp, md5_fp) =
+            compute_ssh_fingerprints(key.public_key()).expect("fingerprints");
+        assert_eq!(alg, "ssh-ed25519");
+        assert!(sha256_fp.starts_with("SHA256:"));
+        assert!(md5_fp.starts_with("MD5:"));
     }
 }

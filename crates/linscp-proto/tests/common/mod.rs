@@ -5,7 +5,6 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use ed25519_dalek::SigningKey as Ed25519SigningKey;
-use linscp_crypto::ppk::PrivateKeyMaterial;
 use linscp_proto::ssh::compute_ssh_fingerprints;
 use linscp_proto::tls::spki_sha256_pin;
 use p256::ecdsa::signature::Signer as _;
@@ -22,12 +21,60 @@ pub struct GeneratedSshKey {
     pub md5_fingerprint: String,
 }
 
+fn push_ssh_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+fn push_ssh_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    push_ssh_u32(out, bytes.len() as u32);
+    out.extend_from_slice(bytes);
+}
+
+fn build_ed25519_openssh_pem(secret: &[u8; 32], public: &[u8; 32], comment: &str) -> String {
+    let mut pub_blob = Vec::new();
+    push_ssh_bytes(&mut pub_blob, b"ssh-ed25519");
+    push_ssh_bytes(&mut pub_blob, public);
+
+    let mut priv_section = Vec::new();
+    let check_int: u32 = 0xa1b2_c3d4;
+    push_ssh_u32(&mut priv_section, check_int);
+    push_ssh_u32(&mut priv_section, check_int);
+    push_ssh_bytes(&mut priv_section, b"ssh-ed25519");
+    push_ssh_bytes(&mut priv_section, public);
+    let mut keypair64 = [0u8; 64];
+    keypair64[..32].copy_from_slice(secret);
+    keypair64[32..].copy_from_slice(public);
+    push_ssh_bytes(&mut priv_section, &keypair64);
+    push_ssh_bytes(&mut priv_section, comment.as_bytes());
+    let pad_len = (8 - (priv_section.len() % 8)) % 8;
+    for p in 1..=pad_len {
+        priv_section.push(p as u8);
+    }
+
+    let mut wire = Vec::new();
+    wire.extend_from_slice(b"openssh-key-v1\0");
+    push_ssh_bytes(&mut wire, b"none");
+    push_ssh_bytes(&mut wire, b"none");
+    push_ssh_bytes(&mut wire, b"");
+    push_ssh_u32(&mut wire, 1);
+    push_ssh_bytes(&mut wire, &pub_blob);
+    push_ssh_bytes(&mut wire, &priv_section);
+
+    let b64 = BASE64.encode(&wire);
+    let mut pem = String::from("-----BEGIN OPENSSH PRIVATE KEY-----\n");
+    for chunk in b64.as_bytes().chunks(70) {
+        pem.push_str(std::str::from_utf8(chunk).unwrap());
+        pem.push('\n');
+    }
+    pem.push_str("-----END OPENSSH PRIVATE KEY-----\n");
+    pem
+}
+
 pub fn generate_ed25519_ssh_key(seed_byte: u8, comment: &str) -> GeneratedSshKey {
     let secret = [seed_byte; 32];
     let dalek = Ed25519SigningKey::from_bytes(&secret);
     let public = dalek.verifying_key().to_bytes();
-    let mat = PrivateKeyMaterial::Ed25519 { secret, public };
-    let openssh_pem = mat.to_openssh_pem(comment).expect("encode OpenSSH PEM");
+    let openssh_pem = build_ed25519_openssh_pem(&secret, &public, comment);
     let private_key = decode_secret_key(&openssh_pem, None).expect("decode russh PrivateKey");
     let (_alg, sha256_fingerprint, md5_fingerprint) =
         compute_ssh_fingerprints(private_key.public_key()).expect("compute fingerprints");

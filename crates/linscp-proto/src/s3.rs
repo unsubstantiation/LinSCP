@@ -16,9 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use linscp_crypto::digests::{compute_digest_hex, DigestAlgorithm, DigestHasher};
-use linscp_crypto::sigv4::{
-    format_amz_date, region_from_s3_host, sign_request, SigV4Credentials, SigV4Request,
-};
+use linscp_crypto::sigv4::{region_from_s3_host, sign_s3_request, S3SignParams};
 use linscp_types::{FileEntry, ProtocolScheme};
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
@@ -377,20 +375,20 @@ impl S3Session {
         body: Vec<u8>,
     ) -> Result<reqwest::Response, ProtoError> {
         let (host_header, canonical_uri, base_url) = self.endpoint_for(bucket, key);
-        let url = if query_params.is_empty() {
+        let qs = query_params
+            .iter()
+            .map(|(k, v)| {
+                if v.is_empty() {
+                    s3_query_encode(k)
+                } else {
+                    format!("{}={}", s3_query_encode(k), s3_query_encode(v))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        let url = if qs.is_empty() {
             base_url
         } else {
-            let qs = query_params
-                .iter()
-                .map(|(k, v)| {
-                    if v.is_empty() {
-                        s3_query_encode(k)
-                    } else {
-                        format!("{}={}", s3_query_encode(k), s3_query_encode(v))
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("&");
             format!("{base_url}?{qs}")
         };
 
@@ -398,60 +396,37 @@ impl S3Session {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let amz_date = format_amz_date(now_secs);
         let payload_sha256 = compute_digest_hex(DigestAlgorithm::Sha256, &body);
 
-        let mut sign_headers: Vec<(String, String)> = vec![
-            ("host".to_string(), host_header.clone()),
-            ("x-amz-content-sha256".to_string(), payload_sha256.clone()),
-            ("x-amz-date".to_string(), amz_date.clone()),
-        ];
+        let mut custom_headers: Vec<(String, String)> = Vec::new();
         if let Some(tok) = self.cfg.session_token.as_deref().filter(|t| !t.is_empty()) {
-            sign_headers.push(("x-amz-security-token".to_string(), tok.as_str().to_string()));
+            custom_headers.push(("x-amz-security-token".to_string(), tok.as_str().to_string()));
         }
         for (hk, hv) in &self.cfg.extra_signed_headers {
-            sign_headers.push((hk.clone(), hv.clone()));
+            custom_headers.push((hk.clone(), hv.clone()));
         }
         for (hk, hv) in extra_headers {
-            sign_headers.push((hk.clone(), hv.clone()));
+            custom_headers.push((hk.clone(), hv.clone()));
         }
 
-        let creds = SigV4Credentials {
-            access_key_id: self.cfg.access_key_id.clone(),
-            secret_access_key: self.cfg.secret_access_key.clone(),
-            session_token: self.cfg.session_token.as_ref().map(|z| z.as_str().to_string()),
-            region: self.region.clone(),
-            service: "s3".to_string(),
-        };
-        let sig = sign_request(
-            &creds,
-            &SigV4Request {
-                method: method.as_str(),
-                canonical_uri: &canonical_uri,
-                query_params,
-                headers: &sign_headers,
-                payload_sha256: &payload_sha256,
-                amz_date: &amz_date,
-            },
-        )
-        .map_err(|e| ProtoError::Transport(format!("S3 SigV4 signing failed: {e}")))?;
+        let sig = sign_s3_request(&S3SignParams {
+            method: method.as_str(),
+            uri: &canonical_uri,
+            query: &qs,
+            host: &host_header,
+            extra_headers: &custom_headers,
+            payload_hash: &payload_sha256,
+            epoch_seconds: now_secs,
+            region: &self.region,
+            access_key: &self.cfg.access_key_id,
+            secret_access_key: self.cfg.secret_access_key.as_str(),
+        });
 
-        let mut req = self
-            .client
-            .request(method, url)
-            .header("Host", host_header)
-            .header("x-amz-date", amz_date)
-            .header("x-amz-content-sha256", payload_sha256)
-            .header("Authorization", sig.authorization_header);
-        if let Some(tok) = self.cfg.session_token.as_deref().filter(|t| !t.is_empty()) {
-            req = req.header("x-amz-security-token", tok.as_str());
-        }
-        for (hk, hv) in &self.cfg.extra_signed_headers {
+        let mut req = self.client.request(method, url);
+        for (hk, hv) in &sig.headers {
             req = req.header(hk, hv);
         }
-        for (hk, hv) in extra_headers {
-            req = req.header(hk, hv);
-        }
+        req = req.header("Authorization", sig.authorization);
         if !body.is_empty() {
             req = req.body(body);
         }
