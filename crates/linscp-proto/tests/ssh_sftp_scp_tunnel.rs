@@ -1263,7 +1263,7 @@ async fn sftp_full_lifecycle_auth_modes_and_extensions_succeed() {
         .await
         .unwrap()
         .expect("server supports check-file-name");
-    assert_eq!(used_alg, "sha256");
+    assert_eq!(used_alg, "sha-256");
     let local_hex = linscp_crypto::digests::compute_digest_hex(DigestAlgorithm::Sha256, full_expected);
     assert_eq!(srv_hex, local_hex);
     assert_eq!(
