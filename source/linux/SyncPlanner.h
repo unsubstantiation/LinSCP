@@ -82,7 +82,7 @@ std::string SyncCriteriaName(const SyncCriteria & criteria);
 bool ParseSyncCriteria(const std::string & text, SyncCriteria & criteria,
     std::string & error);
 
-/* One comparison attached to a mask token, WinSCP's extended mask
+/* One comparison attached to a mask token, LinSCP's extended mask
  * syntax: '*.tmp>1M' or '*.log>=2026-01-01'. */
 struct MaskCriterion
 {
@@ -92,7 +92,7 @@ struct MaskCriterion
     unsigned long time;           /* seconds since the epoch, when !isSize */
 };
 
-/* One mask token of a WinSCP file mask:
+/* One mask token of a LinSCP file mask:
  *
  *   name mask       "*.tmp"         matches file names
  *   directory mask  "any/build/"      matches directories (trailing '/')
@@ -112,7 +112,7 @@ struct FileMaskToken
 
 /* A set of include/exclude file masks.
  *
- * The syntax is the WinSCP one:
+ * The syntax is LinSCP's:
  *
  *   "*.txt"                 include only files matching *.txt
  *   "|*.bak"                exclude files matching *.bak

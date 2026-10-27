@@ -36,7 +36,7 @@ with another program.
 
 History
 
-LinSCP began as a fork of WinSCP. The WinSCP-derived code has been removed
+LinSCP began as a fork of WinSCP. The inherited code has been removed
 from this source tree; it survives only in the git history, where those old
 commits stay under the GNU General Public License version 3. The files in the
 current tree are LinSCP's own work, apart from the components named

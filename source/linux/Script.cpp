@@ -8435,9 +8435,9 @@ bool Script::CopyPublicKey(const std::vector<std::string> & args)
             {{"path", sshDirectory}}));
     }
 
-    /* Keep the keys that are installed already; a repeated 'copyid' must not
-     * grow the file, and a server with a full authorized_keys is a common
-     * leftover of a previous WinSCP run. */
+    /* Keep the keys that are installed already; a repeated 'copyid' must
+     * not grow authorized_keys, which may already contain keys from an
+     * earlier run. */
     const std::string temp = MakeTempPath("authkeys");
     if (temp.empty())
     {
@@ -8806,12 +8806,11 @@ bool Script::StatRemote(const std::vector<std::string> & args)
 }
 
 /*
- * WinSCP's "Open Terminal" (Ctrl+P): an interactive shell on the server
- * that the session is connected to. This client's SSH core offers the
- * SFTP subsystem only, so the shell comes from the system ssh client in
- * a terminal window, which is also what makes the command useful in a
- * script file. The terminal program is picked by the platform layer
- * (LINSCP_TERMINAL overrides it on POSIX).
+ * "Open Terminal": an interactive shell for an SSH session. This command
+ * uses the system ssh client in a local terminal; the GUI's embedded
+ * terminal instead uses the core's own -shell channel. The platform layer
+ * selects a terminal for the active display server; LINSCP_TERMINAL
+ * overrides its choice.
  */
 void Script::OpenTerminal(const std::vector<std::string> & args)
 {
@@ -9360,7 +9359,7 @@ static std::string CanonicalCommandAlias(const std::string & name)
 /* Help texts, kept as data so that 'help' can enumerate the commands the
  * way upstream enumerates its registered ones. Upstream keeps these in its
  * resource strings; this is the equivalent for the implemented subset,
- * close to the wording of the WinSCP documentation. */
+ * close to the wording of the upstream documentation. */
 namespace {
 const struct ScriptCommandHelpEntry
 {

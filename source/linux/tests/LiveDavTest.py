@@ -351,7 +351,7 @@ class LiveDavTests(unittest.TestCase):
         self.assertEqual(sha256_of(source), sha256_of(downloaded))
 
     def test_keepuptodate_reflects_local_files_on_the_remote_side(self):
-        """WinSCP's command watches the local side and reflects its files
+        """`keepuptodate` watches the local side and reflects its files
         onto the remote directory; one bounded pass must therefore upload."""
         local_dir = self.root / "keepuptodate-once"
         local_dir.mkdir()

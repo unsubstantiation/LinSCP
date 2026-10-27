@@ -17,7 +17,7 @@ configured parent proxy is used to reach the **jump host**, not to bypass it
 and reach the destination directly. If the jump refuses a forward, the session
 fails; it never falls back to a direct connection.
 
-This is a supported subset, **not full WinSCP tunnel or authentication parity**.
+This is a supported subset, **not full upstream tunnel or authentication parity**.
 Kerberos/GSSAPI authentication uses libssh when its public GSSAPI capability is
 present; GSSAPI key exchange is probed separately and `AuthGSSAPIKEX` is refused
 if the loaded libssh cannot honor it or a host-key pin is configured, rather
@@ -82,7 +82,7 @@ the same OS user and privileged processes may be able to read them.
 
 The upstream `TunnelPasswordPlain` and `TunnelPassphrasePlain` spellings are
 also accepted as aliases for the corresponding plaintext inputs and are masked
-in logs. This does not import WinSCP's encrypted password representation.
+in logs. This does not import the upstream client's encrypted password format.
 
 Passwords and passphrases are not saved merely by connecting. To store jump
 secrets explicitly, supply `TunnelPassword`/`TunnelPassphrase` to

@@ -1,10 +1,9 @@
 /*
- * TransferPresets: named sets of transfer settings with an optional
- * applicability rule - the shape of upstream's TCopyParamList, which
- * WinSCP's GUI edits in its "transfer settings preset" dialog and
- * applies by rule (host name, user name, remote directory, local
- * directory and a file mask), with the settings themselves being the
- * fields of its TCopyParamType.
+ * TransferPresets: named sets of transfer settings with optional
+ * applicability rules, modeled on upstream's TCopyParamList. The
+ * upstream GUI edits these in its "transfer settings preset" dialog and
+ * applies them by host, user, directory and file mask. The settings
+ * mirror the fields of upstream's TCopyParamType.
  *
  * This client keeps the presets in an INI file next to sessions.ini,
  * one section per preset:

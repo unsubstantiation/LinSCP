@@ -133,10 +133,9 @@ check: $(BINDIR)/unittest
 	$(PYTHON) $(TOP)/tools/check_wayland_compatibility.py
 	$(PYTHON) $(TOP)/tools/tests/test_wayland_compatibility.py
 
-# The guard that keeps this a Linux-only client: it reads the sources
-# and refuses a Windows construct, a file of another platform, an
-# installer that disagrees with the others, and an error message that
-# contradicts the template it is filled into.
+# Guards the Linux-only conversion and product naming: Windows constructs,
+# non-Linux files, inconsistent installers, contradictory error templates,
+# and upstream names outside the documented external-identifier allowlist.
 check-conversion:
 	$(PYTHON) $(TOP)/tools/check_platform_conversion.py
 	$(PYTHON) $(TOP)/tools/tests/test_platform_conversion.py
@@ -209,7 +208,7 @@ install: $(BINDIR)/linscp
 	install -m 0644 $(TOP)/automation/LinSCP.psm1 $(DESTDIR)$(PREFIX)/share/linscp/automation/
 	install -m 0644 $(TOP)/automation/dotnet/LinSCP/LinSCP.csproj \
 		$(TOP)/automation/dotnet/LinSCP/Session.cs \
-		$(TOP)/automation/dotnet/LinSCP/WinSCPCompat.cs \
+		$(TOP)/automation/dotnet/LinSCP/LinSCPCompat.cs \
 		$(DESTDIR)$(PREFIX)/share/linscp/dotnet/
 
 clean:

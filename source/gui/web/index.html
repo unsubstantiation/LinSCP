@@ -357,7 +357,7 @@
     </div>
   </div>
 
-  <!-- WinSCP Commander function-key order; actions follow the focused panel. -->
+  <!-- LinSCP Commander function-key order; actions follow the focused panel. -->
   <div class="function-keys" role="toolbar" aria-label="Commander function keys">
     <button class="fn-key" onclick="showHelp()" title="Help"><strong>F1</strong><span>Help</span></button>
     <button class="fn-key" onclick="renamePrompt(state.focusPane)" title="Rename selected item"><strong>F2</strong><span>Rename</span></button>
@@ -1160,7 +1160,7 @@
     paused: false,
     editor: { path: '', content: '', original: '', baseMtime: 0, dirty: false },
     syncPlan: null,
-    /* Synchronized browsing (WinSCP's): entering a directory in one
+    /* Synchronized browsing (LinSCP's): entering a directory in one
      * pane carries the other one along when the counterpart exists. */
     syncBrowse: (() => {
       try { return localStorage.getItem('lscp-sync-browse') === '1'; }
@@ -1640,7 +1640,7 @@
    * Synchronized browsing: both panes move as one. The counterpart is
    * loaded first, and the pane the user acted on only follows when it
    * exists there - otherwise both stay where they were, which is what
-   * WinSCP does instead of leaving the pair at different depths.
+   * LinSCP does instead of leaving the pair at different depths.
    */
   async function navigateSync(side, targetOfSide) {
     const other = side === 'local' ? 'remote' : 'local';

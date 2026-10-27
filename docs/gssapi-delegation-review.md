@@ -50,8 +50,9 @@ Facts a reviewer should confirm:
    `GSSAPIFwdTGT=1`, the TGT is delegated to the jump host as well as to the
    destination. `SshJumpTunnel::Start` and `SshJumpTunnel::StartSocks` copy the
    destination's whole GSSAPI policy except `LogicalHostName`. This matches
-   upstream: WinSCP's `TSessionData::CreateTunnelData` copies `AuthGSSAPI`,
-   `AuthGSSAPIKEX` and `GSSAPIFwdTGT` into the tunnel session.
+   the upstream implementation: `TSessionData::CreateTunnelData` copies
+   `AuthGSSAPI`, `AuthGSSAPIKEX` and `GSSAPIFwdTGT` into the tunnel
+   session.
 4. **The delegation notice is not shown by default.** "Kerberos credentials
    will be delegated to the server (GSSAPIFwdTGT)" goes through
    `Console::LogEvent`. It appears only with `-verbose` or in a `-log` file.

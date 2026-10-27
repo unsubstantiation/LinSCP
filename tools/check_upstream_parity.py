@@ -340,7 +340,7 @@ def matrix_report(inventory):
         '# Linux feature inventory', '',
         'Generated from [upstream-parity.json](upstream-parity.json). Baseline: ' +
         inventory['upstream']['repository'] + ' `' + inventory['upstream']['commit'] + '`.', '',
-        '**Inventory completeness is not implementation completeness. Full WinSCP parity is not achieved.**', '',
+        '**Inventory completeness is not implementation completeness. Full upstream parity is not achieved.**', '',
         inventory.get('scope', {}).get('definition', ''), '',
         f"{len(rows)} capabilities: {counts['verified']} verified for the stated behavior, "
         f"{counts['partial']} partial, {counts['missing']} missing.", '',

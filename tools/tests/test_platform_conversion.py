@@ -1,8 +1,8 @@
 """Regressions of the platform-conversion check.
 
-The check is the guard that keeps LinSCP a Linux-only client, so it
-has to be shown to fail on the things it claims to catch and to stay
-quiet about the ones it does not.
+The check guards the Linux-only conversion and product naming, so it has
+to fail on the constructs it claims to catch and stay quiet about the
+allowlisted external identifiers.
 """
 import pathlib
 import sys
@@ -37,6 +37,17 @@ class ConversionCheckTests(unittest.TestCase):
 
     def test_the_real_tree_has_no_windows_construct(self):
         self.assertEqual(check.collect(), [])
+
+    def test_a_stale_upstream_product_reference_is_found(self):
+        stale = 'Win' + 'SCP-style interface'
+        self.write('docs/brand.md', stale + '\n')
+        findings = check.check_brand_references(self.root)
+        self.assertIn('brand-reference', self.names(findings))
+
+    def test_an_external_compatibility_identifier_is_allowed(self):
+        xmlns = 'http://' + 'win' + 'scp' + '.net/schema/session/1.0'
+        self.write('docs/brand.md', 'The log namespace is ' + xmlns + '.\n')
+        self.assertEqual(check.check_brand_references(self.root), [])
 
     def test_a_windows_api_call_is_found(self):
         path = self.write('source/linux/Platform.cpp',

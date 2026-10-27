@@ -726,7 +726,7 @@ bool TrimString(const std::string & text, std::string & result)
     return !result.empty();
 }
 
-/* A WinSCP-style octal permission value: '600', '0600', '00600'. */
+/* An octal permission value accepted by chmod: '600', '0600', '00600'. */
 bool ParseOctalMode(const std::string & text, unsigned long & result)
 {
     std::string digits = text;

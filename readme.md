@@ -7,11 +7,12 @@
 # LinSCP
 
 LinSCP is a noncommercial file transfer client for Debian GNU/Linux. It has
-a command-line client with a WinSCP-style scripting language, and a
+a command-line client with an upstream-compatible scripting language, and a
 browser-based dual-pane Commander (`linscp-gui`).
 
-LinSCP implements a subset of WinSCP's workflows. It is **not full WinSCP
-parity**: see [Protocols](#protocols) and the [parity audit](docs/upstream-parity.md).
+LinSCP implements a subset of the upstream feature set. It does **not**
+provide full upstream parity: see [Protocols](#protocols) and the
+[parity audit](docs/upstream-parity.md).
 
 ## Requirements
 
@@ -63,12 +64,11 @@ permission, response headers, command quoting, and the confinement of every
 local path to its pane.
 
 `make -C source/linux check` also runs `tools/check_platform_conversion.py`.
-LinSCP is a Linux-only client - the Windows port is gone - and that check
-reads the sources and refuses a Windows API call, a Windows environment
-variable, a Windows path, a file of another platform, an installer that
-disagrees with the others, and an error message whose wording contradicts the
-template it is filled into. It is what keeps the conversion complete rather
-than merely done once.
+LinSCP is Linux-only - the Windows port is gone - and the check rejects
+Windows constructs, non-Linux files, inconsistent installers, contradictory
+error templates, and upstream names outside the documented external-identifier
+allowlist. It is what keeps the conversion complete rather than merely done
+once.
 
 A second check guards the other half of "runs on Linux": a Wayland desktop,
 where an application that only asks for `$DISPLAY` sees no display at all.
@@ -113,7 +113,7 @@ it can be pinned.
 
 ## Features
 
-- **Transfers:** binary, ASCII and automatic modes; WinSCP file masks; recursive
+- **Transfers:** binary, ASCII and automatic modes; LinSCP file masks; recursive
   `get` and `put`; resume through `.filepart` staging; `-append` (SFTP only);
   `-speed=` limits; `-preservetime`; transfer presets.
 - **Synchronization:** `synchronize` in one or both directions, and
@@ -150,7 +150,7 @@ it can be pinned.
   `xdotool`, `wmctrl` or `xrandr`, which is what makes a Linux application
   X11-only.
 
-Full WinSCP parity is **not** implemented. Remaining gaps include complete
+Full upstream parity is **not** implemented. Remaining gaps include complete
 compatibility with the upstream .NET object model, broader localization beyond
 English/Spanish, and an independent security review plus broader production-realm
 validation of GSSAPI. The live SFTP suite exercises GSSAPI against a throwaway
@@ -158,15 +158,21 @@ Kerberos realm; this does not certify every KDC deployment. Local-to-local sessi
 local panes, named multi-tab workspaces, directory bookmarks, session import
 from OpenSSH/FileZilla and session-URL generation are implemented and covered
 by the `gui-local` and `gui` suites.
-The .NET-compatible assembly (`LinSCP.Session`, with `WinSCP.Session` aliases)
-covers session lifecycle, listing, transfers, synchronization, cancellation and
-structured errors; it is not every type of the upstream object model.
+The .NET-compatible assembly (`LinSCP.Session`, with an upstream compatibility
+namespace) covers session lifecycle, listing, transfers, synchronization,
+cancellation and structured errors; it is not every type of the upstream
+object model.
 `automation/LinSCP.psm1` is a PowerShell 7 CLI wrapper with static tests and
-optional live Pester tests, not the WinSCP .NET API. Optional account sign-in
+optional live Pester tests, not the upstream .NET API. Optional account sign-in
 isolates users at the application layer; the backend still runs as one OS user.
 See the
 [remaining parity plan](docs/remaining-parity-plan.md) for scope and acceptance
 criteria; passing the inventory checker is not a full-parity certification.
+
+A small allowlist preserves upstream repository paths, XML/.NET identifiers,
+external documentation URLs, Windows-executable detection and the fork notice
+in NOTICE. These are interoperability or historical identifiers, not product
+branding.
 
 ## Documentation
 
@@ -184,14 +190,16 @@ criteria; passing the inventory checker is not a full-parity certification.
 ## Repository layout
 
 ```
-automation/    PowerShell 7 CLI wrapper, static and optional Pester tests
+.github/       CI workflows
+automation/    PowerShell 7 wrapper and .NET assembly, with their tests
 debian/        Debian packaging
-docs/          documentation, manual page and parity inventory
+docs/          documentation, manual page, schema and parity inventory
+fixtures/      XML action-log examples used by tests
 logo/          logo artwork
 source/gui/    browser Commander: Python server, web client, tests
-source/linux/  linscp client: front end, protocol glue, tests, Makefile
-source/linux/  console client: libssh transport, native SFTP/SCP
-tools/         parity inventory, translation and platform-conversion checkers
+source/linux/  console client: front end, protocol glue, libssh transport,
+               native SFTP/SCP, tests and Makefile
+tools/         parity, translation, Wayland and platform/branding checkers
 ```
 
 ## Licence

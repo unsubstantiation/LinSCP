@@ -1,8 +1,8 @@
-// LinSCP .NET assembly: a WinSCP.Session-shaped object model for Linux.
+// LinSCP .NET assembly: a session object model for Linux.
 //
-// The upstream WinSCP assembly wraps winscp.com's scripting interface. This
-// library does the same for `linscp -server`: one persistent process, one
-// command per line, answers ending in `LSCP-RESULT <code>`. The public types
+// The upstream assembly drives a Windows console process; this library drives
+// `linscp -server`: one persistent process, one command per line and one
+// `LSCP-RESULT <code>` answer per command. The public types
 // are the session lifecycle, listing, transfer, synchronization, cancellation,
 // structured results and error propagation - not a thin CLI wrapper with no
 // object model.
@@ -175,9 +175,8 @@ namespace LinSCP
         public List<RemoteFileInfo> Files { get; } = new List<RemoteFileInfo>();
     }
 
-    /* Derived from the compatibility types in WinSCPCompat.cs, not the other
-     * way round, so that a script written against WinSCP.Session and catching
-     * its own SessionRemoteException/SessionLocalException still catches what
+    /* These exceptions derive from the compatibility types in
+     * LinSCPCompat.cs, so scripts importing either namespace catch what
      * this assembly throws. */
     public class SessionRemoteException : WinSCP.SessionRemoteException
     {

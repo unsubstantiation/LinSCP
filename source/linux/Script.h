@@ -1,6 +1,6 @@
 /*
  * Script: the command interpreter of the POSIX front end, following the
- * command set of the WinSCP console client so that existing scripts keep
+ * command set of the upstream console client so that existing scripts keep
  * working.
  */
 
@@ -389,7 +389,7 @@ private:
     /* One file or tree to one exact destination. */
     bool CopyRemoteTree(const std::string & from, const std::string & to);
     bool CopyRemoteOneFile(const std::string & from, const std::string & to);
-    /* 'ln'/'symlink': target first, like ln(1) and WinSCP. */
+    /* 'ln'/'symlink': target first, like ln(1) and the upstream client. */
     bool LinkRemote(const std::vector<std::string> & args, const char * name);
     /* 'checksum <algorithm> <file>': server-side when the protocol can,
      * otherwise computed while downloading. */
@@ -543,7 +543,7 @@ private:
      * not even one whose host/user/directory rule matches. */
     bool mPresetOff = false;
     TransferMode mTransferMode;
-    /* 'option include' / 'option exclude' (one WinSCP mask: setting one
+    /* 'option include' / 'option exclude' (one LinSCP mask: setting one
      * half replaces the other, like upstream). */
     FileMask mOptionMask;
     bool mOptionMaskUsed;

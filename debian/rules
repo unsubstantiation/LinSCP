@@ -51,7 +51,7 @@ binary: build
 	install -m 0644 automation/LinSCP.psm1 $(destdir)/usr/share/linscp/automation/
 	install -m 0644 automation/dotnet/LinSCP/LinSCP.csproj \
 		automation/dotnet/LinSCP/Session.cs \
-		automation/dotnet/LinSCP/WinSCPCompat.cs \
+		automation/dotnet/LinSCP/LinSCPCompat.cs \
 		$(destdir)/usr/share/linscp/dotnet/
 	install -m 0644 debian/linscp.desktop $(destdir)/usr/share/applications/linscp.desktop
 	install -m 0644 debian/linscp.png $(destdir)/usr/share/pixmaps/linscp.png

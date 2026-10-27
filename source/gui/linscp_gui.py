@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 LinSCP Graphical Commander Interface Server
-Provides a web-based dual-pane WinSCP Commander-style interface
-backed by the LinSCP protocol engine.
+Provides a web-based dual-pane LinSCP Commander backed by
+`linscp -server`.
 
 Architecture
 ------------
@@ -5343,17 +5343,13 @@ def local_search(start, pattern, limit=500, case_sensitive=False,
 # Local-to-local copies (no server, no core process)
 # ---------------------------------------------------------------------------
 #
-# Upstream's local browser session has two local directories and no remote
-# side. The copy engine here is deliberately independent of the console
-# client: there is no command stream, no quote parser and no SSH state to
-# disturb, and a local operation cannot accidentally become a remote one.
+# A local-to-local tab has two local directories and no remote side. Its
+# copy engine is independent of the console client, so no command stream,
+# quote parser or SSH state can turn a local operation into a remote one.
 #
-# The policy is part of the API, because a browser cannot answer an overwrite
-# prompt from a background queue thread. A caller that did not state a policy
-# gets "ask": if a destination entry exists the request is refused with the
-# list of conflicts and nothing is copied, so the page can confirm once and
-# retry with an explicit decision. "skip", "overwrite" and "rename" are the
-# three answers WinSCP's copy dialog offers.
+# The overwrite policy is part of the API because a background queue cannot
+# prompt. Without a policy, conflicts are returned so the page can ask once
+# and retry; the other accepted policies are skip, overwrite and rename.
 
 LOCAL_OVERWRITE_POLICIES = ("ask", "overwrite", "skip", "rename")
 

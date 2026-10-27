@@ -129,7 +129,7 @@ linscp -batch -command="open sftp://user@example.com/; cd /data; ls; get * /tmp"
 | `-port=<number>` | port (default 22) |
 | `-timeout=<secs>` | connection timeout (default 15) |
 | `-log=<file>` | write the session log to a file |
-| `-xmllog=<file>` | write an XML log in the upstream session format (`http://winscp.net/schema/session/1.0`, pinned as [winscp-session-1.0.xsd](winscp-session-1.0.xsd)): one `<group>` per command and one element per operation, with passwords masked |
+| `-xmllog=<file>` | write an XML log in the upstream session format (namespace `http://winscp.net/schema/session/1.0`, schema pinned as [linscp-session-1.0.xsd](linscp-session-1.0.xsd)): one `<group>` per command and one element per operation, with passwords masked |
 | `-parameter <value>...` | script parameters, for `%1%` to `%9%` |
 | `-batch` | never ask; fail instead |
 | `-server` | read one command per line on standard input and answer each with `LSCP-RESULT`; the GUI drives the client this way |
@@ -149,10 +149,10 @@ commands through a pipe.
 `chmod`, `stat`, `checksum`, `copyid`, `presets`, `savepreset`, `rmspreset`,
 `option`, `echo`, `call` (`!`), `terminal`, `help`, `exit`.
 
-Upstream WinSCP aliases are also accepted: `recv`/`mget`, `send`/`mput`, `dir`,
-`rename`, `del`, `md`, `sync`, `man`, `bye`, `quit` and `end`. `show` is
-recognised only to refuse it: the connection runs the SFTP subsystem, so there
-is no shell to ask for settings.
+Compatibility aliases from the upstream scripting language are also accepted:
+`recv`/`mget`, `send`/`mput`, `dir`, `rename`, `del`, `md`, `sync`, `man`,
+`bye`, `quit` and `end`. `show` is recognised only to refuse it: the
+connection runs the SFTP subsystem, so there is no shell to ask for settings.
 
 `lock`, `unlock` and `property` are WebDAV extensions. A lock is an exclusive
 write lock, and later uploads, deletes and moves of that path carry its token.
@@ -244,9 +244,9 @@ Scripts stop at the first error by default. `option batch on|off|abort|continue`
 sets this: `on` and `abort` stop, while `off` and `continue` carry on and keep a
 non-zero exit status. `echo` prints a message to the script output.
 
-`terminal` opens an interactive shell on the server, as the "Open Terminal"
-button of WinSCP does. It starts the system `ssh` client in a terminal window
-on the desktop. The program is taken from `LINSCP_TERMINAL` (`<program>
+`terminal` opens an interactive shell on the server, as the upstream "Open
+Terminal" command does. It starts the system `ssh` client in a local
+terminal window. The program is taken from `LINSCP_TERMINAL` (`<program>
 [args]`, for example `xterm -e`), or else from these, in this order and among
 the ones that are installed: `x-terminal-emulator`, `gnome-terminal`,
 `konsole`, `xfce4-terminal`, `mate-terminal`, `lxterminal`, `terminator`,
@@ -343,7 +343,7 @@ writes the same files.
 
 ## Graphical client (`linscp-gui`)
 
-`linscp-gui` and `linscp -gui` start a dark, WinSCP-style Commander in the
+`linscp-gui` and `linscp -gui` start a dark, dual-pane LinSCP Commander in the
 browser. Run at a terminal, `linscp -gui` also asks the desktop for the browser
 window (`--open-browser`); with its output redirected it does not, so a script
 is never interrupted by a window it did not ask for. The Commander offers:
@@ -507,9 +507,10 @@ watch cannot be set up, the client falls back to timer polling. It runs in the
 foreground until Ctrl-C, or until `-count=` passes complete, so a
 non-interactive script must give `-count=`.
 
-The .NET-compatible assembly (`LinSCP.Session`, with `WinSCP.Session` aliases)
-implements session lifecycle, listing, transfers, synchronization, cancellation
-and structured errors, but it is not the complete upstream object model.
+The .NET-compatible assembly (`LinSCP.Session`, with an upstream compatibility
+namespace) implements session lifecycle, listing, transfers, synchronization,
+cancellation and structured errors, but it is not the complete upstream object
+model.
 Optional account sign-in isolates users at the application layer while the
 backend still runs as one OS user. Catalogs for every language upstream ships
 (the shipped ones are listed in [Localization](localization.md)) and complete

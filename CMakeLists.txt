@@ -156,10 +156,9 @@ if(Python3_Interpreter_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_parity_inventory.py)
   add_test(NAME parity-inventory COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_upstream_parity.py)
-  # The guard that keeps this a Linux-only client: it reads the sources
-  # and refuses a Windows construct, a file of another platform, an
-  # installer that disagrees with the others, and an error message that
-  # contradicts the template it is filled into.
+  # Guards the Linux-only conversion and product naming: Windows constructs,
+  # non-Linux files, inconsistent installers, contradictory error templates,
+  # and upstream names outside the documented external-identifier allowlist.
   add_test(NAME platform-conversion-check COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_platform_conversion.py)
   add_test(NAME platform-conversion-tests COMMAND ${Python3_EXECUTABLE}
@@ -235,5 +234,5 @@ install(DIRECTORY source/gui/web/ DESTINATION share/linscp/gui/web)
 install(FILES automation/LinSCP.psm1 DESTINATION share/linscp/automation)
 install(FILES automation/dotnet/LinSCP/LinSCP.csproj
               automation/dotnet/LinSCP/Session.cs
-              automation/dotnet/LinSCP/WinSCPCompat.cs
+              automation/dotnet/LinSCP/LinSCPCompat.cs
         DESTINATION share/linscp/dotnet)

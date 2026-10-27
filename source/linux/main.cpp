@@ -397,7 +397,7 @@ int main(int argc, char ** argv)
     {
         if (collectingParameters)
         {
-            /* WinSCP takes the script parameters after a bare '/parameter';
+            /* LinSCP takes the script parameters after a bare '/parameter';
              * they are not the site URL, however they look. */
             parameters.push_back(argv[i]);
             continue;

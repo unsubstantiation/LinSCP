@@ -1,7 +1,10 @@
 # LinSCP .NET assembly
 
-A WinSCP.Session-shaped object model for Linux. It drives `linscp -server`
-the way upstream's assembly drives its scripting interface.
+A LinSCP session object model for Linux. It drives `linscp -server` as the
+upstream assembly drives its scripting interface.
+
+The compatibility namespace below is retained for existing scripts. New code
+should use `LinSCP`.
 
 ```csharp
 using LinSCP;

@@ -1,16 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  XML Schema for the XML log format '-xmllog=' writes: the upstream
-  WinSCP session log namespace http://winscp.net/schema/session/1.0.
+  XML Schema for the action log written by '-xmllog='. Its namespace is
+  http://winscp.net/schema/session/1.0, deliberately kept in the upstream
+  wire form for existing consumers; only the local filename is rebranded.
 
-  This schema is pinned here, in the repository, from upstream's own
-  definition of the format: the emitter in winscp/winscp
-  source/core/SessionInfo.cpp (TSessionActionRecord/TActionLog at the
-  parity pin, see docs/upstream-parity.json) and the "XML Logging"
-  documentation page (winscp.net/eng/docs/logging_xml), which describes
-  every element below and names this namespace as the schema's home.
-  It is written from that specification, not copied from the published
-  schema file, so the tests can validate offline:
+  The schema is derived from the upstream emitter in
+  source/core/SessionInfo.cpp (TSessionActionRecord/TActionLog at the pin in
+  docs/upstream-parity.json) and the "XML Logging" page
+  (winscp.net/eng/docs/logging_xml). It is written from those sources, not
+  copied from a published schema, so tests can validate logs offline:
 
     - '<session>' holds operations directly, or '<group>' elements (one
       per script command; this client always groups), each holding

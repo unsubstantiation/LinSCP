@@ -1,11 +1,11 @@
 /*
- * TextMode: WinSCP's transfer modes (binary, ASCII and automatic).
+ * TextMode: LinSCP's transfer modes (binary, ASCII and automatic).
  *
  * In ASCII mode a text file is converted between the line endings of
  * the two sides: CRLF on the remote side becomes LF on a POSIX local
  * side when downloading, and LF becomes CRLF when uploading.
  * 'Automatic' applies that conversion only to files whose name matches
- * the ASCII file mask below, like WinSCP's default configuration.
+ * the ASCII file mask below, like LinSCP's default configuration.
  *
  * The conversion happens around a binary transfer: a download is
  * converted in place afterwards, an upload is converted into a
@@ -19,7 +19,7 @@
 
 namespace linscp {
 
-/* Which files 'automatic' mode converts. This is WinSCP's default list
+/* Which files 'automatic' mode converts. This is LinSCP's default list
  * of text file extensions. */
 extern const char * const kAsciiFileMask;
 
