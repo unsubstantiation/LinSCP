@@ -2170,6 +2170,7 @@ fn make_gui_ssh_host_key_callback(
 
 /// Connects a `ParsedSiteSpec` silently for `CommanderService` tabs, returning a
 /// structured `GuiConnectError::HostKeyChallenge` instead of writing `HOSTKEY` lines to stdout.
+#[allow(clippy::result_large_err)]
 pub async fn connect_gui_site_spec(
     spec: &ParsedSiteSpec,
     config_dir: &Path,
