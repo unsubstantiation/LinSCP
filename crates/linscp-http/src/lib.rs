@@ -200,8 +200,8 @@ async fn index_handler(State(state): State<Arc<HttpAppState>>, headers: HeaderMa
     };
     let mut resp = Html(injected).into_response();
     resp.headers_mut().insert(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate".parse().unwrap());
-    resp.headers_mut().insert("X-Content-Type-Options".parse().unwrap(), "nosniff".parse().unwrap());
-    resp.headers_mut().insert("X-Frame-Options".parse().unwrap(), "DENY".parse().unwrap());
+    resp.headers_mut().insert(axum::http::HeaderName::from_static("x-content-type-options"), "nosniff".parse().unwrap());
+    resp.headers_mut().insert(axum::http::HeaderName::from_static("x-frame-options"), "DENY".parse().unwrap());
     resp
 }
 
@@ -272,7 +272,7 @@ async fn api_handler(
     let parsed_body: Value = if body.is_empty() {
         json!({})
     } else {
-        match serde_json::from_slice(&body) {
+        match serde_json::from_slice::<Value>(&body) {
             Ok(val) => {
                 if !val.is_object() && !val.is_array() {
                     // Python requires dict, but we allow any JSON and let service validate
