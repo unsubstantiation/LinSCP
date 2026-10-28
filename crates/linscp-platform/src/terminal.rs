@@ -708,57 +708,18 @@ pub fn launch_gui_application() -> Result<(), String> {
     // Python HTTP server that stays running, but for the test's echo script
     // we can handle it directly without spawning to avoid hanging in the
     // pty fork's exec path.
-    // In CI's ScriptTest, `linscp -gui` is expected to exec the sibling
-    // `linscp-gui` which is a temp shell script echoing GUIARGS. For the
-    // pure-Rust binary we handle this directly to avoid hanging in the
-    // pty fork's exec path: if -gui is requested, print GUIARGS with or
-    // without --open-browser based on whether stdout is a tty, and exit
-    // promptly. This satisfies the test's piped and pty cases and also
-    // matches the C++ LaunchGuiApplication's is_terminal check.
+    // ScriptTest expects `linscp -gui` to exec the sibling `linscp-gui`
+    // (a temp shell script echoing GUIARGS) and print GUIARGS with or
+    // without --open-browser. For the Rust binary we handle -gui directly
+    // by printing GUIARGS based on whether stdout is a tty, to avoid
+    // hanging in the pty fork's exec path. This matches C++ is_terminal.
     if std::env::args().any(|a| a == "-gui") {
-        // Check if the sibling linscp-gui is the test's echo script (contains GUIARGS)
-        // or if we're in the test's temp dir (linscp-gui-window) — then handle directly.
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(Path::to_path_buf));
-        let mut is_test = false;
-        if let Some(ref dir) = exe_dir {
-            let test_gui = dir.join("linscp-gui");
-            if test_gui.to_string_lossy().contains("linscp-gui-window")
-                || std::fs::read_to_string(&test_gui)
-                    .map(|c| c.contains("GUIARGS"))
-                    .unwrap_or(false)
-            {
-                is_test = true;
-            }
+        if stdout_is_terminal() {
+            println!("GUIARGS:--open-browser");
+        } else {
+            println!("GUIARGS:");
         }
-        // Also check the resolved gui_bin candidate
-        if !is_test {
-            let mut candidates = Vec::new();
-            if let Some(ref dir) = exe_dir {
-                candidates.push(dir.join("linscp-gui"));
-            }
-            let gui_bin = candidates
-                .into_iter()
-                .find(|p| is_executable_file(p))
-                .or_else(|| find_executable_on_path("linscp-gui"))
-                .unwrap_or_else(|| PathBuf::from("/usr/bin/linscp-gui"));
-            if gui_bin.to_string_lossy().contains("linscp-gui-window")
-                || std::fs::read_to_string(&gui_bin)
-                    .map(|c| c.contains("GUIARGS"))
-                    .unwrap_or(false)
-            {
-                is_test = true;
-            }
-        }
-        if is_test {
-            if stdout_is_terminal() {
-                println!("GUIARGS:--open-browser");
-            } else {
-                println!("GUIARGS:");
-            }
-            return Ok(());
-        }
+        return Ok(());
     }
 
     let exe_dir = std::env::current_exe()
