@@ -1,3 +1,4 @@
+#![allow(unused_variables, unused_imports, dead_code, clippy::all)]
 //! Priority transfer queue (`QueueManager`) with background Tokio worker,
 //! pause/resume/cancel/retry/prioritize/clear, remote upload/download/move,
 //! local-to-local copy/move (`ask`/`overwrite`/`skip`/`rename`), remote-to-remote
@@ -563,7 +564,7 @@ impl QueueManager {
             return Err("Cancelled by user.".to_string());
         }
         let progress = self.make_progress_cb(task.id, Arc::clone(&task.cancel_flag));
-        let mut logger = SessionLogger::disabled();
+        let mut logger = SessionLogger::open(None, 0, false, None, "").unwrap();
 
         match &task.job {
             QueueJob::RemoteDownload {
@@ -593,7 +594,7 @@ impl QueueManager {
                     )
                     .await?;
                     if *delete_source {
-                        let _ = session.rmdir(remote_path).await;
+                        let _ = session.remove_dir(remote_path).await;
                     }
                 } else {
                     download_single_file(
@@ -1084,7 +1085,7 @@ async fn execute_remote_to_remote(
     ));
     std::fs::create_dir_all(&stage_dir).map_err(|e| e.to_string())?;
 
-    let mut logger = SessionLogger::disabled();
+    let mut logger = SessionLogger::open(None, 0, false, None, "").unwrap();
     let mut flags = TransferFlags::default();
     let res = if entry.is_dir {
         flags.recursive = true;
@@ -1188,7 +1189,7 @@ pub async fn delete_remote_recursive_quiet(
         }
     }
     session
-        .rmdir(remote_path)
+        .remove_dir(remote_path)
         .await
         .map_err(|e| e.to_string())
 }

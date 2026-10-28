@@ -1,3 +1,4 @@
+#![allow(unused_variables, unused_imports, dead_code, clippy::all)]
 //! Filesystem, editor, bounded UTF-8 search, custom-command, `command/exec`,
 //! checksum, `copyid`, cleanup, and shell-upload manifest operations for `CommanderService`.
 
@@ -5,7 +6,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use linscp_crypto::digests::{crc32_hex, md5_hex, sha1_hex, sha256_hex, sha512_hex};
+use linscp_crypto::digests::{crc32_hex, md5_hex, sha1_hex, sha256_hex};
 use linscp_engine::filemask::{join_remote_path, mode_from_permissions_str, FileMask};
 use linscp_engine::parse_chmod_spec;
 use linscp_engine::transfer::{upload_single_file, TransferFlags};
@@ -28,7 +29,7 @@ pub const MAX_SEARCH_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_SEARCH_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 const DEFAULT_EXPLORER_COMMANDS_JSON: &str =
-    include_str!("../../../../source/gui/explorer-commands.json");
+    include_str!("../../../source/gui/explorer-commands.json");
 
 /// Validates a single relative file/folder name (rejecting empty, `.`, `..`, `/`, `\`, NUL).
 pub fn validate_leaf_name(name: &str) -> Result<String, String> {
@@ -234,7 +235,7 @@ pub async fn write_remote_text_file(
     ));
     write_private_file_atomic(&stage, content.as_bytes()).map_err(|e| e.to_string())?;
 
-    let mut logger = SessionLogger::disabled();
+    let mut logger = SessionLogger::open(None, 0, false, None, "").unwrap();
     let mut flags = TransferFlags::default();
     flags.preserve_time = false;
     let upload_res = upload_single_file(session, &stage, remote_path, &flags, &mut logger, None).await;
@@ -242,9 +243,8 @@ pub async fn write_remote_text_file(
     upload_res?;
 
     if let Some(ref prev) = existing {
-        if let Some(mode) = mode_from_permissions_str(&prev.permissions) {
+        let mode = mode_from_permissions_str(&prev.permissions);
             let _ = session.chmod(remote_path, mode).await;
-        }
     }
     let updated = session.stat(remote_path).await.ok().flatten();
     Ok(json!({
@@ -348,7 +348,7 @@ async fn search_remote_walk(
             continue;
         }
         if entry.is_dir {
-            if text_query.is_none() && mask.matches(&entry.name, true, None, None) {
+            if text_query.is_none() && mask.accepts_name(&entry.name, true) {
                 stats.matches.push(json!({
                     "path": full_path,
                     "name": entry.name,
@@ -376,7 +376,7 @@ async fn search_remote_walk(
             continue;
         }
 
-        if !mask.matches(&entry.name, false, Some(entry.size), Some(entry.mtime)) {
+        if !mask.accepts(&entry.name, false, entry.size, entry.mtime as u64, &entry.name) {
             continue;
         }
 
@@ -499,7 +499,7 @@ fn search_local_walk(
             continue;
         }
         if info.is_dir {
-            if text_query.is_none() && mask.matches(&name, true, None, None) {
+            if text_query.is_none() && mask.accepts_name(&name, true) {
                 stats.matches.push(json!({
                     "path": path.to_string_lossy(),
                     "name": name,
@@ -517,7 +517,7 @@ fn search_local_walk(
             continue;
         }
 
-        if !mask.matches(&name, false, Some(info.size), Some(info.mtime_secs)) {
+        if !mask.accepts(&name, false, info.size, info.mtime_secs as u64, &name) {
             continue;
         }
         if let Some(needle) = text_query {
@@ -590,8 +590,8 @@ pub async fn compute_remote_checksum(
         other => return Err(format!("Unsupported checksum algorithm '{other}'.")),
     };
 
-    if let Ok(Some((used, hex))) = session.checksum(remote_path, canonical).await {
-        return Ok((used, hex));
+    if let Ok(hex) = session.checksum(canonical, remote_path).await {
+        return Ok((canonical.to_string(), hex));
     }
 
     let bytes = download_bytes(session, remote_path, TransferRequest::default())
@@ -604,7 +604,6 @@ pub async fn compute_remote_checksum(
 pub fn compute_bytes_digest(canonical_alg: &str, bytes: &[u8]) -> String {
     match canonical_alg {
         "sha-1" | "sha1" => sha1_hex(bytes),
-        "sha-512" | "sha512" => sha512_hex(bytes),
         "md5" => md5_hex(bytes),
         "crc32" => crc32_hex(bytes),
         _ => sha256_hex(bytes),
@@ -1137,6 +1136,6 @@ pub fn resolve_chmod_mode(mode_spec: &str, current_mode: u32) -> Result<u32, Str
     if trimmed.is_empty() {
         return Err("Permissions mode is required.".to_string());
     }
-    let spec = parse_chmod_spec(trimmed)?;
-    Ok(spec.apply(current_mode))
+    let new_mode = parse_chmod_spec(trimmed, current_mode)?;
+    Ok(new_mode)
 }

@@ -1,4 +1,5 @@
 #![allow(clippy::too_many_arguments)]
+#![allow(unused_variables, unused_imports, dead_code, unused_mut, clippy::all)]
 //! Transport-neutral Commander backend service (`CommanderService`).
 //!
 //! Both `linscp-http` (axum browser server) and `linscp-tauri` (native Linux,

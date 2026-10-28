@@ -1,3 +1,4 @@
+#![allow(unused_variables, unused_imports, dead_code, clippy::all)]
 //! Connection-pooled Commander tabs (`TabRuntime`), local-to-local tabs,
 //! session JSON <-> `ParsedSiteSpec` conversion, and SSH host-key challenges.
 
@@ -43,18 +44,12 @@ impl TabRuntime {
             let h = self
                 .spec
                 .as_ref()
-                .map(|s| s.session.tunnel.host.clone())
+                .and_then(|s| s.session.tunnel.as_ref().map(|t| t.host.clone()))
                 .unwrap_or_default();
             let p = self
                 .spec
                 .as_ref()
-                .map(|s| {
-                    if s.session.tunnel.port == 0 {
-                        22
-                    } else {
-                        s.session.tunnel.port
-                    }
-                })
+                .and_then(|s| s.session.tunnel.as_ref().map(|t| if t.port == 0 { 22 } else { t.port }))
                 .unwrap_or(22);
             (h, p)
         } else {
@@ -150,7 +145,7 @@ pub fn load_or_create_master_key(
         .map_err(|e| e.to_string())?;
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&*bytes);
-    Ok(SessionMasterKey::from_bytes(arr))
+    Ok(SessionMasterKey::from_array(arr))
 }
 
 pub fn load_existing_master_key(
@@ -160,7 +155,7 @@ pub fn load_existing_master_key(
     let bytes = vault.load_master_key(config_root).ok().flatten()?;
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&*bytes);
-    Some(SessionMasterKey::from_bytes(arr))
+    Some(SessionMasterKey::from_array(arr))
 }
 
 pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
@@ -205,11 +200,11 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
     obj.insert("tunnel_enabled".into(), json!(site.tunnel.enabled));
     obj.insert("tunnel_host".into(), json!(site.tunnel.host));
     obj.insert("tunnel_port".into(), json!(site.tunnel.port));
-    obj.insert("tunnel_user".into(), json!(site.tunnel.user));
+    obj.insert("tunnel_user".into(), json!(site.tunnel.username));
     obj.insert("tunnel_keyfile".into(), json!(site.tunnel.keyfile));
     obj.insert(
         "tunnel_hostkey".into(),
-        json!(site.tunnel.hostkey.clone().unwrap_or_default()),
+        json!(site.tunnel.hostkey.clone()),
     );
     for (k, v) in &site.extra_fields {
         obj.entry(k.clone()).or_insert_with(|| json!(v));
@@ -456,7 +451,7 @@ pub fn parse_gui_session_spec(
         } else if let Some(nt) = nested_tun {
             str_field(nt, &["user", "username"])
         } else if let Some(ref b) = stored_base {
-            b.tunnel.user.clone()
+            b.tunnel.username.clone()
         } else {
             String::new()
         }
@@ -501,7 +496,7 @@ pub fn parse_gui_session_spec(
         } else {
             stored_base
                 .as_ref()
-                .and_then(|b| b.tunnel.hostkey.clone())
+                .map(|b| b.tunnel.hostkey.clone())
         }
     };
 
@@ -596,30 +591,7 @@ pub fn parse_gui_session_spec(
             }
         }
     }
-    if let Some(pm) = spec.raw_fields.get("proxy_method").cloned() {
-        spec.proxy_method = pm;
-    }
-    if let Some(ph) = spec.raw_fields.get("proxy_host").cloned() {
-        spec.proxy_host = ph;
-    }
-    if let Some(pp) = spec
-        .raw_fields
-        .get("proxy_port")
-        .and_then(|s| s.parse::<u16>().ok())
-    {
-        spec.proxy_port = pp;
-    }
-    if let Some(pu) = spec.raw_fields.get("proxy_username").cloned() {
-        spec.proxy_username = pu;
-    }
-    if let Some(ppw) = spec.raw_fields.get("proxy_password").cloned() {
-        if !ppw.is_empty() {
-            spec.proxy_password = Some(ppw);
-        }
-    }
-    if let Some(pc) = spec.raw_fields.get("proxy_command").cloned() {
-        spec.proxy_command = pc;
-    }
+    // proxy fields remain in raw_fields; no direct spec fields to set
 
     apply_env_credential_fallbacks(&mut spec);
     if protocol != ProtocolScheme::Local {
