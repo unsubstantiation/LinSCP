@@ -5,6 +5,7 @@ use encoding_rs::{Encoding, UTF_8};
 use linscp_types::TransferMode;
 
 use crate::filemask::matches_wildcard;
+use crate::script_params::{PrefixMatch, resolve_prefixed_name};
 
 /// Default filename masks treated as text when `TransferMode::Automatic` is active.
 pub const DEFAULT_ASCII_FILE_MASK: &str = "*.txt;*.htm;*.html;*.php;*.php3;*.cgi;*.c;*.cpp;*.h;\
@@ -55,10 +56,11 @@ impl EolStyle {
 }
 
 pub fn parse_transfer_mode(text: &str) -> Option<TransferMode> {
-    match text.trim().to_ascii_lowercase().as_str() {
-        "binary" => Some(TransferMode::Binary),
-        "ascii" => Some(TransferMode::Ascii),
-        "automatic" | "auto" => Some(TransferMode::Automatic),
+    const MODES: &[&str] = &["binary", "ascii", "automatic"];
+    match resolve_prefixed_name(MODES, text) {
+        PrefixMatch::ExactOrUnique("binary") => Some(TransferMode::Binary),
+        PrefixMatch::ExactOrUnique("ascii") => Some(TransferMode::Ascii),
+        PrefixMatch::ExactOrUnique("automatic") => Some(TransferMode::Automatic),
         _ => None,
     }
 }

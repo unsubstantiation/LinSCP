@@ -189,8 +189,35 @@ jobs:
           BIN_WIN="$(cygpath -m "$PWD/target/release/linscp.exe")"
           ./target/release/linscp.exe -version
           ./target/release/linscp.exe -batch -command="option batch; option transfer; sessions list; presets; exit"
-          python -u source/linux/tests/LiveDavTest.py "$BIN_WIN"
-          python -u source/linux/tests/LiveS3Test.py "$BIN_WIN"
+          run_win_suite() {
+            local label="$1"
+            local script_path="$2"
+            local log="$RUNNER_TEMP/rust-win-${label}.log"
+            echo "=== Running Windows parity suite: ${label} ==="
+            if ! python -u - "$script_path" "$BIN_WIN" >"$log" 2>&1 <<'PYEOF'
+          import os, runpy, sys
+          if not hasattr(os, "killpg"):
+              os.getpgid = lambda pid: pid
+              os.killpg = lambda pgid, sig: os.kill(pgid, sig)
+          script_path, bin_win = sys.argv[1], sys.argv[2]
+          sys.argv = [script_path, bin_win]
+          runpy.run_path(script_path, run_name="__main__")
+          PYEOF
+            then
+              cat "$log"
+              python - "$label" "$log" <<'ERRPY'
+          import pathlib, sys
+          label, path = sys.argv[1], sys.argv[2]
+          tail = pathlib.Path(path).read_text(errors="replace")[-3500:]
+          esc = tail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::error title=Win-{label}::{esc}")
+          ERRPY
+              return 1
+            fi
+            grep -E '^evidence:' "$log" | tail -n 1 || true
+          }
+          run_win_suite "LiveDavTest" "source/linux/tests/LiveDavTest.py"
+          run_win_suite "LiveS3Test" "source/linux/tests/LiveS3Test.py"
 
   rust-android:
     name: Rust Core & Android SAF Platform Target (Android NDK)

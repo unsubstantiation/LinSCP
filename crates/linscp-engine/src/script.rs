@@ -1578,13 +1578,19 @@ impl ScriptInterpreter {
                 } else {
                     format!("{}@", s.username)
                 };
+                let preset_suffix = if s.preset.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (preset {})", s.preset)
+                };
                 println!(
-                    "{}  {}://{}{}:{}",
+                    "{}  {}://{}{}:{}{}",
                     s.name,
                     s.protocol.as_str(),
                     user_prefix,
                     s.host,
-                    port
+                    port,
+                    preset_suffix
                 );
             }
             return Ok(());
@@ -1887,6 +1893,19 @@ impl ScriptInterpreter {
         }
 
         validate_session_settings(&spec).map_err(|e| self.wrong_args("savesession", &e))?;
+        if !spec.preset_name.is_empty() {
+            let preset_store = TransferPresetStore::load_from_dir(&self.cfg.config_dir)
+                .map_err(|e| self.wrong_args("savesession", &e))?;
+            if preset_store.find(&spec.preset_name).is_none() {
+                let p = TransferPresetStore::presets_path(&self.cfg.config_dir);
+                let p_str = p.display().to_string();
+                let h = self.trp(
+                    "There is no transfer preset named '{name}' in '{path}'.",
+                    &[("name", &spec.preset_name), ("path", &p_str)],
+                );
+                return Err(self.wrong_args("savesession", &h));
+            }
+        }
 
         let stored_non_empty_pw = spec
             .session
@@ -3938,32 +3957,52 @@ impl ScriptInterpreter {
                     flags.apply_preset(p);
                 }
                 _ if low == "-rawtransfersettings" || low.starts_with("-rawtransfersettings=") => {
-                    let explicit_count = low
-                        .strip_prefix("-rawtransfersettings=")
-                        .map(|c| {
-                            c.parse::<usize>().map_err(|_| {
-                                format!("Invalid '-rawtransfersettings' count '{c}'.")
-                            })
-                        })
-                        .transpose()?;
-                    if let Some(cnt) = explicit_count {
-                        for _ in 0..cnt {
-                            i += 1;
-                            let Some(kv) = args.get(i) else {
-                                return Err(
-                                    "'-rawtransfersettings' ended before reading all pairs."
-                                        .to_string(),
-                                );
-                            };
-                            apply_raw_transfer_pair(&mut flags, kv)?;
-                        }
+                    let explicit_count = if let Some(c) = low.strip_prefix("-rawtransfersettings=")
+                    {
+                        let parsed = c
+                            .parse::<i32>()
+                            .ok()
+                            .filter(|&n| n >= 0)
+                            .ok_or_else(|| {
+                                self.wrong_args(
+                                    cmd_name,
+                                    self.tr("The value of '-rawtransfersettings' is the number of settings that follow it, as in '-rawtransfersettings=2'."),
+                                )
+                            })? as usize;
+                        Some(parsed)
                     } else {
-                        while i + 1 < args.len()
-                            && args[i + 1].contains('=')
-                            && !args[i + 1].starts_with('-')
+                        None
+                    };
+                    let mut taken = 0usize;
+                    while i + 1 < args.len() && explicit_count.is_none_or(|cap| taken < cap) {
+                        let next_arg = &args[i + 1];
+                        if next_arg.is_empty()
+                            || next_arg.starts_with('-')
+                            || !next_arg.contains('=')
                         {
-                            i += 1;
-                            apply_raw_transfer_pair(&mut flags, &args[i])?;
+                            if explicit_count.is_none() {
+                                break;
+                            }
+                            let h = self.trp(
+                                "'{name}' is not a 'key=value' raw transfer setting.",
+                                &[("name", next_arg)],
+                            );
+                            return Err(self.wrong_args(cmd_name, &h));
+                        }
+                        apply_raw_transfer_pair(&mut flags, next_arg)
+                            .map_err(|e| self.wrong_args(cmd_name, &e))?;
+                        i += 1;
+                        taken += 1;
+                    }
+                    if let Some(cap) = explicit_count {
+                        if taken < cap {
+                            let cap_s = cap.to_string();
+                            let taken_s = taken.to_string();
+                            let h = self.trp(
+                                "'-rawtransfersettings={count}' was given, but only {taken} setting parameter(s) follow.",
+                                &[("count", &cap_s), ("taken", &taken_s)],
+                            );
+                            return Err(self.wrong_args(cmd_name, &h));
                         }
                     }
                 }
@@ -5218,38 +5257,127 @@ pub fn apply_open_switches(
 }
 
 fn apply_raw_transfer_pair(flags: &mut TransferFlags, pair: &str) -> Result<(), String> {
-    let Some((k, v)) = pair.split_once('=') else {
-        return Err(format!(
-            "Invalid '-rawtransfersettings' item '{pair}' (expected NAME=VALUE)."
-        ));
+    let Some((raw_k, raw_v)) = pair.split_once('=') else {
+        return Err(format!("'{pair}' is not a 'key=value' raw transfer setting."));
     };
-    match k.trim().to_ascii_lowercase().as_str() {
-        "preservetimedirs" => {
-            flags.preserve_time_dirs = matches!(v.trim(), "1" | "on" | "true");
+    let raw_key = raw_k.trim();
+    let v = raw_v.trim();
+    let key = raw_key.to_ascii_lowercase();
+    let parse_raw_bool = |val: &str| -> Option<bool> {
+        match val.to_ascii_lowercase().as_str() {
+            "1" | "on" | "true" => Some(true),
+            "0" | "off" | "false" => Some(false),
+            _ => None,
         }
-        "preservetime" => {
-            flags.preserve_time = matches!(v.trim(), "1" | "on" | "true");
-        }
+    };
+    match key.as_str() {
         "transfermode" => {
-            flags.transfer_mode = match v.trim() {
+            flags.transfer_mode = match v {
                 "0" | "binary" => TransferMode::Binary,
                 "1" | "ascii" => TransferMode::Ascii,
                 "2" | "automatic" => TransferMode::Automatic,
-                _ => return Err(format!("Invalid TransferMode '{v}'.")),
+                _ => {
+                    return Err(
+                        "The raw transfer setting 'TransferMode' must be 0 (binary), 1 (ascii) or 2 (automatic)."
+                            .to_string(),
+                    );
+                }
             };
         }
-        "neweronly" => {
-            flags.newer_only = matches!(v.trim(), "1" | "on" | "true");
+        "preservetime" | "preservetimedirs" | "neweronly" => {
+            let Some(on) = parse_raw_bool(v) else {
+                return Err(format!(
+                    "The raw transfer setting '{raw_key}' must be 1 or 0."
+                ));
+            };
+            match key.as_str() {
+                "preservetime" => flags.preserve_time = on,
+                "preservetimedirs" => flags.preserve_time_dirs = on,
+                _ => flags.newer_only = on,
+            }
         }
-        "speedlimit" => {
-            let kb: u64 = v
-                .trim()
-                .parse()
-                .map_err(|_| format!("Invalid SpeedLimit '{v}'."))?;
+        "resumesupport" => {
+            let cur_thresh = match flags.resume_support {
+                ResumeSupportMode::Smart(t) => t,
+                _ => 100 * 1024,
+            };
+            flags.explicit_resume_support = true;
+            flags.resume_support = match v {
+                "0" => {
+                    flags.resume = true;
+                    ResumeSupportMode::On
+                }
+                "1" => ResumeSupportMode::Smart(cur_thresh),
+                "2" => {
+                    flags.resume = false;
+                    ResumeSupportMode::Off
+                }
+                _ => {
+                    return Err(
+                        "The raw transfer setting 'ResumeSupport' must be 0 (on), 1 (smart) or 2 (off)."
+                            .to_string(),
+                    );
+                }
+            };
+        }
+        "resumethreshold" => {
+            let bytes: u64 = v.parse().map_err(|_| {
+                "The raw transfer setting 'ResumeThreshold' must be a number of bytes.".to_string()
+            })?;
+            flags.explicit_resume_support = true;
+            flags.resume_support = ResumeSupportMode::Smart(bytes);
+        }
+        "cpslimit" | "speedlimit" => {
+            let cps: u64 = v.parse().map_err(|_| {
+                "The raw transfer setting 'CPSLimit' must be a number of bytes per second."
+                    .to_string()
+            })?;
+            let kb = if key == "cpslimit" {
+                cps.div_ceil(1024)
+            } else {
+                cps
+            };
             flags.speed_kbytes_per_sec = if kb == 0 { None } else { Some(kb) };
         }
-        other => {
-            return Err(format!("Unsupported raw transfer setting '{other}'."));
+        "preserverights" => {
+            let Some(on) = parse_raw_bool(v) else {
+                return Err("The raw transfer setting 'PreserveRights' must be 1 or 0.".to_string());
+            };
+            if !on {
+                flags.permissions = PresetPermissions::Off;
+            }
+        }
+        "text" => {
+            let mode = parse_permissions_expr(v, 0o644, false).map_err(|e| {
+                format!("The raw transfer setting 'Text' is not a permission mode: {e}")
+            })?;
+            flags.permissions = PresetPermissions::Mode(mode & 0o7777);
+        }
+        "masks"
+        | "includefilemask"
+        | "excludefilemask"
+        | "negativeexclude"
+        | "filenamecase"
+        | "preservereadonly"
+        | "ignorepermerrors"
+        | "addxtodirectories"
+        | "cleararchive"
+        | "removectrlz"
+        | "removebom"
+        | "replaceinvalidchars"
+        | "localinvalidchars"
+        | "calculatesize"
+        | "encryptnewfiles"
+        | "excludehiddenfiles"
+        | "excludeemptydirectories" => {
+            return Err(format!(
+                "The raw transfer setting '{raw_key}' has no equivalent in this build and will not be ignored."
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "The raw transfer setting '{raw_key}' is not known to this build; the settings it accepts are TransferMode, PreserveTime, PreserveTimeDirs, ResumeSupport, ResumeThreshold, CPSLimit, NewerOnly, PreserveRights and Text."
+            ));
         }
     }
     Ok(())

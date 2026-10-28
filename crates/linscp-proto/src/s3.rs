@@ -248,12 +248,6 @@ impl S3Session {
         tunnel_cfg: Option<&SshConnectConfig>,
         tunnel_local_port: u16,
     ) -> Result<Self, ProtoError> {
-        if cfg.access_key_id.trim().is_empty() || cfg.secret_access_key.is_empty() {
-            return Err(ProtoError::Transport(
-                "S3 access key id and secret access key are required.".to_string(),
-            ));
-        }
-
         let mut jump_tunnel = None;
         let mut socks_relay = None;
         if let Some(tcfg) = tunnel_cfg {
@@ -262,6 +256,12 @@ impl S3Session {
             cfg.proxy = Some(ProxyConfig::socks5_loopback(relay.local_port()));
             jump_tunnel = Some(jump);
             socks_relay = Some(relay);
+        }
+
+        if cfg.access_key_id.trim().is_empty() || cfg.secret_access_key.is_empty() {
+            return Err(ProtoError::Transport(
+                "S3 access key id and secret access key are required.".to_string(),
+            ));
         }
 
         let region = cfg
