@@ -755,6 +755,42 @@ async fn handle_mock_s3(
                     .into_response();
             }
             let etag = format!("\"part-etag-{pnum}\"");
+            if let Some(copy_src) = headers
+                .get("x-amz-copy-source")
+                .and_then(|v| v.to_str().ok())
+            {
+                let decoded_copy = percent_decode_str(copy_src);
+                let clean = decoded_copy.trim_start_matches('/');
+                let (sb, sk) = clean.split_once('/').unwrap_or(("", ""));
+                let Some(mut src_bytes) = guard
+                    .buckets
+                    .get(sb)
+                    .and_then(|m| m.get(sk))
+                    .and_then(|v| v.last())
+                    .filter(|e| !e.is_delete_marker)
+                    .map(|e| e.data.clone())
+                else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                if let Some(rng) = headers
+                    .get("x-amz-copy-source-range")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.strip_prefix("bytes="))
+                {
+                    if let Some((a, b)) = rng.split_once('-') {
+                        if let (Ok(start), Ok(end)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                            if start <= end && end < src_bytes.len() {
+                                src_bytes = src_bytes[start..=end].to_vec();
+                            }
+                        }
+                    }
+                }
+                if let Some(parts) = guard.multiparts.get_mut(uid) {
+                    parts.insert(pnum, (etag.clone(), src_bytes));
+                }
+                let xml = format!("<CopyPartResult><ETag>{etag}</ETag></CopyPartResult>");
+                return (StatusCode::OK, xml).into_response();
+            }
             if let Some(parts) = guard.multiparts.get_mut(uid) {
                 parts.insert(pnum, (etag.clone(), body.to_vec()));
             }

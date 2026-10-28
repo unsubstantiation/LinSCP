@@ -22,6 +22,8 @@ pub enum ProxyKind {
     Socks5,
     Socks4,
     HttpConnect,
+    Telnet,
+    LocalCommand,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -33,6 +35,8 @@ pub struct ProxyConfig {
     pub password: Option<String>,
     /// Resolve DNS on the proxy (`socks5h` / `socks4a`) rather than locally.
     pub remote_dns: bool,
+    /// Optional command template (`%host` / `%port`) for `Telnet` or `LocalCommand` proxies.
+    pub command: Option<String>,
 }
 
 impl ProxyConfig {
@@ -44,6 +48,7 @@ impl ProxyConfig {
             username: None,
             password: None,
             remote_dns: true,
+            command: None,
         }
     }
 }
@@ -555,6 +560,35 @@ pub async fn connect_tcp_maybe_proxied(
                     ProxyKind::HttpConnect => {
                         http_connect_on_stream(&mut stream, clean_dest, dest_port, creds).await?;
                     }
+                    ProxyKind::Telnet => {
+                        let tpl = cfg
+                            .command
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("connect %host %port");
+                        let cmd = tpl
+                            .replace("%host", clean_dest)
+                            .replace("%port", &dest_port.to_string());
+                        stream
+                            .write_all(cmd.as_bytes())
+                            .await
+                            .map_err(|e| ProtoError::Transport(format!("Cannot write to the telnet proxy: {e}")))?;
+                        if !cmd.ends_with("\r\n") && !cmd.ends_with('\n') {
+                            stream
+                                .write_all(b"\r\n")
+                                .await
+                                .map_err(|e| ProtoError::Transport(format!("Cannot write to the telnet proxy: {e}")))?;
+                        }
+                        stream
+                            .flush()
+                            .await
+                            .map_err(|e| ProtoError::Transport(format!("Cannot flush the telnet proxy: {e}")))?;
+                    }
+                    ProxyKind::LocalCommand => {
+                        return Err(ProtoError::Transport(
+                            "This protocol connects through curl, which cannot run a local command proxy; use SOCKS4, SOCKS5 or HTTP, or a protocol this build serves with its own transport.".to_string(),
+                        ));
+                    }
                 }
                 Ok(stream)
             }
@@ -566,6 +600,32 @@ pub async fn connect_tcp_maybe_proxied(
             "Timed out connecting to {clean_dest}:{dest_port}."
         ))
     })?
+}
+
+/// Opens an `AsyncStream` to `dest_host:dest_port`, supporting all proxy kinds
+/// including `ProxyKind::LocalCommand` (`ProxyMethod=Cmd`).
+pub async fn connect_stream_maybe_proxied(
+    dest_host: &str,
+    dest_port: u16,
+    proxy: Option<&ProxyConfig>,
+    timeout: Duration,
+) -> Result<Box<dyn linscp_platform::AsyncStream>, ProtoError> {
+    if let Some(cfg) = proxy.filter(|p| p.kind == ProxyKind::LocalCommand) {
+        let clean_dest = validate_target_endpoint(dest_host, dest_port)?;
+        let tpl = cfg
+            .command
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                ProtoError::Transport(
+                    "A local (Cmd) proxy needs a command: set ProxyTelnetCommand=COMMAND with %host and %port where the destination belongs.".to_string(),
+                )
+            })?;
+        return linscp_platform::terminal::spawn_proxy_command_stream(tpl, clean_dest, dest_port)
+            .map_err(|e| ProtoError::Transport(format!("Failed to start local command proxy: {e}")));
+    }
+    let tcp = connect_tcp_maybe_proxied(dest_host, dest_port, proxy, timeout).await?;
+    Ok(Box::new(tcp))
 }
 
 #[cfg(test)]

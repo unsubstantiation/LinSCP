@@ -17,6 +17,8 @@ use rand::RngCore;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+pub mod gssapi_sys;
+pub mod terminal;
 pub mod watcher;
 
 #[cfg(target_os = "linux")]
@@ -427,6 +429,11 @@ pub fn write_private_file_atomic(target: &Path, content: &[u8]) -> Result<(), Pl
     Ok(())
 }
 
+/// Creates `path` (and missing parent directories) with owner-only (`0700` on Unix) permissions.
+pub fn create_private_dir(path: &Path) -> Result<(), PlatformError> {
+    sys::ensure_private_dir(path)
+}
+
 /// Creates a brand-new owner-only file (`O_CREAT | O_EXCL`, `0600` on Unix),
 /// refusing to overwrite an existing file (used by `ConvertPpkToOpenSsh`).
 pub fn write_exclusive_private_file(target: &Path, content: &[u8]) -> Result<(), PlatformError> {
@@ -572,7 +579,8 @@ impl SecretVault for NativeSecretVault {
             return Ok(generated);
         }
 
-        write_private_file_atomic(&key_path, &*generated)?;
+        let encoded = format!("{}\n", BASE64.encode(*generated));
+        write_private_file_atomic(&key_path, encoded.as_bytes())?;
         Ok(generated)
     }
 }

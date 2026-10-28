@@ -241,6 +241,16 @@ pub(crate) fn build_reqwest_proxy(proxy: &ProxyConfig) -> Result<Option<Proxy>, 
             format!("{scheme}://{}:{}", proxy.host, proxy.port)
         }
         ProxyKind::HttpConnect => format!("http://{}:{}", proxy.host, proxy.port),
+        ProxyKind::Telnet => {
+            return Err(ProtoError::Transport(
+                "This protocol connects through curl, which cannot run a telnet proxy; use SOCKS4, SOCKS5 or HTTP, or a protocol this build serves with its own transport.".to_string(),
+            ));
+        }
+        ProxyKind::LocalCommand => {
+            return Err(ProtoError::Transport(
+                "This protocol connects through curl, which cannot run a local command proxy; use SOCKS4, SOCKS5 or HTTP, or a protocol this build serves with its own transport.".to_string(),
+            ));
+        }
     };
     let mut p = Proxy::all(&url)
         .map_err(|e| ProtoError::Transport(format!("Invalid proxy URL '{url}': {e}")))?;
@@ -260,6 +270,20 @@ impl Stream for ChannelBodyStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
     }
+}
+
+fn format_reqwest_err(err: &reqwest::Error) -> String {
+    let mut out = err.to_string();
+    let mut cur = std::error::Error::source(err);
+    while let Some(src) = cur {
+        let msg = src.to_string();
+        if !msg.is_empty() && !out.contains(&msg) {
+            out.push_str(": ");
+            out.push_str(&msg);
+        }
+        cur = src.source();
+    }
+    out
 }
 
 fn percent_encode_path(path: &str) -> String {
@@ -440,7 +464,7 @@ impl WebDavSession {
 
     fn http_scheme(&self) -> &'static str {
         match self.cfg.scheme {
-            ProtocolScheme::Davs | ProtocolScheme::Webdavs => "https",
+            ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs => "https",
             _ => "http",
         }
     }
@@ -486,6 +510,12 @@ impl WebDavSession {
         } else {
             req
         }
+    }
+
+    async fn has_etag_precondition(&self, remote_path: &str) -> bool {
+        let key = self.resolve_remote_path(remote_path);
+        let guard = self.state.lock().await;
+        guard.etags.contains_key(&key)
     }
 
     async fn if_header_for(&self, remote_path: &str) -> Option<String> {
@@ -615,6 +645,54 @@ impl WebDavSession {
         Ok(etag_opt)
     }
 
+    /// Queries `(etag, path_missing)` for `etag <file> -get`.
+    pub async fn get_etag_with_existence(
+        &self,
+        remote_path: &str,
+    ) -> Result<(Option<String>, bool), ProtoError> {
+        let (entry_opt, etag_opt) = self.propfind_single(remote_path).await?;
+        Ok((etag_opt, entry_opt.is_none()))
+    }
+
+    /// Verifies that the WebDAV endpoint is reachable and credentials are accepted.
+    pub async fn check_endpoint(&self, initial_dir: &str) -> Result<(), ProtoError> {
+        let method = Method::from_bytes(b"PROPFIND")
+            .map_err(|e| ProtoError::Transport(format!("Invalid PROPFIND method: {e}")))?;
+        let target = if initial_dir.is_empty() {
+            "/"
+        } else {
+            initial_dir
+        };
+        let body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+            <D:propfind xmlns:D=\"DAV:\"><D:prop><D:resourcetype/></D:prop></D:propfind>";
+        let resp = self
+            .apply_auth(self.client.request(method, self.url_for(target, false)))
+            .header("Depth", "0")
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| {
+                ProtoError::Transport(format!(
+                    "WebDAV endpoint probe failed: {}",
+                    format_reqwest_err(&e)
+                ))
+            })?;
+        let code = resp.status().as_u16();
+        if code == 401 {
+            return Err(ProtoError::Transport(
+                "Authentication failed: WebDAV server rejected credentials (HTTP 401 Unauthorized)."
+                    .to_string(),
+            ));
+        }
+        if code == 405 {
+            return Err(ProtoError::Transport(
+                "The server does not support WebDAV: PROPFIND is not allowed.".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Sets a custom dead property in `urn:linscp:properties` via `PROPPATCH`.
     pub async fn set_property(
         &self,
@@ -699,7 +777,12 @@ impl WebDavSession {
             .body(body)
             .send()
             .await
-            .map_err(|e| ProtoError::Transport(format!("WebDAV PROPFIND failed: {e}")))?;
+            .map_err(|e| {
+                ProtoError::Transport(format!(
+                    "WebDAV PROPFIND failed: {}",
+                    format_reqwest_err(&e)
+                ))
+            })?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
         }
@@ -712,7 +795,12 @@ impl WebDavSession {
         let text = resp
             .text()
             .await
-            .map_err(|e| ProtoError::Transport(format!("Reading PROPFIND XML failed: {e}")))?;
+            .map_err(|e| {
+                ProtoError::Transport(format!(
+                    "Reading PROPFIND XML failed: {}",
+                    format_reqwest_err(&e)
+                ))
+            })?;
         Ok(Some(text))
     }
 
@@ -909,8 +997,15 @@ impl RemoteSession for WebDavSession {
         let resp = req
             .send()
             .await
-            .map_err(|e| ProtoError::Transport(format!("WebDAV MKCOL failed: {e}")))?;
+            .map_err(|e| {
+                ProtoError::Transport(format!("WebDAV MKCOL failed: {}", format_reqwest_err(&e)))
+            })?;
         if !resp.status().is_success() {
+            if resp.status().as_u16() == 405 {
+                return Err(ProtoError::Transport(format!(
+                    "Cannot create the directory '{remote_path}': that name already exists."
+                )));
+            }
             return Err(ProtoError::Transport(format!(
                 "WebDAV MKCOL '{remote_path}' failed with HTTP {}.",
                 resp.status()
@@ -921,14 +1016,28 @@ impl RemoteSession for WebDavSession {
 
     async fn remove_file(&self, remote_path: &str) -> Result<(), ProtoError> {
         let mut req = self.apply_auth(self.client.delete(self.url_for(remote_path, false)));
+        let has_etag = self.has_etag_precondition(remote_path).await;
         if let Some(if_hdr) = self.if_header_for(remote_path).await {
             req = req.header("If", if_hdr);
         }
         let resp = req
             .send()
             .await
-            .map_err(|e| ProtoError::Transport(format!("WebDAV DELETE failed: {e}")))?;
+            .map_err(|e| {
+                ProtoError::Transport(format!("WebDAV DELETE failed: {}", format_reqwest_err(&e)))
+            })?;
         if !resp.status().is_success() {
+            if resp.status().as_u16() == 404 {
+                return Err(ProtoError::Transport(
+                    "No such file or directory.".to_string(),
+                ));
+            }
+            if resp.status().as_u16() == 412 && has_etag {
+                return Err(ProtoError::Transport(format!(
+                    "WebDAV DELETE '{remote_path}' failed with HTTP {} (ETag precondition not satisfied).",
+                    resp.status()
+                )));
+            }
             return Err(ProtoError::Transport(format!(
                 "WebDAV DELETE '{remote_path}' failed with HTTP {}.",
                 resp.status()
@@ -939,14 +1048,37 @@ impl RemoteSession for WebDavSession {
 
     async fn remove_dir(&self, remote_path: &str) -> Result<(), ProtoError> {
         let mut req = self.apply_auth(self.client.delete(self.url_for(remote_path, true)));
+        let has_etag = self.has_etag_precondition(remote_path).await;
         if let Some(if_hdr) = self.if_header_for(remote_path).await {
             req = req.header("If", if_hdr);
         }
         let resp = req
             .send()
             .await
-            .map_err(|e| ProtoError::Transport(format!("WebDAV DELETE collection failed: {e}")))?;
+            .map_err(|e| {
+                ProtoError::Transport(format!(
+                    "WebDAV DELETE collection failed: {}",
+                    format_reqwest_err(&e)
+                ))
+            })?;
         if !resp.status().is_success() {
+            if resp.status().as_u16() == 404 {
+                return Err(ProtoError::Transport(
+                    "No such file or directory.".to_string(),
+                ));
+            }
+            if resp.status().as_u16() == 409 {
+                return Err(ProtoError::Transport(format!(
+                    "WebDAV directory '{remote_path}' is not empty (HTTP {}).",
+                    resp.status()
+                )));
+            }
+            if resp.status().as_u16() == 412 && has_etag {
+                return Err(ProtoError::Transport(format!(
+                    "WebDAV DELETE '{remote_path}' failed with HTTP {} (ETag precondition not satisfied).",
+                    resp.status()
+                )));
+            }
             return Err(ProtoError::Transport(format!(
                 "WebDAV DELETE '{remote_path}' failed with HTTP {}.",
                 resp.status()
@@ -963,14 +1095,28 @@ impl RemoteSession for WebDavSession {
             .apply_auth(self.client.request(method, self.url_for(from, false)))
             .header("Destination", dest_url)
             .header("Overwrite", "T");
+        let has_etag = self.has_etag_precondition(from).await;
         if let Some(if_hdr) = self.if_header_for(from).await {
             req = req.header("If", if_hdr);
         }
         let resp = req
             .send()
             .await
-            .map_err(|e| ProtoError::Transport(format!("WebDAV MOVE failed: {e}")))?;
+            .map_err(|e| {
+                ProtoError::Transport(format!("WebDAV MOVE failed: {}", format_reqwest_err(&e)))
+            })?;
         if !resp.status().is_success() {
+            if resp.status().as_u16() == 404 {
+                return Err(ProtoError::Transport(
+                    "No such file or directory.".to_string(),
+                ));
+            }
+            if resp.status().as_u16() == 412 && has_etag {
+                return Err(ProtoError::Transport(format!(
+                    "WebDAV MOVE '{from}' -> '{to}' failed with HTTP {} (ETag precondition not satisfied).",
+                    resp.status()
+                )));
+            }
             return Err(ProtoError::Transport(format!(
                 "WebDAV MOVE '{from}' -> '{to}' failed with HTTP {}.",
                 resp.status()
@@ -993,8 +1139,18 @@ impl RemoteSession for WebDavSession {
         let resp = req
             .send()
             .await
-            .map_err(|e| ProtoError::Transport(format!("WebDAV COPY failed: {e}")))?;
+            .map_err(|e| {
+                ProtoError::Transport(format!("WebDAV COPY failed: {}", format_reqwest_err(&e)))
+            })?;
         if !resp.status().is_success() {
+            if resp.status().as_u16() == 404 {
+                return Err(ProtoError::Transport(
+                    "No such file or directory.".to_string(),
+                ));
+            }
+            if matches!(resp.status().as_u16(), 405 | 501) {
+                return Err(ProtoError::UnsupportedCapability("COPY", self.cfg.scheme));
+            }
             return Err(ProtoError::Transport(format!(
                 "WebDAV COPY '{from}' -> '{to}' failed with HTTP {}.",
                 resp.status()
@@ -1042,7 +1198,9 @@ impl RemoteSession for WebDavSession {
         let mut resp = req
             .send()
             .await
-            .map_err(|e| ProtoError::Transport(format!("WebDAV GET failed: {e}")))?;
+            .map_err(|e| {
+                ProtoError::Transport(format!("WebDAV GET failed: {}", format_reqwest_err(&e)))
+            })?;
         if opts.resume_offset > 0 && resp.status().as_u16() != 206 {
             return Err(ProtoError::Transport(format!(
                 "WebDAV server did not honor byte-range resume (HTTP {}).",
@@ -1050,6 +1208,11 @@ impl RemoteSession for WebDavSession {
             )));
         }
         if !resp.status().is_success() {
+            if resp.status().as_u16() == 404 {
+                return Err(ProtoError::Transport(
+                    "No such file or directory.".to_string(),
+                ));
+            }
             return Err(ProtoError::Transport(format!(
                 "WebDAV GET '{remote_path}' failed with HTTP {}.",
                 resp.status()
@@ -1072,6 +1235,11 @@ impl RemoteSession for WebDavSession {
             transferred += chunk.len() as u64;
             if let Some(cb) = progress {
                 cb(opts.resume_offset + transferred, total);
+            }
+            if opts.speed_kbytes_per_sec > 0 {
+                sink.flush()
+                    .await
+                    .map_err(|e| ProtoError::Transport(format!("Flushing download sink failed: {e}")))?;
             }
             limiter.consume(chunk.len()).await;
         }
@@ -1100,6 +1268,7 @@ impl RemoteSession for WebDavSession {
         if let Some(sz) = total_size {
             req = req.header("Content-Length", sz.to_string());
         }
+        let has_etag = self.has_etag_precondition(remote_path).await;
         if let Some(if_hdr) = self.if_header_for(remote_path).await {
             req = req.header("If", if_hdr);
         }
@@ -1134,17 +1303,69 @@ impl RemoteSession for WebDavSession {
 
         let (pump_res, resp_res) = tokio::join!(pump_fut, send_fut);
         let transferred = pump_res?;
-        let resp = resp_res
-            .map_err(|e| ProtoError::Transport(format!("WebDAV PUT '{remote_path}' failed: {e}")))?;
+        let resp = resp_res.map_err(|e| {
+            ProtoError::Transport(format!(
+                "WebDAV PUT '{remote_path}' failed: {}",
+                format_reqwest_err(&e)
+            ))
+        })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 412 && has_etag {
+                return Err(ProtoError::Transport(format!(
+                    "WebDAV PUT '{remote_path}' failed with HTTP {status} (ETag precondition not satisfied): {}",
+                    detail.trim()
+                )));
+            }
             return Err(ProtoError::Transport(format!(
                 "WebDAV PUT '{remote_path}' failed with HTTP {status}: {}",
                 detail.trim()
             )));
         }
         Ok(transferred)
+    }
+
+    async fn probe_endpoint(&self, initial_dir: &str) -> Result<(), ProtoError> {
+        self.check_endpoint(initial_dir).await
+    }
+
+    async fn dav_lock(&self, remote_path: &str, timeout_secs: u32) -> Result<String, ProtoError> {
+        self.lock(remote_path, timeout_secs).await
+    }
+
+    async fn dav_unlock(&self, remote_path: &str, token: Option<&str>) -> Result<(), ProtoError> {
+        self.unlock(remote_path, token).await
+    }
+
+    async fn dav_get_etag(&self, remote_path: &str) -> Result<(Option<String>, bool), ProtoError> {
+        self.get_etag_with_existence(remote_path).await
+    }
+
+    async fn dav_set_etag_precondition(
+        &self,
+        remote_path: &str,
+        precondition: Option<DavEtagPrecondition>,
+    ) -> Result<(), ProtoError> {
+        self.set_etag_precondition(remote_path, precondition).await;
+        Ok(())
+    }
+
+    async fn dav_set_property(
+        &self,
+        remote_path: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<(), ProtoError> {
+        self.set_property(remote_path, name, value).await
+    }
+
+    async fn dav_get_property(
+        &self,
+        remote_path: &str,
+        name: &str,
+    ) -> Result<Option<String>, ProtoError> {
+        self.get_property(remote_path, name).await
     }
 
     async fn close(&self) -> Result<(), ProtoError> {

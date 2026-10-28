@@ -45,10 +45,92 @@ jobs:
           python3 tools/run_cargo_ci.py cargo test --workspace
           python3 tools/run_cargo_ci.py cargo test -p linscp-proto --features gssapi
 
+      - name: Build release Rust CLI binary (linscp)
+        run: python3 tools/run_cargo_ci.py cargo build --release -p linscp-cli
+
+      - name: Install live parity test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            libssh-dev libcurl4-openssl-dev libssl-dev libargon2-dev zlib1g-dev \
+            krb5-kdc krb5-user krb5-admin-server libkrb5-dev openssh-server curl
+          python3 -m venv "$RUNNER_TEMP/live-test-venv"
+          "$RUNNER_TEMP/live-test-venv/bin/pip" install --quiet \
+            paramiko botocore pyftpdlib pyOpenSSL xmlschema
+          if ! command -v pwsh >/dev/null 2>&1; then
+            wget -q "https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb"
+            sudo dpkg -i packages-microsoft-prod.deb
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq powershell
+          fi
+
+      - name: Run all 9 CLI, protocol, and automation parity suites against Rust linscp
+        run: |
+          set -euo pipefail
+          BIN="$GITHUB_WORKSPACE/target/release/linscp"
+          PY="$RUNNER_TEMP/live-test-venv/bin/python"
+          overall_rc=0
+
+          run_suite() {
+            local label="$1"
+            local log="$RUNNER_TEMP/rust-parity-${label}.log"
+            shift
+            echo "=== Running parity suite: ${label} ==="
+            if ! "$@" >"$log" 2>&1; then
+              cat "$log"
+              python3 - "$label" "$log" <<'PYEOF'
+          import pathlib, re, sys
+          label, path = sys.argv[1], sys.argv[2]
+          text = pathlib.Path(path).read_text(errors="replace")
+          blocks = re.split(r"\n={60,}\n", text)
+          summaries = []
+          for b in blocks[1:]:
+              lines = [ln for ln in b.strip().splitlines() if ln.strip()]
+              if lines:
+                  head = lines[0]
+                  tail = "\n".join(lines[-8:])
+                  summaries.append(f"{head}\n{tail}")
+          snippet = "\n---\n".join(summaries) if summaries else text[-3500:]
+          chunks = [snippet[i:i + 3400] for i in range(0, len(snippet), 3400)]
+          for idx, part in enumerate(chunks[:2], 1):
+              esc = part.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error title={label} ({idx}/{min(len(chunks), 2)})::{esc}")
+          PYEOF
+              overall_rc=1
+              return 0
+            fi
+            grep '^evidence: ' "$log" | while IFS= read -r line; do
+              printf '::notice title=%s::%s\n' "$label" "${line//]/%5D}"
+            done || true
+          }
+
+          run_suite "ScriptTest" "$PY" -u source/linux/tests/ScriptTest.py "$BIN"
+          LSCP_REQUIRE_GSSAPI_REALM=1 run_suite "LiveSftpTest" "$PY" -u source/linux/tests/LiveSftpTest.py "$BIN"
+          if ! grep -E 'evidence: suite=live-sftp .*ran=[1-9][0-9]* skipped=0 failed=0' "$RUNNER_TEMP/rust-parity-LiveSftpTest.log" >/dev/null 2>&1; then
+            echo "::error title=LiveSftpTest::live-sftp suite skipped or failed cases"
+            overall_rc=1
+          fi
+          run_suite "LiveTunnelTest" "$PY" -u source/linux/tests/LiveTunnelTest.py "$BIN"
+          run_suite "LiveScpTest" "$PY" -u source/linux/tests/LiveScpTest.py "$BIN"
+          run_suite "LiveDavTest" "$PY" -u source/linux/tests/LiveDavTest.py "$BIN"
+          run_suite "LiveS3Test" "$PY" -u source/linux/tests/LiveS3Test.py "$BIN"
+          run_suite "LiveCurlTest" "$PY" -u source/linux/tests/LiveCurlTest.py "$BIN"
+          run_suite "PowerShellModule" python3 -u automation/test_psmodule.py "$BIN"
+          if ! grep -E 'evidence: suite=powershell .*ran=[1-9][0-9]* skipped=0 failed=0' "$RUNNER_TEMP/rust-parity-PowerShellModule.log" >/dev/null 2>&1; then
+            echo "::error title=PowerShellModule::powershell suite skipped or failed cases"
+            overall_rc=1
+          fi
+          run_suite "DotNetAssembly" python3 -u automation/test_dotnet.py "$BIN"
+          if ! grep -E 'evidence: suite=dotnet .*ran=1[0-9] skipped=[01] failed=0' "$RUNNER_TEMP/rust-parity-DotNetAssembly.log" >/dev/null 2>&1; then
+            echo "::error title=DotNetAssembly::dotnet suite failed or did not build LinSCP.csproj"
+            overall_rc=1
+          fi
+          exit "$overall_rc"
+
       - name: Lint workspace with Clippy
         run: |
-          python3 tools/run_cargo_ci.py cargo clippy --workspace --all-targets -- -D warnings
-          python3 tools/run_cargo_ci.py cargo clippy -p linscp-proto --features gssapi --all-targets -- -D warnings
+          python3 tools/run_cargo_ci.py cargo clippy --workspace --all-targets --keep-going -- -D warnings
+          python3 tools/run_cargo_ci.py cargo clippy -p linscp-proto --features gssapi --all-targets --keep-going -- -D warnings
 
       - name: Install Linux Tauri WebKit2GTK headers
         run: |
@@ -80,17 +162,67 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run pure-Rust workspace unit tests on Windows
+        shell: bash
         run: |
+          set -euo pipefail
           python tools/run_cargo_ci.py cargo test --workspace
           python tools/run_cargo_ci.py cargo test -p linscp-proto --features gssapi
 
       - name: Lint workspace with Clippy on Windows
+        shell: bash
         run: |
-          python tools/run_cargo_ci.py cargo clippy --workspace --all-targets -- -D warnings
-          python tools/run_cargo_ci.py cargo clippy -p linscp-proto --features gssapi --all-targets -- -D warnings
+          set -euo pipefail
+          python tools/run_cargo_ci.py cargo clippy --workspace --all-targets --keep-going -- -D warnings
+          python tools/run_cargo_ci.py cargo clippy -p linscp-proto --features gssapi --all-targets --keep-going -- -D warnings
 
       - name: Check Tauri v2 native shell crate on Windows
-        run: python tools/run_cargo_ci.py cargo check -p linscp-tauri --features native-shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_cargo_ci.py cargo check -p linscp-tauri --features native-shell
+
+      - name: Build and smoke-test release Rust CLI on Windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_cargo_ci.py cargo build --release -p linscp-cli
+          BIN_WIN="$(cygpath -m "$PWD/target/release/linscp.exe")"
+          ./target/release/linscp.exe -version
+          ./target/release/linscp.exe -batch -command="option batch; option transfer; sessions list; presets; exit"
+          run_win_suite() {
+            local label="$1"
+            local script_path="$2"
+            local log="$RUNNER_TEMP/rust-win-${label}.log"
+            echo "=== Running Windows parity suite: ${label} ==="
+            if ! python -u - "$script_path" "$BIN_WIN" >"$log" 2>&1 <<'PYEOF'
+          import os, pathlib, runpy, sys
+          if not hasattr(os, "killpg"):
+              os.getpgid = lambda pid: pid
+              os.killpg = lambda pgid, sig: os.kill(pgid, sig)
+          _orig_write_text = pathlib.Path.write_text
+          pathlib.Path.write_text = (
+              lambda self, data, encoding=None, errors=None, newline="\n":
+              _orig_write_text(self, data, encoding=encoding, errors=errors, newline=newline)
+          )
+          script_path, bin_win = sys.argv[1], sys.argv[2]
+          sys.argv = [script_path, bin_win]
+          runpy.run_path(script_path, run_name="__main__")
+          PYEOF
+            then
+              cat "$log"
+              python - "$label" "$log" <<'ERRPY'
+          import pathlib, sys
+          label, path = sys.argv[1], sys.argv[2]
+          tail = pathlib.Path(path).read_text(errors="replace")[-3500:]
+          esc = tail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::error title=Win-{label}::{esc}")
+          ERRPY
+              return 1
+            fi
+            grep -E '^evidence:' "$log" | tail -n 1 || true
+          }
+          run_win_suite "LiveDavTest" "source/linux/tests/LiveDavTest.py"
+          run_win_suite "LiveS3Test" "source/linux/tests/LiveS3Test.py"
 
   rust-android:
     name: Rust Core & Android SAF Platform Target (Android NDK)

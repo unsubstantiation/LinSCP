@@ -291,6 +291,7 @@ async fn read_scp_ack<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(), ProtoE
 /// Native SCP + POSIX shell session implementing `RemoteSession`.
 pub struct ScpSession {
     ssh: Arc<SshConnection>,
+    dest_cfg: Option<SshConnectConfig>,
     jump_tunnel: Option<Arc<SshJumpTunnel>>,
     home_dir: String,
 }
@@ -303,15 +304,44 @@ impl ScpSession {
     ) -> Result<Self, ProtoError> {
         let (ssh, jump_tunnel) = if let Some(tcfg) = tunnel_cfg {
             let jump = Arc::new(SshJumpTunnel::connect(tcfg.clone()).await?);
-            let stream = jump
+            let stream = match jump
                 .open_destination_stream(&dest_cfg.host, dest_cfg.port, tunnel_local_port)
-                .await?;
-            let conn = SshConnection::connect_over_stream(dest_cfg, stream).await?;
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = jump.close().await;
+                    return Err(e);
+                }
+            };
+            let conn = match SshConnection::connect_over_stream(dest_cfg, stream).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = jump.close().await;
+                    return Err(e);
+                }
+            };
             (Arc::new(conn), Some(jump))
         } else {
             (Arc::new(SshConnection::connect(dest_cfg).await?), None)
         };
-        Self::from_ssh_connection(ssh, jump_tunnel).await
+        let mut session = match Self::from_ssh_connection(ssh, jump_tunnel.clone()).await {
+            Ok(s) => s,
+            Err(e) => {
+                if let Some(j) = jump_tunnel {
+                    let _ = j.close().await;
+                }
+                return Err(e);
+            }
+        };
+        let mut stored_cfg = dest_cfg.clone();
+        stored_cfg.host_key_decision = None;
+        stored_cfg.event_logger = None;
+        stored_cfg.danger_accept_any_host_key = false;
+        stored_cfg.pinned_host_key = Some(session.ssh.observed_fingerprint().to_string());
+        let _ = session.ssh.disconnect().await;
+        session.dest_cfg = Some(stored_cfg);
+        Ok(session)
     }
 
     pub async fn from_ssh_connection(
@@ -332,6 +362,7 @@ impl ScpSession {
         };
         Ok(Self {
             ssh,
+            dest_cfg: None,
             jump_tunnel,
             home_dir,
         })
@@ -341,8 +372,31 @@ impl ScpSession {
         self.ssh.observed_fingerprint()
     }
 
+    async fn acquire_ssh(&self) -> Result<(Arc<SshConnection>, bool), ProtoError> {
+        if let Some(cfg) = &self.dest_cfg {
+            let conn = if let Some(jump) = &self.jump_tunnel {
+                let stream = jump.open_destination_stream(&cfg.host, cfg.port, 0).await?;
+                SshConnection::connect_over_stream(cfg, stream).await?
+            } else {
+                SshConnection::connect(cfg).await?
+            };
+            Ok((Arc::new(conn), true))
+        } else {
+            Ok((Arc::clone(&self.ssh), false))
+        }
+    }
+
+    async fn exec_one_shot(&self, cmd: &str) -> Result<crate::ssh::ExecOutput, ProtoError> {
+        let (conn, owned) = self.acquire_ssh().await?;
+        let res = conn.exec_command(cmd).await;
+        if owned {
+            let _ = conn.disconnect().await;
+        }
+        res
+    }
+
     async fn run_shell_checked(&self, cmd: &str) -> Result<String, ProtoError> {
-        let reply = self.ssh.exec_command(cmd).await?;
+        let reply = self.exec_one_shot(cmd).await?;
         match reply.exit_code {
             Some(0) => Ok(String::from_utf8_lossy(&reply.stdout).into_owned()),
             Some(code) => {
@@ -365,7 +419,7 @@ impl ScpSession {
             let env_prefix = if with_env { "env LC_ALL=C " } else { "" };
             let ft = if full_time { "--full-time " } else { "" };
             let cmd = format!("{env_prefix}ls -l {flag} {ft}{quoted}");
-            let out = self.ssh.exec_command(&cmd).await?;
+            let out = self.exec_one_shot(&cmd).await?;
             let Some(code) = out.exit_code else {
                 return Err(ProtoError::Transport(
                     "Connection closed while running remote 'ls'.".to_string(),
@@ -448,14 +502,14 @@ impl RemoteSession for ScpSession {
 
     async fn mkdir(&self, remote_path: &str) -> Result<(), ProtoError> {
         let norm = prepare_remote_path(remote_path)?;
-        self.run_shell_checked(&format!("mkdir -p -- {}", scp_shell_quote(&norm)))
+        self.run_shell_checked(&format!("mkdir -- {}", scp_shell_quote(&norm)))
             .await?;
         Ok(())
     }
 
     async fn remove_file(&self, remote_path: &str) -> Result<(), ProtoError> {
         let norm = prepare_remote_path(remote_path)?;
-        self.run_shell_checked(&format!("rm -f -- {}", scp_shell_quote(&norm)))
+        self.run_shell_checked(&format!("rm -- {}", scp_shell_quote(&norm)))
             .await?;
         Ok(())
     }
@@ -526,27 +580,6 @@ impl RemoteSession for ScpSession {
     }
 
     async fn checksum(&self, algorithm: &str, remote_path: &str) -> Result<String, ProtoError> {
-        let norm = prepare_remote_path(remote_path)?;
-        let tool = match DigestAlgorithm::parse(algorithm) {
-            Some(DigestAlgorithm::Sha256) => Some("sha256sum"),
-            Some(DigestAlgorithm::Sha1) => Some("sha1sum"),
-            Some(DigestAlgorithm::Md5) => Some("md5sum"),
-            _ => None,
-        };
-        if let Some(bin) = tool {
-            let cmd = format!("{bin} -- {}", scp_shell_quote(&norm));
-            if let Ok(out) = self.ssh.exec_command(&cmd).await {
-                if out.exit_code == Some(0) {
-                    if let Some(hex) = String::from_utf8_lossy(&out.stdout)
-                        .split_whitespace()
-                        .next()
-                        .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
-                    {
-                        return Ok(hex.to_ascii_lowercase());
-                    }
-                }
-            }
-        }
         let alg = DigestAlgorithm::parse(algorithm).ok_or_else(|| {
             ProtoError::Transport(format!("Unsupported checksum algorithm '{algorithm}'."))
         })?;
@@ -575,95 +608,108 @@ impl RemoteSession for ScpSession {
         let p_flag = if opts.preserve_time { "-p " } else { "" };
         let cmd = format!("scp {p_flag}-f -- {}", scp_shell_quote(&norm));
 
-        let channel = self.ssh.open_session_channel().await?;
-        channel
-            .exec(true, cmd.as_str())
-            .await
-            .map_err(|e| ProtoError::Transport(format!("Failed to start '{cmd}': {e}")))?;
-        let mut stream = channel.into_stream();
+        let (conn, owned) = self.acquire_ssh().await?;
+        let res: Result<u64, ProtoError> = async {
+            let channel = conn.open_session_channel().await?;
+            channel
+                .exec(true, cmd.as_str())
+                .await
+                .map_err(|e| ProtoError::Transport(format!("Failed to start '{cmd}': {e}")))?;
+            let mut stream = channel.into_stream();
 
-        // Kick off source mode by sending initial NUL byte
-        stream
-            .write_all(&[0u8])
-            .await
-            .map_err(|e| ProtoError::Transport(format!("SCP initial ack write failed: {e}")))?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| ProtoError::Transport(format!("SCP initial ack flush failed: {e}")))?;
+            // Kick off source mode by sending initial NUL byte
+            stream.write_all(&[0u8]).await.map_err(|e| {
+                ProtoError::Transport(format!("SCP initial ack write failed: {e}"))
+            })?;
+            stream.flush().await.map_err(|e| {
+                ProtoError::Transport(format!("SCP initial ack flush failed: {e}"))
+            })?;
 
-        loop {
-            let line = read_scp_line(&mut stream).await?;
-            match scp_parse_header_line(&line)? {
-                ScpRecord::Timestamp { .. } => {
-                    stream.write_all(&[0u8]).await.map_err(|e| {
-                        ProtoError::Transport(format!("SCP timestamp ack write failed: {e}"))
-                    })?;
-                    stream.flush().await.map_err(|e| {
-                        ProtoError::Transport(format!("SCP timestamp ack flush failed: {e}"))
-                    })?;
-                }
-                ScpRecord::File { size, .. } => {
-                    stream.write_all(&[0u8]).await.map_err(|e| {
-                        ProtoError::Transport(format!("SCP file header ack failed: {e}"))
-                    })?;
-                    stream.flush().await.map_err(|e| {
-                        ProtoError::Transport(format!("SCP file header flush failed: {e}"))
-                    })?;
-
-                    let mut remaining = size;
-                    let mut transferred = 0u64;
-                    let mut buf = vec![0u8; SCP_CHUNK_SIZE];
-                    let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
-                    while remaining > 0 {
-                        let to_read = (remaining as usize).min(SCP_CHUNK_SIZE);
-                        let n = stream.read(&mut buf[..to_read]).await.map_err(|e| {
-                            ProtoError::Transport(format!("SCP payload read failed: {e}"))
+            loop {
+                let line = read_scp_line(&mut stream).await?;
+                match scp_parse_header_line(&line)? {
+                    ScpRecord::Timestamp { .. } => {
+                        stream.write_all(&[0u8]).await.map_err(|e| {
+                            ProtoError::Transport(format!("SCP timestamp ack write failed: {e}"))
                         })?;
-                        if n == 0 {
-                            return Err(ProtoError::Transport(
-                                "Remote scp closed connection mid-file.".to_string(),
-                            ));
-                        }
-                        sink.write_all(&buf[..n]).await.map_err(|e| {
-                            ProtoError::Transport(format!("SCP local sink write failed: {e}"))
+                        stream.flush().await.map_err(|e| {
+                            ProtoError::Transport(format!("SCP timestamp ack flush failed: {e}"))
                         })?;
-                        remaining -= n as u64;
-                        transferred += n as u64;
-                        if let Some(cb) = progress {
-                            cb(transferred, size);
-                        }
-                        limiter.consume(n).await;
                     }
-                    sink.flush().await.map_err(|e| {
-                        ProtoError::Transport(format!("SCP local sink flush failed: {e}"))
-                    })?;
+                    ScpRecord::File { size, .. } => {
+                        stream.write_all(&[0u8]).await.map_err(|e| {
+                            ProtoError::Transport(format!("SCP file header ack failed: {e}"))
+                        })?;
+                        stream.flush().await.map_err(|e| {
+                            ProtoError::Transport(format!("SCP file header flush failed: {e}"))
+                        })?;
 
-                    // Read trailing status byte from `scp -f` and acknowledge with `\0`
-                    read_scp_ack(&mut stream).await?;
-                    let _ = stream.write_all(&[0u8]).await;
-                    let _ = stream.flush().await;
-                    return Ok(transferred);
-                }
-                ScpRecord::Error { message, .. } => {
-                    return Err(ProtoError::Transport(if message.is_empty() {
-                        "Remote scp reported an error.".to_string()
-                    } else {
-                        message
-                    }));
-                }
-                ScpRecord::Directory { name, .. } => {
-                    return Err(ProtoError::Transport(format!(
-                        "Remote path '{name}' is a directory, not a regular file."
-                    )));
-                }
-                ScpRecord::EndDirectory => {
-                    return Err(ProtoError::Transport(
-                        "Unexpected SCP 'E' record during single-file download.".to_string(),
-                    ));
+                        let mut remaining = size;
+                        let mut transferred = 0u64;
+                        let mut buf = vec![0u8; SCP_CHUNK_SIZE];
+                        let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
+                        while remaining > 0 {
+                            let to_read = (remaining as usize).min(SCP_CHUNK_SIZE);
+                            let n = stream.read(&mut buf[..to_read]).await.map_err(|e| {
+                                ProtoError::Transport(format!("SCP payload read failed: {e}"))
+                            })?;
+                            if n == 0 {
+                                return Err(ProtoError::Transport(
+                                    "Remote scp closed connection mid-file.".to_string(),
+                                ));
+                            }
+                            sink.write_all(&buf[..n]).await.map_err(|e| {
+                                ProtoError::Transport(format!("SCP local sink write failed: {e}"))
+                            })?;
+                            remaining -= n as u64;
+                            transferred += n as u64;
+                            if let Some(cb) = progress {
+                                cb(transferred, size);
+                            }
+                            if opts.speed_kbytes_per_sec > 0 {
+                                sink.flush().await.map_err(|e| {
+                                    ProtoError::Transport(format!(
+                                        "SCP local sink flush failed: {e}"
+                                    ))
+                                })?;
+                            }
+                            limiter.consume(n).await;
+                        }
+                        sink.flush().await.map_err(|e| {
+                            ProtoError::Transport(format!("SCP local sink flush failed: {e}"))
+                        })?;
+
+                        // Read trailing status byte from `scp -f` and acknowledge with `\0`
+                        read_scp_ack(&mut stream).await?;
+                        let _ = stream.write_all(&[0u8]).await;
+                        let _ = stream.flush().await;
+                        return Ok(transferred);
+                    }
+                    ScpRecord::Error { message, .. } => {
+                        return Err(ProtoError::Transport(if message.is_empty() {
+                            "Remote scp reported an error.".to_string()
+                        } else {
+                            message
+                        }));
+                    }
+                    ScpRecord::Directory { name, .. } => {
+                        return Err(ProtoError::Transport(format!(
+                            "Remote path '{name}' is a directory, not a regular file."
+                        )));
+                    }
+                    ScpRecord::EndDirectory => {
+                        return Err(ProtoError::Transport(
+                            "Unexpected SCP 'E' record during single-file download.".to_string(),
+                        ));
+                    }
                 }
             }
         }
+        .await;
+        if owned {
+            let _ = conn.disconnect().await;
+        }
+        res
     }
 
     async fn upload(
@@ -709,92 +755,127 @@ impl RemoteSession for ScpSession {
         };
         let cmd = format!("scp {p_flag}-t -- {}", scp_shell_quote(&target_arg));
 
-        let channel = self.ssh.open_session_channel().await?;
-        channel
-            .exec(true, cmd.as_str())
-            .await
-            .map_err(|e| ProtoError::Transport(format!("Failed to start '{cmd}': {e}")))?;
-        let mut stream = channel.into_stream();
+        let (conn, owned) = self.acquire_ssh().await?;
+        let res: Result<u64, ProtoError> = async {
+            let channel = conn.open_session_channel().await?;
+            channel
+                .exec(true, cmd.as_str())
+                .await
+                .map_err(|e| ProtoError::Transport(format!("Failed to start '{cmd}': {e}")))?;
+            let mut stream = channel.into_stream();
 
-        read_scp_ack(&mut stream).await?;
+            read_scp_ack(&mut stream).await?;
 
-        if opts.preserve_time {
-            if let Some(mtime) = opts.mtime {
-                let ts = mtime.max(0) as u64;
-                let thdr = scp_time_header_line(ts, ts);
-                stream.write_all(thdr.as_bytes()).await.map_err(|e| {
-                    ProtoError::Transport(format!("SCP time header write failed: {e}"))
-                })?;
-                stream
-                    .flush()
-                    .await
-                    .map_err(|e| ProtoError::Transport(format!("SCP time flush failed: {e}")))?;
-                read_scp_ack(&mut stream).await?;
-            }
-        }
-
-        let mode = opts.permissions.unwrap_or(0o644);
-        let chdr = scp_file_header_line(mode, exact_size, &leaf_name)?;
-        stream
-            .write_all(chdr.as_bytes())
-            .await
-            .map_err(|e| ProtoError::Transport(format!("SCP file header write failed: {e}")))?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| ProtoError::Transport(format!("SCP file header flush failed: {e}")))?;
-        read_scp_ack(&mut stream).await?;
-
-        let mut transferred = 0u64;
-        let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
-
-        if let Some(bytes) = buffered_payload {
-            for chunk in bytes.chunks(SCP_CHUNK_SIZE) {
-                stream
-                    .write_all(chunk)
-                    .await
-                    .map_err(|e| ProtoError::Transport(format!("SCP data write failed: {e}")))?;
-                transferred += chunk.len() as u64;
-                if let Some(cb) = progress {
-                    cb(transferred, exact_size);
+            if opts.preserve_time {
+                if let Some(mtime) = opts.mtime {
+                    let ts = mtime.max(0) as u64;
+                    let thdr = scp_time_header_line(ts, ts);
+                    stream.write_all(thdr.as_bytes()).await.map_err(|e| {
+                        ProtoError::Transport(format!("SCP time header write failed: {e}"))
+                    })?;
+                    stream.flush().await.map_err(|e| {
+                        ProtoError::Transport(format!("SCP time flush failed: {e}"))
+                    })?;
+                    read_scp_ack(&mut stream).await?;
                 }
-                limiter.consume(chunk.len()).await;
             }
+
+            let mode = opts.permissions.unwrap_or(0o644);
+            let chdr = scp_file_header_line(mode, exact_size, &leaf_name)?;
+            stream.write_all(chdr.as_bytes()).await.map_err(|e| {
+                ProtoError::Transport(format!("SCP file header write failed: {e}"))
+            })?;
+            stream
+                .flush()
+                .await
+                .map_err(|e| ProtoError::Transport(format!("SCP file header flush failed: {e}")))?;
+            read_scp_ack(&mut stream).await?;
+
+            let mut transferred = 0u64;
+            let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
+
+            if let Some(bytes) = buffered_payload {
+                for chunk in bytes.chunks(SCP_CHUNK_SIZE) {
+                    stream.write_all(chunk).await.map_err(|e| {
+                        ProtoError::Transport(format!("SCP data write failed: {e}"))
+                    })?;
+                    transferred += chunk.len() as u64;
+                    if let Some(cb) = progress {
+                        cb(transferred, exact_size);
+                    }
+                    limiter.consume(chunk.len()).await;
+                }
+            } else {
+                let mut buf = vec![0u8; SCP_CHUNK_SIZE];
+                while transferred < exact_size {
+                    let want = ((exact_size - transferred) as usize).min(SCP_CHUNK_SIZE);
+                    let n = source.read(&mut buf[..want]).await.map_err(|e| {
+                        ProtoError::Transport(format!("SCP upload source read failed: {e}"))
+                    })?;
+                    if n == 0 {
+                        return Err(ProtoError::Transport(format!(
+                            "Upload source ended early after {transferred} of {exact_size} bytes."
+                        )));
+                    }
+                    stream.write_all(&buf[..n]).await.map_err(|e| {
+                        ProtoError::Transport(format!("SCP data write failed: {e}"))
+                    })?;
+                    transferred += n as u64;
+                    if let Some(cb) = progress {
+                        cb(transferred, exact_size);
+                    }
+                    limiter.consume(n).await;
+                }
+            }
+
+            // Trailing NUL byte + final server ack
+            stream
+                .write_all(&[0u8])
+                .await
+                .map_err(|e| ProtoError::Transport(format!("SCP trailer write failed: {e}")))?;
+            stream
+                .flush()
+                .await
+                .map_err(|e| ProtoError::Transport(format!("SCP trailer flush failed: {e}")))?;
+            read_scp_ack(&mut stream).await?;
+            let _ = stream.shutdown().await;
+            Ok(transferred)
+        }
+        .await;
+        if owned {
+            let _ = conn.disconnect().await;
+        }
+        res
+    }
+
+    async fn realpath(&self, remote_path: &str) -> Result<String, ProtoError> {
+        let target = if remote_path.is_empty() || remote_path == "." {
+            return Ok(self.home_dir.clone());
         } else {
-            let mut buf = vec![0u8; SCP_CHUNK_SIZE];
-            while transferred < exact_size {
-                let want = ((exact_size - transferred) as usize).min(SCP_CHUNK_SIZE);
-                let n = source.read(&mut buf[..want]).await.map_err(|e| {
-                    ProtoError::Transport(format!("SCP upload source read failed: {e}"))
-                })?;
-                if n == 0 {
-                    return Err(ProtoError::Transport(format!(
-                        "Upload source ended early after {transferred} of {exact_size} bytes."
-                    )));
-                }
-                stream.write_all(&buf[..n]).await.map_err(|e| {
-                    ProtoError::Transport(format!("SCP data write failed: {e}"))
-                })?;
-                transferred += n as u64;
-                if let Some(cb) = progress {
-                    cb(transferred, exact_size);
-                }
-                limiter.consume(n).await;
-            }
-        }
+            remote_path
+        };
+        scp_valid_remote_path(target)?;
+        let cmd = format!("cd -- {} && pwd", scp_shell_quote(target));
+        let out = self.run_shell_checked(&cmd).await?;
+        Ok(out
+            .lines()
+            .last()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("/")
+            .to_string())
+    }
 
-        // Trailing NUL byte + final server ack
-        stream
-            .write_all(&[0u8])
-            .await
-            .map_err(|e| ProtoError::Transport(format!("SCP trailer write failed: {e}")))?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| ProtoError::Transport(format!("SCP trailer flush failed: {e}")))?;
-        read_scp_ack(&mut stream).await?;
-        let _ = stream.shutdown().await;
-        Ok(transferred)
+    async fn readlink(&self, link_path: &str) -> Result<String, ProtoError> {
+        let norm = prepare_remote_path(link_path)?;
+        let out = self
+            .run_shell_checked(&format!("readlink -- {}", scp_shell_quote(&norm)))
+            .await?;
+        Ok(out.trim_end_matches(['\r', '\n']).to_string())
+    }
+
+    async fn exec_command(&self, command: &str) -> Result<crate::ssh::ExecOutput, ProtoError> {
+        self.exec_one_shot(command).await
     }
 
     async fn close(&self) -> Result<(), ProtoError> {

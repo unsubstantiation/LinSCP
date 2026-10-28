@@ -215,15 +215,58 @@ impl Socks5JumpRelay {
 /// Authenticated SSH jump-host (bastion) session capable of opening private
 /// in-memory `direct-tcpip` streams (for SFTP/SCP/SSH) or a loopback-only
 /// SOCKS5h relay (for FTP/FTPS/WebDAV/S3).
+type TunnelWatchSignal = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
 pub struct SshJumpTunnel {
     ssh: Arc<SshConnection>,
+    watcher_thread: std::sync::Mutex<Option<(TunnelWatchSignal, std::thread::JoinHandle<()>)>>,
 }
 
 impl SshJumpTunnel {
     pub async fn connect(mut bastion_cfg: SshConnectConfig) -> Result<Self, ProtoError> {
         bastion_cfg.role = "tunnel".to_string();
-        let ssh = SshConnection::connect(&bastion_cfg).await?;
-        Ok(Self { ssh: Arc::new(ssh) })
+        let ssh = SshConnection::connect(&bastion_cfg)
+            .await
+            .map_err(|err| match err {
+                ProtoError::HostKeyChallengeRequired { .. }
+                | ProtoError::WeakHostKeyPolicy(_) => err,
+                other => ProtoError::Transport(format!("SSH tunnel: {other}")),
+            })?;
+        let sig: TunnelWatchSignal =
+            Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let sig_bg = Arc::clone(&sig);
+        let handle = std::thread::Builder::new()
+            .name("linscp-tunnel".to_string())
+            .spawn(move || {
+                let (lock, cvar) = &*sig_bg;
+                if let Ok(mut done) = lock.lock() {
+                    while !*done {
+                        let Ok(next) = cvar.wait(done) else {
+                            break;
+                        };
+                        done = next;
+                    }
+                }
+            })
+            .ok()
+            .map(|jh| (sig, jh));
+        Ok(Self {
+            ssh: Arc::new(ssh),
+            watcher_thread: std::sync::Mutex::new(handle),
+        })
+    }
+
+    fn stop_watcher(&self) {
+        if let Ok(mut guard) = self.watcher_thread.lock() {
+            if let Some((sig, jh)) = guard.take() {
+                let (lock, cvar) = &*sig;
+                if let Ok(mut done) = lock.lock() {
+                    *done = true;
+                    cvar.notify_all();
+                }
+                let _ = jh.join();
+            }
+        }
     }
 
     pub fn observed_fingerprint(&self) -> &str {
@@ -250,7 +293,7 @@ impl SshJumpTunnel {
             .await
             .map_err(|e| {
                 ProtoError::Transport(format!(
-                    "Failed to bind TunnelLocalPortNumber 127.0.0.1:{local_port}: {e}"
+                    "Cannot listen on the tunnel local port 127.0.0.1:{local_port}: {e}"
                 ))
             })?;
         let bound_addr = listener.local_addr().map_err(|e| {
@@ -281,7 +324,7 @@ impl SshJumpTunnel {
             .await
             .map_err(|e| {
                 ProtoError::Transport(format!(
-                    "Failed to bind loopback SOCKS5 jump relay on 127.0.0.1:{local_port}: {e}"
+                    "Cannot listen on the tunnel local port 127.0.0.1:{local_port}: {e}"
                 ))
             })?;
         let actual_port = listener
@@ -322,7 +365,15 @@ impl SshJumpTunnel {
     }
 
     pub async fn close(&self) -> Result<(), ProtoError> {
-        self.ssh.disconnect().await
+        let res = self.ssh.disconnect().await;
+        self.stop_watcher();
+        res
+    }
+}
+
+impl Drop for SshJumpTunnel {
+    fn drop(&mut self) {
+        self.stop_watcher();
     }
 }
 

@@ -77,12 +77,17 @@ pub struct StoredSite {
     pub proxy_exclude: String,
     pub proxy_dns: String,
     pub proxy_localhost: bool,
+    pub proxy_error: Option<String>,
 
     // SSH jump / tunnel fields
     pub tunnel: TunnelConfig,
     pub tunnel_password_raw: Option<String>,
     pub tunnel_passphrase: Option<String>,
     pub tunnel_passphrase_raw: Option<String>,
+    pub tunnel_error: Option<String>,
+
+    /// First invalid stored raw setting encountered while parsing `sessions.ini`.
+    pub setting_error: Option<String>,
 
     // Preserved protocol-specific & future INI keys (`s3_*`, `ftp_*`, `tls_*`, etc.)
     pub extra_fields: BTreeMap<String, String>,
@@ -115,10 +120,13 @@ impl StoredSite {
             proxy_exclude: String::new(),
             proxy_dns: String::new(),
             proxy_localhost: false,
+            proxy_error: None,
             tunnel: TunnelConfig::default(),
             tunnel_password_raw: None,
             tunnel_passphrase: None,
             tunnel_passphrase_raw: None,
+            tunnel_error: None,
+            setting_error: None,
             extra_fields: BTreeMap::new(),
         }
     }
@@ -171,7 +179,7 @@ impl StoredSite {
     }
 
     pub fn folder_and_leaf(&self) -> (&str, &str) {
-        match self.name.split_once('/') {
+        match self.name.rsplit_once('/') {
             Some((folder, leaf)) if !folder.is_empty() && !leaf.is_empty() => (folder, leaf),
             _ => ("", self.name.as_str()),
         }
@@ -205,8 +213,9 @@ impl StoredSite {
     pub fn needs_encryption_key(&self) -> bool {
         self.password.as_deref().is_some_and(|s| !s.is_empty())
             || self.proxy_password.as_deref().is_some_and(|s| !s.is_empty())
-            || self.tunnel.password.as_deref().is_some_and(|s| !s.is_empty())
-            || self.tunnel_passphrase.as_deref().is_some_and(|s| !s.is_empty())
+            || (self.tunnel.enabled
+                && (self.tunnel.password.as_deref().is_some_and(|s| !s.is_empty())
+                    || self.tunnel_passphrase.as_deref().is_some_and(|s| !s.is_empty())))
     }
 }
 
@@ -251,11 +260,12 @@ fn encode_secret_field(
     Ok(None)
 }
 
-fn parse_bool_ini(val: &str) -> bool {
-    matches!(
-        val.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+fn parse_strict_toggle_ini(val: &str) -> Option<bool> {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "0" | "off" | "no" | "false" => Some(false),
+        "1" | "2" | "on" | "yes" | "true" | "auto" | "automatic" => Some(true),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -320,51 +330,153 @@ impl SessionStore {
                 .and_then(|v| v.parse::<u64>().ok());
 
             site.proxy_method = map.remove("proxy_method").unwrap_or_default();
+            if !site.proxy_method.trim().is_empty() {
+                let pm = site.proxy_method.trim().to_ascii_lowercase();
+                if !matches!(
+                    pm.as_str(),
+                    "none"
+                        | "socks4"
+                        | "socks5"
+                        | "socks"
+                        | "http"
+                        | "telnet"
+                        | "cmd"
+                        | "local"
+                        | "command"
+                        | "0"
+                        | "1"
+                        | "2"
+                        | "3"
+                        | "4"
+                        | "5"
+                ) {
+                    site.proxy_error = Some(format!(
+                        "Unknown stored proxy_method '{}'.",
+                        site.proxy_method
+                    ));
+                }
+            }
             site.proxy_host = map.remove("proxy_host").unwrap_or_default();
-            site.proxy_port = map
-                .remove("proxy_port")
-                .and_then(|v| v.parse::<u16>().ok())
-                .unwrap_or(0);
+            if let Some(pp) = map.remove("proxy_port") {
+                if !pp.trim().is_empty() {
+                    match pp.trim().parse::<u16>() {
+                        Ok(p) if p > 0 => site.proxy_port = p,
+                        _ if site.proxy_error.is_none() => {
+                            site.proxy_error =
+                                Some(format!("Invalid stored proxy_port '{pp}'."));
+                        }
+                        _ => {}
+                    }
+                }
+            }
             site.proxy_username = map.remove("proxy_username").unwrap_or_default();
             if let Some(ppw) = map.remove("proxy_password") {
-                let (plain, raw, _) = decode_secret_field(&ppw, master_key);
+                let (plain, raw, err) = decode_secret_field(&ppw, master_key);
                 site.proxy_password = plain;
                 site.proxy_password_raw = raw;
+                if let Some(e) = err {
+                    if site.proxy_error.is_none()
+                        && !site.proxy_method.trim().is_empty()
+                        && !site.proxy_method.trim().eq_ignore_ascii_case("none")
+                        && site.proxy_method.trim() != "0"
+                    {
+                        site.proxy_error =
+                            Some(format!("The stored proxy password cannot be used: {e}"));
+                    }
+                }
             }
             site.proxy_command = map.remove("proxy_command").unwrap_or_default();
             site.proxy_exclude = map.remove("proxy_exclude").unwrap_or_default();
             site.proxy_dns = map.remove("proxy_dns").unwrap_or_default();
-            site.proxy_localhost = map
-                .remove("proxy_localhost")
-                .map(|v| parse_bool_ini(&v))
-                .unwrap_or(false);
+            if !site.proxy_dns.trim().is_empty() {
+                let pd = site.proxy_dns.trim().to_ascii_lowercase();
+                if !matches!(
+                    pd.as_str(),
+                    "0" | "1" | "2" | "off" | "no" | "false" | "auto" | "automatic" | "on" | "yes" | "true"
+                ) && site.proxy_error.is_none()
+                {
+                    site.proxy_error = Some(format!(
+                        "Invalid stored setting 'proxy_dns' value '{}'.",
+                        site.proxy_dns
+                    ));
+                }
+            }
+            if let Some(pl) = map.remove("proxy_localhost") {
+                if !pl.trim().is_empty() {
+                    match parse_strict_toggle_ini(&pl) {
+                        Some(v) => site.proxy_localhost = v,
+                        None if site.proxy_error.is_none() => {
+                            site.proxy_error = Some(format!(
+                                "Invalid stored setting 'proxy_localhost' value '{pl}'."
+                            ));
+                        }
+                        None => {}
+                    }
+                }
+            }
 
-            site.tunnel.enabled = map
-                .remove("tunnel")
-                .map(|v| parse_bool_ini(&v))
-                .unwrap_or(false);
+            if let Some(tv) = map.remove("tunnel") {
+                if !tv.trim().is_empty() {
+                    match parse_strict_toggle_ini(&tv) {
+                        Some(v) => site.tunnel.enabled = v,
+                        None => {
+                            site.setting_error = Some(format!(
+                                "Invalid stored setting 'tunnel' value '{tv}' (expected 0 or 1)."
+                            ));
+                        }
+                    }
+                }
+            }
             site.tunnel.host = map.remove("tunnel_host").unwrap_or_default();
-            site.tunnel.port = map
-                .remove("tunnel_port")
-                .and_then(|v| v.parse::<u16>().ok())
-                .unwrap_or(0);
+            if let Some(tp) = map.remove("tunnel_port") {
+                if !tp.trim().is_empty() {
+                    match tp.trim().parse::<u16>() {
+                        Ok(p) if p > 0 => site.tunnel.port = p,
+                        _ if site.setting_error.is_none() => {
+                            site.setting_error = Some(format!(
+                                "Invalid stored setting 'tunnel_port' value '{tp}'."
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
             site.tunnel.username = map.remove("tunnel_username").unwrap_or_default();
             if let Some(tpw) = map.remove("tunnel_password") {
-                let (plain, raw, _) = decode_secret_field(&tpw, master_key);
+                let (plain, raw, err) = decode_secret_field(&tpw, master_key);
                 site.tunnel.password = plain;
                 site.tunnel_password_raw = raw;
+                if let Some(e) = err {
+                    site.tunnel_error =
+                        Some(format!("The stored tunnel password cannot be used: {e}"));
+                }
             }
             site.tunnel.keyfile = map.remove("tunnel_private_key").filter(|s| !s.is_empty());
             if let Some(tpass) = map.remove("tunnel_passphrase") {
-                let (plain, raw, _) = decode_secret_field(&tpass, master_key);
+                let (plain, raw, err) = decode_secret_field(&tpass, master_key);
                 site.tunnel_passphrase = plain;
                 site.tunnel_passphrase_raw = raw;
+                if let Some(e) = err {
+                    if site.tunnel_error.is_none() {
+                        site.tunnel_error =
+                            Some(format!("The stored tunnel passphrase cannot be used: {e}"));
+                    }
+                }
             }
             site.tunnel.hostkey = map.remove("tunnel_hostkey").unwrap_or_default();
-            site.tunnel.local_port = map
-                .remove("tunnel_local_port")
-                .and_then(|v| v.parse::<u16>().ok())
-                .unwrap_or(0);
+            if let Some(tlp) = map.remove("tunnel_local_port") {
+                if !tlp.trim().is_empty() {
+                    match tlp.trim().parse::<u16>() {
+                        Ok(p) => site.tunnel.local_port = p,
+                        Err(_) if site.setting_error.is_none() => {
+                            site.setting_error = Some(format!(
+                                "Invalid stored setting 'tunnel_local_port' value '{tlp}'."
+                            ));
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
 
             site.extra_fields = map;
             if let Some(existing) = out.iter_mut().find(|s| s.name == site.name) {
@@ -499,53 +611,53 @@ impl SessionStore {
 
             if site.tunnel.enabled {
                 out.push_str("tunnel=1\n");
-            }
-            if !site.tunnel.host.is_empty() {
-                out.push_str(&format!(
-                    "tunnel_host={}\n",
-                    escape_ini_value(&site.tunnel.host)
-                ));
-            }
-            if site.tunnel.port != 0 {
-                out.push_str(&format!("tunnel_port={}\n", site.tunnel.port));
-            }
-            if !site.tunnel.username.is_empty() {
-                out.push_str(&format!(
-                    "tunnel_username={}\n",
-                    escape_ini_value(&site.tunnel.username)
-                ));
-            }
-            if let Some(enc_tpw) = encode_secret_field(
-                site.tunnel.password.as_deref(),
-                site.tunnel_password_raw.as_deref(),
-                master_key,
-            )? {
-                out.push_str(&format!(
-                    "tunnel_password={}\n",
-                    escape_ini_value(&enc_tpw)
-                ));
-            }
-            if let Some(tpk) = site.tunnel.keyfile.as_deref().filter(|s| !s.is_empty()) {
-                out.push_str(&format!("tunnel_private_key={}\n", escape_ini_value(tpk)));
-            }
-            if let Some(enc_tpass) = encode_secret_field(
-                site.tunnel_passphrase.as_deref(),
-                site.tunnel_passphrase_raw.as_deref(),
-                master_key,
-            )? {
-                out.push_str(&format!(
-                    "tunnel_passphrase={}\n",
-                    escape_ini_value(&enc_tpass)
-                ));
-            }
-            if !site.tunnel.hostkey.is_empty() {
-                out.push_str(&format!(
-                    "tunnel_hostkey={}\n",
-                    escape_ini_value(&site.tunnel.hostkey)
-                ));
-            }
-            if site.tunnel.local_port != 0 {
-                out.push_str(&format!("tunnel_local_port={}\n", site.tunnel.local_port));
+                if !site.tunnel.host.is_empty() {
+                    out.push_str(&format!(
+                        "tunnel_host={}\n",
+                        escape_ini_value(&site.tunnel.host)
+                    ));
+                }
+                if site.tunnel.port != 0 {
+                    out.push_str(&format!("tunnel_port={}\n", site.tunnel.port));
+                }
+                if !site.tunnel.username.is_empty() {
+                    out.push_str(&format!(
+                        "tunnel_username={}\n",
+                        escape_ini_value(&site.tunnel.username)
+                    ));
+                }
+                if let Some(enc_tpw) = encode_secret_field(
+                    site.tunnel.password.as_deref(),
+                    site.tunnel_password_raw.as_deref(),
+                    master_key,
+                )? {
+                    out.push_str(&format!(
+                        "tunnel_password={}\n",
+                        escape_ini_value(&enc_tpw)
+                    ));
+                }
+                if let Some(tpk) = site.tunnel.keyfile.as_deref().filter(|s| !s.is_empty()) {
+                    out.push_str(&format!("tunnel_private_key={}\n", escape_ini_value(tpk)));
+                }
+                if let Some(enc_tpass) = encode_secret_field(
+                    site.tunnel_passphrase.as_deref(),
+                    site.tunnel_passphrase_raw.as_deref(),
+                    master_key,
+                )? {
+                    out.push_str(&format!(
+                        "tunnel_passphrase={}\n",
+                        escape_ini_value(&enc_tpass)
+                    ));
+                }
+                if !site.tunnel.hostkey.is_empty() {
+                    out.push_str(&format!(
+                        "tunnel_hostkey={}\n",
+                        escape_ini_value(&site.tunnel.hostkey)
+                    ));
+                }
+                if site.tunnel.local_port != 0 {
+                    out.push_str(&format!("tunnel_local_port={}\n", site.tunnel.local_port));
+                }
             }
 
             for (extra_k, extra_v) in &site.extra_fields {
@@ -603,6 +715,21 @@ impl SessionStore {
                 site.password_raw = existing.password_raw.take();
                 site.password_error = existing.password_error.take();
             }
+            let proxy_disabled = site.proxy_method.trim().is_empty()
+                || site.proxy_method.trim().eq_ignore_ascii_case("none")
+                || site.proxy_method.trim() == "0";
+            if !proxy_disabled && site.proxy_password.is_none() && site.proxy_password_raw.is_none()
+            {
+                site.proxy_password_raw = existing.proxy_password_raw.take();
+            }
+            if site.tunnel.enabled {
+                if site.tunnel.password.is_none() && site.tunnel_password_raw.is_none() {
+                    site.tunnel_password_raw = existing.tunnel_password_raw.take();
+                }
+                if site.tunnel_passphrase.is_none() && site.tunnel_passphrase_raw.is_none() {
+                    site.tunnel_passphrase_raw = existing.tunnel_passphrase_raw.take();
+                }
+            }
             *existing = site;
         } else {
             self.sites.push(site);
@@ -631,7 +758,14 @@ impl SessionStore {
         for site in &self.sites {
             let (folder, _) = site.folder_and_leaf();
             if !folder.is_empty() {
-                set.insert(folder.to_string());
+                let mut cur = String::new();
+                for seg in folder.split('/').filter(|s| !s.is_empty()) {
+                    if !cur.is_empty() {
+                        cur.push('/');
+                    }
+                    cur.push_str(seg);
+                    set.insert(cur.clone());
+                }
             }
         }
         set.into_iter().collect()
@@ -645,6 +779,25 @@ impl SessionStore {
         let before = self.sites.len();
         self.sites.retain(|s| !s.name.starts_with(&prefix));
         before - self.sites.len()
+    }
+
+    pub fn rename_folder(&mut self, old_folder: &str, new_folder: &str) -> usize {
+        if old_folder.is_empty() || new_folder.is_empty() || new_folder.contains('/') {
+            return 0;
+        }
+        let old_prefix = format!("{old_folder}/");
+        let new_prefix = format!("{new_folder}/");
+        if self.sites.iter().any(|s| s.name.starts_with(&new_prefix)) {
+            return 0;
+        }
+        let mut count = 0usize;
+        for site in &mut self.sites {
+            if let Some(rest) = site.name.strip_prefix(&old_prefix) {
+                site.name = format!("{new_prefix}{rest}");
+                count += 1;
+            }
+        }
+        count
     }
 }
 

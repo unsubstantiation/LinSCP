@@ -2,9 +2,20 @@
 //! host-key cache, and session-importer engine.
 
 pub mod config_stores;
+pub mod editor;
+pub mod filemask;
 pub mod hostkeys;
 pub mod importers;
+pub mod keepuptodate;
+pub mod presets;
+pub mod script;
+pub mod script_params;
 pub mod session_store;
+pub mod sync_planner;
+pub mod text_mode;
+pub mod transfer;
+pub mod url_and_raw;
+pub mod xml_log;
 
 use linscp_crypto::SessionMasterKey;
 use linscp_types::SessionConfig;

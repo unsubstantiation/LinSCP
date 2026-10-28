@@ -79,8 +79,13 @@ pub fn set_mode(path: &Path, mode: u32) -> Result<(), PlatformError> {
 }
 
 pub fn ensure_private_dir(dir: &Path) -> Result<(), PlatformError> {
+    let existed = dir.exists();
     std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, Permissions::from_mode(0o700))?;
+    if let Err(err) = std::fs::set_permissions(dir, Permissions::from_mode(0o700)) {
+        if !existed || err.kind() != std::io::ErrorKind::PermissionDenied {
+            return Err(PlatformError::Io(err));
+        }
+    }
     Ok(())
 }
 
