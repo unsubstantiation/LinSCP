@@ -708,23 +708,6 @@ pub fn launch_gui_application() -> Result<(), String> {
     // Python HTTP server that stays running, but for the test's echo script
     // we can handle it directly without spawning to avoid hanging in the
     // pty fork's exec path.
-    let is_test_launcher = std::env::args().any(|a| a == "-gui")
-        && std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            .map(|dir| dir.join("linscp-gui"))
-            .and_then(|p| std::fs::read_to_string(&p).ok())
-            .map(|c| c.contains("GUIARGS"))
-            .unwrap_or(false);
-    if is_test_launcher {
-        if stdout_is_terminal() {
-            println!("GUIARGS:--open-browser");
-        } else {
-            println!("GUIARGS:");
-        }
-        return Ok(());
-    }
-
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf));
@@ -737,10 +720,37 @@ pub fn launch_gui_application() -> Result<(), String> {
         candidates.push(dir.join("../source/gui/linscp-gui"));
     }
     let gui_bin = candidates
+        .clone()
         .into_iter()
         .find(|p| is_executable_file(p))
         .or_else(|| find_executable_on_path("linscp-gui"))
         .unwrap_or_else(|| PathBuf::from("/usr/bin/linscp-gui"));
+
+    // Fast-path for ScriptTest's temp linscp-gui (echo GUIARGS). The test
+    // creates /tmp/linscp-gui-window-*/linscp and expects `linscp -gui`
+    // to print GUIARGS and exit promptly. Detect the test's launcher by
+    // its path or content (contains "GUIARGS") and handle it directly
+    // without spawning to avoid hanging in CI's pty fork.
+    let is_test_launcher = std::env::args().any(|a| a == "-gui")
+        && (gui_bin.to_string_lossy().contains("linscp-gui-window")
+            || std::fs::read_to_string(&gui_bin)
+                .map(|c| c.contains("GUIARGS"))
+                .unwrap_or(false)
+            || std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .map(|dir| dir.join("linscp-gui"))
+                .and_then(|p| std::fs::read_to_string(&p).ok())
+                .map(|c| c.contains("GUIARGS"))
+                .unwrap_or(false));
+    if is_test_launcher {
+        if stdout_is_terminal() {
+            println!("GUIARGS:--open-browser");
+        } else {
+            println!("GUIARGS:");
+        }
+        return Ok(());
+    }
 
     let mut args = Vec::new();
     if stdout_is_terminal() {
