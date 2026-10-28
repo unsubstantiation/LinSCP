@@ -224,12 +224,10 @@ jobs:
           node-version: "22"
 
       - name: Build TypeScript UI for Tauri (Windows)
-        shell: bash
+        working-directory: ui
         run: |
-          set -euo pipefail
-          npm --prefix ui install --no-audit --no-fund
-          npm --prefix ui run build
-          ls -la ui/dist
+          npm install --no-audit --no-fund
+          npm run build
 
       - name: Check Tauri v2 native shell crate on Windows
         shell: bash
