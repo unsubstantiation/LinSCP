@@ -502,14 +502,14 @@ impl RemoteSession for ScpSession {
 
     async fn mkdir(&self, remote_path: &str) -> Result<(), ProtoError> {
         let norm = prepare_remote_path(remote_path)?;
-        self.run_shell_checked(&format!("mkdir -p -- {}", scp_shell_quote(&norm)))
+        self.run_shell_checked(&format!("mkdir -- {}", scp_shell_quote(&norm)))
             .await?;
         Ok(())
     }
 
     async fn remove_file(&self, remote_path: &str) -> Result<(), ProtoError> {
         let norm = prepare_remote_path(remote_path)?;
-        self.run_shell_checked(&format!("rm -f -- {}", scp_shell_quote(&norm)))
+        self.run_shell_checked(&format!("rm -- {}", scp_shell_quote(&norm)))
             .await?;
         Ok(())
     }

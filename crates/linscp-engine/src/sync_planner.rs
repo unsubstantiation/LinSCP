@@ -598,6 +598,19 @@ pub async fn plan_synchronization(
                         remote_mode: r.mode,
                         reason,
                     });
+                } else {
+                    items.push(SyncItem {
+                        action: SyncAction::None,
+                        rel_path: rel,
+                        is_directory: false,
+                        local_size: l.size,
+                        remote_size: r.size,
+                        local_mtime: l.mtime,
+                        remote_mtime: r.mtime,
+                        local_mode: l.mode,
+                        remote_mode: r.mode,
+                        reason: "up to date".to_string(),
+                    });
                 }
             }
             (None, Some(r)) => {
@@ -706,7 +719,7 @@ async fn one_way_differs(
             .await
             .map_err(|e| format!("Cannot hash remote '{remote_path}': {e}"))?;
         if !local_hex.eq_ignore_ascii_case(&remote_hex) {
-            return Ok(Some("checksum differs".to_string()));
+            return Ok(Some("contents differ".to_string()));
         }
     }
     Ok(None)
@@ -744,7 +757,7 @@ async fn one_way_differs_upload(
             .await
             .map_err(|e| format!("Cannot hash remote '{remote_path}': {e}"))?;
         if !local_hex.eq_ignore_ascii_case(&remote_hex) {
-            return Ok(Some("checksum differs".to_string()));
+            return Ok(Some("contents differ".to_string()));
         }
     }
     Ok(None)
@@ -881,6 +894,9 @@ pub async fn apply_sync_plan(
     let mut conflicts = 0usize;
 
     for item in items {
+        if item.action == SyncAction::None {
+            continue;
+        }
         let diff_rec = XmlDiffRecord {
             action: item.action.as_str().to_string(),
             is_directory: item.is_directory,
@@ -918,7 +934,19 @@ pub async fn apply_sync_plan(
         let local_path = local_root.join(&item.rel_path);
         let remote_path = join_remote_path(remote_root, &item.rel_path);
         match item.action {
-            SyncAction::None | SyncAction::Conflict => {}
+            SyncAction::None => {
+                if !item.is_directory {
+                    state.update(
+                        item.rel_path.clone(),
+                        SyncStateEntry {
+                            local_time: item.local_mtime.max(0) as u64,
+                            remote_time: item.remote_mtime.max(0) as u64,
+                            size: item.local_size,
+                        },
+                    );
+                }
+            }
+            SyncAction::Conflict => {}
             SyncAction::Download => {
                 if item.is_directory {
                     std::fs::create_dir_all(&local_path).map_err(|e| {
@@ -990,6 +1018,9 @@ pub async fn apply_sync_plan(
                 applied += 1;
             }
             SyncAction::DeleteLocal => {
+                if conflicts > 0 {
+                    continue;
+                }
                 if item.is_directory {
                     let _ = std::fs::remove_dir_all(&local_path);
                 } else if local_path.exists() {
@@ -1001,6 +1032,9 @@ pub async fn apply_sync_plan(
                 applied += 1;
             }
             SyncAction::DeleteRemote => {
+                if conflicts > 0 {
+                    continue;
+                }
                 if item.is_directory {
                     if let Err(e) = session.remove_dir(&remote_path).await {
                         let msg = e.to_string();

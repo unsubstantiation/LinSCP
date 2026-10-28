@@ -158,7 +158,7 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>, ()> {
 }
 
 pub fn looks_like_legacy_cert_fingerprint(pin: &str) -> bool {
-    let stripped: String = pin.chars().filter(|&c| c != ':').collect();
+    let stripped: String = pin.chars().filter(|&c| c != ':' && c != '-').collect();
     matches!(stripped.len(), 32 | 40 | 64) && stripped.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -169,24 +169,32 @@ fn is_valid_spki_pin_list(spec: &str) -> bool {
         if item.is_empty() {
             continue;
         }
+        if item == "*" {
+            return false;
+        }
         any = true;
-        let rest = match item
+        if let Some(rest) = item
             .strip_prefix("sha256//")
             .or_else(|| item.strip_prefix("SHA256//"))
         {
-            Some(r) => r.trim(),
-            None => return false,
-        };
-        if rest.len() == 64 && rest.bytes().all(|b| b.is_ascii_hexdigit()) {
-            continue;
-        }
-        let mut padded = rest.to_string();
-        while !padded.len().is_multiple_of(4) {
-            padded.push('=');
-        }
-        if BASE64.decode(padded.as_bytes()).map(|b| b.len()).ok() != Some(32) {
+            let rest = rest.trim();
+            if rest.len() == 64 && rest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let mut padded = rest.to_string();
+            while !padded.len().is_multiple_of(4) {
+                padded.push('=');
+            }
+            if BASE64.decode(padded.as_bytes()).map(|b| b.len()).ok() == Some(32) {
+                continue;
+            }
             return false;
         }
+        let expanded = linscp_platform::terminal::expand_tilde(item);
+        if std::path::Path::new(&expanded).is_file() {
+            continue;
+        }
+        return false;
     }
     any
 }
@@ -198,6 +206,7 @@ pub struct ParsedSiteSpec {
     pub explicit_port: bool,
     pub preset_name: String,
     pub session_label: String,
+    pub explicit_session_name: Option<String>,
     pub passphrase: Option<String>,
     pub timeout_secs: u64,
 }
@@ -222,6 +231,7 @@ impl Default for ParsedSiteSpec {
             explicit_port: false,
             preset_name: String::new(),
             session_label: String::new(),
+            explicit_session_name: None,
             passphrase: None,
             timeout_secs: 30,
         }
@@ -273,7 +283,8 @@ pub fn parse_site_url(url: &str) -> Result<ParsedSiteSpec, String> {
     let scheme_lc = raw_scheme.to_ascii_lowercase();
     let mut raw_fields = BTreeMap::new();
     let (protocol, default_port) = match scheme_lc.as_str() {
-        "sftp" | "ssh" => (ProtocolScheme::Sftp, 22u16),
+        "sftp" => (ProtocolScheme::Sftp, 22u16),
+        "ssh" => (ProtocolScheme::Ssh, 22u16),
         "scp" => (ProtocolScheme::Scp, 22u16),
         "ftp" => (ProtocolScheme::Ftp, 21u16),
         "ftps" => {
@@ -399,11 +410,7 @@ pub fn parse_site_url(url: &str) -> Result<ParsedSiteSpec, String> {
     spec.session.initial_dir = initial_dir;
     spec.raw_fields = raw_fields;
     spec.explicit_port = explicit_port;
-    spec.session_label = if username.is_empty() {
-        host
-    } else {
-        format!("{username}@{host}")
-    };
+    spec.session_label = host;
     spec.session.name = spec.session_label.clone();
     Ok(spec)
 }
@@ -448,6 +455,7 @@ pub fn site_spec_from_stored(site: &StoredSite) -> Result<ParsedSiteSpec, String
         explicit_port: site.port != 0,
         preset_name: site.preset.clone(),
         session_label: site.name.clone(),
+        explicit_session_name: None,
         passphrase: None,
         timeout_secs: 30,
     };
@@ -507,6 +515,7 @@ pub fn site_spec_from_stored_for_resave(site: &StoredSite) -> ParsedSiteSpec {
         explicit_port: site.port != 0,
         preset_name: site.preset.clone(),
         session_label: site.name.clone(),
+        explicit_session_name: None,
         passphrase: None,
         timeout_secs: 30,
     };
@@ -983,11 +992,23 @@ pub fn apply_raw_settings(spec: &mut ParsedSiteSpec, pairs: &[String]) -> Result
                 }
                 if !val.is_empty() && !is_valid_spki_pin_list(val) {
                     return Err(format!(
-                        "Invalid PinnedPublicKey '{val}' (expected 'sha256//<base64>')."
+                        "Invalid PinnedPublicKey '{val}' (expected 'sha256//<base64>' or a public-key/certificate file)."
                     ));
                 }
+                let normalized_pin = val
+                    .split(';')
+                    .map(|p| {
+                        let t = p.trim();
+                        if t.starts_with("sha256//") || t.starts_with("SHA256//") || t.is_empty() {
+                            t.to_string()
+                        } else {
+                            linscp_platform::terminal::expand_tilde(t)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(";");
                 spec.raw_fields
-                    .insert("pinned_public_key".to_string(), val.to_string());
+                    .insert("pinned_public_key".to_string(), normalized_pin);
             }
 
             // S3 settings
@@ -1077,7 +1098,7 @@ pub fn apply_raw_settings(spec: &mut ParsedSiteSpec, pairs: &[String]) -> Result
                 spec.raw_fields
                     .insert("s3_sse_algorithm".to_string(), val.to_string());
             }
-            "s3ssekmskeyid" => {
+            "s3ssekmskeyid" | "s3kmskeyid" => {
                 if !is_s3 {
                     return Err(format!(
                         "Raw setting '{key_trimmed}' is supported only for S3 sessions."
@@ -1469,7 +1490,7 @@ fn build_tls_settings(spec: &ParsedSiteSpec) -> Result<TlsSettings, String> {
             tls.pinned_public_key = Some(hk.to_string());
         } else {
             return Err(format!(
-                "Invalid TLS host key pin '{hk}'; use PinnedPublicKey=sha256//<base64> or -hostkey=*."
+                "Invalid TLS certificate fingerprint or host key pin '{hk}'; use PinnedPublicKey=sha256//<base64> or -hostkey=*."
             ));
         }
     }
@@ -1842,6 +1863,8 @@ pub async fn connect_site_spec(
                 force_pasv_ip: spec.raw_fields.get("ftp_force_pasv_ip").map(String::as_str)
                     != Some("0"),
                 use_mlsd: spec.raw_fields.get("ftp_use_mlsd").map(String::as_str) != Some("0"),
+                mlsd_required: spec.raw_fields.get("ftp_use_mlsd").map(String::as_str)
+                    == Some("2"),
                 tls,
                 proxy,
                 timeout,

@@ -302,7 +302,7 @@ pub async fn download_single_file(
                     .map_err(|e| e.to_string())?
             };
             let Some(found) = st else {
-                let msg = format!("Remote file '{remote_path}' does not exist.");
+                let msg = format!("No such file or directory: '{remote_path}'.");
                 logger.record_transfer(
                     false,
                     remote_path,

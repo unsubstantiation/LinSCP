@@ -681,7 +681,8 @@ impl WebDavSession {
         let code = resp.status().as_u16();
         if code == 401 {
             return Err(ProtoError::Transport(
-                "Authentication failed: WebDAV server rejected credentials (HTTP 401).".to_string(),
+                "Authentication failed: WebDAV server rejected credentials (HTTP 401 Unauthorized)."
+                    .to_string(),
             ));
         }
         if code == 405 {
@@ -1065,6 +1066,12 @@ impl RemoteSession for WebDavSession {
                 return Err(ProtoError::Transport(
                     "No such file or directory.".to_string(),
                 ));
+            }
+            if resp.status().as_u16() == 409 {
+                return Err(ProtoError::Transport(format!(
+                    "WebDAV directory '{remote_path}' is not empty (HTTP {}).",
+                    resp.status()
+                )));
             }
             if resp.status().as_u16() == 412 && has_etag {
                 return Err(ProtoError::Transport(format!(

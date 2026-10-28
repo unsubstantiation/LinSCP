@@ -52,7 +52,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            libssh-dev libcurl4-openssl-dev libssl-dev \
+            libssh-dev libcurl4-openssl-dev libssl-dev libargon2-dev zlib1g-dev \
             krb5-kdc krb5-user krb5-admin-server libkrb5-dev openssh-server curl
           python3 -m venv "$RUNNER_TEMP/live-test-venv"
           "$RUNNER_TEMP/live-test-venv/bin/pip" install --quiet \

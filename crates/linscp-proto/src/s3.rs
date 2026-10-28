@@ -250,7 +250,7 @@ impl S3Session {
     ) -> Result<Self, ProtoError> {
         if cfg.access_key_id.trim().is_empty() || cfg.secret_access_key.is_empty() {
             return Err(ProtoError::Transport(
-                "S3 access_key_id and secret_access_key are required.".to_string(),
+                "S3 access key id and secret access key are required.".to_string(),
             ));
         }
 
@@ -636,8 +636,18 @@ impl S3Session {
         let resp = self
             .send_signed(Method::HEAD, Some(&bucket), &key, &qp, &[], Vec::new())
             .await?;
-        if resp.status().as_u16() == 404 {
+        let is_delete_marker = resp
+            .headers()
+            .get("x-amz-delete-marker")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.eq_ignore_ascii_case("true"));
+        if resp.status().as_u16() == 404 && (version_id.is_empty() || !is_delete_marker) {
             return Ok(None);
+        }
+        if !version_id.is_empty() && (is_delete_marker || resp.status().as_u16() == 405) {
+            return Err(ProtoError::Transport(format!(
+                "S3 version '{version_id}' of '{remote_path}' is a delete marker and cannot be downloaded."
+            )));
         }
         if !resp.status().is_success() {
             return Err(ProtoError::Transport(format!(
@@ -1463,6 +1473,16 @@ impl RemoteSession for S3Session {
             .send_signed(Method::GET, Some(&bucket), &key, &qp, &headers, Vec::new())
             .await?;
         let status = resp.status();
+        let is_delete_marker = resp
+            .headers()
+            .get("x-amz-delete-marker")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.eq_ignore_ascii_case("true"));
+        if is_delete_marker || status.as_u16() == 405 {
+            return Err(ProtoError::Transport(format!(
+                "S3 object '{remote_path}' is a delete marker and cannot be downloaded."
+            )));
+        }
         if opts.resume_offset > 0 && status.as_u16() != 206 {
             let body = resp.text().await.unwrap_or_default();
             return Err(parse_s3_error_xml(status, &body));

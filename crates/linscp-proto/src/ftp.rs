@@ -165,6 +165,8 @@ pub struct FtpConnectConfig {
     pub force_pasv_ip: bool,
     /// Prefer `MLSD`/`MLST` when advertised in `FEAT`.
     pub use_mlsd: bool,
+    /// Require `MLSD` (`FtpUseMlsd=2`); refuse rather than falling back to `LIST`.
+    pub mlsd_required: bool,
     pub tls: TlsSettings,
     pub proxy: Option<ProxyConfig>,
     pub timeout: Duration,
@@ -182,6 +184,7 @@ impl Default for FtpConnectConfig {
             pasv_mode: true,
             force_pasv_ip: true,
             use_mlsd: true,
+            mlsd_required: false,
             tls: TlsSettings::default(),
             proxy: None,
             timeout: Duration::from_secs(20),
@@ -939,23 +942,37 @@ impl RemoteSession for FtpSession {
             Some(remote_path)
         };
 
-        if inner.supports_mlst && self.cfg.use_mlsd {
+        if self.cfg.mlsd_required && !inner.supports_mlst {
+            return Err(ProtoError::Transport(
+                "FTP server does not advertise MLSD support (FtpUseMlsd=2).".to_string(),
+            ));
+        }
+
+        if (inner.supports_mlst && self.cfg.use_mlsd) || self.cfg.mlsd_required {
             let cmd = match target {
                 Some(p) => format!("MLSD {p}"),
                 None => "MLSD".to_string(),
             };
-            if let Ok(data) = self.open_data_command(&mut inner, &cmd).await {
-                let raw = self.read_data_to_string(&mut inner, data).await?;
-                let mut entries = Vec::new();
-                for line in raw.lines() {
-                    if let Some(parsed) =
-                        parse_mlsx_line(line).map_err(ProtoError::Transport)?
-                    {
-                        entries.push(parsed.into_file_entry());
+            match self.open_data_command(&mut inner, &cmd).await {
+                Ok(data) => {
+                    let raw = self.read_data_to_string(&mut inner, data).await?;
+                    let mut entries = Vec::new();
+                    for line in raw.lines() {
+                        if let Some(parsed) =
+                            parse_mlsx_line(line).map_err(ProtoError::Transport)?
+                        {
+                            entries.push(parsed.into_file_entry());
+                        }
                     }
+                    entries.sort_by(|a, b| a.name.cmp(&b.name));
+                    return Ok(entries);
                 }
-                entries.sort_by(|a, b| a.name.cmp(&b.name));
-                return Ok(entries);
+                Err(e) if self.cfg.mlsd_required => {
+                    return Err(ProtoError::Transport(format!(
+                        "FTP MLSD refused by server (FtpUseMlsd=2): {e}"
+                    )));
+                }
+                Err(_) => {}
             }
         }
 

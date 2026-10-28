@@ -148,8 +148,64 @@ fn decode_hex_32(hex: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+fn parse_pin_file_bytes(raw_item: &str, bytes: &[u8]) -> Result<Vec<[u8; 32]>, ProtoError> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if text.contains("-----BEGIN ") {
+            let mut pins = Vec::new();
+            let mut in_pub = false;
+            let mut pub_b64 = String::new();
+            for line in text.lines() {
+                let t = line.trim();
+                if t == "-----BEGIN PUBLIC KEY-----" {
+                    in_pub = true;
+                    pub_b64.clear();
+                } else if t == "-----END PUBLIC KEY-----" && in_pub {
+                    in_pub = false;
+                    let spki_der = BASE64.decode(pub_b64.as_bytes()).map_err(|_| {
+                        ProtoError::Transport(format!(
+                            "Malformed PEM PUBLIC KEY in PinnedPublicKey file '{raw_item}'."
+                        ))
+                    })?;
+                    pins.push(Sha256::digest(&spki_der).into());
+                } else if in_pub {
+                    pub_b64.push_str(t);
+                }
+            }
+            if text.contains("-----BEGIN CERTIFICATE-----") {
+                let mut reader = BufReader::new(bytes);
+                for cert_res in rustls_pemfile::certs(&mut reader) {
+                    let cert = cert_res.map_err(|e| {
+                        ProtoError::Transport(format!(
+                            "Malformed PEM CERTIFICATE in PinnedPublicKey file '{raw_item}': {e}"
+                        ))
+                    })?;
+                    let spki = extract_spki_der(cert.as_ref()).map_err(|e| {
+                        ProtoError::Transport(format!(
+                            "Failed to extract SPKI from PinnedPublicKey certificate '{raw_item}': {e}"
+                        ))
+                    })?;
+                    pins.push(Sha256::digest(spki).into());
+                }
+            }
+            if !pins.is_empty() {
+                return Ok(pins);
+            }
+        }
+    }
+    if let Ok(spki) = extract_spki_der(bytes) {
+        return Ok(vec![Sha256::digest(spki).into()]);
+    }
+    if bytes.first() == Some(&0x30) && bytes.len() >= 24 {
+        return Ok(vec![Sha256::digest(bytes).into()]);
+    }
+    Err(ProtoError::Transport(format!(
+        "Unrecognized PinnedPublicKey file '{raw_item}'."
+    )))
+}
+
 /// Parses one or more `;`-separated SPKI SHA-256 public-key pins
-/// (`sha256//<base64>`, `sha256//<64-hex>`, or bare 44-char base64 SHA-256).
+/// (`sha256//<base64>`, `sha256//<64-hex>`, bare 44-char base64 SHA-256, or
+/// a path to a PEM/DER public-key or certificate file).
 /// Wildcards (`*`) or malformed pins fail closed.
 pub fn parse_pinned_public_keys(spec: &str) -> Result<Vec<[u8; 32]>, ProtoError> {
     let trimmed = spec.trim();
@@ -165,6 +221,10 @@ pub fn parse_pinned_public_keys(spec: &str) -> Result<Vec<[u8; 32]>, ProtoError>
                 "Wildcard '*' is not a valid PinnedPublicKey.".to_string(),
             ));
         }
+        let has_hash_prefix = raw_item.starts_with("sha256//")
+            || raw_item.starts_with("SHA256//")
+            || raw_item.starts_with("sha256:")
+            || raw_item.starts_with("SHA256:");
         let body = raw_item
             .strip_prefix("sha256//")
             .or_else(|| raw_item.strip_prefix("SHA256//"))
@@ -174,6 +234,14 @@ pub fn parse_pinned_public_keys(spec: &str) -> Result<Vec<[u8; 32]>, ProtoError>
 
         if let Some(hex_bytes) = decode_hex_32(body) {
             pins.push(hex_bytes);
+            continue;
+        }
+
+        if !has_hash_prefix && std::path::Path::new(raw_item).is_file() {
+            let file_bytes = std::fs::read(raw_item).map_err(|e| {
+                ProtoError::Transport(format!("Failed to read PinnedPublicKey file '{raw_item}': {e}"))
+            })?;
+            pins.extend(parse_pin_file_bytes(raw_item, &file_bytes)?);
             continue;
         }
 
@@ -206,6 +274,7 @@ struct CustomServerVerifier {
     webpki: Arc<WebPkiServerVerifier>,
     provider: Arc<CryptoProvider>,
     pins: Vec<[u8; 32]>,
+    explicit_ca_ders: Vec<Vec<u8>>,
     accept_invalid_certs: bool,
 }
 
@@ -219,13 +288,23 @@ impl ServerCertVerifier for CustomServerVerifier {
         now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
         if !self.accept_invalid_certs {
-            self.webpki.verify_server_cert(
+            if let Err(err) = self.webpki.verify_server_cert(
                 end_entity,
                 intermediates,
                 server_name,
                 ocsp_response,
                 now,
-            )?;
+            ) {
+                let ca_as_ee = format!("{err:?}").contains("CaUsedAsEndEntity");
+                let explicitly_trusted = ca_as_ee
+                    && self
+                        .explicit_ca_ders
+                        .iter()
+                        .any(|der| der.as_slice() == end_entity.as_ref());
+                if !explicitly_trusted {
+                    return Err(err);
+                }
+            }
         }
 
         if !self.pins.is_empty() {
@@ -237,9 +316,11 @@ impl ServerCertVerifier for CustomServerVerifier {
                 .iter()
                 .any(|pin| bool::from(pin.ct_eq(&observed)));
             if !matched {
-                return Err(TlsError::InvalidCertificate(
-                    CertificateError::ApplicationVerificationFailure,
-                ));
+                return Err(TlsError::InvalidCertificate(CertificateError::Other(
+                    rustls::OtherError(Arc::new(std::io::Error::other(
+                        "Server public key does not match PinnedPublicKey",
+                    ))),
+                )));
             }
         }
 
@@ -315,6 +396,7 @@ pub fn build_rustls_client_config(settings: &TlsSettings) -> Result<ClientConfig
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
+    let mut explicit_ca_ders = Vec::new();
     if let Some(ca_pem) = settings.ca_cert_pem.as_deref() {
         let mut reader = BufReader::new(ca_pem);
         let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
@@ -326,6 +408,7 @@ pub fn build_rustls_client_config(settings: &TlsSettings) -> Result<ClientConfig
             ));
         }
         for cert in certs {
+            explicit_ca_ders.push(cert.as_ref().to_vec());
             root_store.add(cert).map_err(|e| {
                 ProtoError::Transport(format!("Failed to add CA certificate to root store: {e}"))
             })?;
@@ -376,7 +459,8 @@ pub fn build_rustls_client_config(settings: &TlsSettings) -> Result<ClientConfig
         (None, None) => None,
     };
 
-    let config = if pins.is_empty() && !settings.accept_invalid_certs {
+    let config = if pins.is_empty() && explicit_ca_ders.is_empty() && !settings.accept_invalid_certs
+    {
         let step = builder.with_root_certificates(root_store);
         match client_certs {
             Some((certs, key)) => step.with_client_auth_cert(certs, key).map_err(|e| {
@@ -392,6 +476,7 @@ pub fn build_rustls_client_config(settings: &TlsSettings) -> Result<ClientConfig
             webpki,
             provider,
             pins,
+            explicit_ca_ders,
             accept_invalid_certs: settings.accept_invalid_certs,
         });
         let step = builder.dangerous().with_custom_certificate_verifier(custom);

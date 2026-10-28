@@ -13,7 +13,10 @@ use linscp_types::TransferMode;
 
 use crate::filemask::FileMask;
 use crate::presets::PresetPermissions;
-use crate::sync_planner::{SyncCriteria, SyncMode, SyncOptions, SyncState, apply_sync_plan, plan_synchronization};
+use crate::sync_planner::{
+    SyncAction, SyncCriteria, SyncMode, SyncOptions, SyncState, apply_sync_plan,
+    plan_synchronization,
+};
 use crate::xml_log::SessionLogger;
 
 struct SignalHandlerGuard;
@@ -124,7 +127,7 @@ where
 
     // Initial catch-up pass (Pass 1)
     let pass1_status = match plan_synchronization(session, local_root, remote_root, &sync_opts, &dummy_state).await {
-        Ok(plan) if !plan.is_empty() => {
+        Ok(plan) if plan.iter().any(|i| i.action != SyncAction::None) => {
             match apply_sync_plan(
                 session,
                 local_root,
@@ -196,7 +199,7 @@ where
 
         match plan_synchronization(session, local_root, remote_root, &sync_opts, &dummy_state).await
         {
-            Ok(plan) if !plan.is_empty() => {
+            Ok(plan) if plan.iter().any(|i| i.action != SyncAction::None) => {
                 match apply_sync_plan(
                     session,
                     local_root,

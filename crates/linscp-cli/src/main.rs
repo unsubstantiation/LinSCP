@@ -315,6 +315,7 @@ async fn run_cli() -> i32 {
     let mut defaults_port: Option<u16> = None;
     let mut defaults_timeout: Option<u64> = None;
     let mut defaults_clientcert: Option<String> = None;
+    let mut defaults_sessionname: Option<String> = None;
     let mut defaults_ftps_mode: Option<u8> = None;
     let mut defaults_ftp_pasv_mode: Option<bool> = None;
     let mut defaults_raw_pairs: Vec<String> = Vec::new();
@@ -533,6 +534,8 @@ async fn run_cli() -> i32 {
             log_file = Some(PathBuf::from(expand_tilde(val)));
         } else if let Some(val) = arg.strip_prefix("-clientcert=") {
             defaults_clientcert = Some(expand_tilde(val));
+        } else if let Some(val) = arg.strip_prefix("-sessionname=") {
+            defaults_sessionname = Some(val.to_string());
         } else if arg == "-implicit" || arg.starts_with("-implicit=") {
             let val = arg.strip_prefix("-implicit=");
             let Some(enabled) = parse_on_off_switch(val) else {
@@ -835,6 +838,12 @@ async fn run_cli() -> i32 {
             spec.raw_fields
                 .insert("tls_certificate_file".to_string(), cc.clone());
         }
+        if let Some(ref sn) = defaults_sessionname {
+            if !sn.is_empty() {
+                spec.session_label = sn.clone();
+                spec.explicit_session_name = Some(sn.clone());
+            }
+        }
         if let Some(ftps) = defaults_ftps_mode {
             spec.raw_fields
                 .insert("ftps".to_string(), ftps.to_string());
@@ -948,6 +957,7 @@ async fn run_cli() -> i32 {
         port: defaults_port,
         timeout_secs: defaults_timeout,
         clientcert: defaults_clientcert.clone(),
+        sessionname: defaults_sessionname.clone(),
         ftps_mode: defaults_ftps_mode,
         ftp_pasv_mode: defaults_ftp_pasv_mode,
         raw_pairs: defaults_raw_pairs.clone(),

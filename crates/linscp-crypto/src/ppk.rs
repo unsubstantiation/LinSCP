@@ -844,7 +844,7 @@ fn aes256_cbc_encrypt_pkcs7(key: &[u8; 32], iv: &[u8; 16], plain: &[u8]) -> Vec<
 
     let mut prev = *iv;
     let mut out = Vec::with_capacity(padded.len());
-    for chunk in padded.chunks_exact(16) {
+    for chunk in padded.as_chunks::<16>().0 {
         let mut xored = [0u8; 16];
         for ((dst, &p), &iv_b) in xored.iter_mut().zip(chunk.iter()).zip(prev.iter()) {
             *dst = p ^ iv_b;
@@ -1180,13 +1180,18 @@ pub fn decrypt_legacy_encrypted_pem(
             let key = evp_bytes_to_key_md5(passphrase.as_bytes(), &salt8, 16);
             let cipher = Aes128::new_from_slice(&key).expect("16-byte key");
             let mut prev = iv;
-            for (c_blk, p_blk) in ciphertext.chunks_exact(16).zip(plain.chunks_exact_mut(16)) {
+            for (c_blk, p_blk) in ciphertext
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .zip(plain.as_chunks_mut::<16>().0.iter_mut())
+            {
                 let mut blk = GenericArray::clone_from_slice(c_blk);
                 cipher.decrypt_block(&mut blk);
                 for ((dst, &b), &iv_b) in p_blk.iter_mut().zip(blk.iter()).zip(prev.iter()) {
                     *dst = b ^ iv_b;
                 }
-                prev.copy_from_slice(c_blk);
+                prev = *c_blk;
                 blk.zeroize();
             }
         }
@@ -1194,13 +1199,18 @@ pub fn decrypt_legacy_encrypted_pem(
             let key = evp_bytes_to_key_md5(passphrase.as_bytes(), &salt8, 24);
             let cipher = Aes192::new_from_slice(&key).expect("24-byte key");
             let mut prev = iv;
-            for (c_blk, p_blk) in ciphertext.chunks_exact(16).zip(plain.chunks_exact_mut(16)) {
+            for (c_blk, p_blk) in ciphertext
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .zip(plain.as_chunks_mut::<16>().0.iter_mut())
+            {
                 let mut blk = GenericArray::clone_from_slice(c_blk);
                 cipher.decrypt_block(&mut blk);
                 for ((dst, &b), &iv_b) in p_blk.iter_mut().zip(blk.iter()).zip(prev.iter()) {
                     *dst = b ^ iv_b;
                 }
-                prev.copy_from_slice(c_blk);
+                prev = *c_blk;
                 blk.zeroize();
             }
         }

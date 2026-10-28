@@ -840,6 +840,14 @@ pub fn format_file_clock(epoch_secs: i64) -> String {
     format!("{hh:02}:{mm:02}")
 }
 
+pub fn format_sync_time(epoch_secs: i64) -> String {
+    if epoch_secs <= 0 {
+        return "unknown".to_string();
+    }
+    let (y, m, d, hh, mm, _, _) = local_ymdhms_wday(epoch_secs);
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,7 +12,7 @@ use linscp_platform::terminal::{
     RawTerminalGuard, expand_tilde, launch_desktop_ssh_terminal, read_stdin_chunk,
     stat_local_path, stdin_is_terminal, take_window_resized, terminal_size,
 };
-use linscp_proto::{ProgressCallback, RemoteSession};
+use linscp_proto::{ProgressCallback, RemoteSession, TransferRequest};
 use linscp_proto::ssh::{ChannelMsg, SshConnection, extract_openssh_public_key_line};
 use linscp_proto::webdav::{DavEtagPrecondition, dav_entity_tag};
 use linscp_types::{FileEntry, ProtocolScheme, TransferMode};
@@ -20,8 +20,9 @@ use linscp_types::{FileEntry, ProtocolScheme, TransferMode};
 use crate::editor::{EditOptions, edit_remote_file};
 use crate::filemask::{
     FileMask, format_file_clock, format_file_date, format_ls_time, format_permissions_10,
-    has_wildcard, join_remote_path, matches_wildcard, mode_from_permissions_str,
-    parse_permissions_expr, remote_parent_and_name, resolve_remote_path,
+    format_sync_time, has_wildcard, join_remote_path, matches_wildcard,
+    mode_from_permissions_str, parse_permissions_expr, remote_parent_and_name,
+    resolve_remote_path,
 };
 use crate::keepuptodate::{KeepUpToDateOptions, run_keep_up_to_date};
 use crate::presets::{PresetPermissions, ResumeSupportMode, TransferPreset, TransferPresetStore};
@@ -30,8 +31,8 @@ use crate::script_params::{
 };
 use crate::session_store::SessionStore;
 use crate::sync_planner::{
-    SyncConflictPolicy, SyncCriteria, SyncMode, SyncOptions, SyncState, apply_sync_plan,
-    plan_synchronization,
+    SyncAction, SyncConflictPolicy, SyncCriteria, SyncMode, SyncOptions, SyncState,
+    apply_sync_plan, plan_synchronization,
 };
 use crate::text_mode::{EolStyle, parse_transfer_mode, transfer_mode_name};
 use crate::transfer::{
@@ -352,6 +353,7 @@ pub struct CliSessionDefaults {
     pub port: Option<u16>,
     pub timeout_secs: Option<u64>,
     pub clientcert: Option<String>,
+    pub sessionname: Option<String>,
     pub ftps_mode: Option<u8>,
     pub ftp_pasv_mode: Option<bool>,
     pub raw_pairs: Vec<String>,
@@ -421,7 +423,7 @@ impl ScriptInterpreter {
             resume_support: ResumeSupportMode::Smart(100 * 1024),
             option_mask: FileMask::default(),
             option_mask_used: false,
-            fail_on_nomatch: true,
+            fail_on_nomatch: false,
             synch_delete: false,
             reconnect_time_secs: 120,
             editor_cmd: String::new(),
@@ -556,6 +558,12 @@ impl ScriptInterpreter {
                 .entry("ftp_pasv_mode".to_string())
                 .or_insert_with(|| (if pasv { "1" } else { "0" }).to_string());
         }
+        if let Some(ref sn) = d.sessionname {
+            if !sn.is_empty() && spec.explicit_session_name.is_none() {
+                spec.session_label = sn.clone();
+                spec.explicit_session_name = Some(sn.clone());
+            }
+        }
         if !d.raw_pairs.is_empty() {
             apply_raw_settings(spec, &d.raw_pairs)?;
         }
@@ -621,12 +629,45 @@ impl ScriptInterpreter {
 
         let remote_cwd = if !spec.session.initial_dir.is_empty() {
             let want = resolve_remote_path("/", &spec.session.initial_dir);
+            if want != "/" && session.scheme() != ProtocolScheme::S3 {
+                match session.stat(&want).await {
+                    Ok(Some(info)) if !info.is_dir && !info.is_symlink => {
+                        let _ = session.close().await;
+                        let reason = format!("'{want}' is not a directory.");
+                        return Err(self.trp(
+                            "Cannot open session to {host}: {reason}",
+                            &[("host", &spec.session.host), ("reason", &reason)],
+                        ));
+                    }
+                    Ok(None) => {
+                        let _ = session.close().await;
+                        let reason = format!(
+                            "Initial remote directory '{want}' does not exist: {}",
+                            self.tr("There is no such file or directory.")
+                        );
+                        return Err(self.trp(
+                            "Cannot open session to {host}: {reason}",
+                            &[("host", &spec.session.host), ("reason", &reason)],
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = session.close().await;
+                        let reason = e.to_string();
+                        return Err(self.trp(
+                            "Cannot open session to {host}: {reason}",
+                            &[("host", &spec.session.host), ("reason", &reason)],
+                        ));
+                    }
+                    Ok(Some(_)) => {}
+                }
+            }
             session.realpath(&want).await.unwrap_or(want)
         } else {
             session.pwd().await.unwrap_or_else(|_| "/".to_string())
         };
-        let label = spec.session_label.clone();
-        self.logger.set_session_name(&label);
+        let display_name = slot_display_name_from_spec(&spec);
+        let xml_name = xml_session_name(&spec);
+        self.logger.set_session_name(&xml_name);
         spec.timeout_secs = self.reconnect_time_secs.max(spec.timeout_secs);
         self.slots.push(ConnectedSlot {
             spec,
@@ -634,7 +675,7 @@ impl ScriptInterpreter {
             remote_cwd: remote_cwd.clone(),
         });
         self.active_slot = self.slots.len() - 1;
-        self.emit_status(&self.trp("Session '{host}' opened.", &[("host", &label)]));
+        self.emit_status(&self.trp("Session '{host}' opened.", &[("host", &display_name)]));
         self.emit_status(&self.trp(
             "Connected, the remote directory is {path}",
             &[("path", &remote_cwd)],
@@ -1470,9 +1511,11 @@ impl ScriptInterpreter {
         preset.name = args[0].clone();
         for item in &args[1..] {
             if let Some((k, v)) = item.split_once('=') {
-                preset.parse_setting(k, v)?;
+                let k_clean = k.strip_prefix('-').unwrap_or(k);
+                preset.parse_setting(k_clean, v)?;
             } else {
-                preset.parse_setting(item, "")?;
+                let item_clean = item.strip_prefix('-').unwrap_or(item);
+                preset.parse_setting(item_clean, "")?;
             }
         }
         store.add_or_update(preset)?;
@@ -1583,6 +1626,46 @@ impl ScriptInterpreter {
             return Ok(());
         }
 
+        if args.len() == 1 && args[0].eq_ignore_ascii_case("folders") {
+            let folders = store.folders();
+            if folders.is_empty() {
+                println!("{}", self.tr("There are no session folders."));
+                return Ok(());
+            }
+            for f in folders {
+                println!("  {f}/");
+            }
+            return Ok(());
+        }
+
+        if args.len() == 1
+            && (args[0].to_ascii_lowercase().starts_with("-folder=")
+                || (args[0].len() > 1 && args[0].ends_with('/')))
+        {
+            let raw_folder = if args[0].to_ascii_lowercase().starts_with("-folder=") {
+                &args[0]["-folder=".len()..]
+            } else {
+                &args[0]
+            };
+            let folder_clean = raw_folder.trim_end_matches('/');
+            let matched: Vec<&str> = store
+                .sites()
+                .iter()
+                .filter(|s| !folder_clean.is_empty() && s.folder_and_leaf().0 == folder_clean)
+                .map(|s| s.name.as_str())
+                .collect();
+            if matched.is_empty() {
+                return Err(self.trp(
+                    "There are no stored sessions in folder '{folder}'.",
+                    &[("folder", raw_folder)],
+                ));
+            }
+            for m in matched {
+                println!("  {m}");
+            }
+            return Ok(());
+        }
+
         if args.len() == 1 {
             let Some(site) = store.find(&args[0]).cloned() else {
                 return Err(self.trp(
@@ -1597,7 +1680,10 @@ impl ScriptInterpreter {
             return self.open_slot_from_spec(spec).await;
         }
 
-        Err("Syntax: sessions [ NAME | list | export <file> | import <file> ]".to_string())
+        Err(self.wrong_args(
+            "session",
+            self.tr("Syntax: sessions [NAME|list|export <file>|import <file>]."),
+        ))
     }
 
     fn cmd_savesession(&mut self, args: &[String]) -> Result<(), String> {
@@ -1758,17 +1844,25 @@ impl ScriptInterpreter {
             ));
         }
 
-        if !port_given && ((!connected && !spec.explicit_port) || protocol_given) {
-            let default_p = if matches!(
-                spec.session.protocol,
-                ProtocolScheme::Ftp | ProtocolScheme::Ftps
-            ) && spec.raw_fields.get("ftps").map(String::as_str) == Some("1")
-            {
-                990
-            } else {
-                spec.session.protocol.default_port()
-            };
-            spec.session.port = default_p;
+        if !port_given {
+            if !connected && !spec.explicit_port {
+                if let Some(cli_p) = self.cfg.cli_defaults.port {
+                    spec.session.port = cli_p;
+                    spec.explicit_port = true;
+                }
+            }
+            if (!connected && !spec.explicit_port) || (protocol_given && self.cfg.cli_defaults.port.is_none()) {
+                let default_p = if matches!(
+                    spec.session.protocol,
+                    ProtocolScheme::Ftp | ProtocolScheme::Ftps
+                ) && spec.raw_fields.get("ftps").map(String::as_str) == Some("1")
+                {
+                    990
+                } else {
+                    spec.session.protocol.default_port()
+                };
+                spec.session.port = default_p;
+            }
         }
 
         if save_password {
@@ -1795,9 +1889,23 @@ impl ScriptInterpreter {
             .as_deref()
             .is_some_and(|s| !s.is_empty());
         let site = stored_site_from_spec(name, &spec);
+        let site_proto = site.protocol.as_str().to_string();
+        let site_user = site.username.clone();
+        let site_host = site.host.clone();
         store.upsert(site);
         store.save_to_dir(&self.cfg.config_dir, &vault)?;
-        println!("Saved session '{name}'.");
+        let sessions_path = self.cfg.config_dir.join("sessions.ini");
+        let sessions_loc = format!(" in {}", sessions_path.display());
+        self.emit_status(&self.trp(
+            "Stored session '{name}' for {protocol}://{user}@{host}{location}.",
+            &[
+                ("name", name),
+                ("protocol", &site_proto),
+                ("user", &site_user),
+                ("host", &site_host),
+                ("location", &sessions_loc),
+            ],
+        ));
         if stored_non_empty_pw {
             let key_path = self.cfg.config_dir.join("sessions.key");
             let loc = format!(" under '{}'", key_path.display());
@@ -1810,21 +1918,54 @@ impl ScriptInterpreter {
     }
 
     fn cmd_rmsession(&mut self, args: &[String]) -> Result<(), String> {
-        if args.len() != 1 {
-            return Err("Syntax: rmsession <name>".to_string());
-        }
         let vault = DefaultOsVault;
         let mut store = SessionStore::load_from_dir(&self.cfg.config_dir, &vault)?;
-        let target = args[0].trim_end_matches('/');
-        if store.remove(target) {
+        if args.len() == 2 && args[0].eq_ignore_ascii_case("-folder") {
+            let folder_clean = args[1].trim_end_matches('/');
+            let removed = store.remove_folder(folder_clean);
+            if removed == 0 {
+                return Err(self.trp(
+                    "There are no stored sessions in folder '{folder}'.",
+                    &[("folder", &args[1])],
+                ));
+            }
             store.save_to_dir(&self.cfg.config_dir, &vault)?;
-            println!("Removed stored session '{target}'.");
+            let count_s = removed.to_string();
+            self.emit_status(&self.trp(
+                "Removed {count} stored session(s) in folder '{folder}'.",
+                &[("count", &count_s), ("folder", &args[1])],
+            ));
             return Ok(());
         }
-        let removed_in_folder = store.remove_folder(target);
-        if removed_in_folder > 0 {
+        if args.len() != 1 {
+            return Err(self.wrong_args(
+                "rmsession",
+                self.tr("Syntax: rmsession [-folder] <name>."),
+            ));
+        }
+        if args[0].len() > 1 && args[0].ends_with('/') {
+            let folder_clean = args[0].trim_end_matches('/');
+            let removed = store.remove_folder(folder_clean);
+            if removed == 0 {
+                return Err(self.trp(
+                    "There are no stored sessions in folder '{folder}'.",
+                    &[("folder", &args[0])],
+                ));
+            }
             store.save_to_dir(&self.cfg.config_dir, &vault)?;
-            println!("Removed {removed_in_folder} session(s) in folder '{target}'.");
+            let count_s = removed.to_string();
+            self.emit_status(&self.trp(
+                "Removed {count} stored session(s) in folder '{folder}'.",
+                &[("count", &count_s), ("folder", &args[0])],
+            ));
+            return Ok(());
+        }
+        if store.remove(&args[0]) {
+            store.save_to_dir(&self.cfg.config_dir, &vault)?;
+            self.emit_status(&self.trp(
+                "Removed the stored session '{name}'.",
+                &[("name", &args[0])],
+            ));
             return Ok(());
         }
         Err(self.trp(
@@ -1834,37 +1975,44 @@ impl ScriptInterpreter {
     }
 
     fn cmd_session(&mut self, args: &[String]) -> Result<(), String> {
-        if args.is_empty() {
-            if self.slots.is_empty() {
-                println!(
-                    "{}",
-                    self.tr("Not connected. Use 'open' to connect to a site first.")
-                );
-                return Ok(());
-            }
+        if self.slots.is_empty() {
+            return Err(self
+                .tr("Not connected. Use 'open' to connect to a site first.")
+                .to_string());
+        }
+        if args.len() > 1 {
+            return Err(
+                self.wrong_args("session", self.tr("Syntax: session [<index>]."))
+            );
+        }
+        if !args.is_empty() {
+            let idx_1: usize = args[0]
+                .parse()
+                .ok()
+                .filter(|&n| n >= 1 && n <= self.slots.len())
+                .ok_or_else(|| {
+                    self.trp("Invalid session index '{index}'.", &[("index", &args[0])])
+                })?;
+            self.active_slot = idx_1 - 1;
+            let xml_name = xml_session_name(&self.slots[self.active_slot].spec);
+            self.logger.set_session_name(&xml_name);
+        } else {
             for (idx, slot) in self.slots.iter().enumerate() {
-                let mark = if idx == self.active_slot { "*" } else { " " };
                 println!(
-                    "{mark} {}  {} ({})",
+                    "{:3}  {}",
                     idx + 1,
-                    slot.spec.session_label,
-                    slot.spec.session.protocol.as_str()
+                    slot_display_name_from_spec(&slot.spec)
                 );
             }
-            return Ok(());
         }
-        if args.len() != 1 {
-            return Err("Syntax: session [ <index> ]".to_string());
-        }
-        let idx_1: usize = args[0]
-            .parse()
-            .ok()
-            .filter(|&n| n >= 1 && n <= self.slots.len())
-            .ok_or_else(|| format!("There is no open session at index '{}'.", args[0]))?;
-        self.active_slot = idx_1 - 1;
+        let active_idx_s = (self.active_slot + 1).to_string();
+        let active_name = slot_display_name_from_spec(&self.slots[self.active_slot].spec);
         println!(
-            "Active session: {} ({})",
-            self.slots[self.active_slot].spec.session_label, idx_1
+            "{}",
+            self.trp(
+                "Active session: {index} ({name})",
+                &[("index", &active_idx_s), ("name", &active_name)],
+            )
         );
         Ok(())
     }
@@ -1940,27 +2088,35 @@ impl ScriptInterpreter {
                 .tr("Not connected. Use 'open' to connect to a site first.")
                 .to_string());
         }
+        if args.len() > 1 {
+            return Err(self.wrong_args("close", self.tr("Syntax: close [<index>].")));
+        }
         let idx = if args.is_empty() {
             self.active_slot
-        } else if args.len() == 1 {
+        } else {
             let n: usize = args[0]
                 .parse()
                 .ok()
                 .filter(|&n| n >= 1 && n <= self.slots.len())
-                .ok_or_else(|| format!("There is no open session at index '{}'.", args[0]))?;
+                .ok_or_else(|| {
+                    self.trp("Invalid session index '{index}'.", &[("index", &args[0])])
+                })?;
             n - 1
-        } else {
-            return Err("Syntax: close [ <index> ]".to_string());
         };
         let removed = self.slots.remove(idx);
         let _ = removed.session.close().await;
         if self.active_slot >= self.slots.len() && !self.slots.is_empty() {
             self.active_slot = self.slots.len() - 1;
         }
-        self.emit_status(&self.trp(
-            "Session '{name}' closed.",
-            &[("name", &removed.spec.session_label)],
-        ));
+        if !self.slots.is_empty() {
+            let xml_name = xml_session_name(&self.slots[self.active_slot].spec);
+            self.logger.set_session_name(&xml_name);
+        }
+        let closed_name = slot_display_name_from_spec(&removed.spec);
+        println!(
+            "{}",
+            self.trp("Session '{name}' closed.", &[("name", &closed_name)])
+        );
         Ok(())
     }
 
@@ -2155,7 +2311,10 @@ impl ScriptInterpreter {
         if args.len() != 1 {
             return Err("Syntax: stat <file>".to_string());
         }
-        let cwd = self.active_slot()?.remote_cwd.clone();
+        let (cwd, scheme) = {
+            let slot = self.active_slot()?;
+            (slot.remote_cwd.clone(), slot.session.scheme())
+        };
         let path = resolve_remote_path(&cwd, &args[0]);
         match self.slots[self.active_slot].session.stat(&path).await {
             Ok(Some(entry)) => {
@@ -2169,11 +2328,12 @@ impl ScriptInterpreter {
                 Ok(())
             }
             Ok(None) => {
-                let msg = self.remote_error(
-                    "read the attributes of",
-                    &path,
-                    self.tr("There is no such file or directory."),
-                );
+                let detail = if is_webdav_scheme(scheme) {
+                    "No such file or directory."
+                } else {
+                    self.tr("There is no such file or directory.")
+                };
+                let msg = self.remote_error("read the attributes of", &path, detail);
                 self.logger.record_stat(&path, None, Err(&msg));
                 Err(msg)
             }
@@ -2274,7 +2434,7 @@ impl ScriptInterpreter {
                         Some(existing) if existing.is_dir => {}
                         Some(_) => {
                             let msg = format!(
-                                "Cannot create the directory '{cur}': that name already exists."
+                                "Cannot create the directory '{cur}': exists and is not a directory."
                             );
                             self.logger.record_mkdir(&cur, Err(&msg));
                             return Err(msg);
@@ -2823,13 +2983,18 @@ impl ScriptInterpreter {
             return Err("Syntax: ln <target> <link>".to_string());
         }
         let cwd = self.active_slot()?.remote_cwd.clone();
-        let target = &args[0];
+        let target = resolve_remote_path(&cwd, &args[0]);
         let link = resolve_remote_path(&cwd, &args[1]);
         self.slots[self.active_slot]
             .session
-            .symlink(target, &link)
+            .symlink(&target, &link)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| self.remote_error("create the symbolic link", &link, &e.to_string()))?;
+        self.emit_status(&self.trp(
+            "Created '{link}' pointing at '{target}'.",
+            &[("link", &link), ("target", &target)],
+        ));
+        Ok(())
     }
 
     async fn cmd_checksum(&mut self, args: &[String]) -> Result<(), String> {
@@ -2884,7 +3049,7 @@ impl ScriptInterpreter {
                     format!(
                         "'{alg}' is not a server-side algorithm; it is computed from the downloaded file."
                     )
-                } else if matches!(scheme, ProtocolScheme::Sftp | ProtocolScheme::Ssh) {
+                } else if matches!(scheme, ProtocolScheme::Sftp) {
                     format!(
                         "The server cannot calculate checksums; '{alg}' is computed from the downloaded file."
                     )
@@ -2994,59 +3159,202 @@ impl ScriptInterpreter {
     }
 
     async fn cmd_copyid(&mut self, args: &[String]) -> Result<(), String> {
-        if args.len() > 1 {
-            return Err("Syntax: copyid [ <keyfile> ]".to_string());
+        let mut explicit_passphrase: Option<String> = None;
+        let mut positional = Vec::new();
+        for a in args {
+            let norm = normalize_switch_prefix(a);
+            let low = norm.to_ascii_lowercase();
+            if low.starts_with("-passphrase=") {
+                explicit_passphrase = Some(norm["-passphrase=".len()..].to_string());
+            } else if a.starts_with('-') || is_slash_switch(a) {
+                let h = self.trp("Unknown switch '{switch}'.", &[("switch", a)]);
+                return Err(self.wrong_args("copyid", &h));
+            } else {
+                positional.push(a.clone());
+            }
         }
-        let slot = self.active_slot()?;
-        if !is_ssh_scheme(slot.session.scheme()) {
-            return Err("'copyid' requires an SFTP or SCP session.".to_string());
-        }
-        let key_path = if let Some(explicit) = args.first() {
-            expand_tilde(explicit)
-        } else if let Some(ref kp) = slot.spec.session.keyfile {
-            kp.clone()
-        } else {
-            return Err(
-                "No private key file is configured; pass 'copyid <keyfile>'.".to_string(),
-            );
-        };
-        let pub_candidate = format!("{key_path}.pub");
-        let pub_line = if Path::new(&pub_candidate).is_file() {
-            std::fs::read_to_string(&pub_candidate)
-                .map_err(|e| format!("Cannot read '{pub_candidate}': {e}"))?
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .ok_or_else(|| format!("'{pub_candidate}' is empty."))?
-                .trim()
-                .to_string()
-        } else {
-            let raw_priv = std::fs::read_to_string(&key_path)
-                .map_err(|e| format!("Cannot read '{key_path}': {e}"))?;
-            extract_openssh_public_key_line(&raw_priv, slot.spec.passphrase.as_deref())
-                .map_err(|e| format!("Cannot decode private key '{key_path}': {e}"))?
-        };
-        let escaped = pub_line.replace('\'', "'\\''");
-        let install_sh = format!(
-            "umask 077 && mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && (grep -qxF '{escaped}' ~/.ssh/authorized_keys || printf '%s\\n' '{escaped}' >> ~/.ssh/authorized_keys)"
-        );
-        let out = self.slots[self.active_slot]
-            .session
-            .exec_command(&install_sh)
-            .await
-            .map_err(|e| e.to_string())?;
-        if out.exit_code.unwrap_or(0) != 0 {
-            return Err(format!(
-                "Installing public key failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
+        if positional.len() > 1 {
+            return Err(self.wrong_args(
+                "copyid",
+                "Syntax: copyid [ <keyfile> ] [-passphrase=<passphrase>]",
             ));
         }
-        println!(
-            "{}",
-            self.trp(
-                "Public key installed in '{path}'.",
-                &[("path", "~/.ssh/authorized_keys")],
+
+        let (key_path, session_passphrase) = {
+            let slot = self.active_slot()?;
+            if !is_ssh_scheme(slot.session.scheme()) {
+                return Err("'copyid' requires an SFTP or SCP session.".to_string());
+            }
+            let kp = if let Some(explicit) = positional.first() {
+                expand_tilde(explicit)
+            } else if let Some(ref cfg_kp) = slot.spec.session.keyfile {
+                cfg_kp.clone()
+            } else {
+                return Err(self.wrong_args(
+                    "copyid",
+                    "No private key file is configured; pass 'copyid <keyfile>'.",
+                ));
+            };
+            (kp, slot.spec.passphrase.clone())
+        };
+
+        let eff_passphrase = explicit_passphrase
+            .as_deref()
+            .or(session_passphrase.as_deref());
+
+        let raw_key = std::fs::read_to_string(&key_path)
+            .map_err(|e| self.wrong_args("copyid", &format!("Cannot read '{key_path}': {e}")))?;
+        let trimmed_key = raw_key.trim_start_matches('\u{feff}').trim_start();
+        let pub_line = if !trimmed_key.starts_with("-----BEGIN ")
+            && !trimmed_key.starts_with("PuTTY-User-Key-File-")
+        {
+            let first_line = trimmed_key
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+                .ok_or_else(|| self.wrong_args("copyid", &format!("'{key_path}' is empty.")))?;
+            let _ = extract_openssh_public_key_line(first_line, None)
+                .map_err(|e| self.wrong_args("copyid", &e.to_string()))?;
+            first_line.to_string()
+        } else {
+            match extract_openssh_public_key_line(&raw_key, eff_passphrase) {
+                Ok(derived) => derived,
+                Err(decode_err) => {
+                    let pub_sibling = format!("{key_path}.pub");
+                    if eff_passphrase.is_none() && Path::new(&pub_sibling).is_file() {
+                        let sib = std::fs::read_to_string(&pub_sibling)
+                            .map_err(|e| format!("Cannot read '{pub_sibling}': {e}"))?;
+                        let first = sib
+                            .lines()
+                            .map(str::trim)
+                            .find(|l| !l.is_empty() && !l.starts_with('#'))
+                            .ok_or_else(|| format!("'{pub_sibling}' is empty."))?;
+                        let _ = extract_openssh_public_key_line(first, None)
+                            .map_err(|e| self.wrong_args("copyid", &e.to_string()))?;
+                        first.to_string()
+                    } else {
+                        return Err(self.wrong_args(
+                            "copyid",
+                            &format!("Cannot decode private key '{key_path}': {decode_err}"),
+                        ));
+                    }
+                }
+            }
+        };
+
+        let home_dir = self.slots[self.active_slot]
+            .session
+            .pwd()
+            .await
+            .map_err(|e| self.wrong_args("copyid", &e.to_string()))?;
+        if home_dir.is_empty() {
+            return Err(self.wrong_args(
+                "copyid",
+                self.tr("The home directory of the session is not known, so ~/.ssh/authorized_keys cannot be located."),
+            ));
+        }
+
+        let ssh_dir = join_remote_path(&home_dir, ".ssh");
+        let auth_keys = join_remote_path(&ssh_dir, "authorized_keys");
+
+        if self.slots[self.active_slot]
+            .session
+            .stat(&ssh_dir)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            self.slots[self.active_slot]
+                .session
+                .mkdir(&ssh_dir)
+                .await
+                .map_err(|e| {
+                    self.trp(
+                        "Cannot create '{path}': {reason}",
+                        &[("path", &ssh_dir), ("reason", &e.to_string())],
+                    )
+                })?;
+            let _ = self.slots[self.active_slot]
+                .session
+                .chmod(&ssh_dir, 0o700)
+                .await;
+            self.emit_status(&self.trp("Created '{path}'.", &[("path", &ssh_dir)]));
+        }
+
+        let target_id = ssh_key_identity(&pub_line);
+        let mut kept: Vec<String> = Vec::new();
+        let mut already_installed = false;
+        if self.slots[self.active_slot]
+            .session
+            .stat(&auth_keys)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            let mut existing_bytes: Vec<u8> = Vec::new();
+            self.slots[self.active_slot]
+                .session
+                .download(&auth_keys, TransferRequest::default(), &mut existing_bytes, None)
+                .await
+                .map_err(|e| {
+                    self.trp(
+                        "Cannot read '{path}': {reason}",
+                        &[("path", &auth_keys), ("reason", &e.to_string())],
+                    )
+                })?;
+            let existing_text = String::from_utf8_lossy(&existing_bytes);
+            for raw_l in existing_text.lines() {
+                let line = raw_l.trim_end_matches('\r');
+                if line.is_empty() {
+                    continue;
+                }
+                if !target_id.is_empty() && ssh_key_identity(line) == target_id {
+                    already_installed = true;
+                }
+                kept.push(line.to_string());
+            }
+        }
+
+        if already_installed {
+            self.emit_status(&self.trp(
+                "The key is already installed in '{path}'.",
+                &[("path", &auth_keys)],
+            ));
+            return Ok(());
+        }
+
+        let mut payload = String::new();
+        for l in &kept {
+            payload.push_str(l);
+            payload.push('\n');
+        }
+        payload.push_str(&pub_line);
+        payload.push('\n');
+        let bytes = payload.into_bytes();
+        let mut reader: &[u8] = &bytes;
+        self.slots[self.active_slot]
+            .session
+            .upload(
+                &auth_keys,
+                TransferRequest {
+                    mode: Some(0o600),
+                    ..TransferRequest::default()
+                },
+                &mut reader,
+                Some(bytes.len() as u64),
+                None,
             )
-        );
+            .await
+            .map_err(|e| self.transfer_failed(&auth_keys, &e.to_string()))?;
+        let _ = self.slots[self.active_slot]
+            .session
+            .chmod(&auth_keys, 0o600)
+            .await;
+
+        self.emit_status(&self.trp(
+            "Installed the public key of '{key}' in '{path}'.",
+            &[("key", &key_path), ("path", &auth_keys)],
+        ));
         Ok(())
     }
 
@@ -3830,21 +4138,59 @@ impl ScriptInterpreter {
         )
         .await?;
 
-        if plan.is_empty() {
-            println!("Nothing to synchronize.");
-            return Ok(());
+        if opts.preview_only {
+            println!(
+                "SYNCPLAN local={}\tremote={}\tmode={}\tcriteria={}\tmask={}",
+                local_root.display(),
+                remote_root,
+                opts.mode.as_str(),
+                opts.criteria.name(),
+                opts.file_mask.describe()
+            );
+            let mut n_dl = 0usize;
+            let mut n_ul = 0usize;
+            let mut n_del_l = 0usize;
+            let mut n_del_r = 0usize;
+            let mut n_conf = 0usize;
+            let mut n_none = 0usize;
+            let mut bytes_total = 0u64;
+            for item in &plan {
+                match item.action {
+                    SyncAction::Download => {
+                        n_dl += 1;
+                        bytes_total = bytes_total.saturating_add(item.remote_size);
+                    }
+                    SyncAction::Upload => {
+                        n_ul += 1;
+                        bytes_total = bytes_total.saturating_add(item.local_size);
+                    }
+                    SyncAction::DeleteLocal => n_del_l += 1,
+                    SyncAction::DeleteRemote => n_del_r += 1,
+                    SyncAction::Conflict => n_conf += 1,
+                    SyncAction::None => {
+                        n_none += 1;
+                        continue;
+                    }
+                }
+                let mut detail = item.reason.clone();
+                if item.local_mtime != 0 || item.remote_mtime != 0 {
+                    detail.push_str(&format!(
+                        " (local {}, remote {})",
+                        format_sync_time(item.local_mtime),
+                        format_sync_time(item.remote_mtime)
+                    ));
+                }
+                println!("{}\t{}\t{}", item.action.as_str(), item.rel_path, detail);
+            }
+            println!(
+                "SYNCSUMMARY download={n_dl} upload={n_ul} delete-local={n_del_l} delete-remote={n_del_r} conflict={n_conf} unchanged={n_none} bytes={bytes_total}"
+            );
         }
 
-        if opts.preview_only {
-            for item in &plan {
-                println!(
-                    "{:<12} {} ({})",
-                    item.action.as_str(),
-                    item.rel_path,
-                    item.reason
-                );
-            }
-        }
+        let actionable_count = plan
+            .iter()
+            .filter(|i| i.action != SyncAction::None)
+            .count();
 
         let (applied, conflicts) = apply_sync_plan(
             self.slots[self.active_slot].session.as_ref(),
@@ -3861,14 +4207,37 @@ impl ScriptInterpreter {
             state.save(&state_file)?;
         }
 
+        if opts.preview_only {
+            return Ok(());
+        }
+
+        if actionable_count == 0 {
+            println!("Nothing to synchronize.");
+            return Ok(());
+        }
+
         if conflicts > 0 {
-            return Err(format!(
-                "Synchronization encountered {conflicts} conflict(s); pass '-conflict=local|remote|newer' or resolve manually."
-            ));
+            let mut first_msg = None;
+            for item in &plan {
+                if item.action == SyncAction::Conflict {
+                    let msg = self.trp(
+                        "Conflict: '{path}' {reason}, so it was left unchanged.",
+                        &[("path", &item.rel_path), ("reason", &item.reason)],
+                    );
+                    if first_msg.is_none() {
+                        first_msg = Some(msg);
+                    } else {
+                        self.emit_error(&msg);
+                    }
+                }
+            }
+            return Err(first_msg.unwrap_or_else(|| {
+                format!(
+                    "Synchronization encountered {conflicts} conflict(s); pass '-conflict=local|remote|newer' or resolve manually."
+                )
+            }));
         }
-        if !opts.preview_only {
-            println!("Synchronized {applied} item(s).");
-        }
+        println!("Synchronized {applied} item(s).");
         Ok(())
     }
 
@@ -4223,10 +4592,12 @@ impl ScriptInterpreter {
             .dav_lock(&path, timeout_secs)
             .await
             .map_err(|e| e.to_string())?;
-        let _ = token;
         println!(
             "{}",
-            self.trp("Lock acquired on '{path}'.", &[("path", &path)])
+            self.trp(
+                "Locked {path} with token {token}.",
+                &[("path", &path), ("token", &token)],
+            )
         );
         Ok(())
     }
@@ -4813,7 +5184,9 @@ pub fn apply_open_switches(
                 (if on { "1" } else { "0" }).to_string(),
             );
         } else if low.starts_with("-sessionname=") {
-            spec.session_label = norm["-sessionname=".len()..].to_string();
+            let sn = norm["-sessionname=".len()..].to_string();
+            spec.session_label = sn.clone();
+            spec.explicit_session_name = Some(sn);
         } else if allow_preset_switch && low.starts_with("-preset=") {
             spec.preset_name = norm["-preset=".len()..].to_string();
         } else {
@@ -4987,3 +5360,38 @@ fn format_listing_line(entry: &FileEntry, link_target: Option<&str>) -> String {
         entry.size
     )
 }
+
+fn slot_display_name_from_spec(spec: &ParsedSiteSpec) -> String {
+    if !spec.session_label.is_empty() {
+        spec.session_label.clone()
+    } else if !spec.session.host.is_empty() {
+        spec.session.host.clone()
+    } else {
+        "session".to_string()
+    }
+}
+
+fn xml_session_name(spec: &ParsedSiteSpec) -> String {
+    if let Some(ref explicit) = spec.explicit_session_name {
+        if !explicit.is_empty() {
+            return explicit.clone();
+        }
+    }
+    if spec.session.username.is_empty() {
+        spec.session.host.clone()
+    } else {
+        format!("{}@{}", spec.session.username, spec.session.host)
+    }
+}
+
+fn ssh_key_identity(line: &str) -> String {
+    let mut parts = line.split_whitespace();
+    let Some(alg) = parts.next() else {
+        return String::new();
+    };
+    let Some(blob) = parts.next() else {
+        return String::new();
+    };
+    format!("{alg} {blob}")
+}
+
