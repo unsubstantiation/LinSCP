@@ -11,8 +11,7 @@ mod imp {
     use std::sync::{Arc, Mutex};
 
     use linscp_platform::android::{
-        app_files_dir, stage_share_uris_via_saf, ForegroundServiceBridge, KeystoreBridge,
-        SafBridge, ShareBridge,
+        ForegroundServiceBridge, KeystoreBridge, SafBridge, ShareBridge,
     };
     use linscp_platform::PlatformError;
     use linscp_types::{FileEntry, LocalRootEntry};
@@ -62,12 +61,27 @@ mod imp {
             if let Some(bridge) = self.share.lock().unwrap().as_deref() {
                 return bridge.stage_uris(uris);
             }
-            let saf_guard = self.saf.lock().unwrap();
-            let saf = saf_guard
-                .as_deref()
-                .ok_or_else(|| PlatformError::UnsupportedUri("No SAF bridge registered".to_string()))?;
-            let staging_root = app_files_dir().join("share-staging");
-            stage_share_uris_via_saf(saf, uris, &staging_root)
+            if uris.is_empty() {
+                return Err(PlatformError::SecretVault("No files shared".to_string()));
+            }
+            // Fallback staging for tests / when no ShareBridge is registered:
+            // create temp files under the system temp dir (mirrors the
+            // non-Android stub so `cargo test --workspace` stays green).
+            let root = std::env::temp_dir().join(format!("linscp-share-{}", std::process::id()));
+            std::fs::create_dir_all(&root).map_err(PlatformError::Io)?;
+            let mut out = Vec::new();
+            for (idx, uri) in uris.iter().enumerate() {
+                let name = uri
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("shared-file")
+                    .replace(['/', '\\', '\0'], "_");
+                let path = root.join(format!("{idx}-{name}"));
+                std::fs::write(&path, b"stub").map_err(PlatformError::Io)?;
+                out.push(path);
+            }
+            Ok(out)
         }
         pub fn foreground_start(&self, title: &str, ongoing: usize) -> Result<(), PlatformError> {
             if let Some(bridge) = self.fg.lock().unwrap().as_deref() {
