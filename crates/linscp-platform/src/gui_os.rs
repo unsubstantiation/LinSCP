@@ -174,6 +174,7 @@ pub fn default_os_username() -> String {
     "user".to_string()
 }
 
+#[allow(dead_code)]
 fn find_program_on_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -307,6 +308,7 @@ fn validate_shell_launcher_path(launcher: &Path) -> Result<String, String> {
     Ok(text)
 }
 
+#[allow(dead_code)]
 fn linux_shell_targets() -> Result<Vec<(String, PathBuf, bool)>, String> {
     let data_home = std::env::var_os("XDG_DATA_HOME")
         .filter(|v| !v.is_empty())
@@ -368,11 +370,11 @@ pub fn install_shell_integration(
         }
         let body = format!("@echo off\r\n\"{exec_path}\" --shell-upload %*\r\n");
         write_private_file_atomic(&sendto, body.as_bytes()).map_err(|e| e.to_string())?;
-        return Ok(vec![(
+        Ok(vec![(
             "Windows Explorer (Send To)".to_string(),
             sendto.display().to_string(),
             if existed { "updated" } else { "installed" }.to_string(),
-        )]);
+        )])
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -436,11 +438,11 @@ pub fn uninstall_shell_integration() -> Result<Vec<(String, String, String)>, St
         } else {
             "not installed"
         };
-        return Ok(vec![(
+        Ok(vec![(
             "Windows Explorer (Send To)".to_string(),
             sendto.display().to_string(),
             outcome.to_string(),
-        )]);
+        )])
     }
 
     #[cfg(not(target_os = "windows"))]
