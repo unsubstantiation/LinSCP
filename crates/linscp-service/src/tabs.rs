@@ -269,7 +269,7 @@ pub fn parse_gui_session_spec(
 
     let stored_base = if let Some(sname) = site_name.map(str::trim).filter(|s| !s.is_empty()) {
         let store = SessionStore::load_from_dir(config_root, vault).unwrap_or_default();
-        store.get(sname).cloned()
+        store.find(sname).cloned()
     } else {
         None
     };
