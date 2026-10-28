@@ -725,16 +725,27 @@ pub fn launch_gui_application() -> Result<(), String> {
 
     #[cfg(unix)]
     {
-        let status = Command::new(&gui_bin)
+        // Use output() to capture and forward the GUI launcher's stdout/stderr
+        // so `linscp -gui | cat` and the pty test both see the launcher's
+        // `echo` correctly even though `linscp` spawns it as a child.
+        let output = Command::new(&gui_bin)
             .args(&args)
-            .status()
+            .output()
             .map_err(|err| format!("Failed to launch LinSCP GUI '{}': {err}", gui_bin.display()))?;
-        if status.success() {
+        // Forward the launcher's output to our own stdout/stderr so the
+        // caller's pipe/pty sees it (mirrors exec() replacement).
+        use std::io::Write as _;
+        let _ = std::io::stdout().write_all(&output.stdout);
+        let _ = std::io::stderr().write_all(&output.stderr);
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        if output.status.success() {
             Ok(())
         } else {
             Err(format!(
-                "LinSCP GUI '{}' exited with status {status}",
-                gui_bin.display()
+                "LinSCP GUI '{}' exited with status {}",
+                gui_bin.display(),
+                output.status
             ))
         }
     }
