@@ -629,39 +629,43 @@ impl ScriptInterpreter {
 
         let remote_cwd = if !spec.session.initial_dir.is_empty() {
             let want = resolve_remote_path("/", &spec.session.initial_dir);
-            if want != "/" && session.scheme() != ProtocolScheme::S3 {
-                match session.stat(&want).await {
-                    Ok(Some(info)) if !info.is_dir && !info.is_symlink => {
-                        let _ = session.close().await;
-                        let reason = format!("'{want}' is not a directory.");
-                        return Err(self.trp(
-                            "Cannot open session to {host}: {reason}",
-                            &[("host", &spec.session.host), ("reason", &reason)],
-                        ));
+            if is_ssh_scheme(session.scheme()) {
+                if want != "/" {
+                    match session.stat(&want).await {
+                        Ok(Some(info)) if !info.is_dir && !info.is_symlink => {
+                            let _ = session.close().await;
+                            let reason = format!("'{want}' is not a directory.");
+                            return Err(self.trp(
+                                "Cannot open session to {host}: {reason}",
+                                &[("host", &spec.session.host), ("reason", &reason)],
+                            ));
+                        }
+                        Ok(None) => {
+                            let _ = session.close().await;
+                            let reason = format!(
+                                "Initial remote directory '{want}' does not exist: {}",
+                                self.tr("There is no such file or directory.")
+                            );
+                            return Err(self.trp(
+                                "Cannot open session to {host}: {reason}",
+                                &[("host", &spec.session.host), ("reason", &reason)],
+                            ));
+                        }
+                        Err(e) => {
+                            let _ = session.close().await;
+                            let reason = e.to_string();
+                            return Err(self.trp(
+                                "Cannot open session to {host}: {reason}",
+                                &[("host", &spec.session.host), ("reason", &reason)],
+                            ));
+                        }
+                        Ok(Some(_)) => {}
                     }
-                    Ok(None) => {
-                        let _ = session.close().await;
-                        let reason = format!(
-                            "Initial remote directory '{want}' does not exist: {}",
-                            self.tr("There is no such file or directory.")
-                        );
-                        return Err(self.trp(
-                            "Cannot open session to {host}: {reason}",
-                            &[("host", &spec.session.host), ("reason", &reason)],
-                        ));
-                    }
-                    Err(e) => {
-                        let _ = session.close().await;
-                        let reason = e.to_string();
-                        return Err(self.trp(
-                            "Cannot open session to {host}: {reason}",
-                            &[("host", &spec.session.host), ("reason", &reason)],
-                        ));
-                    }
-                    Ok(Some(_)) => {}
                 }
+                session.realpath(&want).await.unwrap_or(want)
+            } else {
+                want
             }
-            session.realpath(&want).await.unwrap_or(want)
         } else {
             session.pwd().await.unwrap_or_else(|_| "/".to_string())
         };
@@ -1648,10 +1652,11 @@ impl ScriptInterpreter {
                 &args[0]
             };
             let folder_clean = raw_folder.trim_end_matches('/');
+            let prefix = format!("{folder_clean}/");
             let matched: Vec<&str> = store
                 .sites()
                 .iter()
-                .filter(|s| !folder_clean.is_empty() && s.folder_and_leaf().0 == folder_clean)
+                .filter(|s| !folder_clean.is_empty() && s.name.starts_with(&prefix))
                 .map(|s| s.name.as_str())
                 .collect();
             if matched.is_empty() {
@@ -4032,28 +4037,32 @@ impl ScriptInterpreter {
                 "-permissions" => opts.permissions = PresetPermissions::FromFile,
                 "-nopermissions" => opts.permissions = PresetPermissions::Off,
                 _ if low.starts_with("-permissions=") => {
-                    let mode =
-                        parse_permissions_expr(&norm["-permissions=".len()..], 0o644, false)?;
+                    let mode = parse_permissions_expr(&norm["-permissions=".len()..], 0o644, false)
+                        .map_err(|e| self.wrong_args("synchronize", &e))?;
                     opts.permissions = PresetPermissions::Mode(mode);
                 }
                 _ if low.starts_with("-criteria=") => {
-                    opts.criteria = SyncCriteria::parse(&norm["-criteria=".len()..])?;
+                    opts.criteria = SyncCriteria::parse(&norm["-criteria=".len()..])
+                        .map_err(|e| self.wrong_args("synchronize", &e))?;
                 }
                 _ if low.starts_with("-conflict=") => {
-                    opts.conflict_policy = SyncConflictPolicy::parse(&norm["-conflict=".len()..])?;
+                    opts.conflict_policy = SyncConflictPolicy::parse(&norm["-conflict=".len()..])
+                        .map_err(|e| self.wrong_args("synchronize", &e))?;
                 }
                 _ if low.starts_with("-filemask=") => {
-                    opts.file_mask = FileMask::parse(&norm["-filemask=".len()..])?;
+                    opts.file_mask = FileMask::parse(&norm["-filemask=".len()..])
+                        .map_err(|e| self.wrong_args("synchronize", &e))?;
                 }
                 _ if low.starts_with("-transfer=") => {
                     let v = &norm["-transfer=".len()..];
-                    opts.transfer_mode = parse_transfer_mode(v)
-                        .ok_or_else(|| format!("Invalid '-transfer' mode '{v}'."))?;
+                    opts.transfer_mode = parse_transfer_mode(v).ok_or_else(|| {
+                        self.wrong_args("synchronize", &format!("Invalid '-transfer' mode '{v}'."))
+                    })?;
                 }
                 _ if low.starts_with("-speed=") => {
                     let kb: u64 = norm["-speed=".len()..]
                         .parse()
-                        .map_err(|_| "Invalid '-speed' value.".to_string())?;
+                        .map_err(|_| self.wrong_args("synchronize", "Invalid '-speed' value."))?;
                     opts.speed_kbytes_per_sec = if kb == 0 { None } else { Some(kb) };
                 }
                 _ => {
@@ -4631,7 +4640,7 @@ impl ScriptInterpreter {
             .map_err(|e| e.to_string())?;
         println!(
             "{}",
-            self.trp("Lock released on '{path}'.", &[("path", &path)])
+            self.trp("Unlocked {path}.", &[("path", &path)])
         );
         Ok(())
     }

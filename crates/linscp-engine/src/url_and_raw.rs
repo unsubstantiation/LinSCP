@@ -2090,7 +2090,7 @@ pub fn collect_s3_object_write_headers(
         );
     }
     if let Some(meta) = raw_fields.get("s3_metadata").filter(|s| !s.is_empty()) {
-        for item in meta.split(';') {
+        for item in meta.split([';', ',']) {
             let item = item.trim();
             if item.is_empty() {
                 continue;

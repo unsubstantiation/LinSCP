@@ -179,7 +179,7 @@ impl StoredSite {
     }
 
     pub fn folder_and_leaf(&self) -> (&str, &str) {
-        match self.name.split_once('/') {
+        match self.name.rsplit_once('/') {
             Some((folder, leaf)) if !folder.is_empty() && !leaf.is_empty() => (folder, leaf),
             _ => ("", self.name.as_str()),
         }
@@ -758,7 +758,14 @@ impl SessionStore {
         for site in &self.sites {
             let (folder, _) = site.folder_and_leaf();
             if !folder.is_empty() {
-                set.insert(folder.to_string());
+                let mut cur = String::new();
+                for seg in folder.split('/').filter(|s| !s.is_empty()) {
+                    if !cur.is_empty() {
+                        cur.push('/');
+                    }
+                    cur.push_str(seg);
+                    set.insert(cur.clone());
+                }
             }
         }
         set.into_iter().collect()
