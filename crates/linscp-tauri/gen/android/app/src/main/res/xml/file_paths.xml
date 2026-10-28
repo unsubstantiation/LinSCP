@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <files-path name="linscp_files" path="." />
+    <cache-path name="linscp_cache" path="." />
+    <external-files-path name="linscp_external" path="." />
+</paths>

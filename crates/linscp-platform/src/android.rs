@@ -25,6 +25,22 @@ pub trait SafBridge: Send + Sync {
     fn rename_uri(&self, uri: &str, new_name: &str) -> Result<String, PlatformError>;
 }
 
+/// Bridge for staging incoming Android Share Sheet intents (`ACTION_SEND` /
+/// `ACTION_SEND_MULTIPLE`).
+pub trait ShareBridge: Send + Sync {
+    fn staged_share_paths(&self) -> Result<Vec<PathBuf>, PlatformError>;
+    fn stage_uris(&self, uris: &[String]) -> Result<Vec<PathBuf>, PlatformError>;
+}
+
+/// Bridge for the Android `ForegroundService` that keeps the process alive
+/// while transfers or `keepuptodate` watches are active.
+pub trait ForegroundServiceBridge: Send + Sync {
+    fn start(&self, title: &str, ongoing_transfers: usize) -> Result<(), PlatformError>;
+    fn update_progress(&self, bytes_done: u64, bytes_total: u64) -> Result<(), PlatformError>;
+    fn stop(&self) -> Result<(), PlatformError>;
+    fn is_running(&self) -> bool;
+}
+
 /// Optional Android Keystore hardware-backed AES-256-GCM wrapper supplied by
 /// the Tauri Android plugin when running inside the Android app runtime.
 pub trait KeystoreBridge: Send + Sync {
@@ -42,10 +58,15 @@ pub fn default_config_dir() -> PathBuf {
     std::env::temp_dir().join("linscp")
 }
 
+pub fn app_files_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("LINSCP_ANDROID_FILES_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    std::env::temp_dir().join("linscp-files")
+}
+
 pub fn list_roots(saf: Option<&dyn SafBridge>) -> Result<Vec<LocalRootEntry>, PlatformError> {
-    let app_root = std::env::var_os("LINSCP_ANDROID_FILES_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("linscp-files"));
+    let app_root = app_files_dir();
     let mut roots = vec![LocalRootEntry {
         path: app_root.to_string_lossy().into_owned(),
         label: "App Storage".to_string(),

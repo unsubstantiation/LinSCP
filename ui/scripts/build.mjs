@@ -47,7 +47,8 @@ fs.cpSync(
   { recursive: true },
 );
 
-const rawHtml = fs.readFileSync(path.join(legacyWebDir, 'index.html'), 'utf8');
+const rawHtml = fs.readFileSync(path.join(legacyWebDir, 'index.html'), 'utf8').replace(/\r\n/g, '\n');
+
 const anchor = '  async function api(url, options) {\n    options = options || {};';
 if (!rawHtml.includes(anchor)) {
   throw new Error('Expected api(url, options) entrypoint in source/gui/web/index.html');
