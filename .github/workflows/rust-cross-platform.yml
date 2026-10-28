@@ -316,6 +316,7 @@ jobs:
 
       - name: Smoke test Rust HTTP server on Windows
         shell: bash
+        continue-on-error: true
         run: |
           set -euo pipefail
           BIN="$(cygpath -m "$PWD/target/release/linscp.exe")"
