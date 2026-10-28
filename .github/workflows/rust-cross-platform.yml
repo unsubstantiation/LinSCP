@@ -195,10 +195,15 @@ jobs:
             local log="$RUNNER_TEMP/rust-win-${label}.log"
             echo "=== Running Windows parity suite: ${label} ==="
             if ! python -u - "$script_path" "$BIN_WIN" >"$log" 2>&1 <<'PYEOF'
-          import os, runpy, sys
+          import os, pathlib, runpy, sys
           if not hasattr(os, "killpg"):
               os.getpgid = lambda pid: pid
               os.killpg = lambda pgid, sig: os.kill(pgid, sig)
+          _orig_write_text = pathlib.Path.write_text
+          pathlib.Path.write_text = (
+              lambda self, data, encoding=None, errors=None, newline="\n":
+              _orig_write_text(self, data, encoding=encoding, errors=errors, newline=newline)
+          )
           script_path, bin_win = sys.argv[1], sys.argv[2]
           sys.argv = [script_path, bin_win]
           runpy.run_path(script_path, run_name="__main__")
