@@ -174,10 +174,14 @@ pub fn stage_share_uris_via_saf(
     }
     ensure_private_dir(staging_root)?;
     // Create a unique subdir per staging operation to avoid collisions.
-    let mut rnd = [0u8; 8];
-    use rand::RngCore;
-    rand::thread_rng().fill_bytes(&mut rnd);
-    let id = rnd.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let id = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::time::SystemTime::now().hash(&mut h);
+        std::process::id().hash(&mut h);
+        std::thread::current().id().hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
     let staging_dir = staging_root.join(&id);
     ensure_private_dir(&staging_dir)?;
 
