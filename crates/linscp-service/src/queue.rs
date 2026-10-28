@@ -507,14 +507,14 @@ impl QueueManager {
         }
     }
 
-    fn make_progress_cb(&self, task_id: u64, cancel_flag: Arc<AtomicBool>) -> ProgressCallback {
+    fn make_progress_cb(&self, task_id: u64, cancel_flag: Arc<AtomicBool>) -> Arc<dyn Fn(u64, u64) + Send + Sync> {
         let inner = Arc::clone(&self.inner);
         let event_tx = self.event_tx.clone();
         let started = Instant::now();
         let last_emit = Mutex::new(Instant::now() - Duration::from_secs(1));
-        Arc::new(move |done: u64, total: Option<u64>| -> bool {
+        Arc::new(move |done: u64, total: u64| {
             if cancel_flag.load(Ordering::SeqCst) {
-                return false;
+                return;
             }
             loop {
                 let paused = inner.lock().map(|g| g.paused).unwrap_or(false);
@@ -522,7 +522,7 @@ impl QueueManager {
                     break;
                 }
                 if cancel_flag.load(Ordering::SeqCst) {
-                    return false;
+                    return;
                 }
                 std::thread::sleep(Duration::from_millis(40));
             }
@@ -555,7 +555,6 @@ impl QueueManager {
                     }
                 }
             }
-            !cancel_flag.load(Ordering::SeqCst)
         })
     }
 
@@ -590,7 +589,7 @@ impl QueueManager {
                         "",
                         &f,
                         &mut logger,
-                        Some(&progress),
+                        Some(&*progress),
                     )
                     .await?;
                     if *delete_source {
@@ -604,7 +603,7 @@ impl QueueManager {
                         local_dest,
                         &f,
                         &mut logger,
-                        Some(&progress),
+                        Some(&*progress),
                     )
                     .await?;
                 }
@@ -632,7 +631,7 @@ impl QueueManager {
                         "",
                         &f,
                         &mut logger,
-                        Some(&progress),
+                        Some(&*progress),
                     )
                     .await?;
                     if *delete_source {
@@ -645,7 +644,7 @@ impl QueueManager {
                         remote_dest,
                         &f,
                         &mut logger,
-                        Some(&progress),
+                        Some(&*progress),
                     )
                     .await?;
                 }
@@ -664,7 +663,7 @@ impl QueueManager {
                 let cancel = Arc::clone(&task.cancel_flag);
                 let prog = progress.clone();
                 tokio::task::spawn_blocking(move || {
-                    execute_local_item(&src, &dst, mv, pol, &cancel, &prog)
+                    execute_local_item(&src, &dst, mv, pol, &cancel, &*prog)
                 })
                 .await
                 .map_err(|e| format!("Local worker panicked: {e}"))?
@@ -686,7 +685,7 @@ impl QueueManager {
                     dst_path,
                     *move_item,
                     staging_root,
-                    &progress,
+                    &*progress,
                 )
                 .await
             }
@@ -1022,7 +1021,8 @@ fn local_copy_recursive(
             }
             writer.write_all(&buf[..n]).map_err(|e| e.to_string())?;
             *copied = copied.saturating_add(n as u64);
-            if !progress(*copied, Some(total)) {
+            progress(*copied, total);
+            if cancel.load(Ordering::SeqCst) {
                 return Err("Cancelled by user.".to_string());
             }
         }

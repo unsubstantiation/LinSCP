@@ -11,7 +11,7 @@ use linscp_engine::parse_chmod_spec;
 use linscp_engine::transfer::{upload_single_file, TransferFlags};
 use linscp_engine::xml_log::SessionLogger;
 use linscp_platform::gui_os::{create_local_symlink, format_listing_date, stat_extended};
-use linscp_platform::terminal::{run_local_shell_command, set_local_permissions};
+use linscp_platform::terminal::set_local_permissions;
 use linscp_platform::write_private_file_atomic;
 use linscp_proto::ssh::extract_openssh_public_key_line;
 use linscp_proto::{download_bytes, RemoteSession, TransferRequest};
@@ -830,16 +830,19 @@ pub async fn execute_custom_command_template(
             };
             let expanded = expand_command_template(raw_cmd, &leaf, work_dir, tab);
             let full_cmd = format!("cd -- {} && {expanded}", shell_quote_single(work_dir));
-            let res = tokio::task::spawn_blocking(move || run_local_shell_command(&full_cmd))
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())?;
+            let full_clone = full_cmd.clone();
+            let output = tokio::task::spawn_blocking(move || {
+                std::process::Command::new("sh").arg("-c").arg(&full_clone).output().map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
             results.push(json!({
                 "file": leaf,
                 "command": expanded,
-                "exit_code": res.exit_code,
-                "stdout": String::from_utf8_lossy(&res.stdout),
-                "stderr": String::from_utf8_lossy(&res.stderr),
+                "exit_code": output.status.code().unwrap_or(1),
+                "stdout": String::from_utf8_lossy(&output.stdout).into_owned(),
+                "stderr": String::from_utf8_lossy(&output.stderr).into_owned(),
             }));
         } else {
             let session = tab
@@ -876,14 +879,17 @@ pub async fn exec_raw_remote_or_local_command(
         } else {
             command.to_string()
         };
-        let res = tokio::task::spawn_blocking(move || run_local_shell_command(&cmd_str))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
+        let cmd_clone = cmd_str.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("sh").arg("-c").arg(&cmd_clone).output().map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
         return Ok((
-            res.exit_code,
-            String::from_utf8_lossy(&res.stdout).into_owned(),
-            String::from_utf8_lossy(&res.stderr).into_owned(),
+            output.status.code().unwrap_or(1),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
         ));
     }
     let tab = tab.ok_or_else(|| "Not connected".to_string())?;
