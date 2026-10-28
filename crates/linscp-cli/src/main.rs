@@ -3,7 +3,7 @@
 //! conversion, `-gui` desktop launcher, and `--serve-http` standalone browser mode.
 
 use std::io::{BufReader, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
