@@ -146,8 +146,51 @@ jobs:
             librsvg2-dev \
             patchelf
 
+      - name: Setup Node for UI build
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build TypeScript UI for Tauri
+        run: |
+          npm --prefix ui install --no-audit --no-fund
+          npm --prefix ui run build
+          ls -la ui/dist
+
       - name: Check Tauri v2 native shell crate on Linux
         run: python3 tools/run_cargo_ci.py cargo check -p linscp-tauri --features native-shell
+
+      - name: Smoke test Rust HTTP standalone browser server
+        run: |
+          set -euo pipefail
+          BIN="$GITHUB_WORKSPACE/target/release/linscp"
+          # Also ensure linscp-gui binary exists
+          test -x "$GITHUB_WORKSPACE/target/release/linscp-gui" || test -x "$GITHUB_WORKSPACE/target/release/linscp" || (echo "linscp-gui binary missing"; exit 1)
+          PORT=18080
+          LOG="$RUNNER_TEMP/rust-http-smoke.log"
+          rm -f "$LOG"
+          LINSCP_CONFIG_DIR="$RUNNER_TEMP/rust-http-config" "$BIN" --serve-http --host=127.0.0.1 --port=$PORT --print-token > "$LOG" 2>&1 &
+          SRV=$!
+          token=""
+          for i in $(seq 1 15); do
+            sleep 1
+            token=$(sed -n 's/^Token: //p' "$LOG" | head -1)
+            if [ -n "$token" ]; then break; fi
+            if ! kill -0 "$SRV" 2>/dev/null; then cat "$LOG"; echo "Rust HTTP server died"; exit 1; fi
+          done
+          if [ -z "$token" ]; then cat "$LOG"; kill "$SRV" || true; echo "No token from Rust HTTP server"; exit 1; fi
+          echo "Rust HTTP token: $token"
+          curl -fsS -H "X-LSCP-Token: $token" "http://127.0.0.1:$PORT/api/status" | grep -q '"local_dir"' || (cat "$LOG"; kill "$SRV"; exit 1)
+          curl -fsS -H "X-LSCP-Token: $token" "http://127.0.0.1:$PORT/api/local/roots" | grep -q '"roots"' || (kill "$SRV"; exit 1)
+          curl -fsS -H "X-LSCP-Token: $token" "http://127.0.0.1:$PORT/api/sessions" | grep -q '"sessions"' || (kill "$SRV"; exit 1)
+          # Host header check (DNS rebinding defense)
+          code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/api/status")
+          if [ "$code" != "401" ]; then echo "Expected 401 without token, got $code"; kill "$SRV"; exit 1; fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: evil.example" -H "X-LSCP-Token: $token" "http://127.0.0.1:$PORT/api/status")
+          if [ "$code" != "403" ]; then echo "Expected 403 for evil host, got $code"; kill "$SRV"; exit 1; fi
+          kill "$SRV" || true
+          wait "$SRV" || true
+          echo "Rust HTTP smoke test passed"
 
   rust-windows:
     name: Rust Workspace & Tauri Host (Windows)
@@ -175,11 +218,47 @@ jobs:
           python tools/run_cargo_ci.py cargo clippy --workspace --all-targets --keep-going -- -D warnings
           python tools/run_cargo_ci.py cargo clippy -p linscp-proto --features gssapi --all-targets --keep-going -- -D warnings
 
+      - name: Setup Node for UI build (Windows)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build TypeScript UI for Tauri (Windows)
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix ui install --no-audit --no-fund
+          npm --prefix ui run build
+          ls -la ui/dist
+
       - name: Check Tauri v2 native shell crate on Windows
         shell: bash
         run: |
           set -euo pipefail
           python tools/run_cargo_ci.py cargo check -p linscp-tauri --features native-shell
+
+      - name: Smoke test Rust HTTP server on Windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cygpath -m "$PWD/target/release/linscp.exe")"
+          PORT=18081
+          LOG="$RUNNER_TEMP/rust-http-win.log"
+          rm -f "$LOG"
+          LINSCP_CONFIG_DIR="$RUNNER_TEMP/rust-http-win-config" "$BIN" --serve-http --host=127.0.0.1 --port=$PORT --print-token > "$LOG" 2>&1 &
+          SRV=$!
+          token=""
+          for i in $(seq 1 15); do
+            sleep 1
+            token=$(sed -n 's/^Token: //p' "$LOG" | head -1)
+            if [ -n "$token" ]; then break; fi
+            if ! kill -0 "$SRV" 2>/dev/null; then cat "$LOG"; echo "Rust HTTP server died"; exit 1; fi
+          done
+          if [ -z "$token" ]; then cat "$LOG"; kill "$SRV" || true; echo "No token"; exit 1; fi
+          curl -fsS -H "X-LSCP-Token: $token" "http://127.0.0.1:$PORT/api/status" | grep -q '"local_dir"'
+          kill "$SRV" || true
+          wait "$SRV" || true
+          echo "Rust HTTP Windows smoke test passed"
 
       - name: Build and smoke-test release Rust CLI on Windows
         shell: bash
