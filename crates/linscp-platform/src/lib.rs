@@ -18,6 +18,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 pub mod gssapi_sys;
+pub mod gui_os;
 pub mod terminal;
 pub mod watcher;
 

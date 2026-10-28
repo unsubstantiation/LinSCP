@@ -421,6 +421,12 @@ pub trait RemoteSession: Send + Sync {
     async fn close(&self) -> Result<(), ProtoError> {
         Ok(())
     }
+    fn ssh_connection(&self) -> Option<&std::sync::Arc<ssh::SshConnection>> {
+        None
+    }
+    fn observed_host_key(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Convenience helper downloading an entire remote file into memory.

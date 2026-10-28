@@ -1803,7 +1803,27 @@ pub async fn connect_site_spec(
         ssh_log_sink,
         proxy.clone(),
     );
+    connect_site_spec_inner(
+        spec,
+        proxy,
+        tls,
+        config_dir,
+        dest_ssh_cfg,
+        tunnel_ssh_cfg,
+        tunnel_local_port,
+    )
+    .await
+}
 
+async fn connect_site_spec_inner(
+    spec: &ParsedSiteSpec,
+    proxy: Option<ProxyConfig>,
+    tls: TlsSettings,
+    config_dir: &Path,
+    dest_ssh_cfg: SshConnectConfig,
+    tunnel_ssh_cfg: Option<SshConnectConfig>,
+    tunnel_local_port: u16,
+) -> Result<Box<dyn RemoteSession>, String> {
     let timeout = Duration::from_secs(spec.timeout_secs.max(1));
     let port = if spec.session.port == 0 {
         spec.session.protocol.default_port()
@@ -1865,8 +1885,8 @@ pub async fn connect_site_spec(
                 use_mlsd: spec.raw_fields.get("ftp_use_mlsd").map(String::as_str) != Some("0"),
                 mlsd_required: spec.raw_fields.get("ftp_use_mlsd").map(String::as_str)
                     == Some("2"),
-                tls,
-                proxy,
+                tls: tls.clone(),
+                proxy: proxy.clone(),
                 timeout,
             };
             let ftp = FtpSession::connect(ftp_cfg, tunnel_ssh_cfg.as_ref(), tunnel_local_port)
@@ -1893,8 +1913,8 @@ pub async fn connect_site_spec(
                     Some(spec.session.username.clone())
                 },
                 password: spec.session.password.clone().map(Zeroizing::new),
-                tls,
-                proxy,
+                tls: tls.clone(),
+                proxy: proxy.clone(),
                 timeout,
             };
             let dav = WebDavSession::connect(dav_cfg, tunnel_ssh_cfg.as_ref(), tunnel_local_port)
@@ -2004,6 +2024,220 @@ pub async fn connect_site_spec(
     }
 
     Ok(session)
+}
+
+/// Structured SSH host-key verification challenge returned to `CommanderService`
+/// when a destination or jump-tunnel host key is uncached or mismatched.
+#[derive(Debug, Clone)]
+pub struct GuiHostKeyChallenge {
+    pub role: String,
+    pub changed: bool,
+    pub host: String,
+    pub port: u16,
+    pub key_type: String,
+    pub sha256_fingerprint: String,
+    /// Combined `"<key_type> <SHA256:...>"` string matching the GUI challenge contract.
+    pub display_fingerprint: String,
+    pub error: String,
+}
+
+#[derive(Debug)]
+pub enum GuiConnectError {
+    HostKeyChallenge(GuiHostKeyChallenge),
+    Failed(String),
+}
+
+fn make_gui_ssh_host_key_callback(
+    is_tunnel: bool,
+    pinned_hostkey: String,
+    config_dir: std::path::PathBuf,
+    cache_pinned: bool,
+    locale: String,
+    capture: Arc<std::sync::Mutex<Option<GuiHostKeyChallenge>>>,
+) -> HostKeyDecisionCallback {
+    Arc::new(move |obs: &ObservedServerHostKey| -> Result<(), ProtoError> {
+        let role = if is_tunnel { "tunnel" } else { "destination" };
+        let cache_path = config_dir.join("sshhostkeys");
+        let mut cache = HostKeyCache::load_from_path(&cache_path).unwrap_or_default();
+        let cached_fp = cache
+            .lookup(&obs.host, obs.port, &obs.key_type)
+            .map(str::to_string);
+
+        let pin = pinned_hostkey.trim();
+        if pin == "*" {
+            return Ok(());
+        }
+
+        let display_fp = format!("{} {}", obs.key_type, obs.sha256_fingerprint);
+        if !pin.is_empty() {
+            if matches_extended_ssh_pin(pin, obs) {
+                if cache_pinned {
+                    let _ = cache.upsert(
+                        &obs.host,
+                        obs.port,
+                        &obs.key_type,
+                        &obs.sha256_fingerprint,
+                    );
+                    let _ = cache.save_to_path(&cache_path);
+                }
+                return Ok(());
+            }
+            let port_s = obs.port.to_string();
+            let msg = translate_with(
+                CatalogDomain::Cli,
+                &locale,
+                "The host key of {host} (port {port}) is not the expected one.\n  {type} key fingerprint: {fingerprint}\n  expected fingerprint:           {expected}\nThe connection may be intercepted; refusing to continue.",
+                &[
+                    ("host", &obs.host),
+                    ("port", &port_s),
+                    ("type", &obs.key_type),
+                    ("fingerprint", &obs.sha256_fingerprint),
+                    ("expected", pin),
+                ],
+            );
+            if let Ok(mut guard) = capture.lock() {
+                *guard = Some(GuiHostKeyChallenge {
+                    role: role.to_string(),
+                    changed: true,
+                    host: obs.host.clone(),
+                    port: obs.port,
+                    key_type: obs.key_type.clone(),
+                    sha256_fingerprint: obs.sha256_fingerprint.clone(),
+                    display_fingerprint: display_fp,
+                    error: msg.clone(),
+                });
+            }
+            return Err(ProtoError::Transport(msg));
+        }
+
+        match cached_fp {
+            Some(ref c) if c == &obs.sha256_fingerprint => Ok(()),
+            Some(_) => {
+                let port_s = obs.port.to_string();
+                let msg = translate_with(
+                    CatalogDomain::Cli,
+                    &locale,
+                    "The host key of {host} (port {port}) does not match the cached key.\n  {type} key fingerprint: {fingerprint}\nThe connection may be intercepted; refusing to continue.",
+                    &[
+                        ("host", &obs.host),
+                        ("port", &port_s),
+                        ("type", &obs.key_type),
+                        ("fingerprint", &obs.sha256_fingerprint),
+                    ],
+                );
+                if let Ok(mut guard) = capture.lock() {
+                    *guard = Some(GuiHostKeyChallenge {
+                        role: role.to_string(),
+                        changed: true,
+                        host: obs.host.clone(),
+                        port: obs.port,
+                        key_type: obs.key_type.clone(),
+                        sha256_fingerprint: obs.sha256_fingerprint.clone(),
+                        display_fingerprint: display_fp,
+                        error: msg.clone(),
+                    });
+                }
+                Err(ProtoError::Transport(msg))
+            }
+            None => {
+                let msg = if is_tunnel {
+                    format!(
+                        "Unknown tunnel SSH host key for {}:{} ({}); verify and continue.",
+                        obs.host, obs.port, obs.sha256_fingerprint
+                    )
+                } else {
+                    format!(
+                        "The server's host key is not cached ({display_fp}). Verify the fingerprint before connecting."
+                    )
+                };
+                if let Ok(mut guard) = capture.lock() {
+                    *guard = Some(GuiHostKeyChallenge {
+                        role: role.to_string(),
+                        changed: false,
+                        host: obs.host.clone(),
+                        port: obs.port,
+                        key_type: obs.key_type.clone(),
+                        sha256_fingerprint: obs.sha256_fingerprint.clone(),
+                        display_fingerprint: display_fp,
+                        error: msg.clone(),
+                    });
+                }
+                Err(ProtoError::Transport(msg))
+            }
+        }
+    })
+}
+
+/// Connects a `ParsedSiteSpec` silently for `CommanderService` tabs, returning a
+/// structured `GuiConnectError::HostKeyChallenge` instead of writing `HOSTKEY` lines to stdout.
+#[allow(clippy::result_large_err)]
+pub async fn connect_gui_site_spec(
+    spec: &ParsedSiteSpec,
+    config_dir: &Path,
+    cache_pinned_hostkeys: bool,
+    locale: &str,
+    ssh_log_sink: Option<SshEventLogger>,
+) -> Result<Box<dyn RemoteSession>, GuiConnectError> {
+    validate_ssh_gssapi_policy(spec).map_err(GuiConnectError::Failed)?;
+    let proxy = build_proxy_config(spec).map_err(GuiConnectError::Failed)?;
+    let tls = build_tls_settings(spec).map_err(GuiConnectError::Failed)?;
+    let (mut dest_ssh_cfg, mut tunnel_ssh_cfg, tunnel_local_port) = build_ssh_configs(
+        spec,
+        config_dir,
+        false,
+        false,
+        locale,
+        0,
+        ssh_log_sink,
+        proxy.clone(),
+    );
+
+    let capture: Arc<std::sync::Mutex<Option<GuiHostKeyChallenge>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    dest_ssh_cfg.host_key_decision = Some(make_gui_ssh_host_key_callback(
+        false,
+        spec.session.hostkey.clone(),
+        config_dir.to_path_buf(),
+        cache_pinned_hostkeys,
+        locale.to_string(),
+        Arc::clone(&capture),
+    ));
+    if let Some(ref mut tun_cfg) = tunnel_ssh_cfg {
+        tun_cfg.host_key_decision = Some(make_gui_ssh_host_key_callback(
+            true,
+            spec.session
+                .tunnel
+                .as_ref()
+                .map(|t| t.hostkey.clone())
+                .unwrap_or_default(),
+            config_dir.to_path_buf(),
+            cache_pinned_hostkeys,
+            locale.to_string(),
+            Arc::clone(&capture),
+        ));
+    }
+
+    match connect_site_spec_inner(
+        spec,
+        proxy,
+        tls,
+        config_dir,
+        dest_ssh_cfg,
+        tunnel_ssh_cfg,
+        tunnel_local_port,
+    )
+    .await
+    {
+        Ok(session) => Ok(session),
+        Err(err) => {
+            if let Ok(mut guard) = capture.lock() {
+                if let Some(challenge) = guard.take() {
+                    return Err(GuiConnectError::HostKeyChallenge(challenge));
+                }
+            }
+            Err(GuiConnectError::Failed(err))
+        }
+    }
 }
 
 /// Opens a direct (or jump-tunneled) SSH connection for `-shell` or `terminal`.

@@ -30,6 +30,45 @@ use crate::{evaluate_host_key_extended, ProtoError};
 
 const DEFAULT_SSH_TIMEOUT_SECS: u64 = 20;
 
+#[derive(Debug)]
+enum PtyShellCommand {
+    Write(Vec<u8>),
+    Resize { cols: u32, rows: u32 },
+    Close,
+}
+
+/// Output/lifecycle events emitted by an interactive SSH PTY shell channel.
+#[derive(Debug, Clone)]
+pub enum PtyShellEvent {
+    Data(Vec<u8>),
+    ExitStatus(u32),
+    Closed,
+}
+
+/// Cloneable sender handle controlling an interactive SSH PTY shell channel.
+#[derive(Clone, Debug)]
+pub struct PtyShellHandle {
+    tx: tokio::sync::mpsc::UnboundedSender<PtyShellCommand>,
+}
+
+impl PtyShellHandle {
+    pub fn write_bytes(&self, bytes: Vec<u8>) -> Result<(), ProtoError> {
+        self.tx
+            .send(PtyShellCommand::Write(bytes))
+            .map_err(|_| ProtoError::Transport("SSH terminal channel is closed.".to_string()))
+    }
+
+    pub fn resize(&self, cols: u32, rows: u32) -> Result<(), ProtoError> {
+        self.tx
+            .send(PtyShellCommand::Resize { cols, rows })
+            .map_err(|_| ProtoError::Transport("SSH terminal channel is closed.".to_string()))
+    }
+
+    pub fn close(&self) {
+        let _ = self.tx.send(PtyShellCommand::Close);
+    }
+}
+
 /// Produces an async stream connected to an SSH agent (e.g. OS `SSH_AUTH_SOCK`
 /// / Windows named pipe via `SystemSshAgentConnector`, or an in-memory duplex
 /// stream in integration tests).
@@ -789,6 +828,67 @@ impl SshConnection {
             .await
             .map_err(|e| ProtoError::Transport(format!("SSH shell request failed: {e}")))?;
         Ok(channel)
+    }
+
+    /// Opens an interactive PTY shell channel backed by an async actor task for
+    /// embedded `xterm.js` bridges in `CommanderService`.
+    pub async fn open_pty_shell_session(
+        &self,
+        term: &str,
+        cols: u32,
+        rows: u32,
+    ) -> Result<(PtyShellHandle, tokio::sync::mpsc::UnboundedReceiver<PtyShellEvent>), ProtoError> {
+        let mut channel = self.open_pty_shell(term, cols, rows).await?;
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<PtyShellCommand>();
+        let (evt_tx, evt_rx) = tokio::sync::mpsc::unbounded_channel::<PtyShellEvent>();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    maybe_msg = channel.wait() => {
+                        match maybe_msg {
+                            Some(ChannelMsg::Data { data }) => {
+                                let _ = evt_tx.send(PtyShellEvent::Data(data.to_vec()));
+                            }
+                            Some(ChannelMsg::ExtendedData { data, .. }) => {
+                                let _ = evt_tx.send(PtyShellEvent::Data(data.to_vec()));
+                            }
+                            Some(ChannelMsg::ExitStatus { exit_status }) => {
+                                let _ = evt_tx.send(PtyShellEvent::ExitStatus(exit_status));
+                            }
+                            Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
+                                let _ = evt_tx.send(PtyShellEvent::Closed);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    maybe_cmd = cmd_rx.recv() => {
+                        match maybe_cmd {
+                            Some(PtyShellCommand::Write(bytes)) => {
+                                if !bytes.is_empty() && channel.data(&bytes[..]).await.is_err() {
+                                    let _ = evt_tx.send(PtyShellEvent::Closed);
+                                    break;
+                                }
+                            }
+                            Some(PtyShellCommand::Resize { cols, rows }) => {
+                                let c = if cols > 0 { cols } else { 80 };
+                                let r = if rows > 0 { rows } else { 24 };
+                                let _ = channel.window_change(c, r, 0, 0).await;
+                            }
+                            Some(PtyShellCommand::Close) | None => {
+                                let _ = channel.eof().await;
+                                let _ = channel.close().await;
+                                let _ = evt_tx.send(PtyShellEvent::Closed);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok((PtyShellHandle { tx: cmd_tx }, evt_rx))
     }
 
     pub async fn disconnect(&self) -> Result<(), ProtoError> {

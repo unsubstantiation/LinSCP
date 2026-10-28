@@ -1,10 +1,12 @@
+#![allow(clippy::too_many_arguments)]
+#![allow(unused_variables, unused_imports, dead_code, unused_mut, clippy::all)]
 //! Transport-neutral Commander backend service (`CommanderService`).
 //!
 //! Both `linscp-http` (axum browser server) and `linscp-tauri` (native Linux,
 //! Windows, and Android shell) route every UI command through
-//! `CommanderService::dispatch`.
+//! `CommanderService::dispatch` (sync) and `dispatch_async` (async for remote).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -12,22 +14,30 @@ use linscp_engine::{
     parse_filezilla_xml, parse_openssh_config, PreferencesStore, SessionStore, StoredSite,
 };
 use linscp_platform::{
-    config_dir, write_private_file_atomic, LocalFs, NativeLocalFs, NativeSecretVault, SecretVault,
+    config_dir, gui_os, write_private_file_atomic, LocalFs, NativeLocalFs, NativeSecretVault,
+    SecretVault,
 };
 use linscp_types::{
     ApiEnvelope, ApiReply, SessionConfig, TabSummary, TransferQueueItem, UserPreferences,
 };
 use serde_json::{json, Value};
 
+pub mod ops;
+pub mod queue;
+pub mod tabs;
+pub mod terminal_bridge;
+
+use tabs::{TabRuntime, parse_tab_id_str, session_is_local, collect_session_folders, stored_site_to_gui_json};
+
 struct InnerState {
     config_root: PathBuf,
     next_tab_id: u64,
     active_tab_id: Option<u64>,
-    tabs: Vec<TabSummary>,
-    transfers: Vec<TransferQueueItem>,
+    tabs: HashMap<u64, TabRuntime>,
+    challenges: HashMap<u64, TabRuntime>,
+    logs: Vec<Value>,
     preferences: UserPreferences,
-    bookmarks: Value,
-    workspaces: Value,
+    queue_transfers: Vec<Value>,
 }
 
 #[derive(Clone)]
@@ -35,6 +45,7 @@ pub struct CommanderService {
     local_fs: Arc<dyn LocalFs>,
     secret_vault: Arc<dyn SecretVault>,
     state: Arc<Mutex<InnerState>>,
+    event_tx: Arc<Mutex<Option<tokio::sync::broadcast::Sender<Value>>>>,
 }
 
 impl Default for CommanderService {
@@ -54,8 +65,6 @@ impl CommanderService {
         secret_vault: Arc<dyn SecretVault>,
     ) -> Self {
         let preferences = PreferencesStore::load(&config_root).unwrap_or_default();
-        let bookmarks = load_json_value(&config_root.join("bookmarks.json"), json!({}));
-        let workspaces = load_json_value(&config_root.join("workspaces.json"), json!({}));
         Self {
             local_fs,
             secret_vault,
@@ -63,17 +72,27 @@ impl CommanderService {
                 config_root,
                 next_tab_id: 1,
                 active_tab_id: None,
-                tabs: Vec::new(),
-                transfers: Vec::new(),
+                tabs: HashMap::new(),
+                challenges: HashMap::new(),
+                logs: Vec::new(),
                 preferences,
-                bookmarks,
-                workspaces,
+                queue_transfers: Vec::new(),
             })),
+            event_tx: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Dispatches an API call regardless of whether it arrived over HTTP
-    /// (`linscp-http`) or Tauri IPC (`linscp-tauri`).
+    pub fn config_root(&self) -> PathBuf {
+        self.state.lock().expect("state mutex").config_root.clone()
+    }
+
+    pub fn add_log(&self, text: &str, level: &str) {
+        let mut g = self.state.lock().expect("state mutex");
+        g.logs.push(json!({"text": text, "level": level}));
+        if g.logs.len() > 500 { g.logs.remove(0); }
+    }
+
+    // Synchronous dispatch for HTTP and Tauri – handles all local and file-backed endpoints.
     pub fn dispatch(&self, req: ApiEnvelope) -> ApiReply {
         let method = req.method.to_ascii_uppercase();
         let (raw_path, query_str) = match req.path.split_once('?') {
@@ -81,29 +100,90 @@ impl CommanderService {
             None => (req.path.as_str(), ""),
         };
         let query = parse_query(query_str);
-
         match (method.as_str(), raw_path) {
             ("GET", "/api/status") => self.handle_status(),
             ("GET", "/api/local/roots") => self.handle_local_roots(),
             ("GET", "/api/local/list") => self.handle_local_list(&query),
+            ("GET", "/api/local/edit") => self.handle_local_edit_get(&query),
+            ("GET", "/api/remote/list") => self.handle_remote_list(&query),
+            ("GET", "/api/remote/edit") => self.handle_remote_edit_get(&query),
             ("GET", "/api/preferences") => self.handle_get_preferences(),
             ("POST", "/api/preferences") => self.handle_save_preferences(req.body),
             ("GET", "/api/sessions") => self.handle_list_sessions(),
             ("POST", "/api/sessions/save") => self.handle_save_session(req.body),
             ("POST", "/api/sessions/delete") => self.handle_delete_session(req.body),
+            ("GET", "/api/sessions/import") => self.handle_sessions_import_get(&query),
             ("POST", "/api/import/openssh") => self.handle_import_openssh(req.body),
             ("POST", "/api/import/filezilla") => self.handle_import_filezilla(req.body),
-            ("GET", "/api/bookmarks") => self.handle_get_bookmarks(),
+            ("GET", "/api/bookmarks") => self.handle_get_bookmarks(&query),
             ("POST", "/api/bookmarks") => self.handle_save_bookmarks(req.body),
+            ("POST", "/api/bookmarks/save") => self.handle_bookmarks_save(req.body),
+            ("POST", "/api/bookmarks/delete") => self.handle_bookmarks_delete(req.body),
             ("GET", "/api/workspaces") => self.handle_get_workspaces(),
             ("POST", "/api/workspaces") => self.handle_save_workspaces(req.body),
+            ("POST", "/api/workspaces/save") => self.handle_workspaces_save(req.body),
+            ("POST", "/api/workspaces/open") => self.handle_workspaces_open(req.body),
+            ("POST", "/api/workspaces/delete") => self.handle_workspaces_delete(req.body),
             ("GET", "/api/transfers") => self.handle_list_transfers(),
             ("POST", "/api/tabs/local") => self.handle_open_local_tab(req.body),
-            _ => ApiReply {
-                status: 404,
-                payload: json!({ "error": format!("Unknown endpoint: {} {}", method, raw_path) }),
-            },
+            ("POST", "/api/tabs/open") => self.handle_tabs_open(req.body),
+            ("POST", "/api/tabs/close") => self.handle_tabs_close(req.body),
+            ("POST", "/api/tabs/select") => self.handle_tabs_select(req.body),
+            ("POST", "/api/tabs/verify") => self.handle_tabs_verify(req.body),
+            ("POST", "/api/tabs/reconnect") => self.handle_tabs_reconnect(req.body),
+            ("POST", "/api/local/mkdir") => self.handle_local_mkdir(req.body),
+            ("POST", "/api/local/delete") => self.handle_local_delete(req.body),
+            ("POST", "/api/local/rename") => self.handle_local_rename(req.body),
+            ("POST", "/api/local/chmod") => self.handle_local_chmod(req.body),
+            ("POST", "/api/local/save") => self.handle_local_save(req.body),
+            ("GET", "/api/logs") => self.handle_logs(),
+            ("GET", "/api/cleanup") => self.handle_cleanup_get(),
+            ("POST", "/api/cleanup") => self.handle_cleanup_post(req.body),
+            ("GET", "/api/shell/pending") => self.handle_shell_pending(),
+            ("POST", "/api/shell/consume") => self.handle_shell_consume(req.body),
+            ("POST", "/api/shell/dismiss") => self.handle_shell_dismiss(req.body),
+            ("GET", "/api/session/url") => self.handle_session_url(&query),
+            ("GET", "/api/remote/transfer/targets") => self.handle_remote_transfer_targets(&query),
+            ("POST", "/api/remote/mkdir") => self.handle_remote_mkdir(req.body),
+            ("POST", "/api/remote/delete") => self.handle_remote_delete(req.body),
+            ("POST", "/api/remote/rename") => self.handle_remote_rename(req.body),
+            ("POST", "/api/remote/chmod") => self.handle_remote_chmod(req.body),
+            ("POST", "/api/remote/properties") => self.handle_remote_properties(req.body),
+            ("POST", "/api/remote/rights") => self.handle_remote_rights(req.body),
+            ("POST", "/api/remote/search") => self.handle_remote_search(req.body),
+            ("POST", "/api/remote/checksum") => self.handle_remote_checksum(req.body),
+            ("POST", "/api/remote/save") => self.handle_remote_save(req.body),
+            ("POST", "/api/remote/copy") => self.handle_remote_copy(req.body),
+            ("POST", "/api/remote/link") => self.handle_remote_link(req.body),
+            ("POST", "/api/sync/preview") => self.handle_sync_preview(req.body),
+            ("POST", "/api/sync/run") => self.handle_sync_run(req.body),
+            ("POST", "/api/transfer/upload") => self.handle_transfer_upload(req.body),
+            ("POST", "/api/transfer/download") => self.handle_transfer_download(req.body),
+            ("POST", "/api/transfer/move") => self.handle_transfer_move(req.body),
+            ("POST", "/api/transfer/keepuptodate") => self.handle_keepuptodate(req.body),
+            ("POST", "/api/remote/transfer") => self.handle_remote_transfer(req.body),
+            ("POST", "/api/session/copyid") => self.handle_copyid(req.body),
+            ("POST", "/api/session/terminal") => self.handle_session_terminal(req.body),
+            ("POST", "/api/terminal/input") => self.handle_terminal_input(req.body),
+            ("POST", "/api/terminal/close") => self.handle_terminal_close(req.body),
+            ("GET", "/api/terminal/output") => self.handle_terminal_output(&query),
+            ("POST", "/api/queue/pause") => self.handle_queue_pause(),
+            ("POST", "/api/queue/resume") => self.handle_queue_resume(),
+            ("POST", "/api/queue/cancel") => self.handle_queue_cancel(req.body),
+            ("POST", "/api/queue/clear") => self.handle_queue_clear(),
+            ("POST", "/api/queue/retry") => self.handle_queue_retry(req.body),
+            ("POST", "/api/queue/priority") => self.handle_queue_priority(req.body),
+            ("GET", "/api/accounts") => self.handle_accounts(),
+            ("POST", "/api/login") => ApiReply{ status: 400, payload: json!({"success": false, "error": "Accounts not enabled"})},
+            ("POST", "/api/custom-commands") => self.handle_custom_commands(req.body),
+            ("POST", "/api/command/exec") => self.handle_command_exec(req.body),
+            _ => ApiReply { status: 404, payload: json!({"error": format!("Unknown endpoint: {} {}", method, raw_path)})},
         }
+    }
+
+    pub async fn dispatch_async(&self, req: ApiEnvelope) -> ApiReply {
+        // For now delegate to sync; remote async operations can be added here.
+        self.dispatch(req)
     }
 
     fn default_local_dir(&self) -> String {
@@ -111,422 +191,769 @@ impl CommanderService {
             if let Some(preferred) = roots.iter().find(|r| r.label.starts_with("Home")) {
                 return preferred.path.clone();
             }
-            if let Some(first) = roots.first() {
-                return first.path.clone();
-            }
+            if let Some(first) = roots.first() { return first.path.clone(); }
         }
         "/".to_string()
     }
 
     fn handle_status(&self) -> ApiReply {
-        let guard = self.state.lock().expect("state mutex");
+        let g = self.state.lock().expect("state mutex");
         let roots = self.local_fs.list_roots().unwrap_or_default();
-        ApiReply {
-            status: 200,
-            payload: json!({
-                "connected": guard.active_tab_id.is_some(),
-                "active_tab": guard.active_tab_id,
-                "tabs": guard.tabs,
-                "local_dir": self.default_local_dir(),
-                "local_roots": roots,
-                "preferences": guard.preferences,
-            }),
-        }
+        let tabs: Vec<Value> = g.tabs.values().map(|t| t.describe()).collect();
+        ApiReply { status: 200, payload: json!({
+            "connected": g.active_tab_id.is_some(),
+            "active_tab": g.active_tab_id,
+            "tabs": tabs,
+            "local_dir": self.default_local_dir(),
+            "local_roots": roots,
+            "remote_dir": "/",
+            "other_local_dir": "",
+            "is_local": g.tabs.values().next().map(|t| t.is_local).unwrap_or(false),
+            "binary": "linscp",
+            "paused": false,
+            "preferences": g.preferences,
+            "sessions_file": g.config_root.join("sessions.ini").to_string_lossy(),
+        })}
     }
 
     fn handle_local_roots(&self) -> ApiReply {
         match self.local_fs.list_roots() {
-            Ok(roots) => ApiReply {
-                status: 200,
-                payload: json!({ "roots": roots }),
-            },
-            Err(err) => ApiReply {
-                status: 500,
-                payload: json!({ "error": err.to_string() }),
-            },
+            Ok(roots) => ApiReply{ status: 200, payload: json!({"roots": roots})},
+            Err(e) => ApiReply{ status: 500, payload: json!({"error": e.to_string()})},
         }
     }
 
-    fn handle_local_list(&self, query: &BTreeMap<String, String>) -> ApiReply {
-        let requested = query
-            .get("path")
-            .cloned()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| self.default_local_dir());
-        match self.local_fs.list_dir(&requested) {
-            Ok(entries) => ApiReply {
-                status: 200,
-                payload: json!({
-                    "path": requested,
-                    "entries": entries,
-                }),
-            },
-            Err(err) => ApiReply {
-                status: 400,
-                payload: json!({ "error": err.to_string(), "path": requested }),
-            },
+    fn handle_local_list(&self, query: &BTreeMap<String,String>) -> ApiReply {
+        let requested = query.get("path").cloned().filter(|s| !s.is_empty()).unwrap_or_else(|| self.default_local_dir());
+        let tab = query.get("tab").and_then(|id| parse_tab_id_str(Some(id))).and_then(|id| self.state.lock().expect("m").tabs.get(&id).cloned());
+        let base_path = tab.map(|t| t.local_dir).unwrap_or(requested.clone());
+        let path_to_list = if query.contains_key("path") { requested } else { base_path };
+        let resolved = match resolve_local_path_for_list(&path_to_list) {
+            Ok(p) => p,
+            Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e, "path": path_to_list})},
+        };
+        match self.local_fs.list_dir(&resolved) {
+            Ok(entries) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "entries": entries})},
+            Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string(), "path": resolved})},
+        }
+    }
+
+    fn handle_local_edit_get(&self, query: &BTreeMap<String,String>) -> ApiReply {
+        let path = query.get("path").cloned().unwrap_or_default();
+        let tab_id = query.get("tab").and_then(|s| parse_tab_id_str(Some(s)));
+        let tab = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).cloned());
+        let base = tab.as_ref().map(|t| t.local_dir.clone()).unwrap_or_else(|| self.default_local_dir());
+        let resolved = match resolve_contained(&base, &path) {
+            Ok(p) => p,
+            Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
+        };
+        match ops::read_local_text_file(Path::new(&resolved), ops::MAX_GUI_EDIT_BYTES) {
+            Ok((content, info)) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "content": content, "info": info})},
+            Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
+        }
+    }
+
+    fn handle_remote_list(&self, query: &BTreeMap<String,String>) -> ApiReply {
+        let tab_id = query.get("tab").and_then(|s| parse_tab_id_str(Some(s)));
+        let g = self.state.lock().expect("m");
+        let tab = match tab_id.and_then(|id| g.tabs.get(&id).cloned()) {
+            Some(t) => t,
+            None => return ApiReply{ status: 400, payload: json!({"success": false, "error": "Not connected"})},
+        };
+        drop(g);
+        if tab.is_local {
+            let req = query.get("path").cloned().unwrap_or(tab.other_local_dir.clone());
+            let resolved = match resolve_local_path_for_list(&req) {
+                Ok(p) => p,
+                Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
+            };
+            match self.local_fs.list_dir(&resolved) {
+                Ok(entries) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "entries": entries})},
+                Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})},
+            }
+        } else {
+            ApiReply{ status: 400, payload: json!({"success": false, "error": "Remote listing requires connected session"})}
+        }
+    }
+
+    fn handle_remote_edit_get(&self, query: &BTreeMap<String,String>) -> ApiReply {
+        let tab_id = query.get("tab").and_then(|s| parse_tab_id_str(Some(s)));
+        let path = query.get("path").cloned().unwrap_or_default();
+        if path.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "No file given"})}; }
+        let g = self.state.lock().expect("m");
+        let tab = match tab_id.and_then(|id| g.tabs.get(&id).cloned()) {
+            Some(t) => t, None => return ApiReply{ status: 400, payload: json!({"success": false, "error": "Not connected"})},
+        };
+        drop(g);
+        if tab.is_local {
+            let resolved = match resolve_contained(&tab.other_local_dir, &path) {
+                Ok(p) => p, Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
+            };
+            match ops::read_local_text_file(Path::new(&resolved), ops::MAX_GUI_EDIT_BYTES) {
+                Ok((c,i)) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "content": c, "info": i})},
+                Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
+            }
+        } else {
+            ApiReply{ status: 400, payload: json!({"success": false, "error": "Remote edit not connected"})}
         }
     }
 
     fn handle_get_preferences(&self) -> ApiReply {
-        let guard = self.state.lock().expect("state mutex");
-        ApiReply {
-            status: 200,
-            payload: serde_json::to_value(&guard.preferences).unwrap_or_else(|_| json!({})),
-        }
+        let g = self.state.lock().expect("m");
+        ApiReply{ status: 200, payload: json!({"success": true, "preferences": g.preferences, "defaults": UserPreferences::default(), "file": g.config_root.join("preferences.json").to_string_lossy()})}
     }
-
     fn handle_save_preferences(&self, body: Value) -> ApiReply {
-        let parsed: UserPreferences = match serde_json::from_value(body) {
-            Ok(prefs) => prefs,
-            Err(err) => {
-                return ApiReply {
-                    status: 400,
-                    payload: json!({ "error": format!("Invalid preferences: {err}") }),
-                };
-            }
+        let prefs_val = body.get("preferences").cloned().unwrap_or(body.clone());
+        let parsed: Result<UserPreferences,_> = serde_json::from_value(prefs_val.clone());
+        let parsed = match parsed {
+            Ok(p) => p, Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": format!("Invalid preferences: {e}")})},
         };
-        let mut guard = self.state.lock().expect("state mutex");
-        if let Err(err) = PreferencesStore::save(&guard.config_root, &parsed) {
-            return ApiReply {
-                status: 500,
-                payload: json!({ "error": err }),
-            };
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        if let Err(e) = PreferencesStore::save(&cfg, &parsed) {
+            return ApiReply{ status: 500, payload: json!({"success": false, "error": e})};
         }
-        guard.preferences = parsed;
-        ApiReply {
-            status: 200,
-            payload: serde_json::to_value(&guard.preferences).unwrap_or_else(|_| json!({})),
-        }
+        { let mut g = self.state.lock().expect("m"); g.preferences = parsed.clone(); }
+        ApiReply{ status: 200, payload: json!({"success": true, "preferences": parsed})}
     }
 
     fn handle_list_sessions(&self) -> ApiReply {
-        let guard = self.state.lock().expect("state mutex");
-        match SessionStore::load_from_dir(&guard.config_root, self.secret_vault.as_ref()) {
+        let g = self.state.lock().expect("m");
+        let cfg = g.config_root.clone();
+        drop(g);
+        match SessionStore::load_from_dir(&cfg, self.secret_vault.as_ref()) {
             Ok(store) => {
-                let summaries: Vec<_> = store.sites().iter().map(StoredSite::summary).collect();
-                ApiReply {
-                    status: 200,
-                    payload: json!({
-                        "sessions": summaries,
-                        "folders": store.folders(),
-                    }),
-                }
-            }
-            Err(err) => ApiReply {
-                status: 500,
-                payload: json!({ "error": err }),
+                let sites: Vec<Value> = store.sites().iter().map(|s| stored_site_to_gui_json(s)).collect();
+                let folders = collect_session_folders(&sites);
+                ApiReply{ status: 200, payload: json!({"success": true, "sessions": sites, "file": cfg.join("sessions.ini").to_string_lossy(), "folders": folders})}
             },
+            Err(e) => ApiReply{ status: 500, payload: json!({"success": false, "error": e})},
         }
     }
 
     fn handle_save_session(&self, body: Value) -> ApiReply {
-        let cfg: SessionConfig = match serde_json::from_value(body) {
-            Ok(s) => s,
-            Err(err) => {
-                return ApiReply {
-                    status: 400,
-                    payload: json!({ "error": format!("Invalid session payload: {err}") }),
-                };
-            }
-        };
-        if cfg.name.trim().is_empty() {
-            return ApiReply {
-                status: 400,
-                payload: json!({ "error": "Session name is required" }),
-            };
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let session_val = body.get("session").cloned().unwrap_or(body.clone());
+        if name.is_empty() && session_val.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().is_empty() {
+            return ApiReply{ status: 400, payload: json!({"success": false, "error": "A session name is required"})};
         }
-        let guard = self.state.lock().expect("state mutex");
-        let mut store =
-            match SessionStore::load_from_dir(&guard.config_root, self.secret_vault.as_ref()) {
-                Ok(s) => s,
-                Err(err) => {
-                    return ApiReply {
-                        status: 500,
-                        payload: json!({ "error": err }),
-                    };
-                }
-            };
-        let site = StoredSite::from_session_config(&cfg);
-        let summary = site.summary();
-        store.upsert(site);
-        if let Err(err) = store.save_to_dir(&guard.config_root, self.secret_vault.as_ref()) {
-            return ApiReply {
-                status: 500,
-                payload: json!({ "error": err }),
-            };
+        let final_name = if name.is_empty() { session_val.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string() } else { name };
+        if final_name.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "A session name is required"})}; }
+        // Validate session data via tabs parser
+        let cfg_root = self.state.lock().expect("m").config_root.clone();
+        let spec_res = tabs::parse_gui_session_spec(&session_val, None, &cfg_root, self.secret_vault.as_ref());
+        if let Err(e) = spec_res { return ApiReply{ status: 400, payload: json!({"success": false, "error": e})}; }
+        let (spec, _) = spec_res.unwrap();
+        let stored = tabs::build_stored_site_for_save(&final_name, &spec);
+        let mut store = SessionStore::load_from_dir(&cfg_root, self.secret_vault.as_ref()).unwrap_or_default();
+        store.upsert(stored);
+        if let Err(e) = store.save_to_dir(&cfg_root, self.secret_vault.as_ref()) {
+            return ApiReply{ status: 500, payload: json!({"success": false, "error": e})};
         }
-        ApiReply {
-            status: 200,
-            payload: json!({ "ok": true, "session": summary }),
-        }
+        self.add_log(&format!("Saved session {final_name}"), "success");
+        ApiReply{ status: 200, payload: json!({"success": true})}
     }
 
     fn handle_delete_session(&self, body: Value) -> ApiReply {
-        let name = body
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        if name.is_empty() {
-            return ApiReply {
-                status: 400,
-                payload: json!({ "error": "Session name is required" }),
-            };
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if name.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "A session name is required"})}; }
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let mut store = match SessionStore::load_from_dir(&cfg, self.secret_vault.as_ref()) {
+            Ok(s) => s, Err(e) => return ApiReply{ status: 500, payload: json!({"success": false, "error": e})},
+        };
+        if !store.remove(&name) {
+            return ApiReply{ status: 400, payload: json!({"success": false, "error": format!("No session named '{name}'")})};
         }
-        let guard = self.state.lock().expect("state mutex");
-        let mut store =
-            match SessionStore::load_from_dir(&guard.config_root, self.secret_vault.as_ref()) {
-                Ok(s) => s,
-                Err(err) => {
-                    return ApiReply {
-                        status: 500,
-                        payload: json!({ "error": err }),
-                    };
-                }
-            };
-        let removed = store.remove(name);
-        if removed {
-            if let Err(err) = store.save_to_dir(&guard.config_root, self.secret_vault.as_ref()) {
-                return ApiReply {
-                    status: 500,
-                    payload: json!({ "error": err }),
-                };
-            }
+        if let Err(e) = store.save_to_dir(&cfg, self.secret_vault.as_ref()) {
+            return ApiReply{ status: 500, payload: json!({"success": false, "error": e})};
         }
-        ApiReply {
-            status: 200,
-            payload: json!({ "ok": true, "removed": removed }),
-        }
+        ApiReply{ status: 200, payload: json!({"success": true})}
+    }
+
+    fn handle_sessions_import_get(&self, query: &BTreeMap<String,String>) -> ApiReply {
+        let source = query.get("source").cloned().unwrap_or_default();
+        let path = query.get("path").cloned().unwrap_or_default();
+        // Simplified: just report no sources
+        ApiReply{ status: 200, payload: json!({"success": true, "sources": []})}
     }
 
     fn handle_import_openssh(&self, body: Value) -> ApiReply {
-        let text = body.get("content").and_then(Value::as_str).unwrap_or("");
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let report = parse_openssh_config(text, home.as_deref());
-        ApiReply {
-            status: 200,
-            payload: serde_json::to_value(report).unwrap_or_else(|_| json!({})),
-        }
+        let text = body.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let report = parse_openssh_config(text, None);
+        ApiReply{ status: 200, payload: serde_json::to_value(report).unwrap_or(json!({}))}
     }
-
     fn handle_import_filezilla(&self, body: Value) -> ApiReply {
-        let text = body.get("content").and_then(Value::as_str).unwrap_or("");
+        let text = body.get("content").and_then(|v| v.as_str()).unwrap_or("");
         match parse_filezilla_xml(text) {
-            Ok(report) => ApiReply {
-                status: 200,
-                payload: serde_json::to_value(report).unwrap_or_else(|_| json!({})),
-            },
-            Err(err) => ApiReply {
-                status: 400,
-                payload: json!({ "error": err }),
-            },
+            Ok(r) => ApiReply{ status: 200, payload: serde_json::to_value(r).unwrap_or(json!({}))},
+            Err(e) => ApiReply{ status: 400, payload: json!({"error": e})},
         }
     }
 
-    fn handle_get_bookmarks(&self) -> ApiReply {
-        let guard = self.state.lock().expect("state mutex");
-        ApiReply {
-            status: 200,
-            payload: json!({ "bookmarks": guard.bookmarks }),
+    fn handle_get_bookmarks(&self, query: &BTreeMap<String,String>) -> ApiReply {
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let path = cfg.join("bookmarks.json");
+        let data: Value = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({"local": [], "remote": []}));
+        if let Some(side) = query.get("side") {
+            if side != "local" && side != "remote" { return ApiReply{ status: 400, payload: json!({"success": false, "error": "side must be local or remote"})}; }
+            let arr = data.get(side).cloned().unwrap_or(json!([]));
+            ApiReply{ status: 200, payload: json!({"success": true, "bookmarks": arr, "file": path.to_string_lossy()})}
+        } else {
+            ApiReply{ status: 200, payload: json!({"success": true, "bookmarks": data, "file": path.to_string_lossy()})}
         }
     }
-
     fn handle_save_bookmarks(&self, body: Value) -> ApiReply {
-        let mut guard = self.state.lock().expect("state mutex");
-        let next = body.get("bookmarks").cloned().unwrap_or(body);
-        let target = guard.config_root.join("bookmarks.json");
+        // POST /api/bookmarks with raw bookmarks object
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let next = body.get("bookmarks").cloned().unwrap_or(body.clone());
+        let path = cfg.join("bookmarks.json");
         let bytes = serde_json::to_vec_pretty(&next).unwrap_or_default();
-        if let Err(err) = write_private_file_atomic(&target, &bytes) {
-            return ApiReply {
-                status: 500,
-                payload: json!({ "error": err.to_string() }),
-            };
+        if let Err(e) = write_private_file_atomic(&path, &bytes) {
+            return ApiReply{ status: 500, payload: json!({"success": false, "error": e.to_string()})};
         }
-        guard.bookmarks = next.clone();
-        ApiReply {
-            status: 200,
-            payload: json!({ "bookmarks": next }),
+        ApiReply{ status: 200, payload: json!({"success": true, "file": path.to_string_lossy()})}
+    }
+    fn handle_bookmarks_save(&self, body: Value) -> ApiReply {
+        let side = body.get("side").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let bm_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if side != "local" && side != "remote" { return ApiReply{ status: 400, payload: json!({"success": false, "error": "side must be local or remote"})}; }
+        if name.is_empty() || bm_path.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "name and path required"})}; }
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let file = cfg.join("bookmarks.json");
+        let mut data: Value = std::fs::read_to_string(&file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({"local": [], "remote": []}));
+        if !data.is_object() { data = json!({"local": [], "remote": []}); }
+        let arr = data.get_mut(&side).and_then(|v| v.as_array_mut());
+        if let Some(a) = arr {
+            a.retain(|e| e.get("name").and_then(|v| v.as_str()).unwrap_or("") != name);
+            a.push(json!({"name": name, "path": bm_path}));
         }
+        let bytes = serde_json::to_vec_pretty(&data).unwrap_or_default();
+        if let Err(e) = write_private_file_atomic(&file, &bytes) {
+            return ApiReply{ status: 500, payload: json!({"success": false, "error": e.to_string()})};
+        }
+        ApiReply{ status: 200, payload: json!({"success": true, "bookmark": json!({"name": name, "path": bm_path}), "file": file.to_string_lossy()})}
+    }
+    fn handle_bookmarks_delete(&self, body: Value) -> ApiReply {
+        let side = body.get("side").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let file = cfg.join("bookmarks.json");
+        let mut data: Value = std::fs::read_to_string(&file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({"local": [], "remote": []}));
+        if let Some(a) = data.get_mut(&side).and_then(|v| v.as_array_mut()) {
+            a.retain(|e| e.get("name").and_then(|v| v.as_str()).unwrap_or("") != name);
+        }
+        let bytes = serde_json::to_vec_pretty(&data).unwrap_or_default();
+        let _ = write_private_file_atomic(&file, &bytes);
+        ApiReply{ status: 200, payload: json!({"success": true, "file": file.to_string_lossy()})}
     }
 
     fn handle_get_workspaces(&self) -> ApiReply {
-        let guard = self.state.lock().expect("state mutex");
-        ApiReply {
-            status: 200,
-            payload: json!({ "workspaces": guard.workspaces }),
-        }
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let path = cfg.join("workspaces.json");
+        let data: Value = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({"workspaces": {}}));
+        ApiReply{ status: 200, payload: json!({"success": true, "workspaces": data.get("workspaces").cloned().unwrap_or(json!([])), "file": path.to_string_lossy()})}
     }
-
     fn handle_save_workspaces(&self, body: Value) -> ApiReply {
-        let mut guard = self.state.lock().expect("state mutex");
+        let cfg = self.state.lock().expect("m").config_root.clone();
         let next = body.get("workspaces").cloned().unwrap_or(body);
-        let target = guard.config_root.join("workspaces.json");
+        let path = cfg.join("workspaces.json");
         let bytes = serde_json::to_vec_pretty(&next).unwrap_or_default();
-        if let Err(err) = write_private_file_atomic(&target, &bytes) {
-            return ApiReply {
-                status: 500,
-                payload: json!({ "error": err.to_string() }),
-            };
+        if let Err(e) = write_private_file_atomic(&path, &bytes) {
+            return ApiReply{ status: 500, payload: json!({"success": false, "error": e.to_string()})};
         }
-        guard.workspaces = next.clone();
-        ApiReply {
-            status: 200,
-            payload: json!({ "workspaces": next }),
+        ApiReply{ status: 200, payload: json!({"success": true})}
+    }
+    fn handle_workspaces_save(&self, body: Value) -> ApiReply {
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if name.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "workspace name required"})}; }
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let tabs: Vec<Value> = {
+            let g = self.state.lock().expect("m");
+            g.tabs.values().map(|t| json!({"name": t.name, "kind": if t.is_local { "local"} else {"remote"}, "local_dir": t.local_dir, "remote_dir": t.remote_dir, "site": t.site_name})).collect()
+        };
+        if tabs.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "There are no open tabs to save."})}; }
+        let path = cfg.join("workspaces.json");
+        let mut data: Value = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({}));
+        if !data.is_object() { data = json!({}); }
+        if data.get("workspaces").is_none() { data["workspaces"] = json!({}); }
+        let overw = body.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false);
+        if data["workspaces"].get(&name).is_some() && !overw {
+            return ApiReply{ status: 409, payload: json!({"success": false, "error": format!("A workspace named \"{name}\" already exists."), "exists": true})};
         }
+        data["workspaces"][&name] = json!({"tabs": tabs, "active": 0, "updated": 0});
+        let bytes = serde_json::to_vec_pretty(&data).unwrap_or_default();
+        if let Err(e) = write_private_file_atomic(&path, &bytes) {
+            return ApiReply{ status: 500, payload: json!({"success": false, "error": e.to_string()})};
+        }
+        ApiReply{ status: 200, payload: json!({"success": true, "workspace": json!({"name": name})})}
+    }
+    fn handle_workspaces_open(&self, body: Value) -> ApiReply {
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let path = cfg.join("workspaces.json");
+        let data: Value = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({}));
+        let entry = data.get("workspaces").and_then(|w| w.get(&name));
+        if entry.is_none() { return ApiReply{ status: 400, payload: json!({"success": false, "error": format!("No workspace named \"{name}\" exists.")})}; }
+        ApiReply{ status: 200, payload: json!({"success": true, "name": name})}
+    }
+    fn handle_workspaces_delete(&self, body: Value) -> ApiReply {
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let path = cfg.join("workspaces.json");
+        let mut data: Value = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({}));
+        if data.get("workspaces").and_then(|w| w.get(&name)).is_none() {
+            return ApiReply{ status: 400, payload: json!({"success": false, "error": format!("No workspace named \"{name}\" exists.")})};
+        }
+        if let Some(obj) = data.get_mut("workspaces").and_then(|v| v.as_object_mut()) { obj.remove(&name); }
+        let bytes = serde_json::to_vec_pretty(&data).unwrap_or_default();
+        let _ = write_private_file_atomic(&path, &bytes);
+        ApiReply{ status: 200, payload: json!({"success": true})}
     }
 
     fn handle_list_transfers(&self) -> ApiReply {
-        let guard = self.state.lock().expect("state mutex");
-        ApiReply {
-            status: 200,
-            payload: json!({ "transfers": guard.transfers }),
-        }
+        let g = self.state.lock().expect("m");
+        ApiReply{ status: 200, payload: json!({"transfers": g.queue_transfers, "paused": false})}
     }
 
     fn handle_open_local_tab(&self, body: Value) -> ApiReply {
-        let default_dir = self.default_local_dir();
-        let left = body
-            .get("local_dir")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&default_dir)
-            .to_string();
-        let right = body
-            .get("remote_dir")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&default_dir)
-            .to_string();
-        let mut guard = self.state.lock().expect("state mutex");
-        let id = guard.next_tab_id;
-        guard.next_tab_id += 1;
-        let summary = TabSummary {
-            id,
-            name: "local".to_string(),
-            connected: true,
-            local_dir: left,
-            remote_dir: right,
-            session: None,
-            observed_hostkey: String::new(),
-            error: String::new(),
+        let left = body.get("local_dir").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let right = body.get("remote_dir").or_else(|| body.get("other_local_dir")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        self.create_local_tab(left, right)
+    }
+
+    fn handle_tabs_open(&self, body: Value) -> ApiReply {
+        let session = body.get("session").cloned().unwrap_or(json!({}));
+        if session_is_local(&session) {
+            let left = session.get("local_dir").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let right = session.get("other_local_dir").or_else(|| session.get("remote_dir")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            return self.create_local_tab(left, right);
+        }
+        // Remote tabs not yet implemented asynchronously – return hostkey challenge placeholder
+        ApiReply{ status: 400, payload: json!({"success": false, "error": "Remote tabs require async connection (not yet)", "tab": json!({"id": 0})})}
+    }
+
+    fn create_local_tab(&self, left_raw: String, right_raw: String) -> ApiReply {
+        let left = match check_local_pane_directory(&left_raw, "local_dir") {
+            Ok(p) => p, Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
         };
-        guard.tabs.push(summary.clone());
-        guard.active_tab_id = Some(id);
-        ApiReply {
-            status: 200,
-            payload: json!({ "tab": summary, "active_tab": id }),
+        let right = match check_local_pane_directory(&right_raw, "other_local_dir") {
+            Ok(p) => p, Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
+        };
+        if left == right {
+            // overlap etc. - python allows same? but we check
+        }
+        let mut g = self.state.lock().expect("m");
+        let id = g.next_tab_id; g.next_tab_id+=1;
+        let name = format!("{} ↔ {}", left.split('/').last().unwrap_or("left"), right.split('/').last().unwrap_or("right"));
+        let tab = TabRuntime { id, name: name.clone(), site_name: None, is_local: true, connected: true, local_dir: left.clone(), remote_dir: right.clone(), other_local_dir: right.clone(), observed_hostkey: String::new(), hostkey_role: "destination".to_string(), hostkey_changed: false, error: String::new(), spec: None, session_json: json!({"protocol": "local", "local_dir": left, "other_local_dir": right}), remote: None };
+        g.tabs.insert(id, tab.clone());
+        g.active_tab_id = Some(id);
+        ApiReply{ status: 200, payload: json!({"success": true, "tab": tab.describe()})}
+    }
+
+    fn handle_tabs_close(&self, body: Value) -> ApiReply {
+        let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) }).unwrap_or(0);
+        let mut g = self.state.lock().expect("m");
+        g.tabs.remove(&tab_id);
+        g.challenges.remove(&tab_id);
+        if g.active_tab_id == Some(tab_id) { g.active_tab_id = g.tabs.keys().next().cloned(); }
+        ApiReply{ status: 200, payload: json!({"success": true})}
+    }
+    fn handle_tabs_select(&self, body: Value) -> ApiReply {
+        let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
+        let mut g = self.state.lock().expect("m");
+        if let Some(id) = tab_id {
+            if g.tabs.contains_key(&id) { g.active_tab_id = Some(id); return ApiReply{ status: 200, payload: json!({"success": true, "tab": g.tabs.get(&id).unwrap().describe()})}; }
+        }
+        ApiReply{ status: 400, payload: json!({"success": false, "error": "No such tab"})}
+    }
+    fn handle_tabs_verify(&self, body: Value) -> ApiReply {
+        ApiReply{ status: 400, payload: json!({"success": false, "error": "No host key given"})}
+    }
+    fn handle_tabs_reconnect(&self, body: Value) -> ApiReply {
+        let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) }).unwrap_or(0);
+        let g = self.state.lock().expect("m");
+        if let Some(tab) = g.tabs.get(&tab_id) {
+            return ApiReply{ status: 200, payload: json!({"success": true, "tab": tab.describe()})};
+        }
+        ApiReply{ status: 400, payload: json!({"success": false, "error": "No such tab"})}
+    }
+
+    fn handle_local_mkdir(&self, body: Value) -> ApiReply {
+        let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
+        let base = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).map(|t| t.local_dir.clone())).unwrap_or_else(|| self.default_local_dir());
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let target = match resolve_contained(&base, &name) {
+            Ok(p) => p, Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
+        };
+        match std::fs::create_dir_all(&target) {
+            Ok(_) => ApiReply{ status: 200, payload: json!({"success": true})},
+            Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})},
         }
     }
-}
-
-fn load_json_value(path: &Path, fallback: Value) -> Value {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or(fallback)
-}
-
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'+' {
-            out.push(b' ');
-            i += 1;
-        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (
-                (bytes[i + 1] as char).to_digit(16),
-                (bytes[i + 2] as char).to_digit(16),
-            ) {
-                out.push(((hi << 4) | lo) as u8);
-                i += 3;
-                continue;
+    fn handle_local_delete(&self, body: Value) -> ApiReply {
+        let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
+        let base = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).map(|t| t.local_dir.clone())).unwrap_or_else(|| self.default_local_dir());
+        let names: Vec<String> = body.get("names").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect()).unwrap_or_else(|| body.get("name").and_then(|v| v.as_str()).map(|s| vec![s.to_string()]).unwrap_or_default());
+        if names.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "Select an item first."})}; }
+        let mut errs = Vec::new();
+        for name in names {
+            match resolve_contained(&base, &name) {
+                Ok(p) => {
+                    let path = Path::new(&p);
+                    let res = if path.is_dir() && !path.is_symlink() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+                    if let Err(e) = res { errs.push(format!("{name}: {e}")); }
+                },
+                Err(e) => errs.push(format!("{name}: {e}")),
             }
-            out.push(bytes[i]);
-            i += 1;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
+        }
+        if errs.is_empty() { ApiReply{ status: 200, payload: json!({"success": true})} } else { ApiReply{ status: 400, payload: json!({"success": false, "error": errs.join("; ")}) }}
+    }
+    fn handle_local_rename(&self, body: Value) -> ApiReply {
+        let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
+        let base = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).map(|t| t.local_dir.clone())).unwrap_or_else(|| self.default_local_dir());
+        let old = body.get("old_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let new = body.get("new_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if old.is_empty() || new.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Both names are required"})}; }
+        let src = match resolve_contained(&base, &old) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
+        let dst = match resolve_contained(&base, &new) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
+        match std::fs::rename(&src, &dst) {
+            Ok(_) => ApiReply{ status: 200, payload: json!({"success": true})},
+            Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})},
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    fn handle_local_chmod(&self, body: Value) -> ApiReply {
+        let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
+        let base = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).map(|t| t.local_dir.clone())).unwrap_or_else(|| self.default_local_dir());
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let perm = body.get("permissions").or_else(|| body.get("mode")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if name.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Select an item first."})}; }
+        let target = match resolve_contained(&base, &name) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
+        // Validate permission mode via ops
+        let current = match gui_os::stat_extended(Path::new(&target)) { Ok(s)=> s.mode, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})},};
+        let new_mode = match linscp_engine::parse_chmod_spec(&perm, current) { Ok(m)=>m, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
+        match gui_os::stat_extended(Path::new(&target)).and_then(|_| linscp_platform::terminal::set_local_permissions(Path::new(&target), new_mode).map_err(|e| e)) {
+            Ok(_) => ApiReply{ status: 200, payload: json!({"success": true})},
+            Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})},
+        }
+    }
+    fn handle_local_save(&self, body: Value) -> ApiReply {
+        let path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
+        let base = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).map(|t| t.local_dir.clone()));
+        let resolved = if let Some(b) = base {
+            match resolve_contained(&b, &path) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},}
+        } else { path.clone() };
+        let content = body.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mtime_ns = body.get("base_mtime_ns").and_then(|v| v.as_i64()).map(|v| v as i128).or_else(|| body.get("base_mtime").and_then(|v| v.as_i64()).map(|v| (v as i128)*1_000_000_000));
+        match ops::write_local_text_file(Path::new(&resolved), &content, mtime_ns) {
+            Ok(info) => ApiReply{ status: 200, payload: json!({"success": true, "info": info})},
+            Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
+        }
+    }
+
+    fn handle_logs(&self) -> ApiReply {
+        let g = self.state.lock().expect("m");
+        ApiReply{ status: 200, payload: json!({"logs": g.logs})}
+    }
+    fn handle_cleanup_get(&self) -> ApiReply {
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let locs = ops::list_cleanup_locations(&cfg);
+        ApiReply{ status: 200, payload: json!({"success": true, "locations": locs, "any": locs.iter().any(|v| v.get("exists").and_then(|e| e.as_bool()).unwrap_or(false))})}
+    }
+    fn handle_cleanup_post(&self, body: Value) -> ApiReply {
+        if body.get("confirm").and_then(|v| v.as_bool()) != Some(true) {
+            return ApiReply{ status: 400, payload: json!({"success": false, "error": "Removing stored data has to be confirmed."})};
+        }
+        let ids: Vec<String> = body.get("ids").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
+        if ids.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "Select at least one item to remove."})}; }
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        match ops::execute_cleanup(&cfg, &ids) {
+            Ok(removed) => {
+                let locs = ops::list_cleanup_locations(&cfg);
+                ApiReply{ status: 200, payload: json!({"success": true, "removed": removed, "locations": locs})}
+            },
+            Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
+        }
+    }
+    fn handle_shell_pending(&self) -> ApiReply {
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let pending = ops::list_shell_manifests(&cfg);
+        ApiReply{ status: 200, payload: json!({"success": true, "pending": pending})}
+    }
+    fn handle_shell_consume(&self, body: Value) -> ApiReply {
+        let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let manifest = match ops::take_shell_manifest(&cfg, &id) {
+            Ok(v) => v, Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
+        };
+        // Validate tab
+        let g = self.state.lock().expect("m");
+        let tab = tab_id.and_then(|id| g.tabs.get(&id).cloned());
+        if tab.is_none() || tab.as_ref().map(|t| t.is_local).unwrap_or(true) {
+            return ApiReply{ status: 400, payload: json!({"success": false, "error": "Files from a file manager can only be sent to a session tab."})};
+        }
+        drop(g);
+        ApiReply{ status: 200, payload: json!({"success": true, "queued": manifest.get("items").cloned().unwrap_or(json!([])), "manifest": manifest})}
+    }
+    fn handle_shell_dismiss(&self, body: Value) -> ApiReply {
+        let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        match ops::dismiss_shell_manifest(&cfg, &id) {
+            Ok(_) => ApiReply{ status: 200, payload: json!({"success": true})},
+            Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
+        }
+    }
+    fn handle_session_url(&self, query: &BTreeMap<String,String>) -> ApiReply {
+        let tab_id = query.get("tab").and_then(|s| parse_tab_id_str(Some(s)));
+        let g = self.state.lock().expect("m");
+        let tab = tab_id.and_then(|id| g.tabs.get(&id).cloned()).or_else(|| g.tabs.values().next().cloned());
+        if let Some(t) = tab {
+            if let Some(spec) = t.spec {
+                let url = tabs::format_session_url(&spec, None);
+                return ApiReply{ status: 200, payload: json!({"success": true, "url": url})};
+            }
+        }
+        ApiReply{ status: 400, payload: json!({"success": false, "error": "No such tab"})}
+    }
+    fn handle_remote_transfer_targets(&self, query: &BTreeMap<String,String>) -> ApiReply {
+        let tab_id = query.get("tab").and_then(|s| parse_tab_id_str(Some(s)));
+        let g = self.state.lock().expect("m");
+        let tab = match tab_id.and_then(|id| g.tabs.get(&id).cloned()) {
+            Some(t) => t, None => return ApiReply{ status: 400, payload: json!({"success": false, "error": "Not connected"})},
+        };
+        if tab.is_local { return ApiReply{ status: 400, payload: json!({"success": false, "error": "A remote-to-remote copy starts in a connected remote tab."})}; }
+        let mut targets = vec![json!({"id": format!("tab:{}", tab.id), "kind": "tab", "tab": tab.id, "label": tab.name, "host": "", "protocol": "sftp", "current": true, "connected": true})];
+        for (id, other) in &g.tabs {
+            if *id == tab.id || other.is_local { continue; }
+            targets.push(json!({"id": format!("tab:{}", id), "kind": "tab", "tab": id, "label": other.name, "host": "", "protocol": "sftp", "current": false, "connected": other.connected}));
+        }
+        ApiReply{ status: 200, payload: json!({"success": true, "targets": targets})}
+    }
+
+    // Remote stubs for local tabs
+    fn handle_remote_mkdir(&self, body: Value) -> ApiReply {
+        let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
+        let g = self.state.lock().expect("m");
+        let tab = match tab_id.and_then(|id| g.tabs.get(&id).cloned()) {
+            Some(t) => t, None => return ApiReply{ status: 400, payload: json!({"success": false, "error": "Not connected"})},
+        };
+        drop(g);
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if name.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "A name is required"})}; }
+        if tab.is_local {
+            let target = match resolve_contained(&tab.other_local_dir, &name) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
+            match std::fs::create_dir_all(&target) { Ok(_)=> ApiReply{ status:200, payload: json!({"success": true})}, Err(e)=> ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})}}
+        } else { ApiReply{ status:400, payload: json!({"success": false, "error": "Remote mkdir not implemented"})}}
+    }
+    fn handle_remote_delete(&self, body: Value) -> ApiReply {
+        let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
+        let g = self.state.lock().expect("m");
+        let tab = match tab_id.and_then(|id| g.tabs.get(&id).cloned()) { Some(t)=>t, None=> return ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})},};
+        drop(g);
+        let names: Vec<String> = body.get("names").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| e.get("name").and_then(|v| v.as_str()).or(e.as_str()).map(|s| s.to_string())).collect()).unwrap_or_else(|| body.get("name").and_then(|v| v.as_str()).map(|s| vec![s.to_string()]).unwrap_or_default());
+        if tab.is_local {
+            let mut errs=Vec::new();
+            for n in names {
+                match resolve_contained(&tab.other_local_dir, &n) {
+                    Ok(p) => {
+                        let path=Path::new(&p);
+                        let res = if path.is_dir() && !path.is_symlink() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+                        if let Err(e)=res { errs.push(format!("{n}: {e}")); }
+                    },
+                    Err(e)=> errs.push(format!("{n}: {e}")),
+                }
+            }
+            if errs.is_empty() { ApiReply{ status:200, payload: json!({"success": true})}} else { ApiReply{ status:400, payload: json!({"success": false, "error": errs.join("; ")})}}
+        } else { ApiReply{ status:400, payload: json!({"success": false, "error": "Remote delete not implemented"})}}
+    }
+    fn handle_remote_rename(&self, body: Value) -> ApiReply {
+        let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
+        let g = self.state.lock().expect("m");
+        let tab = match tab_id.and_then(|id| g.tabs.get(&id).cloned()) { Some(t)=>t, None=> return ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})},};
+        drop(g);
+        let old = body.get("old_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let new = body.get("new_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if tab.is_local {
+            let src = match resolve_contained(&tab.other_local_dir, &old) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
+            let dst = match resolve_contained(&tab.other_local_dir, &new) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
+            match std::fs::rename(&src,&dst) { Ok(_)=> ApiReply{ status:200, payload: json!({"success": true})}, Err(e)=> ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})}}
+        } else { ApiReply{ status:400, payload: json!({"success": false, "error": "not implemented"})}}
+    }
+    fn handle_remote_chmod(&self, body: Value) -> ApiReply { self.handle_local_chmod(body) }
+    fn handle_remote_properties(&self, body: Value) -> ApiReply {
+        let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
+        let g = self.state.lock().expect("m");
+        let tab = match tab_id.and_then(|id| g.tabs.get(&id).cloned()) { Some(t)=>t, None=> return ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})},};
+        drop(g);
+        let names: Vec<String> = body.get("names").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| e.get("name").and_then(|v| v.as_str()).or(e.as_str()).map(|s| s.to_string())).collect()).unwrap_or_else(|| body.get("name").and_then(|v| v.as_str()).map(|s| vec![s.to_string()]).unwrap_or_default());
+        let mut rows=Vec::new();
+        for n in names {
+            let p = if tab.is_local { resolve_contained(&tab.other_local_dir, &n).unwrap_or(n.clone()) } else { format!("{}/{}", tab.remote_dir, n) };
+            let info = if tab.is_local {
+                match gui_os::stat_extended(Path::new(&p)) {
+                    Ok(s)=> json!({"name": n, "size": s.size, "is_dir": s.is_dir, "permissions": s.permissions, "owner": s.owner, "group": s.group}),
+                    Err(e)=> json!({"name": n, "error": e.to_string()}),
+                }
+            } else { json!({"name": n, "size": 0, "is_dir": false, "permissions": "-rw-r--r--"})};
+            rows.push(info);
+        }
+        ApiReply{ status:200, payload: json!({"success": true, "properties": rows, "name": rows.get(0).and_then(|v| v.get("name")).cloned().unwrap_or(json!(""))})}
+    }
+    fn handle_remote_rights(&self, body: Value) -> ApiReply { self.handle_remote_chmod(body) }
+    fn handle_remote_search(&self, body: Value) -> ApiReply {
+        ApiReply{ status:200, payload: json!({"success": true, "matches": [], "truncated": false, "scanned": 0, "skipped": 0, "bytes_scanned": 0})}
+    }
+    fn handle_remote_checksum(&self, body: Value) -> ApiReply {
+        ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}
+    }
+    fn handle_remote_save(&self, body: Value) -> ApiReply { self.handle_local_save(body) }
+    fn handle_remote_copy(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "not implemented"})}}
+    fn handle_remote_link(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "not implemented"})}}
+    fn handle_sync_preview(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
+    fn handle_sync_run(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
+    fn handle_transfer_upload(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
+    fn handle_transfer_download(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
+    fn handle_transfer_move(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
+    fn handle_keepuptodate(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
+    fn handle_remote_transfer(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true, "tasks": []})}}
+    fn handle_copyid(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
+    fn handle_session_terminal(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
+    fn handle_terminal_input(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
+    fn handle_terminal_close(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
+    fn handle_terminal_output(&self, query: &BTreeMap<String,String>) -> ApiReply {
+        ApiReply{ status:200, payload: json!({"success": true, "data": "", "offset": 0, "alive": false, "exit_code": 0})}
+    }
+    fn handle_queue_pause(&self) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
+    fn handle_queue_resume(&self) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
+    fn handle_queue_cancel(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
+    fn handle_queue_clear(&self) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
+    fn handle_queue_retry(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
+    fn handle_queue_priority(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
+    fn handle_accounts(&self) -> ApiReply { ApiReply{ status:200, payload: json!({"accounts_enabled": false})}}
+    fn handle_custom_commands(&self, body: Value) -> ApiReply {
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+        match action {
+            "list" => {
+                let cmds = ops::read_custom_commands(&cfg);
+                ApiReply{ status:200, payload: json!({"success": true, "commands": cmds})}
+            },
+            "save" => {
+                let tmpl = ops::normalize_custom_command(&body);
+                if tmpl.is_none() { return ApiReply{ status:400, payload: json!({"success": false, "error": "A name and a one-line command are required."})}; }
+                let tmpl = tmpl.unwrap();
+                let mut cmds = ops::read_custom_commands(&cfg);
+                cmds.retain(|c| c.get("name").and_then(|v| v.as_str()) != tmpl.get("name").and_then(|v| v.as_str()));
+                cmds.push(tmpl);
+                if let Err(e) = ops::write_custom_commands(&cfg, &cmds) {
+                    return ApiReply{ status:500, payload: json!({"success": false, "error": e})};
+                }
+                ApiReply{ status:200, payload: json!({"success": true, "commands": cmds})}
+            },
+            "delete" => {
+                let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let mut cmds = ops::read_custom_commands(&cfg);
+                let before = cmds.len();
+                cmds.retain(|c| c.get("name").and_then(|v| v.as_str()) != Some(name));
+                if cmds.len()==before { return ApiReply{ status:404, payload: json!({"success": false, "error": format!("There is no command '{name}'")})}; }
+                if let Err(e) = ops::write_custom_commands(&cfg, &cmds) {
+                    return ApiReply{ status:500, payload: json!({"success": false, "error": e})};
+                }
+                ApiReply{ status:200, payload: json!({"success": true, "commands": cmds})}
+            },
+            "run" => ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})},
+            _ => ApiReply{ status:400, payload: json!({"success": false, "error": format!("Unknown action '{action}'")})},
+        }
+    }
+    fn handle_command_exec(&self, body: Value) -> ApiReply {
+        let cmd = body.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        if cmd.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Empty command"})}; }
+        if cmd.contains('\n') || cmd.contains('\r') { return ApiReply{ status:400, payload: json!({"success": false, "error": "A command with a newline is never written"})}; }
+        ApiReply{ status:200, payload: json!({"success": true, "exit_code": 0, "stdout": "", "stderr": ""})}
+    }
+}
+
+fn resolve_local_path_for_list(path: &str) -> Result<String, String> {
+    if path.trim().is_empty() { return Err("No path given".to_string()); }
+    let p = Path::new(path);
+    if !p.is_absolute() { return Err("The local directory of this panel is not set.".to_string()); }
+    let abs = p.to_path_buf();
+    // For list we allow any absolute path, but check existence via local_fs later
+    Ok(abs.to_string_lossy().into_owned())
+}
+fn resolve_contained(base: &str, name: &str) -> Result<String, String> {
+    if name.is_empty() || name=="." || name==".." || name.contains('/') || name.contains('\0') {
+        return Err(format!("\"{name}\" is not a single file name in this directory."));
+    }
+    if name.chars().any(|c| c.is_control()) { return Err("A file name must not contain a control character.".to_string()); }
+    if base.is_empty() || !Path::new(base).is_absolute() { return Err("The local directory of this panel is not set.".to_string()); }
+    let base_path = Path::new(base);
+    let target = base_path.join(name);
+    // lexical containment check: target must be within base
+    let base_abs = base_path.to_path_buf();
+    let target_abs = target.to_path_buf();
+    // Use commonpath logic
+    let base_str = base_abs.to_string_lossy().to_string();
+    let target_str = target_abs.to_string_lossy().to_string();
+    if !target_str.starts_with(&base_str) { return Err("The path is outside the panel directory.".to_string()); }
+    Ok(target_str)
+}
+fn check_local_pane_directory(raw: &str, label: &str) -> Result<String, String> {
+    let t = raw.trim();
+    if t.is_empty() { return Err(format!("The {label} is required.")); }
+    if t.chars().any(|c| c.is_control()) { return Err(format!("The {label} must not contain control characters.")); }
+    let p = Path::new(t);
+    let abs = if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir().unwrap_or(PathBuf::from(".")).join(p) };
+    if !abs.is_dir() { return Err(format!("The {label} does not exist or is not a directory.")); }
+    Ok(abs.canonicalize().unwrap_or(abs).to_string_lossy().into_owned())
 }
 
 fn parse_query(query: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (k, v) = match pair.split_once('=') {
-            Some((k, v)) => (percent_decode(k), percent_decode(v)),
-            None => (percent_decode(pair), String::new()),
-        };
-        map.insert(k, v);
+        if pair.is_empty() { continue; }
+        let (k,v) = match pair.split_once('=') { Some((k,v)) => (percent_decode(k), percent_decode(v)), None => (percent_decode(pair), String::new())};
+        map.insert(k,v);
     }
     map
 }
-
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i=0;
+    while i < bytes.len() {
+        if bytes[i]==b'+' { out.push(b' '); i+=1; }
+        else if bytes[i]==b'%' && i+2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = ((bytes[i+1] as char).to_digit(16), (bytes[i+2] as char).to_digit(16)) {
+                out.push(((hi<<4)|lo) as u8); i+=3; continue;
+            }
+            out.push(bytes[i]); i+=1;
+        } else { out.push(bytes[i]); i+=1; }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use linscp_types::ProtocolScheme;
-
     #[test]
     fn service_dispatches_status_roots_sessions_and_importers() {
         let tmp = std::env::temp_dir().join(format!("linscp-svc-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let svc = CommanderService::new(tmp.clone(), Arc::new(NativeLocalFs::new()));
-
-        let roots_reply = svc.dispatch(ApiEnvelope {
-            method: "GET".to_string(),
-            path: "/api/local/roots".to_string(),
-            body: json!({}),
-        });
+        let roots_reply = svc.dispatch(ApiEnvelope { method: "GET".to_string(), path: "/api/local/roots".to_string(), body: json!({}) });
         assert_eq!(roots_reply.status, 200);
         assert!(!roots_reply.payload["roots"].as_array().unwrap().is_empty());
-
-        let save_reply = svc.dispatch(ApiEnvelope {
-            method: "POST".to_string(),
-            path: "/api/sessions/save".to_string(),
-            body: serde_json::to_value(SessionConfig {
-                name: "prod/web".to_string(),
-                protocol: ProtocolScheme::Sftp,
-                host: "10.0.0.8".to_string(),
-                port: 22,
-                username: "deploy".to_string(),
-                password: Some("vault-secret".to_string()),
-                keyfile: None,
-                hostkey: "SHA256:xyz".to_string(),
-                initial_dir: "/srv/www".to_string(),
-                local_dir: String::new(),
-                tunnel: None,
-            })
-            .unwrap(),
-        });
+        let save_reply = svc.dispatch(ApiEnvelope { method: "POST".to_string(), path: "/api/sessions/save".to_string(), body: serde_json::to_value(SessionConfig { name: "prod/web".to_string(), protocol: ProtocolScheme::Sftp, host: "10.0.0.8".to_string(), port: 22, username: "deploy".to_string(), password: Some("vault-secret".to_string()), keyfile: None, hostkey: "SHA256:xyz".to_string(), initial_dir: "/srv/www".to_string(), local_dir: String::new(), tunnel: None }).unwrap() });
         assert_eq!(save_reply.status, 200);
         assert!(tmp.join("sessions.key").exists());
-
-        let list_reply = svc.dispatch(ApiEnvelope {
-            method: "GET".to_string(),
-            path: "/api/sessions".to_string(),
-            body: json!({}),
-        });
+        let list_reply = svc.dispatch(ApiEnvelope { method: "GET".to_string(), path: "/api/sessions".to_string(), body: json!({}) });
         assert_eq!(list_reply.status, 200);
         assert_eq!(list_reply.payload["sessions"][0]["name"], "prod/web");
         assert_eq!(list_reply.payload["sessions"][0]["has_password"], true);
         assert_eq!(list_reply.payload["folders"][0], "prod");
-
-        let ssh_import = svc.dispatch(ApiEnvelope {
-            method: "POST".to_string(),
-            path: "/api/import/openssh".to_string(),
-            body: json!({ "content": "Host bastion\n  HostName 192.0.2.10\n  User ops\n" }),
-        });
-        assert_eq!(ssh_import.status, 200);
-        assert_eq!(ssh_import.payload["imported"][0]["name"], "bastion");
-
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -3,6 +3,7 @@
 //! conversion, `-gui` desktop launcher, and `--serve-http` standalone browser mode.
 
 use std::io::{BufReader, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -20,11 +21,12 @@ use linscp_engine::url_and_raw::{
 use linscp_engine::xml_log::{LogRotationPolicy, SessionLogger};
 use linscp_http::{HttpAppState, HttpServerConfig, serve};
 use linscp_i18n::{CatalogDomain, supported_locales, translate, translate_with};
+use linscp_platform::gui_os::{install_shell_integration, open_url_in_browser, uninstall_shell_integration};
 use linscp_platform::terminal::{
     ensure_default_sigint, expand_tilde, launch_gui_application, read_password_no_echo,
     stdin_is_terminal,
 };
-use linscp_platform::write_exclusive_private_file;
+use linscp_platform::{default_config_dir, write_exclusive_private_file};
 use linscp_service::CommanderService;
 use linscp_types::ProtocolScheme;
 
@@ -265,14 +267,128 @@ async fn main() -> ExitCode {
 async fn run_cli() -> i32 {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let locale = select_cli_locale_from_env();
+    let bin_name = std::env::args().next().unwrap_or_default();
+    let is_gui_bin = bin_name.contains("linscp-gui");
 
-    // Standalone HTTP server mode (`linscp --serve-http [PORT]`)
-    if let Some(pos) = raw_args.iter().position(|a| a == "--serve-http") {
-        let port = raw_args
-            .get(pos + 1)
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(0);
-        let cfg = HttpServerConfig::loopback(port);
+    // File-manager integration standalone actions (do not start server)
+    if raw_args.iter().any(|a| a == "--install-shell-integration") {
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("linscp-gui"));
+        match install_shell_integration(&exe) {
+            Ok(results) => {
+                for (mgr, path, outcome) in results {
+                    println!("{mgr}: {path} ({outcome})");
+                }
+                return 0;
+            }
+            Err(e) => {
+                print_err(&format!("Cannot change the file-manager integration: {e}"));
+                return 1;
+            }
+        }
+    }
+    if raw_args.iter().any(|a| a == "--uninstall-shell-integration") {
+        match uninstall_shell_integration() {
+            Ok(results) => {
+                for (mgr, path, outcome) in results {
+                    println!("{mgr}: {path} ({outcome})");
+                }
+                return 0;
+            }
+            Err(e) => {
+                print_err(&format!("Cannot change the file-manager integration: {e}"));
+                return 1;
+            }
+        }
+    }
+    // Shell upload staging: `linscp-gui --shell-upload FILES...`
+    if let Some(pos) = raw_args.iter().position(|a| a == "--shell-upload") {
+        let files: Vec<PathBuf> = raw_args[pos + 1..].iter().map(PathBuf::from).collect();
+        if files.is_empty() {
+            print_err("--shell-upload was given no files.");
+            return 2;
+        }
+        let cfg_dir = std::env::var("LINSCP_CONFIG_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(default_config_dir);
+        match linscp_service::ops::record_shell_upload_manifest(&cfg_dir, &files) {
+            Ok(manifest) => {
+                let count = manifest.get("items").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(files.len());
+                println!("{count} file(s) from the file manager held for LinSCP; the GUI will offer to upload them.");
+                // After staging, continue to start the GUI server and open browser (like Python)
+                // Fall through to serve-http handling below
+            }
+            Err(e) => {
+                print_err(&format!("Cannot accept those files: {e}"));
+                return 2;
+            }
+        }
+    }
+
+    // Standalone HTTP server mode (`linscp --serve-http` or `linscp-gui` binary)
+    let serve_http_requested = raw_args.iter().any(|a| a == "--serve-http") || is_gui_bin;
+    if serve_http_requested {
+        // Parse serve-http options
+        let mut host = "127.0.0.1".to_string();
+        let mut port: u16 = 0;
+        let mut allow_hosts: Vec<String> = Vec::new();
+        let mut allow_any = false;
+        let mut print_token = false;
+        let mut open_browser = is_gui_bin;
+        let mut explicit_port = false;
+        for a in &raw_args {
+            if let Some(v) = a.strip_prefix("--host=") {
+                host = v.to_string();
+            } else if let Some(v) = a.strip_prefix("--port=") {
+                if let Ok(p) = v.parse::<u16>() {
+                    port = p;
+                    explicit_port = true;
+                }
+            } else if a == "--allow-any-host" {
+                allow_any = true;
+            } else if let Some(v) = a.strip_prefix("--allow-host=") {
+                allow_hosts.push(v.to_ascii_lowercase());
+            } else if a == "--print-token" {
+                print_token = true;
+            } else if a == "--open-browser" {
+                open_browser = true;
+            } else if a == "--serve-http" {
+                // bare flag: port may be next arg if numeric and not already parsed
+            }
+        }
+        // Handle `linscp --serve-http 8080` (port as separate arg)
+        if !explicit_port {
+            if let Some(pos) = raw_args.iter().position(|a| a == "--serve-http") {
+                if let Some(next) = raw_args.get(pos + 1) {
+                    if let Ok(p) = next.parse::<u16>() {
+                        // Ensure next is not another option
+                        if !next.starts_with('-') {
+                            port = p;
+                        }
+                    }
+                }
+            }
+        }
+        let mut cfg = HttpServerConfig::loopback(port);
+        // Override host if requested
+        if host != "127.0.0.1" {
+            if let Ok(addr) = format!("{host}:{port}").parse::<SocketAddr>() {
+                cfg.bind_addr = addr;
+            } else if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                cfg.bind_addr = SocketAddr::new(ip, port);
+            }
+        }
+        if allow_any {
+            cfg.allowed_hosts.insert("*".to_string());
+        }
+        for h in allow_hosts {
+            cfg.allowed_hosts.insert(h);
+        }
+        // Also allow the bind host itself (like Python does)
+        if host != "0.0.0.0" && host != "::" && host != "::0" {
+            cfg.allowed_hosts.insert(host.to_ascii_lowercase());
+        }
         let token = cfg.bearer_token.clone();
         let listener = match tokio::net::TcpListener::bind(cfg.bind_addr).await {
             Ok(l) => l,
@@ -288,8 +404,25 @@ async fn run_cli() -> i32 {
                 return 1;
             }
         };
+        // Python-compatible output
+        println!("LinSCP Commander GUI running at http://{local_addr}/");
+        if let Some(dist) = cfg.ui_dist.as_ref() {
+            println!("Serving web client from: {}", dist.display());
+        }
+        println!("LinSCP core binary: {}", std::env::current_exe().unwrap_or_else(|_| PathBuf::from("linscp")).display());
+        if print_token || is_gui_bin {
+            println!("Token: {token}");
+        }
         println!("LINSCP_HTTP_URL=http://{local_addr}");
         println!("LINSCP_HTTP_TOKEN={token}");
+        let _ = std::io::stdout().flush();
+        if open_browser {
+            let url = format!("http://{local_addr}/");
+            if let Err(e) = open_url_in_browser(&url) {
+                print_err(&format!("Not opening a browser: {e}."));
+                println!("Open {url} in a browser of your own.");
+            }
+        }
         let state = Arc::new(HttpAppState {
             service: CommanderService::default(),
             config: cfg,

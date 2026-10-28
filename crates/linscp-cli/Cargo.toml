@@ -10,6 +10,10 @@ publish.workspace = true
 name = "linscp"
 path = "src/main.rs"
 
+[[bin]]
+name = "linscp-gui"
+path = "src/main.rs"
+
 [dependencies]
 linscp-crypto.workspace = true
 linscp-engine.workspace = true
