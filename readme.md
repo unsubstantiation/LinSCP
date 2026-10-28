@@ -18,36 +18,52 @@ remain.
 
 ## Requirements
 
-- Debian 13 (trixie) or newer, with a GCC or Clang toolchain.
-- Build dependencies: `libssh-dev` (0.10 or newer), `libssl-dev`, `libargon2-dev`, `zlib1g-dev` and `pkg-config`.
-- `curl` at run time, for FTP transfers, FTPS, WebDAV and S3.
-- Python 3, for the graphical client.
+- Debian 13 (trixie) or newer, with Rust 1.89+ (`cargo`, `rustc`) and `pkg-config`.
+  No C/C++ cross-compilation is required for the pure-Rust workspace.
 - `xdg-utils` (recommended), so `linscp-gui --open-browser` can ask the desktop
   for a browser window on Wayland as well as under X11.
-- Node 20.19 or newer with `npm`, for the optional browser test suites
-  (`npm install jsdom@29`). Not needed to build or use the client.
+- Node 22 or newer with `npm`, for the TypeScript UI build (`ui/`) and its tests.
+- Python 3, for the live regression suites (the test harnesses drive `target/release/linscp`).
 
 ```sh
-sudo apt install build-essential dpkg-dev pkg-config \
-  libssh-dev libssl-dev libargon2-dev zlib1g-dev curl python3
+sudo apt install dpkg-dev pkg-config cargo rustc xdg-utils python3 nodejs npm
+# or: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-LinSCP is Linux-only. The Makefile refuses to build on other systems.
+LinSCP builds pure-Rust on Linux, Windows (`x86_64-pc-windows-msvc`) and Android
+(`aarch64-linux-android` via `cargo ndk`). The `debian/rules` and `CMakeLists.txt`
+wrappers now delegate to `cargo`.
 
 ## Building and testing
 
-```sh
-make -C source/linux                 # -> source/linux/build/linscp
-make -C source/linux check           # unit tests and the platform check
-make -C source/linux check-live      # script and live-server suites
-```
-
-CMake builds the same client and registers the suites with CTest:
+Pure-Rust (primary):
 
 ```sh
-cmake -S . -B build && cmake --build build -j
-ctest --test-dir build --output-on-failure
+cargo build --release --workspace      # -> target/release/linscp + linscp-gui
+cargo test --workspace --all-targets   # Rust unit + integration tests
+cargo run -p linscp-cli --release -- -help
 ```
+
+The live suites are Python harnesses that drive `target/release/linscp`
+(the same binary CI uses on `ubuntu-24.04` and `windows-latest`):
+
+```sh
+python3 source/linux/tests/ScriptTest.py target/release/linscp
+python3 source/linux/tests/LiveSftpTest.py target/release/linscp
+# ... LiveTunnel/S3/Dav/Scp/Curl, plus gui suites via linscp --serve-http
+```
+
+The UI is TypeScript:
+
+```sh
+npm --prefix ui install
+npm --prefix ui run build   # -> ui/dist (embedded in linscp-http)
+npm --prefix ui test
+```
+
+Legacy wrappers remain for compatibility: `make -C source/linux` and
+`cmake -S . -B build && cmake --build build` now delegate to `cargo`
+and exist only for CI parity and Debian `cmake --install` expectations.
 
 The live suites use optional Python packages: `paramiko` (SFTP),
 `botocore` (S3 signature reference), `xmlschema` (XML log schema
@@ -58,29 +74,19 @@ they start an isolated KDC and `sshd` bound to loopback. The SCP suite also
 needs `openssh-server`; it starts its own `sshd` on a free port. A suite that
 skips a case says so on its evidence line.
 
-The GUI suites (`source/gui/tests/`) run separately, as in CI. The two browser
-suites (`ClientTest.js`, `LocalizationTest.js`) are the ones that need Node and
-`jsdom`; CMake registers them only when both are installed. `SecurityTest.py`
-drives the server itself, with no browser: tokens, sign-in, the absence of CORS
-permission, response headers, command quoting, and the confinement of every
-local path to its pane.
+The GUI suites (`source/gui/tests/` + `ui/tests/`) run separately, as in CI.
+`ui/tests/TransportAndPlatform.test.mjs` exercises the dual-mode
+`HttpTransport`/`TauriTransport` and the Windows drive selector / Android
+mobile UX. `SecurityTest.py` drives the `linscp-http` server itself, with no
+browser: tokens, sign-in, the absence of CORS permission, response headers,
+command quoting, and the confinement of every local path to its pane.
 
-`make -C source/linux check` also runs `tools/check_platform_conversion.py`.
-LinSCP is Linux-only - the Windows port is gone - and the check rejects
-Windows constructs, non-Linux files, inconsistent installers, contradictory
-error templates, and upstream names outside the documented external-identifier
-allowlist. It is what keeps the conversion complete rather than merely done
-once.
-
-A second check guards the other half of "runs on Linux": a Wayland desktop,
-where an application that only asks for `$DISPLAY` sees no display at all.
-`tools/check_wayland_compatibility.py` refuses a display-server test that reads
-`DISPLAY` without `WAYLAND_DISPLAY`, a terminal candidate that does not say
-which display server it draws on, an X11-only or Wayland-only helper program,
-a desktop entry a Wayland compositor cannot act on, and the two
-implementations of the detection disagreeing about what a session is. It runs
-in `make -C source/linux check`, in CTest as `wayland-compatibility-check`, and
-in CI. For the Debian package:
+`cargo test` also runs `tools/check_platform_conversion.py` (now
+`tools/check_repo_hygiene.py` scope: it forbids Windows/Android `cfg`
+outside `crates/linscp-platform`/`linscp-tauri` and keeps brand/wayland checks).
+A second check guards Wayland: `tools/check_wayland_compatibility.py`
+refuses a display-server test that reads `DISPLAY` without `WAYLAND_DISPLAY`,
+etc. Both run in CI. For the Debian package:
 
 ```sh
 dpkg-buildpackage -b -us -uc         # -> ../linscp_1.0-5_<arch>.deb
@@ -101,13 +107,13 @@ Run `linscp -help` for the options and `man linscp` for the full reference.
 
 | URL | Served by | Notes |
 | --- | --- | --- |
-| `sftp://` | native SFTP v3 over libssh (copy-data / check-file-name extensions included) | full command set |
-| `scp://`, `ssh://` | the client's SSH code: the server's shell for directory work, rcp for bytes | no resume; the protocol has no offset |
-| `ftp://` | native FTP engine for listing and metadata; curl for transfers | |
-| `ftps://` | curl, implicit TLS | |
-| `ftpes://` | curl, explicit TLS on FTP (upstream's spelling; the same session as `ftp://` with `Ftps=2` or `3`) | |
-| `dav://`, `webdav://` | curl, with PROPFIND, MOVE, COPY, locks, dead properties and ETag preconditions | |
-| `s3://` | curl, with SigV4 signing and multipart transfers | partial |
+| `sftp://` | pure-Rust `russh` + `russh-sftp` (copy-data / check-file-name extensions) | full command set |
+| `scp://`, `ssh://` | pure-Rust `russh` SSH: the server's shell for directory work, rcp for bytes | no resume; the protocol has no offset |
+| `ftp://` | pure-Rust `suppaftp` + native Unix/DOS/VMS LIST + MLSD parser | |
+| `ftps://` | `suppaftp` (async-rustls), implicit TLS | |
+| `ftpes://` | `suppaftp` (async-rustls), explicit TLS on FTP (same session as `ftp://` with `Ftps=2` or `3`) | |
+| `dav://`, `webdav://` | pure-Rust `reqwest` + `rustls` (WebPki, SPKI pin, Min/MaxTlsVersion), PROPFIND/MOVE/COPY/locks/dead props/ETag | |
+| `s3://` | pure-Rust `reqwest` + `rustls`, SigV4 signing, multipart, versioning | partial |
 
 Host keys are verified. `-hostkey=` takes a SHA-256 or MD5 fingerprint. An
 unknown key in a run that cannot prompt is refused, and the key is printed so
@@ -192,16 +198,22 @@ branding.
 ## Repository layout
 
 ```
-.github/       CI workflows
+.github/       CI workflows (Build & test, Cross-Platform Rust & UI, Debian, Android)
 automation/    PowerShell 7 wrapper and .NET assembly, with their tests
-debian/        Debian packaging
+crates/        pure-Rust workspace: linscp-types, linscp-i18n, linscp-crypto,
+               linscp-platform (linux/windows/android), linscp-proto (SFTP/SCP/FTP/WebDAV/S3),
+               linscp-engine (transfers/sync/script), linscp-service (Commander),
+               linscp-http (axum browser mode), linscp-cli (linscp/linscp-gui), linscp-tauri
+locales/       unified translation catalogs (de, en, es, fr - single source for CLI+GUI)
+ui/            TypeScript + CSS Commander frontend (dual-mode: Tauri IPC + HTTP)
+debian/        Debian packaging (now cargo-based, wraps ui/dist embedding)
 docs/          documentation, manual page, schema and parity inventory
 fixtures/      XML action-log examples used by tests
 logo/          logo artwork
-source/gui/    browser Commander: Python server, web client, tests
-source/linux/  console client: front end, protocol glue, libssh transport,
-               native SFTP/SCP, tests and Makefile
-tools/         parity, translation, Wayland and platform/branding checkers
+source/        legacy C++ / Python reference (retained for regression-suite harnesses;
+               production code retired to crates/* in Phase 6; tests still drive
+               target/release/linscp via the same Python/Node suites)
+tools/         parity, translation, Wayland and hygiene checkers
 ```
 
 ## Licence

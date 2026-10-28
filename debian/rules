@@ -1,9 +1,9 @@
 #!/usr/bin/make -f
-# Debian build rules for LinSCP.
+# Debian build rules for LinSCP (pure-Rust + Tauri v2).
 #
-# This package deliberately does not use debhelper: the whole build is one
-# plain Makefile (source/linux/Makefile), so the few targets are written out
-# here and the build dependency list stays at dpkg-dev.
+# This package now builds the Rust workspace (crates/* + ui/) with cargo.
+# The C++ Makefile and CMake are retained as thin wrappers over cargo for
+# developer convenience, but the .deb is produced from cargo.
 
 package := linscp
 destdir := debian/$(package)
@@ -16,17 +16,17 @@ destdir := debian/$(package)
 build: build-stamp
 
 build-stamp:
-	$(MAKE) -C source/linux all check
+	cargo test --workspace --all-targets
+	cargo build --release --workspace
 	touch $@
 
-# The tree this package installs is the tree 'make -C source/linux install'
-# and 'cmake --install' produce: the client in bin/, the graphical client's
-# modules, its command templates and its web client under share/linscp/gui/,
-# the PowerShell module under share/linscp/automation/, the .NET assembly
-# sources under share/linscp/dotnet/, the manual page, the desktop entry
-# and the icons. The command templates are listed because
-# without them an installed client starts with an empty command list, where
-# a run from the source tree offers the shipped ones.
+# The tree this package installs is the tree cargo produces plus the
+# desktop integration: the CLI in bin/ (linscp + linscp-gui are the same
+# Rust binary), the PowerShell module under share/linscp/automation/,
+# the .NET assembly sources under share/linscp/dotnet/, the manual page,
+# the desktop entry and the icons. The UI assets (ui/dist) are embedded
+# in the Rust binary via include_str, so no separate gui/web tree is
+# installed - the browser mode is served from the binary itself.
 binary: build
 	rm -rf $(destdir)
 	install -d $(destdir)/usr/bin
@@ -35,19 +35,11 @@ binary: build
 	install -d $(destdir)/usr/share/applications
 	install -d $(destdir)/usr/share/pixmaps
 	install -d $(destdir)/usr/share/icons/hicolor/scalable/apps
-	install -d $(destdir)/usr/share/linscp/gui/web
 	install -d $(destdir)/usr/share/linscp/automation
 	install -d $(destdir)/usr/share/linscp/dotnet
 	install -d $(destdir)/DEBIAN
-	install -m 0755 source/linux/build/linscp $(destdir)/usr/bin/linscp
-	install -m 0755 source/gui/linscp-gui $(destdir)/usr/bin/linscp-gui
-	install -m 0644 source/gui/linscp_gui.py source/gui/linscp_crypto.py \
-		$(destdir)/usr/share/linscp/gui/
-	install -m 0644 source/gui/explorer-commands.json $(destdir)/usr/share/linscp/gui/
-	install -m 0644 $(shell find source/gui/web -maxdepth 1 -type f) \
-		$(destdir)/usr/share/linscp/gui/web/
-	install -d $(destdir)/usr/share/linscp/gui/web/vendor
-	install -m 0644 source/gui/web/vendor/* $(destdir)/usr/share/linscp/gui/web/vendor/
+	install -m 0755 target/release/linscp $(destdir)/usr/bin/linscp
+	install -m 0755 target/release/linscp-gui $(destdir)/usr/bin/linscp-gui
 	install -m 0644 automation/LinSCP.psm1 $(destdir)/usr/share/linscp/automation/
 	install -m 0644 automation/dotnet/LinSCP/LinSCP.csproj \
 		automation/dotnet/LinSCP/Session.cs \
@@ -67,6 +59,6 @@ binary: build
 	dpkg-deb --build $(destdir) ..
 
 clean:
-	$(MAKE) -C source/linux clean
+	cargo clean
 	rm -f build-stamp
 	rm -rf $(destdir) debian/files debian/substvars
