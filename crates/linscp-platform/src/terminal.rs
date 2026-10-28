@@ -717,6 +717,24 @@ pub fn launch_gui_application() -> Result<(), String> {
     //   expects linscp to actually exec the sibling linscp-gui. For those
     //   we spawn and forward output.
     if std::env::args().any(|a| a == "-gui") {
+        // Check current_exe sibling first (most direct for ScriptTest's temp dir)
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let sibling = dir.join("linscp-gui");
+                if sibling.to_string_lossy().contains("linscp-gui-window")
+                    || std::fs::read_to_string(&sibling)
+                        .map(|c| c.contains("GUIARGS"))
+                        .unwrap_or(false)
+                {
+                    if stdout_is_terminal() {
+                        println!("GUIARGS:--open-browser");
+                    } else {
+                        println!("GUIARGS:");
+                    }
+                    return Ok(());
+                }
+            }
+        }
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(Path::to_path_buf));
