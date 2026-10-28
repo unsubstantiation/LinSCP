@@ -532,10 +532,8 @@ impl QueueManager {
             if let Ok(mut g) = inner.lock() {
                 if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
                     t.bytes_done = done;
-                    if let Some(tot) = total {
-                        if tot > 0 {
-                            t.bytes_total = tot;
-                        }
+                    if total > 0 {
+                        t.bytes_total = total;
                     }
                     t.speed_bps = speed;
                 }
@@ -564,7 +562,7 @@ impl QueueManager {
             return Err("Cancelled by user.".to_string());
         }
         let progress = self.make_progress_cb(task.id, Arc::clone(&task.cancel_flag));
-        let mut logger = SessionLogger::open(None, 0, false, None, "").unwrap();
+        let mut logger = SessionLogger::open(None, 0, false, None, None, false, "").unwrap();
 
         match &task.job {
             QueueJob::RemoteDownload {
@@ -1032,7 +1030,7 @@ fn local_copy_recursive(
 
         if let Ok(ext) = linscp_platform::gui_os::stat_extended(source) {
             let _ = set_local_permissions(&tmp_path, ext.mode);
-            let _ = set_local_file_times(&tmp_path, ext.mtime_secs);
+            let _ = set_local_file_times(&tmp_path, ext.mtime_secs, ext.mtime_secs);
         }
         std::fs::rename(&tmp_path, target).map_err(|e| e.to_string())?;
         Ok(())
@@ -1085,7 +1083,7 @@ async fn execute_remote_to_remote(
     ));
     std::fs::create_dir_all(&stage_dir).map_err(|e| e.to_string())?;
 
-    let mut logger = SessionLogger::open(None, 0, false, None, "").unwrap();
+    let mut logger = SessionLogger::open(None, 0, false, None, None, false, "").unwrap();
     let mut flags = TransferFlags::default();
     let res = if entry.is_dir {
         flags.recursive = true;

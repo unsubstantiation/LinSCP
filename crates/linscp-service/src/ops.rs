@@ -235,7 +235,7 @@ pub async fn write_remote_text_file(
     ));
     write_private_file_atomic(&stage, content.as_bytes()).map_err(|e| e.to_string())?;
 
-    let mut logger = SessionLogger::open(None, 0, false, None, "").unwrap();
+    let mut logger = SessionLogger::open(None, 0, false, None, None, false, "").unwrap();
     let mut flags = TransferFlags::default();
     flags.preserve_time = false;
     let upload_res = upload_single_file(session, &stage, remote_path, &flags, &mut logger, None).await;

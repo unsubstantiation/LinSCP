@@ -268,14 +268,8 @@ pub fn parse_gui_session_spec(
     }
 
     let stored_base = if let Some(sname) = site_name.map(str::trim).filter(|s| !s.is_empty()) {
-        let store_path = config_root.join("sessions.ini");
-        if store_path.exists() {
-            let mk = load_existing_master_key(config_root, vault);
-            let store = SessionStore::load_from_path(&store_path, mk.as_ref())?;
-            store.get(sname).cloned()
-        } else {
-            None
-        }
+        let store = SessionStore::load_from_dir(config_root, vault).unwrap_or_default();
+        store.get(sname).cloned()
     } else {
         None
     };
@@ -504,7 +498,7 @@ pub fn parse_gui_session_spec(
         enabled: tunnel_enabled,
         host: tunnel_host,
         port: tunnel_port,
-        user: tunnel_user,
+        username: tunnel_user,
         password: tunnel_password,
         keyfile: tunnel_keyfile,
         hostkey: tunnel_hostkey,
@@ -530,7 +524,7 @@ pub fn parse_gui_session_spec(
         local_dir: local_dir.clone(),
         tunnel: tunnel.enabled.then(|| tunnel.clone()),
     };
-    spec.private_key = keyfile.clone();
+    spec.session.keyfile = keyfile.clone();
     if let Some(pp) = session
         .get("passphrase")
         .or_else(|| session.get("key_passphrase"))
