@@ -229,7 +229,7 @@ fn entry_from_symlink_meta(
         is_dir,
         is_symlink,
         broken_link,
-        date: gui_os::format_listing_date(mtime),
+        date: String::new(),
         mtime,
         permissions: sys::format_permissions(meta),
         owner: None,
