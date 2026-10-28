@@ -224,7 +224,7 @@ pub fn register_saf_tree(state: &AndroidState, uri: &str) -> Result<linscp_types
         .rsplit(&['/', ':'][..])
         .next()
         .filter(|s| !s.is_empty())
-        .map(|s| urlencoding_decode(s))
+        .map(urlencoding_decode)
         .unwrap_or_else(|| "SAF Folder".to_string());
     Ok(linscp_types::LocalRootEntry {
         path: uri.to_string(),

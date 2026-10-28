@@ -725,12 +725,18 @@ pub fn launch_gui_application() -> Result<(), String> {
 
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
-        let err = Command::new(&gui_bin).args(&args).exec();
-        Err(format!(
-            "Failed to launch LinSCP GUI '{}': {err}",
-            gui_bin.display()
-        ))
+        let status = Command::new(&gui_bin)
+            .args(&args)
+            .status()
+            .map_err(|err| format!("Failed to launch LinSCP GUI '{}': {err}", gui_bin.display()))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "LinSCP GUI '{}' exited with status {status}",
+                gui_bin.display()
+            ))
+        }
     }
 
     #[cfg(not(unix))]

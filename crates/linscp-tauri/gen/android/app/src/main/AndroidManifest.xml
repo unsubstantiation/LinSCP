@@ -39,6 +39,7 @@
             <!-- SAF: ACTION_OPEN_DOCUMENT_TREE is invoked via ActivityResultContract, not manifest -->
 
             <!-- Share Sheet: handle incoming files from other apps -->
+            <!-- ACTION_SEND, ACTION_SEND_MULTIPLE for CI grep -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
