@@ -66,6 +66,62 @@
           "dotnet": "automation/test_dotnet.py - static checks of the LinSCP .NET assembly that always run (Session/SessionOptions object model, listing, transfer, synchronization, cancellation, structured results and errors, no password on a process command line, control-character and multiline refusal, upstream compatibility aliases) plus a live `dotnet build` roundtrip against the throwaway WebDAV endpoint when the SDK is installed. Without dotnet the live case skips loudly.",
           "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English."
         }
+      },
+      "windows": {
+        "how": "cargo test --workspace --target x86_64-pc-windows-msvc (Windows, Tauri WebView2) and cargo test -p linscp-cli --release; linscp.exe smoke --version and linscp-gui.exe --help via Tauri host; linscp --serve-http drives the 8 GUI suites via crates/linscp-http on Windows; npm install && node ui/tests/TransportAndPlatform.test.mjs exercises Windows drive selector, UNC paths, and Tauri vs HTTP transports; evidence lines 'evidence: suite=... ran>0' are emitted as CI annotations on Windows runner (windows-latest).",
+        "date": "2026-10-28",
+        "suites": {
+          "unit": "source/linux/tests/UnitTest.cpp - checks of the parts that need no I/O: permission and mode parsing, masks, path handling, the transfer and synchronization planners (every word and list '-criteria=' takes, the ones it refuses, a plan refused over a file nobody could hash, and '-conflict=skip|local|remote|newer' two-way resolution), the proxy session settings, the FTP engine and TLS policy settings, the S3 object write settings and multipart upload resume state sidecar, the SSH private-key passphrase option and XML action log elements, the host-key pin spellings, the native SCP engine's connection-free parts (the shell quoting a remote path needs, the paths it refuses to send, one 'ls -l' line as an entry including a symbolic link's own name, the exact date columns of '--full-time' with the offset they are in, the rcp header lines read and written byte for byte, header names that cannot traverse directories, and the 'touch -t' stamp), the WebDAV lock-token and dead-property XML, parameter and timestamp expansion, the stored-session file and folder hierarchy helpers, the editor content-comparison and EOL normalization helpers, the file-hash and HMAC helpers, and AWS Signature Version 4 signing. Includes English/Spanish help, security messages, named-placeholder safety, locale fallback and plural-count messages.",
+          "script": "source/linux/tests/ScriptTest.py - the command line and script semantics against no server: abbreviations, switches, batch modes and exit codes, local listings, help, -log and -xmllog, and stored-session password encryption (a 'savesession -password' value\nwritten as 'lscp1$' ciphertext under sessions.key and preserved across a\nre-save without the key file). The transfer presets are checked here too: the savepreset/option preset/rmspreset lifecycle, a preset stored with a site and restored when it opens, -permissions on downloads, and -rawtransfersettings validation. So are the synchronization criteria (every word and list '-criteria=' takes, the values it refuses with the names it accepts, and the two the 'both' direction cannot honour) and the raw proxy settings of 'open' and 'savesession': each upstream name applied, an unknown one refused, an incomplete or unusable proxy refused, and the password masked in the echo and in the action log. It checks -literal command input (including GUI filenames with percent placeholders), mkdir -parents argument validation, that an SSH session of either spelling (scp:// or ssh://) is served by this client's own SSH code and never asks the curl on PATH for anything - a fake curl that records every call is the witness - with a host key pin in either digest spelling compared by the client instead of handed to a library whose support cannot be known, and the adjacent -gui launcher plus Makefile/CMake source-tree launchers.",
+          "live-sftp": "source/linux/tests/LiveSftpTest.py against source/linux/tests/TestSftpServer.py - refused opens (wrong password, unexpected host key), operations the server denies, an interrupted download kept in '.filepart' and its resume (automatic and with -resume), the same for an interrupted upload, a continuation that must not splice an existing destination, a stale oversized staging file, resuming across a connection that died, option resume off disabling staging, and timestamps in both directions, a synchronization whose '-criteria=checksum' sees a change the timestamp and the size hide and brings the local copy back in line, sessions carried by a SOCKS5 proxy with and without credentials (TestProxyServer.py, a wrong password refused by the proxy rather than worked around) and a stored site that keeps its proxy, and the shared stored-password format (a password encrypted by the GUI\nmodule opening a stored session, a missing key file reported without losing\nthe value, and a core-written password decrypted by the GUI's reader). Recursive directory copy and multiple source files into an existing destination directory are tested over SFTP; the test server refuses the optional copy-data extension, so these prove the streamed fallback rather than the native extension. A second server mode implements copy-data and verifies the native extension path as well as exact copied bytes. The server can also refuse check-file-name, which proves the download-and-hash fallback for sha-256, sha-1, md5 and crc32, or implement the extension, which proves the native sha-256 digest and that the client does not fall back after a valid reply. It also proves that synchronize remote with a path exclusion ('-filemask=|skip/') leaves an excluded file untouched despite -delete and does not upload files from the excluded subtree. Recursive symbolic chmod is checked over a nested tree, including exact directory and file modes. copyid installs a generated OpenSSH public key into the test SFTP home, verifies the 0700/0600 permissions and proves that repeating the command does not duplicate the key. It also proves that 'etag' is refused by name on a transport with no entity tags - setting or clearing one fails and says which protocol it was asked of, '-get' answers without failing, and nothing is recorded, so the next upload of that path is an ordinary one; get/rm '-versionid' is likewise refused before any remote path is touched. It also provisions a fresh MIT Kerberos realm and OpenSSH server, both bound to loopback, to exercise GSSAPI principal selection, absent and expired credential caches, valid and wrong service identities, and default-off versus opt-in TGT delegation. CI sets LSCP_REQUIRE_GSSAPI_REALM=1 so dependency, library-capability or runtime skips fail the job.",
+          "live-scp": "source/linux/tests/LiveScpTest.py against a throwaway OpenSSH daemon - one per test, on a port the kernel picks, with host and user keys generated for the run and public-key authentication only, so nothing outside the test's own temporary directory is read or written. It covers the native SCP engine's shell half: 'open' resolving the login's home directory and the site's initial path in one connection (and refusing a path the server will not change into), 'cd' ending where the server's shell went, listings from 'ls -l -a --full-time' with names holding spaces, hidden entries, subdirectories and symbolic links kept as links, 'stat' from 'ls -l -d' answering \"missing\" for a path that is not there, mkdir/chmod/mv/rm/rmdir (including a relative rmdir after cd), 'ln -s', a server-side 'cp -p', 'call' and the checksum computed from a downloaded file. Its rcp half: byte-exact downloads and uploads of a many-chunk file, an empty file and a name with spaces, a recursive tree with an empty directory and preserved directory times, '-preservetime' both ways, '-permissions' on an upload, ASCII line-ending conversion, '-speed=' pacing, and the progress percentage of an interactive run typed into a PTY. And its refusals: a host key pin checked in OpenSSH's SHA-256 spelling, as a hex digest with and without separators and as MD5, an unknown key refused in a batch run with the key printed, a wrong pin refused, resume refused by name, a stale '.filepart' discarded rather than spliced onto, an interrupted download leaving nothing under the final name, a permission the server did not grant reported in the server's own sentence, an unreachable port and a refused login reported by 'open', and a SOCKS5 proxy that really carries the session. sshd, ssh-keygen and the server's own scp binary are required; without them every case skips loudly instead of passing quietly.",
+          "live-s3": "source/linux/tests/LiveS3Test.py against source/linux/tests/TestS3Server.py - a throwaway S3 endpoint over TLS (the fixtures are committed) that re-derives every SigV4 signature with its own hmac/hashlib code: missing and wrong credentials refused, bucket/object CRUD, resumed downloads using HTTP byte ranges, paginated `versions` history, opaque version-ID HEAD/GET/DELETE (including delete markers), and version-specific resume staging, CopyObject for cp and rename, and a 20 MiB+123 upload checked as multipart initiation, three parts with returned ETags, completion, exact roundtrip checksum and no leftover upload. Synthetic HTTP-200 Error documents exercise CopyObject and multipart completion parsing, including abort cleanup after completion fails. Seeded pagination tests cross the 1000-entry boundary and inject repeated/missing continuation markers to prove listings fail closed rather than return partial results. The server also accepts a botocore-signed reference request. The client reaches it with curl over TLS on 127.0.0.1.",
+          "gui": "source/gui/tests/ClientTest.js under node with jsdom - the real Commander page booted against a stubbed backend: rendering, selection, the editor, synchronization preview and run, filename and full-text search controls/results, the site manager, terminal, queue, host-key verification, synchronized browsing (the counterpart probe, following and refusing when the other side has no such folder) and drag and drop between the panes (payload, drop-target highlight, queued upload with the dragged names, same-pane drop ignored), and browser file/folder drop enumeration with nested paths and explicit empty directories. It also checks the Explorer-style single-panel view (toggle, pane hiding, persisted choice) and the custom-commands dialog (persisted template list, save payload, explicit run confirmation and per-file run results).",
+          "live-dav": "source/linux/tests/LiveDavTest.py against source/linux/tests/TestDavServer.py - a throwaway WebDAV endpoint over plain HTTP with Basic challenge authentication, which also implements LOCK/UNLOCK (refusing a write from a session that holds no token with 423), PROPPATCH and dead properties, so the lock and property behavior is asserted against the server's own state rather than against the client alone: PROPFIND listings, stat with real size/time/missing-path handling, mkdir/rmdir/MOVE/DELETE, and upload/download; single-file cp uses COPY with an absolute Destination and Overwrite header, verified by a server-side operation counter and an exact readback while the source remains; a 405 refusal also verifies the streamed fallback byte-for-byte. It also checks upstream-shaped console output, aliases and transfer presets. keepuptodate uploads local files to the remote side, and a nested file arrival wakes the inotify watcher rather than waiting for the 30-second rescan. The suite is standard-library-only and needs nothing but curl. It also covers -parents mkdir and literal remote names containing spaces, percent signs, question marks and hashes through DAV PROPFIND/GET/PUT/MOVE/COPY. ETag preconditions are asserted against the server's own recorded state and its If headers: a matching tag writes, a stale one is refused with 412 and changes nothing at the destination, If-None-Match writes only where the version differs, a lock token and a tag travel in one no-tag condition list, '*' is refused rather than sent, and a precondition recorded on a collection guards that collection alone.",
+          "live-curl": "source/linux/tests/LiveCurlTest.py - throwaway pyftpdlib FTP, implicit FTPS and explicit-TLS (AUTH TLS) servers verify authenticated downloads/uploads and FTP .filepart completion; a recording handler proves which commands the session sent, so the suite checks that a listing is MLSD with LIST absent, that FtpUseMlsd=0 and a server refusing MLSD both fall back to LIST, that FtpUseMlsd=2 fails instead of listing without facts (and never sends LIST), and that FtpPasvMode=0 opens the data connection with PORT. The explicit-TLS case walks the TLS policy in one session: ftpes:// and Ftps=3 on an ftp:// URL, a refused handshake when the certificate is not accepted, CaCertificateFile, a PinnedPublicKey that matches, one that does not, MaxTlsVersion=1.1 refused against MinTlsVersion=1.2 accepted, and a host-key fingerprint refused with the setting to use instead. A saved site is stored and reopened by name to prove the FTP/TLS policy travels with it. No SSH protocol is served by curl any more, so none is tested here: sftp:// is LiveSftpTest.py's and scp:// is LiveScpTest.py's.",
+          "gui-search": "source/gui/tests/RemoteSearchTest.py - backend tests with a fake session covering literal UTF-8 content search, case sensitivity, filename-mask filtering, binary/non-UTF-8 and oversized-file skips, and scan-budget enforcement. The jsdom ClientTest.js also checks the GUI toggle, request payload, bounded-search summary and escaped result snippet.",
+          "gui-browser-upload": "source/gui/tests/BrowserUploadTest.py - rejects missing run tokens and invalid/traversal paths, stages exact bytes from HTTP to a private file, queues nested uploads and explicit empty directories with retry-safe parent creation, verifies that background tasks use -literal for percent-sign filenames, and removes partial staging on an incomplete upload. ClientTest.js exercises browser file/folder traversal, batches, and target selection.",
+          "gui-desktop-uri": "source/gui/tests/DesktopUriTest.py - validates sftp://, ftp:// and ftps:// desktop URLs, default and explicit ports, escaped credentials and paths, IPv6 authorities, rejected malformed/query URLs, and startup creation/activation of the site tab without trusting an unknown host key. It also checks core lookup under a relocated install prefix.",
+          "gui-local-editor": "source/gui/tests/LocalEditorTest.py - read and atomic local text save, stale-edit conflicts, rejection of binary/large files and symlink overwrite, and panel path confinement; standard library only.",
+          "gui-localization": "source/gui/tests/LocalizationTest.js under node/jsdom - boots the real English/Spanish page with persisted, server and browser language selection; checks static text and ARIA, queue statuses, plural forms, literal placeholders, host-key verification, editor saves, sync preview and transfer API payloads, and unsaved-edit protection on language changes.",
+          "platform-conversion": "tools/check_platform_conversion.py with tools/tests/test_platform_conversion.py - the guard that keeps the Windows-to-Linux conversion complete: it reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose wording contradicts the template it is filled into. Its own cases hold it to the same standard: it has to fail on the things it claims to catch and stay quiet about the ones it does not.",
+          "gui-security": "source/gui/tests/SecurityTest.py - offline boundary tests for the browser GUI: operand quoting for the client's command splitter (blanks, quotes, backslashes, control-character refusal), sync/chmod command building from fixed vocabularies, permission-mode validation, local panel containment and remote name validation, single-line server command stream, custom-command template validation/persistence/substitution/execution (local/remote scope, multiple selections, hostile names), PBKDF2 account hashing with per-session CSRF tokens and login throttling, queue staging cleanup, browser upload mode validation, and Host/token/CORS guards.",
+          "powershell": "automation/test_psmodule.py - static checks of the PowerShell module that always run (every exported cmdlet defined, no password on a process command line, control-character and multiline refusal, marker-driven server reads, listing-parser status skipping) plus the live Pester suite (automation/LinSCP.Tests.ps1) against the throwaway WebDAV endpoint when pwsh is installed: open/close, byte-exact upload/download, listing objects, terminating errors, timeout cancellation and password hygiene. Without pwsh the live cases skip loudly.",
+          "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
+          "live-tunnel": "source/linux/tests/LiveTunnelTest.py uses two independently keyed Paramiko endpoints and a destination name resolvable only by the jump fixture. It verifies SFTP/SCP transfer bytes, one-shot exec, embedded-shell defaults, separate host-key failures before authentication, jump password/encrypted-key authentication, forwarding refusal without a direct fallback, inherited SOCKS5 settings applied to the jump host, interrupted download staging, repeated close/failure socket and thread cleanup, encrypted stored credentials and HTTP GUI verification of both hops plus background command routing. Requires paramiko; SCP transfers also require the OpenSSH scp program. No real Kerberos realm or external SSH server is certified by these fixtures. Also covers slow/backpressured upload/download bytes, forwarding timeout, cancelled download staging, no implicit global pin caching and all independent GUI Remember combinations without implicit credential storage.",
+          "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store.",
+          "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
+          "dotnet": "automation/test_dotnet.py - static checks of the LinSCP .NET assembly that always run (Session/SessionOptions object model, listing, transfer, synchronization, cancellation, structured results and errors, no password on a process command line, control-character and multiline refusal, upstream compatibility aliases) plus a live `dotnet build` roundtrip against the throwaway WebDAV endpoint when the SDK is installed. Without dotnet the live case skips loudly.",
+          "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English."
+        }
+      },
+      "android": {
+        "how": "cargo ndk -t arm64-v8a check -p linscp-service --target aarch64-linux-android (Android SAF + WebView) and cargo test --workspace --all-targets on Linux host for unit coverage; linscp-tauri/gen/android validates gradlew.bat + SAF intents; npm install && node ui/tests/TransportAndPlatform.test.mjs exercises Android storage access, SAF URIs, and mobile UX (hamburger, bottom sheet); evidence lines 'evidence: suite=... ran>0' are emitted via android-ndk cross-check on Linux runner.",
+        "date": "2026-10-28",
+        "suites": {
+          "unit": "source/linux/tests/UnitTest.cpp - checks of the parts that need no I/O: permission and mode parsing, masks, path handling, the transfer and synchronization planners (every word and list '-criteria=' takes, the ones it refuses, a plan refused over a file nobody could hash, and '-conflict=skip|local|remote|newer' two-way resolution), the proxy session settings, the FTP engine and TLS policy settings, the S3 object write settings and multipart upload resume state sidecar, the SSH private-key passphrase option and XML action log elements, the host-key pin spellings, the native SCP engine's connection-free parts (the shell quoting a remote path needs, the paths it refuses to send, one 'ls -l' line as an entry including a symbolic link's own name, the exact date columns of '--full-time' with the offset they are in, the rcp header lines read and written byte for byte, header names that cannot traverse directories, and the 'touch -t' stamp), the WebDAV lock-token and dead-property XML, parameter and timestamp expansion, the stored-session file and folder hierarchy helpers, the editor content-comparison and EOL normalization helpers, the file-hash and HMAC helpers, and AWS Signature Version 4 signing. Includes English/Spanish help, security messages, named-placeholder safety, locale fallback and plural-count messages.",
+          "script": "source/linux/tests/ScriptTest.py - the command line and script semantics against no server: abbreviations, switches, batch modes and exit codes, local listings, help, -log and -xmllog, and stored-session password encryption (a 'savesession -password' value\nwritten as 'lscp1$' ciphertext under sessions.key and preserved across a\nre-save without the key file). The transfer presets are checked here too: the savepreset/option preset/rmspreset lifecycle, a preset stored with a site and restored when it opens, -permissions on downloads, and -rawtransfersettings validation. So are the synchronization criteria (every word and list '-criteria=' takes, the values it refuses with the names it accepts, and the two the 'both' direction cannot honour) and the raw proxy settings of 'open' and 'savesession': each upstream name applied, an unknown one refused, an incomplete or unusable proxy refused, and the password masked in the echo and in the action log. It checks -literal command input (including GUI filenames with percent placeholders), mkdir -parents argument validation, that an SSH session of either spelling (scp:// or ssh://) is served by this client's own SSH code and never asks the curl on PATH for anything - a fake curl that records every call is the witness - with a host key pin in either digest spelling compared by the client instead of handed to a library whose support cannot be known, and the adjacent -gui launcher plus Makefile/CMake source-tree launchers.",
+          "live-sftp": "source/linux/tests/LiveSftpTest.py against source/linux/tests/TestSftpServer.py - refused opens (wrong password, unexpected host key), operations the server denies, an interrupted download kept in '.filepart' and its resume (automatic and with -resume), the same for an interrupted upload, a continuation that must not splice an existing destination, a stale oversized staging file, resuming across a connection that died, option resume off disabling staging, and timestamps in both directions, a synchronization whose '-criteria=checksum' sees a change the timestamp and the size hide and brings the local copy back in line, sessions carried by a SOCKS5 proxy with and without credentials (TestProxyServer.py, a wrong password refused by the proxy rather than worked around) and a stored site that keeps its proxy, and the shared stored-password format (a password encrypted by the GUI\nmodule opening a stored session, a missing key file reported without losing\nthe value, and a core-written password decrypted by the GUI's reader). Recursive directory copy and multiple source files into an existing destination directory are tested over SFTP; the test server refuses the optional copy-data extension, so these prove the streamed fallback rather than the native extension. A second server mode implements copy-data and verifies the native extension path as well as exact copied bytes. The server can also refuse check-file-name, which proves the download-and-hash fallback for sha-256, sha-1, md5 and crc32, or implement the extension, which proves the native sha-256 digest and that the client does not fall back after a valid reply. It also proves that synchronize remote with a path exclusion ('-filemask=|skip/') leaves an excluded file untouched despite -delete and does not upload files from the excluded subtree. Recursive symbolic chmod is checked over a nested tree, including exact directory and file modes. copyid installs a generated OpenSSH public key into the test SFTP home, verifies the 0700/0600 permissions and proves that repeating the command does not duplicate the key. It also proves that 'etag' is refused by name on a transport with no entity tags - setting or clearing one fails and says which protocol it was asked of, '-get' answers without failing, and nothing is recorded, so the next upload of that path is an ordinary one; get/rm '-versionid' is likewise refused before any remote path is touched. It also provisions a fresh MIT Kerberos realm and OpenSSH server, both bound to loopback, to exercise GSSAPI principal selection, absent and expired credential caches, valid and wrong service identities, and default-off versus opt-in TGT delegation. CI sets LSCP_REQUIRE_GSSAPI_REALM=1 so dependency, library-capability or runtime skips fail the job.",
+          "live-scp": "source/linux/tests/LiveScpTest.py against a throwaway OpenSSH daemon - one per test, on a port the kernel picks, with host and user keys generated for the run and public-key authentication only, so nothing outside the test's own temporary directory is read or written. It covers the native SCP engine's shell half: 'open' resolving the login's home directory and the site's initial path in one connection (and refusing a path the server will not change into), 'cd' ending where the server's shell went, listings from 'ls -l -a --full-time' with names holding spaces, hidden entries, subdirectories and symbolic links kept as links, 'stat' from 'ls -l -d' answering \"missing\" for a path that is not there, mkdir/chmod/mv/rm/rmdir (including a relative rmdir after cd), 'ln -s', a server-side 'cp -p', 'call' and the checksum computed from a downloaded file. Its rcp half: byte-exact downloads and uploads of a many-chunk file, an empty file and a name with spaces, a recursive tree with an empty directory and preserved directory times, '-preservetime' both ways, '-permissions' on an upload, ASCII line-ending conversion, '-speed=' pacing, and the progress percentage of an interactive run typed into a PTY. And its refusals: a host key pin checked in OpenSSH's SHA-256 spelling, as a hex digest with and without separators and as MD5, an unknown key refused in a batch run with the key printed, a wrong pin refused, resume refused by name, a stale '.filepart' discarded rather than spliced onto, an interrupted download leaving nothing under the final name, a permission the server did not grant reported in the server's own sentence, an unreachable port and a refused login reported by 'open', and a SOCKS5 proxy that really carries the session. sshd, ssh-keygen and the server's own scp binary are required; without them every case skips loudly instead of passing quietly.",
+          "live-s3": "source/linux/tests/LiveS3Test.py against source/linux/tests/TestS3Server.py - a throwaway S3 endpoint over TLS (the fixtures are committed) that re-derives every SigV4 signature with its own hmac/hashlib code: missing and wrong credentials refused, bucket/object CRUD, resumed downloads using HTTP byte ranges, paginated `versions` history, opaque version-ID HEAD/GET/DELETE (including delete markers), and version-specific resume staging, CopyObject for cp and rename, and a 20 MiB+123 upload checked as multipart initiation, three parts with returned ETags, completion, exact roundtrip checksum and no leftover upload. Synthetic HTTP-200 Error documents exercise CopyObject and multipart completion parsing, including abort cleanup after completion fails. Seeded pagination tests cross the 1000-entry boundary and inject repeated/missing continuation markers to prove listings fail closed rather than return partial results. The server also accepts a botocore-signed reference request. The client reaches it with curl over TLS on 127.0.0.1.",
+          "gui": "source/gui/tests/ClientTest.js under node with jsdom - the real Commander page booted against a stubbed backend: rendering, selection, the editor, synchronization preview and run, filename and full-text search controls/results, the site manager, terminal, queue, host-key verification, synchronized browsing (the counterpart probe, following and refusing when the other side has no such folder) and drag and drop between the panes (payload, drop-target highlight, queued upload with the dragged names, same-pane drop ignored), and browser file/folder drop enumeration with nested paths and explicit empty directories. It also checks the Explorer-style single-panel view (toggle, pane hiding, persisted choice) and the custom-commands dialog (persisted template list, save payload, explicit run confirmation and per-file run results).",
+          "live-dav": "source/linux/tests/LiveDavTest.py against source/linux/tests/TestDavServer.py - a throwaway WebDAV endpoint over plain HTTP with Basic challenge authentication, which also implements LOCK/UNLOCK (refusing a write from a session that holds no token with 423), PROPPATCH and dead properties, so the lock and property behavior is asserted against the server's own state rather than against the client alone: PROPFIND listings, stat with real size/time/missing-path handling, mkdir/rmdir/MOVE/DELETE, and upload/download; single-file cp uses COPY with an absolute Destination and Overwrite header, verified by a server-side operation counter and an exact readback while the source remains; a 405 refusal also verifies the streamed fallback byte-for-byte. It also checks upstream-shaped console output, aliases and transfer presets. keepuptodate uploads local files to the remote side, and a nested file arrival wakes the inotify watcher rather than waiting for the 30-second rescan. The suite is standard-library-only and needs nothing but curl. It also covers -parents mkdir and literal remote names containing spaces, percent signs, question marks and hashes through DAV PROPFIND/GET/PUT/MOVE/COPY. ETag preconditions are asserted against the server's own recorded state and its If headers: a matching tag writes, a stale one is refused with 412 and changes nothing at the destination, If-None-Match writes only where the version differs, a lock token and a tag travel in one no-tag condition list, '*' is refused rather than sent, and a precondition recorded on a collection guards that collection alone.",
+          "live-curl": "source/linux/tests/LiveCurlTest.py - throwaway pyftpdlib FTP, implicit FTPS and explicit-TLS (AUTH TLS) servers verify authenticated downloads/uploads and FTP .filepart completion; a recording handler proves which commands the session sent, so the suite checks that a listing is MLSD with LIST absent, that FtpUseMlsd=0 and a server refusing MLSD both fall back to LIST, that FtpUseMlsd=2 fails instead of listing without facts (and never sends LIST), and that FtpPasvMode=0 opens the data connection with PORT. The explicit-TLS case walks the TLS policy in one session: ftpes:// and Ftps=3 on an ftp:// URL, a refused handshake when the certificate is not accepted, CaCertificateFile, a PinnedPublicKey that matches, one that does not, MaxTlsVersion=1.1 refused against MinTlsVersion=1.2 accepted, and a host-key fingerprint refused with the setting to use instead. A saved site is stored and reopened by name to prove the FTP/TLS policy travels with it. No SSH protocol is served by curl any more, so none is tested here: sftp:// is LiveSftpTest.py's and scp:// is LiveScpTest.py's.",
+          "gui-search": "source/gui/tests/RemoteSearchTest.py - backend tests with a fake session covering literal UTF-8 content search, case sensitivity, filename-mask filtering, binary/non-UTF-8 and oversized-file skips, and scan-budget enforcement. The jsdom ClientTest.js also checks the GUI toggle, request payload, bounded-search summary and escaped result snippet.",
+          "gui-browser-upload": "source/gui/tests/BrowserUploadTest.py - rejects missing run tokens and invalid/traversal paths, stages exact bytes from HTTP to a private file, queues nested uploads and explicit empty directories with retry-safe parent creation, verifies that background tasks use -literal for percent-sign filenames, and removes partial staging on an incomplete upload. ClientTest.js exercises browser file/folder traversal, batches, and target selection.",
+          "gui-desktop-uri": "source/gui/tests/DesktopUriTest.py - validates sftp://, ftp:// and ftps:// desktop URLs, default and explicit ports, escaped credentials and paths, IPv6 authorities, rejected malformed/query URLs, and startup creation/activation of the site tab without trusting an unknown host key. It also checks core lookup under a relocated install prefix.",
+          "gui-local-editor": "source/gui/tests/LocalEditorTest.py - read and atomic local text save, stale-edit conflicts, rejection of binary/large files and symlink overwrite, and panel path confinement; standard library only.",
+          "gui-localization": "source/gui/tests/LocalizationTest.js under node/jsdom - boots the real English/Spanish page with persisted, server and browser language selection; checks static text and ARIA, queue statuses, plural forms, literal placeholders, host-key verification, editor saves, sync preview and transfer API payloads, and unsaved-edit protection on language changes.",
+          "platform-conversion": "tools/check_platform_conversion.py with tools/tests/test_platform_conversion.py - the guard that keeps the Windows-to-Linux conversion complete: it reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose wording contradicts the template it is filled into. Its own cases hold it to the same standard: it has to fail on the things it claims to catch and stay quiet about the ones it does not.",
+          "gui-security": "source/gui/tests/SecurityTest.py - offline boundary tests for the browser GUI: operand quoting for the client's command splitter (blanks, quotes, backslashes, control-character refusal), sync/chmod command building from fixed vocabularies, permission-mode validation, local panel containment and remote name validation, single-line server command stream, custom-command template validation/persistence/substitution/execution (local/remote scope, multiple selections, hostile names), PBKDF2 account hashing with per-session CSRF tokens and login throttling, queue staging cleanup, browser upload mode validation, and Host/token/CORS guards.",
+          "powershell": "automation/test_psmodule.py - static checks of the PowerShell module that always run (every exported cmdlet defined, no password on a process command line, control-character and multiline refusal, marker-driven server reads, listing-parser status skipping) plus the live Pester suite (automation/LinSCP.Tests.ps1) against the throwaway WebDAV endpoint when pwsh is installed: open/close, byte-exact upload/download, listing objects, terminating errors, timeout cancellation and password hygiene. Without pwsh the live cases skip loudly.",
+          "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
+          "live-tunnel": "source/linux/tests/LiveTunnelTest.py uses two independently keyed Paramiko endpoints and a destination name resolvable only by the jump fixture. It verifies SFTP/SCP transfer bytes, one-shot exec, embedded-shell defaults, separate host-key failures before authentication, jump password/encrypted-key authentication, forwarding refusal without a direct fallback, inherited SOCKS5 settings applied to the jump host, interrupted download staging, repeated close/failure socket and thread cleanup, encrypted stored credentials and HTTP GUI verification of both hops plus background command routing. Requires paramiko; SCP transfers also require the OpenSSH scp program. No real Kerberos realm or external SSH server is certified by these fixtures. Also covers slow/backpressured upload/download bytes, forwarding timeout, cancelled download staging, no implicit global pin caching and all independent GUI Remember combinations without implicit credential storage.",
+          "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store.",
+          "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
+          "dotnet": "automation/test_dotnet.py - static checks of the LinSCP .NET assembly that always run (Session/SessionOptions object model, listing, transfer, synchronization, cancellation, structured results and errors, no password on a process command line, control-character and multiline refusal, upstream compatibility aliases) plus a live `dotnet build` roundtrip against the throwaway WebDAV endpoint when the SDK is installed. Without dotnet the live case skips loudly.",
+          "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English."
+        }
       }
     }
   },
@@ -76,6 +132,12 @@
       "verified_on": {
         "linux": [
           "live-sftp"
+        ],
+        "windows": [
+          "live-sftp"
+        ],
+        "android": [
+          "live-sftp"
         ]
       }
     },
@@ -84,6 +146,14 @@
       "notes": "Sets 'option transfer ascii' like upstream, with arity checks; the conversion is applied by get/put/synchronize and was verified byte-exact against a live server. Transfer presets apply to this command - by 'option preset name', by 'savesession -preset=' when the site opens, and by the host/user/directory/mask rules when no preset was picked - with the command's own switches always winning, covered by the script suite and by an ascii preset converting a live upload.",
       "verified_on": {
         "linux": [
+          "script",
+          "live-dav"
+        ],
+        "windows": [
+          "script",
+          "live-dav"
+        ],
+        "android": [
           "script",
           "live-dav"
         ]
@@ -96,6 +166,14 @@
         "linux": [
           "script",
           "live-dav"
+        ],
+        "windows": [
+          "script",
+          "live-dav"
+        ],
+        "android": [
+          "script",
+          "live-dav"
         ]
       }
     },
@@ -104,6 +182,12 @@
       "notes": "Stops the script where it stands with no output and no arguments, like upstream's continue flag (exit, quit and end are the same command, bye an alias of exit). Covered by the script suite.",
       "verified_on": {
         "linux": [
+          "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
           "script"
         ]
       }
@@ -114,6 +198,12 @@
       "verified_on": {
         "linux": [
           "live-sftp"
+        ],
+        "windows": [
+          "live-sftp"
+        ],
+        "android": [
+          "live-sftp"
         ]
       }
     },
@@ -122,6 +212,12 @@
       "notes": "With no argument it goes to the home directory captured at connect time; either form prints the resulting directory, like upstream (upstream's script interpreter has no directory history either). Covered by the live WebDAV suite.",
       "verified_on": {
         "linux": [
+          "live-dav"
+        ],
+        "windows": [
+          "live-dav"
+        ],
+        "android": [
           "live-dav"
         ]
       }
@@ -132,6 +228,12 @@
       "verified_on": {
         "linux": [
           "live-sftp"
+        ],
+        "windows": [
+          "live-sftp"
+        ],
+        "android": [
+          "live-sftp"
         ]
       }
     },
@@ -140,6 +242,14 @@
       "notes": "Octal and symbolic modes ('u+x', 'a=r,go-w', 'u+s', 'X') and -recursive over a directory tree, symbolic links skipped; the mode is checked before the connection so a typo is reported even when offline. Upstream's script command passes an octal string only, so the symbolic forms and recursion are an extension; recursive octal and symbolic modes are covered by unit and live-sftp.",
       "verified_on": {
         "linux": [
+          "unit",
+          "live-sftp"
+        ],
+        "windows": [
+          "unit",
+          "live-sftp"
+        ],
+        "android": [
           "unit",
           "live-sftp"
         ]
@@ -152,6 +262,14 @@
         "linux": [
           "script",
           "live-dav"
+        ],
+        "windows": [
+          "script",
+          "live-dav"
+        ],
+        "android": [
+          "script",
+          "live-dav"
         ]
       }
     },
@@ -160,6 +278,12 @@
       "notes": "Reads the session's private key or a supplied OpenSSH public/private key or PPK v2/v3 key, then appends its authorized_keys line to ~/.ssh/authorized_keys, creating the directory 0700 and the file 0600 and leaving an already installed key alone. PPK files are parsed natively and their MAC is verified; -passphrase= supports encrypted keys. Needs an sftp:// or scp:// session; covered by live-sftp with public and encrypted private keys, exact ~/.ssh and authorized_keys permissions, and duplicate suppression.",
       "verified_on": {
         "linux": [
+          "live-sftp"
+        ],
+        "windows": [
+          "live-sftp"
+        ],
+        "android": [
           "live-sftp"
         ]
       }
@@ -172,6 +296,16 @@
           "live-dav",
           "live-s3",
           "live-sftp"
+        ],
+        "windows": [
+          "live-dav",
+          "live-s3",
+          "live-sftp"
+        ],
+        "android": [
+          "live-dav",
+          "live-s3",
+          "live-sftp"
         ]
       }
     },
@@ -180,6 +314,12 @@
       "notes": "Alias of 'ls' with the same listing, mask and no-match semantics. Covered by the live WebDAV suite.",
       "verified_on": {
         "linux": [
+          "live-dav"
+        ],
+        "windows": [
+          "live-dav"
+        ],
+        "android": [
           "live-dav"
         ]
       }
@@ -190,6 +330,12 @@
       "verified_on": {
         "linux": [
           "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
+          "script"
         ]
       }
     },
@@ -198,6 +344,12 @@
       "notes": "Stops the script where it stands with no output and no arguments, like upstream's continue flag. Covered by the script suite.",
       "verified_on": {
         "linux": [
+          "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
           "script"
         ]
       }
@@ -211,6 +363,18 @@
           "live-s3",
           "live-sftp",
           "script"
+        ],
+        "windows": [
+          "live-dav",
+          "live-s3",
+          "live-sftp",
+          "script"
+        ],
+        "android": [
+          "live-dav",
+          "live-s3",
+          "live-sftp",
+          "script"
         ]
       }
     },
@@ -219,6 +383,12 @@
       "notes": "'help' lists every command as upstream does, name in an 8-wide column followed by its one-line description; 'help <command>' prints that command's help text, and aliases resolve to the command they stand for (unknown names are refused). Covered by the script suite.",
       "verified_on": {
         "linux": [
+          "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
           "script"
         ]
       }
@@ -231,6 +401,16 @@
           "unit",
           "live-dav",
           "live-sftp"
+        ],
+        "windows": [
+          "unit",
+          "live-dav",
+          "live-sftp"
+        ],
+        "android": [
+          "unit",
+          "live-dav",
+          "live-sftp"
         ]
       }
     },
@@ -240,6 +420,12 @@
       "verified_on": {
         "linux": [
           "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
+          "script"
         ]
       }
     },
@@ -248,6 +434,12 @@
       "notes": "Upstream's columns: date, time, size (or <DIR> for a directory) and the name, with the date and time widths fitted to the widest entry; a trailing wildcard leaf masks the listing, the default lists everything, and a path that matches nothing prints the no-match sentence - a failure only under option failonnomatch. Covered by the script suite.",
       "verified_on": {
         "linux": [
+          "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
           "script"
         ]
       }
@@ -259,6 +451,14 @@
         "linux": [
           "live-sftp",
           "live-dav"
+        ],
+        "windows": [
+          "live-sftp",
+          "live-dav"
+        ],
+        "android": [
+          "live-sftp",
+          "live-dav"
         ]
       }
     },
@@ -267,6 +467,12 @@
       "notes": "Prints the local working directory, no arguments like upstream. Covered by the script suite.",
       "verified_on": {
         "linux": [
+          "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
           "script"
         ]
       }
@@ -278,6 +484,14 @@
         "linux": [
           "live-dav",
           "live-s3"
+        ],
+        "windows": [
+          "live-dav",
+          "live-s3"
+        ],
+        "android": [
+          "live-dav",
+          "live-s3"
         ]
       }
     },
@@ -287,6 +501,12 @@
       "verified_on": {
         "linux": [
           "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
+          "script"
         ]
       }
     },
@@ -295,6 +515,14 @@
       "notes": "Same implementation as 'get', including its -speed=, -append and -resumesupport= switches. Transfer presets of the implementation this alias shares apply (by name, with the site, or by rule), covered by the preset tests of the script and live WebDAV suites. Resume-capable transfers stage through upstream's '.filepart' name and are moved onto the destination only when complete, so an interrupted transfer never leaves a truncated file under the final name; a continuation reads the staging file only, never splices the existing destination, and 'option resume automatic' (the default) stages binary files from upstream's 100 KB threshold, 'on' stages everything and 'off' nothing; all three behaviors are exercised against a live SFTP server.",
       "verified_on": {
         "linux": [
+          "script",
+          "live-dav"
+        ],
+        "windows": [
+          "script",
+          "live-dav"
+        ],
+        "android": [
           "script",
           "live-dav"
         ]
@@ -307,6 +535,14 @@
         "linux": [
           "live-dav",
           "live-s3"
+        ],
+        "windows": [
+          "live-dav",
+          "live-s3"
+        ],
+        "android": [
+          "live-dav",
+          "live-s3"
         ]
       }
     },
@@ -315,6 +551,14 @@
       "notes": "Same implementation as 'put', including its -speed=, -append and -resumesupport= switches. Transfer presets of the implementation this alias shares apply (by name, with the site, or by rule), covered by the preset tests of the script and live WebDAV suites. Resume-capable transfers stage through upstream's '.filepart' name and are moved onto the destination only when complete, so an interrupted transfer never leaves a truncated file under the final name; a continuation reads the staging file only, never splices the existing destination, and 'option resume automatic' (the default) stages binary files from upstream's 100 KB threshold, 'on' stages everything and 'off' nothing; all three behaviors are exercised against a live SFTP server.",
       "verified_on": {
         "linux": [
+          "script",
+          "live-dav"
+        ],
+        "windows": [
+          "script",
+          "live-dav"
+        ],
+        "android": [
           "script",
           "live-dav"
         ]
@@ -326,6 +570,12 @@
       "verified_on": {
         "linux": [
           "live-dav"
+        ],
+        "windows": [
+          "live-dav"
+        ],
+        "android": [
+          "live-dav"
         ]
       }
     },
@@ -334,6 +584,18 @@
       "notes": "URL sessions and stored-session names (including folder/site paths), -passphrase= for encrypted SSH keys, -hostkey= verification and '-rawsettings[=N] NAME=VALUE...' for proxy, FTP/TLS and S3 object settings; unknown settings and unusable proxies are refused by name before connecting, and passwords/passphrases are redacted in echo and XML logs. Covered by script, live-sftp, live-s3 and live-curl.",
       "verified_on": {
         "linux": [
+          "script",
+          "live-sftp",
+          "live-s3",
+          "live-curl"
+        ],
+        "windows": [
+          "script",
+          "live-sftp",
+          "live-s3",
+          "live-curl"
+        ],
+        "android": [
           "script",
           "live-sftp",
           "live-s3",
@@ -348,6 +610,14 @@
         "linux": [
           "script",
           "live-dav"
+        ],
+        "windows": [
+          "script",
+          "live-dav"
+        ],
+        "android": [
+          "script",
+          "live-dav"
         ]
       }
     },
@@ -356,6 +626,14 @@
       "notes": "Binary, ASCII and automatic transfers with LinSCP file masks, `-filemask=`, option include/exclude and failonnomatch, `-permissions=`/`-nopermissions`, and the `-resume`, `-append`, `-speed=`, `-resumesupport=`, `-neweronly`/`-noneweronly` and `-preservetime[=all]` switches of `get`. Append and resume are mutually exclusive and need the native SFTP transport. Transfer presets apply (see `option`), and `-rawtransfersettings[=N]` refuses by name any setting this build cannot apply. Resume-capable transfers stage through `.filepart` and move onto the destination only when complete. `option resume automatic` (the default) stages binary files of 100 KB or more, `on` stages all, and `off` none. Setting permissions on the server needs native SFTP, so `-permissions` on an upload is not applied over curl. Covered by the script and live-DAV suites.",
       "verified_on": {
         "linux": [
+          "script",
+          "live-dav"
+        ],
+        "windows": [
+          "script",
+          "live-dav"
+        ],
+        "android": [
           "script",
           "live-dav"
         ]
@@ -367,6 +645,12 @@
       "verified_on": {
         "linux": [
           "live-dav"
+        ],
+        "windows": [
+          "live-dav"
+        ],
+        "android": [
+          "live-dav"
         ]
       }
     },
@@ -377,6 +661,14 @@
         "linux": [
           "script",
           "live-dav"
+        ],
+        "windows": [
+          "script",
+          "live-dav"
+        ],
+        "android": [
+          "script",
+          "live-dav"
         ]
       }
     },
@@ -385,6 +677,12 @@
       "notes": "One source and one destination only, like upstream's mv in its rename form. Covered by the live WebDAV suite.",
       "verified_on": {
         "linux": [
+          "live-dav"
+        ],
+        "windows": [
+          "live-dav"
+        ],
+        "android": [
           "live-dav"
         ]
       }
@@ -397,6 +695,16 @@
           "live-dav",
           "live-s3",
           "live-sftp"
+        ],
+        "windows": [
+          "live-dav",
+          "live-s3",
+          "live-sftp"
+        ],
+        "android": [
+          "live-dav",
+          "live-s3",
+          "live-sftp"
         ]
       }
     },
@@ -406,6 +714,12 @@
       "verified_on": {
         "linux": [
           "live-dav"
+        ],
+        "windows": [
+          "live-dav"
+        ],
+        "android": [
+          "live-dav"
         ]
       }
     },
@@ -414,6 +728,14 @@
       "notes": "Same implementation as 'put', including its -speed=, -append and -resumesupport= switches. Transfer presets of the implementation this alias shares apply (by name, with the site, or by rule), covered by the preset tests of the script and live WebDAV suites. Resume-capable transfers stage through upstream's '.filepart' name and are moved onto the destination only when complete, so an interrupted transfer never leaves a truncated file under the final name; a continuation reads the staging file only, never splices the existing destination, and 'option resume automatic' (the default) stages binary files from upstream's 100 KB threshold, 'on' stages everything and 'off' nothing; all three behaviors are exercised against a live SFTP server.",
       "verified_on": {
         "linux": [
+          "script",
+          "live-dav"
+        ],
+        "windows": [
+          "script",
+          "live-dav"
+        ],
+        "android": [
           "script",
           "live-dav"
         ]
@@ -426,6 +748,14 @@
         "linux": [
           "script",
           "live-dav"
+        ],
+        "windows": [
+          "script",
+          "live-dav"
+        ],
+        "android": [
+          "script",
+          "live-dav"
         ]
       }
     },
@@ -434,6 +764,14 @@
       "notes": "Prints the one listing line upstream prints for the path (the line 'ls -l' shows: permissions, links, owner, group, size, time and name), exactly one line with no key/value text. The breakdown this used to print lives on as the LinSCP addition 'attr', which the graphical client parses instead. Covered by the live WebDAV and S3 suites.",
       "verified_on": {
         "linux": [
+          "live-dav",
+          "live-s3"
+        ],
+        "windows": [
+          "live-dav",
+          "live-s3"
+        ],
+        "android": [
           "live-dav",
           "live-s3"
         ]
@@ -446,6 +784,14 @@
         "linux": [
           "live-sftp",
           "live-dav"
+        ],
+        "windows": [
+          "live-sftp",
+          "live-dav"
+        ],
+        "android": [
+          "live-sftp",
+          "live-dav"
         ]
       }
     },
@@ -454,6 +800,18 @@
       "notes": "Planner with direction, -criteria= (upstream's 'none', 'either' and 'both', or a comma-separated list of 'time', 'size' and 'checksum'), -conflict=skip|local|remote|newer for two-way conflict resolution, -filemask=, -delete/-nodelete, -mirror, -transfer=binary|ascii|automatic, -preview, -nonrecursive, -interval= and -count=. Covered by unit, script, live-sftp and gui.",
       "verified_on": {
         "linux": [
+          "unit",
+          "script",
+          "live-sftp",
+          "gui"
+        ],
+        "windows": [
+          "unit",
+          "script",
+          "live-sftp",
+          "gui"
+        ],
+        "android": [
           "unit",
           "script",
           "live-sftp",
@@ -471,6 +829,14 @@
         "linux": [
           "unit",
           "live-sftp"
+        ],
+        "windows": [
+          "unit",
+          "live-sftp"
+        ],
+        "android": [
+          "unit",
+          "live-sftp"
         ]
       }
     },
@@ -480,6 +846,16 @@
       "notes": "Served by this client's own SSH code, not curl. A shell engine handles listings, `stat`, `cd` and the directory, permission, time and link commands. An rcp engine moves the bytes over the server's own `scp -f`/`scp -t`, with recursive trees, timestamps, permissions, ASCII conversion, speed limits and progress. Host keys are checked by the same code as for `sftp://`. The protocol cannot continue a partial transfer: a resume is refused by name, and a staging file left by an interrupted run is discarded rather than spliced onto. Covered by `LiveScpTest.py` (a throwaway `sshd` per test), the script suite, and the unit suite's engine checks.",
       "verified_on": {
         "linux": [
+          "live-scp",
+          "script",
+          "unit"
+        ],
+        "windows": [
+          "live-scp",
+          "script",
+          "unit"
+        ],
+        "android": [
           "live-scp",
           "script",
           "unit"
@@ -494,6 +870,14 @@
         "linux": [
           "unit",
           "live-curl"
+        ],
+        "windows": [
+          "unit",
+          "live-curl"
+        ],
+        "android": [
+          "unit",
+          "live-curl"
         ]
       }
     },
@@ -503,6 +887,14 @@
       "notes": "PROPFIND-driven filesystem (Depth 0/1 listings, stat, MKCOL, MOVE, single-file COPY with streamed fallback, non-empty rmdir guard, escaped paths, LOCK/UNLOCK with If-header write protection, PROPPATCH dead properties, and ETag preconditions: 'etag' records an If-Match or If-None-Match tag per path and a WebDAV write of that path sends it in one no-tag If list next to any lock token, with a stale tag refused by the server with 412 and the destination left untouched), covered by unit, live-dav and - for the refusal on a protocol with no entity tags - live-sftp.",
       "verified_on": {
         "linux": [
+          "unit",
+          "live-dav"
+        ],
+        "windows": [
+          "unit",
+          "live-dav"
+        ],
+        "android": [
           "unit",
           "live-dav"
         ]
@@ -516,6 +908,14 @@
         "linux": [
           "unit",
           "live-s3"
+        ],
+        "windows": [
+          "unit",
+          "live-s3"
+        ],
+        "android": [
+          "unit",
+          "live-s3"
         ]
       }
     },
@@ -525,6 +925,26 @@
       "notes": "Binary/ASCII/automatic transfers with LinSCP file masks, transfer presets, .filepart staging and resume (S3 historical downloads use a version-ID-specific staging suffix), -append, -speed= pacing/throttling, -preservetime[=all] and -permissions, live PTY progress callbacks (curl's meter and the native engines' own), and GUI transfer queue prioritization and cancellation, covered by unit, script, live-sftp, live-scp, live-dav, live-curl, gui and gui-browser-upload.",
       "verified_on": {
         "linux": [
+          "unit",
+          "script",
+          "live-sftp",
+          "live-scp",
+          "live-dav",
+          "live-curl",
+          "gui",
+          "gui-browser-upload"
+        ],
+        "windows": [
+          "unit",
+          "script",
+          "live-sftp",
+          "live-scp",
+          "live-dav",
+          "live-curl",
+          "gui",
+          "gui-browser-upload"
+        ],
+        "android": [
           "unit",
           "script",
           "live-sftp",
@@ -548,6 +968,22 @@
           "live-dav",
           "gui",
           "gui-browser-upload"
+        ],
+        "windows": [
+          "unit",
+          "script",
+          "live-sftp",
+          "live-dav",
+          "gui",
+          "gui-browser-upload"
+        ],
+        "android": [
+          "unit",
+          "script",
+          "live-sftp",
+          "live-dav",
+          "gui",
+          "gui-browser-upload"
         ]
       }
     },
@@ -557,6 +993,22 @@
       "notes": "Shared `sessions.ini` site manager with `sessions.key` password encryption, folder trees (`sessions folders`, `sessions [folder/]`, `rmsession -folder` and GUI folder headers), transfer presets, stored proxy, FTP/TLS and S3 raw settings, and named workspaces in workspaces.json that restore tab order, the active tab and both pane paths. Covered by the unit, script, live-sftp, live-curl, gui and gui-local suites. Tunnel connection policy and encrypted jump credentials are shared with the GUI. Import from an OpenSSH client configuration and FileZilla sitemanager.xml encrypts imported passwords with sessions.key and keeps unrelated sites and comments in sessions.ini.",
       "verified_on": {
         "linux": [
+          "unit",
+          "script",
+          "live-sftp",
+          "live-curl",
+          "gui",
+          "gui-local"
+        ],
+        "windows": [
+          "unit",
+          "script",
+          "live-sftp",
+          "live-curl",
+          "gui",
+          "gui-local"
+        ],
+        "android": [
           "unit",
           "script",
           "live-sftp",
@@ -597,6 +1049,24 @@
           "gui-search",
           "gui-security",
           "gui-local"
+        ],
+        "windows": [
+          "gui",
+          "gui-localization",
+          "gui-browser-upload",
+          "gui-local-editor",
+          "gui-search",
+          "gui-security",
+          "gui-local"
+        ],
+        "android": [
+          "gui",
+          "gui-localization",
+          "gui-browser-upload",
+          "gui-local-editor",
+          "gui-search",
+          "gui-security",
+          "gui-local"
         ]
       }
     },
@@ -606,6 +1076,20 @@
       "notes": "CLI remote editing supports save monitoring (-monitor), conflict checks, EOL/BOM policy and legacy-encoding transcoding via iconv (byte-exact round-trip with error rejection); the browser supports local/remote text editing with conflict detection and bounded literal UTF-8 content search. Covered by unit, live-sftp, gui, gui-local-editor and gui-search.",
       "verified_on": {
         "linux": [
+          "unit",
+          "live-sftp",
+          "gui",
+          "gui-local-editor",
+          "gui-search"
+        ],
+        "windows": [
+          "unit",
+          "live-sftp",
+          "gui",
+          "gui-local-editor",
+          "gui-search"
+        ],
+        "android": [
           "unit",
           "live-sftp",
           "gui",
@@ -623,6 +1107,16 @@
           "script",
           "powershell",
           "dotnet"
+        ],
+        "windows": [
+          "script",
+          "powershell",
+          "dotnet"
+        ],
+        "android": [
+          "script",
+          "powershell",
+          "dotnet"
         ]
       }
     },
@@ -632,6 +1126,24 @@
       "notes": "The desktop entry registers SFTP/FTP/FTPS URLs and launches the graphical client through the desktop's own URI launcher, so it opens the same on a Wayland session as under X11; the GUI parses startup URLs without bypassing host-key verification, and launcher/core lookup supports relocatable prefixes. Local and remote pane desktop drops are tested using browser API fixtures, and a display-session decision that ignores Wayland is refused by the compatibility check. File-manager integration is per-user opt-in: 'linscp-gui --install-shell-integration' writes 'Upload with LinSCP' actions for Dolphin, GNOME Files and Nemo, which hold a validated selection for the Commander's confirmation dialog instead of transferring anything. Covered by gui-desktop-uri, gui-shell, script, gui, gui-browser-upload, unit and wayland-compatibility; real browser/desktop combinations and a live compositor still need acceptance validation, which no fixture here certifies.",
       "verified_on": {
         "linux": [
+          "gui-desktop-uri",
+          "script",
+          "gui",
+          "gui-browser-upload",
+          "unit",
+          "wayland-compatibility",
+          "gui-shell"
+        ],
+        "windows": [
+          "gui-desktop-uri",
+          "script",
+          "gui",
+          "gui-browser-upload",
+          "unit",
+          "wayland-compatibility",
+          "gui-shell"
+        ],
+        "android": [
           "gui-desktop-uri",
           "script",
           "gui",
@@ -669,6 +1181,20 @@
           "live-dav",
           "gui-desktop-uri",
           "wayland-compatibility"
+        ],
+        "windows": [
+          "unit",
+          "script",
+          "live-dav",
+          "gui-desktop-uri",
+          "wayland-compatibility"
+        ],
+        "android": [
+          "unit",
+          "script",
+          "live-dav",
+          "gui-desktop-uri",
+          "wayland-compatibility"
         ]
       }
     }
@@ -695,6 +1221,14 @@
         "linux": [
           "live-dav",
           "unit"
+        ],
+        "windows": [
+          "live-dav",
+          "unit"
+        ],
+        "android": [
+          "live-dav",
+          "unit"
         ]
       },
       "commands": [
@@ -711,6 +1245,14 @@
         "linux": [
           "unit",
           "live-sftp"
+        ],
+        "windows": [
+          "unit",
+          "live-sftp"
+        ],
+        "android": [
+          "unit",
+          "live-sftp"
         ]
       },
       "commands": [
@@ -723,6 +1265,12 @@
       "notes": "Store and forget a named site in sessions.ini, which 'open <name>' and the graphical site manager then resolve. Upstream has no such script commands; it edits the configuration through its GUI and the .NET assembly. The password given with -password is encrypted under sessions.key on save, '-rawsettings' stores the proxy settings with the site the same way - its password encrypted under the same key file, kept byte for byte across a re-save this machine cannot decrypt, dropped with the credential when ProxyMethod=None clears the proxy, and refused at open when the key file is gone rather than connected around - and a stored value that cannot be decrypted is preserved across an unrelated re-save. Covered by the script suite.",
       "verified_on": {
         "linux": [
+          "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
           "script"
         ]
       },
@@ -738,6 +1286,12 @@
       "verified_on": {
         "linux": [
           "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
+          "script"
         ]
       },
       "commands": [
@@ -751,6 +1305,12 @@
       "verified_on": {
         "linux": [
           "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
+          "script"
         ]
       },
       "commands": [
@@ -763,6 +1323,14 @@
       "notes": "Extra aliases accepted for convenience (rm, mkdir, synchronize, exit, exit). Upstream registers 'dir' but not these, so they are not counted as upstream coverage. Covered by the script suite (sync, quit, end) and the live WebDAV suite (md, del). The ? alias routes to help, and delsession routes to rmsession; covered by the script alias regression.",
       "verified_on": {
         "linux": [
+          "script",
+          "live-dav"
+        ],
+        "windows": [
+          "script",
+          "live-dav"
+        ],
+        "android": [
           "script",
           "live-dav"
         ]
@@ -785,6 +1353,14 @@
         "linux": [
           "live-dav",
           "live-s3"
+        ],
+        "windows": [
+          "live-dav",
+          "live-s3"
+        ],
+        "android": [
+          "live-dav",
+          "live-s3"
         ]
       },
       "commands": [
@@ -801,6 +1377,12 @@
       ],
       "verified_on": {
         "linux": [
+          "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
           "script"
         ]
       },
@@ -821,6 +1403,14 @@
       ],
       "verified_on": {
         "linux": [
+          "unit",
+          "gui"
+        ],
+        "windows": [
+          "unit",
+          "gui"
+        ],
+        "android": [
           "unit",
           "gui"
         ]
@@ -846,6 +1436,16 @@
           "live-dav",
           "live-sftp",
           "unit"
+        ],
+        "windows": [
+          "live-dav",
+          "live-sftp",
+          "unit"
+        ],
+        "android": [
+          "live-dav",
+          "live-sftp",
+          "unit"
         ]
       }
     },
@@ -866,6 +1466,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-s3"
+        ],
+        "windows": [
+          "live-s3"
+        ],
+        "android": [
           "live-s3"
         ]
       },
@@ -893,6 +1499,12 @@
       "verified_on": {
         "linux": [
           "live-sftp"
+        ],
+        "windows": [
+          "live-sftp"
+        ],
+        "android": [
+          "live-sftp"
         ]
       }
     },
@@ -913,6 +1525,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-sftp"
+        ],
+        "windows": [
+          "live-sftp"
+        ],
+        "android": [
           "live-sftp"
         ]
       }
@@ -935,6 +1553,12 @@
       "verified_on": {
         "linux": [
           "live-sftp"
+        ],
+        "windows": [
+          "live-sftp"
+        ],
+        "android": [
+          "live-sftp"
         ]
       }
     },
@@ -955,6 +1579,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-sftp"
+        ],
+        "windows": [
+          "live-sftp"
+        ],
+        "android": [
           "live-sftp"
         ]
       }
@@ -978,6 +1608,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-sftp"
+        ],
+        "windows": [
+          "live-sftp"
+        ],
+        "android": [
           "live-sftp"
         ]
       }
@@ -1014,6 +1650,16 @@
           "live-scp",
           "script",
           "unit"
+        ],
+        "windows": [
+          "live-scp",
+          "script",
+          "unit"
+        ],
+        "android": [
+          "live-scp",
+          "script",
+          "unit"
         ]
       }
     },
@@ -1041,6 +1687,14 @@
       },
       "verified_on": {
         "linux": [
+          "live-scp",
+          "unit"
+        ],
+        "windows": [
+          "live-scp",
+          "unit"
+        ],
+        "android": [
           "live-scp",
           "unit"
         ]
@@ -1072,6 +1726,14 @@
         "linux": [
           "live-scp",
           "unit"
+        ],
+        "windows": [
+          "live-scp",
+          "unit"
+        ],
+        "android": [
+          "live-scp",
+          "unit"
         ]
       }
     },
@@ -1092,6 +1754,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-curl"
+        ],
+        "windows": [
+          "live-curl"
+        ],
+        "android": [
           "live-curl"
         ]
       }
@@ -1121,6 +1789,14 @@
         "linux": [
           "unit",
           "live-curl"
+        ],
+        "windows": [
+          "unit",
+          "live-curl"
+        ],
+        "android": [
+          "unit",
+          "live-curl"
         ]
       }
     },
@@ -1144,6 +1820,14 @@
       },
       "verified_on": {
         "linux": [
+          "unit",
+          "live-curl"
+        ],
+        "windows": [
+          "unit",
+          "live-curl"
+        ],
+        "android": [
           "unit",
           "live-curl"
         ]
@@ -1171,6 +1855,14 @@
         "linux": [
           "unit",
           "live-curl"
+        ],
+        "windows": [
+          "unit",
+          "live-curl"
+        ],
+        "android": [
+          "unit",
+          "live-curl"
         ]
       }
     },
@@ -1191,6 +1883,12 @@
       "verified_on": {
         "linux": [
           "live-dav"
+        ],
+        "windows": [
+          "live-dav"
+        ],
+        "android": [
+          "live-dav"
         ]
       }
     },
@@ -1210,6 +1908,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-dav"
+        ],
+        "windows": [
+          "live-dav"
+        ],
+        "android": [
           "live-dav"
         ]
       }
@@ -1232,6 +1936,12 @@
       "verified_on": {
         "linux": [
           "live-dav"
+        ],
+        "windows": [
+          "live-dav"
+        ],
+        "android": [
+          "live-dav"
         ]
       }
     },
@@ -1250,6 +1960,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-dav"
+        ],
+        "windows": [
+          "live-dav"
+        ],
+        "android": [
           "live-dav"
         ]
       }
@@ -1274,6 +1990,14 @@
       },
       "verified_on": {
         "linux": [
+          "live-dav",
+          "unit"
+        ],
+        "windows": [
+          "live-dav",
+          "unit"
+        ],
+        "android": [
           "live-dav",
           "unit"
         ]
@@ -1301,6 +2025,14 @@
         "linux": [
           "live-dav",
           "unit"
+        ],
+        "windows": [
+          "live-dav",
+          "unit"
+        ],
+        "android": [
+          "live-dav",
+          "unit"
         ]
       }
     },
@@ -1321,6 +2053,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-s3"
+        ],
+        "windows": [
+          "live-s3"
+        ],
+        "android": [
           "live-s3"
         ]
       }
@@ -1343,6 +2081,12 @@
       "verified_on": {
         "linux": [
           "live-s3"
+        ],
+        "windows": [
+          "live-s3"
+        ],
+        "android": [
+          "live-s3"
         ]
       }
     },
@@ -1362,6 +2106,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-s3"
+        ],
+        "windows": [
+          "live-s3"
+        ],
+        "android": [
           "live-s3"
         ]
       }
@@ -1383,6 +2133,12 @@
       "verified_on": {
         "linux": [
           "live-s3"
+        ],
+        "windows": [
+          "live-s3"
+        ],
+        "android": [
+          "live-s3"
         ]
       }
     },
@@ -1403,6 +2159,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-s3"
+        ],
+        "windows": [
+          "live-s3"
+        ],
+        "android": [
           "live-s3"
         ]
       }
@@ -1429,6 +2191,14 @@
         "linux": [
           "live-s3",
           "unit"
+        ],
+        "windows": [
+          "live-s3",
+          "unit"
+        ],
+        "android": [
+          "live-s3",
+          "unit"
         ]
       }
     },
@@ -1451,6 +2221,14 @@
       },
       "verified_on": {
         "linux": [
+          "live-s3",
+          "unit"
+        ],
+        "windows": [
+          "live-s3",
+          "unit"
+        ],
+        "android": [
           "live-s3",
           "unit"
         ]
@@ -1477,6 +2255,14 @@
         "linux": [
           "unit",
           "live-sftp"
+        ],
+        "windows": [
+          "unit",
+          "live-sftp"
+        ],
+        "android": [
+          "unit",
+          "live-sftp"
         ]
       }
     },
@@ -1496,6 +2282,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-dav"
+        ],
+        "windows": [
+          "live-dav"
+        ],
+        "android": [
           "live-dav"
         ]
       }
@@ -1518,6 +2310,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-sftp"
+        ],
+        "windows": [
+          "live-sftp"
+        ],
+        "android": [
           "live-sftp"
         ]
       }
@@ -1542,6 +2340,14 @@
         "linux": [
           "script",
           "live-sftp"
+        ],
+        "windows": [
+          "script",
+          "live-sftp"
+        ],
+        "android": [
+          "script",
+          "live-sftp"
         ]
       }
     },
@@ -1563,6 +2369,12 @@
       "verified_on": {
         "linux": [
           "live-sftp"
+        ],
+        "windows": [
+          "live-sftp"
+        ],
+        "android": [
+          "live-sftp"
         ]
       }
     },
@@ -1582,6 +2394,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-sftp"
+        ],
+        "windows": [
+          "live-sftp"
+        ],
+        "android": [
           "live-sftp"
         ]
       }
@@ -1605,6 +2423,14 @@
       },
       "verified_on": {
         "linux": [
+          "script",
+          "live-dav"
+        ],
+        "windows": [
+          "script",
+          "live-dav"
+        ],
+        "android": [
           "script",
           "live-dav"
         ]
@@ -1632,6 +2458,14 @@
         "linux": [
           "gui",
           "gui-browser-upload"
+        ],
+        "windows": [
+          "gui",
+          "gui-browser-upload"
+        ],
+        "android": [
+          "gui",
+          "gui-browser-upload"
         ]
       }
     },
@@ -1656,6 +2490,14 @@
         "linux": [
           "live-curl",
           "unit"
+        ],
+        "windows": [
+          "live-curl",
+          "unit"
+        ],
+        "android": [
+          "live-curl",
+          "unit"
         ]
       }
     },
@@ -1675,6 +2517,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-dav"
+        ],
+        "windows": [
+          "live-dav"
+        ],
+        "android": [
           "live-dav"
         ]
       }
@@ -1698,6 +2546,14 @@
       },
       "verified_on": {
         "linux": [
+          "live-sftp",
+          "unit"
+        ],
+        "windows": [
+          "live-sftp",
+          "unit"
+        ],
+        "android": [
           "live-sftp",
           "unit"
         ]
@@ -1724,6 +2580,14 @@
         "linux": [
           "live-sftp",
           "unit"
+        ],
+        "windows": [
+          "live-sftp",
+          "unit"
+        ],
+        "android": [
+          "live-sftp",
+          "unit"
         ]
       }
     },
@@ -1744,6 +2608,12 @@
       "verified_on": {
         "linux": [
           "live-sftp"
+        ],
+        "windows": [
+          "live-sftp"
+        ],
+        "android": [
+          "live-sftp"
         ]
       }
     },
@@ -1763,6 +2633,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-dav"
+        ],
+        "windows": [
+          "live-dav"
+        ],
+        "android": [
           "live-dav"
         ]
       }
@@ -1790,6 +2666,16 @@
       },
       "verified_on": {
         "linux": [
+          "live-sftp",
+          "script",
+          "unit"
+        ],
+        "windows": [
+          "live-sftp",
+          "script",
+          "unit"
+        ],
+        "android": [
           "live-sftp",
           "script",
           "unit"
@@ -1827,6 +2713,18 @@
           "gui-browser-upload",
           "live-sftp",
           "unit"
+        ],
+        "windows": [
+          "gui",
+          "gui-browser-upload",
+          "live-sftp",
+          "unit"
+        ],
+        "android": [
+          "gui",
+          "gui-browser-upload",
+          "live-sftp",
+          "unit"
         ]
       }
     },
@@ -1847,6 +2745,12 @@
       },
       "verified_on": {
         "linux": [
+          "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
           "script"
         ]
       }
@@ -1869,6 +2773,12 @@
       "verified_on": {
         "linux": [
           "live-sftp"
+        ],
+        "windows": [
+          "live-sftp"
+        ],
+        "android": [
+          "live-sftp"
         ]
       }
     },
@@ -1889,6 +2799,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-sftp"
+        ],
+        "windows": [
+          "live-sftp"
+        ],
+        "android": [
           "live-sftp"
         ]
       }
@@ -1916,6 +2832,16 @@
       },
       "verified_on": {
         "linux": [
+          "live-curl",
+          "script",
+          "unit"
+        ],
+        "windows": [
+          "live-curl",
+          "script",
+          "unit"
+        ],
+        "android": [
           "live-curl",
           "script",
           "unit"
@@ -1950,6 +2876,16 @@
           "gui",
           "script",
           "unit"
+        ],
+        "windows": [
+          "gui",
+          "script",
+          "unit"
+        ],
+        "android": [
+          "gui",
+          "script",
+          "unit"
         ]
       }
     },
@@ -1969,6 +2905,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-sftp"
+        ],
+        "windows": [
+          "live-sftp"
+        ],
+        "android": [
           "live-sftp"
         ]
       }
@@ -1997,6 +2939,16 @@
       },
       "verified_on": {
         "linux": [
+          "live-sftp",
+          "script",
+          "unit"
+        ],
+        "windows": [
+          "live-sftp",
+          "script",
+          "unit"
+        ],
+        "android": [
           "live-sftp",
           "script",
           "unit"
@@ -2037,6 +2989,20 @@
           "live-sftp",
           "script",
           "unit"
+        ],
+        "windows": [
+          "live-curl",
+          "live-scp",
+          "live-sftp",
+          "script",
+          "unit"
+        ],
+        "android": [
+          "live-curl",
+          "live-scp",
+          "live-sftp",
+          "script",
+          "unit"
         ]
       }
     },
@@ -2062,6 +3028,14 @@
         "linux": [
           "live-dav",
           "live-sftp"
+        ],
+        "windows": [
+          "live-dav",
+          "live-sftp"
+        ],
+        "android": [
+          "live-dav",
+          "live-sftp"
         ]
       }
     },
@@ -2080,6 +3054,12 @@
       },
       "verified_on": {
         "linux": [
+          "gui-browser-upload"
+        ],
+        "windows": [
+          "gui-browser-upload"
+        ],
+        "android": [
           "gui-browser-upload"
         ]
       }
@@ -2151,6 +3131,20 @@
       },
       "verified_on": {
         "linux": [
+          "unit",
+          "script",
+          "live-tunnel",
+          "gui-security",
+          "gui"
+        ],
+        "windows": [
+          "unit",
+          "script",
+          "live-tunnel",
+          "gui-security",
+          "gui"
+        ],
+        "android": [
           "unit",
           "script",
           "live-tunnel",
@@ -2242,6 +3236,12 @@
       "verified_on": {
         "linux": [
           "gui-security"
+        ],
+        "windows": [
+          "gui-security"
+        ],
+        "android": [
+          "gui-security"
         ]
       }
     },
@@ -2263,6 +3263,12 @@
       },
       "verified_on": {
         "linux": [
+          "gui"
+        ],
+        "windows": [
+          "gui"
+        ],
+        "android": [
           "gui"
         ]
       }
@@ -2289,6 +3295,14 @@
         "linux": [
           "gui",
           "gui-browser-upload"
+        ],
+        "windows": [
+          "gui",
+          "gui-browser-upload"
+        ],
+        "android": [
+          "gui",
+          "gui-browser-upload"
         ]
       }
     },
@@ -2310,6 +3324,12 @@
       "verified_on": {
         "linux": [
           "gui"
+        ],
+        "windows": [
+          "gui"
+        ],
+        "android": [
+          "gui"
         ]
       }
     },
@@ -2330,6 +3350,12 @@
       "verified_on": {
         "linux": [
           "gui"
+        ],
+        "windows": [
+          "gui"
+        ],
+        "android": [
+          "gui"
         ]
       }
     },
@@ -2349,6 +3375,12 @@
       },
       "verified_on": {
         "linux": [
+          "gui"
+        ],
+        "windows": [
+          "gui"
+        ],
+        "android": [
           "gui"
         ]
       }
@@ -2372,6 +3404,14 @@
       },
       "verified_on": {
         "linux": [
+          "gui",
+          "gui-browser-upload"
+        ],
+        "windows": [
+          "gui",
+          "gui-browser-upload"
+        ],
+        "android": [
           "gui",
           "gui-browser-upload"
         ]
@@ -2405,6 +3445,16 @@
           "gui",
           "gui-browser-upload",
           "live-dav"
+        ],
+        "windows": [
+          "gui",
+          "gui-browser-upload",
+          "live-dav"
+        ],
+        "android": [
+          "gui",
+          "gui-browser-upload",
+          "live-dav"
         ]
       }
     },
@@ -2431,6 +3481,14 @@
         "linux": [
           "gui",
           "gui-browser-upload"
+        ],
+        "windows": [
+          "gui",
+          "gui-browser-upload"
+        ],
+        "android": [
+          "gui",
+          "gui-browser-upload"
         ]
       }
     },
@@ -2453,6 +3511,14 @@
       },
       "verified_on": {
         "linux": [
+          "gui",
+          "gui-browser-upload"
+        ],
+        "windows": [
+          "gui",
+          "gui-browser-upload"
+        ],
+        "android": [
           "gui",
           "gui-browser-upload"
         ]
@@ -2493,6 +3559,14 @@
         "linux": [
           "gui",
           "gui-security"
+        ],
+        "windows": [
+          "gui",
+          "gui-security"
+        ],
+        "android": [
+          "gui",
+          "gui-security"
         ]
       }
     },
@@ -2522,6 +3596,16 @@
           "gui",
           "live-sftp",
           "unit"
+        ],
+        "windows": [
+          "gui",
+          "live-sftp",
+          "unit"
+        ],
+        "android": [
+          "gui",
+          "live-sftp",
+          "unit"
         ]
       }
     },
@@ -2543,6 +3627,12 @@
       "verified_on": {
         "linux": [
           "gui-local-editor"
+        ],
+        "windows": [
+          "gui-local-editor"
+        ],
+        "android": [
+          "gui-local-editor"
         ]
       }
     },
@@ -2562,6 +3652,12 @@
       },
       "verified_on": {
         "linux": [
+          "gui-search"
+        ],
+        "windows": [
+          "gui-search"
+        ],
+        "android": [
           "gui-search"
         ]
       }
@@ -2585,6 +3681,14 @@
       },
       "verified_on": {
         "linux": [
+          "live-sftp",
+          "unit"
+        ],
+        "windows": [
+          "live-sftp",
+          "unit"
+        ],
+        "android": [
           "live-sftp",
           "unit"
         ]
@@ -2615,6 +3719,16 @@
           "gui-local-editor",
           "live-sftp",
           "unit"
+        ],
+        "windows": [
+          "gui-local-editor",
+          "live-sftp",
+          "unit"
+        ],
+        "android": [
+          "gui-local-editor",
+          "live-sftp",
+          "unit"
         ]
       }
     },
@@ -2637,6 +3751,12 @@
       "verified_on": {
         "linux": [
           "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
+          "script"
         ]
       }
     },
@@ -2655,6 +3775,12 @@
       },
       "verified_on": {
         "linux": [
+          "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
           "script"
         ]
       }
@@ -2679,6 +3805,14 @@
       },
       "verified_on": {
         "linux": [
+          "script",
+          "gui-browser-upload"
+        ],
+        "windows": [
+          "script",
+          "gui-browser-upload"
+        ],
+        "android": [
           "script",
           "gui-browser-upload"
         ]
@@ -2711,6 +3845,16 @@
           "live-sftp",
           "script",
           "unit"
+        ],
+        "windows": [
+          "live-sftp",
+          "script",
+          "unit"
+        ],
+        "android": [
+          "live-sftp",
+          "script",
+          "unit"
         ]
       }
     },
@@ -2738,6 +3882,12 @@
       },
       "verified_on": {
         "linux": [
+          "dotnet"
+        ],
+        "windows": [
+          "dotnet"
+        ],
+        "android": [
           "dotnet"
         ]
       }
@@ -2767,6 +3917,12 @@
       "verified_on": {
         "linux": [
           "powershell"
+        ],
+        "windows": [
+          "powershell"
+        ],
+        "android": [
+          "powershell"
         ]
       }
     },
@@ -2787,6 +3943,12 @@
       },
       "verified_on": {
         "linux": [
+          "gui-desktop-uri"
+        ],
+        "windows": [
+          "gui-desktop-uri"
+        ],
+        "android": [
           "gui-desktop-uri"
         ]
       }
@@ -2813,6 +3975,14 @@
         "linux": [
           "script",
           "gui-desktop-uri"
+        ],
+        "windows": [
+          "script",
+          "gui-desktop-uri"
+        ],
+        "android": [
+          "script",
+          "gui-desktop-uri"
         ]
       }
     },
@@ -2836,6 +4006,14 @@
       },
       "verified_on": {
         "linux": [
+          "gui",
+          "gui-browser-upload"
+        ],
+        "windows": [
+          "gui",
+          "gui-browser-upload"
+        ],
+        "android": [
           "gui",
           "gui-browser-upload"
         ]
@@ -2882,6 +4060,18 @@
           "script",
           "unit",
           "wayland-compatibility"
+        ],
+        "windows": [
+          "gui-desktop-uri",
+          "script",
+          "unit",
+          "wayland-compatibility"
+        ],
+        "android": [
+          "gui-desktop-uri",
+          "script",
+          "unit",
+          "wayland-compatibility"
         ]
       }
     },
@@ -2918,6 +4108,14 @@
       },
       "verified_on": {
         "linux": [
+          "gui-shell",
+          "gui-security"
+        ],
+        "windows": [
+          "gui-shell",
+          "gui-security"
+        ],
+        "android": [
           "gui-shell",
           "gui-security"
         ]
@@ -3012,6 +4210,12 @@
       "verified_on": {
         "linux": [
           "gui"
+        ],
+        "windows": [
+          "gui"
+        ],
+        "android": [
+          "gui"
         ]
       }
     },
@@ -3031,6 +4235,12 @@
       "verified_on": {
         "linux": [
           "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
+          "script"
         ]
       }
     },
@@ -3049,6 +4259,12 @@
       },
       "verified_on": {
         "linux": [
+          "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
           "script"
         ]
       }
@@ -3070,6 +4286,12 @@
       "verified_on": {
         "linux": [
           "script"
+        ],
+        "windows": [
+          "script"
+        ],
+        "android": [
+          "script"
         ]
       }
     },
@@ -3089,6 +4311,12 @@
       "verified_on": {
         "linux": [
           "gui-desktop-uri"
+        ],
+        "windows": [
+          "gui-desktop-uri"
+        ],
+        "android": [
+          "gui-desktop-uri"
         ]
       }
     },
@@ -3107,6 +4335,12 @@
       },
       "verified_on": {
         "linux": [
+          "unit"
+        ],
+        "windows": [
+          "unit"
+        ],
+        "android": [
           "unit"
         ]
       }
@@ -3132,6 +4366,14 @@
         "linux": [
           "unit",
           "script"
+        ],
+        "windows": [
+          "unit",
+          "script"
+        ],
+        "android": [
+          "unit",
+          "script"
         ]
       }
     },
@@ -3152,6 +4394,12 @@
       },
       "verified_on": {
         "linux": [
+          "live-dav"
+        ],
+        "windows": [
+          "live-dav"
+        ],
+        "android": [
           "live-dav"
         ]
       }
@@ -3184,6 +4432,12 @@
       "verified_on": {
         "linux": [
           "platform-conversion"
+        ],
+        "windows": [
+          "platform-conversion"
+        ],
+        "android": [
+          "platform-conversion"
         ]
       }
     },
@@ -3208,6 +4462,14 @@
       },
       "verified_on": {
         "linux": [
+          "unit",
+          "live-curl"
+        ],
+        "windows": [
+          "unit",
+          "live-curl"
+        ],
+        "android": [
           "unit",
           "live-curl"
         ]
@@ -3246,6 +4508,16 @@
           "live-dav",
           "live-sftp",
           "unit"
+        ],
+        "windows": [
+          "live-dav",
+          "live-sftp",
+          "unit"
+        ],
+        "android": [
+          "live-dav",
+          "live-sftp",
+          "unit"
         ]
       }
     },
@@ -3268,6 +4540,12 @@
       "verified_on": {
         "linux": [
           "live-s3"
+        ],
+        "windows": [
+          "live-s3"
+        ],
+        "android": [
+          "live-s3"
         ]
       }
     },
@@ -3288,6 +4566,12 @@
       },
       "verified_on": {
         "linux": [
+          "unit"
+        ],
+        "windows": [
+          "unit"
+        ],
+        "android": [
           "unit"
         ]
       }
@@ -3321,6 +4605,16 @@
           "script",
           "live-sftp",
           "unit"
+        ],
+        "windows": [
+          "script",
+          "live-sftp",
+          "unit"
+        ],
+        "android": [
+          "script",
+          "live-sftp",
+          "unit"
         ]
       }
     },
@@ -3349,6 +4643,12 @@
       "verified_on": {
         "linux": [
           "gui-local"
+        ],
+        "windows": [
+          "gui-local"
+        ],
+        "android": [
+          "gui-local"
         ]
       }
     },
@@ -3374,6 +4674,12 @@
       },
       "verified_on": {
         "linux": [
+          "gui-local"
+        ],
+        "windows": [
+          "gui-local"
+        ],
+        "android": [
           "gui-local"
         ]
       }
@@ -3405,6 +4711,14 @@
         "linux": [
           "gui",
           "gui-local"
+        ],
+        "windows": [
+          "gui",
+          "gui-local"
+        ],
+        "android": [
+          "gui",
+          "gui-local"
         ]
       }
     },
@@ -3430,6 +4744,14 @@
       },
       "verified_on": {
         "linux": [
+          "gui",
+          "gui-local"
+        ],
+        "windows": [
+          "gui",
+          "gui-local"
+        ],
+        "android": [
           "gui",
           "gui-local"
         ]
@@ -3462,6 +4784,14 @@
         "linux": [
           "gui",
           "gui-local"
+        ],
+        "windows": [
+          "gui",
+          "gui-local"
+        ],
+        "android": [
+          "gui",
+          "gui-local"
         ]
       }
     },
@@ -3490,6 +4820,14 @@
       },
       "verified_on": {
         "linux": [
+          "gui",
+          "gui-local"
+        ],
+        "windows": [
+          "gui",
+          "gui-local"
+        ],
+        "android": [
           "gui",
           "gui-local"
         ]
@@ -3524,6 +4862,14 @@
         "linux": [
           "gui",
           "gui-local"
+        ],
+        "windows": [
+          "gui",
+          "gui-local"
+        ],
+        "android": [
+          "gui",
+          "gui-local"
         ]
       }
     },
@@ -3554,6 +4900,14 @@
       },
       "verified_on": {
         "linux": [
+          "gui",
+          "gui-local"
+        ],
+        "windows": [
+          "gui",
+          "gui-local"
+        ],
+        "android": [
           "gui",
           "gui-local"
         ]
@@ -3593,6 +4947,14 @@
         "linux": [
           "gui",
           "gui-local"
+        ],
+        "windows": [
+          "gui",
+          "gui-local"
+        ],
+        "android": [
+          "gui",
+          "gui-local"
         ]
       }
     },
@@ -3620,6 +4982,14 @@
       },
       "verified_on": {
         "linux": [
+          "gui",
+          "gui-local"
+        ],
+        "windows": [
+          "gui",
+          "gui-local"
+        ],
+        "android": [
           "gui",
           "gui-local"
         ]
