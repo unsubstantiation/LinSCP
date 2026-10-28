@@ -83,8 +83,20 @@ if(NPM)
     COMMAND ${NPM} --prefix ${CMAKE_SOURCE_DIR}/ui run test --if-present)
 endif()
 
-# Install the Rust binaries (cargo install layout)
+# Install the Rust binaries (cargo install layout) plus the shared
+# documentation, desktop and automation files that every installer ships.
+# TheChecker (tools/check_platform_conversion.py:INSTALLED_FILES) requires
+# all three installers (make, cmake, debian) to mention the same set.
 install(PROGRAMS ${CMAKE_SOURCE_DIR}/target/release/linscp
   DESTINATION bin)
 install(PROGRAMS ${CMAKE_SOURCE_DIR}/target/release/linscp-gui
   DESTINATION bin)
+install(FILES ${CMAKE_SOURCE_DIR}/docs/linscp.1 DESTINATION share/man/man1)
+install(FILES ${CMAKE_SOURCE_DIR}/debian/linscp.desktop DESTINATION share/applications)
+install(FILES ${CMAKE_SOURCE_DIR}/debian/linscp.png DESTINATION share/pixmaps)
+install(FILES ${CMAKE_SOURCE_DIR}/debian/linscp.svg DESTINATION share/icons/hicolor/scalable/apps)
+install(FILES ${CMAKE_SOURCE_DIR}/automation/LinSCP.psm1 DESTINATION share/linscp/automation)
+install(FILES ${CMAKE_SOURCE_DIR}/automation/dotnet/LinSCP/LinSCP.csproj
+              ${CMAKE_SOURCE_DIR}/automation/dotnet/LinSCP/Session.cs
+              ${CMAKE_SOURCE_DIR}/automation/dotnet/LinSCP/LinSCPCompat.cs
+        DESTINATION share/linscp/dotnet)
