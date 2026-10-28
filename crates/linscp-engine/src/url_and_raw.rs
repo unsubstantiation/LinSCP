@@ -1807,6 +1807,7 @@ pub async fn connect_site_spec(
         spec,
         proxy,
         tls,
+        config_dir,
         dest_ssh_cfg,
         tunnel_ssh_cfg,
         tunnel_local_port,
@@ -1816,8 +1817,9 @@ pub async fn connect_site_spec(
 
 async fn connect_site_spec_inner(
     spec: &ParsedSiteSpec,
-    proxy: ProxyConfig,
+    proxy: Option<ProxyConfig>,
     tls: TlsSettings,
+    config_dir: &Path,
     dest_ssh_cfg: SshConnectConfig,
     tunnel_ssh_cfg: Option<SshConnectConfig>,
     tunnel_local_port: u16,
@@ -1883,8 +1885,8 @@ async fn connect_site_spec_inner(
                 use_mlsd: spec.raw_fields.get("ftp_use_mlsd").map(String::as_str) != Some("0"),
                 mlsd_required: spec.raw_fields.get("ftp_use_mlsd").map(String::as_str)
                     == Some("2"),
-                tls,
-                proxy,
+                tls: tls.clone(),
+                proxy: proxy.clone(),
                 timeout,
             };
             let ftp = FtpSession::connect(ftp_cfg, tunnel_ssh_cfg.as_ref(), tunnel_local_port)
@@ -1911,8 +1913,8 @@ async fn connect_site_spec_inner(
                     Some(spec.session.username.clone())
                 },
                 password: spec.session.password.clone().map(Zeroizing::new),
-                tls,
-                proxy,
+                tls: tls.clone(),
+                proxy: proxy.clone(),
                 timeout,
             };
             let dav = WebDavSession::connect(dav_cfg, tunnel_ssh_cfg.as_ref(), tunnel_local_port)
@@ -2191,29 +2193,34 @@ pub async fn connect_gui_site_spec(
 
     let capture: Arc<std::sync::Mutex<Option<GuiHostKeyChallenge>>> =
         Arc::new(std::sync::Mutex::new(None));
-    dest_ssh_cfg.host_key_decision = make_gui_ssh_host_key_callback(
+    dest_ssh_cfg.host_key_decision = Some(make_gui_ssh_host_key_callback(
         false,
-        spec.session.hostkey.clone().unwrap_or_default(),
+        spec.session.hostkey.clone(),
         config_dir.to_path_buf(),
         cache_pinned_hostkeys,
         locale.to_string(),
         Arc::clone(&capture),
-    );
+    ));
     if let Some(ref mut tun_cfg) = tunnel_ssh_cfg {
-        tun_cfg.host_key_decision = make_gui_ssh_host_key_callback(
+        tun_cfg.host_key_decision = Some(make_gui_ssh_host_key_callback(
             true,
-            spec.session.tunnel.hostkey.clone().unwrap_or_default(),
+            spec.session
+                .tunnel
+                .as_ref()
+                .map(|t| t.hostkey.clone())
+                .unwrap_or_default(),
             config_dir.to_path_buf(),
             cache_pinned_hostkeys,
             locale.to_string(),
             Arc::clone(&capture),
-        );
+        ));
     }
 
     match connect_site_spec_inner(
         spec,
         proxy,
         tls,
+        config_dir,
         dest_ssh_cfg,
         tunnel_ssh_cfg,
         tunnel_local_port,
