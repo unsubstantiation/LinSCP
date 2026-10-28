@@ -501,7 +501,7 @@ pub fn parse_gui_session_spec(
         username: tunnel_user,
         password: tunnel_password,
         keyfile: tunnel_keyfile,
-        hostkey: tunnel_hostkey,
+        hostkey: tunnel_hostkey.unwrap_or_default(),
         local_port: 0,
     };
 
