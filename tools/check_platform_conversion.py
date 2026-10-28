@@ -321,6 +321,11 @@ def check_windows_files(root=ROOT):
         relative = path.relative_to(root)
         if any(part in SKIP_DIRECTORIES for part in relative.parts):
             continue
+        # Android Gradle wrapper batch file is required for `gradlew assembleDebug`
+        # on Windows hosts and lives under crates/linscp-tauri/gen/android;
+        # it is not a leftover of the Windows port.
+        if relative.as_posix() == 'crates/linscp-tauri/gen/android/gradlew.bat':
+            continue
         if path.suffix.lower() in WINDOWS_FILE_SUFFIXES:
             findings.append((path, 0, 'windows-file',
                              'a file of another platform', path.name))
