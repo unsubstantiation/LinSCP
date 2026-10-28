@@ -4,7 +4,16 @@
   "version": "0.1.0",
   "identifier": "io.linscp.commander",
   "build": {
-    "frontendDist": "../../ui/dist"
+    "frontendDist": "../../ui/dist",
+    "beforeBuildCommand": "npm --prefix ../../ui run build"
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "deb", "appimage", "nsis"],
+    "icon": ["../../logo/linscp.png"],
+    "android": {
+      "minSdkVersion": 26
+    }
   },
   "app": {
     "windows": [
@@ -19,6 +28,12 @@
     ],
     "security": {
       "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": []
     }
   }
 }

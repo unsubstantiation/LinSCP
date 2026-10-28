@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LinSCP</string>
+    <string name="main_activity_title">LinSCP Commander</string>
+    <string name="foreground_notification_title">LinSCP transfers</string>
+    <string name="foreground_notification_text">%1$d file(s) • %2$s</string>
+    <string name="foreground_notification_cancel">Cancel</string>
+    <string name="saf_grant_rationale">Grant folder access so LinSCP can browse this location. Your grant persists until revoked in system settings.</string>
+</resources>
