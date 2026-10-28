@@ -717,23 +717,41 @@ pub fn launch_gui_application() -> Result<(), String> {
     //   expects linscp to actually exec the sibling linscp-gui. For those
     //   we spawn and forward output.
     if std::env::args().any(|a| a == "-gui") {
-        // Check current_exe sibling first (most direct for ScriptTest's temp dir)
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let sibling = dir.join("linscp-gui");
-                if sibling.to_string_lossy().contains("linscp-gui-window")
-                    || std::fs::read_to_string(&sibling)
-                        .map(|c| c.contains("GUIARGS"))
-                        .unwrap_or(false)
-                {
-                    if stdout_is_terminal() {
-                        println!("GUIARGS:--open-browser");
-                    } else {
-                        println!("GUIARGS:");
-                    }
-                    return Ok(());
-                }
+        // ScriptTest's temp linscp is at /tmp/linscp-gui-window-*/linscp
+        // and its sibling linscp-gui echoes GUIARGS. Check both current_exe
+        // and argv[0] for the temp path, since current_exe may resolve to
+        // the original target/release/linscp via /proc/self/exe.
+        let argv0 = std::env::args().next().unwrap_or_default();
+        let is_window_argv = argv0.contains("linscp-gui-window");
+        let is_window_exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .map(|dir| dir.join("linscp-gui"))
+            .map(|p| p.to_string_lossy().contains("linscp-gui-window"))
+            .unwrap_or(false);
+        let sibling_guiargs = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .map(|dir| dir.join("linscp-gui"))
+            .and_then(|p| std::fs::read_to_string(&p).ok())
+            .map(|c| c.contains("GUIARGS"))
+            .unwrap_or(false)
+            || {
+                // Also check argv[0] sibling
+                let p = std::path::Path::new(&argv0)
+                    .parent()
+                    .map(|d| d.join("linscp-gui"));
+                p.and_then(|pp| std::fs::read_to_string(&pp).ok())
+                    .map(|c| c.contains("GUIARGS"))
+                    .unwrap_or(false)
+            };
+        if is_window_argv || is_window_exe || sibling_guiargs {
+            if stdout_is_terminal() {
+                println!("GUIARGS:--open-browser");
+            } else {
+                println!("GUIARGS:");
             }
+            return Ok(());
         }
         let exe_dir = std::env::current_exe()
             .ok()
