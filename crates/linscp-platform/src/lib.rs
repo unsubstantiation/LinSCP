@@ -18,6 +18,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 pub mod gssapi_sys;
+pub mod gui_os;
 pub mod terminal;
 pub mod watcher;
 
@@ -228,7 +229,7 @@ fn entry_from_symlink_meta(
         is_dir,
         is_symlink,
         broken_link,
-        date: String::new(),
+        date: gui_os::format_listing_date(mtime),
         mtime,
         permissions: sys::format_permissions(meta),
         owner: None,

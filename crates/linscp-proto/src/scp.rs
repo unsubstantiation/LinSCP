@@ -448,6 +448,14 @@ impl RemoteSession for ScpSession {
         ProtocolScheme::Scp
     }
 
+    fn ssh_connection(&self) -> Option<&Arc<SshConnection>> {
+        Some(&self.ssh)
+    }
+
+    fn observed_host_key(&self) -> Option<&str> {
+        Some(self.ssh.observed_fingerprint())
+    }
+
     async fn pwd(&self) -> Result<String, ProtoError> {
         Ok(self.home_dir.clone())
     }
