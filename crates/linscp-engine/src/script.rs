@@ -3337,7 +3337,7 @@ impl ScriptInterpreter {
             .upload(
                 &auth_keys,
                 TransferRequest {
-                    mode: Some(0o600),
+                    permissions: Some(0o600),
                     ..TransferRequest::default()
                 },
                 &mut reader,
