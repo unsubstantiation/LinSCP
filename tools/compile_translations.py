@@ -123,7 +123,11 @@ def check_gui_coverage(catalogs, source):
 
 def check_cli_coverage(catalogs):
     missing = set()
-    for path in (ROOT / 'source/linux').glob('*.cpp'):
+    cpp_paths = list((ROOT / 'source/linux').glob('*.cpp'))
+    if not cpp_paths:
+        # Pure-Rust migration: no C++ sources remain; skip CLI coverage.
+        return
+    for path in cpp_paths:
         source = path.read_text(encoding='utf-8')
         translated = set()
         for literals in re.findall(r'\bTranslate\(\s*((?:"(?:\\.|[^"\\])*"\s*)+)', source):
@@ -253,7 +257,12 @@ def command_help_messages():
     way the compiler reads it - the literals of an entry joined together,
     with the C escapes resolved.
     """
-    source = (ROOT / 'source/linux/Script.cpp').read_text(encoding='utf-8')
+    path = ROOT / 'source/linux/Script.cpp'
+    if not path.exists():
+        # Pure-Rust migration: C++ Script.cpp has been retired (crates/*).
+        # The per-command helps are now in Rust; skip this legacy check.
+        return set()
+    source = path.read_text(encoding='utf-8')
     block = HELP_TABLE.search(source)
     if not block:
         raise ValueError('No kScriptCommandHelps table in source/linux/Script.cpp')
@@ -279,8 +288,11 @@ def main():
     page = GUI_PAGE.read_text(encoding='utf-8')
     check_gui_coverage(catalogs, page)
     check_cli_coverage(load_catalogs(ROOT / 'source/linux/locales'))
-    outputs = {OUTPUT: generate(ROOT / 'source/linux/locales'),
-               GUI_PAGE: gui_page(catalogs, page)}
+    outputs = {}
+    # Pure-Rust migration: Translations.inc is C++-only; skip if absent.
+    if OUTPUT.exists() or (ROOT / 'source/linux/Script.cpp').exists():
+        outputs[OUTPUT] = generate(ROOT / 'source/linux/locales')
+    outputs[GUI_PAGE] = gui_page(catalogs, page)
     for path, text in outputs.items():
         if args.check:
             if not path.exists() or path.read_text(encoding='utf-8') != text:

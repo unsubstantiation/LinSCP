@@ -14,6 +14,8 @@ from compile_translations import (generate, ROOT, OUTPUT, load_catalogs,
 
 class TranslationTests(unittest.TestCase):
     def test_checked_in_table_is_current(self):
+        if not OUTPUT.exists():
+            self.skipTest('Translations.inc absent in pure-Rust build')
         self.assertEqual(generate(ROOT / 'source/linux/locales'), OUTPUT.read_text(encoding='utf-8'))
 
     def test_gui_is_current_and_all_source_messages_have_catalogs(self):
