@@ -1,3 +1,5 @@
+> **Historical:** This report predates the native GUI-only distribution. CLI, automation, and browser-server claims and test instructions below no longer describe shipped functionality.
+
 # Upstream parity audit and inventory guide
 
 **Full feature parity is not achieved.** LinSCP is a Linux-only client using

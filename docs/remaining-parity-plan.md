@@ -1,3 +1,5 @@
+> **Historical:** This report predates the native GUI-only distribution. CLI, automation, and browser-server claims and test instructions below no longer describe shipped functionality.
+
 # Remaining parity implementation plan
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.

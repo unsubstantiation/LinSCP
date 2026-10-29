@@ -228,11 +228,6 @@ REMOVED_ARTEFACTS = [
 # as loose files under /usr/share/linscp/gui/. The Debian/CMake/Make installers
 # were updated to ship the Rust binaries instead.
 INSTALLED_FILES = [
-    'automation/LinSCP.psm1',
-    'automation/dotnet/LinSCP/LinSCP.csproj',
-    'automation/dotnet/LinSCP/Session.cs',
-    'automation/dotnet/LinSCP/LinSCPCompat.cs',
-    'docs/linscp.1',
     'debian/linscp.desktop',
     'debian/linscp.png',
     'debian/linscp.svg',

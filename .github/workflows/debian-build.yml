@@ -10,7 +10,11 @@ jobs:
     name: Debian package (.deb)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
 
       - name: Install the Rust toolchain and packaging dependencies
         run: |
@@ -21,9 +25,13 @@ jobs:
           # $HOME/.cargo/bin is prepended to PATH so rustup's cargo runs
           # the build in debian/rules.
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            build-essential dpkg-dev pkg-config curl cargo rustc
+            build-essential dpkg-dev pkg-config curl cargo rustc nodejs npm \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Check GUI distribution configuration
+        run: python3 -m unittest discover -s tools/tests -p test_gui_distribution.py
 
       - name: Build the binary package
         run: python3 tools/run_cargo_ci.py dpkg-buildpackage -b -us -uc
@@ -34,12 +42,10 @@ jobs:
           echo "Built $deb"
           dpkg-deb --contents "$deb"
           contents=$(dpkg-deb --contents "$deb" | awk '{print $NF}' | sed 's|^\./||' | sort)
-          for path in usr/bin/linscp usr/bin/linscp-gui \
-                      usr/share/linscp/automation/LinSCP.psm1 \
+          for path in usr/bin/linscp-gui \
                       usr/share/applications/linscp.desktop \
                       usr/share/pixmaps/linscp.png \
-                      usr/share/icons/hicolor/scalable/apps/linscp.svg \
-                      usr/share/man/man1/linscp.1.gz; do
+                      usr/share/icons/hicolor/scalable/apps/linscp.svg; do
             echo "$contents" | grep -qx "$path" ||
               { echo "::error::$path is missing from the package"; exit 1; }
           done
@@ -49,12 +55,10 @@ jobs:
       - name: Install and smoke test the package
         run: |
           sudo dpkg -i ../linscp_*_*.deb
-          linscp -version
-          linscp -batch -command="echo ok; exit"
           test -x /usr/bin/linscp-gui
 
       - name: Upload the Debian package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linscp-debian
           path: linscp_*_*.deb

@@ -3,19 +3,11 @@ Version=1.0
 Type=Application
 Name=LinSCP
 GenericName=Secure File Transfer Client
-Comment=Dual-Pane File Transfer Client with SFTP, FTP, WebDAV and S3
-# --open-browser asks the desktop's own URI launcher for the window: a Wayland
-# compositor maps windows itself, and the X11 tools that used to place them are
-# not answered at all. TryExec says which program the entry needs, so that a
-# missing one is reported as a missing one.
-Exec=linscp-gui --open-browser %u
+Comment=Dual-Pane File Transfer Client
+Exec=linscp-gui
 TryExec=linscp-gui
 Icon=linscp
 Terminal=false
 Categories=Network;FileTransfer;
-Keywords=sftp;ftp;ftps;ftpes;webdav;s3;scp;linscp;commander;
-MimeType=x-scheme-handler/sftp;x-scheme-handler/ftp;x-scheme-handler/ftps;x-scheme-handler/ftpes;
-# Startup notification is not for this entry: it starts a server and prints an
-# address, and the window that opens belongs to a browser this launcher does not
-# own. A compositor waiting for a window from here waits until it gives up.
+Keywords=sftp;ftp;ftps;webdav;s3;scp;
 StartupNotify=false

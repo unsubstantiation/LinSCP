@@ -55,9 +55,9 @@ class WaylandCheckTests(unittest.TestCase):
         text = (check.ROOT / check.DESKTOP_ENTRY).read_text()
         self.assertIn('StartupNotify=false', text)
         self.assertIn('TryExec=linscp-gui', text)
-        # The window comes from the desktop's own launcher, so the entry asks
-        # for it instead of leaving the user to open the address by hand.
-        self.assertIn('--open-browser', text)
+        # The desktop entry runs the native GUI directly, not a browser server.
+        self.assertIn('Exec=linscp-gui\n', text)
+        self.assertNotIn('--open-browser', text)
 
     def test_the_real_detection_reads_both_display_servers(self):
         for relative in check.SESSION_DETECTORS:

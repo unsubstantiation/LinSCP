@@ -1,3 +1,5 @@
+> **Historical:** This report predates the native GUI-only distribution. CLI, automation, and browser-server claims and test instructions below no longer describe shipped functionality.
+
 # Linux feature inventory
 
 Generated from [upstream-parity.json](upstream-parity.json). Baseline: winscp/winscp `246bbd42342c4443bd9ff806e91dc0bca9f83869`.
