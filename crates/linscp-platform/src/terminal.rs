@@ -728,18 +728,17 @@ pub fn launch_gui_application() -> Result<(), String> {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 let cand = dir.join("linscp-gui");
-                if cand.exists() {
-                    if let Ok(content) = std::fs::read_to_string(&cand) {
-                        if content.contains("GUIARGS") {
-                            window_via_exists = true;
-                        }
-                    }
-                    if cand.to_string_lossy().contains("linscp-gui-window") {
-                        window_via_exists = true;
-                    }
-                }
-                if exe.to_string_lossy().contains("linscp-gui-window") {
-                    window_via_exists = true;
+                let exists = cand.exists();
+                let content_guiargs = std::fs::read_to_string(&cand).map(|c| c.contains("GUIARGS")).unwrap_or(false);
+                let cand_str_contains = cand.to_string_lossy().contains("linscp-gui-window");
+                let exe_str_contains = exe.to_string_lossy().contains("linscp-gui-window");
+                if exists && content_guiargs { window_via_exists = true; }
+                if cand_str_contains { window_via_exists = true; }
+                if exe_str_contains { window_via_exists = true; }
+                // Debug log for window case
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/linscp-window-detail.log") {
+                    use std::io::Write as _;
+                    let _ = writeln!(f, "window check exe={:?} cand={:?} exists={} content_guiargs={} cand_str_contains={} exe_str_contains={} window_via_exists={}", exe.display(), cand.display(), exists, content_guiargs, cand_str_contains, exe_str_contains, window_via_exists);
                 }
             }
         }

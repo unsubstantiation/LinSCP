@@ -61,6 +61,14 @@ jobs:
             else
               echo "no window debug log"
             fi
+            if [ -f /tmp/linscp-window-detail.log ]; then
+              while IFS= read -r line; do
+                printf '::notice::%s\n' "${line//]/%5D}"
+              done < /tmp/linscp-window-detail.log
+              cat /tmp/linscp-window-detail.log
+            else
+              echo "no window detail log"
+            fi
             ls -la /tmp/linscp-gui-window-*/ 2>/dev/null | head -n 30 || echo "no window dir"
             # Also check the binary's own debug via current_exe
             ls -lh /tmp/linscp-gui-window-*/linscp 2>/dev/null | head -n 5 || true
