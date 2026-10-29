@@ -89,7 +89,7 @@ object LinScpSafPlugin {
 
     fun readUriBytes(context: Context, uriString: String): ByteArray {
         val uri = Uri.parse(uriString)
-        context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        return context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
             ?: throw IllegalArgumentException("Cannot open SAF URI: $uriString")
     }
 
