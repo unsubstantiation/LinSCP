@@ -30,6 +30,8 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Check GUI distribution configuration
         run: python3 -m unittest discover -s tools/tests -p test_gui_distribution.py
 
@@ -59,7 +61,7 @@ jobs:
 
       - name: Smoke test the native window
         run: |
-          xvfb-run -a bash -euo pipefail -c '
+          if xvfb-run -a bash -euo pipefail -c '
             export WEBKIT_DISABLE_COMPOSITING_MODE=1
             linscp-gui &
             app=$!
@@ -77,8 +79,15 @@ jobs:
               sleep 1
             done
             echo "The LinSCP window did not open within 30 seconds" >&2
+            xdotool search --name ".*" getwindowname %@ || true
             exit 1
-          '
+          ' > native-smoke.log 2>&1; then
+            cat native-smoke.log
+          else
+            cat native-smoke.log
+            python3 -c 'from pathlib import Path; t=Path("native-smoke.log").read_text().replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"); print("::error title=Native window smoke test::" + t[-3000:])'
+            exit 1
+          fi
 
       - name: Upload the Debian package
         uses: actions/upload-artifact@v7
