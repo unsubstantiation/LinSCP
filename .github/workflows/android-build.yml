@@ -1,0 +1,77 @@
+name: Android build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Android (NDK + APK)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build and test the TypeScript UI
+        run: |
+          npm --prefix ui install --no-audit --no-fund
+          npm --prefix ui run build
+          npm --prefix ui test
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Check the Rust workspace for Android (arm64-v8a + x86_64)
+        run: |
+          if [ -z "${ANDROID_NDK_HOME:-}" ] && [ -d /usr/local/lib/android/sdk/ndk ]; then
+            echo "ANDROID_NDK_HOME=$(ls -d /usr/local/lib/android/sdk/ndk/* | sort -V | tail -n 1)" >> "$GITHUB_ENV"
+          fi
+          python3 tools/run_cargo_ci.py cargo ndk -t arm64-v8a -t x86_64 check \
+            -p linscp-types \
+            -p linscp-i18n \
+            -p linscp-crypto \
+            -p linscp-platform \
+            -p linscp-proto \
+            -p linscp-engine \
+            -p linscp-service \
+            -p linscp-http \
+            -p linscp-cli
+
+      - name: Run Android bridge unit tests (host)
+        run: |
+          python3 tools/run_cargo_ci.py cargo test -p linscp-platform --lib
+          python3 tools/run_cargo_ci.py cargo test -p linscp-tauri --lib
+
+      - name: Build the Termux CLI for aarch64-linux-android
+        run: bash tools/build-termux.sh
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build the debug APK with Gradle
+        working-directory: crates/linscp-tauri/gen/android
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload the APK and Termux CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: linscp-android
+          path: |
+            crates/linscp-tauri/gen/android/app/build/outputs/apk/debug/app-debug.apk
+            target/aarch64-linux-android/release/linscp
