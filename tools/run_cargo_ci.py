@@ -15,7 +15,9 @@ def main():
         return 2
     env = dict(os.environ)
     env['CARGO_TERM_COLOR'] = 'never'
-    proc = subprocess.run(cmd, text=True, capture_output=True, env=env)
+    # On Windows, console commands like `npm` are .cmd shims that
+    # CreateProcess cannot start directly; run them through the shell.
+    proc = subprocess.run(cmd, text=True, capture_output=True, env=env, shell=(os.name == 'nt'))
     if proc.stdout:
         sys.stdout.write(proc.stdout)
         sys.stdout.flush()
