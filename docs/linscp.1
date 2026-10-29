@@ -1,4 +1,4 @@
-.TH LINSCP 1 "2026-10-19" "LinSCP 1.0" "LinSCP"
+.TH LINSCP 1 "2026-10-28" "LinSCP 1.0" "LinSCP"
 .SH NAME
 linscp \- secure file transfer client for the command line
 .SH SYNOPSIS
@@ -19,10 +19,14 @@ is the console file transfer client of LinSCP. It connects to an SFTP or an
 SCP server over SSH, and transfers files to and from the local file system,
 either from a script, from a command line, or interactively.
 .PP
-SSH transport, authentication and host-key verification use libssh. The
-client speaks the SFTP v3 protocol over a libssh subsystem channel and
-implements SCP over libssh channels; neither protocol is delegated to curl
-or another SSH library.
+SSH transport, authentication and host-key verification use pure-Rust
+\fBrussh\fR (and \fBrussh-sftp\fR). The client speaks the SFTP v3 protocol
+over a \fBrussh\fR subsystem channel and implements SCP over \fBrussh\fR
+channels; neither protocol is delegated to curl or another C library.
+FTP/FTPS is served by \fBsuppaftp\fR (async-rustls) with a native
+Unix/DOS/VMS LIST + MLSD parser, WebDAV and S3 by \fBreqwest\fR + \fBrustls\fR
+(custom SPKI pinning and Min/MaxTlsVersion enforcement). TLS uses
+\fBrustls\fR with \fBring\fR and \fBwebpki-roots\fR.
 .SH OPTIONS
 .TP
 .BI \-script= file

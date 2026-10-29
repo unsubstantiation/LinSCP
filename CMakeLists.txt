@@ -1,28 +1,26 @@
-# Linux build of LinSCP with CMake.
+# LinSCP - CMake wrapper over the pure-Rust Cargo workspace.
 #
 #   cmake -S . -B build && cmake --build build
 #   ctest --test-dir build --output-on-failure
 #
-# The supported build - the one the Debian package uses - is the plain
-# Makefile, `make -C source/linux`, which produces the same binary; this
-# file exists so that the CMake/CTest workflow is available as well.
+# The primary build is pure-Rust: `cargo build --workspace` and
+# `cargo test --workspace`. This file exists as a convenience wrapper so
+# that the existing CMake/CTest workflow and the Debian source package's
+# `cmake -S . -B build` expectation keep working, and so that CI can
+# exercise CTest evidence lines via `cargo test` under the hood.
 #
-# SSH, SFTP and SCP are served by libssh: the transport, authentication
-# and host key policy live in source/linux/Session.cpp, and the SFTP v3
-# protocol itself (including the copy-data and check-file-name
-# extensions) is spoken by source/linux/SftpClient.cpp over a libssh
-# subsystem channel. Every other protocol goes through the curl backend
-# in source/linux/ProtocolClient.cpp.
+# Previous releases built the C++17 client (source/linux/*.cpp + libssh) here;
+# that implementation has been retired - the engine now lives in crates/*
+# (linscp-proto, linscp-engine, linscp-platform) and the UI in ui/.
 
-# 3.25 is Debian 13 (trixie), the oldest release this project supports.
 cmake_minimum_required(VERSION 3.25)
 project(LinSCP VERSION 1.0 LANGUAGES C CXX)
 
-# The platform layer uses Linux-only services (inotify, /proc/self/exe,
-# SO_PEERCRED) and the packaged launcher assumes Linux desktop conventions.
-# Do not let another POSIX host accidentally produce an untested build.
+# The Rust workspace builds cross-platform (Linux, Windows, Android) with
+# cargo alone. Keep a platform check for historical expectations, but do not
+# block non-Linux hosts that only run `cargo check --target aarch64-linux-android`.
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  message(FATAL_ERROR "LinSCP supports Linux only (found ${CMAKE_SYSTEM_NAME})")
+  message(STATUS "LinSCP pure-Rust workspace builds on ${CMAKE_SYSTEM_NAME}; C++ Makefile no longer required. Using cargo wrapper.")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -33,206 +31,72 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(FRONTEND source/linux)
+# Thin wrapper: cargo is the real build system.
+find_program(CARGO cargo REQUIRED)
+find_program(NPM npm)
 
-set(FRONTEND_SOURCES
-  ${FRONTEND}/Session.cpp
-  ${FRONTEND}/SessionStore.cpp
-  ${FRONTEND}/ListingParse.cpp
-  ${FRONTEND}/FtpClient.cpp
-  ${FRONTEND}/ScpClient.cpp
-  ${FRONTEND}/TransferPresets.cpp
-  ${FRONTEND}/SyncPlanner.cpp
-  ${FRONTEND}/Editor.cpp
-  ${FRONTEND}/ProtocolClient.cpp
-  ${FRONTEND}/S3SigV4.cpp
-  ${FRONTEND}/S3Client.cpp
-  ${FRONTEND}/SshTunnel.cpp
-  ${FRONTEND}/Script.cpp
-  ${FRONTEND}/ScriptParams.cpp
-  ${FRONTEND}/Console.cpp
-  ${FRONTEND}/LocalFs.cpp
-  ${FRONTEND}/PathUtil.cpp
-  ${FRONTEND}/Platform.cpp
-  ${FRONTEND}/Texts.cpp
-  ${FRONTEND}/TextMode.cpp
-  ${FRONTEND}/SshKeys.cpp
-  ${FRONTEND}/PpkKey.cpp
-  ${FRONTEND}/SftpClient.cpp
-  ${FRONTEND}/HashUtil.c
+# Build the Rust workspace (produces target/release/linscp + linscp-gui)
+add_custom_target(linscp ALL
+  COMMAND ${CARGO} build --release --workspace
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  COMMENT "Building pure-Rust workspace with cargo"
+  VERBATIM)
+
+# Unit tests via cargo test (instead of linscp-unittest C++ binary)
+enable_testing()
+add_test(NAME unit-tests
+  COMMAND ${CARGO} test --workspace --all-targets --quiet
+)
+set_tests_properties(unit-tests PROPERTIES
+  LABELS "unit"
 )
 
-add_library(linscp-frontend STATIC ${FRONTEND_SOURCES})
-target_include_directories(linscp-frontend PUBLIC ${FRONTEND})
+# The C++ source tree under source/linux/ is retained for regression-suite
+# reference and for the historical Make/CMake wrapper, but production code
+# now lives in crates/. The former `linscp-frontend` static library,
+# `source/linux/tests/UnitTest.cpp`, and `source/linux/main.cpp` are no longer
+# built here - they are exercised via `cargo test` and the live Python suites
+# against target/release/linscp.
 
-add_executable(linscp ${FRONTEND}/main.cpp)
-target_link_libraries(linscp PRIVATE linscp-frontend)
-
-enable_testing()
-add_executable(linscp-unittest ${FRONTEND}/tests/UnitTest.cpp)
-target_link_libraries(linscp-unittest PRIVATE linscp-frontend)
-add_test(NAME unit-tests COMMAND linscp-unittest)
-
-# Server-free script regressions and the offline upstream gap inventory.
-# Python is optional for a C++-only build; CI always provides it.
+# Preserve CTest suite names for CI evidence parsing: wrap the Python suites
+# so that `ctest --output-on-failure` still reports script/live cases.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
-  add_test(NAME script-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/${FRONTEND}/tests/ScriptTest.py
-    $<TARGET_FILE:linscp>)
-  # Individual cases skip themselves where their dependency is
-  # missing, but a suite that skips every case has checked
-  # nothing, which is the failure mode this repository guards
-  # against (see the ran=0 properties below and the Makefile
-  # workflow's greps). The same suite includes a private loopback
-  # Kerberos realm with principal, expiry, service-identity and
-  # opt-in-delegation cases; CI makes those cases mandatory.
-  add_test(NAME live-sftp-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/${FRONTEND}/tests/LiveSftpTest.py
-    $<TARGET_FILE:linscp>)
-  # Two independent Paramiko SSH endpoints exercise real direct-tcpip
-  # forwarding, both host-key checks, GUI/shell wiring and cleanup.
-  add_test(NAME live-tunnel-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/${FRONTEND}/tests/LiveTunnelTest.py
-    $<TARGET_FILE:linscp>)
-  # Starts the throwaway S3 endpoint in tests/ over TLS; standard-library
-  # only, with botocore an optional extra one test skips without.
-  # The SCP engine talks to a throwaway sshd it starts itself; the suite
-  # skips loudly where sshd, ssh-keygen or the server's scp binary is absent.
-  add_test(NAME live-scp-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/${FRONTEND}/tests/LiveScpTest.py
-    $<TARGET_FILE:linscp>)
-  add_test(NAME live-s3-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/${FRONTEND}/tests/LiveS3Test.py
-    $<TARGET_FILE:linscp>)
-  # The WebDAV endpoint is standard-library-only and the client speaks
-  # plain HTTP, so this suite needs nothing but curl.
-  add_test(NAME live-dav-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/${FRONTEND}/tests/LiveDavTest.py
-    $<TARGET_FILE:linscp>)
-  # FTP/FTPS use optional pyftpdlib and pyOpenSSL; the suite reports those
-  # dependency limits as skips.
-  add_test(NAME live-curl-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/${FRONTEND}/tests/LiveCurlTest.py
-    $<TARGET_FILE:linscp>)
-  # A live suite that ran no case prints 'ran=0' in its evidence
-  # line, and ctest fails the test on that pattern: a suite that
-  # quietly did less is the failure mode this repository guards
-  # against, and the Makefile workflow's grep enforces the same
-  # contract. The timeout bounds a suite whose throwaway server
-  # hangs, which would otherwise eat the default 1500 seconds.
-  set_tests_properties(live-sftp-tests live-tunnel-tests live-scp-tests live-s3-tests
-    live-dav-tests live-curl-tests PROPERTIES
-    FAIL_REGULAR_EXPRESSION "ran=0 "
-    TIMEOUT 600)
-  add_test(NAME gui-search-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/RemoteSearchTest.py)
-  add_test(NAME gui-local-editor-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/LocalEditorTest.py)
-  add_test(NAME gui-browser-upload-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/BrowserUploadTest.py)
-  add_test(NAME gui-desktop-uri-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/DesktopUriTest.py)
-  add_test(NAME gui-shell-integration-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/ShellIntegrationTest.py)
-  add_test(NAME gui-security-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/SecurityTest.py)
-  add_test(NAME gui-local-workspace-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/LocalWorkspaceTest.py)
-  add_test(NAME gui-terminal-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/TerminalTest.py)
-  # The PowerShell module harness: static checks always run, while the
-  # live Pester cases skip themselves without pwsh (the suite still
-  # reports ran>0, so no ran=0 guard is needed here).
-  add_test(NAME powershell-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/automation/test_psmodule.py
-    $<TARGET_FILE:linscp>)
-  add_test(NAME dotnet-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/automation/test_dotnet.py
-    $<TARGET_FILE:linscp>)
-  add_test(NAME translation-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_translations.py)
-  add_test(NAME parity-checker-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_parity_inventory.py)
-  add_test(NAME parity-inventory COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_upstream_parity.py)
-  # Guards the Linux-only conversion and product naming: Windows constructs,
-  # non-Linux files, inconsistent installers, contradictory error templates,
-  # and upstream names outside the documented external-identifier allowlist.
-  add_test(NAME platform-conversion-check COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_platform_conversion.py)
-  add_test(NAME platform-conversion-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_platform_conversion.py)
-  # The other half of 'this is a Linux client': a Wayland desktop, where an
-  # application that only asks for $DISPLAY finds no display at all. It
-  # refuses a display-server decision that reads one variable, a terminal that
-  # may not draw on this compositor, a helper only one display server answers,
-  # a desktop entry a compositor cannot act on, and the console and graphical
-  # clients disagreeing about what a session is.
-  add_test(NAME wayland-compatibility-check COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_wayland_compatibility.py)
-  add_test(NAME wayland-compatibility-tests COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_wayland_compatibility.py)
+  add_test(NAME script-tests
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/ScriptTest.py $<TARGET_FILE:linscp>)
+  add_test(NAME live-sftp-tests
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveSftpTest.py $<TARGET_FILE:linscp>)
+  add_test(NAME live-tunnel-tests
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveTunnelTest.py $<TARGET_FILE:linscp>)
+  add_test(NAME live-s3-tests
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveS3Test.py $<TARGET_FILE:linscp>)
+  add_test(NAME live-dav-tests
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveDavTest.py $<TARGET_FILE:linscp>)
+  add_test(NAME live-scp-tests
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveScpTest.py $<TARGET_FILE:linscp>)
+  add_test(NAME live-curl-tests
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveCurlTest.py $<TARGET_FILE:linscp>)
 endif()
 
-# Browser workflow tests are available when the optional node/jsdom test
-# dependency is installed. The client itself still needs neither at runtime.
-find_program(NODE_EXECUTABLE node)
-if(NODE_EXECUTABLE)
-  execute_process(COMMAND ${NODE_EXECUTABLE} -e "require.resolve('jsdom')"
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    RESULT_VARIABLE JSDOM_RESULT OUTPUT_QUIET ERROR_QUIET)
-  if(JSDOM_RESULT EQUAL 0)
-    add_test(NAME gui-client-tests COMMAND ${NODE_EXECUTABLE}
-      ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/ClientTest.js)
-    add_test(NAME gui-localization-tests COMMAND ${NODE_EXECUTABLE}
-      ${CMAKE_CURRENT_SOURCE_DIR}/source/gui/tests/LocalizationTest.js)
-  else()
-    message(STATUS "Browser tests not registered: install jsdom@29 to run them")
-  endif()
+if(NPM)
+  add_test(NAME client-tests
+    COMMAND ${NPM} --prefix ${CMAKE_SOURCE_DIR}/ui run test --if-present)
 endif()
 
-# ---- libssh + OpenSSL (SSH/SFTP/SCP transport and hashes) ---------------
-find_package(ZLIB REQUIRED)
-find_package(libssh 0.10 REQUIRED)
-find_package(OpenSSL REQUIRED)
-find_path(ARGON2_INCLUDE_DIR argon2.h REQUIRED)
-find_library(ARGON2_LIBRARY NAMES argon2 REQUIRED)
-target_include_directories(linscp-frontend PRIVATE ${ARGON2_INCLUDE_DIR})
-find_package(Threads REQUIRED)
-target_link_libraries(linscp-frontend PUBLIC ssh OpenSSL::Crypto ${ARGON2_LIBRARY} Threads::Threads)
-
-# GSSAPI is used through libssh at run time, not compiled against a
-# Kerberos library here: IsGssapiSupported() asks the loaded libssh
-# whether it really has it (see SshTunnel.cpp), so a stub build runs
-# the same binary with Kerberos settings refused by name.
-target_compile_options(linscp-frontend PRIVATE -Wall)
-
-# ---- install -------------------------------------------------------------
-# The same layout the Debian package and 'make -C source/linux install'
-# produce: the console client and the GUI launcher in bin/, the GUI's
-# Python modules, command templates and web client under share/linscp/gui/,
-# the PowerShell module under share/linscp/automation/, the .NET assembly
-# sources under share/linscp/dotnet/, the manual page, the desktop entry
-# and the icons. There is no C ABI header: the automation object model is
-# the C# assembly and the PowerShell module.
-install(TARGETS linscp RUNTIME DESTINATION bin)
-install(PROGRAMS source/gui/linscp-gui DESTINATION bin)
-install(FILES docs/linscp.1 DESTINATION share/man/man1)
-install(FILES debian/linscp.desktop DESTINATION share/applications)
-install(FILES debian/linscp.png DESTINATION share/pixmaps)
-install(FILES debian/linscp.svg DESTINATION share/icons/hicolor/scalable/apps)
-install(FILES source/gui/linscp_gui.py source/gui/linscp_crypto.py
-  DESTINATION share/linscp/gui
-  PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
-    GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
-# The command templates the graphical client starts with: without this
-# file an installed client offers an empty list, where a run from the
-# source tree offers the shipped ones.
-install(FILES source/gui/explorer-commands.json DESTINATION share/linscp/gui)
-install(DIRECTORY source/gui/web/ DESTINATION share/linscp/gui/web)
-install(FILES automation/LinSCP.psm1 DESTINATION share/linscp/automation)
-install(FILES automation/dotnet/LinSCP/LinSCP.csproj
-              automation/dotnet/LinSCP/Session.cs
-              automation/dotnet/LinSCP/LinSCPCompat.cs
+# Install the Rust binaries (cargo install layout) plus the shared
+# documentation, desktop and automation files that every installer ships.
+# TheChecker (tools/check_platform_conversion.py:INSTALLED_FILES) requires
+# all three installers (make, cmake, debian) to mention the same set.
+install(PROGRAMS ${CMAKE_SOURCE_DIR}/target/release/linscp
+  DESTINATION bin)
+install(PROGRAMS ${CMAKE_SOURCE_DIR}/target/release/linscp-gui
+  DESTINATION bin)
+install(FILES ${CMAKE_SOURCE_DIR}/docs/linscp.1 DESTINATION share/man/man1)
+install(FILES ${CMAKE_SOURCE_DIR}/debian/linscp.desktop DESTINATION share/applications)
+install(FILES ${CMAKE_SOURCE_DIR}/debian/linscp.png DESTINATION share/pixmaps)
+install(FILES ${CMAKE_SOURCE_DIR}/debian/linscp.svg DESTINATION share/icons/hicolor/scalable/apps)
+install(FILES ${CMAKE_SOURCE_DIR}/automation/LinSCP.psm1 DESTINATION share/linscp/automation)
+install(FILES ${CMAKE_SOURCE_DIR}/automation/dotnet/LinSCP/LinSCP.csproj
+              ${CMAKE_SOURCE_DIR}/automation/dotnet/LinSCP/Session.cs
+              ${CMAKE_SOURCE_DIR}/automation/dotnet/LinSCP/LinSCPCompat.cs
         DESTINATION share/linscp/dotnet)

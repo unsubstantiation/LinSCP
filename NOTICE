@@ -15,16 +15,41 @@ This is not an open source licence: commercial use is not granted.
 
 Third-party components
 
-SSH, SFTP and SCP transport, authentication and host-key handling are
-provided by libssh (https://www.libssh.org, LGPL-2.1-or-later), linked
-dynamically from the system. Hashing and PPK key conversion use OpenSSL's libcrypto
-(Apache-2.0). Argon2 key derivation for encrypted PPK v3 files uses the
-system libargon2 (CC0 1.0 or Apache-2.0, at the user's option). Neither
-library is vendored into this tree.
+The pure-Rust workspace replaces the former C++ dependencies:
+
+- SSH, SFTP and SCP transport, jump tunnels and host-key handling via `russh`
+  and `russh-sftp` (Apache-2.0), key parsing via `ssh-key`/`ssh-encoding` (MIT/Apache-2.0).
+- Cryptography: `argon2` (MIT), `aes`/`cbc` (MIT/Apache-2.0), `hmac`/`sha1`/`sha2`/`pbkdf2`
+  (MIT/Apache-2.0), `base64` (MIT/Apache-2.0), `zeroize` (MIT/Apache-2.0),
+  `bcrypt-pbkdf` (MIT/Apache-2.0), `ed25519-dalek`/`p256`/`p384`/`p521` (BSD/Apache-2.0),
+  `crc32fast`/`md-5` (MIT/Apache-2.0). PPK v2/v3 and `lscp1$` session encryption live in
+  `crates/linscp-crypto`.
+- TLS: `rustls` (Apache-2.0/MIT/ISC) with `ring` (ISC) and `webpki-roots`
+  (MPL-2.0), `tokio-rustls` (MIT/Apache-2.0), `rustls-pki-types` (MIT/Apache-2.0),
+  custom `ServerCertVerifier` wrapping `WebPkiServerVerifier` for SPKI pinning and
+  Min/MaxTlsVersion enforcement.
+- HTTP/WebDAV/S3: `reqwest` (MIT/Apache-2.0), `hyper` (MIT), `http` (MIT/Apache-2.0),
+  `quick-xml` (MIT), `bytes` (MIT), `http-body` (MIT).
+- FTP/FTPS: `suppaftp` (Apache-2.0/MIT) with native Unix/DOS/VMS LIST + MLSD parser
+  (`crates/linscp-proto/src/listing.rs`).
+- Async runtime: `tokio` (MIT).
+- Local filesystem & platform: `crossterm` (MIT), `portable-pty` (MIT), `notify`
+  (CC0/MIT), `encoding_rs` (BSD-3-Clause), `filetime` (MIT/Apache-2.0).
+- HTTP server mode: `axum` (MIT), `tower` (MIT), `tokio-tungstenite` (MIT/Apache-2.0),
+  `serde`/`serde_json` (MIT/Apache-2.0).
+- Tauri v2 desktop/mobile shell (`crates/linscp-tauri`) and plugins: `tauri`
+  (MIT/Apache-2.0), `tauri-plugin-dialog`/`fs`/`shell` (MIT/Apache-2.0).
+- UI: TypeScript + `esbuild` (MIT), and the browser terminal embeds xterm.js 6.0.0
+  and its FitAddon (source/gui/web/vendor/, MIT licence; full notice in
+  vendor/LICENSE-xterm.txt) now vendored under `ui/src/vendor/` and `ui/vendor/`
+  where applicable, bundled via `ui/scripts/build.mjs`.
+
+All Rust crates are listed with exact versions and licenses in `Cargo.lock`;
+a `cargo-about`/`cargo-deny` report can be generated with `cargo about generate`.
 
 The browser terminal in the graphical client embeds xterm.js 6.0.0 and
-its FitAddon (source/gui/web/vendor/, MIT licence; the full notice is in
-source/gui/web/vendor/LICENSE-xterm.txt).
+its FitAddon (MIT licence; the full notice is in
+ui/vendor/LICENSE-xterm.txt or source/gui/web/vendor/LICENSE-xterm.txt).
 
 Artwork
 
@@ -40,7 +65,9 @@ LinSCP began as a fork of WinSCP. The inherited code has been removed
 from this source tree; it survives only in the git history, where those old
 commits stay under the GNU General Public License version 3. The files in the
 current tree are LinSCP's own work, apart from the components named
-above, and are licensed as described in LICENSE.
+above, and are licensed as described in LICENSE. The C++ implementation
+(source/linux/*.cpp, source/gui/*.py) was retired in Phase 6; the pure-Rust
+crates (crates/*) and TypeScript UI (ui/*) are now authoritative.
 
 
 Privacy

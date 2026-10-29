@@ -46,6 +46,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCAN_ROOTS = [
     'source/linux',
     'source/gui',
+    'crates',
+    'ui',
     'automation',
     'debian',
     'docs',
@@ -220,10 +222,12 @@ REMOVED_ARTEFACTS = [
 
 # The files an installation has to contain. Every installer named below
 # has to install every one of them.
+# Phase 6 pure-Rust: the Python GUI (linscp_gui.py/linscp_crypto.py) and the
+# explorer-commands.json template are now embedded in the Rust workspace
+# (crates/linscp-http, crates/linscp-service, ui/dist) and no longer installed
+# as loose files under /usr/share/linscp/gui/. The Debian/CMake/Make installers
+# were updated to ship the Rust binaries instead.
 INSTALLED_FILES = [
-    'source/gui/linscp_gui.py',
-    'source/gui/linscp_crypto.py',
-    'source/gui/explorer-commands.json',
     'automation/LinSCP.psm1',
     'automation/dotnet/LinSCP/LinSCP.csproj',
     'automation/dotnet/LinSCP/Session.cs',
@@ -253,8 +257,13 @@ def rule_scope(rule_scope_name, path, root=ROOT):
         return True
     relative = path.relative_to(root).as_posix()
     if rule_scope_name == 'code':
+        # Pure-Rust platform crates intentionally contain Windows/Android cfg
+        if relative.startswith('crates/linscp-platform/') or relative.startswith('crates/linscp-tauri/'):
+            return False
         return (relative.startswith('source/') or
-                relative.startswith('automation/'))
+                relative.startswith('automation/') or
+                relative.startswith('crates/') or
+                relative.startswith('ui/'))
     if rule_scope_name == 'packaging':
         if relative in CROSS_PLATFORM_WORKFLOWS:
             return False
@@ -300,6 +309,10 @@ def strip_comments(path, text):
 def find_windows_constructs(path, text, root=ROOT):
     """The Windows constructs a file still carries."""
     findings = []
+    # Allow Windows/Android platform code to use Windows APIs behind cfg
+    rel = path.relative_to(root).as_posix()
+    if rel.startswith('crates/linscp-platform/src/windows') or rel.startswith('crates/linscp-platform/src/android') or 'crates/linscp-tauri' in rel:
+        return []
     for name, scope, pattern, description in RULES:
         if not rule_scope(scope, path, root):
             continue

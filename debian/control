@@ -2,33 +2,32 @@ Source: linscp
 Section: net
 Priority: optional
 Maintainer: nuipona <nuipona@users.noreply.github.com>
-Build-Depends: dpkg-dev (>= 1.20), g++ | c++-compiler, make, pkg-config,
- libssh-dev (>= 0.10), libssl-dev, libargon2-dev, zlib1g-dev
+Build-Depends: dpkg-dev (>= 1.20), cargo, rustc, pkg-config
 Standards-Version: 4.7.4
 Rules-Requires-Root: no
 
 Package: linscp
 Architecture: any
-Depends: ${shlibs:Depends}, python3
-Recommends: curl, xdg-utils
-Description: graphical and console file transfer client for Linux
- LinSCP is a native noncommercial file transfer client for Linux, inspired
- by the upstream Windows client. It provides an interactive
- command-line client (linscp) and a dual-pane Commander graphical client
- (linscp-gui) in the browser.
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: xdg-utils
+Description: graphical and console file transfer client for Linux, Windows and Android
+ LinSCP is a noncommercial file transfer client inspired by the upstream Windows
+ client. It provides an interactive command-line client (linscp) and a dual-pane
+ Commander graphical client: natively via Tauri v2 (Linux/WebKitGTK, Windows/WebView2,
+ Android/WebView) and in any browser via linscp --serve-http (linscp-gui).
  .
  The desktop entry starts the graphical client through xdg-utils, so
  the browser window is asked for the way a Wayland session expects; without
  xdg-utils the address is printed and nothing is opened.
  .
- SSH, SFTP and SCP are served by libssh and this client's own protocol
- code - the SFTP v3 wire protocol (with the copy-data and check-file-name
- extensions) and, for SCP, the remote-shell directory engine and the rcp
- transfer protocol; ftp, ftps, WebDAV and S3 go through curl, which is why
- it is recommended. The client provides transfer resume and recursive
- synchronization, public-key, ssh-agent and password authentication,
- host-key verification, stored sessions and a subset of the upstream
- scripting language.
+ SSH, SFTP and SCP are served by pure-Rust crates (russh, russh-sftp) - the
+ SFTP v3 wire protocol (with copy-data and check-file-name extensions) and,
+ for SCP, the remote-shell directory engine and the rcp transfer protocol;
+ FTP/FTPS via suppaftp (async-rustls), WebDAV and S3 via reqwest/rustls with
+ custom SPKI pinning and TLS version enforcement. The client provides transfer
+ resume and recursive synchronization, public-key, ssh-agent and password
+ authentication, host-key verification, stored sessions and a subset of the
+ upstream scripting language.
  Protocol support depends on the backend; WebDAV and Amazon S3 support are
  incomplete, and an SCP transfer cannot be resumed, because the rcp
  protocol has no offset to continue from. Full upstream feature parity is

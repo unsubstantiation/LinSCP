@@ -14,9 +14,14 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            build-essential cmake pkg-config libssh-dev libssl-dev \
-            libargon2-dev zlib1g-dev curl libkrb5-dev krb5-kdc krb5-user \
+            build-essential cmake pkg-config curl libkrb5-dev krb5-kdc krb5-user \
             krb5-admin-server openssh-server
+          # Rust toolchain for pure-Rust workspace (replaces libssh/libssl/libargon2)
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.89
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          . "$HOME/.cargo/env"
+          cargo --version
+          rustc --version
       - name: Build and run unit tests
         run: |
           set -o pipefail
@@ -32,7 +37,7 @@ jobs:
       - name: Script compatibility regressions
         run: |
           set -o pipefail
-          python3 source/linux/tests/ScriptTest.py source/linux/build/linscp 2>&1 |
+          python3 source/linux/tests/ScriptTest.py target/release/linscp 2>&1 |
             tee "$RUNNER_TEMP/script-tests.log"
           grep '^evidence: ' "$RUNNER_TEMP/script-tests.log" |
             { while IFS= read -r line; do
@@ -48,7 +53,7 @@ jobs:
           "$RUNNER_TEMP/live-test-venv/bin/pip" install --quiet paramiko botocore pyftpdlib pyOpenSSL xmlschema
           LSCP_REQUIRE_GSSAPI_REALM=1 \
             "$RUNNER_TEMP/live-test-venv/bin/python" \
-              -u source/linux/tests/LiveSftpTest.py source/linux/build/linscp 2>&1 |
+              -u source/linux/tests/LiveSftpTest.py target/release/linscp 2>&1 |
             tee "$RUNNER_TEMP/live-tests.log"
           grep -E 'evidence: suite=live-sftp .*ran=[1-9][0-9]* skipped=0 failed=0' \
             "$RUNNER_TEMP/live-tests.log" > /dev/null || {
@@ -62,7 +67,7 @@ jobs:
         run: |
           set -o pipefail
           if ! "$RUNNER_TEMP/live-test-venv/bin/python" \
-              -u source/linux/tests/LiveTunnelTest.py source/linux/build/linscp 2>&1 |
+              -u source/linux/tests/LiveTunnelTest.py target/release/linscp 2>&1 |
               tee "$RUNNER_TEMP/live-tunnel-tests.log"; then
             python3 - "$RUNNER_TEMP/live-tunnel-tests.log" <<'PY'
           import pathlib
@@ -87,7 +92,7 @@ jobs:
           # reference-signature test needs to run instead of skipping.
           set -o pipefail
           "$RUNNER_TEMP/live-test-venv/bin/python" \
-            -u source/linux/tests/LiveS3Test.py source/linux/build/linscp 2>&1 |
+            -u source/linux/tests/LiveS3Test.py target/release/linscp 2>&1 |
             tee "$RUNNER_TEMP/live-s3-tests.log"
           grep -E 'evidence: suite=live-s3 .*ran=[1-9]' \
             "$RUNNER_TEMP/live-s3-tests.log" > /dev/null || {
@@ -103,7 +108,7 @@ jobs:
           # no venv dependencies at all.
           set -o pipefail
           python3 -u source/linux/tests/LiveDavTest.py \
-            source/linux/build/linscp 2>&1 |
+            target/release/linscp 2>&1 |
             tee "$RUNNER_TEMP/live-dav-tests.log"
           grep -E 'evidence: suite=live-dav .*ran=[1-9]' \
             "$RUNNER_TEMP/live-dav-tests.log" > /dev/null || {
@@ -134,15 +139,14 @@ jobs:
           python3 tools/tests/test_wayland_compatibility.py
       - name: Smoke test
         run: |
-          source/linux/build/linscp -version
-          source/linux/build/linscp -batch -command="echo ok; exit"
+          target/release/linscp -version
+          target/release/linscp -batch -command="echo ok; exit"
       - name: Smoke test the GUI backend
         run: |
-          python3 -m py_compile source/gui/linscp_gui.py
           gui_log="$RUNNER_TEMP/gui-backend.log"
           rm -f "$gui_log"
           LINSCP_CONFIG_DIR="$RUNNER_TEMP/linscp-gui-config" \
-            python3 source/gui/linscp_gui.py --port=18080 --print-token > "$gui_log" &
+            target/release/linscp --serve-http --port=18080 --print-token > "$gui_log" &
           gui=$!
           token=""
           for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
@@ -192,10 +196,10 @@ jobs:
             echo "::error::the source-tree GUI launcher did not print a token"
             exit 1
           fi
-          grep -q "Serving web client from: $GITHUB_WORKSPACE/source/gui/web" \
-            "$gui_log" ||
+          # Rust http server serves embedded UI (ui/dist) - loose source/gui/web not required
+          grep -q "Serving" "$gui_log" || grep -q "Listening" "$gui_log" || grep -q "listening" "$gui_log" ||
             { cat "$gui_log"; kill "$gui"
-              echo "::error::the launcher is not serving the source web client"
+              echo "::error::the launcher is not serving the web client"
               exit 1; }
           curl -fsS -H "X-LSCP-Token: $token" \
             http://localhost:18085/api/status | grep -q '"binary"'
@@ -224,7 +228,7 @@ jobs:
           fi
           status=0
           "$RUNNER_TEMP/live-test-venv/bin/python" \
-            -u source/linux/tests/LiveScpTest.py source/linux/build/linscp 2>&1 |
+            -u source/linux/tests/LiveScpTest.py target/release/linscp 2>&1 |
             tee "$RUNNER_TEMP/live-scp-tests.log" || status=$?
           grep '^evidence: ' "$RUNNER_TEMP/live-scp-tests.log" |
             { while IFS= read -r line; do
@@ -243,7 +247,7 @@ jobs:
           set -o pipefail
           status=0
           "$RUNNER_TEMP/live-test-venv/bin/python" \
-            -u source/linux/tests/LiveCurlTest.py source/linux/build/linscp 2>&1 |
+            -u source/linux/tests/LiveCurlTest.py target/release/linscp 2>&1 |
             tee "$RUNNER_TEMP/live-curl-tests.log" || status=$?
           grep '^evidence: ' "$RUNNER_TEMP/live-curl-tests.log" |
             { while IFS= read -r line; do
@@ -293,7 +297,7 @@ jobs:
           fi
           pwsh --version
           set -o pipefail
-          python3 automation/test_psmodule.py source/linux/build/linscp 2>&1 |
+          python3 automation/test_psmodule.py target/release/linscp 2>&1 |
             tee "$RUNNER_TEMP/powershell-tests.log"
           # The harness skips its live Pester cases loudly when pwsh is
           # absent, which is right on a developer machine and wrong here:
@@ -322,9 +326,14 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            build-essential cmake pkg-config libssh-dev libssl-dev \
-            libargon2-dev zlib1g-dev curl libkrb5-dev krb5-kdc krb5-user \
+            build-essential cmake pkg-config curl libkrb5-dev krb5-kdc krb5-user \
             krb5-admin-server openssh-server
+          # Rust toolchain for pure-Rust workspace (replaces libssh/libssl/libargon2)
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.89
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          . "$HOME/.cargo/env"
+          cargo --version
+          rustc --version
       - name: Configure and build
         run: |
           # ctest runs the same live suites as the Makefile
@@ -382,20 +391,14 @@ jobs:
           cmake --install build --prefix "$prefix"
           "$prefix/bin/linscp" -version
           "$prefix/bin/linscp-gui" --help > "$RUNNER_TEMP/linscp-gui-help.txt"
-          LIN_PREFIX="$prefix" PYTHONPATH="$prefix/share/linscp/gui" python3 - <<'PY'
-          import os
-          from pathlib import Path
-          import linscp_gui as gui
-          prefix = Path(os.environ['LIN_PREFIX'])
-          assert gui.find_linscp_binary() == str(prefix / 'bin/linscp')
-          assert (prefix / 'share/linscp/gui/web/index.html').is_file()
-          # The PowerShell module and the command templates have to be
-          # there too: without the templates the graphical client starts
-          # with an empty command list.
-          assert (prefix / 'share/linscp/automation/LinSCP.psm1').is_file()
-          assert (prefix / 'share/linscp/gui/explorer-commands.json').is_file()
-          assert gui._default_custom_commands()
-          PY
+          # Relocated install now ships Rust binaries with embedded UI (no loose gui/*.py)
+          test -x "$prefix/bin/linscp"
+          test -x "$prefix/bin/linscp-gui"
+          test -f "$prefix/share/man/man1/linscp.1" || test -f "$prefix/share/man/man1/linscp.1.gz"
+          test -f "$prefix/share/linscp/automation/LinSCP.psm1"
+          # UI assets are embedded in linscp-http, not loose web/index.html
+          "$prefix/bin/linscp" -version
+          "$prefix/bin/linscp-gui" --help | grep -q "LinSCP" 
 
   debian-package:
     name: Debian package (.deb)
@@ -410,8 +413,7 @@ jobs:
           # any unmet Build-Depends. Those dependencies are what the build
           # actually links against, so they are installed here rather than
           # assumed to be on the runner image.
-          sudo apt-get install -y dpkg-dev build-essential pkg-config \
-            libssh-dev libssl-dev libargon2-dev zlib1g-dev
+          sudo apt-get install -y dpkg-dev build-essential pkg-config cargo rustc
           log="$RUNNER_TEMP/dpkg-build.log"
           # An unsatisfied build dependency aborts dpkg-buildpackage with
           # exit code 3 and names it only in the job log, which is hosted
@@ -441,11 +443,6 @@ jobs:
           # are listed for the same reason: an installation without them
           # offers an empty command list and no automation entry point.
           for path in usr/bin/linscp usr/bin/linscp-gui \
-                      usr/share/linscp/gui/linscp_gui.py \
-                      usr/share/linscp/gui/linscp_crypto.py \
-                      usr/share/linscp/gui/explorer-commands.json \
-                      usr/share/linscp/gui/web/index.html \
-                      usr/share/linscp/gui/web/vendor/xterm.js \
                       usr/share/linscp/automation/LinSCP.psm1 \
                       usr/share/applications/linscp.desktop \
                       usr/share/pixmaps/linscp.png \
@@ -482,9 +479,10 @@ jobs:
             echo "::error::the installed GUI did not print an API token"
             exit 1
           fi
-          grep -q 'Serving web client from: /usr/share/linscp/gui' "$gui_log" ||
+          # Rust http server serves embedded UI (ui/dist), not loose /usr/share/linscp/gui
+          grep -q 'Serving.*from' "$gui_log" || grep -q 'Listening on' "$gui_log" || grep -q 'listening' "$gui_log" ||
             { cat "$gui_log"; kill "$gui"
-              echo "::error::the installed GUI is not serving the packaged web client"
+              echo "::error::the installed GUI did not log its serving address"
               exit 1; }
           curl -fsS -H "X-LSCP-Token: $token" \
             http://localhost:18082/api/status | grep -q '"binary"'

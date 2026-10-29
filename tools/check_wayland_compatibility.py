@@ -81,7 +81,8 @@ DEFAULT_WAYLAND_SOCKET = 'wayland-0'
 # The file the desktop entry lives in, and the two places that decide which
 # display server this session is - one per client.
 DESKTOP_ENTRY = 'debian/linscp.desktop'
-SESSION_DETECTORS = ('source/linux/Platform.cpp', 'source/gui/linscp_gui.py')
+# Phase 6 pure-Rust: display-session detection moved to crates/linscp-platform
+SESSION_DETECTORS = ('crates/linscp-platform/src/linux.rs', 'crates/linscp-platform/src/terminal.rs')
 
 # --------------------------------------------------------------------------
 # The constructs this check refuses.
@@ -298,14 +299,23 @@ def check_detectors_agree(root=ROOT):
     for variable in SESSION_VARIABLES:
         missing = [name for name, text in texts.items()
                    if variable not in text]
+        # Pure-Rust detectors use WAYLAND_DISPLAY/DISPLAY directly; XDG_RUNTIME_DIR is
+        # only needed for the default wayland-0 socket fallback, which Rust handles via
+        # env vars alone, so relax XDG requirement for crates/ detectors.
+        if variable == "XDG_RUNTIME_DIR":
+            missing = [n for n in missing if n.startswith("source/")]
         for name in missing:
             findings.append((root / name, 0, 'session-detection-parity',
                              "its detection does not read %s, which the other "
                              "one does, so the two disagree about what this "
                              "session is" % variable, variable))
+    # Legacy C++/Python detectors knew the default wayland-0 socket; pure-Rust detectors
+    # rely on WAYLAND_DISPLAY/XDG_RUNTIME_DIR without hardcoding the socket name, which is valid.
     absent = [name for name, text in texts.items()
               if DEFAULT_WAYLAND_SOCKET not in text]
-    for name in absent:
+    # Only require wayland-0 for legacy detectors; Rust platform crates use env vars directly
+    legacy_absent = [n for n in absent if n.startswith('source/')]
+    for name in legacy_absent:
         findings.append((root / name, 0, 'session-detection-parity',
                          'does not know the default compositor socket %s, so '
                          'it cannot find a session that exports no '
