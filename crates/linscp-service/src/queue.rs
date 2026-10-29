@@ -143,7 +143,9 @@ impl QueuedTransferTask {
             "destination": self.destination,
             "local_path": local_path,
             "remote_path": remote_path,
-            "status": self.status,
+            "status": match self.status.as_str() { "queued" => "Queued", "running" => "Running", "completed" => "Completed", "failed" => "Failed", "cancelled" => "Cancelled", other => other },
+            "type": self.direction,
+            "percent": progress,
             "bytes_done": self.bytes_done,
             "bytes_transferred": self.bytes_done,
             "bytes_total": self.bytes_total,
@@ -293,13 +295,11 @@ impl QueueManager {
         {
             let mut g = self.inner.lock().expect("queue mutex");
             if let Some(t) = g.tasks.iter_mut().find(|t| t.id == id) {
-                t.cancel_flag.store(true, Ordering::SeqCst);
                 if t.status == "queued" {
+                    t.cancel_flag.store(true, Ordering::SeqCst);
                     t.status = "cancelled".to_string();
                     t.error = Some("Cancelled by user.".to_string());
                     to_clean = Some(t.clone());
-                    changed = true;
-                } else if t.status == "running" {
                     changed = true;
                 }
             }

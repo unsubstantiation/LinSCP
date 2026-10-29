@@ -66,6 +66,23 @@ test('detectTransportMode and createTransport select Tauri vs HTTP automatically
   assert.equal(status.local_roots[0].path, 'C:\\');
 });
 
+test('TauriTransport retains structured failures for connection and overwrite dialogs', async () => {
+  const challenge = { tab: 7, role: 'destination', fingerprint: 'ssh-ed25519 SHA256:test' };
+  const client = new TauriTransport({
+    invoke: async (_cmd, { envelope }) => envelope.path === '/api/tabs/open'
+      ? { status: 409, payload: { success: false, error: 'Verify host key', challenge } }
+      : { status: 409, payload: { success: false, error: 'Already exists', conflicts: ['file.txt'] } },
+  });
+  await assert.rejects(() => client.post('/api/tabs/open', {}), (error) => {
+    assert.deepEqual(error.payload.challenge, challenge);
+    return true;
+  });
+  await assert.rejects(() => client.post('/api/transfer/upload', {}), (error) => {
+    assert.deepEqual(error.payload.conflicts, ['file.txt']);
+    return true;
+  });
+});
+
 test('HttpTransport attaches X-LSCP-Token and X-LSCP-CSRF and surfaces login_required', async () => {
   const seen = [];
   let authPrompted = 0;
@@ -231,6 +248,12 @@ test('Built ui/dist/index.html boots inside Tauri IPC mode with zero HTTP calls'
         invoke: async (cmd, args) => {
           ipcCalls.push({ cmd, path: args.envelope.path });
           const p = args.envelope.path;
+          if (p === '/api/test-challenge') {
+            return { status: 409, payload: { success: false, error: 'Verify host key', challenge: { tab: 7, fingerprint: 'SHA256:test' } } };
+          }
+          if (p === '/api/test-conflict') {
+            return { status: 409, payload: { success: true, conflicts: ['file.txt'] } };
+          }
           if (p === '/api/status') {
             return {
               status: 200,
@@ -267,5 +290,11 @@ test('Built ui/dist/index.html boots inside Tauri IPC mode with zero HTTP calls'
   await new Promise((r) => setTimeout(r, 80));
   assert.equal(dom.window.LinSCPTransport.mode, 'tauri');
   assert.ok(ipcCalls.some((c) => c.cmd === 'linscp_invoke' && c.path === '/api/status'));
+  const challenge = await dom.window.api('/api/test-challenge', { method: 'POST', body: '{}' });
+  assert.equal(challenge.success, false);
+  assert.equal(challenge.challenge.fingerprint, 'SHA256:test');
+  const conflict = await dom.window.api('/api/test-conflict', { method: 'POST', body: '{}' });
+  assert.equal(conflict.success, false); // HTTP failure cannot claim success.
+  assert.equal(conflict.conflicts[0], 'file.txt');
   dom.window.close();
 });

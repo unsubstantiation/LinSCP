@@ -50,7 +50,7 @@ export class TauriTransport implements TransportClient {
       throw new TransportError(
         errBody.error ?? `IPC error (${reply.status})`,
         reply.status,
-        { hostKeyChallenge: errBody.hostkey_challenge },
+        { hostKeyChallenge: errBody.hostkey_challenge, payload: errBody as Record<string, unknown> },
       );
     }
     return reply.payload;

@@ -2536,7 +2536,7 @@
       (local ? session.local_dir.split('/').filter(Boolean).pop() + ' ↔ ' +
         session.other_local_dir.split('/').filter(Boolean).pop() : session.host);
     closeModal('siteModal');
-    const result = await apiPost('/api/tabs/open', { session: session, name: name });
+    const result = await apiPost('/api/tabs/open', { session: session, name: name, site_name: state.selectedSite === name ? name : '' });
     if (result.success) {
       state.activeTab = result.tab.id;
       await refreshStatus();
@@ -3272,7 +3272,7 @@
     }
   }
 
-  async function cancelTask(id) { await apiPost('/api/queue/cancel', { task_id: id }); await refreshQueue(); }
+  async function cancelTask(id) { const result = await apiPost('/api/queue/cancel', { task_id: id }); if (!result.success) toast(errorMessage(result.error, t('Cannot cancel the task.')), true); await refreshQueue(); }
   async function retryTask(id) { await apiPost('/api/queue/retry', { task_id: id }); await refreshQueue(); }
   async function prioritizeTask(id, position) { await apiPost('/api/queue/priority', { task_id: id, position: position || 'top' }); await refreshQueue(); }
   async function togglePause() {

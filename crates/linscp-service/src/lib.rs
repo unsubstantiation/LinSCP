@@ -28,6 +28,7 @@ pub mod tabs;
 pub mod terminal_bridge;
 
 use tabs::{TabRuntime, parse_tab_id_str, session_is_local, collect_session_folders, stored_site_to_gui_json};
+use linscp_engine::url_and_raw::GuiConnectError;
 
 struct InnerState {
     config_root: PathBuf,
@@ -46,6 +47,7 @@ pub struct CommanderService {
     secret_vault: Arc<dyn SecretVault>,
     state: Arc<Mutex<InnerState>>,
     event_tx: Arc<Mutex<Option<tokio::sync::broadcast::Sender<Value>>>>,
+    queue: queue::QueueManager,
 }
 
 impl Default for CommanderService {
@@ -86,6 +88,7 @@ impl CommanderService {
                 queue_transfers: Vec::new(),
             })),
             event_tx: Arc::new(Mutex::new(None)),
+            queue: queue::QueueManager::new(tokio::sync::broadcast::channel(64).0),
         }
     }
 
@@ -189,6 +192,11 @@ impl CommanderService {
             ("POST", "/api/desktop/install-script") => self.handle_desktop_install_script(&query, req.body),
             ("POST", "/api/desktop/ticket") => self.handle_desktop_ticket(req.body),
             ("POST", "/api/desktop/launch") => self.handle_desktop_launch(req.body),
+            ("POST", "/api/tabs/open") => self.open_tab_async(req.body).await,
+            ("POST", "/api/tabs/verify") => self.verify_tab_async(req.body).await,
+            ("POST", "/api/transfer/upload") => self.queue_transfer_async(req.body, true).await,
+            ("POST", "/api/transfer/download") => self.queue_transfer_async(req.body, false).await,
+            ("GET", "/api/remote/list") => self.list_remote_async(&req.path).await,
             ("POST", "/api/desktop/check") => self.handle_desktop_check(req.body),
             ("POST", "/api/desktop/install") => self.handle_desktop_install_sync(req.body),
             _ => ApiReply { status: 404, payload: json!({"error": format!("Unknown endpoint: {} {}", method, raw_path)})},
@@ -208,6 +216,205 @@ impl CommanderService {
             ("POST", "/api/desktop/ticket") => self.handle_desktop_ticket(req.body),
             _ => self.dispatch(req),
         }
+    }
+
+    async fn open_tab_async(&self, body: Value) -> ApiReply {
+        let session = body.get("session").cloned().unwrap_or(json!({}));
+        if session_is_local(&session) { return self.handle_tabs_open(body); }
+        let site_name = body.get("site_name").and_then(Value::as_str).filter(|s| !s.is_empty());
+        let root = self.config_root();
+        let (spec, mut clean) = match tabs::parse_gui_session_spec(&session, site_name, &root, self.secret_vault.as_ref()) {
+            Ok(value) => value,
+            Err(error) => return api_error(400, error),
+        };
+        if spec.session.hostkey.trim() == "*" || spec.session.tunnel.as_ref().is_some_and(|t| t.hostkey.trim() == "*") {
+            return api_error(400, "Wildcard SSH host keys are not supported");
+        }
+        if let Some(object) = clean.as_object_mut() {
+            for key in ["proxy_password", "passphrase", "password", "tunnel_password", "tunnel_passphrase"] { object.remove(key); }
+            if let Some(tunnel) = object.get_mut("tunnel").and_then(Value::as_object_mut) {
+                for key in ["password", "passphrase"] { tunnel.remove(key); }
+            }
+        }
+        let local = if spec.session.local_dir.is_empty() { self.default_local_dir() } else {
+            match check_local_pane_directory(&spec.session.local_dir, "local_dir") {
+                Ok(path) => path, Err(error) => return api_error(400, error),
+            }
+        };
+        let mut tab = {
+            let mut state = self.state.lock().expect("state mutex");
+            let id = state.next_tab_id;
+            state.next_tab_id += 1;
+            TabRuntime {
+                id, name: body.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or(&spec.session.host).to_string(),
+                site_name: site_name.map(str::to_string), is_local: false, connected: false,
+                local_dir: local, remote_dir: String::new(), other_local_dir: String::new(),
+                observed_hostkey: String::new(), hostkey_role: String::new(), hostkey_changed: false,
+                error: String::new(), spec: Some(spec), session_json: clean, remote: None,
+            }
+        };
+        self.connect_tab(&mut tab).await
+    }
+
+    async fn connect_tab(&self, tab: &mut TabRuntime) -> ApiReply {
+        let spec = match tab.spec.as_ref() { Some(s) => s, None => return api_error(400, "Missing session settings") };
+        match tabs::dial_gui_tab_session(spec, &self.config_root(), false, "en").await {
+            Ok((session, remote_dir, observed)) => {
+                tab.remote = Some(session);
+                tab.remote_dir = remote_dir;
+                tab.observed_hostkey = observed;
+                tab.connected = true;
+                tab.error.clear();
+                let mut state = self.state.lock().expect("state mutex");
+                state.challenges.remove(&tab.id);
+                state.active_tab_id = Some(tab.id);
+                state.tabs.insert(tab.id, tab.clone());
+                ApiReply { status: 200, payload: json!({"success": true, "tab": tab.describe()}) }
+            }
+            Err(GuiConnectError::HostKeyChallenge(challenge)) => {
+                tabs::apply_challenge_to_tab(tab, &challenge);
+                let response = tab.hostkey_challenge_json();
+                self.state.lock().expect("state mutex").challenges.insert(tab.id, tab.clone());
+                ApiReply { status: 409, payload: json!({"success": false, "error": challenge.error, "challenge": response}) }
+            }
+            Err(GuiConnectError::Failed(error)) => api_error(400, error),
+        }
+    }
+
+    async fn verify_tab_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "Missing challenge tab") };
+        let mut tab = match self.state.lock().expect("state mutex").challenges.remove(&id) {
+            Some(tab) => tab, None => return api_error(400, "Host-key challenge expired"),
+        };
+        let fingerprint = body.get("fingerprint").and_then(Value::as_str).unwrap_or("");
+        let role = body.get("role").and_then(Value::as_str).unwrap_or("destination");
+        if fingerprint != tab.observed_hostkey || role != tab.hostkey_role {
+            self.state.lock().expect("state mutex").challenges.insert(id, tab);
+            return api_error(400, "Host-key challenge did not match");
+        }
+        if body.get("remember").and_then(Value::as_bool).unwrap_or(false) {
+            let challenge = tab.hostkey_challenge_json();
+            let mut parts = fingerprint.split_whitespace();
+            let (kind, key) = match (parts.next(), parts.next(), parts.next()) {
+                (Some(kind), Some(key), None) => (kind, key),
+                _ => return api_error(400, "Invalid host-key fingerprint"),
+            };
+            let path = self.config_root().join("sshhostkeys");
+            let result = linscp_engine::hostkeys::HostKeyCache::load_from_path(&path).and_then(|mut cache| {
+                cache.upsert(challenge["host"].as_str().unwrap_or(""), challenge["port"].as_u64().unwrap_or(22) as u16, kind, key)?;
+                cache.save_to_path(&path)
+            });
+            if let Err(error) = result { return api_error(500, error); }
+        }
+        let spec = tab.spec.as_mut().expect("challenge has session settings");
+        if role == "tunnel" {
+            match spec.session.tunnel.as_mut() { Some(tunnel) => tunnel.hostkey = fingerprint.to_string(), None => return api_error(400, "No tunnel configured") }
+        } else if role == "destination" { spec.session.hostkey = fingerprint.to_string(); }
+        else { return api_error(400, "Invalid host-key role"); }
+        self.connect_tab(&mut tab).await
+    }
+
+    async fn list_remote_async(&self, path: &str) -> ApiReply {
+        let query = parse_query(path.split_once('?').map(|(_, q)| q).unwrap_or(""));
+        let id = query.get("tab").and_then(|s| parse_tab_id_str(Some(s)));
+        let tab = id.and_then(|id| self.state.lock().expect("state mutex").tabs.get(&id).cloned());
+        let tab = match tab { Some(tab) => tab, None => return api_error(400, "Not connected") };
+        if tab.is_local { return self.handle_remote_list(&query); }
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        let requested = query.get("path").filter(|p| !p.is_empty()).map(String::as_str).unwrap_or(&tab.remote_dir);
+        let resolved = match session.realpath(requested).await { Ok(path) => path, Err(error) => return api_error(400, error.to_string()) };
+        match session.list_dir(&resolved).await {
+            Ok(entries) => {
+                if let Some(current) = self.state.lock().expect("state mutex").tabs.get_mut(&tab.id) { current.remote_dir = resolved.clone(); }
+                ApiReply { status: 200, payload: json!({"success": true, "path": resolved, "entries": entries}) }
+            }
+            Err(error) => api_error(400, error.to_string()),
+        }
+    }
+
+    async fn queue_transfer_async(&self, body: Value, upload: bool) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
+        };
+        let names = match body.get("names").and_then(Value::as_array) {
+            Some(names) if !names.is_empty() && names.len() <= 1000 => names,
+            _ => return api_error(400, "Select at least one file"),
+        };
+        // Until the queue implements these options, reject rather than silently ignore them.
+        for key in ["append", "newer_only"] {
+            if body.get(key).and_then(Value::as_bool).unwrap_or(false) { return api_error(400, format!("{key} is not yet supported")); }
+        }
+        for key in ["filemask", "resumesupport"] {
+            if body.get(key).and_then(Value::as_str).is_some_and(|s| !s.is_empty()) { return api_error(400, format!("{key} is not yet supported")); }
+        }
+        if body.get("speed").and_then(Value::as_u64).unwrap_or(0) != 0 { return api_error(400, "Speed limits are not yet supported"); }
+        if !matches!(body.get("transfer").and_then(Value::as_str).unwrap_or(""), "" | "binary") { return api_error(400, "Only binary transfers are supported"); }
+        let local_dir = match body.get("local_dir").and_then(Value::as_str) {
+            Some(path) => match check_local_pane_directory(path, "local_dir") { Ok(path) => path, Err(error) => return api_error(400, error) },
+            None => return api_error(400, "Missing local directory"),
+        };
+        let other_dir = body.get("remote_dir").and_then(Value::as_str).unwrap_or("");
+        if other_dir.is_empty() || other_dir.chars().any(char::is_control) { return api_error(400, "Missing remote directory"); }
+        let session = tab.remote.clone();
+        if !tab.is_local && session.is_none() { return api_error(400, "Not connected"); }
+        let overwrite = body.get("overwrite").and_then(Value::as_str).unwrap_or("ask");
+        if overwrite != "ask" && overwrite != "overwrite" { return api_error(400, "Unsupported overwrite policy"); }
+        let mut jobs = Vec::new();
+        let mut conflicts = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for value in names {
+            let name = match value.as_str() { Some(name) => name, None => return api_error(400, "Invalid file name") };
+            if !seen.insert(name) { return api_error(400, "Duplicate file name"); }
+            let local = match resolve_contained(&local_dir, name) { Ok(path) => PathBuf::from(path), Err(error) => return api_error(400, error) };
+            let other = if tab.is_local {
+                let directory = match check_local_pane_directory(other_dir, "other_local_dir") { Ok(path) => path, Err(error) => return api_error(400, error) };
+                match resolve_contained(&directory, name) { Ok(path) => path, Err(error) => return api_error(400, error) }
+            } else {
+                format!("{}/{}", other_dir.trim_end_matches('/'), name)
+            };
+            let (source, destination) = if upload { (local.to_string_lossy().into_owned(), other.clone()) } else { (other.clone(), local.to_string_lossy().into_owned()) };
+            if tab.is_local && source == destination { return api_error(400, "Source and destination are the same file"); }
+            let size;
+            let exists;
+            if tab.is_local {
+                let meta = match std::fs::symlink_metadata(&source) { Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => meta, Ok(_) => return api_error(400, "Only regular files can be transferred"), Err(error) => return api_error(400, error.to_string()) };
+                size = meta.len();
+                exists = std::fs::symlink_metadata(&destination).is_ok();
+            } else if upload {
+                let meta = match std::fs::symlink_metadata(&local) { Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => meta, Ok(_) => return api_error(400, "Only regular files can be transferred"), Err(error) => return api_error(400, error.to_string()) };
+                size = meta.len();
+                exists = match session.as_ref().unwrap().stat(&other).await {
+                    Ok(Some(entry)) if entry.is_dir || entry.is_symlink => return api_error(400, "Refusing to overwrite a remote symlink or directory"),
+                    Ok(entry) => entry.is_some(), Err(error) => return api_error(400, error.to_string()),
+                };
+            } else {
+                let entry = match session.as_ref().unwrap().stat(&other).await { Ok(Some(entry)) if !entry.is_dir && !entry.is_symlink => entry, Ok(_) => return api_error(400, "Only existing regular files can be transferred"), Err(error) => return api_error(400, error.to_string()) };
+                size = entry.size;
+                exists = std::fs::symlink_metadata(&local).is_ok();
+            }
+            if !upload || tab.is_local {
+                let target = Path::new(&destination);
+                if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink() || !m.is_file()) { return api_error(400, "Refusing to overwrite a symlink or directory"); }
+            }
+            if exists && overwrite == "ask" { conflicts.push(name.to_string()); }
+            let mut flags = linscp_engine::transfer::TransferFlags::default();
+            flags.resume = body.get("resume").and_then(Value::as_bool).unwrap_or(false);
+            flags.preserve_time = body.get("preserve_time").and_then(Value::as_bool).unwrap_or(true);
+            let job = if tab.is_local {
+                queue::QueueJob::LocalCopyOrMove { source: PathBuf::from(&source), target: PathBuf::from(&destination), move_item: false, policy: queue::ConflictPolicy::Overwrite }
+            } else if upload {
+                queue::QueueJob::RemoteUpload { session: session.as_ref().unwrap().clone(), local_src: local, remote_dest: other, delete_source: false, cleanup_path: None, flags }
+            } else {
+                queue::QueueJob::RemoteDownload { session: session.as_ref().unwrap().clone(), remote_path: other, local_dest: local, delete_source: false, flags }
+            };
+            jobs.push((name.to_string(), source, destination, size, job));
+        }
+        if !conflicts.is_empty() { return ApiReply { status: 409, payload: json!({"success": false, "error": "Destination exists", "conflicts": conflicts}) }; }
+        for (name, source, destination, size, job) in jobs {
+            self.queue.enqueue(Some(id), if upload { "upload" } else { "download" }, name, source, destination, size, body.get("priority").and_then(Value::as_bool).unwrap_or(false), job);
+        }
+        ApiReply { status: 200, payload: json!({"success": true}) }
     }
 
     fn default_local_dir(&self) -> String {
@@ -535,8 +742,8 @@ impl CommanderService {
     }
 
     fn handle_list_transfers(&self) -> ApiReply {
-        let g = self.state.lock().expect("m");
-        ApiReply{ status: 200, payload: json!({"transfers": g.queue_transfers, "paused": false})}
+        let (transfers, paused) = self.queue.snapshot();
+        ApiReply{ status: 200, payload: json!({"transfers": transfers, "paused": paused})}
     }
 
     fn handle_open_local_tab(&self, body: Value) -> ApiReply {
@@ -847,12 +1054,21 @@ impl CommanderService {
     fn handle_terminal_output(&self, query: &BTreeMap<String,String>) -> ApiReply {
         ApiReply{ status:200, payload: json!({"success": true, "data": "", "offset": 0, "alive": false, "exit_code": 0})}
     }
-    fn handle_queue_pause(&self) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
-    fn handle_queue_resume(&self) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
-    fn handle_queue_cancel(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
-    fn handle_queue_clear(&self) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
-    fn handle_queue_retry(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
-    fn handle_queue_priority(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
+    fn handle_queue_pause(&self) -> ApiReply { self.queue.pause(); ApiReply{ status:200, payload: json!({"success": true})}}
+    fn handle_queue_resume(&self) -> ApiReply { self.queue.resume(); ApiReply{ status:200, payload: json!({"success": true})}}
+    fn handle_queue_cancel(&self, body: Value) -> ApiReply {
+        let id = body.get("task_id").and_then(Value::as_u64).unwrap_or(0);
+        if self.queue.cancel(id) { ApiReply{ status:200, payload: json!({"success": true})} } else { api_error(400, "Task cannot be cancelled") }
+    }
+    fn handle_queue_clear(&self) -> ApiReply { self.queue.clear_finished(); ApiReply{ status:200, payload: json!({"success": true})}}
+    fn handle_queue_retry(&self, body: Value) -> ApiReply {
+        let id = body.get("task_id").and_then(Value::as_u64).unwrap_or(0);
+        if self.queue.retry(id) { ApiReply{ status:200, payload: json!({"success": true})} } else { api_error(400, "Task cannot be retried") }
+    }
+    fn handle_queue_priority(&self, body: Value) -> ApiReply {
+        let id = body.get("task_id").and_then(Value::as_u64).unwrap_or(0);
+        if self.queue.prioritize(id, body.get("position").and_then(Value::as_str).unwrap_or("top")) { ApiReply{ status:200, payload: json!({"success": true})} } else { api_error(400, "Task cannot be prioritized") }
+    }
     fn handle_accounts(&self) -> ApiReply { ApiReply{ status:200, payload: json!({"accounts_enabled": false})}}
     fn handle_custom_commands(&self, body: Value) -> ApiReply {
         let cfg = self.state.lock().expect("m").config_root.clone();
@@ -1551,6 +1767,10 @@ impl CommanderService {
     }
 }
 
+fn api_error(status: u16, error: impl Into<String>) -> ApiReply {
+    ApiReply { status, payload: json!({"success": false, "error": error.into()}) }
+}
+
 fn resolve_local_path_for_list(path: &str) -> Result<String, String> {
     if path.trim().is_empty() { return Err("No path given".to_string()); }
     let p = Path::new(path);
@@ -1560,7 +1780,7 @@ fn resolve_local_path_for_list(path: &str) -> Result<String, String> {
     Ok(abs.to_string_lossy().into_owned())
 }
 fn resolve_contained(base: &str, name: &str) -> Result<String, String> {
-    if name.is_empty() || name=="." || name==".." || name.contains('/') || name.contains('\0') {
+    if name.is_empty() || name=="." || name==".." || name.contains('/') || name.contains('\\') || name.contains(':') || name.contains('\0') || Path::new(name).components().count() != 1 {
         return Err(format!("\"{name}\" is not a single file name in this directory."));
     }
     if name.chars().any(|c| c.is_control()) { return Err("A file name must not contain a control character.".to_string()); }
@@ -1629,6 +1849,40 @@ mod tests {
             assert_eq!(reply.status, 501, "{path}");
             assert_eq!(reply.payload["success"], false, "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn local_file_copy_is_queued_and_conflicts_are_not_overwritten() {
+        let tmp = std::env::temp_dir().join(format!("linscp-queue-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let left = tmp.join("left");
+        let right = tmp.join("right");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        std::fs::write(left.join("data.txt"), b"test content").unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let open = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": left, "other_local_dir": right}}) }).await;
+        assert_eq!(open.status, 200);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        let request = || ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": left, "remote_dir": right, "names": ["data.txt"]}) };
+        let result = svc.dispatch_async(request()).await;
+        assert_eq!(result.status, 200, "{}", result.payload);
+        let mut finished = false;
+        for _ in 0..200 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.first().and_then(|v| v["status"].as_str()) == Some("Completed") { finished = true; break; }
+            if tasks.first().and_then(|v| v["status"].as_str()) == Some("Failed") { panic!("queue failure: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(finished, "transfer did not complete");
+        assert_eq!(std::fs::read(right.join("data.txt")).unwrap(), b"test content");
+        std::fs::write(right.join("data.txt"), b"do not overwrite").unwrap();
+        let conflict = svc.dispatch_async(request()).await;
+        assert_eq!(conflict.status, 409);
+        assert_eq!(std::fs::read(right.join("data.txt")).unwrap(), b"do not overwrite");
+        let invalid = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": left, "remote_dir": right, "names": ["../data.txt"]}) }).await;
+        assert_eq!(invalid.status, 400);
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]
