@@ -104,15 +104,13 @@ def read_stored_sessions():
                     pwd = lc.decrypt(pwd, key)
                 except Exception:
                     password_locked = True
+                    pwd = ""
             elif pwd.startswith("lscp1$"):
                 password_locked = True
                 pwd = ""
-            sessions.append({
-                "name": name,
-                "password": pwd,
-                "password_locked": password_locked,
-                **data
-            })
+            # Merge stored data but ensure decrypted password wins
+            merged = {**data, "name": name, "password": pwd, "password_locked": password_locked}
+            sessions.append(merged)
         except Exception:
             continue
     return sessions
