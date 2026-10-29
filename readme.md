@@ -4,8 +4,10 @@
 
 LinSCP is a noncommercial graphical file-transfer client. Its Commander UI
 runs in a native Tauri window backed by the Rust transfer engine. No separate
-command-line client or browser server is built or distributed. Protocol
-support varies by backend; full upstream feature parity is not provided.
+command-line client or browser server is built or distributed. **This native GUI is experimental and is not yet a functional file-transfer
+client.** Remote connections and transfers are not implemented in its service
+adapter. Do not rely on it for production transfers. Unsupported transfer
+operations return an error rather than reporting success.
 
 ## Build the desktop application
 

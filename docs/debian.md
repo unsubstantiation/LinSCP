@@ -1,5 +1,7 @@
 # LinSCP on Debian
 
+**The native desktop application is experimental: remote connections and file transfers are not implemented. Do not use it for production transfers.**
+
 LinSCP is a native Tauri desktop application. It does not ship the retired
 console client, browser-server launcher, PowerShell module or .NET CLI wrapper.
 

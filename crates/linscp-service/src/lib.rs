@@ -55,6 +55,13 @@ impl Default for CommanderService {
 }
 
 impl CommanderService {
+    fn not_implemented() -> ApiReply {
+        ApiReply { status: 501, payload: json!({
+            "success": false,
+            "error": "This operation is not yet implemented in the native application."
+        }) }
+    }
+
     pub fn new(config_root: PathBuf, local_fs: Arc<dyn LocalFs>) -> Self {
         Self::with_secret_vault(config_root, local_fs, Arc::new(NativeSecretVault::new()))
     }
@@ -798,7 +805,7 @@ impl CommanderService {
             match std::fs::rename(&src,&dst) { Ok(_)=> ApiReply{ status:200, payload: json!({"success": true})}, Err(e)=> ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})}}
         } else { ApiReply{ status:400, payload: json!({"success": false, "error": "not implemented"})}}
     }
-    fn handle_remote_chmod(&self, body: Value) -> ApiReply { self.handle_local_chmod(body) }
+    fn handle_remote_chmod(&self, _body: Value) -> ApiReply { Self::not_implemented() }
     fn handle_remote_properties(&self, body: Value) -> ApiReply {
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
         let g = self.state.lock().expect("m");
@@ -819,22 +826,20 @@ impl CommanderService {
         ApiReply{ status:200, payload: json!({"success": true, "properties": rows, "name": rows.get(0).and_then(|v| v.get("name")).cloned().unwrap_or(json!(""))})}
     }
     fn handle_remote_rights(&self, body: Value) -> ApiReply { self.handle_remote_chmod(body) }
-    fn handle_remote_search(&self, body: Value) -> ApiReply {
-        ApiReply{ status:200, payload: json!({"success": true, "matches": [], "truncated": false, "scanned": 0, "skipped": 0, "bytes_scanned": 0})}
-    }
+    fn handle_remote_search(&self, _body: Value) -> ApiReply { Self::not_implemented() }
     fn handle_remote_checksum(&self, body: Value) -> ApiReply {
         ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}
     }
-    fn handle_remote_save(&self, body: Value) -> ApiReply { self.handle_local_save(body) }
+    fn handle_remote_save(&self, _body: Value) -> ApiReply { Self::not_implemented() }
     fn handle_remote_copy(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "not implemented"})}}
     fn handle_remote_link(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "not implemented"})}}
     fn handle_sync_preview(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
     fn handle_sync_run(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
-    fn handle_transfer_upload(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
-    fn handle_transfer_download(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
-    fn handle_transfer_move(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
+    fn handle_transfer_upload(&self, _body: Value) -> ApiReply { Self::not_implemented() }
+    fn handle_transfer_download(&self, _body: Value) -> ApiReply { Self::not_implemented() }
+    fn handle_transfer_move(&self, _body: Value) -> ApiReply { Self::not_implemented() }
     fn handle_keepuptodate(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
-    fn handle_remote_transfer(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true, "tasks": []})}}
+    fn handle_remote_transfer(&self, _body: Value) -> ApiReply { Self::not_implemented() }
     fn handle_copyid(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
     fn handle_session_terminal(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
     fn handle_terminal_input(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
@@ -888,7 +893,7 @@ impl CommanderService {
         let cmd = body.get("command").and_then(|v| v.as_str()).unwrap_or("");
         if cmd.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Empty command"})}; }
         if cmd.contains('\n') || cmd.contains('\r') { return ApiReply{ status:400, payload: json!({"success": false, "error": "A command with a newline is never written"})}; }
-        ApiReply{ status:200, payload: json!({"success": true, "exit_code": 0, "stdout": "", "stderr": ""})}
+        Self::not_implemented()
     }
 
     fn handle_desktop_recommendations(&self) -> ApiReply {
@@ -1609,6 +1614,23 @@ fn percent_decode(input: &str) -> String {
 mod tests {
     use super::*;
     use linscp_types::ProtocolScheme;
+    #[test]
+    fn unsupported_operations_never_report_success_or_write_files() {
+        let svc = CommanderService::default();
+        for path in [
+            "/api/transfer/upload", "/api/transfer/download", "/api/transfer/move",
+            "/api/remote/transfer", "/api/remote/save", "/api/remote/chmod",
+            "/api/remote/rights", "/api/remote/search", "/api/command/exec",
+        ] {
+            let reply = svc.dispatch(ApiEnvelope {
+                method: "POST".into(), path: path.into(),
+                body: json!({"command": "test", "path": "nonexistent-test-file"}),
+            });
+            assert_eq!(reply.status, 501, "{path}");
+            assert_eq!(reply.payload["success"], false, "{path}");
+        }
+    }
+
     #[test]
     fn service_dispatches_status_roots_sessions_and_importers() {
         let tmp = std::env::temp_dir().join(format!("linscp-svc-test-{}", std::process::id()));
