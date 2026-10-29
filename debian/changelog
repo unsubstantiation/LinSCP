@@ -1,3 +1,45 @@
+linscp (1.0-6) unstable; urgency=medium
+
+  * Pure-Rust + Tauri v2 + TypeScript migration (crates/* + ui/): the
+    workspace builds with cargo (1.89+) on Linux, Windows (x86_64-pc-windows-msvc)
+    and Android (aarch64-linux-android via cargo ndk) with zero C/C++ cross-
+    compilation in the default build. `debian/rules`, `CMakeLists.txt` and
+    `source/linux/Makefile` are now thin cargo wrappers; `ui/dist` is built
+    with `npm --prefix ui run build` and embedded in `linscp-http` via
+    `include_str!`, so no `/usr/share/linscp/gui/` Python tree is shipped.
+  * Protocols now pure-Rust: SSH/SFTP/SCP via `russh` + `russh-sftp` (SFTP v3
+    copy-data / check-file-name, SCP rcp), FTP/FTPS via `suppaftp` (async-rustls)
+    with native LIST/MLSD, WebDAV/S3 via `reqwest` + `rustls` (SPKI pin,
+    Min/MaxTlsVersion). PPK v2/v3 and `lscp1$` handled by `linscp-crypto`
+    (`argon2`, `ssh-key`, `hmac-sha2`, `pbkdf2`, `zeroize`); no external
+    `libssh`/`libssl`/`libargon2` required at run time.
+  * Commander UI polish: site protocol selector lists `rdp://` (3389, xfreerdp/mstsc),
+    `vnc://` (5900, tigervnc), `spice://` (remote-viewer), `x2go://` and `x11://`
+    (waypipe/ssh -X) as first-class; Proxy (SOCKS5/4/HTTP/Telnet/Cmd, DNS,
+    localhost, exclude) and Advanced (FTPS/TLS, passive, MLSD, certs, pinned
+    pubkey) are now visible `<details>` with fill/round-trip; menus/toolbars
+    no longer clipped (`Remote desktop…` in Commands, `Backup/Restore…` in
+    Options, toolbar `Desktop` with pulse when SSH connected, menu-bar scroll,
+    responsive panes, 44px touch targets).
+  * Remote desktop: `open rdp://` etc. launches the platform viewer or, in
+    headless HTTP/Tauri mode, returns a `.rdp`/`.vv` ticket (`DESKTOP_TICKET`)
+    or BrowserGateway JSON (ironrdp WASM fallback); XDMCP (UDP 177) is refused.
+    When SSH-connected to the same host and xrdp/tigervnc/spice-vdagent/x2goserver
+    is missing, the UI prompts “Not available” with Cancel / Install (per-OS
+    apt/dnf/pacman/zypper script via `/etc/os-release`, `sudo`,
+    `DEBIAN_FRONTEND=noninteractive`) and Copy — `POST /api/desktop/check|launch|install`
+    and `GET /api/desktop/install-script`.
+  * Backup/restore: `backup export|import <file>` (script + `POST /api/command/exec`
+    + GUI Backup modal) writes distribution-agnostic LF JSON with LF-normalized
+    `sessions.ini` and unwrapped base64 `sessions.key` (Debian ↔ Windows ↔ Android
+    round-trips).
+  * Docs: `docs/debian.md` rewritten for cargo/Node/Python 3, `docs/linscp.1`
+    updated from libssh/curl to russh/suppaftp/reqwest/rustls, verification now
+    `tools/check_repo_hygiene.py` (cross-platform) + `check_wayland_compatibility.py`.
+    `readme.md` already reflects pure-Rust.
+
+ -- nuipona <nuipona@users.noreply.github.com>  Thu, 29 Oct 2026 18:30:00 +0000
+
 linscp (1.0-5) unstable; urgency=medium
 
   * The client now reads a Wayland session as the desktop it is, instead of

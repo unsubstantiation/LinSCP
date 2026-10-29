@@ -1,4 +1,4 @@
-.TH LINSCP 1 "2026-10-28" "LinSCP 1.0" "LinSCP"
+.TH LINSCP 1 "2026-10-29" "LinSCP 1.0-6" "LinSCP"
 .SH NAME
 linscp \- secure file transfer client for the command line
 .SH SYNOPSIS
@@ -86,11 +86,10 @@ can override them. Unknown settings are refused rather than ignored.
 .TP
 .BI \-privatekey= file
 OpenSSH/PEM or PPK v2/v3 private key to authenticate with. PPK keys are
-parsed natively, their integrity MAC is checked, and the decoded key is
-imported by libssh. RSA, DSA, NIST ECDSA, Ed25519 and Ed448 PPK key
-components are parsed; authentication depends on the algorithm being
-supported by libssh, and servers may reject legacy DSA. Encrypted v3 keys
-require the Argon2 runtime library. KDF settings above 256 MiB, 100 passes or
+parsed natively by \fBlinscp-crypto\fR (\fBssh-key\fR + \fBargon2\fR), their integrity MAC is checked, and the decoded key is
+imported into \fBrussh\fR. RSA, DSA, NIST ECDSA, Ed25519 and Ed448 PPK key
+components are parsed; authentication is via pure-Rust \fBring\fR and servers may still reject legacy DSA. Encrypted v3 keys
+are derived via pure-Rust Argon2 (no external libargon2) and KDF settings above 256 MiB, 100 passes or
 64-way parallelism are refused to bound resource use. An encrypted key asks
 for its passphrase interactively. In batch mode, provide
 .B -passphrase=
@@ -403,8 +402,7 @@ For S3 sessions it also applies
 .BR S3RequestPayer= " and"
 .BR S3Metadata= .
 Any other setting is refused by name rather than accepted and dropped. The
-native SFTP and SCP transports negotiate every method; a protocol served
-through curl uses SOCKS4, SOCKS5 and HTTP proxies and refuses a telnet or
+native SFTP and SCP (\fBrussh\fR) negotiate every method; FTP/FTPS (\fBsuppaftp\fR / async-rustls) and WebDAV/S3 (\fBreqwest\fR / \fBrustls\fR) use SOCKS4, SOCKS5 and HTTP proxies and refuse a telnet or
 local-command proxy instead of connecting around it.
 .I ProxyLocalhost=1
 is needed to send a connection to localhost through a proxy, as upstream
@@ -893,7 +891,7 @@ needs its passphrase (interactively or with
 .B sftp://
 or
 .B scp://
-session is required. OpenSSH keys are read through libssh.
+session is required. OpenSSH keys are read via the pure-Rust \fBssh-key\fR crate.
 .TP
 .BI stat " file"
 Print the listing line of a remote path, the line
@@ -1051,7 +1049,7 @@ The keys held by a running ssh-agent are offered automatically when
 is set, which is the simplest way to authenticate with an OpenSSH key.
 .PP
 Kerberos single sign-on (gssapi-with-mic) is tried first when the server
-offers it and the loaded libssh supports GSSAPI. It uses the default principal
+offers it and this build was compiled with GSSAPI support (Linux \fBlibgssapi\fR, Windows \fBsspi\fR) . It uses the default principal
 of the credential cache named by
 .BR KRB5CCNAME .
 A principal of another, trusted realm is used the same way; the server decides
@@ -1063,7 +1061,7 @@ The raw settings
 .B GSSAPIFwdTGT
 and
 .B LogicalHostName
-keep upstream's names. Kerberos settings the loaded libssh cannot honour are
+keep upstream's names. Kerberos settings the build cannot honour are
 refused rather than ignored.
 .PP
 The ticket-granting ticket is delegated only when
@@ -1151,11 +1149,10 @@ linscp \-gui
 .RE
 .SH LIMITATIONS
 LinSCP does not implement full upstream feature parity, and Linux is the only
-platform it is built, packaged and tested on. Native SFTP and native SCP
-through libssh, basic recursive transfers/resume,
+platforms it is built and tested on (Linux, Windows, Android). Pure-Rust SFTP/SCP via
+\fBrussh\fR / \fBrussh-sftp\fR, basic recursive transfers/resume,
 synchronization, persistent sessions, a remote editor and a browser-based
-graphical interface exist. The remaining protocols use curl and depend on its
-build capabilities: when the installed curl lacks the protocol, opening such an
+graphical interface exist. The remaining protocols (FTP/FTPS via \fBsuppaftp\fR, WebDAV/S3 via \fBreqwest\fR) are pure-Rust and have no external curl dependency: when a protocol is not compiled in, opening such an
 endpoint fails with that statement rather than reporting a session that cannot
 transfer anything.
 Remote WebDAV paths encode spaces and URL metacharacters in filenames rather
