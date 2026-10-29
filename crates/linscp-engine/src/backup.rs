@@ -366,10 +366,7 @@ fn detect_distribution_id() -> String {
             }
         }
     }
-    return os.to_string();
-    }
-    #[allow(unreachable_code)]
-    "unknown".to_string()
+    os.to_string()
 }
 
 #[cfg(test)]
