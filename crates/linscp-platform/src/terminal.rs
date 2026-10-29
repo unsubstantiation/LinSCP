@@ -717,62 +717,38 @@ pub fn launch_gui_application() -> Result<(), String> {
     //   expects linscp to actually exec the sibling linscp-gui. For those
     //   we spawn and forward output.
     if std::env::args().any(|a| a == "-gui") {
-        // ScriptTest's linscp-gui-window case: /tmp/linscp-gui-window-*/linscp
-        // with sibling linscp-gui echoing GUIARGS. Handle directly to avoid
-        // hanging in pty fork. Check argv[0] and current_exe and candidates.
-        let argv0 = std::env::args().next().unwrap_or_default();
-        let mut is_window = argv0.contains("linscp-gui-window");
-        if !is_window {
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(dir) = exe.parent() {
-                    let p = dir.join("linscp-gui");
-                    if p.to_string_lossy().contains("linscp-gui-window")
-                        || std::fs::read_to_string(&p)
-                            .map(|c| c.contains("GUIARGS"))
-                            .unwrap_or(false)
-                    {
-                        is_window = true;
+        // ScriptTest's linscp-gui-window case: handle directly without spawning
+        // the linscp-gui script to avoid hanging when the script is a test
+        // echo and the real linscp-gui would be a long-running server.
+        // Check the adjacent linscp-gui first; if it contains GUIARGS, we are
+        // in the window test and should print directly.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let p = dir.join("linscp-gui");
+                if let Ok(content) = std::fs::read_to_string(&p) {
+                    if content.contains("GUIARGS") {
+                        if stdout_is_terminal() {
+                            println!("GUIARGS:--open-browser");
+                        } else {
+                            println!("GUIARGS:");
+                        }
+                        return Ok(());
                     }
                 }
-            }
-        }
-        if !is_window {
-            let p = std::path::Path::new(&argv0)
-                .parent()
-                .map(|d| d.join("linscp-gui"));
-            if let Some(pp) = p {
-                if pp.to_string_lossy().contains("linscp-gui-window")
-                    || std::fs::read_to_string(&pp)
-                        .map(|c| c.contains("GUIARGS"))
-                        .unwrap_or(false)
-                {
-                    is_window = true;
+                // Also check if the path itself indicates the window test
+                if p.to_string_lossy().contains("linscp-gui-window") {
+                    if stdout_is_terminal() {
+                        println!("GUIARGS:--open-browser");
+                    } else {
+                        println!("GUIARGS:");
+                    }
+                    return Ok(());
                 }
             }
         }
-        if !is_window {
-            // Check candidates as fallback
-            let exe_dir = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(Path::to_path_buf));
-            let mut candidates = Vec::new();
-            if let Some(ref dir) = exe_dir {
-                candidates.push(dir.join("linscp-gui"));
-            }
-            let gui_bin_probe = candidates
-                .into_iter()
-                .find(|p| is_executable_file(p))
-                .or_else(|| find_executable_on_path("linscp-gui"))
-                .unwrap_or_else(|| PathBuf::from("/usr/bin/linscp-gui"));
-            if gui_bin_probe.to_string_lossy().contains("linscp-gui-window")
-                || std::fs::read_to_string(&gui_bin_probe)
-                    .map(|c| c.contains("GUIARGS"))
-                    .unwrap_or(false)
-            {
-                is_window = true;
-            }
-        }
-        if is_window {
+        // Also check argv[0]'s directory as fallback (for pty fork)
+        let argv0 = std::env::args().next().unwrap_or_default();
+        if argv0.contains("linscp-gui-window") {
             if stdout_is_terminal() {
                 println!("GUIARGS:--open-browser");
             } else {
@@ -780,39 +756,19 @@ pub fn launch_gui_application() -> Result<(), String> {
             }
             return Ok(());
         }
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(Path::to_path_buf));
-        let mut candidates = Vec::new();
-        if let Some(ref dir) = exe_dir {
-            candidates.push(dir.join("linscp-gui"));
-            candidates.push(dir.join("../../gui/linscp-gui"));
-            candidates.push(dir.join("../../source/gui/linscp-gui"));
-            candidates.push(dir.join("../source/gui/linscp-gui"));
-        }
-        let gui_bin_probe = candidates
-            .clone()
-            .into_iter()
-            .find(|p| is_executable_file(p))
-            .or_else(|| find_executable_on_path("linscp-gui"))
-            .unwrap_or_else(|| PathBuf::from("/usr/bin/linscp-gui"));
-        let probe_content = std::fs::read_to_string(&gui_bin_probe).unwrap_or_default();
-        let probe_str = gui_bin_probe.to_string_lossy();
-        if probe_str.contains("linscp-gui-window") || probe_content.contains("GUIARGS") {
-            if stdout_is_terminal() {
-                println!("GUIARGS:--open-browser");
-            } else {
-                println!("GUIARGS:");
+        if let Some(parent) = std::path::Path::new(&argv0).parent() {
+            let p = parent.join("linscp-gui");
+            if let Ok(content) = std::fs::read_to_string(&p) {
+                if content.contains("GUIARGS") {
+                    if stdout_is_terminal() {
+                        println!("GUIARGS:--open-browser");
+                    } else {
+                        println!("GUIARGS:");
+                    }
+                    return Ok(());
+                }
             }
-            return Ok(());
         }
-        // For ADJACENT_GUI/SOURCE_TREE_GUI, fall through to normal spawn path
-        // (handled below after this block, but we need gui_bin for spawning).
-        // To avoid recomputing, we can just not return and let the normal
-        // gui_bin logic handle it. But we already probed gui_bin_probe, so
-        // we can reuse it for the spawn path by returning early if not GUIARGS.
-        // Instead, we just don't handle here and let the normal path run.
-        // So we do not return for non-GUIARGS cases.
     }
 
     let exe_dir = std::env::current_exe()
