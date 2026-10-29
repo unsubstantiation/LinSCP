@@ -717,6 +717,11 @@ pub fn launch_gui_application() -> Result<(), String> {
     //   expects linscp to actually exec the sibling linscp-gui. For those
     //   we spawn and forward output.
     if std::env::args().any(|a| a == "-gui") {
+        // Debug log for CI window test
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/linscp-gui-debug2.log") {
+            use std::io::Write as _;
+            let _ = writeln!(f, "launch_gui called exe={:?} argv0={:?} args={:?} is_tty={}", std::env::current_exe().unwrap_or_default().display(), std::env::args().next().unwrap_or_default(), std::env::args().collect::<Vec<_>>(), stdout_is_terminal());
+        }
         // For ScriptTest's window case, also check via simple exists() without mode check
         // to avoid hang when is_executable_file fails due to race or permission.
         let mut window_via_exists = false;
@@ -753,6 +758,11 @@ pub fn launch_gui_application() -> Result<(), String> {
             }
         }
         if window_via_exists {
+            // Debug: log to /tmp for CI
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/linscp-gui-window-debug.log") {
+                use std::io::Write as _;
+                let _ = writeln!(f, "window_via_exists exe={:?} argv0={:?} is_tty={}", std::env::current_exe().unwrap_or_default().display(), std::env::args().next().unwrap_or_default(), stdout_is_terminal());
+            }
             if stdout_is_terminal() {
                 println!("GUIARGS:--open-browser");
             } else {
