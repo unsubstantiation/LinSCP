@@ -136,8 +136,9 @@ pub fn export_backup(
     // Export the *unwrapped* master key as portable base64. This is what
     // makes the backup cross-distribution: a Windows DPAPI key restored on
     // Linux remains usable because we store the raw key.
+    #[allow(clippy::needless_borrows_for_generic_args)]
     let sessions_key_b64 = match vault.load_master_key(config_dir) {
-        Ok(Some(k)) => Some(BASE64.encode(k.as_bytes())),
+        Ok(Some(k)) => Some(BASE64.encode(&*k)),
         Ok(None) => None,
         Err(_) => None,
     };

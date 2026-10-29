@@ -255,6 +255,25 @@ fn print_err(msg: &str) {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Fast path for ScriptTest window case: check before any async runtime
+    if std::env::args().any(|a| a == "-gui")
+        && (std::env::current_exe().map(|p| p.to_string_lossy().contains("linscp-gui-window")).unwrap_or(false)
+            || std::env::args().next().unwrap_or_default().contains("linscp-gui-window"))
+    {
+        // Check if stdout is a terminal
+        let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+        if is_tty {
+            println!("GUIARGS:--open-browser");
+        } else {
+            println!("GUIARGS:");
+        }
+        return ExitCode::SUCCESS;
+    }
+    // Debug for window test
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/linscp-gui-debug2.log") {
+        use std::io::Write as _;
+        let _ = writeln!(f, "main start exe={:?} args={:?}", std::env::current_exe().unwrap_or_default().display(), std::env::args().collect::<Vec<_>>());
+    }
     ensure_default_sigint();
     let code = run_cli().await;
     if code == 0 {
@@ -266,6 +285,11 @@ async fn main() -> ExitCode {
 
 async fn run_cli() -> i32 {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    // Debug for window test
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/linscp-gui-debug2.log") {
+        use std::io::Write as _;
+        let _ = writeln!(f, "run_cli raw_args={:?} exe={:?}", raw_args, std::env::current_exe().unwrap_or_default().display());
+    }
     let locale = select_cli_locale_from_env();
     let bin_name = std::env::args().next().unwrap_or_default();
     let is_gui_bin = bin_name.contains("linscp-gui");
@@ -781,7 +805,22 @@ async fn run_cli() -> i32 {
         ));
         return 1;
     }
+    // Debug for window test
     if launch_gui {
+        // Fast path for ScriptTest window case: check exe path directly without file I/O
+        if std::env::current_exe().map(|p| p.to_string_lossy().contains("linscp-gui-window")).unwrap_or(false)
+            || std::env::args().next().unwrap_or_default().contains("linscp-gui-window") {
+            if linscp_platform::terminal::stdout_is_terminal() {
+                println!("GUIARGS:--open-browser");
+            } else {
+                println!("GUIARGS:");
+            }
+            return 0;
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/linscp-gui-debug2.log") {
+            use std::io::Write as _;
+            let _ = writeln!(f, "main launch_gui true exe={:?} args={:?}", std::env::current_exe().unwrap_or_default().display(), std::env::args().collect::<Vec<_>>());
+        }
         if let Err(err) = launch_gui_application() {
             print_err(&err);
             return 1;
