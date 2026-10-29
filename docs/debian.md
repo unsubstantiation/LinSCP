@@ -4,106 +4,98 @@ This is the operator reference for the Debian build of LinSCP: the console
 client, its options and commands, protocols, authentication, packaging and
 troubleshooting. For an overview, see the top-level [readme.md](../readme.md).
 
-The client `linscp` is built from the LinSCP front end (`source/linux`)
-on libssh: Session.cpp owns the transport, authentication and host-key
-policy, and SftpClient.cpp speaks the SFTP v3 wire protocol itself over
-a libssh subsystem channel.
+LinSCP is now a **pure-Rust + Tauri v2 + TypeScript** workspace. The console
+client (`linscp`), the browser HTTP server (`linscp --serve-http` / `linscp-gui`)
+and the native desktop host (`linscp-tauri`) share one Cargo workspace
+(`crates/*`) and one TypeScript Commander frontend (`ui/`). No C/C++ cross-
+compilation is required for the default build; `debian/rules`, `CMakeLists.txt`
+and `source/linux/Makefile` are thin wrappers that delegate to `cargo`.
 
 ## Requirements
 
 | What | Why |
 | --- | --- |
-| GNU make | the build system, `source/linux/Makefile` |
-| a C and C++17 compiler (`gcc`/`g++` or `clang`) | the core is C, the front end is C++ |
-| POSIX threads | the core's critical sections (`-pthread`) |
-| `libssh-dev` (>= 0.10) | SSH transport, authentication, host keys and SFTP/SCP channels |
-| `libssl-dev` | OpenSSL hashing, cryptographic helpers and PPK key material conversion |
-| `libargon2-dev` | Argon2 key derivation for encrypted PPK v3 keys |
-| `zlib1g-dev` | compression support required by the native build |
-| `pkg-config` | discovers native SSH and crypto compiler/linker flags |
-| `dpkg-dev` | only to build the `.deb` package |
-| `curl` (run time) | FTP transfers, FTPS, `dav://`/`webdav://` and `s3://` |
-| `python3` (run time) | the graphical client, `linscp-gui` |
-| `xdg-utils` (recommended, run time) | the `xdg-open` launcher that shows the graphical client in a browser on a Wayland or X11 desktop |
-| Node 20.19 or newer with `npm` (tests only) | the browser test suites boot the page in `jsdom` |
+| `cargo` + `rustc` 1.89+ | builds `crates/*` (`--release --workspace` → `target/release/linscp{,-gui}`) |
+| `pkg-config` + `dpkg-dev` | only to build the `.deb` (`debian/rules`) |
+| `xdg-utils` (recommended, run time) | `xdg-open` launcher that shows `linscp-gui --open-browser` on Wayland and X11 |
+| Node 22+ with `npm` | TypeScript UI build (`ui/`) and its `jsdom` suites (`ClientTest.js`, `LocalizationTest.js`) |
+| Python 3 | live regression harnesses that drive `target/release/linscp` and `linscp --serve-http` |
+| `openssh-server`, `krb5-kdc`, `krb5-admin-server`, `krb5-user` (live GSSAPI/SCP) | isolated loopback `sshd` + throwaway KDC for `LiveSftpTest.py` / `LiveTunnelTest.py` / `LiveScpTest.py` |
+| `python3-paramiko`, `python3-pyftpdlib`, `python3-openssl`, `python3-botocore`, `python3-xmlschema` (live) | SFTP / FTPS / S3 / XML-log reference implementations |
+
+Legacy C++ deps (`libssh-dev`, `libssl-dev`, `libargon2-dev`, `zlib1g-dev`, `build-essential`) are **not**
+required for the pure-Rust build; they remain only in git history for the retired
+`source/linux/*.cpp` reference implementation.
 
 ```sh
-sudo apt install build-essential dpkg-dev pkg-config libssh-dev libssl-dev \
-  libargon2-dev zlib1g-dev curl python3
+sudo apt install dpkg-dev pkg-config cargo rustc xdg-utils python3 nodejs npm
+# optional live deps:  sudo apt install openssh-server krb5-kdc krb5-admin-server krb5-user \
+#   python3-paramiko python3-pyftpdlib python3-openssl python3-botocore python3-xmlschema
 ```
 
 ## Building
 
+Pure-Rust is primary:
+
 ```sh
-make -C source/linux            # -> source/linux/build/linscp
-make -C source/linux check      # unit tests
-make -C source/linux check-live # script and live-server suites
-make -C source/linux clean
+cargo build --release --workspace      # -> target/release/linscp + linscp-gui (linscp-tauri on desktop)
+cargo test --workspace --all-targets   # Rust unit + integration tests
+npm --prefix ui install
+npm --prefix ui run build              # -> ui/dist (embedded in linscp-http via include_str)
+npm --prefix ui test                   # TypeScript UI + jsdom suites
+python3 source/linux/tests/ScriptTest.py target/release/linscp
+python3 source/linux/tests/LiveSftpTest.py target/release/linscp
+# ... LiveTunnel/S3/Dav/Scp/Curl + gui suites via linscp --serve-http
 ```
 
-There is no `configure` step. Build output goes to `source/linux/build/`, which
-is git-ignored. The Makefile stops on any host that is not Linux.
-
-For the live suites, the Python packages and the `sshd` they need, see the
-[readme](../readme.md#building-and-testing).
-
-CMake builds the same client from the same sources and registers the suites
-with CTest. It is the second job in CI:
+Legacy wrappers remain for compatibility and CI parity:
 
 ```sh
-cmake -S . -B build && cmake --build build -j
+make -C source/linux            # delegates to cargo build
+make -C source/linux check      # delegates to cargo test + hygiene checks
+cmake -S . -B build && cmake --build build -j   # delegates to cargo
 ctest --test-dir build --output-on-failure
-cmake --install build --prefix /opt/linscp  # relocatable private prefix
 ```
 
-Useful overrides:
-
-```sh
-make -C source/linux OPT=-O0 WARN=-Wall          # debug-friendly build
-make -C source/linux BUILD=build-asan OPT=-O0 \
-     CFLAGS=-fsanitize=address CXXFLAGS=-fsanitize=address \
-     LDFLAGS=-fsanitize=address                  # AddressSanitizer build
-```
+Build output is `target/` (git-ignored). Use `cargo --target aarch64-linux-android` (via `cargo ndk`)
+and `cargo --target x86_64-pc-windows-msvc` for cross builds; default builds need no C toolchain.
 
 ## Packaging
 
 ```sh
 dpkg-buildpackage -b -us -uc
-# -> ../linscp_1.0-5_amd64.deb
-sudo dpkg -i ../linscp_1.0-5_amd64.deb
+# -> ../linscp_1.0-6_amd64.deb
+sudo dpkg -i ../linscp_1.0-6_amd64.deb
 ```
 
-`debian/rules` does not use debhelper. The build is one plain Makefile, so the
-rules call it directly, run the unit tests as part of the package build, and
-install these paths:
+`debian/rules` does **not** use debhelper. It runs `cargo test --workspace --all-targets`,
+`cargo build --release --workspace`, then installs exactly the tree `cargo` produced plus
+desktop integration:
 
 | Path | What |
 | --- | --- |
-| `/usr/bin/linscp` | the console client |
-| `/usr/bin/linscp-gui` | the graphical client launcher |
-| `/usr/share/linscp/gui/` | the GUI's Python modules, its command templates and its web client |
-| `/usr/share/linscp/automation/LinSCP.psm1` | the PowerShell 7 wrapper over the console client |
-| `/usr/share/linscp/dotnet/` | the LinSCP .NET assembly sources (`LinSCP.csproj`, `Session.cs`) |
-| `/usr/share/man/man1/linscp.1.gz` | the manual page |
-| `/usr/share/applications/linscp.desktop` | the desktop entry, with `sftp://`, `ftp://`, `ftps://` and `ftpes://` handlers |
-| `/usr/share/pixmaps/linscp.png`, `/usr/share/icons/hicolor/scalable/apps/linscp.svg` | the icons |
-| `/usr/share/doc/linscp/` | the copyright, the licence and this document as `README.Debian` |
+| `/usr/bin/linscp` | console client (also `-server`, `-shell`, `backup`, `-xmllog`) |
+| `/usr/bin/linscp-gui` | same Rust binary; `linscp-gui --open-browser` serves `ui/dist` on 127.0.0.1 and asks `xdg-open`/`$BROWSER`/`gio` for a window (Wayland/X11) |
+| `/usr/share/linscp/automation/LinSCP.psm1` | PowerShell 7 wrapper over the console client |
+| `/usr/share/linscp/dotnet/` | LinSCP .NET assembly sources (`LinSCP.csproj`, `Session.cs`) |
+| `/usr/share/man/man1/linscp.1.gz` | manual page (`docs/linscp.1`, pure-Rust/reqwest/suppaftp/russh) |
+| `/usr/share/applications/linscp.desktop` | desktop entry, `sftp://`, `ftp://`, `ftps://`, `ftpes://`; `StartupNotify=false`, `TryExec=linscp`, recommends `xdg-utils` |
+| `/usr/share/pixmaps/linscp.png`, `/usr/share/icons/hicolor/scalable/apps/linscp.svg` | icons |
+| `/usr/share/doc/linscp/` | `copyright`, `LICENSE`, `NOTICE`, this document as `README.Debian` |
 
-`linscp -gui` and the desktop entry both start `linscp-gui`, which runs
-the GUI's Python modules under `/usr/share/linscp/gui/`.
+The UI assets are **embedded** in the binary (`linscp-http` `include_str!` of `ui/dist`), so no
+`/usr/share/linscp/gui/` tree is shipped — browser mode is served from the binary itself.
+`linscp -gui` and the desktop entry both exec `linscp-gui`.
 
-`make -C source/linux install` and `cmake --install` lay out the same tree
-under the prefix they are given. The three installers are kept in step by
-`tools/check_platform_conversion.py`, which fails when one of them ships a
-file the others do not.
+`make -C source/linux install` and `cmake --install` lay out the same tree under the prefix they are
+given, delegating to `cargo install`-equivalent logic. The installers are kept in step by
+`tools/check_repo_hygiene.py` (successor to `check_platform_conversion.py`).
 
-The CI `debian-package` job builds the package, checks that the main paths
-above are present, installs it, and starts the installed GUI. A launcher that
-cannot find its modules therefore fails the build.
+The CI `debian-package` job builds the `.deb`, asserts the paths above exist, installs it,
+and starts the installed GUI. A launcher that cannot find its binary therefore fails the build.
 
-`Depends` is generated by `dpkg-shlibdeps`, so it follows the libraries of the
-build host. Update `debian/changelog` and the `Maintainer` field before
-publishing a package.
+`Depends` is generated by `dpkg-shlibdeps` from the Rust binary's linked libs (mostly `libc`).
+Update `debian/changelog` and `Maintainer` before publishing.
 
 ## Using the client
 
@@ -546,20 +538,22 @@ prints an evidence line that reports its passes, failures and skipped cases.
 [`upstream-parity.md`](upstream-parity.md) explains how the evidence is recorded
 and checked.
 
-One of those commands checks the platform itself. LinSCP is a Linux-only
-client - the Windows port is gone - and
+One of those commands guards the repository hygiene and branding. LinSCP is now
+**cross-platform** (Linux, Windows, Android) via the pure-Rust workspace, so
 
 ```sh
-python3 tools/check_platform_conversion.py
+python3 tools/check_repo_hygiene.py
+# (legacy: tools/check_platform_conversion.py — now delegates to the above)
 ```
 
-reads the sources and refuses a Windows API call, a Windows environment
-variable, a Windows path, a file of another platform, an installer that
-disagrees with the others, and an error message whose wording contradicts
-the template it is filled into. `make -C source/linux check` runs it, CTest
-registers it as `platform-conversion-check`, and CI runs it on every push.
-`tools/tests/test_platform_conversion.py` holds the check itself to the same
-standard: it has to fail on the things it claims to catch.
+enforces the branding allowlist, the retired-artefact denylist, and that
+`#[cfg(windows)]` / `#[cfg(target_os = "android")]` / `windows-sys` / `jni` appear only
+inside `crates/linscp-platform` and `crates/linscp-tauri` (the rest of the workspace
+stays OS-agnostic). It also guards `debian/` and `CMakeLists.txt` packaging parity.
+`cargo test` (and `make -C source/linux check` as a thin wrapper) runs it, CTest
+registers it as `repo-hygiene-check`, and CI runs it on every push.
+`tools/tests/test_platform_conversion.py` keeps the legacy name but now exercises the
+new hygiene rules to the same standard: it must fail on the things it claims to catch.
 
 A second one guards the display server. LinSCP ships for both Wayland and X11
 desktops, and the way an application gets that wrong is to ask for X11 alone,

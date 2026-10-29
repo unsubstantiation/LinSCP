@@ -37,13 +37,13 @@ English, Spanish, German and French catalogs cover the browser interface (menus,
 
 RDP/VNC/SPICE are direct-TCP (3389/5900) with optional SSH jump SOCKS5h relay; X2Go/X11 are SSH-transported via direct-tcpip. Native viewers are resolved via PATH (xfreerdp3→xfreerdp→wlfreerdp/sdl-freerdp, mstsc, open, vncviewer, remote-viewer/spicy, x2goclient/pyhoca-cli, waypipe/ssh -X) with Windows/macOS/Android specifics, and dial the same proxy/tunnel/TLS/SPKI stack as file protocols. Headless mode falls back to .rdp/.vv file tickets or BrowserGateway hints for HTML5 gateways; XDMCP (UDP 177, unencrypted) is explicitly refused/recommended against. Wayland vs X11 detection drives waypipe vs ssh -X. Verified by unit ticket/argv tests; live viewer integration and ironrdp gateway tests are outstanding.
 
-**Next:** Live integration tests (live-desktop-rdp/vnc/spice/x2go/x11) with real viewers and ironrdp gateway are not yet gated.
+**Next:** Ironrdp WASM / Guacamole gateway HTML5 fallback credential isolation review remains; live viewer launches (xfreerdp/vncviewer/remote-viewer/x2goclient/waypipe, headless .rdp/.vv, jump tunnel inheritance, XDMCP refusal, SSH prompt + installer) are now gated via live-desktop.
 
 **Acceptance criteria:**
 
-- [ ] Live RDP launch with xfreerdp/mstsc against a throwaway RDP server (or loopback stub) verifies argv, port 3389, TLS/NLA option, and jump-host SOCKS5h relay without exposing credentials.
-- [ ] Live VNC (5900) and SPICE (5900/.vv) launches verify viewer resolution (tigervnc/remote-viewer), TLS port, and headless .vv/.rdp ticket generation.
-- [ ] Live X2Go/NX and X11/Waypipe launches verify SSH-transported NX compression over direct-tcpip, WAYLAND_DISPLAY detection, and that jump-host proxy/TLS/SPKI settings are inherited without fallback.
+- [ ] Live RDP launch with xfreerdp/mstsc against a throwaway RDP stub verifies argv, port 3389, TLS/NLA option, and jump-host SOCKS5h relay without exposing credentials (live-desktop).
+- [ ] Live VNC (5900) and SPICE (5900/.vv) launches verify viewer resolution (tigervnc/remote-viewer), TLS port, and headless .vv/.rdp ticket generation (live-desktop).
+- [ ] Live X2Go/NX and X11/Waypipe launches verify SSH-transported NX compression over direct-tcpip, WAYLAND_DISPLAY detection, and that jump-host proxy/TLS/SPKI settings are inherited without fallback (live-desktop).
 - [ ] Obtain independent review that ironrdp WASM / Guacamole gateway fallback correctly isolates credentials and that XDMCP (UDP 177) remains refusing/not recommended.
 
 ## Cross-cutting release gate

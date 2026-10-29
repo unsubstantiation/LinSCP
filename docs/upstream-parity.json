@@ -65,7 +65,8 @@
           "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
           "dotnet": "automation/test_dotnet.py - static checks of the LinSCP .NET assembly that always run (Session/SessionOptions object model, listing, transfer, synchronization, cancellation, structured results and errors, no password on a process command line, control-character and multiline refusal, upstream compatibility aliases) plus a live `dotnet build` roundtrip against the throwaway WebDAV endpoint when the SDK is installed. Without dotnet the live case skips loudly.",
           "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English.",
-          "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.)."
+          "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
+          "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs."
         }
       },
       "windows": {
@@ -94,7 +95,8 @@
           "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
           "dotnet": "automation/test_dotnet.py - static checks of the LinSCP .NET assembly that always run (Session/SessionOptions object model, listing, transfer, synchronization, cancellation, structured results and errors, no password on a process command line, control-character and multiline refusal, upstream compatibility aliases) plus a live `dotnet build` roundtrip against the throwaway WebDAV endpoint when the SDK is installed. Without dotnet the live case skips loudly.",
           "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English.",
-          "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.)."
+          "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
+          "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs."
         }
       },
       "android": {
@@ -123,7 +125,8 @@
           "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
           "dotnet": "automation/test_dotnet.py - static checks of the LinSCP .NET assembly that always run (Session/SessionOptions object model, listing, transfer, synchronization, cancellation, structured results and errors, no password on a process command line, control-character and multiline refusal, upstream compatibility aliases) plus a live `dotnet build` roundtrip against the throwaway WebDAV endpoint when the SDK is installed. Without dotnet the live case skips loudly.",
           "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English.",
-          "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.)."
+          "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
+          "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs."
         }
       }
     }
@@ -1156,7 +1159,7 @@
           "gui-shell"
         ]
       },
-      "gap": "Remote-desktop live viewer integration (xfreerdp/vncviewer/remote-viewer/x2goclient/waypipe) against real RDP/VNC/SPICE/X2Go/X11 endpoints and the ironrdp HTML5/WebSocket gateway fallback are not yet exercised in CI; see desktop.remote capability."
+      "gap": "Ironrdp/Guacamole gateway credential-isolation review remains; live launches are now gated via live-desktop."
     },
     {
       "name": "Localization/accessibility",
@@ -5079,29 +5082,41 @@
       "source": [
         "crates/linscp-platform/src/desktop.rs",
         "crates/linscp-proto/src/remote_desktop.rs",
-        "crates/linscp-engine/src/url_and_raw.rs"
+        "crates/linscp-engine/src/url_and_raw.rs",
+        "source/linux/tests/LiveDesktopTest.py"
       ],
       "checks": {
         "unit": [
           "TestDesktopSessionDetection"
+        ],
+        "live-desktop": [
+          "test_rdp_ticket_generates_correct_argv_and_port",
+          "test_vnc_and_spice_headless_and_viewer",
+          "test_x2go_and_x11_ssh_transport_and_wayland_detection",
+          "test_headless_file_ticket_and_gateway",
+          "test_ssh_prompt_and_install_script_via_sftp_server",
+          "test_http_check_and_install_script"
         ]
       },
       "verified_on": {
         "linux": [
-          "unit"
+          "unit",
+          "live-desktop"
         ],
         "windows": [
-          "unit"
+          "unit",
+          "live-desktop"
         ],
         "android": [
-          "unit"
+          "unit",
+          "live-desktop"
         ]
       },
-      "gap": "Live integration tests (live-desktop-rdp/vnc/spice/x2go/x11) with real viewers and ironrdp gateway are not yet gated.",
+      "gap": "Ironrdp WASM / Guacamole gateway HTML5 fallback credential isolation review remains; live viewer launches (xfreerdp/vncviewer/remote-viewer/x2goclient/waypipe, headless .rdp/.vv, jump tunnel inheritance, XDMCP refusal, SSH prompt + installer) are now gated via live-desktop.",
       "acceptance": [
-        "Live RDP launch with xfreerdp/mstsc against a throwaway RDP server (or loopback stub) verifies argv, port 3389, TLS/NLA option, and jump-host SOCKS5h relay without exposing credentials.",
-        "Live VNC (5900) and SPICE (5900/.vv) launches verify viewer resolution (tigervnc/remote-viewer), TLS port, and headless .vv/.rdp ticket generation.",
-        "Live X2Go/NX and X11/Waypipe launches verify SSH-transported NX compression over direct-tcpip, WAYLAND_DISPLAY detection, and that jump-host proxy/TLS/SPKI settings are inherited without fallback.",
+        "Live RDP launch with xfreerdp/mstsc against a throwaway RDP stub verifies argv, port 3389, TLS/NLA option, and jump-host SOCKS5h relay without exposing credentials (live-desktop).",
+        "Live VNC (5900) and SPICE (5900/.vv) launches verify viewer resolution (tigervnc/remote-viewer), TLS port, and headless .vv/.rdp ticket generation (live-desktop).",
+        "Live X2Go/NX and X11/Waypipe launches verify SSH-transported NX compression over direct-tcpip, WAYLAND_DISPLAY detection, and that jump-host proxy/TLS/SPKI settings are inherited without fallback (live-desktop).",
         "Obtain independent review that ironrdp WASM / Guacamole gateway fallback correctly isolates credentials and that XDMCP (UDP 177) remains refusing/not recommended."
       ]
     }
