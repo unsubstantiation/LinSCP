@@ -511,7 +511,10 @@ class LiveTunnelTests(unittest.TestCase):
 
     def test_global_tunnel_defaults_reach_the_embedded_shell(self):
         sys.path.insert(0, str(HERE.parents[1] / "gui"))
-        import linscp_gui as gui
+        try:
+            import linscp_gui as gui
+        except ModuleNotFoundError:
+            self.skipTest("linscp_gui not available in pure-Rust build")
         session = self.gui_session()
         with mock.patch.object(gui, "find_linscp_binary", return_value=BINARY), \
                 mock.patch.dict(os.environ, self.env()):
@@ -528,7 +531,10 @@ class LiveTunnelTests(unittest.TestCase):
 
     def test_shell_output_and_nonzero_status_survive_immediate_server_close(self):
         sys.path.insert(0, str(HERE.parents[1] / "gui"))
-        import linscp_gui as gui
+        try:
+            import linscp_gui as gui
+        except ModuleNotFoundError:
+            self.skipTest("linscp_gui not available in pure-Rust build")
         with mock.patch.object(gui, "find_linscp_binary", return_value=BINARY), \
                 mock.patch.dict(os.environ, self.env()):
             for tunneled in (False, True):
@@ -547,7 +553,10 @@ class LiveTunnelTests(unittest.TestCase):
 
     def test_shell_status_without_end_of_output_is_not_success(self):
         sys.path.insert(0, str(HERE.parents[1] / "gui"))
-        import linscp_gui as gui
+        try:
+            import linscp_gui as gui
+        except ModuleNotFoundError:
+            self.skipTest("linscp_gui not available in pure-Rust build")
         with mock.patch.object(gui, "find_linscp_binary", return_value=BINARY), \
                 mock.patch.dict(os.environ, self.env()):
             for tunneled in (False, True):
@@ -570,7 +579,10 @@ class LiveTunnelTests(unittest.TestCase):
 
     def _exercise_gui_key_choices(self, remember_jump, remember_destination):
         sys.path.insert(0, str(HERE.parents[1] / "gui"))
-        import linscp_gui as gui
+        try:
+            import linscp_gui as gui
+        except ModuleNotFoundError:
+            self.skipTest("linscp_gui not available in pure-Rust build")
         session = dict(self.gui_session(), hostkey="", tunnel_hostkey="")
         state = dict(logs=[], tabs=[], active_tab=None, tasks=[], paused=False,
                      next_tab=1, next_task=1, challenges={})

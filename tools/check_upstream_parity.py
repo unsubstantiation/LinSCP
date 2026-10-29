@@ -67,6 +67,7 @@ CASE_SOURCES = {
     "gui-shell": "source/gui/tests/ShellIntegrationTest.py",
     "platform-conversion": "tools/tests/test_platform_conversion.py",
     "wayland-compatibility": "tools/tests/test_wayland_compatibility.py",
+    "backup": "crates/linscp-engine/src/backup.rs",
 }
 
 
@@ -87,11 +88,11 @@ def command_table(source):
         return set(re.findall(r'"([^"]+)"', block.group(1)))
     # Pure-Rust workspace: look for a kCommandNames-like table or COMMANDS array in script.rs
     # Fallback to any quoted command-like list; if still not found, return empty set and let caller skip.
-    rust_block = re.search(r"(?:kCommandNames|COMMANDS|commands)\s*[:=]\s*[\[\{](.*?)[\]\}]", source, re.S | re.I)
+    rust_block = re.search(r"(?:kCommandNames|COMMAND_NAMES)\s*[^=]*=\s*[^\[]*\[([^\]]+)\]", source, re.S)
     if rust_block:
         candidates = set(re.findall(r'"([^"]+)"', rust_block.group(1)))
         # filter to plausible command names (lowercase, no spaces)
-        filtered = {c for c in candidates if re.match(r'^[a-z-]+$', c)}
+        filtered = {c for c in candidates if re.match(r'^[a-z?\-]+$', c)}
         if filtered:
             return filtered
     # No table found - pure-Rust dispatch is matched differently; return empty to skip strict validation
@@ -266,8 +267,8 @@ def check_capabilities(inventory, errors, root=ROOT):
                     # The JS harness calls check('description', condition).
                     expression = r"check\(\s*['\"]" + re.escape(case) + r"['\"]"
                 else:
-                    # Python's test_* methods and the named C++ Test* functions.
-                    expression = r"\b(?:def|void)\s+" + re.escape(case) + r"\s*\("
+                    # Python's test_* / C++ Test* / Rust fn test_*.
+                    expression = r"\b(?:def|void|fn)\s+" + re.escape(case) + r"\s*\("
                 if not re.search(expression, text):
                     errors.append(f"{label}: {suite} has no test case {case}")
     for area in sorted(areas - found.keys()):
@@ -330,7 +331,7 @@ def case_links(row):
             if suite in ('gui', 'gui-localization'):
                 pattern = r"check\(\s*['\"]" + re.escape(case) + r"['\"]"
             else:
-                pattern = r'\b(?:def|void)\s+' + re.escape(case) + r'\s*\('
+                pattern = r'\b(?:def|void|fn)\s+' + re.escape(case) + r'\s*\('
             match = re.search(pattern, text)
             line = text.count('\n', 0, match.start()) + 1 if match else 1
             label = markdown_cell(suite + ': ' + case)

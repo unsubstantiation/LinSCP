@@ -63,19 +63,19 @@ set_tests_properties(unit-tests PROPERTIES
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
   add_test(NAME script-tests
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/ScriptTest.py $<TARGET_FILE:linscp>)
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/ScriptTest.py ${CMAKE_SOURCE_DIR}/target/release/linscp)
   add_test(NAME live-sftp-tests
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveSftpTest.py $<TARGET_FILE:linscp>)
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveSftpTest.py ${CMAKE_SOURCE_DIR}/target/release/linscp)
   add_test(NAME live-tunnel-tests
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveTunnelTest.py $<TARGET_FILE:linscp>)
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveTunnelTest.py ${CMAKE_SOURCE_DIR}/target/release/linscp)
   add_test(NAME live-s3-tests
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveS3Test.py $<TARGET_FILE:linscp>)
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveS3Test.py ${CMAKE_SOURCE_DIR}/target/release/linscp)
   add_test(NAME live-dav-tests
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveDavTest.py $<TARGET_FILE:linscp>)
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveDavTest.py ${CMAKE_SOURCE_DIR}/target/release/linscp)
   add_test(NAME live-scp-tests
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveScpTest.py $<TARGET_FILE:linscp>)
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveScpTest.py ${CMAKE_SOURCE_DIR}/target/release/linscp)
   add_test(NAME live-curl-tests
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveCurlTest.py $<TARGET_FILE:linscp>)
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/source/linux/tests/LiveCurlTest.py ${CMAKE_SOURCE_DIR}/target/release/linscp)
 endif()
 
 if(NPM)

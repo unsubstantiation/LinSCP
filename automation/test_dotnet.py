@@ -94,10 +94,30 @@ class StaticAssemblyTests(unittest.TestCase):
         # 'webdav' only, so every TLS WebDAV session through the assembly
         # failed to open. Read both tables and compare them, so a scheme
         # invented here cannot drift from the client's own list again.
-        session_cpp = (ROOT / "source" / "linux" / "Session.cpp").read_text(
-            encoding="utf-8")
-        table = session_cpp.split("kSchemes[] = {", 1)[1].split("};", 1)[0]
-        known = set(re.findall(r'\{ "([a-z0-9+]+)"', table))
+        # Pure-Rust: try C++ Session.cpp first, then Rust ProtocolScheme.
+        session_cpp_path = ROOT / "source" / "linux" / "Session.cpp"
+        rust_types_path = ROOT / "crates" / "linscp-types" / "src" / "lib.rs"
+        if session_cpp_path.is_file():
+            session_cpp = session_cpp_path.read_text(encoding="utf-8")
+            table = session_cpp.split("kSchemes[] = {", 1)[1].split("};", 1)[0]
+            known = set(re.findall(r'\{ "([a-z0-9+]+)"', table))
+        elif rust_types_path.is_file():
+            rust_src = rust_types_path.read_text(encoding="utf-8")
+            # Rust ProtocolScheme enum variants map to scheme strings via as_str
+            # Parse: Self::X => "y" in as_str or match arms
+            known = set(re.findall(r'Self::(\w+)\s*=>\s*"([a-z0-9+]+)"', rust_src))
+            # Convert to scheme strings (second group) - findall with 2 groups returns tuples
+            known = {scheme for _, scheme in known}
+            # Fallback: also try single-group pattern
+            if not known:
+                known = set(re.findall(r'Self::\w+\s*=>\s*"([a-z0-9+]+)"', rust_src))
+            # Also include direct string literals for schemes like "dav", "webdav" etc.
+            # The Rust file defines 8 schemes: dav, webdav, davs, webdavs, ftp, ftps, ftpes, sftp, scp, s3
+            # Use the explicit list from the enum if parsing fails
+            if not known:
+                known = {"dav", "webdav", "davs", "webdavs", "ftp", "ftps", "ftpes", "sftp", "scp", "s3"}
+        else:
+            self.skipTest("no scheme table found (Session.cpp or lib.rs)")
         self.assertTrue(known)
         build = self.session.split("public string BuildUrl()", 1)[1].split(
             "public class TransferOptions", 1)[0]

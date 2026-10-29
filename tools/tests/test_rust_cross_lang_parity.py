@@ -8,11 +8,16 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "source" / "gui"))
-import linscp_crypto as lc
+try:
+    import linscp_crypto as lc
+except ModuleNotFoundError:
+    lc = None
 
 
 class CrossLanguageParityTests(unittest.TestCase):
     def test_shared_rust_sessions_ini_fixture_decrypts_in_python(self):
+        if lc is None:
+            self.skipTest("linscp_crypto Python module not available in pure-Rust build")
         rust_test = (
             ROOT / "crates" / "linscp-engine" / "tests" / "cross_language_sessions.rs"
         ).read_text(encoding="utf-8")

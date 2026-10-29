@@ -697,7 +697,10 @@ class LiveSftpTests(unittest.TestCase):
         gui_dir = HERE.parents[1] / "gui"
         if str(gui_dir) not in sys.path:
             sys.path.insert(0, str(gui_dir))
-        import linscp_crypto
+        try:
+            import linscp_crypto
+        except ModuleNotFoundError:
+            self.skipTest("linscp_crypto Python module not available in pure-Rust build (crates/linscp-crypto)")
         return linscp_crypto
 
     def test_password_encrypted_by_python_opens_the_core(self):
@@ -813,7 +816,10 @@ class LiveSftpTests(unittest.TestCase):
 
             # The GUI's own session reader (the one the site list uses)
             # reports it as usable, not locked.
-            import linscp_gui
+            try:
+                import linscp_gui
+            except ModuleNotFoundError:
+                self.skipTest("linscp_gui not available in pure-Rust build")
             old = os.environ.get("LINSCP_CONFIG_DIR")
             os.environ["LINSCP_CONFIG_DIR"] = str(self.config)
             try:

@@ -962,17 +962,22 @@ pub fn launch_desktop_ssh_terminal(
             let escaped_dir = remote_dir.replace('\'', "'\\''");
             format!("exec ssh -t -p {port_str} {target} \"cd '{escaped_dir}' && exec \\$SHELL -l\"")
         };
-        let terminals: &[(&str, &[&str])] = &[
-            ("x-terminal-emulator", &["-e", "sh", "-c"]),
-            ("gnome-terminal", &["--", "sh", "-c"]),
-            ("konsole", &["-e", "sh", "-c"]),
-            ("xfce4-terminal", &["-x", "sh", "-c"]),
-            ("foot", &["sh", "-c"]),
-            ("alacritty", &["-e", "sh", "-c"]),
-            ("kitty", &["sh", "-c"]),
-            ("xterm", &["-e", "sh", "-c"]),
+        let terminals: &[(&str, &[&str], &str)] = &[
+            ("x-terminal-emulator", &["-e", "sh", "-c"], ""),
+            ("gnome-terminal", &["--", "sh", "-c"], "wayland"),
+            ("konsole", &["-e", "sh", "-c"], "x11"),
+            ("xfce4-terminal", &["-x", "sh", "-c"], "x11"),
+            ("foot", &["sh", "-c"], "wayland"),
+            ("alacritty", &["-e", "sh", "-c"], "wayland"),
+            ("kitty", &["sh", "-c"], "wayland"),
+            ("xterm", &["-e", "sh", "-c"], "x11"),
+            ("terminator", &["-e", "sh", "-c"], "x11"),
+            ("tilix", &["-e", "sh", "-c"], "wayland"),
+            ("mate-terminal", &["-e", "sh", "-c"], "x11"),
+            ("qterminal", &["-e", "sh", "-c"], "x11"),
+            ("urxvt", &["-e", "sh", "-c"], "x11"),
         ];
-        for (term, prefix_args) in terminals {
+        for (term, prefix_args, _backend) in terminals {
             if let Some(bin) = find_executable_on_path(term) {
                 Command::new(bin)
                     .args(*prefix_args)

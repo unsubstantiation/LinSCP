@@ -122,9 +122,17 @@ RULES = [
      r'\{\s*"[a-z0-9._-]+"\s*,\s*\{[^{}]*\}\s*\}',
      "a terminal candidate with no display server named: the table is how "
      "this client knows not to start a Wayland-only terminal under X11"),
+    ('terminal-backend-missing', 'code',
+     r'\(\s*"[a-z0-9._-]+"\s*,\s*&\[[^\]]*\]\s*\)',
+     "a terminal candidate with no display server named: the table is how "
+     "this client knows not to start a Wayland-only terminal under X11"),
 
     ('terminal-backend-unknown', 'code',
      r'\{\s*"[a-z0-9._-]+"\s*,\s*\{[^{}]*\}\s*,\s*"(?!(?:wayland|x11)"?\s*\})[a-z0-9_-]+"',
+     "a terminal candidate whose display server is none of '', 'wayland' or "
+     "'x11', so no session can be matched against it"),
+    ('terminal-backend-unknown', 'code',
+     r'\(\s*"[a-z0-9._-]+"\s*,\s*&\[[^\]]*\]\s*,\s*"(?!(?:wayland|x11)"\s*\))[a-z0-9_-]+"\s*\)',
      "a terminal candidate whose display server is none of '', 'wayland' or "
      "'x11', so no session can be matched against it"),
 ]

@@ -29,6 +29,7 @@ use crate::presets::{PresetPermissions, ResumeSupportMode, TransferPreset, Trans
 use crate::script_params::{
     PrefixMatch, expand_script_parameters, resolve_prefixed_name, tokenize_script_line,
 };
+use crate::backup::{export_backup_to_file, import_backup_from_file};
 use crate::session_store::SessionStore;
 use crate::sync_planner::{
     SyncAction, SyncConflictPolicy, SyncCriteria, SyncMode, SyncOptions, SyncState,
@@ -124,6 +125,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "sync",
     "synchronize",
     "terminal",
+    "backup",
     "unlock",
     "versions",
     "?",
@@ -268,6 +270,10 @@ const SCRIPT_COMMAND_HELPS: &[(&str, &str)] = &[
     (
         "sessions",
         "sessions [ NAME | list | export <file> | import <file> ]\n  Lists the stored sites, opens one by name, or exports and\n  imports the whole list.",
+    ),
+    (
+        "backup",
+        "backup export <file> | import <file>\n  Exports or imports *all* per-user configuration as a single\n  distribution-compatible JSON bundle (sessions.ini + sessions.key,\n  workspaces.json, bookmarks.json, preferences.json, accounts.ini,\n  sshhostkeys, explorer-commands.json). The bundle is LF, UTF-8,\n  base64 for secrets and CRLF-tolerant, so a backup from Debian\n  restores on Fedora, Arch, Windows and Android and vice versa.",
     ),
     (
         "etag",
@@ -935,6 +941,7 @@ impl ScriptInterpreter {
             "savepreset" => self.cmd_savepreset(args),
             "rmspreset" => self.cmd_rmspreset(args),
             "sessions" => self.cmd_sessions(args).await,
+            "backup" => self.cmd_backup(args).await,
             "savesession" => self.cmd_savesession(args),
             "rmsession" => self.cmd_rmsession(args),
             "session" => self.cmd_session(args),
@@ -1695,6 +1702,30 @@ impl ScriptInterpreter {
             "session",
             self.tr("Syntax: sessions [NAME|list|export <file>|import <file>]."),
         ))
+    }
+
+    async fn cmd_backup(&mut self, args: &[String]) -> Result<(), String> {
+        if args.len() != 2 {
+            return Err(self.tr("Syntax: backup export <file> | import <file>.").to_string());
+        }
+        let sub = args[0].to_ascii_lowercase();
+        let path = std::path::PathBuf::from(expand_tilde(&args[1]));
+        let vault = linscp_platform::NativeSecretVault::new();
+        match sub.as_str() {
+            "export" => {
+                export_backup_to_file(&self.cfg.config_dir, &path, &vault)
+                    .map_err(|e| self.trp("Cannot export backup to '{file}': {error}", &[("file", &args[1]), ("error", &e)]))?;
+                println!("{}", self.trp("Full backup exported to '{file}'.", &[("file", &args[1])]));
+                Ok(())
+            }
+            "import" => {
+                import_backup_from_file(&self.cfg.config_dir, &path, &vault)
+                    .map_err(|e| self.trp("Cannot import backup from '{file}': {error}", &[("file", &args[1]), ("error", &e)]))?;
+                println!("{}", self.trp("Full backup imported from '{file}'.", &[("file", &args[1])]));
+                Ok(())
+            }
+            _ => Err(self.tr("Syntax: backup export <file> | import <file>.").to_string())
+        }
     }
 
     fn cmd_savesession(&mut self, args: &[String]) -> Result<(), String> {

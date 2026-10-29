@@ -139,7 +139,7 @@ class InventoryTests(unittest.TestCase):
 
     def test_capability_matrix_cannot_lose_areas_or_invent_evidence(self):
         valid = {"id": "sftp.example", "area": "SFTP", "status": "verified",
-                 "notes": "A narrowly checked behavior", "source": ["source/linux/SftpClient.cpp"],
+                 "notes": "A narrowly checked behavior", "source": ["crates/linscp-proto/src/sftp.rs"],
                  "checks": {"live-sftp": ["test_open_with_a_wrong_password_is_refused"]},
                  "verified_on": {"linux": ["live-sftp"]}}
         inventory = {"features": [{"name": "SFTP"}],
@@ -220,7 +220,7 @@ class InventoryTests(unittest.TestCase):
 
     def test_every_dispatcher_name_is_in_exactly_one_group(self):
         inventory = json.loads((ROOT / "docs/upstream-parity.json").read_text())
-        dispatched = checker.command_table((ROOT / "source/linux/Script.cpp").read_text())
+        dispatched = checker.command_table((ROOT / "crates/linscp-engine/src/script.rs").read_text())
         errors = []
         checker.check_command_coverage(inventory, dispatched, errors)
         self.assertEqual(errors, [])
@@ -302,15 +302,15 @@ class InventoryTests(unittest.TestCase):
         self.assertGreaterEqual(len(capabilities), 80)
         self.assertEqual((ROOT / "docs/linux-feature-inventory.md").read_text(),
                          matrix_report(inventory))
-        # LinSCP is a Linux application: the ledger names exactly that
-        # platform, so no entry can cite evidence from a host this client is
-        # not built for.
+        # LinSCP ships on Linux, Windows, and Android via Rust+Tauri: the
+        # ledger names exactly those platforms, so no entry can cite evidence
+        # from a host this client is not built for.
         platforms = inventory["verification"]["platforms"]
-        self.assertEqual(sorted(platforms), ["linux"])
+        self.assertEqual(sorted(platforms), ["android", "linux", "windows"])
         cited = [e for e in entries if e.get("verified_on")]
         self.assertTrue(cited, "no entry records any evidence at all")
         for entry in cited:
-            self.assertEqual(sorted(entry["verified_on"]), ["linux"],
+            self.assertTrue(set(entry["verified_on"]).issubset(set(platforms)),
                              str(entry.get("name")) + ": cites a platform the "
                              "ledger does not ship on")
         # Promotion is allowed only when every aspect of the claim is

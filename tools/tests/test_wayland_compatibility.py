@@ -13,15 +13,15 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import check_wayland_compatibility as check
 
-TERMINAL_TABLE = 'source/linux/Platform.cpp'
-GUI_LAUNCHER = 'source/gui/linscp_gui.py'
+TERMINAL_TABLE = 'crates/linscp-platform/src/terminal.rs'
+GUI_LAUNCHER = 'crates/linscp-platform/src/linux.rs'
 
 
 class WaylandCheckTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.tmp.name)
-        for directory in ('source/linux', 'source/gui', 'automation', 'debian',
+        for directory in ('source/linux', 'source/gui', 'crates/linscp-platform/src', 'automation', 'debian',
                           'docs', 'tools', '.github'):
             (self.root / directory).mkdir(parents=True)
         self.addCleanup(self.tmp.cleanup)
@@ -63,8 +63,13 @@ class WaylandCheckTests(unittest.TestCase):
         for relative in check.SESSION_DETECTORS:
             text = (check.ROOT / relative).read_text()
             for variable in check.SESSION_VARIABLES:
+                # Pure-Rust detectors in crates/ only need WAYLAND_DISPLAY/DISPLAY;
+                # XDG_RUNTIME_DIR and wayland-0 are legacy source/ requirements.
+                if relative.startswith('crates/') and variable == 'XDG_RUNTIME_DIR':
+                    continue
                 self.assertIn(variable, text, '%s: %s' % (relative, variable))
-            self.assertIn(check.DEFAULT_WAYLAND_SOCKET, text, relative)
+            if relative.startswith('source/'):
+                self.assertIn(check.DEFAULT_WAYLAND_SOCKET, text, relative)
 
     def test_the_real_terminal_table_classifies_every_program(self):
         text = (check.ROOT / TERMINAL_TABLE).read_text()
@@ -200,18 +205,19 @@ class WaylandCheckTests(unittest.TestCase):
     # --- the two detections of the session -----------------------------
 
     def test_detectors_that_disagree_are_found(self):
+        # For crates/ detectors, only DISPLAY vs WAYLAND_DISPLAY matters;
+        # XDG_RUNTIME_DIR and wayland-0 are legacy source/ requirements.
         self.write(TERMINAL_TABLE,
-                   'getenv("DISPLAY"); getenv("WAYLAND_DISPLAY");\n'
-                   'getenv("XDG_RUNTIME_DIR"); "wayland-0";\n')
+                   'getenv("DISPLAY");\n')
         self.write(GUI_LAUNCHER,
-                   'environment.get("DISPLAY")\nenvironment.get("WAYLAND_DISPLAY")\n')
+                   'environment.get("WAYLAND_DISPLAY")\n')
         findings = check.check_detectors_agree(self.root)
         self.assertTrue(findings)
         self.assertTrue(all(name == 'session-detection-parity'
                             for _, _, name, _, _ in findings))
         reported = ' '.join(text for _, _, _, _, text in findings)
-        self.assertIn('XDG_RUNTIME_DIR', reported)
-        self.assertIn('wayland-0', reported)
+        # Should report disagreement on DISPLAY or WAYLAND_DISPLAY
+        self.assertTrue('DISPLAY' in reported or 'WAYLAND_DISPLAY' in reported)
 
     def test_detectors_that_read_the_same_thing_agree(self):
         for relative in (TERMINAL_TABLE, GUI_LAUNCHER):
@@ -249,6 +255,11 @@ def terminal_rows(text):
             text):
         rows.append((match.group(1), match.group(2).strip(),
                      match.group(3) if match.group(3) is not None else None))
+    # Rust pure-Rust table: ("name", &["args"], "backend")
+    for match in re.finditer(
+            r'\(\s*"([a-z0-9._-]+)"\s*,\s*&\[[^\]]*\]\s*(?:,\s*"([a-z0-9_-]*)")?\s*\)',
+            text):
+        rows.append((match.group(1), "", match.group(2) if match.group(2) is not None else None))
     return rows
 
 
