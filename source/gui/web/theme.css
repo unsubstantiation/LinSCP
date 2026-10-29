@@ -1012,3 +1012,78 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .commander-main { scroll-behavior: auto; }
 }
+
+/* ==========================================================================
+   UI polish — all features visible (desktop, proxy, backup, S3, etc.)
+   ========================================================================== */
+
+/* Site manager: protocol group affordance — desktop protocols are first-class */
+#siteProtocol option[value="rdp"] { font-weight: 700; }
+#siteProtocol option[value="vnc"],
+#siteProtocol option[value="spice"] { color: var(--accent-hover); }
+#siteForm details { border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; background: var(--surface); }
+#siteForm details[open] { border-color: var(--border-strong); background: var(--surface-raised); box-shadow: 0 2px 10px rgba(0,0,0,.08); }
+#siteForm details > summary { cursor: pointer; font-weight: 700; font-size: 11px; color: var(--accent); padding: 4px 2px; list-style: none; }
+#siteForm details > summary::-webkit-details-marker { display: none; }
+#siteForm details > summary::before { content: "▸"; display: inline-block; width: 12px; color: var(--muted); transition: transform .16s ease; }
+#siteForm details[open] > summary::before { transform: rotate(90deg); color: var(--accent); }
+#siteForm details .form-row { margin-top: 6px; }
+
+/* Toolbar: remote desktop button is a first-class action — visible even on narrow */
+#remoteDesktopToolbarBtn { border-color: var(--accent); color: var(--accent-hover); }
+#remoteDesktopToolbarBtn:hover { background: var(--accent-soft); }
+#remoteDesktopToolbarBtn .tool-icon { filter: drop-shadow(0 1px 4px rgba(85,168,237,.35)); }
+
+/* Make all toolbar buttons wrap gracefully instead of vanishing on 960px */
+@media (max-width: 960px) {
+  .toolbar-button .tool-label { display: inline !important; font-size: 11px; }
+  .app-toolbar { gap: 6px; padding: 7px 10px; }
+}
+@media (max-width: 720px) {
+  .toolbar-button .tool-label { display: none !important; }
+  #remoteDesktopToolbarBtn .tool-label { display: none !important; }
+  .toolbar-divider { display: none; }
+}
+
+/* Menu bar: ensure all 7 groups are reachable via horizontal scroll with affordance */
+.menu-bar { overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+.menu-bar::-webkit-scrollbar { height: 6px; }
+.menu-bar::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; }
+
+/* Remote desktop prompt: Not available card — Cancel / Install are both visible */
+#remoteDesktopPrompt { animation: fadeIn .18s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+#remoteDesktopScript { font-family: "Cascadia Code", Consolas, monospace; }
+#remoteDesktopStatus { font-weight: 600; }
+
+/* Backup modal: file path + CLI hint are both visible, not truncated */
+#backupModal .hint code { user-select: all; background: var(--surface-raised); border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; }
+
+/* Commander actions: ensure Synchronize / Terminal / Desktop all visible, no clipping */
+.commander-actions { gap: 6px; }
+.commander-actions .action-btn { border-color: var(--border); }
+.commander-actions .action-btn:hover { border-color: var(--accent); }
+
+/* Function keys: show F1-F10 labels even on narrow, scrollable */
+.function-keys { overflow-x: auto; scrollbar-width: thin; }
+
+/* Panes: stronger focus ring so the active pane is always obvious */
+.pane.active { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent), 0 8px 24px rgba(0,0,0,.18); }
+
+/* Lower panel tabs: all of Queue / Log / CLI visible with count badges */
+.tabs .tab[data-count]:after { content: " (" attr(data-count) ")"; color: var(--muted); font-weight: 500; }
+
+/* Toast: ensure success vs error are visually distinct and not hidden behind FAB */
+.toast { border-left-width: 4px; }
+.toast.error { border-left-color: var(--danger); }
+
+/* Accessibility: ensure every menu item has at least 44px hit area on coarse pointer (already for file rows) */
+@media (pointer: coarse) {
+  .menu-item { min-height: 36px; }
+  .menu-dropdown button { min-height: 40px; }
+  .modal-footer .btn { min-height: 40px; }
+}
+
+/* Feature tour hint: subtle “what's new” pulse for Remote Desktop after first load */
+@keyframes pulseGlow { 0%,100% { box-shadow: 0 0 0 0 rgba(85,168,237,0); } 50% { box-shadow: 0 0 0 6px rgba(85,168,237,.18); } }
+#remoteDesktopToolbarBtn.is-new { animation: pulseGlow 1.8s ease 1.2s 3; }

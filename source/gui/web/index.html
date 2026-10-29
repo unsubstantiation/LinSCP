@@ -69,6 +69,7 @@
           <button role="menuitem" onclick="menuAction(openKeepUpToDate)">Keep remote directory up to date</button>
           <button role="menuitem" onclick="menuAction(openSearch)">Find files</button>
           <button role="menuitem" onclick="menuAction(openTerminal)">Open remote terminal</button>
+          <button role="menuitem" onclick="menuAction(openRemoteDesktop)">Remote desktop (RDP/VNC/SPICE)…</button>
           <button role="menuitem" onclick="menuAction(() => switchTab('cli'))">LinSCP command console</button>
           <div class="menu-separator"></div>
           <button role="menuitem" onclick="menuAction(openProperties)">Properties</button>
@@ -115,6 +116,7 @@
           <button role="menuitem" onclick="menuAction(() => switchTab('log'))">Command log</button>
           <div class="menu-separator"></div>
           <button role="menuitem" onclick="menuAction(openPreferences)">Preferences...</button>
+          <button role="menuitem" onclick="menuAction(openBackup)">Backup / Restore…</button>
           <button role="menuitem" onclick="menuAction(openCleanup)">Cleanup stored data...</button>
           <div class="menu-separator" id="accountSeparator" style="display:none;"></div>
           <button role="menuitem" id="accountMenuItem" onclick="menuAction(openLogin)" style="display:none;">Sign in</button>
@@ -173,6 +175,9 @@
       </button>
       <button class="toolbar-button tertiary" onclick="openTerminal()" title="Open a terminal on the remote server">
         <span class="tool-icon">&gt;_</span><span class="tool-label">Terminal</span>
+      </button>
+      <button class="toolbar-button" onclick="openRemoteDesktop()" title="Open remote desktop (RDP/VNC/SPICE via SSH)" id="remoteDesktopToolbarBtn">
+        <span class="tool-icon">🖥️</span><span class="tool-label">Desktop</span>
       </button>
       <span class="toolbar-spacer"></span>
       <label class="language-control">Language
@@ -523,6 +528,74 @@
     </div>
   </div>
 
+  <!-- Remote Desktop (RDP/VNC/SPICE/X2Go/X11 via SSH, with server probe and per-OS installer) -->
+  <div class="modal-overlay" id="remoteDesktopModal" role="dialog" aria-modal="true" aria-label="Remote desktop">
+    <div class="modal-box" style="width:680px; max-width:96vw;">
+      <div class="modal-header">
+        <span>🖥️ Remote desktop</span>
+        <span style="cursor:pointer;" onclick="closeModal('remoteDesktopModal')">✕</span>
+      </div>
+      <div class="modal-body">
+        <div class="hint">Open a desktop session on the remote host. RDP (3389, <code>xrdp</code>), VNC (5900, <code>TigerVNC</code>), SPICE (<code>spice-vdagent</code>) ride the SSH tunnel when a jump is configured; X2Go/NX and X11 are transported over SSH direct-tcpip. Wayland sessions use <code>waypipe</code>, X11 uses <code>ssh -X</code>.</div>
+        <div class="form-row"><label>SSH session:</label>
+          <select id="remoteDesktopTab" class="select-field"></select>
+        </div>
+        <div class="form-row"><label>Kind:</label>
+          <select id="remoteDesktopKind" class="select-field" onchange="remoteDesktopKindChanged()">
+            <option value="rdp">RDP — xrdp :3389 (xfreerdp / mstsc)</option>
+            <option value="vnc">VNC — TigerVNC :5900</option>
+            <option value="spice">SPICE — remote-viewer :5900</option>
+            <option value="x2go">X2Go / NX — over SSH</option>
+            <option value="x11">X11 — waypipe / ssh -X</option>
+          </select>
+        </div>
+        <div class="form-row"><label>Host:</label><input type="text" id="remoteDesktopHost" class="input-field" placeholder="127.0.0.1 (empty = session host)"></div>
+        <div class="form-row"><label>Display / port:</label><input type="number" id="remoteDesktopPort" class="input-field" placeholder="3389 for RDP, 5900 for VNC/SPICE"></div>
+        <div id="remoteDesktopStatus" class="hint" style="min-height:1.2em;"></div>
+        <details id="remoteDesktopScriptDetails" style="margin-top:8px;"><summary>Installer script (auto-detects Debian/Ubuntu, Fedora/RHEL, Arch, openSUSE via <code>/etc/os-release</code>)</summary>
+          <pre id="remoteDesktopScript" style="max-height:220px; overflow:auto; background:var(--surface-raised); border:1px solid var(--border); border-radius:6px; padding:8px; font-size:11px; white-space:pre-wrap; margin-top:6px;"></pre>
+          <div class="hint">Runs on the server via the SSH session (<code>sudo</code> when not root, <code>DEBIAN_FRONTEND=noninteractive</code> for apt). Shows <code>apt/dnf/yum/pacman/zypper</code> variant for <code>xrdp</code>/<code>tigervnc-server</code>/<code>spice-vdagent</code>/<code>x2goserver</code>.</div>
+        </details>
+        <div id="remoteDesktopPrompt" style="display:none; margin-top:12px; border:1px solid var(--border); border-radius:8px; padding:12px; background:var(--surface-raised);">
+          <div style="font-weight:700; color:var(--warning);" id="remoteDesktopPromptTitle">Not available</div>
+          <div style="margin:6px 0 10px; white-space:pre-wrap;" id="remoteDesktopPromptBody"></div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="btn" onclick="closeModal('remoteDesktopModal')">Cancel</button>
+            <button class="btn btn-primary" id="remoteDesktopInstallBtn" onclick="installRemoteDesktop()">Install on server</button>
+            <button class="btn" onclick="copyRemoteDesktopScript()">Copy script</button>
+          </div>
+          <div class="hint" id="remoteDesktopInstallStatus" style="margin-top:8px;"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="checkRemoteDesktop()">Check</button>
+        <button class="btn btn-primary" onclick="launchRemoteDesktop()">Open desktop</button>
+        <button class="btn" onclick="closeModal('remoteDesktopModal')">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Backup / Restore (distribution-compatible full export) -->
+  <div class="modal-overlay" id="backupModal" role="dialog" aria-modal="true" aria-label="Backup and restore">
+    <div class="modal-box" style="width:640px; max-width:96vw;">
+      <div class="modal-header">
+        <span>Backup / Restore</span>
+        <span style="cursor:pointer;" onclick="closeModal('backupModal')">✕</span>
+      </div>
+      <div class="modal-body">
+        <div class="hint">Full export of sessions, workspaces, bookmarks, preferences, host keys and custom commands as a single JSON bundle (LF, 0600, CRLF-tolerant). The encrypted password key is stored unwrapped so a Debian export restores on Fedora/Arch/Windows/Android and vice-versa. Nothing is written until you choose a file.</div>
+        <div class="form-row"><label>File:</label><input type="text" id="backupPath" class="input-field" placeholder="/tmp/linscp-backup.json"></div>
+        <div class="hint" id="backupStatus" style="min-height:1.1em;"></div>
+        <div class="hint" style="margin-top:6px;">Also available as CLI: <code>linscp backup export &lt;file&gt;</code> / <code>linscp backup import &lt;file&gt;</code></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="exportBackup()">Export</button>
+        <button class="btn btn-primary" onclick="importBackup()">Import</button>
+        <button class="btn" onclick="closeModal('backupModal')">Close</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Remote-to-remote transfer (upstream's Transfer between two servers):
        a target session, a directory and a file mask. -->
   <div class="modal-overlay" id="remoteTransferModal" role="dialog" aria-modal="true" aria-label="Copy to another server">
@@ -596,6 +669,11 @@
               <option value="dav">WebDAV</option>
               <option value="webdav">WebDAV (HTTPS)</option>
               <option value="s3">Amazon S3</option>
+              <option value="rdp">RDP — Remote Desktop (xfreerdp/mstsc :3389)</option>
+              <option value="vnc">VNC (TigerVNC :5900)</option>
+              <option value="spice">SPICE (remote-viewer :5900)</option>
+              <option value="x2go">X2Go / NX (SSH)</option>
+              <option value="x11">X11 Forwarding (waypipe/ssh -X)</option>
               <option value="local">Local (two local directories)</option>
             </select>
           </div>
@@ -629,6 +707,40 @@
             <div class="form-row"><label for="siteGssapiFwdTgt">Forward the Kerberos ticket (delegate credentials):</label><input type="checkbox" id="siteGssapiFwdTgt"></div>
             <div class="form-row"><label for="siteLogicalHost">Logical host name:</label><input type="text" id="siteLogicalHost" class="input-field" autocomplete="off" placeholder="empty = the host being connected to"></div>
             <div class="hint">Single sign-on with the Kerberos tickets of the user the backend runs as. Credentials are delegated only when asked for here. With GSSAPI key exchange the server is authenticated by Kerberos, so no host key is checked (a pinned host key disables it).</div>
+          </details>
+          <details id="siteProxySettings" class="remote-only-row">
+            <summary>Proxy</summary>
+            <div class="form-row"><label for="siteProxyMethod">Proxy method:</label>
+              <select id="siteProxyMethod" class="select-field">
+                <option value="">None (direct)</option>
+                <option value="SOCKS5">SOCKS5</option>
+                <option value="SOCKS4">SOCKS4</option>
+                <option value="HTTP">HTTP CONNECT</option>
+                <option value="TELNET">Telnet</option>
+                <option value="CMD">Local command</option>
+              </select>
+            </div>
+            <div class="form-row"><label for="siteProxyHost">Proxy host:</label><input type="text" id="siteProxyHost" class="input-field" placeholder="proxy.example.test"></div>
+            <div class="form-row"><label for="siteProxyPort">Proxy port:</label><input type="number" id="siteProxyPort" class="input-field" placeholder="1080"></div>
+            <div class="form-row"><label for="siteProxyUsername">Proxy username:</label><input type="text" id="siteProxyUsername" class="input-field"></div>
+            <div class="form-row"><label for="siteProxyPassword">Proxy password:</label><input type="password" id="siteProxyPassword" class="input-field"></div>
+            <div class="form-row"><label for="siteProxyCommand">Proxy command:</label><input type="text" id="siteProxyCommand" class="input-field" placeholder="nc %host %port"></div>
+            <div class="form-row"><label for="siteProxyDns">Proxy DNS:</label><select id="siteProxyDns" class="select-field"><option value="0">Auto</option><option value="1">Proxy</option><option value="2">Local</option></select></div>
+            <div class="form-row"><label for="siteProxyLocalhost">Localhost:</label><input type="checkbox" id="siteProxyLocalhost"></div>
+            <div class="form-row"><label for="siteProxyExclude">Exclude hosts:</label><input type="text" id="siteProxyExclude" class="input-field" placeholder="*.local, 192.168.*"></div>
+            <div class="hint">HTTP CONNECT and SOCKS5h ride the proxy; Telnet/CMD runs a local command with %host/%port.</div>
+          </details>
+          <details id="siteAdvancedSettings" class="remote-only-row">
+            <summary>Advanced (FTPS/TLS, passive, certificates)</summary>
+            <div class="form-row"><label for="siteFtps">FTPS mode:</label><select id="siteFtps" class="select-field"><option value="">None</option><option value="explicit">Explicit (FTPS)</option><option value="implicit">Implicit</option></select></div>
+            <div class="form-row"><label for="siteMinTls">Min TLS:</label><input type="text" id="siteMinTls" class="input-field" placeholder="1.2"></div>
+            <div class="form-row"><label for="siteMaxTls">Max TLS:</label><input type="text" id="siteMaxTls" class="input-field" placeholder="1.3"></div>
+            <div class="form-row"><label for="siteFtpPasv">Passive mode:</label><input type="checkbox" id="siteFtpPasv" checked></div>
+            <div class="form-row"><label for="siteFtpMlsd">Use MLSD:</label><input type="checkbox" id="siteFtpMlsd" checked></div>
+            <div class="form-row"><label for="siteTlsCert">TLS cert file:</label><input type="text" id="siteTlsCert" class="input-field" placeholder="/etc/ssl/certs/ca.crt"></div>
+            <div class="form-row"><label for="siteCaCert">CA cert file:</label><input type="text" id="siteCaCert" class="input-field"></div>
+            <div class="form-row"><label for="sitePinnedKey">Pinned pubkey:</label><input type="text" id="sitePinnedKey" class="input-field" placeholder="sha256/..."></div>
+            <div class="hint">FTPS/TLS settings are stored per-site and honoured by both console and GUI.</div>
           </details>
           <div class="form-row remote-only-row"><label>Remote dir:</label><input type="text" id="siteRemoteDir" class="input-field" value="/"></div>
           <div class="form-row"><label>Local dir:</label><input type="text" id="siteLocalDir" class="input-field"></div>
@@ -1388,6 +1500,20 @@
     $('statusBadge').textContent = tab ? (tab.connected ? t("Connected: {name}", {name: tab.name}) : t("Disconnected: {name}", {name: tab.name}))
                                        : t("Disconnected");
     renderTabs();
+    try { updateRemoteDesktopButton(); } catch(_) {}
+  }
+  function updateRemoteDesktopButton() {
+    const btn = $('remoteDesktopToolbarBtn');
+    if (!btn) return;
+    const hasSsh = (state.tabs||[]).some(t=> t.connected && t.session && ['sftp','scp','ssh'].includes((t.session.protocol||'').toLowerCase()));
+    btn.style.opacity = hasSsh ? '1' : '.72';
+    btn.title = hasSsh ? t('Open remote desktop (RDP/VNC/SPICE via SSH)') : t('Open remote desktop — connect an SSH session first, then check/install xrdp etc. via the prompt');
+    if (!hasSsh) { btn.classList.remove('is-new'); return; }
+    if (!btn.dataset.pulsed) {
+      btn.dataset.pulsed = '1';
+      btn.classList.add('is-new');
+      setTimeout(()=> btn.classList.remove('is-new'), 6200);
+    }
   }
 
   function renderTabs() {
@@ -2205,7 +2331,7 @@
   // read a site without one. 'dav' is WebDAV over plain HTTP, 'webdav'
   // over HTTPS.
   const DEFAULT_PORTS = { sftp: 22, scp: 22, ssh: 22, ftp: 21, ftpes: 21,
-                          ftps: 990, dav: 80, webdav: 443, s3: 443 };
+                          ftps: 990, dav: 80, webdav: 443, s3: 443, rdp: 3389, vnc: 5900, spice: 5900, x2go: 22, x11: 22 };
 
   function defaultPort(protocol) {
     return DEFAULT_PORTS[protocol] || 22;
@@ -2278,6 +2404,26 @@
     $('siteGssapiKex').checked = tri(site.auth_gssapi_kex) === true;
     $('siteGssapiFwdTgt').checked = tri(site.gssapi_fwd_tgt) === true;
     $('siteLogicalHost').value = site.logical_host || '';
+    // Proxy / FTPS / TLS (visible in siteProxySettings/siteAdvancedSettings)
+    if ($('siteProxyMethod')) $('siteProxyMethod').value = site.proxy_method || '';
+    if ($('siteProxyHost')) $('siteProxyHost').value = site.proxy_host || '';
+    if ($('siteProxyPort')) $('siteProxyPort').value = site.proxy_port || '';
+    if ($('siteProxyUsername')) $('siteProxyUsername').value = site.proxy_username || '';
+    if ($('siteProxyPassword')) $('siteProxyPassword').value = site.proxy_password || '';
+    if ($('siteProxyCommand')) $('siteProxyCommand').value = site.proxy_command || '';
+    if ($('siteProxyDns')) $('siteProxyDns').value = String(site.proxy_dns ?? 0);
+    if ($('siteProxyLocalhost')) $('siteProxyLocalhost').checked = !!site.proxy_localhost;
+    if ($('siteProxyExclude')) $('siteProxyExclude').value = site.proxy_exclude || '';
+    if ($('siteFtps')) $('siteFtps').value = site.ftps || '';
+    if ($('siteMinTls')) $('siteMinTls').value = site.min_tls_version || '';
+    if ($('siteMaxTls')) $('siteMaxTls').value = site.max_tls_version || '';
+    if ($('siteFtpPasv')) $('siteFtpPasv').checked = site.ftp_pasv_mode !== false;
+    if ($('siteFtpMlsd')) $('siteFtpMlsd').checked = !!site.ftp_use_mlsd;
+    if ($('siteTlsCert')) $('siteTlsCert').value = site.tls_certificate_file || '';
+    if ($('siteCaCert')) $('siteCaCert').value = site.ca_certificate_file || '';
+    if ($('sitePinnedKey')) $('sitePinnedKey').value = site.pinned_pubkey || '';
+    if (site.proxy_method && $('siteProxySettings')) $('siteProxySettings').open = true;
+    if ((site.ftps || site.min_tls_version || site.tls_certificate_file) && $('siteAdvancedSettings')) $('siteAdvancedSettings').open = true;
     $('siteTunnelSettings').open = !!site.tunnel;
     siteTunnelError = site.tunnel_error || '';
     siteTunnelChanged();
@@ -2307,6 +2453,23 @@
       initial_dir: $('siteRemoteDir').value.trim() || '/',
       local_dir: $('siteLocalDir').value.trim(),
       other_local_dir: $('siteOtherLocalDir').value.trim(),
+      proxy_method: ($('siteProxyMethod')||{}).value || '',
+      proxy_host: ($('siteProxyHost')||{}).value || '',
+      proxy_port: parseInt(($('siteProxyPort')||{}).value, 10) || 0,
+      proxy_username: ($('siteProxyUsername')||{}).value || '',
+      proxy_password: ($('siteProxyPassword')||{}).value || '',
+      proxy_command: ($('siteProxyCommand')||{}).value || '',
+      proxy_dns: parseInt(($('siteProxyDns')||{}).value, 10) || 0,
+      proxy_localhost: !!($('siteProxyLocalhost')||{}).checked,
+      proxy_exclude: ($('siteProxyExclude')||{}).value || '',
+      ftps: ($('siteFtps')||{}).value || '',
+      min_tls_version: ($('siteMinTls')||{}).value || '',
+      max_tls_version: ($('siteMaxTls')||{}).value || '',
+      ftp_pasv_mode: !!($('siteFtpPasv')||{}).checked,
+      ftp_use_mlsd: !!($('siteFtpMlsd')||{}).checked,
+      tls_certificate_file: ($('siteTlsCert')||{}).value || '',
+      ca_certificate_file: ($('siteCaCert')||{}).value || '',
+      pinned_pubkey: ($('sitePinnedKey')||{}).value || '',
       tunnel: $('siteTunnel').checked,
       tunnel_host: $('siteTunnelHost').value.trim(),
       tunnel_port: $('siteTunnelPort').value || '22',
@@ -3609,6 +3772,127 @@
     csrfToken = (status && status.csrf_token) || '';
     setAccountMenu();
     if (!signedInAs) openLogin();
+  }
+
+  // --- Remote desktop (RDP/VNC/SPICE/X2Go/X11) — visible entry point, probe, prompt+installer ---
+  let remoteDesktopState = { lastCheck: null };
+  function openRemoteDesktop() {
+    const tabs = (state.tabs||[]).filter(t=> t.session && ['sftp','scp','ssh'].includes((t.session.protocol||'').toLowerCase()));
+    const sel = $('remoteDesktopTab');
+    sel.innerHTML = '';
+    if (!tabs.length) {
+      const opt = document.createElement('option'); opt.value=''; opt.textContent=t('No SSH session — connect first'); sel.appendChild(opt);
+    } else {
+      tabs.forEach(t=> { const opt=document.createElement('option'); opt.value=t.id; opt.textContent=t.name + ' (' + (t.session.host||'') + ')'; sel.appendChild(opt); });
+      if (state.activeTab) sel.value = state.activeTab;
+    }
+    $('remoteDesktopHost').value = '';
+    $('remoteDesktopPort').value = '';
+    $('remoteDesktopStatus').textContent = '';
+    $('remoteDesktopScript').textContent = '';
+    $('remoteDesktopPrompt').style.display='none';
+    $('remoteDesktopInstallStatus').textContent='';
+    openModal('remoteDesktopModal');
+    remoteDesktopKindChanged();
+    if (tabs.length) checkRemoteDesktop();
+  }
+  function remoteDesktopKindChanged() {
+    const kind = $('remoteDesktopKind').value;
+    const portMap = { rdp:'3389', vnc:'5900', spice:'5900', x2go:'22', x11:'22' };
+    if (!$('remoteDesktopPort').value) $('remoteDesktopPort').value = portMap[kind]||'';
+  }
+  async function checkRemoteDesktop() {
+    const tabId = parseInt(($('remoteDesktopTab')||{}).value,10);
+    const kind = $('remoteDesktopKind').value;
+    if (!tabId) { $('remoteDesktopStatus').textContent = t('No SSH session selected.'); return; }
+    $('remoteDesktopStatus').textContent = t('Checking…');
+    try {
+      const data = await apiPost('/api/desktop/check', { tab: tabId, kind: kind, host: $('remoteDesktopHost').value, port: parseInt($('remoteDesktopPort').value,10)||0 });
+      remoteDesktopState.lastCheck = data;
+      if (data && data.install_script) $('remoteDesktopScript').textContent = data.install_script;
+      if (data && data.available) {
+        $('remoteDesktopStatus').textContent = t('Available — ready to open.');
+        $('remoteDesktopPrompt').style.display='none';
+      } else {
+        $('remoteDesktopStatus').textContent = data && data.reason ? data.reason : t('Not available on the server.');
+        const title = $('remoteDesktopPromptTitle');
+        const body = $('remoteDesktopPromptBody');
+        title.textContent = t('Not available');
+        body.textContent = (data && (data.reason || data.hint) ? (data.reason + (data.hint? "\n\n"+data.hint:"")) : t('The selected desktop service is not installed or not reachable. Install it on the server?\n\nThe script auto-detects Debian/Ubuntu (apt), Fedora/RHEL (dnf/yum), Arch (pacman) and openSUSE (zypper) via /etc/os-release, uses sudo when needed and is safe to inspect before running.'));
+        $('remoteDesktopPrompt').style.display='block';
+      }
+    } catch(e) {
+      $('remoteDesktopStatus').textContent = t('Cannot reach the LinSCP backend: {error}', {error: String(e)});
+    }
+  }
+  async function launchRemoteDesktop() {
+    const tabId = parseInt(($('remoteDesktopTab')||{}).value,10);
+    const kind = $('remoteDesktopKind').value;
+    if (!tabId) { toast(t('No SSH session selected.'), true); return; }
+    const host = $('remoteDesktopHost').value;
+    const port = parseInt($('remoteDesktopPort').value,10)||0;
+    try {
+      const data = await apiPost('/api/desktop/launch', { tab: tabId, kind: kind, host: host, port: port });
+      if (data && data.success === false && data.install_script) {
+        $('remoteDesktopScript').textContent = data.install_script;
+        $('remoteDesktopStatus').textContent = data.error || t('Not available');
+        $('remoteDesktopPromptBody').textContent = (data.error || '') + "\n\n" + (data.install_script||'');
+        $('remoteDesktopPrompt').style.display='block';
+        return;
+      }
+      if (data && data.ticket) toast(t('Headless ticket written: {path}', {path: data.ticket}));
+      else if (data && data.url) window.open(data.url, '_blank');
+      else toast(t('Desktop launched'));
+      closeModal('remoteDesktopModal');
+    } catch(e) {
+      toast(t('Cannot launch desktop: {error}', {error: String(e)}), true);
+    }
+  }
+  async function installRemoteDesktop() {
+    const tabId = parseInt(($('remoteDesktopTab')||{}).value,10);
+    const kind = $('remoteDesktopKind').value;
+    $('remoteDesktopInstallStatus').textContent = t('Installing…');
+    try {
+      const data = await apiPost('/api/desktop/install', { tab: tabId, kind: kind });
+      $('remoteDesktopInstallStatus').textContent = data && data.success ? t('Installed — checking again…') : (data && data.error || t('Install failed'));
+      if (data && data.success) await checkRemoteDesktop();
+    } catch(e) {
+      $('remoteDesktopInstallStatus').textContent = t('Install failed: {error}', {error: String(e)});
+    }
+  }
+  function copyRemoteDesktopScript() {
+    const txt = $('remoteDesktopScript').textContent || '';
+    if (!txt) { toast(t('No script to copy.'), true); return; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(txt).then(()=> toast(t('Script copied to clipboard.'))).catch(()=> fallbackCopy(txt));
+    } else fallbackCopy(txt);
+    function fallbackCopy(s) {
+      const ta = document.createElement('textarea'); ta.value=s; document.body.appendChild(ta); ta.select(); try{document.execCommand('copy'); toast(t('Script copied.'));}catch(_){toast(t('Copy failed — select the script manually.'), true);} document.body.removeChild(ta);
+    }
+  }
+  function openBackup() {
+    $('backupPath').value = $('backupPath').value || (state.local.path || '/tmp') + '/linscp-backup.json';
+    $('backupStatus').textContent = '';
+    openModal('backupModal');
+  }
+  async function exportBackup() {
+    const path = $('backupPath').value;
+    if (!path) { toast(t('A destination directory is required.'), true); return; }
+    $('backupStatus').textContent = t('Exporting…');
+    try {
+      const data = await apiPost('/api/command/exec', { command: 'backup export ' + path });
+      $('backupStatus').textContent = data && data.success ? t('Backup written: {path}', {path: path}) : (data && data.error || t('Export failed'));
+    } catch(e) { $('backupStatus').textContent = String(e); }
+  }
+  async function importBackup() {
+    const path = $('backupPath').value;
+    if (!path) { toast(t('A name and a command are required.'), true); return; }
+    $('backupStatus').textContent = t('Importing…');
+    try {
+      const data = await apiPost('/api/command/exec', { command: 'backup import ' + path });
+      $('backupStatus').textContent = data && data.success ? t('Backup restored — reload the site list.') : (data && data.error || t('Import failed'));
+      if (data && data.success) await refreshSites();
+    } catch(e) { $('backupStatus').textContent = String(e); }
   }
 
   function openLogin() {
