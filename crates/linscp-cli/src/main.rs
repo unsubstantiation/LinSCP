@@ -781,7 +781,12 @@ async fn run_cli() -> i32 {
         ));
         return 1;
     }
+    // Debug for window test
     if launch_gui {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/linscp-gui-debug2.log") {
+            use std::io::Write as _;
+            let _ = writeln!(f, "main launch_gui true exe={:?} args={:?}", std::env::current_exe().unwrap_or_default().display(), std::env::args().collect::<Vec<_>>());
+        }
         if let Err(err) = launch_gui_application() {
             print_err(&err);
             return 1;
