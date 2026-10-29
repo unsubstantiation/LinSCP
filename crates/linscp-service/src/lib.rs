@@ -178,15 +178,29 @@ impl CommanderService {
             ("POST", "/api/custom-commands") => self.handle_custom_commands(req.body),
             ("POST", "/api/command/exec") => self.handle_command_exec(req.body),
             ("GET", "/api/desktop/recommendations") => self.handle_desktop_recommendations(),
+            ("GET", "/api/desktop/install-script") => self.handle_desktop_install_script(&query, req.body),
+            ("POST", "/api/desktop/install-script") => self.handle_desktop_install_script(&query, req.body),
             ("POST", "/api/desktop/ticket") => self.handle_desktop_ticket(req.body),
             ("POST", "/api/desktop/launch") => self.handle_desktop_launch(req.body),
+            ("POST", "/api/desktop/check") => self.handle_desktop_check(req.body),
+            ("POST", "/api/desktop/install") => self.handle_desktop_install_sync(req.body),
             _ => ApiReply { status: 404, payload: json!({"error": format!("Unknown endpoint: {} {}", method, raw_path)})},
         }
     }
 
     pub async fn dispatch_async(&self, req: ApiEnvelope) -> ApiReply {
-        // For now delegate to sync; remote async operations can be added here.
-        self.dispatch(req)
+        let (method, raw_path) = {
+            let m = req.method.to_ascii_uppercase();
+            let p = req.path.split('?').next().unwrap_or(&req.path).to_string();
+            (m, p)
+        };
+        match (method.as_str(), raw_path.as_str()) {
+            ("POST", "/api/desktop/check") => self.handle_desktop_check_async(req.body).await,
+            ("POST", "/api/desktop/install") => self.handle_desktop_install_async(req.body).await,
+            ("POST", "/api/desktop/launch") => self.handle_desktop_launch_async(req.body).await,
+            ("POST", "/api/desktop/ticket") => self.handle_desktop_ticket(req.body),
+            _ => self.dispatch(req),
+        }
     }
 
     fn default_local_dir(&self) -> String {
@@ -1001,6 +1015,532 @@ impl CommanderService {
             Ok(linscp_platform::desktop::DesktopLaunchResult::BrowserGateway { url_hint }) => {
                 ApiReply{ status:200, payload: json!({"success": true, "launched": false, "gateway": url_hint, "kind": ticket.kind, "viewer": ticket.viewer, "argv": ticket.argv})}
             },
+            Err(e) => ApiReply{ status:500, payload: json!({"success": false, "error": e})},
+        }
+    }
+
+    fn parse_desktop_kind_str(raw: Option<&str>) -> linscp_proto::remote_desktop::RemoteDesktopKind {
+        use linscp_proto::remote_desktop::RemoteDesktopKind;
+        match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+            "vnc" | "rfb" => RemoteDesktopKind::Vnc,
+            "spice" => RemoteDesktopKind::Spice,
+            "x2go" | "nx" => RemoteDesktopKind::X2Go,
+            "x11" | "x" | "waypipe" => RemoteDesktopKind::X11,
+            _ => RemoteDesktopKind::Rdp,
+        }
+    }
+
+    fn handle_desktop_install_script(&self, query: &BTreeMap<String, String>, body: Value) -> ApiReply {
+        use linscp_proto::remote_desktop::{server_description, server_package_name, probe_command_for_kind, install_script_for_kind};
+        let kind_str = query.get("kind").map(|s| s.as_str()).or_else(|| body.get("kind").and_then(|v| v.as_str()));
+        let kind = Self::parse_desktop_kind_str(kind_str);
+        let pkg = server_package_name(kind);
+        let descr = server_description(kind);
+        let script = install_script_for_kind(kind);
+        let probe = probe_command_for_kind(kind);
+        ApiReply{ status:200, payload: json!({
+            "success": true,
+            "kind": kind.as_str(),
+            "package": pkg,
+            "description": descr,
+            "probe_command": probe,
+            "install_script": script
+        })}
+    }
+
+    fn handle_desktop_check(&self, body: Value) -> ApiReply {
+        // Sync fallback: does not actually probe via SSH (needs async). Returns
+        // the installer so the UI can still prompt with cancel/install.
+        use linscp_proto::remote_desktop::{server_description, server_package_name, probe_command_for_kind, install_script_for_kind};
+        let kind_str = body.get("kind").and_then(|v| v.as_str()).or_else(|| body.get("protocol").and_then(|v| v.as_str()));
+        let host = body.get("host").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let tab_id = tabs::parse_tab_id_value(body.get("tab")).or_else(|| body.get("tabId").and_then(|v| v.as_u64())).or_else(|| body.get("via_tab").and_then(|v| v.as_u64()));
+        let mut kind = Self::parse_desktop_kind_str(kind_str);
+        let mut target_host = host.clone();
+        let mut target_port: u16 = body.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+        // If a desktop tab is referenced, prefer its spec for host/port/kind
+        if let Some(tid) = tab_id {
+            let state = self.state.lock().expect("state mutex");
+            if let Some(tab) = state.tabs.get(&tid) {
+                if let Some(spec) = tab.spec.as_ref() {
+                    if spec.session.protocol.is_remote_desktop() {
+                        kind = linscp_proto::remote_desktop::RemoteDesktopKind::from_scheme(spec.session.protocol).unwrap_or(kind);
+                        if target_host.is_empty() { target_host = spec.session.host.clone(); }
+                        if target_port == 0 { target_port = if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port }; }
+                    } else if target_host.is_empty() {
+                        target_host = spec.session.host.clone();
+                        if target_port == 0 { target_port = if spec.session.port == 0 { 22 } else { spec.session.port }; }
+                    }
+                }
+            }
+        }
+        if target_host.is_empty() {
+            // Try any connected SSH tab as hint
+            let state = self.state.lock().expect("state mutex");
+            for t in state.tabs.values() {
+                if t.connected && t.spec.as_ref().map(|s| matches!(s.session.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)).unwrap_or(false) {
+                    target_host = t.spec.as_ref().map(|s| s.session.host.clone()).unwrap_or_default();
+                    break;
+                }
+            }
+        }
+        if target_port == 0 { target_port = kind.default_viewer(false).len() as u16; target_port = match kind { linscp_proto::remote_desktop::RemoteDesktopKind::Rdp => 3389, linscp_proto::remote_desktop::RemoteDesktopKind::Vnc => 5900, linscp_proto::remote_desktop::RemoteDesktopKind::Spice => 5900, _ => 22 }; }
+        let pkg = server_package_name(kind);
+        let descr = server_description(kind);
+        let script = install_script_for_kind(kind);
+        let probe = probe_command_for_kind(kind);
+        // Sync cannot safely run SSH exec; report not_available with script and
+        // instruct client to call async /api/desktop/check for a live probe.
+        ApiReply{ status:200, payload: json!({
+            "success": true,
+            "available": false,
+            "checked": false,
+            "kind": kind.as_str(),
+            "host": target_host,
+            "port": target_port,
+            "package": pkg,
+            "description": descr,
+            "probe_command": probe,
+            "install_script": script,
+            "reason": format!("{descr} ({pkg}) not verified synchronously — call POST /api/desktop/check via dispatch_async with via_tab for live SSH probe, or run: {probe}"),
+            "can_install": true,
+            "message": format!("Remote desktop ({}) is not available on server '{}': {} ({}) not found. Install it now? The following compatible installer works on Debian/Ubuntu, Fedora/RHEL, Arch, openSUSE and detects the OS automatically.", kind.as_str(), target_host, descr, pkg)
+        })}
+    }
+
+    fn handle_desktop_install_sync(&self, _body: Value) -> ApiReply {
+        // Sync cannot run long SSH install; prompt client to use async.
+        ApiReply{ status:202, payload: json!({
+            "success": false,
+            "error": "Install requires async dispatch. Call POST /api/desktop/install via dispatch_async with {via_tab, kind}.",
+            "install_script": "Call GET /api/desktop/install-script?kind=rdp to fetch the compatible installer, or use async install."
+        })}
+    }
+
+    async fn handle_desktop_check_async(&self, body: Value) -> ApiReply {
+        use linscp_proto::remote_desktop::{server_description, server_package_name, probe_command_for_kind, install_script_for_kind, RemoteDesktopKind};
+        let kind_str = body.get("kind").and_then(|v| v.as_str()).or_else(|| body.get("protocol").and_then(|v| v.as_str()));
+        let host = body.get("host").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let via_tab_raw = body.get("via_tab").cloned().or_else(|| body.get("tab").cloned());
+        let tab_id = tabs::parse_tab_id_value(via_tab_raw.as_ref()).or_else(|| body.get("tabId").and_then(|v| v.as_u64()));
+        let mut kind = Self::parse_desktop_kind_str(kind_str);
+        let mut target_host = host.clone();
+        let mut target_port: u16 = body.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+        // Prefer desktop tab spec if provided
+        let mut via_session: Option<std::sync::Arc<dyn linscp_proto::RemoteSession>> = None;
+        let mut via_tab_id: Option<u64> = None;
+        if let Some(tid) = tab_id {
+            let state = self.state.lock().expect("state mutex");
+            if let Some(tab) = state.tabs.get(&tid) {
+                if let Some(spec) = tab.spec.as_ref() {
+                    if spec.session.protocol.is_remote_desktop() {
+                        kind = RemoteDesktopKind::from_scheme(spec.session.protocol).unwrap_or(kind);
+                        if target_host.is_empty() { target_host = spec.session.host.clone(); }
+                        if target_port == 0 { target_port = if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port }; }
+                    }
+                }
+                // If this tab itself is an SSH session, use it as via
+                if tab.remote.is_some() && tab.spec.as_ref().map(|s| matches!(s.session.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)).unwrap_or(false) {
+                    via_session = tab.remote.clone();
+                    via_tab_id = Some(tid);
+                }
+            }
+        }
+        // Also check explicit via_tab field separate from tab
+        if via_session.is_none() {
+            if let Some(vid) = body.get("via_tab").and_then(|v| v.as_u64()).or_else(|| body.get("viaTab").and_then(|v| v.as_u64())) {
+                let state = self.state.lock().expect("state mutex");
+                if let Some(tab) = state.tabs.get(&vid) {
+                    via_session = tab.remote.clone();
+                    via_tab_id = Some(vid);
+                    if target_host.is_empty() { if let Some(spec) = tab.spec.as_ref() { target_host = spec.session.host.clone(); } }
+                }
+            }
+        }
+        // Fallback: find any connected SSH tab with matching host
+        if via_session.is_none() && !target_host.is_empty() {
+            let state = self.state.lock().expect("state mutex");
+            for (id, tab) in state.tabs.iter() {
+                let is_ssh = tab.spec.as_ref().map(|s| matches!(s.session.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)).unwrap_or(false);
+                if is_ssh && tab.remote.is_some() && tab.connected {
+                    let h = tab.spec.as_ref().map(|s| s.session.host.clone()).unwrap_or_default();
+                    if h.eq_ignore_ascii_case(&target_host) {
+                        via_session = tab.remote.clone();
+                        via_tab_id = Some(*id);
+                        break;
+                    }
+                }
+            }
+        }
+        // Last fallback: any SSH tab
+        if via_session.is_none() {
+            let state = self.state.lock().expect("state mutex");
+            for (id, tab) in state.tabs.iter() {
+                let is_ssh = tab.spec.as_ref().map(|s| matches!(s.session.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)).unwrap_or(false);
+                if is_ssh && tab.remote.is_some() {
+                    via_session = tab.remote.clone();
+                    via_tab_id = Some(*id);
+                    if target_host.is_empty() { if let Some(spec) = tab.spec.as_ref() { target_host = spec.session.host.clone(); } }
+                    break;
+                }
+            }
+        }
+        if target_host.is_empty() { target_host = "server".to_string(); }
+        if target_port == 0 { target_port = match kind { RemoteDesktopKind::Rdp => 3389, RemoteDesktopKind::Vnc => 5900, RemoteDesktopKind::Spice => 5900, _ => 22 }; }
+        let pkg = server_package_name(kind);
+        let descr = server_description(kind);
+        let script = install_script_for_kind(kind);
+        let probe = probe_command_for_kind(kind);
+
+        // If we have an SSH session, probe via exec
+        if let Some(sess) = via_session {
+            match linscp_proto::remote_desktop::check_via_ssh(sess.as_ref(), kind).await {
+                Ok(true) => {
+                    return ApiReply{ status:200, payload: json!({
+                        "success": true,
+                        "available": true,
+                        "checked": true,
+                        "via_ssh": true,
+                        "via_tab": via_tab_id,
+                        "kind": kind.as_str(),
+                        "host": target_host,
+                        "port": target_port,
+                        "package": pkg,
+                        "description": descr,
+                        "probe_command": probe,
+                        "install_script": script,
+                        "reason": format!("{descr} ({pkg}) is installed on {target_host}"),
+                        "can_install": true,
+                        "message": format!("Remote desktop ({}) is available on server '{}'.", kind.as_str(), target_host)
+                    })};
+                },
+                Ok(false) => {
+                    return ApiReply{ status:200, payload: json!({
+                        "success": true,
+                        "available": false,
+                        "checked": true,
+                        "via_ssh": true,
+                        "via_tab": via_tab_id,
+                        "kind": kind.as_str(),
+                        "host": target_host,
+                        "port": target_port,
+                        "package": pkg,
+                        "description": descr,
+                        "probe_command": probe,
+                        "install_script": script,
+                        "reason": format!("{descr} ({pkg}) not found on {target_host} — command `{probe}` failed"),
+                        "can_install": true,
+                        "message": format!("Remote desktop ({}) is not available on server '{}': {} ({}) not found. Install it now?", kind.as_str(), target_host, descr, pkg),
+                        "prompt": {
+                            "title": format!("Remote desktop not available on {}", target_host),
+                            "body": format!("{} ({}) is not installed on server '{}'. The installer below works on Debian/Ubuntu, Fedora/RHEL, Arch, openSUSE (auto-detects via /etc/os-release and uses apt/dnf/yum/pacman/zypper). Install now or cancel?", descr, pkg, target_host),
+                            "install_script": script,
+                            "actions": ["cancel", "install"]
+                        }
+                    })};
+                },
+                Err(e) => {
+                    return ApiReply{ status:200, payload: json!({
+                        "success": true,
+                        "available": false,
+                        "checked": true,
+                        "via_ssh": true,
+                        "via_tab": via_tab_id,
+                        "kind": kind.as_str(),
+                        "host": target_host,
+                        "port": target_port,
+                        "package": pkg,
+                        "description": descr,
+                        "probe_command": probe,
+                        "install_script": script,
+                        "reason": format!("Probe failed: {e}"),
+                        "can_install": true,
+                        "message": format!("Could not verify {} on {}: {e}. Installer available.", descr, target_host)
+                    })};
+                }
+            }
+        }
+
+        // No SSH session: try TCP probe if direct desktop port
+        let tcp_ok = linscp_proto::remote_desktop::check_tcp_availability(&target_host, target_port).await;
+        if tcp_ok {
+            return ApiReply{ status:200, payload: json!({
+                "success": true,
+                "available": true,
+                "checked": true,
+                "via_ssh": false,
+                "kind": kind.as_str(),
+                "host": target_host,
+                "port": target_port,
+                "package": pkg,
+                "description": descr,
+                "probe_command": probe,
+                "install_script": script,
+                "reason": format!("TCP connect to {target_host}:{target_port} succeeded"),
+                "can_install": false
+            })};
+        }
+        ApiReply{ status:200, payload: json!({
+            "success": true,
+            "available": false,
+            "checked": true,
+            "via_ssh": false,
+            "kind": kind.as_str(),
+            "host": target_host,
+            "port": target_port,
+            "package": pkg,
+            "description": descr,
+            "probe_command": probe,
+            "install_script": script,
+            "reason": format!("{descr} ({pkg}) not reachable on {target_host}:{target_port} and no SSH session to probe"),
+            "can_install": false,
+            "message": format!("Remote desktop ({}) does not appear to be listening on {}:{} ({}, {}). If you have SSH access, connect via SSH first and run the installer, or run this script manually on the server.", kind.as_str(), target_host, target_port, descr, pkg),
+            "prompt": {
+                "title": format!("Remote desktop not available on {}", target_host),
+                "body": format!("{} is not listening on {}:{}. Installer for {}:\n{}", descr, target_host, target_port, pkg, script),
+                "install_script": script,
+                "actions": ["cancel", "install"]
+            }
+        })}
+    }
+
+    async fn handle_desktop_install_async(&self, body: Value) -> ApiReply {
+        use linscp_proto::remote_desktop::{server_package_name, install_script_for_kind, RemoteDesktopKind};
+        let kind_str = body.get("kind").and_then(|v| v.as_str()).or_else(|| body.get("protocol").and_then(|v| v.as_str()));
+        let kind = Self::parse_desktop_kind_str(kind_str);
+        let via_tab = body.get("via_tab").and_then(|v| v.as_u64()).or_else(|| body.get("viaTab").and_then(|v| v.as_u64())).or_else(|| tabs::parse_tab_id_value(body.get("tab"))).or_else(|| body.get("tabId").and_then(|v| v.as_u64()));
+        let mut target_host = body.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mut via_session: Option<std::sync::Arc<dyn linscp_proto::RemoteSession>> = None;
+        let mut via_tab_id: Option<u64> = None;
+        if let Some(vid) = via_tab {
+            let state = self.state.lock().expect("state mutex");
+            if let Some(tab) = state.tabs.get(&vid) {
+                via_session = tab.remote.clone();
+                via_tab_id = Some(vid);
+                if target_host.is_empty() { if let Some(spec) = tab.spec.as_ref() { target_host = spec.session.host.clone(); } }
+            }
+        }
+        if via_session.is_none() {
+            let state = self.state.lock().expect("state mutex");
+            for (id, tab) in state.tabs.iter() {
+                let is_ssh = tab.spec.as_ref().map(|s| matches!(s.session.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)).unwrap_or(false);
+                if is_ssh && tab.remote.is_some() {
+                    via_session = tab.remote.clone();
+                    via_tab_id = Some(*id);
+                    if target_host.is_empty() { if let Some(spec) = tab.spec.as_ref() { target_host = spec.session.host.clone(); } }
+                    break;
+                }
+            }
+        }
+        let Some(sess) = via_session else {
+            return ApiReply{ status:400, payload: json!({"success": false, "error": "No SSH session found to install on. Connect via SSH to the server first (sftp:// or scp://), then retry."})};
+        };
+        let pkg = server_package_name(kind);
+        let script = install_script_for_kind(kind);
+        // For X11/SPICE etc the script is short; for RDP/VNC/X2Go it may take minutes
+        match sess.exec_command(&script).await {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                let exit = out.exit_code.unwrap_or(1);
+                let success = exit == 0;
+                // Re-probe after install if succeeded
+                let mut now_available = false;
+                if success {
+                    if let Ok(avail) = linscp_proto::remote_desktop::check_via_ssh(sess.as_ref(), kind).await {
+                        now_available = avail;
+                    }
+                }
+                ApiReply{ status: if success {200} else {500}, payload: json!({
+                    "success": success,
+                    "via_tab": via_tab_id,
+                    "host": target_host,
+                    "kind": kind.as_str(),
+                    "package": pkg,
+                    "exit_code": exit,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "now_available": now_available,
+                    "install_script": script,
+                    "message": if success { format!("{pkg} installed on {target_host} — now_available={now_available}") } else { format!("Installer for {pkg} failed (exit {exit})") }
+                })}
+            },
+            Err(e) => ApiReply{ status:500, payload: json!({"success": false, "error": format!("SSH install exec failed: {e}"), "kind": kind.as_str(), "package": pkg})},
+        }
+    }
+
+    async fn handle_desktop_launch_async(&self, body: Value) -> ApiReply {
+        use linscp_proto::remote_desktop::{server_description, server_package_name, probe_command_for_kind, install_script_for_kind, RemoteDesktopKind, ticket_from_config, DesktopOptions, RemoteDesktopConnectConfig};
+        // First, perform availability check via SSH if possible. If not available,
+        // return the same prompt as /api/desktop/check so the UI can show cancel/install.
+        let kind_str = body.get("kind").and_then(|v| v.as_str()).or_else(|| body.get("protocol").and_then(|v| v.as_str()));
+        let mut target_host = body.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let tab_id = tabs::parse_tab_id_value(body.get("tab")).or_else(|| body.get("tabId").and_then(|v| v.as_u64()));
+        let mut kind = Self::parse_desktop_kind_str(kind_str);
+        let mut target_port: u16 = body.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+        let mut desktop_tab_spec: Option<tabs::TabRuntime> = None;
+        let mut via_session: Option<std::sync::Arc<dyn linscp_proto::RemoteSession>> = None;
+        let mut via_tab_id: Option<u64> = None;
+        // Extract desktop tab spec if provided
+        if let Some(tid) = tab_id {
+            let state = self.state.lock().expect("state mutex");
+            if let Some(tab) = state.tabs.get(&tid).cloned() {
+                if let Some(spec) = tab.spec.as_ref() {
+                    if spec.session.protocol.is_remote_desktop() {
+                        kind = RemoteDesktopKind::from_scheme(spec.session.protocol).unwrap_or(kind);
+                        if target_host.is_empty() { target_host = spec.session.host.clone(); }
+                        if target_port == 0 { target_port = if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port }; }
+                        desktop_tab_spec = Some(tab);
+                    } else if target_host.is_empty() {
+                        target_host = spec.session.host.clone();
+                    }
+                }
+                // If this tab is SSH, remember as via
+                if tab.remote.is_some() && tab.spec.as_ref().map(|s| matches!(s.session.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)).unwrap_or(false) {
+                    via_session = tab.remote.clone();
+                    via_tab_id = Some(tid);
+                }
+            }
+        }
+        // Also check explicit via_tab separate from tab
+        if via_session.is_none() {
+            if let Some(vid) = body.get("via_tab").and_then(|v| v.as_u64()).or_else(|| body.get("viaTab").and_then(|v| v.as_u64())) {
+                let state = self.state.lock().expect("state mutex");
+                if let Some(tab) = state.tabs.get(&vid) {
+                    via_session = tab.remote.clone();
+                    via_tab_id = Some(vid);
+                    if target_host.is_empty() { if let Some(spec) = tab.spec.as_ref() { target_host = spec.session.host.clone(); } }
+                }
+            }
+        }
+        // Fallback: any SSH tab with matching host
+        if via_session.is_none() && !target_host.is_empty() {
+            let state = self.state.lock().expect("state mutex");
+            for (id, tab) in state.tabs.iter() {
+                let is_ssh = tab.spec.as_ref().map(|s| matches!(s.session.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)).unwrap_or(false);
+                if is_ssh && tab.remote.is_some() && tab.connected {
+                    let h = tab.spec.as_ref().map(|s| s.session.host.clone()).unwrap_or_default();
+                    if h.eq_ignore_ascii_case(&target_host) { via_session = tab.remote.clone(); via_tab_id = Some(*id); break; }
+                }
+            }
+        }
+        if via_session.is_none() {
+            let state = self.state.lock().expect("state mutex");
+            for (id, tab) in state.tabs.iter() {
+                let is_ssh = tab.spec.as_ref().map(|s| matches!(s.session.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)).unwrap_or(false);
+                if is_ssh && tab.remote.is_some() { via_session = tab.remote.clone(); via_tab_id = Some(*id); if target_host.is_empty() { if let Some(spec) = tab.spec.as_ref() { target_host = spec.session.host.clone(); } } break; }
+            }
+        }
+        if target_host.is_empty() {
+            if let Some(tab) = desktop_tab_spec.as_ref() { if let Some(spec) = tab.spec.as_ref() { target_host = spec.session.host.clone(); } }
+        }
+        if target_port == 0 { target_port = match kind { RemoteDesktopKind::Rdp => 3389, RemoteDesktopKind::Vnc => 5900, RemoteDesktopKind::Spice => 5900, _ => 22 }; }
+        let pkg = server_package_name(kind);
+        let descr = server_description(kind);
+        let script = install_script_for_kind(kind);
+        let probe = probe_command_for_kind(kind);
+        // If we have SSH, probe via exec; if not available, return prompt instead of launching
+        if let Some(sess) = via_session.as_ref() {
+            match linscp_proto::remote_desktop::check_via_ssh(sess.as_ref(), kind).await {
+                Ok(false) => {
+                    return ApiReply{ status: 409, payload: json!({
+                        "success": false,
+                        "available": false,
+                        "checked": true,
+                        "via_ssh": true,
+                        "via_tab": via_tab_id,
+                        "kind": kind.as_str(),
+                        "host": target_host,
+                        "port": target_port,
+                        "package": pkg,
+                        "description": descr,
+                        "probe_command": probe,
+                        "install_script": script,
+                        "reason": format!("{descr} ({pkg}) not found on {target_host}"),
+                        "can_install": true,
+                        "message": format!("Remote desktop ({}) is not available on server '{}': {} ({}) not found. Install it now?", kind.as_str(), target_host, descr, pkg),
+                        "prompt": {
+                            "title": format!("Remote desktop not available on {}", target_host),
+                            "body": format!("{} ({}) is not installed on server '{}'. The installer below works on Debian/Ubuntu, Fedora/RHEL, Arch, openSUSE (auto-detects via /etc/os-release). Install now or cancel?", descr, pkg, target_host),
+                            "install_script": script,
+                            "actions": ["cancel", "install"]
+                        },
+                        "error": format!("Remote desktop not available: {descr} not found on {target_host}")
+                    })};
+                },
+                Ok(true) => { /* continue to launch */ },
+                Err(e) => {
+                    // Probe error: log but still allow launch to be attempted (maybe transient)
+                    let _ = e;
+                }
+            }
+        } else if !target_host.is_empty() && matches!(kind, RemoteDesktopKind::Rdp | RemoteDesktopKind::Vnc | RemoteDesktopKind::Spice) {
+            // No SSH, try TCP probe for direct desktop ports
+            let tcp_ok = linscp_proto::remote_desktop::check_tcp_availability(&target_host, target_port).await;
+            if !tcp_ok {
+                return ApiReply{ status: 409, payload: json!({
+                    "success": false,
+                    "available": false,
+                    "checked": true,
+                    "via_ssh": false,
+                    "kind": kind.as_str(),
+                    "host": target_host,
+                    "port": target_port,
+                    "package": pkg,
+                    "description": descr,
+                    "probe_command": probe,
+                    "install_script": script,
+                    "reason": format!("TCP connect to {target_host}:{target_port} failed"),
+                    "can_install": false,
+                    "message": format!("Remote desktop ({}) does not appear to be listening on {}:{} ({}, {}). Connect via SSH first to install, or run installer manually.", kind.as_str(), target_host, target_port, descr, pkg),
+                    "prompt": {
+                        "title": format!("Remote desktop not available on {}", target_host),
+                        "body": format!("{} is not listening on {}:{}. Installer for {}:\n{}", descr, target_host, target_port, pkg, script),
+                        "install_script": script,
+                        "actions": ["cancel"]
+                    },
+                    "error": format!("Remote desktop not listening on {target_host}:{target_port}")
+                })};
+            }
+        }
+        // Proceed with actual launch (reuse sync logic but with async context)
+        // Reuse the desktop tab if provided, otherwise require host/port
+        let (spec_host, spec_port, spec_protocol) = if let Some(tab) = desktop_tab_spec.as_ref() {
+            if let Some(spec) = tab.spec.as_ref() {
+                (spec.session.host.clone(), if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port }, spec.session.protocol)
+            } else { (target_host.clone(), target_port, match kind { RemoteDesktopKind::Rdp => linscp_types::ProtocolScheme::Rdp, RemoteDesktopKind::Vnc => linscp_types::ProtocolScheme::Vnc, RemoteDesktopKind::Spice => linscp_types::ProtocolScheme::Spice, RemoteDesktopKind::X2Go => linscp_types::ProtocolScheme::X2Go, RemoteDesktopKind::X11 => linscp_types::ProtocolScheme::X11 }) }
+        } else {
+            (target_host.clone(), target_port, match kind { RemoteDesktopKind::Rdp => linscp_types::ProtocolScheme::Rdp, RemoteDesktopKind::Vnc => linscp_types::ProtocolScheme::Vnc, RemoteDesktopKind::Spice => linscp_types::ProtocolScheme::Spice, RemoteDesktopKind::X2Go => linscp_types::ProtocolScheme::X2Go, RemoteDesktopKind::X11 => linscp_types::ProtocolScheme::X11 })
+        };
+        // Try to find the desktop tab to get full spec (including raw_fields, tunnel)
+        let tab_for_launch = if let Some(tid) = tab_id { self.state.lock().expect("m").tabs.get(&tid).cloned() } else { None };
+        let (cfg, target, tunneled) = if let Some(tab) = tab_for_launch.as_ref() {
+            if let Some(spec) = tab.spec.as_ref() {
+                let k = RemoteDesktopKind::from_scheme(spec.session.protocol).unwrap_or(kind);
+                let p = if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port };
+                let t = format!("{}:{}", spec.session.host, p);
+                let opts = DesktopOptions::from_raw_fields(&spec.raw_fields);
+                let tun = spec.session.tunnel.as_ref().map(|t| t.enabled && !t.host.trim().is_empty()).unwrap_or(false);
+                let c = RemoteDesktopConnectConfig{ scheme: spec.session.protocol, kind: k, host: spec.session.host.clone(), port: p, username: if spec.session.username.is_empty() { None } else { Some(spec.session.username.clone()) }, password: spec.session.password.clone().map(zeroize::Zeroizing::new), domain: opts.domain.clone(), desktop_opts: opts, tls: linscp_proto::tls::TlsSettings::default(), proxy: None, timeout: std::time::Duration::from_secs(15) };
+                (c, t, tun)
+            } else { return ApiReply{ status:400, payload: json!({"success": false, "error": "Tab has no session spec"})}; }
+        } else {
+            if target_host.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Desktop target host is required. Provide tab with desktop session or host/kind."})}; }
+            let opts = DesktopOptions::default();
+            let c = RemoteDesktopConnectConfig{ scheme: spec_protocol, kind, host: spec_host.clone(), port: spec_port, username: None, password: None, domain: None, desktop_opts: opts, tls: linscp_proto::tls::TlsSettings::default(), proxy: None, timeout: std::time::Duration::from_secs(15) };
+            let t = format!("{}:{}", spec_host, spec_port);
+            (c, t, false)
+        };
+        let proto_ticket = ticket_from_config(&cfg, kind, &target, tunneled, None);
+        let ticket = linscp_platform::desktop::DesktopTicket{ kind: proto_ticket.kind.clone(), target: proto_ticket.target.clone(), viewer: proto_ticket.viewer.clone(), argv: proto_ticket.argv.clone(), file_content: proto_ticket.file_content.clone(), file_extension: proto_ticket.file_extension.clone(), tunneled: proto_ticket.tunneled, local_endpoint: proto_ticket.local_endpoint.clone() };
+        let config_root = self.state.lock().expect("m").config_root.clone();
+        match linscp_platform::desktop::launch_remote_desktop(&ticket, &config_root, false) {
+            Ok(linscp_platform::desktop::DesktopLaunchResult::Spawned{ pid, viewer, argv }) => ApiReply{ status:200, payload: json!({"success": true, "launched": true, "available": true, "pid": pid, "viewer": viewer.display().to_string(), "argv": argv, "kind": kind.as_str(), "host": target_host})},
+            Ok(linscp_platform::desktop::DesktopLaunchResult::FileTicket{ path, viewer_hint }) => {
+                let file_content = proto_ticket.file_content.clone().or_else(|| std::fs::read_to_string(&path).ok());
+                ApiReply{ status:200, payload: json!({"success": true, "launched": false, "available": true, "file": path.display().to_string(), "file_content": file_content, "file_extension": proto_ticket.file_extension, "viewer_hint": viewer_hint, "kind": ticket.kind})}
+            },
+            Ok(linscp_platform::desktop::DesktopLaunchResult::BrowserGateway{ url_hint }) => ApiReply{ status:200, payload: json!({"success": true, "launched": false, "available": true, "gateway": url_hint, "kind": ticket.kind, "viewer": ticket.viewer, "argv": ticket.argv})},
             Err(e) => ApiReply{ status:500, payload: json!({"success": false, "error": e})},
         }
     }

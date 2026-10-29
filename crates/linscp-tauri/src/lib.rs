@@ -41,6 +41,10 @@ impl TauriBridge {
         self.service.dispatch(envelope)
     }
 
+    pub async fn invoke_async(&self, envelope: ApiEnvelope) -> ApiReply {
+        self.service.dispatch_async(envelope).await
+    }
+
     pub fn android_state(&self) -> &std::sync::Arc<android::AndroidState> {
         &self.android
     }
@@ -58,7 +62,7 @@ pub mod commands {
         state: tauri::State<'_, TauriBridge>,
         envelope: ApiEnvelope,
     ) -> Result<ApiReply, String> {
-        Ok(state.invoke(envelope))
+        Ok(state.invoke_async(envelope).await)
     }
 
     #[tauri::command]

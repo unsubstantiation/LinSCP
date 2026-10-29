@@ -565,6 +565,179 @@ fn build_x11_argv(viewer: &str, sess: &RemoteDesktopSession) -> Vec<String> {
     }
 }
 
+/// Human-readable server package and description for UI prompts.
+
+pub fn server_package_name(kind: RemoteDesktopKind) -> &'static str {
+    match kind {
+        RemoteDesktopKind::Rdp => "xrdp",
+        RemoteDesktopKind::Vnc => "tigervnc-standalone-server / x11vnc",
+        RemoteDesktopKind::Spice => "spice-vdagent",
+        RemoteDesktopKind::X2Go => "x2goserver",
+        RemoteDesktopKind::X11 => "xauth / xorg-xauth",
+    }
+}
+
+pub fn server_description(kind: RemoteDesktopKind) -> &'static str {
+    match kind {
+        RemoteDesktopKind::Rdp => "RDP server (xrdp) on port 3389",
+        RemoteDesktopKind::Vnc => "VNC server (TigerVNC / x11vnc) on port 5900-5999",
+        RemoteDesktopKind::Spice => "SPICE agent (spice-vdagent) for QEMU/KVM",
+        RemoteDesktopKind::X2Go => "X2Go server (x2goserver) over SSH",
+        RemoteDesktopKind::X11 => "X11 forwarding (xauth + Xorg/Waypipe) over SSH",
+    }
+}
+
+/// Shell probe command that exits 0 when the server side is available, 1 otherwise.
+/// Run via `ssh.exec_command(&probe_command_for_kind(kind))` — exit_code 0 means available.
+pub fn probe_command_for_kind(kind: RemoteDesktopKind) -> &'static str {
+    match kind {
+        RemoteDesktopKind::Rdp => "command -v xrdp >/dev/null 2>&1",
+        RemoteDesktopKind::Vnc => "command -v x11vnc >/dev/null 2>&1 || command -v Xtigervnc >/dev/null 2>&1 || command -v vncserver >/dev/null 2>&1 || command -v tigervncserver >/dev/null 2>&1 || command -v x0vncserver >/dev/null 2>&1",
+        RemoteDesktopKind::Spice => "command -v spice-vdagentd >/dev/null 2>&1 || command -v spice-vdagent >/dev/null 2>&1 || test -x /usr/libexec/spice-vdagentd 2>/dev/null || test -x /usr/sbin/spice-vdagentd 2>/dev/null",
+        RemoteDesktopKind::X2Go => "command -v x2godbadmin >/dev/null 2>&1 || command -v x2goserver >/dev/null 2>&1 || dpkg -l 2>/dev/null | grep -q x2goserver || rpm -q x2goserver >/dev/null 2>&1",
+        RemoteDesktopKind::X11 => "command -v xauth >/dev/null 2>&1",
+    }
+}
+
+/// Compatible installer script for `kind`. Detects the remote OS via `/etc/os-release`
+/// and uses the native package manager (apt/dnf/yum/pacman/zypper). Safe to run
+/// multiple times — exits 0 if already installed and listening.
+/// The script uses `sudo` when not root and `DEBIAN_FRONTEND=noninteractive` for apt.
+pub fn install_script_for_kind(kind: RemoteDesktopKind) -> String {
+    match kind {
+        RemoteDesktopKind::Rdp => r#"#!/bin/bash
+set -e
+SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo" || true
+echo "[linscp] Checking RDP server (xrdp)..."
+if command -v xrdp >/dev/null 2>&1; then
+  echo "[linscp] xrdp already installed at $(command -v xrdp)"
+  if ss -tln 2>/dev/null | grep -q ':3389' || netstat -tln 2>/dev/null | grep -q ':3389' 2>/dev/null || systemctl is-active --quiet xrdp 2>/dev/null; then
+    echo "[linscp] xrdp is running on 3389"; exit 0; fi
+  echo "[linscp] starting xrdp..."
+  $SUDO systemctl enable --now xrdp 2>/dev/null || $SUDO systemctl enable --now xrdp-sesman 2>/dev/null || $SUDO service xrdp start 2>/dev/null || true
+  sleep 2
+  if ss -tln 2>/dev/null | grep -q ':3389' || netstat -tln 2>/dev/null | grep -q ':3389' 2>/dev/null; then echo "[linscp] xrdp now listening"; exit 0; fi
+  echo "[linscp] xrdp binary present (port check inconclusive)"; exit 0
+fi
+echo "[linscp] xrdp not found, installing..."
+if [ -f /etc/os-release ]; then . /etc/os-release; OS=$ID; else OS=unknown; fi
+echo "[linscp] OS: $OS"
+case "$OS" in
+  ubuntu|debian|linuxmint|pop) $SUDO apt-get update -qq && $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y xrdp ;;
+  fedora) $SUDO dnf install -y xrdp ;;
+  rhel|centos|almalinux|rocky) $SUDO dnf install -y epel-release 2>/dev/null || $SUDO yum install -y epel-release 2>/dev/null || true; $SUDO dnf install -y xrdp 2>/dev/null || $SUDO yum install -y xrdp ;;
+  arch|manjaro) $SUDO pacman -Sy --noconfirm xrdp ;;
+  opensuse*|sles) $SUDO zypper --non-interactive install xrdp ;;
+  *) if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update -qq && $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y xrdp; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y xrdp; elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y xrdp; elif command -v pacman >/dev/null 2>&1; then $SUDO pacman -Sy --noconfirm xrdp; elif command -v zypper >/dev/null 2>&1; then $SUDO zypper --non-interactive install xrdp; else echo "[linscp] no known package manager"; exit 1; fi ;;
+esac
+$SUDO systemctl enable --now xrdp 2>/dev/null || $SUDO systemctl enable --now xrdp-sesman 2>/dev/null || $SUDO service xrdp start 2>/dev/null || true
+$SUDO firewall-cmd --permanent --add-port=3389/tcp 2>/dev/null && $SUDO firewall-cmd --reload 2>/dev/null || true
+$SUDO ufw allow 3389/tcp 2>/dev/null || true
+echo "[linscp] xrdp installed. Verify: ss -tln | grep 3389; systemctl status xrdp"
+"#.to_string(),
+        RemoteDesktopKind::Vnc => r#"#!/bin/bash
+set -e
+SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo" || true
+echo "[linscp] Checking VNC server..."
+if command -v x11vnc >/dev/null 2>&1 || command -v Xtigervnc >/dev/null 2>&1 || command -v vncserver >/dev/null 2>&1; then echo "[linscp] VNC already installed"; exit 0; fi
+echo "[linscp] VNC not found, installing TigerVNC/x11vnc..."
+if [ -f /etc/os-release ]; then . /etc/os-release; OS=$ID; else OS=unknown; fi
+case "$OS" in
+  ubuntu|debian|linuxmint|pop) $SUDO apt-get update -qq && $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y tigervnc-standalone-server tigervnc-common x11vnc 2>/dev/null || $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y tigervnc-standalone-server tigervnc-common ;;
+  fedora) $SUDO dnf install -y tigervnc-server x11vnc ;;
+  rhel|centos|almalinux|rocky) $SUDO dnf install -y tigervnc-server x11vnc 2>/dev/null || $SUDO yum install -y tigervnc-server x11vnc ;;
+  arch|manjaro) $SUDO pacman -Sy --noconfirm tigervnc x11vnc ;;
+  opensuse*|sles) $SUDO zypper --non-interactive install tigervnc x11vnc ;;
+  *) if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update -qq && $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y tigervnc-standalone-server; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y tigervnc-server; elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y tigervnc-server; elif command -v pacman >/dev/null 2>&1; then $SUDO pacman -Sy --noconfirm tigervnc; elif command -v zypper >/dev/null 2>&1; then $SUDO zypper --non-interactive install tigervnc; else echo "no package manager"; exit 1; fi ;;
+esac
+echo "[linscp] VNC installed. Create password with: vncpasswd ; start with: vncserver :1 -geometry 1024x768"
+"#.to_string(),
+        RemoteDesktopKind::Spice => r#"#!/bin/bash
+set -e
+SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo" || true
+echo "[linscp] Checking SPICE agent..."
+if command -v spice-vdagentd >/dev/null 2>&1 || test -x /usr/sbin/spice-vdagentd 2>/dev/null; then echo "[linscp] spice-vdagent already installed"; exit 0; fi
+if [ -f /etc/os-release ]; then . /etc/os-release; OS=$ID; else OS=unknown; fi
+case "$OS" in
+  ubuntu|debian|linuxmint|pop) $SUDO apt-get update -qq && $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y spice-vdagent ;;
+  fedora) $SUDO dnf install -y spice-vdagent ;;
+  rhel|centos|almalinux|rocky) $SUDO dnf install -y spice-vdagent 2>/dev/null || $SUDO yum install -y spice-vdagent ;;
+  arch|manjaro) $SUDO pacman -Sy --noconfirm spice-vdagent ;;
+  opensuse*|sles) $SUDO zypper --non-interactive install spice-vdagent ;;
+  *) if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update -qq && $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y spice-vdagent; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y spice-vdagent; elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y spice-vdagent; elif command -v pacman >/dev/null 2>&1; then $SUDO pacman -Sy --noconfirm spice-vdagent; elif command -v zypper >/dev/null 2>&1; then $SUDO zypper --non-interactive install spice-vdagent; else echo "no package manager"; exit 1; fi ;;
+esac
+$SUDO systemctl enable --now spice-vdagentd 2>/dev/null || $SUDO service spice-vdagentd start 2>/dev/null || true
+echo "[linscp] spice-vdagent installed."
+"#.to_string(),
+        RemoteDesktopKind::X2Go => r#"#!/bin/bash
+set -e
+SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo" || true
+echo "[linscp] Checking X2Go server..."
+if command -v x2godbadmin >/dev/null 2>&1 || dpkg -l 2>/dev/null | grep -q x2goserver || rpm -q x2goserver >/dev/null 2>&1; then echo "[linscp] x2goserver already installed"; exit 0; fi
+if [ -f /etc/os-release ]; then . /etc/os-release; OS=$ID; else OS=unknown; fi
+case "$OS" in
+  ubuntu|debian|linuxmint|pop)
+    $SUDO apt-get update -qq
+    $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common 2>/dev/null || true
+    $SUDO add-apt-repository -y ppa:x2go/stable 2>/dev/null || true
+    $SUDO apt-get update -qq
+    $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y x2goserver x2goserver-xsession ;;
+  fedora) $SUDO dnf install -y x2goserver x2goserver-xsession ;;
+  rhel|centos|almalinux|rocky) $SUDO dnf install -y epel-release 2>/dev/null || true; $SUDO dnf install -y x2goserver x2goserver-xsession 2>/dev/null || $SUDO yum install -y x2goserver x2goserver-xsession ;;
+  arch|manjaro) $SUDO pacman -Sy --noconfirm x2goserver ;;
+  opensuse*|sles) $SUDO zypper --non-interactive install x2goserver x2goserver-xsession ;;
+  *) if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update -qq && $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y x2goserver; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y x2goserver; elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y x2goserver; elif command -v pacman >/dev/null 2>&1; then $SUDO pacman -Sy --noconfirm x2goserver; elif command -v zypper >/dev/null 2>&1; then $SUDO zypper --non-interactive install x2goserver; else echo "no package manager"; exit 1; fi ;;
+esac
+echo "[linscp] x2goserver installed. Ensure SSH is running and a desktop environment is present (e.g. apt install xfce4)."
+"#.to_string(),
+        RemoteDesktopKind::X11 => r#"#!/bin/bash
+set -e
+SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo" || true
+echo "[linscp] Checking X11 forwarding..."
+if command -v xauth >/dev/null 2>&1; then echo "[linscp] xauth already installed"; exit 0; fi
+if [ -f /etc/os-release ]; then . /etc/os-release; OS=$ID; else OS=unknown; fi
+case "$OS" in
+  ubuntu|debian|linuxmint|pop) $SUDO apt-get update -qq && $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y xauth x11-xserver-utils ;;
+  fedora) $SUDO dnf install -y xorg-x11-xauth ;;
+  rhel|centos|almalinux|rocky) $SUDO dnf install -y xorg-x11-xauth 2>/dev/null || $SUDO yum install -y xorg-x11-xauth ;;
+  arch|manjaro) $SUDO pacman -Sy --noconfirm xorg-xauth ;;
+  opensuse*|sles) $SUDO zypper --non-interactive install xauth ;;
+  *) if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update -qq && $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y xauth; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y xorg-x11-xauth; elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y xorg-x11-xauth; elif command -v pacman >/dev/null 2>&1; then $SUDO pacman -Sy --noconfirm xorg-xauth; elif command -v zypper >/dev/null 2>&1; then $SUDO zypper --non-interactive install xauth; else echo "no package manager"; exit 1; fi ;;
+esac
+echo "[linscp] xauth installed. For Wayland hosts, also: apt/dnf install waypipe"
+"#.to_string(),
+    }
+}
+
+/// Lightweight TCP probe — tries to connect to `host:port` with 1.5s timeout.
+/// Used when no SSH session is available for a remote-exec probe.
+pub async fn check_tcp_availability(host: &str, port: u16) -> bool {
+    let target = format!("{host}:{port}");
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        tokio::net::TcpStream::connect(&target),
+    )
+    .await
+    {
+        Ok(Ok(_)) => true,
+        _ => false,
+    }
+}
+
+/// Check availability via an existing SSH session (preferred when the user
+/// is already SSH-connected to the same host). Returns true if the server package
+/// for `kind` appears to be installed.
+pub async fn check_via_ssh(
+    session: &dyn crate::RemoteSession,
+    kind: RemoteDesktopKind,
+) -> Result<bool, crate::ProtoError> {
+    let cmd = probe_command_for_kind(kind);
+    match session.exec_command(cmd).await {
+        Ok(out) => Ok(out.exit_code == Some(0)),
+        Err(e) => Err(e),
+    }
+}
+
 // `RemoteSession` impl — desktops are not file-transfer sessions, so every file op returns
 // `UnsupportedCapability(<op>, <scheme>)` just like FTP/Dav/S3's `dav_lock` does for SFTP.
 // `probe_endpoint` does the light TCP connect above; `close` tears down jump + SOCKS.

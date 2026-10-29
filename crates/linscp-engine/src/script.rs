@@ -773,6 +773,216 @@ impl ScriptInterpreter {
             proxy: None,
             timeout: std::time::Duration::from_secs(spec.timeout_secs.max(1)),
         };
+
+        // If we are already SSH-connected to the same host, probe whether the
+        // requested desktop server is actually installed there. When it is not
+        // available we prompt (interactive) to cancel or install via a
+        // compatible distro-detecting script executed over that SSH session.
+        // This satisfies: "if we are connected by ssh to a server and we press
+        // the button to connect by remote desktop, if the appropriate remote
+        // desktop connection is not available on the server we should be
+        // prompted that it is not available and given the option of cancelling
+        // or installing via a script that will be compatible."
+        let ssh_probe_idx = self.slots.iter().position(|s| {
+            s.spec.session.host.eq_ignore_ascii_case(&spec.session.host)
+                && matches!(
+                    s.spec.session.protocol,
+                    ProtocolScheme::Sftp | ProtocolScheme::Scp | ProtocolScheme::Ssh
+                )
+                && !s.session.scheme().is_remote_desktop()
+        });
+        if let Some(ssh_idx) = ssh_probe_idx {
+            let probe = linscp_proto::remote_desktop::probe_command_for_kind(kind);
+            let probe_available = {
+                let sess = &self.slots[ssh_idx].session;
+                match sess.exec_command(probe).await {
+                    Ok(out) => out.exit_code == Some(0),
+                    Err(_) => false,
+                }
+            };
+            let available = probe_available;
+            if !available {
+                let pkg = linscp_proto::remote_desktop::server_package_name(kind);
+                let descr = linscp_proto::remote_desktop::server_description(kind);
+                let install_script = linscp_proto::remote_desktop::install_script_for_kind(kind);
+                let msg = self.trp(
+                    "Remote desktop ({kind}) is not available on server '{host}': {descr} ({pkg}) not found. Install it now?",
+                    &[
+                        ("kind", kind.as_str()),
+                        ("host", &spec.session.host),
+                        ("descr", descr),
+                        ("pkg", pkg),
+                    ],
+                );
+                // In batch / non-interactive mode we must not block, but we
+                // still surface the script so the user can run it manually.
+                if !self.is_interactive_confirm() {
+                    // Emit a machine-readable hint plus the install script to stderr/log
+                    let hint = format!(
+                        "{msg} Run this script on the server via SSH:\n{install_script}\nOr press cancel and install manually."
+                    );
+                    self.emit_error(&hint);
+                    self.logger.log_event(&hint);
+                    let reason = format!(
+                        "{} not available on {} — install script: see log or run via SSH",
+                        kind.as_str(),
+                        spec.session.host
+                    );
+                    let _ = session.close().await;
+                    return Err(self.trp(
+                        "Cannot open session to {host}: {reason}",
+                        &[("host", &spec.session.host), ("reason", &reason)],
+                    ));
+                }
+                // Interactive prompt: cancel or install via compatible script.
+                eprintln!("\n{msg}");
+                eprintln!(
+                    "The following compatible installer will be run on the server over SSH:\n---\n{install_script}\n---"
+                );
+                let prompt = self.trp("Install {pkg} on {host} now?", &[("pkg", pkg), ("host", &spec.session.host)]);
+                let do_install = prompt_yes_no_tty(&format!("{prompt} [y/N]: "), &self.cfg.locale);
+                if do_install {
+                    self.emit_status(&self.trp(
+                        "Installing {pkg} on {host} via SSH...",
+                        &[("pkg", pkg), ("host", &spec.session.host)],
+                    ));
+                    self.logger.log_event(&format!("Installing {} on {} via SSH", pkg, spec.session.host));
+                    // Execute the installer via the same SSH session. The script is
+                    // idempotent and detects the remote OS (apt/dnf/yum/pacman/zypper).
+                    let install_res = {
+                        let sess = &self.slots[ssh_idx].session;
+                        sess.exec_command(&install_script).await
+                    };
+                    match install_res {
+                        Ok(out) => {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            if !stdout.is_empty() {
+                                self.emit_status(&stdout.to_string());
+                            }
+                            if !stderr.is_empty() {
+                                eprintln!("{stderr}");
+                            }
+                            self.logger.log_event(&format!(
+                                "Install exit={:?} stdout={} stderr={}",
+                                out.exit_code,
+                                stdout.chars().take(400).collect::<String>(),
+                                stderr.chars().take(400).collect::<String>()
+                            ));
+                            if out.exit_code != Some(0) {
+                                let reason = format!(
+                                    "Installer for {pkg} failed (exit {:?}): {}",
+                                    out.exit_code,
+                                    if stderr.is_empty() { stdout.to_string() } else { stderr.to_string() }
+                                );
+                                let _ = session.close().await;
+                                return Err(self.trp(
+                                    "Cannot open session to {host}: {reason}",
+                                    &[("host", &spec.session.host), ("reason", &reason)],
+                                ));
+                            }
+                            // Re-probe after install
+                            let reprobe = {
+                                let sess = &self.slots[ssh_idx].session;
+                                sess.exec_command(probe).await
+                            };
+                            let now_available = reprobe.map(|o| o.exit_code == Some(0)).unwrap_or(false);
+                            if !now_available {
+                                let reason = format!("{pkg} still not available after install — check log");
+                                let _ = session.close().await;
+                                return Err(self.trp(
+                                    "Cannot open session to {host}: {reason}",
+                                    &[("host", &spec.session.host), ("reason", &reason)],
+                                ));
+                            }
+                            self.emit_status(&self.trp(
+                                "{pkg} installed successfully on {host}.",
+                                &[("pkg", pkg), ("host", &spec.session.host)],
+                            ));
+                        }
+                        Err(e) => {
+                            let reason = format!("SSH install failed: {e}");
+                            let _ = session.close().await;
+                            return Err(self.trp(
+                                "Cannot open session to {host}: {reason}",
+                                &[("host", &spec.session.host), ("reason", &reason)],
+                            ));
+                        }
+                    }
+                } else {
+                    let reason = format!(
+                        "{} not available on {} — cancelled (run installer manually to enable {})",
+                        kind.as_str(),
+                        spec.session.host,
+                        descr
+                    );
+                    let _ = session.close().await;
+                    return Err(self.trp(
+                        "Cannot open session to {host}: {reason}",
+                        &[("host", &spec.session.host), ("reason", &reason)],
+                    ));
+                }
+            }
+        } else {
+            // No SSH session to probe — fall back to lightweight TCP probe when direct
+            // (non-tunneled) RDP/VNC/SPICE. If the port is not listening we treat it as
+            // "not available" and surface the installer script for manual use.
+            if !tunneled
+                && matches!(
+                    kind,
+                    linscp_proto::remote_desktop::RemoteDesktopKind::Rdp
+                        | linscp_proto::remote_desktop::RemoteDesktopKind::Vnc
+                        | linscp_proto::remote_desktop::RemoteDesktopKind::Spice
+                )
+            {
+                let tcp_available = linscp_proto::remote_desktop::check_tcp_availability(&spec.session.host, port).await;
+                if !tcp_available {
+                    let pkg = linscp_proto::remote_desktop::server_package_name(kind);
+                    let descr = linscp_proto::remote_desktop::server_description(kind);
+                    let install_script = linscp_proto::remote_desktop::install_script_for_kind(kind);
+                    // Only prompt if interactive; otherwise just log and continue to ticket
+                    // (the viewer will fail with connection refused, but we have already warned).
+                    if self.is_interactive_confirm() {
+                        let msg = self.trp(
+                            "Remote desktop ({kind}) does not appear to be listening on {host}:{port} ({descr}, {pkg}). Install it on the server?",
+                            &[
+                                ("kind", kind.as_str()),
+                                ("host", &spec.session.host),
+                                ("port", &port.to_string()),
+                                ("descr", descr),
+                                ("pkg", pkg),
+                            ],
+                        );
+                        eprintln!("\n{msg}");
+                        eprintln!("If you have SSH access, run this compatible installer on the server:\n---\n{install_script}\n---");
+                        let prompt = self.trp("Continue to launch viewer anyway?", &[("pkg", pkg)]);
+                        let cont = prompt_yes_no_tty(&format!("{prompt} [y/N]: "), &self.cfg.locale);
+                        if !cont {
+                            let reason = format!("{} not listening on {}:{} — cancelled", kind.as_str(), spec.session.host, port);
+                            let _ = session.close().await;
+                            return Err(self.trp(
+                                "Cannot open session to {host}: {reason}",
+                                &[("host", &spec.session.host), ("reason", &reason)],
+                            ));
+                        }
+                    } else {
+                        let hint = format!(
+                            "Note: {} not listening on {}:{} ({}) — server package {} not detected. Installer:\n{}",
+                            kind.as_str(),
+                            spec.session.host,
+                            port,
+                            descr,
+                            pkg,
+                            install_script
+                        );
+                        self.logger.log_event(&hint);
+                        // In batch mode we do not block, just continue to produce a ticket/gateway
+                        // so headless HTTP can still download the .rdp file.
+                    }
+                }
+            }
+        }
+
         let proto_ticket = ticket_from_config(&cfg, kind, &target, tunneled, None);
 
         let ticket = DesktopTicket {

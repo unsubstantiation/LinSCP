@@ -294,11 +294,11 @@ async fn api_handler(
         .unwrap_or_else(|| uri.path().to_string());
     // Enforce JSON object for POST body (like Python)
     let body_for_service = if parsed_body.is_object() { parsed_body } else if parsed_body.is_null() { json!({}) } else { parsed_body };
-    let reply = state.service.dispatch(ApiEnvelope {
+    let reply = state.service.dispatch_async(ApiEnvelope {
         method: method.as_str().to_string(),
         path: full_path,
         body: body_for_service,
-    });
+    }).await;
     let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     // Add security headers
     let mut resp = (status, Json(reply.payload)).into_response();

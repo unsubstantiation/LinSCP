@@ -134,6 +134,15 @@ Remote desktop (RDP, VNC, SPICE, X2Go/NX, X11/Waypipe) via open rdp:// etc.
   In headless/HTTP mode a .rdp/.vv ticket is written and DESKTOP_TICKET printed.
   Options: -rawsettings RdpDomain=, RdpSecurity=nla|tls, ColorDepth, Width,
            Height, Fullscreen, VncViewOnly, SpiceTlsPort, X2GoSessionType, etc.
+  If already SSH-connected to the same host and the server package (xrdp,
+  tigervnc, x2goserver, spice-vdagent, xauth) is not found, you will be
+  prompted that it is not available and given the choice to cancel or
+  install via a compatible script (detects Debian/Ubuntu, Fedora/RHEL,
+  Arch, openSUSE and uses apt/dnf/yum/pacman/zypper, runs over that SSH
+  session via exec). HTTP/Tauri: POST /api/desktop/check (via_tab) returns
+  {available, install_script, prompt{cancel,install}} and POST
+  /api/desktop/install runs it; GET /api/desktop/install-script?kind=rdp
+  fetches the script for manual use.
 ";
 
 fn is_option_name_char(b: u8) -> bool {
