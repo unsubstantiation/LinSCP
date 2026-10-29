@@ -168,6 +168,22 @@ jobs:
           grep '^evidence: ' "$RUNNER_TEMP/live-dav-tests.log" |
             { while IFS= read -r line; do
               printf '::notice::%s\n' "${line//]/%5D}"; done; } || :
+      - name: Live desktop (RDP/VNC/SPICE/X2Go/X11) regressions
+        run: |
+          # Stub viewers (xfreerdp/vncviewer/remote-viewer/x2goclient/waypipe) and
+          # stub TCP servers are created inside the test, so no system viewer
+          # or real RDP server is required. The test drives target/release/linscp
+          # and checks argv/ports, Wayland vs X11, headless tickets, jump-tunnel
+          # inheritance, XDMCP refusal and the SSH-prompt + installer API.
+          set -o pipefail
+          python3 -u source/linux/tests/LiveDesktopTest.py target/release/linscp 2>&1 |
+            tee "$RUNNER_TEMP/live-desktop-tests.log"
+          grep -E 'evidence: suite=live-desktop .*ran=[1-9]' "$RUNNER_TEMP/live-desktop-tests.log" > /dev/null || {
+            echo "::error::the live desktop suite ran no tests"
+            exit 1
+          }
+          grep '^evidence: ' "$RUNNER_TEMP/live-desktop-tests.log" |
+            { while IFS= read -r line; do printf '::notice::%s\n' "${line//]/%5D}"; done; } || :
       - name: Validate upstream gap inventory (not full parity)
         run: |
           python3 tools/compile_translations.py --check

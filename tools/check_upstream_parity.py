@@ -68,6 +68,7 @@ CASE_SOURCES = {
     "platform-conversion": "tools/tests/test_platform_conversion.py",
     "wayland-compatibility": "tools/tests/test_wayland_compatibility.py",
     "backup": "crates/linscp-engine/src/backup.rs",
+    "live-desktop": "source/linux/tests/LiveDesktopTest.py",
 }
 
 

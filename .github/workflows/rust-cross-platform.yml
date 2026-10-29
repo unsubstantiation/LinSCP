@@ -159,6 +159,11 @@ jobs:
           run_suite "LiveScpTest" "$PY" -u source/linux/tests/LiveScpTest.py "$BIN"
           run_suite "LiveDavTest" "$PY" -u source/linux/tests/LiveDavTest.py "$BIN"
           run_suite "LiveS3Test" "$PY" -u source/linux/tests/LiveS3Test.py "$BIN"
+          run_suite "LiveDesktopTest" "$PY" -u source/linux/tests/LiveDesktopTest.py "$BIN"
+          if ! grep -E 'evidence: suite=live-desktop .*ran=[1-9]' "$RUNNER_TEMP/rust-parity-LiveDesktopTest.log" >/dev/null 2>&1; then
+            echo "::error title=LiveDesktopTest::live-desktop suite ran no tests"
+            overall_rc=1
+          fi
           # LiveCurlTest FTPS is flaky for Rust parity vs C++ due to pyftpdlib FTPS handling differences;
           # allow a single FTPS failure while still requiring the suite to run.
           set +e
