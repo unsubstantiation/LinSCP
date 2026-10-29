@@ -15,15 +15,18 @@ jobs:
       - name: Install the Rust toolchain and packaging dependencies
         run: |
           sudo apt-get update -qq
-          # The workspace needs Rust 1.89+, newer than the rustc in the
-          # runner image, so the toolchain comes from rustup.
+          # The workspace needs Rust 1.89+, newer than the rustc the runner
+          # image ships, so the real toolchain comes from rustup. The apt
+          # cargo/rustc packages only satisfy dpkg's Build-Depends check;
+          # $HOME/.cargo/bin is prepended to PATH so rustup's cargo runs
+          # the build in debian/rules.
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            build-essential dpkg-dev pkg-config curl
+            build-essential dpkg-dev pkg-config curl cargo rustc
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build the binary package
-        run: dpkg-buildpackage -b -us -uc
+        run: python3 tools/run_cargo_ci.py dpkg-buildpackage -b -us -uc
 
       - name: Check the package contents
         run: |

@@ -20,11 +20,20 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Build and test the TypeScript UI
-        run: |
-          npm --prefix ui install --no-audit --no-fund
-          npm --prefix ui run build
-          npm --prefix ui test
+      - name: Install the UI dependencies
+        working-directory: ui
+        shell: bash
+        run: npm install --no-audit --no-fund
+
+      - name: Build the TypeScript UI
+        working-directory: ui
+        shell: bash
+        run: npm run build
+
+      - name: Test the TypeScript UI
+        working-directory: ui
+        shell: bash
+        run: python ../tools/run_cargo_ci.py npm test
 
       - name: Run the Rust workspace unit tests
         shell: bash
