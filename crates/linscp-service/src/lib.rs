@@ -177,6 +177,9 @@ impl CommanderService {
             ("POST", "/api/login") => ApiReply{ status: 400, payload: json!({"success": false, "error": "Accounts not enabled"})},
             ("POST", "/api/custom-commands") => self.handle_custom_commands(req.body),
             ("POST", "/api/command/exec") => self.handle_command_exec(req.body),
+            ("GET", "/api/desktop/recommendations") => self.handle_desktop_recommendations(),
+            ("POST", "/api/desktop/ticket") => self.handle_desktop_ticket(req.body),
+            ("POST", "/api/desktop/launch") => self.handle_desktop_launch(req.body),
             _ => ApiReply { status: 404, payload: json!({"error": format!("Unknown endpoint: {} {}", method, raw_path)})},
         }
     }
@@ -872,6 +875,134 @@ impl CommanderService {
         if cmd.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Empty command"})}; }
         if cmd.contains('\n') || cmd.contains('\r') { return ApiReply{ status:400, payload: json!({"success": false, "error": "A command with a newline is never written"})}; }
         ApiReply{ status:200, payload: json!({"success": true, "exit_code": 0, "stdout": "", "stderr": ""})}
+    }
+
+    fn handle_desktop_recommendations(&self) -> ApiReply {
+        let rec = linscp_platform::desktop::desktop_recommendations();
+        ApiReply{ status:200, payload: json!({"success": true, "recommendations": rec, "protocols": ["rdp","vnc","spice","x2go","x11"]})}
+    }
+
+    fn handle_desktop_ticket(&self, body: Value) -> ApiReply {
+        let tab_id = tabs::parse_tab_id_value(body.get("tab"))
+            .or_else(|| body.get("tabId").and_then(|v| v.as_u64()))
+            .or_else(|| body.get("tab_id").and_then(|v| v.as_u64()));
+        let Some(tab_id) = tab_id else {
+            return ApiReply{ status:400, payload: json!({"success": false, "error": "tab is required"})};
+        };
+        let state = self.state.lock().expect("state mutex");
+        let tab = match state.tabs.get(&tab_id) {
+            Some(t) => t.clone(),
+            None => return ApiReply{ status:404, payload: json!({"success": false, "error": format!("Tab {tab_id} not found")})},
+        };
+        drop(state);
+        let Some(spec) = tab.spec.as_ref() else {
+            return ApiReply{ status:400, payload: json!({"success": false, "error": "Tab has no session spec"})};
+        };
+        if !spec.session.protocol.is_remote_desktop() {
+            return ApiReply{ status:400, payload: json!({"success": false, "error": format!("Protocol {} is not a desktop protocol", spec.session.protocol.as_str())})};
+        }
+        // Build ticket from stored spec via proto helper.
+        let kind = linscp_proto::remote_desktop::RemoteDesktopKind::from_scheme(spec.session.protocol)
+            .unwrap_or(linscp_proto::remote_desktop::RemoteDesktopKind::Rdp);
+        let port = if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port };
+        let target = format!("{}:{}", spec.session.host, port);
+        let desktop_opts = linscp_proto::remote_desktop::DesktopOptions::from_raw_fields(&spec.raw_fields);
+        let tunneled = spec.session.tunnel.as_ref().map(|t| t.enabled && !t.host.trim().is_empty()).unwrap_or(false);
+        let cfg = linscp_proto::remote_desktop::RemoteDesktopConnectConfig {
+            scheme: spec.session.protocol,
+            kind,
+            host: spec.session.host.clone(),
+            port,
+            username: if spec.session.username.is_empty() { None } else { Some(spec.session.username.clone()) },
+            password: spec.session.password.clone().map(zeroize::Zeroizing::new),
+            domain: desktop_opts.domain.clone(),
+            desktop_opts,
+            tls: linscp_proto::tls::TlsSettings::default(),
+            proxy: None,
+            timeout: std::time::Duration::from_secs(15),
+        };
+        let ticket = linscp_proto::remote_desktop::ticket_from_config(&cfg, kind, &target, tunneled, None);
+        ApiReply{ status:200, payload: json!({
+            "success": true,
+            "tab": tab_id,
+            "ticket": {
+                "kind": ticket.kind,
+                "target": ticket.target,
+                "viewer": ticket.viewer,
+                "argv": ticket.argv,
+                "file_extension": ticket.file_extension,
+                "file_content": ticket.file_content,
+                "tunneled": ticket.tunneled,
+                "local_endpoint": ticket.local_endpoint,
+                "has_file": ticket.file_content.is_some(),
+            }
+        })}
+    }
+
+    fn handle_desktop_launch(&self, body: Value) -> ApiReply {
+        let tab_id = tabs::parse_tab_id_value(body.get("tab"))
+            .or_else(|| body.get("tabId").and_then(|v| v.as_u64()))
+            .or_else(|| body.get("tab_id").and_then(|v| v.as_u64()));
+        let Some(tab_id) = tab_id else {
+            return ApiReply{ status:400, payload: json!({"success": false, "error": "tab is required"})};
+        };
+        let state = self.state.lock().expect("state mutex");
+        let tab = match state.tabs.get(&tab_id) {
+            Some(t) => t.clone(),
+            None => return ApiReply{ status:404, payload: json!({"success": false, "error": format!("Tab {tab_id} not found")})},
+        };
+        let config_root = state.config_root.clone();
+        drop(state);
+        let Some(spec) = tab.spec.as_ref() else {
+            return ApiReply{ status:400, payload: json!({"success": false, "error": "Tab has no session spec"})};
+        };
+        if !spec.session.protocol.is_remote_desktop() {
+            return ApiReply{ status:400, payload: json!({"success": false, "error": format!("Protocol {} is not a desktop protocol", spec.session.protocol.as_str())})};
+        }
+        let kind = linscp_proto::remote_desktop::RemoteDesktopKind::from_scheme(spec.session.protocol)
+            .unwrap_or(linscp_proto::remote_desktop::RemoteDesktopKind::Rdp);
+        let port = if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port };
+        let target = format!("{}:{}", spec.session.host, port);
+        let desktop_opts = linscp_proto::remote_desktop::DesktopOptions::from_raw_fields(&spec.raw_fields);
+        let tunneled = spec.session.tunnel.as_ref().map(|t| t.enabled && !t.host.trim().is_empty()).unwrap_or(false);
+        let cfg = linscp_proto::remote_desktop::RemoteDesktopConnectConfig {
+            scheme: spec.session.protocol,
+            kind,
+            host: spec.session.host.clone(),
+            port,
+            username: if spec.session.username.is_empty() { None } else { Some(spec.session.username.clone()) },
+            password: spec.session.password.clone().map(zeroize::Zeroizing::new),
+            domain: desktop_opts.domain.clone(),
+            desktop_opts,
+            tls: linscp_proto::tls::TlsSettings::default(),
+            proxy: None,
+            timeout: std::time::Duration::from_secs(15),
+        };
+        let proto_ticket = linscp_proto::remote_desktop::ticket_from_config(&cfg, kind, &target, tunneled, None);
+        let ticket = linscp_platform::desktop::DesktopTicket {
+            kind: proto_ticket.kind.clone(),
+            target: proto_ticket.target.clone(),
+            viewer: proto_ticket.viewer.clone(),
+            argv: proto_ticket.argv.clone(),
+            file_content: proto_ticket.file_content.clone(),
+            file_extension: proto_ticket.file_extension.clone(),
+            tunneled: proto_ticket.tunneled,
+            local_endpoint: proto_ticket.local_endpoint.clone(),
+        };
+        match linscp_platform::desktop::launch_remote_desktop(&ticket, &config_root, false) {
+            Ok(linscp_platform::desktop::DesktopLaunchResult::Spawned { pid, viewer, argv }) => {
+                ApiReply{ status:200, payload: json!({"success": true, "launched": true, "pid": pid, "viewer": viewer.display().to_string(), "argv": argv})}
+            },
+            Ok(linscp_platform::desktop::DesktopLaunchResult::FileTicket { path, viewer_hint }) => {
+                // Read file content for HTTP clients that cannot read server filesystem.
+                let file_content = proto_ticket.file_content.clone().or_else(|| std::fs::read_to_string(&path).ok());
+                ApiReply{ status:200, payload: json!({"success": true, "launched": false, "file": path.display().to_string(), "file_content": file_content, "file_extension": proto_ticket.file_extension, "viewer_hint": viewer_hint, "kind": ticket.kind})}
+            },
+            Ok(linscp_platform::desktop::DesktopLaunchResult::BrowserGateway { url_hint }) => {
+                ApiReply{ status:200, payload: json!({"success": true, "launched": false, "gateway": url_hint, "kind": ticket.kind, "viewer": ticket.viewer, "argv": ticket.argv})}
+            },
+            Err(e) => ApiReply{ status:500, payload: json!({"success": false, "error": e})},
+        }
     }
 }
 

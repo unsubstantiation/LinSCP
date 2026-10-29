@@ -42,9 +42,9 @@ use crate::transfer::{
 };
 use crate::url_and_raw::{
     DefaultOsVault, ParsedSiteSpec, apply_env_credential_fallbacks, apply_raw_settings,
-    connect_site_spec, connect_ssh_for_shell, is_ssh_scheme, is_webdav_scheme, parse_site_url,
-    prompt_yes_no_tty, site_spec_from_stored, site_spec_from_stored_for_resave,
-    stored_site_from_spec, validate_session_settings,
+    connect_site_spec, connect_ssh_for_shell, is_desktop_scheme, is_ssh_scheme,
+    is_webdav_scheme, parse_site_url, prompt_yes_no_tty, site_spec_from_stored,
+    site_spec_from_stored_for_resave, stored_site_from_spec, validate_session_settings,
 };
 use crate::xml_log::SessionLogger;
 
@@ -597,6 +597,13 @@ impl ScriptInterpreter {
             self.presets_disabled = false;
         }
 
+        // Remote desktop schemes do not open a file tree — they produce a viewer
+        // ticket (xfreerdp / vncviewer / remote-viewer / x2goclient / waypipe)
+        // or a .rdp/.vv file when no viewer is installed / in headless mode.
+        if is_desktop_scheme(spec.session.protocol) {
+            return self.open_desktop_slot_from_spec(spec).await;
+        }
+
         let collected_events: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink_events = Arc::clone(&collected_events);
@@ -690,6 +697,141 @@ impl ScriptInterpreter {
             "Connected, the remote directory is {path}",
             &[("path", &remote_cwd)],
         ));
+        Ok(())
+    }
+
+    async fn open_desktop_slot_from_spec(&mut self, spec: ParsedSiteSpec) -> Result<(), String> {
+        use linscp_platform::desktop::{launch_remote_desktop, DesktopTicket};
+        use linscp_proto::remote_desktop::{DesktopOptions, RemoteDesktopConnectConfig, RemoteDesktopKind, ticket_from_config};
+
+        let collected_events: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&collected_events);
+        let ssh_sink: linscp_proto::ssh::SshEventLogger = Arc::new(move |msg: &str| {
+            sink_events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(msg.to_string());
+        });
+
+        let connect_res = connect_site_spec(
+            &spec,
+            &self.cfg.config_dir,
+            self.is_interactive_confirm(),
+            self.is_interactive_auth(),
+            &self.cfg.locale,
+            self.cfg.log_level,
+            Some(ssh_sink),
+        )
+        .await;
+
+        for ev in collected_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            self.logger.log_event(&ev);
+        }
+
+        let session = connect_res.map_err(|err| {
+            self.trp(
+                "Cannot open session to {host}: {reason}",
+                &[("host", &spec.session.host), ("reason", &err)],
+            )
+        })?;
+
+        let kind = RemoteDesktopKind::from_scheme(spec.session.protocol)
+            .unwrap_or(RemoteDesktopKind::Rdp);
+        let port = if spec.session.port == 0 {
+            spec.session.protocol.default_port()
+        } else {
+            spec.session.port
+        };
+        let target = format!("{}:{}", spec.session.host, port);
+        let desktop_opts = DesktopOptions::from_raw_fields(&spec.raw_fields);
+        let tunneled = spec
+            .session
+            .tunnel
+            .as_ref()
+            .map(|t| t.enabled && !t.host.trim().is_empty())
+            .unwrap_or(false);
+        // Timeout and proxy/tls are already validated by connect_site_spec; reuse defaults for ticket.
+        let cfg = RemoteDesktopConnectConfig {
+            scheme: spec.session.protocol,
+            kind,
+            host: spec.session.host.clone(),
+            port,
+            username: if spec.session.username.is_empty() {
+                None
+            } else {
+                Some(spec.session.username.clone())
+            },
+            password: spec.session.password.clone().map(zeroize::Zeroizing::new),
+            domain: desktop_opts.domain.clone(),
+            desktop_opts: desktop_opts.clone(),
+            tls: linscp_proto::tls::TlsSettings::default(),
+            proxy: None,
+            timeout: std::time::Duration::from_secs(spec.timeout_secs.max(1)),
+        };
+        let proto_ticket = ticket_from_config(&cfg, kind, &target, tunneled, None);
+
+        let ticket = DesktopTicket {
+            kind: proto_ticket.kind.clone(),
+            target: proto_ticket.target.clone(),
+            viewer: proto_ticket.viewer.clone(),
+            argv: proto_ticket.argv.clone(),
+            file_content: proto_ticket.file_content.clone(),
+            file_extension: proto_ticket.file_extension.clone(),
+            tunneled: proto_ticket.tunneled,
+            local_endpoint: proto_ticket.local_endpoint.clone(),
+        };
+
+        // In batch / headless mode we emit a file ticket rather than failing.
+        let is_headless = std::env::var_os("WAYLAND_DISPLAY").is_none()
+            && std::env::var_os("DISPLAY").is_none();
+        let launch = launch_remote_desktop(&ticket, &self.cfg.config_dir, is_headless)
+            .map_err(|e| {
+                self.trp(
+                    "Cannot open session to {host}: {reason}",
+                    &[("host", &spec.session.host), ("reason", &e)],
+                )
+            })?;
+
+        // Close the probe session — the viewer (or file) is the artifact.
+        let _ = session.close().await;
+
+        let display_name = slot_display_name_from_spec(&spec);
+        match launch {
+            linscp_platform::desktop::DesktopLaunchResult::Spawned { pid, viewer, .. } => {
+                self.emit_status(&self.trp(
+                    "Desktop '{host}' opened via {viewer} (pid {pid}).",
+                    &[
+                        ("host", &display_name),
+                        ("viewer", &viewer.display().to_string()),
+                        ("pid", &pid.to_string()),
+                    ],
+                ));
+            }
+            linscp_platform::desktop::DesktopLaunchResult::FileTicket { path, viewer_hint } => {
+                self.emit_status(&self.trp(
+                    "Desktop '{host}' ticket written to {path} (viewer hint: {viewer}).",
+                    &[
+                        ("host", &display_name),
+                        ("path", &path.display().to_string()),
+                        ("viewer", &viewer_hint),
+                    ],
+                ));
+                // Also emit a machine-readable line for the HTTP bridge.
+                println!("DESKTOP_TICKET {} {}", proto_ticket.kind, path.display());
+            }
+            linscp_platform::desktop::DesktopLaunchResult::BrowserGateway { url_hint } => {
+                self.emit_status(&self.trp(
+                    "Desktop '{host}' ready: {hint}.",
+                    &[("host", &display_name), ("hint", &url_hint)],
+                ));
+                println!("DESKTOP_GATEWAY {} {}", proto_ticket.kind, url_hint);
+            }
+        }
         Ok(())
     }
 

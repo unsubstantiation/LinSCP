@@ -21,6 +21,7 @@ pub mod ftp;
 pub mod gssapi;
 pub mod listing;
 pub mod proxy;
+pub mod remote_desktop;
 pub mod s3;
 pub mod scp;
 pub mod sftp;
@@ -55,6 +56,7 @@ pub struct ProtocolCapabilities {
     pub posix_permissions: bool,
     pub server_checksum: bool,
     pub object_versioning: bool,
+    pub remote_desktop: bool,
 }
 
 pub const fn capabilities_for(scheme: ProtocolScheme) -> ProtocolCapabilities {
@@ -66,6 +68,7 @@ pub const fn capabilities_for(scheme: ProtocolScheme) -> ProtocolCapabilities {
             posix_permissions: true,
             server_checksum: true,
             object_versioning: false,
+            remote_desktop: false,
         },
         ProtocolScheme::Scp => ProtocolCapabilities {
             pty_shell: true,
@@ -74,6 +77,7 @@ pub const fn capabilities_for(scheme: ProtocolScheme) -> ProtocolCapabilities {
             posix_permissions: true,
             server_checksum: true,
             object_versioning: false,
+            remote_desktop: false,
         },
         ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes => ProtocolCapabilities {
             pty_shell: false,
@@ -82,6 +86,7 @@ pub const fn capabilities_for(scheme: ProtocolScheme) -> ProtocolCapabilities {
             posix_permissions: true,
             server_checksum: true,
             object_versioning: false,
+            remote_desktop: false,
         },
         ProtocolScheme::Dav
         | ProtocolScheme::Davs
@@ -93,6 +98,7 @@ pub const fn capabilities_for(scheme: ProtocolScheme) -> ProtocolCapabilities {
             posix_permissions: false,
             server_checksum: false,
             object_versioning: false,
+            remote_desktop: false,
         },
         ProtocolScheme::S3 => ProtocolCapabilities {
             pty_shell: false,
@@ -101,6 +107,7 @@ pub const fn capabilities_for(scheme: ProtocolScheme) -> ProtocolCapabilities {
             posix_permissions: false,
             server_checksum: true,
             object_versioning: true,
+            remote_desktop: false,
         },
         ProtocolScheme::Local => ProtocolCapabilities {
             pty_shell: false,
@@ -109,6 +116,20 @@ pub const fn capabilities_for(scheme: ProtocolScheme) -> ProtocolCapabilities {
             posix_permissions: true,
             server_checksum: true,
             object_versioning: false,
+            remote_desktop: false,
+        },
+        ProtocolScheme::Rdp
+        | ProtocolScheme::Vnc
+        | ProtocolScheme::Spice
+        | ProtocolScheme::X2Go
+        | ProtocolScheme::X11 => ProtocolCapabilities {
+            pty_shell: false,
+            remote_exec: false,
+            symlinks: false,
+            posix_permissions: false,
+            server_checksum: false,
+            object_versioning: false,
+            remote_desktop: true,
         },
     }
 }
@@ -633,6 +654,34 @@ pub async fn connect_session(
             "network_session",
             ProtocolScheme::Local,
         )),
+        ProtocolScheme::Rdp
+        | ProtocolScheme::Vnc
+        | ProtocolScheme::Spice
+        | ProtocolScheme::X2Go
+        | ProtocolScheme::X11 => {
+            let kind = remote_desktop::RemoteDesktopKind::from_scheme(session.protocol)
+                .unwrap_or(remote_desktop::RemoteDesktopKind::Rdp);
+            let cfg = remote_desktop::RemoteDesktopConnectConfig {
+                scheme: session.protocol,
+                kind,
+                host: session.host.clone(),
+                port,
+                username: if session.username.is_empty() { None } else { Some(session.username.clone()) },
+                password: session.password.clone().map(Zeroizing::new),
+                domain: None,
+                desktop_opts: remote_desktop::DesktopOptions::default(),
+                tls: tls.clone(),
+                proxy: proxy.clone(),
+                timeout: Duration::from_secs(15),
+            };
+            let sess = remote_desktop::RemoteDesktopSession::connect(
+                cfg,
+                tunnel_ssh_cfg.as_ref(),
+                tunnel_local_port,
+            )
+            .await?;
+            Ok(Box::new(sess))
+        }
     }
 }
 

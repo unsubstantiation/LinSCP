@@ -17,6 +17,7 @@ use rand::RngCore;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+pub mod desktop;
 pub mod gssapi_sys;
 pub mod gui_os;
 pub mod terminal;

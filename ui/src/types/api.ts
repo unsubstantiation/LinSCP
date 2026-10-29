@@ -10,7 +10,12 @@ export type ProtocolScheme =
   | 'webdav'
   | 'webdavs'
   | 's3'
-  | 'local';
+  | 'local'
+  | 'rdp'
+  | 'vnc'
+  | 'spice'
+  | 'x2go'
+  | 'x11';
 
 export interface TunnelConfig {
   enabled: boolean;
@@ -83,6 +88,24 @@ export interface TabSummary {
   session?: SessionConfig;
   observed_hostkey: string;
   error: string;
+  is_desktop?: boolean;
+  protocol?: ProtocolScheme;
+}
+
+export interface DesktopTicket {
+  kind: string;
+  target: string;
+  viewer: string;
+  argv: string[];
+  file_extension?: string;
+  tunneled: boolean;
+  local_endpoint: string;
+  has_file: boolean;
+}
+
+export const DESKTOP_PROTOCOLS: ProtocolScheme[] = ['rdp', 'vnc', 'spice', 'x2go', 'x11'];
+export function isDesktopProtocol(p?: ProtocolScheme): boolean {
+  return !!p && (DESKTOP_PROTOCOLS as string[]).includes(p);
 }
 
 export interface TransferQueueItem {

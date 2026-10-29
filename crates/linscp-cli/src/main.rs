@@ -74,7 +74,7 @@ Options:
   -help             print this help and exit
 
 Commands:
-  open SITE         connect to a site (sftp://user@host:port/path)
+  open SITE         connect to a site (sftp://user@host:port/path or rdp://, vnc://, spice://, x2go://, x11:// for remote desktop)
   close [INDEX]     disconnect the open session, or session INDEX
   cd DIR            change the remote directory
   pwd               print the remote directory
@@ -127,6 +127,13 @@ Commands:
   binary / ascii    select the transfer mode of the following commands
   help              list the commands (alias: man)
   exit              end the session
+
+Remote desktop (RDP, VNC, SPICE, X2Go/NX, X11/Waypipe) via open rdp:// etc.
+  Viewer: Linux xfreerdp3/xfreerdp (RDP), tigervnc/remmina (VNC),
+          remote-viewer/spicy (SPICE), x2goclient (X2Go), waypipe/ssh -X (X11).
+  In headless/HTTP mode a .rdp/.vv ticket is written and DESKTOP_TICKET printed.
+  Options: -rawsettings RdpDomain=, RdpSecurity=nla|tls, ColorDepth, Width,
+           Height, Fullscreen, VncViewOnly, SpiceTlsPort, X2GoSessionType, etc.
 ";
 
 fn is_option_name_char(b: u8) -> bool {
@@ -593,6 +600,11 @@ async fn run_cli() -> i32 {
                     ProtocolScheme::Ftp,
                     ProtocolScheme::Dav,
                     ProtocolScheme::S3,
+                    ProtocolScheme::Rdp,
+                    ProtocolScheme::Vnc,
+                    ProtocolScheme::Spice,
+                    ProtocolScheme::X2Go,
+                    ProtocolScheme::X11,
                 ] {
                     let mut probe = ParsedSiteSpec::default();
                     probe.session.protocol = proto;

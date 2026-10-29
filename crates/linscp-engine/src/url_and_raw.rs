@@ -20,6 +20,9 @@ use linscp_platform::gssapi_sys::{
 use linscp_proto::ftp::{FtpConnectConfig, FtpSession};
 use linscp_proto::gssapi::{GssapiExchangeStep, GssapiTokenProvider};
 use linscp_proto::proxy::{ProxyConfig, ProxyKind};
+use linscp_proto::remote_desktop::{
+    DesktopOptions, RemoteDesktopConnectConfig, RemoteDesktopKind, RemoteDesktopSession,
+};
 use linscp_proto::s3::{MultipartResumeStore, S3ConnectConfig, S3Session};
 use linscp_proto::scp::ScpSession;
 use linscp_proto::sftp::SftpClientSession;
@@ -303,9 +306,14 @@ pub fn parse_site_url(url: &str) -> Result<ParsedSiteSpec, String> {
             raw_fields.insert("s3_protocol".to_string(), "1".to_string());
             (ProtocolScheme::S3, 443u16)
         }
+        "rdp" | "rdps" | "msrdp" => (ProtocolScheme::Rdp, 3389u16),
+        "vnc" | "rfb" => (ProtocolScheme::Vnc, 5900u16),
+        "spice" => (ProtocolScheme::Spice, 5900u16),
+        "x2go" | "nx" => (ProtocolScheme::X2Go, 22u16),
+        "x11" | "x" | "waypipe" => (ProtocolScheme::X11, 22u16),
         other => {
             return Err(format!(
-                "Unsupported URL protocol scheme '{other}' (expected sftp, scp, ftp, ftps, ftpes, http, https, dav, davs, webdav, webdavs or s3)."
+                "Unsupported URL protocol scheme '{other}' (expected sftp, scp, ftp, ftps, ftpes, http, https, dav, davs, webdav, webdavs, s3, rdp, vnc, spice, x2go or x11)."
             ));
         }
     };
@@ -612,6 +620,17 @@ pub fn is_webdav_scheme(p: ProtocolScheme) -> bool {
             | ProtocolScheme::Davs
             | ProtocolScheme::Webdav
             | ProtocolScheme::Webdavs
+    )
+}
+
+pub fn is_desktop_scheme(p: ProtocolScheme) -> bool {
+    matches!(
+        p,
+        ProtocolScheme::Rdp
+            | ProtocolScheme::Vnc
+            | ProtocolScheme::Spice
+            | ProtocolScheme::X2Go
+            | ProtocolScheme::X11
     )
 }
 
@@ -1155,9 +1174,220 @@ pub fn apply_raw_settings(spec: &mut ParsedSiteSpec, pairs: &[String]) -> Result
                 );
             }
 
+            // Remote desktop — RDP / VNC / SPICE / X2Go / X11 (only for desktop schemes)
+            "rdpdomain" | "domain" | "rdp_domain" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for RDP/X2Go/desktop sessions."
+                    ));
+                }
+                if val.contains(';') {
+                    return Err(format!("Invalid RdpDomain '{val}'."));
+                }
+                spec.raw_fields.insert("rdp_domain".to_string(), val.to_string());
+            }
+            "rdpsecurity" | "rdp_security" | "security" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for RDP sessions."
+                    ));
+                }
+                let sec = val.to_ascii_lowercase();
+                if !matches!(sec.as_str(), "nla" | "tls" | "rdp" | "ext" | "auto" | "negotiate") {
+                    return Err(format!(
+                        "Invalid RdpSecurity '{val}' (expected nla, tls, rdp, ext or auto)."
+                    ));
+                }
+                spec.raw_fields.insert("rdp_security".to_string(), sec);
+            }
+            "rdpcolortdepth" | "rdp_color_depth" | "colortdepth" | "color_depth" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for RDP sessions."
+                    ));
+                }
+                let depth: u8 = val.parse().ok().filter(|&n| matches!(n, 8 | 15 | 16 | 24 | 32)).ok_or_else(|| {
+                    format!("Invalid RdpColorDepth '{val}' (expected 8, 15, 16, 24 or 32).")
+                })?;
+                spec.raw_fields.insert("rdp_color_depth".to_string(), depth.to_string());
+            }
+            "rdpwidth" | "rdp_width" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for RDP sessions."
+                    ));
+                }
+                let w: u32 = val.parse().ok().filter(|&n| n >= 100 && n <= 8192).ok_or_else(|| {
+                    format!("Invalid RdpWidth '{val}' (expected 100..8192).")
+                })?;
+                spec.raw_fields.insert("rdp_width".to_string(), w.to_string());
+            }
+            "rdpheight" | "rdp_height" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for RDP sessions."
+                    ));
+                }
+                let h: u32 = val.parse().ok().filter(|&n| n >= 100 && n <= 8192).ok_or_else(|| {
+                    format!("Invalid RdpHeight '{val}' (expected 100..8192).")
+                })?;
+                spec.raw_fields.insert("rdp_height".to_string(), h.to_string());
+            }
+            "rdpfullscreen" | "rdp_fullscreen" | "fullscreen" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for RDP sessions."
+                    ));
+                }
+                let b = parse_zero_one(val)
+                    .ok_or_else(|| format!("Invalid RdpFullscreen '{val}' (expected 0 or 1)."))?;
+                spec.raw_fields.insert(
+                    "rdp_fullscreen".to_string(),
+                    if b { "1" } else { "0" }.to_string(),
+                );
+            }
+            "rdpdriveredirection" | "rdp_drive_redirection" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for RDP sessions."
+                    ));
+                }
+                let b = parse_zero_one(val)
+                    .ok_or_else(|| format!("Invalid RdpDriveRedirection '{val}'."))?;
+                spec.raw_fields.insert(
+                    "rdp_drive_redirection".to_string(),
+                    if b { "1" } else { "0" }.to_string(),
+                );
+            }
+            "rdpaudiomode" | "rdp_audio_mode" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for RDP sessions."
+                    ));
+                }
+                let mode: u8 = val.parse().ok().filter(|&n| n <= 3).ok_or_else(|| {
+                    format!("Invalid RdpAudioMode '{val}' (expected 0..3).")
+                })?;
+                spec.raw_fields.insert("rdp_audio_mode".to_string(), mode.to_string());
+            }
+            "rdpcompression" | "rdp_compression" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for RDP sessions."
+                    ));
+                }
+                let b = parse_zero_one(val)
+                    .ok_or_else(|| format!("Invalid RdpCompression '{val}'."))?;
+                spec.raw_fields.insert(
+                    "rdp_compression".to_string(),
+                    if b { "1" } else { "0" }.to_string(),
+                );
+            }
+            "vncviewonly" | "vnc_view_only" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for VNC sessions."
+                    ));
+                }
+                let b = parse_zero_one(val)
+                    .ok_or_else(|| format!("Invalid VncViewOnly '{val}'."))?;
+                spec.raw_fields.insert(
+                    "vnc_view_only".to_string(),
+                    if b { "1" } else { "0" }.to_string(),
+                );
+            }
+            "vncquality" | "vnc_quality" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for VNC sessions."
+                    ));
+                }
+                let q: u8 = val.parse().ok().filter(|&n| n <= 9).ok_or_else(|| {
+                    format!("Invalid VncQuality '{val}' (expected 0..9).")
+                })?;
+                spec.raw_fields.insert("vnc_quality".to_string(), q.to_string());
+            }
+            "spicetlsport" | "spice_tls_port" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for SPICE sessions."
+                    ));
+                }
+                let p: u16 = val.parse().ok().filter(|&n| n > 0).ok_or_else(|| {
+                    format!("Invalid SpiceTlsPort '{val}'.")
+                })?;
+                spec.raw_fields.insert("spice_tls_port".to_string(), p.to_string());
+            }
+            "spicetlsinsecure" | "spice_tls_insecure" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for SPICE sessions."
+                    ));
+                }
+                let b = parse_zero_one(val)
+                    .ok_or_else(|| format!("Invalid SpiceTlsInsecure '{val}'."))?;
+                spec.raw_fields.insert(
+                    "spice_tls_insecure".to_string(),
+                    if b { "1" } else { "0" }.to_string(),
+                );
+            }
+            "x2gosessiontype" | "x2go_session_type" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for X2Go sessions."
+                    ));
+                }
+                spec.raw_fields.insert("x2go_session_type".to_string(), val.to_string());
+            }
+            "x2gocommand" | "x2go_command" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for X2Go sessions."
+                    ));
+                }
+                spec.raw_fields.insert("x2go_command".to_string(), val.to_string());
+            }
+            "x2golink" | "x2go_link" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for X2Go sessions."
+                    ));
+                }
+                spec.raw_fields.insert("x2go_link".to_string(), val.to_ascii_lowercase());
+            }
+            "x2gopack" | "x2go_pack" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for X2Go sessions."
+                    ));
+                }
+                spec.raw_fields.insert("x2go_pack".to_string(), val.to_ascii_lowercase());
+            }
+            "x11display" | "x11_display" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for X11/Waypipe sessions."
+                    ));
+                }
+                spec.raw_fields.insert("x11_display".to_string(), val.to_string());
+            }
+            "waypipe" => {
+                if !is_desktop_scheme(proto) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for X11/Waypipe sessions."
+                    ));
+                }
+                let b = parse_zero_one(val)
+                    .ok_or_else(|| format!("Invalid Waypipe '{val}'."))?;
+                spec.raw_fields.insert(
+                    "waypipe".to_string(),
+                    if b { "1" } else { "0" }.to_string(),
+                );
+            }
+
             _ => {
                 return Err(format!(
-                    "Unsupported raw session setting '{key_trimmed}'; supported settings include ProxyMethod, ProxyHost, ProxyPort, Tunnel, Ftps, S3UrlStyle, and AuthGSSAPI."
+                    "Unsupported raw session setting '{key_trimmed}'; supported settings include ProxyMethod, ProxyHost, ProxyPort, Tunnel, Ftps, S3UrlStyle, AuthGSSAPI, RdpDomain, RdpSecurity, VncViewOnly and X2GoSessionType."
                 ));
             }
         }
@@ -2012,6 +2242,40 @@ async fn connect_site_spec_inner(
                 .await
                 .map_err(|e| e.to_string())?;
             Box::new(s3)
+        }
+        ProtocolScheme::Rdp
+        | ProtocolScheme::Vnc
+        | ProtocolScheme::Spice
+        | ProtocolScheme::X2Go
+        | ProtocolScheme::X11 => {
+            let kind = RemoteDesktopKind::from_scheme(spec.session.protocol)
+                .unwrap_or(RemoteDesktopKind::Rdp);
+            let desktop_opts = DesktopOptions::from_raw_fields(&spec.raw_fields);
+            let rd_cfg = RemoteDesktopConnectConfig {
+                scheme: spec.session.protocol,
+                kind,
+                host: spec.session.host.clone(),
+                port,
+                username: if spec.session.username.is_empty() {
+                    None
+                } else {
+                    Some(spec.session.username.clone())
+                },
+                password: spec.session.password.clone().map(Zeroizing::new),
+                domain: desktop_opts.domain.clone(),
+                desktop_opts,
+                tls: tls.clone(),
+                proxy: proxy.clone(),
+                timeout,
+            };
+            let sess = RemoteDesktopSession::connect(
+                rd_cfg,
+                tunnel_ssh_cfg.as_ref(),
+                tunnel_local_port,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            Box::new(sess)
         }
         ProtocolScheme::Local => {
             return Err("Local sessions cannot be opened as remote network sessions.".to_string());

@@ -88,11 +88,17 @@ impl TabRuntime {
             obj.remove("tunnel_password");
             obj.remove("tunnel_passphrase");
         }
+        let is_desktop = self.spec.as_ref().map(|s| s.session.protocol.is_remote_desktop()).unwrap_or(false);
+        let protocol = self.spec.as_ref().map(|s| s.session.protocol.as_str().to_string()).unwrap_or_else(|| {
+            redacted.get("protocol").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        });
         json!({
             "id": self.id,
             "name": self.name,
             "connected": self.connected,
             "is_local": self.is_local,
+            "is_desktop": is_desktop,
+            "protocol": protocol,
             "session": redacted,
             "remote_dir": if self.is_local { &self.other_local_dir } else { &self.remote_dir },
             "local_dir": self.local_dir,
