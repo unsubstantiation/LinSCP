@@ -266,6 +266,11 @@ async fn main() -> ExitCode {
 
 async fn run_cli() -> i32 {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    // Debug for window test
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/linscp-gui-debug2.log") {
+        use std::io::Write as _;
+        let _ = writeln!(f, "run_cli raw_args={:?} exe={:?}", raw_args, std::env::current_exe().unwrap_or_default().display());
+    }
     let locale = select_cli_locale_from_env();
     let bin_name = std::env::args().next().unwrap_or_default();
     let is_gui_bin = bin_name.contains("linscp-gui");
