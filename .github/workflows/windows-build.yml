@@ -53,7 +53,7 @@ jobs:
               Start-Sleep -Seconds 1
               $app.Refresh()
               if ($app.HasExited) { throw "Application exited before opening a window: $($app.ExitCode)" }
-              if ($app.MainWindowHandle -ne 0 -and $app.MainWindowTitle -eq 'LinSCP') { $ready = $true; break }
+              if ($app.MainWindowHandle -ne 0 -and $app.MainWindowTitle -like 'LinSCP*') { $ready = $true; break }
             }
             if (-not $ready) { throw 'The LinSCP window did not open within 30 seconds' }
           } finally {
