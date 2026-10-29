@@ -10,7 +10,7 @@
     "test": "npm run typecheck && npm run build && node --test tests/*.test.mjs && node ../source/gui/tests/ClientTest.js dist/index.html && node ../source/gui/tests/LocalizationTest.js dist/index.html"
   },
   "devDependencies": {
-    "esbuild": "^0.24.2",
+    "esbuild": "^0.25.0",
     "jsdom": "^25.0.1",
     "typescript": "^5.7.2"
   }
