@@ -10,7 +10,12 @@ export type ProtocolScheme =
   | 'webdav'
   | 'webdavs'
   | 's3'
-  | 'local';
+  | 'local'
+  | 'rdp'
+  | 'vnc'
+  | 'spice'
+  | 'x2go'
+  | 'x11';
 
 export interface TunnelConfig {
   enabled: boolean;
@@ -83,6 +88,92 @@ export interface TabSummary {
   session?: SessionConfig;
   observed_hostkey: string;
   error: string;
+  is_desktop?: boolean;
+  protocol?: ProtocolScheme;
+}
+
+export interface DesktopTicket {
+  kind: string;
+  target: string;
+  viewer: string;
+  argv: string[];
+  file_extension?: string;
+  file_content?: string;
+  tunneled: boolean;
+  local_endpoint: string;
+  has_file: boolean;
+}
+
+export const DESKTOP_PROTOCOLS: ProtocolScheme[] = ['rdp', 'vnc', 'spice', 'x2go', 'x11'];
+export function isDesktopProtocol(p?: ProtocolScheme): boolean {
+  return !!p && (DESKTOP_PROTOCOLS as string[]).includes(p);
+}
+
+export interface DesktopInstallScriptResponse {
+  success: boolean;
+  kind: string;
+  package: string;
+  description: string;
+  probe_command: string;
+  install_script: string;
+}
+
+export interface DesktopCheckRequest {
+  tab?: number;
+  via_tab?: number;
+  host?: string;
+  port?: number;
+  kind?: string;
+  protocol?: string;
+}
+
+export interface DesktopCheckPrompt {
+  title: string;
+  body: string;
+  install_script: string;
+  actions: string[];
+}
+
+export interface DesktopCheckResponse {
+  success: boolean;
+  available: boolean;
+  checked: boolean;
+  via_ssh?: boolean;
+  via_tab?: number | null;
+  kind: string;
+  host: string;
+  port: number;
+  package: string;
+  description: string;
+  probe_command: string;
+  install_script: string;
+  reason: string;
+  can_install: boolean;
+  message?: string;
+  prompt?: DesktopCheckPrompt;
+}
+
+export interface DesktopInstallRequest {
+  via_tab?: number;
+  tab?: number;
+  host?: string;
+  kind?: string;
+  protocol?: string;
+}
+
+export interface DesktopInstallResponse {
+  success: boolean;
+  via_tab?: number;
+  host: string;
+  kind: string;
+  package: string;
+  exit_code: number;
+  stdout: string;
+  stderr: string;
+  now_available: boolean;
+  install_script: string;
+  message: string;
+  error?: string;
 }
 
 export interface TransferQueueItem {

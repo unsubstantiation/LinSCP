@@ -584,7 +584,7 @@
     },
     "open": {
       "status": "verified",
-      "notes": "URL sessions and stored-session names (including folder/site paths), -passphrase= for encrypted SSH keys, -hostkey= verification and '-rawsettings[=N] NAME=VALUE...' for proxy, FTP/TLS and S3 object settings; unknown settings and unusable proxies are refused by name before connecting, and passwords/passphrases are redacted in echo and XML logs. Covered by script, live-sftp, live-s3 and live-curl.",
+      "notes": "URL sessions and stored-session names (including folder/site paths), -passphrase= for encrypted SSH keys, -hostkey= verification and '-rawsettings[=N] NAME=VALUE...' for proxy, FTP/TLS and S3 object settings; unknown settings and unusable proxies are refused by name before connecting, and passwords/passphrases are redacted in echo and XML logs. Covered by script, live-sftp, live-s3 and live-curl. Also parses rdp:// (3389, xfreerdp/mstsc/aFreeRDP), vnc:// (5900, tigervnc/remmina), spice:// (5900, remote-viewer/.vv), x2go:// (22, x2goclient, NX over SSH) and x11:// (22, waypipe/ssh -X); each shares proxy/tunnel/TLS/SPKI handling and emits a viewer ticket (or .rdp/.vv file/gateway in headless HTTP) — see desktop.remote capability and linscp_additions remote desktop entry.",
       "verified_on": {
         "linux": [
           "script",
@@ -1125,7 +1125,7 @@
     },
     {
       "name": "Desktop integration",
-      "status": "verified",
+      "status": "partial",
       "notes": "The desktop entry registers SFTP/FTP/FTPS URLs and launches the graphical client through the desktop's own URI launcher, so it opens the same on a Wayland session as under X11; the GUI parses startup URLs without bypassing host-key verification, and launcher/core lookup supports relocatable prefixes. Local and remote pane desktop drops are tested using browser API fixtures, and a display-session decision that ignores Wayland is refused by the compatibility check. File-manager integration is per-user opt-in: 'linscp-gui --install-shell-integration' writes 'Upload with LinSCP' actions for Dolphin, GNOME Files and Nemo, which hold a validated selection for the Commander's confirmation dialog instead of transferring anything. Covered by gui-desktop-uri, gui-shell, script, gui, gui-browser-upload, unit and wayland-compatibility; real browser/desktop combinations and a live compositor still need acceptance validation, which no fixture here certifies.",
       "verified_on": {
         "linux": [
@@ -1155,7 +1155,8 @@
           "wayland-compatibility",
           "gui-shell"
         ]
-      }
+      },
+      "gap": "Remote-desktop live viewer integration (xfreerdp/vncviewer/remote-viewer/x2goclient/waypipe) against real RDP/VNC/SPICE/X2Go/X11 endpoints and the ironrdp HTML5/WebSocket gateway fallback are not yet exercised in CI; see desktop.remote capability."
     },
     {
       "name": "Localization/accessibility",
@@ -5069,6 +5070,40 @@
           "script"
         ]
       }
+    },
+    {
+      "id": "desktop.remote",
+      "area": "Desktop integration",
+      "status": "partial",
+      "notes": "RDP/VNC/SPICE are direct-TCP (3389/5900) with optional SSH jump SOCKS5h relay; X2Go/X11 are SSH-transported via direct-tcpip. Native viewers are resolved via PATH (xfreerdp3→xfreerdp→wlfreerdp/sdl-freerdp, mstsc, open, vncviewer, remote-viewer/spicy, x2goclient/pyhoca-cli, waypipe/ssh -X) with Windows/macOS/Android specifics, and dial the same proxy/tunnel/TLS/SPKI stack as file protocols. Headless mode falls back to .rdp/.vv file tickets or BrowserGateway hints for HTML5 gateways; XDMCP (UDP 177, unencrypted) is explicitly refused/recommended against. Wayland vs X11 detection drives waypipe vs ssh -X. Verified by unit ticket/argv tests; live viewer integration and ironrdp gateway tests are outstanding.",
+      "source": [
+        "crates/linscp-platform/src/desktop.rs",
+        "crates/linscp-proto/src/remote_desktop.rs",
+        "crates/linscp-engine/src/url_and_raw.rs"
+      ],
+      "checks": {
+        "unit": [
+          "TestDesktopSessionDetection"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "unit"
+        ],
+        "windows": [
+          "unit"
+        ],
+        "android": [
+          "unit"
+        ]
+      },
+      "gap": "Live integration tests (live-desktop-rdp/vnc/spice/x2go/x11) with real viewers and ironrdp gateway are not yet gated.",
+      "acceptance": [
+        "Live RDP launch with xfreerdp/mstsc against a throwaway RDP server (or loopback stub) verifies argv, port 3389, TLS/NLA option, and jump-host SOCKS5h relay without exposing credentials.",
+        "Live VNC (5900) and SPICE (5900/.vv) launches verify viewer resolution (tigervnc/remote-viewer), TLS port, and headless .vv/.rdp ticket generation.",
+        "Live X2Go/NX and X11/Waypipe launches verify SSH-transported NX compression over direct-tcpip, WAYLAND_DISPLAY detection, and that jump-host proxy/TLS/SPKI settings are inherited without fallback.",
+        "Obtain independent review that ironrdp WASM / Guacamole gateway fallback correctly isolates credentials and that XDMCP (UDP 177) remains refusing/not recommended."
+      ]
     }
   ],
   "scope": {

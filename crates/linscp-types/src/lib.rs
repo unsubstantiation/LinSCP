@@ -23,6 +23,16 @@ pub enum ProtocolScheme {
     Webdavs,
     S3,
     Local,
+    /// Microsoft Remote Desktop Protocol (RDP) — native Windows, xfreerdp/FreeRDP on Linux, aRDP/aFreeRDP on Android.
+    Rdp,
+    /// Virtual Network Computing (RFB) — TigerVNC, TightVNC, RealVNC.
+    Vnc,
+    /// SPICE (Simple Protocol for Independent Computing Environments) — QEMU/KVM `remote-viewer`/`spicy`.
+    Spice,
+    /// X2Go / NX — SSH-tunneled X11 with NX compression (`x2goclient`, `nxproxy`, `pyhoca`).
+    X2Go,
+    /// Generic X11 forwarding (`ssh -X`) — Wayland-aware via `waypipe`/`xwayland`.
+    X11,
 }
 
 impl ProtocolScheme {
@@ -35,6 +45,11 @@ impl ProtocolScheme {
             Self::Dav => 80,
             Self::Davs | Self::Webdav | Self::Webdavs | Self::S3 => 443,
             Self::Local => 0,
+            Self::Rdp => 3389,
+            Self::Vnc => 5900,
+            Self::Spice => 5900,
+            Self::X2Go => 22,
+            Self::X11 => 22,
         }
     }
 
@@ -53,6 +68,11 @@ impl ProtocolScheme {
             "webdavs" => Some(Self::Webdavs),
             "s3" | "s3s" => Some(Self::S3),
             "local" => Some(Self::Local),
+            "rdp" | "rdps" | "msrdp" | "ms-rdp" => Some(Self::Rdp),
+            "vnc" | "rfb" => Some(Self::Vnc),
+            "spice" => Some(Self::Spice),
+            "x2go" | "nx" | "nx3" => Some(Self::X2Go),
+            "x11" | "x" | "waypipe" => Some(Self::X11),
             _ => None,
         }
     }
@@ -71,7 +91,25 @@ impl ProtocolScheme {
             Self::Webdavs => "webdavs",
             Self::S3 => "s3",
             Self::Local => "local",
+            Self::Rdp => "rdp",
+            Self::Vnc => "vnc",
+            Self::Spice => "spice",
+            Self::X2Go => "x2go",
+            Self::X11 => "x11",
         }
+    }
+
+    /// Returns true for interactive remote-desktop protocols that open a viewer rather than a file tree.
+    pub const fn is_remote_desktop(self) -> bool {
+        matches!(
+            self,
+            Self::Rdp | Self::Vnc | Self::Spice | Self::X2Go | Self::X11
+        )
+    }
+
+    /// True for desktop sessions that are transported over SSH (X2Go, X11) vs direct TCP (RDP/VNC/SPICE).
+    pub const fn desktop_over_ssh(self) -> bool {
+        matches!(self, Self::X2Go | Self::X11)
     }
 }
 

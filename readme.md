@@ -114,6 +114,11 @@ Run `linscp -help` for the options and `man linscp` for the full reference.
 | `ftpes://` | `suppaftp` (async-rustls), explicit TLS on FTP (same session as `ftp://` with `Ftps=2` or `3`) | |
 | `dav://`, `webdav://` | pure-Rust `reqwest` + `rustls` (WebPki, SPKI pin, Min/MaxTlsVersion), PROPFIND/MOVE/COPY/locks/dead props/ETag | |
 | `s3://` | pure-Rust `reqwest` + `rustls`, SigV4 signing, multipart, versioning | partial |
+| `rdp://` | `xfreerdp`/`xfreerdp3`/`wlfreerdp` (Linux), `mstsc.exe` (Windows), `aRDP`/`aFreeRDP` (Android), fallback `ironrdp` WASM gateway | optional viewer |
+| `vnc://` | `vncviewer`/`tigervnc`/`remmina` (Linux), `vncviewer.exe` (Windows), `androidVNC` | 5900-range |
+| `spice://` | `remote-viewer`/`virt-viewer`/`spicy` (virt-viewer, QEMU/KVM), `.vv` virt-viewer files | |
+| `x2go://` | `x2goclient`/`pyhoca-cli`, `nxproxy` — SSH (22) with NX compression, reuses jump-host tunnel | |
+| `x11://` | `waypipe ssh` (Wayland, preferred) or `ssh -X`/`-Y` (X11) — detected via `WAYLAND_DISPLAY`/`XDG_SESSION_TYPE`/`DISPLAY` | headless prints `DESKTOP_TICKET` |
 
 Host keys are verified. `-hostkey=` takes a SHA-256 or MD5 fingerprint. An
 unknown key in a run that cannot prompt is refused, and the key is printed so
@@ -157,6 +162,7 @@ it can be pinned.
   own launcher (`xdg-open`, `$BROWSER`) for a browser window. No `xclip`,
   `xdotool`, `wmctrl` or `xrandr`, which is what makes a Linux application
   X11-only.
+- **Remote desktop:** `open rdp://host:3389`, `vnc://`, `spice://`, `x2go://` and `x11://` launch the platform viewer (xfreerdp/tigervnc/remote-viewer/x2goclient/waypipe or the Windows/macOS/Android equivalent) or, in headless HTTP mode, write a `.rdp`/`.vv` ticket file and return `DESKTOP_TICKET`/gateway JSON for the browser (embedded `ironrdp` WASM fallback). Shares proxy/SSH-jump/TLS/SPKI verification; XDMCP (UDP 177, unencrypted) is not recommended — use X2Go or `waypipe` over SSH instead. If you are already SSH-connected to the same host and the server package (xrdp, tigervnc, x2goserver, spice-vdagent, xauth) is not installed, LinSCP prompts that it is not available and offers to cancel or to install it via a compatible distro-detecting script (apt/dnf/yum/pacman/zypper, runs over that SSH session via `exec`; HTTP/Tauri: `POST /api/desktop/check` → `{prompt{cancel,install}, install_script}` and `POST /api/desktop/install`). `GET /api/desktop/install-script?kind=rdp` fetches the script for manual use.
 
 Full upstream parity is **not** implemented. Remaining gaps include complete
 compatibility with the upstream .NET object model, broader localization beyond

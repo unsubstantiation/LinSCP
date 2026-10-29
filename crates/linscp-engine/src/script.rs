@@ -42,9 +42,9 @@ use crate::transfer::{
 };
 use crate::url_and_raw::{
     DefaultOsVault, ParsedSiteSpec, apply_env_credential_fallbacks, apply_raw_settings,
-    connect_site_spec, connect_ssh_for_shell, is_ssh_scheme, is_webdav_scheme, parse_site_url,
-    prompt_yes_no_tty, site_spec_from_stored, site_spec_from_stored_for_resave,
-    stored_site_from_spec, validate_session_settings,
+    connect_site_spec, connect_ssh_for_shell, is_desktop_scheme, is_ssh_scheme,
+    is_webdav_scheme, parse_site_url, prompt_yes_no_tty, site_spec_from_stored,
+    site_spec_from_stored_for_resave, stored_site_from_spec, validate_session_settings,
 };
 use crate::xml_log::SessionLogger;
 
@@ -597,6 +597,13 @@ impl ScriptInterpreter {
             self.presets_disabled = false;
         }
 
+        // Remote desktop schemes do not open a file tree — they produce a viewer
+        // ticket (xfreerdp / vncviewer / remote-viewer / x2goclient / waypipe)
+        // or a .rdp/.vv file when no viewer is installed / in headless mode.
+        if is_desktop_scheme(spec.session.protocol) {
+            return self.open_desktop_slot_from_spec(spec).await;
+        }
+
         let collected_events: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink_events = Arc::clone(&collected_events);
@@ -690,6 +697,351 @@ impl ScriptInterpreter {
             "Connected, the remote directory is {path}",
             &[("path", &remote_cwd)],
         ));
+        Ok(())
+    }
+
+    async fn open_desktop_slot_from_spec(&mut self, spec: ParsedSiteSpec) -> Result<(), String> {
+        use linscp_platform::desktop::{launch_remote_desktop, DesktopTicket};
+        use linscp_proto::remote_desktop::{DesktopOptions, RemoteDesktopConnectConfig, RemoteDesktopKind, ticket_from_config};
+
+        let collected_events: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&collected_events);
+        let ssh_sink: linscp_proto::ssh::SshEventLogger = Arc::new(move |msg: &str| {
+            sink_events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(msg.to_string());
+        });
+
+        let connect_res = connect_site_spec(
+            &spec,
+            &self.cfg.config_dir,
+            self.is_interactive_confirm(),
+            self.is_interactive_auth(),
+            &self.cfg.locale,
+            self.cfg.log_level,
+            Some(ssh_sink),
+        )
+        .await;
+
+        for ev in collected_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            self.logger.log_event(&ev);
+        }
+
+        let session = connect_res.map_err(|err| {
+            self.trp(
+                "Cannot open session to {host}: {reason}",
+                &[("host", &spec.session.host), ("reason", &err)],
+            )
+        })?;
+
+        let kind = RemoteDesktopKind::from_scheme(spec.session.protocol)
+            .unwrap_or(RemoteDesktopKind::Rdp);
+        let port = if spec.session.port == 0 {
+            spec.session.protocol.default_port()
+        } else {
+            spec.session.port
+        };
+        let target = format!("{}:{}", spec.session.host, port);
+        let desktop_opts = DesktopOptions::from_raw_fields(&spec.raw_fields);
+        let tunneled = spec
+            .session
+            .tunnel
+            .as_ref()
+            .map(|t| t.enabled && !t.host.trim().is_empty())
+            .unwrap_or(false);
+        // Timeout and proxy/tls are already validated by connect_site_spec; reuse defaults for ticket.
+        let cfg = RemoteDesktopConnectConfig {
+            scheme: spec.session.protocol,
+            kind,
+            host: spec.session.host.clone(),
+            port,
+            username: if spec.session.username.is_empty() {
+                None
+            } else {
+                Some(spec.session.username.clone())
+            },
+            password: spec.session.password.clone().map(zeroize::Zeroizing::new),
+            domain: desktop_opts.domain.clone(),
+            desktop_opts: desktop_opts.clone(),
+            tls: linscp_proto::tls::TlsSettings::default(),
+            proxy: None,
+            timeout: std::time::Duration::from_secs(spec.timeout_secs.max(1)),
+        };
+
+        // If we are already SSH-connected to the same host, probe whether the
+        // requested desktop server is actually installed there. When it is not
+        // available we prompt (interactive) to cancel or install via a
+        // compatible distro-detecting script executed over that SSH session.
+        // This satisfies: "if we are connected by ssh to a server and we press
+        // the button to connect by remote desktop, if the appropriate remote
+        // desktop connection is not available on the server we should be
+        // prompted that it is not available and given the option of cancelling
+        // or installing via a script that will be compatible."
+        let ssh_probe_idx = self.slots.iter().position(|s| {
+            s.spec.session.host.eq_ignore_ascii_case(&spec.session.host)
+                && matches!(
+                    s.spec.session.protocol,
+                    ProtocolScheme::Sftp | ProtocolScheme::Scp | ProtocolScheme::Ssh
+                )
+                && !s.session.scheme().is_remote_desktop()
+        });
+        if let Some(ssh_idx) = ssh_probe_idx {
+            let probe = linscp_proto::remote_desktop::probe_command_for_kind(kind);
+            let probe_available = {
+                let sess = &self.slots[ssh_idx].session;
+                match sess.exec_command(probe).await {
+                    Ok(out) => out.exit_code == Some(0),
+                    Err(_) => false,
+                }
+            };
+            let available = probe_available;
+            if !available {
+                let pkg = linscp_proto::remote_desktop::server_package_name(kind);
+                let descr = linscp_proto::remote_desktop::server_description(kind);
+                let install_script = linscp_proto::remote_desktop::install_script_for_kind(kind);
+                let msg = self.trp(
+                    "Remote desktop ({kind}) is not available on server '{host}': {descr} ({pkg}) not found. Install it now?",
+                    &[
+                        ("kind", kind.as_str()),
+                        ("host", &spec.session.host),
+                        ("descr", descr),
+                        ("pkg", pkg),
+                    ],
+                );
+                // In batch / non-interactive mode we must not block, but we
+                // still surface the script so the user can run it manually.
+                if !self.is_interactive_confirm() {
+                    // Emit a machine-readable hint plus the install script to stderr/log
+                    let hint = format!(
+                        "{msg} Run this script on the server via SSH:\n{install_script}\nOr press cancel and install manually."
+                    );
+                    self.emit_error(&hint);
+                    self.logger.log_event(&hint);
+                    let reason = format!(
+                        "{} not available on {} — install script: see log or run via SSH",
+                        kind.as_str(),
+                        spec.session.host
+                    );
+                    let _ = session.close().await;
+                    return Err(self.trp(
+                        "Cannot open session to {host}: {reason}",
+                        &[("host", &spec.session.host), ("reason", &reason)],
+                    ));
+                }
+                // Interactive prompt: cancel or install via compatible script.
+                eprintln!("\n{msg}");
+                eprintln!(
+                    "The following compatible installer will be run on the server over SSH:\n---\n{install_script}\n---"
+                );
+                let prompt = self.trp("Install {pkg} on {host} now?", &[("pkg", pkg), ("host", &spec.session.host)]);
+                let do_install = prompt_yes_no_tty(&format!("{prompt} [y/N]: "), &self.cfg.locale);
+                if do_install {
+                    self.emit_status(&self.trp(
+                        "Installing {pkg} on {host} via SSH...",
+                        &[("pkg", pkg), ("host", &spec.session.host)],
+                    ));
+                    self.logger.log_event(&format!("Installing {} on {} via SSH", pkg, spec.session.host));
+                    // Execute the installer via the same SSH session. The script is
+                    // idempotent and detects the remote OS (apt/dnf/yum/pacman/zypper).
+                    let install_res = {
+                        let sess = &self.slots[ssh_idx].session;
+                        sess.exec_command(&install_script).await
+                    };
+                    match install_res {
+                        Ok(out) => {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            if !stdout.is_empty() {
+                                self.emit_status(&stdout.to_string());
+                            }
+                            if !stderr.is_empty() {
+                                eprintln!("{stderr}");
+                            }
+                            self.logger.log_event(&format!(
+                                "Install exit={:?} stdout={} stderr={}",
+                                out.exit_code,
+                                stdout.chars().take(400).collect::<String>(),
+                                stderr.chars().take(400).collect::<String>()
+                            ));
+                            if out.exit_code != Some(0) {
+                                let reason = format!(
+                                    "Installer for {pkg} failed (exit {:?}): {}",
+                                    out.exit_code,
+                                    if stderr.is_empty() { stdout.to_string() } else { stderr.to_string() }
+                                );
+                                let _ = session.close().await;
+                                return Err(self.trp(
+                                    "Cannot open session to {host}: {reason}",
+                                    &[("host", &spec.session.host), ("reason", &reason)],
+                                ));
+                            }
+                            // Re-probe after install
+                            let reprobe = {
+                                let sess = &self.slots[ssh_idx].session;
+                                sess.exec_command(probe).await
+                            };
+                            let now_available = reprobe.map(|o| o.exit_code == Some(0)).unwrap_or(false);
+                            if !now_available {
+                                let reason = format!("{pkg} still not available after install — check log");
+                                let _ = session.close().await;
+                                return Err(self.trp(
+                                    "Cannot open session to {host}: {reason}",
+                                    &[("host", &spec.session.host), ("reason", &reason)],
+                                ));
+                            }
+                            self.emit_status(&self.trp(
+                                "{pkg} installed successfully on {host}.",
+                                &[("pkg", pkg), ("host", &spec.session.host)],
+                            ));
+                        }
+                        Err(e) => {
+                            let reason = format!("SSH install failed: {e}");
+                            let _ = session.close().await;
+                            return Err(self.trp(
+                                "Cannot open session to {host}: {reason}",
+                                &[("host", &spec.session.host), ("reason", &reason)],
+                            ));
+                        }
+                    }
+                } else {
+                    let reason = format!(
+                        "{} not available on {} — cancelled (run installer manually to enable {})",
+                        kind.as_str(),
+                        spec.session.host,
+                        descr
+                    );
+                    let _ = session.close().await;
+                    return Err(self.trp(
+                        "Cannot open session to {host}: {reason}",
+                        &[("host", &spec.session.host), ("reason", &reason)],
+                    ));
+                }
+            }
+        } else {
+            // No SSH session to probe — fall back to lightweight TCP probe when direct
+            // (non-tunneled) RDP/VNC/SPICE. If the port is not listening we treat it as
+            // "not available" and surface the installer script for manual use.
+            if !tunneled
+                && matches!(
+                    kind,
+                    linscp_proto::remote_desktop::RemoteDesktopKind::Rdp
+                        | linscp_proto::remote_desktop::RemoteDesktopKind::Vnc
+                        | linscp_proto::remote_desktop::RemoteDesktopKind::Spice
+                )
+            {
+                let tcp_available = linscp_proto::remote_desktop::check_tcp_availability(&spec.session.host, port).await;
+                if !tcp_available {
+                    let pkg = linscp_proto::remote_desktop::server_package_name(kind);
+                    let descr = linscp_proto::remote_desktop::server_description(kind);
+                    let install_script = linscp_proto::remote_desktop::install_script_for_kind(kind);
+                    // Only prompt if interactive; otherwise just log and continue to ticket
+                    // (the viewer will fail with connection refused, but we have already warned).
+                    if self.is_interactive_confirm() {
+                        let msg = self.trp(
+                            "Remote desktop ({kind}) does not appear to be listening on {host}:{port} ({descr}, {pkg}). Install it on the server?",
+                            &[
+                                ("kind", kind.as_str()),
+                                ("host", &spec.session.host),
+                                ("port", &port.to_string()),
+                                ("descr", descr),
+                                ("pkg", pkg),
+                            ],
+                        );
+                        eprintln!("\n{msg}");
+                        eprintln!("If you have SSH access, run this compatible installer on the server:\n---\n{install_script}\n---");
+                        let prompt = self.trp("Continue to launch viewer anyway?", &[("pkg", pkg)]);
+                        let cont = prompt_yes_no_tty(&format!("{prompt} [y/N]: "), &self.cfg.locale);
+                        if !cont {
+                            let reason = format!("{} not listening on {}:{} — cancelled", kind.as_str(), spec.session.host, port);
+                            let _ = session.close().await;
+                            return Err(self.trp(
+                                "Cannot open session to {host}: {reason}",
+                                &[("host", &spec.session.host), ("reason", &reason)],
+                            ));
+                        }
+                    } else {
+                        let hint = format!(
+                            "Note: {} not listening on {}:{} ({}) — server package {} not detected. Installer:\n{}",
+                            kind.as_str(),
+                            spec.session.host,
+                            port,
+                            descr,
+                            pkg,
+                            install_script
+                        );
+                        self.logger.log_event(&hint);
+                        // In batch mode we do not block, just continue to produce a ticket/gateway
+                        // so headless HTTP can still download the .rdp file.
+                    }
+                }
+            }
+        }
+
+        let proto_ticket = ticket_from_config(&cfg, kind, &target, tunneled, None);
+
+        let ticket = DesktopTicket {
+            kind: proto_ticket.kind.clone(),
+            target: proto_ticket.target.clone(),
+            viewer: proto_ticket.viewer.clone(),
+            argv: proto_ticket.argv.clone(),
+            file_content: proto_ticket.file_content.clone(),
+            file_extension: proto_ticket.file_extension.clone(),
+            tunneled: proto_ticket.tunneled,
+            local_endpoint: proto_ticket.local_endpoint.clone(),
+        };
+
+        // In batch / headless mode we emit a file ticket rather than failing.
+        let is_headless = std::env::var_os("WAYLAND_DISPLAY").is_none()
+            && std::env::var_os("DISPLAY").is_none();
+        let launch = launch_remote_desktop(&ticket, &self.cfg.config_dir, is_headless)
+            .map_err(|e| {
+                self.trp(
+                    "Cannot open session to {host}: {reason}",
+                    &[("host", &spec.session.host), ("reason", &e)],
+                )
+            })?;
+
+        // Close the probe session — the viewer (or file) is the artifact.
+        let _ = session.close().await;
+
+        let display_name = slot_display_name_from_spec(&spec);
+        match launch {
+            linscp_platform::desktop::DesktopLaunchResult::Spawned { pid, viewer, .. } => {
+                self.emit_status(&self.trp(
+                    "Desktop '{host}' opened via {viewer} (pid {pid}).",
+                    &[
+                        ("host", &display_name),
+                        ("viewer", &viewer.display().to_string()),
+                        ("pid", &pid.to_string()),
+                    ],
+                ));
+            }
+            linscp_platform::desktop::DesktopLaunchResult::FileTicket { path, viewer_hint } => {
+                self.emit_status(&self.trp(
+                    "Desktop '{host}' ticket written to {path} (viewer hint: {viewer}).",
+                    &[
+                        ("host", &display_name),
+                        ("path", &path.display().to_string()),
+                        ("viewer", &viewer_hint),
+                    ],
+                ));
+                // Also emit a machine-readable line for the HTTP bridge.
+                println!("DESKTOP_TICKET {} {}", proto_ticket.kind, path.display());
+            }
+            linscp_platform::desktop::DesktopLaunchResult::BrowserGateway { url_hint } => {
+                self.emit_status(&self.trp(
+                    "Desktop '{host}' ready: {hint}.",
+                    &[("host", &display_name), ("hint", &url_hint)],
+                ));
+                println!("DESKTOP_GATEWAY {} {}", proto_ticket.kind, url_hint);
+            }
+        }
         Ok(())
     }
 
