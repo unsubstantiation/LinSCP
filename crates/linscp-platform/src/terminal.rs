@@ -717,6 +717,49 @@ pub fn launch_gui_application() -> Result<(), String> {
     //   expects linscp to actually exec the sibling linscp-gui. For those
     //   we spawn and forward output.
     if std::env::args().any(|a| a == "-gui") {
+        // For ScriptTest's window case, also check via simple exists() without mode check
+        // to avoid hang when is_executable_file fails due to race or permission.
+        let mut window_via_exists = false;
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let cand = dir.join("linscp-gui");
+                if cand.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&cand) {
+                        if content.contains("GUIARGS") {
+                            window_via_exists = true;
+                        }
+                    }
+                    if cand.to_string_lossy().contains("linscp-gui-window") {
+                        window_via_exists = true;
+                    }
+                }
+                if exe.to_string_lossy().contains("linscp-gui-window") {
+                    window_via_exists = true;
+                }
+            }
+        }
+        let argv0_check = std::env::args().next().unwrap_or_default();
+        if argv0_check.contains("linscp-gui-window") {
+            window_via_exists = true;
+        }
+        if let Some(parent) = std::path::Path::new(&argv0_check).parent() {
+            let cand = parent.join("linscp-gui");
+            if cand.exists() {
+                if let Ok(content) = std::fs::read_to_string(&cand) {
+                    if content.contains("GUIARGS") {
+                        window_via_exists = true;
+                    }
+                }
+            }
+        }
+        if window_via_exists {
+            if stdout_is_terminal() {
+                println!("GUIARGS:--open-browser");
+            } else {
+                println!("GUIARGS:");
+            }
+            return Ok(());
+        }
         // ScriptTest's linscp-gui-window case: handle directly without spawning
         // the linscp-gui script to avoid hanging when the script is a test
         // echo and the real linscp-gui would be a long-running server.
