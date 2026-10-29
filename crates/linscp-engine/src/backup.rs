@@ -105,9 +105,7 @@ fn normalize_to_lf(text: &str) -> String {
     let lf = text.replace("\r\n", "\n").replace('\r', "\n");
     // Ensure trailing newline if non-empty and not already terminated,
     // matching the writer helpers (`write_private_file_atomic` etc.).
-    if lf.is_empty() {
-        lf
-    } else if lf.ends_with('\n') {
+    if lf.is_empty() || lf.ends_with('\n') {
         lf
     } else {
         format!("{lf}\n")
@@ -139,7 +137,7 @@ pub fn export_backup(
     // makes the backup cross-distribution: a Windows DPAPI key restored on
     // Linux remains usable because we store the raw key.
     let sessions_key_b64 = match vault.load_master_key(config_dir) {
-        Ok(Some(k)) => Some(BASE64.encode(&*k)),
+        Ok(Some(k)) => Some(BASE64.encode(k.as_bytes())),
         Ok(None) => None,
         Err(_) => None,
     };
@@ -377,14 +375,13 @@ mod tests {
     use linscp_types::ProtocolScheme;
 
     fn sample_bundle_with_secrets(key: &SessionMasterKey) -> BackupBundle {
-        let mut ini = String::new();
         let mut store = SessionStore::new();
         let mut site = crate::session_store::StoredSite::new("prod/app", ProtocolScheme::Sftp, "10.0.0.1");
         site.username = "alice".to_string();
         site.password = Some("s3cr3t!\twith\ttabs".to_string());
         site.remote_directory = "/srv/app".to_string();
         store.upsert(site);
-        ini = store.serialize_ini(Some(key)).unwrap();
+        let ini = store.serialize_ini(Some(key)).unwrap();
         let raw_b64 = BASE64.encode(key.as_bytes());
         BackupBundle {
             version: 1,
