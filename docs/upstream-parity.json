@@ -58,12 +58,10 @@
           "gui-localization": "source/gui/tests/LocalizationTest.js under node/jsdom - boots the real English/Spanish page with persisted, server and browser language selection; checks static text and ARIA, queue statuses, plural forms, literal placeholders, host-key verification, editor saves, sync preview and transfer API payloads, and unsaved-edit protection on language changes.",
           "platform-conversion": "tools/check_platform_conversion.py with tools/tests/test_platform_conversion.py - the guard that keeps the Windows-to-Linux conversion complete: it reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose wording contradicts the template it is filled into. Its own cases hold it to the same standard: it has to fail on the things it claims to catch and stay quiet about the ones it does not.",
           "gui-security": "source/gui/tests/SecurityTest.py - offline boundary tests for the browser GUI: operand quoting for the client's command splitter (blanks, quotes, backslashes, control-character refusal), sync/chmod command building from fixed vocabularies, permission-mode validation, local panel containment and remote name validation, single-line server command stream, custom-command template validation/persistence/substitution/execution (local/remote scope, multiple selections, hostile names), PBKDF2 account hashing with per-session CSRF tokens and login throttling, queue staging cleanup, browser upload mode validation, and Host/token/CORS guards.",
-          "powershell": "automation/test_psmodule.py - static checks of the PowerShell module that always run (every exported cmdlet defined, no password on a process command line, control-character and multiline refusal, marker-driven server reads, listing-parser status skipping) plus the live Pester suite (automation/LinSCP.Tests.ps1) against the throwaway WebDAV endpoint when pwsh is installed: open/close, byte-exact upload/download, listing objects, terminating errors, timeout cancellation and password hygiene. Without pwsh the live cases skip loudly.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "live-tunnel": "source/linux/tests/LiveTunnelTest.py uses two independently keyed Paramiko endpoints and a destination name resolvable only by the jump fixture. It verifies SFTP/SCP transfer bytes, one-shot exec, embedded-shell defaults, separate host-key failures before authentication, jump password/encrypted-key authentication, forwarding refusal without a direct fallback, inherited SOCKS5 settings applied to the jump host, interrupted download staging, repeated close/failure socket and thread cleanup, encrypted stored credentials and HTTP GUI verification of both hops plus background command routing. Requires paramiko; SCP transfers also require the OpenSSH scp program. No real Kerberos realm or external SSH server is certified by these fixtures. Also covers slow/backpressured upload/download bytes, forwarding timeout, cancelled download staging, no implicit global pin caching and all independent GUI Remember combinations without implicit credential storage.",
           "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store.",
           "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
-          "dotnet": "automation/test_dotnet.py - static checks of the LinSCP .NET assembly that always run (Session/SessionOptions object model, listing, transfer, synchronization, cancellation, structured results and errors, no password on a process command line, control-character and multiline refusal, upstream compatibility aliases) plus a live `dotnet build` roundtrip against the throwaway WebDAV endpoint when the SDK is installed. Without dotnet the live case skips loudly.",
           "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English.",
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
           "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs."
@@ -88,12 +86,10 @@
           "gui-localization": "source/gui/tests/LocalizationTest.js under node/jsdom - boots the real English/Spanish page with persisted, server and browser language selection; checks static text and ARIA, queue statuses, plural forms, literal placeholders, host-key verification, editor saves, sync preview and transfer API payloads, and unsaved-edit protection on language changes.",
           "platform-conversion": "tools/check_platform_conversion.py with tools/tests/test_platform_conversion.py - the guard that keeps the Windows-to-Linux conversion complete: it reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose wording contradicts the template it is filled into. Its own cases hold it to the same standard: it has to fail on the things it claims to catch and stay quiet about the ones it does not.",
           "gui-security": "source/gui/tests/SecurityTest.py - offline boundary tests for the browser GUI: operand quoting for the client's command splitter (blanks, quotes, backslashes, control-character refusal), sync/chmod command building from fixed vocabularies, permission-mode validation, local panel containment and remote name validation, single-line server command stream, custom-command template validation/persistence/substitution/execution (local/remote scope, multiple selections, hostile names), PBKDF2 account hashing with per-session CSRF tokens and login throttling, queue staging cleanup, browser upload mode validation, and Host/token/CORS guards.",
-          "powershell": "automation/test_psmodule.py - static checks of the PowerShell module that always run (every exported cmdlet defined, no password on a process command line, control-character and multiline refusal, marker-driven server reads, listing-parser status skipping) plus the live Pester suite (automation/LinSCP.Tests.ps1) against the throwaway WebDAV endpoint when pwsh is installed: open/close, byte-exact upload/download, listing objects, terminating errors, timeout cancellation and password hygiene. Without pwsh the live cases skip loudly.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "live-tunnel": "source/linux/tests/LiveTunnelTest.py uses two independently keyed Paramiko endpoints and a destination name resolvable only by the jump fixture. It verifies SFTP/SCP transfer bytes, one-shot exec, embedded-shell defaults, separate host-key failures before authentication, jump password/encrypted-key authentication, forwarding refusal without a direct fallback, inherited SOCKS5 settings applied to the jump host, interrupted download staging, repeated close/failure socket and thread cleanup, encrypted stored credentials and HTTP GUI verification of both hops plus background command routing. Requires paramiko; SCP transfers also require the OpenSSH scp program. No real Kerberos realm or external SSH server is certified by these fixtures. Also covers slow/backpressured upload/download bytes, forwarding timeout, cancelled download staging, no implicit global pin caching and all independent GUI Remember combinations without implicit credential storage.",
           "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store.",
           "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
-          "dotnet": "automation/test_dotnet.py - static checks of the LinSCP .NET assembly that always run (Session/SessionOptions object model, listing, transfer, synchronization, cancellation, structured results and errors, no password on a process command line, control-character and multiline refusal, upstream compatibility aliases) plus a live `dotnet build` roundtrip against the throwaway WebDAV endpoint when the SDK is installed. Without dotnet the live case skips loudly.",
           "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English.",
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
           "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs."
@@ -118,12 +114,10 @@
           "gui-localization": "source/gui/tests/LocalizationTest.js under node/jsdom - boots the real English/Spanish page with persisted, server and browser language selection; checks static text and ARIA, queue statuses, plural forms, literal placeholders, host-key verification, editor saves, sync preview and transfer API payloads, and unsaved-edit protection on language changes.",
           "platform-conversion": "tools/check_platform_conversion.py with tools/tests/test_platform_conversion.py - the guard that keeps the Windows-to-Linux conversion complete: it reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose wording contradicts the template it is filled into. Its own cases hold it to the same standard: it has to fail on the things it claims to catch and stay quiet about the ones it does not.",
           "gui-security": "source/gui/tests/SecurityTest.py - offline boundary tests for the browser GUI: operand quoting for the client's command splitter (blanks, quotes, backslashes, control-character refusal), sync/chmod command building from fixed vocabularies, permission-mode validation, local panel containment and remote name validation, single-line server command stream, custom-command template validation/persistence/substitution/execution (local/remote scope, multiple selections, hostile names), PBKDF2 account hashing with per-session CSRF tokens and login throttling, queue staging cleanup, browser upload mode validation, and Host/token/CORS guards.",
-          "powershell": "automation/test_psmodule.py - static checks of the PowerShell module that always run (every exported cmdlet defined, no password on a process command line, control-character and multiline refusal, marker-driven server reads, listing-parser status skipping) plus the live Pester suite (automation/LinSCP.Tests.ps1) against the throwaway WebDAV endpoint when pwsh is installed: open/close, byte-exact upload/download, listing objects, terminating errors, timeout cancellation and password hygiene. Without pwsh the live cases skip loudly.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "live-tunnel": "source/linux/tests/LiveTunnelTest.py uses two independently keyed Paramiko endpoints and a destination name resolvable only by the jump fixture. It verifies SFTP/SCP transfer bytes, one-shot exec, embedded-shell defaults, separate host-key failures before authentication, jump password/encrypted-key authentication, forwarding refusal without a direct fallback, inherited SOCKS5 settings applied to the jump host, interrupted download staging, repeated close/failure socket and thread cleanup, encrypted stored credentials and HTTP GUI verification of both hops plus background command routing. Requires paramiko; SCP transfers also require the OpenSSH scp program. No real Kerberos realm or external SSH server is certified by these fixtures. Also covers slow/backpressured upload/download bytes, forwarding timeout, cancelled download staging, no implicit global pin caching and all independent GUI Remember combinations without implicit credential storage.",
           "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store.",
           "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
-          "dotnet": "automation/test_dotnet.py - static checks of the LinSCP .NET assembly that always run (Session/SessionOptions object model, listing, transfer, synchronization, cancellation, structured results and errors, no password on a process command line, control-character and multiline refusal, upstream compatibility aliases) plus a live `dotnet build` roundtrip against the throwaway WebDAV endpoint when the SDK is installed. Without dotnet the live case skips loudly.",
           "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English.",
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
           "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs."
@@ -1106,25 +1100,9 @@
     },
     {
       "name": "Automation",
-      "status": "verified",
-      "notes": "Console scripting with LinSCP script switches, unambiguous command and option abbreviations, script parameters, %TIMESTAMP%, XML action log, a PowerShell 7 compatibility module whose live Pester suite runs in CI, and a .NET assembly (LinSCP.Session plus upstream namespace aliases) for session lifecycle, listing, transfer, synchronization, cancellation, structured results and error propagation. Expansions are not applied to -server input, and GUI-generated -command lines use -literal to preserve filenames containing percent signs. Covered by the script, powershell and dotnet suites.",
-      "verified_on": {
-        "linux": [
-          "script",
-          "powershell",
-          "dotnet"
-        ],
-        "windows": [
-          "script",
-          "powershell",
-          "dotnet"
-        ],
-        "android": [
-          "script",
-          "powershell",
-          "dotnet"
-        ]
-      }
+      "status": "partial",
+      "notes": "The CLI, PowerShell and .NET automation interfaces were removed from the GUI-only distribution.",
+      "gap": "External CLI-based automation is no longer shipped."
     },
     {
       "name": "Desktop integration",
@@ -3116,7 +3094,6 @@
         "crates/linscp-proto/src/tunnel.rs",
         "crates/linscp-engine/src/session_store.rs",
         "crates/linscp-engine/src/script.rs",
-        "crates/linscp-cli/src/main.rs",
         "crates/linscp-http/src/lib.rs",
         "ui/src/index.ts"
       ],
@@ -3778,30 +3755,14 @@
     {
       "id": "automation.command-interpreter",
       "area": "Automation",
-      "status": "verified",
-      "notes": "Batch abort/continue, aliases, abbreviated commands and rejected unknown options are checked server-free.",
-      "source": [
-        "crates/linscp-engine/src/script.rs",
-        "crates/linscp-cli/src/main.rs"
-      ],
-      "checks": {
-        "script": [
-          "test_batch_modes",
-          "test_command_abbreviations",
-          "test_reject_noop_options"
-        ]
-      },
-      "verified_on": {
-        "linux": [
-          "script"
-        ],
-        "windows": [
-          "script"
-        ],
-        "android": [
-          "script"
-        ]
-      }
+      "status": "missing",
+      "notes": "The CLI and its external automation interfaces were removed in the GUI-only conversion.",
+      "source": [],
+      "checks": {},
+      "gap": "This interface is not part of the GUI-only distribution.",
+      "acceptance": [
+        "No restoration is planned for the GUI-only distribution."
+      ]
     },
     {
       "id": "automation.parameter-and-timestamp",
@@ -3831,35 +3792,14 @@
     {
       "id": "automation.literal-gui-command",
       "area": "Automation",
-      "status": "verified",
-      "notes": "CLI -literal suppresses expansion, and both the GUI command runner and its background task queue use it so names containing %...% stay literal.",
-      "source": [
-        "crates/linscp-cli/src/main.rs",
-        "crates/linscp-engine/src/script.rs",
-        "crates/linscp-http/src/lib.rs"
-      ],
-      "checks": {
-        "script": [
-          "test_literal_commands_preserve_file_names_with_percent_signs"
-        ],
-        "gui-browser-upload": [
-          "test_gui_queue_uses_the_literal_server_protocol_for_percent_filenames"
-        ]
-      },
-      "verified_on": {
-        "linux": [
-          "script",
-          "gui-browser-upload"
-        ],
-        "windows": [
-          "script",
-          "gui-browser-upload"
-        ],
-        "android": [
-          "script",
-          "gui-browser-upload"
-        ]
-      }
+      "status": "missing",
+      "notes": "The CLI and its external automation interfaces were removed in the GUI-only conversion.",
+      "source": [],
+      "checks": {},
+      "gap": "This interface is not part of the GUI-only distribution.",
+      "acceptance": [
+        "No restoration is planned for the GUI-only distribution."
+      ]
     },
     {
       "id": "automation.xml-action-log",
@@ -3904,70 +3844,26 @@
     {
       "id": "automation.dotnet",
       "area": "Automation",
-      "status": "verified",
-      "notes": "automation/dotnet/LinSCP is a .NET assembly (net8.0 and netstandard2.0) exposing a LinSCP session object model plus an upstream compatibility namespace: Session, SessionOptions, Open/Close/Abort, GetFiles/PutFiles, ListDirectory, FileExists, GetFileInfo, ExecuteCommand, SynchronizeDirectories, and structured TransferOperationResult/SynchronizationResult/CommandExecutionResult with Check() and Failures. It drives linscp -server as the upstream assembly drives its scripting interface. Passwords travel on the server stdin open command, never on the process command line; quoting refuses control characters and multiline commands. automation/test_dotnet.py always runs the static object-model checks; live `dotnet build` roundtrips skip loudly without an SDK. 'make install', cmake --install and the Debian package ship the sources under share/linscp/dotnet/.",
-      "source": [
-        "automation/dotnet/LinSCP/LinSCP.csproj",
-        "automation/dotnet/LinSCP/Session.cs",
-        "automation/dotnet/LinSCP/LinSCPCompat.cs",
-        "automation/test_dotnet.py"
-      ],
-      "checks": {
-        "dotnet": [
-          "test_the_object_model_types_are_defined",
-          "test_session_lifecycle_listing_transfer_sync_and_cancel_are_public",
-          "test_no_password_reaches_a_process_command_line",
-          "test_quoting_refuses_control_characters_and_multiline_commands",
-          "test_linscp_compatibility_aliases_exist",
-          "test_the_project_targets_netstandard_and_net8",
-          "test_dotnet_build_and_roundtrip"
-        ]
-      },
-      "verified_on": {
-        "linux": [
-          "dotnet"
-        ],
-        "windows": [
-          "dotnet"
-        ],
-        "android": [
-          "dotnet"
-        ]
-      }
+      "status": "missing",
+      "notes": "The CLI and its external automation interfaces were removed in the GUI-only conversion.",
+      "source": [],
+      "checks": {},
+      "gap": "This interface is not part of the GUI-only distribution.",
+      "acceptance": [
+        "No restoration is planned for the GUI-only distribution."
+      ]
     },
     {
       "id": "automation.powershell",
       "area": "Automation",
-      "status": "verified",
-      "notes": "automation/LinSCP.psm1 is a PowerShell 7 (pwsh) module that wraps the console client in -server mode and exports Open-LScpSession, Close-LScpSession, Get-LScpItem, Send-LScpItem, Get-LScpDirectory and Sync-LScpDirectory; 'make install', 'cmake --install' and the Debian package all put it in PREFIX/share/linscp/automation. Passwords travel on stdin to -server, never on a command line. The test harness (automation/test_psmodule.py, run by make check-live, CTest and CI) has static checks that always run and a Pester suite (automation/LinSCP.Tests.ps1, invoked through automation/Invoke-LinSCPPester.ps1 so Pester 4 and Pester 5 both run) against the throwaway WebDAV endpoint: a session opened and closed, an upload and a download of exact bytes, a missing file reported without throwing, a listing as pipeline objects, terminating errors, a timeout-cancelled connection, and a password that appears neither in the process list nor in any output. The live cases ran green in CI (the 'PowerShell module regressions' step of the Makefile job, e.g. master run 39291584018), and that step now fails unless its evidence line reports ran>=1 skipped=0 failed=0 and Pester reports total>=1 skipped=0, so a future skip cannot look green. The module remains a compatibility module over the CLI rather than upstream's assembly API; the assembly itself is automation.dotnet.",
-      "source": [
-        "automation/LinSCP.psm1",
-        "automation/LinSCP.Tests.ps1",
-        "automation/Invoke-LinSCPPester.ps1",
-        "automation/test_psmodule.py"
-      ],
-      "checks": {
-        "powershell": [
-          "test_every_exported_cmdlet_is_defined",
-          "test_no_password_reaches_a_process_command_line",
-          "test_quoting_refuses_control_characters",
-          "test_multiline_commands_are_refused",
-          "test_server_answers_are_read_to_the_marker",
-          "test_listing_parser_skips_status_lines",
-          "test_pester_suite_passes"
-        ]
-      },
-      "verified_on": {
-        "linux": [
-          "powershell"
-        ],
-        "windows": [
-          "powershell"
-        ],
-        "android": [
-          "powershell"
-        ]
-      }
+      "status": "missing",
+      "notes": "The CLI and its external automation interfaces were removed in the GUI-only conversion.",
+      "source": [],
+      "checks": {},
+      "gap": "This interface is not part of the GUI-only distribution.",
+      "acceptance": [
+        "No restoration is planned for the GUI-only distribution."
+      ]
     },
     {
       "id": "desktop.scheme-handlers",
@@ -4177,7 +4073,6 @@
         "crates/linscp-engine/src/session_store.rs",
         "crates/linscp-crypto/src/ppk.rs",
         "crates/linscp-engine/src/editor.rs",
-        "crates/linscp-cli/src/main.rs",
         "locales/en.json",
         "locales/es.json",
         "locales/de.json",

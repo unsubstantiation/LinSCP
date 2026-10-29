@@ -43,6 +43,23 @@ jobs:
         shell: bash
         run: python tools/run_cargo_ci.py cargo build --release -p linscp-tauri --features native-shell
 
+      - name: Smoke test the native window
+        shell: pwsh
+        run: |
+          $app = Start-Process -FilePath "$PWD/target/release/linscp-gui.exe" -PassThru
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 1
+              $app.Refresh()
+              if ($app.HasExited) { throw "Application exited before opening a window: $($app.ExitCode)" }
+              if ($app.MainWindowHandle -ne 0 -and $app.MainWindowTitle -eq 'LinSCP') { $ready = $true; break }
+            }
+            if (-not $ready) { throw 'The LinSCP window did not open within 30 seconds' }
+          } finally {
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
+          }
+
       - name: Upload the portable application
         uses: actions/upload-artifact@v7
         with:
