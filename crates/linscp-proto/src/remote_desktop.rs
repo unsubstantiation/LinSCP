@@ -394,7 +394,6 @@ pub fn ticket_from_config(
         local_endpoint,
     }
 }
-}
 
 fn build_rdp_argv(viewer: &str, sess: &RemoteDesktopSession, tunneled: bool, endpoint: &str) -> (Vec<String>, Option<String>) {
     let opts = &sess.config.desktop_opts;

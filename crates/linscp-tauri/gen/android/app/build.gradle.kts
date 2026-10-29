@@ -43,8 +43,17 @@ android {
     }
 }
 
+// The Kotlin compiler otherwise targets the running JDK (17 on CI), which
+// fails the build with "Inconsistent JVM-target compatibility" against the
+// 1.8 bytecode level in compileOptions above.
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
+    kotlinOptions.jvmTarget = "1.8"
+}
+
 dependencies {
+    implementation("androidx.biometric:biometric:1.1.0")
     implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.core:core-splashscreen:1.0.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.activity:activity-ktx:1.9.2")

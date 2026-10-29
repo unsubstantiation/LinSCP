@@ -1390,7 +1390,7 @@ impl CommanderService {
                         kind = RemoteDesktopKind::from_scheme(spec.session.protocol).unwrap_or(kind);
                         if target_host.is_empty() { target_host = spec.session.host.clone(); }
                         if target_port == 0 { target_port = if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port }; }
-                        desktop_tab_spec = Some(tab);
+                        desktop_tab_spec = Some(tab.clone());
                     } else if target_host.is_empty() {
                         target_host = spec.session.host.clone();
                     }
