@@ -1,0 +1,55 @@
+name: Debian build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Debian package (.deb)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain and packaging dependencies
+        run: |
+          sudo apt-get update -qq
+          # The workspace needs Rust 1.89+, newer than the rustc in the
+          # runner image, so the toolchain comes from rustup.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            build-essential dpkg-dev pkg-config curl
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build the binary package
+        run: dpkg-buildpackage -b -us -uc
+
+      - name: Check the package contents
+        run: |
+          deb=$(ls ../linscp_*_*.deb)
+          echo "Built $deb"
+          dpkg-deb --contents "$deb"
+          contents=$(dpkg-deb --contents "$deb" | awk '{print $NF}' | sed 's|^\./||' | sort)
+          for path in usr/bin/linscp usr/bin/linscp-gui \
+                      usr/share/linscp/automation/LinSCP.psm1 \
+                      usr/share/applications/linscp.desktop \
+                      usr/share/pixmaps/linscp.png \
+                      usr/share/icons/hicolor/scalable/apps/linscp.svg \
+                      usr/share/man/man1/linscp.1.gz; do
+            echo "$contents" | grep -qx "$path" ||
+              { echo "::error::$path is missing from the package"; exit 1; }
+          done
+
+      - name: Install and smoke test the package
+        run: |
+          sudo dpkg -i ../linscp_*_*.deb
+          linscp -version
+          linscp -batch -command="echo ok; exit"
+          test -x /usr/bin/linscp-gui
+
+      - name: Upload the Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: linscp-debian
+          path: ../linscp_*_*.deb

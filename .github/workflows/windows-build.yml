@@ -1,0 +1,53 @@
+name: Windows build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Windows (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build and test the TypeScript UI
+        run: |
+          npm --prefix ui install --no-audit --no-fund
+          npm --prefix ui run build
+          npm --prefix ui test
+
+      - name: Run the Rust workspace unit tests
+        shell: bash
+        run: python tools/run_cargo_ci.py cargo test --workspace
+
+      - name: Build the release CLI (linscp + linscp-gui)
+        shell: bash
+        run: python tools/run_cargo_ci.py cargo build --release -p linscp-cli
+
+      - name: Check the Tauri native shell
+        shell: bash
+        run: python tools/run_cargo_ci.py cargo check -p linscp-tauri --features native-shell
+
+      - name: Smoke test the release binary
+        shell: bash
+        run: |
+          ./target/release/linscp.exe -version
+          ./target/release/linscp.exe -batch -command="option batch; sessions list; presets; exit"
+
+      - name: Upload the Windows binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: linscp-windows
+          path: |
+            target/release/linscp.exe
+            target/release/linscp-gui.exe
