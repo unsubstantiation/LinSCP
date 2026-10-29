@@ -580,6 +580,11 @@ impl QueueManager {
                         return Err("Destination changed or overwrite was not approved.".to_string());
                     }
                 }
+                if let Some(stage) = linscp_engine::transfer::local_stage_path(local_dest, None) {
+                    if std::fs::symlink_metadata(&stage).is_ok() {
+                        return Err(format!("A partial file already exists at '{}'; remove it before retrying.", stage.display()));
+                    }
+                }
                 let entry = session
                     .stat(remote_path)
                     .await
@@ -628,6 +633,11 @@ impl QueueManager {
                 if let Some(entry) = session.stat(remote_dest).await.map_err(|e| e.to_string())? {
                     if entry.is_dir || entry.is_symlink || !allow_overwrite {
                         return Err("Destination changed or overwrite was not approved.".to_string());
+                    }
+                }
+                if let Some(stage) = linscp_engine::transfer::remote_stage_path(remote_dest, None) {
+                    if session.stat(&stage).await.map_err(|e| e.to_string())?.is_some() {
+                        return Err(format!("A partial file already exists at '{stage}'; remove it before retrying."));
                     }
                 }
                 let meta = std::fs::symlink_metadata(local_src).map_err(|e| {

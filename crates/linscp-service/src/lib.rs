@@ -342,7 +342,7 @@ impl CommanderService {
             _ => return api_error(400, "Select at least one file"),
         };
         // Until the queue implements these options, reject rather than silently ignore them.
-        for key in ["append", "newer_only"] {
+        for key in ["append", "newer_only", "resume"] {
             if body.get(key).and_then(Value::as_bool).unwrap_or(false) { return api_error(400, format!("{key} is not yet supported")); }
         }
         for key in ["filemask", "resumesupport"] {
@@ -399,7 +399,10 @@ impl CommanderService {
             }
             if exists && overwrite == "ask" { conflicts.push(name.to_string()); }
             let mut flags = linscp_engine::transfer::TransferFlags::default();
-            flags.resume = body.get("resume").and_then(Value::as_bool).unwrap_or(false);
+            // Resuming existing partial files without verifying their source can
+            // splice unrelated bytes into the result. Always stage a fresh copy.
+            flags.resume = false;
+            flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
             flags.preserve_time = body.get("preserve_time").and_then(Value::as_bool).unwrap_or(true);
             let job = if tab.is_local {
                 queue::QueueJob::LocalCopyOrMove { source: PathBuf::from(&source), target: PathBuf::from(&destination), move_item: false, policy: if overwrite == "overwrite" { queue::ConflictPolicy::Overwrite } else { queue::ConflictPolicy::Ask } }
@@ -1953,6 +1956,19 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(std::fs::read(downloaded.join("upload.txt")).unwrap(), b"hello from native");
+        std::fs::write(local.join("another.txt"), b"new data").unwrap();
+        std::fs::write(remote.join("another.txt.filepart"), b"unrelated partial").unwrap();
+        let blocked = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["another.txt"]}))).await;
+        assert_eq!(blocked.status, 200);
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(2).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed, "an unrelated partial file must block a transfer");
+        assert_eq!(std::fs::read(remote.join("another.txt.filepart")).unwrap(), b"unrelated partial");
+        assert!(!remote.join("another.txt").exists());
         drop(server);
         let _ = std::fs::remove_dir_all(tmp);
     }
