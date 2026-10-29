@@ -43,6 +43,8 @@ jobs:
             echo "$contents" | grep -qx "$path" ||
               { echo "::error::$path is missing from the package"; exit 1; }
           done
+          # upload-artifact forbids '..' paths, so stage the .deb in the workspace.
+          cp ../linscp_*_*.deb "$GITHUB_WORKSPACE/"
 
       - name: Install and smoke test the package
         run: |
@@ -55,4 +57,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linscp-debian
-          path: ../linscp_*_*.deb
+          path: linscp_*_*.deb
