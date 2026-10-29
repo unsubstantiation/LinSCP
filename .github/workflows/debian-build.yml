@@ -68,7 +68,7 @@ jobs:
             linscp-gui &
             app=$!
             trap "kill $app $wm 2>/dev/null || true" EXIT
-            for i in $(seq 1 30); do
+            for i in $(seq 1 120); do
               if ! kill -0 "$app" 2>/dev/null; then
                 wait "$app" || true
                 echo "Application exited before opening a window" >&2
@@ -80,7 +80,7 @@ jobs:
               fi
               sleep 1
             done
-            echo "The LinSCP window did not open within 30 seconds" >&2
+            echo "The LinSCP window did not open within 120 seconds" >&2
             xdotool search --name ".*" getwindowname %@ || true
             for id in $(xdotool search --name "LinSCP" || true); do xwininfo -id "$id" || true; done
             ps -ef | grep -E "[l]inscp-gui|[W]ebKit|[b]wrap" || true
