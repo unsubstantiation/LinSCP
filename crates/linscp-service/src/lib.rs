@@ -402,11 +402,11 @@ impl CommanderService {
             flags.resume = body.get("resume").and_then(Value::as_bool).unwrap_or(false);
             flags.preserve_time = body.get("preserve_time").and_then(Value::as_bool).unwrap_or(true);
             let job = if tab.is_local {
-                queue::QueueJob::LocalCopyOrMove { source: PathBuf::from(&source), target: PathBuf::from(&destination), move_item: false, policy: queue::ConflictPolicy::Overwrite }
+                queue::QueueJob::LocalCopyOrMove { source: PathBuf::from(&source), target: PathBuf::from(&destination), move_item: false, policy: if overwrite == "overwrite" { queue::ConflictPolicy::Overwrite } else { queue::ConflictPolicy::Ask } }
             } else if upload {
-                queue::QueueJob::RemoteUpload { session: session.as_ref().unwrap().clone(), local_src: local, remote_dest: other, delete_source: false, cleanup_path: None, flags }
+                queue::QueueJob::RemoteUpload { session: session.as_ref().unwrap().clone(), local_src: local, remote_dest: other, allow_overwrite: overwrite == "overwrite", delete_source: false, cleanup_path: None, flags }
             } else {
-                queue::QueueJob::RemoteDownload { session: session.as_ref().unwrap().clone(), remote_path: other, local_dest: local, delete_source: false, flags }
+                queue::QueueJob::RemoteDownload { session: session.as_ref().unwrap().clone(), remote_path: other, local_dest: local, allow_overwrite: overwrite == "overwrite", delete_source: false, flags }
             };
             jobs.push((name.to_string(), source, destination, size, job));
         }
@@ -1882,6 +1882,20 @@ mod tests {
         assert_eq!(std::fs::read(right.join("data.txt")).unwrap(), b"do not overwrite");
         let invalid = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": left, "remote_dir": right, "names": ["../data.txt"]}) }).await;
         assert_eq!(invalid.status, 400);
+        std::fs::write(left.join("later.txt"), b"new data").unwrap();
+        svc.queue.pause();
+        let queued = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": left, "remote_dir": right, "names": ["later.txt"]}) }).await;
+        assert_eq!(queued.status, 200);
+        std::fs::write(right.join("later.txt"), b"created after queuing").unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..200 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(1).and_then(|v| v["status"].as_str()) == Some("Failed") { failed = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(failed, "new destination should fail without overwrite approval");
+        assert_eq!(std::fs::read(right.join("later.txt")).unwrap(), b"created after queuing");
         let _ = std::fs::remove_dir_all(tmp);
     }
 

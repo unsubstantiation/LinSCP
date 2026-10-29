@@ -59,6 +59,7 @@ pub enum QueueJob {
         session: Arc<dyn RemoteSession>,
         remote_path: String,
         local_dest: PathBuf,
+        allow_overwrite: bool,
         delete_source: bool,
         flags: TransferFlags,
     },
@@ -66,6 +67,7 @@ pub enum QueueJob {
         session: Arc<dyn RemoteSession>,
         local_src: PathBuf,
         remote_dest: String,
+        allow_overwrite: bool,
         delete_source: bool,
         cleanup_path: Option<PathBuf>,
         flags: TransferFlags,
@@ -569,9 +571,15 @@ impl QueueManager {
                 session,
                 remote_path,
                 local_dest,
+                allow_overwrite,
                 delete_source,
                 flags,
             } => {
+                if let Ok(meta) = std::fs::symlink_metadata(local_dest) {
+                    if meta.file_type().is_symlink() || !meta.is_file() || !allow_overwrite {
+                        return Err("Destination changed or overwrite was not approved.".to_string());
+                    }
+                }
                 let entry = session
                     .stat(remote_path)
                     .await
@@ -612,10 +620,16 @@ impl QueueManager {
                 session,
                 local_src,
                 remote_dest,
+                allow_overwrite,
                 delete_source,
                 flags,
                 ..
             } => {
+                if let Some(entry) = session.stat(remote_dest).await.map_err(|e| e.to_string())? {
+                    if entry.is_dir || entry.is_symlink || !allow_overwrite {
+                        return Err("Destination changed or overwrite was not approved.".to_string());
+                    }
+                }
                 let meta = std::fs::symlink_metadata(local_src).map_err(|e| {
                     format!("Cannot inspect local source '{}': {e}", local_src.display())
                 })?;
