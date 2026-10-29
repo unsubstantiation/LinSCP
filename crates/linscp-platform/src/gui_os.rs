@@ -234,12 +234,12 @@ pub fn open_url_in_browser(url: &str) -> Result<(), String> {
                 }
             }
         }
-        let openers: &[(&str, &[&str])] = &[
-            ("xdg-open", &[]),
-            ("gio", &["open"]),
-            ("sensible-browser", &[]),
+        let openers: &[(&str, &[&str], &str)] = &[
+            ("xdg-open", &[], ""),
+            ("gio", &["open"], ""),
+            ("sensible-browser", &[], ""),
         ];
-        for (prog, prefix_args) in openers {
+        for (prog, prefix_args, _backend) in openers {
             if let Some(resolved) = find_program_on_path(prog) {
                 Command::new(resolved)
                     .args(*prefix_args)

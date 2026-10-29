@@ -30,7 +30,6 @@ use std::path::Path;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use linscp_crypto::SessionMasterKey;
 use linscp_platform::SecretVault;
 use linscp_types::{BookmarkEntry, UserPreferences, WorkspaceSnapshot};
 use serde::{Deserialize, Serialize};
@@ -347,27 +346,27 @@ fn chrono_lite_now_utc() -> String {
 
 fn detect_distribution_id() -> String {
     // Best-effort OS/distro identifier for the `created_on` display field.
-    #[cfg(target_os = "windows")]
-    {
+    // Runtime check via consts::OS avoids #[cfg(target_os)] in linscp-engine
+    // per repository hygiene (OS branches live in linscp-platform).
+    let os = std::env::consts::OS;
+    if os == "windows" {
         return "windows".to_string();
     }
-    #[cfg(target_os = "android")]
-    {
+    if os == "android" {
         return "android".to_string();
     }
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(os_release) = std::fs::read_to_string("/etc/os-release") {
-            for line in os_release.lines() {
-                if let Some(val) = line.strip_prefix("ID=") {
-                    let id = val.trim_matches('"').trim().to_string();
-                    if !id.is_empty() {
-                        return id;
-                    }
+    // Linux and other Unix: try /etc/os-release, fallback to OS string.
+    if let Ok(os_release) = std::fs::read_to_string("/etc/os-release") {
+        for line in os_release.lines() {
+            if let Some(val) = line.strip_prefix("ID=") {
+                let id = val.trim_matches('"').trim().to_string();
+                if !id.is_empty() {
+                    return id;
                 }
             }
         }
-        return "linux".to_string();
+    }
+    return os.to_string();
     }
     #[allow(unreachable_code)]
     "unknown".to_string()

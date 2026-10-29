@@ -1706,10 +1706,10 @@ impl ScriptInterpreter {
 
     async fn cmd_backup(&mut self, args: &[String]) -> Result<(), String> {
         if args.len() != 2 {
-            return Err(self.tr("Syntax: backup export <file> | import <file>."));
+            return Err(self.tr("Syntax: backup export <file> | import <file>.").to_string());
         }
         let sub = args[0].to_ascii_lowercase();
-        let path = std::path::PathBuf::from(crate::text_mode::expand_tilde(&args[1]));
+        let path = std::path::PathBuf::from(expand_tilde(&args[1]));
         let vault = linscp_platform::NativeSecretVault::new();
         match sub.as_str() {
             "export" => {
@@ -1724,7 +1724,7 @@ impl ScriptInterpreter {
                 println!("{}", self.trp("Full backup imported from '{file}'.", &[("file", &args[1])]));
                 Ok(())
             }
-            _ => Err(self.tr("Syntax: backup export <file> | import <file>."))
+            _ => Err(self.tr("Syntax: backup export <file> | import <file>.").to_string())
         }
     }
 

@@ -88,11 +88,11 @@ def command_table(source):
         return set(re.findall(r'"([^"]+)"', block.group(1)))
     # Pure-Rust workspace: look for a kCommandNames-like table or COMMANDS array in script.rs
     # Fallback to any quoted command-like list; if still not found, return empty set and let caller skip.
-    rust_block = re.search(r"(?:kCommandNames|COMMANDS|commands)\s*[:=]\s*[\[\{](.*?)[\]\}]", source, re.S | re.I)
+    rust_block = re.search(r"(?:kCommandNames|COMMAND_NAMES)\s*[^=]*=\s*[^\[]*\[([^\]]+)\]", source, re.S)
     if rust_block:
         candidates = set(re.findall(r'"([^"]+)"', rust_block.group(1)))
         # filter to plausible command names (lowercase, no spaces)
-        filtered = {c for c in candidates if re.match(r'^[a-z-]+$', c)}
+        filtered = {c for c in candidates if re.match(r'^[a-z?\-]+$', c)}
         if filtered:
             return filtered
     # No table found - pure-Rust dispatch is matched differently; return empty to skip strict validation

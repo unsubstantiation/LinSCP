@@ -1481,6 +1481,42 @@
       "commands": [
         "versions"
       ]
+    },
+    {
+      "name": "backup",
+      "status": "verified",
+      "notes": "Full application backup as a single distribution-compatible JSON bundle (version 1, LF UTF-8, CRLF-tolerant, unwrapped base64 sessions.key) via `backup export|import <file>` in script mode; covers sessions.ini + sessions.key, workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json, restores identically on Debian, Fedora, Arch, Windows (CRLF) and Android, and is covered by the `backup` (distribution round-trip, CRLF tolerance, fail-closed) and `script` (sessions export/import) suites. Implemented in crates/linscp-engine/src/backup.rs and dispatched in script.rs.",
+      "source": [
+        "crates/linscp-engine/src/backup.rs",
+        "crates/linscp-engine/src/script.rs"
+      ],
+      "checks": {
+        "backup": [
+          "backup_is_distribution_compatible_between_linux_windows_and_android",
+          "backup_refuses_encrypted_ini_without_key",
+          "backup_round_trips_via_file_with_crlf_tolerance"
+        ],
+        "script": [
+          "test_session_export_import"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "backup",
+          "script"
+        ],
+        "windows": [
+          "backup",
+          "script"
+        ],
+        "android": [
+          "backup",
+          "script"
+        ]
+      },
+      "commands": [
+        "backup"
+      ]
     }
   ],
   "capabilities": [
