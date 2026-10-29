@@ -67,6 +67,7 @@ CASE_SOURCES = {
     "gui-shell": "source/gui/tests/ShellIntegrationTest.py",
     "platform-conversion": "tools/tests/test_platform_conversion.py",
     "wayland-compatibility": "tools/tests/test_wayland_compatibility.py",
+    "backup": "crates/linscp-engine/src/backup.rs",
 }
 
 
@@ -266,8 +267,8 @@ def check_capabilities(inventory, errors, root=ROOT):
                     # The JS harness calls check('description', condition).
                     expression = r"check\(\s*['\"]" + re.escape(case) + r"['\"]"
                 else:
-                    # Python's test_* methods and the named C++ Test* functions.
-                    expression = r"\b(?:def|void)\s+" + re.escape(case) + r"\s*\("
+                    # Python's test_* / C++ Test* / Rust fn test_*.
+                    expression = r"\b(?:def|void|fn)\s+" + re.escape(case) + r"\s*\("
                 if not re.search(expression, text):
                     errors.append(f"{label}: {suite} has no test case {case}")
     for area in sorted(areas - found.keys()):
@@ -330,7 +331,7 @@ def case_links(row):
             if suite in ('gui', 'gui-localization'):
                 pattern = r"check\(\s*['\"]" + re.escape(case) + r"['\"]"
             else:
-                pattern = r'\b(?:def|void)\s+' + re.escape(case) + r'\s*\('
+                pattern = r'\b(?:def|void|fn)\s+' + re.escape(case) + r'\s*\('
             match = re.search(pattern, text)
             line = text.count('\n', 0, match.start()) + 1 if match else 1
             label = markdown_cell(suite + ': ' + case)

@@ -577,3 +577,5 @@ implementations of the detection disagreeing about the variables they read.
 `make -C source/linux check` runs it, CTest registers it as
 `wayland-compatibility-check`, and `tools/tests/test_wayland_compatibility.py`
 has to show it failing on each of those.
+
+Backups (`backup export|import <file>` in script mode, `crates/linscp-engine/src/backup.rs`) are distribution-agnostic: LF-only, CRLF-tolerant JSON containing sessions.ini (LF-normalized), unwrapped base64 `sessions.key` (so a Windows `dpapi1$` or Android `aks1$` backup restores on Linux), and the JSON/text stores — Debian → Windows → Android round-trips are covered in `backup`.

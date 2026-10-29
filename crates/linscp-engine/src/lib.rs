@@ -1,6 +1,7 @@
 //! Shared transfer, synchronization, filemask, permission, session-storage,
 //! host-key cache, and session-importer engine.
 
+pub mod backup;
 pub mod config_stores;
 pub mod editor;
 pub mod filemask;

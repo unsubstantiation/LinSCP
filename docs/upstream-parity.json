@@ -64,7 +64,8 @@
           "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store.",
           "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
           "dotnet": "automation/test_dotnet.py - static checks of the LinSCP .NET assembly that always run (Session/SessionOptions object model, listing, transfer, synchronization, cancellation, structured results and errors, no password on a process command line, control-character and multiline refusal, upstream compatibility aliases) plus a live `dotnet build` roundtrip against the throwaway WebDAV endpoint when the SDK is installed. Without dotnet the live case skips loudly.",
-          "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English."
+          "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English.",
+          "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.)."
         }
       },
       "windows": {
@@ -92,7 +93,8 @@
           "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store.",
           "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
           "dotnet": "automation/test_dotnet.py - static checks of the LinSCP .NET assembly that always run (Session/SessionOptions object model, listing, transfer, synchronization, cancellation, structured results and errors, no password on a process command line, control-character and multiline refusal, upstream compatibility aliases) plus a live `dotnet build` roundtrip against the throwaway WebDAV endpoint when the SDK is installed. Without dotnet the live case skips loudly.",
-          "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English."
+          "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English.",
+          "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.)."
         }
       },
       "android": {
@@ -120,7 +122,8 @@
           "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store.",
           "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
           "dotnet": "automation/test_dotnet.py - static checks of the LinSCP .NET assembly that always run (Session/SessionOptions object model, listing, transfer, synchronization, cancellation, structured results and errors, no password on a process command line, control-character and multiline refusal, upstream compatibility aliases) plus a live `dotnet build` roundtrip against the throwaway WebDAV endpoint when the SDK is installed. Without dotnet the live case skips loudly.",
-          "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English."
+          "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English.",
+          "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.)."
         }
       }
     }
@@ -4992,6 +4995,42 @@
         "android": [
           "gui",
           "gui-local"
+        ]
+      }
+    },
+    {
+      "id": "backup.full-export-import",
+      "area": "Sessions/configuration",
+      "status": "verified",
+      "notes": "Full application backup as a distribution-compatible JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute config_dir, unwrapped base64 sessions.key via SecretVault for dpapi1$/aks1$ portability, LF-normalized INI/JSON/text). Covers sessions.ini + sessions.key, workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Exported on Debian (LF) restores identically on Fedora, Arch, Windows (CRLF) and Android and vice versa; backup_is_distribution_compatible_between_linux_windows_and_android proves Debian→Windows→Android round-trip, raw base64 key, LF-only decryptable INI and JSON stores, plus fail-closed without key and CRLF file tolerance. Implemented via crates/linscp-engine/src/backup.rs and `backup export|import <file>` in script.rs.",
+      "source": [
+        "crates/linscp-engine/src/backup.rs",
+        "crates/linscp-engine/src/script.rs",
+        "crates/linscp-platform/src/lib.rs",
+        "crates/linscp-types/src/lib.rs"
+      ],
+      "checks": {
+        "backup": [
+          "backup_is_distribution_compatible_between_linux_windows_and_android",
+          "backup_refuses_encrypted_ini_without_key",
+          "backup_round_trips_via_file_with_crlf_tolerance"
+        ],
+        "script": [
+          "test_session_export_import"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "backup",
+          "script"
+        ],
+        "windows": [
+          "backup",
+          "script"
+        ],
+        "android": [
+          "backup",
+          "script"
         ]
       }
     }
