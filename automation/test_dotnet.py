@@ -106,8 +106,11 @@ class StaticAssemblyTests(unittest.TestCase):
             # Rust ProtocolScheme enum variants map to scheme strings via as_str
             # Parse: Self::X => "y" in as_str or match arms
             known = set(re.findall(r'Self::(\w+)\s*=>\s*"([a-z0-9+]+)"', rust_src))
-            # Convert to scheme strings (second group)
-            known = {scheme for _, scheme in re.findall(r'Self::\w+\s*=>\s*"([a-z0-9+]+)"', rust_src)}
+            # Convert to scheme strings (second group) - findall with 2 groups returns tuples
+            known = {scheme for _, scheme in known}
+            # Fallback: also try single-group pattern
+            if not known:
+                known = set(re.findall(r'Self::\w+\s*=>\s*"([a-z0-9+]+)"', rust_src))
             # Also include direct string literals for schemes like "dav", "webdav" etc.
             # The Rust file defines 8 schemes: dav, webdav, davs, webdavs, ftp, ftps, ftpes, sftp, scp, s3
             # Use the explicit list from the enum if parsing fails
