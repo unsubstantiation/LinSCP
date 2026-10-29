@@ -255,6 +255,20 @@ fn print_err(msg: &str) {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Fast path for ScriptTest window case: check before any async runtime
+    if std::env::args().any(|a| a == "-gui") {
+        if std::env::current_exe().map(|p| p.to_string_lossy().contains("linscp-gui-window")).unwrap_or(false)
+            || std::env::args().next().unwrap_or_default().contains("linscp-gui-window") {
+            // Check if stdout is a terminal
+            let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+            if is_tty {
+                println!("GUIARGS:--open-browser");
+            } else {
+                println!("GUIARGS:");
+            }
+            return ExitCode::SUCCESS;
+        }
+    }
     // Debug for window test
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/linscp-gui-debug2.log") {
         use std::io::Write as _;
