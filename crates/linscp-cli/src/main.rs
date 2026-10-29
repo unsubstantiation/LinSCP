@@ -255,6 +255,11 @@ fn print_err(msg: &str) {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Debug for window test
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/linscp-gui-debug2.log") {
+        use std::io::Write as _;
+        let _ = writeln!(f, "main start exe={:?} args={:?}", std::env::current_exe().unwrap_or_default().display(), std::env::args().collect::<Vec<_>>());
+    }
     ensure_default_sigint();
     let code = run_cli().await;
     if code == 0 {
