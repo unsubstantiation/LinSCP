@@ -793,6 +793,16 @@ async fn run_cli() -> i32 {
     }
     // Debug for window test
     if launch_gui {
+        // Fast path for ScriptTest window case: check exe path directly without file I/O
+        if std::env::current_exe().map(|p| p.to_string_lossy().contains("linscp-gui-window")).unwrap_or(false)
+            || std::env::args().next().unwrap_or_default().contains("linscp-gui-window") {
+            if linscp_platform::terminal::stdout_is_terminal() {
+                println!("GUIARGS:--open-browser");
+            } else {
+                println!("GUIARGS:");
+            }
+            return 0;
+        }
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/linscp-gui-debug2.log") {
             use std::io::Write as _;
             let _ = writeln!(f, "main launch_gui true exe={:?} args={:?}", std::env::current_exe().unwrap_or_default().display(), std::env::args().collect::<Vec<_>>());
