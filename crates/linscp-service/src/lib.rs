@@ -192,11 +192,6 @@ impl CommanderService {
             ("POST", "/api/desktop/install-script") => self.handle_desktop_install_script(&query, req.body),
             ("POST", "/api/desktop/ticket") => self.handle_desktop_ticket(req.body),
             ("POST", "/api/desktop/launch") => self.handle_desktop_launch(req.body),
-            ("POST", "/api/tabs/open") => self.open_tab_async(req.body).await,
-            ("POST", "/api/tabs/verify") => self.verify_tab_async(req.body).await,
-            ("POST", "/api/transfer/upload") => self.queue_transfer_async(req.body, true).await,
-            ("POST", "/api/transfer/download") => self.queue_transfer_async(req.body, false).await,
-            ("GET", "/api/remote/list") => self.list_remote_async(&req.path).await,
             ("POST", "/api/desktop/check") => self.handle_desktop_check(req.body),
             ("POST", "/api/desktop/install") => self.handle_desktop_install_sync(req.body),
             _ => ApiReply { status: 404, payload: json!({"error": format!("Unknown endpoint: {} {}", method, raw_path)})},
@@ -210,6 +205,11 @@ impl CommanderService {
             (m, p)
         };
         match (method.as_str(), raw_path.as_str()) {
+            ("POST", "/api/tabs/open") => self.open_tab_async(req.body).await,
+            ("POST", "/api/tabs/verify") => self.verify_tab_async(req.body).await,
+            ("POST", "/api/transfer/upload") => self.queue_transfer_async(req.body, true).await,
+            ("POST", "/api/transfer/download") => self.queue_transfer_async(req.body, false).await,
+            ("GET", "/api/remote/list") => self.list_remote_async(&req.path).await,
             ("POST", "/api/desktop/check") => self.handle_desktop_check_async(req.body).await,
             ("POST", "/api/desktop/install") => self.handle_desktop_install_async(req.body).await,
             ("POST", "/api/desktop/launch") => self.handle_desktop_launch_async(req.body).await,
@@ -1882,6 +1882,64 @@ mod tests {
         assert_eq!(std::fs::read(right.join("data.txt")).unwrap(), b"do not overwrite");
         let invalid = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": left, "remote_dir": right, "names": ["../data.txt"]}) }).await;
         assert_eq!(invalid.status, 400);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_sftp_connection_hostkey_upload_download() {
+        if std::env::var_os("LSCP_LIVE_SFTP").is_none() { return; }
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        struct Server(std::process::Child);
+        impl Drop for Server { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let tmp = std::env::temp_dir().join(format!("linscp-live-native-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let remote = tmp.join("remote"); let local = tmp.join("local"); let downloaded = tmp.join("downloaded");
+        for p in [&remote, &local, &downloaded] { std::fs::create_dir_all(p).unwrap(); }
+        let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestSftpServer.py");
+        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_ROOT", &remote)
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut server = Server(child);
+        let mut line = String::new();
+        BufReader::new(server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let port: u16 = line.trim().strip_prefix("READY ").expect("SFTP server failed to start").parse().unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        let open = svc.dispatch_async(request("/api/tabs/open", json!({"name": "live", "session": {"protocol": "sftp", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
+        assert_eq!(open.status, 409, "{}", open.payload);
+        let challenge = &open.payload["challenge"];
+        let id = challenge["tab"].as_u64().unwrap();
+        let fingerprint = challenge["fingerprint"].as_str().unwrap().to_string();
+        let bad = svc.dispatch_async(request("/api/tabs/verify", json!({"tab": id, "role": "destination", "fingerprint": "wrong"}))).await;
+        assert_eq!(bad.status, 400);
+        let connected = svc.dispatch_async(request("/api/tabs/verify", json!({"tab": id, "role": "destination", "fingerprint": fingerprint, "remember": false}))).await;
+        assert_eq!(connected.status, 200, "{}", connected.payload);
+        assert!(connected.payload["tab"]["session"].get("password").is_none());
+        assert!(!tmp.join("config/sshhostkeys").exists());
+        std::fs::write(local.join("upload.txt"), b"hello from native").unwrap();
+        let upload = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["upload.txt"]}))).await;
+        assert_eq!(upload.status, 200, "{}", upload.payload);
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.first().and_then(|t| t["status"].as_str()) == Some("Completed") { break; }
+            if tasks.first().and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("upload failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(std::fs::read(remote.join("upload.txt")).unwrap(), b"hello from native");
+        let list = svc.dispatch_async(ApiEnvelope { method: "GET".into(), path: format!("/api/remote/list?tab={id}&path=%2F"), body: json!({}) }).await;
+        assert_eq!(list.status, 200, "{}", list.payload);
+        assert!(list.payload["entries"].as_array().unwrap().iter().any(|e| e["name"] == "upload.txt"));
+        let download = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["upload.txt"]}))).await;
+        assert_eq!(download.status, 200, "{}", download.payload);
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(1).and_then(|t| t["status"].as_str()) == Some("Completed") { break; }
+            if tasks.get(1).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("download failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(std::fs::read(downloaded.join("upload.txt")).unwrap(), b"hello from native");
+        drop(server);
         let _ = std::fs::remove_dir_all(tmp);
     }
 
