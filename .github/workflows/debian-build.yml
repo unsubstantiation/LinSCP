@@ -26,7 +26,7 @@ jobs:
           # the build in debian/rules.
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             build-essential dpkg-dev pkg-config curl cargo rustc nodejs npm \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev xvfb xdotool xauth openbox
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev xvfb xdotool xauth openbox x11-utils
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
@@ -83,6 +83,7 @@ jobs:
             echo "The LinSCP window did not open within 30 seconds" >&2
             xdotool search --name ".*" getwindowname %@ || true
             for id in $(xdotool search --name "LinSCP" || true); do xwininfo -id "$id" || true; done
+            ps -ef | grep -E "[l]inscp-gui|[W]ebKit|[b]wrap" || true
             exit 1
           ' > native-smoke.log 2>&1; then
             cat native-smoke.log
