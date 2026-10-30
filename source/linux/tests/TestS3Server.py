@@ -34,6 +34,7 @@ import pathlib
 import re
 import ssl
 import sys
+import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -196,6 +197,7 @@ class Store:
     """Bucket -> key -> (bytes, last-modified). In memory only."""
 
     def __init__(self):
+        self.write_lock = threading.Lock()
         self.buckets = {}  # name -> creation epoch
         self.objects = {}  # (bucket, key) -> (bytes, mtime), current version only
         self.versions = {}  # (bucket, key) -> oldest-to-newest version records
@@ -785,7 +787,11 @@ class S3Handler(BaseHTTPRequestHandler):
         if bucket not in STORE.buckets and key.endswith("/"):
             # mkdir creates both the bucket and its marker.
             STORE.ensure_bucket(bucket, now)
-        STORE.put(bucket, key, body, now)
+        with STORE.write_lock:
+            if headers.get("if-none-match", "").strip() == "*" and STORE.get(bucket, key) is not None:
+                self.send_error_xml(412, "PreconditionFailed", "The object already exists.")
+                return
+            STORE.put(bucket, key, body, now)
         STORE.object_headers["%s/%s" % (bucket, key)] = amz_headers
         self.send_bytes(200, b"", extra=(
             ("ETag", '"%s"' % hashlib.sha256(body).hexdigest()[:32]),))

@@ -2044,6 +2044,26 @@ mod tests {
         }
         assert!(done, "S3 download timed out");
         assert_eq!(std::fs::read(local.join("seed.txt")).unwrap(), b"S3 verified download");
+        std::fs::write(local.join("upload.txt"), b"S3 exclusive upload").unwrap();
+        let upload = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"]}))).await;
+        assert_eq!(upload.status, 200, "{}", upload.payload);
+        let mut uploaded = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(1).and_then(|t| t["status"].as_str()) == Some("Completed") { uploaded = true; break; }
+            if tasks.get(1).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("S3 upload failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(uploaded, "S3 upload timed out");
+        let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        let uploaded_bytes = linscp_proto::download_bytes(session.as_ref(), "/photos/upload.txt", Default::default()).await.unwrap();
+        assert_eq!(uploaded_bytes, b"S3 exclusive upload");
+        let mut flags = linscp_engine::transfer::TransferFlags::default(); flags.no_clobber = true;
+        let mut logger = linscp_engine::xml_log::SessionLogger::open(None, 0, false, None, None, false, "").unwrap();
+        let collision = linscp_engine::transfer::upload_single_file(session.as_ref(), &local.join("upload.txt"), "/photos/seed.txt", &flags, &mut logger, None).await;
+        assert!(collision.is_err());
+        let seed = linscp_proto::download_bytes(session.as_ref(), "/photos/seed.txt", Default::default()).await.unwrap();
+        assert_eq!(seed, b"S3 verified download");
         drop(server); let _ = std::fs::remove_dir_all(tmp);
     }
 

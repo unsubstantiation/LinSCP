@@ -1577,6 +1577,43 @@ impl RemoteSession for S3Session {
         Ok(total)
     }
 
+    async fn upload_exclusive(
+        &self,
+        remote_path: &str,
+        opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send),
+        total_size: Option<u64>,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        // Single PUT with If-None-Match is atomic. Multipart conditional
+        // completion is not implemented here; fail closed rather than overwrite.
+        const MAX_EXCLUSIVE_BYTES: u64 = 16 * 1024 * 1024;
+        let Some(expected) = total_size else { return Err(ProtoError::UnsupportedCapability("exclusive upload without known size", self.scheme())); };
+        if opts.append || opts.resume_offset != 0 || expected > MAX_EXCLUSIVE_BYTES {
+            return Err(ProtoError::UnsupportedCapability("exclusive multipart, resume or append", self.scheme()));
+        }
+        let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else {
+            return Err(ProtoError::Transport("S3 upload requires a bucket and object key.".to_string()));
+        };
+        if key.is_empty() { return Err(ProtoError::Transport("S3 object key must not be empty.".to_string())); }
+        let mut payload = Vec::with_capacity(expected as usize);
+        source.take(MAX_EXCLUSIVE_BYTES + 1).read_to_end(&mut payload).await
+            .map_err(|e| ProtoError::Transport(format!("Reading S3 upload source failed: {e}")))?;
+        if payload.len() as u64 != expected {
+            return Err(ProtoError::Transport("S3 upload source size changed during transfer.".to_string()));
+        }
+        let mut headers = self.write_headers_vec();
+        headers.push(("if-none-match".to_string(), "*".to_string()));
+        let response = self.send_signed(Method::PUT, Some(&bucket), &key, &[], &headers, payload).await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(parse_s3_error_xml(status, &body));
+        }
+        if let Some(callback) = progress { callback(expected, expected); }
+        Ok(expected)
+    }
+
     async fn probe_endpoint(&self, _initial_dir: &str) -> Result<(), ProtoError> {
         self.check_endpoint().await
     }
