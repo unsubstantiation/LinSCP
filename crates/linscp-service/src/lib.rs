@@ -406,6 +406,9 @@ impl CommanderService {
                 if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink() || !m.is_file()) { return api_error(400, "Refusing to overwrite a symlink or directory"); }
             }
             if exists && overwrite == "ask" { conflicts.push(name.to_string()); }
+            // Approval applies only to destinations actually present at enqueue.
+            // A different item appearing later must not inherit that approval.
+            let allow_overwrite = overwrite == "overwrite" && exists;
             let mut flags = linscp_engine::transfer::TransferFlags::default();
             // Resuming existing partial files without verifying their source can
             // splice unrelated bytes into the result. Always stage a fresh copy.
@@ -413,11 +416,11 @@ impl CommanderService {
             flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
             flags.preserve_time = body.get("preserve_time").and_then(Value::as_bool).unwrap_or(true);
             let job = if tab.is_local {
-                queue::QueueJob::LocalCopyOrMove { source: PathBuf::from(&source), target: PathBuf::from(&destination), move_item: false, policy: if overwrite == "overwrite" { queue::ConflictPolicy::Overwrite } else { queue::ConflictPolicy::Ask } }
+                queue::QueueJob::LocalCopyOrMove { source: PathBuf::from(&source), target: PathBuf::from(&destination), move_item: false, policy: if allow_overwrite { queue::ConflictPolicy::Overwrite } else { queue::ConflictPolicy::Ask } }
             } else if upload {
-                queue::QueueJob::RemoteUpload { session: session.as_ref().unwrap().clone(), local_src: local, remote_dest: other, allow_overwrite: overwrite == "overwrite", delete_source: false, cleanup_path: None, flags }
+                queue::QueueJob::RemoteUpload { session: session.as_ref().unwrap().clone(), local_src: local, remote_dest: other, allow_overwrite, delete_source: false, cleanup_path: None, flags }
             } else {
-                queue::QueueJob::RemoteDownload { session: session.as_ref().unwrap().clone(), remote_path: other, local_dest: local, allow_overwrite: overwrite == "overwrite", delete_source: false, flags }
+                queue::QueueJob::RemoteDownload { session: session.as_ref().unwrap().clone(), remote_path: other, local_dest: local, allow_overwrite, delete_source: false, flags }
             };
             jobs.push((name.to_string(), source, destination, size, job));
         }
@@ -1907,6 +1910,20 @@ mod tests {
         }
         assert!(failed, "new destination should fail without overwrite approval");
         assert_eq!(std::fs::read(right.join("later.txt")).unwrap(), b"created after queuing");
+        std::fs::write(left.join("approved-new.txt"), b"queued data").unwrap();
+        svc.queue.pause();
+        let approved = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": left, "remote_dir": right, "names": ["approved-new.txt"], "overwrite": "overwrite"}) }).await;
+        assert_eq!(approved.status, 200);
+        std::fs::write(right.join("approved-new.txt"), b"concurrent data").unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..200 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(2).and_then(|v| v["status"].as_str()) == Some("Failed") { failed = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(failed, "approval for existing destinations must not apply to new files");
+        assert_eq!(std::fs::read(right.join("approved-new.txt")).unwrap(), b"concurrent data");
         let _ = std::fs::remove_dir_all(tmp);
     }
 
