@@ -85,7 +85,7 @@ impl TabRuntime {
         let mut redacted = self.session_json.clone();
         if let Some(obj) = redacted.as_object_mut() {
             for key in ["s3_secret_key", "s3_session_token", "proxy_password", "passphrase", "key_passphrase"] { obj.remove(key); }
-        obj.remove("password");
+            obj.remove("password");
             obj.remove("tunnel_password");
             obj.remove("tunnel_passphrase");
         }
@@ -638,6 +638,7 @@ pub fn parse_gui_session_spec(
         );
         obj.insert("remote_dir".into(), json!(initial_dir));
         obj.insert("local_dir".into(), json!(local_dir));
+        for key in ["s3_secret_key", "s3_session_token", "proxy_password", "passphrase", "key_passphrase"] { obj.remove(key); }
         obj.remove("password");
         obj.remove("tunnel_password");
         obj.remove("tunnel_passphrase");
