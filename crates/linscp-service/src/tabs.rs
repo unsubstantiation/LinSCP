@@ -214,6 +214,7 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
         json!(site.tunnel.hostkey.clone()),
     );
     for (k, v) in &site.extra_fields {
+        if matches!(k.as_str(), "s3_secret_key" | "s3_session_token" | "proxy_password" | "passphrase" | "tunnel_passphrase") { continue; }
         obj.entry(k.clone()).or_insert_with(|| json!(v));
     }
     Value::Object(obj)

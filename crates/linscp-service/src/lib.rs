@@ -1879,6 +1879,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn s3_secrets_are_not_returned_or_saved_as_plaintext() {
+        let root = std::env::temp_dir().join(format!("linscp-s3-secrets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let svc = CommanderService::new(root.clone(), Arc::new(NativeLocalFs::new()));
+        let body = json!({"name": "s3-test", "session": {"protocol": "s3", "host": "example.test", "s3_access_key": "access", "s3_secret_key": "secret", "s3_session_token": "token"}});
+        let (spec, clean) = tabs::parse_gui_session_spec(&body["session"], None, &root, svc.secret_vault.as_ref()).unwrap();
+        assert_eq!(spec.session.username, "access");
+        assert_eq!(spec.session.password.as_deref(), Some("secret"));
+        assert!(clean.get("s3_secret_key").is_none());
+        assert!(clean.get("s3_session_token").is_none());
+        let reply = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/sessions/save".into(), body });
+        assert_eq!(reply.status, 400);
+        let mut site = tabs::build_stored_site_for_save("old", &spec);
+        site.extra_fields.insert("s3_secret_key".into(), "legacy secret".into());
+        let view = tabs::stored_site_to_gui_json(&site);
+        assert!(view.get("s3_secret_key").is_none());
+        assert!(view.get("s3_session_token").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn local_file_copy_is_queued_and_conflicts_are_not_overwritten() {
         let tmp = std::env::temp_dir().join(format!("linscp-queue-test-{}", std::process::id()));
