@@ -2354,7 +2354,7 @@ mod tests {
         let local = tmp.join("local"); let downloaded = tmp.join("downloaded");
         std::fs::create_dir_all(&local).unwrap(); std::fs::create_dir_all(&downloaded).unwrap();
         let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestDavServer.py");
-        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_GET_DELAY", "0.005").env("LSCP_TEST_DELETE_RACE", "1").env("LSCP_TEST_DROP_ONCE", "/resume-drop.bin")
+        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_GET_DELAY", "0.005").env("LSCP_TEST_DELETE_RACE", "1").env("LSCP_TEST_DROP_ONCE", "/resume-drop.bin").env("LSCP_TEST_BAD_RANGE", "1")
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let mut server = Server(child);
         let mut line = String::new();
@@ -2563,6 +2563,22 @@ mod tests {
         assert!(failed);
         assert!(!downloaded.join("resume-race.txt").exists());
         assert_eq!(std::fs::read(downloaded.join("resume-race.txt.filepart")).unwrap(), b"abcd");
+        // A server that lies about the returned range cannot cause a splice.
+        linscp_proto::upload_bytes(session.as_ref(), "/resume-wrong-range.txt", b"abcdefghij", Default::default()).await.unwrap();
+        std::fs::write(downloaded.join("resume-wrong-range.txt.filepart"), b"abcd").unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let resumed = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["resume-wrong-range.txt"], "resume": true}))).await;
+        assert_eq!(resumed.status, 200);
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("invalid range was published"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert!(!downloaded.join("resume-wrong-range.txt").exists());
+        assert_eq!(std::fs::read(downloaded.join("resume-wrong-range.txt.filepart")).unwrap(), b"abcd");
         // Full-length partials are still compared, and symlink partials are
         // rejected rather than followed or removed.
         linscp_proto::upload_bytes(session.as_ref(), "/resume-full.txt", b"complete", Default::default()).await.unwrap();

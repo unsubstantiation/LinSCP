@@ -671,9 +671,10 @@ class DavHandler(BaseHTTPRequestHandler):
                 end = int(match.group(2)) if match.group(2) else len(data) - 1
                 end = min(end, len(data) - 1)
                 body = data[start:end + 1]
-                extra = extra + (
-                    ("Content-Range",
-                     "bytes %d-%d/%d" % (start, end, len(data))),)
+                content_range = "bytes %d-%d/%d" % (start, end, len(data))
+                if path == "/resume-wrong-range.txt" and os.environ.get("LSCP_TEST_BAD_RANGE") == "1":
+                    content_range = "bytes %d-%d/%d" % (start + 1, end, len(data))
+                extra = extra + (("Content-Range", content_range),)
                 self.send_body(206, body,
                                "application/octet-stream", extra)
                 return
