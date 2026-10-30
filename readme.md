@@ -7,9 +7,9 @@ runs in a native Tauri window backed by the Rust transfer engine. No separate
 command-line client or browser server is built or distributed. **The native GUI
 is experimental and is not ready for production transfers.** Remote listing
 and queued file uploads and downloads are implemented. SFTP and plain HTTP
-WebDAV connections and transfers have live integration tests; FTP and explicit
-FTPS connection, listing and download, and S3 connection and small-file transfers,
-also have live tests. SFTP directories can be copied to new destinations or
+WebDAV connections and transfers have live integration tests; FTP, explicit FTPS
+and implicit FTPS staged uploads, plus FTP/explicit FTPS downloads and S3 small-file
+transfers, also have live tests. SFTP directories can be copied to new destinations or
 merged into explicitly approved existing directories. Merges fail rather than
 replace conflicting files and are not transactional; concurrent directory path
 changes can still affect them. Other directory merges are unsupported. WebDAV files can be moved to a new local
@@ -41,7 +41,7 @@ Queued WebDAV and S3 file overwrites require a strong ETag and use conditional
 PUT, relying on server enforcement; S3 conditional uploads are limited to 16 MiB.
 An ETag is not necessarily a unique version: changes that retain the same ETag
 may not be detected. Other queued overwrites are rejected until they can be made
-safe. FTP/FTPS uploads and other protocols and configurations require further verification.
+safe. Other protocols and configurations require further verification.
 Unsupported operations return an error rather than reporting success.
 
 ## Build the desktop application
