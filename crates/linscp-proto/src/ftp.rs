@@ -389,6 +389,9 @@ impl DataStream {
 
 struct FtpInner {
     ctrl: ControlStream,
+    // A failed data transfer can leave one or more completion replies on the
+    // control channel. Never interpret them as replies to later commands.
+    poisoned: bool,
     prot_private: bool,
     supports_mlst: bool,
     supports_size: bool,
@@ -399,6 +402,9 @@ struct FtpInner {
 
 impl FtpInner {
     async fn read_reply(&mut self) -> Result<FtpReply, ProtoError> {
+        if self.poisoned {
+            return Err(ProtoError::Transport("FTP control connection is unusable after an interrupted transfer; reconnect.".to_string()));
+        }
         let first = self.ctrl.read_line_capped().await?;
         let trimmed_first = first.trim_end_matches(['\r', '\n']);
         if trimmed_first.len() < 3
@@ -430,6 +436,9 @@ impl FtpInner {
     }
 
     async fn command(&mut self, cmd: &str) -> Result<FtpReply, ProtoError> {
+        if self.poisoned {
+            return Err(ProtoError::Transport("FTP control connection is unusable after an interrupted transfer; reconnect.".to_string()));
+        }
         self.ctrl.write_command(cmd).await?;
         self.read_reply().await
     }
@@ -513,6 +522,7 @@ impl FtpSession {
 
         let mut inner = FtpInner {
             ctrl,
+            poisoned: false,
             prot_private: false,
             supports_mlst: false,
             supports_size: false,
@@ -1146,39 +1156,50 @@ impl RemoteSession for FtpSession {
             }
         }
 
-        let mut data = self
-            .open_data_command(&mut inner, &format!("RETR {remote_path}"))
-            .await?;
+        let mut data = match self.open_data_command(&mut inner, &format!("RETR {remote_path}")).await {
+            Ok(data) => data,
+            Err(error) => { inner.poisoned = true; return Err(error); }
+        };
         let mut buf = vec![0u8; FTP_CHUNK_SIZE];
         let mut transferred = 0u64;
         let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
 
         loop {
-            let n = data.read_chunk(&mut buf).await?;
+            let n = match data.read_chunk(&mut buf).await {
+                Ok(n) => n,
+                Err(error) => { inner.poisoned = true; return Err(error); }
+            };
             if n == 0 {
                 break;
             }
-            sink.write_all(&buf[..n])
-                .await
-                .map_err(|e| ProtoError::Transport(format!("Writing FTP sink failed: {e}")))?;
+            if let Err(error) = sink.write_all(&buf[..n]).await {
+                inner.poisoned = true;
+                return Err(ProtoError::Transport(format!("Writing FTP sink failed: {error}; reconnect before using this session.")));
+            }
             transferred += n as u64;
             if let Some(cb) = progress {
                 cb(opts.resume_offset + transferred, total_size);
             }
             if opts.speed_kbytes_per_sec > 0 {
-                sink.flush()
-                    .await
-                    .map_err(|e| ProtoError::Transport(format!("Flushing FTP sink failed: {e}")))?;
+                if let Err(error) = sink.flush().await {
+                    inner.poisoned = true;
+                    return Err(ProtoError::Transport(format!("Flushing FTP sink failed: {error}; reconnect before using this session.")));
+                }
             }
             limiter.consume(n).await;
         }
         drop(data);
-        sink.flush()
-            .await
-            .map_err(|e| ProtoError::Transport(format!("Flushing FTP sink failed: {e}")))?;
+        if let Err(error) = sink.flush().await {
+            inner.poisoned = true;
+            return Err(ProtoError::Transport(format!("Flushing FTP sink failed: {error}; reconnect before using this session.")));
+        }
 
-        let done = inner.read_reply().await?;
+        let done = match inner.read_reply().await {
+            Ok(done) => done,
+            Err(error) => { inner.poisoned = true; return Err(error); }
+        };
         if done.code != 226 && done.code != 250 {
+            inner.poisoned = true;
             return Err(ProtoError::Transport(format!(
                 "FTP RETR '{remote_path}' failed: {}",
                 done.summary()
@@ -1221,31 +1242,44 @@ impl RemoteSession for FtpSession {
             format!("STOR {remote_path}")
         };
 
-        let mut data = self.open_data_command(&mut inner, &verb).await?;
+        let mut data = match self.open_data_command(&mut inner, &verb).await {
+            Ok(data) => data,
+            Err(error) => { inner.poisoned = true; return Err(error); }
+        };
         let mut buf = vec![0u8; FTP_CHUNK_SIZE];
         let mut transferred = 0u64;
         let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
         let reported_total = total_size.unwrap_or(0);
 
         loop {
-            let n = source
-                .read(&mut buf)
-                .await
-                .map_err(|e| ProtoError::Transport(format!("Reading FTP upload source: {e}")))?;
+            let n = match source.read(&mut buf).await {
+                Ok(n) => n,
+                Err(error) => { inner.poisoned = true; return Err(ProtoError::Transport(format!("Reading FTP upload source: {error}; reconnect before using this session."))); }
+            };
             if n == 0 {
                 break;
             }
-            data.write_all_chunk(&buf[..n]).await?;
+            if let Err(error) = data.write_all_chunk(&buf[..n]).await {
+                inner.poisoned = true;
+                return Err(error);
+            }
             transferred += n as u64;
             if let Some(cb) = progress {
                 cb(opts.resume_offset + transferred, reported_total);
             }
             limiter.consume(n).await;
         }
-        data.finish_write().await?;
+        if let Err(error) = data.finish_write().await {
+            inner.poisoned = true;
+            return Err(error);
+        }
 
-        let done = inner.read_reply().await?;
+        let done = match inner.read_reply().await {
+            Ok(done) => done,
+            Err(error) => { inner.poisoned = true; return Err(error); }
+        };
         if done.code != 226 && done.code != 250 {
+            inner.poisoned = true;
             return Err(ProtoError::Transport(format!(
                 "FTP upload '{remote_path}' failed: {}",
                 done.summary()

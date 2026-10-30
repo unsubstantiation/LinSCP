@@ -2220,6 +2220,23 @@ mod tests {
         }
         assert!(done, "FTPS download timed out");
         assert_eq!(std::fs::read(local.join("download.txt")).unwrap(), b"explicit FTPS download");
+        std::fs::write(remote.join("large.bin"), vec![19u8; 4 * 1024 * 1024]).unwrap();
+        let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_flag = Arc::clone(&cancel);
+        let progress = move |_: u64, _: u64| callback_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut flags = linscp_engine::transfer::TransferFlags::default();
+        flags.no_clobber = true;
+        flags.cleanup_download_stage = true;
+        flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
+        flags.cancel_flag = Some(cancel);
+        let mut logger = linscp_engine::xml_log::SessionLogger::open(None, 0, false, None, None, false, "").unwrap();
+        let interrupted = linscp_engine::transfer::download_single_file(session.as_ref(), "/large.bin", None, &local.join("large.bin"), &flags, &mut logger, Some(&progress)).await;
+        assert!(interrupted.is_err());
+        assert!(!local.join("large.bin").exists());
+        assert!(!std::fs::read_dir(&local).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-download-")));
+        let err = session.stat("/download.txt").await.expect_err("interrupted FTPS control channel must not be reused");
+        assert!(err.to_string().contains("reconnect"), "{err}");
         drop(server); let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -2236,8 +2253,9 @@ mod tests {
         let remote = tmp.join("remote"); let local = tmp.join("local");
         std::fs::create_dir_all(&remote).unwrap(); std::fs::create_dir_all(&local).unwrap();
         std::fs::write(remote.join("download.txt"), b"FTP roundtrip").unwrap();
+        std::fs::write(remote.join("slow.bin"), vec![17u8; 4 * 1024 * 1024]).unwrap();
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestFtpServer.py");
-        let child = Command::new("/usr/bin/python3").arg(path).env("LSCP_TEST_ROOT", &remote)
+        let child = Command::new("/usr/bin/python3").arg(path).env("LSCP_TEST_ROOT", &remote).env("LSCP_TEST_FTP_THROTTLE", "1")
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let mut server = Server(child);
         let mut line = String::new();
@@ -2262,6 +2280,38 @@ mod tests {
         }
         assert!(done, "FTP download timed out");
         assert_eq!(std::fs::read(local.join("download.txt")).unwrap(), b"FTP roundtrip");
+        let slow_index = svc.queue.snapshot().0.len();
+        let slow = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["slow.bin"]}))).await;
+        assert_eq!(slow.status, 200, "{}", slow.payload);
+        let mut task_id = None;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(task) = tasks.get(slow_index) {
+                if task["status"] == "Running" && task["bytes_done"].as_u64().unwrap_or(0) > 0 { task_id = task["id"].as_u64(); break; }
+                assert_ne!(task["status"], "Completed", "FTP download finished before cancellation");
+                assert_ne!(task["status"], "Failed", "{tasks:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let result = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": task_id.expect("FTP download did not start")}))).await;
+        assert_eq!(result.status, 200, "{}", result.payload);
+        let mut cancelled = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(slow_index).and_then(|t| t["status"].as_str()) == Some("Cancelled") {
+                assert!(tasks[slow_index]["error"].as_str().unwrap_or_default().contains("Reconnect"));
+                cancelled = true; break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(cancelled, "FTP cancellation was not observed");
+        assert!(!local.join("slow.bin").exists());
+        assert!(!std::fs::read_dir(&local).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-download-")));
+        let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        let err = session.stat("/download.txt").await.expect_err("interrupted FTP control channel must not be reused");
+        assert!(err.to_string().contains("reconnect"), "{err}");
+        let reopened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "ftp", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
+        assert_eq!(reopened.status, 200, "{}", reopened.payload);
         drop(server); let _ = std::fs::remove_dir_all(tmp);
     }
 

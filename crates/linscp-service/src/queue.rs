@@ -176,7 +176,7 @@ fn task_supports_cancellation(job: &QueueJob) -> bool {
     match job {
         QueueJob::LocalCopyOrMove { .. } => true,
         QueueJob::RemoteDownload { session, .. } => {
-            matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs | ProtocolScheme::S3)
+            matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs | ProtocolScheme::S3 | ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes)
         }
         QueueJob::RemoteUpload { session, .. } => {
             matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs)
@@ -566,7 +566,8 @@ impl QueueManager {
                 if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task.id) {
                     if cancelled && result.is_err() {
                         t.status = "cancelled".to_string();
-                        t.error = Some("Cancelled by user.".to_string());
+                        let reconnect = matches!(&task.job, QueueJob::RemoteDownload { session, .. } if matches!(session.scheme(), ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes));
+                        t.error = Some(if reconnect { "Cancelled by user. Reconnect the FTP session before further transfers." } else { "Cancelled by user." }.to_string());
                         clean = true;
                     } else {
                         match result {
