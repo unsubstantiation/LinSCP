@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 
 import paramiko
 from paramiko.message import Message
@@ -75,6 +76,14 @@ def _err(exc_info=None):
     return paramiko.SFTPServer.convert_errno(e.errno)
 
 
+class DelayedSFTPHandle(SFTPHandle):
+    def write(self, offset, data):
+        delay = float(os.environ.get("LSCP_TEST_WRITE_DELAY", "0"))
+        if delay:
+            time.sleep(delay)
+        return super().write(offset, data)
+
+
 class SftpSI(paramiko.SFTPServerInterface):
     """Filesystem-backed SFTP backend with ROOT as the visible '/'."""
 
@@ -130,7 +139,7 @@ class SftpSI(paramiko.SFTPServerInterface):
                 os.fchmod(fd, attr.st_mode)
             except OSError:
                 pass
-        handle = SFTPHandle(fd)
+        handle = DelayedSFTPHandle(fd)
         mode = "r+b"  # both directions; SFTP handles manage offsets
         try:
             handle.readfile = handle.writefile = os.fdopen(fd, mode, 0)

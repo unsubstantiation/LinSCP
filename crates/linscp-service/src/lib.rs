@@ -1980,7 +1980,7 @@ mod tests {
         let remote = tmp.join("remote"); let local = tmp.join("local"); let downloaded = tmp.join("downloaded");
         for p in [&remote, &local, &downloaded] { std::fs::create_dir_all(p).unwrap(); }
         let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestSftpServer.py");
-        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_ROOT", &remote)
+        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_ROOT", &remote).env("LSCP_TEST_WRITE_DELAY", "0.01")
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let mut server = Server(child);
         let mut line = String::new();
@@ -2118,6 +2118,35 @@ mod tests {
         }
         assert!(rejected, "a directory containing a symlink must be rejected");
         assert!(!remote.join("links/link").exists());
+        // Exercise cancellation through the public queue API while SFTP is running.
+        std::fs::write(local.join("slow.bin"), vec![19u8; 4 * 1024 * 1024]).unwrap();
+        let slow_index = svc.queue.snapshot().0.len();
+        let slow = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["slow.bin"]}))).await;
+        assert_eq!(slow.status, 200);
+        let mut task_id = None;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(task) = tasks.get(slow_index) {
+                if task["status"] == "Running" && task["bytes_done"].as_u64().unwrap_or(0) > 0 {
+                    task_id = task["id"].as_u64(); break;
+                }
+                assert_ne!(task["status"], "Failed", "{tasks:?}");
+                assert_ne!(task["status"], "Completed", "upload finished before cancellation");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let task_id = task_id.expect("upload did not begin");
+        let cancelled = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": task_id}))).await;
+        assert_eq!(cancelled.status, 200, "{}", cancelled.payload);
+        let mut stopped = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(slow_index).and_then(|t| t["status"].as_str()) == Some("Cancelled") { stopped = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped, "cancellation was not observed");
+        assert!(std::fs::metadata(remote.join("slow.bin")).unwrap().len() < 4 * 1024 * 1024);
+        assert!(session.stat("/upload.txt").await.unwrap().is_some());
         drop(server);
         let _ = std::fs::remove_dir_all(tmp);
     }
