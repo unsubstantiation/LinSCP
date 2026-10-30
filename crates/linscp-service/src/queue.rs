@@ -23,6 +23,7 @@ use linscp_engine::xml_log::SessionLogger;
 use linscp_platform::gui_os::create_local_symlink;
 use linscp_platform::terminal::{set_local_file_times, set_local_permissions};
 use linscp_proto::{ProgressCallback, RemoteSession};
+use linscp_types::ProtocolScheme;
 use rand::RngCore;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Notify};
@@ -101,6 +102,16 @@ pub enum QueueJob {
         remote_root: String,
         opts: KeepUpToDateOptions,
     },
+}
+
+fn task_supports_cancellation(job: &QueueJob) -> bool {
+    match job {
+        QueueJob::LocalCopyOrMove { .. } => true,
+        QueueJob::RemoteDownload { session, .. } | QueueJob::RemoteUpload { session, .. } => {
+            matches!(session.scheme(), ProtocolScheme::Sftp)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone)]
@@ -303,7 +314,7 @@ impl QueueManager {
                     t.error = Some("Cancelled by user.".to_string());
                     to_clean = Some(t.clone());
                     changed = true;
-                } else if t.status == "running" && matches!(&t.job, QueueJob::LocalCopyOrMove { .. }) {
+                } else if t.status == "running" && task_supports_cancellation(&t.job) {
                     t.cancel_flag.store(true, Ordering::SeqCst);
                     changed = true;
                 }
@@ -324,7 +335,7 @@ impl QueueManager {
         {
             let mut g = self.inner.lock().expect("queue mutex");
             for t in &mut g.tasks {
-                if t.tab_id == Some(tab_id) && (t.status == "queued" || (t.status == "running" && matches!(&t.job, QueueJob::LocalCopyOrMove { .. }))) {
+                if t.tab_id == Some(tab_id) && (t.status == "queued" || (t.status == "running" && task_supports_cancellation(&t.job))) {
                     t.cancel_flag.store(true, Ordering::SeqCst);
                     if t.status == "queued" {
                         t.status = "cancelled".to_string();
@@ -595,6 +606,7 @@ impl QueueManager {
                     .ok_or_else(|| format!("Remote item '{remote_path}' does not exist."))?;
                 let mut f = flags.clone();
                 f.delete_source = *delete_source;
+                f.cancel_flag = Some(Arc::clone(&task.cancel_flag));
                 f.no_clobber = !allow_overwrite;
                 if entry.is_dir {
                     f.recursive = true;
@@ -649,6 +661,7 @@ impl QueueManager {
                 })?;
                 let mut f = flags.clone();
                 f.delete_source = *delete_source;
+                f.cancel_flag = Some(Arc::clone(&task.cancel_flag));
                 if meta.is_dir() {
                     f.recursive = true;
                     upload_directory_recursive(

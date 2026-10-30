@@ -2016,6 +2016,27 @@ mod tests {
         let race = linscp_engine::transfer::download_single_file(session.as_ref(), "/upload.txt", None, &raced_target, &flags, &mut logger, Some(&progress)).await;
         assert!(race.is_err(), "concurrent destination must not be replaced");
         assert_eq!(std::fs::read(&raced_target).unwrap(), b"concurrent data");
+        // Cancel both directions mid-stream and ensure the session remains usable.
+        std::fs::write(remote.join("large.bin"), vec![17u8; 512 * 1024]).unwrap();
+        std::fs::write(local.join("large.bin"), vec![29u8; 512 * 1024]).unwrap();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_flag = Arc::clone(&cancel);
+        let cancel_on_progress = move |_: u64, _: u64| callback_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut cancelling = linscp_engine::transfer::TransferFlags::default();
+        cancelling.no_clobber = true;
+        cancelling.cancel_flag = Some(Arc::clone(&cancel));
+        cancelling.resume_support = linscp_engine::presets::ResumeSupportMode::On;
+        let cancelled_download = linscp_engine::transfer::download_single_file(session.as_ref(), "/large.bin", None, &downloaded.join("large.bin"), &cancelling, &mut logger, Some(&cancel_on_progress)).await;
+        assert!(cancelled_download.is_err());
+        assert!(!downloaded.join("large.bin").exists());
+        assert!(downloaded.join("large.bin.filepart").exists());
+        cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+        cancelling.no_clobber = false;
+        let cancelled_upload = linscp_engine::transfer::upload_single_file(session.as_ref(), &local.join("large.bin"), "/cancelled.bin", &cancelling, &mut logger, Some(&cancel_on_progress)).await;
+        assert!(cancelled_upload.is_err());
+        assert!(!remote.join("cancelled.bin").exists());
+        assert!(remote.join("cancelled.bin.filepart").exists());
+        assert!(session.stat("/upload.txt").await.unwrap().is_some());
         std::fs::write(local.join("another.txt"), b"new data").unwrap();
         std::fs::write(remote.join("another.txt.filepart"), b"unrelated partial").unwrap();
         let blocked = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["another.txt"]}))).await;

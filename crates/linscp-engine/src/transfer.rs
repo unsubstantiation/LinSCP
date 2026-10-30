@@ -4,6 +4,7 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use linscp_crypto::digests::sha256_hex;
 use linscp_platform::terminal::{
@@ -32,6 +33,8 @@ pub struct TransferFlags {
     pub recursive: bool,
     /// Publish a staged download only if the destination does not exist.
     pub no_clobber: bool,
+    /// Cooperative cancellation checked between I/O operations.
+    pub cancel_flag: Option<Arc<AtomicBool>>,
     pub resume_support: ResumeSupportMode,
     pub explicit_resume_support: bool,
     pub permissions: PresetPermissions,
@@ -54,6 +57,7 @@ impl Default for TransferFlags {
             append: false,
             recursive: false,
             no_clobber: false,
+            cancel_flag: None,
             resume_support: ResumeSupportMode::Smart(100 * 1024),
             explicit_resume_support: false,
             permissions: PresetPermissions::Off,
@@ -154,6 +158,7 @@ pub fn should_use_filepart(
 /// returning `ErrorKind::Interrupted` immediately on Ctrl+C / SIGTERM so `.filepart` stays intact.
 struct InterruptibleReader<R> {
     inner: R,
+    cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for InterruptibleReader<R> {
@@ -162,6 +167,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for InterruptibleReader<R> {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        if self.cancel_flag.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            return std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, "Transfer cancelled.")));
+        }
         if is_interrupted() {
             return std::task::Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
@@ -175,6 +183,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for InterruptibleReader<R> {
 /// AsyncWrite adapter that checks `linscp_platform::terminal::is_interrupted()` on every write.
 struct InterruptibleWriter<W> {
     inner: W,
+    cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 impl<W: AsyncWrite + Unpin> AsyncWrite for InterruptibleWriter<W> {
@@ -183,6 +192,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for InterruptibleWriter<W> {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.cancel_flag.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            return std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, "Transfer cancelled.")));
+        }
         if is_interrupted() {
             return std::task::Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
@@ -331,7 +343,7 @@ pub async fn download_single_file(
             speed_kbytes_per_sec: speed_u32(flags.speed_kbytes_per_sec),
             version_id: flags.version_id.clone(),
         };
-        let mut writer = InterruptibleWriter { inner: &mut mem };
+        let mut writer = InterruptibleWriter { inner: &mut mem, cancel_flag: flags.cancel_flag.clone() };
         if let Err(e) = session
             .download(remote_path, req, &mut writer, progress)
             .await
@@ -393,6 +405,7 @@ pub async fn download_single_file(
         };
         let mut writer = InterruptibleWriter {
             inner: &mut raw_bytes,
+            cancel_flag: flags.cancel_flag.clone(),
         };
         if let Err(e) = session
             .download(remote_path, req, &mut writer, progress)
@@ -504,7 +517,7 @@ pub async fn download_single_file(
         version_id: flags.version_id.clone(),
     };
     let dl_res = {
-        let mut writer = InterruptibleWriter { inner: &mut file };
+        let mut writer = InterruptibleWriter { inner: &mut file, cancel_flag: flags.cancel_flag.clone() };
         session
             .download(remote_path, req, &mut writer, progress)
             .await
@@ -521,6 +534,9 @@ pub async fn download_single_file(
         }
     };
 
+    if flags.cancel_flag.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Err("Transfer cancelled before publication.".to_string());
+    }
     if let Some(ref sp) = stage_opt {
         let publish = if flags.no_clobber {
             // The hard link is an atomic create-if-absent on the same filesystem.
@@ -597,7 +613,7 @@ pub async fn upload_single_file(
         };
         let total = payload.len() as u64;
         let mut cursor = std::io::Cursor::new(payload);
-        let mut reader = InterruptibleReader { inner: &mut cursor };
+        let mut reader = InterruptibleReader { inner: &mut cursor, cancel_flag: flags.cancel_flag.clone() };
         let req = TransferRequest {
             resume_offset: 0,
             append: flags.append,
@@ -670,7 +686,7 @@ pub async fn upload_single_file(
         let converted = convert_eol_bytes(&raw, target_eol);
         let total = converted.len() as u64;
         let mut cursor = std::io::Cursor::new(converted);
-        let mut reader = InterruptibleReader { inner: &mut cursor };
+        let mut reader = InterruptibleReader { inner: &mut cursor, cancel_flag: flags.cancel_flag.clone() };
         let req = TransferRequest {
             resume_offset: 0,
             append: flags.append,
@@ -754,7 +770,7 @@ pub async fn upload_single_file(
             .map_err(|e| format!("Cannot seek local file '{src_label}': {e}"))?;
     }
     let async_file = tokio::fs::File::from_std(std_file);
-    let mut reader = InterruptibleReader { inner: async_file };
+    let mut reader = InterruptibleReader { inner: async_file, cancel_flag: flags.cancel_flag.clone() };
     let remaining = local_info.size.saturating_sub(resume_offset);
 
     let req = TransferRequest {
@@ -776,6 +792,9 @@ pub async fn upload_single_file(
         return Err(msg);
     }
 
+    if flags.cancel_flag.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Err("Transfer cancelled before publication.".to_string());
+    }
     if let Some(ref sp) = stage_opt {
         if upload_path == *sp {
             // S3 CopyObject and WebDAV MOVE(Overwrite: T) replace atomically; POSIX/FTP servers may refuse rename over existing file
