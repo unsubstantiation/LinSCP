@@ -2477,7 +2477,7 @@ mod tests {
         let remote = tmp.join("remote"); let local = tmp.join("local"); let downloaded = tmp.join("downloaded");
         for p in [&remote, &local, &downloaded] { std::fs::create_dir_all(p).unwrap(); }
         let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestSftpServer.py");
-        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_ROOT", &remote).env("LSCP_TEST_WRITE_DELAY", "0.01")
+        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_ROOT", &remote).env("LSCP_TEST_WRITE_DELAY", "0.01").env("LSCP_TEST_READ_DELAY", "0.005")
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let mut server = Server(child);
         let mut line = String::new();
@@ -2635,6 +2635,82 @@ mod tests {
         }
         assert_eq!(std::fs::read(downloaded.join("tree/nested/data.txt")).unwrap(), b"directory roundtrip");
         assert!(downloaded.join("tree/empty").is_dir());
+        assert!(!std::fs::read_dir(&downloaded).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-tree-")));
+        // A failed new-tree copy must leave neither its final directory nor
+        // its privately staged partial tree, while preserving other data.
+        std::fs::create_dir_all(remote.join("bad-tree")).unwrap();
+        std::fs::write(remote.join("bad-tree/aaa-file"), b"partial data").unwrap();
+        std::os::unix::fs::symlink(remote.join("upload.txt"), remote.join("bad-tree/zzz-link")).unwrap();
+        let failed_index = svc.queue.snapshot().0.len();
+        let bad_tree = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["bad-tree"]}))).await;
+        assert_eq!(bad_tree.status, 200, "{}", bad_tree.payload);
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(failed_index).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert!(!downloaded.join("bad-tree").exists());
+        assert!(!std::fs::read_dir(&downloaded).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-tree-")));
+        assert_eq!(std::fs::read(downloaded.join("tree/nested/data.txt")).unwrap(), b"directory roundtrip");
+        // Cancellation of an in-progress tree copy also removes its stage.
+        std::fs::create_dir_all(remote.join("slow-tree")).unwrap();
+        std::fs::write(remote.join("slow-tree/large.bin"), vec![21u8; 4 * 1024 * 1024]).unwrap();
+        let slow_tree_index = svc.queue.snapshot().0.len();
+        let slow_tree = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["slow-tree"]}))).await;
+        assert_eq!(slow_tree.status, 200, "{}", slow_tree.payload);
+        let mut tree_task_id = None;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(task) = tasks.get(slow_tree_index) {
+                if task["status"] == "Running" && task["bytes_done"].as_u64().unwrap_or(0) > 0 { tree_task_id = task["id"].as_u64(); break; }
+                assert_ne!(task["status"], "Completed", "tree completed before cancellation");
+                assert_ne!(task["status"], "Failed", "{tasks:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let cancelled = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": tree_task_id.expect("tree download did not start")}))).await;
+        assert_eq!(cancelled.status, 200, "{}", cancelled.payload);
+        let mut stopped = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(slow_tree_index).and_then(|t| t["status"].as_str()) == Some("Cancelled") { stopped = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped, "tree cancellation was not observed");
+        assert!(!downloaded.join("slow-tree").exists());
+        assert!(!std::fs::read_dir(&downloaded).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-tree-")));
+        assert_eq!(std::fs::metadata(remote.join("slow-tree/large.bin")).unwrap().len(), 4 * 1024 * 1024);
+        // A competing destination appearing during the copy must survive
+        // atomic no-replace publication; the staged tree is then removed.
+        let race_index = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["slow-tree"]}))).await;
+        assert_eq!(queued.status, 200);
+        let mut started = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(task) = tasks.get(race_index) {
+                if task["status"] == "Running" && task["bytes_done"].as_u64().unwrap_or(0) > 0 { started = true; break; }
+                assert_ne!(task["status"], "Completed", "tree completed before race");
+                assert_ne!(task["status"], "Failed", "{tasks:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(started);
+        std::fs::create_dir_all(downloaded.join("slow-tree")).unwrap();
+        std::fs::write(downloaded.join("slow-tree/keep"), b"concurrent tree").unwrap();
+        let mut race_failed = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(race_index).and_then(|t| t["status"].as_str()) == Some("Failed") { race_failed = true; break; }
+            if tasks.get(race_index).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("competing directory was replaced"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(race_failed);
+        assert_eq!(std::fs::read(downloaded.join("slow-tree/keep")).unwrap(), b"concurrent tree");
+        assert!(!downloaded.join("slow-tree/large.bin").exists());
+        assert!(!std::fs::read_dir(&downloaded).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-tree-")));
         let blocked_merge = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["tree"], "overwrite": "overwrite"}))).await;
         assert_eq!(blocked_merge.status, 409);
         // Merges require a separate, per-root approval and never overwrite files.

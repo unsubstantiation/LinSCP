@@ -77,6 +77,12 @@ def _err(exc_info=None):
 
 
 class DelayedSFTPHandle(SFTPHandle):
+    def read(self, offset, length):
+        delay = float(os.environ.get("LSCP_TEST_READ_DELAY", "0"))
+        if delay:
+            time.sleep(delay)
+        return super().read(offset, length)
+
     def write(self, offset, data):
         delay = float(os.environ.get("LSCP_TEST_WRITE_DELAY", "0"))
         if delay:

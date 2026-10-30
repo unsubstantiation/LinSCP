@@ -104,9 +104,9 @@ pub enum QueueJob {
     },
 }
 
-// These routines create each destination with no-replace operations. They do not
-// merge existing trees or follow symlinks. Failed/cancelled copies leave the new
-// partial tree in place for inspection rather than deleting unrelated data.
+// Directory copies reject symlinks and use no-replace publication for files.
+// Approved merges do not replace files and may leave already-copied entries on
+// error. New downloaded trees are staged privately before atomic publication.
 fn safe_tree_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name == "." || name == ".." || (name.contains('/') || name.contains('\\') || name.contains(':')) || name.chars().any(char::is_control) || Path::new(name).components().count() != 1 {
         return Err("Invalid directory entry name.".to_string());
@@ -701,7 +701,23 @@ impl QueueManager {
                 if entry.is_dir {
                     if session.scheme() != ProtocolScheme::Sftp || *delete_source { return Err("Only SFTP directory copies are supported.".to_string()); }
                     f.no_clobber = true;
-                    download_new_sftp_tree(session.as_ref(), remote_path, local_dest, &f, &mut logger, Some(&*progress), 0).await?;
+                    if f.merge_directories {
+                        // Merges modify an existing tree: do not recursively
+                        // delete anything that might belong to another writer.
+                        download_new_sftp_tree(session.as_ref(), remote_path, local_dest, &f, &mut logger, Some(&*progress), 0).await?;
+                    } else {
+                        // An owned private directory keeps an incomplete tree
+                        // away from its final name. It is removed on error or
+                        // cancellation, best effort, without touching the target.
+                        let parent = local_dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+                        let stage = tempfile::Builder::new().prefix(".linscp-tree-").rand_bytes(16).tempdir_in(parent)
+                            .map_err(|e| format!("Cannot create temporary directory in '{}': {e}", parent.display()))?;
+                        let staged_tree = stage.path().join("contents");
+                        download_new_sftp_tree(session.as_ref(), remote_path, &staged_tree, &f, &mut logger, Some(&*progress), 0).await?;
+                        if task.cancel_flag.load(Ordering::SeqCst) { return Err("Transfer cancelled before publication.".to_string()); }
+                        linscp_platform::gui_os::rename_no_replace(&staged_tree, local_dest)
+                            .map_err(|e| format!("Cannot publish downloaded directory '{}': {e}", local_dest.display()))?;
+                    }
                 } else {
                     if entry.is_symlink { return Err("Refusing to transfer a remote symlink.".to_string()); }
                     download_single_file(
