@@ -2132,6 +2132,22 @@ mod tests {
         }
         assert!(completed);
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/photos/upload.txt", Default::default()).await.unwrap(), b"S3 exclusive upload");
+        // Conditional multipart is unsupported: reject large replacements
+        // rather than silently falling back to an unconditional upload.
+        std::fs::OpenOptions::new().write(true).open(local.join("upload.txt")).unwrap().set_len(16 * 1024 * 1024 + 1).unwrap();
+        let conflict = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"]}))).await;
+        let large_index = svc.queue.snapshot().0.len();
+        let large = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"], "overwrite": "overwrite", "conflict_versions": conflict.payload["conflict_versions"]}))).await;
+        assert_eq!(large.status, 200, "{}", large.payload);
+        let mut large_failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(large_index).and_then(|t| t["status"].as_str()) == Some("Failed") { large_failed = true; break; }
+            if tasks.get(large_index).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("large conditional S3 overwrite unexpectedly succeeded"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(large_failed);
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/photos/upload.txt", Default::default()).await.unwrap(), b"S3 exclusive upload");
         let slow_index = svc.queue.snapshot().0.len();
         let slow = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["slow.bin"]}))).await;
         assert_eq!(slow.status, 200);
