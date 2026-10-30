@@ -176,7 +176,7 @@ fn task_supports_cancellation(job: &QueueJob) -> bool {
     match job {
         QueueJob::LocalCopyOrMove { .. } => true,
         QueueJob::RemoteDownload { session, .. } | QueueJob::RemoteUpload { session, .. } => {
-            matches!(session.scheme(), ProtocolScheme::Sftp)
+            matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs)
         }
         _ => false,
     }

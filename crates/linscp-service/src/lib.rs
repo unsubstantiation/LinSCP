@@ -1982,7 +1982,7 @@ mod tests {
         let local = tmp.join("local"); let downloaded = tmp.join("downloaded");
         std::fs::create_dir_all(&local).unwrap(); std::fs::create_dir_all(&downloaded).unwrap();
         let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestDavServer.py");
-        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0")
+        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_GET_DELAY", "0.005")
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let mut server = Server(child);
         let mut line = String::new();
@@ -2023,6 +2023,53 @@ mod tests {
         assert!(collision.is_err());
         let remote_bytes = linscp_proto::download_bytes(session.as_ref(), "/upload.txt", Default::default()).await.unwrap();
         assert_eq!(remote_bytes, b"WebDAV roundtrip");
+        // Queue a large WebDAV download and cancel it after the first chunk.
+        std::fs::write(local.join("slow.bin"), vec![13u8; 4 * 1024 * 1024]).unwrap();
+        let upload_index = svc.queue.snapshot().0.len();
+        let large_upload = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["slow.bin"]}))).await;
+        assert_eq!(large_upload.status, 200, "{}", large_upload.payload);
+        let mut uploaded = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(upload_index).and_then(|t| t["status"].as_str()) == Some("Completed") { uploaded = true; break; }
+            if tasks.get(upload_index).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("WebDAV upload failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(uploaded);
+        let download_index = svc.queue.snapshot().0.len();
+        let slow_download = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["slow.bin"]}))).await;
+        assert_eq!(slow_download.status, 200);
+        let mut task_id = None;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(task) = tasks.get(download_index) {
+                if task["status"] == "Running" && task["bytes_done"].as_u64().unwrap_or(0) > 0 { task_id = task["id"].as_u64(); break; }
+                assert_ne!(task["status"], "Completed", "download finished before cancellation");
+                assert_ne!(task["status"], "Failed", "{tasks:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let cancelled = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": task_id.expect("download did not start")}))).await;
+        assert_eq!(cancelled.status, 200, "{}", cancelled.payload);
+        let mut stopped = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(download_index).and_then(|t| t["status"].as_str()) == Some("Cancelled") { stopped = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped, "WebDAV cancellation was not observed");
+        assert!(!downloaded.join("slow.bin").exists());
+        assert!(session.stat("/upload.txt").await.unwrap().is_some());
+        // An interrupted PUT must not deadlock the queue or report success.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_flag = Arc::clone(&cancel);
+        let progress = move |_: u64, _: u64| callback_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut cancelling = linscp_engine::transfer::TransferFlags::default();
+        cancelling.no_clobber = true;
+        cancelling.cancel_flag = Some(cancel);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), linscp_engine::transfer::upload_single_file(session.as_ref(), &local.join("slow.bin"), "/cancelled.bin", &cancelling, &mut logger, Some(&progress))).await.expect("cancelled PUT hung");
+        assert!(result.is_err());
+        assert!(session.stat("/upload.txt").await.unwrap().is_some());
         drop(server); let _ = std::fs::remove_dir_all(tmp);
     }
 

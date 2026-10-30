@@ -25,6 +25,8 @@ import calendar
 import datetime
 import hashlib
 import json
+import os
+import time
 import re
 import sys
 import threading
@@ -335,7 +337,14 @@ class DavHandler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.end_headers()
         if self.command != "HEAD" and body and status not in (204, 304):
-            self.wfile.write(body)
+            delay = float(os.environ.get("LSCP_TEST_GET_DELAY", "0"))
+            if self.command == "GET" and delay:
+                for offset in range(0, len(body), 32768):
+                    self.wfile.write(body[offset:offset + 32768])
+                    self.wfile.flush()
+                    time.sleep(delay)
+            else:
+                self.wfile.write(body)
 
     def send_error_text(self, status, text):
         self.send_body(status, text)
@@ -661,6 +670,9 @@ class DavHandler(BaseHTTPRequestHandler):
     def do_PUT(self):
         length = int(self.headers.get("Content-Length") or "0")
         data = self.rfile.read(length) if length else b""
+        if len(data) != length:
+            self.close_connection = True
+            return
         if not self.authorized():
             return
         path = self.local_path()
