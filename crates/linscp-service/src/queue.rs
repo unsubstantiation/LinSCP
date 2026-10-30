@@ -303,6 +303,9 @@ impl QueueManager {
                     t.error = Some("Cancelled by user.".to_string());
                     to_clean = Some(t.clone());
                     changed = true;
+                } else if t.status == "running" && matches!(&t.job, QueueJob::LocalCopyOrMove { .. }) {
+                    t.cancel_flag.store(true, Ordering::SeqCst);
+                    changed = true;
                 }
             }
         }
@@ -321,7 +324,7 @@ impl QueueManager {
         {
             let mut g = self.inner.lock().expect("queue mutex");
             for t in &mut g.tasks {
-                if t.tab_id == Some(tab_id) && (t.status == "queued" || t.status == "running") {
+                if t.tab_id == Some(tab_id) && (t.status == "queued" || (t.status == "running" && matches!(&t.job, QueueJob::LocalCopyOrMove { .. }))) {
                     t.cancel_flag.store(true, Ordering::SeqCst);
                     if t.status == "queued" {
                         t.status = "cancelled".to_string();
@@ -479,7 +482,7 @@ impl QueueManager {
                 let mut g = self.inner.lock().expect("queue mutex");
                 let mut clean = false;
                 if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task.id) {
-                    if cancelled {
+                    if cancelled && result.is_err() {
                         t.status = "cancelled".to_string();
                         t.error = Some("Cancelled by user.".to_string());
                         clean = true;
@@ -592,6 +595,7 @@ impl QueueManager {
                     .ok_or_else(|| format!("Remote item '{remote_path}' does not exist."))?;
                 let mut f = flags.clone();
                 f.delete_source = *delete_source;
+                f.no_clobber = !allow_overwrite;
                 if entry.is_dir {
                     f.recursive = true;
                     download_directory_recursive(
@@ -1030,9 +1034,11 @@ fn local_copy_recursive(
     );
     let tmp_path = parent.join(tmp_name);
 
+    let mut created_tmp = false;
     let copy_res = (|| -> Result<(), String> {
         let mut reader = std::fs::File::open(source).map_err(|e| e.to_string())?;
-        let mut writer = std::fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
+        let mut writer = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp_path).map_err(|e| e.to_string())?;
+        created_tmp = true;
         let mut buf = vec![0u8; 256 * 1024];
         loop {
             if cancel.load(Ordering::SeqCst) {
@@ -1056,11 +1062,17 @@ fn local_copy_recursive(
             let _ = set_local_permissions(&tmp_path, ext.mode);
             let _ = set_local_file_times(&tmp_path, ext.mtime_secs, ext.mtime_secs);
         }
-        std::fs::rename(&tmp_path, target).map_err(|e| e.to_string())?;
+        if policy == ConflictPolicy::Ask || policy == ConflictPolicy::Skip || policy == ConflictPolicy::Rename {
+            // Publish without replacing a destination created after preflight.
+            std::fs::hard_link(&tmp_path, target).map_err(|e| e.to_string())?;
+            let _ = std::fs::remove_file(&tmp_path);
+        } else {
+            std::fs::rename(&tmp_path, target).map_err(|e| e.to_string())?;
+        }
         Ok(())
     })();
 
-    if copy_res.is_err() {
+    if copy_res.is_err() && created_tmp {
         let _ = std::fs::remove_file(&tmp_path);
     }
     copy_res
@@ -1214,4 +1226,45 @@ pub async fn delete_remote_recursive_quiet(
         .remove_dir(remote_path)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod transfer_safety_tests {
+    use super::*;
+
+    #[test]
+    fn local_copy_does_not_replace_destination_created_during_copy() {
+        let dir = std::env::temp_dir().join(format!("linscp-copy-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source");
+        let target = dir.join("target");
+        std::fs::write(&source, vec![42u8; 1024 * 1024]).unwrap();
+        let target_for_callback = target.clone();
+        let progress = move |_: u64, _: u64| {
+            if !target_for_callback.exists() {
+                std::fs::write(&target_for_callback, b"concurrent data").unwrap();
+            }
+        };
+        assert!(execute_local_item(&source, &target, false, ConflictPolicy::Ask, &AtomicBool::new(false), &progress).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"concurrent data");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn local_copy_cancellation_does_not_publish_partial_file() {
+        let dir = std::env::temp_dir().join(format!("linscp-copy-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source");
+        let target = dir.join("target");
+        std::fs::write(&source, vec![42u8; 1024 * 1024]).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        let progress = move |_: u64, _: u64| flag.store(true, Ordering::SeqCst);
+        assert!(execute_local_item(&source, &target, false, ConflictPolicy::Ask, &cancel, &progress).is_err());
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

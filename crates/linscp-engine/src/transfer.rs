@@ -30,6 +30,8 @@ pub struct TransferFlags {
     pub resume: bool,
     pub append: bool,
     pub recursive: bool,
+    /// Publish a staged download only if the destination does not exist.
+    pub no_clobber: bool,
     pub resume_support: ResumeSupportMode,
     pub explicit_resume_support: bool,
     pub permissions: PresetPermissions,
@@ -51,6 +53,7 @@ impl Default for TransferFlags {
             resume: false,
             append: false,
             recursive: false,
+            no_clobber: false,
             resume_support: ResumeSupportMode::Smart(100 * 1024),
             explicit_resume_support: false,
             permissions: PresetPermissions::Off,
@@ -437,8 +440,13 @@ pub async fn download_single_file(
         None
     };
 
+    if flags.no_clobber && (stage_opt.is_none() || flags.resume || flags.append) {
+        return Err("Safe no-overwrite downloads require a fresh staging file.".to_string());
+    }
     let can_resume_proto = !matches!(session.scheme(), ProtocolScheme::Scp | ProtocolScheme::Ssh);
-    let (write_path, resume_offset) = if let Some(ref sp) = stage_opt {
+    let (write_path, resume_offset) = if flags.no_clobber {
+        (stage_opt.as_ref().expect("checked above").clone(), 0u64)
+    } else if let Some(ref sp) = stage_opt {
         let sp_meta = stat_local_path(sp);
         if can_resume_proto && sp_meta.exists && sp_meta.is_regular {
             if sp_meta.size < info.size {
@@ -469,7 +477,9 @@ pub async fn download_single_file(
         (local_dest.to_path_buf(), 0u64)
     };
 
-    let open_res = if resume_offset > 0 || flags.append {
+    let open_res = if flags.no_clobber {
+        tokio::fs::OpenOptions::new().write(true).create_new(true).open(&write_path).await
+    } else if resume_offset > 0 || flags.append {
         tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -512,10 +522,17 @@ pub async fn download_single_file(
     };
 
     if let Some(ref sp) = stage_opt {
-        if local_dest.exists() {
-            let _ = std::fs::remove_file(local_dest);
-        }
-        std::fs::rename(sp, local_dest).map_err(|e| {
+        let publish = if flags.no_clobber {
+            // The hard link is an atomic create-if-absent on the same filesystem.
+            // Never fall back to rename, which can replace a newly created target.
+            std::fs::hard_link(sp, local_dest).map(|_| { let _ = std::fs::remove_file(sp); })
+        } else {
+            if local_dest.exists() {
+                let _ = std::fs::remove_file(local_dest);
+            }
+            std::fs::rename(sp, local_dest)
+        };
+        publish.map_err(|e| {
             let msg = format!(
                 "Cannot finalize downloaded file '{}' -> '{}': {e}",
                 sp.display(),

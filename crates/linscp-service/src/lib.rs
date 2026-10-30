@@ -1956,6 +1956,18 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(std::fs::read(downloaded.join("upload.txt")).unwrap(), b"hello from native");
+        // Create a competing destination during the transfer, after preflight.
+        let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        let raced_target = downloaded.join("race.txt");
+        let callback_target = raced_target.clone();
+        let progress = move |_: u64, _: u64| { std::fs::write(&callback_target, b"concurrent data").unwrap(); };
+        let mut flags = linscp_engine::transfer::TransferFlags::default();
+        flags.no_clobber = true;
+        flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
+        let mut logger = linscp_engine::xml_log::SessionLogger::open(None, 0, false, None, None, false, "").unwrap();
+        let race = linscp_engine::transfer::download_single_file(session.as_ref(), "/upload.txt", None, &raced_target, &flags, &mut logger, Some(&progress)).await;
+        assert!(race.is_err(), "concurrent destination must not be replaced");
+        assert_eq!(std::fs::read(&raced_target).unwrap(), b"concurrent data");
         std::fs::write(local.join("another.txt"), b"new data").unwrap();
         std::fs::write(remote.join("another.txt.filepart"), b"unrelated partial").unwrap();
         let blocked = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["another.txt"]}))).await;
