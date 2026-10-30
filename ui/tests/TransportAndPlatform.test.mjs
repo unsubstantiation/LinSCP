@@ -334,7 +334,7 @@ test('directory merge requires explicit approval and forwards only approved root
 });
 
 test('FTP uploads require risk confirmation and separately confirm existing files', async () => {
-  const html = fs.readFileSync(path.join(repoRoot, 'source/gui/web/index.html'), 'utf8');
+  const html = fs.readFileSync(path.join(repoRoot, 'source/gui/web/index.html'), 'utf8').replace(/\r\n/g, '\n');
   const match = html.match(/async function queueWithOverwriteDecision\(endpoint, payload, conflicts\) \{[\s\S]*?\n  \}\n\n  async function transfer/);
   assert.ok(match);
   const source = match[0].replace(/\n\n  async function transfer$/, '');

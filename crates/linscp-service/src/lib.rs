@@ -2184,7 +2184,6 @@ mod tests {
         }
         assert!(large_failed);
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/photos/upload.txt", Default::default()).await.unwrap(), b"S3 exclusive upload");
-        exercise_ftp_uploads(&svc, id, &local, &remote).await;
         let slow_index = svc.queue.snapshot().0.len();
         let slow = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["slow.bin"]}))).await;
         assert_eq!(slow.status, 200);
@@ -2394,6 +2393,7 @@ mod tests {
         }
         assert!(done, "FTP download timed out");
         assert_eq!(std::fs::read(local.join("download.txt")).unwrap(), b"FTP roundtrip");
+        exercise_ftp_uploads(&svc, id, &local, &remote).await;
         let slow_index = svc.queue.snapshot().0.len();
         let slow = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["slow.bin"]}))).await;
         assert_eq!(slow.status, 200, "{}", slow.payload);
