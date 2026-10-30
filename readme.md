@@ -9,9 +9,10 @@ is experimental and is not ready for production transfers.** Remote listing
 and queued file uploads and downloads are implemented. SFTP and plain HTTP
 WebDAV connections and transfers have live integration tests; FTP and explicit
 FTPS connection, listing and download, and S3 connection and small-file transfers,
-also have live tests. SFTP directory
-copies are supported only into new destinations; directory merges and remote
-moves are unsupported. Local moves are supported on the same filesystem on Linux
+also have live tests. SFTP directories can be copied to new destinations or
+merged into explicitly approved existing directories. Merges fail rather than
+replace conflicting files and are not transactional; concurrent directory path
+changes can still affect them. Other directory merges and remote moves are unsupported. Local moves are supported on the same filesystem on Linux
 and Windows, without replacing existing destinations. Resumption is unsupported.
 Running local copies, SFTP and WebDAV transfers, and FTP, FTPS and S3 downloads
 can be cancelled cooperatively. An interrupted FTP/FTPS transfer invalidates its

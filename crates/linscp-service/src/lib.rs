@@ -2692,6 +2692,18 @@ mod tests {
         assert!(done);
         assert_eq!(std::fs::read(downloaded.join("merge-down/nested/new.txt")).unwrap(), b"new download");
         assert_eq!(std::fs::read(downloaded.join("merge-down/nested/kept.txt")).unwrap(), b"keep local");
+        std::fs::write(remote.join("merge-down/nested/kept.txt"), b"must not replace").unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let conflict = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["merge-down"], "merge_directories": ["merge-down"]}))).await;
+        assert_eq!(conflict.status, 200);
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert_eq!(std::fs::read(downloaded.join("merge-down/nested/kept.txt")).unwrap(), b"keep local");
         // Approval for other roots must not authorize merging a directory
         // that appears after this transfer was queued.
         std::fs::create_dir_all(local.join("new-root")).unwrap();
