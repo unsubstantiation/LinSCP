@@ -2370,6 +2370,36 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn live_ftps_implicit_gui_upload() {
+        if std::env::var_os("LSCP_LIVE_FTPS_IMPLICIT").is_none() { return; }
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        struct Server(std::process::Child);
+        impl Drop for Server { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let tmp = std::env::temp_dir().join(format!("linscp-live-implicit-ftps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let remote = tmp.join("remote"); let local = tmp.join("local");
+        std::fs::create_dir_all(&remote).unwrap(); std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(remote.join("download.txt"), b"implicit FTPS").unwrap();
+        let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests");
+        let child = Command::new("/usr/bin/python3").arg(tests.join("TestFtpServer.py"))
+            .env("LSCP_TEST_ROOT", &remote).env("LSCP_TEST_FTP_TLS", "1").env("LSCP_TEST_FTP_IMPLICIT", "1")
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut server = Server(child); let mut line = String::new();
+        BufReader::new(server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let port: u16 = line.trim().strip_prefix("READY ").expect("implicit FTPS server failed to start").parse().unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let request = |body: Value| ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body };
+        let open = svc.dispatch_async(request(json!({"session": {"protocol": "ftps", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "tls_ca_file": tests.join("fixtures/s3-server-cert.pem"), "local_dir": local, "initial_dir": "/"}}))).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        exercise_ftp_uploads(&svc, id, &local, &remote).await;
+        exercise_ftp_upload_cancellation(&svc, id, &local, &remote).await;
+        drop(server); let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn live_ftp_gui_download() {
         if std::env::var_os("LSCP_LIVE_FTP").is_none() { return; }
         use std::io::{BufRead, BufReader};

@@ -8,7 +8,14 @@ root = os.environ["LSCP_TEST_ROOT"]
 authorizer = DummyAuthorizer()
 authorizer.add_user("testuser", "testpass", root, perm="elradfmwMT")
 if os.environ.get("LSCP_TEST_FTP_TLS") == "1":
-    handler = TLS_FTPHandler
+    if os.environ.get("LSCP_TEST_FTP_IMPLICIT") == "1":
+        class ImplicitTLSHandler(TLS_FTPHandler):
+            def handle(self):
+                self.secure_connection(self.ssl_context)
+                super().handle()
+        handler = ImplicitTLSHandler
+    else:
+        handler = TLS_FTPHandler
     fixtures = os.path.join(os.path.dirname(__file__), "fixtures")
     handler.certfile = os.path.join(fixtures, "s3-server-cert.pem")
     handler.keyfile = os.path.join(fixtures, "s3-server-key.pem")

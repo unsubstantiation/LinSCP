@@ -58,6 +58,11 @@ jobs:
           LSCP_LIVE_FTPES: "1"
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ftpes_gui_download -- --nocapture
 
+      - name: Exercise implicit FTPS upload
+        env:
+          LSCP_LIVE_FTPS_IMPLICIT: "1"
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ftps_implicit_gui_upload -- --nocapture
+
       - name: Exercise native S3 TLS connection and download
         env:
           LSCP_LIVE_S3: "1"
