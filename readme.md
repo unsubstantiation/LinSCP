@@ -7,10 +7,12 @@ runs in a native Tauri window backed by the Rust transfer engine. No separate
 command-line client or browser server is built or distributed. **The native GUI
 is experimental and is not ready for production transfers.** Remote listing
 and queued single-file uploads and downloads are implemented; SFTP connections,
-host-key approval and round-trip transfers have a live integration test. Other
-protocols are not yet verified. Directory transfers, moves, resumption and
-running-transfer cancellation are not supported. Conflict checks are not atomic,
-so concurrent changes to destination paths can still lead to overwrites.
+host-key approval and SFTP and plain HTTP WebDAV round-trip transfers have live
+integration tests. Other protocols are not yet verified. Directory transfers,
+moves, resumption and running remote-transfer cancellation are not supported.
+Running local copies can be cancelled. Local copies and downloads without
+approved overwrite use atomic no-replace publication; remote uploads still have
+non-atomic conflict checks and can overwrite concurrently created files.
 Unsupported operations return an error rather than reporting success.
 
 ## Build the desktop application
