@@ -18,10 +18,11 @@ cancelled cooperatively; cancellation may leave partial files or directories.
 Without overwrite approval, local copies and downloads use no-replace publication,
 and SFTP, WebDAV and S3 uploads use exclusive creation. S3 exclusive uploads are
 limited to 16 MiB; other protocols cannot yet perform unapproved-overwrite uploads.
-Approved WebDAV file overwrites require a strong ETag and use conditional PUT,
-relying on the server to enforce it. Other approved overwrites do not protect
-against a destination changing after approval. FTP/FTPS uploads and other
-protocols and configurations remain unverified.
+Queued WebDAV and S3 file overwrites require a strong ETag and use conditional
+PUT, relying on server enforcement; S3 conditional uploads are limited to 16 MiB.
+An ETag is not necessarily a unique version: changes that retain the same ETag
+may not be detected. Other queued overwrites are rejected until they can be made
+safe. FTP/FTPS uploads and other protocols and configurations remain unverified.
 Unsupported operations return an error rather than reporting success.
 
 ## Build the desktop application
