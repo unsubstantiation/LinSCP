@@ -2391,6 +2391,7 @@ mod tests {
         }
         assert!(stopped, "WebDAV cancellation was not observed");
         assert!(!downloaded.join("slow.bin").exists());
+        assert!(!std::fs::read_dir(&downloaded).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-download-")), "cancelled WebDAV download left an owned temporary file");
         assert!(session.stat("/upload.txt").await.unwrap().is_some());
         // An interrupted PUT must not deadlock the queue or report success.
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
