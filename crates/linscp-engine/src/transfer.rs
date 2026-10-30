@@ -715,6 +715,26 @@ pub async fn upload_single_file(
         return Ok(true);
     }
 
+    if flags.no_clobber {
+        if flags.resume || flags.append || effective_ascii {
+            return Err("Exclusive uploads require a fresh binary transfer.".to_string());
+        }
+        let input = tokio::fs::File::open(local_src).await.map_err(|e| format!("Cannot open local file '{src_label}': {e}"))?;
+        let mut reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
+        let req = TransferRequest {
+            resume_offset: 0, append: false, preserve_time: desired_mtime.is_some(),
+            mtime: desired_mtime, permissions: desired_perms,
+            speed_kbytes_per_sec: speed_u32(flags.speed_kbytes_per_sec), version_id: None,
+        };
+        let bytes = session.upload_exclusive(remote_dest, req, &mut reader, Some(local_info.size), progress)
+            .await.map_err(|e| e.to_string())?;
+        logger.record_transfer(true, &src_label, remote_dest, Some(bytes), Ok(()));
+        if flags.delete_source {
+            std::fs::remove_file(local_src).map_err(|e| format!("Cannot remove source '{src_label}': {e}"))?;
+        }
+        return Ok(true);
+    }
+
     let use_stage = should_use_filepart(flags, session.scheme(), true, false, local_info.size);
     let stage_opt = if use_stage {
         remote_stage_path(remote_dest, None)

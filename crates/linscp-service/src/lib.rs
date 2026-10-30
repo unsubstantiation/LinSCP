@@ -2037,6 +2037,19 @@ mod tests {
         assert!(!remote.join("cancelled.bin").exists());
         assert!(remote.join("cancelled.bin.filepart").exists());
         assert!(session.stat("/upload.txt").await.unwrap().is_some());
+        // Exclusive creation must fail without changing a destination that
+        // appeared after any earlier conflict check.
+        let mut exclusive = linscp_engine::transfer::TransferFlags::default();
+        exclusive.no_clobber = true;
+        let collision = linscp_engine::transfer::upload_single_file(session.as_ref(), &local.join("large.bin"), "/upload.txt", &exclusive, &mut logger, None).await;
+        assert!(collision.is_err());
+        assert_eq!(std::fs::read(remote.join("upload.txt")).unwrap(), b"hello from native");
+        cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+        exclusive.cancel_flag = Some(Arc::clone(&cancel));
+        let direct_cancel = linscp_engine::transfer::upload_single_file(session.as_ref(), &local.join("large.bin"), "/exclusive-cancelled.bin", &exclusive, &mut logger, Some(&cancel_on_progress)).await;
+        assert!(direct_cancel.is_err());
+        let partial = std::fs::metadata(remote.join("exclusive-cancelled.bin")).unwrap();
+        assert!(partial.len() < 512 * 1024);
         std::fs::write(local.join("another.txt"), b"new data").unwrap();
         std::fs::write(remote.join("another.txt.filepart"), b"unrelated partial").unwrap();
         let blocked = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["another.txt"]}))).await;

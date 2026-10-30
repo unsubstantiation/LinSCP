@@ -354,6 +354,18 @@ pub trait RemoteSession: Send + Sync {
         total_size: Option<u64>,
         progress: Option<&ProgressCallback>,
     ) -> Result<u64, ProtoError>;
+    /// Create a new destination atomically, failing if any entry already exists.
+    /// Implementations must not silently fall back to an overwriting upload.
+    async fn upload_exclusive(
+        &self,
+        _remote_path: &str,
+        _opts: TransferRequest,
+        _source: &mut (dyn AsyncRead + Unpin + Send),
+        _total_size: Option<u64>,
+        _progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        Err(ProtoError::UnsupportedCapability("exclusive upload", self.scheme()))
+    }
     async fn probe_endpoint(&self, _initial_dir: &str) -> Result<(), ProtoError> {
         Ok(())
     }
