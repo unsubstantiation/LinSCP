@@ -353,6 +353,13 @@ pub trait RemoteSession: Send + Sync {
     ) -> Result<u64, ProtoError> {
         Err(ProtoError::UnsupportedCapability("conditional download", self.scheme()))
     }
+    /// Compare a local prefix against an ETag-pinned remote representation.
+    async fn verify_prefix_if_match(
+        &self, _remote_path: &str, _etag: &str, _prefix_len: u64, _total_len: u64,
+        _prefix: &mut (dyn AsyncRead + Unpin + Send),
+    ) -> Result<(), ProtoError> {
+        Err(ProtoError::UnsupportedCapability("verified resume", self.scheme()))
+    }
     /// Remove only the representation matching the supplied strong ETag.
     async fn remove_if_match(&self, _remote_path: &str, _etag: &str) -> Result<(), ProtoError> {
         Err(ProtoError::UnsupportedCapability("conditional delete", self.scheme()))

@@ -1066,6 +1066,19 @@ impl WebDavSession {
                 resp.status()
             )));
         }
+        if opts.resume_offset > 0 {
+            let range = resp.headers().get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let Some((bounds, total)) = range.strip_prefix("bytes ").and_then(|v| v.split_once('/')) else {
+                return Err(ProtoError::Transport("WebDAV returned an invalid Content-Range.".to_string()));
+            };
+            let Some((start, end)) = bounds.split_once('-').and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))) else {
+                return Err(ProtoError::Transport("WebDAV returned an invalid Content-Range.".to_string()));
+            };
+            let total = total.parse::<u64>().map_err(|_| ProtoError::Transport("WebDAV returned an invalid Content-Range total.".to_string()))?;
+            if start != opts.resume_offset || end.checked_add(1) != Some(total) || start > end {
+                return Err(ProtoError::Transport("WebDAV returned an inconsistent resume range.".to_string()));
+            }
+        }
         if !resp.status().is_success() {
             if resp.status().as_u16() == 404 {
                 return Err(ProtoError::Transport(
@@ -1360,6 +1373,33 @@ impl RemoteSession for WebDavSession {
         sink: &mut (dyn AsyncWrite + Unpin + Send), progress: Option<&ProgressCallback>,
     ) -> Result<u64, ProtoError> {
         self.download_inner(remote_path, opts, sink, progress, Some(etag)).await
+    }
+
+    async fn verify_prefix_if_match(
+        &self, remote_path: &str, etag: &str, prefix_len: u64, total_len: u64,
+        prefix: &mut (dyn AsyncRead + Unpin + Send),
+    ) -> Result<(), ProtoError> {
+        if !valid_strong_etag(etag) || prefix_len == 0 || prefix_len > total_len {
+            return Err(ProtoError::Transport("Invalid verified-resume prefix or ETag.".to_string()));
+        }
+        let mut response = self.apply_auth(self.client.get(self.url_for(remote_path, false)))
+            .header("If-Match", etag).header("Range", format!("bytes=0-{}", prefix_len - 1)).send().await
+            .map_err(|e| ProtoError::Transport(format!("WebDAV prefix verification failed: {}", format_reqwest_err(&e))))?;
+        let expected = format!("bytes 0-{}/{}", prefix_len - 1, total_len);
+        let received = response.headers().get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if response.status().as_u16() != 206 || received != expected {
+            return Err(ProtoError::Transport("WebDAV did not return the expected conditional prefix range.".to_string()));
+        }
+        let mut compared = 0u64;
+        while let Some(chunk) = response.chunk().await.map_err(|e| ProtoError::Transport(format!("WebDAV prefix stream failed: {e}")))? {
+            compared = compared.checked_add(chunk.len() as u64).ok_or_else(|| ProtoError::Transport("Prefix length overflow.".to_string()))?;
+            if compared > prefix_len { return Err(ProtoError::Transport("WebDAV returned too much prefix data.".to_string())); }
+            let mut local = vec![0u8; chunk.len()];
+            prefix.read_exact(&mut local).await.map_err(|e| ProtoError::Transport(format!("Reading local resume prefix failed: {e}")))?;
+            if local.as_slice() != chunk.as_ref() { return Err(ProtoError::Transport("Local partial file does not match the remote source.".to_string())); }
+        }
+        if compared != prefix_len { return Err(ProtoError::Transport("WebDAV returned an incomplete prefix.".to_string())); }
+        Ok(())
     }
 
     async fn remove_if_match(&self, remote_path: &str, etag: &str) -> Result<(), ProtoError> {

@@ -353,7 +353,7 @@ impl CommanderService {
             _ => return api_error(400, "Select at least one file"),
         };
         // Until the queue implements these options, reject rather than silently ignore them.
-        for key in ["append", "newer_only", "resume"] {
+        for key in ["append", "newer_only"] {
             if body.get(key).and_then(Value::as_bool).unwrap_or(false) { return api_error(400, format!("{key} is not yet supported")); }
         }
         for key in ["filemask", "resumesupport"] {
@@ -369,6 +369,10 @@ impl CommanderService {
         if other_dir.is_empty() || other_dir.chars().any(char::is_control) { return api_error(400, "Missing remote directory"); }
         let session = tab.remote.clone();
         if !tab.is_local && session.is_none() { return api_error(400, "Not connected"); }
+        let resume = body.get("resume").and_then(Value::as_bool).unwrap_or(false);
+        if resume && (move_item || upload || tab.is_local || session.as_ref().is_none_or(|s| !matches!(s.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs))) {
+            return api_error(400, "Verified resume is supported only for WebDAV file downloads.");
+        }
         let overwrite = body.get("overwrite").and_then(Value::as_str).unwrap_or("ask");
         if overwrite != "ask" && overwrite != "overwrite" { return api_error(400, "Unsupported overwrite policy"); }
         let mut jobs = Vec::new();
@@ -415,6 +419,7 @@ impl CommanderService {
                 size = if is_dir { 0 } else { entry.size };
                 exists = std::fs::symlink_metadata(&local).is_ok();
             }
+            if resume && is_dir { return api_error(400, "Verified resume is supported only for individual files."); }
             if move_item && !tab.is_local && is_dir { return api_error(400, "WebDAV directory moves are not supported."); }
             if is_dir && !move_item {
                 if tab.is_local || session.as_ref().is_none_or(|s| s.scheme() != linscp_types::ProtocolScheme::Sftp) { return api_error(400, "Directory transfers are supported only for SFTP"); }
@@ -450,21 +455,22 @@ impl CommanderService {
             // Approval applies only to destinations actually present at enqueue.
             // A different item appearing later must not inherit that approval.
             let allow_overwrite = overwrite == "overwrite" && exists && !is_dir;
+            if resume && allow_overwrite { return api_error(400, "Verified resume requires a new local destination."); }
             if allow_overwrite && !is_dav_upload && !is_s3_upload {
                 return api_error(501, "Safe approved overwrites are not yet supported for this transfer. The destination was not changed.");
             }
             let mut flags = linscp_engine::transfer::TransferFlags::default();
             // Resuming existing partial files without verifying their source can
             // splice unrelated bytes into the result. Always stage a fresh copy.
-            flags.resume = false;
+            flags.resume = resume;
             // Approval is per root and only applies to directories that exist now.
             flags.merge_directories = is_dir && exists && merge_names.contains(name);
             flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
             flags.preserve_time = body.get("preserve_time").and_then(Value::as_bool).unwrap_or(true);
-            if move_item && !tab.is_local {
+            if (move_item && !tab.is_local) || resume {
                 let tag = match session.as_ref().unwrap().dav_get_etag(&other).await {
                     Ok((Some(tag), false)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => tag,
-                    Ok(_) => return api_error(400, "WebDAV moves require a strong source ETag."),
+                    Ok(_) => return api_error(400, "WebDAV moves and verified resume require a strong source ETag."),
                     Err(error) => return api_error(400, error.to_string()),
                 };
                 flags.source_etag = Some(tag);
@@ -2507,6 +2513,56 @@ mod tests {
         assert!(failed);
         assert_eq!(std::fs::read(downloaded.join("move-delete-race.txt")).unwrap(), b"original copy");
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/move-delete-race.txt", Default::default()).await.unwrap(), b"changed before conditional delete");
+        // Verified resume compares the entire existing partial to the same
+        // ETag-pinned source before requesting the remaining range.
+        linscp_proto::upload_bytes(session.as_ref(), "/resume-good.txt", b"abcdefghij", Default::default()).await.unwrap();
+        std::fs::write(downloaded.join("resume-good.txt.filepart"), b"abcd").unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let resumed = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["resume-good.txt"], "resume": true}))).await;
+        assert_eq!(resumed.status, 200, "{}", resumed.payload);
+        let mut complete = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { complete = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("verified resume failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(complete);
+        assert_eq!(std::fs::read(downloaded.join("resume-good.txt")).unwrap(), b"abcdefghij");
+        assert_eq!(std::fs::read(downloaded.join("resume-good.txt.filepart")).unwrap(), b"abcd");
+        linscp_proto::upload_bytes(session.as_ref(), "/resume-bad.txt", b"abcdefghij", Default::default()).await.unwrap();
+        std::fs::write(downloaded.join("resume-bad.txt.filepart"), b"xxxx").unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let resumed = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["resume-bad.txt"], "resume": true}))).await;
+        assert_eq!(resumed.status, 200, "{}", resumed.payload);
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("mismatched partial was published"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert!(!downloaded.join("resume-bad.txt").exists());
+        assert_eq!(std::fs::read(downloaded.join("resume-bad.txt.filepart")).unwrap(), b"xxxx");
+        linscp_proto::upload_bytes(session.as_ref(), "/resume-race.txt", b"abcdefghij", Default::default()).await.unwrap();
+        std::fs::write(downloaded.join("resume-race.txt.filepart"), b"abcd").unwrap();
+        svc.queue.pause();
+        let idx = svc.queue.snapshot().0.len();
+        let resumed = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["resume-race.txt"], "resume": true}))).await;
+        assert_eq!(resumed.status, 200, "{}", resumed.payload);
+        linscp_proto::upload_bytes(session.as_ref(), "/resume-race.txt", b"abcdNEWxyz", Default::default()).await.unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("changed source was resumed"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert!(!downloaded.join("resume-race.txt").exists());
+        assert_eq!(std::fs::read(downloaded.join("resume-race.txt.filepart")).unwrap(), b"abcd");
         // Queue a large WebDAV download and cancel it after the first chunk.
         std::fs::write(local.join("slow.bin"), vec![13u8; 4 * 1024 * 1024]).unwrap();
         let upload_index = svc.queue.snapshot().0.len();

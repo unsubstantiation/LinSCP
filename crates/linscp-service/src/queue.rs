@@ -723,16 +723,11 @@ impl QueueManager {
                     }
                 } else {
                     if entry.is_symlink { return Err("Refusing to transfer a remote symlink.".to_string()); }
-                    download_single_file(
-                        session.as_ref(),
-                        remote_path,
-                        Some(&entry),
-                        local_dest,
-                        &f,
-                        &mut logger,
-                        Some(&*progress),
-                    )
-                    .await?;
+                    if f.resume {
+                        linscp_engine::transfer::download_verified_resume(session.as_ref(), remote_path, &entry, local_dest, &f, &mut logger, Some(&*progress)).await?;
+                    } else {
+                        download_single_file(session.as_ref(), remote_path, Some(&entry), local_dest, &f, &mut logger, Some(&*progress)).await?;
+                    }
                     if *delete_source {
                         let etag = f.source_etag.as_deref().ok_or("Move incomplete: local file was published but source identity is missing.")?;
                         session.remove_if_match(remote_path, etag).await.map_err(|e| format!("Move incomplete: local file was published, but remote source deletion could not be confirmed; the source may or may not exist: {e}"))?;

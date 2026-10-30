@@ -12,7 +12,7 @@ use linscp_platform::terminal::{
 };
 use linscp_proto::{ProgressCallback, RemoteSession, TransferRequest};
 use linscp_types::{FileEntry, ProtocolScheme, TransferMode};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
 use crate::filemask::{FileMask, join_remote_path, mode_from_permissions_str};
 use crate::presets::{PresetPermissions, ResumeSupportMode, TransferPreset};
 use crate::text_mode::{EolStyle, convert_eol_bytes, wants_ascii_conversion};
@@ -291,6 +291,72 @@ fn validate_protocol_transfer_flags(
     {
         return Err("The SCP protocol cannot resume transfers.".to_string());
     }
+    Ok(())
+}
+
+/// Resume a WebDAV download only after comparing every existing partial byte
+/// against the same ETag-pinned remote representation. The existing partial is
+/// read-only and is never deleted or modified by this routine.
+pub async fn download_verified_resume(
+    session: &dyn RemoteSession, remote_path: &str, info: &FileEntry, local_dest: &Path,
+    flags: &TransferFlags, logger: &mut SessionLogger, progress: Option<&ProgressCallback>,
+) -> Result<(), String> {
+    let etag = flags.source_etag.as_deref().ok_or("Verified resume requires a strong source ETag.")?;
+    if !flags.no_clobber || flags.append || flags.delete_source || flags.transfer_mode != TransferMode::Binary {
+        return Err("Verified resume requires a fresh binary, no-overwrite download.".to_string());
+    }
+    let checkpoint = local_stage_path(local_dest, None).ok_or("Cannot construct a safe partial-file name.")?;
+    let existing = match std::fs::symlink_metadata(&checkpoint) {
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => true,
+        Ok(_) => return Err("Resume partial must be a regular file, not a symlink or directory.".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(format!("Cannot inspect resume partial: {error}")),
+    };
+    let parent = local_dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let temp = tempfile::Builder::new().prefix(".linscp-download-").rand_bytes(16).tempfile_in(parent)
+        .map_err(|e| format!("Cannot create temporary download: {e}"))?;
+    let (std_file, stage) = temp.into_parts();
+    let mut file = tokio::fs::File::from_std(std_file);
+    let mut offset = 0u64;
+    if existing {
+        let input = tokio::fs::File::open(&checkpoint).await.map_err(|e| format!("Cannot open resume partial: {e}"))?;
+        let reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
+        let mut reader = reader.take(info.size.saturating_add(1));
+        offset = tokio::io::copy(&mut reader, &mut file).await.map_err(|e| format!("Cannot copy resume partial: {e}"))?;
+        if offset > info.size { return Err("Resume partial is larger than the remote file.".to_string()); }
+        file.flush().await.map_err(|e| format!("Cannot flush resume staging file: {e}"))?;
+        if offset > 0 {
+            file.seek(std::io::SeekFrom::Start(0)).await.map_err(|e| e.to_string())?;
+            let mut reader = InterruptibleReader { inner: &mut file, cancel_flag: flags.cancel_flag.clone() };
+            session.verify_prefix_if_match(remote_path, etag, offset, info.size, &mut reader).await.map_err(|e| e.to_string())?;
+        }
+        file.seek(std::io::SeekFrom::End(0)).await.map_err(|e| e.to_string())?;
+    }
+    let result = if offset < info.size || info.size == 0 {
+        let request = TransferRequest { resume_offset: offset, append: false, preserve_time: false, mtime: None, permissions: None, speed_kbytes_per_sec: speed_u32(flags.speed_kbytes_per_sec), version_id: None };
+        let mut writer = InterruptibleWriter { inner: &mut file, cancel_flag: flags.cancel_flag.clone() };
+        session.download_if_match(remote_path, etag, request, &mut writer, progress).await.map_err(|e| e.to_string())
+    } else { Ok(0) };
+    let flush = file.flush().await;
+    drop(file);
+    let received = match result {
+        Ok(n) => n,
+        Err(error) => {
+            let cancelled = flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst));
+            if !existing && !cancelled && flush.is_ok() && std::fs::metadata(&stage).is_ok_and(|m| m.len() > 0) {
+                if std::fs::hard_link(&stage, &checkpoint).is_ok() {
+                    return Err(format!("{error}; a partial file was saved at '{}'.", checkpoint.display()));
+                }
+            }
+            return Err(error);
+        }
+    };
+    flush.map_err(|e| format!("Cannot flush resume staging file: {e}"))?;
+    if offset.checked_add(received) != Some(info.size) { return Err("Remote file length changed during verified resume.".to_string()); }
+    if flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) { return Err("Transfer cancelled before publication.".to_string()); }
+    std::fs::hard_link(&stage, local_dest).map_err(|e| format!("Cannot publish resumed file '{}': {e}", local_dest.display()))?;
+    apply_downloaded_attrs(local_dest, info, flags);
+    logger.record_transfer(false, remote_path, &local_dest.display().to_string(), Some(info.size), Ok(()));
     Ok(())
 }
 
