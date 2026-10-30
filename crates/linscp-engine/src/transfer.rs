@@ -557,7 +557,7 @@ pub async fn download_single_file(
             .download(remote_path, req, &mut writer, progress)
             .await
     };
-    let _ = tokio::io::AsyncWriteExt::flush(&mut file).await;
+    let flush_res = tokio::io::AsyncWriteExt::flush(&mut file).await;
     drop(file);
 
     let bytes = match dl_res {
@@ -569,6 +569,11 @@ pub async fn download_single_file(
         }
     };
 
+    if let Err(err) = flush_res {
+        let msg = format!("Cannot flush downloaded file '{}': {err}", write_path.display());
+        logger.record_transfer(false, remote_path, &dest_label, None, Err(&msg));
+        return Err(msg);
+    }
     if flags.cancel_flag.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst)) {
         return Err("Transfer cancelled before publication.".to_string());
     }
