@@ -40,6 +40,11 @@ jobs:
           LSCP_LIVE_SFTP: "1"
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_sftp_connection_hostkey_upload_download -- --nocapture
 
+      - name: Exercise native WebDAV connection and transfers
+        env:
+          LSCP_LIVE_WEBDAV: "1"
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_webdav_gui_upload_download -- --nocapture
+
       - name: Build the binary package
         run: python3 tools/run_cargo_ci.py dpkg-buildpackage -b -us -uc
 
