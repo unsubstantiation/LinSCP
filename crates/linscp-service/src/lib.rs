@@ -2459,6 +2459,25 @@ mod tests {
         assert!(failed);
         assert!(!downloaded.join("move-before-get.txt").exists());
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/move-before-get.txt", Default::default()).await.unwrap(), b"new source");
+        // A destination appearing after the move was queued must not be
+        // replaced, and the remote source must not be deleted.
+        linscp_proto::upload_bytes(session.as_ref(), "/move-dest-race.txt", b"remote source", Default::default()).await.unwrap();
+        svc.queue.pause();
+        let dest_index = svc.queue.snapshot().0.len();
+        let moved = svc.dispatch_async(request("/api/transfer/move", json!({"tab": id, "direction": "download", "local_dir": downloaded, "remote_dir": "/", "names": ["move-dest-race.txt"]}))).await;
+        assert_eq!(moved.status, 200, "{}", moved.payload);
+        std::fs::write(downloaded.join("move-dest-race.txt"), b"concurrent local destination").unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(dest_index).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(dest_index).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("competing destination was overwritten"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert_eq!(std::fs::read(downloaded.join("move-dest-race.txt")).unwrap(), b"concurrent local destination");
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/move-dest-race.txt", Default::default()).await.unwrap(), b"remote source");
         // A source changed between publication and DELETE remains remote,
         // while the downloaded copy remains local and the task reports failure.
         linscp_proto::upload_bytes(session.as_ref(), "/move-delete-race.txt", b"original copy", Default::default()).await.unwrap();

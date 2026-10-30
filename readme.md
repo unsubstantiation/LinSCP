@@ -12,13 +12,18 @@ FTPS connection, listing and download, and S3 connection and small-file transfer
 also have live tests. SFTP directories can be copied to new destinations or
 merged into explicitly approved existing directories. Merges fail rather than
 replace conflicting files and are not transactional; concurrent directory path
-changes can still affect them. Other directory merges and remote moves are unsupported. Local moves are supported on the same filesystem on Linux
+changes can still affect them. Other directory merges are unsupported. WebDAV files can be moved to a new local
+name using conditional GET and DELETE with the original strong ETag; this relies
+on server enforcement and can leave a duplicate if deletion cannot be confirmed.
+Other remote moves are unsupported. Local moves are supported on the same filesystem on Linux
 and Windows, without replacing existing destinations. Resumption is unsupported.
 Running local copies, SFTP and WebDAV transfers, and FTP, FTPS and S3 downloads
 can be cancelled cooperatively. An interrupted FTP/FTPS transfer invalidates its
 control connection; reconnect before further transfers. Fresh queued file downloads use owned temporary files
 that are removed on cancellation or failure on a best-effort basis; cleanup can
-fail, and uploads and directory transfers may leave partial files or directories.
+fail. New SFTP directory downloads are staged as a tree and published without
+replacement on Linux and Windows; their cleanup is best-effort. Uploads and merges
+may leave partial files or directories.
 Without overwrite approval, local copies and downloads use no-replace publication,
 and SFTP, WebDAV and S3 uploads use exclusive creation. S3 exclusive uploads are
 limited to 16 MiB; other protocols cannot yet perform unapproved-overwrite uploads.
