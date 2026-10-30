@@ -73,6 +73,7 @@ class Store:
         self.write_seq = 0
         self.copy_count = 0
         self.reject_next_copy = False
+        self.drop_next_get = os.environ.get("LSCP_TEST_DROP_ONCE", "")
         # path -> token, and path -> {name: value} for the dead properties.
         # Both are what a LOCK/UNLOCK/PROPPATCH implementation has to keep,
         # and the If header is checked against the first of them.
@@ -337,6 +338,13 @@ class DavHandler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.end_headers()
         if self.command != "HEAD" and body and status not in (204, 304):
+            if self.command == "GET" and status == 200 and self.local_path() == SERVER_STORE.drop_next_get:
+                SERVER_STORE.drop_next_get = ""
+                self.wfile.write(body[:32768])
+                self.wfile.flush()
+                self.close_connection = True
+                self.connection.shutdown(2)
+                return
             delay = float(os.environ.get("LSCP_TEST_GET_DELAY", "0"))
             if self.command == "GET" and delay:
                 for offset in range(0, len(body), 32768):

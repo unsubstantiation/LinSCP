@@ -2354,7 +2354,7 @@ mod tests {
         let local = tmp.join("local"); let downloaded = tmp.join("downloaded");
         std::fs::create_dir_all(&local).unwrap(); std::fs::create_dir_all(&downloaded).unwrap();
         let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestDavServer.py");
-        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_GET_DELAY", "0.005").env("LSCP_TEST_DELETE_RACE", "1")
+        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_GET_DELAY", "0.005").env("LSCP_TEST_DELETE_RACE", "1").env("LSCP_TEST_DROP_ONCE", "/resume-drop.bin")
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let mut server = Server(child);
         let mut line = String::new();
@@ -2563,6 +2563,38 @@ mod tests {
         assert!(failed);
         assert!(!downloaded.join("resume-race.txt").exists());
         assert_eq!(std::fs::read(downloaded.join("resume-race.txt.filepart")).unwrap(), b"abcd");
+        // A network interruption creates a no-clobber checkpoint; retry
+        // verifies it before reusing any bytes and leaves the checkpoint intact.
+        let resume_data = vec![42u8; 256 * 1024];
+        linscp_proto::upload_bytes(session.as_ref(), "/resume-drop.bin", &resume_data, Default::default()).await.unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let first = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["resume-drop.bin"], "resume": true}))).await;
+        assert_eq!(first.status, 200, "{}", first.payload);
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("interrupted download unexpectedly completed"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert!(!downloaded.join("resume-drop.bin").exists());
+        let checkpoint = downloaded.join("resume-drop.bin.filepart");
+        let partial = std::fs::read(&checkpoint).expect("network interruption did not save checkpoint");
+        assert!(!partial.is_empty() && partial.len() < resume_data.len());
+        let retry_index = svc.queue.snapshot().0.len();
+        let retry = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["resume-drop.bin"], "resume": true}))).await;
+        assert_eq!(retry.status, 200, "{}", retry.payload);
+        let mut complete = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(retry_index).and_then(|t| t["status"].as_str()) == Some("Completed") { complete = true; break; }
+            if tasks.get(retry_index).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("checkpoint retry failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(complete);
+        assert_eq!(std::fs::read(downloaded.join("resume-drop.bin")).unwrap(), resume_data);
+        assert_eq!(std::fs::read(checkpoint).unwrap(), partial);
         // Queue a large WebDAV download and cancel it after the first chunk.
         std::fs::write(local.join("slow.bin"), vec![13u8; 4 * 1024 * 1024]).unwrap();
         let upload_index = svc.queue.snapshot().0.len();
