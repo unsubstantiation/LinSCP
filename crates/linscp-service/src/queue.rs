@@ -890,7 +890,9 @@ fn execute_local_item(
                 effective_target = unique_local_target(&effective_target);
             }
             ConflictPolicy::Overwrite => {
-                if !src_meta.is_dir() || src_meta.file_type().is_symlink() {
+                // Keep the old file in place until the replacement has been
+                // completely copied and is ready to publish.
+                if src_meta.file_type().is_symlink() {
                     remove_path_any(&effective_target)?;
                 }
             }
@@ -1010,10 +1012,11 @@ fn local_copy_recursive(
         return Ok(());
     }
 
-    if std::fs::symlink_metadata(target).is_ok() {
+    if let Ok(existing) = std::fs::symlink_metadata(target) {
         match policy {
             ConflictPolicy::Skip => return Ok(()),
-            ConflictPolicy::Overwrite => remove_path_any(target)?,
+            ConflictPolicy::Overwrite if existing.is_file() && !existing.file_type().is_symlink() => {},
+            ConflictPolicy::Overwrite => return Err("Refusing to overwrite a symlink or non-file.".to_string()),
             ConflictPolicy::Rename => {
                 let alt = unique_local_target(target);
                 return local_copy_recursive(source, &alt, policy, cancel, copied, total, progress);
@@ -1265,6 +1268,10 @@ mod transfer_safety_tests {
         assert!(execute_local_item(&source, &target, false, ConflictPolicy::Ask, &cancel, &progress).is_err());
         assert!(!target.exists());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::write(&target, b"original").unwrap();
+        cancel.store(false, Ordering::SeqCst);
+        assert!(execute_local_item(&source, &target, false, ConflictPolicy::Overwrite, &cancel, &progress).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
