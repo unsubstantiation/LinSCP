@@ -2484,6 +2484,16 @@ mod tests {
         let changed_index = svc.queue.snapshot().0.len();
         let moved = svc.dispatch_async(request("/api/transfer/move", json!({"tab": id, "direction": "download", "local_dir": downloaded, "remote_dir": "/", "names": ["move-delete-race.txt"]}))).await;
         assert_eq!(moved.status, 200, "{}", moved.payload);
+        let mut running_id = None;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if downloaded.join("move-delete-race.txt").exists() && tasks.get(changed_index).and_then(|t| t["status"].as_str()) == Some("Running") {
+                running_id = tasks[changed_index]["id"].as_u64(); break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let cancel = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": running_id.expect("conditional delete did not start")}))).await;
+        assert_eq!(cancel.status, 200, "{}", cancel.payload);
         let mut failed = false;
         for _ in 0..500 {
             let (tasks, _) = svc.queue.snapshot();

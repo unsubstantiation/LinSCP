@@ -723,6 +723,7 @@ class DavHandler(BaseHTTPRequestHandler):
         with SERVER_STORE.write_lock:
             expected = self.headers.get("If-Match", "").strip()
             if expected and path == "/move-delete-race.txt" and os.environ.get("LSCP_TEST_DELETE_RACE") == "1":
+                time.sleep(0.5)
                 SERVER_STORE.add_file(path, b"changed before conditional delete")
             if expected and expected != SERVER_STORE.etag_of(path):
                 self.send_precondition_failed()
