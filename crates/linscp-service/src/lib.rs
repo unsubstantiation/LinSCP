@@ -2270,6 +2270,27 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    async fn exercise_ftp_upload_cancellation(svc: &CommanderService, id: u64, local: &Path, remote: &Path) {
+        std::fs::write(local.join("cancel-upload.bin"), vec![23u8; 4 * 1024 * 1024]).unwrap();
+        let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_flag = Arc::clone(&cancel);
+        let progress = move |_: u64, _: u64| callback_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut flags = linscp_engine::transfer::TransferFlags::default();
+        flags.no_clobber = true;
+        flags.ftp_risky_publish = true;
+        flags.cancel_flag = Some(cancel);
+        let mut logger = linscp_engine::xml_log::SessionLogger::open(None, 0, false, None, None, false, "").unwrap();
+        let result = linscp_engine::transfer::upload_single_file(session.as_ref(), &local.join("cancel-upload.bin"), "/cancel-upload.bin", &flags, &mut logger, Some(&progress)).await;
+        assert!(result.is_err(), "FTP upload should be interrupted");
+        assert!(result.unwrap_err().contains("temporary file"));
+        assert!(!remote.join("cancel-upload.bin").exists());
+        assert!(std::fs::read_dir(remote).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-upload-")));
+        let err = session.stat("/download.txt").await.expect_err("cancelled FTP upload must poison control channel");
+        assert!(err.to_string().contains("reconnect"), "{err}");
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn live_ftpes_gui_download() {
         if std::env::var_os("LSCP_LIVE_FTPES").is_none() { return; }
@@ -2326,6 +2347,10 @@ mod tests {
         assert!(!std::fs::read_dir(&local).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-download-")));
         let err = session.stat("/download.txt").await.expect_err("interrupted FTPS control channel must not be reused");
         assert!(err.to_string().contains("reconnect"), "{err}");
+        let reopened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "ftpes", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "tls_ca_file": tests.join("fixtures/s3-server-cert.pem"), "local_dir": local, "initial_dir": "/"}}))).await;
+        assert_eq!(reopened.status, 200, "{}", reopened.payload);
+        let new_id = reopened.payload["tab"]["id"].as_u64().unwrap();
+        exercise_ftp_upload_cancellation(&svc, new_id, &local, &remote).await;
         drop(server); let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -2401,6 +2426,8 @@ mod tests {
         assert!(err.to_string().contains("reconnect"), "{err}");
         let reopened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "ftp", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
         assert_eq!(reopened.status, 200, "{}", reopened.payload);
+        let new_id = reopened.payload["tab"]["id"].as_u64().unwrap();
+        exercise_ftp_upload_cancellation(&svc, new_id, &local, &remote).await;
         drop(server); let _ = std::fs::remove_dir_all(tmp);
     }
 

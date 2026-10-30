@@ -21,7 +21,7 @@ resume from a `.filepart` after comparing its entire prefix with the ETag-pinned
 remote file; verification retransfers that prefix. Existing partials are never
 removed or modified. A network failure may save a new partial for retry; other
 resumption modes are unsupported.
-Running local copies, SFTP and WebDAV transfers, and FTP, FTPS and S3 downloads
+Running local copies, SFTP and WebDAV transfers, FTP/FTPS transfers, and S3 downloads
 can be cancelled cooperatively. An interrupted FTP/FTPS transfer invalidates its
 control connection; reconnect before further transfers. Fresh queued file downloads use owned temporary files
 that are removed on cancellation or failure on a best-effort basis; cleanup can
@@ -30,12 +30,18 @@ replacement on Linux and Windows; their cleanup is best-effort. Uploads and merg
 may leave partial files or directories.
 Without overwrite approval, local copies and downloads use no-replace publication,
 and SFTP, WebDAV and S3 uploads use exclusive creation. S3 exclusive uploads are
-limited to 16 MiB; other protocols cannot yet perform unapproved-overwrite uploads.
+limited to 16 MiB. FTP/FTPS file uploads are available only after explicitly
+accepting a destination-race warning: a server-created STOU temporary file is
+renamed to the target, and the server may overwrite a destination created or
+changed after the last check. Existing targets also require overwrite approval.
+Servers must support STOU with an RFC 1123 FILE response; an interruption or
+failed rename may leave a temporary file that must be inspected and removed
+manually. Never use this mode if no-clobber guarantees are required.
 Queued WebDAV and S3 file overwrites require a strong ETag and use conditional
 PUT, relying on server enforcement; S3 conditional uploads are limited to 16 MiB.
 An ETag is not necessarily a unique version: changes that retain the same ETag
 may not be detected. Other queued overwrites are rejected until they can be made
-safe. FTP/FTPS uploads and other protocols and configurations remain unverified.
+safe. FTP/FTPS uploads and other protocols and configurations require further verification.
 Unsupported operations return an error rather than reporting success.
 
 ## Build the desktop application
