@@ -975,12 +975,6 @@ fn execute_local_item(
         }
     }
 
-    if move_item && std::fs::symlink_metadata(&effective_target).is_err() {
-        if std::fs::rename(source, &effective_target).is_ok() {
-            return Ok(());
-        }
-    }
-
     let mut copied = 0u64;
     let total = compute_local_size(source);
     local_copy_recursive(
@@ -993,9 +987,6 @@ fn execute_local_item(
         progress,
     )?;
 
-    if move_item {
-        remove_path_any(source)?;
-    }
     Ok(())
 }
 
