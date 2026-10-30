@@ -592,6 +592,14 @@ pub fn parse_gui_session_spec(
             }
         }
     }
+    if protocol == ProtocolScheme::S3 {
+        if let Some(access) = spec.raw_fields.remove("s3_access_key") {
+            if spec.session.username.is_empty() { spec.session.username = access; }
+        }
+        if let Some(secret) = spec.raw_fields.remove("s3_secret_key") {
+            if spec.session.password.is_none() && !secret.is_empty() { spec.session.password = Some(secret); }
+        }
+    }
     // Translate GUI TLS option names to the names consumed by the engine.
     for (gui, engine) in [
         ("tls_ca_file", "ca_certificate_file"),
@@ -621,8 +629,8 @@ pub fn parse_gui_session_spec(
         obj.insert("protocol".into(), json!(protocol.as_str()));
         obj.insert("host".into(), json!(host));
         obj.insert("port".into(), json!(port));
-        obj.insert("username".into(), json!(username));
-        obj.insert("user".into(), json!(username));
+        obj.insert("username".into(), json!(spec.session.username));
+        obj.insert("user".into(), json!(spec.session.username));
         obj.insert(
             "has_password".into(),
             json!(spec.session.password.as_ref().is_some_and(|p| !p.is_empty())),

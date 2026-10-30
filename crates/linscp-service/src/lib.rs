@@ -599,6 +599,9 @@ impl CommanderService {
         let spec_res = tabs::parse_gui_session_spec(&session_val, None, &cfg_root, self.secret_vault.as_ref());
         if let Err(e) = spec_res { return ApiReply{ status: 400, payload: json!({"success": false, "error": e})}; }
         let (spec, _) = spec_res.unwrap();
+        if spec.raw_fields.get("s3_session_token").is_some_and(|token| !token.is_empty()) {
+            return api_error(400, "Saving S3 session tokens is not supported; supply the token when connecting instead.");
+        }
         let stored = tabs::build_stored_site_for_save(&final_name, &spec);
         let mut store = SessionStore::load_from_dir(&cfg_root, self.secret_vault.as_ref()).unwrap_or_default();
         store.upsert(stored);
@@ -2001,9 +2004,10 @@ mod tests {
         let port: u16 = line.trim().strip_prefix("READY ").expect("S3 server failed to start").parse().unwrap();
         let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
         let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
-        let open = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "s3", "host": "127.0.0.1", "port": port, "username": "AKIDTEST", "password": "testsecret42", "s3_region": "us-east-1", "tls_ca_file": tests.join("fixtures/s3-server-cert.pem"), "local_dir": local, "initial_dir": "/"}}))).await;
+        let open = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "s3", "host": "127.0.0.1", "port": port, "s3_access_key": "AKIDTEST", "s3_secret_key": "testsecret42", "s3_region": "us-east-1", "tls_ca_file": tests.join("fixtures/s3-server-cert.pem"), "local_dir": local, "initial_dir": "/"}}))).await;
         assert_eq!(open.status, 200, "{}", open.payload);
         assert!(open.payload["tab"]["session"].get("password").is_none());
+        assert!(open.payload["tab"]["session"].get("s3_secret_key").is_none());
         let id = open.payload["tab"]["id"].as_u64().unwrap();
         let list = svc.dispatch_async(ApiEnvelope { method: "GET".into(), path: format!("/api/remote/list?tab={id}&path=%2Fphotos"), body: json!({}) }).await;
         assert_eq!(list.status, 200, "{}", list.payload);
