@@ -1597,7 +1597,7 @@ impl RemoteSession for S3Session {
         };
         if key.is_empty() { return Err(ProtoError::Transport("S3 object key must not be empty.".to_string())); }
         let mut payload = Vec::with_capacity(expected as usize);
-        source.take(MAX_EXCLUSIVE_BYTES + 1).read_to_end(&mut payload).await
+        source.take(expected + 1).read_to_end(&mut payload).await
             .map_err(|e| ProtoError::Transport(format!("Reading S3 upload source failed: {e}")))?;
         if payload.len() as u64 != expected {
             return Err(ProtoError::Transport("S3 upload source size changed during transfer.".to_string()));

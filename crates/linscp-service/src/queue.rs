@@ -175,7 +175,10 @@ async fn upload_new_sftp_tree(
 fn task_supports_cancellation(job: &QueueJob) -> bool {
     match job {
         QueueJob::LocalCopyOrMove { .. } => true,
-        QueueJob::RemoteDownload { session, .. } | QueueJob::RemoteUpload { session, .. } => {
+        QueueJob::RemoteDownload { session, .. } => {
+            matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs | ProtocolScheme::S3)
+        }
+        QueueJob::RemoteUpload { session, .. } => {
             matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs)
         }
         _ => false,

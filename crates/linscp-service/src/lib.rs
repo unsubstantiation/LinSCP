@@ -2018,7 +2018,7 @@ mod tests {
         let local = tmp.join("local"); std::fs::create_dir_all(&local).unwrap();
         let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests");
         let child = Command::new("/usr/bin/python3").arg(tests.join("TestS3Server.py"))
-            .env("LSCP_TEST_PORT", "0").env("LSCP_TEST_SEED", "1")
+            .env("LSCP_TEST_PORT", "0").env("LSCP_TEST_SEED", "1").env("LSCP_TEST_GET_DELAY", "0.005")
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let mut server = Server(child); let mut line = String::new();
         BufReader::new(server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
@@ -2064,6 +2064,30 @@ mod tests {
         assert!(collision.is_err());
         let seed = linscp_proto::download_bytes(session.as_ref(), "/photos/seed.txt", Default::default()).await.unwrap();
         assert_eq!(seed, b"S3 verified download");
+        let slow_index = svc.queue.snapshot().0.len();
+        let slow = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["slow.bin"]}))).await;
+        assert_eq!(slow.status, 200);
+        let mut task_id = None;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(task) = tasks.get(slow_index) {
+                if task["status"] == "Running" && task["bytes_done"].as_u64().unwrap_or(0) > 0 { task_id = task["id"].as_u64(); break; }
+                assert_ne!(task["status"], "Completed", "S3 download finished before cancellation");
+                assert_ne!(task["status"], "Failed", "{tasks:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let cancel = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": task_id.expect("S3 download did not start")}))).await;
+        assert_eq!(cancel.status, 200, "{}", cancel.payload);
+        let mut cancelled = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(slow_index).and_then(|t| t["status"].as_str()) == Some("Cancelled") { cancelled = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(cancelled, "S3 cancellation was not observed");
+        assert!(!local.join("slow.bin").exists());
+        assert!(session.stat("/photos/seed.txt").await.unwrap().is_some());
         drop(server); let _ = std::fs::remove_dir_all(tmp);
     }
 
