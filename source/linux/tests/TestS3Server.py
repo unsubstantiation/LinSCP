@@ -755,6 +755,7 @@ class S3Handler(BaseHTTPRequestHandler):
         self.send_bytes(200, b"", extra=(
             ("Last-Modified", http_date(mtime)),
             ("Content-Type", "application/octet-stream"),
+            ("ETag", '"%s"' % hashlib.sha256(data).hexdigest()[:32]),
         ) + version_header, content_length=len(data))
 
     def put_object(self, bucket, key, headers, body):
@@ -799,6 +800,11 @@ class S3Handler(BaseHTTPRequestHandler):
         with STORE.write_lock:
             if headers.get("if-none-match", "").strip() == "*" and STORE.get(bucket, key) is not None:
                 self.send_error_xml(412, "PreconditionFailed", "The object already exists.")
+                return
+            match = headers.get("if-match")
+            current = STORE.get(bucket, key)
+            if match is not None and (current is None or match.strip() != '"%s"' % hashlib.sha256(current[0]).hexdigest()[:32]):
+                self.send_error_xml(412, "PreconditionFailed", "The object has changed.")
                 return
             STORE.put(bucket, key, body, now)
         STORE.object_headers["%s/%s" % (bucket, key)] = amz_headers

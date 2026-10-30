@@ -418,30 +418,42 @@ impl CommanderService {
                 if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink() || !m.is_file()) { return api_error(400, "Refusing to overwrite a symlink or directory"); }
             }
             let is_dav_upload = !tab.is_local && upload && matches!(session.as_ref().unwrap().scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs);
+            let is_s3_upload = !tab.is_local && upload && session.as_ref().unwrap().scheme() == linscp_types::ProtocolScheme::S3;
             if exists && overwrite == "ask" {
                 conflicts.push(name.to_string());
-                if is_dav_upload {
+                let tag = if is_dav_upload {
                     match session.as_ref().unwrap().dav_get_etag(&other).await {
-                        Ok((Some(tag), false)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => { conflict_versions.insert(name.to_string(), json!(tag)); }
-                        Ok(_) => {},
+                        Ok((tag, false)) => tag,
+                        Ok(_) => None,
                         Err(error) => return api_error(400, error.to_string()),
                     }
+                } else if is_s3_upload {
+                    match session.as_ref().unwrap().s3_get_etag(&other).await {
+                        Ok(tag) => tag,
+                        Err(error) => return api_error(400, error.to_string()),
+                    }
+                } else { None };
+                if let Some(tag) = tag.filter(|tag| tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control)) {
+                    conflict_versions.insert(name.to_string(), json!(tag));
                 }
             }
             // Approval applies only to destinations actually present at enqueue.
             // A different item appearing later must not inherit that approval.
             let allow_overwrite = overwrite == "overwrite" && exists;
+            if allow_overwrite && !is_dav_upload && !is_s3_upload {
+                return api_error(501, "Safe approved overwrites are not yet supported for this transfer. The destination was not changed.");
+            }
             let mut flags = linscp_engine::transfer::TransferFlags::default();
             // Resuming existing partial files without verifying their source can
             // splice unrelated bytes into the result. Always stage a fresh copy.
             flags.resume = false;
             flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
             flags.preserve_time = body.get("preserve_time").and_then(Value::as_bool).unwrap_or(true);
-            if allow_overwrite && is_dav_upload {
+            if allow_overwrite && (is_dav_upload || is_s3_upload) {
                 let tag = body.get("conflict_versions").and_then(|v| v.get(name)).and_then(Value::as_str);
                 match tag {
                     Some(tag) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => flags.overwrite_etag = Some(tag.to_string()),
-                    _ => return api_error(400, "WebDAV overwrite requires the strong ETag returned with the original conflict."),
+                    _ => return api_error(400, "Overwrite requires the strong ETag returned with the original conflict."),
                 }
             }
             let job = if tab.is_local {
@@ -1947,6 +1959,9 @@ mod tests {
         let conflict = svc.dispatch_async(request()).await;
         assert_eq!(conflict.status, 409);
         assert_eq!(std::fs::read(right.join("data.txt")).unwrap(), b"do not overwrite");
+        let refused = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": left, "remote_dir": right, "names": ["data.txt"], "overwrite": "overwrite"}) }).await;
+        assert_eq!(refused.status, 501, "{}", refused.payload);
+        assert_eq!(std::fs::read(right.join("data.txt")).unwrap(), b"do not overwrite");
         let invalid = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": left, "remote_dir": right, "names": ["../data.txt"]}) }).await;
         assert_eq!(invalid.status, 400);
         std::fs::write(left.join("later.txt"), b"new data").unwrap();
@@ -2082,6 +2097,41 @@ mod tests {
         assert!(collision.is_err());
         let seed = linscp_proto::download_bytes(session.as_ref(), "/photos/seed.txt", Default::default()).await.unwrap();
         assert_eq!(seed, b"S3 verified download");
+        // Capture the initial ETag, then change the object while the approved
+        // request is queued; If-Match must preserve the concurrent contents.
+        let conflict = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"]}))).await;
+        assert_eq!(conflict.status, 409, "{}", conflict.payload);
+        let versions = conflict.payload["conflict_versions"].clone();
+        assert!(versions["upload.txt"].as_str().is_some());
+        svc.queue.pause();
+        let race_index = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"], "overwrite": "overwrite", "conflict_versions": versions}))).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        linscp_proto::upload_bytes(session.as_ref(), "/photos/upload.txt", b"changed after approval", Default::default()).await.unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(race_index).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(race_index).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("conditional S3 overwrite replaced a changed object"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed, "changed object must reject the overwrite");
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/photos/upload.txt", Default::default()).await.unwrap(), b"changed after approval");
+        let conflict = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"]}))).await;
+        let versions = conflict.payload["conflict_versions"].clone();
+        let success_index = svc.queue.snapshot().0.len();
+        let approved = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"], "overwrite": "overwrite", "conflict_versions": versions}))).await;
+        assert_eq!(approved.status, 200, "{}", approved.payload);
+        let mut completed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(success_index).and_then(|t| t["status"].as_str()) == Some("Completed") { completed = true; break; }
+            if tasks.get(success_index).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("unchanged S3 object overwrite failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(completed);
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/photos/upload.txt", Default::default()).await.unwrap(), b"S3 exclusive upload");
         let slow_index = svc.queue.snapshot().0.len();
         let slow = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["slow.bin"]}))).await;
         assert_eq!(slow.status, 200);

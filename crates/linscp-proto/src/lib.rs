@@ -399,6 +399,10 @@ pub trait RemoteSession: Send + Sync {
     async fn dav_unlock(&self, _remote_path: &str, _token: Option<&str>) -> Result<(), ProtoError> {
         Err(ProtoError::UnsupportedCapability("dav_unlock", self.scheme()))
     }
+    /// Return the current S3 object's ETag, or None if it does not exist.
+    async fn s3_get_etag(&self, _remote_path: &str) -> Result<Option<String>, ProtoError> {
+        Err(ProtoError::UnsupportedCapability("s3_etag", self.scheme()))
+    }
     async fn dav_get_etag(&self, _remote_path: &str) -> Result<(Option<String>, bool), ProtoError> {
         Err(ProtoError::UnsupportedCapability("dav_etag", self.scheme()))
     }
