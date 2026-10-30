@@ -298,3 +298,20 @@ test('Built ui/dist/index.html boots inside Tauri IPC mode with zero HTTP calls'
   assert.equal(conflict.conflicts[0], 'file.txt');
   dom.window.close();
 });
+
+test('overwrite confirmation forwards the original WebDAV conflict ETag', async () => {
+  const html = fs.readFileSync(path.join(repoRoot, 'source', 'gui', 'web', 'index.html'), 'utf8');
+  const match = html.match(/async function queueWithOverwriteDecision\(endpoint, payload, conflicts\) \{[\s\S]*?\n  \}\n\n  async function transfer/);
+  assert.ok(match, 'overwrite decision handler exists');
+  const handlerSource = match[0].replace(/\n\n  async function transfer$/, '');
+  const calls = [];
+  const apiPost = async (endpoint, payload) => {
+    calls.push({ endpoint, payload });
+    return calls.length === 1
+      ? { success: false, conflicts: ['file.txt'], conflict_versions: { 'file.txt': '"original"' } }
+      : { success: true };
+  };
+  const handler = new Function('apiPost', 'preferences', 'confirm', 't', `${handlerSource}; return queueWithOverwriteDecision;`)(apiPost, {}, () => true, s => s);
+  assert.equal((await handler('/api/transfer/upload', { overwrite: 'ask' }, [])).success, true);
+  assert.deepEqual(calls[1].payload, { overwrite: 'overwrite', conflict_versions: { 'file.txt': '"original"' } });
+});

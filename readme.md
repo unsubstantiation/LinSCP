@@ -17,8 +17,11 @@ Running local copies, SFTP and WebDAV transfers, and S3 downloads can be
 cancelled cooperatively; cancellation may leave partial files or directories.
 Without overwrite approval, local copies and downloads use no-replace publication,
 and SFTP, WebDAV and S3 uploads use exclusive creation. S3 exclusive uploads are
-limited to 16 MiB; other protocols cannot yet perform unapproved-overwrite uploads. Approving overwrite does not protect against
-a destination changing after approval. FTP/FTPS uploads and other protocols and configurations remain unverified.
+limited to 16 MiB; other protocols cannot yet perform unapproved-overwrite uploads.
+Approved WebDAV file overwrites require a strong ETag and use conditional PUT,
+relying on the server to enforce it. Other approved overwrites do not protect
+against a destination changing after approval. FTP/FTPS uploads and other
+protocols and configurations remain unverified.
 Unsupported operations return an error rather than reporting success.
 
 ## Build the desktop application
