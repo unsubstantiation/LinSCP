@@ -16,7 +16,11 @@ changes can still affect them. Other directory merges are unsupported. WebDAV fi
 name using conditional GET and DELETE with the original strong ETag; this relies
 on server enforcement and can leave a duplicate if deletion cannot be confirmed.
 Other remote moves are unsupported. Local moves are supported on the same filesystem on Linux
-and Windows, without replacing existing destinations. Resumption is unsupported.
+and Windows, without replacing existing destinations. WebDAV file downloads can
+resume from a `.filepart` after comparing its entire prefix with the ETag-pinned
+remote file; verification retransfers that prefix. Existing partials are never
+removed or modified. A network failure may save a new partial for retry; other
+resumption modes are unsupported.
 Running local copies, SFTP and WebDAV transfers, and FTP, FTPS and S3 downloads
 can be cancelled cooperatively. An interrupted FTP/FTPS transfer invalidates its
 control connection; reconnect before further transfers. Fresh queued file downloads use owned temporary files
