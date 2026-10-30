@@ -1299,6 +1299,14 @@ mod transfer_safety_tests {
     use super::*;
 
     #[test]
+    fn tree_names_cannot_escape_destination() {
+        for name in ["", ".", "..", "a/b", "a\\b", "c:d", "bad\nname"] {
+            assert!(safe_tree_name(name).is_err(), "accepted {name:?}");
+        }
+        assert!(safe_tree_name("safe.txt").is_ok());
+    }
+
+    #[test]
     fn local_copy_does_not_replace_destination_created_during_copy() {
         let dir = std::env::temp_dir().join(format!("linscp-copy-race-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

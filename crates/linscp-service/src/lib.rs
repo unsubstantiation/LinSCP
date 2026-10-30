@@ -2105,6 +2105,19 @@ mod tests {
         assert!(downloaded.join("tree/empty").is_dir());
         let blocked_merge = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["tree"], "overwrite": "overwrite"}))).await;
         assert_eq!(blocked_merge.status, 400);
+        std::fs::create_dir_all(local.join("links")).unwrap();
+        std::os::unix::fs::symlink(local.join("upload.txt"), local.join("links/link")).unwrap();
+        let link_index = svc.queue.snapshot().0.len();
+        let link_up = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["links"]}))).await;
+        assert_eq!(link_up.status, 200);
+        let mut rejected = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(link_index).and_then(|t| t["status"].as_str()) == Some("Failed") { rejected = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(rejected, "a directory containing a symlink must be rejected");
+        assert!(!remote.join("links/link").exists());
         drop(server);
         let _ = std::fs::remove_dir_all(tmp);
     }

@@ -31,7 +31,7 @@ pub struct TransferFlags {
     pub resume: bool,
     pub append: bool,
     pub recursive: bool,
-    /// Publish a staged download only if the destination does not exist.
+    /// Do not replace an existing destination; fail if the protocol cannot enforce this.
     pub no_clobber: bool,
     /// Cooperative cancellation checked between I/O operations.
     pub cancel_flag: Option<Arc<AtomicBool>>,
@@ -392,6 +392,9 @@ pub async fn download_single_file(
     let effective_ascii = wants_ascii_conversion(flags.transfer_mode, leaf);
     let dest_label = local_dest.display().to_string();
 
+    if flags.no_clobber && effective_ascii {
+        return Err("No-overwrite downloads require binary transfer mode.".to_string());
+    }
     if effective_ascii {
         let mut raw_bytes = Vec::with_capacity(info.size as usize);
         let req = TransferRequest {
@@ -678,6 +681,9 @@ pub async fn upload_single_file(
         .unwrap_or_default();
     let effective_ascii = wants_ascii_conversion(flags.transfer_mode, &leaf);
 
+    if flags.no_clobber && effective_ascii {
+        return Err("No-overwrite uploads require binary transfer mode.".to_string());
+    }
     if effective_ascii {
         let raw = std::fs::read(local_src)
             .map_err(|e| format!("Cannot read local file '{src_label}': {e}"))?;
