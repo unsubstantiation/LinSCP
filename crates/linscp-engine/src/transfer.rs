@@ -35,6 +35,8 @@ pub struct TransferFlags {
     pub no_clobber: bool,
     /// Server-side compare-and-replace using a previously approved strong ETag.
     pub overwrite_etag: Option<String>,
+    /// Read only the remote representation matching this strong ETag.
+    pub source_etag: Option<String>,
     /// Cooperative cancellation checked between I/O operations.
     pub cancel_flag: Option<Arc<AtomicBool>>,
     /// Use an owned temporary stage and remove it after a fresh download.
@@ -64,6 +66,7 @@ impl Default for TransferFlags {
             recursive: false,
             no_clobber: false,
             overwrite_etag: None,
+            source_etag: None,
             cancel_flag: None,
             cleanup_download_stage: false,
             merge_directories: false,
@@ -301,6 +304,9 @@ pub async fn download_single_file(
     logger: &mut SessionLogger,
     progress: Option<&ProgressCallback>,
 ) -> Result<bool, String> {
+    if flags.source_etag.is_some() && (flags.delete_source || flags.append || flags.resume || local_dest == Path::new("-")) {
+        return Err("Conditional downloads require a fresh staged file and separate conditional deletion.".to_string());
+    }
     if flags.append {
         // Local append on download
     } else {
@@ -401,8 +407,8 @@ pub async fn download_single_file(
     let effective_ascii = wants_ascii_conversion(flags.transfer_mode, leaf);
     let dest_label = local_dest.display().to_string();
 
-    if flags.no_clobber && effective_ascii {
-        return Err("No-overwrite downloads require binary transfer mode.".to_string());
+    if (flags.no_clobber || flags.source_etag.is_some()) && effective_ascii {
+        return Err("Guarded downloads require binary transfer mode.".to_string());
     }
     if effective_ascii {
         let mut raw_bytes = Vec::with_capacity(info.size as usize);
@@ -556,9 +562,11 @@ pub async fn download_single_file(
     };
     let dl_res = {
         let mut writer = InterruptibleWriter { inner: &mut file, cancel_flag: flags.cancel_flag.clone() };
-        session
-            .download(remote_path, req, &mut writer, progress)
-            .await
+        if let Some(etag) = flags.source_etag.as_deref() {
+            session.download_if_match(remote_path, etag, req, &mut writer, progress).await
+        } else {
+            session.download(remote_path, req, &mut writer, progress).await
+        }
     };
     let flush_res = tokio::io::AsyncWriteExt::flush(&mut file).await;
     drop(file);

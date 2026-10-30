@@ -344,7 +344,10 @@ impl CommanderService {
         let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
             Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
         };
-        if move_item && !tab.is_local { return api_error(501, "Remote moves are not yet supported"); }
+        if move_item && !tab.is_local {
+            let dav = tab.remote.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs));
+            if upload || !dav { return api_error(501, "Only WebDAV file moves to a new local destination are supported."); }
+        }
         let names = match body.get("names").and_then(Value::as_array) {
             Some(names) if !names.is_empty() && names.len() <= 1000 => names,
             _ => return api_error(400, "Select at least one file"),
@@ -412,12 +415,13 @@ impl CommanderService {
                 size = if is_dir { 0 } else { entry.size };
                 exists = std::fs::symlink_metadata(&local).is_ok();
             }
+            if move_item && !tab.is_local && is_dir { return api_error(400, "WebDAV directory moves are not supported."); }
             if is_dir && !move_item {
                 if tab.is_local || session.as_ref().is_none_or(|s| s.scheme() != linscp_types::ProtocolScheme::Sftp) { return api_error(400, "Directory transfers are supported only for SFTP"); }
                 if exists && !merge_names.contains(name) { directory_conflicts.push(name.to_string()); }
             }
             if move_item && exists {
-                return api_error(409, "Local moves require a new destination; overwriting is not supported.");
+                return api_error(409, "Moves require a new destination; overwriting is not supported.");
             }
             if !upload || tab.is_local {
                 let target = Path::new(&destination);
@@ -457,6 +461,14 @@ impl CommanderService {
             flags.merge_directories = is_dir && exists && merge_names.contains(name);
             flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
             flags.preserve_time = body.get("preserve_time").and_then(Value::as_bool).unwrap_or(true);
+            if move_item && !tab.is_local {
+                let tag = match session.as_ref().unwrap().dav_get_etag(&other).await {
+                    Ok((Some(tag), false)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => tag,
+                    Ok(_) => return api_error(400, "WebDAV moves require a strong source ETag."),
+                    Err(error) => return api_error(400, error.to_string()),
+                };
+                flags.source_etag = Some(tag);
+            }
             if allow_overwrite && (is_dav_upload || is_s3_upload) {
                 let tag = body.get("conflict_versions").and_then(|v| v.get(name)).and_then(Value::as_str);
                 match tag {
@@ -469,7 +481,7 @@ impl CommanderService {
             } else if upload {
                 queue::QueueJob::RemoteUpload { session: session.as_ref().unwrap().clone(), local_src: local, remote_dest: other, allow_overwrite, delete_source: false, cleanup_path: None, flags }
             } else {
-                queue::QueueJob::RemoteDownload { session: session.as_ref().unwrap().clone(), remote_path: other, local_dest: local, allow_overwrite, delete_source: false, flags }
+                queue::QueueJob::RemoteDownload { session: session.as_ref().unwrap().clone(), remote_path: other, local_dest: local, allow_overwrite, delete_source: move_item, flags }
             };
             jobs.push((name.to_string(), source, destination, size, job));
         }
@@ -2336,7 +2348,7 @@ mod tests {
         let local = tmp.join("local"); let downloaded = tmp.join("downloaded");
         std::fs::create_dir_all(&local).unwrap(); std::fs::create_dir_all(&downloaded).unwrap();
         let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestDavServer.py");
-        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_GET_DELAY", "0.005")
+        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_GET_DELAY", "0.005").env("LSCP_TEST_DELETE_RACE", "1")
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let mut server = Server(child);
         let mut line = String::new();
@@ -2413,6 +2425,59 @@ mod tests {
         }
         assert!(completed);
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/upload.txt", Default::default()).await.unwrap(), b"WebDAV roundtrip");
+        // A remote-to-local WebDAV move pins the source ETag for both GET
+        // and DELETE, and publishes locally only with no-replace semantics.
+        linscp_proto::upload_bytes(session.as_ref(), "/move-success.txt", b"move payload", Default::default()).await.unwrap();
+        let move_index = svc.queue.snapshot().0.len();
+        let moved = svc.dispatch_async(request("/api/transfer/move", json!({"tab": id, "direction": "download", "local_dir": downloaded, "remote_dir": "/", "names": ["move-success.txt"], "resume": false}))).await;
+        assert_eq!(moved.status, 200, "{}", moved.payload);
+        let mut complete = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(move_index).and_then(|t| t["status"].as_str()) == Some("Completed") { complete = true; break; }
+            if tasks.get(move_index).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("WebDAV move failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(complete);
+        assert_eq!(std::fs::read(downloaded.join("move-success.txt")).unwrap(), b"move payload");
+        assert!(session.stat("/move-success.txt").await.unwrap().is_none());
+        // A source changed after queueing fails conditional GET without a local publication.
+        linscp_proto::upload_bytes(session.as_ref(), "/move-before-get.txt", b"original", Default::default()).await.unwrap();
+        svc.queue.pause();
+        let changed_index = svc.queue.snapshot().0.len();
+        let moved = svc.dispatch_async(request("/api/transfer/move", json!({"tab": id, "direction": "download", "local_dir": downloaded, "remote_dir": "/", "names": ["move-before-get.txt"]}))).await;
+        assert_eq!(moved.status, 200, "{}", moved.payload);
+        linscp_proto::upload_bytes(session.as_ref(), "/move-before-get.txt", b"new source", Default::default()).await.unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(changed_index).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(changed_index).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("changed source was moved"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert!(!downloaded.join("move-before-get.txt").exists());
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/move-before-get.txt", Default::default()).await.unwrap(), b"new source");
+        // A source changed between publication and DELETE remains remote,
+        // while the downloaded copy remains local and the task reports failure.
+        linscp_proto::upload_bytes(session.as_ref(), "/move-delete-race.txt", b"original copy", Default::default()).await.unwrap();
+        let changed_index = svc.queue.snapshot().0.len();
+        let moved = svc.dispatch_async(request("/api/transfer/move", json!({"tab": id, "direction": "download", "local_dir": downloaded, "remote_dir": "/", "names": ["move-delete-race.txt"]}))).await;
+        assert_eq!(moved.status, 200, "{}", moved.payload);
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(changed_index).and_then(|t| t["status"].as_str()) == Some("Failed") {
+                assert!(tasks[changed_index]["error"].as_str().unwrap_or_default().contains("Move incomplete"));
+                failed = true; break;
+            }
+            if tasks.get(changed_index).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("changed source was deleted"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert_eq!(std::fs::read(downloaded.join("move-delete-race.txt")).unwrap(), b"original copy");
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/move-delete-race.txt", Default::default()).await.unwrap(), b"changed before conditional delete");
         // Queue a large WebDAV download and cancel it after the first chunk.
         std::fs::write(local.join("slow.bin"), vec![13u8; 4 * 1024 * 1024]).unwrap();
         let upload_index = svc.queue.snapshot().0.len();

@@ -346,6 +346,17 @@ pub trait RemoteSession: Send + Sync {
         sink: &mut (dyn AsyncWrite + Unpin + Send),
         progress: Option<&ProgressCallback>,
     ) -> Result<u64, ProtoError>;
+    /// Read only the representation matching the supplied strong ETag.
+    async fn download_if_match(
+        &self, _remote_path: &str, _etag: &str, _opts: TransferRequest,
+        _sink: &mut (dyn AsyncWrite + Unpin + Send), _progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        Err(ProtoError::UnsupportedCapability("conditional download", self.scheme()))
+    }
+    /// Remove only the representation matching the supplied strong ETag.
+    async fn remove_if_match(&self, _remote_path: &str, _etag: &str) -> Result<(), ProtoError> {
+        Err(ProtoError::UnsupportedCapability("conditional delete", self.scheme()))
+    }
     async fn upload(
         &self,
         remote_path: &str,

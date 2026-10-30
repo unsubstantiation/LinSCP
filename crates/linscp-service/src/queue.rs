@@ -586,7 +586,8 @@ impl QueueManager {
                 let mut g = self.inner.lock().expect("queue mutex");
                 let mut clean = false;
                 if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task.id) {
-                    if cancelled && result.is_err() {
+                    let committed_move_failure = result.as_ref().is_err_and(|e| e.starts_with("Move incomplete:"));
+                    if cancelled && result.is_err() && !committed_move_failure {
                         t.status = "cancelled".to_string();
                         let reconnect = matches!(&task.job, QueueJob::RemoteDownload { session, .. } if matches!(session.scheme(), ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes));
                         t.error = Some(if reconnect { "Cancelled by user. Reconnect the FTP session before further transfers." } else { "Cancelled by user." }.to_string());
@@ -694,7 +695,9 @@ impl QueueManager {
                     if !allowed_dir && !allowed_file { return Err("Destination changed or merge/overwrite was not approved.".to_string()); }
                 }
                 let mut f = flags.clone();
-                f.delete_source = *delete_source;
+                // Moves delete separately with the original ETag, only after
+                // no-replace local publication has succeeded.
+                f.delete_source = false;
                 f.cancel_flag = Some(Arc::clone(&task.cancel_flag));
                 f.no_clobber = !allow_overwrite;
                 f.cleanup_download_stage = true;
@@ -730,6 +733,10 @@ impl QueueManager {
                         Some(&*progress),
                     )
                     .await?;
+                    if *delete_source {
+                        let etag = f.source_etag.as_deref().ok_or("Move incomplete: local file was published but source identity is missing.")?;
+                        session.remove_if_match(remote_path, etag).await.map_err(|e| format!("Move incomplete: local file was published but the remote source was not removed: {e}"))?;
+                    }
                 }
                 Ok(())
             }

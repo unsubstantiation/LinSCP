@@ -2142,7 +2142,7 @@
       names: names,
       local_dir: state.local.path,
       remote_dir: state.remote.path,
-      resume: transferSettings.resume !== false,
+      resume: false, // Safe resumption is not implemented for moves.
       preserve_time: transferSettings.preserveTime !== false
     }, transferSettings.priority ? { priority: true } : {}), names);
     if (result.success) {

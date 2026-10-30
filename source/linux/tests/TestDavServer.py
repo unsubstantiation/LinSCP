@@ -634,17 +634,24 @@ class DavHandler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
         path = self.local_path()
-        item = SERVER_STORE.get(path)
-        if item is None:
-            self.send_error_text(404, "Not Found.")
-            return
-        if item["kind"] == "dir":
-            self.send_error_text(405, "The collection is not gettable.")
-            return
-        data = item.get("data", b"")
-        extra = (("Last-Modified", http_date(item["mtime"])),
+        with SERVER_STORE.write_lock:
+            item = SERVER_STORE.get(path)
+            if item is None:
+                self.send_error_text(404, "Not Found.")
+                return
+            if item["kind"] == "dir":
+                self.send_error_text(405, "The collection is not gettable.")
+                return
+            tag = SERVER_STORE.etag_of(path) or ""
+            expected = self.headers.get("If-Match", "").strip()
+            if expected and expected != tag:
+                self.send_precondition_failed()
+                return
+            data = item.get("data", b"")
+            mtime = item["mtime"]
+        extra = (("Last-Modified", http_date(mtime)),
                  ("Accept-Ranges", "bytes"),
-                 ("ETag", SERVER_STORE.etag_of(path) or ""))
+                 ("ETag", tag))
         range_header = self.headers.get("Range")
         if range_header:
             match = re.match(r"bytes=(\d+)-(\d*)$", range_header.strip())
@@ -713,7 +720,14 @@ class DavHandler(BaseHTTPRequestHandler):
         if self.precondition_failed(path):
             self.send_precondition_failed()
             return
-        result = SERVER_STORE.delete(path)
+        with SERVER_STORE.write_lock:
+            expected = self.headers.get("If-Match", "").strip()
+            if expected and path == "/move-delete-race.txt" and os.environ.get("LSCP_TEST_DELETE_RACE") == "1":
+                SERVER_STORE.add_file(path, b"changed before conditional delete")
+            if expected and expected != SERVER_STORE.etag_of(path):
+                self.send_precondition_failed()
+                return
+            result = SERVER_STORE.delete(path)
         if result == "deleted":
             self.send_response(204)
             self.send_header("Content-Length", "0")
