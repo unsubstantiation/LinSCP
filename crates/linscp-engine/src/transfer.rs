@@ -37,6 +37,8 @@ pub struct TransferFlags {
     pub overwrite_etag: Option<String>,
     /// Cooperative cancellation checked between I/O operations.
     pub cancel_flag: Option<Arc<AtomicBool>>,
+    /// Use an owned temporary stage and remove it after a fresh download.
+    pub cleanup_download_stage: bool,
     pub resume_support: ResumeSupportMode,
     pub explicit_resume_support: bool,
     pub permissions: PresetPermissions,
@@ -61,6 +63,7 @@ impl Default for TransferFlags {
             no_clobber: false,
             overwrite_etag: None,
             cancel_flag: None,
+            cleanup_download_stage: false,
             resume_support: ResumeSupportMode::Smart(100 * 1024),
             explicit_resume_support: false,
             permissions: PresetPermissions::Off,
@@ -453,7 +456,24 @@ pub async fn download_single_file(
     }
 
     let use_stage = should_use_filepart(flags, session.scheme(), false, false, info.size);
-    let stage_opt = if use_stage {
+    if flags.cleanup_download_stage && (flags.resume || flags.append || !use_stage) {
+        return Err("Automatic cleanup requires a fresh staged download.".to_string());
+    }
+    // The private temp file is created exclusively in the destination directory
+    // so publication stays on the same filesystem. TempPath removes only this
+    // owned stage on early return, cancellation, or publication failure.
+    let mut private_file = None;
+    let mut _cleanup_stage = None;
+    let stage_opt = if flags.cleanup_download_stage {
+        let parent = local_dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let temp = tempfile::Builder::new().prefix(".linscp-download-").rand_bytes(16)
+            .tempfile_in(parent).map_err(|e| format!("Cannot create temporary download in '{}': {e}", parent.display()))?;
+        let (file, path) = temp.into_parts();
+        let stage = path.to_path_buf();
+        private_file = Some(tokio::fs::File::from_std(file));
+        _cleanup_stage = Some(path);
+        Some(stage)
+    } else if use_stage {
         local_stage_path(local_dest, flags.version_id.as_deref())
     } else {
         None
@@ -503,7 +523,9 @@ pub async fn download_single_file(
     };
 
     let fresh_stage = stage_opt.is_some() && !flags.resume && !flags.append;
-    let open_res = if flags.no_clobber || fresh_stage {
+    let open_res = if let Some(file) = private_file.take() {
+        Ok(file)
+    } else if flags.no_clobber || fresh_stage {
         tokio::fs::OpenOptions::new().write(true).create_new(true).open(&write_path).await
     } else if resume_offset > 0 || flags.append {
         tokio::fs::OpenOptions::new()

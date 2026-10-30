@@ -2066,6 +2066,8 @@ mod tests {
         let list = svc.dispatch_async(ApiEnvelope { method: "GET".into(), path: format!("/api/remote/list?tab={id}&path=%2Fphotos"), body: json!({}) }).await;
         assert_eq!(list.status, 200, "{}", list.payload);
         assert!(list.payload["entries"].as_array().unwrap().iter().any(|e| e["name"] == "seed.txt"));
+        // Existing user partials must not be consumed or removed by a fresh download.
+        std::fs::write(local.join("seed.txt.filepart"), b"unrelated partial").unwrap();
         let download = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["seed.txt"]}))).await;
         assert_eq!(download.status, 200, "{}", download.payload);
         let mut done = false;
@@ -2077,6 +2079,8 @@ mod tests {
         }
         assert!(done, "S3 download timed out");
         assert_eq!(std::fs::read(local.join("seed.txt")).unwrap(), b"S3 verified download");
+        assert_eq!(std::fs::read(local.join("seed.txt.filepart")).unwrap(), b"unrelated partial");
+        assert!(!std::fs::read_dir(&local).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-download-")));
         std::fs::write(local.join("upload.txt"), b"S3 exclusive upload").unwrap();
         let upload = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"]}))).await;
         assert_eq!(upload.status, 200, "{}", upload.payload);
@@ -2171,6 +2175,8 @@ mod tests {
         }
         assert!(cancelled, "S3 cancellation was not observed");
         assert!(!local.join("slow.bin").exists());
+        assert_eq!(std::fs::read(local.join("seed.txt.filepart")).unwrap(), b"unrelated partial");
+        assert!(!std::fs::read_dir(&local).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-download-")), "cancelled download left an owned temporary file");
         assert!(session.stat("/photos/seed.txt").await.unwrap().is_some());
         drop(server); let _ = std::fs::remove_dir_all(tmp);
     }
@@ -2460,11 +2466,13 @@ mod tests {
         let progress = move |_: u64, _: u64| { std::fs::write(&callback_target, b"concurrent data").unwrap(); };
         let mut flags = linscp_engine::transfer::TransferFlags::default();
         flags.no_clobber = true;
+        flags.cleanup_download_stage = true;
         flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
         let mut logger = linscp_engine::xml_log::SessionLogger::open(None, 0, false, None, None, false, "").unwrap();
         let race = linscp_engine::transfer::download_single_file(session.as_ref(), "/upload.txt", None, &raced_target, &flags, &mut logger, Some(&progress)).await;
         assert!(race.is_err(), "concurrent destination must not be replaced");
         assert_eq!(std::fs::read(&raced_target).unwrap(), b"concurrent data");
+        assert!(!std::fs::read_dir(&downloaded).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-download-")), "failed publication left an owned temporary file");
         // Fresh overwrite downloads must not touch an unrelated stage file,
         // even if it appears after the queue's preflight check.
         let overwrite_target = downloaded.join("overwrite.txt");

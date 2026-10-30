@@ -665,11 +665,6 @@ impl QueueManager {
                         return Err("Destination changed or overwrite was not approved.".to_string());
                     }
                 }
-                if let Some(stage) = linscp_engine::transfer::local_stage_path(local_dest, None) {
-                    if std::fs::symlink_metadata(&stage).is_ok() {
-                        return Err(format!("A partial file already exists at '{}'; remove it before retrying.", stage.display()));
-                    }
-                }
                 let entry = session
                     .stat(remote_path)
                     .await
@@ -679,6 +674,7 @@ impl QueueManager {
                 f.delete_source = *delete_source;
                 f.cancel_flag = Some(Arc::clone(&task.cancel_flag));
                 f.no_clobber = !allow_overwrite;
+                f.cleanup_download_stage = true;
                 if entry.is_dir {
                     if session.scheme() != ProtocolScheme::Sftp || *delete_source { return Err("Only SFTP directory copies to new destinations are supported.".to_string()); }
                     f.no_clobber = true;
