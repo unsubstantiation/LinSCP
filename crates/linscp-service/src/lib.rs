@@ -2563,6 +2563,37 @@ mod tests {
         assert!(failed);
         assert!(!downloaded.join("resume-race.txt").exists());
         assert_eq!(std::fs::read(downloaded.join("resume-race.txt.filepart")).unwrap(), b"abcd");
+        // Full-length partials are still compared, and symlink partials are
+        // rejected rather than followed or removed.
+        linscp_proto::upload_bytes(session.as_ref(), "/resume-full.txt", b"complete", Default::default()).await.unwrap();
+        std::fs::write(downloaded.join("resume-full.txt.filepart"), b"complete").unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let resumed = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["resume-full.txt"], "resume": true}))).await;
+        assert_eq!(resumed.status, 200);
+        let mut complete = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { complete = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("full-prefix resume failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(complete);
+        assert_eq!(std::fs::read(downloaded.join("resume-full.txt")).unwrap(), b"complete");
+        linscp_proto::upload_bytes(session.as_ref(), "/resume-link.txt", b"complete", Default::default()).await.unwrap();
+        std::os::unix::fs::symlink(downloaded.join("resume-full.txt"), downloaded.join("resume-link.txt.filepart")).unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let resumed = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["resume-link.txt"], "resume": true}))).await;
+        assert_eq!(resumed.status, 200);
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("symlink partial was followed"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert!(!downloaded.join("resume-link.txt").exists());
+        assert_eq!(std::fs::read(downloaded.join("resume-full.txt")).unwrap(), b"complete");
         // A network interruption creates a no-clobber checkpoint; retry
         // verifies it before reusing any bytes and leaves the checkpoint intact.
         let resume_data = vec![42u8; 256 * 1024];
