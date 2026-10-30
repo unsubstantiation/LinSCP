@@ -281,6 +281,8 @@ class Store:
 
 
 STORE = Store()
+if os.environ.get("LSCP_TEST_SEED") == "1":
+    STORE.put("photos", "seed.txt", b"S3 verified download", datetime.datetime.now(datetime.timezone.utc).timestamp())
 
 
 class S3Handler(BaseHTTPRequestHandler):

@@ -84,7 +84,8 @@ impl TabRuntime {
     pub fn describe(&self) -> Value {
         let mut redacted = self.session_json.clone();
         if let Some(obj) = redacted.as_object_mut() {
-            obj.remove("password");
+            for key in ["s3_secret_key", "s3_session_token", "proxy_password", "passphrase", "key_passphrase"] { obj.remove(key); }
+        obj.remove("password");
             obj.remove("tunnel_password");
             obj.remove("tunnel_passphrase");
         }
@@ -589,6 +590,23 @@ pub fn parse_gui_session_spec(
                 }
                 _ => {}
             }
+        }
+    }
+    // Translate GUI TLS option names to the names consumed by the engine.
+    for (gui, engine) in [
+        ("tls_ca_file", "ca_certificate_file"),
+        ("tls_cert_file", "tls_certificate_file"),
+        ("tls_key_file", "tls_certificate_key_file"),
+        ("tls_min_version", "min_tls_version"),
+        ("tls_max_version", "max_tls_version"),
+    ] {
+        if let Some(value) = spec.raw_fields.remove(gui) {
+            spec.raw_fields.insert(engine.to_string(), value);
+        }
+    }
+    if let Some(value) = spec.raw_fields.remove("tls_verify") {
+        if !matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "") {
+            return Err("Disabling TLS certificate verification is not supported.".to_string());
         }
     }
     // proxy fields remain in raw_fields; no direct spec fields to set
