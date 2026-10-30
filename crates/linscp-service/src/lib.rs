@@ -2412,6 +2412,14 @@ mod tests {
         assert_eq!(std::fs::read(&overwrite_stage).unwrap(), b"unrelated stage");
         assert_eq!(std::fs::read(&overwrite_target).unwrap(), b"old destination");
         std::fs::remove_file(&overwrite_stage).unwrap();
+        let unrelated = downloaded.join("unrelated.txt");
+        std::fs::write(&unrelated, b"unrelated data").unwrap();
+        std::os::unix::fs::symlink(&unrelated, &overwrite_stage).unwrap();
+        let symlink_stage = linscp_engine::transfer::download_single_file(session.as_ref(), "/upload.txt", None, &overwrite_target, &overwrite_flags, &mut logger, None).await;
+        assert!(symlink_stage.is_err());
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"unrelated data");
+        assert_eq!(std::fs::read(&overwrite_target).unwrap(), b"old destination");
+        std::fs::remove_file(&overwrite_stage).unwrap();
         let overwrite = linscp_engine::transfer::download_single_file(session.as_ref(), "/upload.txt", None, &overwrite_target, &overwrite_flags, &mut logger, None).await;
         assert!(overwrite.is_ok(), "{overwrite:?}");
         assert_eq!(std::fs::read(&overwrite_target).unwrap(), b"hello from native");
