@@ -2664,6 +2664,34 @@ mod tests {
         assert!(!downloaded.join("slow.bin").exists());
         assert!(!std::fs::read_dir(&downloaded).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-download-")), "cancelled WebDAV download left an owned temporary file");
         assert!(session.stat("/upload.txt").await.unwrap().is_some());
+        // Cancellation of a resumable download must not create a new partial.
+        let resume_cancel_dir = downloaded.join("resume-cancel-dir");
+        std::fs::create_dir_all(&resume_cancel_dir).unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let resumed = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": resume_cancel_dir, "remote_dir": "/", "names": ["slow.bin"], "resume": true}))).await;
+        assert_eq!(resumed.status, 200, "{}", resumed.payload);
+        let mut task_id = None;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(task) = tasks.get(idx) {
+                if task["status"] == "Running" && task["bytes_done"].as_u64().unwrap_or(0) > 0 { task_id = task["id"].as_u64(); break; }
+                assert_ne!(task["status"], "Completed", "resumable download finished before cancellation");
+                assert_ne!(task["status"], "Failed", "{tasks:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let cancel = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": task_id.expect("resumable download did not start")}))).await;
+        assert_eq!(cancel.status, 200, "{}", cancel.payload);
+        let mut stopped = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Cancelled") { stopped = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped);
+        assert!(!resume_cancel_dir.join("slow.bin").exists());
+        assert!(!resume_cancel_dir.join("slow.bin.filepart").exists());
+        assert!(!std::fs::read_dir(&resume_cancel_dir).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-download-")));
         // An interrupted PUT must not deadlock the queue or report success.
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let callback_flag = Arc::clone(&cancel);
