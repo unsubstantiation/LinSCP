@@ -1947,6 +1947,15 @@ mod tests {
         assert_eq!(list.status, 200, "{}", list.payload);
         assert!(list.payload["entries"].as_array().unwrap().iter().any(|e| e["name"] == "upload.txt"));
         assert_eq!(std::fs::read(downloaded.join("upload.txt")).unwrap(), b"WebDAV roundtrip");
+        let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        std::fs::write(local.join("other.txt"), b"must not replace").unwrap();
+        let mut flags = linscp_engine::transfer::TransferFlags::default();
+        flags.no_clobber = true;
+        let mut logger = linscp_engine::xml_log::SessionLogger::open(None, 0, false, None, None, false, "").unwrap();
+        let collision = linscp_engine::transfer::upload_single_file(session.as_ref(), &local.join("other.txt"), "/upload.txt", &flags, &mut logger, None).await;
+        assert!(collision.is_err());
+        let remote_bytes = linscp_proto::download_bytes(session.as_ref(), "/upload.txt", Default::default()).await.unwrap();
+        assert_eq!(remote_bytes, b"WebDAV roundtrip");
         drop(server); let _ = std::fs::remove_dir_all(tmp);
     }
 

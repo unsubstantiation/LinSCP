@@ -662,10 +662,8 @@ impl QueueManager {
                 let mut f = flags.clone();
                 f.delete_source = *delete_source;
                 f.cancel_flag = Some(Arc::clone(&task.cancel_flag));
-                // SFTP exclusive create prevents replacing a newly created destination.
-                // Other protocols retain their existing behaviour until they expose
-                // an equivalent verified capability.
-                f.no_clobber = !allow_overwrite && session.scheme() == ProtocolScheme::Sftp;
+                // Fail closed if the protocol has no atomic exclusive-create capability.
+                f.no_clobber = !allow_overwrite;
                 if meta.is_dir() {
                     f.recursive = true;
                     upload_directory_recursive(

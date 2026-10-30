@@ -418,6 +418,88 @@ pub struct WebDavSession {
 }
 
 impl WebDavSession {
+    async fn upload_inner(
+        &self,
+        remote_path: &str,
+        opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send),
+        total_size: Option<u64>,
+        progress: Option<&ProgressCallback>,
+        exclusive: bool,
+    ) -> Result<u64, ProtoError> {
+        if opts.resume_offset > 0 || opts.append {
+            return Err(ProtoError::Transport(
+                "WebDAV PUT does not support unguarded byte-offset resume or append.".to_string(),
+            ));
+        }
+
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let mut req = self.apply_auth(self.client.put(self.url_for(remote_path, false)));
+        if exclusive {
+            req = req.header("If-None-Match", "*");
+        }
+        if let Some(sz) = total_size {
+            req = req.header("Content-Length", sz.to_string());
+        }
+        let has_etag = self.has_etag_precondition(remote_path).await;
+        if let Some(if_hdr) = self.if_header_for(remote_path).await {
+            req = req.header("If", if_hdr);
+        }
+        req = req.body(Body::wrap_stream(ChannelBodyStream { rx }));
+
+        let send_fut = req.send();
+        let pump_fut = async {
+            let mut buf = vec![0u8; 32 * 1024];
+            let mut sent = 0u64;
+            let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
+            let reported_total = total_size.unwrap_or(0);
+            loop {
+                let n = source.read(&mut buf).await.map_err(|e| {
+                    ProtoError::Transport(format!("Reading upload source failed: {e}"))
+                })?;
+                if n == 0 {
+                    break;
+                }
+                let bytes = Bytes::copy_from_slice(&buf[..n]);
+                if tx.send(Ok(bytes)).await.is_err() {
+                    break;
+                }
+                sent += n as u64;
+                if let Some(cb) = progress {
+                    cb(sent, reported_total);
+                }
+                limiter.consume(n).await;
+            }
+            drop(tx);
+            Ok::<u64, ProtoError>(sent)
+        };
+
+        let (pump_res, resp_res) = tokio::join!(pump_fut, send_fut);
+        let transferred = pump_res?;
+        let resp = resp_res.map_err(|e| {
+            ProtoError::Transport(format!(
+                "WebDAV PUT '{remote_path}' failed: {}",
+                format_reqwest_err(&e)
+            ))
+        })?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 412 && has_etag {
+                return Err(ProtoError::Transport(format!(
+                    "WebDAV PUT '{remote_path}' failed with HTTP {status} (ETag precondition not satisfied): {}",
+                    detail.trim()
+                )));
+            }
+            return Err(ProtoError::Transport(format!(
+                "WebDAV PUT '{remote_path}' failed with HTTP {status}: {}",
+                detail.trim()
+            )));
+        }
+        Ok(transferred)
+    }
+
+
     pub async fn connect(
         mut cfg: WebDavConnectConfig,
         tunnel_cfg: Option<&SshConnectConfig>,
@@ -1250,80 +1332,19 @@ impl RemoteSession for WebDavSession {
     }
 
     async fn upload(
-        &self,
-        remote_path: &str,
-        opts: TransferRequest,
-        source: &mut (dyn AsyncRead + Unpin + Send),
-        total_size: Option<u64>,
+        &self, remote_path: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
         progress: Option<&ProgressCallback>,
     ) -> Result<u64, ProtoError> {
-        if opts.resume_offset > 0 || opts.append {
-            return Err(ProtoError::Transport(
-                "WebDAV PUT does not support unguarded byte-offset resume or append.".to_string(),
-            ));
-        }
+        self.upload_inner(remote_path, opts, source, total_size, progress, false).await
+    }
 
-        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
-        let mut req = self.apply_auth(self.client.put(self.url_for(remote_path, false)));
-        if let Some(sz) = total_size {
-            req = req.header("Content-Length", sz.to_string());
-        }
-        let has_etag = self.has_etag_precondition(remote_path).await;
-        if let Some(if_hdr) = self.if_header_for(remote_path).await {
-            req = req.header("If", if_hdr);
-        }
-        req = req.body(Body::wrap_stream(ChannelBodyStream { rx }));
-
-        let send_fut = req.send();
-        let pump_fut = async {
-            let mut buf = vec![0u8; 32 * 1024];
-            let mut sent = 0u64;
-            let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
-            let reported_total = total_size.unwrap_or(0);
-            loop {
-                let n = source.read(&mut buf).await.map_err(|e| {
-                    ProtoError::Transport(format!("Reading upload source failed: {e}"))
-                })?;
-                if n == 0 {
-                    break;
-                }
-                let bytes = Bytes::copy_from_slice(&buf[..n]);
-                if tx.send(Ok(bytes)).await.is_err() {
-                    break;
-                }
-                sent += n as u64;
-                if let Some(cb) = progress {
-                    cb(sent, reported_total);
-                }
-                limiter.consume(n).await;
-            }
-            drop(tx);
-            Ok::<u64, ProtoError>(sent)
-        };
-
-        let (pump_res, resp_res) = tokio::join!(pump_fut, send_fut);
-        let transferred = pump_res?;
-        let resp = resp_res.map_err(|e| {
-            ProtoError::Transport(format!(
-                "WebDAV PUT '{remote_path}' failed: {}",
-                format_reqwest_err(&e)
-            ))
-        })?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let detail = resp.text().await.unwrap_or_default();
-            if status.as_u16() == 412 && has_etag {
-                return Err(ProtoError::Transport(format!(
-                    "WebDAV PUT '{remote_path}' failed with HTTP {status} (ETag precondition not satisfied): {}",
-                    detail.trim()
-                )));
-            }
-            return Err(ProtoError::Transport(format!(
-                "WebDAV PUT '{remote_path}' failed with HTTP {status}: {}",
-                detail.trim()
-            )));
-        }
-        Ok(transferred)
+    async fn upload_exclusive(
+        &self, remote_path: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        self.upload_inner(remote_path, opts, source, total_size, progress, true).await
     }
 
     async fn probe_endpoint(&self, initial_dir: &str) -> Result<(), ProtoError> {

@@ -27,6 +27,7 @@ import hashlib
 import json
 import re
 import sys
+import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -61,6 +62,7 @@ class Store:
 
     def __init__(self):
         self.items = {"/": {"kind": "dir", "mtime": _now()}}
+        self.write_lock = threading.Lock()
         # Every write moves the entity tags, even a rewrite of the same
         # bytes within the same second: without this two successive PUTs
         # of identical content could share one tag, and a precondition
@@ -674,8 +676,12 @@ class DavHandler(BaseHTTPRequestHandler):
         if self.precondition_failed(path):
             self.send_precondition_failed()
             return
-        existed = SERVER_STORE.get(path) is not None
-        SERVER_STORE.add_file(path, data)
+        with SERVER_STORE.write_lock:
+            existed = SERVER_STORE.get(path) is not None
+            if self.headers.get("If-None-Match", "").strip() == "*" and existed:
+                self.send_precondition_failed()
+                return
+            SERVER_STORE.add_file(path, data)
         self.send_response(204 if existed else 201)
         self.send_header("Content-Length", "0")
         self.end_headers()
