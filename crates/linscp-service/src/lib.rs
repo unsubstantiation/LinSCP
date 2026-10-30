@@ -2295,10 +2295,11 @@ mod tests {
         flags.cancel_flag = Some(cancel);
         let mut logger = linscp_engine::xml_log::SessionLogger::open(None, 0, false, None, None, false, "").unwrap();
         let result = linscp_engine::transfer::upload_single_file(session.as_ref(), &local.join("cancel-upload.bin"), "/cancel-upload.bin", &flags, &mut logger, Some(&progress)).await;
-        assert!(result.is_err(), "FTP upload should be interrupted");
-        assert!(result.unwrap_err().contains("temporary file"));
+        let error = result.expect_err("FTP upload should be interrupted");
+        assert!(error.contains("temporary file"));
         assert!(!remote.join("cancel-upload.bin").exists());
-        assert!(std::fs::read_dir(remote).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-upload-")));
+        let stage = error.split('\'').nth(1).expect("missing temporary path in cancellation error");
+        assert!(remote.join(stage.trim_start_matches('/')).exists(), "reported temporary file must exist");
         let err = session.stat("/download.txt").await.expect_err("cancelled FTP upload must poison control channel");
         assert!(err.to_string().contains("reconnect"), "{err}");
     }
