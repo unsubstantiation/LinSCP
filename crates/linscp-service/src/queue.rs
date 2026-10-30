@@ -735,7 +735,7 @@ impl QueueManager {
                     .await?;
                     if *delete_source {
                         let etag = f.source_etag.as_deref().ok_or("Move incomplete: local file was published but source identity is missing.")?;
-                        session.remove_if_match(remote_path, etag).await.map_err(|e| format!("Move incomplete: local file was published but the remote source was not removed: {e}"))?;
+                        session.remove_if_match(remote_path, etag).await.map_err(|e| format!("Move incomplete: local file was published, but remote source deletion could not be confirmed; the source may or may not exist: {e}"))?;
                     }
                 }
                 Ok(())
