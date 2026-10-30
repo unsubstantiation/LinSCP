@@ -848,6 +848,9 @@ impl RemoteSession for FtpSession {
     async fn stat(&self, remote_path: &str) -> Result<Option<FileEntry>, ProtoError> {
         validate_ftp_arg(remote_path)?;
         let mut inner = self.inner.lock().await;
+        if inner.poisoned {
+            return Err(ProtoError::Transport("FTP control connection is unusable after an interrupted transfer; reconnect.".to_string()));
+        }
         if inner.supports_mlst && self.cfg.use_mlsd {
             let rep = inner.command(&format!("MLST {remote_path}")).await?;
             if rep.code == 250 {
