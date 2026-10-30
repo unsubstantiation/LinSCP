@@ -466,27 +466,33 @@ pub async fn download_single_file(
     let (write_path, resume_offset) = if flags.no_clobber {
         (stage_opt.as_ref().expect("checked above").clone(), 0u64)
     } else if let Some(ref sp) = stage_opt {
-        let sp_meta = stat_local_path(sp);
-        if can_resume_proto && sp_meta.exists && sp_meta.is_regular {
-            if sp_meta.size < info.size {
-                (sp.clone(), sp_meta.size)
+        if !flags.resume && !flags.append {
+            // A fresh transfer must never adopt, truncate or remove somebody
+            // else's staging file, even if it appeared after preflight.
+            (sp.clone(), 0u64)
+        } else {
+            let sp_meta = stat_local_path(sp);
+            if can_resume_proto && sp_meta.exists && sp_meta.is_regular {
+                if sp_meta.size < info.size {
+                    (sp.clone(), sp_meta.size)
+                } else {
+                    let _ = std::fs::remove_file(sp);
+                    (sp.clone(), 0u64)
+                }
+            } else if can_resume_proto
+                && flags.resume
+                && local_stat.exists
+                && local_stat.is_regular
+                && local_stat.size < info.size
+            {
+                // Adopt existing partial target into stage path or resume directly
+                let _ = std::fs::rename(local_dest, sp);
+                let moved = stat_local_path(sp);
+                (sp.clone(), if moved.exists { moved.size } else { 0 })
             } else {
                 let _ = std::fs::remove_file(sp);
                 (sp.clone(), 0u64)
             }
-        } else if can_resume_proto
-            && flags.resume
-            && local_stat.exists
-            && local_stat.is_regular
-            && local_stat.size < info.size
-        {
-            // Adopt existing partial target into stage path or resume directly
-            let _ = std::fs::rename(local_dest, sp);
-            let moved = stat_local_path(sp);
-            (sp.clone(), if moved.exists { moved.size } else { 0 })
-        } else {
-            let _ = std::fs::remove_file(sp);
-            (sp.clone(), 0u64)
         }
     } else if flags.append && local_stat.exists && local_stat.is_regular {
         (local_dest.to_path_buf(), 0u64)
@@ -496,7 +502,8 @@ pub async fn download_single_file(
         (local_dest.to_path_buf(), 0u64)
     };
 
-    let open_res = if flags.no_clobber {
+    let fresh_stage = stage_opt.is_some() && !flags.resume && !flags.append;
+    let open_res = if flags.no_clobber || fresh_stage {
         tokio::fs::OpenOptions::new().write(true).create_new(true).open(&write_path).await
     } else if resume_offset > 0 || flags.append {
         tokio::fs::OpenOptions::new()
@@ -549,9 +556,8 @@ pub async fn download_single_file(
             // Never fall back to rename, which can replace a newly created target.
             std::fs::hard_link(sp, local_dest).map(|_| { let _ = std::fs::remove_file(sp); })
         } else {
-            if local_dest.exists() {
-                let _ = std::fs::remove_file(local_dest);
-            }
+            // Rename replaces atomically; never unlink the old destination first.
+            // This still does not protect against changes after approval.
             std::fs::rename(sp, local_dest)
         };
         publish.map_err(|e| {

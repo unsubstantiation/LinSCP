@@ -2399,6 +2399,23 @@ mod tests {
         let race = linscp_engine::transfer::download_single_file(session.as_ref(), "/upload.txt", None, &raced_target, &flags, &mut logger, Some(&progress)).await;
         assert!(race.is_err(), "concurrent destination must not be replaced");
         assert_eq!(std::fs::read(&raced_target).unwrap(), b"concurrent data");
+        // Fresh overwrite downloads must not touch an unrelated stage file,
+        // even if it appears after the queue's preflight check.
+        let overwrite_target = downloaded.join("overwrite.txt");
+        let overwrite_stage = downloaded.join("overwrite.txt.filepart");
+        std::fs::write(&overwrite_target, b"old destination").unwrap();
+        std::fs::write(&overwrite_stage, b"unrelated stage").unwrap();
+        let mut overwrite_flags = linscp_engine::transfer::TransferFlags::default();
+        overwrite_flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
+        let blocked_stage = linscp_engine::transfer::download_single_file(session.as_ref(), "/upload.txt", None, &overwrite_target, &overwrite_flags, &mut logger, None).await;
+        assert!(blocked_stage.is_err());
+        assert_eq!(std::fs::read(&overwrite_stage).unwrap(), b"unrelated stage");
+        assert_eq!(std::fs::read(&overwrite_target).unwrap(), b"old destination");
+        std::fs::remove_file(&overwrite_stage).unwrap();
+        let overwrite = linscp_engine::transfer::download_single_file(session.as_ref(), "/upload.txt", None, &overwrite_target, &overwrite_flags, &mut logger, None).await;
+        assert!(overwrite.is_ok(), "{overwrite:?}");
+        assert_eq!(std::fs::read(&overwrite_target).unwrap(), b"hello from native");
+        assert!(!overwrite_stage.exists());
         // Cancel both directions mid-stream and ensure the session remains usable.
         std::fs::write(remote.join("large.bin"), vec![17u8; 512 * 1024]).unwrap();
         std::fs::write(local.join("large.bin"), vec![29u8; 512 * 1024]).unwrap();
@@ -2409,6 +2426,14 @@ mod tests {
         cancelling.no_clobber = true;
         cancelling.cancel_flag = Some(Arc::clone(&cancel));
         cancelling.resume_support = linscp_engine::presets::ResumeSupportMode::On;
+        let cancel_overwrite_target = downloaded.join("cancel-overwrite.bin");
+        std::fs::write(&cancel_overwrite_target, b"original destination").unwrap();
+        cancelling.no_clobber = false;
+        let cancelled_overwrite = linscp_engine::transfer::download_single_file(session.as_ref(), "/large.bin", None, &cancel_overwrite_target, &cancelling, &mut logger, Some(&cancel_on_progress)).await;
+        assert!(cancelled_overwrite.is_err());
+        assert_eq!(std::fs::read(&cancel_overwrite_target).unwrap(), b"original destination");
+        cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+        cancelling.no_clobber = true;
         let cancelled_download = linscp_engine::transfer::download_single_file(session.as_ref(), "/large.bin", None, &downloaded.join("large.bin"), &cancelling, &mut logger, Some(&cancel_on_progress)).await;
         assert!(cancelled_download.is_err());
         assert!(!downloaded.join("large.bin").exists());
