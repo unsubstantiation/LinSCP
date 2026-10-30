@@ -589,8 +589,8 @@ impl QueueManager {
                     let committed_move_failure = result.as_ref().is_err_and(|e| e.starts_with("Move incomplete:"));
                     if cancelled && result.is_err() && !committed_move_failure {
                         t.status = "cancelled".to_string();
-                        let reconnect = matches!(&task.job, QueueJob::RemoteDownload { session, .. } if matches!(session.scheme(), ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes));
-                        t.error = Some(if reconnect { "Cancelled by user. Reconnect the FTP session before further transfers." } else { "Cancelled by user." }.to_string());
+                        let reconnect = match &task.job { QueueJob::RemoteDownload { session, .. } | QueueJob::RemoteUpload { session, .. } => matches!(session.scheme(), ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes), _ => false };
+                        t.error = Some(if reconnect { format!("Cancelled by user. Reconnect the FTP session before further transfers. {}", result.as_ref().err().map(String::as_str).unwrap_or("A temporary file may remain.")) } else { "Cancelled by user.".to_string() });
                         clean = true;
                     } else {
                         match result {
@@ -750,10 +750,11 @@ impl QueueManager {
                     let allowed_file = source_meta.is_file() && *allow_overwrite && !entry.is_dir && !entry.is_symlink;
                     if !allowed_dir && !allowed_file { return Err("Destination changed or merge/overwrite was not approved.".to_string()); }
                 }
-                if let Some(stage) = linscp_engine::transfer::remote_stage_path(remote_dest, None) {
+                if !flags.ftp_risky_publish { if let Some(stage) = linscp_engine::transfer::remote_stage_path(remote_dest, None) {
                     if session.stat(&stage).await.map_err(|e| e.to_string())?.is_some() {
                         return Err(format!("A partial file already exists at '{stage}'; remove it before retrying."));
                     }
+                }
                 }
                 let meta = source_meta;
                 let mut f = flags.clone();

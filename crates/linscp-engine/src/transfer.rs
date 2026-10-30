@@ -33,6 +33,8 @@ pub struct TransferFlags {
     pub recursive: bool,
     /// Do not replace an existing destination; fail if the protocol cannot enforce this.
     pub no_clobber: bool,
+    /// User acknowledged FTP's non-atomic rename and overwrite race.
+    pub ftp_risky_publish: bool,
     /// Server-side compare-and-replace using a previously approved strong ETag.
     pub overwrite_etag: Option<String>,
     /// Read only the remote representation matching this strong ETag.
@@ -65,6 +67,7 @@ impl Default for TransferFlags {
             append: false,
             recursive: false,
             no_clobber: false,
+            ftp_risky_publish: false,
             overwrite_etag: None,
             source_etag: None,
             cancel_flag: None,
@@ -831,6 +834,30 @@ pub async fn upload_single_file(
             std::fs::remove_file(local_src)
                 .map_err(|e| format!("Cannot remove source '{src_label}': {e}"))?;
         }
+        return Ok(true);
+    }
+
+    if flags.ftp_risky_publish {
+        if !is_ftp_scheme(session.scheme()) || flags.resume || flags.append || effective_ascii || flags.delete_source {
+            return Err("FTP staged upload requires a fresh binary copy.".to_string());
+        }
+        let directory = remote_dest.rsplit_once('/').map(|(dir, _)| if dir.is_empty() { "/" } else { dir }).unwrap_or(".");
+        let input = tokio::fs::File::open(local_src).await.map_err(|e| format!("Cannot open local file '{src_label}': {e}"))?;
+        let mut reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
+        let req = TransferRequest { resume_offset: 0, append: false, preserve_time: false, mtime: None, permissions: None, speed_kbytes_per_sec: speed_u32(flags.speed_kbytes_per_sec), version_id: None };
+        let (bytes, stage) = session.upload_ftp_unique(directory, req, &mut reader, Some(local_info.size), progress).await.map_err(|e| e.to_string())?;
+        if flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) {
+            return Err(format!("Cancelled before publication; temporary FTP file '{stage}' remains."));
+        }
+        if bytes != local_info.size { return Err(format!("Source size changed; temporary FTP file '{stage}' remains.")); }
+        let current = session.stat(remote_dest).await.map_err(|e| format!("Cannot check FTP destination; temporary file '{stage}' remains: {e}"))?;
+        if current.as_ref().is_some_and(|e| e.is_dir || e.is_symlink || flags.no_clobber) {
+            return Err(format!("FTP destination changed; temporary file '{stage}' remains."));
+        }
+        if flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) { return Err(format!("Cancelled before publication; temporary FTP file '{stage}' remains.")); }
+        session.rename(&stage, remote_dest).await.map_err(|e| format!("FTP rename failed or could not be confirmed; '{stage}' may remain and destination may have changed: {e}"))?;
+        if let Some(mt) = desired_mtime { let _ = session.set_mtime(remote_dest, mt).await; }
+        logger.record_transfer(true, &src_label, remote_dest, Some(bytes), Ok(()));
         return Ok(true);
     }
 

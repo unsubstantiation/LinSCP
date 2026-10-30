@@ -332,3 +332,27 @@ test('directory merge requires explicit approval and forwards only approved root
   assert.equal(confirmations, 1);
   assert.deepEqual(calls[1].merge_directories, ['tree']);
 });
+
+test('FTP uploads require risk confirmation and separately confirm existing files', async () => {
+  const html = fs.readFileSync(path.join(repoRoot, 'source/gui/web/index.html'), 'utf8');
+  const match = html.match(/async function queueWithOverwriteDecision\(endpoint, payload, conflicts\) \{[\s\S]*?\n  \}\n\n  async function transfer/);
+  assert.ok(match);
+  const source = match[0].replace(/\n\n  async function transfer$/, '');
+  const calls = [];
+  let confirmations = 0;
+  const apiPost = async (_endpoint, payload) => {
+    calls.push({ ...payload });
+    if (!payload.accept_ftp_rename_risk) return { success: false, ftp_rename_risk: true };
+    if (!payload.overwrite) return { success: false, conflicts: ['file.txt'] };
+    return { success: true };
+  };
+  const handler = new Function('apiPost', 'preferences', 'confirm', 't', `${source}; return queueWithOverwriteDecision;`)(apiPost, { confirm_overwrite: false }, () => { confirmations++; return true; }, s => s);
+  assert.equal((await handler('/api/transfer/upload', {}, [])).success, true);
+  assert.equal(confirmations, 2);
+  assert.equal(calls[1].accept_ftp_rename_risk, true);
+  assert.equal(calls[2].overwrite, 'overwrite');
+  const reject = new Function('apiPost', 'preferences', 'confirm', 't', `${source}; return queueWithOverwriteDecision;`)(apiPost, {}, () => false, s => s);
+  const before = calls.length;
+  await reject('/api/transfer/upload', {}, []);
+  assert.equal(calls.length, before + 1);
+});

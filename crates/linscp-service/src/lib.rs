@@ -369,6 +369,11 @@ impl CommanderService {
         if other_dir.is_empty() || other_dir.chars().any(char::is_control) { return api_error(400, "Missing remote directory"); }
         let session = tab.remote.clone();
         if !tab.is_local && session.is_none() { return api_error(400, "Not connected"); }
+        let is_ftp_upload = upload && !move_item && !tab.is_local && session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes));
+        let ftp_risk_accepted = body.get("accept_ftp_rename_risk").and_then(Value::as_bool).unwrap_or(false);
+        if is_ftp_upload && !ftp_risk_accepted {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP upload requires confirmation of rename risks", "ftp_rename_risk": true}) };
+        }
         let resume = body.get("resume").and_then(Value::as_bool).unwrap_or(false);
         if resume && (move_item || upload || tab.is_local || session.as_ref().is_none_or(|s| !matches!(s.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs))) {
             return api_error(400, "Verified resume is supported only for WebDAV file downloads.");
@@ -456,13 +461,14 @@ impl CommanderService {
             // A different item appearing later must not inherit that approval.
             let allow_overwrite = overwrite == "overwrite" && exists && !is_dir;
             if resume && allow_overwrite { return api_error(400, "Verified resume requires a new local destination."); }
-            if allow_overwrite && !is_dav_upload && !is_s3_upload {
+            if allow_overwrite && !is_dav_upload && !is_s3_upload && !is_ftp_upload {
                 return api_error(501, "Safe approved overwrites are not yet supported for this transfer. The destination was not changed.");
             }
             let mut flags = linscp_engine::transfer::TransferFlags::default();
             // Resuming existing partial files without verifying their source can
             // splice unrelated bytes into the result. Always stage a fresh copy.
             flags.resume = resume;
+            flags.ftp_risky_publish = is_ftp_upload && ftp_risk_accepted;
             // Approval is per root and only applies to directories that exist now.
             flags.merge_directories = is_dir && exists && merge_names.contains(name);
             flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
@@ -2178,6 +2184,7 @@ mod tests {
         }
         assert!(large_failed);
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/photos/upload.txt", Default::default()).await.unwrap(), b"S3 exclusive upload");
+        exercise_ftp_uploads(&svc, id, &local, &remote).await;
         let slow_index = svc.queue.snapshot().0.len();
         let slow = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["slow.bin"]}))).await;
         assert_eq!(slow.status, 200);
@@ -2205,6 +2212,61 @@ mod tests {
         assert!(!std::fs::read_dir(&local).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-download-")), "cancelled download left an owned temporary file");
         assert!(session.stat("/photos/seed.txt").await.unwrap().is_some());
         drop(server); let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn exercise_ftp_uploads(svc: &CommanderService, id: u64, local: &Path, remote: &Path) {
+        let request = |body: Value| ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body };
+        std::fs::write(local.join("up.txt"), b"FTP upload payload").unwrap();
+        let no_consent = svc.dispatch_async(request(json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["up.txt"]}))).await;
+        assert_eq!(no_consent.status, 409);
+        assert_eq!(no_consent.payload["ftp_rename_risk"], true);
+        assert!(!remote.join("up.txt").exists());
+        let idx = svc.queue.snapshot().0.len();
+        let upload = svc.dispatch_async(request(json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["up.txt"], "accept_ftp_rename_risk": true}))).await;
+        assert_eq!(upload.status, 200, "{}", upload.payload);
+        let mut done = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("FTP upload failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done);
+        assert_eq!(std::fs::read(remote.join("up.txt")).unwrap(), b"FTP upload payload");
+        assert!(!std::fs::read_dir(remote).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-upload-")));
+        std::fs::write(local.join("up.txt"), b"replacement").unwrap();
+        let conflict = svc.dispatch_async(request(json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["up.txt"], "accept_ftp_rename_risk": true}))).await;
+        assert_eq!(conflict.status, 409);
+        assert_eq!(conflict.payload["conflicts"], json!(["up.txt"]));
+        let idx = svc.queue.snapshot().0.len();
+        let upload = svc.dispatch_async(request(json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["up.txt"], "accept_ftp_rename_risk": true, "overwrite": "overwrite"}))).await;
+        assert_eq!(upload.status, 200, "{}", upload.payload);
+        let mut done = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("FTP overwrite failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done);
+        assert_eq!(std::fs::read(remote.join("up.txt")).unwrap(), b"replacement");
+        std::fs::write(local.join("new-race.txt"), b"source").unwrap();
+        svc.queue.pause();
+        let idx = svc.queue.snapshot().0.len();
+        let upload = svc.dispatch_async(request(json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["new-race.txt"], "accept_ftp_rename_risk": true}))).await;
+        assert_eq!(upload.status, 200, "{}", upload.payload);
+        std::fs::write(remote.join("new-race.txt"), b"competing data").unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("queued FTP race overwrote destination"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert_eq!(std::fs::read(remote.join("new-race.txt")).unwrap(), b"competing data");
     }
 
     #[cfg(target_os = "linux")]
@@ -2246,6 +2308,7 @@ mod tests {
         }
         assert!(done, "FTPS download timed out");
         assert_eq!(std::fs::read(local.join("download.txt")).unwrap(), b"explicit FTPS download");
+        exercise_ftp_uploads(&svc, id, &local, &remote).await;
         std::fs::write(remote.join("large.bin"), vec![19u8; 4 * 1024 * 1024]).unwrap();
         let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));

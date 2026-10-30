@@ -678,6 +678,12 @@ impl FtpSession {
         inner: &mut FtpInner,
         transfer_cmd: &str,
     ) -> Result<DataStream, ProtoError> {
+        self.open_data_command_with_reply(inner, transfer_cmd).await.map(|(data, _)| data)
+    }
+
+    async fn open_data_command_with_reply(
+        &self, inner: &mut FtpInner, transfer_cmd: &str,
+    ) -> Result<(DataStream, FtpReply), ProtoError> {
         if self.cfg.pasv_mode {
             let (data_host, data_port) = self.enter_passive(inner).await?;
             let tcp = connect_tcp_maybe_proxied(
@@ -694,7 +700,7 @@ impl FtpSession {
                     prelim.summary()
                 )));
             }
-            self.upgrade_data_if_needed(inner.prot_private, tcp).await
+            Ok((self.upgrade_data_if_needed(inner.prot_private, tcp).await?, prelim))
         } else {
             if self.cfg.proxy.is_some() {
                 return Err(ProtoError::Transport(
@@ -760,7 +766,7 @@ impl FtpSession {
             let (tcp, _) = acc_res
                 .map_err(|_| ProtoError::Transport("Timed out awaiting active FTP data connection.".to_string()))?
                 .map_err(|e| ProtoError::Transport(format!("Active FTP accept failed: {e}")))?;
-            self.upgrade_data_if_needed(inner.prot_private, tcp).await
+            Ok((self.upgrade_data_if_needed(inner.prot_private, tcp).await?, prelim))
         }
     }
 
@@ -1298,6 +1304,60 @@ impl RemoteSession for FtpSession {
             }
         }
         Ok(transferred)
+    }
+
+    async fn upload_ftp_unique(
+        &self, directory: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<(u64, String), ProtoError> {
+        validate_ftp_arg(directory)?;
+        let mut inner = self.inner.lock().await;
+        let tp = inner.command("TYPE I").await?;
+        if tp.code != 200 { return Err(ProtoError::Transport(format!("FTP TYPE I failed: {}", tp.summary()))); }
+        let prefix = format!("{}/.linscp-upload-", directory.trim_end_matches('/'));
+        let (mut data, reply) = match self.open_data_command_with_reply(&mut inner, &format!("STOU {prefix}")).await {
+            Ok(result) => result,
+            Err(error) => { inner.poisoned = true; return Err(error); }
+        };
+        // RFC 1123 specifies FILE: followed by the unique filename. Accept only
+        // the requested directory and our prefix; never send a server-provided
+        // arbitrary pathname to RNFR or DELE.
+        let reported = reply.lines.iter().find_map(|line| line.trim().strip_prefix("125 FILE: ").or_else(|| line.trim().strip_prefix("150 FILE: ")));
+        let stage = reported.and_then(|name| {
+            let basename = if name.starts_with('/') {
+                let (parent, base) = name.rsplit_once('/')?;
+                if parent != directory.trim_end_matches('/') { return None; }
+                base
+            } else { name };
+            if !basename.starts_with(".linscp-upload-") || basename.contains('/') || basename.contains('\\') || basename.chars().any(char::is_control) { return None; }
+            Some(format!("{}/{}", directory.trim_end_matches('/'), basename))
+        });
+        let stage = match stage {
+            Some(stage) => stage,
+            None => { inner.poisoned = true; return Err(ProtoError::Transport("FTP STOU returned an unrecognized filename; a temporary file may remain. Reconnect before further transfers.".to_string())); }
+        };
+        let mut buf = vec![0u8; FTP_CHUNK_SIZE];
+        let mut transferred = 0u64;
+        let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
+        loop {
+            let n = match source.read(&mut buf).await {
+                Ok(n) => n,
+                Err(error) => { inner.poisoned = true; return Err(ProtoError::Transport(format!("FTP upload interrupted; temporary file '{stage}' may remain. Reconnect: {error}"))); }
+            };
+            if n == 0 { break; }
+            if let Err(error) = data.write_all_chunk(&buf[..n]).await {
+                inner.poisoned = true;
+                return Err(ProtoError::Transport(format!("FTP upload failed; temporary file '{stage}' may remain. Reconnect: {error}")));
+            }
+            transferred += n as u64;
+            if let Some(cb) = progress { cb(transferred, total_size.unwrap_or(0)); }
+            limiter.consume(n).await;
+        }
+        if let Err(error) = data.finish_write().await { inner.poisoned = true; return Err(ProtoError::Transport(format!("FTP upload failed; temporary file '{stage}' may remain. Reconnect: {error}"))); }
+        let done = match inner.read_reply().await { Ok(done) => done, Err(error) => { inner.poisoned = true; return Err(ProtoError::Transport(format!("FTP completion unconfirmed; temporary file '{stage}' may remain. Reconnect: {error}"))); } };
+        if done.code != 226 && done.code != 250 { inner.poisoned = true; return Err(ProtoError::Transport(format!("FTP upload failed; temporary file '{stage}' may remain. Reconnect: {}", done.summary()))); }
+        Ok((transferred, stage))
     }
 
     async fn close(&self) -> Result<(), ProtoError> {

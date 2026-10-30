@@ -2162,6 +2162,11 @@
    * and the same request is retried with an explicit policy. */
   async function queueWithOverwriteDecision(endpoint, payload, conflicts) {
     let result = await apiPost(endpoint, payload);
+    if (!result.success && result.ftp_rename_risk) {
+      if (!confirm(t("FTP/FTPS cannot guarantee that the destination stays unchanged. Another client's file could be overwritten when the temporary upload is renamed, even if no overwrite was approved. Interruptions may leave a temporary file and require reconnecting. Continue?"))) return result;
+      payload = Object.assign({}, payload, { accept_ftp_rename_risk: true });
+      result = await apiPost(endpoint, payload);
+    }
     if (!result.success && result.directory_conflicts && result.directory_conflicts.length) {
       const names = result.directory_conflicts;
       if (!confirm(t("The destination already contains these directories: {names}.\n\nMerge them? Existing files will not be replaced; conflicting files stop the transfer.", {names: names.join(', ')}))) return result;
@@ -2171,7 +2176,7 @@
     if (!result.success && result.conflicts && result.conflicts.length) {
       // Asking before replacing a file is a preference, not a fixed rule:
       // with it turned off the same request is retried as an overwrite.
-      const overwrite = preferences && preferences.confirm_overwrite === false
+      const overwrite = !payload.accept_ftp_rename_risk && preferences && preferences.confirm_overwrite === false
         ? true
         : confirm(t("The destination already contains: {names}.\n\nOverwrite those entries?", {
             names: result.conflicts.join(', ')

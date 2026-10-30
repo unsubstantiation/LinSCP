@@ -372,6 +372,14 @@ pub trait RemoteSession: Send + Sync {
         total_size: Option<u64>,
         progress: Option<&ProgressCallback>,
     ) -> Result<u64, ProtoError>;
+    /// FTP STOU uploads to a server-created unique temporary name.
+    async fn upload_ftp_unique(
+        &self, _directory: &str, _opts: TransferRequest,
+        _source: &mut (dyn AsyncRead + Unpin + Send), _total_size: Option<u64>,
+        _progress: Option<&ProgressCallback>,
+    ) -> Result<(u64, String), ProtoError> {
+        Err(ProtoError::UnsupportedCapability("FTP unique upload", self.scheme()))
+    }
     /// Create a new destination atomically, failing if any entry already exists.
     /// Implementations must not silently fall back to an overwriting upload.
     async fn upload_exclusive(
