@@ -33,6 +33,8 @@ pub struct TransferFlags {
     pub recursive: bool,
     /// Do not replace an existing destination; fail if the protocol cannot enforce this.
     pub no_clobber: bool,
+    /// Server-side compare-and-replace using a previously approved strong ETag.
+    pub overwrite_etag: Option<String>,
     /// Cooperative cancellation checked between I/O operations.
     pub cancel_flag: Option<Arc<AtomicBool>>,
     pub resume_support: ResumeSupportMode,
@@ -57,6 +59,7 @@ impl Default for TransferFlags {
             append: false,
             recursive: false,
             no_clobber: false,
+            overwrite_etag: None,
             cancel_flag: None,
             resume_support: ResumeSupportMode::Smart(100 * 1024),
             explicit_resume_support: false,
@@ -681,8 +684,8 @@ pub async fn upload_single_file(
         .unwrap_or_default();
     let effective_ascii = wants_ascii_conversion(flags.transfer_mode, &leaf);
 
-    if flags.no_clobber && effective_ascii {
-        return Err("No-overwrite uploads require binary transfer mode.".to_string());
+    if (flags.no_clobber || flags.overwrite_etag.is_some()) && effective_ascii {
+        return Err("Guarded uploads require binary transfer mode.".to_string());
     }
     if effective_ascii {
         let raw = std::fs::read(local_src)
@@ -721,8 +724,8 @@ pub async fn upload_single_file(
         return Ok(true);
     }
 
-    if flags.no_clobber {
-        if flags.resume || flags.append || effective_ascii {
+    if flags.no_clobber || flags.overwrite_etag.is_some() {
+        if flags.resume || flags.append || effective_ascii || (flags.no_clobber && flags.overwrite_etag.is_some()) {
             return Err("Exclusive uploads require a fresh binary transfer.".to_string());
         }
         let input = tokio::fs::File::open(local_src).await.map_err(|e| format!("Cannot open local file '{src_label}': {e}"))?;
@@ -732,8 +735,11 @@ pub async fn upload_single_file(
             mtime: desired_mtime, permissions: desired_perms,
             speed_kbytes_per_sec: speed_u32(flags.speed_kbytes_per_sec), version_id: None,
         };
-        let bytes = session.upload_exclusive(remote_dest, req, &mut reader, Some(local_info.size), progress)
-            .await.map_err(|e| e.to_string())?;
+        let bytes = if let Some(etag) = flags.overwrite_etag.as_deref() {
+            session.upload_if_match(remote_dest, etag, req, &mut reader, Some(local_info.size), progress).await
+        } else {
+            session.upload_exclusive(remote_dest, req, &mut reader, Some(local_info.size), progress).await
+        }.map_err(|e| e.to_string())?;
         logger.record_transfer(true, &src_label, remote_dest, Some(bytes), Ok(()));
         if flags.delete_source {
             std::fs::remove_file(local_src).map_err(|e| format!("Cannot remove source '{src_label}': {e}"))?;

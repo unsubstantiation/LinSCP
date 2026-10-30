@@ -370,6 +370,7 @@ impl CommanderService {
         if overwrite != "ask" && overwrite != "overwrite" { return api_error(400, "Unsupported overwrite policy"); }
         let mut jobs = Vec::new();
         let mut conflicts = Vec::new();
+        let mut conflict_versions = serde_json::Map::new();
         let mut seen = std::collections::HashSet::new();
         for value in names {
             let name = match value.as_str() { Some(name) => name, None => return api_error(400, "Invalid file name") };
@@ -416,7 +417,17 @@ impl CommanderService {
                 let target = Path::new(&destination);
                 if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink() || !m.is_file()) { return api_error(400, "Refusing to overwrite a symlink or directory"); }
             }
-            if exists && overwrite == "ask" { conflicts.push(name.to_string()); }
+            let is_dav_upload = !tab.is_local && upload && matches!(session.as_ref().unwrap().scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs);
+            if exists && overwrite == "ask" {
+                conflicts.push(name.to_string());
+                if is_dav_upload {
+                    match session.as_ref().unwrap().dav_get_etag(&other).await {
+                        Ok((Some(tag), false)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => { conflict_versions.insert(name.to_string(), json!(tag)); }
+                        Ok(_) => {},
+                        Err(error) => return api_error(400, error.to_string()),
+                    }
+                }
+            }
             // Approval applies only to destinations actually present at enqueue.
             // A different item appearing later must not inherit that approval.
             let allow_overwrite = overwrite == "overwrite" && exists;
@@ -426,6 +437,13 @@ impl CommanderService {
             flags.resume = false;
             flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
             flags.preserve_time = body.get("preserve_time").and_then(Value::as_bool).unwrap_or(true);
+            if allow_overwrite && is_dav_upload {
+                let tag = body.get("conflict_versions").and_then(|v| v.get(name)).and_then(Value::as_str);
+                match tag {
+                    Some(tag) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => flags.overwrite_etag = Some(tag.to_string()),
+                    _ => return api_error(400, "WebDAV overwrite requires the strong ETag returned with the original conflict."),
+                }
+            }
             let job = if tab.is_local {
                 queue::QueueJob::LocalCopyOrMove { source: PathBuf::from(&source), target: PathBuf::from(&destination), move_item, policy: if allow_overwrite { queue::ConflictPolicy::Overwrite } else { queue::ConflictPolicy::Ask } }
             } else if upload {
@@ -435,7 +453,7 @@ impl CommanderService {
             };
             jobs.push((name.to_string(), source, destination, size, job));
         }
-        if !conflicts.is_empty() { return ApiReply { status: 409, payload: json!({"success": false, "error": "Destination exists", "conflicts": conflicts}) }; }
+        if !conflicts.is_empty() { return ApiReply { status: 409, payload: json!({"success": false, "error": "Destination exists", "conflicts": conflicts, "conflict_versions": conflict_versions}) }; }
         for (name, source, destination, size, job) in jobs {
             self.queue.enqueue(Some(id), if upload { "upload" } else { "download" }, name, source, destination, size, body.get("priority").and_then(Value::as_bool).unwrap_or(false), job);
         }
@@ -2229,6 +2247,42 @@ mod tests {
         assert!(collision.is_err());
         let remote_bytes = linscp_proto::download_bytes(session.as_ref(), "/upload.txt", Default::default()).await.unwrap();
         assert_eq!(remote_bytes, b"WebDAV roundtrip");
+        // Approval captures the ETag; replacing the destination while queued
+        // must cause the conditional PUT to fail without changing its contents.
+        let conflict_body = || json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["upload.txt"]});
+        let conflict = svc.dispatch_async(request("/api/transfer/upload", conflict_body())).await;
+        assert_eq!(conflict.status, 409, "{}", conflict.payload);
+        let versions = conflict.payload["conflict_versions"].clone();
+        assert!(versions["upload.txt"].as_str().is_some());
+        svc.queue.pause();
+        let race_index = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["upload.txt"], "overwrite": "overwrite", "conflict_versions": versions}))).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        linscp_proto::upload_bytes(session.as_ref(), "/upload.txt", b"changed after approval", Default::default()).await.unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(race_index).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(race_index).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("conditional overwrite replaced a changed target"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed, "changed target must reject the overwrite");
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/upload.txt", Default::default()).await.unwrap(), b"changed after approval");
+        let conflict = svc.dispatch_async(request("/api/transfer/upload", conflict_body())).await;
+        let versions = conflict.payload["conflict_versions"].clone();
+        let success_index = svc.queue.snapshot().0.len();
+        let approved = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["upload.txt"], "overwrite": "overwrite", "conflict_versions": versions}))).await;
+        assert_eq!(approved.status, 200, "{}", approved.payload);
+        let mut completed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(success_index).and_then(|t| t["status"].as_str()) == Some("Completed") { completed = true; break; }
+            if tasks.get(success_index).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("unchanged target overwrite failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(completed);
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/upload.txt", Default::default()).await.unwrap(), b"WebDAV roundtrip");
         // Queue a large WebDAV download and cancel it after the first chunk.
         std::fs::write(local.join("slow.bin"), vec![13u8; 4 * 1024 * 1024]).unwrap();
         let upload_index = svc.queue.snapshot().0.len();

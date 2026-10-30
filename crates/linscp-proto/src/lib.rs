@@ -366,6 +366,14 @@ pub trait RemoteSession: Send + Sync {
     ) -> Result<u64, ProtoError> {
         Err(ProtoError::UnsupportedCapability("exclusive upload", self.scheme()))
     }
+    /// Replace only if the server atomically matches the supplied strong ETag.
+    async fn upload_if_match(
+        &self, _remote_path: &str, _etag: &str, _opts: TransferRequest,
+        _source: &mut (dyn AsyncRead + Unpin + Send), _total_size: Option<u64>,
+        _progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        Err(ProtoError::UnsupportedCapability("conditional overwrite", self.scheme()))
+    }
     async fn probe_endpoint(&self, _initial_dir: &str) -> Result<(), ProtoError> {
         Ok(())
     }

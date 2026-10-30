@@ -426,6 +426,7 @@ impl WebDavSession {
         total_size: Option<u64>,
         progress: Option<&ProgressCallback>,
         exclusive: bool,
+        match_etag: Option<&str>,
     ) -> Result<u64, ProtoError> {
         if opts.resume_offset > 0 || opts.append {
             return Err(ProtoError::Transport(
@@ -437,6 +438,9 @@ impl WebDavSession {
         let mut req = self.apply_auth(self.client.put(self.url_for(remote_path, false)));
         if exclusive {
             req = req.header("If-None-Match", "*");
+        }
+        if let Some(etag) = match_etag {
+            req = req.header("If-Match", etag);
         }
         if let Some(sz) = total_size {
             req = req.header("Content-Length", sz.to_string());
@@ -1336,7 +1340,7 @@ impl RemoteSession for WebDavSession {
         source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
         progress: Option<&ProgressCallback>,
     ) -> Result<u64, ProtoError> {
-        self.upload_inner(remote_path, opts, source, total_size, progress, false).await
+        self.upload_inner(remote_path, opts, source, total_size, progress, false, None).await
     }
 
     async fn upload_exclusive(
@@ -1344,7 +1348,19 @@ impl RemoteSession for WebDavSession {
         source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
         progress: Option<&ProgressCallback>,
     ) -> Result<u64, ProtoError> {
-        self.upload_inner(remote_path, opts, source, total_size, progress, true).await
+        self.upload_inner(remote_path, opts, source, total_size, progress, true, None).await
+    }
+
+    async fn upload_if_match(
+        &self, remote_path: &str, etag: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        // If-Match requires a strong entity tag, not a wildcard or weak tag.
+        if !etag.starts_with('"') || !etag.ends_with('"') || etag.len() < 2 || etag[1..etag.len()-1].contains('"') || etag.chars().any(char::is_control) {
+            return Err(ProtoError::Transport("A strong WebDAV ETag is required for overwrite.".to_string()));
+        }
+        self.upload_inner(remote_path, opts, source, total_size, progress, false, Some(etag)).await
     }
 
     async fn probe_endpoint(&self, initial_dir: &str) -> Result<(), ProtoError> {

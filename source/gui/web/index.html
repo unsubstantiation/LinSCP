@@ -2172,7 +2172,7 @@
           }));
       if (!overwrite) return result;
       result = await apiPost(endpoint, Object.assign({}, payload,
-        { overwrite: 'overwrite' }));
+        { overwrite: 'overwrite', conflict_versions: result.conflict_versions || {} }));
     }
     return result;
   }

@@ -693,6 +693,10 @@ class DavHandler(BaseHTTPRequestHandler):
             if self.headers.get("If-None-Match", "").strip() == "*" and existed:
                 self.send_precondition_failed()
                 return
+            expected = self.headers.get("If-Match", "").strip()
+            if expected and (not existed or expected != SERVER_STORE.etag_of(path)):
+                self.send_precondition_failed()
+                return
             SERVER_STORE.add_file(path, data)
         self.send_response(204 if existed else 201)
         self.send_header("Content-Length", "0")
