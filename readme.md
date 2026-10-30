@@ -8,15 +8,15 @@ command-line client or browser server is built or distributed. **The native GUI
 is experimental and is not ready for production transfers.** Remote listing
 and queued file uploads and downloads are implemented. SFTP and plain HTTP
 WebDAV connections and transfers have live integration tests; FTP connection,
-listing and download also have a live test. SFTP directory
+listing and download, and S3 connection and small-file transfers, also have live tests. SFTP directory
 copies are supported only into new destinations; directory merges and remote
 moves are unsupported. Local moves are supported on the same filesystem on Linux
 and Windows, without replacing existing destinations. Resumption is unsupported.
-Running local copies and SFTP and WebDAV transfers can be cancelled cooperatively;
-cancellation may leave partial files or directories.
+Running local copies, SFTP and WebDAV transfers, and S3 downloads can be
+cancelled cooperatively; cancellation may leave partial files or directories.
 Without overwrite approval, local copies and downloads use no-replace publication,
-and SFTP and WebDAV uploads use exclusive creation. Other protocols cannot yet
-perform unapproved-overwrite uploads. Approving overwrite does not protect against
+and SFTP, WebDAV and S3 uploads use exclusive creation. S3 exclusive uploads are
+limited to 16 MiB; other protocols cannot yet perform unapproved-overwrite uploads. Approving overwrite does not protect against
 a destination changing after approval. FTP uploads and other protocols and configurations remain unverified.
 Unsupported operations return an error rather than reporting success.
 
