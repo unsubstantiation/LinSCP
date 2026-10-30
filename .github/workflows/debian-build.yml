@@ -35,6 +35,9 @@ jobs:
       - name: Check GUI distribution configuration
         run: python3 -m unittest discover -s tools/tests -p test_gui_distribution.py
 
+      - name: Exercise atomic local moves
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service local_moves_are_atomic_no_replace -- --nocapture
+
       - name: Exercise native SFTP host-key verification and transfers
         env:
           LSCP_LIVE_SFTP: "1"
