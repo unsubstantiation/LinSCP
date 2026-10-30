@@ -104,6 +104,74 @@ pub enum QueueJob {
     },
 }
 
+// These routines create each destination with no-replace operations. They do not
+// merge existing trees or follow symlinks. Failed/cancelled copies leave the new
+// partial tree in place for inspection rather than deleting unrelated data.
+fn safe_tree_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name == "." || name == ".." || (name.contains('/') || name.contains('\\') || name.contains(':')) || name.chars().any(char::is_control) || Path::new(name).components().count() != 1 {
+        return Err("Invalid directory entry name.".to_string());
+    }
+    Ok(())
+}
+
+async fn download_new_sftp_tree(
+    session: &dyn RemoteSession, remote: &str, local: &Path,
+    flags: &TransferFlags, logger: &mut SessionLogger, progress: Option<&ProgressCallback>, depth: usize,
+) -> Result<(), String> {
+    if depth > 64 { return Err("Directory nesting limit exceeded.".to_string()); }
+    if flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) { return Err("Transfer cancelled.".to_string()); }
+    let entry = session.stat(remote).await.map_err(|e| e.to_string())?.ok_or("Remote directory disappeared.")?;
+    if !entry.is_dir || entry.is_symlink { return Err("Remote directory changed or is a symlink.".to_string()); }
+    std::fs::create_dir(local).map_err(|e| format!("Cannot create new directory '{}': {e}", local.display()))?;
+    let entries = session.list_dir(remote).await.map_err(|e| e.to_string())?;
+    if entries.len() > 100_000 { return Err("Directory entry limit exceeded.".to_string()); }
+    for item in entries {
+        if item.name == "." || item.name == ".." { continue; }
+        safe_tree_name(&item.name)?;
+        if item.is_symlink { return Err("Refusing to transfer a remote symlink.".to_string()); }
+        let from = join_remote_path(remote, &item.name);
+        let to = local.join(&item.name);
+        let current = session.stat(&from).await.map_err(|e| e.to_string())?.ok_or("Remote entry disappeared.")?;
+        if current.is_symlink { return Err("Refusing to transfer a remote symlink.".to_string()); }
+        if current.is_dir {
+            Box::pin(download_new_sftp_tree(session, &from, &to, flags, logger, progress, depth + 1)).await?;
+        } else {
+            download_single_file(session, &from, Some(&current), &to, flags, logger, progress).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn upload_new_sftp_tree(
+    session: &dyn RemoteSession, local: &Path, remote: &str,
+    flags: &TransferFlags, logger: &mut SessionLogger, progress: Option<&ProgressCallback>, depth: usize,
+) -> Result<(), String> {
+    if depth > 64 { return Err("Directory nesting limit exceeded.".to_string()); }
+    if flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) { return Err("Transfer cancelled.".to_string()); }
+    let meta = std::fs::symlink_metadata(local).map_err(|e| e.to_string())?;
+    if !meta.is_dir() || meta.file_type().is_symlink() { return Err("Local directory changed or is a symlink.".to_string()); }
+    session.mkdir(remote).await.map_err(|e| e.to_string())?;
+    let entries = std::fs::read_dir(local).map_err(|e| e.to_string())?;
+    let mut count = 0usize;
+    for entry in entries {
+        count += 1;
+        if count > 100_000 { return Err("Directory entry limit exceeded.".to_string()); }
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().into_string().map_err(|_| "Non-UTF-8 file name is not supported.".to_string())?;
+        safe_tree_name(&name)?;
+        let from = entry.path();
+        let to = join_remote_path(remote, &name);
+        let meta = std::fs::symlink_metadata(&from).map_err(|e| e.to_string())?;
+        if meta.file_type().is_symlink() { return Err("Refusing to transfer a local symlink.".to_string()); }
+        if meta.is_dir() {
+            Box::pin(upload_new_sftp_tree(session, &from, &to, flags, logger, progress, depth + 1)).await?;
+        } else if meta.is_file() {
+            upload_single_file(session, &from, &to, flags, logger, progress).await?;
+        } else { return Err("Refusing to transfer a non-file.".to_string()); }
+    }
+    Ok(())
+}
+
 fn task_supports_cancellation(job: &QueueJob) -> bool {
     match job {
         QueueJob::LocalCopyOrMove { .. } => true,
@@ -609,21 +677,11 @@ impl QueueManager {
                 f.cancel_flag = Some(Arc::clone(&task.cancel_flag));
                 f.no_clobber = !allow_overwrite;
                 if entry.is_dir {
-                    f.recursive = true;
-                    download_directory_recursive(
-                        session.as_ref(),
-                        remote_path,
-                        local_dest,
-                        "",
-                        &f,
-                        &mut logger,
-                        Some(&*progress),
-                    )
-                    .await?;
-                    if *delete_source {
-                        let _ = session.remove_dir(remote_path).await;
-                    }
+                    if session.scheme() != ProtocolScheme::Sftp || *delete_source { return Err("Only SFTP directory copies to new destinations are supported.".to_string()); }
+                    f.no_clobber = true;
+                    download_new_sftp_tree(session.as_ref(), remote_path, local_dest, &f, &mut logger, Some(&*progress), 0).await?;
                 } else {
+                    if entry.is_symlink { return Err("Refusing to transfer a remote symlink.".to_string()); }
                     download_single_file(
                         session.as_ref(),
                         remote_path,
@@ -665,21 +723,11 @@ impl QueueManager {
                 // Fail closed if the protocol has no atomic exclusive-create capability.
                 f.no_clobber = !allow_overwrite;
                 if meta.is_dir() {
-                    f.recursive = true;
-                    upload_directory_recursive(
-                        session.as_ref(),
-                        local_src,
-                        remote_dest,
-                        "",
-                        &f,
-                        &mut logger,
-                        Some(&*progress),
-                    )
-                    .await?;
-                    if *delete_source {
-                        let _ = std::fs::remove_dir_all(local_src);
-                    }
+                    if session.scheme() != ProtocolScheme::Sftp || *delete_source { return Err("Only SFTP directory copies to new destinations are supported.".to_string()); }
+                    f.no_clobber = true;
+                    upload_new_sftp_tree(session.as_ref(), local_src, remote_dest, &f, &mut logger, Some(&*progress), 0).await?;
                 } else {
+                    if meta.file_type().is_symlink() || !meta.is_file() { return Err("Refusing to transfer a symlink or non-file.".to_string()); }
                     upload_single_file(
                         session.as_ref(),
                         local_src,

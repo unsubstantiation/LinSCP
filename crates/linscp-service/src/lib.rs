@@ -377,21 +377,29 @@ impl CommanderService {
             if tab.is_local && source == destination { return api_error(400, "Source and destination are the same file"); }
             let size;
             let exists;
+            let is_dir;
             if tab.is_local {
                 let meta = match std::fs::symlink_metadata(&source) { Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => meta, Ok(_) => return api_error(400, "Only regular files can be transferred"), Err(error) => return api_error(400, error.to_string()) };
                 size = meta.len();
+                is_dir = false;
                 exists = std::fs::symlink_metadata(&destination).is_ok();
             } else if upload {
-                let meta = match std::fs::symlink_metadata(&local) { Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => meta, Ok(_) => return api_error(400, "Only regular files can be transferred"), Err(error) => return api_error(400, error.to_string()) };
-                size = meta.len();
+                let meta = match std::fs::symlink_metadata(&local) { Ok(meta) if (meta.is_file() || meta.is_dir()) && !meta.file_type().is_symlink() => meta, Ok(_) => return api_error(400, "Only regular files and directories can be transferred"), Err(error) => return api_error(400, error.to_string()) };
+                is_dir = meta.is_dir();
+                size = if is_dir { 0 } else { meta.len() };
                 exists = match session.as_ref().unwrap().stat(&other).await {
                     Ok(Some(entry)) if entry.is_dir || entry.is_symlink => return api_error(400, "Refusing to overwrite a remote symlink or directory"),
                     Ok(entry) => entry.is_some(), Err(error) => return api_error(400, error.to_string()),
                 };
             } else {
-                let entry = match session.as_ref().unwrap().stat(&other).await { Ok(Some(entry)) if !entry.is_dir && !entry.is_symlink => entry, Ok(_) => return api_error(400, "Only existing regular files can be transferred"), Err(error) => return api_error(400, error.to_string()) };
-                size = entry.size;
+                let entry = match session.as_ref().unwrap().stat(&other).await { Ok(Some(entry)) if !entry.is_symlink => entry, Ok(_) => return api_error(400, "Only existing files and directories can be transferred"), Err(error) => return api_error(400, error.to_string()) };
+                is_dir = entry.is_dir;
+                size = if is_dir { 0 } else { entry.size };
                 exists = std::fs::symlink_metadata(&local).is_ok();
+            }
+            if is_dir {
+                if tab.is_local || session.as_ref().is_none_or(|s| s.scheme() != linscp_types::ProtocolScheme::Sftp) { return api_error(400, "Directory transfers are supported only for SFTP"); }
+                if exists { return api_error(400, "Directory transfers require a new destination; merging or replacing directories is not supported"); }
             }
             if !upload || tab.is_local {
                 let target = Path::new(&destination);
@@ -2072,6 +2080,31 @@ mod tests {
         assert!(failed, "an unrelated partial file must block a transfer");
         assert_eq!(std::fs::read(remote.join("another.txt.filepart")).unwrap(), b"unrelated partial");
         assert!(!remote.join("another.txt").exists());
+        // Copy a new nested directory in both directions, including an empty folder.
+        std::fs::create_dir_all(local.join("tree/nested")).unwrap();
+        std::fs::create_dir_all(local.join("tree/empty")).unwrap();
+        std::fs::write(local.join("tree/nested/data.txt"), b"directory roundtrip").unwrap();
+        let upload_index = svc.queue.snapshot().0.len();
+        let tree_up = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["tree"]}))).await;
+        assert_eq!(tree_up.status, 200, "{}", tree_up.payload);
+        for index in [upload_index, upload_index + 1] {
+            if index != upload_index {
+                let tree_down = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["tree"]}))).await;
+                assert_eq!(tree_down.status, 200, "{}", tree_down.payload);
+            }
+            let mut done = false;
+            for _ in 0..500 {
+                let (tasks, _) = svc.queue.snapshot();
+                if tasks.get(index).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+                if tasks.get(index).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("directory transfer failed: {tasks:?}"); }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(done, "directory transfer timed out");
+        }
+        assert_eq!(std::fs::read(downloaded.join("tree/nested/data.txt")).unwrap(), b"directory roundtrip");
+        assert!(downloaded.join("tree/empty").is_dir());
+        let blocked_merge = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["tree"], "overwrite": "overwrite"}))).await;
+        assert_eq!(blocked_merge.status, 400);
         drop(server);
         let _ = std::fs::remove_dir_all(tmp);
     }
