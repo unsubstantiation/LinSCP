@@ -1,6 +1,6 @@
 # LinSCP on Debian
 
-**The native desktop application is experimental and not ready for production transfers.** SFTP connections, host-key approval, and queued single-file transfers over SFTP and plain HTTP WebDAV have live integration tests; other protocols remain unverified. Directory transfers, moves, resumption and running remote-transfer cancellation are unsupported. Running local copies can be cancelled. Remote upload conflict checks are not atomic.
+**The native desktop application is experimental and not ready for production transfers.** SFTP and plain HTTP WebDAV transfers have live integration tests. SFTP directory copies require new destinations; merges, moves and resumption are unsupported. Local copies and SFTP transfers support cooperative cancellation, which can leave partial files or directories. No-overwrite uploads require an exclusive-create capability (currently SFTP and WebDAV); approved overwrites remain subject to concurrent destination changes. Other protocols and configurations remain unverified.
 
 LinSCP is a native Tauri desktop application. It does not ship the retired
 console client, browser-server launcher, PowerShell module or .NET CLI wrapper.

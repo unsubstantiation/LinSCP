@@ -6,13 +6,16 @@ LinSCP is a noncommercial graphical file-transfer client. Its Commander UI
 runs in a native Tauri window backed by the Rust transfer engine. No separate
 command-line client or browser server is built or distributed. **The native GUI
 is experimental and is not ready for production transfers.** Remote listing
-and queued single-file uploads and downloads are implemented; SFTP connections,
-host-key approval and SFTP and plain HTTP WebDAV round-trip transfers have live
-integration tests. Other protocols are not yet verified. Directory transfers,
-moves, resumption and running remote-transfer cancellation are not supported.
-Running local copies can be cancelled. Local copies and downloads without
-approved overwrite use atomic no-replace publication; remote uploads still have
-non-atomic conflict checks and can overwrite concurrently created files.
+and queued file uploads and downloads are implemented. SFTP and plain HTTP
+WebDAV connections and transfers have live integration tests. SFTP directory
+copies are supported only into new destinations; directory merges, moves and
+resumption are unsupported. Running local copies and SFTP transfers can be
+cancelled cooperatively; cancellation may leave partial files or directories.
+Without overwrite approval, local copies and downloads use no-replace publication,
+and SFTP and WebDAV uploads use exclusive creation. Other protocols cannot yet
+perform unapproved-overwrite uploads. Approving overwrite does not protect against
+a destination changing after approval. Other protocols and configurations remain
+unverified.
 Unsupported operations return an error rather than reporting success.
 
 ## Build the desktop application
