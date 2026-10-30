@@ -1047,14 +1047,20 @@ impl RemoteSession for FtpSession {
         validate_ftp_arg(from)?;
         validate_ftp_arg(to)?;
         let mut inner = self.inner.lock().await;
-        let rnfr = inner.command(&format!("RNFR {from}")).await?;
+        let rnfr = match inner.command(&format!("RNFR {from}")).await {
+            Ok(reply) => reply,
+            Err(error) => { inner.poisoned = true; return Err(error); }
+        };
         if rnfr.code != 350 {
             return Err(ProtoError::Transport(format!(
                 "FTP RNFR '{from}' failed: {}",
                 rnfr.summary()
             )));
         }
-        let rnto = inner.command(&format!("RNTO {to}")).await?;
+        let rnto = match inner.command(&format!("RNTO {to}")).await {
+            Ok(reply) => reply,
+            Err(error) => { inner.poisoned = true; return Err(error); }
+        };
         if rnto.code != 250 {
             return Err(ProtoError::Transport(format!(
                 "FTP RNTO '{to}' failed: {}",

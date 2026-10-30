@@ -2250,6 +2250,20 @@ mod tests {
         }
         assert!(done);
         assert_eq!(std::fs::read(remote.join("up.txt")).unwrap(), b"replacement");
+        // A destination appearing while STOU is writing is caught by the
+        // final check. The remaining check-to-rename race is explicitly warned.
+        std::fs::write(local.join("during-upload.txt"), b"upload content").unwrap();
+        let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        let competing = remote.join("during-upload.txt");
+        let competing_for_progress = competing.clone();
+        let progress = move |_: u64, _: u64| { std::fs::write(&competing_for_progress, b"concurrent content").unwrap(); };
+        let mut flags = linscp_engine::transfer::TransferFlags::default();
+        flags.no_clobber = true; flags.ftp_risky_publish = true;
+        let mut logger = linscp_engine::xml_log::SessionLogger::open(None, 0, false, None, None, false, "").unwrap();
+        let raced = linscp_engine::transfer::upload_single_file(session.as_ref(), &local.join("during-upload.txt"), "/during-upload.txt", &flags, &mut logger, Some(&progress)).await;
+        assert!(raced.is_err());
+        assert_eq!(std::fs::read(&competing).unwrap(), b"concurrent content");
+        assert!(std::fs::read_dir(remote).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".linscp-upload-")));
         std::fs::write(local.join("new-race.txt"), b"source").unwrap();
         svc.queue.pause();
         let idx = svc.queue.snapshot().0.len();
