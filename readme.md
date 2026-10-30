@@ -13,8 +13,9 @@ also have live tests. SFTP directory
 copies are supported only into new destinations; directory merges and remote
 moves are unsupported. Local moves are supported on the same filesystem on Linux
 and Windows, without replacing existing destinations. Resumption is unsupported.
-Running local copies, SFTP and WebDAV transfers, and S3 downloads can be
-cancelled cooperatively. Fresh queued file downloads use owned temporary files
+Running local copies, SFTP and WebDAV transfers, and FTP, FTPS and S3 downloads
+can be cancelled cooperatively. An interrupted FTP/FTPS transfer invalidates its
+control connection; reconnect before further transfers. Fresh queued file downloads use owned temporary files
 that are removed on cancellation or failure on a best-effort basis; cleanup can
 fail, and uploads and directory transfers may leave partial files or directories.
 Without overwrite approval, local copies and downloads use no-replace publication,
