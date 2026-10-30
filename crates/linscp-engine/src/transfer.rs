@@ -39,6 +39,8 @@ pub struct TransferFlags {
     pub cancel_flag: Option<Arc<AtomicBool>>,
     /// Use an owned temporary stage and remove it after a fresh download.
     pub cleanup_download_stage: bool,
+    /// Merge an explicitly approved existing SFTP directory without replacing files.
+    pub merge_directories: bool,
     pub resume_support: ResumeSupportMode,
     pub explicit_resume_support: bool,
     pub permissions: PresetPermissions,
@@ -64,6 +66,7 @@ impl Default for TransferFlags {
             overwrite_etag: None,
             cancel_flag: None,
             cleanup_download_stage: false,
+            merge_directories: false,
             resume_support: ResumeSupportMode::Smart(100 * 1024),
             explicit_resume_support: false,
             permissions: PresetPermissions::Off,

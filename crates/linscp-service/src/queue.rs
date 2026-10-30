@@ -122,7 +122,12 @@ async fn download_new_sftp_tree(
     if flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) { return Err("Transfer cancelled.".to_string()); }
     let entry = session.stat(remote).await.map_err(|e| e.to_string())?.ok_or("Remote directory disappeared.")?;
     if !entry.is_dir || entry.is_symlink { return Err("Remote directory changed or is a symlink.".to_string()); }
-    std::fs::create_dir(local).map_err(|e| format!("Cannot create new directory '{}': {e}", local.display()))?;
+    match std::fs::symlink_metadata(local) {
+        Ok(meta) if flags.merge_directories && meta.is_dir() && !meta.file_type().is_symlink() => {},
+        Ok(_) => return Err(format!("Directory destination '{}' already exists or is not a directory.", local.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(local).map_err(|e| format!("Cannot create new directory '{}': {e}", local.display()))?,
+        Err(error) => return Err(format!("Cannot inspect directory '{}': {error}", local.display())),
+    }
     let entries = session.list_dir(remote).await.map_err(|e| e.to_string())?;
     if entries.len() > 100_000 { return Err("Directory entry limit exceeded.".to_string()); }
     for item in entries {
@@ -136,6 +141,13 @@ async fn download_new_sftp_tree(
         if current.is_dir {
             Box::pin(download_new_sftp_tree(session, &from, &to, flags, logger, progress, depth + 1)).await?;
         } else {
+            if flags.merge_directories {
+                match std::fs::symlink_metadata(&to) {
+                    Ok(_) => return Err(format!("Cannot merge: destination '{}' already exists.", to.display())),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(error) => return Err(format!("Cannot inspect '{}': {error}", to.display())),
+                }
+            }
             download_single_file(session, &from, Some(&current), &to, flags, logger, progress).await?;
         }
     }
@@ -150,7 +162,11 @@ async fn upload_new_sftp_tree(
     if flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) { return Err("Transfer cancelled.".to_string()); }
     let meta = std::fs::symlink_metadata(local).map_err(|e| e.to_string())?;
     if !meta.is_dir() || meta.file_type().is_symlink() { return Err("Local directory changed or is a symlink.".to_string()); }
-    session.mkdir(remote).await.map_err(|e| e.to_string())?;
+    match session.stat(remote).await.map_err(|e| e.to_string())? {
+        Some(entry) if flags.merge_directories && entry.is_dir && !entry.is_symlink => {},
+        Some(_) => return Err(format!("Directory destination '{remote}' already exists or is not a directory.")),
+        None => session.mkdir(remote).await.map_err(|e| e.to_string())?,
+    }
     let entries = std::fs::read_dir(local).map_err(|e| e.to_string())?;
     let mut count = 0usize;
     for entry in entries {
@@ -166,6 +182,12 @@ async fn upload_new_sftp_tree(
         if meta.is_dir() {
             Box::pin(upload_new_sftp_tree(session, &from, &to, flags, logger, progress, depth + 1)).await?;
         } else if meta.is_file() {
+            if flags.merge_directories {
+                match session.stat(&to).await.map_err(|e| e.to_string())? {
+                    Some(_) => return Err(format!("Cannot merge: destination '{to}' already exists.")),
+                    None => {},
+                }
+            }
             upload_single_file(session, &from, &to, flags, logger, progress).await?;
         } else { return Err("Refusing to transfer a non-file.".to_string()); }
     }
@@ -661,23 +683,23 @@ impl QueueManager {
                 delete_source,
                 flags,
             } => {
-                if let Ok(meta) = std::fs::symlink_metadata(local_dest) {
-                    if meta.file_type().is_symlink() || !meta.is_file() || !allow_overwrite {
-                        return Err("Destination changed or overwrite was not approved.".to_string());
-                    }
-                }
                 let entry = session
                     .stat(remote_path)
                     .await
                     .map_err(|e| e.to_string())?
                     .ok_or_else(|| format!("Remote item '{remote_path}' does not exist."))?;
+                if let Ok(meta) = std::fs::symlink_metadata(local_dest) {
+                    let allowed_dir = entry.is_dir && flags.merge_directories && meta.is_dir() && !meta.file_type().is_symlink();
+                    let allowed_file = !entry.is_dir && *allow_overwrite && meta.is_file() && !meta.file_type().is_symlink();
+                    if !allowed_dir && !allowed_file { return Err("Destination changed or merge/overwrite was not approved.".to_string()); }
+                }
                 let mut f = flags.clone();
                 f.delete_source = *delete_source;
                 f.cancel_flag = Some(Arc::clone(&task.cancel_flag));
                 f.no_clobber = !allow_overwrite;
                 f.cleanup_download_stage = true;
                 if entry.is_dir {
-                    if session.scheme() != ProtocolScheme::Sftp || *delete_source { return Err("Only SFTP directory copies to new destinations are supported.".to_string()); }
+                    if session.scheme() != ProtocolScheme::Sftp || *delete_source { return Err("Only SFTP directory copies are supported.".to_string()); }
                     f.no_clobber = true;
                     download_new_sftp_tree(session.as_ref(), remote_path, local_dest, &f, &mut logger, Some(&*progress), 0).await?;
                 } else {
@@ -704,26 +726,25 @@ impl QueueManager {
                 flags,
                 ..
             } => {
+                let source_meta = std::fs::symlink_metadata(local_src).map_err(|e| format!("Cannot inspect local source '{}': {e}", local_src.display()))?;
                 if let Some(entry) = session.stat(remote_dest).await.map_err(|e| e.to_string())? {
-                    if entry.is_dir || entry.is_symlink || !allow_overwrite {
-                        return Err("Destination changed or overwrite was not approved.".to_string());
-                    }
+                    let allowed_dir = source_meta.is_dir() && !source_meta.file_type().is_symlink() && flags.merge_directories && entry.is_dir && !entry.is_symlink;
+                    let allowed_file = source_meta.is_file() && *allow_overwrite && !entry.is_dir && !entry.is_symlink;
+                    if !allowed_dir && !allowed_file { return Err("Destination changed or merge/overwrite was not approved.".to_string()); }
                 }
                 if let Some(stage) = linscp_engine::transfer::remote_stage_path(remote_dest, None) {
                     if session.stat(&stage).await.map_err(|e| e.to_string())?.is_some() {
                         return Err(format!("A partial file already exists at '{stage}'; remove it before retrying."));
                     }
                 }
-                let meta = std::fs::symlink_metadata(local_src).map_err(|e| {
-                    format!("Cannot inspect local source '{}': {e}", local_src.display())
-                })?;
+                let meta = source_meta;
                 let mut f = flags.clone();
                 f.delete_source = *delete_source;
                 f.cancel_flag = Some(Arc::clone(&task.cancel_flag));
                 // Fail closed if the protocol has no atomic exclusive-create capability.
                 f.no_clobber = !allow_overwrite;
                 if meta.is_dir() {
-                    if session.scheme() != ProtocolScheme::Sftp || *delete_source { return Err("Only SFTP directory copies to new destinations are supported.".to_string()); }
+                    if session.scheme() != ProtocolScheme::Sftp || *delete_source { return Err("Only SFTP directory copies are supported.".to_string()); }
                     f.no_clobber = true;
                     upload_new_sftp_tree(session.as_ref(), local_src, remote_dest, &f, &mut logger, Some(&*progress), 0).await?;
                 } else {

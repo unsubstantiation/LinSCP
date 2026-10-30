@@ -315,3 +315,20 @@ test('overwrite confirmation forwards the original WebDAV conflict ETag', async 
   assert.equal((await handler('/api/transfer/upload', { overwrite: 'ask' }, [])).success, true);
   assert.deepEqual(calls[1].payload, { overwrite: 'overwrite', conflict_versions: { 'file.txt': '"original"' } });
 });
+
+test('directory merge requires explicit approval and forwards only approved roots', async () => {
+  const html = fs.readFileSync(path.join(repoRoot, 'source', 'gui', 'web', 'index.html'), 'utf8').replace(/\r\n/g, '\n');
+  const match = html.match(/async function queueWithOverwriteDecision\(endpoint, payload, conflicts\) \{[\s\S]*?\n  \}\n\n  async function transfer/);
+  assert.ok(match);
+  const source = match[0].replace(/\n\n  async function transfer$/, '');
+  const calls = [];
+  const apiPost = async (_endpoint, payload) => {
+    calls.push(payload);
+    return calls.length === 1 ? { success: false, directory_conflicts: ['tree'] } : { success: true };
+  };
+  let confirmations = 0;
+  const handler = new Function('apiPost', 'preferences', 'confirm', 't', `${source}; return queueWithOverwriteDecision;`)(apiPost, { confirm_overwrite: false }, () => { confirmations++; return true; }, s => s);
+  assert.equal((await handler('/api/transfer/upload', { names: ['tree', 'other'] }, [])).success, true);
+  assert.equal(confirmations, 1);
+  assert.deepEqual(calls[1].merge_directories, ['tree']);
+});

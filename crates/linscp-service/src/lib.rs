@@ -370,6 +370,12 @@ impl CommanderService {
         if overwrite != "ask" && overwrite != "overwrite" { return api_error(400, "Unsupported overwrite policy"); }
         let mut jobs = Vec::new();
         let mut conflicts = Vec::new();
+        let mut directory_conflicts = Vec::new();
+        let merge_names: std::collections::HashSet<&str> = match body.get("merge_directories") {
+            None => std::collections::HashSet::new(),
+            Some(Value::Array(items)) if items.iter().all(|item| item.is_string()) => items.iter().filter_map(Value::as_str).collect(),
+            _ => return api_error(400, "Invalid directory merge approval"),
+        };
         let mut conflict_versions = serde_json::Map::new();
         let mut seen = std::collections::HashSet::new();
         for value in names {
@@ -397,7 +403,7 @@ impl CommanderService {
                 is_dir = meta.is_dir();
                 size = if is_dir { 0 } else { meta.len() };
                 exists = match session.as_ref().unwrap().stat(&other).await {
-                    Ok(Some(entry)) if entry.is_dir || entry.is_symlink => return api_error(400, "Refusing to overwrite a remote symlink or directory"),
+                    Ok(Some(entry)) if entry.is_symlink || entry.is_dir != is_dir => return api_error(400, "Destination type conflicts with source or is a symlink"),
                     Ok(entry) => entry.is_some(), Err(error) => return api_error(400, error.to_string()),
                 };
             } else {
@@ -408,18 +414,18 @@ impl CommanderService {
             }
             if is_dir && !move_item {
                 if tab.is_local || session.as_ref().is_none_or(|s| s.scheme() != linscp_types::ProtocolScheme::Sftp) { return api_error(400, "Directory transfers are supported only for SFTP"); }
-                if exists { return api_error(400, "Directory transfers require a new destination; merging or replacing directories is not supported"); }
+                if exists && !merge_names.contains(name) { directory_conflicts.push(name.to_string()); }
             }
             if move_item && exists {
                 return api_error(409, "Local moves require a new destination; overwriting is not supported.");
             }
             if !upload || tab.is_local {
                 let target = Path::new(&destination);
-                if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink() || !m.is_file()) { return api_error(400, "Refusing to overwrite a symlink or directory"); }
+                if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink() || (is_dir && !m.is_dir()) || (!is_dir && !m.is_file())) { return api_error(400, "Destination type conflicts with source or is a symlink"); }
             }
             let is_dav_upload = !tab.is_local && upload && matches!(session.as_ref().unwrap().scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs);
             let is_s3_upload = !tab.is_local && upload && session.as_ref().unwrap().scheme() == linscp_types::ProtocolScheme::S3;
-            if exists && overwrite == "ask" {
+            if exists && !is_dir && overwrite == "ask" {
                 conflicts.push(name.to_string());
                 let tag = if is_dav_upload {
                     match session.as_ref().unwrap().dav_get_etag(&other).await {
@@ -439,7 +445,7 @@ impl CommanderService {
             }
             // Approval applies only to destinations actually present at enqueue.
             // A different item appearing later must not inherit that approval.
-            let allow_overwrite = overwrite == "overwrite" && exists;
+            let allow_overwrite = overwrite == "overwrite" && exists && !is_dir;
             if allow_overwrite && !is_dav_upload && !is_s3_upload {
                 return api_error(501, "Safe approved overwrites are not yet supported for this transfer. The destination was not changed.");
             }
@@ -447,6 +453,8 @@ impl CommanderService {
             // Resuming existing partial files without verifying their source can
             // splice unrelated bytes into the result. Always stage a fresh copy.
             flags.resume = false;
+            // Approval is per root and only applies to directories that exist now.
+            flags.merge_directories = is_dir && exists && merge_names.contains(name);
             flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
             flags.preserve_time = body.get("preserve_time").and_then(Value::as_bool).unwrap_or(true);
             if allow_overwrite && (is_dav_upload || is_s3_upload) {
@@ -465,7 +473,7 @@ impl CommanderService {
             };
             jobs.push((name.to_string(), source, destination, size, job));
         }
-        if !conflicts.is_empty() { return ApiReply { status: 409, payload: json!({"success": false, "error": "Destination exists", "conflicts": conflicts, "conflict_versions": conflict_versions}) }; }
+        if !conflicts.is_empty() || !directory_conflicts.is_empty() { return ApiReply { status: 409, payload: json!({"success": false, "error": "Destination exists", "conflicts": conflicts, "directory_conflicts": directory_conflicts, "conflict_versions": conflict_versions}) }; }
         for (name, source, destination, size, job) in jobs {
             self.queue.enqueue(Some(id), if upload { "upload" } else { "download" }, name, source, destination, size, body.get("priority").and_then(Value::as_bool).unwrap_or(false), job);
         }
@@ -2628,7 +2636,82 @@ mod tests {
         assert_eq!(std::fs::read(downloaded.join("tree/nested/data.txt")).unwrap(), b"directory roundtrip");
         assert!(downloaded.join("tree/empty").is_dir());
         let blocked_merge = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["tree"], "overwrite": "overwrite"}))).await;
-        assert_eq!(blocked_merge.status, 400);
+        assert_eq!(blocked_merge.status, 409);
+        // Merges require a separate, per-root approval and never overwrite files.
+        std::fs::create_dir_all(local.join("merge-up/nested")).unwrap();
+        std::fs::create_dir_all(remote.join("merge-up/nested")).unwrap();
+        std::fs::write(local.join("merge-up/nested/new.txt"), b"new upload").unwrap();
+        std::fs::write(remote.join("merge-up/nested/kept.txt"), b"keep remote").unwrap();
+        let merge_body = || json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["merge-up"]});
+        let ask = svc.dispatch_async(request("/api/transfer/upload", merge_body())).await;
+        assert_eq!(ask.status, 409, "{}", ask.payload);
+        assert_eq!(ask.payload["directory_conflicts"], json!(["merge-up"]));
+        let idx = svc.queue.snapshot().0.len();
+        let merged = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["merge-up"], "merge_directories": ["merge-up"]}))).await;
+        assert_eq!(merged.status, 200, "{}", merged.payload);
+        let mut done = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("upload merge failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done);
+        assert_eq!(std::fs::read(remote.join("merge-up/nested/new.txt")).unwrap(), b"new upload");
+        assert_eq!(std::fs::read(remote.join("merge-up/nested/kept.txt")).unwrap(), b"keep remote");
+        // A file conflict fails and leaves the remote file intact.
+        std::fs::write(local.join("merge-up/nested/kept.txt"), b"must not replace").unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let conflict = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["merge-up"], "merge_directories": ["merge-up"]}))).await;
+        assert_eq!(conflict.status, 200);
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert_eq!(std::fs::read(remote.join("merge-up/nested/kept.txt")).unwrap(), b"keep remote");
+        std::fs::create_dir_all(remote.join("merge-down/nested")).unwrap();
+        std::fs::create_dir_all(downloaded.join("merge-down/nested")).unwrap();
+        std::fs::write(remote.join("merge-down/nested/new.txt"), b"new download").unwrap();
+        std::fs::write(downloaded.join("merge-down/nested/kept.txt"), b"keep local").unwrap();
+        let ask = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["merge-down"]}))).await;
+        assert_eq!(ask.status, 409, "{}", ask.payload);
+        assert_eq!(ask.payload["directory_conflicts"], json!(["merge-down"]));
+        let idx = svc.queue.snapshot().0.len();
+        let merged = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["merge-down"], "merge_directories": ["merge-down"]}))).await;
+        assert_eq!(merged.status, 200, "{}", merged.payload);
+        let mut done = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("download merge failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done);
+        assert_eq!(std::fs::read(downloaded.join("merge-down/nested/new.txt")).unwrap(), b"new download");
+        assert_eq!(std::fs::read(downloaded.join("merge-down/nested/kept.txt")).unwrap(), b"keep local");
+        // Approval for other roots must not authorize merging a directory
+        // that appears after this transfer was queued.
+        std::fs::create_dir_all(local.join("new-root")).unwrap();
+        std::fs::write(local.join("new-root/data"), b"source data").unwrap();
+        svc.queue.pause();
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["new-root"], "merge_directories": ["other-root"]}))).await;
+        assert_eq!(queued.status, 200);
+        std::fs::create_dir_all(remote.join("new-root")).unwrap();
+        std::fs::write(remote.join("new-root/keep"), b"concurrent data").unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed, "a newly created destination must not inherit merge approval");
+        assert_eq!(std::fs::read(remote.join("new-root/keep")).unwrap(), b"concurrent data");
+        assert!(!remote.join("new-root/data").exists());
         std::fs::create_dir_all(local.join("links")).unwrap();
         std::os::unix::fs::symlink(local.join("upload.txt"), local.join("links/link")).unwrap();
         let link_index = svc.queue.snapshot().0.len();
