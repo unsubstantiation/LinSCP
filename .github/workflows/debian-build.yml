@@ -26,7 +26,7 @@ jobs:
           # the build in debian/rules.
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             build-essential dpkg-dev pkg-config curl cargo rustc nodejs npm \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev xvfb xdotool xauth openbox x11-utils python3-paramiko python3-pyftpdlib
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev xvfb xdotool xauth openbox x11-utils python3-paramiko python3-pyftpdlib python3-openssl
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
@@ -52,6 +52,11 @@ jobs:
         env:
           LSCP_LIVE_FTP: "1"
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ftp_gui_download -- --nocapture
+
+      - name: Exercise native explicit FTPS connection and download
+        env:
+          LSCP_LIVE_FTPES: "1"
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ftpes_gui_download -- --nocapture
 
       - name: Exercise native S3 TLS connection and download
         env:

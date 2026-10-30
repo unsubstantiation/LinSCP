@@ -2093,6 +2093,48 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn live_ftpes_gui_download() {
+        if std::env::var_os("LSCP_LIVE_FTPES").is_none() { return; }
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        struct Server(std::process::Child);
+        impl Drop for Server { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let tmp = std::env::temp_dir().join(format!("linscp-live-ftpes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let remote = tmp.join("remote"); let local = tmp.join("local");
+        std::fs::create_dir_all(&remote).unwrap(); std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(remote.join("download.txt"), b"explicit FTPS download").unwrap();
+        let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests");
+        let child = Command::new("/usr/bin/python3").arg(tests.join("TestFtpServer.py"))
+            .env("LSCP_TEST_ROOT", &remote).env("LSCP_TEST_FTP_TLS", "1")
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut server = Server(child); let mut line = String::new();
+        BufReader::new(server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let port: u16 = line.trim().strip_prefix("READY ").expect("FTPS server failed to start").parse().unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        let open = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "ftpes", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "tls_ca_file": tests.join("fixtures/s3-server-cert.pem"), "local_dir": local, "initial_dir": "/"}}))).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        let list = svc.dispatch_async(ApiEnvelope { method: "GET".into(), path: format!("/api/remote/list?tab={id}&path=%2F"), body: json!({}) }).await;
+        assert_eq!(list.status, 200, "{}", list.payload);
+        assert!(list.payload["entries"].as_array().unwrap().iter().any(|e| e["name"] == "download.txt"));
+        let download = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["download.txt"]}))).await;
+        assert_eq!(download.status, 200, "{}", download.payload);
+        let mut done = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.first().and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+            if tasks.first().and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("FTPS download failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done, "FTPS download timed out");
+        assert_eq!(std::fs::read(local.join("download.txt")).unwrap(), b"explicit FTPS download");
+        drop(server); let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn live_ftp_gui_download() {
         if std::env::var_os("LSCP_LIVE_FTP").is_none() { return; }
         use std::io::{BufRead, BufReader};
