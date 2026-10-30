@@ -940,6 +940,13 @@ fn execute_local_item(
     }
     let src_meta = std::fs::symlink_metadata(source)
         .map_err(|e| format!("Cannot inspect '{}': {e}", source.display()))?;
+    if move_item {
+        if policy != ConflictPolicy::Ask || src_meta.file_type().is_symlink() {
+            return Err("Local moves require a new destination and a non-symlink source.".to_string());
+        }
+        return linscp_platform::gui_os::rename_no_replace(source, target)
+            .map_err(|e| format!("Cannot atomically move '{}' to '{}': {e}", source.display(), target.display()));
+    }
 
     let mut effective_target = target.to_path_buf();
     if std::fs::symlink_metadata(&effective_target).is_ok() {

@@ -2130,7 +2130,7 @@
     const direction = source === 'local' ? 'upload' : 'download';
     const destination = source === 'local' ? state.remote.path : state.local.path;
     const question = tab.is_local ?
-      t("Move {count} item(s) to {destination}?\n\nThe source is removed only after its copy completes successfully.", {count: names.length, destination}) :
+      t("Move {count} item(s) to {destination}?\n\nLocal moves require a new destination on the same filesystem.", {count: names.length, destination}) :
       t("Move {count} file(s) to {destination}?\n\nThe source is removed only after its transfer completes successfully.", {count: names.length, destination});
     if (!confirm(question)) return;
     // A move deletes its source when the transfer lands, so it never takes
@@ -2147,7 +2147,7 @@
     }, transferSettings.priority ? { priority: true } : {}), names);
     if (result.success) {
       toast(tab.is_local ?
-        t("{count} local move(s) queued. Sources are removed after a successful copy.", {count: names.length}) :
+        t("{count} local move(s) queued.", {count: names.length}) :
         t("{count} move(s) queued. Source files are removed after successful transfer.", {count: names.length}));
       switchTab('queue');
       refreshQueue();

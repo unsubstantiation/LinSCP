@@ -207,8 +207,15 @@ impl CommanderService {
         match (method.as_str(), raw_path.as_str()) {
             ("POST", "/api/tabs/open") => self.open_tab_async(req.body).await,
             ("POST", "/api/tabs/verify") => self.verify_tab_async(req.body).await,
-            ("POST", "/api/transfer/upload") => self.queue_transfer_async(req.body, true).await,
-            ("POST", "/api/transfer/download") => self.queue_transfer_async(req.body, false).await,
+            ("POST", "/api/transfer/upload") => self.queue_transfer_async(req.body, true, false).await,
+            ("POST", "/api/transfer/download") => self.queue_transfer_async(req.body, false, false).await,
+            ("POST", "/api/transfer/move") => {
+                let upload = match req.body.get("direction").and_then(Value::as_str) {
+                    Some("upload") => true, Some("download") => false,
+                    _ => return api_error(400, "Invalid move direction"),
+                };
+                self.queue_transfer_async(req.body, upload, true).await
+            }
             ("GET", "/api/remote/list") => self.list_remote_async(&req.path).await,
             ("POST", "/api/desktop/check") => self.handle_desktop_check_async(req.body).await,
             ("POST", "/api/desktop/install") => self.handle_desktop_install_async(req.body).await,
@@ -332,11 +339,12 @@ impl CommanderService {
         }
     }
 
-    async fn queue_transfer_async(&self, body: Value, upload: bool) -> ApiReply {
+    async fn queue_transfer_async(&self, body: Value, upload: bool, move_item: bool) -> ApiReply {
         let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
         let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
             Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
         };
+        if move_item && !tab.is_local { return api_error(501, "Remote moves are not yet supported"); }
         let names = match body.get("names").and_then(Value::as_array) {
             Some(names) if !names.is_empty() && names.len() <= 1000 => names,
             _ => return api_error(400, "Select at least one file"),
@@ -379,9 +387,9 @@ impl CommanderService {
             let exists;
             let is_dir;
             if tab.is_local {
-                let meta = match std::fs::symlink_metadata(&source) { Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => meta, Ok(_) => return api_error(400, "Only regular files can be transferred"), Err(error) => return api_error(400, error.to_string()) };
-                size = meta.len();
-                is_dir = false;
+                let meta = match std::fs::symlink_metadata(&source) { Ok(meta) if (meta.is_file() || (move_item && meta.is_dir())) && !meta.file_type().is_symlink() => meta, Ok(_) => return api_error(400, "Only regular files and movable directories are supported"), Err(error) => return api_error(400, error.to_string()) };
+                size = if meta.is_dir() { 0 } else { meta.len() };
+                is_dir = meta.is_dir();
                 exists = std::fs::symlink_metadata(&destination).is_ok();
             } else if upload {
                 let meta = match std::fs::symlink_metadata(&local) { Ok(meta) if (meta.is_file() || meta.is_dir()) && !meta.file_type().is_symlink() => meta, Ok(_) => return api_error(400, "Only regular files and directories can be transferred"), Err(error) => return api_error(400, error.to_string()) };
@@ -397,9 +405,12 @@ impl CommanderService {
                 size = if is_dir { 0 } else { entry.size };
                 exists = std::fs::symlink_metadata(&local).is_ok();
             }
-            if is_dir {
+            if is_dir && !move_item {
                 if tab.is_local || session.as_ref().is_none_or(|s| s.scheme() != linscp_types::ProtocolScheme::Sftp) { return api_error(400, "Directory transfers are supported only for SFTP"); }
                 if exists { return api_error(400, "Directory transfers require a new destination; merging or replacing directories is not supported"); }
+            }
+            if move_item && exists {
+                return api_error(409, "Local moves require a new destination; overwriting is not supported.");
             }
             if !upload || tab.is_local {
                 let target = Path::new(&destination);
@@ -416,7 +427,7 @@ impl CommanderService {
             flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
             flags.preserve_time = body.get("preserve_time").and_then(Value::as_bool).unwrap_or(true);
             let job = if tab.is_local {
-                queue::QueueJob::LocalCopyOrMove { source: PathBuf::from(&source), target: PathBuf::from(&destination), move_item: false, policy: if allow_overwrite { queue::ConflictPolicy::Overwrite } else { queue::ConflictPolicy::Ask } }
+                queue::QueueJob::LocalCopyOrMove { source: PathBuf::from(&source), target: PathBuf::from(&destination), move_item, policy: if allow_overwrite { queue::ConflictPolicy::Overwrite } else { queue::ConflictPolicy::Ask } }
             } else if upload {
                 queue::QueueJob::RemoteUpload { session: session.as_ref().unwrap().clone(), local_src: local, remote_dest: other, allow_overwrite, delete_source: false, cleanup_path: None, flags }
             } else {
@@ -1924,6 +1935,49 @@ mod tests {
         }
         assert!(failed, "approval for existing destinations must not apply to new files");
         assert_eq!(std::fs::read(right.join("approved-new.txt")).unwrap(), b"concurrent data");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn local_moves_are_atomic_no_replace() {
+        let tmp = std::env::temp_dir().join(format!("linscp-move-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let left = tmp.join("left"); let right = tmp.join("right");
+        std::fs::create_dir_all(left.join("tree")).unwrap(); std::fs::create_dir_all(&right).unwrap();
+        std::fs::write(left.join("tree/data"), b"directory data").unwrap();
+        std::fs::write(left.join("later"), b"move source").unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let open = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": left, "other_local_dir": right}}) }).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        let request = |name: &str| ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": id, "direction": "upload", "local_dir": left, "remote_dir": right, "names": [name]}) };
+        let moved = svc.dispatch_async(request("tree")).await;
+        assert_eq!(moved.status, 200, "{}", moved.payload);
+        let mut complete = false;
+        for _ in 0..200 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.first().and_then(|t| t["status"].as_str()) == Some("Completed") { complete = true; break; }
+            if tasks.first().and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("move failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(complete);
+        assert!(!left.join("tree").exists());
+        assert_eq!(std::fs::read(right.join("tree/data")).unwrap(), b"directory data");
+        svc.queue.pause();
+        let queued = svc.dispatch_async(request("later")).await;
+        assert_eq!(queued.status, 200);
+        std::fs::write(right.join("later"), b"concurrent destination").unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..200 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(1).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(failed);
+        assert_eq!(std::fs::read(left.join("later")).unwrap(), b"move source");
+        assert_eq!(std::fs::read(right.join("later")).unwrap(), b"concurrent destination");
         let _ = std::fs::remove_dir_all(tmp);
     }
 
