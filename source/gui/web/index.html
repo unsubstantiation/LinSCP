@@ -4310,10 +4310,7 @@
       item => item.id === $('remoteTransferTarget').value);
     const hint = $('remoteTransferHint');
     if (!target) { hint.textContent = ''; return; }
-    hint.textContent = target.current
-      ? t('The files are copied by the server itself; nothing is sent twice.')
-      : t('The files are downloaded to a temporary directory and uploaded to {label}.',
-          { label: target.label });
+    hint.textContent = t('Copies and cross-session moves use a temporary local download. Same-session moves are performed by the server.');
   }
 
   async function runRemoteTransfer(moveItem) {

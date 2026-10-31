@@ -86,13 +86,14 @@ pub enum QueueJob {
         etag: String,
         is_dir: bool,
     },
-    CrossServerMove {
+    StagedRemoteTransfer {
         source_session: Arc<dyn RemoteSession>,
         target_session: Arc<dyn RemoteSession>,
         source: String,
         target: String,
         etag: String,
         source_entry: linscp_types::FileEntry,
+        move_item: bool,
     },
     RemoteToRemote {
         src_session: Arc<dyn RemoteSession>,
@@ -242,7 +243,7 @@ async fn upload_new_sftp_tree(
 
 fn task_supports_cancellation(job: &QueueJob) -> bool {
     match job {
-        QueueJob::LocalCopyOrMove { .. } | QueueJob::CrossServerMove { .. } => true,
+        QueueJob::LocalCopyOrMove { .. } | QueueJob::StagedRemoteTransfer { .. } => true,
         QueueJob::RemoteDownload { session, .. } => {
             matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs | ProtocolScheme::S3 | ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes)
         }
@@ -636,7 +637,7 @@ impl QueueManager {
                     if cancelled && result.is_err() && !committed_move_failure {
                         t.status = "cancelled".to_string();
                         let reconnect = match &task.job { QueueJob::RemoteDownload { session, .. } | QueueJob::RemoteUpload { session, .. } => matches!(session.scheme(), ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes), _ => false };
-                        t.error = Some(if reconnect { format!("Cancelled by user. Reconnect the FTP session before further transfers. {}", result.as_ref().err().map(String::as_str).unwrap_or("A temporary file may remain.")) } else if matches!(&task.job, QueueJob::RemoteDownload { flags, .. } if flags.merge_directories) { "Cancelled by user. A merge that had begun publication may have left files in the destination.".to_string() } else if matches!(&task.job, QueueJob::RemoteUpload { .. }) { "Cancelled by user. A partial or completed remote destination or temporary file may remain; inspect it before retrying.".to_string() } else { "Cancelled by user.".to_string() });
+                        t.error = Some(if reconnect { format!("Cancelled by user. Reconnect the FTP session before further transfers. {}", result.as_ref().err().map(String::as_str).unwrap_or("A temporary file may remain.")) } else if matches!(&task.job, QueueJob::RemoteDownload { flags, .. } if flags.merge_directories) { "Cancelled by user. A merge that had begun publication may have left files in the destination.".to_string() } else if matches!(&task.job, QueueJob::RemoteUpload { .. } | QueueJob::StagedRemoteTransfer { move_item: false, .. }) { "Cancelled by user. A partial or completed remote destination or temporary file may remain; inspect it before retrying.".to_string() } else { "Cancelled by user.".to_string() });
                         clean = true;
                     } else {
                         match result {
@@ -843,7 +844,7 @@ impl QueueManager {
                 .await
                 .map_err(|e| format!("Local worker panicked: {e}"))?
             }
-            QueueJob::CrossServerMove { source_session, target_session, source, target, etag, source_entry } => {
+            QueueJob::StagedRemoteTransfer { source_session, target_session, source, target, etag, source_entry, move_item } => {
                 let stage = tempfile::Builder::new().prefix("linscp-cross-move-").rand_bytes(16).tempdir()
                     .map_err(|e| format!("Cannot create local move staging directory: {e}"))?;
                 let payload = stage.path().join("payload");
@@ -862,7 +863,8 @@ impl QueueManager {
                 upload_flags.preserve_time = false;
                 upload_flags.cancel_flag = Some(Arc::clone(&task.cancel_flag));
                 upload_single_file(target_session.as_ref(), &payload, target, &upload_flags, &mut logger, Some(&*progress)).await
-                    .map_err(|e| format!("Move incomplete: source remains; destination may contain a partial or completed file: {e}"))?;
+                    .map_err(|e| if *move_item { format!("Move incomplete: source remains; destination may contain a partial or completed file: {e}") } else { format!("Copy failed; source remains and destination may contain a partial or completed file: {e}") })?;
+                if !*move_item { return Ok(()); }
                 if task.cancel_flag.load(Ordering::SeqCst) { return Err("Move incomplete: destination was uploaded; cancellation left the source in place.".to_string()); }
                 source_session.remove_if_match(source, etag).await
                     .map_err(|e| format!("Move incomplete: destination was uploaded; source deletion was not confirmed and the source may or may not remain: {e}"))?;

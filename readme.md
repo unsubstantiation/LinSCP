@@ -26,7 +26,7 @@ explicit confirmation: an ETag-pinned download is followed by an exclusive
 upload and conditional source deletion. Cross-server moves are not transactional;
 errors or cancellation can leave a duplicate or partial destination, and source
 deletion may be unconfirmed. S3 destinations are limited to 16 MiB per file.
-Cross-server directory moves and other remote move combinations are unsupported.
+WebDAV files can also be copied to a new name in the same session or to a connected WebDAV, SFTP or S3 session via a temporary local download and exclusive upload. Copies can leave partial remote destinations on failure or cancellation. Remote directory copies, cross-server directory moves and other source protocols are unsupported.
 Local moves are supported on the same filesystem on Linux
 and Windows, without replacing existing destinations. WebDAV file downloads can
 resume from a `.filepart` after comparing its entire prefix with the ETag-pinned
