@@ -2848,6 +2848,23 @@ mod tests {
         assert!(done);
         assert!(session.stat("/cross-success.txt").await.unwrap().is_none());
         assert_eq!(linscp_proto::download_bytes(dest_session.as_ref(), "/cross-success.txt", Default::default()).await.unwrap(), b"cross server");
+        linscp_proto::upload_bytes(session.as_ref(), "/cross-copy-race.txt", b"original", Default::default()).await.unwrap();
+        svc.queue.pause();
+        let idx = svc.queue.snapshot().0.len();
+        let copied = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": "/", "names": ["cross-copy-race.txt"], "operation": "copy"}))).await;
+        assert_eq!(copied.status, 200, "{}", copied.payload);
+        linscp_proto::upload_bytes(session.as_ref(), "/cross-copy-race.txt", b"changed source", Default::default()).await.unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("changed source was copied"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert!(dest_session.stat("/cross-copy-race.txt").await.unwrap().is_none());
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/cross-copy-race.txt", Default::default()).await.unwrap(), b"changed source");
         linscp_proto::upload_bytes(session.as_ref(), "/cross-conflict.txt", b"source", Default::default()).await.unwrap();
         linscp_proto::upload_bytes(dest_session.as_ref(), "/cross-conflict.txt", b"existing destination", Default::default()).await.unwrap();
         let idx = svc.queue.snapshot().0.len();
