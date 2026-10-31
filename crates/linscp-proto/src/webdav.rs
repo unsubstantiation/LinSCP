@@ -436,7 +436,8 @@ impl WebDavSession {
         }
 
         let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
-        let mut req = self.apply_auth(self.client.put(self.url_for(remote_path, false)));
+        let client = if exclusive || match_etag.is_some() { &self.no_redirect_client } else { &self.client };
+        let mut req = self.apply_auth(client.put(self.url_for(remote_path, false)));
         if exclusive {
             req = req.header("If-None-Match", "*");
         }
@@ -1057,7 +1058,8 @@ impl WebDavSession {
         progress: Option<&ProgressCallback>,
         etag: Option<&str>,
     ) -> Result<u64, ProtoError> {
-        let mut req = self.apply_auth(self.client.get(self.url_for(remote_path, false)));
+        let client = if etag.is_some() { &self.no_redirect_client } else { &self.client };
+        let mut req = self.apply_auth(client.get(self.url_for(remote_path, false)));
         if let Some(tag) = etag {
             if !valid_strong_etag(tag) { return Err(ProtoError::Transport("Conditional download requires a strong ETag.".to_string())); }
             req = req.header("If-Match", tag);
@@ -1427,7 +1429,7 @@ impl RemoteSession for WebDavSession {
 
     async fn remove_if_match(&self, remote_path: &str, etag: &str) -> Result<(), ProtoError> {
         if !valid_strong_etag(etag) { return Err(ProtoError::Transport("Conditional delete requires a strong ETag.".to_string())); }
-        let response = self.apply_auth(self.client.delete(self.url_for(remote_path, false)))
+        let response = self.apply_auth(self.no_redirect_client.delete(self.url_for(remote_path, false)))
             .header("If-Match", etag).send().await
             .map_err(|e| ProtoError::Transport(format!("Conditional WebDAV DELETE failed: {}", format_reqwest_err(&e))))?;
         if !response.status().is_success() {

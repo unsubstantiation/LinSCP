@@ -86,6 +86,14 @@ pub enum QueueJob {
         etag: String,
         is_dir: bool,
     },
+    CrossServerMove {
+        source_session: Arc<dyn RemoteSession>,
+        target_session: Arc<dyn RemoteSession>,
+        source: String,
+        target: String,
+        etag: String,
+        source_entry: linscp_types::FileEntry,
+    },
     RemoteToRemote {
         src_session: Arc<dyn RemoteSession>,
         dst_session: Arc<dyn RemoteSession>,
@@ -203,7 +211,7 @@ async fn upload_new_sftp_tree(
 
 fn task_supports_cancellation(job: &QueueJob) -> bool {
     match job {
-        QueueJob::LocalCopyOrMove { .. } => true,
+        QueueJob::LocalCopyOrMove { .. } | QueueJob::CrossServerMove { .. } => true,
         QueueJob::RemoteDownload { session, .. } => {
             matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs | ProtocolScheme::S3 | ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes)
         }
@@ -804,6 +812,30 @@ impl QueueManager {
                 })
                 .await
                 .map_err(|e| format!("Local worker panicked: {e}"))?
+            }
+            QueueJob::CrossServerMove { source_session, target_session, source, target, etag, source_entry } => {
+                let stage = tempfile::Builder::new().prefix("linscp-cross-move-").rand_bytes(16).tempdir()
+                    .map_err(|e| format!("Cannot create local move staging directory: {e}"))?;
+                let payload = stage.path().join("payload");
+                let mut download_flags = TransferFlags::default();
+                download_flags.no_clobber = true;
+                download_flags.cleanup_download_stage = true;
+                download_flags.source_etag = Some(etag.clone());
+                download_flags.cancel_flag = Some(Arc::clone(&task.cancel_flag));
+                download_single_file(source_session.as_ref(), source, Some(source_entry), &payload, &download_flags, &mut logger, Some(&*progress)).await?;
+                let staged_len = std::fs::metadata(&payload).map_err(|e| format!("Cannot inspect staged move: {e}"))?.len();
+                if staged_len != source_entry.size { return Err("Source length changed during conditional download; source remains.".to_string()); }
+                if task.cancel_flag.load(Ordering::SeqCst) { return Err("Cancelled before upload; source remains.".to_string()); }
+                let mut upload_flags = TransferFlags::default();
+                upload_flags.no_clobber = true;
+                upload_flags.preserve_time = false;
+                upload_flags.cancel_flag = Some(Arc::clone(&task.cancel_flag));
+                upload_single_file(target_session.as_ref(), &payload, target, &upload_flags, &mut logger, Some(&*progress)).await
+                    .map_err(|e| format!("Move incomplete: source remains; destination may contain a partial or completed file: {e}"))?;
+                if task.cancel_flag.load(Ordering::SeqCst) { return Err("Move incomplete: destination was uploaded; cancellation left the source in place.".to_string()); }
+                source_session.remove_if_match(source, etag).await
+                    .map_err(|e| format!("Move incomplete: destination was uploaded; source deletion was not confirmed and the source may or may not remain: {e}"))?;
+                Ok(())
             }
             QueueJob::DavMove { session, source, target, etag, is_dir } => {
                 if task.cancel_flag.load(Ordering::SeqCst) { return Err("Cancelled by user.".to_string()); }

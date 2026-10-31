@@ -345,7 +345,20 @@ impl CommanderService {
         if body.get("operation").and_then(Value::as_str) != Some("move") { return Self::not_implemented(); }
         let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
         let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() { Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected") };
-        if body.get("target").and_then(Value::as_str) != Some(format!("tab:{id}").as_str()) { return api_error(400, "Only moves within the current WebDAV session are supported."); }
+        let target_id = match body.get("target").and_then(Value::as_str).and_then(|v| v.strip_prefix("tab:")).and_then(|v| v.parse::<u64>().ok()) {
+            Some(id) => id, None => return api_error(400, "Select an open destination session.")
+        };
+        let target_tab = match self.state.lock().expect("state mutex").tabs.get(&target_id).cloned() {
+            Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Destination session is not connected")
+        };
+        let target_session = match target_tab.remote { Some(session) => session, None => return api_error(400, "Destination session is not connected") };
+        let same_tab = target_id == id;
+        if !same_tab && !matches!(target_session.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs | linscp_types::ProtocolScheme::S3) {
+            return api_error(501, "Cross-server moves require an exclusively creatable destination.");
+        }
+        if !same_tab && !body.get("accept_cross_move_risk").and_then(Value::as_bool).unwrap_or(false) {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "Cross-server move requires confirmation", "cross_move_risk": true}) };
+        }
         let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
         if !matches!(session.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs) { return api_error(501, "Only WebDAV file moves are supported here."); }
         if body.get("filemask").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) { return api_error(400, "File masks are not supported for remote moves."); }
@@ -361,21 +374,34 @@ impl CommanderService {
             if !seen.insert(name) { return api_error(400, "Duplicate file name"); }
             let source = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
             let target = format!("{}/{}", directory.trim_end_matches('/'), name);
-            if source == target { return api_error(400, "Source and destination are the same file."); }
+            if same_tab && source == target { return api_error(400, "Source and destination are the same file."); }
             let (tag, is_dir) = match session.dav_get_etag(&source).await {
                 Ok((Some(tag), is_dir)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => (tag, is_dir),
                 Ok(_) => return api_error(400, "WebDAV moves require a strong source ETag."),
                 Err(error) => return api_error(400, error.to_string()),
             };
-            if is_dir && target.starts_with(&format!("{source}/")) { return api_error(400, "Cannot move a directory into itself."); }
+            if !same_tab && is_dir { return api_error(501, "Cross-server directory moves are not yet supported."); }
+            if is_dir && same_tab && target.starts_with(&format!("{source}/")) { return api_error(400, "Cannot move a directory into itself."); }
             if is_dir && !body.get("accept_directory_move_risk").and_then(Value::as_bool).unwrap_or(false) {
                 return ApiReply { status: 409, payload: json!({"success": false, "error": "Directory move requires confirmation", "directory_move_risk": true}) };
             }
-            jobs.push((name.to_string(), source, target, tag, is_dir));
+            let entry = if same_tab { None } else {
+                match session.stat(&source).await {
+                    Ok(Some(entry)) if !entry.is_dir && !entry.is_symlink => Some(entry),
+                    Ok(_) => return api_error(400, "Cross-server moves require an existing regular file."),
+                    Err(error) => return api_error(400, error.to_string()),
+                }
+            };
+            jobs.push((name.to_string(), source, target, tag, is_dir, entry));
         }
-        for (name, source, target, etag, is_dir) in jobs {
-            let job = queue::QueueJob::DavMove { session: session.clone(), source: source.clone(), target: target.clone(), etag, is_dir };
-            self.queue.enqueue(Some(id), "move", name, source, target, 0, false, job);
+        for (name, source, target, etag, is_dir, entry) in jobs {
+            let size = entry.as_ref().map(|entry| entry.size).unwrap_or(0);
+            let job = if let Some(source_entry) = entry {
+                queue::QueueJob::CrossServerMove { source_session: session.clone(), target_session: target_session.clone(), source: source.clone(), target: target.clone(), etag, source_entry }
+            } else {
+                queue::QueueJob::DavMove { session: session.clone(), source: source.clone(), target: target.clone(), etag, is_dir }
+            };
+            self.queue.enqueue(Some(id), "move", name, source, target, size, false, job);
         }
         ApiReply { status: 200, payload: json!({"success": true}) }
     }
@@ -2664,6 +2690,81 @@ mod tests {
         assert!(complete);
         assert_eq!(std::fs::read(downloaded.join("move-success.txt")).unwrap(), b"move payload");
         assert!(session.stat("/move-success.txt").await.unwrap().is_none());
+        // Exercise cross-server moves against a second independent WebDAV server.
+        let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestDavServer.py");
+        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0")
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut dest_server = Server(child); let mut line = String::new();
+        BufReader::new(dest_server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let dest_port: u16 = line.trim().strip_prefix("READY ").expect("destination DAV server failed to start").parse().unwrap();
+        let dest_open = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "dav", "host": "127.0.0.1", "port": dest_port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
+        assert_eq!(dest_open.status, 200, "{}", dest_open.payload);
+        let dest_id = dest_open.payload["tab"]["id"].as_u64().unwrap();
+        let dest_session = svc.state.lock().unwrap().tabs.get(&dest_id).unwrap().remote.as_ref().unwrap().clone();
+        linscp_proto::upload_bytes(session.as_ref(), "/cross-success.txt", b"cross server", Default::default()).await.unwrap();
+        let risk = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": "/", "names": ["cross-success.txt"], "operation": "move"}))).await;
+        assert_eq!(risk.status, 409);
+        assert_eq!(risk.payload["cross_move_risk"], true);
+        let idx = svc.queue.snapshot().0.len();
+        let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": "/", "names": ["cross-success.txt"], "operation": "move", "accept_cross_move_risk": true}))).await;
+        assert_eq!(moved.status, 200, "{}", moved.payload);
+        let mut done = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("cross-server move failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done);
+        assert!(session.stat("/cross-success.txt").await.unwrap().is_none());
+        assert_eq!(linscp_proto::download_bytes(dest_session.as_ref(), "/cross-success.txt", Default::default()).await.unwrap(), b"cross server");
+        linscp_proto::upload_bytes(session.as_ref(), "/cross-conflict.txt", b"source", Default::default()).await.unwrap();
+        linscp_proto::upload_bytes(dest_session.as_ref(), "/cross-conflict.txt", b"existing destination", Default::default()).await.unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": "/", "names": ["cross-conflict.txt"], "operation": "move", "accept_cross_move_risk": true}))).await;
+        assert_eq!(moved.status, 200, "{}", moved.payload);
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("cross-server conflict was overwritten"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/cross-conflict.txt", Default::default()).await.unwrap(), b"source");
+        assert_eq!(linscp_proto::download_bytes(dest_session.as_ref(), "/cross-conflict.txt", Default::default()).await.unwrap(), b"existing destination");
+        linscp_proto::upload_bytes(session.as_ref(), "/cross-changed.txt", b"original", Default::default()).await.unwrap();
+        svc.queue.pause();
+        let idx = svc.queue.snapshot().0.len();
+        let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": "/", "names": ["cross-changed.txt"], "operation": "move", "accept_cross_move_risk": true}))).await;
+        assert_eq!(moved.status, 200);
+        linscp_proto::upload_bytes(session.as_ref(), "/cross-changed.txt", b"changed", Default::default()).await.unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("changed source was moved"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert!(dest_session.stat("/cross-changed.txt").await.unwrap().is_none());
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/cross-changed.txt", Default::default()).await.unwrap(), b"changed");
+        linscp_proto::upload_bytes(session.as_ref(), "/move-delete-race.txt", b"original cross copy", Default::default()).await.unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": "/", "names": ["move-delete-race.txt"], "operation": "move", "accept_cross_move_risk": true}))).await;
+        assert_eq!(moved.status, 200);
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { assert!(tasks[idx]["error"].as_str().unwrap_or("").contains("Move incomplete")); failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("changed source was deleted"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert_eq!(linscp_proto::download_bytes(dest_session.as_ref(), "/move-delete-race.txt", Default::default()).await.unwrap(), b"original cross copy");
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/move-delete-race.txt", Default::default()).await.unwrap(), b"changed before conditional delete");
+        drop(dest_server);
         // Same-session queued moves use the captured source ETag and an
         // atomic no-replace request against a different remote directory.
         session.mkdir("/archive").await.unwrap();
