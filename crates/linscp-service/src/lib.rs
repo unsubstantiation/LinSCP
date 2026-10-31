@@ -2358,6 +2358,16 @@ mod tests {
         assert!(history.iter().any(|e| e["action"] == "abort" && e["key"] == "multipart-conflict.bin"));
         assert!(history.iter().any(|e| e["action"] == "abort" && e["key"] == "multipart-queued.bin"));
         assert!(history.iter().any(|e| e["action"] == "complete" && e["key"] == "multipart-success.bin"));
+        // If abort fails, report the upload ID for later inspection instead of
+        // claiming cleanup succeeded or deleting the destination pathname.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trigger = Arc::clone(&cancel);
+        let stop = move |_: u64, _: u64| trigger.store(true, std::sync::atomic::Ordering::SeqCst);
+        multipart_flags.cancel_flag = Some(cancel);
+        let failed_abort = linscp_engine::transfer::upload_single_file(session.as_ref(), &multipart_path, "/photos/multipart-abort-failure.bin", &multipart_flags, &mut logger, Some(&stop)).await.unwrap_err();
+        assert!(failed_abort.contains("abort was not confirmed"), "{failed_abort}");
+        assert!(failed_abort.contains("upload ID"), "{failed_abort}");
+        assert!(session.stat("/photos/multipart-abort-failure.bin").await.unwrap().is_none());
         // Enforce the supported upper bound without an unconditional fallback.
         std::fs::OpenOptions::new().write(true).open(local.join("upload.txt")).unwrap().set_len(1024 * 1024 * 1024 + 1).unwrap();
         let conflict = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"]}))).await;
