@@ -15,7 +15,7 @@ use bytes::Bytes;
 use futures_core::Stream;
 use linscp_crypto::digests::{DigestAlgorithm, DigestHasher};
 use linscp_types::{FileEntry, ProtocolScheme};
-use rand::RngCore;
+use rand::{seq::SliceRandom, RngCore};
 use reqwest::{Body, Client, Method, Proxy};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
@@ -408,6 +408,9 @@ impl Default for WebDavConnectConfig {
 struct DavConditionState {
     locks: HashMap<String, String>,
     etags: HashMap<String, DavEtagPrecondition>,
+    // Tokens never leave memory; a failed DELETE can be retried while this
+    // session and the server-side lock both remain alive.
+    pending_cleanup: HashMap<String, String>,
 }
 
 pub struct WebDavSession {
@@ -507,6 +510,26 @@ impl WebDavSession {
     }
 
 
+    async fn retry_locked_upload_cleanup(&self) {
+        let mut pending: Vec<_> = self.state.lock().await.pending_cleanup.iter()
+            .map(|(stage, token)| (stage.clone(), token.clone())).collect();
+        // Bound reconnect latency and give each failed stage a chance even if
+        // other stages persistently fail. Never hold the state lock over I/O.
+        pending.shuffle(&mut rand::thread_rng());
+        for (stage, token) in pending.into_iter().take(4) {
+            let cleanup = tokio::time::timeout(Duration::from_secs(3),
+                self.apply_auth(self.no_redirect_client.delete(self.url_for(&stage, false)))
+                    .header("If", format!("(<{token}>)")).send()).await;
+            if matches!(cleanup, Ok(Ok(ref response)) if matches!(response.status().as_u16(), 200 | 204)) {
+                {
+                    let mut state = self.state.lock().await;
+                    if state.pending_cleanup.get(&stage) == Some(&token) { state.pending_cleanup.remove(&stage); }
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(3), self.unlock(&stage, Some(&token))).await;
+            }
+        }
+    }
+
     // Try a lock-null staging resource. Cleanup is conditional on the
     // server still recognizing our exclusive lock token; never unlink a path
     // merely because we once created it. Servers that explicitly do not offer
@@ -517,6 +540,7 @@ impl WebDavSession {
         progress: Option<&ProgressCallback>, destination_etag: Option<&str>,
     ) -> Result<Option<u64>, ProtoError> {
         if opts.resume_offset != 0 || opts.append { return Ok(None); }
+        self.retry_locked_upload_cleanup().await;
         let mut random = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut random);
         let directory = remote_path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
@@ -564,19 +588,32 @@ impl WebDavSession {
             Err(e) => Err(e),
         };
         if let Err(error) = result {
-            let cleanup = self.apply_auth(self.no_redirect_client.delete(self.url_for(&stage, false)))
-                .header("If", format!("(<{token}>)")).send().await;
+            let cleanup = tokio::time::timeout(Duration::from_secs(3),
+                self.apply_auth(self.no_redirect_client.delete(self.url_for(&stage, false)))
+                    .header("If", format!("(<{token}>)")).send()).await;
+            let confirmed = matches!(cleanup, Ok(Ok(ref response)) if matches!(response.status().as_u16(), 200 | 204));
             let detail = match cleanup {
-                Ok(response) if matches!(response.status().as_u16(), 200 | 204) => "Locked temporary resource removed.".to_string(),
-                Ok(response) => format!("Locked temporary resource '{stage}' was not removed (HTTP {}); inspect it before retrying.", response.status()),
-                Err(e) => format!("Cleanup of locked temporary resource '{stage}' was not confirmed: {}", format_reqwest_err(&e)),
+                Ok(Ok(_response)) if confirmed => "Locked temporary resource removed.".to_string(),
+                Ok(Ok(response)) => format!("Locked temporary resource '{stage}' was not removed (HTTP {}); inspect it before retrying.", response.status()),
+                Ok(Err(e)) => format!("Cleanup of locked temporary resource '{stage}' was not confirmed: {}", format_reqwest_err(&e)),
+                Err(_) => format!("Cleanup of locked temporary resource '{stage}' timed out and was not confirmed."),
             };
-            // UNLOCK is token-scoped and never removes a pathname.
-            let _ = self.unlock(&stage, Some(&token)).await;
-            self.state.lock().await.locks.remove(&state_key);
-            return Err(ProtoError::Transport(format!("{error}; {detail}")));
+            if confirmed {
+                // UNLOCK is token-scoped and never removes a pathname.
+                let _ = tokio::time::timeout(Duration::from_secs(3), self.unlock(&stage, Some(&token))).await;
+            }
+            let mut state = self.state.lock().await;
+            state.locks.remove(&state_key);
+            let retry = !confirmed && state.pending_cleanup.len() < 128;
+            if retry { state.pending_cleanup.insert(stage.clone(), token); }
+            // Do not unlock after an unconfirmed DELETE: retaining the lock
+            // gives a later conditional retry a chance without deleting a
+            // replacement. If this session ends or the lock expires, manual
+            // inspection may still be required.
+            let note = if retry { " Cleanup will be retried on a later staged upload in this session while the lock remains valid." } else { "" };
+            return Err(ProtoError::Transport(format!("{error}; {detail}{note}")));
         }
-        let _ = self.unlock(&stage, Some(&token)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.unlock(&stage, Some(&token))).await;
         self.state.lock().await.locks.remove(&state_key);
         result.map(Some)
     }
@@ -797,7 +834,7 @@ impl WebDavSession {
             format!("<{resolved_tok}>")
         };
         let resp = self
-            .apply_auth(self.client.request(method, self.url_for(remote_path, false)))
+            .apply_auth(self.no_redirect_client.request(method, self.url_for(remote_path, false)))
             .header("Lock-Token", formatted_tok)
             .send()
             .await

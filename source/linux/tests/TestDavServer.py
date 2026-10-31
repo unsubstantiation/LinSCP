@@ -73,6 +73,7 @@ class Store:
         self.write_seq = 0
         self.copy_count = 0
         self.reject_next_copy = False
+        self.reject_next_stage_delete = False
         self.drop_next_get = os.environ.get("LSCP_TEST_DROP_ONCE", "")
         # path -> token, and path -> {name: value} for the dead properties.
         # Both are what a LOCK/UNLOCK/PROPPATCH implementation has to keep,
@@ -643,6 +644,10 @@ class DavHandler(BaseHTTPRequestHandler):
             SERVER_STORE.reject_next_copy = True
             self.send_body(204, b"")
             return
+        if parsed.path == "/__test__/reject-next-stage-delete":
+            SERVER_STORE.reject_next_stage_delete = True
+            self.send_body(204, b"")
+            return
         if parsed.path == "/__test__/state":
             body = json.dumps({
                 "copy_count": SERVER_STORE.copy_count,
@@ -749,6 +754,10 @@ class DavHandler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
         path = self.local_path()
+        if "/.linscp-lock-" in path and SERVER_STORE.reject_next_stage_delete:
+            SERVER_STORE.reject_next_stage_delete = False
+            self.send_error_text(503, "Injected temporary cleanup failure.")
+            return
         if "/.linscp-lock-" in path and os.environ.get("LSCP_TEST_LOCK_REPLACEMENT") == "1":
             with SERVER_STORE.write_lock:
                 SERVER_STORE.locks.pop(SERVER_STORE.normalize(path), None)

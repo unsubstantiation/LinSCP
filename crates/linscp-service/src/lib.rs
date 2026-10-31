@@ -3692,6 +3692,30 @@ mod tests {
                     assert!(!session.list_dir("/").await.unwrap().iter().any(|e| e.name.starts_with(".linscp-lock-")));
                 }
             }
+            if !replacement {
+                // A transient failure leaves the lock intact and is retried
+                // when this session next attempts a staged upload.
+                let injected = Command::new("curl").args(["--silent", "--show-error", &format!("http://127.0.0.1:{port}/__test__/reject-next-stage-delete")]).status().unwrap();
+                assert!(injected.success());
+                let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let callback_flag = Arc::clone(&cancelled);
+                let progress = move |_: u64, _: u64| callback_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                flags.cancel_flag = Some(cancelled);
+                let error = linscp_engine::transfer::upload_single_file(session.as_ref(), &input, "/lock-retry-cancel.bin", &flags, &mut logger, Some(&progress)).await.unwrap_err();
+                assert!(error.contains("will be retried"), "{error}");
+                let stages: Vec<_> = session.list_dir("/").await.unwrap().into_iter().filter(|e| e.name.starts_with(".linscp-lock-")).collect();
+                assert_eq!(stages.len(), 1);
+                let output = Command::new("curl").args(["--silent", "--show-error", &format!("http://127.0.0.1:{port}/__test__/state")]).output().unwrap();
+                let state: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert!(state["locks"].as_object().unwrap().contains_key(&format!("/{}", stages[0].name)), "failed cleanup must retain the lock: {state}");
+                flags.cancel_flag = None;
+                let next = linscp_engine::transfer::upload_single_file(session.as_ref(), &input, "/lock-retry-next.bin", &flags, &mut logger, None).await;
+                assert!(next.is_ok(), "{next:?}");
+                assert!(!session.list_dir("/").await.unwrap().iter().any(|e| e.name.starts_with(".linscp-lock-")));
+                let output = Command::new("curl").args(["--silent", "--show-error", &format!("http://127.0.0.1:{port}/__test__/state")]).output().unwrap();
+                let state: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert!(!state["locks"].as_object().unwrap().contains_key(&format!("/{}", stages[0].name)), "resolved stage should be unlocked: {state}");
+            }
             let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let callback_flag = Arc::clone(&cancelled);
             let progress = move |_: u64, _: u64| callback_flag.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3703,6 +3727,10 @@ mod tests {
                 assert!(error.contains("was not removed"), "{error}");
                 assert_eq!(stages.len(), 1);
                 assert_eq!(linscp_proto::download_bytes(session.as_ref(), &format!("/{}", stages[0].name), Default::default()).await.unwrap(), b"replacement by another actor");
+                flags.cancel_flag = None;
+                let next = linscp_engine::transfer::upload_single_file(session.as_ref(), &input, "/lock-replacement-next.bin", &flags, &mut logger, None).await;
+                assert!(next.is_ok(), "{next:?}");
+                assert_eq!(linscp_proto::download_bytes(session.as_ref(), &format!("/{}", stages[0].name), Default::default()).await.unwrap(), b"replacement by another actor", "retry removed another actor's replacement");
             } else {
                 assert!(error.contains("Locked temporary resource removed"), "{error}");
                 assert!(stages.is_empty(), "owned locked stage was not cleaned");
