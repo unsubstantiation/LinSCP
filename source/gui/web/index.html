@@ -4332,6 +4332,10 @@
       payload.accept_sftp_copy_risk = true;
       result = await apiPost('/api/remote/transfer', payload);
     }
+    if (result.directory_copy_risk && confirm(t("Directory copies are not snapshots: concurrent changes can affect the copied tree. Destination path changes may redirect writes, and interruptions may leave a partial remote tree. Continue?"))) {
+      payload.accept_directory_copy_risk = true;
+      result = await apiPost('/api/remote/transfer', payload);
+    }
     if (result.cross_move_risk && confirm(t("Cross-server moves are not transactional. An interruption can leave a duplicate or partial destination, and source deletion may be unconfirmed. Destination changes are not locked. Continue?"))) {
       payload.accept_cross_move_risk = true;
       result = await apiPost('/api/remote/transfer', payload);

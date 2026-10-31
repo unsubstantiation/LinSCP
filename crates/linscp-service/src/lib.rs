@@ -401,7 +401,10 @@ impl CommanderService {
             if (!same_tab || !move_item) && target_session.scheme() == linscp_types::ProtocolScheme::S3 && source_entry.size > 16 * 1024 * 1024 {
                 return api_error(400, "Remote transfers to S3 are limited to 16 MiB per file.");
             }
-            if is_dir && (!same_tab || !move_item) && (move_item || !source_is_sftp || target_session.scheme() != linscp_types::ProtocolScheme::Sftp) { return api_error(501, "Directory copies require SFTP source and destination sessions; cross-server directory moves are unsupported."); }
+            if is_dir && (!same_tab || !move_item) && (move_item || !(source_is_sftp || source_is_dav) || target_session.scheme() != linscp_types::ProtocolScheme::Sftp) { return api_error(501, "Directory copies require an SFTP or WebDAV source and an SFTP destination; cross-server directory moves are unsupported."); }
+            if is_dir && !move_item && source_is_dav && !body.get("accept_directory_copy_risk").and_then(Value::as_bool).unwrap_or(false) {
+                return ApiReply { status: 409, payload: json!({"success": false, "error": "Directory copy requires confirmation", "directory_copy_risk": true}) };
+            }
             if is_dir && same_tab && target.starts_with(&format!("{source}/")) { return api_error(400, "Cannot move a directory into itself."); }
             if is_dir && move_item && !body.get("accept_directory_move_risk").and_then(Value::as_bool).unwrap_or(false) {
                 return ApiReply { status: 409, payload: json!({"success": false, "error": "Directory move requires confirmation", "directory_move_risk": true}) };
@@ -2409,6 +2412,67 @@ mod tests {
         assert!(done);
         assert_eq!(linscp_proto::download_bytes(source.as_ref(), "/cross-copy.txt", Default::default()).await.unwrap(), b"copy source");
         assert_eq!(linscp_proto::download_bytes(dest.as_ref(), &format!("{}/cross-copy.txt", dest_dir.trim_end_matches('/')), Default::default()).await.unwrap(), b"copy source");
+        if dest_dir == "/" {
+            source.mkdir("/dav-copy-tree").await.unwrap();
+            source.mkdir("/dav-copy-tree/nested").await.unwrap();
+            source.mkdir("/dav-copy-tree/nested/empty").await.unwrap();
+            linscp_proto::upload_bytes(source.as_ref(), "/dav-copy-tree/nested/data", b"WebDAV tree", Default::default()).await.unwrap();
+            let risk = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": dest_dir, "names": ["dav-copy-tree"]}))).await;
+            assert_eq!(risk.status, 409, "{}", risk.payload);
+            assert_eq!(risk.payload["directory_copy_risk"], true);
+            let idx = svc.queue.snapshot().0.len();
+            let copied = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": dest_dir, "names": ["dav-copy-tree"], "accept_directory_copy_risk": true}))).await;
+            assert_eq!(copied.status, 200, "{}", copied.payload);
+            let mut done = false;
+            for _ in 0..1000 {
+                let (tasks, _) = svc.queue.snapshot();
+                if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+                if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("WebDAV tree copy failed: {:?}", tasks.get(idx)); }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(done);
+            assert_eq!(linscp_proto::download_bytes(dest.as_ref(), "/dav-copy-tree/nested/data", Default::default()).await.unwrap(), b"WebDAV tree");
+            assert!(dest.stat("/dav-copy-tree/nested/empty").await.unwrap().unwrap().is_dir);
+            assert_eq!(linscp_proto::download_bytes(source.as_ref(), "/dav-copy-tree/nested/data", Default::default()).await.unwrap(), b"WebDAV tree");
+            let idx = svc.queue.snapshot().0.len();
+            let copied = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": dest_dir, "names": ["dav-copy-tree"], "accept_directory_copy_risk": true}))).await;
+            assert_eq!(copied.status, 200);
+            let mut failed = false;
+            for _ in 0..1000 {
+                let (tasks, _) = svc.queue.snapshot();
+                if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+                if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("existing remote tree was replaced"); }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(failed);
+            assert_eq!(linscp_proto::download_bytes(dest.as_ref(), "/dav-copy-tree/nested/data", Default::default()).await.unwrap(), b"WebDAV tree");
+            source.mkdir("/dav-cancel-tree").await.unwrap();
+            linscp_proto::upload_bytes(source.as_ref(), "/dav-cancel-tree/slow.bin", &vec![53u8; 4 * 1024 * 1024], Default::default()).await.unwrap();
+            let idx = svc.queue.snapshot().0.len();
+            let copied = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": dest_dir, "names": ["dav-cancel-tree"], "accept_directory_copy_risk": true}))).await;
+            assert_eq!(copied.status, 200);
+            let mut task_id = None;
+            for _ in 0..1000 {
+                let (tasks, _) = svc.queue.snapshot();
+                if let Some(task) = tasks.get(idx) {
+                    if task["status"] == "Running" && task["bytes_done"].as_u64().unwrap_or(0) > 0 { task_id = task["id"].as_u64(); break; }
+                    assert_ne!(task["status"], "Completed", "tree copied before cancellation");
+                    assert_ne!(task["status"], "Failed", "{task:?}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            let cancel = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": task_id.expect("tree download did not begin")}))).await;
+            assert_eq!(cancel.status, 200);
+            let mut stopped = false;
+            for _ in 0..1000 {
+                let (tasks, _) = svc.queue.snapshot();
+                if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Cancelled") { stopped = true; break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(stopped);
+            assert!(dest.stat("/dav-cancel-tree").await.unwrap().is_none());
+            assert!(source.stat("/dav-cancel-tree/slow.bin").await.unwrap().is_some());
+        }
         // Cancellation during the first stage leaves source and destination alone.
         let stages_before: std::collections::BTreeSet<_> = std::fs::read_dir(std::env::temp_dir()).unwrap().filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().starts_with("linscp-cross-move-"))

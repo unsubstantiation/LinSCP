@@ -414,3 +414,23 @@ test('SFTP remote copy requires explicit source-race confirmation', async () => 
     if (accepted) assert.equal(calls[1].accept_sftp_copy_risk, true);
   }
 });
+
+test('WebDAV directory copy requires explicit non-snapshot confirmation', async () => {
+  const html = fs.readFileSync(path.join(repoRoot, 'source/gui/web/index.html'), 'utf8').replace(/\r\n/g, '\n');
+  const match = html.match(/async function runRemoteTransfer\(moveItem\) \{[\s\S]*?\n  \}\n\n  \/\*/);
+  assert.ok(match);
+  const source = match[0].replace(/\n\n  \/\*$/, '');
+  for (const accepted of [false, true]) {
+    const values = { remoteTransferDirectory: { value: '/' }, remoteTransferTarget: { value: 'tab:9' }, remoteTransferMask: { value: '' }, remoteTransferStatus: { textContent: '' } };
+    const calls = [];
+    const post = async (_path, payload) => {
+      calls.push({ ...payload });
+      return payload.accept_directory_copy_risk ? { success: true } : { success: false, directory_copy_risk: true, error: 'Confirmation required' };
+    };
+    const run = new Function('$', 'remoteTransferState', 'apiPost', 't', 'errorMessage', 'closeModal', 'toast', 'switchTab', 'refreshQueue', 'confirm', `${source}; return runRemoteTransfer;`)(
+      id => values[id], { tab: 8, names: ['tree'] }, post, s => s, s => s, () => {}, () => {}, () => {}, () => {}, () => accepted);
+    await run(false);
+    assert.equal(calls.length, accepted ? 2 : 1);
+    if (accepted) assert.equal(calls[1].accept_directory_copy_risk, true);
+  }
+});

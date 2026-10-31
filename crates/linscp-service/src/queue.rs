@@ -161,7 +161,7 @@ fn merge_staged_local_tree(stage: &Path, target: &Path, cancel: &AtomicBool, dep
     Ok(())
 }
 
-async fn download_new_sftp_tree(
+async fn download_staged_remote_tree(
     session: &dyn RemoteSession, remote: &str, local: &Path,
     flags: &TransferFlags, logger: &mut SessionLogger, progress: Option<&ProgressCallback>, depth: usize,
 ) -> Result<(), String> {
@@ -183,10 +183,16 @@ async fn download_new_sftp_tree(
         if item.is_symlink { return Err("Refusing to transfer a remote symlink.".to_string()); }
         let from = join_remote_path(remote, &item.name);
         let to = local.join(&item.name);
-        let current = session.stat(&from).await.map_err(|e| e.to_string())?.ok_or("Remote entry disappeared.")?;
+        let is_dav = matches!(session.scheme(), ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs);
+        let (current, child_etag) = if is_dav {
+            let (entry, etag) = session.dav_stat_with_etag(&from).await.map_err(|e| e.to_string())?;
+            (entry.ok_or("Remote entry disappeared.")?, etag)
+        } else {
+            (session.stat(&from).await.map_err(|e| e.to_string())?.ok_or("Remote entry disappeared.")?, None)
+        };
         if current.is_symlink { return Err("Refusing to transfer a remote symlink.".to_string()); }
         if current.is_dir {
-            Box::pin(download_new_sftp_tree(session, &from, &to, flags, logger, progress, depth + 1)).await?;
+            Box::pin(download_staged_remote_tree(session, &from, &to, flags, logger, progress, depth + 1)).await?;
         } else {
             if flags.merge_directories {
                 match std::fs::symlink_metadata(&to) {
@@ -195,7 +201,9 @@ async fn download_new_sftp_tree(
                     Err(error) => return Err(format!("Cannot inspect '{}': {error}", to.display())),
                 }
             }
-            download_single_file(session, &from, Some(&current), &to, flags, logger, progress).await?;
+            let mut child_flags = flags.clone();
+            child_flags.source_etag = if is_dav { Some(child_etag.ok_or("WebDAV tree files require a strong ETag.")?) } else { None };
+            download_single_file(session, &from, Some(&current), &to, &child_flags, logger, progress).await?;
             let received = std::fs::metadata(&to).map_err(|e| format!("Cannot inspect staged file '{}': {e}", to.display()))?.len();
             if received != current.size {
                 return Err(format!("Remote file '{from}' changed length or was incompletely downloaded; refusing to publish the tree."));
@@ -762,7 +770,7 @@ impl QueueManager {
                         .map_err(|e| format!("Cannot create temporary directory in '{}': {e}", parent.display()))?;
                     let staged_tree = stage.path().join("contents");
                     let mut stage_flags = f.clone(); stage_flags.merge_directories = false;
-                    download_new_sftp_tree(session.as_ref(), remote_path, &staged_tree, &stage_flags, &mut logger, Some(&*progress), 0).await?;
+                    download_staged_remote_tree(session.as_ref(), remote_path, &staged_tree, &stage_flags, &mut logger, Some(&*progress), 0).await?;
                     if task.cancel_flag.load(Ordering::SeqCst) { return Err("Transfer cancelled before publication.".to_string()); }
                     if f.merge_directories {
                         merge_staged_local_tree(&staged_tree, local_dest, &task.cancel_flag, 0)?;
@@ -859,10 +867,10 @@ impl QueueManager {
                 download_flags.source_etag = etag.clone();
                 download_flags.cancel_flag = Some(Arc::clone(&task.cancel_flag));
                 if source_entry.is_dir {
-                    if *move_item || source_session.scheme() != ProtocolScheme::Sftp || target_session.scheme() != ProtocolScheme::Sftp {
-                        return Err("Directory copies require SFTP source and destination sessions.".to_string());
+                    if *move_item || !matches!(source_session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs) || target_session.scheme() != ProtocolScheme::Sftp {
+                        return Err("Directory copies require an SFTP or WebDAV source and an SFTP destination.".to_string());
                     }
-                    download_new_sftp_tree(source_session.as_ref(), source, &payload, &download_flags, &mut logger, Some(&*progress), 0).await?;
+                    download_staged_remote_tree(source_session.as_ref(), source, &payload, &download_flags, &mut logger, Some(&*progress), 0).await?;
                     if task.cancel_flag.load(Ordering::SeqCst) { return Err("Cancelled before upload; source remains.".to_string()); }
                     let mut flags = TransferFlags::default();
                     flags.no_clobber = true;
