@@ -820,6 +820,7 @@ impl QueueManager {
                 let mut download_flags = TransferFlags::default();
                 download_flags.no_clobber = true;
                 download_flags.cleanup_download_stage = true;
+                download_flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
                 download_flags.source_etag = Some(etag.clone());
                 download_flags.cancel_flag = Some(Arc::clone(&task.cancel_flag));
                 download_single_file(source_session.as_ref(), source, Some(source_entry), &payload, &download_flags, &mut logger, Some(&*progress)).await?;
