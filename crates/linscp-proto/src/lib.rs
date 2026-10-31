@@ -361,7 +361,7 @@ pub trait RemoteSession: Send + Sync {
         Err(ProtoError::UnsupportedCapability("verified resume", self.scheme()))
     }
     /// Move a WebDAV file only if its source ETag matches and the target is absent.
-    async fn dav_move_if_match(&self, _from: &str, _to: &str, _etag: &str) -> Result<(), ProtoError> {
+    async fn dav_move_if_match(&self, _from: &str, _to: &str, _etag: &str, _is_dir: bool) -> Result<(), ProtoError> {
         Err(ProtoError::UnsupportedCapability("conditional no-replace move", self.scheme()))
     }
     /// Remove only the representation matching the supplied strong ETag.

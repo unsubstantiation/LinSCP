@@ -1413,11 +1413,11 @@ impl RemoteSession for WebDavSession {
         Ok(())
     }
 
-    async fn dav_move_if_match(&self, from: &str, to: &str, etag: &str) -> Result<(), ProtoError> {
+    async fn dav_move_if_match(&self, from: &str, to: &str, etag: &str, is_dir: bool) -> Result<(), ProtoError> {
         if !valid_strong_etag(etag) { return Err(ProtoError::Transport("Conditional MOVE requires a strong ETag.".to_string())); }
         let method = Method::from_bytes(b"MOVE").map_err(|e| ProtoError::Transport(format!("Invalid MOVE method: {e}")))?;
-        let response = self.apply_auth(self.no_redirect_client.request(method, self.url_for(from, false)))
-            .header("Destination", self.url_for(to, false)).header("Overwrite", "F").header("If-Match", etag)
+        let response = self.apply_auth(self.no_redirect_client.request(method, self.url_for(from, is_dir)))
+            .header("Destination", self.url_for(to, is_dir)).header("Overwrite", "F").header("If-Match", etag)
             .send().await.map_err(|e| ProtoError::Transport(format!("Conditional WebDAV MOVE could not be confirmed; the item may have moved: {}", format_reqwest_err(&e))))?;
         if !matches!(response.status().as_u16(), 201 | 204) {
             return Err(ProtoError::Transport(format!("Conditional WebDAV MOVE '{from}' -> '{to}' was not confirmed (HTTP {}); the item may have moved.", response.status())));

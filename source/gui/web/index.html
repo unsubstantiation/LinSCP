@@ -612,7 +612,7 @@
         <div class="form-row"><label>Directory:</label><input type="text" id="remoteTransferDirectory" class="input-field" placeholder="/"></div>
         <div class="form-row"><label>File mask:</label><input type="text" id="remoteTransferMask" class="input-field" placeholder="e.g. *.txt|*.bak (empty = every file)"></div>
         <div class="hint" id="remoteTransferHint"></div>
-        <div class="hint">Move supports files in the current WebDAV session only. It never replaces a destination and relies on server ETag enforcement. If the response is lost, the move may already have completed.</div>
+        <div class="hint">Move supports the current WebDAV session only. It never replaces a destination and relies on server ETag enforcement. Directory contents can change while waiting. If the response is lost, the move may already have completed.</div>
         <div class="hint" id="remoteTransferStatus"></div>
       </div>
       <div class="modal-footer">
@@ -2234,7 +2234,10 @@
     const newName = prompt(t("New name:"), names[0]);
     if (!newName || newName === names[0]) return;
     const endpoint = target === 'remote' ? '/api/remote/rename' : '/api/local/rename';
-    const result = await apiPost(endpoint, { tab: tabId(), old_name: names[0], new_name: newName });
+    let result = await apiPost(endpoint, { tab: tabId(), old_name: names[0], new_name: newName });
+    if (result.directory_move_risk && confirm(t("The server's directory ETag may not cover all children. Files added or changed concurrently may be moved too. Continue?"))) {
+      result = await apiPost(endpoint, { tab: tabId(), old_name: names[0], new_name: newName, accept_directory_move_risk: true });
+    }
     if (!result.success) toast(errorMessage(result.error, t("Cannot rename.")), true);
     await refreshPanes(target);
   }
@@ -4327,7 +4330,11 @@
       filemask: $('remoteTransferMask').value.trim()
     };
     if (moveItem) payload.operation = 'move';
-    const result = await apiPost('/api/remote/transfer', payload);
+    let result = await apiPost('/api/remote/transfer', payload);
+    if (result.directory_move_risk && confirm(t("The server's directory ETag may not cover all children. Files added or changed concurrently may be moved too. Continue?"))) {
+      payload.accept_directory_move_risk = true;
+      result = await apiPost('/api/remote/transfer', payload);
+    }
     if (!result.success) {
       $('remoteTransferStatus').textContent = errorMessage(result.error,
         t(moveItem ? 'Cannot queue the move.' : 'Cannot queue the copy.'));

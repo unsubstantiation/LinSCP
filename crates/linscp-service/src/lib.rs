@@ -362,15 +362,19 @@ impl CommanderService {
             let source = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
             let target = format!("{}/{}", directory.trim_end_matches('/'), name);
             if source == target { return api_error(400, "Source and destination are the same file."); }
-            let tag = match session.dav_get_etag(&source).await {
-                Ok((Some(tag), false)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => tag,
-                Ok(_) => return api_error(400, "WebDAV file moves require a strong source ETag."),
+            let (tag, is_dir) = match session.dav_get_etag(&source).await {
+                Ok((Some(tag), is_dir)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => (tag, is_dir),
+                Ok(_) => return api_error(400, "WebDAV moves require a strong source ETag."),
                 Err(error) => return api_error(400, error.to_string()),
             };
-            jobs.push((name.to_string(), source, target, tag));
+            if is_dir && target.starts_with(&format!("{source}/")) { return api_error(400, "Cannot move a directory into itself."); }
+            if is_dir && !body.get("accept_directory_move_risk").and_then(Value::as_bool).unwrap_or(false) {
+                return ApiReply { status: 409, payload: json!({"success": false, "error": "Directory move requires confirmation", "directory_move_risk": true}) };
+            }
+            jobs.push((name.to_string(), source, target, tag, is_dir));
         }
-        for (name, source, target, etag) in jobs {
-            let job = queue::QueueJob::DavMove { session: session.clone(), source: source.clone(), target: target.clone(), etag };
+        for (name, source, target, etag, is_dir) in jobs {
+            let job = queue::QueueJob::DavMove { session: session.clone(), source: source.clone(), target: target.clone(), etag, is_dir };
             self.queue.enqueue(Some(id), "move", name, source, target, 0, false, job);
         }
         ApiReply { status: 200, payload: json!({"success": true}) }
@@ -390,12 +394,15 @@ impl CommanderService {
         if !valid_name(old) || !valid_name(new) || old == new { return api_error(400, "Select two different single file names."); }
         let from = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), old);
         let to = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), new);
-        let tag = match session.dav_get_etag(&from).await {
-            Ok((Some(tag), false)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => tag,
-            Ok(_) => return api_error(400, "WebDAV file rename requires a strong source ETag."),
+        let (tag, is_dir) = match session.dav_get_etag(&from).await {
+            Ok((Some(tag), is_dir)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => (tag, is_dir),
+            Ok(_) => return api_error(400, "WebDAV rename requires a strong source ETag."),
             Err(error) => return api_error(400, error.to_string()),
         };
-        match session.dav_move_if_match(&from, &to, &tag).await {
+        if is_dir && !body.get("accept_directory_move_risk").and_then(Value::as_bool).unwrap_or(false) {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "Directory move requires confirmation", "directory_move_risk": true}) };
+        }
+        match session.dav_move_if_match(&from, &to, &tag, is_dir).await {
             Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
             Err(error) => api_error(400, error.to_string()),
         }
@@ -2719,6 +2726,32 @@ mod tests {
         svc.queue.resume();
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/queued-cancel.txt", Default::default()).await.unwrap(), b"cancel source");
         assert!(session.stat("/archive/queued-cancel.txt").await.unwrap().is_none());
+        // Directory moves require explicit acknowledgement because a
+        // collection ETag need not describe every descendant.
+        session.mkdir("/tree-to-move").await.unwrap();
+        session.mkdir("/tree-to-move/nested").await.unwrap();
+        linscp_proto::upload_bytes(session.as_ref(), "/tree-to-move/nested/data.txt", b"nested", Default::default()).await.unwrap();
+        let risk = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/archive", "names": ["tree-to-move"], "operation": "move"}))).await;
+        assert_eq!(risk.status, 409);
+        assert_eq!(risk.payload["directory_move_risk"], true);
+        let idx = svc.queue.snapshot().0.len();
+        let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/archive", "names": ["tree-to-move"], "operation": "move", "accept_directory_move_risk": true}))).await;
+        assert_eq!(moved.status, 200, "{}", moved.payload);
+        let mut done = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("WebDAV directory move failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done);
+        assert!(session.stat("/tree-to-move").await.unwrap().is_none());
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/archive/tree-to-move/nested/data.txt", Default::default()).await.unwrap(), b"nested");
+        let risk = svc.dispatch_async(request("/api/remote/rename", json!({"tab": id, "old_name": "archive", "new_name": "renamed-archive"}))).await;
+        assert_eq!(risk.status, 409);
+        assert_eq!(risk.payload["directory_move_risk"], true);
+        let bad = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/archive/tree-to-move", "names": ["archive"], "operation": "move", "accept_directory_move_risk": true}))).await;
+        assert_eq!(bad.status, 400);
         // Same-session renames are conditional on the source ETag and never
         // replace a destination; failure after a lost response is ambiguous.
         linscp_proto::upload_bytes(session.as_ref(), "/rename-old.txt", b"rename content", Default::default()).await.unwrap();
@@ -2733,7 +2766,7 @@ mod tests {
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/rename-dest.txt", Default::default()).await.unwrap(), b"keep destination");
         let tag = session.dav_get_etag("/rename-new.txt").await.unwrap().0.unwrap();
         linscp_proto::upload_bytes(session.as_ref(), "/rename-new.txt", b"changed", Default::default()).await.unwrap();
-        assert!(session.dav_move_if_match("/rename-new.txt", "/rename-race.txt", &tag).await.is_err());
+        assert!(session.dav_move_if_match("/rename-new.txt", "/rename-race.txt", &tag, false).await.is_err());
         assert!(session.stat("/rename-race.txt").await.unwrap().is_none());
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/rename-new.txt", Default::default()).await.unwrap(), b"changed");
         // MOVE must not follow redirects to a different source or treat
