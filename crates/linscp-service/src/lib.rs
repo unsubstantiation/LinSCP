@@ -2446,6 +2446,25 @@ mod tests {
             }
             assert!(failed);
             assert_eq!(linscp_proto::download_bytes(dest.as_ref(), "/dav-copy-tree/nested/data", Default::default()).await.unwrap(), b"WebDAV tree");
+            // Files without a strong ETag cannot be staged as a trusted
+            // conditional copy, even when their collection has an ETag.
+            for (dir, file) in [("dav-weak-tree", "weak.txt"), ("dav-missing-tree", "missing.txt")] {
+                source.mkdir(&format!("/{dir}")).await.unwrap();
+                linscp_proto::upload_bytes(source.as_ref(), &format!("/{dir}/{file}"), b"unsafe version", Default::default()).await.unwrap();
+                let idx = svc.queue.snapshot().0.len();
+                let copied = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": dest_dir, "names": [dir], "accept_directory_copy_risk": true}))).await;
+                assert_eq!(copied.status, 200, "{}", copied.payload);
+                let mut failed = false;
+                for _ in 0..1000 {
+                    let (tasks, _) = svc.queue.snapshot();
+                    if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+                    if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("unversioned file tree was copied"); }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                assert!(failed);
+                assert!(dest.stat(&format!("/{dir}")).await.unwrap().is_none());
+                assert!(source.stat(&format!("/{dir}/{file}")).await.unwrap().is_some());
+            }
             source.mkdir("/dav-cancel-tree").await.unwrap();
             linscp_proto::upload_bytes(source.as_ref(), "/dav-cancel-tree/slow.bin", &vec![53u8; 4 * 1024 * 1024], Default::default()).await.unwrap();
             let idx = svc.queue.snapshot().0.len();

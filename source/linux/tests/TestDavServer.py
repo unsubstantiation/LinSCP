@@ -510,6 +510,10 @@ class DavHandler(BaseHTTPRequestHandler):
             # collection carries one too: it names the version of the
             # listing, which is all a collection has to compare.
             etag = SERVER_STORE.etag_of(target)
+            if target == "/dav-weak-tree/weak.txt" and etag:
+                etag = "W/" + etag
+            if target == "/dav-missing-tree/missing.txt":
+                etag = None
             etag_prop = ("<d:getetag>%s</d:getetag>" % xml_escape(etag)
                          if etag else "")
             # The dead properties this store holds, in the namespace the
