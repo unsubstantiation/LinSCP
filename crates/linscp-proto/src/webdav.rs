@@ -1415,6 +1415,10 @@ impl RemoteSession for WebDavSession {
         Ok(())
     }
 
+    async fn dav_stat_with_etag(&self, remote_path: &str) -> Result<(Option<FileEntry>, Option<String>), ProtoError> {
+        self.propfind_single(remote_path).await
+    }
+
     async fn dav_move_if_match(&self, from: &str, to: &str, etag: &str, is_dir: bool) -> Result<(), ProtoError> {
         if !valid_strong_etag(etag) { return Err(ProtoError::Transport("Conditional MOVE requires a strong ETag.".to_string())); }
         let method = Method::from_bytes(b"MOVE").map_err(|e| ProtoError::Transport(format!("Invalid MOVE method: {e}")))?;

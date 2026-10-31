@@ -375,23 +375,18 @@ impl CommanderService {
             let source = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
             let target = format!("{}/{}", directory.trim_end_matches('/'), name);
             if same_tab && source == target { return api_error(400, "Source and destination are the same file."); }
-            let (tag, is_dir) = match session.dav_get_etag(&source).await {
-                Ok((Some(tag), is_dir)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => (tag, is_dir),
-                Ok(_) => return api_error(400, "WebDAV moves require a strong source ETag."),
+            let (source_entry, tag) = match session.dav_stat_with_etag(&source).await {
+                Ok((Some(entry), Some(tag))) if !entry.is_symlink && tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => (entry, tag),
+                Ok(_) => return api_error(400, "WebDAV moves require an existing resource and a strong source ETag."),
                 Err(error) => return api_error(400, error.to_string()),
             };
+            let is_dir = source_entry.is_dir;
             if !same_tab && is_dir { return api_error(501, "Cross-server directory moves are not yet supported."); }
             if is_dir && same_tab && target.starts_with(&format!("{source}/")) { return api_error(400, "Cannot move a directory into itself."); }
             if is_dir && !body.get("accept_directory_move_risk").and_then(Value::as_bool).unwrap_or(false) {
                 return ApiReply { status: 409, payload: json!({"success": false, "error": "Directory move requires confirmation", "directory_move_risk": true}) };
             }
-            let entry = if same_tab { None } else {
-                match session.stat(&source).await {
-                    Ok(Some(entry)) if !entry.is_dir && !entry.is_symlink => Some(entry),
-                    Ok(_) => return api_error(400, "Cross-server moves require an existing regular file."),
-                    Err(error) => return api_error(400, error.to_string()),
-                }
-            };
+            let entry = if same_tab { None } else { Some(source_entry) };
             jobs.push((name.to_string(), source, target, tag, is_dir, entry));
         }
         for (name, source, target, etag, is_dir, entry) in jobs {
@@ -420,9 +415,9 @@ impl CommanderService {
         if !valid_name(old) || !valid_name(new) || old == new { return api_error(400, "Select two different single file names."); }
         let from = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), old);
         let to = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), new);
-        let (tag, is_dir) = match session.dav_get_etag(&from).await {
-            Ok((Some(tag), is_dir)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => (tag, is_dir),
-            Ok(_) => return api_error(400, "WebDAV rename requires a strong source ETag."),
+        let (tag, is_dir) = match session.dav_stat_with_etag(&from).await {
+            Ok((Some(entry), Some(tag))) if !entry.is_symlink && tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => (tag, entry.is_dir),
+            Ok(_) => return api_error(400, "WebDAV rename requires an existing resource and a strong source ETag."),
             Err(error) => return api_error(400, error.to_string()),
         };
         if is_dir && !body.get("accept_directory_move_risk").and_then(Value::as_bool).unwrap_or(false) {
