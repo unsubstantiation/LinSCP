@@ -2822,6 +2822,16 @@ mod tests {
         let idx = svc.queue.snapshot().0.len();
         let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": "/", "names": ["move-delete-race.txt"], "operation": "move", "accept_cross_move_risk": true}))).await;
         assert_eq!(moved.status, 200);
+        let mut running_id = None;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if dest_session.stat("/move-delete-race.txt").await.unwrap().is_some() && tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Running") {
+                running_id = tasks[idx]["id"].as_u64(); break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let cancelled = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": running_id.expect("conditional source deletion did not start")}))).await;
+        assert_eq!(cancelled.status, 200);
         let mut failed = false;
         for _ in 0..500 {
             let (tasks, _) = svc.queue.snapshot();
