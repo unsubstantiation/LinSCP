@@ -381,6 +381,9 @@ impl CommanderService {
                 Err(error) => return api_error(400, error.to_string()),
             };
             let is_dir = source_entry.is_dir;
+            if !same_tab && target_session.scheme() == linscp_types::ProtocolScheme::S3 && source_entry.size > 16 * 1024 * 1024 {
+                return api_error(400, "Cross-server moves to S3 are limited to 16 MiB per file.");
+            }
             if !same_tab && is_dir { return api_error(501, "Cross-server directory moves are not yet supported."); }
             if is_dir && same_tab && target.starts_with(&format!("{source}/")) { return api_error(400, "Cannot move a directory into itself."); }
             if is_dir && !body.get("accept_directory_move_risk").and_then(Value::as_bool).unwrap_or(false) {
@@ -2351,6 +2354,9 @@ mod tests {
         let target = format!("{}/cross-proto.txt", dest_dir.trim_end_matches('/'));
         assert_eq!(linscp_proto::download_bytes(dest.as_ref(), &target, Default::default()).await.unwrap(), b"cross-protocol content");
         // Cancellation during the first stage leaves source and destination alone.
+        let stages_before: std::collections::BTreeSet<_> = std::fs::read_dir(std::env::temp_dir()).unwrap().filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("linscp-cross-move-"))
+            .map(|entry| entry.file_name()).collect();
         linscp_proto::upload_bytes(source.as_ref(), "/cross-slow.bin", &vec![47u8; 4 * 1024 * 1024], Default::default()).await.unwrap();
         let idx = svc.queue.snapshot().0.len();
         let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": dest_dir, "names": ["cross-slow.bin"], "operation": "move", "accept_cross_move_risk": true}))).await;
@@ -2376,6 +2382,10 @@ mod tests {
         assert!(stopped);
         assert!(source.stat("/cross-slow.bin").await.unwrap().is_some());
         assert!(dest.stat(&format!("{}/cross-slow.bin", dest_dir.trim_end_matches('/'))).await.unwrap().is_none());
+        let stages_after: std::collections::BTreeSet<_> = std::fs::read_dir(std::env::temp_dir()).unwrap().filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("linscp-cross-move-"))
+            .map(|entry| entry.file_name()).collect();
+        assert!(stages_after.difference(&stages_before).next().is_none(), "cancelled cross move leaked its local temporary directory");
         drop(server);
     }
 
