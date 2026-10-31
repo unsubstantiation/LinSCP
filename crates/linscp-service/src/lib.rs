@@ -2429,6 +2429,19 @@ mod tests {
         let state: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(state["active_uploads"], 0, "reconnect did not abort recorded upload: {state}");
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/photos/multipart-conflict.bin", Default::default()).await.unwrap(), b"other actor");
+        // The upload was already aborted. A later retry must accept the explicit
+        // NoSuchUpload response, but not treat an unrelated 404 as confirmation.
+        let expired_path = journal_dir.join("upload-expired.json");
+        std::fs::write(&expired_path, &records[0]).unwrap();
+        let mut other_error: Value = serde_json::from_slice(&records[0]).unwrap();
+        other_error["upload_id"] = json!("test-other-not-found");
+        let other_bytes = serde_json::to_vec(&other_error).unwrap();
+        let other_path = journal_dir.join("upload-other-error.json");
+        std::fs::write(&other_path, &other_bytes).unwrap();
+        let reopened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "s3", "host": "127.0.0.1", "port": port, "s3_access_key": "AKIDTEST", "s3_secret_key": "testsecret42", "s3_region": "us-east-1", "tls_ca_file": tests.join("fixtures/s3-server-cert.pem"), "local_dir": local, "initial_dir": "/"}}))).await;
+        assert_eq!(reopened.status, 200, "{}", reopened.payload);
+        assert_eq!(std::fs::metadata(&expired_path).unwrap().len(), 0, "NoSuchUpload should resolve the journal");
+        assert_eq!(std::fs::read(&other_path).unwrap(), other_bytes, "unrelated 404 must remain unresolved");
         // Enforce the supported upper bound without an unconditional fallback.
         std::fs::OpenOptions::new().write(true).open(local.join("upload.txt")).unwrap().set_len(1024 * 1024 * 1024 + 1).unwrap();
         let conflict = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"]}))).await;

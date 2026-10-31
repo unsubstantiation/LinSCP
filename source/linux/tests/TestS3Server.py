@@ -985,6 +985,9 @@ class S3Handler(BaseHTTPRequestHandler):
 
     def abort_multipart(self, params):
         upload_id = params.get("uploadId", [""])[0]
+        if upload_id == "test-other-not-found":
+            self.send_error_xml(404, "NoSuchBucket", "Injected unrelated 404.")
+            return
         upload = STORE.uploads.get(upload_id)
         if upload is not None and upload["key"] == "multipart-abort-failure.bin" and upload_id not in STORE.abort_fail_once:
             STORE.abort_fail_once.add(upload_id)

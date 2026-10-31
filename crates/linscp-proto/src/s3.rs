@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use fs2::FileExt;
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use linscp_crypto::digests::{compute_digest_hex, DigestAlgorithm, DigestHasher};
 use linscp_crypto::sigv4::{region_from_s3_host, sign_s3_request, S3SignParams};
 use linscp_types::{FileEntry, ProtocolScheme};
@@ -129,7 +129,7 @@ struct ConditionalUploadJournal {
 fn try_open_journal(path: &Path) -> Option<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true);
-    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.custom_flags(libc::O_NOFOLLOW); }
+    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK); }
     #[cfg(windows)] { use std::os::windows::fs::OpenOptionsExt; options.custom_flags(0x0020_0000); }
     let file = options.open(path).ok()?;
     let metadata = file.metadata().ok()?;
@@ -137,6 +137,17 @@ fn try_open_journal(path: &Path) -> Option<std::fs::File> {
     #[cfg(unix)] { use std::os::unix::fs::MetadataExt; if metadata.nlink() != 1 { return None; } }
     file.try_lock_exclusive().ok()?;
     Some(file)
+}
+
+// Uniform reservoir sampling gives every eligible record a chance on each
+// reconnect, without retaining more than the bounded number of file locks.
+fn sample_cleanup_record<T>(sample: &mut Vec<T>, item: T, seen: usize, rng: &mut impl Rng) {
+    const LIMIT: usize = 4;
+    if sample.len() < LIMIT { sample.push(item); }
+    else {
+        let slot = rng.gen_range(0..seen);
+        if slot < LIMIT { sample[slot] = item; }
+    }
 }
 
 impl ConditionalUploadJournal {
@@ -383,20 +394,27 @@ impl S3Session {
         let Some(directory) = self.cfg.conditional_cleanup_dir.as_ref() else { return; };
         let Ok(entries) = std::fs::read_dir(directory) else { return; };
         let endpoint = self.cleanup_endpoint_id();
-        let mut attempted = 0usize;
-        for entry in entries.flatten() {
-            if attempted >= 4 { break; }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with("upload-") || !name.ends_with(".json") { continue; }
-            let Ok(meta) = entry.file_type() else { continue; };
-            if !meta.is_file() || meta.is_symlink() { continue; }
-            let Some(mut file) = try_open_journal(&entry.path()) else { continue; };
-            let mut bytes = Vec::new();
-            if (&mut file).take(64 * 1024).read_to_end(&mut bytes).is_err() || bytes.is_empty() { continue; }
-            let Ok(record) = serde_json::from_slice::<ConditionalUploadRecord>(&bytes) else { continue; };
-            if record.endpoint != endpoint || record.bucket.is_empty() || record.key.is_empty() || record.upload_id.is_empty() { continue; }
-            attempted += 1;
+        let candidates = {
+            let mut selected = Vec::new();
+            let mut seen = 0usize;
+            let mut rng = rand::thread_rng();
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with("upload-") || !name.ends_with(".json") { continue; }
+                let Ok(meta) = entry.file_type() else { continue; };
+                if !meta.is_file() || meta.is_symlink() { continue; }
+                let Some(mut file) = try_open_journal(&entry.path()) else { continue; };
+                let mut bytes = Vec::new();
+                if (&mut file).take(64 * 1024).read_to_end(&mut bytes).is_err() || bytes.is_empty() { continue; }
+                let Ok(record) = serde_json::from_slice::<ConditionalUploadRecord>(&bytes) else { continue; };
+                if record.endpoint != endpoint || record.bucket.is_empty() || record.key.is_empty() || record.upload_id.is_empty() { continue; }
+                seen += 1;
+                sample_cleanup_record(&mut selected, (file, record), seen, &mut rng);
+            }
+            selected
+        };
+        for (file, record) in candidates {
             let query = vec![("uploadId".to_string(), record.upload_id)];
             // Bound both request and body consumption; a stalled or oversized
             // error response must not hang reconnect or exhaust memory.
@@ -1903,5 +1921,37 @@ impl RemoteSession for S3Session {
             let _ = jump.close().await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cleanup_sampling_tests {
+    use super::sample_cleanup_record;
+    use rand::{rngs::StdRng, SeedableRng};
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_rejects_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upload-fifo.json");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(super::try_open_journal(&path).is_none());
+    }
+
+    #[test]
+    fn bounded_sampling_can_reach_later_records() {
+        let mut rng = StdRng::seed_from_u64(9);
+        let mut reached = [false; 20];
+        for _ in 0..256 {
+            let mut sample = Vec::new();
+            for item in 0..reached.len() {
+                sample_cleanup_record(&mut sample, item, item + 1, &mut rng);
+            }
+            assert_eq!(sample.len(), 4);
+            for item in sample { reached[item] = true; }
+        }
+        assert!(reached.into_iter().all(|item| item));
     }
 }
