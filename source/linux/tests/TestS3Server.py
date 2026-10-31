@@ -759,6 +759,14 @@ class S3Handler(BaseHTTPRequestHandler):
         ) + version_header, content_length=len(data))
 
     def put_object(self, bucket, key, headers, body):
+        # Model an accepted-but-unconfirmed write and a redirect to another
+        # object. Conditional moves must not delete their source in either case.
+        if key == "cross-s3-accepted.txt":
+            self.send_bytes(202, b"")
+            return
+        if key == "cross-s3-redirect.txt":
+            self.send_bytes(307, b"", extra=(("Location", "/%s/cross-s3-redirect-target.txt" % bucket),))
+            return
         if key == "":
             # PUT /bucket with a body has no meaning here.
             self.send_error_xml(400, "InvalidBucketName",

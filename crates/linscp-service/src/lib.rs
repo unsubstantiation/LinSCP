@@ -2353,6 +2353,29 @@ mod tests {
         assert!(source.stat("/cross-proto.txt").await.unwrap().is_none());
         let target = format!("{}/cross-proto.txt", dest_dir.trim_end_matches('/'));
         assert_eq!(linscp_proto::download_bytes(dest.as_ref(), &target, Default::default()).await.unwrap(), b"cross-protocol content");
+        if dest_dir == "/photos" {
+            // Neither an asynchronous acceptance nor a redirect confirms an
+            // S3 destination; retain the WebDAV source and do not follow the
+            // redirect to another object.
+            for name in ["cross-s3-accepted.txt", "cross-s3-redirect.txt"] {
+                let source_path = format!("/{name}");
+                linscp_proto::upload_bytes(source.as_ref(), &source_path, b"preserve source", Default::default()).await.unwrap();
+                let idx = svc.queue.snapshot().0.len();
+                let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": dest_dir, "names": [name], "operation": "move", "accept_cross_move_risk": true}))).await;
+                assert_eq!(moved.status, 200, "{}", moved.payload);
+                let mut failed = false;
+                for _ in 0..500 {
+                    let (tasks, _) = svc.queue.snapshot();
+                    if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+                    if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("unconfirmed S3 write completed the move"); }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                assert!(failed);
+                assert_eq!(linscp_proto::download_bytes(source.as_ref(), &source_path, Default::default()).await.unwrap(), b"preserve source");
+                assert!(dest.stat(&format!("{dest_dir}/{name}")).await.unwrap().is_none());
+            }
+            assert!(dest.stat("/photos/cross-s3-redirect-target.txt").await.unwrap().is_none());
+        }
         // Cancellation during the first stage leaves source and destination alone.
         let stages_before: std::collections::BTreeSet<_> = std::fs::read_dir(std::env::temp_dir()).unwrap().filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().starts_with("linscp-cross-move-"))
