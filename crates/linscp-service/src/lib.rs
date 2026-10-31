@@ -2397,11 +2397,34 @@ mod tests {
         assert_eq!(records.len(), 1, "failed abort must be recorded exactly once");
         let journal_text = String::from_utf8(records[0].clone()).unwrap();
         assert!(!journal_text.contains("testsecret42") && !journal_text.contains("AKIDTEST"));
+        // A record for a different endpoint identity must never be retried.
+        let mut foreign: Value = serde_json::from_slice(&records[0]).unwrap();
+        foreign["endpoint_identity"] = json!("different-endpoint");
+        let foreign_bytes = serde_json::to_vec(&foreign).unwrap();
+        let foreign_path = journal_dir.join("upload-foreign.json");
+        std::fs::write(&foreign_path, &foreign_bytes).unwrap();
+        // A forged journal pathname must not cause an unrelated local file to
+        // be opened and truncated, even when its content looks legitimate.
+        #[cfg(unix)]
+        {
+            let target = tmp.join("unrelated-journal-content");
+            std::fs::write(&target, &records[0]).unwrap();
+            std::os::unix::fs::symlink(&target, journal_dir.join("upload-symlink.json")).unwrap();
+            std::fs::hard_link(&target, journal_dir.join("upload-hardlink.json")).unwrap();
+        }
         // Reconnecting retries only the recorded upload ID; the fixture now
         // allows the abort. Existing destination objects remain untouched.
         let reopened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "s3", "host": "127.0.0.1", "port": port, "s3_access_key": "AKIDTEST", "s3_secret_key": "testsecret42", "s3_region": "us-east-1", "tls_ca_file": tests.join("fixtures/s3-server-cert.pem"), "local_dir": local, "initial_dir": "/"}}))).await;
         assert_eq!(reopened.status, 200, "{}", reopened.payload);
-        assert!(std::fs::read_dir(&journal_dir).unwrap().all(|entry| std::fs::metadata(entry.unwrap().path()).unwrap().len() == 0), "resolved upload must be marked clean");
+        assert_eq!(std::fs::read(&foreign_path).unwrap(), foreign_bytes, "other endpoints must not be touched");
+        #[cfg(unix)]
+        assert_eq!(std::fs::read(tmp.join("unrelated-journal-content")).unwrap(), records[0], "linked paths must not be modified");
+        let nonempty_owned_records = std::fs::read_dir(&journal_dir).unwrap().filter_map(Result::ok).filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            !matches!(name.as_ref(), "upload-foreign.json" | "upload-symlink.json" | "upload-hardlink.json") && std::fs::metadata(entry.path()).unwrap().len() != 0
+        }).count();
+        assert_eq!(nonempty_owned_records, 0, "resolved upload must be marked clean");
         let output = Command::new("curl").args(["--silent", "--show-error", "--insecure", &format!("https://127.0.0.1:{port}/__test__/state")]).output().unwrap();
         let state: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(state["active_uploads"], 0, "reconnect did not abort recorded upload: {state}");
