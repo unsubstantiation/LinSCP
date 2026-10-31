@@ -2781,6 +2781,25 @@ mod tests {
         assert!(complete);
         assert_eq!(std::fs::read(downloaded.join("move-success.txt")).unwrap(), b"move payload");
         assert!(session.stat("/move-success.txt").await.unwrap().is_none());
+        // A successful-looking but incomplete GET must never publish a local
+        // destination or delete the remote source during a move.
+        for name in ["move-get-accepted.txt", "move-get-short.txt"] {
+            let path = format!("/{name}");
+            linscp_proto::upload_bytes(session.as_ref(), &path, b"complete source", Default::default()).await.unwrap();
+            let idx = svc.queue.snapshot().0.len();
+            let moved = svc.dispatch_async(request("/api/transfer/move", json!({"tab": id, "direction": "download", "local_dir": downloaded, "remote_dir": "/", "names": [name]}))).await;
+            assert_eq!(moved.status, 200, "{}", moved.payload);
+            let mut failed = false;
+            for _ in 0..500 {
+                let (tasks, _) = svc.queue.snapshot();
+                if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+                if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("incomplete GET completed the move"); }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(failed);
+            assert!(!downloaded.join(name).exists());
+            assert_eq!(session.stat(&path).await.unwrap().unwrap().size, b"complete source".len() as u64);
+        }
         // Exercise cross-server moves against a second independent WebDAV server.
         let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestDavServer.py");
         let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_ACCEPTED_PUT", "1")

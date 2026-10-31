@@ -654,6 +654,9 @@ pub async fn download_single_file(
         logger.record_transfer(false, remote_path, &dest_label, None, Err(&msg));
         return Err(msg);
     }
+    if flags.source_etag.is_some() && bytes != info.size {
+        return Err("Conditional download length does not match the source metadata; the source was not deleted.".to_string());
+    }
     if flags.cancel_flag.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst)) {
         return Err("Transfer cancelled before publication.".to_string());
     }

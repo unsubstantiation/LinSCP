@@ -660,6 +660,12 @@ class DavHandler(BaseHTTPRequestHandler):
         extra = (("Last-Modified", http_date(mtime)),
                  ("Accept-Ranges", "bytes"),
                  ("ETag", tag))
+        if path == "/move-get-accepted.txt":
+            self.send_body(202, data, "application/octet-stream", extra)
+            return
+        if path == "/move-get-short.txt":
+            self.send_body(200, data[:1], "application/octet-stream", extra)
+            return
         range_header = self.headers.get("Range")
         if range_header:
             match = re.match(r"bytes=(\d+)-(\d*)$", range_header.strip())

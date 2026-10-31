@@ -1073,6 +1073,11 @@ impl WebDavSession {
             .map_err(|e| {
                 ProtoError::Transport(format!("WebDAV GET failed: {}", format_reqwest_err(&e)))
             })?;
+        // A conditional full-object GET must confirm a complete representation;
+        // 202, 204 or unsolicited 206 are not proof the source was downloaded.
+        if etag.is_some() && opts.resume_offset == 0 && resp.status().as_u16() != 200 {
+            return Err(ProtoError::Transport(format!("Conditional WebDAV GET was not confirmed (HTTP {}).", resp.status())));
+        }
         if opts.resume_offset > 0 && resp.status().as_u16() != 206 {
             return Err(ProtoError::Transport(format!(
                 "WebDAV server did not honor byte-range resume (HTTP {}).",
@@ -1395,7 +1400,7 @@ impl RemoteSession for WebDavSession {
         if !valid_strong_etag(etag) || prefix_len == 0 || prefix_len > total_len {
             return Err(ProtoError::Transport("Invalid verified-resume prefix or ETag.".to_string()));
         }
-        let mut response = self.apply_auth(self.client.get(self.url_for(remote_path, false)))
+        let mut response = self.apply_auth(self.no_redirect_client.get(self.url_for(remote_path, false)))
             .header("If-Match", etag).header("Range", format!("bytes=0-{}", prefix_len - 1)).send().await
             .map_err(|e| ProtoError::Transport(format!("WebDAV prefix verification failed: {}", format_reqwest_err(&e))))?;
         let expected = format!("bytes 0-{}/{}", prefix_len - 1, total_len);
