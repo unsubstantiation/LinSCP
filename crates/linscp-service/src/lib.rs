@@ -2313,7 +2313,70 @@ mod tests {
         assert_eq!(std::fs::read(local.join("seed.txt.filepart")).unwrap(), b"unrelated partial");
         assert!(!std::fs::read_dir(&local).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-download-")), "cancelled download left an owned temporary file");
         assert!(session.stat("/photos/seed.txt").await.unwrap().is_some());
+        exercise_cross_move_destination(&svc, id, "/photos", &local).await;
         drop(server); let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn exercise_cross_move_destination(svc: &CommanderService, dest_id: u64, dest_dir: &str, local: &Path) {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        struct Server(std::process::Child);
+        impl Drop for Server { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestDavServer.py");
+        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_GET_DELAY", "0.005")
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut server = Server(child); let mut line = String::new();
+        BufReader::new(server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let port: u16 = line.trim().strip_prefix("READY ").expect("DAV source failed to start").parse().unwrap();
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        let open = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "dav", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        let source = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        let dest = svc.state.lock().unwrap().tabs.get(&dest_id).unwrap().remote.as_ref().unwrap().clone();
+        linscp_proto::upload_bytes(source.as_ref(), "/cross-proto.txt", b"cross-protocol content", Default::default()).await.unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": dest_dir, "names": ["cross-proto.txt"], "operation": "move", "accept_cross_move_risk": true}))).await;
+        assert_eq!(moved.status, 200, "{}", moved.payload);
+        let mut done = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("cross-protocol move failed: {:?}", tasks.get(idx)); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done);
+        assert!(source.stat("/cross-proto.txt").await.unwrap().is_none());
+        let target = format!("{}/cross-proto.txt", dest_dir.trim_end_matches('/'));
+        assert_eq!(linscp_proto::download_bytes(dest.as_ref(), &target, Default::default()).await.unwrap(), b"cross-protocol content");
+        // Cancellation during the first stage leaves source and destination alone.
+        linscp_proto::upload_bytes(source.as_ref(), "/cross-slow.bin", &vec![47u8; 4 * 1024 * 1024], Default::default()).await.unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": dest_dir, "names": ["cross-slow.bin"], "operation": "move", "accept_cross_move_risk": true}))).await;
+        assert_eq!(moved.status, 200);
+        let mut task_id = None;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(task) = tasks.get(idx) {
+                if task["status"] == "Running" && task["bytes_done"].as_u64().unwrap_or(0) > 0 { task_id = task["id"].as_u64(); break; }
+                assert_ne!(task["status"], "Failed", "{task:?}");
+                assert_ne!(task["status"], "Completed", "cross move finished before cancellation");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let cancelled = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": task_id.expect("cross move did not start")}))).await;
+        assert_eq!(cancelled.status, 200);
+        let mut stopped = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Cancelled") { stopped = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped);
+        assert!(source.stat("/cross-slow.bin").await.unwrap().is_some());
+        assert!(dest.stat(&format!("{}/cross-slow.bin", dest_dir.trim_end_matches('/'))).await.unwrap().is_none());
+        drop(server);
     }
 
     #[cfg(target_os = "linux")]
@@ -3562,6 +3625,7 @@ mod tests {
         assert!(stopped, "cancellation was not observed");
         assert!(std::fs::metadata(remote.join("slow.bin")).unwrap().len() < 4 * 1024 * 1024);
         assert!(session.stat("/upload.txt").await.unwrap().is_some());
+        exercise_cross_move_destination(&svc, id, "/", &local).await;
         drop(server);
         let _ = std::fs::remove_dir_all(tmp);
     }
