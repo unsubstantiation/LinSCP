@@ -15,7 +15,10 @@ replace conflicting files and are not transactional; concurrent directory path
 changes can still affect them. Other directory merges are unsupported. WebDAV files can be moved to a new local
 name using conditional GET and DELETE with the original strong ETag; this relies
 on server enforcement and can leave a duplicate if deletion cannot be confirmed.
-Other remote moves are unsupported. Local moves are supported on the same filesystem on Linux
+WebDAV files can also be renamed within the current remote directory using a
+strong source ETag and no-replace MOVE, relying on server enforcement. If its
+response is lost or ambiguous, the item may already have moved. WebDAV directory
+renames and other remote moves are unsupported. Local moves are supported on the same filesystem on Linux
 and Windows, without replacing existing destinations. WebDAV file downloads can
 resume from a `.filepart` after comparing its entire prefix with the ETag-pinned
 remote file; verification retransfers that prefix. Existing partials are never
