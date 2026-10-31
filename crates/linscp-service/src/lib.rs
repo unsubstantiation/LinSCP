@@ -3594,6 +3594,13 @@ mod tests {
                 assert!(conflict.is_err());
                 assert!(!session.list_dir("/").await.unwrap().iter().any(|e| e.name.starts_with(".linscp-lock-")));
                 assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/lock-success.bin", Default::default()).await.unwrap().len(), 512 * 1024);
+                for path in ["/lock-redirect.bin", "/lock-multistatus.bin"] {
+                    let result = linscp_engine::transfer::upload_single_file(session.as_ref(), &input, path, &flags, &mut logger, None).await;
+                    assert!(result.is_err(), "ambiguous MOVE reported success");
+                    assert!(session.stat(path).await.unwrap().is_none());
+                    assert!(session.stat("/lock-other.bin").await.unwrap().is_none());
+                    assert!(!session.list_dir("/").await.unwrap().iter().any(|e| e.name.starts_with(".linscp-lock-")));
+                }
             }
             let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let callback_flag = Arc::clone(&cancelled);

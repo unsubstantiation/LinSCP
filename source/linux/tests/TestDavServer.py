@@ -803,6 +803,19 @@ class DavHandler(BaseHTTPRequestHandler):
     def do_MOVE(self):
         if not self.authorized():
             return
+        if "/.linscp-lock-" in self.local_path() and os.environ.get("LSCP_TEST_LOCK_STAGING") == "1":
+            dest = urllib.parse.urlsplit(self.headers.get("Destination", "")).path
+            if dest == "/lock-redirect.bin":
+                self.send_response(307)
+                self.send_header("Location", "/lock-other.bin")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if dest == "/lock-multistatus.bin":
+                self.send_response(207)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
         if self.local_path() == "/rename-redirect.txt":
             self.send_response(307)
             self.send_header("Location", "/rename-other.txt")
