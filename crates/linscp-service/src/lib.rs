@@ -3850,6 +3850,32 @@ mod tests {
         }
         assert!(failed);
         assert!(!remote.join("copy-target/copy-link-tree").exists());
+        std::fs::create_dir_all(remote.join("copy-cancel-tree")).unwrap();
+        std::fs::write(remote.join("copy-cancel-tree/slow.bin"), vec![37u8; 4 * 1024 * 1024]).unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let copy = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/copy-target", "names": ["copy-cancel-tree"], "accept_sftp_copy_risk": true}))).await;
+        assert_eq!(copy.status, 200);
+        let mut task_id = None;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(task) = tasks.get(idx) {
+                if task["status"] == "Running" && task["bytes_done"].as_u64().unwrap_or(0) > 0 { task_id = task["id"].as_u64(); break; }
+                assert_ne!(task["status"], "Failed", "{task:?}");
+                assert_ne!(task["status"], "Completed", "tree copied before cancellation");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let cancelled = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": task_id.expect("tree download did not start")}))).await;
+        assert_eq!(cancelled.status, 200);
+        let mut stopped = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Cancelled") { stopped = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped);
+        assert!(!remote.join("copy-target/copy-cancel-tree").exists());
+        assert_eq!(std::fs::metadata(remote.join("copy-cancel-tree/slow.bin")).unwrap().len(), 4 * 1024 * 1024);
         exercise_cross_move_destination(&svc, id, "/", &local).await;
         drop(server);
         let _ = std::fs::remove_dir_all(tmp);
