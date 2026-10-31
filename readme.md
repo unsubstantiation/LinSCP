@@ -25,7 +25,7 @@ WebDAV files can also be moved to a connected WebDAV, SFTP or S3 session, with
 explicit confirmation: an ETag-pinned download is followed by an exclusive
 upload and conditional source deletion. Cross-server moves are not transactional;
 errors or cancellation can leave a duplicate or partial destination, and source
-deletion may be unconfirmed. S3 destinations are limited to 16 MiB per file.
+deletion may be unconfirmed. S3 destinations are limited to 1 GiB per file.
 WebDAV files can also be copied to a new name in the same session or to a connected WebDAV, SFTP or S3 session via a temporary local download and exclusive upload. Copies can leave partial remote destinations on failure or cancellation. SFTP file copies to WebDAV, SFTP or S3, and directory copies from SFTP or WebDAV to a new SFTP directory, use local staging and require risk confirmation: Neither directory copy is a tree-wide snapshot: SFTP cannot pin source versions, WebDAV pins each file but collection ETags may not cover descendants, and concurrent source or destination path changes can affect the result. Directory copies do not merge and may leave partial remote trees after interruption. Cross-server directory moves and other source protocols remain unsupported.
 Local moves are supported on the same filesystem on Linux
 and Windows, without replacing existing destinations. WebDAV file downloads can
@@ -33,7 +33,7 @@ resume from a `.filepart` after comparing its entire prefix with the ETag-pinned
 remote file; verification retransfers that prefix. Existing partials are never
 removed or modified. A network failure may save a new partial for retry; other
 resumption modes are unsupported.
-Running local copies, SFTP and WebDAV transfers, FTP/FTPS transfers, and S3 downloads
+Running local copies, SFTP and WebDAV transfers, FTP/FTPS transfers, and S3 transfers
 can be cancelled cooperatively. An interrupted FTP/FTPS transfer invalidates its
 control connection; reconnect before further transfers. Fresh queued file downloads use owned temporary files
 that are removed on cancellation or failure on a best-effort basis; cleanup can
@@ -44,7 +44,7 @@ existing tree untouched, but publication is not transactional. Uploads and
 published merges may leave partial files or directories.
 Without overwrite approval, local copies and downloads use no-replace publication,
 and SFTP, WebDAV and S3 uploads use exclusive creation. S3 exclusive uploads are
-limited to 16 MiB. FTP/FTPS file uploads are available only after explicitly
+limited to 1 GiB. FTP/FTPS file uploads are available only after explicitly
 accepting a destination-race warning: a server-created STOU temporary file is
 renamed to the target, and the server may overwrite a destination created or
 changed after the last check. Existing targets also require overwrite approval.
@@ -52,7 +52,7 @@ Servers must support STOU with an RFC 1123 FILE response; an interruption or
 failed rename may leave a temporary file that must be inspected and removed
 manually. Never use this mode if no-clobber guarantees are required.
 Queued WebDAV and S3 file overwrites require a strong ETag and use conditional
-PUT, relying on server enforcement; S3 conditional uploads are limited to 16 MiB.
+PUT or conditional multipart completion, relying on server enforcement; S3 conditional uploads are limited to 1 GiB. S3 uploads over 16 MiB use a fresh multipart upload ID and attempt to abort that ID on failure or cancellation without deleting the destination pathname. Abort can fail or initiation can be unconfirmed, leaving an unfinished multipart upload; a lost completion response can mean the destination exists. Configure an S3 lifecycle rule to remove abandoned multipart uploads.
 An ETag is not necessarily a unique version: changes that retain the same ETag
 may not be detected. Other queued overwrites are rejected until they can be made
 safe. Other protocols and configurations require further verification.
