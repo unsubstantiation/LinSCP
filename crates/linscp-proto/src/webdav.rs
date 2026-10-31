@@ -15,6 +15,7 @@ use bytes::Bytes;
 use futures_core::Stream;
 use linscp_crypto::digests::{DigestAlgorithm, DigestHasher};
 use linscp_types::{FileEntry, ProtocolScheme};
+use rand::RngCore;
 use reqwest::{Body, Client, Method, Proxy};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
@@ -436,7 +437,7 @@ impl WebDavSession {
         }
 
         let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
-        let client = if exclusive || match_etag.is_some() { &self.no_redirect_client } else { &self.client };
+        let client = if exclusive || match_etag.is_some() || self.if_header_for(remote_path).await.is_some() { &self.no_redirect_client } else { &self.client };
         let mut req = self.apply_auth(client.put(self.url_for(remote_path, false)));
         if exclusive {
             req = req.header("If-None-Match", "*");
@@ -505,6 +506,72 @@ impl WebDavSession {
         Ok(transferred)
     }
 
+
+    // Try a lock-null staging resource. Cleanup is conditional on the
+    // server still recognizing our exclusive lock token; never unlink a path
+    // merely because we once created it. Servers that explicitly do not offer
+    // this facility fall back to the ordinary exclusive PUT.
+    async fn try_locked_upload(
+        &self, remote_path: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<Option<u64>, ProtoError> {
+        if opts.resume_offset != 0 || opts.append { return Ok(None); }
+        let mut random = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut random);
+        let directory = remote_path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        let stage = format!("{}/.linscp-lock-{}", directory.trim_end_matches('/'), random.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        let method = Method::from_bytes(b"LOCK").map_err(|e| ProtoError::Transport(e.to_string()))?;
+        let lock_body = r#"<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>"#;
+        let response = self.apply_auth(self.no_redirect_client.request(method, self.url_for(&stage, false)))
+            .header("If-None-Match", "*").header("Depth", "0").header("Timeout", "Second-3600")
+            .header("Content-Type", "application/xml; charset=utf-8").body(lock_body).send().await
+            .map_err(|e| ProtoError::Transport(format!("WebDAV staging LOCK was not confirmed; a temporary resource at '{stage}' may remain: {}", format_reqwest_err(&e))))?;
+        let status = response.status();
+        if matches!(status.as_u16(), 403 | 404 | 405 | 501) { return Ok(None); }
+        let token_header = response.headers().get("lock-token").and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().trim_start_matches('<').trim_end_matches('>').to_string());
+        let body = response.text().await.map_err(|e| ProtoError::Transport(format!("WebDAV staging LOCK response was not confirmed; '{stage}' may remain: {e}")))?;
+        if status.as_u16() != 201 {
+            return Err(ProtoError::Transport(format!("WebDAV staging LOCK was not confirmed (HTTP {status}); '{stage}' may remain.")));
+        }
+        let token = token_header.or_else(|| dav_lock_token_from_xml(&body).ok())
+            .filter(|t| !t.is_empty() && !t.chars().any(|c| c.is_control() || c == '<' || c == '>'))
+            .ok_or_else(|| ProtoError::Transport(format!("WebDAV staging LOCK returned no usable token; '{stage}' may remain.")))?;
+        let state_key = self.resolve_remote_path(&stage);
+        self.state.lock().await.locks.insert(state_key.clone(), token.clone());
+        let uploaded = self.upload_inner(&stage, opts, source, total_size, progress, false, None).await;
+        let result = match uploaded {
+            Ok(bytes) => {
+                let method = Method::from_bytes(b"MOVE").map_err(|e| ProtoError::Transport(e.to_string()))?;
+                let response = self.apply_auth(self.no_redirect_client.request(method, self.url_for(&stage, false)))
+                    .header("Destination", self.url_for(remote_path, false)).header("Overwrite", "F")
+                    .header("If", format!("(<{token}>)")).send().await;
+                match response {
+                    Ok(response) if response.status().as_u16() == 201 => Ok(bytes),
+                    Ok(response) => Err(ProtoError::Transport(format!("WebDAV staged MOVE was not confirmed (HTTP {}); destination may exist.", response.status()))),
+                    Err(e) => Err(ProtoError::Transport(format!("WebDAV staged MOVE was not confirmed; destination may exist: {}", format_reqwest_err(&e)))),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(error) = result {
+            let cleanup = self.apply_auth(self.no_redirect_client.delete(self.url_for(&stage, false)))
+                .header("If", format!("(<{token}>)")).send().await;
+            let detail = match cleanup {
+                Ok(response) if matches!(response.status().as_u16(), 200 | 204) => "Locked temporary resource removed.".to_string(),
+                Ok(response) => format!("Locked temporary resource '{stage}' was not removed (HTTP {}); inspect it before retrying.", response.status()),
+                Err(e) => format!("Cleanup of locked temporary resource '{stage}' was not confirmed: {}", format_reqwest_err(&e)),
+            };
+            // UNLOCK is token-scoped and never removes a pathname.
+            let _ = self.unlock(&stage, Some(&token)).await;
+            self.state.lock().await.locks.remove(&state_key);
+            return Err(ProtoError::Transport(format!("{error}; {detail}")));
+        }
+        let _ = self.unlock(&stage, Some(&token)).await;
+        self.state.lock().await.locks.remove(&state_key);
+        result.map(Some)
+    }
 
     pub async fn connect(
         mut cfg: WebDavConnectConfig,
@@ -1460,6 +1527,9 @@ impl RemoteSession for WebDavSession {
         source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
         progress: Option<&ProgressCallback>,
     ) -> Result<u64, ProtoError> {
+        if let Some(bytes) = self.try_locked_upload(remote_path, opts.clone(), source, total_size, progress).await? {
+            return Ok(bytes);
+        }
         self.upload_inner(remote_path, opts, source, total_size, progress, true, None).await
     }
 

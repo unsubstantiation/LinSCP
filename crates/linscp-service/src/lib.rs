@@ -3556,7 +3556,62 @@ mod tests {
         let result = tokio::time::timeout(std::time::Duration::from_secs(15), linscp_engine::transfer::upload_single_file(session.as_ref(), &local.join("slow.bin"), "/cancelled.bin", &cancelling, &mut logger, Some(&progress))).await.expect("cancelled PUT hung");
         assert!(result.is_err());
         assert!(session.stat("/upload.txt").await.unwrap().is_some());
+        exercise_locked_webdav_upload_cleanup(&local).await;
         drop(server); let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn exercise_locked_webdav_upload_cleanup(local: &Path) {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        struct Server(std::process::Child);
+        impl Drop for Server { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestDavServer.py");
+        for replacement in [false, true] {
+            let mut command = Command::new("/usr/bin/python3");
+            command.arg(&server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_LOCK_STAGING", "1");
+            if replacement { command.env("LSCP_TEST_LOCK_REPLACEMENT", "1"); }
+            let child = command.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+            let mut server = Server(child); let mut line = String::new();
+            BufReader::new(server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+            let port: u16 = line.trim().strip_prefix("READY ").expect("lock-capable DAV server did not start").parse().unwrap();
+            let svc = CommanderService::new(local.join(format!("lock-config-{replacement}")), Arc::new(NativeLocalFs::new()));
+            let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+            let opened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "dav", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
+            assert_eq!(opened.status, 200, "{}", opened.payload);
+            let id = opened.payload["tab"]["id"].as_u64().unwrap();
+            let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+            let mut flags = linscp_engine::transfer::TransferFlags::default(); flags.no_clobber = true;
+            let mut logger = linscp_engine::xml_log::SessionLogger::open(None, 0, false, None, None, false, "").unwrap();
+            let input = local.join("lock-upload.bin");
+            std::fs::write(&input, vec![67u8; 512 * 1024]).unwrap();
+            if !replacement {
+                let completed = linscp_engine::transfer::upload_single_file(session.as_ref(), &input, "/lock-success.bin", &flags, &mut logger, None).await;
+                assert!(completed.is_ok(), "{completed:?}");
+                assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/lock-success.bin", Default::default()).await.unwrap().len(), 512 * 1024);
+                assert!(!session.list_dir("/").await.unwrap().iter().any(|e| e.name.starts_with(".linscp-lock-")));
+                let conflict = linscp_engine::transfer::upload_single_file(session.as_ref(), &input, "/lock-success.bin", &flags, &mut logger, None).await;
+                assert!(conflict.is_err());
+                assert!(!session.list_dir("/").await.unwrap().iter().any(|e| e.name.starts_with(".linscp-lock-")));
+                assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/lock-success.bin", Default::default()).await.unwrap().len(), 512 * 1024);
+            }
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let callback_flag = Arc::clone(&cancelled);
+            let progress = move |_: u64, _: u64| callback_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            flags.cancel_flag = Some(cancelled);
+            let error = tokio::time::timeout(std::time::Duration::from_secs(15), linscp_engine::transfer::upload_single_file(session.as_ref(), &input, "/lock-cancel.bin", &flags, &mut logger, Some(&progress))).await.expect("locked upload cancellation hung").unwrap_err();
+            let stages: Vec<_> = session.list_dir("/").await.unwrap().into_iter().filter(|e| e.name.starts_with(".linscp-lock-")).collect();
+            assert!(session.stat("/lock-cancel.bin").await.unwrap().is_none());
+            if replacement {
+                assert!(error.contains("was not removed"), "{error}");
+                assert_eq!(stages.len(), 1);
+                assert_eq!(linscp_proto::download_bytes(session.as_ref(), &format!("/{}", stages[0].name), Default::default()).await.unwrap(), b"replacement by another actor");
+            } else {
+                assert!(error.contains("Locked temporary resource removed"), "{error}");
+                assert!(stages.is_empty(), "owned locked stage was not cleaned");
+            }
+            drop(server);
+        }
     }
 
     #[cfg(target_os = "linux")]

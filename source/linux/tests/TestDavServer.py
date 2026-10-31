@@ -545,6 +545,18 @@ class DavHandler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
         path = self.local_path()
+        stage_created = False
+        if os.environ.get("LSCP_TEST_LOCK_STAGING") == "1" and self.headers.get("If-None-Match") == "*" and "/.linscp-lock-" in path:
+            with SERVER_STORE.write_lock:
+                parent = SERVER_STORE.get(SERVER_STORE.parent_of(SERVER_STORE.normalize(path)))
+                if SERVER_STORE.get(path) is not None:
+                    self.send_precondition_failed()
+                    return
+                if parent is None or parent["kind"] != "dir":
+                    self.send_error_text(409, "The parent collection does not exist.")
+                    return
+                SERVER_STORE.add_file(path, b"")
+                stage_created = True
         timeout = 0
         header = self.headers.get("Timeout", "")
         if header.lower().startswith("second-"):
@@ -567,7 +579,7 @@ class DavHandler(BaseHTTPRequestHandler):
             "<d:depth>0</d:depth><d:timeout>Second-%d</d:timeout>"
             "<d:locktoken><d:href>%s</d:href></d:locktoken>"
             "</d:activelock></d:lockdiscovery></d:prop>" % (timeout, token))
-        self.send_body(200, body_out, "application/xml; charset=utf-8",
+        self.send_body(201 if stage_created else 200, body_out, "application/xml; charset=utf-8",
                        extra=[("Lock-Token", "<%s>" % token)])
 
     def do_UNLOCK(self):
@@ -737,6 +749,10 @@ class DavHandler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
         path = self.local_path()
+        if "/.linscp-lock-" in path and os.environ.get("LSCP_TEST_LOCK_REPLACEMENT") == "1":
+            with SERVER_STORE.write_lock:
+                SERVER_STORE.locks.pop(SERVER_STORE.normalize(path), None)
+                SERVER_STORE.add_file(path, b"replacement by another actor")
         if path == "/cross-delete-accepted.txt":
             self.send_response(202)
             self.send_header("Content-Length", "0")
