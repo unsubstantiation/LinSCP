@@ -2830,6 +2830,9 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+        // The fixture holds the conditional DELETE for 500 ms. Allow its
+        // request to arrive after the destination becomes visible.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let cancelled = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": running_id.expect("conditional source deletion did not start")}))).await;
         assert_eq!(cancelled.status, 200);
         let mut failed = false;
