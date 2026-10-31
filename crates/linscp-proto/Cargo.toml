@@ -20,6 +20,7 @@ linscp-crypto.workspace = true
 linscp-platform.workspace = true
 linscp-types.workspace = true
 md-5.workspace = true
+rand.workspace = true
 reqwest.workspace = true
 roxmltree.workspace = true
 russh.workspace = true
@@ -40,7 +41,6 @@ zeroize.workspace = true
 axum.workspace = true
 ed25519-dalek.workspace = true
 p256 = { workspace = true, features = ["ecdsa", "pkcs8"] }
-rand.workspace = true
 serde_json.workspace = true
 
 [lints]
