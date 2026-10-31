@@ -218,6 +218,7 @@ impl CommanderService {
             }
             ("GET", "/api/remote/list") => self.list_remote_async(&req.path).await,
             ("POST", "/api/remote/rename") => self.rename_remote_async(req.body).await,
+            ("POST", "/api/remote/transfer") => self.remote_transfer_async(req.body).await,
             ("POST", "/api/desktop/check") => self.handle_desktop_check_async(req.body).await,
             ("POST", "/api/desktop/install") => self.handle_desktop_install_async(req.body).await,
             ("POST", "/api/desktop/launch") => self.handle_desktop_launch_async(req.body).await,
@@ -338,6 +339,41 @@ impl CommanderService {
             }
             Err(error) => api_error(400, error.to_string()),
         }
+    }
+
+    async fn remote_transfer_async(&self, body: Value) -> ApiReply {
+        if body.get("operation").and_then(Value::as_str) != Some("move") { return Self::not_implemented(); }
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() { Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected") };
+        if body.get("target").and_then(Value::as_str) != Some(format!("tab:{id}").as_str()) { return api_error(400, "Only moves within the current WebDAV session are supported."); }
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        if !matches!(session.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs) { return api_error(501, "Only WebDAV file moves are supported here."); }
+        if body.get("filemask").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) { return api_error(400, "File masks are not supported for remote moves."); }
+        let directory = body.get("directory").and_then(Value::as_str).unwrap_or("");
+        if !directory.starts_with('/') || directory.contains("//") || directory.chars().any(char::is_control) || directory.contains('\\') || directory.split('/').any(|part| part == "." || part == "..") {
+            return api_error(400, "An absolute remote directory without dot segments is required.");
+        }
+        let names = match body.get("names").and_then(Value::as_array) { Some(names) if !names.is_empty() && names.len() <= 1000 => names, _ => return api_error(400, "Select at least one file") };
+        let mut jobs = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for value in names {
+            let name = match value.as_str() { Some(name) if !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\') && !name.contains(':') && !name.chars().any(char::is_control) => name, _ => return api_error(400, "Invalid file name") };
+            if !seen.insert(name) { return api_error(400, "Duplicate file name"); }
+            let source = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
+            let target = format!("{}/{}", directory.trim_end_matches('/'), name);
+            if source == target { return api_error(400, "Source and destination are the same file."); }
+            let tag = match session.dav_get_etag(&source).await {
+                Ok((Some(tag), false)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => tag,
+                Ok(_) => return api_error(400, "WebDAV file moves require a strong source ETag."),
+                Err(error) => return api_error(400, error.to_string()),
+            };
+            jobs.push((name.to_string(), source, target, tag));
+        }
+        for (name, source, target, etag) in jobs {
+            let job = queue::QueueJob::DavMove { session: session.clone(), source: source.clone(), target: target.clone(), etag };
+            self.queue.enqueue(Some(id), "move", name, source, target, 0, false, job);
+        }
+        ApiReply { status: 200, payload: json!({"success": true}) }
     }
 
     async fn rename_remote_async(&self, body: Value) -> ApiReply {
@@ -2621,6 +2657,68 @@ mod tests {
         assert!(complete);
         assert_eq!(std::fs::read(downloaded.join("move-success.txt")).unwrap(), b"move payload");
         assert!(session.stat("/move-success.txt").await.unwrap().is_none());
+        // Same-session queued moves use the captured source ETag and an
+        // atomic no-replace request against a different remote directory.
+        session.mkdir("/archive").await.unwrap();
+        linscp_proto::upload_bytes(session.as_ref(), "/remote-move.txt", b"move on server", Default::default()).await.unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/archive", "names": ["remote-move.txt"], "operation": "move"}))).await;
+        assert_eq!(moved.status, 200, "{}", moved.payload);
+        let mut done = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("server move failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done);
+        assert!(session.stat("/remote-move.txt").await.unwrap().is_none());
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/archive/remote-move.txt", Default::default()).await.unwrap(), b"move on server");
+        linscp_proto::upload_bytes(session.as_ref(), "/queued-race.txt", b"original", Default::default()).await.unwrap();
+        svc.queue.pause();
+        let idx = svc.queue.snapshot().0.len();
+        let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/archive", "names": ["queued-race.txt"], "operation": "move"}))).await;
+        assert_eq!(moved.status, 200, "{}", moved.payload);
+        linscp_proto::upload_bytes(session.as_ref(), "/queued-race.txt", b"changed source", Default::default()).await.unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("changed source was moved"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert!(session.stat("/archive/queued-race.txt").await.unwrap().is_none());
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/queued-race.txt", Default::default()).await.unwrap(), b"changed source");
+        linscp_proto::upload_bytes(session.as_ref(), "/queued-target.txt", b"original source", Default::default()).await.unwrap();
+        svc.queue.pause();
+        let idx = svc.queue.snapshot().0.len();
+        let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/archive", "names": ["queued-target.txt"], "operation": "move"}))).await;
+        assert_eq!(moved.status, 200, "{}", moved.payload);
+        linscp_proto::upload_bytes(session.as_ref(), "/archive/queued-target.txt", b"competing target", Default::default()).await.unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("destination was overwritten"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/queued-target.txt", Default::default()).await.unwrap(), b"original source");
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/archive/queued-target.txt", Default::default()).await.unwrap(), b"competing target");
+        linscp_proto::upload_bytes(session.as_ref(), "/queued-cancel.txt", b"cancel source", Default::default()).await.unwrap();
+        svc.queue.pause();
+        let idx = svc.queue.snapshot().0.len();
+        let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/archive", "names": ["queued-cancel.txt"], "operation": "move"}))).await;
+        assert_eq!(moved.status, 200);
+        let task = svc.queue.snapshot().0[idx]["id"].as_u64().unwrap();
+        let cancelled = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": task}))).await;
+        assert_eq!(cancelled.status, 200);
+        svc.queue.resume();
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/queued-cancel.txt", Default::default()).await.unwrap(), b"cancel source");
+        assert!(session.stat("/archive/queued-cancel.txt").await.unwrap().is_none());
         // Same-session renames are conditional on the source ETag and never
         // replace a destination; failure after a lost response is ambiguous.
         linscp_proto::upload_bytes(session.as_ref(), "/rename-old.txt", b"rename content", Default::default()).await.unwrap();

@@ -612,10 +612,12 @@
         <div class="form-row"><label>Directory:</label><input type="text" id="remoteTransferDirectory" class="input-field" placeholder="/"></div>
         <div class="form-row"><label>File mask:</label><input type="text" id="remoteTransferMask" class="input-field" placeholder="e.g. *.txt|*.bak (empty = every file)"></div>
         <div class="hint" id="remoteTransferHint"></div>
+        <div class="hint">Move supports files in the current WebDAV session only. It never replaces a destination and relies on server ETag enforcement. If the response is lost, the move may already have completed.</div>
         <div class="hint" id="remoteTransferStatus"></div>
       </div>
       <div class="modal-footer">
         <button class="btn btn-primary" onclick="runRemoteTransfer()">Copy</button>
+        <button class="btn" onclick="runRemoteTransfer(true)">Move (current WebDAV session)</button>
         <button class="btn" onclick="closeModal('remoteTransferModal')">Close</button>
       </div>
     </div>
@@ -4311,26 +4313,28 @@
           { label: target.label });
   }
 
-  async function runRemoteTransfer() {
+  async function runRemoteTransfer(moveItem) {
     const directory = $('remoteTransferDirectory').value.trim();
     if (!directory) {
       $('remoteTransferStatus').textContent = t('A destination directory is required.');
       return;
     }
-    const result = await apiPost('/api/remote/transfer', {
+    const payload = {
       tab: remoteTransferState.tab,
       names: remoteTransferState.names,
       target: $('remoteTransferTarget').value,
       directory: directory,
       filemask: $('remoteTransferMask').value.trim()
-    });
+    };
+    if (moveItem) payload.operation = 'move';
+    const result = await apiPost('/api/remote/transfer', payload);
     if (!result.success) {
       $('remoteTransferStatus').textContent = errorMessage(result.error,
-        t('Cannot queue the copy.'));
+        t(moveItem ? 'Cannot queue the move.' : 'Cannot queue the copy.'));
       return;
     }
     closeModal('remoteTransferModal');
-    toast(t('The copy is queued.'));
+    toast(t(moveItem ? 'The move is queued.' : 'The copy is queued.'));
     switchTab('queue');
     refreshQueue();
   }

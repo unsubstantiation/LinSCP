@@ -79,6 +79,12 @@ pub enum QueueJob {
         move_item: bool,
         policy: ConflictPolicy,
     },
+    DavMove {
+        session: Arc<dyn RemoteSession>,
+        source: String,
+        target: String,
+        etag: String,
+    },
     RemoteToRemote {
         src_session: Arc<dyn RemoteSession>,
         dst_session: Arc<dyn RemoteSession>,
@@ -797,6 +803,12 @@ impl QueueManager {
                 })
                 .await
                 .map_err(|e| format!("Local worker panicked: {e}"))?
+            }
+            QueueJob::DavMove { session, source, target, etag } => {
+                if task.cancel_flag.load(Ordering::SeqCst) { return Err("Cancelled by user.".to_string()); }
+                session.dav_move_if_match(source, target, etag).await
+                    .map_err(|e| format!("Move incomplete: {e}"))?;
+                Ok(())
             }
             QueueJob::RemoteToRemote {
                 src_session,
