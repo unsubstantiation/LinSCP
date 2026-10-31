@@ -880,6 +880,9 @@ pub async fn upload_single_file(
         } else {
             session.upload_exclusive(remote_dest, req, &mut reader, Some(local_info.size), progress).await
         }.map_err(|e| e.to_string())?;
+        if bytes != local_info.size {
+            return Err(format!("Upload source length changed during transfer; remote destination '{remote_dest}' may be incomplete."));
+        }
         logger.record_transfer(true, &src_label, remote_dest, Some(bytes), Ok(()));
         if flags.delete_source {
             std::fs::remove_file(local_src).map_err(|e| format!("Cannot remove source '{src_label}': {e}"))?;

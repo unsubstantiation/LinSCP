@@ -3523,6 +3523,19 @@ mod tests {
         assert!(direct_cancel.is_err());
         let partial = std::fs::metadata(remote.join("exclusive-cancelled.bin")).unwrap();
         assert!(partial.len() < 512 * 1024);
+        // A source truncated during an exclusive upload must not be reported
+        // as complete or deleted. The partial remote file is left for review,
+        // rather than blindly unlinking a path another client may replace.
+        let shrinking = local.join("shrinking.bin");
+        std::fs::write(&shrinking, vec![31u8; 512 * 1024]).unwrap();
+        let source_to_shrink = shrinking.clone();
+        let shrink = move |_: u64, _: u64| { let _ = std::fs::OpenOptions::new().write(true).open(&source_to_shrink).and_then(|file| file.set_len(1)); };
+        let mut exclusive_shrinking = linscp_engine::transfer::TransferFlags::default();
+        exclusive_shrinking.no_clobber = true;
+        let result = linscp_engine::transfer::upload_single_file(session.as_ref(), &shrinking, "/shrinking.bin", &exclusive_shrinking, &mut logger, Some(&shrink)).await;
+        assert!(result.is_err(), "truncated upload was reported complete");
+        assert!(shrinking.exists());
+        assert!(std::fs::metadata(remote.join("shrinking.bin")).unwrap().len() < 512 * 1024);
         std::fs::write(local.join("another.txt"), b"new data").unwrap();
         std::fs::write(remote.join("another.txt.filepart"), b"unrelated partial").unwrap();
         let blocked = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["another.txt"]}))).await;
