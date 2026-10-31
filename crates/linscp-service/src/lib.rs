@@ -2349,6 +2349,20 @@ mod tests {
         }
         assert!(stopped);
         assert!(session.stat("/photos/multipart-queued.bin").await.unwrap().is_none());
+        // Multipart overwrite must use the originally approved ETag at
+        // completion, not merely check before uploading its parts.
+        linscp_proto::upload_bytes(session.as_ref(), "/photos/multipart-match.bin", b"first version", Default::default()).await.unwrap();
+        let old_etag = session.s3_get_etag("/photos/multipart-match.bin").await.unwrap().unwrap();
+        linscp_proto::upload_bytes(session.as_ref(), "/photos/multipart-match.bin", b"changed version", Default::default()).await.unwrap();
+        let mut approved = linscp_engine::transfer::TransferFlags::default();
+        approved.overwrite_etag = Some(old_etag);
+        let rejected = linscp_engine::transfer::upload_single_file(session.as_ref(), &multipart_path, "/photos/multipart-match.bin", &approved, &mut logger, None).await;
+        assert!(rejected.is_err());
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/photos/multipart-match.bin", Default::default()).await.unwrap(), b"changed version");
+        approved.overwrite_etag = Some(session.s3_get_etag("/photos/multipart-match.bin").await.unwrap().unwrap());
+        let replaced = linscp_engine::transfer::upload_single_file(session.as_ref(), &multipart_path, "/photos/multipart-match.bin", &approved, &mut logger, None).await;
+        assert!(replaced.is_ok(), "{replaced:?}");
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/photos/multipart-match.bin", Default::default()).await.unwrap(), multipart_bytes);
         let output = Command::new("curl").args(["--silent", "--show-error", "--insecure", &format!("https://127.0.0.1:{port}/__test__/state")]).output().unwrap();
         assert!(output.status.success());
         let state: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -2357,6 +2371,7 @@ mod tests {
         assert!(history.iter().any(|e| e["action"] == "abort" && e["key"] == "multipart-cancel.bin"));
         assert!(history.iter().any(|e| e["action"] == "abort" && e["key"] == "multipart-conflict.bin"));
         assert!(history.iter().any(|e| e["action"] == "abort" && e["key"] == "multipart-queued.bin"));
+        assert!(history.iter().any(|e| e["action"] == "abort" && e["key"] == "multipart-match.bin"));
         assert!(history.iter().any(|e| e["action"] == "complete" && e["key"] == "multipart-success.bin"));
         // If abort fails, report the upload ID for later inspection instead of
         // claiming cleanup succeeded or deleting the destination pathname.
