@@ -3712,7 +3712,10 @@ mod tests {
         let mut stopped = false;
         for _ in 0..500 {
             let (tasks, _) = svc.queue.snapshot();
-            if tasks.get(slow_index).and_then(|t| t["status"].as_str()) == Some("Cancelled") { stopped = true; break; }
+            if tasks.get(slow_index).and_then(|t| t["status"].as_str()) == Some("Cancelled") {
+                assert!(tasks[slow_index]["error"].as_str().unwrap_or("").contains("remote destination"));
+                stopped = true; break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(stopped, "cancellation was not observed");

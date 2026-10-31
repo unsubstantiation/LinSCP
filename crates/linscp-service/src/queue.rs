@@ -636,7 +636,7 @@ impl QueueManager {
                     if cancelled && result.is_err() && !committed_move_failure {
                         t.status = "cancelled".to_string();
                         let reconnect = match &task.job { QueueJob::RemoteDownload { session, .. } | QueueJob::RemoteUpload { session, .. } => matches!(session.scheme(), ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes), _ => false };
-                        t.error = Some(if reconnect { format!("Cancelled by user. Reconnect the FTP session before further transfers. {}", result.as_ref().err().map(String::as_str).unwrap_or("A temporary file may remain.")) } else if matches!(&task.job, QueueJob::RemoteDownload { flags, .. } if flags.merge_directories) { "Cancelled by user. A merge that had begun publication may have left files in the destination.".to_string() } else { "Cancelled by user.".to_string() });
+                        t.error = Some(if reconnect { format!("Cancelled by user. Reconnect the FTP session before further transfers. {}", result.as_ref().err().map(String::as_str).unwrap_or("A temporary file may remain.")) } else if matches!(&task.job, QueueJob::RemoteDownload { flags, .. } if flags.merge_directories) { "Cancelled by user. A merge that had begun publication may have left files in the destination.".to_string() } else if matches!(&task.job, QueueJob::RemoteUpload { .. }) { "Cancelled by user. A partial or completed remote destination or temporary file may remain; inspect it before retrying.".to_string() } else { "Cancelled by user.".to_string() });
                         clean = true;
                     } else {
                         match result {
@@ -809,7 +809,8 @@ impl QueueManager {
                 if meta.is_dir() {
                     if session.scheme() != ProtocolScheme::Sftp || *delete_source { return Err("Only SFTP directory copies are supported.".to_string()); }
                     f.no_clobber = true;
-                    upload_new_sftp_tree(session.as_ref(), local_src, remote_dest, &f, &mut logger, Some(&*progress), 0).await?;
+                    upload_new_sftp_tree(session.as_ref(), local_src, remote_dest, &f, &mut logger, Some(&*progress), 0).await
+                        .map_err(|e| format!("Upload failed; a partial remote tree may remain: {e}"))?;
                 } else {
                     if meta.file_type().is_symlink() || !meta.is_file() { return Err("Refusing to transfer a symlink or non-file.".to_string()); }
                     upload_single_file(
@@ -820,7 +821,7 @@ impl QueueManager {
                         &mut logger,
                         Some(&*progress),
                     )
-                    .await?;
+                    .await.map_err(|e| format!("Upload failed; a partial or completed remote destination or temporary file may remain: {e}"))?;
                 }
                 Ok(())
             }
