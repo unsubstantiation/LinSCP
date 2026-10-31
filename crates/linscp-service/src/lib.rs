@@ -2322,7 +2322,7 @@ mod tests {
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/photos/multipart-conflict.bin", Default::default()).await.unwrap(), b"other actor");
         // Cancellation via the public queue also preserves the abort result.
         let queued_file = local.join("multipart-queued.bin");
-        std::fs::write(&queued_file, vec![63u8; 25 * 1024 * 1024]).unwrap();
+        std::fs::write(&queued_file, vec![63u8; 64 * 1024 * 1024]).unwrap();
         let idx = svc.queue.snapshot().0.len();
         let queued = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["multipart-queued.bin"]}))).await;
         assert_eq!(queued.status, 200, "{}", queued.payload);
@@ -2336,6 +2336,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+        // A second app session sharing the journal must not abort an upload
+        // while its originating instance still holds the OS file lock.
+        let second = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "s3", "host": "127.0.0.1", "port": port, "s3_access_key": "AKIDTEST", "s3_secret_key": "testsecret42", "s3_region": "us-east-1", "tls_ca_file": tests.join("fixtures/s3-server-cert.pem"), "local_dir": local, "initial_dir": "/"}}))).await;
+        assert_eq!(second.status, 200, "{}", second.payload);
         let cancelled = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": task_id.expect("multipart upload did not start")}))).await;
         assert_eq!(cancelled.status, 200, "{}", cancelled.payload);
         let mut stopped = false;
@@ -2383,6 +2387,25 @@ mod tests {
         assert!(failed_abort.contains("abort was not confirmed"), "{failed_abort}");
         assert!(failed_abort.contains("upload ID"), "{failed_abort}");
         assert!(session.stat("/photos/multipart-abort-failure.bin").await.unwrap().is_none());
+        let journal_dir = tmp.join("config/s3-conditional-cleanup");
+        let mut records = Vec::new();
+        for entry in std::fs::read_dir(&journal_dir).unwrap() {
+            let path = entry.unwrap().path();
+            let data = std::fs::read(path).unwrap();
+            if !data.is_empty() { records.push(data); }
+        }
+        assert_eq!(records.len(), 1, "failed abort must be recorded exactly once");
+        let journal_text = String::from_utf8(records[0].clone()).unwrap();
+        assert!(!journal_text.contains("testsecret42") && !journal_text.contains("AKIDTEST"));
+        // Reconnecting retries only the recorded upload ID; the fixture now
+        // allows the abort. Existing destination objects remain untouched.
+        let reopened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "s3", "host": "127.0.0.1", "port": port, "s3_access_key": "AKIDTEST", "s3_secret_key": "testsecret42", "s3_region": "us-east-1", "tls_ca_file": tests.join("fixtures/s3-server-cert.pem"), "local_dir": local, "initial_dir": "/"}}))).await;
+        assert_eq!(reopened.status, 200, "{}", reopened.payload);
+        assert!(std::fs::read_dir(&journal_dir).unwrap().all(|entry| std::fs::metadata(entry.unwrap().path()).unwrap().len() == 0), "resolved upload must be marked clean");
+        let output = Command::new("curl").args(["--silent", "--show-error", "--insecure", &format!("https://127.0.0.1:{port}/__test__/state")]).output().unwrap();
+        let state: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(state["active_uploads"], 0, "reconnect did not abort recorded upload: {state}");
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/photos/multipart-conflict.bin", Default::default()).await.unwrap(), b"other actor");
         // Enforce the supported upper bound without an unconditional fallback.
         std::fs::OpenOptions::new().write(true).open(local.join("upload.txt")).unwrap().set_len(1024 * 1024 * 1024 + 1).unwrap();
         let conflict = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"]}))).await;

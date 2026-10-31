@@ -207,6 +207,7 @@ class Store:
         self.version_pagination_fault = ""
         self.object_headers = {}  # "bucket/key" -> dict of x-amz-* headers
         self.request_payers = []
+        self.abort_fail_once = set()
         self.uploads = {}  # UploadId -> {bucket, key, parts, headers}
         self.next_upload_id = 1
         self.multipart_history = []
@@ -985,7 +986,8 @@ class S3Handler(BaseHTTPRequestHandler):
     def abort_multipart(self, params):
         upload_id = params.get("uploadId", [""])[0]
         upload = STORE.uploads.get(upload_id)
-        if upload is not None and upload["key"] == "multipart-abort-failure.bin":
+        if upload is not None and upload["key"] == "multipart-abort-failure.bin" and upload_id not in STORE.abort_fail_once:
+            STORE.abort_fail_once.add(upload_id)
             self.send_error_xml(503, "ServiceUnavailable", "Injected abort failure.")
             return
         upload = STORE.uploads.pop(upload_id, None)

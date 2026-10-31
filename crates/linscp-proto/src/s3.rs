@@ -10,11 +10,14 @@
 //!   `?versionId=` stat, download, and delete)
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use fs2::FileExt;
+use rand::RngCore;
 use linscp_crypto::digests::{compute_digest_hex, DigestAlgorithm, DigestHasher};
 use linscp_crypto::sigv4::{region_from_s3_host, sign_s3_request, S3SignParams};
 use linscp_types::{FileEntry, ProtocolScheme};
@@ -107,6 +110,70 @@ impl MultipartResumeStore {
     }
 }
 
+// One private file per owned multipart upload. The exclusive OS lock stays
+// held for the full transfer, so another running app instance cannot abort it.
+#[derive(Serialize, Deserialize)]
+struct ConditionalUploadRecord {
+    endpoint: String,
+    bucket: String,
+    key: String,
+    upload_id: String,
+}
+
+struct ConditionalUploadJournal {
+    file: std::fs::File,
+}
+
+// Open only ordinary, singly-linked journal files, never symlinks or other
+// special files. The lock is acquired before examining or updating contents.
+fn try_open_journal(path: &Path) -> Option<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.custom_flags(libc::O_NOFOLLOW); }
+    #[cfg(windows)] { use std::os::windows::fs::OpenOptionsExt; options.custom_flags(0x0020_0000); }
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 64 * 1024 { return None; }
+    #[cfg(unix)] { use std::os::unix::fs::MetadataExt; if metadata.nlink() != 1 { return None; } }
+    file.try_lock_exclusive().ok()?;
+    Some(file)
+}
+
+impl ConditionalUploadJournal {
+    fn create(directory: &Path, record: &ConditionalUploadRecord) -> Result<Self, ProtoError> {
+        linscp_platform::create_private_dir(directory).map_err(|e| ProtoError::Transport(format!("Cannot create S3 cleanup journal: {e}")))?;
+        // Reuse a resolved tombstone if available; never unlink an arbitrary
+        // pathname, and keep the lock while writing the next upload record.
+        let reusable = std::fs::read_dir(directory).ok().and_then(|entries| entries.flatten().find_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("upload-") || !name.ends_with(".json") { return None; }
+            let file = try_open_journal(&entry.path())?;
+            if file.metadata().ok()?.len() == 0 { Some(file) } else { None }
+        }));
+        let mut file = if let Some(file) = reusable { file } else {
+            let mut random = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut random);
+            let path = directory.join(format!("upload-{}.json", random.iter().map(|b| format!("{b:02x}")).collect::<String>()));
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+            let file = options.open(&path).map_err(|e| ProtoError::Transport(format!("Cannot create S3 cleanup journal: {e}")))?;
+            file.lock_exclusive().map_err(|e| ProtoError::Transport(format!("Cannot lock S3 cleanup journal: {e}")))?;
+            file
+        };
+        let json = serde_json::to_vec(record).map_err(|e| ProtoError::Transport(format!("Cannot encode S3 cleanup journal: {e}")))?;
+        file.write_all(&json).and_then(|_| file.sync_all()).map_err(|e| ProtoError::Transport(format!("Cannot persist S3 cleanup journal: {e}")))?;
+        Ok(Self { file })
+    }
+
+    fn mark_resolved(&mut self) {
+        // Keep a zero-length tombstone instead of unlinking a pathname another
+        // local process might have replaced. It carries no upload information.
+        let _ = self.file.set_len(0).and_then(|_| self.file.sync_all());
+    }
+}
+
 #[derive(Clone)]
 pub struct S3ConnectConfig {
     pub use_https: bool,
@@ -127,6 +194,8 @@ pub struct S3ConnectConfig {
     /// the caller can retry and resume from the last completed part.
     pub abort_multipart_on_error: bool,
     pub resume_store: Arc<MultipartResumeStore>,
+    /// Private directory for conditional upload IDs that need crash recovery.
+    pub conditional_cleanup_dir: Option<PathBuf>,
     pub extra_signed_headers: BTreeMap<String, String>,
     /// Headers signed and sent exclusively on object write operations (`PUT`, `CreateMultipartUpload`, `CopyObject`).
     pub object_write_headers: BTreeMap<String, String>,
@@ -151,6 +220,7 @@ impl Default for S3ConnectConfig {
             min_part_size: DEFAULT_MIN_PART_SIZE,
             abort_multipart_on_error: true,
             resume_store: MultipartResumeStore::new_in_memory(),
+            conditional_cleanup_dir: None,
             extra_signed_headers: BTreeMap::new(),
             object_write_headers: BTreeMap::new(),
             tls: TlsSettings::default(),
@@ -291,13 +361,58 @@ impl S3Session {
             .build()
             .map_err(|e| ProtoError::Transport(format!("Failed to build S3 HTTP client: {e}")))?;
 
-        Ok(Self {
+        let session = Self {
             cfg,
             region,
             client,
             jump_tunnel,
             socks_relay: Mutex::new(socks_relay),
-        })
+        };
+        session.retry_abandoned_conditional_uploads().await;
+        Ok(session)
+    }
+
+    fn cleanup_endpoint_id(&self) -> String {
+        // Hash, rather than persist, the access key identifier. Secrets and
+        // session tokens are never recorded in the journal.
+        let identity = format!("{}\0{}\0{}\0{}\0{}\0{}", self.cfg.use_https, self.cfg.host.to_lowercase(), self.cfg.port, self.region, self.cfg.path_style, self.cfg.access_key_id);
+        compute_digest_hex(DigestAlgorithm::Sha256, identity.as_bytes())
+    }
+
+    async fn retry_abandoned_conditional_uploads(&self) {
+        let Some(directory) = self.cfg.conditional_cleanup_dir.as_ref() else { return; };
+        let Ok(entries) = std::fs::read_dir(directory) else { return; };
+        let endpoint = self.cleanup_endpoint_id();
+        let mut attempted = 0usize;
+        for entry in entries.flatten() {
+            if attempted >= 4 { break; }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("upload-") || !name.ends_with(".json") { continue; }
+            let Ok(meta) = entry.file_type() else { continue; };
+            if !meta.is_file() || meta.is_symlink() { continue; }
+            let Some(mut file) = try_open_journal(&entry.path()) else { continue; };
+            let mut bytes = Vec::new();
+            if (&mut file).take(64 * 1024).read_to_end(&mut bytes).is_err() || bytes.is_empty() { continue; }
+            let Ok(record) = serde_json::from_slice::<ConditionalUploadRecord>(&bytes) else { continue; };
+            if record.endpoint != endpoint || record.bucket.is_empty() || record.key.is_empty() || record.upload_id.is_empty() { continue; }
+            attempted += 1;
+            let query = vec![("uploadId".to_string(), record.upload_id)];
+            let response = tokio::time::timeout(Duration::from_secs(3), self.send_signed(Method::DELETE, Some(&record.bucket), &record.key, &query, &[], Vec::new())).await;
+            let resolved = match response {
+                Ok(Ok(response)) if response.status().as_u16() == 204 => true,
+                Ok(Ok(response)) if response.status().as_u16() == 404 => {
+                    let body = response.text().await.unwrap_or_default();
+                    reject_xxe_declarations(&body).is_ok() && roxmltree::Document::parse(&body).ok().is_some_and(|doc| {
+                        doc.root_element().tag_name().name() == "Error" && doc.root_element().children().any(|node| node.is_element() && node.tag_name().name() == "Code" && node.text() == Some("NoSuchUpload"))
+                    })
+                }
+                _ => false,
+            };
+            if resolved { let _ = file.set_len(0).and_then(|_| file.sync_all()); }
+            // Ambiguous errors leave the record for later inspection rather
+            // than claiming cleanup succeeded.
+        }
     }
 
     pub fn region(&self) -> &str {
@@ -675,6 +790,18 @@ impl S3Session {
         let checkpoint = self.initiate_multipart(&bucket, &key, expected, PART_SIZE as u64).await
             .map_err(|e| ProtoError::Transport(format!("S3 multipart initiation was not confirmed; an unfinished upload may remain: {e}")))?;
         let upload_id = checkpoint.upload_id;
+        let mut journal = if let Some(directory) = self.cfg.conditional_cleanup_dir.as_ref() {
+            let record = ConditionalUploadRecord { endpoint: self.cleanup_endpoint_id(), bucket: bucket.clone(), key: key.clone(), upload_id: upload_id.clone() };
+            match ConditionalUploadJournal::create(directory, &record) {
+                Ok(journal) => Some(journal),
+                Err(error) => {
+                    let query = vec![("uploadId".to_string(), upload_id.clone())];
+                    let aborted = self.send_signed(Method::DELETE, Some(&bucket), &key, &query, &[], Vec::new()).await;
+                    let confirmed = matches!(aborted, Ok(ref response) if response.status().as_u16() == 204);
+                    return Err(ProtoError::Transport(format!("{error}; multipart abort {} (upload ID '{upload_id}').", if confirmed { "confirmed" } else { "was not confirmed" })));
+                }
+            }
+        } else { None };
         let result: Result<u64, ProtoError> = async {
             let mut parts: Vec<(u32, String)> = Vec::new();
             let mut transferred = 0u64;
@@ -724,14 +851,20 @@ impl S3Session {
             Ok(transferred)
         }.await;
         match result {
-            Ok(bytes) => Ok(bytes),
+            Ok(bytes) => {
+                if let Some(journal) = journal.as_mut() { journal.mark_resolved(); }
+                Ok(bytes)
+            }
             Err(error) => {
                 // Abort only our upload ID; never delete the object pathname.
                 // A lost completion response can still mean the object exists.
                 let query = vec![("uploadId".to_string(), upload_id.clone())];
                 let aborted = self.send_signed(Method::DELETE, Some(&bucket), &key, &query, &[], Vec::new()).await;
                 let cleanup = match aborted {
-                    Ok(response) if response.status().as_u16() == 204 => "Multipart upload was aborted.".to_string(),
+                    Ok(response) if response.status().as_u16() == 204 => {
+                        if let Some(journal) = journal.as_mut() { journal.mark_resolved(); }
+                        "Multipart upload was aborted.".to_string()
+                    },
                     Ok(response) => format!("Multipart abort was not confirmed (HTTP {}); upload ID '{}' may remain.", response.status(), upload_id),
                     Err(e) => format!("Multipart abort was not confirmed; upload ID '{}' may remain: {e}", upload_id),
                 };
