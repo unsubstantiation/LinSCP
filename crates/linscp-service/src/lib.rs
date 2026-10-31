@@ -360,7 +360,7 @@ impl CommanderService {
             return ApiReply { status: 409, payload: json!({"success": false, "error": "Cross-server move requires confirmation", "cross_move_risk": true}) };
         }
         let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
-        if !matches!(session.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs) { return api_error(501, "Only WebDAV file moves are supported here."); }
+        if !matches!(session.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs) { return api_error(501, "Only WebDAV source moves are supported here."); }
         if body.get("filemask").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) { return api_error(400, "File masks are not supported for remote moves."); }
         let directory = body.get("directory").and_then(Value::as_str).unwrap_or("");
         if !directory.starts_with('/') || directory.contains("//") || directory.chars().any(char::is_control) || directory.contains('\\') || directory.split('/').any(|part| part == "." || part == "..") {
@@ -410,7 +410,7 @@ impl CommanderService {
         if tab.is_local { return self.handle_remote_rename(body); }
         let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
         if !matches!(session.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs) {
-            return api_error(501, "Safe remote renaming is currently supported only for WebDAV files.");
+            return api_error(501, "Safe remote renaming is currently supported only for WebDAV resources.");
         }
         let valid_name = |name: &str| !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\') && !name.contains(':') && !name.chars().any(char::is_control);
         let old = body.get("old_name").and_then(Value::as_str).unwrap_or("");
@@ -1138,10 +1138,10 @@ impl CommanderService {
             Some(t) => t, None => return ApiReply{ status: 400, payload: json!({"success": false, "error": "Not connected"})},
         };
         if tab.is_local { return ApiReply{ status: 400, payload: json!({"success": false, "error": "A remote-to-remote copy starts in a connected remote tab."})}; }
-        let mut targets = vec![json!({"id": format!("tab:{}", tab.id), "kind": "tab", "tab": tab.id, "label": tab.name, "host": "", "protocol": "sftp", "current": true, "connected": true})];
+        let mut targets = vec![json!({"id": format!("tab:{}", tab.id), "kind": "tab", "tab": tab.id, "label": tab.name, "host": "", "protocol": tab.remote.as_ref().map(|session| format!("{:?}", session.scheme()).to_ascii_lowercase()).unwrap_or_default(), "current": true, "connected": true})];
         for (id, other) in &g.tabs {
             if *id == tab.id || other.is_local { continue; }
-            targets.push(json!({"id": format!("tab:{}", id), "kind": "tab", "tab": id, "label": other.name, "host": "", "protocol": "sftp", "current": false, "connected": other.connected}));
+            targets.push(json!({"id": format!("tab:{}", id), "kind": "tab", "tab": id, "label": other.name, "host": "", "protocol": other.remote.as_ref().map(|session| format!("{:?}", session.scheme()).to_ascii_lowercase()).unwrap_or_default(), "current": false, "connected": other.connected}));
         }
         ApiReply{ status: 200, payload: json!({"success": true, "targets": targets})}
     }
