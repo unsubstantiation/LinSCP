@@ -371,3 +371,25 @@ test('same-session WebDAV move uses explicit move operation', async () => {
   assert.equal(call.path, '/api/remote/transfer');
   assert.deepEqual(call.payload, { tab: 8, names: ['data'], target: 'tab:8', directory: '/archive', filemask: '', operation: 'move' });
 });
+
+test('remote moves require separate confirmation for non-transactional and directory risks', async () => {
+  const html = fs.readFileSync(path.join(repoRoot, 'source/gui/web/index.html'), 'utf8').replace(/\r\n/g, '\n');
+  const match = html.match(/async function runRemoteTransfer\(moveItem\) \{[\s\S]*?\n  \}\n\n  \/\*/);
+  assert.ok(match);
+  const source = match[0].replace(/\n\n  \/\*$/, '');
+  const values = { remoteTransferDirectory: { value: '/archive' }, remoteTransferTarget: { value: 'tab:9' }, remoteTransferMask: { value: '' }, remoteTransferStatus: { textContent: '' } };
+  const calls = []; let confirmations = 0;
+  const post = async (_path, payload) => {
+    calls.push({ ...payload });
+    if (!payload.accept_cross_move_risk) return { success: false, cross_move_risk: true };
+    if (!payload.accept_directory_move_risk) return { success: false, directory_move_risk: true };
+    return { success: true };
+  };
+  const run = new Function('$', 'remoteTransferState', 'apiPost', 't', 'errorMessage', 'closeModal', 'toast', 'switchTab', 'refreshQueue', 'confirm', `${source}; return runRemoteTransfer;`)(
+    id => values[id], { tab: 8, names: ['data'] }, post, s => s, s => s, () => {}, () => {}, () => {}, () => {}, () => { confirmations++; return true; });
+  await run(true);
+  assert.equal(confirmations, 2);
+  assert.equal(calls[1].accept_cross_move_risk, true);
+  assert.equal(calls[2].accept_directory_move_risk, true);
+  assert.equal(calls[2].accept_cross_move_risk, true);
+});

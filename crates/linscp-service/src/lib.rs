@@ -2712,7 +2712,7 @@ mod tests {
         for _ in 0..500 {
             let (tasks, _) = svc.queue.snapshot();
             if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
-            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("cross-server move failed: {tasks:?}"); }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("cross-server move failed: {:?}", tasks.get(idx)); }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(done);
