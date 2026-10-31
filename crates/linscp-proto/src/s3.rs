@@ -273,6 +273,7 @@ impl S3Session {
 
         let tls_cfg = build_rustls_client_config(&cfg.tls)?;
         let mut builder = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .use_preconfigured_tls(tls_cfg)
             .connect_timeout(cfg.timeout);
 
@@ -618,6 +619,125 @@ impl S3Session {
             ver_marker = Some(next_vm);
         }
         Ok(versions)
+    }
+
+    async fn conditional_put(
+        &self, remote_path: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
+        progress: Option<&ProgressCallback>, header_name: &str, header_value: &str,
+    ) -> Result<u64, ProtoError> {
+        // Multipart conditional completion is not implemented; fail closed.
+        const MAX_CONDITIONAL_BYTES: u64 = 16 * 1024 * 1024;
+        let Some(expected) = total_size else { return Err(ProtoError::UnsupportedCapability("conditional upload without known size", self.scheme())); };
+        if opts.append || opts.resume_offset != 0 {
+            return Err(ProtoError::UnsupportedCapability("conditional resume or append", self.scheme()));
+        }
+        if expected > 1024 * 1024 * 1024 {
+            return Err(ProtoError::UnsupportedCapability("conditional uploads over 1 GiB", self.scheme()));
+        }
+        if expected > MAX_CONDITIONAL_BYTES {
+            return self.conditional_multipart(remote_path, opts, source, expected, progress, header_name, header_value).await;
+        }
+        let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else {
+            return Err(ProtoError::Transport("S3 upload requires a bucket and object key.".to_string()));
+        };
+        if key.is_empty() { return Err(ProtoError::Transport("S3 object key must not be empty.".to_string())); }
+        let mut payload = Vec::with_capacity(expected as usize);
+        source.take(expected + 1).read_to_end(&mut payload).await
+            .map_err(|e| ProtoError::Transport(format!("Reading S3 upload source failed: {e}")))?;
+        if payload.len() as u64 != expected {
+            return Err(ProtoError::Transport("S3 upload source size changed during transfer.".to_string()));
+        }
+        let mut headers = self.write_headers_vec();
+        headers.push((header_name.to_string(), header_value.to_string()));
+        let response = self.send_signed(Method::PUT, Some(&bucket), &key, &[], &headers, payload).await?;
+        let status = response.status();
+        if status.as_u16() != 200 {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProtoError::Transport(format!("Conditional S3 PUT was not confirmed (HTTP {status}); destination may exist: {}", body.trim())));
+        }
+        if let Some(callback) = progress { callback(expected, expected); }
+        Ok(expected)
+    }
+
+    // Each attempt owns a fresh upload ID; no path-based cleanup or resume of
+    // another attempt is allowed. Completion carries the original precondition.
+    async fn conditional_multipart(
+        &self, remote_path: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), expected: u64,
+        progress: Option<&ProgressCallback>, header_name: &str, header_value: &str,
+    ) -> Result<u64, ProtoError> {
+        const PART_SIZE: usize = 8 * 1024 * 1024;
+        let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else {
+            return Err(ProtoError::Transport("S3 upload requires a bucket and object key.".to_string()));
+        };
+        if key.is_empty() { return Err(ProtoError::Transport("S3 object key must not be empty.".to_string())); }
+        let checkpoint = self.initiate_multipart(&bucket, &key, expected, PART_SIZE as u64).await
+            .map_err(|e| ProtoError::Transport(format!("S3 multipart initiation was not confirmed; an unfinished upload may remain: {e}")))?;
+        let upload_id = checkpoint.upload_id;
+        let result: Result<u64, ProtoError> = async {
+            let mut parts: Vec<(u32, String)> = Vec::new();
+            let mut transferred = 0u64;
+            let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
+            while transferred < expected {
+                let size = ((expected - transferred) as usize).min(PART_SIZE);
+                let mut data = vec![0u8; size];
+                source.read_exact(&mut data).await.map_err(|e| ProtoError::Transport(format!("Reading S3 multipart source failed: {e}")))?;
+                let number = parts.len() as u32 + 1;
+                let query = vec![("partNumber".to_string(), number.to_string()), ("uploadId".to_string(), upload_id.clone())];
+                let response = self.send_signed(Method::PUT, Some(&bucket), &key, &query, &[], data).await?;
+                let status = response.status();
+                let etag = response.headers().get("etag").and_then(|v| v.to_str().ok()).unwrap_or("").trim().to_string();
+                if status.as_u16() != 200 || etag.is_empty() {
+                    return Err(ProtoError::Transport(format!("S3 multipart part {number} was not confirmed (HTTP {status}).")));
+                }
+                parts.push((number, etag));
+                transferred += size as u64;
+                if let Some(callback) = progress { callback(transferred, expected); }
+                limiter.consume(size).await;
+            }
+            // Detect growth and give an interruptible reader a final chance to
+            // notice cancellation before the irreversible completion request.
+            let mut extra = [0u8; 1];
+            if source.read(&mut extra).await.map_err(|e| ProtoError::Transport(format!("Checking S3 multipart source failed: {e}")))? != 0 {
+                return Err(ProtoError::Transport("S3 upload source size changed during transfer.".to_string()));
+            }
+            let mut xml = String::from("<CompleteMultipartUpload>");
+            for (number, etag) in &parts {
+                xml.push_str(&format!("<Part><PartNumber>{number}</PartNumber><ETag>{}</ETag></Part>", xml_escape(etag)));
+            }
+            xml.push_str("</CompleteMultipartUpload>");
+            let query = vec![("uploadId".to_string(), upload_id.clone())];
+            let headers = vec![("content-type".to_string(), "application/xml".to_string()), (header_name.to_string(), header_value.to_string())];
+            let response = self.send_signed(Method::POST, Some(&bucket), &key, &query, &headers, xml.into_bytes()).await?;
+            let status = response.status();
+            let body = response.text().await.map_err(|e| ProtoError::Transport(format!("S3 multipart completion response was not confirmed: {e}")))?;
+            if status.as_u16() != 200 { return Err(parse_s3_error_xml(status, &body)); }
+            reject_xxe_declarations(&body)?;
+            let document = roxmltree::Document::parse(&body).map_err(|e| ProtoError::Transport(format!("Malformed S3 completion response: {e}")))?;
+            let root = document.root_element();
+            let confirmed_bucket = root.children().find(|n| n.is_element() && n.tag_name().name() == "Bucket").and_then(|n| n.text());
+            let confirmed_key = root.children().find(|n| n.is_element() && n.tag_name().name() == "Key").and_then(|n| n.text());
+            if root.tag_name().name() != "CompleteMultipartUploadResult" || confirmed_bucket != Some(bucket.as_str()) || confirmed_key != Some(key.as_str()) {
+                return Err(ProtoError::Transport("S3 multipart completion was not confirmed for the requested object; destination may exist.".to_string()));
+            }
+            Ok(transferred)
+        }.await;
+        match result {
+            Ok(bytes) => Ok(bytes),
+            Err(error) => {
+                // Abort only our upload ID; never delete the object pathname.
+                // A lost completion response can still mean the object exists.
+                let query = vec![("uploadId".to_string(), upload_id.clone())];
+                let aborted = self.send_signed(Method::DELETE, Some(&bucket), &key, &query, &[], Vec::new()).await;
+                let cleanup = match aborted {
+                    Ok(response) if response.status().as_u16() == 204 => "Multipart upload was aborted.".to_string(),
+                    Ok(response) => format!("Multipart abort was not confirmed (HTTP {}); upload ID '{}' may remain.", response.status(), upload_id),
+                    Err(e) => format!("Multipart abort was not confirmed; upload ID '{}' may remain: {e}", upload_id),
+                };
+                Err(ProtoError::Transport(format!("{error}; {cleanup} The destination may already exist if completion was unconfirmed.")))
+            }
+        }
     }
 
     pub async fn stat_version(
@@ -1575,6 +1695,39 @@ impl RemoteSession for S3Session {
             cb(total, total);
         }
         Ok(total)
+    }
+
+    async fn upload_exclusive(
+        &self,
+        remote_path: &str,
+        opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send),
+        total_size: Option<u64>,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        self.conditional_put(remote_path, opts, source, total_size, progress, "if-none-match", "*").await
+    }
+
+    async fn upload_if_match(
+        &self, remote_path: &str, etag: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        if !etag.starts_with('"') || !etag.ends_with('"') || etag.len() < 2 || etag[1..etag.len()-1].contains('"') || etag.chars().any(char::is_control) {
+            return Err(ProtoError::Transport("Conditional overwrite requires a single strong ETag.".to_string()));
+        }
+        self.conditional_put(remote_path, opts, source, total_size, progress, "if-match", etag).await
+    }
+
+    async fn s3_get_etag(&self, remote_path: &str) -> Result<Option<String>, ProtoError> {
+        let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else { return Ok(None); };
+        if key.is_empty() { return Ok(None); }
+        let resp = self.send_signed(Method::HEAD, Some(&bucket), &key, &[], &[], Vec::new()).await?;
+        if resp.status().as_u16() == 404 { return Ok(None); }
+        if !resp.status().is_success() {
+            return Err(ProtoError::Transport(format!("S3 HEAD '{remote_path}' failed with HTTP {}.", resp.status())));
+        }
+        Ok(resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(str::to_string))
     }
 
     async fn probe_endpoint(&self, _initial_dir: &str) -> Result<(), ProtoError> {

@@ -34,6 +34,8 @@ import pathlib
 import re
 import ssl
 import sys
+import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -196,6 +198,7 @@ class Store:
     """Bucket -> key -> (bytes, last-modified). In memory only."""
 
     def __init__(self):
+        self.write_lock = threading.Lock()
         self.buckets = {}  # name -> creation epoch
         self.objects = {}  # (bucket, key) -> (bytes, mtime), current version only
         self.versions = {}  # (bucket, key) -> oldest-to-newest version records
@@ -281,6 +284,9 @@ class Store:
 
 
 STORE = Store()
+if os.environ.get("LSCP_TEST_SEED") == "1":
+    STORE.put("photos", "seed.txt", b"S3 verified download", datetime.datetime.now(datetime.timezone.utc).timestamp())
+    STORE.put("photos", "slow.bin", b"s" * (4 * 1024 * 1024), datetime.datetime.now(datetime.timezone.utc).timestamp())
 
 
 class S3Handler(BaseHTTPRequestHandler):
@@ -333,7 +339,14 @@ class S3Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(length))
         self.end_headers()
         if data and self.command != "HEAD" and status not in (204, 304):
-            self.wfile.write(data)
+            delay = float(os.environ.get("LSCP_TEST_GET_DELAY", "0"))
+            if self.command == "GET" and delay:
+                for offset in range(0, len(data), 32768):
+                    self.wfile.write(data[offset:offset + 32768])
+                    self.wfile.flush()
+                    time.sleep(delay)
+            else:
+                self.wfile.write(data)
 
     # -- dispatch ---------------------------------------------------------
     def split_path(self):
@@ -392,7 +405,7 @@ class S3Handler(BaseHTTPRequestHandler):
             elif method == "POST" and "uploads" in params:
                 self.initiate_multipart(bucket, key, headers)
             elif method == "POST" and "uploadId" in params:
-                self.complete_multipart(params, body)
+                self.complete_multipart(params, headers, body)
             elif method == "DELETE" and "uploadId" in params:
                 self.abort_multipart(params)
             elif method == "DELETE":
@@ -742,9 +755,18 @@ class S3Handler(BaseHTTPRequestHandler):
         self.send_bytes(200, b"", extra=(
             ("Last-Modified", http_date(mtime)),
             ("Content-Type", "application/octet-stream"),
+            ("ETag", '"%s"' % hashlib.sha256(data).hexdigest()[:32]),
         ) + version_header, content_length=len(data))
 
     def put_object(self, bucket, key, headers, body):
+        # Model an accepted-but-unconfirmed write and a redirect to another
+        # object. Conditional moves must not delete their source in either case.
+        if key == "cross-s3-accepted.txt":
+            self.send_bytes(202, b"")
+            return
+        if key == "cross-s3-redirect.txt":
+            self.send_bytes(307, b"", extra=(("Location", "/%s/cross-s3-redirect-target.txt" % bucket),))
+            return
         if key == "":
             # PUT /bucket with a body has no meaning here.
             self.send_error_xml(400, "InvalidBucketName",
@@ -783,7 +805,16 @@ class S3Handler(BaseHTTPRequestHandler):
         if bucket not in STORE.buckets and key.endswith("/"):
             # mkdir creates both the bucket and its marker.
             STORE.ensure_bucket(bucket, now)
-        STORE.put(bucket, key, body, now)
+        with STORE.write_lock:
+            if headers.get("if-none-match", "").strip() == "*" and STORE.get(bucket, key) is not None:
+                self.send_error_xml(412, "PreconditionFailed", "The object already exists.")
+                return
+            match = headers.get("if-match")
+            current = STORE.get(bucket, key)
+            if match is not None and (current is None or match.strip() != '"%s"' % hashlib.sha256(current[0]).hexdigest()[:32]):
+                self.send_error_xml(412, "PreconditionFailed", "The object has changed.")
+                return
+            STORE.put(bucket, key, body, now)
         STORE.object_headers["%s/%s" % (bucket, key)] = amz_headers
         self.send_bytes(200, b"", extra=(
             ("ETag", '"%s"' % hashlib.sha256(body).hexdigest()[:32]),))
@@ -869,6 +900,9 @@ class S3Handler(BaseHTTPRequestHandler):
                           "<LastModified>%s</LastModified></CopyPartResult>"
                           % (etag, iso8601(now)))
             return
+        delay = float(os.environ.get("LSCP_TEST_PART_DELAY", "0"))
+        if delay:
+            time.sleep(delay)
         etag = '"%s"' % hashlib.sha256(body).hexdigest()[:32]
         upload["parts"][number] = (body, etag)
         STORE.multipart_history.append({
@@ -877,7 +911,7 @@ class S3Handler(BaseHTTPRequestHandler):
         })
         self.send_bytes(200, b"", extra=(("ETag", etag),))
 
-    def complete_multipart(self, params, body):
+    def complete_multipart(self, params, headers, body):
         upload_id = params.get("uploadId", [""])[0]
         upload = STORE.uploads.get(upload_id)
         if upload is None:
@@ -919,7 +953,16 @@ class S3Handler(BaseHTTPRequestHandler):
                 "<Message>Embedded completion failure.</Message></Error>")
             return
         now = datetime.datetime.now(datetime.timezone.utc).timestamp()
-        STORE.put(upload["bucket"], upload["key"], data, now)
+        with STORE.write_lock:
+            current = STORE.get(upload["bucket"], upload["key"])
+            if headers.get("if-none-match", "").strip() == "*" and current is not None:
+                self.send_error_xml(412, "PreconditionFailed", "The object already exists.")
+                return
+            match = headers.get("if-match")
+            if match is not None and (current is None or match.strip() != '"%s"' % hashlib.sha256(current[0]).hexdigest()[:32]):
+                self.send_error_xml(412, "PreconditionFailed", "The object has changed.")
+                return
+            STORE.put(upload["bucket"], upload["key"], data, now)
         STORE.object_headers["%s/%s" % (upload["bucket"], upload["key"])] = (
             upload.get("headers", {})
         )
@@ -941,6 +984,10 @@ class S3Handler(BaseHTTPRequestHandler):
 
     def abort_multipart(self, params):
         upload_id = params.get("uploadId", [""])[0]
+        upload = STORE.uploads.get(upload_id)
+        if upload is not None and upload["key"] == "multipart-abort-failure.bin":
+            self.send_error_xml(503, "ServiceUnavailable", "Injected abort failure.")
+            return
         upload = STORE.uploads.pop(upload_id, None)
         if upload is None:
             self.send_error_xml(404, "NoSuchUpload",

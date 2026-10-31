@@ -1,4 +1,4 @@
-name: Android build
+name: Android compatibility checks
 
 on:
   push:
@@ -7,12 +7,12 @@ on:
 
 jobs:
   build:
-    name: Android (NDK + APK)
+    name: Android Rust checks
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
 
@@ -46,32 +46,12 @@ jobs:
             -p linscp-proto \
             -p linscp-engine \
             -p linscp-service \
-            -p linscp-http \
-            -p linscp-cli
+            -p linscp-http
 
       - name: Run Android bridge unit tests (host)
         run: |
           python3 tools/run_cargo_ci.py cargo test -p linscp-platform --lib
           python3 tools/run_cargo_ci.py cargo test -p linscp-tauri --lib
 
-      - name: Build the Termux CLI for aarch64-linux-android
-        run: bash tools/build-termux.sh
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - uses: gradle/actions/setup-gradle@v4
-
-      - name: Build the debug APK with Gradle
-        working-directory: crates/linscp-tauri/gen/android
-        run: python3 "$GITHUB_WORKSPACE/tools/run_cargo_ci.py" ./gradlew assembleDebug --stacktrace
-
-      - name: Upload the APK and Termux CLI
-        uses: actions/upload-artifact@v4
-        with:
-          name: linscp-android
-          path: |
-            crates/linscp-tauri/gen/android/app/build/outputs/apk/debug/app-debug.apk
-            target/aarch64-linux-android/release/linscp
+      # The checked-in Android Gradle project is a scaffold, not a Tauri app.
+      # Do not publish its APK as a release until it hosts the Rust backend.

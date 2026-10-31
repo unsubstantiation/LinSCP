@@ -15,6 +15,7 @@ use bytes::Bytes;
 use futures_core::Stream;
 use linscp_crypto::digests::{DigestAlgorithm, DigestHasher};
 use linscp_types::{FileEntry, ProtocolScheme};
+use rand::RngCore;
 use reqwest::{Body, Client, Method, Proxy};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
@@ -412,12 +413,174 @@ struct DavConditionState {
 pub struct WebDavSession {
     cfg: WebDavConnectConfig,
     client: Client,
+    no_redirect_client: Client,
     state: Mutex<DavConditionState>,
     jump_tunnel: Option<Arc<SshJumpTunnel>>,
     socks_relay: Mutex<Option<Socks5JumpRelay>>,
 }
 
 impl WebDavSession {
+    async fn upload_inner(
+        &self,
+        remote_path: &str,
+        opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send),
+        total_size: Option<u64>,
+        progress: Option<&ProgressCallback>,
+        exclusive: bool,
+        match_etag: Option<&str>,
+    ) -> Result<u64, ProtoError> {
+        if opts.resume_offset > 0 || opts.append {
+            return Err(ProtoError::Transport(
+                "WebDAV PUT does not support unguarded byte-offset resume or append.".to_string(),
+            ));
+        }
+
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let client = if exclusive || match_etag.is_some() || self.if_header_for(remote_path).await.is_some() { &self.no_redirect_client } else { &self.client };
+        let mut req = self.apply_auth(client.put(self.url_for(remote_path, false)));
+        if exclusive {
+            req = req.header("If-None-Match", "*");
+        }
+        if let Some(etag) = match_etag {
+            req = req.header("If-Match", etag);
+        }
+        if let Some(sz) = total_size {
+            req = req.header("Content-Length", sz.to_string());
+        }
+        let has_etag = self.has_etag_precondition(remote_path).await;
+        if let Some(if_hdr) = self.if_header_for(remote_path).await {
+            req = req.header("If", if_hdr);
+        }
+        req = req.body(Body::wrap_stream(ChannelBodyStream { rx }));
+
+        let send_fut = req.send();
+        let pump_fut = async {
+            let mut buf = vec![0u8; 32 * 1024];
+            let mut sent = 0u64;
+            let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
+            let reported_total = total_size.unwrap_or(0);
+            loop {
+                let n = source.read(&mut buf).await.map_err(|e| {
+                    ProtoError::Transport(format!("Reading upload source failed: {e}"))
+                })?;
+                if n == 0 {
+                    break;
+                }
+                let bytes = Bytes::copy_from_slice(&buf[..n]);
+                if tx.send(Ok(bytes)).await.is_err() {
+                    break;
+                }
+                sent += n as u64;
+                if let Some(cb) = progress {
+                    cb(sent, reported_total);
+                }
+                limiter.consume(n).await;
+            }
+            drop(tx);
+            Ok::<u64, ProtoError>(sent)
+        };
+
+        let (pump_res, resp_res) = tokio::join!(pump_fut, send_fut);
+        let transferred = pump_res?;
+        let resp = resp_res.map_err(|e| {
+            ProtoError::Transport(format!(
+                "WebDAV PUT '{remote_path}' failed: {}",
+                format_reqwest_err(&e)
+            ))
+        })?;
+        if !matches!(resp.status().as_u16(), 200 | 201 | 204) || total_size.is_some_and(|expected| expected != transferred) {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 412 && has_etag {
+                return Err(ProtoError::Transport(format!(
+                    "WebDAV PUT '{remote_path}' failed with HTTP {status} (ETag precondition not satisfied): {}",
+                    detail.trim()
+                )));
+            }
+            return Err(ProtoError::Transport(format!(
+                "WebDAV PUT '{remote_path}' was not confirmed (HTTP {status}, {transferred} bytes sent); a destination may exist: {}",
+                detail.trim()
+            )));
+        }
+        Ok(transferred)
+    }
+
+
+    // Try a lock-null staging resource. Cleanup is conditional on the
+    // server still recognizing our exclusive lock token; never unlink a path
+    // merely because we once created it. Servers that explicitly do not offer
+    // this facility fall back to the ordinary exclusive PUT.
+    async fn try_locked_upload(
+        &self, remote_path: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
+        progress: Option<&ProgressCallback>, destination_etag: Option<&str>,
+    ) -> Result<Option<u64>, ProtoError> {
+        if opts.resume_offset != 0 || opts.append { return Ok(None); }
+        let mut random = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut random);
+        let directory = remote_path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        let stage = format!("{}/.linscp-lock-{}", directory.trim_end_matches('/'), random.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        let method = Method::from_bytes(b"LOCK").map_err(|e| ProtoError::Transport(e.to_string()))?;
+        let lock_body = r#"<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>"#;
+        let response = self.apply_auth(self.no_redirect_client.request(method, self.url_for(&stage, false)))
+            .header("If-None-Match", "*").header("Depth", "0").header("Timeout", "Second-3600")
+            .header("Content-Type", "application/xml; charset=utf-8").body(lock_body).send().await
+            .map_err(|e| ProtoError::Transport(format!("WebDAV staging LOCK was not confirmed; a temporary resource at '{stage}' may remain: {}", format_reqwest_err(&e))))?;
+        let status = response.status();
+        if matches!(status.as_u16(), 403 | 404 | 405 | 501) { return Ok(None); }
+        let token_header = response.headers().get("lock-token").and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().trim_start_matches('<').trim_end_matches('>').to_string());
+        let body = response.text().await.map_err(|e| ProtoError::Transport(format!("WebDAV staging LOCK response was not confirmed; '{stage}' may remain: {e}")))?;
+        if status.as_u16() != 201 {
+            return Err(ProtoError::Transport(format!("WebDAV staging LOCK was not confirmed (HTTP {status}); '{stage}' may remain.")));
+        }
+        let token = token_header.or_else(|| dav_lock_token_from_xml(&body).ok())
+            .filter(|t| !t.is_empty() && !t.chars().any(|c| c.is_control() || c == '<' || c == '>'))
+            .ok_or_else(|| ProtoError::Transport(format!("WebDAV staging LOCK returned no usable token; '{stage}' may remain.")))?;
+        let state_key = self.resolve_remote_path(&stage);
+        self.state.lock().await.locks.insert(state_key.clone(), token.clone());
+        let uploaded = self.upload_inner(&stage, opts, source, total_size, progress, false, None).await;
+        let result = match uploaded {
+            Ok(bytes) => {
+                let method = Method::from_bytes(b"MOVE").map_err(|e| ProtoError::Transport(e.to_string()))?;
+                let source_url = self.url_for(&stage, false);
+                let destination_url = self.url_for(remote_path, false);
+                // Tagged WebDAV If lists protect both the locked stage and the
+                // approved destination at the instant the server applies MOVE.
+                let condition = match destination_etag {
+                    Some(etag) => format!("<{source_url}> (<{token}>) <{destination_url}> ([{etag}])"),
+                    None => format!("(<{token}>)"),
+                };
+                let response = self.apply_auth(self.no_redirect_client.request(method, source_url))
+                    .header("Destination", destination_url).header("Overwrite", if destination_etag.is_some() { "T" } else { "F" })
+                    .header("If", condition).send().await;
+                match response {
+                    Ok(response) if (destination_etag.is_none() && response.status().as_u16() == 201) || (destination_etag.is_some() && response.status().as_u16() == 204) => Ok(bytes),
+                    Ok(response) => Err(ProtoError::Transport(format!("WebDAV staged MOVE was not confirmed (HTTP {}); destination may exist.", response.status()))),
+                    Err(e) => Err(ProtoError::Transport(format!("WebDAV staged MOVE was not confirmed; destination may exist: {}", format_reqwest_err(&e)))),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(error) = result {
+            let cleanup = self.apply_auth(self.no_redirect_client.delete(self.url_for(&stage, false)))
+                .header("If", format!("(<{token}>)")).send().await;
+            let detail = match cleanup {
+                Ok(response) if matches!(response.status().as_u16(), 200 | 204) => "Locked temporary resource removed.".to_string(),
+                Ok(response) => format!("Locked temporary resource '{stage}' was not removed (HTTP {}); inspect it before retrying.", response.status()),
+                Err(e) => format!("Cleanup of locked temporary resource '{stage}' was not confirmed: {}", format_reqwest_err(&e)),
+            };
+            // UNLOCK is token-scoped and never removes a pathname.
+            let _ = self.unlock(&stage, Some(&token)).await;
+            self.state.lock().await.locks.remove(&state_key);
+            return Err(ProtoError::Transport(format!("{error}; {detail}")));
+        }
+        let _ = self.unlock(&stage, Some(&token)).await;
+        self.state.lock().await.locks.remove(&state_key);
+        result.map(Some)
+    }
+
     pub async fn connect(
         mut cfg: WebDavConnectConfig,
         tunnel_cfg: Option<&SshConnectConfig>,
@@ -436,19 +599,28 @@ impl WebDavSession {
 
         let tls_cfg = build_rustls_client_config(&cfg.tls)?;
         let mut builder = Client::builder()
-            .use_preconfigured_tls(tls_cfg)
+            .use_preconfigured_tls(tls_cfg.clone())
             .connect_timeout(cfg.timeout);
+        let mut guarded_builder = Client::builder()
+            .use_preconfigured_tls(tls_cfg)
+            .connect_timeout(cfg.timeout)
+            .redirect(reqwest::redirect::Policy::none());
 
         if let Some(proxy_cfg) = cfg.proxy.as_ref() {
             if let Some(proxy) = build_reqwest_proxy(proxy_cfg)? {
                 builder = builder.proxy(proxy);
+                guarded_builder = guarded_builder.proxy(build_reqwest_proxy(proxy_cfg)?.expect("proxy was just constructed"));
             } else {
                 builder = builder.no_proxy();
+                guarded_builder = guarded_builder.no_proxy();
             }
         } else {
             builder = builder.no_proxy();
+            guarded_builder = guarded_builder.no_proxy();
         }
 
+        let no_redirect_client = guarded_builder.build()
+            .map_err(|e| ProtoError::Transport(format!("Failed to build guarded WebDAV client: {e}")))?;
         let client = builder
             .build()
             .map_err(|e| ProtoError::Transport(format!("Failed to build WebDAV client: {e}")))?;
@@ -456,6 +628,7 @@ impl WebDavSession {
         Ok(Self {
             cfg,
             client,
+            no_redirect_client,
             state: Mutex::new(DavConditionState::default()),
             jump_tunnel,
             socks_relay: Mutex::new(socks_relay),
@@ -946,6 +1119,103 @@ fn parse_propfind_multistatus(xml: &str) -> Result<Vec<DavParsedResponse>, Proto
     Ok(results)
 }
 
+fn valid_strong_etag(tag: &str) -> bool {
+    tag.len() >= 2 && tag.starts_with('"') && tag.ends_with('"')
+        && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control)
+}
+
+impl WebDavSession {
+    async fn download_inner(
+        &self,
+        remote_path: &str,
+        opts: TransferRequest,
+        sink: &mut (dyn AsyncWrite + Unpin + Send),
+        progress: Option<&ProgressCallback>,
+        etag: Option<&str>,
+    ) -> Result<u64, ProtoError> {
+        let client = if etag.is_some() { &self.no_redirect_client } else { &self.client };
+        let mut req = self.apply_auth(client.get(self.url_for(remote_path, false)));
+        if let Some(tag) = etag {
+            if !valid_strong_etag(tag) { return Err(ProtoError::Transport("Conditional download requires a strong ETag.".to_string())); }
+            req = req.header("If-Match", tag);
+        }
+        if opts.resume_offset > 0 {
+            req = req.header("Range", format!("bytes={}-", opts.resume_offset));
+        }
+        let mut resp = req
+            .send()
+            .await
+            .map_err(|e| {
+                ProtoError::Transport(format!("WebDAV GET failed: {}", format_reqwest_err(&e)))
+            })?;
+        // A conditional full-object GET must confirm a complete representation;
+        // 202, 204 or unsolicited 206 are not proof the source was downloaded.
+        if etag.is_some() && opts.resume_offset == 0 && resp.status().as_u16() != 200 {
+            return Err(ProtoError::Transport(format!("Conditional WebDAV GET was not confirmed (HTTP {}).", resp.status())));
+        }
+        if opts.resume_offset > 0 && resp.status().as_u16() != 206 {
+            return Err(ProtoError::Transport(format!(
+                "WebDAV server did not honor byte-range resume (HTTP {}).",
+                resp.status()
+            )));
+        }
+        if opts.resume_offset > 0 {
+            let range = resp.headers().get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let Some((bounds, total)) = range.strip_prefix("bytes ").and_then(|v| v.split_once('/')) else {
+                return Err(ProtoError::Transport("WebDAV returned an invalid Content-Range.".to_string()));
+            };
+            let Some((start, end)) = bounds.split_once('-').and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))) else {
+                return Err(ProtoError::Transport("WebDAV returned an invalid Content-Range.".to_string()));
+            };
+            let total = total.parse::<u64>().map_err(|_| ProtoError::Transport("WebDAV returned an invalid Content-Range total.".to_string()))?;
+            if start != opts.resume_offset || end.checked_add(1) != Some(total) || start > end {
+                return Err(ProtoError::Transport("WebDAV returned an inconsistent resume range.".to_string()));
+            }
+        }
+        if !resp.status().is_success() {
+            if resp.status().as_u16() == 404 {
+                return Err(ProtoError::Transport(
+                    "No such file or directory.".to_string(),
+                ));
+            }
+            return Err(ProtoError::Transport(format!(
+                "WebDAV GET '{remote_path}' failed with HTTP {}.",
+                resp.status()
+            )));
+        }
+
+        let content_len = resp.content_length().unwrap_or(0);
+        let total = opts.resume_offset + content_len;
+        let mut transferred = 0u64;
+        let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
+
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| ProtoError::Transport(format!("WebDAV download stream error: {e}")))?
+        {
+            sink.write_all(&chunk)
+                .await
+                .map_err(|e| ProtoError::Transport(format!("Writing download sink failed: {e}")))?;
+            transferred += chunk.len() as u64;
+            if let Some(cb) = progress {
+                cb(opts.resume_offset + transferred, total);
+            }
+            if opts.speed_kbytes_per_sec > 0 {
+                sink.flush()
+                    .await
+                    .map_err(|e| ProtoError::Transport(format!("Flushing download sink failed: {e}")))?;
+            }
+            limiter.consume(chunk.len()).await;
+        }
+        sink.flush()
+            .await
+            .map_err(|e| ProtoError::Transport(format!("Flushing download sink failed: {e}")))?;
+        Ok(transferred)
+    }
+
+}
+
 #[async_trait]
 impl RemoteSession for WebDavSession {
     fn scheme(&self) -> ProtocolScheme {
@@ -1185,145 +1455,105 @@ impl RemoteSession for WebDavSession {
     }
 
     async fn download(
-        &self,
-        remote_path: &str,
-        opts: TransferRequest,
-        sink: &mut (dyn AsyncWrite + Unpin + Send),
-        progress: Option<&ProgressCallback>,
+        &self, remote_path: &str, opts: TransferRequest,
+        sink: &mut (dyn AsyncWrite + Unpin + Send), progress: Option<&ProgressCallback>,
     ) -> Result<u64, ProtoError> {
-        let mut req = self.apply_auth(self.client.get(self.url_for(remote_path, false)));
-        if opts.resume_offset > 0 {
-            req = req.header("Range", format!("bytes={}-", opts.resume_offset));
-        }
-        let mut resp = req
-            .send()
-            .await
-            .map_err(|e| {
-                ProtoError::Transport(format!("WebDAV GET failed: {}", format_reqwest_err(&e)))
-            })?;
-        if opts.resume_offset > 0 && resp.status().as_u16() != 206 {
-            return Err(ProtoError::Transport(format!(
-                "WebDAV server did not honor byte-range resume (HTTP {}).",
-                resp.status()
-            )));
-        }
-        if !resp.status().is_success() {
-            if resp.status().as_u16() == 404 {
-                return Err(ProtoError::Transport(
-                    "No such file or directory.".to_string(),
-                ));
-            }
-            return Err(ProtoError::Transport(format!(
-                "WebDAV GET '{remote_path}' failed with HTTP {}.",
-                resp.status()
-            )));
-        }
+        self.download_inner(remote_path, opts, sink, progress, None).await
+    }
 
-        let content_len = resp.content_length().unwrap_or(0);
-        let total = opts.resume_offset + content_len;
-        let mut transferred = 0u64;
-        let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
+    async fn download_if_match(
+        &self, remote_path: &str, etag: &str, opts: TransferRequest,
+        sink: &mut (dyn AsyncWrite + Unpin + Send), progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        self.download_inner(remote_path, opts, sink, progress, Some(etag)).await
+    }
 
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| ProtoError::Transport(format!("WebDAV download stream error: {e}")))?
-        {
-            sink.write_all(&chunk)
-                .await
-                .map_err(|e| ProtoError::Transport(format!("Writing download sink failed: {e}")))?;
-            transferred += chunk.len() as u64;
-            if let Some(cb) = progress {
-                cb(opts.resume_offset + transferred, total);
-            }
-            if opts.speed_kbytes_per_sec > 0 {
-                sink.flush()
-                    .await
-                    .map_err(|e| ProtoError::Transport(format!("Flushing download sink failed: {e}")))?;
-            }
-            limiter.consume(chunk.len()).await;
+    async fn verify_prefix_if_match(
+        &self, remote_path: &str, etag: &str, prefix_len: u64, total_len: u64,
+        prefix: &mut (dyn AsyncRead + Unpin + Send),
+    ) -> Result<(), ProtoError> {
+        if !valid_strong_etag(etag) || prefix_len == 0 || prefix_len > total_len {
+            return Err(ProtoError::Transport("Invalid verified-resume prefix or ETag.".to_string()));
         }
-        sink.flush()
-            .await
-            .map_err(|e| ProtoError::Transport(format!("Flushing download sink failed: {e}")))?;
-        Ok(transferred)
+        let mut response = self.apply_auth(self.no_redirect_client.get(self.url_for(remote_path, false)))
+            .header("If-Match", etag).header("Range", format!("bytes=0-{}", prefix_len - 1)).send().await
+            .map_err(|e| ProtoError::Transport(format!("WebDAV prefix verification failed: {}", format_reqwest_err(&e))))?;
+        let expected = format!("bytes 0-{}/{}", prefix_len - 1, total_len);
+        let received = response.headers().get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if response.status().as_u16() != 206 || received != expected {
+            return Err(ProtoError::Transport("WebDAV did not return the expected conditional prefix range.".to_string()));
+        }
+        let mut compared = 0u64;
+        while let Some(chunk) = response.chunk().await.map_err(|e| ProtoError::Transport(format!("WebDAV prefix stream failed: {e}")))? {
+            compared = compared.checked_add(chunk.len() as u64).ok_or_else(|| ProtoError::Transport("Prefix length overflow.".to_string()))?;
+            if compared > prefix_len { return Err(ProtoError::Transport("WebDAV returned too much prefix data.".to_string())); }
+            let mut local = vec![0u8; chunk.len()];
+            prefix.read_exact(&mut local).await.map_err(|e| ProtoError::Transport(format!("Reading local resume prefix failed: {e}")))?;
+            if local.as_slice() != chunk.as_ref() { return Err(ProtoError::Transport("Local partial file does not match the remote source.".to_string())); }
+        }
+        if compared != prefix_len { return Err(ProtoError::Transport("WebDAV returned an incomplete prefix.".to_string())); }
+        Ok(())
+    }
+
+    async fn dav_stat_with_etag(&self, remote_path: &str) -> Result<(Option<FileEntry>, Option<String>), ProtoError> {
+        self.propfind_single(remote_path).await
+    }
+
+    async fn dav_move_if_match(&self, from: &str, to: &str, etag: &str, is_dir: bool) -> Result<(), ProtoError> {
+        if !valid_strong_etag(etag) { return Err(ProtoError::Transport("Conditional MOVE requires a strong ETag.".to_string())); }
+        let method = Method::from_bytes(b"MOVE").map_err(|e| ProtoError::Transport(format!("Invalid MOVE method: {e}")))?;
+        let response = self.apply_auth(self.no_redirect_client.request(method, self.url_for(from, is_dir)))
+            .header("Destination", self.url_for(to, is_dir)).header("Overwrite", "F").header("If-Match", etag)
+            .send().await.map_err(|e| ProtoError::Transport(format!("Conditional WebDAV MOVE could not be confirmed; the item may have moved: {}", format_reqwest_err(&e))))?;
+        if !matches!(response.status().as_u16(), 201 | 204) {
+            return Err(ProtoError::Transport(format!("Conditional WebDAV MOVE '{from}' -> '{to}' was not confirmed (HTTP {}); the item may have moved.", response.status())));
+        }
+        Ok(())
+    }
+
+    async fn remove_if_match(&self, remote_path: &str, etag: &str) -> Result<(), ProtoError> {
+        if !valid_strong_etag(etag) { return Err(ProtoError::Transport("Conditional delete requires a strong ETag.".to_string())); }
+        let response = self.apply_auth(self.no_redirect_client.delete(self.url_for(remote_path, false)))
+            .header("If-Match", etag).send().await
+            .map_err(|e| ProtoError::Transport(format!("Conditional WebDAV DELETE failed: {}", format_reqwest_err(&e))))?;
+        if !matches!(response.status().as_u16(), 200 | 204) {
+            return Err(ProtoError::Transport(format!("Conditional WebDAV DELETE '{remote_path}' was not confirmed (HTTP {}); the source may or may not remain.", response.status())));
+        }
+        Ok(())
     }
 
     async fn upload(
-        &self,
-        remote_path: &str,
-        opts: TransferRequest,
-        source: &mut (dyn AsyncRead + Unpin + Send),
-        total_size: Option<u64>,
+        &self, remote_path: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
         progress: Option<&ProgressCallback>,
     ) -> Result<u64, ProtoError> {
-        if opts.resume_offset > 0 || opts.append {
-            return Err(ProtoError::Transport(
-                "WebDAV PUT does not support unguarded byte-offset resume or append.".to_string(),
-            ));
-        }
+        self.upload_inner(remote_path, opts, source, total_size, progress, false, None).await
+    }
 
-        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
-        let mut req = self.apply_auth(self.client.put(self.url_for(remote_path, false)));
-        if let Some(sz) = total_size {
-            req = req.header("Content-Length", sz.to_string());
+    async fn upload_exclusive(
+        &self, remote_path: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        if let Some(bytes) = self.try_locked_upload(remote_path, opts.clone(), source, total_size, progress, None).await? {
+            return Ok(bytes);
         }
-        let has_etag = self.has_etag_precondition(remote_path).await;
-        if let Some(if_hdr) = self.if_header_for(remote_path).await {
-            req = req.header("If", if_hdr);
-        }
-        req = req.body(Body::wrap_stream(ChannelBodyStream { rx }));
+        self.upload_inner(remote_path, opts, source, total_size, progress, true, None).await
+    }
 
-        let send_fut = req.send();
-        let pump_fut = async {
-            let mut buf = vec![0u8; 32 * 1024];
-            let mut sent = 0u64;
-            let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
-            let reported_total = total_size.unwrap_or(0);
-            loop {
-                let n = source.read(&mut buf).await.map_err(|e| {
-                    ProtoError::Transport(format!("Reading upload source failed: {e}"))
-                })?;
-                if n == 0 {
-                    break;
-                }
-                let bytes = Bytes::copy_from_slice(&buf[..n]);
-                if tx.send(Ok(bytes)).await.is_err() {
-                    break;
-                }
-                sent += n as u64;
-                if let Some(cb) = progress {
-                    cb(sent, reported_total);
-                }
-                limiter.consume(n).await;
-            }
-            drop(tx);
-            Ok::<u64, ProtoError>(sent)
-        };
-
-        let (pump_res, resp_res) = tokio::join!(pump_fut, send_fut);
-        let transferred = pump_res?;
-        let resp = resp_res.map_err(|e| {
-            ProtoError::Transport(format!(
-                "WebDAV PUT '{remote_path}' failed: {}",
-                format_reqwest_err(&e)
-            ))
-        })?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let detail = resp.text().await.unwrap_or_default();
-            if status.as_u16() == 412 && has_etag {
-                return Err(ProtoError::Transport(format!(
-                    "WebDAV PUT '{remote_path}' failed with HTTP {status} (ETag precondition not satisfied): {}",
-                    detail.trim()
-                )));
-            }
-            return Err(ProtoError::Transport(format!(
-                "WebDAV PUT '{remote_path}' failed with HTTP {status}: {}",
-                detail.trim()
-            )));
+    async fn upload_if_match(
+        &self, remote_path: &str, etag: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        // If-Match requires a strong entity tag, not a wildcard or weak tag.
+        if !etag.starts_with('"') || !etag.ends_with('"') || etag.len() < 2 || etag[1..etag.len()-1].contains('"') || etag.chars().any(char::is_control) {
+            return Err(ProtoError::Transport("A strong WebDAV ETag is required for overwrite.".to_string()));
         }
-        Ok(transferred)
+        if let Some(bytes) = self.try_locked_upload(remote_path, opts.clone(), source, total_size, progress, Some(etag)).await? {
+            return Ok(bytes);
+        }
+        self.upload_inner(remote_path, opts, source, total_size, progress, false, Some(etag)).await
     }
 
     async fn probe_endpoint(&self, initial_dir: &str) -> Result<(), ProtoError> {

@@ -66,6 +66,23 @@ test('detectTransportMode and createTransport select Tauri vs HTTP automatically
   assert.equal(status.local_roots[0].path, 'C:\\');
 });
 
+test('TauriTransport retains structured failures for connection and overwrite dialogs', async () => {
+  const challenge = { tab: 7, role: 'destination', fingerprint: 'ssh-ed25519 SHA256:test' };
+  const client = new TauriTransport({
+    invoke: async (_cmd, { envelope }) => envelope.path === '/api/tabs/open'
+      ? { status: 409, payload: { success: false, error: 'Verify host key', challenge } }
+      : { status: 409, payload: { success: false, error: 'Already exists', conflicts: ['file.txt'] } },
+  });
+  await assert.rejects(() => client.post('/api/tabs/open', {}), (error) => {
+    assert.deepEqual(error.payload.challenge, challenge);
+    return true;
+  });
+  await assert.rejects(() => client.post('/api/transfer/upload', {}), (error) => {
+    assert.deepEqual(error.payload.conflicts, ['file.txt']);
+    return true;
+  });
+});
+
 test('HttpTransport attaches X-LSCP-Token and X-LSCP-CSRF and surfaces login_required', async () => {
   const seen = [];
   let authPrompted = 0;
@@ -231,6 +248,12 @@ test('Built ui/dist/index.html boots inside Tauri IPC mode with zero HTTP calls'
         invoke: async (cmd, args) => {
           ipcCalls.push({ cmd, path: args.envelope.path });
           const p = args.envelope.path;
+          if (p === '/api/test-challenge') {
+            return { status: 409, payload: { success: false, error: 'Verify host key', challenge: { tab: 7, fingerprint: 'SHA256:test' } } };
+          }
+          if (p === '/api/test-conflict') {
+            return { status: 409, payload: { success: true, conflicts: ['file.txt'] } };
+          }
           if (p === '/api/status') {
             return {
               status: 200,
@@ -267,5 +290,147 @@ test('Built ui/dist/index.html boots inside Tauri IPC mode with zero HTTP calls'
   await new Promise((r) => setTimeout(r, 80));
   assert.equal(dom.window.LinSCPTransport.mode, 'tauri');
   assert.ok(ipcCalls.some((c) => c.cmd === 'linscp_invoke' && c.path === '/api/status'));
+  const challenge = await dom.window.api('/api/test-challenge', { method: 'POST', body: '{}' });
+  assert.equal(challenge.success, false);
+  assert.equal(challenge.challenge.fingerprint, 'SHA256:test');
+  const conflict = await dom.window.api('/api/test-conflict', { method: 'POST', body: '{}' });
+  assert.equal(conflict.success, false); // HTTP failure cannot claim success.
+  assert.equal(conflict.conflicts[0], 'file.txt');
   dom.window.close();
+});
+
+test('overwrite confirmation forwards the original WebDAV conflict ETag', async () => {
+  const html = fs.readFileSync(path.join(repoRoot, 'source', 'gui', 'web', 'index.html'), 'utf8').replace(/\r\n/g, '\n');
+  const match = html.match(/async function queueWithOverwriteDecision\(endpoint, payload, conflicts\) \{[\s\S]*?\n  \}\n\n  async function transfer/);
+  assert.ok(match, 'overwrite decision handler exists');
+  const handlerSource = match[0].replace(/\n\n  async function transfer$/, '');
+  const calls = [];
+  const apiPost = async (endpoint, payload) => {
+    calls.push({ endpoint, payload });
+    return calls.length === 1
+      ? { success: false, conflicts: ['file.txt'], conflict_versions: { 'file.txt': '"original"' } }
+      : { success: true };
+  };
+  const handler = new Function('apiPost', 'preferences', 'confirm', 't', `${handlerSource}; return queueWithOverwriteDecision;`)(apiPost, {}, () => true, s => s);
+  assert.equal((await handler('/api/transfer/upload', { overwrite: 'ask' }, [])).success, true);
+  assert.deepEqual(calls[1].payload, { overwrite: 'overwrite', conflict_versions: { 'file.txt': '"original"' } });
+});
+
+test('directory merge requires explicit approval and forwards only approved roots', async () => {
+  const html = fs.readFileSync(path.join(repoRoot, 'source', 'gui', 'web', 'index.html'), 'utf8').replace(/\r\n/g, '\n');
+  const match = html.match(/async function queueWithOverwriteDecision\(endpoint, payload, conflicts\) \{[\s\S]*?\n  \}\n\n  async function transfer/);
+  assert.ok(match);
+  const source = match[0].replace(/\n\n  async function transfer$/, '');
+  const calls = [];
+  const apiPost = async (_endpoint, payload) => {
+    calls.push(payload);
+    return calls.length === 1 ? { success: false, directory_conflicts: ['tree'] } : { success: true };
+  };
+  let confirmations = 0;
+  const handler = new Function('apiPost', 'preferences', 'confirm', 't', `${source}; return queueWithOverwriteDecision;`)(apiPost, { confirm_overwrite: false }, () => { confirmations++; return true; }, s => s);
+  assert.equal((await handler('/api/transfer/upload', { names: ['tree', 'other'] }, [])).success, true);
+  assert.equal(confirmations, 1);
+  assert.deepEqual(calls[1].merge_directories, ['tree']);
+});
+
+test('FTP uploads require risk confirmation and separately confirm existing files', async () => {
+  const html = fs.readFileSync(path.join(repoRoot, 'source/gui/web/index.html'), 'utf8').replace(/\r\n/g, '\n');
+  const match = html.match(/async function queueWithOverwriteDecision\(endpoint, payload, conflicts\) \{[\s\S]*?\n  \}\n\n  async function transfer/);
+  assert.ok(match);
+  const source = match[0].replace(/\n\n  async function transfer$/, '');
+  const calls = [];
+  let confirmations = 0;
+  const apiPost = async (_endpoint, payload) => {
+    calls.push({ ...payload });
+    if (!payload.accept_ftp_rename_risk) return { success: false, ftp_rename_risk: true };
+    if (!payload.overwrite) return { success: false, conflicts: ['file.txt'] };
+    return { success: true };
+  };
+  const handler = new Function('apiPost', 'preferences', 'confirm', 't', `${source}; return queueWithOverwriteDecision;`)(apiPost, { confirm_overwrite: false }, () => { confirmations++; return true; }, s => s);
+  assert.equal((await handler('/api/transfer/upload', {}, [])).success, true);
+  assert.equal(confirmations, 2);
+  assert.equal(calls[1].accept_ftp_rename_risk, true);
+  assert.equal(calls[2].overwrite, 'overwrite');
+  const reject = new Function('apiPost', 'preferences', 'confirm', 't', `${source}; return queueWithOverwriteDecision;`)(apiPost, {}, () => false, s => s);
+  const before = calls.length;
+  await reject('/api/transfer/upload', {}, []);
+  assert.equal(calls.length, before + 1);
+});
+
+test('same-session WebDAV move uses explicit move operation', async () => {
+  const html = fs.readFileSync(path.join(repoRoot, 'source/gui/web/index.html'), 'utf8').replace(/\r\n/g, '\n');
+  const match = html.match(/async function runRemoteTransfer\(moveItem\) \{[\s\S]*?\n  \}\n\n  \/\*/);
+  assert.ok(match);
+  const source = match[0].replace(/\n\n  \/\*$/, '');
+  const values = { remoteTransferDirectory: { value: '/archive' }, remoteTransferTarget: { value: 'tab:8' }, remoteTransferMask: { value: '' }, remoteTransferStatus: { textContent: '' } };
+  let call;
+  const run = new Function('$', 'remoteTransferState', 'apiPost', 't', 'errorMessage', 'closeModal', 'toast', 'switchTab', 'refreshQueue', `${source}; return runRemoteTransfer;`)(
+    id => values[id], { tab: 8, names: ['data'] }, async (path, payload) => { call = { path, payload }; return { success: true }; },
+    s => s, s => s, () => {}, () => {}, () => {}, () => {});
+  await run(true);
+  assert.equal(call.path, '/api/remote/transfer');
+  assert.deepEqual(call.payload, { tab: 8, names: ['data'], target: 'tab:8', directory: '/archive', filemask: '', operation: 'move' });
+});
+
+test('remote moves require separate confirmation for non-transactional and directory risks', async () => {
+  const html = fs.readFileSync(path.join(repoRoot, 'source/gui/web/index.html'), 'utf8').replace(/\r\n/g, '\n');
+  const match = html.match(/async function runRemoteTransfer\(moveItem\) \{[\s\S]*?\n  \}\n\n  \/\*/);
+  assert.ok(match);
+  const source = match[0].replace(/\n\n  \/\*$/, '');
+  const values = { remoteTransferDirectory: { value: '/archive' }, remoteTransferTarget: { value: 'tab:9' }, remoteTransferMask: { value: '' }, remoteTransferStatus: { textContent: '' } };
+  const calls = []; let confirmations = 0;
+  const post = async (_path, payload) => {
+    calls.push({ ...payload });
+    if (!payload.accept_cross_move_risk) return { success: false, cross_move_risk: true };
+    if (!payload.accept_directory_move_risk) return { success: false, directory_move_risk: true };
+    return { success: true };
+  };
+  const run = new Function('$', 'remoteTransferState', 'apiPost', 't', 'errorMessage', 'closeModal', 'toast', 'switchTab', 'refreshQueue', 'confirm', `${source}; return runRemoteTransfer;`)(
+    id => values[id], { tab: 8, names: ['data'] }, post, s => s, s => s, () => {}, () => {}, () => {}, () => {}, () => { confirmations++; return true; });
+  await run(true);
+  assert.equal(confirmations, 2);
+  assert.equal(calls[1].accept_cross_move_risk, true);
+  assert.equal(calls[2].accept_directory_move_risk, true);
+  assert.equal(calls[2].accept_cross_move_risk, true);
+});
+
+test('SFTP remote copy requires explicit source-race confirmation', async () => {
+  const html = fs.readFileSync(path.join(repoRoot, 'source/gui/web/index.html'), 'utf8').replace(/\r\n/g, '\n');
+  const match = html.match(/async function runRemoteTransfer\(moveItem\) \{[\s\S]*?\n  \}\n\n  \/\*/);
+  assert.ok(match);
+  const source = match[0].replace(/\n\n  \/\*$/, '');
+  for (const accepted of [false, true]) {
+    const values = { remoteTransferDirectory: { value: '/archive' }, remoteTransferTarget: { value: 'tab:9' }, remoteTransferMask: { value: '' }, remoteTransferStatus: { textContent: '' } };
+    const calls = []; let confirmations = 0;
+    const post = async (_path, payload) => {
+      calls.push({ ...payload });
+      return payload.accept_sftp_copy_risk ? { success: true } : { success: false, sftp_copy_risk: true, error: 'Confirmation required' };
+    };
+    const run = new Function('$', 'remoteTransferState', 'apiPost', 't', 'errorMessage', 'closeModal', 'toast', 'switchTab', 'refreshQueue', 'confirm', `${source}; return runRemoteTransfer;`)(
+      id => values[id], { tab: 8, names: ['tree'] }, post, s => s, s => s, () => {}, () => {}, () => {}, () => {}, () => { confirmations++; return accepted; });
+    await run(false);
+    assert.equal(confirmations, 1);
+    assert.equal(calls.length, accepted ? 2 : 1);
+    if (accepted) assert.equal(calls[1].accept_sftp_copy_risk, true);
+  }
+});
+
+test('WebDAV directory copy requires explicit non-snapshot confirmation', async () => {
+  const html = fs.readFileSync(path.join(repoRoot, 'source/gui/web/index.html'), 'utf8').replace(/\r\n/g, '\n');
+  const match = html.match(/async function runRemoteTransfer\(moveItem\) \{[\s\S]*?\n  \}\n\n  \/\*/);
+  assert.ok(match);
+  const source = match[0].replace(/\n\n  \/\*$/, '');
+  for (const accepted of [false, true]) {
+    const values = { remoteTransferDirectory: { value: '/' }, remoteTransferTarget: { value: 'tab:9' }, remoteTransferMask: { value: '' }, remoteTransferStatus: { textContent: '' } };
+    const calls = [];
+    const post = async (_path, payload) => {
+      calls.push({ ...payload });
+      return payload.accept_directory_copy_risk ? { success: true } : { success: false, directory_copy_risk: true, error: 'Confirmation required' };
+    };
+    const run = new Function('$', 'remoteTransferState', 'apiPost', 't', 'errorMessage', 'closeModal', 'toast', 'switchTab', 'refreshQueue', 'confirm', `${source}; return runRemoteTransfer;`)(
+      id => values[id], { tab: 8, names: ['tree'] }, post, s => s, s => s, () => {}, () => {}, () => {}, () => {}, () => accepted);
+    await run(false);
+    assert.equal(calls.length, accepted ? 2 : 1);
+    if (accepted) assert.equal(calls[1].accept_directory_copy_risk, true);
+  }
 });

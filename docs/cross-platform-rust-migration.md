@@ -1,3 +1,5 @@
+> **Historical:** This report predates the native GUI-only distribution. CLI, automation, and browser-server claims and test instructions below no longer describe shipped functionality.
+
 # Cross-Platform Pure-Rust & Tauri v2 Migration Specification
 
 ## 1. Purpose and Architectural Goals

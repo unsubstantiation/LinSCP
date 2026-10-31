@@ -1,8 +1,10 @@
 # Remaining parity implementation plan
 
+> **Historical:** This plan predates the native GUI-only conversion; removed CLI interfaces are not planned for restoration.
+
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-3 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+7 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -18,6 +20,54 @@ Authenticated SSH jump-host connections work for SFTP/SCP/SSH and for FTP/FTPS/W
 
 - [ ] Run the isolated-realm GSSAPI cases in CI with a GSSAPI-enabled libssh and no skipped cases; cover principal selection, missing/expired credentials, service mutual authentication, default-off delegation and opt-in TGT delegation.
 - [ ] Obtain an independent security review of delegated TGT handling and validate cross-realm/production-KDC behavior before claiming general Kerberos parity.
+
+## automation.command-interpreter
+
+**Area:** Automation · **Status:** missing
+
+The CLI and its external automation interfaces were removed in the GUI-only conversion.
+
+**Next:** This interface is not part of the GUI-only distribution.
+
+**Acceptance criteria:**
+
+- [ ] No restoration is planned for the GUI-only distribution.
+
+## automation.literal-gui-command
+
+**Area:** Automation · **Status:** missing
+
+The CLI and its external automation interfaces were removed in the GUI-only conversion.
+
+**Next:** This interface is not part of the GUI-only distribution.
+
+**Acceptance criteria:**
+
+- [ ] No restoration is planned for the GUI-only distribution.
+
+## automation.dotnet
+
+**Area:** Automation · **Status:** missing
+
+The CLI and its external automation interfaces were removed in the GUI-only conversion.
+
+**Next:** This interface is not part of the GUI-only distribution.
+
+**Acceptance criteria:**
+
+- [ ] No restoration is planned for the GUI-only distribution.
+
+## automation.powershell
+
+**Area:** Automation · **Status:** missing
+
+The CLI and its external automation interfaces were removed in the GUI-only conversion.
+
+**Next:** This interface is not part of the GUI-only distribution.
+
+**Acceptance criteria:**
+
+- [ ] No restoration is planned for the GUI-only distribution.
 
 ## locale.translations
 

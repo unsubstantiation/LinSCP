@@ -6,6 +6,7 @@ export class TransportError extends Error {
   public readonly status: number;
   public readonly loginRequired: boolean;
   public readonly hostKeyChallenge?: HostKeyChallenge;
+  public readonly payload?: Record<string, unknown>;
 
   public constructor(
     message: string,
@@ -13,6 +14,7 @@ export class TransportError extends Error {
     options?: {
       loginRequired?: boolean;
       hostKeyChallenge?: HostKeyChallenge;
+      payload?: Record<string, unknown>;
     },
   ) {
     super(message);
@@ -20,6 +22,7 @@ export class TransportError extends Error {
     this.status = status;
     this.loginRequired = Boolean(options?.loginRequired);
     this.hostKeyChallenge = options?.hostKeyChallenge;
+    this.payload = options?.payload;
   }
 }
 

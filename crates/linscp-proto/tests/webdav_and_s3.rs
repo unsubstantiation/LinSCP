@@ -249,8 +249,10 @@ async fn handle_mock_dav(
                 if let Some(off_str) = range.strip_prefix("bytes=").and_then(|s| s.strip_suffix('-'))
                 {
                     if let Ok(off) = off_str.parse::<usize>() {
-                        let slice = res.data[off.min(res.data.len())..].to_vec();
-                        return (StatusCode::PARTIAL_CONTENT, slice).into_response();
+                        if off >= res.data.len() { return StatusCode::RANGE_NOT_SATISFIABLE.into_response(); }
+                        let slice = res.data[off..].to_vec();
+                        let content_range = format!("bytes {}-{}/{}", off, res.data.len() - 1, res.data.len());
+                        return (StatusCode::PARTIAL_CONTENT, [("content-range", content_range)], slice).into_response();
                     }
                 }
             }

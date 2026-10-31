@@ -10,7 +10,11 @@ jobs:
     name: Debian package (.deb)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
 
       - name: Install the Rust toolchain and packaging dependencies
         run: |
@@ -21,9 +25,48 @@ jobs:
           # $HOME/.cargo/bin is prepended to PATH so rustup's cargo runs
           # the build in debian/rules.
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            build-essential dpkg-dev pkg-config curl cargo rustc
+            build-essential dpkg-dev pkg-config curl cargo rustc nodejs npm \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev xvfb xdotool xauth openbox x11-utils python3-paramiko python3-pyftpdlib python3-openssl
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check GUI distribution configuration
+        run: python3 -m unittest discover -s tools/tests -p test_gui_distribution.py
+
+      - name: Exercise atomic local moves
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service local_moves_are_atomic_no_replace -- --nocapture
+
+      - name: Exercise native SFTP host-key verification and transfers
+        env:
+          LSCP_LIVE_SFTP: "1"
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_sftp_connection_hostkey_upload_download -- --nocapture
+
+      - name: Exercise native WebDAV connection and transfers
+        env:
+          LSCP_LIVE_WEBDAV: "1"
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_webdav_gui_upload_download -- --nocapture
+
+      - name: Exercise native FTP connection and download
+        env:
+          LSCP_LIVE_FTP: "1"
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ftp_gui_download -- --nocapture
+
+      - name: Exercise native explicit FTPS connection and download
+        env:
+          LSCP_LIVE_FTPES: "1"
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ftpes_gui_download -- --nocapture
+
+      - name: Exercise implicit FTPS upload
+        env:
+          LSCP_LIVE_FTPS_IMPLICIT: "1"
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ftps_implicit_gui_upload -- --nocapture
+
+      - name: Exercise native S3 TLS connection and download
+        env:
+          LSCP_LIVE_S3: "1"
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_s3_gui_download -- --nocapture
 
       - name: Build the binary package
         run: python3 tools/run_cargo_ci.py dpkg-buildpackage -b -us -uc
@@ -34,12 +77,10 @@ jobs:
           echo "Built $deb"
           dpkg-deb --contents "$deb"
           contents=$(dpkg-deb --contents "$deb" | awk '{print $NF}' | sed 's|^\./||' | sort)
-          for path in usr/bin/linscp usr/bin/linscp-gui \
-                      usr/share/linscp/automation/LinSCP.psm1 \
+          for path in usr/bin/linscp-gui \
                       usr/share/applications/linscp.desktop \
                       usr/share/pixmaps/linscp.png \
-                      usr/share/icons/hicolor/scalable/apps/linscp.svg \
-                      usr/share/man/man1/linscp.1.gz; do
+                      usr/share/icons/hicolor/scalable/apps/linscp.svg; do
             echo "$contents" | grep -qx "$path" ||
               { echo "::error::$path is missing from the package"; exit 1; }
           done
@@ -49,12 +90,44 @@ jobs:
       - name: Install and smoke test the package
         run: |
           sudo dpkg -i ../linscp_*_*.deb
-          linscp -version
-          linscp -batch -command="echo ok; exit"
           test -x /usr/bin/linscp-gui
 
+      - name: Smoke test the native window
+        run: |
+          if xvfb-run -a bash -euo pipefail -c '
+            export WEBKIT_DISABLE_COMPOSITING_MODE=1
+            openbox >/dev/null 2>&1 &
+            wm=$!
+            linscp-gui &
+            app=$!
+            trap "kill $app $wm 2>/dev/null || true" EXIT
+            for i in $(seq 1 120); do
+              if ! kill -0 "$app" 2>/dev/null; then
+                wait "$app" || true
+                echo "Application exited before opening a window" >&2
+                exit 1
+              fi
+              if xdotool search --onlyvisible --name "^LinSCP" >/dev/null 2>&1; then
+                echo "LinSCP window opened"
+                exit 0
+              fi
+              sleep 1
+            done
+            echo "The LinSCP window did not open within 120 seconds" >&2
+            xdotool search --name ".*" getwindowname %@ || true
+            for id in $(xdotool search --name "LinSCP" || true); do xwininfo -id "$id" || true; done
+            ps -ef | grep -E "[l]inscp-gui|[W]ebKit|[b]wrap" || true
+            exit 1
+          ' > native-smoke.log 2>&1; then
+            cat native-smoke.log
+          else
+            cat native-smoke.log
+            python3 -c 'from pathlib import Path; t=Path("native-smoke.log").read_text().replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"); print("::error title=Native window smoke test::" + t[-3000:])'
+            exit 1
+          fi
+
       - name: Upload the Debian package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linscp-debian
           path: linscp_*_*.deb

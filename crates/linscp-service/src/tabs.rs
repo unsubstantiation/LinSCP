@@ -84,6 +84,7 @@ impl TabRuntime {
     pub fn describe(&self) -> Value {
         let mut redacted = self.session_json.clone();
         if let Some(obj) = redacted.as_object_mut() {
+            for key in ["s3_secret_key", "s3_session_token", "proxy_password", "passphrase", "key_passphrase"] { obj.remove(key); }
             obj.remove("password");
             obj.remove("tunnel_password");
             obj.remove("tunnel_passphrase");
@@ -213,6 +214,7 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
         json!(site.tunnel.hostkey.clone()),
     );
     for (k, v) in &site.extra_fields {
+        if matches!(k.as_str(), "s3_secret_key" | "s3_session_token" | "proxy_password" | "passphrase" | "tunnel_passphrase") { continue; }
         obj.entry(k.clone()).or_insert_with(|| json!(v));
     }
     Value::Object(obj)
@@ -591,6 +593,31 @@ pub fn parse_gui_session_spec(
             }
         }
     }
+    if protocol == ProtocolScheme::S3 {
+        if let Some(access) = spec.raw_fields.remove("s3_access_key") {
+            if spec.session.username.is_empty() { spec.session.username = access; }
+        }
+        if let Some(secret) = spec.raw_fields.remove("s3_secret_key") {
+            if spec.session.password.is_none() && !secret.is_empty() { spec.session.password = Some(secret); }
+        }
+    }
+    // Translate GUI TLS option names to the names consumed by the engine.
+    for (gui, engine) in [
+        ("tls_ca_file", "ca_certificate_file"),
+        ("tls_cert_file", "tls_certificate_file"),
+        ("tls_key_file", "tls_certificate_key_file"),
+        ("tls_min_version", "min_tls_version"),
+        ("tls_max_version", "max_tls_version"),
+    ] {
+        if let Some(value) = spec.raw_fields.remove(gui) {
+            spec.raw_fields.insert(engine.to_string(), value);
+        }
+    }
+    if let Some(value) = spec.raw_fields.remove("tls_verify") {
+        if !matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "") {
+            return Err("Disabling TLS certificate verification is not supported.".to_string());
+        }
+    }
     // proxy fields remain in raw_fields; no direct spec fields to set
 
     apply_env_credential_fallbacks(&mut spec);
@@ -603,14 +630,15 @@ pub fn parse_gui_session_spec(
         obj.insert("protocol".into(), json!(protocol.as_str()));
         obj.insert("host".into(), json!(host));
         obj.insert("port".into(), json!(port));
-        obj.insert("username".into(), json!(username));
-        obj.insert("user".into(), json!(username));
+        obj.insert("username".into(), json!(spec.session.username));
+        obj.insert("user".into(), json!(spec.session.username));
         obj.insert(
             "has_password".into(),
             json!(spec.session.password.as_ref().is_some_and(|p| !p.is_empty())),
         );
         obj.insert("remote_dir".into(), json!(initial_dir));
         obj.insert("local_dir".into(), json!(local_dir));
+        for key in ["s3_secret_key", "s3_session_token", "proxy_password", "passphrase", "key_passphrase"] { obj.remove(key); }
         obj.remove("password");
         obj.remove("tunnel_password");
         obj.remove("tunnel_passphrase");

@@ -1,231 +1,112 @@
-<p align="center">
-  <img src="logo/linscp-mark.png" alt="LinSCP logo" width="160" height="160" />
-</p>
-
-<img src="pic.jpg" />
+<p align="center"><img src="logo/linscp-mark.png" alt="LinSCP logo" width="160" /></p>
 
 # LinSCP
 
-LinSCP is a noncommercial file transfer client for Debian GNU/Linux. It has
-a command-line client with an upstream-compatible scripting language, and a
-browser-based dual-pane Commander (`linscp-gui`).
+LinSCP is a noncommercial graphical file-transfer client. Its Commander UI
+runs in a native Tauri window backed by the Rust transfer engine. No separate
+command-line client or browser server is built or distributed. **The native GUI
+is experimental and is not ready for production transfers.** Remote listing
+and queued file uploads and downloads are implemented. SFTP and plain HTTP
+WebDAV connections and transfers have live integration tests; FTP, explicit FTPS
+and implicit FTPS staged uploads, plus FTP/explicit FTPS downloads and S3 small-file
+transfers, also have live tests. SFTP directories can be copied to new destinations or
+merged into explicitly approved existing directories. Merges fail rather than
+replace conflicting files and are not transactional; concurrent directory path
+changes can still affect them. Other directory merges are unsupported. WebDAV files can be moved to a new local
+name using conditional GET and DELETE with the original strong ETag; this relies
+on server enforcement and can leave a duplicate if deletion cannot be confirmed.
+WebDAV files and directories can also be renamed or queued for a move to
+another directory in the same session using a strong source ETag and no-replace
+MOVE, relying on server enforcement. A directory ETag may not cover its entire
+subtree, so moving directories requires acknowledgement that concurrent changes
+may be included. Queued moves can be cancelled before they start, not during the
+MOVE request; a lost or ambiguous response means the item may already have moved.
+WebDAV files can also be moved to a connected WebDAV, SFTP or S3 session, with
+explicit confirmation: an ETag-pinned download is followed by an exclusive
+upload and conditional source deletion. Cross-server moves are not transactional;
+errors or cancellation can leave a duplicate or partial destination, and source
+deletion may be unconfirmed. S3 destinations are limited to 1 GiB per file.
+WebDAV files can also be copied to a new name in the same session or to a connected WebDAV, SFTP or S3 session via a temporary local download and exclusive upload. Copies can leave partial remote destinations on failure or cancellation. SFTP file copies to WebDAV, SFTP or S3, and directory copies from SFTP or WebDAV to a new SFTP directory, use local staging and require risk confirmation: Neither directory copy is a tree-wide snapshot: SFTP cannot pin source versions, WebDAV pins each file but collection ETags may not cover descendants, and concurrent source or destination path changes can affect the result. Directory copies do not merge and may leave partial remote trees after interruption. Cross-server directory moves and other source protocols remain unsupported.
+Local moves are supported on the same filesystem on Linux
+and Windows, without replacing existing destinations. WebDAV file downloads can
+resume from a `.filepart` after comparing its entire prefix with the ETag-pinned
+remote file; verification retransfers that prefix. Existing partials are never
+removed or modified. A network failure may save a new partial for retry; other
+resumption modes are unsupported.
+Running local copies, SFTP and WebDAV transfers, FTP/FTPS transfers, and S3 transfers
+can be cancelled cooperatively. An interrupted FTP/FTPS transfer invalidates its
+control connection; reconnect before further transfers. Fresh queued file downloads use owned temporary files
+that are removed on cancellation or failure on a best-effort basis; cleanup can
+fail. New SFTP directory downloads are staged as a tree and published without
+replacement on Linux and Windows; their cleanup is best-effort. SFTP download
+merges are also staged before publication; cancellation during download leaves the
+existing tree untouched, but publication is not transactional. Uploads and
+published merges may leave partial files or directories. For new WebDAV uploads,
+servers supporting conditional lock-null resources can use a randomly named locked
+stage: on failure the app attempts deletion only while its lock token is still valid,
+then releases the lock. This relies on server lock and precondition enforcement;
+cleanup or lock acquisition can be unconfirmed, and a temporary resource may remain.
+When locking is unsupported, uploads fall back to direct exclusive or conditional
+PUT, which can leave partial remote files. Approved overwrites on lock-capable
+servers use tagged source-lock and destination-ETag conditions on MOVE; both
+conditions depend on server enforcement.
+Without overwrite approval, local copies and downloads use no-replace publication,
+and SFTP, WebDAV and S3 uploads use exclusive creation. S3 exclusive uploads are
+limited to 1 GiB. FTP/FTPS file uploads are available only after explicitly
+accepting a destination-race warning: a server-created STOU temporary file is
+renamed to the target, and the server may overwrite a destination created or
+changed after the last check. Existing targets also require overwrite approval.
+Servers must support STOU with an RFC 1123 FILE response; an interruption or
+failed rename may leave a temporary file that must be inspected and removed
+manually. Never use this mode if no-clobber guarantees are required.
+Queued WebDAV and S3 file overwrites require a strong ETag and use conditional
+PUT or conditional multipart completion, relying on server enforcement; S3 conditional uploads are limited to 1 GiB. S3 uploads over 16 MiB use a fresh multipart upload ID and attempt to abort that ID on failure or cancellation without deleting the destination pathname. Abort can fail or initiation can be unconfirmed, leaving an unfinished multipart upload; a lost completion response can mean the destination exists. Configure an S3 lifecycle rule to remove abandoned multipart uploads.
+An ETag is not necessarily a unique version: changes that retain the same ETag
+may not be detected. Other queued overwrites are rejected until they can be made
+safe. Other protocols and configurations require further verification.
+Unsupported operations return an error rather than reporting success.
 
-LinSCP implements a subset of the upstream feature set. It does **not**
-provide full upstream parity: see [Protocols](#protocols) and the
-[parity audit](docs/upstream-parity.md). The inventory tracks upstream master
-as of 2026-10-26; command registrations are current, but two capability gaps
-remain.
+## Build the desktop application
 
-## Requirements
+Install Rust 1.89 or newer, Node.js 22 and npm. On Linux also install the
+Tauri system dependencies (on Debian: `pkg-config libwebkit2gtk-4.1-dev
+libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev`). On Windows, install
+the MSVC build tools and WebView2 runtime.
 
-- Debian 13 (trixie) or newer, with Rust 1.89+ (`cargo`, `rustc`) and `pkg-config`.
-  No C/C++ cross-compilation is required for the pure-Rust workspace.
-- `xdg-utils` (recommended), so `linscp-gui --open-browser` can ask the desktop
-  for a browser window on Wayland as well as under X11.
-- Node 22 or newer with `npm`, for the TypeScript UI build (`ui/`) and its tests.
-- Python 3, for the live regression suites (the test harnesses drive `target/release/linscp`).
-
-```sh
-sudo apt install dpkg-dev pkg-config cargo rustc xdg-utils python3 nodejs npm
-# or: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-LinSCP builds pure-Rust on Linux, Windows (`x86_64-pc-windows-msvc`) and Android
-(`aarch64-linux-android` via `cargo ndk`). The `debian/rules` and `CMakeLists.txt`
-wrappers now delegate to `cargo`.
-
-## Building and testing
-
-Pure-Rust (primary):
-
-```sh
-cargo build --release --workspace      # -> target/release/linscp + linscp-gui
-cargo test --workspace --all-targets   # Rust unit + integration tests
-cargo run -p linscp-cli --release -- -help
-```
-
-The live suites are Python harnesses that drive `target/release/linscp`
-(the same binary CI uses on `ubuntu-24.04` and `windows-latest`):
-
-```sh
-python3 source/linux/tests/ScriptTest.py target/release/linscp
-python3 source/linux/tests/LiveSftpTest.py target/release/linscp
-# ... LiveTunnel/S3/Dav/Scp/Curl, plus gui suites via linscp --serve-http
-```
-
-The UI is TypeScript:
-
-```sh
-npm --prefix ui install
-npm --prefix ui run build   # -> ui/dist (embedded in linscp-http)
-npm --prefix ui test
-```
-
-Legacy wrappers remain for compatibility: `make -C source/linux` and
-`cmake -S . -B build && cmake --build build` now delegate to `cargo`
-and exist only for CI parity and Debian `cmake --install` expectations.
-
-The live suites use optional Python packages: `paramiko` (SFTP),
-`botocore` (S3 signature reference), `xmlschema` (XML log schema
-validation), and `pyftpdlib` with `pyOpenSSL`
-(FTP/FTPS). The GSSAPI cases in the SFTP suite need `krb5-kdc`,
-`krb5-admin-server`, `krb5-user`, `openssh-server` and a GSSAPI-enabled libssh;
-they start an isolated KDC and `sshd` bound to loopback. The SCP suite also
-needs `openssh-server`; it starts its own `sshd` on a free port. A suite that
-skips a case says so on its evidence line.
-
-The GUI suites (`source/gui/tests/` + `ui/tests/`) run separately, as in CI.
-`ui/tests/TransportAndPlatform.test.mjs` exercises the dual-mode
-`HttpTransport`/`TauriTransport` and the Windows drive selector / Android
-mobile UX. `SecurityTest.py` drives the `linscp-http` server itself, with no
-browser: tokens, sign-in, the absence of CORS permission, response headers,
-command quoting, and the confinement of every local path to its pane.
-
-`cargo test` also runs `tools/check_platform_conversion.py` (now
-`tools/check_repo_hygiene.py` scope: it forbids Windows/Android `cfg`
-outside `crates/linscp-platform`/`linscp-tauri` and keeps brand/wayland checks).
-A second check guards Wayland: `tools/check_wayland_compatibility.py`
-refuses a display-server test that reads `DISPLAY` without `WAYLAND_DISPLAY`,
-etc. Both run in CI. For the Debian package:
+From the repository root:
 
 ```sh
-dpkg-buildpackage -b -us -uc         # -> ../linscp_1.0-5_<arch>.deb
+npm --prefix ui ci
+npm --prefix ui run build
+cargo build --release -p linscp-tauri --features native-shell
 ```
 
-## Usage
+Run `target/release/linscp-gui` on Linux or
+`target/release/linscp-gui.exe` on Windows. The frontend is embedded in the
+executable; the system WebView and its platform dependencies are still
+required. User settings are stored in the normal platform configuration
+directory, not alongside the executable. Windows CI uploads the executable
+as a portable, uninstalled application.
 
-```sh
-linscp -batch -script=script.txt
-linscp -batch -command="open sftp://user@example.com/; cd /data; get *.csv /tmp"
-linscp-gui                         # browser Commander on 127.0.0.1:8080
-linscp-gui --open-browser          # ... and ask the desktop to show it
-```
+Run `cargo test --workspace --all-targets` and `npm --prefix ui test` for the
+Rust and frontend tests. CMake and `source/linux/Makefile` are convenience
+wrappers around the same desktop build.
 
-Run `linscp -help` for the options and `man linscp` for the full reference.
+## Debian package
 
-## Protocols
+Install the build dependencies listed in `debian/control`, then run
+`dpkg-buildpackage -b -us -uc`. The package installs the native GUI and its
+desktop entry; see [docs/debian.md](docs/debian.md).
 
-| URL | Served by | Notes |
-| --- | --- | --- |
-| `sftp://` | pure-Rust `russh` + `russh-sftp` (copy-data / check-file-name extensions) | full command set |
-| `scp://`, `ssh://` | pure-Rust `russh` SSH: the server's shell for directory work, rcp for bytes | no resume; the protocol has no offset |
-| `ftp://` | pure-Rust `suppaftp` + native Unix/DOS/VMS LIST + MLSD parser | |
-| `ftps://` | `suppaftp` (async-rustls), implicit TLS | |
-| `ftpes://` | `suppaftp` (async-rustls), explicit TLS on FTP (same session as `ftp://` with `Ftps=2` or `3`) | |
-| `dav://`, `webdav://` | pure-Rust `reqwest` + `rustls` (WebPki, SPKI pin, Min/MaxTlsVersion), PROPFIND/MOVE/COPY/locks/dead props/ETag | |
-| `s3://` | pure-Rust `reqwest` + `rustls`, SigV4 signing, multipart, versioning | partial |
-| `rdp://` | `xfreerdp`/`xfreerdp3`/`wlfreerdp` (Linux), `mstsc.exe` (Windows), `aRDP`/`aFreeRDP` (Android), fallback `ironrdp` WASM gateway | optional viewer |
-| `vnc://` | `vncviewer`/`tigervnc`/`remmina` (Linux), `vncviewer.exe` (Windows), `androidVNC` | 5900-range |
-| `spice://` | `remote-viewer`/`virt-viewer`/`spicy` (virt-viewer, QEMU/KVM), `.vv` virt-viewer files | |
-| `x2go://` | `x2goclient`/`pyhoca-cli`, `nxproxy` — SSH (22) with NX compression, reuses jump-host tunnel | |
-| `x11://` | `waypipe ssh` (Wayland, preferred) or `ssh -X`/`-Y` (X11) — detected via `WAYLAND_DISPLAY`/`XDG_SESSION_TYPE`/`DISPLAY` | headless prints `DESKTOP_TICKET` |
+## Android
 
-Host keys are verified. `-hostkey=` takes a SHA-256 or MD5 fingerprint. An
-unknown key in a run that cannot prompt is refused, and the key is printed so
-it can be pinned.
+The Android Gradle project is an experimental WebView scaffold, not a complete
+native Tauri application. Its debug APK should not be treated as a functioning
+release of the desktop client.
 
-## Features
+## Historical material
 
-- **Transfers:** binary, ASCII and automatic modes; LinSCP file masks; recursive
-  `get` and `put`; resume through `.filepart` staging; `-append` (SFTP only);
-  `-speed=` limits; `-preservetime`; transfer presets.
-- **Synchronization:** `synchronize` in one or both directions, and
-  `keepuptodate`, which watches the local tree with inotify.
-- **SSH keys:** native PPK v2/v3 parsing for authentication and `copyid`,
-  including encrypted keys (Argon2 for encrypted v3), plus
-  `linscp -convertkey=input.ppk -output=output.pem` for a validated PEM copy;
-  encrypted inputs stay encrypted with the same passphrase.
-- **Remote operations:** `chmod` (octal and symbolic), `cp`, `mv`, `ln`,
-  `rm`, `mkdir`, `stat`, `checksum`, `edit`, `call`, and `copyid`.
-- **Scripting:** unambiguous command and option abbreviations, `%1%`..`%9%`
-  parameters, `%TIMESTAMP%` and environment expansion, `option batch` and
-  `option confirm`, and an XML action log (`-xmllog=`).
-- **Stored sessions:** shared between the CLI and the GUI, with folders,
-  encrypted passwords in `sessions.ini` (key in `sessions.key`), and proxy
-  settings through `-rawsettings`.
-- **SSH jump hosts:** independent jump/destination authentication and host-key
-  verification, encrypted saved jump credentials, GUI/queue/terminal support,
-  and fail-closed proxy/forwarding behavior. See [SSH tunnels](docs/ssh-tunnels.md)
-  for configuration and limits.
-- **Graphical client:** dual-pane layout, transfer queue with pause, retry and
-  priority reordering, transfer settings, sync preview, `keepuptodate`, remote
-  search, checksums, session bookmarks, a session URL, session import, cleanup
-  of stored data, a copy between two servers, properties with a rights editor,
-  preferences stored by the backend, saved command templates, multi-user
-  sign-in, local file editing and drag-and-drop in both panes. Sign-in does not
-  isolate users' tabs, files or commands: do not share one backend among
-  untrusted users.
-- **Localization:** English, Spanish, German and French, for the CLI and the GUI.
-- **Desktop sessions:** works on Wayland and on X11 alike. The clients draw no
-  window of their own; the terminal `terminal` opens is chosen among the ones
-  that can draw on this display server, and `--open-browser` asks the desktop's
-  own launcher (`xdg-open`, `$BROWSER`) for a browser window. No `xclip`,
-  `xdotool`, `wmctrl` or `xrandr`, which is what makes a Linux application
-  X11-only.
-- **Remote desktop:** `open rdp://host:3389`, `vnc://`, `spice://`, `x2go://` and `x11://` launch the platform viewer (xfreerdp/tigervnc/remote-viewer/x2goclient/waypipe or the Windows/macOS/Android equivalent) or, in headless HTTP mode, write a `.rdp`/`.vv` ticket file and return `DESKTOP_TICKET`/gateway JSON for the browser (embedded `ironrdp` WASM fallback). Shares proxy/SSH-jump/TLS/SPKI verification; XDMCP (UDP 177, unencrypted) is not recommended — use X2Go or `waypipe` over SSH instead. If you are already SSH-connected to the same host and the server package (xrdp, tigervnc, x2goserver, spice-vdagent, xauth) is not installed, LinSCP prompts that it is not available and offers to cancel or to install it via a compatible distro-detecting script (apt/dnf/yum/pacman/zypper, runs over that SSH session via `exec`; HTTP/Tauri: `POST /api/desktop/check` → `{prompt{cancel,install}, install_script}` and `POST /api/desktop/install`). `GET /api/desktop/install-script?kind=rdp` fetches the script for manual use.
-
-Full upstream parity is **not** implemented. Remaining gaps include complete
-compatibility with the upstream .NET object model, broader localization beyond
-English/Spanish/German/French, and an independent security review plus broader production-realm
-validation of GSSAPI. The live SFTP suite exercises GSSAPI against a throwaway
-Kerberos realm; this does not certify every KDC deployment. Local-to-local sessions with two
-local panes, named multi-tab workspaces, directory bookmarks, session import
-from OpenSSH/FileZilla and session-URL generation are implemented and covered
-by the `gui-local` and `gui` suites.
-The .NET-compatible assembly (`LinSCP.Session`, with an upstream compatibility
-namespace) covers session lifecycle, listing, transfers, synchronization,
-cancellation and structured errors; it is not every type of the upstream
-object model.
-`automation/LinSCP.psm1` is a PowerShell 7 CLI wrapper with static tests and
-optional live Pester tests, not the upstream .NET API. Optional account sign-in
-isolates users at the application layer; the backend still runs as one OS user.
-See the
-[remaining parity plan](docs/remaining-parity-plan.md) for scope and acceptance
-criteria; passing the inventory checker is not a full-parity certification.
-
-A small allowlist preserves upstream repository paths, XML/.NET identifiers,
-external documentation URLs, Windows-executable detection and the fork notice
-in NOTICE. These are interoperability or historical identifiers, not product
-branding.
-
-## Documentation
-
-- [`docs/debian.md`](docs/debian.md): options, commands, protocols,
-  authentication, packaging and troubleshooting.
-- [`docs/linscp.1`](docs/linscp.1): the manual page.
-- [`docs/upstream-parity.md`](docs/upstream-parity.md): the parity audit, its
-  evidence rules and how to maintain them.
-- [`docs/linux-feature-inventory.md`](docs/linux-feature-inventory.md) and
-  [`docs/remaining-parity-plan.md`](docs/remaining-parity-plan.md): generated
-  from `docs/upstream-parity.json`. Regenerate them with
-  `python3 tools/check_upstream_parity.py --write-report`.
-- [`docs/localization.md`](docs/localization.md): language selection and catalogues.
-
-## Repository layout
-
-```
-.github/       CI workflows (Build & test, Cross-Platform Rust & UI, Debian, Android)
-automation/    PowerShell 7 wrapper and .NET assembly, with their tests
-crates/        pure-Rust workspace: linscp-types, linscp-i18n, linscp-crypto,
-               linscp-platform (linux/windows/android), linscp-proto (SFTP/SCP/FTP/WebDAV/S3),
-               linscp-engine (transfers/sync/script), linscp-service (Commander),
-               linscp-http (axum browser mode), linscp-cli (linscp/linscp-gui), linscp-tauri
-locales/       unified translation catalogs (de, en, es, fr - single source for CLI+GUI)
-ui/            TypeScript + CSS Commander frontend (dual-mode: Tauri IPC + HTTP)
-debian/        Debian packaging (now cargo-based, wraps ui/dist embedding)
-docs/          documentation, manual page, schema and parity inventory
-fixtures/      XML action-log examples used by tests
-logo/          logo artwork
-source/        legacy C++ / Python reference (retained for regression-suite harnesses;
-               production code retired to crates/* in Phase 6; tests still drive
-               target/release/linscp via the same Python/Node suites)
-tools/         parity, translation, Wayland and hygiene checkers
-```
-
-## Licence
-
-LinSCP is distributed under the [PolyForm Noncommercial License
-1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0):
-noncommercial use only. This is not an open source licence. The full terms are
-in [`LICENSE`](LICENSE); the copyright line, the MIT notice for the
-third-party components and the artwork terms are in [`NOTICE`](NOTICE).
+Older parity reports, scripts and live-test harnesses in `docs/` and `source/`
+may describe the retired CLI and browser-server architecture. They are not
+current build or usage instructions, and CLI-dependent harnesses cannot be run
+against the native application.
