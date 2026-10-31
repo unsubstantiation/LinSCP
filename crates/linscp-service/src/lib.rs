@@ -3371,6 +3371,37 @@ mod tests {
         assert!(!downloaded.join("slow-tree").exists());
         assert!(!std::fs::read_dir(&downloaded).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-tree-")));
         assert_eq!(std::fs::metadata(remote.join("slow-tree/large.bin")).unwrap().len(), 4 * 1024 * 1024);
+        // Cancelling a merge during its download leaves the pre-existing
+        // target tree untouched; only its private stage is discarded.
+        std::fs::create_dir_all(remote.join("merge-slow")).unwrap();
+        std::fs::write(remote.join("merge-slow/large.bin"), vec![17u8; 4 * 1024 * 1024]).unwrap();
+        std::fs::create_dir_all(downloaded.join("merge-slow")).unwrap();
+        std::fs::write(downloaded.join("merge-slow/keep"), b"keep merged tree").unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["merge-slow"], "merge_directories": ["merge-slow"]}))).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut task_id = None;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(task) = tasks.get(idx) {
+                if task["status"] == "Running" && task["bytes_done"].as_u64().unwrap_or(0) > 0 { task_id = task["id"].as_u64(); break; }
+                assert_ne!(task["status"], "Completed", "merge finished before cancellation");
+                assert_ne!(task["status"], "Failed", "{tasks:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let cancel = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": task_id.expect("merge did not start")}))).await;
+        assert_eq!(cancel.status, 200);
+        let mut stopped = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Cancelled") { stopped = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped);
+        assert_eq!(std::fs::read(downloaded.join("merge-slow/keep")).unwrap(), b"keep merged tree");
+        assert!(!downloaded.join("merge-slow/large.bin").exists());
+        assert!(!std::fs::read_dir(&downloaded).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-tree-")));
         // A competing destination appearing during the copy must survive
         // atomic no-replace publication; the staged tree is then removed.
         let race_index = svc.queue.snapshot().0.len();

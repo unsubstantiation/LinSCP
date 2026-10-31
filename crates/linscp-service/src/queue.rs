@@ -129,6 +129,37 @@ fn safe_tree_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+// The staged tree is on the destination filesystem. Publication uses atomic
+// create-if-absent hard links; never delete entries already merged on failure,
+// since another actor may have replaced them in the meantime.
+fn merge_staged_local_tree(stage: &Path, target: &Path, cancel: &AtomicBool, depth: usize) -> Result<(), String> {
+    if depth > 64 { return Err("Directory nesting limit exceeded.".to_string()); }
+    if cancel.load(Ordering::SeqCst) { return Err("Transfer cancelled during merge publication.".to_string()); }
+    let target_meta = std::fs::symlink_metadata(target).map_err(|e| format!("Cannot inspect merge directory '{}': {e}", target.display()))?;
+    if !target_meta.is_dir() || target_meta.file_type().is_symlink() { return Err(format!("Merge destination '{}' is not a directory.", target.display())); }
+    for entry in std::fs::read_dir(stage).map_err(|e| format!("Cannot read staged tree: {e}"))? {
+        if cancel.load(Ordering::SeqCst) { return Err("Transfer cancelled during merge publication.".to_string()); }
+        let entry = entry.map_err(|e| format!("Cannot read staged entry: {e}"))?;
+        let name = entry.file_name();
+        let name_text = name.to_str().ok_or("Invalid staged entry name")?;
+        safe_tree_name(name_text)?;
+        let src = entry.path(); let dst = target.join(&name);
+        let meta = std::fs::symlink_metadata(&src).map_err(|e| format!("Cannot inspect staged entry: {e}"))?;
+        if meta.file_type().is_symlink() { return Err("Refusing a staged symlink.".to_string()); }
+        if meta.is_dir() {
+            match std::fs::create_dir(&dst) {
+                Ok(()) => {},
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+                Err(error) => return Err(format!("Cannot create merge directory '{}': {error}", dst.display())),
+            }
+            merge_staged_local_tree(&src, &dst, cancel, depth + 1)?;
+        } else if meta.is_file() {
+            std::fs::hard_link(&src, &dst).map_err(|e| format!("Cannot publish merge file '{}': {e}", dst.display()))?;
+        } else { return Err("Refusing a staged non-file.".to_string()); }
+    }
+    Ok(())
+}
+
 async fn download_new_sftp_tree(
     session: &dyn RemoteSession, remote: &str, local: &Path,
     flags: &TransferFlags, logger: &mut SessionLogger, progress: Option<&ProgressCallback>, depth: usize,
@@ -605,7 +636,7 @@ impl QueueManager {
                     if cancelled && result.is_err() && !committed_move_failure {
                         t.status = "cancelled".to_string();
                         let reconnect = match &task.job { QueueJob::RemoteDownload { session, .. } | QueueJob::RemoteUpload { session, .. } => matches!(session.scheme(), ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes), _ => false };
-                        t.error = Some(if reconnect { format!("Cancelled by user. Reconnect the FTP session before further transfers. {}", result.as_ref().err().map(String::as_str).unwrap_or("A temporary file may remain.")) } else { "Cancelled by user.".to_string() });
+                        t.error = Some(if reconnect { format!("Cancelled by user. Reconnect the FTP session before further transfers. {}", result.as_ref().err().map(String::as_str).unwrap_or("A temporary file may remain.")) } else if matches!(&task.job, QueueJob::RemoteDownload { flags, .. } if flags.merge_directories) { "Cancelled by user. A merge that had begun publication may have left files in the destination.".to_string() } else { "Cancelled by user.".to_string() });
                         clean = true;
                     } else {
                         match result {
@@ -719,20 +750,18 @@ impl QueueManager {
                 if entry.is_dir {
                     if session.scheme() != ProtocolScheme::Sftp || *delete_source { return Err("Only SFTP directory copies are supported.".to_string()); }
                     f.no_clobber = true;
+                    // Stage both new trees and merges privately. Cancelling a
+                    // download before publication leaves an existing tree alone.
+                    let parent = local_dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+                    let stage = tempfile::Builder::new().prefix(".linscp-tree-").rand_bytes(16).tempdir_in(parent)
+                        .map_err(|e| format!("Cannot create temporary directory in '{}': {e}", parent.display()))?;
+                    let staged_tree = stage.path().join("contents");
+                    let mut stage_flags = f.clone(); stage_flags.merge_directories = false;
+                    download_new_sftp_tree(session.as_ref(), remote_path, &staged_tree, &stage_flags, &mut logger, Some(&*progress), 0).await?;
+                    if task.cancel_flag.load(Ordering::SeqCst) { return Err("Transfer cancelled before publication.".to_string()); }
                     if f.merge_directories {
-                        // Merges modify an existing tree: do not recursively
-                        // delete anything that might belong to another writer.
-                        download_new_sftp_tree(session.as_ref(), remote_path, local_dest, &f, &mut logger, Some(&*progress), 0).await?;
+                        merge_staged_local_tree(&staged_tree, local_dest, &task.cancel_flag, 0)?;
                     } else {
-                        // An owned private directory keeps an incomplete tree
-                        // away from its final name. It is removed on error or
-                        // cancellation, best effort, without touching the target.
-                        let parent = local_dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-                        let stage = tempfile::Builder::new().prefix(".linscp-tree-").rand_bytes(16).tempdir_in(parent)
-                            .map_err(|e| format!("Cannot create temporary directory in '{}': {e}", parent.display()))?;
-                        let staged_tree = stage.path().join("contents");
-                        download_new_sftp_tree(session.as_ref(), remote_path, &staged_tree, &f, &mut logger, Some(&*progress), 0).await?;
-                        if task.cancel_flag.load(Ordering::SeqCst) { return Err("Transfer cancelled before publication.".to_string()); }
                         linscp_platform::gui_os::rename_no_replace(&staged_tree, local_dest)
                             .map_err(|e| format!("Cannot publish downloaded directory '{}': {e}", local_dest.display()))?;
                     }
