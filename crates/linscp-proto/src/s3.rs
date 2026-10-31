@@ -1939,6 +1939,35 @@ mod cleanup_sampling_tests {
     use rand::{rngs::StdRng, SeedableRng};
 
     #[test]
+    fn journal_lock_released_after_process_termination() {
+        const CHILD_PATH: &str = "LSCP_TEST_JOURNAL_LOCK_CHILD";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let path = std::path::PathBuf::from(path);
+            let _locked = super::try_open_journal(&path).expect("child could not lock journal");
+            std::fs::write(path.with_extension("ready"), b"ready").unwrap();
+            loop { std::thread::sleep(std::time::Duration::from_secs(1)); }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upload-test.json");
+        std::fs::write(&path, b"record").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("s3::cleanup_sampling_tests::journal_lock_released_after_process_termination")
+            .env(CHILD_PATH, &path).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !path.with_extension("ready").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let ready = path.with_extension("ready").exists();
+        let locked = ready && super::try_open_journal(&path).is_none();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(ready, "child did not acquire the journal lock");
+        assert!(locked, "another process could open the active journal");
+        assert!(super::try_open_journal(&path).is_some(), "OS did not release the lock after process termination");
+    }
+
+    #[test]
     fn journal_rejects_hardlinks() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target");
