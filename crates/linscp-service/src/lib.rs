@@ -3984,6 +3984,38 @@ mod tests {
         assert!(stopped);
         assert!(!remote.join("copy-target/copy-cancel-tree").exists());
         assert_eq!(std::fs::metadata(remote.join("copy-cancel-tree/slow.bin")).unwrap().len(), 4 * 1024 * 1024);
+        // Cancellation after publication begins must not remove the remote
+        // pathname blindly: another actor could have replaced it.
+        std::fs::create_dir_all(remote.join("copy-publish-tree")).unwrap();
+        std::fs::write(remote.join("copy-publish-tree/slow.bin"), vec![41u8; 4 * 1024 * 1024]).unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let copied = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/copy-target", "names": ["copy-publish-tree"], "accept_sftp_copy_risk": true}))).await;
+        assert_eq!(copied.status, 200);
+        let target = remote.join("copy-target/copy-publish-tree/slow.bin");
+        let mut task_id = None;
+        for _ in 0..2000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(task) = tasks.get(idx) {
+                if task["status"] == "Running" && std::fs::metadata(&target).is_ok_and(|m| m.len() > 0) { task_id = task["id"].as_u64(); break; }
+                assert_ne!(task["status"], "Failed", "{task:?}");
+                assert_ne!(task["status"], "Completed", "tree uploaded before cancellation");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let cancelled = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": task_id.expect("tree publication did not start")}))).await;
+        assert_eq!(cancelled.status, 200);
+        let mut stopped = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Cancelled") {
+                assert!(tasks[idx]["error"].as_str().unwrap_or("").contains("remote destination"));
+                stopped = true; break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped);
+        assert!(std::fs::metadata(&target).unwrap().len() < 4 * 1024 * 1024);
+        assert_eq!(std::fs::metadata(remote.join("copy-publish-tree/slow.bin")).unwrap().len(), 4 * 1024 * 1024);
         std::fs::create_dir_all(remote.join("copy-shrinking-tree")).unwrap();
         let changing = remote.join("copy-shrinking-tree/large.bin");
         std::fs::write(&changing, vec![39u8; 4 * 1024 * 1024]).unwrap();
