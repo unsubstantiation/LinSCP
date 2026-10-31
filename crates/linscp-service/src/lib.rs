@@ -2638,6 +2638,18 @@ mod tests {
         assert!(session.dav_move_if_match("/rename-new.txt", "/rename-race.txt", &tag).await.is_err());
         assert!(session.stat("/rename-race.txt").await.unwrap().is_none());
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/rename-new.txt", Default::default()).await.unwrap(), b"changed");
+        // MOVE must not follow redirects to a different source or treat
+        // a multi-status response as an unambiguous success.
+        linscp_proto::upload_bytes(session.as_ref(), "/rename-redirect.txt", b"same bytes", Default::default()).await.unwrap();
+        linscp_proto::upload_bytes(session.as_ref(), "/rename-other.txt", b"same bytes", Default::default()).await.unwrap();
+        let redirect = svc.dispatch_async(request("/api/remote/rename", json!({"tab": id, "old_name": "rename-redirect.txt", "new_name": "rename-followed.txt"}))).await;
+        assert_ne!(redirect.status, 200);
+        assert!(session.stat("/rename-other.txt").await.unwrap().is_some());
+        assert!(session.stat("/rename-followed.txt").await.unwrap().is_none());
+        linscp_proto::upload_bytes(session.as_ref(), "/rename-multistatus.txt", b"multi", Default::default()).await.unwrap();
+        let multistatus = svc.dispatch_async(request("/api/remote/rename", json!({"tab": id, "old_name": "rename-multistatus.txt", "new_name": "rename-multi-result.txt"}))).await;
+        assert_ne!(multistatus.status, 200);
+        assert!(multistatus.payload["error"].as_str().unwrap_or("").contains("may have moved"));
         let invalid = svc.dispatch_async(request("/api/remote/rename", json!({"tab": id, "old_name": "rename-new.txt", "new_name": "../escape"}))).await;
         assert_eq!(invalid.status, 400);
         // A source changed after queueing fails conditional GET without a local publication.

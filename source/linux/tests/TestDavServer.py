@@ -767,6 +767,17 @@ class DavHandler(BaseHTTPRequestHandler):
     def do_MOVE(self):
         if not self.authorized():
             return
+        if self.local_path() == "/rename-redirect.txt":
+            self.send_response(307)
+            self.send_header("Location", "/rename-other.txt")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.local_path() == "/rename-multistatus.txt":
+            self.send_response(207)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         destination = self.headers.get("Destination", "")
         if not destination:
             self.send_error_text(400, "Destination required.")
