@@ -2903,9 +2903,14 @@ mod tests {
         let risk = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/archive", "names": ["tree-to-move"], "operation": "move"}))).await;
         assert_eq!(risk.status, 409);
         assert_eq!(risk.payload["directory_move_risk"], true);
+        svc.queue.pause();
         let idx = svc.queue.snapshot().0.len();
         let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/archive", "names": ["tree-to-move"], "operation": "move", "accept_directory_move_risk": true}))).await;
         assert_eq!(moved.status, 200, "{}", moved.payload);
+        // The collection's ETag does not track nested content: the explicitly
+        // acknowledged operation includes this concurrent descendant change.
+        linscp_proto::upload_bytes(session.as_ref(), "/tree-to-move/nested/data.txt", b"changed descendant", Default::default()).await.unwrap();
+        svc.queue.resume();
         let mut done = false;
         for _ in 0..500 {
             let (tasks, _) = svc.queue.snapshot();
@@ -2915,12 +2920,16 @@ mod tests {
         }
         assert!(done);
         assert!(session.stat("/tree-to-move").await.unwrap().is_none());
-        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/archive/tree-to-move/nested/data.txt", Default::default()).await.unwrap(), b"nested");
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/archive/tree-to-move/nested/data.txt", Default::default()).await.unwrap(), b"changed descendant");
         let risk = svc.dispatch_async(request("/api/remote/rename", json!({"tab": id, "old_name": "archive", "new_name": "renamed-archive"}))).await;
         assert_eq!(risk.status, 409);
         assert_eq!(risk.payload["directory_move_risk"], true);
         let bad = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/archive/tree-to-move", "names": ["archive"], "operation": "move", "accept_directory_move_risk": true}))).await;
         assert_eq!(bad.status, 400);
+        let renamed = svc.dispatch_async(request("/api/remote/rename", json!({"tab": id, "old_name": "archive", "new_name": "renamed-archive", "accept_directory_move_risk": true}))).await;
+        assert_eq!(renamed.status, 200, "{}", renamed.payload);
+        assert!(session.stat("/archive").await.unwrap().is_none());
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/renamed-archive/tree-to-move/nested/data.txt", Default::default()).await.unwrap(), b"changed descendant");
         // Same-session renames are conditional on the source ETag and never
         // replace a destination; failure after a lost response is ambiguous.
         linscp_proto::upload_bytes(session.as_ref(), "/rename-old.txt", b"rename content", Default::default()).await.unwrap();
