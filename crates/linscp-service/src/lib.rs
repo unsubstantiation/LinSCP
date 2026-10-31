@@ -3850,6 +3850,37 @@ mod tests {
         }
         assert!(failed);
         assert!(!remote.join("copy-target/copy-link-tree").exists());
+        // Repeat against an independent SFTP server/session, not merely two
+        // directories on one connection.
+        let remote2 = tmp.join("remote2");
+        std::fs::create_dir_all(&remote2).unwrap();
+        let child = Command::new("/usr/bin/python3").arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestSftpServer.py"))
+            .env("LSCP_TEST_PORT", "0").env("LSCP_TEST_ROOT", &remote2)
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut second = Server(child); let mut line = String::new();
+        BufReader::new(second.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let port2: u16 = line.trim().strip_prefix("READY ").expect("second SFTP server did not start").parse().unwrap();
+        let opened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "sftp", "host": "127.0.0.1", "port": port2, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
+        assert_eq!(opened.status, 409, "{}", opened.payload);
+        let target_id = opened.payload["challenge"]["tab"].as_u64().unwrap();
+        let key = opened.payload["challenge"]["fingerprint"].as_str().unwrap();
+        let verified = svc.dispatch_async(request("/api/tabs/verify", json!({"tab": target_id, "role": "destination", "fingerprint": key, "remember": false}))).await;
+        assert_eq!(verified.status, 200, "{}", verified.payload);
+        let idx = svc.queue.snapshot().0.len();
+        let copied = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{target_id}"), "directory": "/", "names": ["copy-tree"], "accept_sftp_copy_risk": true}))).await;
+        assert_eq!(copied.status, 200, "{}", copied.payload);
+        let mut done = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("cross-server SFTP tree copy failed: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done);
+        assert_eq!(std::fs::read(remote2.join("copy-tree/nested/data")).unwrap(), b"tree data");
+        assert!(remote2.join("copy-tree/nested/empty").is_dir());
+        assert_eq!(std::fs::read(remote.join("copy-tree/nested/data")).unwrap(), b"tree data");
+        drop(second);
         std::fs::create_dir_all(remote.join("copy-cancel-tree")).unwrap();
         std::fs::write(remote.join("copy-cancel-tree/slow.bin"), vec![37u8; 4 * 1024 * 1024]).unwrap();
         let idx = svc.queue.snapshot().0.len();
