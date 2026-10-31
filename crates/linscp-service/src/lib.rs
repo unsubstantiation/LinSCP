@@ -398,8 +398,8 @@ impl CommanderService {
                 }
             };
             let is_dir = source_entry.is_dir;
-            if (!same_tab || !move_item) && target_session.scheme() == linscp_types::ProtocolScheme::S3 && source_entry.size > 16 * 1024 * 1024 {
-                return api_error(400, "Remote transfers to S3 are limited to 16 MiB per file.");
+            if (!same_tab || !move_item) && target_session.scheme() == linscp_types::ProtocolScheme::S3 && source_entry.size > 1024 * 1024 * 1024 {
+                return api_error(400, "Remote transfers to S3 are limited to 1 GiB per file.");
             }
             if is_dir && (!same_tab || !move_item) && (move_item || !(source_is_sftp || source_is_dav) || target_session.scheme() != linscp_types::ProtocolScheme::Sftp) { return api_error(501, "Directory copies require an SFTP or WebDAV source and an SFTP destination; cross-server directory moves are unsupported."); }
             if is_dir && !move_item && source_is_dav && !body.get("accept_directory_copy_risk").and_then(Value::as_bool).unwrap_or(false) {
@@ -2294,9 +2294,42 @@ mod tests {
         }
         assert!(completed);
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/photos/upload.txt", Default::default()).await.unwrap(), b"S3 exclusive upload");
-        // Conditional multipart is unsupported: reject large replacements
-        // rather than silently falling back to an unconditional upload.
-        std::fs::OpenOptions::new().write(true).open(local.join("upload.txt")).unwrap().set_len(16 * 1024 * 1024 + 1).unwrap();
+        // Large conditional uploads use unique multipart upload IDs. A
+        // cancelled attempt must abort that ID without deleting an object.
+        let multipart_path = local.join("multipart.bin");
+        let multipart_bytes = vec![61u8; 17 * 1024 * 1024];
+        std::fs::write(&multipart_path, &multipart_bytes).unwrap();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let on_progress = Arc::clone(&cancel);
+        let stop = move |_: u64, _: u64| on_progress.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut multipart_flags = linscp_engine::transfer::TransferFlags::default();
+        multipart_flags.no_clobber = true;
+        multipart_flags.cancel_flag = Some(cancel);
+        let interrupted = linscp_engine::transfer::upload_single_file(session.as_ref(), &multipart_path, "/photos/multipart-cancel.bin", &multipart_flags, &mut logger, Some(&stop)).await;
+        assert!(interrupted.is_err(), "multipart cancellation unexpectedly succeeded");
+        assert!(interrupted.unwrap_err().contains("Multipart upload was aborted"));
+        assert!(session.stat("/photos/multipart-cancel.bin").await.unwrap().is_none());
+        assert!(multipart_path.exists());
+        // Successful no-replace completion publishes only after all parts.
+        multipart_flags.cancel_flag = None;
+        let complete = linscp_engine::transfer::upload_single_file(session.as_ref(), &multipart_path, "/photos/multipart-success.bin", &multipart_flags, &mut logger, None).await;
+        assert!(complete.is_ok(), "{complete:?}");
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/photos/multipart-success.bin", Default::default()).await.unwrap(), multipart_bytes);
+        // A competing object cannot be overwritten by conditional completion.
+        linscp_proto::upload_bytes(session.as_ref(), "/photos/multipart-conflict.bin", b"other actor", Default::default()).await.unwrap();
+        let conflict = linscp_engine::transfer::upload_single_file(session.as_ref(), &multipart_path, "/photos/multipart-conflict.bin", &multipart_flags, &mut logger, None).await;
+        assert!(conflict.is_err());
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/photos/multipart-conflict.bin", Default::default()).await.unwrap(), b"other actor");
+        let output = Command::new("curl").args(["--silent", "--show-error", "--insecure", &format!("https://127.0.0.1:{port}/__test__/state")]).output().unwrap();
+        assert!(output.status.success());
+        let state: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(state["active_uploads"], 0, "multipart upload IDs leaked: {state}");
+        let history = state["multipart_history"].as_array().unwrap();
+        assert!(history.iter().any(|e| e["action"] == "abort" && e["key"] == "multipart-cancel.bin"));
+        assert!(history.iter().any(|e| e["action"] == "abort" && e["key"] == "multipart-conflict.bin"));
+        assert!(history.iter().any(|e| e["action"] == "complete" && e["key"] == "multipart-success.bin"));
+        // Enforce the supported upper bound without an unconditional fallback.
+        std::fs::OpenOptions::new().write(true).open(local.join("upload.txt")).unwrap().set_len(1024 * 1024 * 1024 + 1).unwrap();
         let conflict = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"]}))).await;
         let large_index = svc.queue.snapshot().0.len();
         let large = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"], "overwrite": "overwrite", "conflict_versions": conflict.payload["conflict_versions"]}))).await;

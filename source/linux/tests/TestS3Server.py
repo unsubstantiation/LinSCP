@@ -405,7 +405,7 @@ class S3Handler(BaseHTTPRequestHandler):
             elif method == "POST" and "uploads" in params:
                 self.initiate_multipart(bucket, key, headers)
             elif method == "POST" and "uploadId" in params:
-                self.complete_multipart(params, body)
+                self.complete_multipart(params, headers, body)
             elif method == "DELETE" and "uploadId" in params:
                 self.abort_multipart(params)
             elif method == "DELETE":
@@ -908,7 +908,7 @@ class S3Handler(BaseHTTPRequestHandler):
         })
         self.send_bytes(200, b"", extra=(("ETag", etag),))
 
-    def complete_multipart(self, params, body):
+    def complete_multipart(self, params, headers, body):
         upload_id = params.get("uploadId", [""])[0]
         upload = STORE.uploads.get(upload_id)
         if upload is None:
@@ -950,7 +950,16 @@ class S3Handler(BaseHTTPRequestHandler):
                 "<Message>Embedded completion failure.</Message></Error>")
             return
         now = datetime.datetime.now(datetime.timezone.utc).timestamp()
-        STORE.put(upload["bucket"], upload["key"], data, now)
+        with STORE.write_lock:
+            current = STORE.get(upload["bucket"], upload["key"])
+            if headers.get("if-none-match", "").strip() == "*" and current is not None:
+                self.send_error_xml(412, "PreconditionFailed", "The object already exists.")
+                return
+            match = headers.get("if-match")
+            if match is not None and (current is None or match.strip() != '"%s"' % hashlib.sha256(current[0]).hexdigest()[:32]):
+                self.send_error_xml(412, "PreconditionFailed", "The object has changed.")
+                return
+            STORE.put(upload["bucket"], upload["key"], data, now)
         STORE.object_headers["%s/%s" % (upload["bucket"], upload["key"])] = (
             upload.get("headers", {})
         )

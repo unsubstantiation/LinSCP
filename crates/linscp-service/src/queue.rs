@@ -260,7 +260,7 @@ fn task_supports_cancellation(job: &QueueJob) -> bool {
             matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs | ProtocolScheme::S3 | ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes)
         }
         QueueJob::RemoteUpload { session, .. } => {
-            matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs)
+            matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs | ProtocolScheme::S3)
         }
         _ => false,
     }
