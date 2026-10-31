@@ -15,12 +15,19 @@ replace conflicting files and are not transactional; concurrent directory path
 changes can still affect them. Other directory merges are unsupported. WebDAV files can be moved to a new local
 name using conditional GET and DELETE with the original strong ETag; this relies
 on server enforcement and can leave a duplicate if deletion cannot be confirmed.
-WebDAV files can also be renamed or queued for a move to another directory in
-the same session using a strong source ETag and no-replace MOVE, relying on
-server enforcement. Queued moves can be cancelled before they start, not while
-a MOVE request is in flight. If its
-response is lost or ambiguous, the item may already have moved. WebDAV directory
-renames and other remote moves are unsupported. Local moves are supported on the same filesystem on Linux
+WebDAV files and directories can also be renamed or queued for a move to
+another directory in the same session using a strong source ETag and no-replace
+MOVE, relying on server enforcement. A directory ETag may not cover its entire
+subtree, so moving directories requires acknowledgement that concurrent changes
+may be included. Queued moves can be cancelled before they start, not during the
+MOVE request; a lost or ambiguous response means the item may already have moved.
+WebDAV files can also be moved to a connected WebDAV, SFTP or S3 session, with
+explicit confirmation: an ETag-pinned download is followed by an exclusive
+upload and conditional source deletion. Cross-server moves are not transactional;
+errors or cancellation can leave a duplicate or partial destination, and source
+deletion may be unconfirmed. S3 destinations are limited to 16 MiB per file.
+Cross-server directory moves and other remote move combinations are unsupported.
+Local moves are supported on the same filesystem on Linux
 and Windows, without replacing existing destinations. WebDAV file downloads can
 resume from a `.filepart` after comparing its entire prefix with the ETag-pinned
 remote file; verification retransfers that prefix. Existing partials are never
@@ -31,8 +38,10 @@ can be cancelled cooperatively. An interrupted FTP/FTPS transfer invalidates its
 control connection; reconnect before further transfers. Fresh queued file downloads use owned temporary files
 that are removed on cancellation or failure on a best-effort basis; cleanup can
 fail. New SFTP directory downloads are staged as a tree and published without
-replacement on Linux and Windows; their cleanup is best-effort. Uploads and merges
-may leave partial files or directories.
+replacement on Linux and Windows; their cleanup is best-effort. SFTP download
+merges are also staged before publication; cancellation during download leaves the
+existing tree untouched, but publication is not transactional. Uploads and
+published merges may leave partial files or directories.
 Without overwrite approval, local copies and downloads use no-replace publication,
 and SFTP, WebDAV and S3 uploads use exclusive creation. S3 exclusive uploads are
 limited to 16 MiB. FTP/FTPS file uploads are available only after explicitly
