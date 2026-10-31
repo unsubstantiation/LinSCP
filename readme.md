@@ -46,8 +46,10 @@ servers supporting conditional lock-null resources can use a randomly named lock
 stage: on failure the app attempts deletion only while its lock token is still valid,
 then releases the lock. This relies on server lock and precondition enforcement;
 cleanup or lock acquisition can be unconfirmed, and a temporary resource may remain.
-When locking is unsupported, uploads fall back to direct exclusive PUT, which can
-leave partial remote files. Approved WebDAV overwrites still use direct conditional PUT.
+When locking is unsupported, uploads fall back to direct exclusive or conditional
+PUT, which can leave partial remote files. Approved overwrites on lock-capable
+servers use tagged source-lock and destination-ETag conditions on MOVE; both
+conditions depend on server enforcement.
 Without overwrite approval, local copies and downloads use no-replace publication,
 and SFTP, WebDAV and S3 uploads use exclusive creation. S3 exclusive uploads are
 limited to 1 GiB. FTP/FTPS file uploads are available only after explicitly
