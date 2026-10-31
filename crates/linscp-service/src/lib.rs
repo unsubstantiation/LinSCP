@@ -3594,6 +3594,32 @@ mod tests {
                 assert!(conflict.is_err());
                 assert!(!session.list_dir("/").await.unwrap().iter().any(|e| e.name.starts_with(".linscp-lock-")));
                 assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/lock-success.bin", Default::default()).await.unwrap().len(), 512 * 1024);
+                // Approved overwrite publishes only if the destination's
+                // original ETag still matches at the MOVE itself.
+                linscp_proto::upload_bytes(session.as_ref(), "/lock-overwrite-race.bin", b"approved original", Default::default()).await.unwrap();
+                let old = session.dav_get_etag("/lock-overwrite-race.bin").await.unwrap().0.unwrap();
+                let mut overwrite = linscp_engine::transfer::TransferFlags::default();
+                overwrite.overwrite_etag = Some(old);
+                let raced = linscp_engine::transfer::upload_single_file(session.as_ref(), &input, "/lock-overwrite-race.bin", &overwrite, &mut logger, None).await;
+                assert!(raced.is_err(), "changed destination was replaced");
+                assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/lock-overwrite-race.bin", Default::default()).await.unwrap(), b"changed before MOVE");
+                assert!(!session.list_dir("/").await.unwrap().iter().any(|e| e.name.starts_with(".linscp-lock-")));
+                linscp_proto::upload_bytes(session.as_ref(), "/lock-overwrite.bin", b"original", Default::default()).await.unwrap();
+                let tag = session.dav_get_etag("/lock-overwrite.bin").await.unwrap().0.unwrap();
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let set_cancel = Arc::clone(&cancel);
+                let progress = move |_: u64, _: u64| set_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                overwrite.overwrite_etag = Some(tag.clone());
+                overwrite.cancel_flag = Some(cancel);
+                let interrupted = linscp_engine::transfer::upload_single_file(session.as_ref(), &input, "/lock-overwrite.bin", &overwrite, &mut logger, Some(&progress)).await;
+                assert!(interrupted.is_err());
+                assert!(interrupted.unwrap_err().contains("Locked temporary resource removed"));
+                assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/lock-overwrite.bin", Default::default()).await.unwrap(), b"original");
+                overwrite.cancel_flag = None;
+                let completed = linscp_engine::transfer::upload_single_file(session.as_ref(), &input, "/lock-overwrite.bin", &overwrite, &mut logger, None).await;
+                assert!(completed.is_ok(), "{completed:?}");
+                assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/lock-overwrite.bin", Default::default()).await.unwrap().len(), 512 * 1024);
+                assert!(!session.list_dir("/").await.unwrap().iter().any(|e| e.name.starts_with(".linscp-lock-")));
                 for path in ["/lock-redirect.bin", "/lock-multistatus.bin"] {
                     let result = linscp_engine::transfer::upload_single_file(session.as_ref(), &input, path, &flags, &mut logger, None).await;
                     assert!(result.is_err(), "ambiguous MOVE reported success");

@@ -846,6 +846,27 @@ class DavHandler(BaseHTTPRequestHandler):
             if expected and expected != SERVER_STORE.etag_of(self.local_path()):
                 self.send_precondition_failed()
                 return
+            # Tagged If conditions on MOVE must both be evaluated under the
+            # same lock as publication: source lock token AND target ETag.
+            tagged = self.headers.get("If", "").strip()
+            if tagged.startswith("<") and "/.linscp-lock-" in self.local_path():
+                if dest == "/lock-overwrite-race.bin" and os.environ.get("LSCP_TEST_LOCK_STAGING") == "1":
+                    SERVER_STORE.add_file(dest, b"changed before MOVE")
+                groups = re.findall(r"<([^>]*)>\s*\(([^)]*)\)", tagged)
+                if len(groups) != 2:
+                    self.send_precondition_failed()
+                    return
+                src_url, src_cond = groups[0]
+                dst_url, dst_cond = groups[1]
+                src_path = urllib.parse.unquote(urllib.parse.urlsplit(src_url).path)
+                dst_path = urllib.parse.unquote(urllib.parse.urlsplit(dst_url).path)
+                lock = SERVER_STORE.lock_owner(self.local_path())
+                token = re.fullmatch(r"\s*<([^>]*)>\s*", src_cond)
+                tag = re.fullmatch(r"\s*\[(.*?)\]\s*", dst_cond)
+                if (src_path != self.local_path() or dst_path != dest or lock is None or token is None or tag is None or
+                        token.group(1) != lock["token"] or tag.group(1) != SERVER_STORE.etag_of(dest)):
+                    self.send_precondition_failed()
+                    return
             result = SERVER_STORE.move(self.local_path(), dest, overwrite)
         if result in ("created", "replaced"):
             self.send_response(201 if result == "created" else 204)

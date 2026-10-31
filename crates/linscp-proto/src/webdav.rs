@@ -514,7 +514,7 @@ impl WebDavSession {
     async fn try_locked_upload(
         &self, remote_path: &str, opts: TransferRequest,
         source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
-        progress: Option<&ProgressCallback>,
+        progress: Option<&ProgressCallback>, destination_etag: Option<&str>,
     ) -> Result<Option<u64>, ProtoError> {
         if opts.resume_offset != 0 || opts.append { return Ok(None); }
         let mut random = [0u8; 16];
@@ -544,11 +544,19 @@ impl WebDavSession {
         let result = match uploaded {
             Ok(bytes) => {
                 let method = Method::from_bytes(b"MOVE").map_err(|e| ProtoError::Transport(e.to_string()))?;
-                let response = self.apply_auth(self.no_redirect_client.request(method, self.url_for(&stage, false)))
-                    .header("Destination", self.url_for(remote_path, false)).header("Overwrite", "F")
-                    .header("If", format!("(<{token}>)")).send().await;
+                let source_url = self.url_for(&stage, false);
+                let destination_url = self.url_for(remote_path, false);
+                // Tagged WebDAV If lists protect both the locked stage and the
+                // approved destination at the instant the server applies MOVE.
+                let condition = match destination_etag {
+                    Some(etag) => format!("<{source_url}> (<{token}>) <{destination_url}> ([{etag}])"),
+                    None => format!("(<{token}>)"),
+                };
+                let response = self.apply_auth(self.no_redirect_client.request(method, source_url))
+                    .header("Destination", destination_url).header("Overwrite", if destination_etag.is_some() { "T" } else { "F" })
+                    .header("If", condition).send().await;
                 match response {
-                    Ok(response) if response.status().as_u16() == 201 => Ok(bytes),
+                    Ok(response) if (destination_etag.is_none() && response.status().as_u16() == 201) || (destination_etag.is_some() && response.status().as_u16() == 204) => Ok(bytes),
                     Ok(response) => Err(ProtoError::Transport(format!("WebDAV staged MOVE was not confirmed (HTTP {}); destination may exist.", response.status()))),
                     Err(e) => Err(ProtoError::Transport(format!("WebDAV staged MOVE was not confirmed; destination may exist: {}", format_reqwest_err(&e)))),
                 }
@@ -1527,7 +1535,7 @@ impl RemoteSession for WebDavSession {
         source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
         progress: Option<&ProgressCallback>,
     ) -> Result<u64, ProtoError> {
-        if let Some(bytes) = self.try_locked_upload(remote_path, opts.clone(), source, total_size, progress).await? {
+        if let Some(bytes) = self.try_locked_upload(remote_path, opts.clone(), source, total_size, progress, None).await? {
             return Ok(bytes);
         }
         self.upload_inner(remote_path, opts, source, total_size, progress, true, None).await
@@ -1541,6 +1549,9 @@ impl RemoteSession for WebDavSession {
         // If-Match requires a strong entity tag, not a wildcard or weak tag.
         if !etag.starts_with('"') || !etag.ends_with('"') || etag.len() < 2 || etag[1..etag.len()-1].contains('"') || etag.chars().any(char::is_control) {
             return Err(ProtoError::Transport("A strong WebDAV ETag is required for overwrite.".to_string()));
+        }
+        if let Some(bytes) = self.try_locked_upload(remote_path, opts.clone(), source, total_size, progress, Some(etag)).await? {
+            return Ok(bytes);
         }
         self.upload_inner(remote_path, opts, source, total_size, progress, false, Some(etag)).await
     }
