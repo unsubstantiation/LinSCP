@@ -41,7 +41,13 @@ fail. New SFTP directory downloads are staged as a tree and published without
 replacement on Linux and Windows; their cleanup is best-effort. SFTP download
 merges are also staged before publication; cancellation during download leaves the
 existing tree untouched, but publication is not transactional. Uploads and
-published merges may leave partial files or directories.
+published merges may leave partial files or directories. For new WebDAV uploads,
+servers supporting conditional lock-null resources can use a randomly named locked
+stage: on failure the app attempts deletion only while its lock token is still valid,
+then releases the lock. This relies on server lock and precondition enforcement;
+cleanup or lock acquisition can be unconfirmed, and a temporary resource may remain.
+When locking is unsupported, uploads fall back to direct exclusive PUT, which can
+leave partial remote files. Approved WebDAV overwrites still use direct conditional PUT.
 Without overwrite approval, local copies and downloads use no-replace publication,
 and SFTP, WebDAV and S3 uploads use exclusive creation. S3 exclusive uploads are
 limited to 1 GiB. FTP/FTPS file uploads are available only after explicitly
