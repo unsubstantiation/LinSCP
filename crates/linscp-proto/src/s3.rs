@@ -398,17 +398,25 @@ impl S3Session {
             if record.endpoint != endpoint || record.bucket.is_empty() || record.key.is_empty() || record.upload_id.is_empty() { continue; }
             attempted += 1;
             let query = vec![("uploadId".to_string(), record.upload_id)];
-            let response = tokio::time::timeout(Duration::from_secs(3), self.send_signed(Method::DELETE, Some(&record.bucket), &record.key, &query, &[], Vec::new())).await;
-            let resolved = match response {
-                Ok(Ok(response)) if response.status().as_u16() == 204 => true,
-                Ok(Ok(response)) if response.status().as_u16() == 404 => {
-                    let body = response.text().await.unwrap_or_default();
-                    reject_xxe_declarations(&body).is_ok() && roxmltree::Document::parse(&body).ok().is_some_and(|doc| {
-                        doc.root_element().tag_name().name() == "Error" && doc.root_element().children().any(|node| node.is_element() && node.tag_name().name() == "Code" && node.text() == Some("NoSuchUpload"))
-                    })
+            // Bound both request and body consumption; a stalled or oversized
+            // error response must not hang reconnect or exhaust memory.
+            let resolved = tokio::time::timeout(Duration::from_secs(3), async {
+                let Ok(mut response) = self.send_signed(Method::DELETE, Some(&record.bucket), &record.key, &query, &[], Vec::new()).await else { return false; };
+                if response.status().as_u16() == 204 { return true; }
+                if response.status().as_u16() != 404 || response.content_length().is_some_and(|len| len > 64 * 1024) { return false; }
+                let mut body = Vec::new();
+                loop {
+                    match response.chunk().await {
+                        Ok(Some(chunk)) if body.len() + chunk.len() <= 64 * 1024 => body.extend_from_slice(&chunk),
+                        Ok(None) => break,
+                        _ => return false,
+                    }
                 }
-                _ => false,
-            };
+                let Ok(body) = std::str::from_utf8(&body) else { return false; };
+                reject_xxe_declarations(body).is_ok() && roxmltree::Document::parse(body).ok().is_some_and(|doc| {
+                    doc.root_element().tag_name().name() == "Error" && doc.root_element().children().any(|node| node.is_element() && node.tag_name().name() == "Code" && node.text() == Some("NoSuchUpload"))
+                })
+            }).await.unwrap_or(false);
             if resolved { let _ = file.set_len(0).and_then(|_| file.sync_all()); }
             // Ambiguous errors leave the record for later inspection rather
             // than claiming cleanup succeeded.
