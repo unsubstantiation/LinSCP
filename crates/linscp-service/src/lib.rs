@@ -2399,7 +2399,7 @@ mod tests {
         assert!(!journal_text.contains("testsecret42") && !journal_text.contains("AKIDTEST"));
         // A record for a different endpoint identity must never be retried.
         let mut foreign: Value = serde_json::from_slice(&records[0]).unwrap();
-        foreign["endpoint_identity"] = json!("different-endpoint");
+        foreign["endpoint"] = json!("different-endpoint");
         let foreign_bytes = serde_json::to_vec(&foreign).unwrap();
         let foreign_path = journal_dir.join("upload-foreign.json");
         std::fs::write(&foreign_path, &foreign_bytes).unwrap();
