@@ -964,7 +964,7 @@ impl CommanderService {
         if old.is_empty() || new.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Both names are required"})}; }
         let src = match resolve_contained(&base, &old) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
         let dst = match resolve_contained(&base, &new) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
-        match std::fs::rename(&src, &dst) {
+        match gui_os::rename_no_replace(Path::new(&src), Path::new(&dst)) {
             Ok(_) => ApiReply{ status: 200, payload: json!({"success": true})},
             Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})},
         }
@@ -1125,7 +1125,7 @@ impl CommanderService {
         if tab.is_local {
             let src = match resolve_contained(&tab.other_local_dir, &old) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
             let dst = match resolve_contained(&tab.other_local_dir, &new) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
-            match std::fs::rename(&src,&dst) { Ok(_)=> ApiReply{ status:200, payload: json!({"success": true})}, Err(e)=> ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})}}
+            match gui_os::rename_no_replace(Path::new(&src), Path::new(&dst)) { Ok(_)=> ApiReply{ status:200, payload: json!({"success": true})}, Err(e)=> ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})}}
         } else { ApiReply{ status:400, payload: json!({"success": false, "error": "not implemented"})}}
     }
     fn handle_remote_chmod(&self, _body: Value) -> ApiReply { Self::not_implemented() }
@@ -2067,6 +2067,19 @@ mod tests {
         assert_eq!(open.status, 200, "{}", open.payload);
         let id = open.payload["tab"]["id"].as_u64().unwrap();
         let request = |name: &str| ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": id, "direction": "upload", "local_dir": left, "remote_dir": right, "names": [name]}) };
+        // Rename in either local pane must not replace another entry.
+        std::fs::write(left.join("rename-source"), b"source").unwrap();
+        std::fs::write(left.join("rename-target"), b"target").unwrap();
+        let rename = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/local/rename".into(), body: json!({"tab": id, "old_name": "rename-source", "new_name": "rename-target"}) }).await;
+        assert_ne!(rename.status, 200);
+        assert_eq!(std::fs::read(left.join("rename-source")).unwrap(), b"source");
+        assert_eq!(std::fs::read(left.join("rename-target")).unwrap(), b"target");
+        std::fs::write(right.join("rename-source"), b"source").unwrap();
+        std::fs::write(right.join("rename-target"), b"target").unwrap();
+        let rename = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/remote/rename".into(), body: json!({"tab": id, "old_name": "rename-source", "new_name": "rename-target"}) }).await;
+        assert_ne!(rename.status, 200);
+        assert_eq!(std::fs::read(right.join("rename-source")).unwrap(), b"source");
+        assert_eq!(std::fs::read(right.join("rename-target")).unwrap(), b"target");
         let moved = svc.dispatch_async(request("tree")).await;
         assert_eq!(moved.status, 200, "{}", moved.payload);
         let mut complete = false;
