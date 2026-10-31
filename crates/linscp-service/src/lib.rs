@@ -3650,6 +3650,12 @@ mod tests {
             let input = local.join("lock-upload.bin");
             std::fs::write(&input, vec![67u8; 512 * 1024]).unwrap();
             if !replacement {
+                // An UNLOCK token must never be forwarded through a redirect.
+                let unlocked = session.dav_unlock("/unlock-redirect-source", Some("opaquelocktoken:private-test")).await;
+                assert!(unlocked.is_err(), "UNLOCK redirect must not be followed");
+                let output = Command::new("curl").args(["--silent", "--show-error", &format!("http://127.0.0.1:{port}/__test__/state")]).output().unwrap();
+                let state: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(state["unlock_redirect_target_count"], 0, "UNLOCK leaked the token through a redirect");
                 let completed = linscp_engine::transfer::upload_single_file(session.as_ref(), &input, "/lock-success.bin", &flags, &mut logger, None).await;
                 assert!(completed.is_ok(), "{completed:?}");
                 assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/lock-success.bin", Default::default()).await.unwrap().len(), 512 * 1024);

@@ -74,6 +74,7 @@ class Store:
         self.copy_count = 0
         self.reject_next_copy = False
         self.reject_next_stage_delete = False
+        self.unlock_redirect_target_count = 0
         self.drop_next_get = os.environ.get("LSCP_TEST_DROP_ONCE", "")
         # path -> token, and path -> {name: value} for the dead properties.
         # Both are what a LOCK/UNLOCK/PROPPATCH implementation has to keep,
@@ -587,6 +588,14 @@ class DavHandler(BaseHTTPRequestHandler):
         self.drain_body()
         if not self.authorized():
             return
+        if self.local_path() == "/unlock-redirect-source":
+            self.send_response(307)
+            self.send_header("Location", "/unlock-redirect-target")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.local_path() == "/unlock-redirect-target":
+            SERVER_STORE.unlock_redirect_target_count += 1
         header = self.headers.get("Lock-Token", "").strip().strip("<>")
         result = SERVER_STORE.unlock(self.local_path(), header)
         if result == "unlocked":
@@ -651,6 +660,7 @@ class DavHandler(BaseHTTPRequestHandler):
         if parsed.path == "/__test__/state":
             body = json.dumps({
                 "copy_count": SERVER_STORE.copy_count,
+                "unlock_redirect_target_count": SERVER_STORE.unlock_redirect_target_count,
                 "locks": {path: entry["token"] for path, entry
                           in SERVER_STORE.locks.items()},
                 "properties": SERVER_STORE.properties,
