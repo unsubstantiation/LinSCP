@@ -612,7 +612,7 @@
         <div class="form-row"><label>Directory:</label><input type="text" id="remoteTransferDirectory" class="input-field" placeholder="/"></div>
         <div class="form-row"><label>File mask:</label><input type="text" id="remoteTransferMask" class="input-field" placeholder="e.g. *.txt|*.bak (empty = every file)"></div>
         <div class="hint" id="remoteTransferHint"></div>
-        <div class="hint">WebDAV moves never intentionally replace a destination and rely on server ETag enforcement. Directory contents can change while waiting. Cross-server moves are not transactional and may leave duplicate or partial files.</div>
+        <div class="hint">WebDAV moves rely on server ETag enforcement. SFTP copies can see concurrent changes; directory copies and cross-server moves are not transactional and may leave partial files.</div>
         <div class="hint" id="remoteTransferStatus"></div>
       </div>
       <div class="modal-footer">
@@ -4328,6 +4328,10 @@
     };
     if (moveItem) payload.operation = 'move';
     let result = await apiPost('/api/remote/transfer', payload);
+    if (result.sftp_copy_risk && confirm(t("SFTP copies cannot pin the source. Concurrent changes or path substitutions may affect what is copied. Directory copies are not transactional and a partial remote tree may remain. Continue?"))) {
+      payload.accept_sftp_copy_risk = true;
+      result = await apiPost('/api/remote/transfer', payload);
+    }
     if (result.cross_move_risk && confirm(t("Cross-server moves are not transactional. An interruption can leave a duplicate or partial destination, and source deletion may be unconfirmed. Destination changes are not locked. Continue?"))) {
       payload.accept_cross_move_risk = true;
       result = await apiPost('/api/remote/transfer', payload);

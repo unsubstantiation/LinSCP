@@ -364,7 +364,12 @@ impl CommanderService {
             return ApiReply { status: 409, payload: json!({"success": false, "error": "Cross-server move requires confirmation", "cross_move_risk": true}) };
         }
         let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
-        if !matches!(session.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs) { return api_error(501, "Only WebDAV source transfers are supported here."); }
+        let source_is_dav = matches!(session.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs);
+        let source_is_sftp = session.scheme() == linscp_types::ProtocolScheme::Sftp;
+        if !source_is_dav && (move_item || !source_is_sftp) { return api_error(501, "Remote transfers support WebDAV sources, or SFTP sources for copies only."); }
+        if source_is_sftp && !body.get("accept_sftp_copy_risk").and_then(Value::as_bool).unwrap_or(false) {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "SFTP copy requires confirmation", "sftp_copy_risk": true}) };
+        }
         if body.get("filemask").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) { return api_error(400, "File masks are not supported for remote moves."); }
         let directory = body.get("directory").and_then(Value::as_str).unwrap_or("");
         if !directory.starts_with('/') || directory.contains("//") || directory.chars().any(char::is_control) || directory.contains('\\') || directory.split('/').any(|part| part == "." || part == "..") {
@@ -379,18 +384,26 @@ impl CommanderService {
             let source = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
             let target = format!("{}/{}", directory.trim_end_matches('/'), name);
             if same_tab && source == target { return api_error(400, "Source and destination are the same file."); }
-            let (source_entry, tag) = match session.dav_stat_with_etag(&source).await {
-                Ok((Some(entry), Some(tag))) if !entry.is_symlink && tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => (entry, tag),
-                Ok(_) => return api_error(400, "WebDAV moves require an existing resource and a strong source ETag."),
-                Err(error) => return api_error(400, error.to_string()),
+            let (source_entry, tag) = if source_is_dav {
+                match session.dav_stat_with_etag(&source).await {
+                    Ok((Some(entry), Some(tag))) if !entry.is_symlink && tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => (entry, Some(tag)),
+                    Ok(_) => return api_error(400, "WebDAV transfers require an existing resource and a strong source ETag."),
+                    Err(error) => return api_error(400, error.to_string()),
+                }
+            } else {
+                match session.stat(&source).await {
+                    Ok(Some(entry)) if !entry.is_symlink => (entry, None),
+                    Ok(_) => return api_error(400, "SFTP copies require an existing non-symlink source."),
+                    Err(error) => return api_error(400, error.to_string()),
+                }
             };
             let is_dir = source_entry.is_dir;
             if (!same_tab || !move_item) && target_session.scheme() == linscp_types::ProtocolScheme::S3 && source_entry.size > 16 * 1024 * 1024 {
                 return api_error(400, "Remote transfers to S3 are limited to 16 MiB per file.");
             }
-            if is_dir && (!same_tab || !move_item) { return api_error(501, "Remote directory copies and cross-server directory moves are not yet supported."); }
+            if is_dir && (!same_tab || !move_item) && (move_item || !source_is_sftp || target_session.scheme() != linscp_types::ProtocolScheme::Sftp) { return api_error(501, "Directory copies require SFTP source and destination sessions; cross-server directory moves are unsupported."); }
             if is_dir && same_tab && target.starts_with(&format!("{source}/")) { return api_error(400, "Cannot move a directory into itself."); }
-            if is_dir && !body.get("accept_directory_move_risk").and_then(Value::as_bool).unwrap_or(false) {
+            if is_dir && move_item && !body.get("accept_directory_move_risk").and_then(Value::as_bool).unwrap_or(false) {
                 return ApiReply { status: 409, payload: json!({"success": false, "error": "Directory move requires confirmation", "directory_move_risk": true}) };
             }
             let entry = if same_tab && move_item { None } else { Some(source_entry) };
@@ -401,7 +414,7 @@ impl CommanderService {
             let job = if let Some(source_entry) = entry {
                 queue::QueueJob::StagedRemoteTransfer { source_session: session.clone(), target_session: target_session.clone(), source: source.clone(), target: target.clone(), etag, source_entry, move_item }
             } else {
-                queue::QueueJob::DavMove { session: session.clone(), source: source.clone(), target: target.clone(), etag, is_dir }
+                queue::QueueJob::DavMove { session: session.clone(), source: source.clone(), target: target.clone(), etag: etag.expect("WebDAV move preflight requires an ETag"), is_dir }
             };
             self.queue.enqueue(Some(id), if move_item { "move" } else { "copy" }, name, source, target, size, false, job);
         }
@@ -3787,6 +3800,56 @@ mod tests {
         assert!(stopped, "cancellation was not observed");
         assert!(std::fs::metadata(remote.join("slow.bin")).unwrap().len() < 4 * 1024 * 1024);
         assert!(session.stat("/upload.txt").await.unwrap().is_some());
+        // SFTP-to-SFTP file and tree copies require explicit acceptance of
+        // source/path races and never replace an existing destination.
+        std::fs::create_dir_all(remote.join("copy-target")).unwrap();
+        std::fs::create_dir_all(remote.join("copy-tree/nested/empty")).unwrap();
+        std::fs::write(remote.join("copy-file.txt"), b"source file").unwrap();
+        std::fs::write(remote.join("copy-tree/nested/data"), b"tree data").unwrap();
+        let no_risk = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/copy-target", "names": ["copy-tree"]}))).await;
+        assert_eq!(no_risk.status, 409);
+        assert_eq!(no_risk.payload["sftp_copy_risk"], true);
+        let idx = svc.queue.snapshot().0.len();
+        let copied = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/copy-target", "names": ["copy-file.txt", "copy-tree"], "accept_sftp_copy_risk": true}))).await;
+        assert_eq!(copied.status, 200, "{}", copied.payload);
+        let mut done = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") || tasks.get(idx + 1).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("SFTP copy failed: {tasks:?}"); }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") && tasks.get(idx + 1).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done);
+        assert_eq!(std::fs::read(remote.join("copy-target/copy-file.txt")).unwrap(), b"source file");
+        assert_eq!(std::fs::read(remote.join("copy-target/copy-tree/nested/data")).unwrap(), b"tree data");
+        assert!(remote.join("copy-target/copy-tree/nested/empty").is_dir());
+        assert_eq!(std::fs::read(remote.join("copy-tree/nested/data")).unwrap(), b"tree data");
+        let idx = svc.queue.snapshot().0.len();
+        let conflict = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/copy-target", "names": ["copy-tree"], "accept_sftp_copy_risk": true}))).await;
+        assert_eq!(conflict.status, 200);
+        let mut failed = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("directory conflict was replaced"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert_eq!(std::fs::read(remote.join("copy-target/copy-tree/nested/data")).unwrap(), b"tree data");
+        std::fs::create_dir_all(remote.join("copy-link-tree")).unwrap();
+        std::os::unix::fs::symlink(remote.join("copy-file.txt"), remote.join("copy-link-tree/link")).unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let copy = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/copy-target", "names": ["copy-link-tree"], "accept_sftp_copy_risk": true}))).await;
+        assert_eq!(copy.status, 200);
+        let mut failed = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("symlink tree copied"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert!(!remote.join("copy-target/copy-link-tree").exists());
         exercise_cross_move_destination(&svc, id, "/", &local).await;
         drop(server);
         let _ = std::fs::remove_dir_all(tmp);

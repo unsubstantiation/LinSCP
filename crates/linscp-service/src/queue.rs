@@ -91,7 +91,7 @@ pub enum QueueJob {
         target_session: Arc<dyn RemoteSession>,
         source: String,
         target: String,
-        etag: String,
+        etag: Option<String>,
         source_entry: linscp_types::FileEntry,
         move_item: bool,
     },
@@ -852,8 +852,22 @@ impl QueueManager {
                 download_flags.no_clobber = true;
                 download_flags.cleanup_download_stage = true;
                 download_flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
-                download_flags.source_etag = Some(etag.clone());
+                download_flags.source_etag = etag.clone();
                 download_flags.cancel_flag = Some(Arc::clone(&task.cancel_flag));
+                if source_entry.is_dir {
+                    if *move_item || source_session.scheme() != ProtocolScheme::Sftp || target_session.scheme() != ProtocolScheme::Sftp {
+                        return Err("Directory copies require SFTP source and destination sessions.".to_string());
+                    }
+                    download_new_sftp_tree(source_session.as_ref(), source, &payload, &download_flags, &mut logger, Some(&*progress), 0).await?;
+                    if task.cancel_flag.load(Ordering::SeqCst) { return Err("Cancelled before upload; source remains.".to_string()); }
+                    let mut flags = TransferFlags::default();
+                    flags.no_clobber = true;
+                    flags.preserve_time = false;
+                    flags.cancel_flag = Some(Arc::clone(&task.cancel_flag));
+                    upload_new_sftp_tree(target_session.as_ref(), &payload, target, &flags, &mut logger, Some(&*progress), 0).await
+                        .map_err(|e| format!("Copy failed; source remains and a partial remote tree may remain: {e}"))?;
+                    return Ok(());
+                }
                 download_single_file(source_session.as_ref(), source, Some(source_entry), &payload, &download_flags, &mut logger, Some(&*progress)).await?;
                 let staged_len = std::fs::metadata(&payload).map_err(|e| format!("Cannot inspect staged move: {e}"))?.len();
                 if staged_len != source_entry.size { return Err("Source length changed during conditional download; source remains.".to_string()); }
@@ -866,7 +880,7 @@ impl QueueManager {
                     .map_err(|e| if *move_item { format!("Move incomplete: source remains; destination may contain a partial or completed file: {e}") } else { format!("Copy failed; source remains and destination may contain a partial or completed file: {e}") })?;
                 if !*move_item { return Ok(()); }
                 if task.cancel_flag.load(Ordering::SeqCst) { return Err("Move incomplete: destination was uploaded; cancellation left the source in place.".to_string()); }
-                source_session.remove_if_match(source, etag).await
+                source_session.remove_if_match(source, etag.as_deref().ok_or("Move incomplete: source identity is missing.")?).await
                     .map_err(|e| format!("Move incomplete: destination was uploaded; source deletion was not confirmed and the source may or may not remain: {e}"))?;
                 Ok(())
             }
