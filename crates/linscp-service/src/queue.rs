@@ -196,6 +196,10 @@ async fn download_new_sftp_tree(
                 }
             }
             download_single_file(session, &from, Some(&current), &to, flags, logger, progress).await?;
+            let received = std::fs::metadata(&to).map_err(|e| format!("Cannot inspect staged file '{}': {e}", to.display()))?.len();
+            if received != current.size {
+                return Err(format!("Remote file '{from}' changed length or was incompletely downloaded; refusing to publish the tree."));
+            }
         }
     }
     Ok(())
