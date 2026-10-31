@@ -481,10 +481,19 @@ class S3Handler(BaseHTTPRequestHandler):
                           now + index)
             self.send_bytes(204, b"")
             return
+        if parsed.path == "/__test__/seed-unrelated-upload":
+            # Same key as the cancelled transfer, but owned by another client.
+            STORE.uploads["test-unrelated-upload"] = {
+                "bucket": "photos", "key": "multipart-abort-failure.bin",
+                "parts": {}, "headers": {},
+            }
+            self.send_bytes(204, b"")
+            return
         if parsed.path == "/__test__/state":
             # This makes the multipart tests prove which API operations ran.
             body = json.dumps({
                 "active_uploads": len(STORE.uploads),
+                "active_upload_ids": sorted(STORE.uploads),
                 "multipart_history": STORE.multipart_history,
                 "copy_count": STORE.copy_count,
                 "object_headers": STORE.object_headers,

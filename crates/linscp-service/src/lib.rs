@@ -2412,6 +2412,10 @@ mod tests {
             std::os::unix::fs::symlink(&target, journal_dir.join("upload-symlink.json")).unwrap();
             std::fs::hard_link(&target, journal_dir.join("upload-hardlink.json")).unwrap();
         }
+        // Seed another client's upload for the same destination key. Only our
+        // journaled upload ID may be aborted on reconnect.
+        let seeded = Command::new("curl").args(["--silent", "--show-error", "--insecure", &format!("https://127.0.0.1:{port}/__test__/seed-unrelated-upload")]).status().unwrap();
+        assert!(seeded.success());
         // Reconnecting retries only the recorded upload ID; the fixture now
         // allows the abort. Existing destination objects remain untouched.
         let reopened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "s3", "host": "127.0.0.1", "port": port, "s3_access_key": "AKIDTEST", "s3_secret_key": "testsecret42", "s3_region": "us-east-1", "tls_ca_file": tests.join("fixtures/s3-server-cert.pem"), "local_dir": local, "initial_dir": "/"}}))).await;
@@ -2427,7 +2431,8 @@ mod tests {
         assert_eq!(nonempty_owned_records, 0, "resolved upload must be marked clean");
         let output = Command::new("curl").args(["--silent", "--show-error", "--insecure", &format!("https://127.0.0.1:{port}/__test__/state")]).output().unwrap();
         let state: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(state["active_uploads"], 0, "reconnect did not abort recorded upload: {state}");
+        assert_eq!(state["active_uploads"], 1, "reconnect must only abort the recorded upload: {state}");
+        assert_eq!(state["active_upload_ids"], json!(["test-unrelated-upload"]), "unrelated upload was modified: {state}");
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/photos/multipart-conflict.bin", Default::default()).await.unwrap(), b"other actor");
         // The upload was already aborted. A later retry must accept the explicit
         // NoSuchUpload response, but not treat an unrelated 404 as confirmation.
