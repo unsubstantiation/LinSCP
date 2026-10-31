@@ -217,6 +217,7 @@ impl CommanderService {
                 self.queue_transfer_async(req.body, upload, true).await
             }
             ("GET", "/api/remote/list") => self.list_remote_async(&req.path).await,
+            ("POST", "/api/remote/rename") => self.rename_remote_async(req.body).await,
             ("POST", "/api/desktop/check") => self.handle_desktop_check_async(req.body).await,
             ("POST", "/api/desktop/install") => self.handle_desktop_install_async(req.body).await,
             ("POST", "/api/desktop/launch") => self.handle_desktop_launch_async(req.body).await,
@@ -335,6 +336,31 @@ impl CommanderService {
                 if let Some(current) = self.state.lock().expect("state mutex").tabs.get_mut(&tab.id) { current.remote_dir = resolved.clone(); }
                 ApiReply { status: 200, payload: json!({"success": true, "path": resolved, "entries": entries}) }
             }
+            Err(error) => api_error(400, error.to_string()),
+        }
+    }
+
+    async fn rename_remote_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() { Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected") };
+        if tab.is_local { return self.handle_remote_rename(body); }
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        if !matches!(session.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs) {
+            return api_error(501, "Safe remote renaming is currently supported only for WebDAV files.");
+        }
+        let valid_name = |name: &str| !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\') && !name.contains(':') && !name.chars().any(char::is_control);
+        let old = body.get("old_name").and_then(Value::as_str).unwrap_or("");
+        let new = body.get("new_name").and_then(Value::as_str).unwrap_or("");
+        if !valid_name(old) || !valid_name(new) || old == new { return api_error(400, "Select two different single file names."); }
+        let from = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), old);
+        let to = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), new);
+        let tag = match session.dav_get_etag(&from).await {
+            Ok((Some(tag), false)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => tag,
+            Ok(_) => return api_error(400, "WebDAV file rename requires a strong source ETag."),
+            Err(error) => return api_error(400, error.to_string()),
+        };
+        match session.dav_move_if_match(&from, &to, &tag).await {
+            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
             Err(error) => api_error(400, error.to_string()),
         }
     }
@@ -2582,6 +2608,25 @@ mod tests {
         assert!(complete);
         assert_eq!(std::fs::read(downloaded.join("move-success.txt")).unwrap(), b"move payload");
         assert!(session.stat("/move-success.txt").await.unwrap().is_none());
+        // Same-session renames are conditional on the source ETag and never
+        // replace a destination; failure after a lost response is ambiguous.
+        linscp_proto::upload_bytes(session.as_ref(), "/rename-old.txt", b"rename content", Default::default()).await.unwrap();
+        let renamed = svc.dispatch_async(request("/api/remote/rename", json!({"tab": id, "old_name": "rename-old.txt", "new_name": "rename-new.txt"}))).await;
+        assert_eq!(renamed.status, 200, "{}", renamed.payload);
+        assert!(session.stat("/rename-old.txt").await.unwrap().is_none());
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/rename-new.txt", Default::default()).await.unwrap(), b"rename content");
+        linscp_proto::upload_bytes(session.as_ref(), "/rename-dest.txt", b"keep destination", Default::default()).await.unwrap();
+        let conflict = svc.dispatch_async(request("/api/remote/rename", json!({"tab": id, "old_name": "rename-new.txt", "new_name": "rename-dest.txt"}))).await;
+        assert_ne!(conflict.status, 200);
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/rename-new.txt", Default::default()).await.unwrap(), b"rename content");
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/rename-dest.txt", Default::default()).await.unwrap(), b"keep destination");
+        let tag = session.dav_get_etag("/rename-new.txt").await.unwrap().0.unwrap();
+        linscp_proto::upload_bytes(session.as_ref(), "/rename-new.txt", b"changed", Default::default()).await.unwrap();
+        assert!(session.dav_move_if_match("/rename-new.txt", "/rename-race.txt", &tag).await.is_err());
+        assert!(session.stat("/rename-race.txt").await.unwrap().is_none());
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/rename-new.txt", Default::default()).await.unwrap(), b"changed");
+        let invalid = svc.dispatch_async(request("/api/remote/rename", json!({"tab": id, "old_name": "rename-new.txt", "new_name": "../escape"}))).await;
+        assert_eq!(invalid.status, 400);
         // A source changed after queueing fails conditional GET without a local publication.
         linscp_proto::upload_bytes(session.as_ref(), "/move-before-get.txt", b"original", Default::default()).await.unwrap();
         svc.queue.pause();

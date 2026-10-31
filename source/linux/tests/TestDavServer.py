@@ -781,7 +781,12 @@ class DavHandler(BaseHTTPRequestHandler):
         if self.precondition_failed(self.local_path()):
             self.send_precondition_failed()
             return
-        result = SERVER_STORE.move(self.local_path(), dest, overwrite)
+        with SERVER_STORE.write_lock:
+            expected = self.headers.get("If-Match", "").strip()
+            if expected and expected != SERVER_STORE.etag_of(self.local_path()):
+                self.send_precondition_failed()
+                return
+            result = SERVER_STORE.move(self.local_path(), dest, overwrite)
         if result in ("created", "replaced"):
             self.send_response(201 if result == "created" else 204)
             self.send_header("Content-Length", "0")

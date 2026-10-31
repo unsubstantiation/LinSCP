@@ -1402,6 +1402,18 @@ impl RemoteSession for WebDavSession {
         Ok(())
     }
 
+    async fn dav_move_if_match(&self, from: &str, to: &str, etag: &str) -> Result<(), ProtoError> {
+        if !valid_strong_etag(etag) { return Err(ProtoError::Transport("Conditional MOVE requires a strong ETag.".to_string())); }
+        let method = Method::from_bytes(b"MOVE").map_err(|e| ProtoError::Transport(format!("Invalid MOVE method: {e}")))?;
+        let response = self.apply_auth(self.client.request(method, self.url_for(from, false)))
+            .header("Destination", self.url_for(to, false)).header("Overwrite", "F").header("If-Match", etag)
+            .send().await.map_err(|e| ProtoError::Transport(format!("Conditional WebDAV MOVE could not be confirmed; the item may have moved: {}", format_reqwest_err(&e))))?;
+        if !response.status().is_success() {
+            return Err(ProtoError::Transport(format!("Conditional WebDAV MOVE '{from}' -> '{to}' failed with HTTP {}.", response.status())));
+        }
+        Ok(())
+    }
+
     async fn remove_if_match(&self, remote_path: &str, etag: &str) -> Result<(), ProtoError> {
         if !valid_strong_etag(etag) { return Err(ProtoError::Transport("Conditional delete requires a strong ETag.".to_string())); }
         let response = self.apply_auth(self.client.delete(self.url_for(remote_path, false)))
