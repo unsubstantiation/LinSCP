@@ -2209,7 +2209,7 @@ mod tests {
         let local = tmp.join("local"); std::fs::create_dir_all(&local).unwrap();
         let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests");
         let child = Command::new("/usr/bin/python3").arg(tests.join("TestS3Server.py"))
-            .env("LSCP_TEST_PORT", "0").env("LSCP_TEST_SEED", "1").env("LSCP_TEST_GET_DELAY", "0.005")
+            .env("LSCP_TEST_PORT", "0").env("LSCP_TEST_SEED", "1").env("LSCP_TEST_GET_DELAY", "0.005").env("LSCP_TEST_PART_DELAY", "0.1")
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let mut server = Server(child); let mut line = String::new();
         BufReader::new(server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
@@ -2320,6 +2320,35 @@ mod tests {
         let conflict = linscp_engine::transfer::upload_single_file(session.as_ref(), &multipart_path, "/photos/multipart-conflict.bin", &multipart_flags, &mut logger, None).await;
         assert!(conflict.is_err());
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/photos/multipart-conflict.bin", Default::default()).await.unwrap(), b"other actor");
+        // Cancellation via the public queue also preserves the abort result.
+        let queued_file = local.join("multipart-queued.bin");
+        std::fs::write(&queued_file, vec![63u8; 25 * 1024 * 1024]).unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["multipart-queued.bin"]}))).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut task_id = None;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(task) = tasks.get(idx) {
+                if task["status"] == "Running" && task["bytes_done"].as_u64().unwrap_or(0) > 0 { task_id = task["id"].as_u64(); break; }
+                assert_ne!(task["status"], "Completed", "multipart upload finished before cancellation");
+                assert_ne!(task["status"], "Failed", "{task:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let cancelled = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": task_id.expect("multipart upload did not start")}))).await;
+        assert_eq!(cancelled.status, 200, "{}", cancelled.payload);
+        let mut stopped = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Cancelled") {
+                assert!(tasks[idx]["error"].as_str().unwrap_or("").contains("Multipart upload was aborted"), "{:?}", tasks[idx]);
+                stopped = true; break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped);
+        assert!(session.stat("/photos/multipart-queued.bin").await.unwrap().is_none());
         let output = Command::new("curl").args(["--silent", "--show-error", "--insecure", &format!("https://127.0.0.1:{port}/__test__/state")]).output().unwrap();
         assert!(output.status.success());
         let state: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -2327,6 +2356,7 @@ mod tests {
         let history = state["multipart_history"].as_array().unwrap();
         assert!(history.iter().any(|e| e["action"] == "abort" && e["key"] == "multipart-cancel.bin"));
         assert!(history.iter().any(|e| e["action"] == "abort" && e["key"] == "multipart-conflict.bin"));
+        assert!(history.iter().any(|e| e["action"] == "abort" && e["key"] == "multipart-queued.bin"));
         assert!(history.iter().any(|e| e["action"] == "complete" && e["key"] == "multipart-success.bin"));
         // Enforce the supported upper bound without an unconditional fallback.
         std::fs::OpenOptions::new().write(true).open(local.join("upload.txt")).unwrap().set_len(1024 * 1024 * 1024 + 1).unwrap();

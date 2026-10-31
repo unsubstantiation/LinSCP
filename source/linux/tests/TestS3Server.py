@@ -900,6 +900,9 @@ class S3Handler(BaseHTTPRequestHandler):
                           "<LastModified>%s</LastModified></CopyPartResult>"
                           % (etag, iso8601(now)))
             return
+        delay = float(os.environ.get("LSCP_TEST_PART_DELAY", "0"))
+        if delay:
+            time.sleep(delay)
         etag = '"%s"' % hashlib.sha256(body).hexdigest()[:32]
         upload["parts"][number] = (body, etag)
         STORE.multipart_history.append({
