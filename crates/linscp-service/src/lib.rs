@@ -3920,6 +3920,34 @@ mod tests {
         assert!(stopped);
         assert!(!remote.join("copy-target/copy-cancel-tree").exists());
         assert_eq!(std::fs::metadata(remote.join("copy-cancel-tree/slow.bin")).unwrap().len(), 4 * 1024 * 1024);
+        std::fs::create_dir_all(remote.join("copy-shrinking-tree")).unwrap();
+        let changing = remote.join("copy-shrinking-tree/large.bin");
+        std::fs::write(&changing, vec![39u8; 4 * 1024 * 1024]).unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let copied = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/copy-target", "names": ["copy-shrinking-tree"], "accept_sftp_copy_risk": true}))).await;
+        assert_eq!(copied.status, 200);
+        let mut downloading = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(task) = tasks.get(idx) {
+                if task["status"] == "Running" && task["bytes_done"].as_u64().unwrap_or(0) > 0 { downloading = true; break; }
+                assert_ne!(task["status"], "Failed", "{task:?}");
+                assert_ne!(task["status"], "Completed", "tree copied before source change");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(downloading);
+        std::fs::OpenOptions::new().write(true).open(&changing).unwrap().set_len(1).unwrap();
+        let mut failed = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("truncated source tree was published"); }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(failed);
+        assert!(!remote.join("copy-target/copy-shrinking-tree").exists());
+        assert_eq!(std::fs::metadata(changing).unwrap().len(), 1);
         exercise_cross_move_destination(&svc, id, "/", &local).await;
         drop(server);
         let _ = std::fs::remove_dir_all(tmp);
