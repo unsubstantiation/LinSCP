@@ -273,6 +273,7 @@ impl S3Session {
 
         let tls_cfg = build_rustls_client_config(&cfg.tls)?;
         let mut builder = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .use_preconfigured_tls(tls_cfg)
             .connect_timeout(cfg.timeout);
 
@@ -645,9 +646,9 @@ impl S3Session {
         headers.push((header_name.to_string(), header_value.to_string()));
         let response = self.send_signed(Method::PUT, Some(&bucket), &key, &[], &headers, payload).await?;
         let status = response.status();
-        if !status.is_success() {
+        if status.as_u16() != 200 {
             let body = response.text().await.unwrap_or_default();
-            return Err(parse_s3_error_xml(status, &body));
+            return Err(ProtoError::Transport(format!("Conditional S3 PUT was not confirmed (HTTP {status}); destination may exist: {}", body.trim())));
         }
         if let Some(callback) = progress { callback(expected, expected); }
         Ok(expected)

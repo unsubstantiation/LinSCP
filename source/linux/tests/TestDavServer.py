@@ -692,6 +692,11 @@ class DavHandler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
         path = self.local_path()
+        if path == "/cross-accepted.txt" and os.environ.get("LSCP_TEST_ACCEPTED_PUT") == "1":
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         parent = SERVER_STORE.parent_of(SERVER_STORE.normalize(path))
         item = SERVER_STORE.get(parent)
         if item is None or item["kind"] != "dir":
@@ -722,6 +727,11 @@ class DavHandler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
         path = self.local_path()
+        if path == "/cross-delete-accepted.txt":
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.record_if_header(path)
         if self.locked_out(path):
             self.send_locked()

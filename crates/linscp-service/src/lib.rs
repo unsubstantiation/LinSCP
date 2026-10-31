@@ -2760,7 +2760,7 @@ mod tests {
         assert!(session.stat("/move-success.txt").await.unwrap().is_none());
         // Exercise cross-server moves against a second independent WebDAV server.
         let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestDavServer.py");
-        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0")
+        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_ACCEPTED_PUT", "1")
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let mut dest_server = Server(child); let mut line = String::new();
         BufReader::new(dest_server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
@@ -2832,6 +2832,25 @@ mod tests {
         assert!(failed);
         assert_eq!(linscp_proto::download_bytes(dest_session.as_ref(), "/move-delete-race.txt", Default::default()).await.unwrap(), b"original cross copy");
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/move-delete-race.txt", Default::default()).await.unwrap(), b"changed before conditional delete");
+        // HTTP 202 does not confirm either a destination write or source
+        // deletion; neither may be reported as a completed move.
+        for name in ["cross-accepted.txt", "cross-delete-accepted.txt"] {
+            linscp_proto::upload_bytes(session.as_ref(), &format!("/{name}"), b"preserve source", Default::default()).await.unwrap();
+            let idx = svc.queue.snapshot().0.len();
+            let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{dest_id}"), "directory": "/", "names": [name], "operation": "move", "accept_cross_move_risk": true}))).await;
+            assert_eq!(moved.status, 200, "{}", moved.payload);
+            let mut failed = false;
+            for _ in 0..500 {
+                let (tasks, _) = svc.queue.snapshot();
+                if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+                if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("unconfirmed HTTP operation reported success"); }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(failed);
+            assert_eq!(linscp_proto::download_bytes(session.as_ref(), &format!("/{name}"), Default::default()).await.unwrap(), b"preserve source");
+            if name == "cross-accepted.txt" { assert!(dest_session.stat(&format!("/{name}")).await.unwrap().is_none()); }
+            else { assert_eq!(linscp_proto::download_bytes(dest_session.as_ref(), &format!("/{name}"), Default::default()).await.unwrap(), b"preserve source"); }
+        }
         drop(dest_server);
         // Same-session queued moves use the captured source ETag and an
         // atomic no-replace request against a different remote directory.

@@ -488,7 +488,7 @@ impl WebDavSession {
                 format_reqwest_err(&e)
             ))
         })?;
-        if !resp.status().is_success() {
+        if !matches!(resp.status().as_u16(), 200 | 201 | 204) || total_size.is_some_and(|expected| expected != transferred) {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
             if status.as_u16() == 412 && has_etag {
@@ -498,7 +498,7 @@ impl WebDavSession {
                 )));
             }
             return Err(ProtoError::Transport(format!(
-                "WebDAV PUT '{remote_path}' failed with HTTP {status}: {}",
+                "WebDAV PUT '{remote_path}' was not confirmed (HTTP {status}, {transferred} bytes sent); a destination may exist: {}",
                 detail.trim()
             )));
         }
@@ -1436,8 +1436,8 @@ impl RemoteSession for WebDavSession {
         let response = self.apply_auth(self.no_redirect_client.delete(self.url_for(remote_path, false)))
             .header("If-Match", etag).send().await
             .map_err(|e| ProtoError::Transport(format!("Conditional WebDAV DELETE failed: {}", format_reqwest_err(&e))))?;
-        if !response.status().is_success() {
-            return Err(ProtoError::Transport(format!("Conditional WebDAV DELETE '{remote_path}' failed with HTTP {}.", response.status())));
+        if !matches!(response.status().as_u16(), 200 | 204) {
+            return Err(ProtoError::Transport(format!("Conditional WebDAV DELETE '{remote_path}' was not confirmed (HTTP {}); the source may or may not remain.", response.status())));
         }
         Ok(())
     }
