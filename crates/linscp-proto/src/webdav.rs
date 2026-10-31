@@ -412,6 +412,7 @@ struct DavConditionState {
 pub struct WebDavSession {
     cfg: WebDavConnectConfig,
     client: Client,
+    no_redirect_client: Client,
     state: Mutex<DavConditionState>,
     jump_tunnel: Option<Arc<SshJumpTunnel>>,
     socks_relay: Mutex<Option<Socks5JumpRelay>>,
@@ -522,19 +523,28 @@ impl WebDavSession {
 
         let tls_cfg = build_rustls_client_config(&cfg.tls)?;
         let mut builder = Client::builder()
-            .use_preconfigured_tls(tls_cfg)
+            .use_preconfigured_tls(tls_cfg.clone())
             .connect_timeout(cfg.timeout);
+        let mut guarded_builder = Client::builder()
+            .use_preconfigured_tls(tls_cfg)
+            .connect_timeout(cfg.timeout)
+            .redirect(reqwest::redirect::Policy::none());
 
         if let Some(proxy_cfg) = cfg.proxy.as_ref() {
             if let Some(proxy) = build_reqwest_proxy(proxy_cfg)? {
                 builder = builder.proxy(proxy);
+                guarded_builder = guarded_builder.proxy(build_reqwest_proxy(proxy_cfg)?.expect("proxy was just constructed"));
             } else {
                 builder = builder.no_proxy();
+                guarded_builder = guarded_builder.no_proxy();
             }
         } else {
             builder = builder.no_proxy();
+            guarded_builder = guarded_builder.no_proxy();
         }
 
+        let no_redirect_client = guarded_builder.build()
+            .map_err(|e| ProtoError::Transport(format!("Failed to build guarded WebDAV client: {e}")))?;
         let client = builder
             .build()
             .map_err(|e| ProtoError::Transport(format!("Failed to build WebDAV client: {e}")))?;
@@ -542,6 +552,7 @@ impl WebDavSession {
         Ok(Self {
             cfg,
             client,
+            no_redirect_client,
             state: Mutex::new(DavConditionState::default()),
             jump_tunnel,
             socks_relay: Mutex::new(socks_relay),
@@ -1405,11 +1416,11 @@ impl RemoteSession for WebDavSession {
     async fn dav_move_if_match(&self, from: &str, to: &str, etag: &str) -> Result<(), ProtoError> {
         if !valid_strong_etag(etag) { return Err(ProtoError::Transport("Conditional MOVE requires a strong ETag.".to_string())); }
         let method = Method::from_bytes(b"MOVE").map_err(|e| ProtoError::Transport(format!("Invalid MOVE method: {e}")))?;
-        let response = self.apply_auth(self.client.request(method, self.url_for(from, false)))
+        let response = self.apply_auth(self.no_redirect_client.request(method, self.url_for(from, false)))
             .header("Destination", self.url_for(to, false)).header("Overwrite", "F").header("If-Match", etag)
             .send().await.map_err(|e| ProtoError::Transport(format!("Conditional WebDAV MOVE could not be confirmed; the item may have moved: {}", format_reqwest_err(&e))))?;
-        if !response.status().is_success() {
-            return Err(ProtoError::Transport(format!("Conditional WebDAV MOVE '{from}' -> '{to}' failed with HTTP {}.", response.status())));
+        if !matches!(response.status().as_u16(), 201 | 204) {
+            return Err(ProtoError::Transport(format!("Conditional WebDAV MOVE '{from}' -> '{to}' was not confirmed (HTTP {}); the item may have moved.", response.status())));
         }
         Ok(())
     }
