@@ -43,9 +43,11 @@ merges are also staged before publication; cancellation during download leaves t
 existing tree untouched, but publication is not transactional. Uploads and
 published merges may leave partial files or directories. For new WebDAV uploads,
 servers supporting conditional lock-null resources can use a randomly named locked
-stage: on failure the app attempts deletion only while its lock token is still valid,
-then releases the lock. This relies on server lock and precondition enforcement;
-cleanup or lock acquisition can be unconfirmed, and a temporary resource may remain.
+stage: on failure the app attempts deletion only while its lock token is still valid.
+If cleanup is unconfirmed, the app retains the token in memory and retries on a
+later staged upload in the same session; it does not persist tokens across restarts.
+This relies on server lock and precondition enforcement; locks can expire, and
+cleanup or lock acquisition can be unconfirmed, leaving a temporary resource.
 When locking is unsupported, uploads fall back to direct exclusive or conditional
 PUT, which can leave partial remote files. Approved overwrites on lock-capable
 servers use tagged source-lock and destination-ETag conditions on MOVE; both
