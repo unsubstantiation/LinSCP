@@ -135,6 +135,15 @@ fn try_open_journal(path: &Path) -> Option<std::fs::File> {
     let metadata = file.metadata().ok()?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 64 * 1024 { return None; }
     #[cfg(unix)] { use std::os::unix::fs::MetadataExt; if metadata.nlink() != 1 { return None; } }
+    #[cfg(windows)] {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT};
+        // MetadataExt does not expose the link count on our MSRV. Inspect the
+        // opened handle, not the pathname, and fail closed on unknown metadata.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0
+            || info.nNumberOfLinks != 1 || info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 { return None; }
+    }
     file.try_lock_exclusive().ok()?;
     Some(file)
 }
@@ -1928,6 +1937,17 @@ impl RemoteSession for S3Session {
 mod cleanup_sampling_tests {
     use super::sample_cleanup_record;
     use rand::{rngs::StdRng, SeedableRng};
+
+    #[test]
+    fn journal_rejects_hardlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let path = dir.path().join("upload-hardlink.json");
+        std::fs::write(&target, b"unrelated").unwrap();
+        std::fs::hard_link(&target, &path).unwrap();
+        assert!(super::try_open_journal(&path).is_none());
+        assert_eq!(std::fs::read(&target).unwrap(), b"unrelated");
+    }
 
     #[cfg(unix)]
     #[test]
