@@ -3721,6 +3721,23 @@ mod tests {
                 let output = Command::new("curl").args(["--silent", "--show-error", &format!("http://127.0.0.1:{port}/__test__/state")]).output().unwrap();
                 let state: Value = serde_json::from_slice(&output.stdout).unwrap();
                 assert!(!state["locks"].as_object().unwrap().contains_key(&format!("/{}", stages[0].name)), "resolved stage should be unlocked: {state}");
+                // The background retry also works without starting another
+                // transfer in the session.
+                let injected = Command::new("curl").args(["--silent", "--show-error", &format!("http://127.0.0.1:{port}/__test__/reject-next-stage-delete")]).status().unwrap();
+                assert!(injected.success());
+                let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let callback_flag = Arc::clone(&cancelled);
+                let progress = move |_: u64, _: u64| callback_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                flags.cancel_flag = Some(cancelled);
+                let error = linscp_engine::transfer::upload_single_file(session.as_ref(), &input, "/lock-background-cancel.bin", &flags, &mut logger, Some(&progress)).await.unwrap_err();
+                assert!(error.contains("will be retried"), "{error}");
+                let mut removed = false;
+                for _ in 0..100 {
+                    if !session.list_dir("/").await.unwrap().iter().any(|e| e.name.starts_with(".linscp-lock-")) { removed = true; break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                assert!(removed, "background cleanup did not retry the locked stage");
+                assert!(session.stat("/lock-background-cancel.bin").await.unwrap().is_none());
             }
             let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let callback_flag = Arc::clone(&cancelled);
@@ -3733,6 +3750,8 @@ mod tests {
                 assert!(error.contains("was not removed"), "{error}");
                 assert_eq!(stages.len(), 1);
                 assert_eq!(linscp_proto::download_bytes(session.as_ref(), &format!("/{}", stages[0].name), Default::default()).await.unwrap(), b"replacement by another actor");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                assert_eq!(linscp_proto::download_bytes(session.as_ref(), &format!("/{}", stages[0].name), Default::default()).await.unwrap(), b"replacement by another actor", "background retry removed a replacement");
                 flags.cancel_flag = None;
                 let next = linscp_engine::transfer::upload_single_file(session.as_ref(), &input, "/lock-replacement-next.bin", &flags, &mut logger, None).await;
                 assert!(next.is_ok(), "{next:?}");

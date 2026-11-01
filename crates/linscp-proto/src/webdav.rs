@@ -417,7 +417,7 @@ pub struct WebDavSession {
     cfg: WebDavConnectConfig,
     client: Client,
     no_redirect_client: Client,
-    state: Mutex<DavConditionState>,
+    state: Arc<Mutex<DavConditionState>>,
     jump_tunnel: Option<Arc<SshJumpTunnel>>,
     socks_relay: Mutex<Option<Socks5JumpRelay>>,
 }
@@ -530,6 +530,39 @@ impl WebDavSession {
         }
     }
 
+    fn schedule_locked_upload_cleanup(&self, stage: String, token: String) {
+        // A weak reference avoids keeping a closed session (and its tunnel)
+        // alive just to retry. Each request is token-guarded and cannot follow
+        // redirects; neither the token nor authentication is logged or saved.
+        let state = Arc::downgrade(&self.state);
+        let url = self.url_for(&stage, false);
+        let delete = self.apply_auth(self.no_redirect_client.delete(url.as_str()))
+            .header("If", format!("(<{token}>)"));
+        let unlock = self.apply_auth(self.no_redirect_client.request(Method::from_bytes(b"UNLOCK").expect("valid method"), url.as_str()))
+            .header("Lock-Token", format!("<{token}>"));
+        tokio::spawn(async move {
+            for delay in [2, 5, 15] {
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                let Some(shared) = state.upgrade() else { break; };
+                let still_pending = shared.lock().await.pending_cleanup.get(&stage) == Some(&token);
+                drop(shared);
+                if !still_pending { break; }
+                let Some(request) = delete.try_clone() else { break; };
+                let response = tokio::time::timeout(Duration::from_secs(3), request.send()).await;
+                if matches!(response, Ok(Ok(ref response)) if matches!(response.status().as_u16(), 200 | 204)) {
+                    if let Some(shared) = state.upgrade() {
+                        let mut state = shared.lock().await;
+                        if state.pending_cleanup.get(&stage) == Some(&token) { state.pending_cleanup.remove(&stage); }
+                    }
+                    if let Some(request) = unlock.try_clone() {
+                        let _ = tokio::time::timeout(Duration::from_secs(3), request.send()).await;
+                    }
+                    break;
+                }
+            }
+        });
+    }
+
     // Try a lock-null staging resource. Cleanup is conditional on the
     // server still recognizing our exclusive lock token; never unlink a path
     // merely because we once created it. Servers that explicitly do not offer
@@ -605,12 +638,12 @@ impl WebDavSession {
             let mut state = self.state.lock().await;
             state.locks.remove(&state_key);
             let retry = !confirmed && state.pending_cleanup.len() < 128;
-            if retry { state.pending_cleanup.insert(stage.clone(), token); }
+            if retry { state.pending_cleanup.insert(stage.clone(), token.clone()); }
+            drop(state);
             // Do not unlock after an unconfirmed DELETE: retaining the lock
-            // gives a later conditional retry a chance without deleting a
-            // replacement. If this session ends or the lock expires, manual
-            // inspection may still be required.
-            let note = if retry { " Cleanup will be retried on a later staged upload in this session while the lock remains valid." } else { "" };
+            // gives conditional retries a chance without deleting a replacement.
+            if retry { self.schedule_locked_upload_cleanup(stage, token); }
+            let note = if retry { " Cleanup will be retried while this session and lock remain active." } else { "" };
             return Err(ProtoError::Transport(format!("{error}; {detail}{note}")));
         }
         let _ = tokio::time::timeout(Duration::from_secs(3), self.unlock(&stage, Some(&token))).await;
@@ -666,7 +699,7 @@ impl WebDavSession {
             cfg,
             client,
             no_redirect_client,
-            state: Mutex::new(DavConditionState::default()),
+            state: Arc::new(Mutex::new(DavConditionState::default())),
             jump_tunnel,
             socks_relay: Mutex::new(socks_relay),
         })
