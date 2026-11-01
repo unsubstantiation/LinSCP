@@ -583,9 +583,11 @@ impl WebDavSession {
         let stage = format!("{}/.linscp-lock-{}", directory.trim_end_matches('/'), random.iter().map(|b| format!("{b:02x}")).collect::<String>());
         let method = Method::from_bytes(b"LOCK").map_err(|e| ProtoError::Transport(e.to_string()))?;
         let lock_body = r#"<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>"#;
-        let response = self.apply_auth(self.no_redirect_client.request(method, self.url_for(&stage, false)))
-            .header("If-None-Match", "*").header("Depth", "0").header("Timeout", "Second-3600")
-            .header("Content-Type", "application/xml; charset=utf-8").body(lock_body).send().await
+        let response = tokio::time::timeout(self.cfg.timeout.max(Duration::from_secs(1)),
+            self.apply_auth(self.no_redirect_client.request(method, self.url_for(&stage, false)))
+                .header("If-None-Match", "*").header("Depth", "0").header("Timeout", "Second-3600")
+                .header("Content-Type", "application/xml; charset=utf-8").body(lock_body).send()).await
+            .map_err(|_| ProtoError::Transport(format!("WebDAV staging LOCK timed out; a temporary resource at '{stage}' may remain.")))?
             .map_err(|e| ProtoError::Transport(format!("WebDAV staging LOCK was not confirmed; a temporary resource at '{stage}' may remain: {}", format_reqwest_err(&e))))?;
         let status = response.status();
         if matches!(status.as_u16(), 403 | 404 | 405 | 501) { return Ok(None); }

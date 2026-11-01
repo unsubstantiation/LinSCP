@@ -585,6 +585,8 @@ class DavHandler(BaseHTTPRequestHandler):
         mode = SERVER_STORE.next_stage_lock_mode if stage_created else ""
         if stage_created:
             SERVER_STORE.next_stage_lock_mode = ""
+        if mode == "slow-headers":
+            time.sleep(5)
         if mode in ("slow-body", "slow-no-header"):
             payload = body_out.encode("utf-8")
             self.send_response(201)
@@ -673,7 +675,7 @@ class DavHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/__test__/next-stage-lock":
             mode = urllib.parse.parse_qs(parsed.query).get("mode", [""])[0]
-            if mode not in ("slow-body", "slow-no-header", "xml-only"):
+            if mode not in ("slow-body", "slow-no-header", "slow-headers", "xml-only"):
                 self.send_error_text(400, "Unknown lock mode.")
                 return
             SERVER_STORE.next_stage_lock_mode = mode

@@ -3780,6 +3780,22 @@ mod tests {
                 assert!(session.stat("/lock-no-token.bin").await.unwrap().is_none());
                 let stages: Vec<_> = session.list_dir("/").await.unwrap().into_iter().filter(|e| e.name.starts_with(".linscp-lock-")).collect();
                 assert_eq!(stages.len(), 1, "unconfirmed token must not trigger pathname deletion");
+                // A server can also create the lock but never send headers.
+                // Honor the connection timeout and leave that unknown stage
+                // untouched rather than guessing ownership from its pathname.
+                let injected = Command::new("curl").args(["--silent", "--show-error", &format!("http://127.0.0.1:{port}/__test__/next-stage-lock?mode=slow-headers")]).status().unwrap();
+                assert!(injected.success());
+                let dav = linscp_proto::webdav::WebDavSession::connect(linscp_proto::webdav::WebDavConnectConfig {
+                    scheme: linscp_types::ProtocolScheme::Dav,
+                    host: "127.0.0.1".into(), port,
+                    username: Some("testuser".into()), password: Some(zeroize::Zeroizing::new("testpass".into())),
+                    timeout: std::time::Duration::from_secs(1), ..Default::default()
+                }, None, 0).await.unwrap();
+                let result = tokio::time::timeout(std::time::Duration::from_secs(4), linscp_engine::transfer::upload_single_file(&dav, &input, "/lock-no-headers.bin", &flags, &mut logger, None)).await.expect("staging LOCK did not honor its timeout").unwrap_err();
+                assert!(result.contains("LOCK timed out"), "{result}");
+                assert!(session.stat("/lock-no-headers.bin").await.unwrap().is_none());
+                let stages: Vec<_> = session.list_dir("/").await.unwrap().into_iter().filter(|e| e.name.starts_with(".linscp-lock-")).collect();
+                assert_eq!(stages.len(), 2, "unknown lock token must not cause pathname deletion");
             }
             drop(server);
         }
