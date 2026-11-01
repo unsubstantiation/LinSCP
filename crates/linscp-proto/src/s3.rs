@@ -898,7 +898,7 @@ impl S3Session {
                 let cleanup = match aborted {
                     Ok(Ok(response)) if response.status().as_u16() == 204 => {
                         if let Some(journal) = journal.as_mut() { journal.mark_resolved(); }
-                        "Multipart upload was aborted.".to_string()
+                        "Multipart upload was aborted; in-flight parts may still require lifecycle cleanup.".to_string()
                     },
                     Ok(Ok(response)) => format!("Multipart abort was not confirmed (HTTP {}); upload ID '{}' may remain.", response.status(), upload_id),
                     Ok(Err(e)) => format!("Multipart abort was not confirmed; upload ID '{}' may remain: {e}", upload_id),
