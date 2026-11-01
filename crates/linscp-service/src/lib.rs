@@ -2377,6 +2377,20 @@ mod tests {
         assert!(history.iter().any(|e| e["action"] == "abort" && e["key"] == "multipart-queued.bin"));
         assert!(history.iter().any(|e| e["action"] == "abort" && e["key"] == "multipart-match.bin"));
         assert!(history.iter().any(|e| e["action"] == "complete" && e["key"] == "multipart-success.bin"));
+        // A server that stalls an abort response must not hang cancellation.
+        // The unconfirmed upload ID stays journaled for the next connection.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trigger = Arc::clone(&cancel);
+        let stop = move |_: u64, _: u64| trigger.store(true, std::sync::atomic::Ordering::SeqCst);
+        multipart_flags.cancel_flag = Some(cancel);
+        let stalled = tokio::time::timeout(std::time::Duration::from_secs(12), linscp_engine::transfer::upload_single_file(session.as_ref(), &multipart_path, "/photos/multipart-abort-stall.bin", &multipart_flags, &mut logger, Some(&stop))).await.expect("stalled S3 abort hung cancellation").unwrap_err();
+        assert!(stalled.contains("abort timed out") && stalled.contains("not confirmed"), "{stalled}");
+        assert!(session.stat("/photos/multipart-abort-stall.bin").await.unwrap().is_none());
+        let journal_dir = tmp.join("config/s3-conditional-cleanup");
+        assert!(std::fs::read_dir(&journal_dir).unwrap().any(|entry| std::fs::metadata(entry.unwrap().path()).unwrap().len() > 0), "unconfirmed abort must remain journaled");
+        let retried = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "s3", "host": "127.0.0.1", "port": port, "s3_access_key": "AKIDTEST", "s3_secret_key": "testsecret42", "s3_region": "us-east-1", "tls_ca_file": tests.join("fixtures/s3-server-cert.pem"), "local_dir": local, "initial_dir": "/"}}))).await;
+        assert_eq!(retried.status, 200, "{}", retried.payload);
+        assert!(std::fs::read_dir(&journal_dir).unwrap().all(|entry| std::fs::metadata(entry.unwrap().path()).unwrap().len() == 0), "reconnection should resolve the timed-out abort");
         // If abort fails, report the upload ID for later inspection instead of
         // claiming cleanup succeeded or deleting the destination pathname.
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));

@@ -998,6 +998,9 @@ class S3Handler(BaseHTTPRequestHandler):
             self.send_error_xml(404, "NoSuchBucket", "Injected unrelated 404.")
             return
         upload = STORE.uploads.get(upload_id)
+        if upload is not None and upload["key"] == "multipart-abort-stall.bin" and upload_id not in STORE.abort_fail_once:
+            STORE.abort_fail_once.add(upload_id)
+            time.sleep(6)
         if upload is not None and upload["key"] == "multipart-abort-failure.bin" and upload_id not in STORE.abort_fail_once:
             STORE.abort_fail_once.add(upload_id)
             self.send_error_xml(503, "ServiceUnavailable", "Injected abort failure.")

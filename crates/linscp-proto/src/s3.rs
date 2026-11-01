@@ -831,8 +831,8 @@ impl S3Session {
                 Ok(journal) => Some(journal),
                 Err(error) => {
                     let query = vec![("uploadId".to_string(), upload_id.clone())];
-                    let aborted = self.send_signed(Method::DELETE, Some(&bucket), &key, &query, &[], Vec::new()).await;
-                    let confirmed = matches!(aborted, Ok(ref response) if response.status().as_u16() == 204);
+                    let aborted = tokio::time::timeout(Duration::from_secs(3), self.send_signed(Method::DELETE, Some(&bucket), &key, &query, &[], Vec::new())).await;
+                    let confirmed = matches!(aborted, Ok(Ok(ref response)) if response.status().as_u16() == 204);
                     return Err(ProtoError::Transport(format!("{error}; multipart abort {} (upload ID '{upload_id}').", if confirmed { "confirmed" } else { "was not confirmed" })));
                 }
             }
@@ -894,14 +894,15 @@ impl S3Session {
                 // Abort only our upload ID; never delete the object pathname.
                 // A lost completion response can still mean the object exists.
                 let query = vec![("uploadId".to_string(), upload_id.clone())];
-                let aborted = self.send_signed(Method::DELETE, Some(&bucket), &key, &query, &[], Vec::new()).await;
+                let aborted = tokio::time::timeout(Duration::from_secs(3), self.send_signed(Method::DELETE, Some(&bucket), &key, &query, &[], Vec::new())).await;
                 let cleanup = match aborted {
-                    Ok(response) if response.status().as_u16() == 204 => {
+                    Ok(Ok(response)) if response.status().as_u16() == 204 => {
                         if let Some(journal) = journal.as_mut() { journal.mark_resolved(); }
                         "Multipart upload was aborted.".to_string()
                     },
-                    Ok(response) => format!("Multipart abort was not confirmed (HTTP {}); upload ID '{}' may remain.", response.status(), upload_id),
-                    Err(e) => format!("Multipart abort was not confirmed; upload ID '{}' may remain: {e}", upload_id),
+                    Ok(Ok(response)) => format!("Multipart abort was not confirmed (HTTP {}); upload ID '{}' may remain.", response.status(), upload_id),
+                    Ok(Err(e)) => format!("Multipart abort was not confirmed; upload ID '{}' may remain: {e}", upload_id),
+                    Err(_) => format!("Multipart abort timed out and was not confirmed; upload ID '{}' may remain.", upload_id),
                 };
                 Err(ProtoError::Transport(format!("{error}; {cleanup} The destination may already exist if completion was unconfirmed.")))
             }
