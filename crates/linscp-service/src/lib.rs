@@ -3769,6 +3769,18 @@ mod tests {
                 assert!(error.contains("Locked temporary resource removed"), "{error}");
                 assert!(stages.is_empty(), "owned locked stage was not cleaned");
             }
+            if !replacement {
+                // If the server never supplies a usable token, fail within the
+                // body deadline and never attempt path-only cleanup.
+                let injected = Command::new("curl").args(["--silent", "--show-error", &format!("http://127.0.0.1:{port}/__test__/next-stage-lock?mode=slow-no-header")]).status().unwrap();
+                assert!(injected.success());
+                flags.cancel_flag = None;
+                let result = tokio::time::timeout(std::time::Duration::from_secs(4), linscp_engine::transfer::upload_single_file(session.as_ref(), &input, "/lock-no-token.bin", &flags, &mut logger, None)).await.expect("missing token response hung").unwrap_err();
+                assert!(result.contains("no usable token"), "{result}");
+                assert!(session.stat("/lock-no-token.bin").await.unwrap().is_none());
+                let stages: Vec<_> = session.list_dir("/").await.unwrap().into_iter().filter(|e| e.name.starts_with(".linscp-lock-")).collect();
+                assert_eq!(stages.len(), 1, "unconfirmed token must not trigger pathname deletion");
+            }
             drop(server);
         }
     }
