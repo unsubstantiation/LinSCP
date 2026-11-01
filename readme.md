@@ -38,7 +38,9 @@ can be cancelled cooperatively. An interrupted FTP/FTPS transfer invalidates its
 control connection; reconnect before further transfers. Fresh queued file downloads use owned temporary files
 that are removed on cancellation or failure on a best-effort basis; cleanup can
 fail. New SFTP directory downloads are staged as a tree and published without
-replacement on Linux and Windows; their cleanup is best-effort. SFTP download
+replacement on Linux and Windows; their cleanup is best-effort. Local staging
+and cleanup assume a trusted destination directory: concurrent pathname
+replacement can affect the temporary files. SFTP download
 merges are also staged before publication; cancellation during download leaves the
 existing tree untouched, but publication is not transactional. Uploads and
 published merges may leave partial files or directories. For new WebDAV uploads,
