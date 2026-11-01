@@ -573,7 +573,10 @@ impl WebDavSession {
         progress: Option<&ProgressCallback>, destination_etag: Option<&str>,
     ) -> Result<Option<u64>, ProtoError> {
         if opts.resume_offset != 0 || opts.append { return Ok(None); }
-        self.retry_locked_upload_cleanup().await;
+        // Pending cleanup must not indefinitely delay a newly queued transfer
+        // or its cancellation. Dropping an unconfirmed request is safe: the
+        // token stays pending and every retry remains conditional.
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.retry_locked_upload_cleanup()).await;
         let mut random = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut random);
         let directory = remote_path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
