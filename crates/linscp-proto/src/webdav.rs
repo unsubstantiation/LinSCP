@@ -589,15 +589,32 @@ impl WebDavSession {
             .map_err(|e| ProtoError::Transport(format!("WebDAV staging LOCK was not confirmed; a temporary resource at '{stage}' may remain: {}", format_reqwest_err(&e))))?;
         let status = response.status();
         if matches!(status.as_u16(), 403 | 404 | 405 | 501) { return Ok(None); }
-        let token_header = response.headers().get("lock-token").and_then(|v| v.to_str().ok())
-            .map(|s| s.trim().trim_start_matches('<').trim_end_matches('>').to_string());
-        let body = response.text().await.map_err(|e| ProtoError::Transport(format!("WebDAV staging LOCK response was not confirmed; '{stage}' may remain: {e}")))?;
         if status.as_u16() != 201 {
             return Err(ProtoError::Transport(format!("WebDAV staging LOCK was not confirmed (HTTP {status}); '{stage}' may remain.")));
         }
-        let token = token_header.or_else(|| dav_lock_token_from_xml(&body).ok())
-            .filter(|t| !t.is_empty() && !t.chars().any(|c| c.is_control() || c == '<' || c == '>'))
-            .ok_or_else(|| ProtoError::Transport(format!("WebDAV staging LOCK returned no usable token; '{stage}' may remain.")))?;
+        let token_header = response.headers().get("lock-token").and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+            .filter(|t| !t.is_empty() && !t.chars().any(|c| c.is_control() || c == '<' || c == '>'));
+        // A valid header is authoritative: do not wait for an optional body
+        // while a newly created locked resource is already on the server.
+        let token = if let Some(token) = token_header { drop(response); token } else {
+            let mut response = response;
+            let body = tokio::time::timeout(Duration::from_secs(3), async {
+                if response.content_length().is_some_and(|len| len > 64 * 1024) { return None; }
+                let mut bytes = Vec::new();
+                loop {
+                    match response.chunk().await {
+                        Ok(Some(chunk)) if bytes.len() + chunk.len() <= 64 * 1024 => bytes.extend_from_slice(&chunk),
+                        Ok(None) => break,
+                        _ => return None,
+                    }
+                }
+                String::from_utf8(bytes).ok()
+            }).await.ok().flatten();
+            body.as_deref().and_then(|body| dav_lock_token_from_xml(body).ok())
+                .filter(|t| !t.is_empty() && !t.chars().any(|c| c.is_control() || c == '<' || c == '>'))
+                .ok_or_else(|| ProtoError::Transport(format!("WebDAV staging LOCK returned no usable token; '{stage}' may remain.")))?
+        };
         let state_key = self.resolve_remote_path(&stage);
         self.state.lock().await.locks.insert(state_key.clone(), token.clone());
         let uploaded = self.upload_inner(&stage, opts, source, total_size, progress, false, None).await;

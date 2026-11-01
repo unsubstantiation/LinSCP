@@ -74,6 +74,7 @@ class Store:
         self.copy_count = 0
         self.reject_next_copy = False
         self.reject_next_stage_delete = False
+        self.next_stage_lock_mode = ""
         self.unlock_redirect_target_count = 0
         self.drop_next_get = os.environ.get("LSCP_TEST_DROP_ONCE", "")
         # path -> token, and path -> {name: value} for the dead properties.
@@ -581,8 +582,24 @@ class DavHandler(BaseHTTPRequestHandler):
             "<d:depth>0</d:depth><d:timeout>Second-%d</d:timeout>"
             "<d:locktoken><d:href>%s</d:href></d:locktoken>"
             "</d:activelock></d:lockdiscovery></d:prop>" % (timeout, token))
+        mode = SERVER_STORE.next_stage_lock_mode if stage_created else ""
+        if stage_created:
+            SERVER_STORE.next_stage_lock_mode = ""
+        if mode == "slow-body":
+            payload = body_out.encode("utf-8")
+            self.send_response(201)
+            self.send_header("Content-Type", "application/xml; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Lock-Token", "<%s>" % token)
+            self.end_headers()
+            time.sleep(5)
+            try:
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         self.send_body(201 if stage_created else 200, body_out, "application/xml; charset=utf-8",
-                       extra=[("Lock-Token", "<%s>" % token)])
+                       extra=[] if mode == "xml-only" else [("Lock-Token", "<%s>" % token)])
 
     def do_UNLOCK(self):
         self.drain_body()
@@ -651,6 +668,14 @@ class DavHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path == "/__test__/reject-next-copy":
             SERVER_STORE.reject_next_copy = True
+            self.send_body(204, b"")
+            return
+        if parsed.path == "/__test__/next-stage-lock":
+            mode = urllib.parse.parse_qs(parsed.query).get("mode", [""])[0]
+            if mode not in ("slow-body", "xml-only"):
+                self.send_error_text(400, "Unknown lock mode.")
+                return
+            SERVER_STORE.next_stage_lock_mode = mode
             self.send_body(204, b"")
             return
         if parsed.path == "/__test__/reject-next-stage-delete":

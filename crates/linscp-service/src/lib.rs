@@ -3656,6 +3656,15 @@ mod tests {
                 let output = Command::new("curl").args(["--silent", "--show-error", &format!("http://127.0.0.1:{port}/__test__/state")]).output().unwrap();
                 let state: Value = serde_json::from_slice(&output.stdout).unwrap();
                 assert_eq!(state["unlock_redirect_target_count"], 0, "UNLOCK leaked the token through a redirect");
+                // A valid Lock-Token header is usable without waiting for a
+                // stalled optional response body. XML-only servers still work.
+                for (mode, path) in [("slow-body", "/lock-slow-body.bin"), ("xml-only", "/lock-xml-only.bin")] {
+                    let injected = Command::new("curl").args(["--silent", "--show-error", &format!("http://127.0.0.1:{port}/__test__/next-stage-lock?mode={mode}")]).status().unwrap();
+                    assert!(injected.success());
+                    let result = tokio::time::timeout(std::time::Duration::from_secs(4), linscp_engine::transfer::upload_single_file(session.as_ref(), &input, path, &flags, &mut logger, None)).await.expect("staging LOCK waited for a stalled body");
+                    assert!(result.is_ok(), "{result:?}");
+                    assert_eq!(linscp_proto::download_bytes(session.as_ref(), path, Default::default()).await.unwrap().len(), 512 * 1024);
+                }
                 let completed = linscp_engine::transfer::upload_single_file(session.as_ref(), &input, "/lock-success.bin", &flags, &mut logger, None).await;
                 assert!(completed.is_ok(), "{completed:?}");
                 assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/lock-success.bin", Default::default()).await.unwrap().len(), 512 * 1024);
