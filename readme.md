@@ -44,8 +44,9 @@ existing tree untouched, but publication is not transactional. Uploads and
 published merges may leave partial files or directories. For new WebDAV uploads,
 servers supporting conditional lock-null resources can use a randomly named locked
 stage: on failure the app attempts deletion only while its lock token is still valid.
-If cleanup is unconfirmed, the app retains the token in memory and retries on a
-later staged upload in the same session; it does not persist tokens across restarts.
+If cleanup is unconfirmed, the app retains the token in memory and retries in the
+background and on later staged uploads in the same session; tokens are not persisted
+across restarts.
 This relies on server lock and precondition enforcement; locks can expire, and
 cleanup or lock acquisition can be unconfirmed, leaving a temporary resource.
 When locking is unsupported, uploads fall back to direct exclusive or conditional
