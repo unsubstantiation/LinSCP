@@ -26,6 +26,7 @@ else:
 if os.environ.get("LSCP_TEST_FTP_THROTTLE") == "1":
     class SlowDTPHandler(ThrottledDTPHandler):
         write_limit = 256 * 1024
+        read_limit = 256 * 1024
     handler.dtp_handler = SlowDTPHandler
 handler.authorizer = authorizer
 server = FTPServer(("127.0.0.1", 0), handler)

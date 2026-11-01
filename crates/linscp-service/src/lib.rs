@@ -2988,6 +2988,41 @@ mod tests {
         let reopened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "ftp", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
         assert_eq!(reopened.status, 200, "{}", reopened.payload);
         let new_id = reopened.payload["tab"]["id"].as_u64().unwrap();
+        // Running FTP uploads must accept cancellation through the public
+        // queue, poison the control connection, and retain the reported stage.
+        std::fs::write(local.join("queued-ftp-cancel.bin"), vec![43u8; 32 * 1024 * 1024]).unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": new_id, "local_dir": local, "remote_dir": "/", "names": ["queued-ftp-cancel.bin"], "accept_ftp_rename_risk": true}))).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut task_id = None;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(task) = tasks.get(idx) {
+                if task["status"] == "Running" && task["bytes_done"].as_u64().unwrap_or(0) > 0 { task_id = task["id"].as_u64(); break; }
+                assert_ne!(task["status"], "Failed", "{tasks:?}");
+                assert_ne!(task["status"], "Completed", "FTP upload finished before cancellation");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let cancelled = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": task_id.expect("queued FTP upload did not start")}))).await;
+        assert_eq!(cancelled.status, 200, "{}", cancelled.payload);
+        let mut stopped = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Cancelled") {
+                let error = tasks[idx]["error"].as_str().unwrap_or("");
+                assert!(error.contains("Reconnect") && error.contains("temporary file"), "{error}");
+                let stage = error.split(''').nth(1).expect("missing FTP temporary path");
+                assert!(remote.join(stage.trim_start_matches('/')).exists());
+                stopped = true; break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped, "running FTP upload did not cancel");
+        assert!(!remote.join("queued-ftp-cancel.bin").exists());
+        let reopened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "ftp", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
+        assert_eq!(reopened.status, 200, "{}", reopened.payload);
+        let new_id = reopened.payload["tab"]["id"].as_u64().unwrap();
         exercise_ftp_upload_cancellation(&svc, new_id, &local, &remote).await;
         drop(server); let _ = std::fs::remove_dir_all(tmp);
     }
