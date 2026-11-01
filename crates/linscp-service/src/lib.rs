@@ -2698,6 +2698,21 @@ mod tests {
     async fn exercise_ftp_uploads(svc: &CommanderService, id: u64, local: &Path, remote: &Path) {
         let request = |body: Value| ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body };
         std::fs::write(local.join("up.txt"), b"FTP upload payload").unwrap();
+        // Direct callers must not bypass the FTP risk acknowledgment or fall
+        // through ASCII conversion to an unguarded STOR.
+        let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        let mut logger = linscp_engine::xml_log::SessionLogger::open(None, 0, false, None, None, false, "").unwrap();
+        std::fs::write(remote.join("unsafe.txt.filepart"), b"unrelated partial").unwrap();
+        let unguarded = linscp_engine::transfer::upload_single_file(session.as_ref(), &local.join("up.txt"), "/unsafe.txt", &linscp_engine::transfer::TransferFlags::default(), &mut logger, None).await;
+        assert!(unguarded.unwrap_err().contains("Unguarded SFTP/FTP uploads are disabled"));
+        assert_eq!(std::fs::read(remote.join("unsafe.txt.filepart")).unwrap(), b"unrelated partial");
+        assert!(!remote.join("unsafe.txt").exists());
+        let mut ascii = linscp_engine::transfer::TransferFlags::default();
+        ascii.ftp_risky_publish = true;
+        ascii.transfer_mode = linscp_types::TransferMode::Ascii;
+        let rejected = linscp_engine::transfer::upload_single_file(session.as_ref(), &local.join("up.txt"), "/ascii-unsafe.txt", &ascii, &mut logger, None).await;
+        assert!(rejected.is_err(), "FTP ASCII upload must not bypass staging");
+        assert!(!remote.join("ascii-unsafe.txt").exists());
         let no_consent = svc.dispatch_async(request(json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["up.txt"]}))).await;
         assert_eq!(no_consent.status, 409);
         assert_eq!(no_consent.payload["ftp_rename_risk"], true);
@@ -3952,10 +3967,13 @@ mod tests {
         assert!(downloaded.join("large.bin.filepart").exists());
         cancel.store(false, std::sync::atomic::Ordering::SeqCst);
         cancelling.no_clobber = false;
+        // The legacy unguarded upload route must fail before it can adopt or
+        // remove a stage that belongs to another client.
+        std::fs::write(remote.join("cancelled.bin.filepart"), b"unrelated partial").unwrap();
         let cancelled_upload = linscp_engine::transfer::upload_single_file(session.as_ref(), &local.join("large.bin"), "/cancelled.bin", &cancelling, &mut logger, Some(&cancel_on_progress)).await;
-        assert!(cancelled_upload.is_err());
+        assert!(cancelled_upload.unwrap_err().contains("Unguarded SFTP/FTP uploads are disabled"));
         assert!(!remote.join("cancelled.bin").exists());
-        assert!(remote.join("cancelled.bin.filepart").exists());
+        assert_eq!(std::fs::read(remote.join("cancelled.bin.filepart")).unwrap(), b"unrelated partial");
         assert!(session.stat("/upload.txt").await.unwrap().is_some());
         // Exclusive creation must fail without changing a destination that
         // appeared after any earlier conflict check.

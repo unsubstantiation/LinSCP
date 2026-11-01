@@ -738,6 +738,16 @@ pub async fn upload_single_file(
 ) -> Result<bool, String> {
     validate_protocol_transfer_flags(flags, session.scheme(), true)?;
 
+    // The legacy unguarded staging path can unlink or replace a pathname
+    // another client has substituted. It is not an ownership proof and must
+    // not be used for SFTP/FTP cleanup or publication.
+    if matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Scp | ProtocolScheme::Ssh | ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes)
+        && !flags.no_clobber && !flags.ftp_risky_publish {
+        return Err("Unguarded SFTP/FTP uploads are disabled; use exclusive creation or the explicitly acknowledged FTP staging mode.".to_string());
+    }
+    if local_src == Path::new("-") && (flags.no_clobber || flags.ftp_risky_publish || flags.overwrite_etag.is_some()) {
+        return Err("Guarded uploads require a local file with a known length.".to_string());
+    }
     if local_src == Path::new("-") {
         let mut buf = Vec::new();
         std::io::stdin()
@@ -817,8 +827,8 @@ pub async fn upload_single_file(
         .unwrap_or_default();
     let effective_ascii = wants_ascii_conversion(flags.transfer_mode, &leaf);
 
-    if (flags.no_clobber || flags.overwrite_etag.is_some()) && effective_ascii {
-        return Err("Guarded uploads require binary transfer mode.".to_string());
+    if (flags.no_clobber || flags.overwrite_etag.is_some() || flags.ftp_risky_publish) && effective_ascii {
+        return Err("Guarded or staged uploads require binary transfer mode.".to_string());
     }
     if effective_ascii {
         let raw = std::fs::read(local_src)
