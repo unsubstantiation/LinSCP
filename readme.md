@@ -55,6 +55,11 @@ When locking is unsupported, uploads fall back to direct exclusive or conditiona
 PUT, which can leave partial remote files. Approved overwrites on lock-capable
 servers use tagged source-lock and destination-ETag conditions on MOVE; both
 conditions depend on server enforcement.
+SFTP and FTP cannot safely delete an interrupted upload by pathname: another
+client may have replaced it. The app leaves such files for inspection rather than
+blindly removing them, and rejects legacy unguarded SFTP/FTP upload paths. Automatic
+safe cleanup requires a server-side ownership or conditional-delete facility that
+these protocols do not generally provide.
 Without overwrite approval, local copies and downloads use no-replace publication,
 and SFTP, WebDAV and S3 uploads use exclusive creation. S3 exclusive uploads are
 limited to 1 GiB. FTP/FTPS file uploads are available only after explicitly
