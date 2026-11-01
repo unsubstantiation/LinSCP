@@ -2769,7 +2769,24 @@ mod tests {
         let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let callback_flag = Arc::clone(&cancel);
-        let progress = move |_: u64, _: u64| callback_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let existing: std::collections::HashSet<_> = std::fs::read_dir(remote).unwrap().filter_map(Result::ok).map(|e| e.file_name()).collect();
+        let remote_dir = remote.to_path_buf();
+        let replacement = Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+        let observed = Arc::clone(&replacement);
+        // Simulate a second client replacing the server-generated STOU path
+        // while the original data connection still writes to its open file.
+        let progress = move |_: u64, _: u64| {
+            let mut observed = observed.lock().unwrap();
+            if observed.is_none() {
+                let stage = std::fs::read_dir(&remote_dir).unwrap().filter_map(Result::ok)
+                    .find(|e| e.file_name().to_string_lossy().starts_with(".linscp-upload-") && !existing.contains(&e.file_name()))
+                    .expect("server did not create unique stage").path();
+                std::fs::rename(&stage, remote_dir.join("held-ftp-upload")).unwrap();
+                std::fs::write(&stage, b"replacement by another client").unwrap();
+                *observed = Some(stage);
+            }
+            callback_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        };
         let mut flags = linscp_engine::transfer::TransferFlags::default();
         flags.no_clobber = true;
         flags.ftp_risky_publish = true;
@@ -2780,7 +2797,10 @@ mod tests {
         assert!(error.contains("temporary file"));
         assert!(!remote.join("cancel-upload.bin").exists());
         let stage = error.split('\'').nth(1).expect("missing temporary path in cancellation error");
-        assert!(remote.join(stage.trim_start_matches('/')).exists(), "reported temporary file must exist");
+        let stage_path = remote.join(stage.trim_start_matches('/'));
+        assert_eq!(replacement.lock().unwrap().as_ref(), Some(&stage_path), "error must identify the untrusted path");
+        assert_eq!(std::fs::read(&stage_path).unwrap(), b"replacement by another client", "cancellation must not delete or alter a replacement");
+        assert!(remote.join("held-ftp-upload").exists(), "the original partial is left for inspection");
         let err = session.stat("/download.txt").await.expect_err("cancelled FTP upload must poison control channel");
         assert!(err.to_string().contains("reconnect"), "{err}");
     }
@@ -4239,6 +4259,36 @@ mod tests {
         }
         assert!(stopped, "cancellation was not observed");
         assert!(std::fs::metadata(remote.join("slow.bin")).unwrap().len() < 4 * 1024 * 1024);
+        // Replace the pathname after the server opened our exclusive upload.
+        // Cancellation must not unlink the other client's replacement.
+        std::fs::write(local.join("replacement-race.bin"), vec![27u8; 4 * 1024 * 1024]).unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["replacement-race.bin"]}))).await;
+        assert_eq!(queued.status, 200);
+        let mut task_id = None;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(task) = tasks.get(idx) {
+                if task["status"] == "Running" && task["bytes_done"].as_u64().unwrap_or(0) > 0 { task_id = task["id"].as_u64(); break; }
+                assert_ne!(task["status"], "Failed", "{tasks:?}");
+                assert_ne!(task["status"], "Completed", "upload finished before replacement");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let task_id = task_id.expect("SFTP replacement test did not start");
+        std::fs::rename(remote.join("replacement-race.bin"), remote.join("held-sftp-upload")).unwrap();
+        std::fs::write(remote.join("replacement-race.bin"), b"replacement by another client").unwrap();
+        let cancelled = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": task_id}))).await;
+        assert_eq!(cancelled.status, 200);
+        let mut stopped = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Cancelled") { stopped = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped, "SFTP replacement test did not cancel");
+        assert_eq!(std::fs::read(remote.join("replacement-race.bin")).unwrap(), b"replacement by another client", "cancellation must not delete or alter a replacement");
+        assert!(remote.join("held-sftp-upload").exists(), "the original partial remains for inspection");
         assert!(session.stat("/upload.txt").await.unwrap().is_some());
         // SFTP-to-SFTP file and tree copies require explicit acceptance of
         // source/path races and never replace an existing destination.
