@@ -363,6 +363,28 @@ pub async fn download_verified_resume(
     Ok(())
 }
 
+// Consume a private TempPath when publishing it. Otherwise its Drop would
+// unlink the old pathname a second time after publication, potentially
+// removing an unrelated file created there in the meantime.
+fn publish_download_stage(
+    stage: &Path, destination: &Path, no_clobber: bool,
+    cleanup: &mut Option<tempfile::TempPath>,
+) -> std::io::Result<()> {
+    if no_clobber {
+        std::fs::hard_link(stage, destination)?;
+        if let Some(path) = cleanup.take() {
+            let _ = path.close();
+        } else {
+            let _ = std::fs::remove_file(stage);
+        }
+        Ok(())
+    } else if let Some(path) = cleanup.take() {
+        path.persist(destination).map_err(|error| error.error)
+    } else {
+        std::fs::rename(stage, destination)
+    }
+}
+
 /// Downloads a single remote file (or streams to stdout when `local_dest == Path::new("-")`).
 pub async fn download_single_file(
     session: &dyn RemoteSession,
@@ -538,8 +560,9 @@ pub async fn download_single_file(
         return Err("Automatic cleanup requires a fresh staged download.".to_string());
     }
     // The private temp file is created exclusively in the destination directory
-    // so publication stays on the same filesystem. TempPath removes only this
-    // owned stage on early return, cancellation, or publication failure.
+    // so publication stays on the same filesystem. TempPath cleans up the
+    // stage pathname on early return, cancellation, or publication failure;
+    // cleanup is best-effort and assumes the directory is trusted.
     let mut private_file = None;
     let mut _cleanup_stage = None;
     let stage_opt = if flags.cleanup_download_stage {
@@ -661,15 +684,9 @@ pub async fn download_single_file(
         return Err("Transfer cancelled before publication.".to_string());
     }
     if let Some(ref sp) = stage_opt {
-        let publish = if flags.no_clobber {
-            // The hard link is an atomic create-if-absent on the same filesystem.
-            // Never fall back to rename, which can replace a newly created target.
-            std::fs::hard_link(sp, local_dest).map(|_| { let _ = std::fs::remove_file(sp); })
-        } else {
-            // Rename replaces atomically; never unlink the old destination first.
-            // This still does not protect against changes after approval.
-            std::fs::rename(sp, local_dest)
-        };
+        // A hard link is atomic create-if-absent; overwrite publication uses
+        // atomic replacement and never unlinks the old destination first.
+        let publish = publish_download_stage(sp, local_dest, flags.no_clobber, &mut _cleanup_stage);
         publish.map_err(|e| {
             let msg = format!(
                 "Cannot finalize downloaded file '{}' -> '{}': {e}",
@@ -1162,4 +1179,47 @@ pub async fn upload_directory_recursive(
         let _ = std::fs::remove_dir(local_dir);
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod owned_stage_cleanup_tests {
+    use super::publish_download_stage;
+
+    #[test]
+    fn publication_does_not_unlink_a_later_stage_replacement() {
+        for no_clobber in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let file = tempfile::Builder::new().prefix(".linscp-download-").tempfile_in(dir.path()).unwrap();
+            std::fs::write(file.path(), b"download").unwrap();
+            let (file, path) = file.into_parts();
+            drop(file);
+            let old = path.to_path_buf();
+            let mut cleanup = Some(path);
+            let dest = dir.path().join("destination");
+            if !no_clobber { std::fs::write(&dest, b"old").unwrap(); }
+            publish_download_stage(&old, &dest, no_clobber, &mut cleanup).unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), b"download");
+            assert!(!old.exists());
+            std::fs::write(&old, b"replacement").unwrap();
+            drop(cleanup);
+            assert_eq!(std::fs::read(&old).unwrap(), b"replacement");
+        }
+    }
+
+    #[test]
+    fn failed_publication_keeps_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        std::fs::write(file.path(), b"download").unwrap();
+        let (file, path) = file.into_parts();
+        drop(file);
+        let old = path.to_path_buf();
+        let mut cleanup = Some(path);
+        let dest = dir.path().join("destination");
+        std::fs::write(&dest, b"existing").unwrap();
+        assert!(publish_download_stage(&old, &dest, true, &mut cleanup).is_err());
+        drop(cleanup);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"existing");
+        assert!(!old.exists());
+    }
 }
