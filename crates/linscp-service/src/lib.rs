@@ -3826,6 +3826,7 @@ mod tests {
         assert!(result.is_err());
         assert!(session.stat("/upload.txt").await.unwrap().is_some());
         exercise_locked_webdav_upload_cleanup(&local).await;
+        Box::pin(exercise_cross_move_destination(&svc, id, "/", &local)).await;
         drop(server); let _ = std::fs::remove_dir_all(tmp);
     }
 
