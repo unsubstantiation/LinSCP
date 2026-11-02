@@ -3033,6 +3033,89 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    async fn exercise_webdav_local_trees(svc: &CommanderService, id: u64, local: &Path, downloaded: &Path, session: &dyn linscp_proto::RemoteSession) {
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        // MKCOL must not follow redirects or treat an ambiguous 207 as a
+        // confirmed creation of the requested directory.
+        assert!(session.mkdir("/mkcol-redirect").await.is_err());
+        assert!(session.stat("/mkcol-target").await.unwrap().is_none());
+        assert!(session.mkdir("/mkcol-multistatus").await.is_err());
+        assert!(session.stat("/mkcol-multistatus").await.unwrap().is_none());
+        // WebDAV trees are staged locally; confirmation is required because
+        // collection ETags do not make their descendants a snapshot.
+        session.mkdir("/tree-download").await.unwrap();
+        session.mkdir("/tree-download/nested").await.unwrap();
+        session.mkdir("/tree-download/nested/empty").await.unwrap();
+        linscp_proto::upload_bytes(session, "/tree-download/nested/data.txt", b"tree data", Default::default()).await.unwrap();
+        let risk = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["tree-download"]}))).await;
+        assert_eq!(risk.status, 409, "{}", risk.payload);
+        assert_eq!(risk.payload["directory_copy_risk"], true);
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["tree-download"], "accept_directory_copy_risk": true}))).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut done = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("WebDAV tree download failed: {:?}", tasks.get(idx)); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done);
+        assert_eq!(std::fs::read(downloaded.join("tree-download/nested/data.txt")).unwrap(), b"tree data");
+        assert!(downloaded.join("tree-download/nested/empty").is_dir());
+        // A merge must preserve existing files, even when publication stops on
+        // a conflicting leaf after approval.
+        linscp_proto::upload_bytes(session, "/tree-download/nested/data.txt", b"changed remote", Default::default()).await.unwrap();
+        let conflict = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["tree-download"], "accept_directory_copy_risk": true}))).await;
+        assert_eq!(conflict.status, 409, "{}", conflict.payload);
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["tree-download"], "accept_directory_copy_risk": true, "merge_directories": ["tree-download"]}))).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut failed = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("existing local file was replaced"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert_eq!(std::fs::read(downloaded.join("tree-download/nested/data.txt")).unwrap(), b"tree data");
+        // Upload a new WebDAV tree, then verify an approved merge cannot
+        // replace a file that appeared in the destination.
+        std::fs::create_dir_all(local.join("tree-upload/nested/empty")).unwrap();
+        std::fs::write(local.join("tree-upload/nested/data.txt"), b"upload tree").unwrap();
+        let risk = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["tree-upload"]}))).await;
+        assert_eq!(risk.status, 409, "{}", risk.payload);
+        assert_eq!(risk.payload["directory_copy_risk"], true);
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["tree-upload"], "accept_directory_copy_risk": true}))).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut done = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("WebDAV tree upload failed: {:?}", tasks.get(idx)); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done);
+        assert_eq!(linscp_proto::download_bytes(session, "/tree-upload/nested/data.txt", Default::default()).await.unwrap(), b"upload tree");
+        assert!(session.stat("/tree-upload/nested/empty").await.unwrap().unwrap().is_dir);
+        std::fs::write(local.join("tree-upload/nested/data.txt"), b"must not replace").unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["tree-upload"], "accept_directory_copy_risk": true, "merge_directories": ["tree-upload"]}))).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut failed = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("existing WebDAV file was replaced"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert_eq!(linscp_proto::download_bytes(session, "/tree-upload/nested/data.txt", Default::default()).await.unwrap(), b"upload tree");
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn live_webdav_gui_upload_download() {
         if std::env::var_os("LSCP_LIVE_WEBDAV").is_none() { return; }
@@ -3078,84 +3161,7 @@ mod tests {
         assert!(list.payload["entries"].as_array().unwrap().iter().any(|e| e["name"] == "upload.txt"));
         assert_eq!(std::fs::read(downloaded.join("upload.txt")).unwrap(), b"WebDAV roundtrip");
         let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
-        // MKCOL must not follow redirects or treat an ambiguous 207 as a
-        // confirmed creation of the requested directory.
-        assert!(session.mkdir("/mkcol-redirect").await.is_err());
-        assert!(session.stat("/mkcol-target").await.unwrap().is_none());
-        assert!(session.mkdir("/mkcol-multistatus").await.is_err());
-        assert!(session.stat("/mkcol-multistatus").await.unwrap().is_none());
-        // WebDAV trees are staged locally; confirmation is required because
-        // collection ETags do not make their descendants a snapshot.
-        session.mkdir("/tree-download").await.unwrap();
-        session.mkdir("/tree-download/nested").await.unwrap();
-        session.mkdir("/tree-download/nested/empty").await.unwrap();
-        linscp_proto::upload_bytes(session.as_ref(), "/tree-download/nested/data.txt", b"tree data", Default::default()).await.unwrap();
-        let risk = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["tree-download"]}))).await;
-        assert_eq!(risk.status, 409, "{}", risk.payload);
-        assert_eq!(risk.payload["directory_copy_risk"], true);
-        let idx = svc.queue.snapshot().0.len();
-        let queued = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["tree-download"], "accept_directory_copy_risk": true}))).await;
-        assert_eq!(queued.status, 200, "{}", queued.payload);
-        let mut done = false;
-        for _ in 0..1000 {
-            let (tasks, _) = svc.queue.snapshot();
-            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
-            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("WebDAV tree download failed: {:?}", tasks.get(idx)); }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(done);
-        assert_eq!(std::fs::read(downloaded.join("tree-download/nested/data.txt")).unwrap(), b"tree data");
-        assert!(downloaded.join("tree-download/nested/empty").is_dir());
-        // A merge must preserve existing files, even when publication stops on
-        // a conflicting leaf after approval.
-        linscp_proto::upload_bytes(session.as_ref(), "/tree-download/nested/data.txt", b"changed remote", Default::default()).await.unwrap();
-        let conflict = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["tree-download"], "accept_directory_copy_risk": true}))).await;
-        assert_eq!(conflict.status, 409, "{}", conflict.payload);
-        let idx = svc.queue.snapshot().0.len();
-        let queued = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["tree-download"], "accept_directory_copy_risk": true, "merge_directories": ["tree-download"]}))).await;
-        assert_eq!(queued.status, 200, "{}", queued.payload);
-        let mut failed = false;
-        for _ in 0..1000 {
-            let (tasks, _) = svc.queue.snapshot();
-            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
-            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("existing local file was replaced"); }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(failed);
-        assert_eq!(std::fs::read(downloaded.join("tree-download/nested/data.txt")).unwrap(), b"tree data");
-        // Upload a new WebDAV tree, then verify an approved merge cannot
-        // replace a file that appeared in the destination.
-        std::fs::create_dir_all(local.join("tree-upload/nested/empty")).unwrap();
-        std::fs::write(local.join("tree-upload/nested/data.txt"), b"upload tree").unwrap();
-        let risk = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["tree-upload"]}))).await;
-        assert_eq!(risk.status, 409, "{}", risk.payload);
-        assert_eq!(risk.payload["directory_copy_risk"], true);
-        let idx = svc.queue.snapshot().0.len();
-        let queued = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["tree-upload"], "accept_directory_copy_risk": true}))).await;
-        assert_eq!(queued.status, 200, "{}", queued.payload);
-        let mut done = false;
-        for _ in 0..1000 {
-            let (tasks, _) = svc.queue.snapshot();
-            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
-            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("WebDAV tree upload failed: {:?}", tasks.get(idx)); }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(done);
-        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/tree-upload/nested/data.txt", Default::default()).await.unwrap(), b"upload tree");
-        assert!(session.stat("/tree-upload/nested/empty").await.unwrap().unwrap().is_dir);
-        std::fs::write(local.join("tree-upload/nested/data.txt"), b"must not replace").unwrap();
-        let idx = svc.queue.snapshot().0.len();
-        let queued = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["tree-upload"], "accept_directory_copy_risk": true, "merge_directories": ["tree-upload"]}))).await;
-        assert_eq!(queued.status, 200, "{}", queued.payload);
-        let mut failed = false;
-        for _ in 0..1000 {
-            let (tasks, _) = svc.queue.snapshot();
-            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
-            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("existing WebDAV file was replaced"); }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(failed);
-        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/tree-upload/nested/data.txt", Default::default()).await.unwrap(), b"upload tree");
+        Box::pin(exercise_webdav_local_trees(&svc, id, &local, &downloaded, session.as_ref())).await;
         std::fs::write(local.join("other.txt"), b"must not replace").unwrap();
         let mut flags = linscp_engine::transfer::TransferFlags::default();
         flags.no_clobber = true;
