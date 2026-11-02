@@ -867,8 +867,8 @@ impl QueueManager {
                 download_flags.source_etag = etag.clone();
                 download_flags.cancel_flag = Some(Arc::clone(&task.cancel_flag));
                 if source_entry.is_dir {
-                    if *move_item || !matches!(source_session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs) || target_session.scheme() != ProtocolScheme::Sftp {
-                        return Err("Directory copies require an SFTP or WebDAV source and an SFTP destination.".to_string());
+                    if *move_item || !matches!(source_session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs) || !matches!(target_session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs) {
+                        return Err("Directory copies require SFTP or WebDAV sources and destinations.".to_string());
                     }
                     download_staged_remote_tree(source_session.as_ref(), source, &payload, &download_flags, &mut logger, Some(&*progress), 0).await?;
                     if task.cancel_flag.load(Ordering::SeqCst) { return Err("Cancelled before upload; source remains.".to_string()); }

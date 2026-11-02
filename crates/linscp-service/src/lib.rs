@@ -401,7 +401,7 @@ impl CommanderService {
             if (!same_tab || !move_item) && target_session.scheme() == linscp_types::ProtocolScheme::S3 && source_entry.size > 1024 * 1024 * 1024 {
                 return api_error(400, "Remote transfers to S3 are limited to 1 GiB per file.");
             }
-            if is_dir && (!same_tab || !move_item) && (move_item || !(source_is_sftp || source_is_dav) || target_session.scheme() != linscp_types::ProtocolScheme::Sftp) { return api_error(501, "Directory copies require an SFTP or WebDAV source and an SFTP destination; cross-server directory moves are unsupported."); }
+            if is_dir && (!same_tab || !move_item) && (move_item || !(source_is_sftp || source_is_dav) || !matches!(target_session.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs)) { return api_error(501, "Directory copies require SFTP or WebDAV sources and destinations; cross-server directory moves are unsupported."); }
             if is_dir && !move_item && source_is_dav && !body.get("accept_directory_copy_risk").and_then(Value::as_bool).unwrap_or(false) {
                 return ApiReply { status: 409, payload: json!({"success": false, "error": "Directory copy requires confirmation", "directory_copy_risk": true}) };
             }
@@ -3080,6 +3080,38 @@ mod tests {
         }
         assert!(failed);
         assert_eq!(std::fs::read(downloaded.join("tree-download/nested/data.txt")).unwrap(), b"tree data");
+        // Remote-to-remote copies also use a locally staged tree and refuse
+        // to replace an existing destination tree.
+        session.mkdir("/webdav-copy-dest").await.unwrap();
+        let risk = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/webdav-copy-dest", "names": ["tree-download"]}))).await;
+        assert_eq!(risk.status, 409, "{}", risk.payload);
+        assert_eq!(risk.payload["directory_copy_risk"], true);
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/webdav-copy-dest", "names": ["tree-download"], "accept_directory_copy_risk": true}))).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut done = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("WebDAV remote tree copy failed: {:?}", tasks.get(idx)); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done);
+        assert_eq!(linscp_proto::download_bytes(session, "/webdav-copy-dest/tree-download/nested/data.txt", Default::default()).await.unwrap(), b"changed remote");
+        assert!(session.stat("/webdav-copy-dest/tree-download/nested/empty").await.unwrap().unwrap().is_dir);
+        assert_eq!(linscp_proto::download_bytes(session, "/tree-download/nested/data.txt", Default::default()).await.unwrap(), b"changed remote");
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": id, "target": format!("tab:{id}"), "directory": "/webdav-copy-dest", "names": ["tree-download"], "accept_directory_copy_risk": true}))).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut failed = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("existing remote WebDAV tree was replaced"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert_eq!(linscp_proto::download_bytes(session, "/webdav-copy-dest/tree-download/nested/data.txt", Default::default()).await.unwrap(), b"changed remote");
         // Upload a new WebDAV tree, then verify an approved merge cannot
         // replace a file that appeared in the destination.
         std::fs::create_dir_all(local.join("tree-upload/nested/empty")).unwrap();
