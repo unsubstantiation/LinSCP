@@ -9,10 +9,12 @@ is experimental and is not ready for production transfers.** Remote listing
 and queued file uploads and downloads are implemented. SFTP and plain HTTP
 WebDAV connections and transfers have live integration tests; FTP, explicit FTPS
 and implicit FTPS staged uploads, plus FTP/explicit FTPS downloads and S3 small-file
-transfers, also have live tests. SFTP directories can be copied to new destinations or
-merged into explicitly approved existing directories. Merges fail rather than
-replace conflicting files and are not transactional; concurrent directory path
-changes can still affect them. Other directory merges are unsupported. WebDAV files can be moved to a new local
+transfers, also have live tests. SFTP and WebDAV directories can be copied between
+a remote session and the local pane, including explicitly approved merges. WebDAV
+copies require acknowledgement that trees are not snapshots and path changes may
+redirect writes. Merges fail rather than replace conflicting files and are not
+transactional; concurrent directory path changes can still affect them. Other
+directory merges are unsupported. WebDAV files can be moved to a new local
 name using conditional GET and DELETE with the original strong ETag; this relies
 on server enforcement and can leave a duplicate if deletion cannot be confirmed.
 WebDAV files and directories can also be renamed or queued for a move to
@@ -37,10 +39,10 @@ Running local copies, SFTP and WebDAV transfers, FTP/FTPS transfers, and S3 tran
 can be cancelled cooperatively. An interrupted FTP/FTPS transfer invalidates its
 control connection; reconnect before further transfers. Fresh queued file downloads use owned temporary files
 that are removed on cancellation or failure on a best-effort basis; cleanup can
-fail. New SFTP directory downloads are staged as a tree and published without
+fail. New SFTP and WebDAV directory downloads are staged as a tree and published without
 replacement on Linux and Windows; their cleanup is best-effort. Local staging
 and cleanup assume a trusted destination directory: concurrent pathname
-replacement can affect the temporary files. SFTP download
+replacement can affect the temporary files. SFTP and WebDAV download
 merges are also staged before publication; cancellation during download leaves the
 existing tree untouched, but publication is not transactional. Uploads and
 published merges may leave partial files or directories. For new WebDAV uploads,
