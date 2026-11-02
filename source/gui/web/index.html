@@ -2169,6 +2169,11 @@
       payload = Object.assign({}, payload, { accept_ftp_rename_risk: true });
       result = await apiPost(endpoint, payload);
     }
+    if (!result.success && result.directory_copy_risk) {
+      if (!confirm(t("WebDAV directory downloads are not snapshots: concurrent changes can affect the copied tree. Continue?"))) return result;
+      payload = Object.assign({}, payload, { accept_directory_copy_risk: true });
+      result = await apiPost(endpoint, payload);
+    }
     if (!result.success && result.directory_conflicts && result.directory_conflicts.length) {
       const names = result.directory_conflicts;
       if (!confirm(t("The destination already contains these directories: {names}.\n\nMerge them? Existing files will not be replaced; conflicting files stop the transfer.", {names: names.join(', ')}))) return result;

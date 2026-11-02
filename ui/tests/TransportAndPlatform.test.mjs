@@ -333,6 +333,30 @@ test('directory merge requires explicit approval and forwards only approved root
   assert.deepEqual(calls[1].merge_directories, ['tree']);
 });
 
+test('WebDAV tree downloads separately confirm snapshot and merge risks', async () => {
+  const html = fs.readFileSync(path.join(repoRoot, 'source/gui/web/index.html'), 'utf8').replace(/\r\n/g, '\n');
+  const match = html.match(/async function queueWithOverwriteDecision\(endpoint, payload, conflicts\) \{[\s\S]*?\n  \}\n\n  async function transfer/);
+  assert.ok(match);
+  const source = match[0].replace(/\n\n  async function transfer$/, '');
+  for (const accepted of [false, true]) {
+    const calls = [];
+    const apiPost = async (_endpoint, payload) => {
+      calls.push({ ...payload });
+      if (!payload.accept_directory_copy_risk) return { success: false, directory_copy_risk: true };
+      if (!payload.merge_directories) return { success: false, directory_conflicts: ['tree'] };
+      return { success: true };
+    };
+    const handler = new Function('apiPost', 'preferences', 'confirm', 't', `${source}; return queueWithOverwriteDecision;`)(apiPost, {}, () => accepted, s => s);
+    const result = await handler('/api/transfer/download', { names: ['tree'] }, []);
+    assert.equal(calls.length, accepted ? 3 : 1);
+    if (accepted) {
+      assert.equal(result.success, true);
+      assert.equal(calls[2].accept_directory_copy_risk, true);
+      assert.deepEqual(calls[2].merge_directories, ['tree']);
+    }
+  }
+});
+
 test('FTP uploads require risk confirmation and separately confirm existing files', async () => {
   const html = fs.readFileSync(path.join(repoRoot, 'source/gui/web/index.html'), 'utf8').replace(/\r\n/g, '\n');
   const match = html.match(/async function queueWithOverwriteDecision\(endpoint, payload, conflicts\) \{[\s\S]*?\n  \}\n\n  async function transfer/);

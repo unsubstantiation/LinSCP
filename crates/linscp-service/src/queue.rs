@@ -761,7 +761,7 @@ impl QueueManager {
                 f.no_clobber = !allow_overwrite;
                 f.cleanup_download_stage = true;
                 if entry.is_dir {
-                    if session.scheme() != ProtocolScheme::Sftp || *delete_source { return Err("Only SFTP directory copies are supported.".to_string()); }
+                    if !matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs) || *delete_source { return Err("Directory downloads require SFTP or WebDAV and cannot delete the source.".to_string()); }
                     f.no_clobber = true;
                     // Stage both new trees and merges privately. Cancelling a
                     // download before publication leaves an existing tree alone.
