@@ -3012,7 +3012,7 @@ mod tests {
             if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Cancelled") {
                 let error = tasks[idx]["error"].as_str().unwrap_or("");
                 assert!(error.contains("Reconnect") && error.contains("temporary file"), "{error}");
-                let stage = error.split(''').nth(1).expect("missing FTP temporary path");
+                let stage = error.split('\'').nth(1).expect("missing FTP temporary path");
                 assert!(remote.join(stage.trim_start_matches('/')).exists());
                 stopped = true; break;
             }
