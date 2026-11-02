@@ -2170,7 +2170,7 @@
       result = await apiPost(endpoint, payload);
     }
     if (!result.success && result.directory_copy_risk) {
-      if (!confirm(t("WebDAV directory downloads are not snapshots: concurrent changes can affect the copied tree. Continue?"))) return result;
+      if (!confirm(t("WebDAV directory copies are not snapshots: concurrent changes can affect the copied tree or redirect writes. Interruptions may leave a partial destination. Continue?"))) return result;
       payload = Object.assign({}, payload, { accept_directory_copy_risk: true });
       result = await apiPost(endpoint, payload);
     }

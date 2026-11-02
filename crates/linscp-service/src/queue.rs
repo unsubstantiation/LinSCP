@@ -213,7 +213,7 @@ async fn download_staged_remote_tree(
     Ok(())
 }
 
-async fn upload_new_sftp_tree(
+async fn upload_new_remote_tree(
     session: &dyn RemoteSession, local: &Path, remote: &str,
     flags: &TransferFlags, logger: &mut SessionLogger, progress: Option<&ProgressCallback>, depth: usize,
 ) -> Result<(), String> {
@@ -239,7 +239,7 @@ async fn upload_new_sftp_tree(
         let meta = std::fs::symlink_metadata(&from).map_err(|e| e.to_string())?;
         if meta.file_type().is_symlink() { return Err("Refusing to transfer a local symlink.".to_string()); }
         if meta.is_dir() {
-            Box::pin(upload_new_sftp_tree(session, &from, &to, flags, logger, progress, depth + 1)).await?;
+            Box::pin(upload_new_remote_tree(session, &from, &to, flags, logger, progress, depth + 1)).await?;
         } else if meta.is_file() {
             if flags.merge_directories {
                 match session.stat(&to).await.map_err(|e| e.to_string())? {
@@ -820,9 +820,9 @@ impl QueueManager {
                 // Fail closed if the protocol has no atomic exclusive-create capability.
                 f.no_clobber = !allow_overwrite;
                 if meta.is_dir() {
-                    if session.scheme() != ProtocolScheme::Sftp || *delete_source { return Err("Only SFTP directory copies are supported.".to_string()); }
+                    if !matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs) || *delete_source { return Err("Directory uploads require SFTP or WebDAV and cannot delete the source.".to_string()); }
                     f.no_clobber = true;
-                    upload_new_sftp_tree(session.as_ref(), local_src, remote_dest, &f, &mut logger, Some(&*progress), 0).await
+                    upload_new_remote_tree(session.as_ref(), local_src, remote_dest, &f, &mut logger, Some(&*progress), 0).await
                         .map_err(|e| format!("Upload failed; a partial remote tree may remain: {e}"))?;
                 } else {
                     if meta.file_type().is_symlink() || !meta.is_file() { return Err("Refusing to transfer a symlink or non-file.".to_string()); }
@@ -876,7 +876,7 @@ impl QueueManager {
                     flags.no_clobber = true;
                     flags.preserve_time = false;
                     flags.cancel_flag = Some(Arc::clone(&task.cancel_flag));
-                    upload_new_sftp_tree(target_session.as_ref(), &payload, target, &flags, &mut logger, Some(&*progress), 0).await
+                    upload_new_remote_tree(target_session.as_ref(), &payload, target, &flags, &mut logger, Some(&*progress), 0).await
                         .map_err(|e| format!("Copy failed; source remains and a partial remote tree may remain: {e}"))?;
                     return Ok(());
                 }

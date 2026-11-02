@@ -1352,7 +1352,9 @@ impl RemoteSession for WebDavSession {
     async fn mkdir(&self, remote_path: &str) -> Result<(), ProtoError> {
         let method = Method::from_bytes(b"MKCOL")
             .map_err(|e| ProtoError::Transport(format!("Invalid MKCOL method: {e}")))?;
-        let mut req = self.apply_auth(self.client.request(method, self.url_for(remote_path, true)));
+        // MKCOL must create this exact resource and must not follow a
+        // redirect to a different pathname or accept ambiguous multi-status.
+        let mut req = self.apply_auth(self.no_redirect_client.request(method, self.url_for(remote_path, true)));
         if let Some(if_hdr) = self.if_header_for(remote_path).await {
             req = req.header("If", if_hdr);
         }
@@ -1362,7 +1364,7 @@ impl RemoteSession for WebDavSession {
             .map_err(|e| {
                 ProtoError::Transport(format!("WebDAV MKCOL failed: {}", format_reqwest_err(&e)))
             })?;
-        if !resp.status().is_success() {
+        if resp.status() != reqwest::StatusCode::CREATED {
             if resp.status().as_u16() == 405 {
                 return Err(ProtoError::Transport(format!(
                     "Cannot create the directory '{remote_path}': that name already exists."
