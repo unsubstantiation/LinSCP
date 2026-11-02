@@ -835,6 +835,19 @@ class DavHandler(BaseHTTPRequestHandler):
     def do_MKCOL(self):
         if not self.authorized():
             return
+        if os.environ.get("LSCP_TEST_MKCOL_RESPONSES") == "1":
+            path = self.local_path().rstrip("/")
+            if path == "/mkcol-redirect":
+                self.send_response(307)
+                self.send_header("Location", "/mkcol-target/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if path == "/mkcol-multistatus":
+                self.send_response(207)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
         result = SERVER_STORE.add_dir(self.local_path())
         if result == "created":
             self.send_response(201)

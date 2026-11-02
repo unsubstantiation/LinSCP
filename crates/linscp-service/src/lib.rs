@@ -3045,7 +3045,7 @@ mod tests {
         let local = tmp.join("local"); let downloaded = tmp.join("downloaded");
         std::fs::create_dir_all(&local).unwrap(); std::fs::create_dir_all(&downloaded).unwrap();
         let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestDavServer.py");
-        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_GET_DELAY", "0.005").env("LSCP_TEST_DELETE_RACE", "1").env("LSCP_TEST_DROP_ONCE", "/resume-drop.bin").env("LSCP_TEST_BAD_RANGE", "1")
+        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_GET_DELAY", "0.005").env("LSCP_TEST_DELETE_RACE", "1").env("LSCP_TEST_DROP_ONCE", "/resume-drop.bin").env("LSCP_TEST_BAD_RANGE", "1").env("LSCP_TEST_MKCOL_RESPONSES", "1")
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let mut server = Server(child);
         let mut line = String::new();
@@ -3078,6 +3078,12 @@ mod tests {
         assert!(list.payload["entries"].as_array().unwrap().iter().any(|e| e["name"] == "upload.txt"));
         assert_eq!(std::fs::read(downloaded.join("upload.txt")).unwrap(), b"WebDAV roundtrip");
         let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        // MKCOL must not follow redirects or treat an ambiguous 207 as a
+        // confirmed creation of the requested directory.
+        assert!(session.mkdir("/mkcol-redirect").await.is_err());
+        assert!(session.stat("/mkcol-target").await.unwrap().is_none());
+        assert!(session.mkdir("/mkcol-multistatus").await.is_err());
+        assert!(session.stat("/mkcol-multistatus").await.unwrap().is_none());
         // WebDAV trees are staged locally; confirmation is required because
         // collection ETags do not make their descendants a snapshot.
         session.mkdir("/tree-download").await.unwrap();
