@@ -49,7 +49,7 @@ jobs:
       - name: Exercise native WebDAV connection and transfers
         env:
           LSCP_LIVE_WEBDAV: "1"
-        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_webdav_gui_upload_download -- --nocapture
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_webdav_ -- --nocapture --test-threads=1
 
       - name: Exercise native FTP connection and download
         env:

@@ -3080,6 +3080,11 @@ mod tests {
         }
         assert!(failed);
         assert_eq!(std::fs::read(downloaded.join("tree-download/nested/data.txt")).unwrap(), b"tree data");
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn exercise_webdav_remote_trees(svc: &CommanderService, id: u64, session: &dyn linscp_proto::RemoteSession) {
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
         // Remote-to-remote copies also use a locally staged tree and refuse
         // to replace an existing destination tree.
         session.mkdir("/webdav-copy-dest").await.unwrap();
@@ -3112,6 +3117,11 @@ mod tests {
         }
         assert!(failed);
         assert_eq!(linscp_proto::download_bytes(session, "/webdav-copy-dest/tree-download/nested/data.txt", Default::default()).await.unwrap(), b"changed remote");
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn exercise_webdav_upload_trees(svc: &CommanderService, id: u64, local: &Path, session: &dyn linscp_proto::RemoteSession) {
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
         // Upload a new WebDAV tree, then verify an approved merge cannot
         // replace a file that appeared in the destination.
         std::fs::create_dir_all(local.join("tree-upload/nested/empty")).unwrap();
@@ -3145,6 +3155,32 @@ mod tests {
         }
         assert!(failed);
         assert_eq!(linscp_proto::download_bytes(session, "/tree-upload/nested/data.txt", Default::default()).await.unwrap(), b"upload tree");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_webdav_cross_server_trees() {
+        if std::env::var_os("LSCP_LIVE_WEBDAV").is_none() { return; }
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        struct Server(std::process::Child);
+        impl Drop for Server { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let tmp = std::env::temp_dir().join(format!("linscp-live-webdav-cross-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestDavServer.py");
+        let child = Command::new("/usr/bin/python3").arg(path).env("LSCP_TEST_PORT", "0")
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut server = Server(child);
+        let mut line = String::new();
+        BufReader::new(server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let port: u16 = line.trim().strip_prefix("READY ").expect("WebDAV destination failed to start").parse().unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let open = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "dav", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": tmp, "initial_dir": "/"}}) }).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        Box::pin(exercise_cross_move_destination(&svc, id, "/", &tmp)).await;
+        drop(server); let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[cfg(target_os = "linux")]
@@ -3194,6 +3230,8 @@ mod tests {
         assert_eq!(std::fs::read(downloaded.join("upload.txt")).unwrap(), b"WebDAV roundtrip");
         let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
         Box::pin(exercise_webdav_local_trees(&svc, id, &local, &downloaded, session.as_ref())).await;
+        Box::pin(exercise_webdav_remote_trees(&svc, id, session.as_ref())).await;
+        Box::pin(exercise_webdav_upload_trees(&svc, id, &local, session.as_ref())).await;
         std::fs::write(local.join("other.txt"), b"must not replace").unwrap();
         let mut flags = linscp_engine::transfer::TransferFlags::default();
         flags.no_clobber = true;
@@ -3826,7 +3864,6 @@ mod tests {
         assert!(result.is_err());
         assert!(session.stat("/upload.txt").await.unwrap().is_some());
         exercise_locked_webdav_upload_cleanup(&local).await;
-        Box::pin(exercise_cross_move_destination(&svc, id, "/", &local)).await;
         drop(server); let _ = std::fs::remove_dir_all(tmp);
     }
 
