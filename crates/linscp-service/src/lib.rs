@@ -2208,6 +2208,37 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    async fn exercise_s3_resume_cancellation(svc: &CommanderService, id: u64, local: &Path, session: &dyn linscp_proto::RemoteSession) {
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        linscp_proto::upload_bytes(session, "/photos/resume-slow.bin", &vec![74u8; 4 * 1024 * 1024], Default::default()).await.unwrap();
+        std::fs::write(local.join("resume-slow.bin.filepart"), vec![74u8; 1024]).unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["resume-slow.bin"], "resume": true}))).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut task_id = None;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(task) = tasks.get(idx) {
+                if task["status"] == "Running" && task["bytes_done"].as_u64().unwrap_or(0) > 1024 { task_id = task["id"].as_u64(); break; }
+                assert_ne!(task["status"], "Failed", "{task:?}");
+                assert_ne!(task["status"], "Completed", "S3 download finished before cancellation");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let cancelled = svc.dispatch_async(request("/api/queue/cancel", json!({"task_id": task_id.expect("S3 resume did not start")}))).await;
+        assert_eq!(cancelled.status, 200, "{}", cancelled.payload);
+        let mut stopped = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Cancelled") { stopped = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped);
+        assert!(!local.join("resume-slow.bin").exists());
+        assert_eq!(std::fs::read(local.join("resume-slow.bin.filepart")).unwrap(), vec![74u8; 1024]);
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn live_s3_verified_resume() {
         if std::env::var_os("LSCP_LIVE_S3").is_none() { return; }
@@ -2240,6 +2271,7 @@ mod tests {
             ("resume-oversize.bin", Some(&b"this local partial is longer than the source object"[..]), false),
             ("resume-bad-prefix.bin", Some(&bytes[..8]), false),
             ("resume-bad-tail.bin", Some(&bytes[..8]), false),
+            ("resume-mid-change.bin", Some(&bytes[..8]), false),
             ("resume-redirect.bin", None, false),
             ("resume-accepted.bin", None, false),
         ] {
@@ -2285,6 +2317,7 @@ mod tests {
         assert!(failed);
         assert!(!local.join("resume-race.bin").exists());
         assert_eq!(std::fs::read(local.join("resume-race.bin.filepart")).unwrap(), &bytes[..8]);
+        Box::pin(exercise_s3_resume_cancellation(&svc, id, &local, session.as_ref())).await;
         assert!(!std::fs::read_dir(&local).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".linscp-download-")));
         drop(server); let _ = std::fs::remove_dir_all(tmp);
     }

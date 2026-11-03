@@ -753,6 +753,8 @@ class S3Handler(BaseHTTPRequestHandler):
                 return
             end = min(end, len(data) - 1)
             sliced = data[start:end + 1]
+            if condition is not None and key == "resume-mid-change.bin" and start == 0:
+                STORE.put(bucket, key, b"x" * len(data), datetime.datetime.now(datetime.timezone.utc).timestamp())
             content_range = "bytes %d-%d/%d" % (start, end, len(data))
             if condition is not None and (key == "resume-bad-prefix.bin" or (key == "resume-bad-tail.bin" and start > 0)):
                 content_range = "bytes %d-%d/%d" % (start + 1, end, len(data))
