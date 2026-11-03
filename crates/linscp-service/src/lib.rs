@@ -366,7 +366,8 @@ impl CommanderService {
         let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
         let source_is_dav = matches!(session.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs);
         let source_is_sftp = session.scheme() == linscp_types::ProtocolScheme::Sftp;
-        if !source_is_dav && (move_item || !source_is_sftp) { return api_error(501, "Remote transfers support WebDAV sources, or SFTP sources for copies only."); }
+        let source_is_s3 = session.scheme() == linscp_types::ProtocolScheme::S3;
+        if !source_is_dav && (move_item || !(source_is_sftp || source_is_s3)) { return api_error(501, "Remote transfers support WebDAV sources, or SFTP and S3 sources for copies only."); }
         if source_is_sftp && !body.get("accept_sftp_copy_risk").and_then(Value::as_bool).unwrap_or(false) {
             return ApiReply { status: 409, payload: json!({"success": false, "error": "SFTP copy requires confirmation", "sftp_copy_risk": true}) };
         }
@@ -390,6 +391,18 @@ impl CommanderService {
                     Ok(_) => return api_error(400, "WebDAV transfers require an existing resource and a strong source ETag."),
                     Err(error) => return api_error(400, error.to_string()),
                 }
+            } else if source_is_s3 {
+                let entry = match session.stat(&source).await {
+                    Ok(Some(entry)) if !entry.is_symlink && !entry.is_dir => entry,
+                    Ok(_) => return api_error(400, "S3 copies require an existing object."),
+                    Err(error) => return api_error(400, error.to_string()),
+                };
+                let tag = match session.s3_get_etag(&source).await {
+                    Ok(Some(tag)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => tag,
+                    Ok(_) => return api_error(400, "S3 copies require a strong source ETag."),
+                    Err(error) => return api_error(400, error.to_string()),
+                };
+                (entry, Some(tag))
             } else {
                 match session.stat(&source).await {
                     Ok(Some(entry)) if !entry.is_symlink => (entry, None),
@@ -2236,6 +2249,95 @@ mod tests {
         assert!(stopped);
         assert!(!local.join("resume-slow.bin").exists());
         assert_eq!(std::fs::read(local.join("resume-slow.bin.filepart")).unwrap(), vec![74u8; 1024]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_s3_remote_copy() {
+        if std::env::var_os("LSCP_LIVE_S3").is_none() { return; }
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        struct Server(std::process::Child);
+        impl Drop for Server { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let tmp = std::env::temp_dir().join(format!("linscp-s3-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp); std::fs::create_dir_all(&tmp).unwrap();
+        let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests");
+        let s3 = Command::new("/usr/bin/python3").arg(tests.join("TestS3Server.py"))
+            .env("LSCP_TEST_PORT", "0").env("LSCP_TEST_SEED", "1").stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut s3 = Server(s3); let mut line = String::new();
+        BufReader::new(s3.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let s3_port: u16 = line.trim().strip_prefix("READY ").unwrap().parse().unwrap();
+        let dav = Command::new("/usr/bin/python3").arg(tests.join("TestDavServer.py"))
+            .env("LSCP_TEST_PORT", "0").stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut dav = Server(dav); let mut line = String::new();
+        BufReader::new(dav.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let dav_port: u16 = line.trim().strip_prefix("READY ").unwrap().parse().unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        let source_tab = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "s3", "host": "127.0.0.1", "port": s3_port, "s3_access_key": "AKIDTEST", "s3_secret_key": "testsecret42", "s3_region": "us-east-1", "tls_ca_file": tests.join("fixtures/s3-server-cert.pem"), "local_dir": tmp, "initial_dir": "/photos"}}))).await;
+        assert_eq!(source_tab.status, 200, "{}", source_tab.payload);
+        let source_id = source_tab.payload["tab"]["id"].as_u64().unwrap();
+        let dest_tab = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "dav", "host": "127.0.0.1", "port": dav_port, "username": "testuser", "password": "testpass", "local_dir": tmp, "initial_dir": "/"}}))).await;
+        assert_eq!(dest_tab.status, 200, "{}", dest_tab.payload);
+        let dest_id = dest_tab.payload["tab"]["id"].as_u64().unwrap();
+        let source = svc.state.lock().unwrap().tabs.get(&source_id).unwrap().remote.as_ref().unwrap().clone();
+        let dest = svc.state.lock().unwrap().tabs.get(&dest_id).unwrap().remote.as_ref().unwrap().clone();
+        let copy = |name: &str, target: u64, dir: &str| json!({"tab": source_id, "target": format!("tab:{target}"), "directory": dir, "names": [name]});
+        linscp_proto::upload_bytes(source.as_ref(), "/photos/copy.txt", b"S3 source", Default::default()).await.unwrap();
+        for (target, dir, dest_path) in [(dest_id, "/", "/copy.txt"), (source_id, "/photos/sub", "/photos/sub/copy.txt")] {
+            let idx = svc.queue.snapshot().0.len();
+            let response = svc.dispatch_async(request("/api/remote/transfer", copy("copy.txt", target, dir))).await;
+            assert_eq!(response.status, 200, "{}", response.payload);
+            let mut done = false;
+            for _ in 0..1000 {
+                let (tasks, _) = svc.queue.snapshot();
+                if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+                if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("S3 copy failed: {:?}", tasks.get(idx)); }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(done);
+            let target_session = if target == source_id { source.as_ref() } else { dest.as_ref() };
+            assert_eq!(linscp_proto::download_bytes(target_session, dest_path, Default::default()).await.unwrap(), b"S3 source");
+        }
+        assert_eq!(linscp_proto::download_bytes(source.as_ref(), "/photos/copy.txt", Default::default()).await.unwrap(), b"S3 source");
+        // The target appeared after enqueue; exclusive creation must not replace it.
+        linscp_proto::upload_bytes(source.as_ref(), "/photos/target-race.txt", b"source", Default::default()).await.unwrap();
+        svc.queue.pause();
+        let idx = svc.queue.snapshot().0.len();
+        let response = svc.dispatch_async(request("/api/remote/transfer", copy("target-race.txt", dest_id, "/"))).await;
+        assert_eq!(response.status, 200);
+        linscp_proto::upload_bytes(dest.as_ref(), "/target-race.txt", b"other client", Default::default()).await.unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("S3 copy replaced competing destination"); }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(failed);
+        assert_eq!(linscp_proto::download_bytes(dest.as_ref(), "/target-race.txt", Default::default()).await.unwrap(), b"other client");
+        // The captured source ETag must still match at download time.
+        linscp_proto::upload_bytes(source.as_ref(), "/photos/source-race.txt", b"original", Default::default()).await.unwrap();
+        svc.queue.pause();
+        let idx = svc.queue.snapshot().0.len();
+        let response = svc.dispatch_async(request("/api/remote/transfer", copy("source-race.txt", dest_id, "/"))).await;
+        assert_eq!(response.status, 200);
+        linscp_proto::upload_bytes(source.as_ref(), "/photos/source-race.txt", b"changed!", Default::default()).await.unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("changed S3 source was copied"); }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(failed);
+        assert!(dest.stat("/source-race.txt").await.unwrap().is_none());
+        let rejected = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": source_id, "target": format!("tab:{dest_id}"), "directory": "/", "names": ["copy.txt"], "operation": "move", "accept_cross_move_risk": true}))).await;
+        assert_eq!(rejected.status, 501);
+        assert_eq!(linscp_proto::download_bytes(source.as_ref(), "/photos/copy.txt", Default::default()).await.unwrap(), b"S3 source");
+        drop(s3); drop(dav); let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[cfg(target_os = "linux")]
