@@ -30,9 +30,10 @@ errors or cancellation can leave a duplicate or partial destination, and source
 deletion may be unconfirmed. S3 destinations are limited to 1 GiB per file.
 WebDAV files can also be copied to a new name in the same session or to a connected WebDAV, SFTP or S3 session via a temporary local download and exclusive upload. Copies can leave partial remote destinations on failure or cancellation. SFTP file copies to WebDAV, SFTP or S3, and directory copies from SFTP or WebDAV to a new SFTP or WebDAV directory, use local staging and require risk confirmation: Neither directory copy is a tree-wide snapshot: SFTP cannot pin source versions, WebDAV pins each file but collection ETags may not cover descendants, and concurrent source or destination path changes can affect the result. Directory copies do not merge and may leave partial remote trees after interruption. Cross-server directory moves and other source protocols remain unsupported.
 Local moves are supported on the same filesystem on Linux
-and Windows, without replacing existing destinations. WebDAV file downloads can
+and Windows, without replacing existing destinations. WebDAV and S3 file downloads can
 resume from a `.filepart` after comparing its entire prefix with the ETag-pinned
-remote file; verification retransfers that prefix. Existing partials are never
+remote file; verification retransfers that prefix and relies on the server enforcing
+conditional requests. An unchanged ETag does not necessarily identify a unique version. Existing partials are never
 removed or modified. A network failure may save a new partial for retry; other
 resumption modes are unsupported.
 Running local copies, SFTP and WebDAV transfers, FTP/FTPS transfers, and S3 transfers
