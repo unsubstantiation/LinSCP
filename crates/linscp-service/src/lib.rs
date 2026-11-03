@@ -2426,6 +2426,7 @@ mod tests {
             ("resume-mid-change.bin", Some(&bytes[..8]), false),
             ("resume-redirect.bin", None, false),
             ("resume-accepted.bin", None, false),
+            ("resume-noetag.bin", None, false),
         ] {
             linscp_proto::upload_bytes(session.as_ref(), &format!("/photos/{name}"), bytes, Default::default()).await.unwrap();
             let checkpoint = local.join(format!("{name}.filepart"));
@@ -2469,6 +2470,29 @@ mod tests {
         assert!(failed);
         assert!(!local.join("resume-race.bin").exists());
         assert_eq!(std::fs::read(local.join("resume-race.bin.filepart")).unwrap(), &bytes[..8]);
+        // Some S3-compatible providers ignore If-Match. Even when the prefix
+        // still matches, a different response ETag must prevent publication.
+        linscp_proto::upload_bytes(session.as_ref(), "/photos/resume-ignore.bin", bytes, Default::default()).await.unwrap();
+        std::fs::write(local.join("resume-ignore.bin.filepart"), &bytes[..8]).unwrap();
+        svc.queue.pause();
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["resume-ignore.bin"], "resume": true}))).await;
+        assert_eq!(queued.status, 200);
+        linscp_proto::upload_bytes(session.as_ref(), "/photos/resume-ignore.bin", b"verified DIFFERENT payload", Default::default()).await.unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") {
+                assert!(tasks[idx]["error"].as_str().unwrap_or("").contains("ETag"), "{:?}", tasks[idx]);
+                failed = true; break;
+            }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("ignored S3 precondition was accepted"); }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(failed);
+        assert!(!local.join("resume-ignore.bin").exists());
+        assert_eq!(std::fs::read(local.join("resume-ignore.bin.filepart")).unwrap(), &bytes[..8]);
         Box::pin(exercise_s3_resume_cancellation(&svc, id, &local, session.as_ref())).await;
         assert!(!std::fs::read_dir(&local).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".linscp-download-")));
         drop(server); let _ = std::fs::remove_dir_all(tmp);

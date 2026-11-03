@@ -736,7 +736,7 @@ class S3Handler(BaseHTTPRequestHandler):
         version_header = (("x-amz-version-id", version_id),) if version_id else ()
         etag = '"%s"' % hashlib.sha256(data).hexdigest()[:32]
         condition = self.headers.get("If-Match")
-        if condition is not None and condition != etag:
+        if condition is not None and condition != etag and key != "resume-ignore.bin":
             self.send_error_xml(412, "PreconditionFailed", "Object changed.")
             return
         if condition is not None and key == "resume-redirect.bin":
@@ -745,6 +745,7 @@ class S3Handler(BaseHTTPRequestHandler):
         if condition is not None and key == "resume-accepted.bin":
             self.send_bytes(202, b"")
             return
+        etag_header = () if key == "resume-noetag.bin" else (("ETag", etag),)
         range_header = self.headers.get("Range")
         if range_header:
             match = re.match(r"bytes=(\d+)-(\d*)$", range_header.strip())
@@ -771,13 +772,13 @@ class S3Handler(BaseHTTPRequestHandler):
                 ("Last-Modified", http_date(mtime)),
                 ("Accept-Ranges", "bytes"),
                 ("Content-Type", "application/octet-stream"),
-            ) + version_header)
+            ) + etag_header + version_header)
             return
         self.send_bytes(200, data, extra=(
             ("Last-Modified", http_date(mtime)),
             ("Accept-Ranges", "bytes"),
             ("Content-Type", "application/octet-stream"),
-        ) + version_header)
+        ) + etag_header + version_header)
 
     def head_object(self, bucket, key, params):
         record, version_id = self._object_record(bucket, key, params)

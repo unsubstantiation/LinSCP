@@ -1833,6 +1833,9 @@ impl RemoteSession for S3Session {
         if response.status().as_u16() != expected_status {
             return Err(ProtoError::Transport(format!("Conditional S3 download was not confirmed (HTTP {}).", response.status())));
         }
+        if response.headers().get("etag").and_then(|value| value.to_str().ok()) != Some(etag) {
+            return Err(ProtoError::Transport("S3 conditional download returned a missing or different ETag.".to_string()));
+        }
         if opts.resume_offset > 0 {
             let range = response.headers().get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("");
             let (bounds, total) = range.strip_prefix("bytes ").and_then(|v| v.split_once('/')).ok_or_else(|| ProtoError::Transport("S3 returned an invalid Content-Range.".to_string()))?;
@@ -1869,6 +1872,9 @@ impl RemoteSession for S3Session {
         let received = response.headers().get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("");
         if response.status().as_u16() != 206 || received != expected {
             return Err(ProtoError::Transport("S3 did not return the expected conditional prefix range.".to_string()));
+        }
+        if response.headers().get("etag").and_then(|value| value.to_str().ok()) != Some(etag) {
+            return Err(ProtoError::Transport("S3 prefix verification returned a missing or different ETag.".to_string()));
         }
         let mut compared = 0u64;
         while let Some(chunk) = response.chunk().await.map_err(|e| ProtoError::Transport(format!("S3 prefix stream failed: {e}")))? {
