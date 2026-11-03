@@ -2253,6 +2253,56 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn live_s3_resume_recovery() {
+        if std::env::var_os("LSCP_LIVE_S3").is_none() { return; }
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        struct Server(std::process::Child);
+        impl Drop for Server { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let tmp = std::env::temp_dir().join(format!("linscp-s3-resume-recovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp); std::fs::create_dir_all(&tmp).unwrap();
+        let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests");
+        let child = Command::new("/usr/bin/python3").arg(tests.join("TestS3Server.py"))
+            .env("LSCP_TEST_PORT", "0").env("LSCP_TEST_SEED", "1").env("LSCP_TEST_DROP_ONCE", "/photos/resume-drop.bin")
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut server = Server(child); let mut line = String::new();
+        BufReader::new(server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let port: u16 = line.trim().strip_prefix("READY ").unwrap().parse().unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        let open = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "s3", "host": "127.0.0.1", "port": port, "s3_access_key": "AKIDTEST", "s3_secret_key": "testsecret42", "s3_region": "us-east-1", "tls_ca_file": tests.join("fixtures/s3-server-cert.pem"), "local_dir": tmp, "initial_dir": "/photos"}}))).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        let data = vec![75u8; 128 * 1024];
+        linscp_proto::upload_bytes(session.as_ref(), "/photos/resume-drop.bin", &data, Default::default()).await.unwrap();
+        for retry in [false, true] {
+            let idx = svc.queue.snapshot().0.len();
+            let queued = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": tmp, "remote_dir": "/photos", "names": ["resume-drop.bin"], "resume": true}))).await;
+            assert_eq!(queued.status, 200, "{}", queued.payload);
+            let mut terminal = false;
+            for _ in 0..1000 {
+                let (tasks, _) = svc.queue.snapshot();
+                if let Some(status) = tasks.get(idx).and_then(|t| t["status"].as_str()) {
+                    if status == "Completed" || status == "Failed" {
+                        assert_eq!(status == "Completed", retry, "{:?}", tasks.get(idx));
+                        terminal = true; break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(terminal);
+            let checkpoint = std::fs::read(tmp.join("resume-drop.bin.filepart")).unwrap();
+            assert!(!checkpoint.is_empty() && checkpoint.len() < data.len());
+            assert_eq!(checkpoint.as_slice(), &data[..checkpoint.len()]);
+            if retry { assert_eq!(std::fs::read(tmp.join("resume-drop.bin")).unwrap(), data); }
+            else { assert!(!tmp.join("resume-drop.bin").exists()); }
+        }
+        drop(server); let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn live_s3_remote_copy() {
         if std::env::var_os("LSCP_LIVE_S3").is_none() { return; }
         use std::io::{BufRead, BufReader};

@@ -213,6 +213,7 @@ class Store:
         self.multipart_history = []
         self.copy_count = 0
         self.embedded_errors = set()
+        self.drop_next_get = os.environ.get("LSCP_TEST_DROP_ONCE", "")
 
     def ensure_bucket(self, bucket, epoch):
         if bucket not in self.buckets:
@@ -340,6 +341,13 @@ class S3Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(length))
         self.end_headers()
         if data and self.command != "HEAD" and status not in (204, 304):
+            if self.command == "GET" and status == 200 and urllib.parse.urlsplit(self.path).path == STORE.drop_next_get:
+                STORE.drop_next_get = ""
+                self.wfile.write(data[:32768])
+                self.wfile.flush()
+                self.close_connection = True
+                self.connection.shutdown(2)
+                return
             delay = float(os.environ.get("LSCP_TEST_GET_DELAY", "0"))
             if self.command == "GET" and delay:
                 for offset in range(0, len(data), 32768):
