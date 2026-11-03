@@ -297,7 +297,7 @@ fn validate_protocol_transfer_flags(
     Ok(())
 }
 
-/// Resume a WebDAV download only after comparing every existing partial byte
+/// Resume a supported conditional download only after comparing every existing partial byte
 /// against the same ETag-pinned remote representation. The existing partial is
 /// read-only and is never deleted or modified by this routine.
 pub async fn download_verified_resume(

@@ -726,6 +726,17 @@ class S3Handler(BaseHTTPRequestHandler):
             return
         data, mtime = record
         version_header = (("x-amz-version-id", version_id),) if version_id else ()
+        etag = '"%s"' % hashlib.sha256(data).hexdigest()[:32]
+        condition = self.headers.get("If-Match")
+        if condition is not None and condition != etag:
+            self.send_error_xml(412, "PreconditionFailed", "Object changed.")
+            return
+        if condition is not None and key == "resume-redirect.bin":
+            self.send_bytes(307, b"", extra=(("Location", "/%s/resume-redirect-target.bin" % bucket),))
+            return
+        if condition is not None and key == "resume-accepted.bin":
+            self.send_bytes(202, b"")
+            return
         range_header = self.headers.get("Range")
         if range_header:
             match = re.match(r"bytes=(\d+)-(\d*)$", range_header.strip())
@@ -742,9 +753,11 @@ class S3Handler(BaseHTTPRequestHandler):
                 return
             end = min(end, len(data) - 1)
             sliced = data[start:end + 1]
+            content_range = "bytes %d-%d/%d" % (start, end, len(data))
+            if condition is not None and (key == "resume-bad-prefix.bin" or (key == "resume-bad-tail.bin" and start > 0)):
+                content_range = "bytes %d-%d/%d" % (start + 1, end, len(data))
             self.send_bytes(206, sliced, extra=(
-                ("Content-Range",
-                 "bytes %d-%d/%d" % (start, end, len(data))),
+                ("Content-Range", content_range),
                 ("Last-Modified", http_date(mtime)),
                 ("Accept-Ranges", "bytes"),
                 ("Content-Type", "application/octet-stream"),

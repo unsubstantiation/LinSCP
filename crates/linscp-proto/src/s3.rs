@@ -194,6 +194,11 @@ impl ConditionalUploadJournal {
     }
 }
 
+fn valid_strong_s3_etag(tag: &str) -> bool {
+    tag.len() >= 2 && tag.starts_with('"') && tag.ends_with('"')
+        && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control)
+}
+
 #[derive(Clone)]
 pub struct S3ConnectConfig {
     pub use_https: bool,
@@ -1809,6 +1814,72 @@ impl RemoteSession for S3Session {
             .await
             .map_err(|e| ProtoError::Transport(format!("S3 sink flush failed: {e}")))?;
         Ok(transferred)
+    }
+
+    async fn download_if_match(
+        &self, remote_path: &str, etag: &str, opts: TransferRequest,
+        sink: &mut (dyn AsyncWrite + Unpin + Send), progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        if !valid_strong_s3_etag(etag) || opts.version_id.is_some() {
+            return Err(ProtoError::Transport("S3 conditional download requires a strong ETag and the current object.".to_string()));
+        }
+        let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else {
+            return Err(ProtoError::Transport("S3 download requires a bucket and object key.".to_string()));
+        };
+        let mut headers = vec![("if-match".to_string(), etag.to_string())];
+        if opts.resume_offset > 0 { headers.push(("range".to_string(), format!("bytes={}-", opts.resume_offset))); }
+        let mut response = self.send_signed(Method::GET, Some(&bucket), &key, &[], &headers, Vec::new()).await?;
+        let expected_status = if opts.resume_offset > 0 { 206 } else { 200 };
+        if response.status().as_u16() != expected_status {
+            return Err(ProtoError::Transport(format!("Conditional S3 download was not confirmed (HTTP {}).", response.status())));
+        }
+        if opts.resume_offset > 0 {
+            let range = response.headers().get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let (bounds, total) = range.strip_prefix("bytes ").and_then(|v| v.split_once('/')).ok_or_else(|| ProtoError::Transport("S3 returned an invalid Content-Range.".to_string()))?;
+            let (start, end) = bounds.split_once('-').and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))).ok_or_else(|| ProtoError::Transport("S3 returned an invalid Content-Range.".to_string()))?;
+            let total = total.parse::<u64>().map_err(|_| ProtoError::Transport("S3 returned an invalid Content-Range total.".to_string()))?;
+            if start != opts.resume_offset || end.checked_add(1) != Some(total) || start > end {
+                return Err(ProtoError::Transport("S3 returned an inconsistent resume range.".to_string()));
+            }
+        }
+        let total = opts.resume_offset.saturating_add(response.content_length().unwrap_or(0));
+        let mut transferred = 0u64;
+        while let Some(chunk) = response.chunk().await.map_err(|e| ProtoError::Transport(format!("S3 download stream failed: {e}")))? {
+            sink.write_all(&chunk).await.map_err(|e| ProtoError::Transport(format!("S3 sink write failed: {e}")))?;
+            transferred = transferred.checked_add(chunk.len() as u64).ok_or_else(|| ProtoError::Transport("S3 download length overflow.".to_string()))?;
+            if let Some(cb) = progress { cb(opts.resume_offset.saturating_add(transferred), total); }
+        }
+        sink.flush().await.map_err(|e| ProtoError::Transport(format!("S3 sink flush failed: {e}")))?;
+        Ok(transferred)
+    }
+
+    async fn verify_prefix_if_match(
+        &self, remote_path: &str, etag: &str, prefix_len: u64, total_len: u64,
+        prefix: &mut (dyn AsyncRead + Unpin + Send),
+    ) -> Result<(), ProtoError> {
+        if !valid_strong_s3_etag(etag) || prefix_len == 0 || prefix_len > total_len {
+            return Err(ProtoError::Transport("Invalid S3 resume prefix or ETag.".to_string()));
+        }
+        let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else {
+            return Err(ProtoError::Transport("S3 download requires a bucket and object key.".to_string()));
+        };
+        let headers = vec![("if-match".to_string(), etag.to_string()), ("range".to_string(), format!("bytes=0-{}", prefix_len - 1))];
+        let mut response = self.send_signed(Method::GET, Some(&bucket), &key, &[], &headers, Vec::new()).await?;
+        let expected = format!("bytes 0-{}/{}", prefix_len - 1, total_len);
+        let received = response.headers().get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if response.status().as_u16() != 206 || received != expected {
+            return Err(ProtoError::Transport("S3 did not return the expected conditional prefix range.".to_string()));
+        }
+        let mut compared = 0u64;
+        while let Some(chunk) = response.chunk().await.map_err(|e| ProtoError::Transport(format!("S3 prefix stream failed: {e}")))? {
+            compared = compared.checked_add(chunk.len() as u64).ok_or_else(|| ProtoError::Transport("S3 prefix length overflow.".to_string()))?;
+            if compared > prefix_len { return Err(ProtoError::Transport("S3 returned too much prefix data.".to_string())); }
+            let mut local = vec![0u8; chunk.len()];
+            prefix.read_exact(&mut local).await.map_err(|e| ProtoError::Transport(format!("Reading local resume prefix failed: {e}")))?;
+            if local.as_slice() != chunk.as_ref() { return Err(ProtoError::Transport("Local partial file does not match the remote source.".to_string())); }
+        }
+        if compared != prefix_len { return Err(ProtoError::Transport("S3 returned an incomplete prefix.".to_string())); }
+        Ok(())
     }
 
     async fn upload(

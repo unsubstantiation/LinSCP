@@ -72,7 +72,7 @@ jobs:
       - name: Exercise native S3 TLS connection and download
         env:
           LSCP_LIVE_S3: "1"
-        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_s3_gui_download -- --nocapture
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_s3_ -- --nocapture --test-threads=1
 
       - name: Build the binary package
         run: python3 tools/run_cargo_ci.py dpkg-buildpackage -b -us -uc

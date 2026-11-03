@@ -488,8 +488,8 @@ impl CommanderService {
             return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP upload requires confirmation of rename risks", "ftp_rename_risk": true}) };
         }
         let resume = body.get("resume").and_then(Value::as_bool).unwrap_or(false);
-        if resume && (move_item || upload || tab.is_local || session.as_ref().is_none_or(|s| !matches!(s.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs))) {
-            return api_error(400, "Verified resume is supported only for WebDAV file downloads.");
+        if resume && (move_item || upload || tab.is_local || session.as_ref().is_none_or(|s| !matches!(s.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs | linscp_types::ProtocolScheme::S3))) {
+            return api_error(400, "Verified resume is supported only for WebDAV and S3 file downloads.");
         }
         let overwrite = body.get("overwrite").and_then(Value::as_str).unwrap_or("ask");
         if overwrite != "ask" && overwrite != "overwrite" { return api_error(400, "Unsupported overwrite policy"); }
@@ -592,9 +592,15 @@ impl CommanderService {
             flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
             flags.preserve_time = body.get("preserve_time").and_then(Value::as_bool).unwrap_or(true);
             if (move_item && !tab.is_local) || resume {
-                let tag = match session.as_ref().unwrap().dav_get_etag(&other).await {
-                    Ok((Some(tag), false)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => tag,
-                    Ok(_) => return api_error(400, "WebDAV moves and verified resume require a strong source ETag."),
+                let sess = session.as_ref().unwrap();
+                let tag = if sess.scheme() == linscp_types::ProtocolScheme::S3 {
+                    sess.s3_get_etag(&other).await
+                } else {
+                    sess.dav_get_etag(&other).await.map(|(tag, missing)| if missing { None } else { tag })
+                };
+                let tag = match tag {
+                    Ok(Some(tag)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => tag,
+                    Ok(_) => return api_error(400, "Moves and verified resume require a strong source ETag."),
                     Err(error) => return api_error(400, error.to_string()),
                 };
                 flags.source_etag = Some(tag);
@@ -2199,6 +2205,88 @@ mod tests {
         assert_eq!(std::fs::read(left.join("later")).unwrap(), b"move source");
         assert_eq!(std::fs::read(right.join("later")).unwrap(), b"concurrent destination");
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_s3_verified_resume() {
+        if std::env::var_os("LSCP_LIVE_S3").is_none() { return; }
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        struct Server(std::process::Child);
+        impl Drop for Server { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let tmp = std::env::temp_dir().join(format!("linscp-s3-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let local = tmp.join("local"); std::fs::create_dir_all(&local).unwrap();
+        let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests");
+        let child = Command::new("/usr/bin/python3").arg(tests.join("TestS3Server.py"))
+            .env("LSCP_TEST_PORT", "0").env("LSCP_TEST_SEED", "1").env("LSCP_TEST_GET_DELAY", "0.005")
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut server = Server(child); let mut line = String::new();
+        BufReader::new(server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let port: u16 = line.trim().strip_prefix("READY ").expect("S3 fixture failed to start").parse().unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        let open = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "s3", "host": "127.0.0.1", "port": port, "s3_access_key": "AKIDTEST", "s3_secret_key": "testsecret42", "s3_region": "us-east-1", "tls_ca_file": tests.join("fixtures/s3-server-cert.pem"), "local_dir": local, "initial_dir": "/"}}))).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        let bytes = b"verified S3 resume payload";
+        for (name, partial, succeeds) in [
+            ("resume-ok.bin", Some(&bytes[..8]), true),
+            ("resume-complete.bin", Some(&bytes[..]), true),
+            ("resume-fresh.bin", None, true),
+            ("resume-mismatch.bin", Some(&b"incorrect"[..]), false),
+            ("resume-oversize.bin", Some(&b"this local partial is longer than the source object"[..]), false),
+            ("resume-bad-prefix.bin", Some(&bytes[..8]), false),
+            ("resume-bad-tail.bin", Some(&bytes[..8]), false),
+            ("resume-redirect.bin", None, false),
+            ("resume-accepted.bin", None, false),
+        ] {
+            linscp_proto::upload_bytes(session.as_ref(), &format!("/photos/{name}"), bytes, Default::default()).await.unwrap();
+            let checkpoint = local.join(format!("{name}.filepart"));
+            if let Some(data) = partial { std::fs::write(&checkpoint, data).unwrap(); }
+            let idx = svc.queue.snapshot().0.len();
+            let queued = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": [name], "resume": true}))).await;
+            assert_eq!(queued.status, 200, "{}", queued.payload);
+            let mut terminal = false;
+            for _ in 0..1000 {
+                let (tasks, _) = svc.queue.snapshot();
+                if let Some(status) = tasks.get(idx).and_then(|t| t["status"].as_str()) {
+                    if status == "Completed" || status == "Failed" {
+                        assert_eq!(status == "Completed", succeeds, "{name}: {:?}", tasks.get(idx));
+                        terminal = true; break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(terminal, "resume timed out: {name}");
+            if succeeds { assert_eq!(std::fs::read(local.join(name)).unwrap(), bytes); }
+            else { assert!(!local.join(name).exists()); }
+            if let Some(data) = partial { assert_eq!(std::fs::read(checkpoint).unwrap(), data); }
+        }
+        // Capture the ETag at enqueue, then replace the object before the
+        // queued request executes: the conditional GET must fail closed.
+        linscp_proto::upload_bytes(session.as_ref(), "/photos/resume-race.bin", bytes, Default::default()).await.unwrap();
+        std::fs::write(local.join("resume-race.bin.filepart"), &bytes[..8]).unwrap();
+        svc.queue.pause();
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["resume-race.bin"], "resume": true}))).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        linscp_proto::upload_bytes(session.as_ref(), "/photos/resume-race.bin", b"changed S3 resume payload!", Default::default()).await.unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("changed S3 source was resumed"); }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(failed);
+        assert!(!local.join("resume-race.bin").exists());
+        assert_eq!(std::fs::read(local.join("resume-race.bin.filepart")).unwrap(), &bytes[..8]);
+        assert!(!std::fs::read_dir(&local).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".linscp-download-")));
+        drop(server); let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[cfg(target_os = "linux")]
