@@ -1,7 +1,9 @@
 //! Android-specific app-private filesystem paths, Storage Access Framework
 //! (`content://`) bridge contract, and Android Keystore secret-wrapping bridge.
 
-use std::fs::{File, OpenOptions, Permissions};
+use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::fs::Permissions;
 use std::io::Write;
 // The SAF bridge is compiled on every host so a desktop build can test the
 // `content://` paths; only a real Unix host can enforce POSIX modes, so those

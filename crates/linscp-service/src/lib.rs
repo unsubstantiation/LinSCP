@@ -154,7 +154,7 @@ impl CommanderService {
             ("POST", "/api/local/chmod") => self.handle_local_chmod(req.body),
             ("POST", "/api/local/save") => self.handle_local_save(req.body),
             ("POST", "/api/local/drop") => self.handle_local_drop(&query, req.body),
-            ("POST", "/api/local/drop-dir") => self.handle_local_drop_dir(req.body),
+            ("POST", "/api/local/drop-dir") => self.handle_local_drop_dir(&query, req.body),
             ("GET", "/api/logs") => self.handle_logs(),
             ("GET", "/api/cleanup") => self.handle_cleanup_get(),
             ("POST", "/api/cleanup") => self.handle_cleanup_post(req.body),
@@ -797,7 +797,7 @@ impl CommanderService {
         if let Ok(Some(_)) = session.stat(&link).await { return api_error(400, "The link name already exists.") }
         // The target is relative to the link's directory, which is what a
         // server-side link means; an absolute target is passed through as is.
-        match session.symlink(target, &link).await {
+        match session.symlink(&target, &link).await {
             Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
             Err(error) => api_error(400, error.to_string()),
         }
@@ -2149,8 +2149,8 @@ impl CommanderService {
     }
 
     /// Creates the folders a dropped directory contained, including empty ones.
-    fn handle_local_drop_dir(&self, body: Value) -> ApiReply {
-        let (base, _name, relative) = match self.drop_target(&BTreeMap::new(), &body, true) {
+    fn handle_local_drop_dir(&self, query: &BTreeMap<String,String>, body: Value) -> ApiReply {
+        let (base, _name, relative) = match self.drop_target(query, &body, true) {
             Ok(parts) => parts,
             Err(reply) => return reply,
         };
@@ -2729,7 +2729,14 @@ impl CommanderService {
                 }
             }
         }
-        if target_port == 0 { target_port = kind.default_viewer(false).len() as u16; target_port = match kind { linscp_proto::remote_desktop::RemoteDesktopKind::Rdp => 3389, linscp_proto::remote_desktop::RemoteDesktopKind::Vnc => 5900, linscp_proto::remote_desktop::RemoteDesktopKind::Spice => 5900, _ => 22 }; }
+        if target_port == 0 {
+            target_port = match kind {
+                linscp_proto::remote_desktop::RemoteDesktopKind::Rdp => 3389,
+                linscp_proto::remote_desktop::RemoteDesktopKind::Vnc => 5900,
+                linscp_proto::remote_desktop::RemoteDesktopKind::Spice => 5900,
+                _ => 22,
+            };
+        }
         let pkg = server_package_name(kind);
         let descr = server_description(kind);
         let script = install_script_for_kind(kind);
