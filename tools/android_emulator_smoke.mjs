@@ -98,5 +98,68 @@ const { execFileSync } = await import('node:child_process');
 execFileSync('adb', ['shell', 'input', 'keyevent', 'BACK']);
 const cancelled = await cancellation;
 assert.equal(cancelled.result?.result?.value, true, 'Cancelled document picker did not reject');
+// Seed a real external file, select it in DocumentsUI and verify the copied bytes.
+const { writeFileSync, unlinkSync } = await import('node:fs');
+const localFixture = '/tmp/linscp-picker-fixture.txt';
+writeFileSync(localFixture, 'Android shared document');
+execFileSync('adb', ['push', localFixture, '/sdcard/Download/linscp-picker-fixture.txt']);
+unlinkSync(localFixture);
+execFileSync('adb', ['shell', 'am', 'broadcast', '-a', 'android.intent.action.MEDIA_SCANNER_SCAN_FILE', '-d', 'file:///sdcard/Download/linscp-picker-fixture.txt']);
+const pendingImport = evaluate(`window.__TAURI_INTERNALS__.invoke('linscp_android_import')`, 120000);
+async function dumpUi() {
+  try {
+    execFileSync('adb', ['shell', 'uiautomator', 'dump', '/sdcard/linscp-window.xml'], {timeout: 15000, stdio: 'ignore'});
+    return execFileSync('adb', ['shell', 'cat', '/sdcard/linscp-window.xml'], {encoding: 'utf8'});
+  } catch (_) { return ''; }
+}
+function tapNode(xml, pattern) {
+  for (const node of xml.match(/<node\b[^>]*>/g) || []) {
+    if (!pattern.test(node)) continue;
+    const box = node.match(/bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/);
+    if (!box) continue;
+    const x = Math.floor((Number(box[1]) + Number(box[3])) / 2);
+    const y = Math.floor((Number(box[2]) + Number(box[4])) / 2);
+    execFileSync('adb', ['shell', 'input', 'tap', String(x), String(y)]);
+    return true;
+  }
+  return false;
+}
+let selected = false;
+for (let i = 0; i < 30 && !selected; i++) {
+  const xml = await dumpUi();
+  if (tapNode(xml, /(?:text|content-desc)="linscp-picker-fixture\.txt"/i)) { selected = true; break; }
+  if (!tapNode(xml, /(?:text|content-desc)="Downloads"/i)) tapNode(xml, /content-desc="(?:Show roots|Open navigation drawer)"/i);
+  await new Promise(resolve => setTimeout(resolve, 700));
+}
+assert.ok(selected, 'Unable to select the fixture in Android DocumentsUI');
+await new Promise(resolve => setTimeout(resolve, 1000));
+tapNode(await dumpUi(), /(?:text|content-desc)="(?:Open|Select)"/i);
+const imported = await pendingImport;
+if (imported.error || imported.result?.exceptionDetails) throw new Error('Document import failed: ' + JSON.stringify(imported));
+const folder = imported.result.result.value?.directory;
+assert.ok(folder && imported.result.result.value.count === 1, 'Import did not return its private directory');
+const checkImport = await evaluate(`(async () => {
+  const invoke = (method, path, body = {}) => window.LinSCPTransport.request(method, path, body);
+  const tab = await invoke('POST', '/api/tabs/local', {local_dir: ${JSON.stringify(folder)}, remote_dir: ${JSON.stringify(folder)}});
+  const content = (await invoke('GET', '/api/local/edit?tab=' + tab.tab.id + '&path=linscp-picker-fixture.txt')).content;
+  await invoke('POST', '/api/local/rename', {tab: tab.tab.id, old_name: 'linscp-picker-fixture.txt', new_name: 'linscp-export-result.txt'});
+  return content;
+})()`);
+assert.equal(checkImport.result?.result?.value, 'Android shared document', 'Imported bytes differ');
+const exportPath = folder + '/linscp-export-result.txt';
+const pendingExport = evaluate(`window.__TAURI_INTERNALS__.invoke('linscp_android_export', {path: ${JSON.stringify(exportPath)}})`, 120000);
+let saved = false;
+for (let i = 0; i < 30 && !saved; i++) {
+  const xml = await dumpUi();
+  // CREATE_DOCUMENT initially opens the same Downloads directory as import.
+  if (tapNode(xml, /(?:text|content-desc)="Save"/i)) { saved = true; break; }
+  if (!tapNode(xml, /(?:text|content-desc)="Downloads"/i)) tapNode(xml, /content-desc="(?:Show roots|Open navigation drawer)"/i);
+  await new Promise(resolve => setTimeout(resolve, 700));
+}
+assert.ok(saved, 'Unable to save the exported document in Android DocumentsUI');
+const exported = await pendingExport;
+if (exported.error || exported.result?.exceptionDetails) throw new Error('Document export failed: ' + JSON.stringify(exported));
+const output = execFileSync('adb', ['shell', 'cat', '/sdcard/Download/linscp-export-result.txt'], {encoding: 'utf8'});
+assert.equal(output, 'Android shared document', 'Exported bytes differ');
 socket.close();
 console.log('Android WebView, document picker and Rust service smoke tests passed:', JSON.stringify(reply.result.result.value));
