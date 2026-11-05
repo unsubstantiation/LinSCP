@@ -1381,13 +1381,13 @@ function options(id) {
     value('remoteTransferDirectory') === '/tmp/slowremote' &&
       value('remoteTransferMask') === '*.txt',
     value('remoteTransferDirectory') + ' / ' + value('remoteTransferMask'));
-  check('a copy inside the current session is done by the server',
-    text('remoteTransferHint').includes('by the server itself'),
+  check('a copy inside the current session uses a local stage',
+    text('remoteTransferHint').includes('temporary local download'),
     text('remoteTransferHint'));
   doc.getElementById('remoteTransferTarget').value = 'tab:2';
   window.remoteTransferTargetChanged();
   check('another session is copied through a temporary directory',
-    text('remoteTransferHint').includes('temporary directory'),
+    text('remoteTransferHint').includes('temporary local download'),
     text('remoteTransferHint'));
   await window.runRemoteTransfer();
   const remoteCopy = calls.filter(call => call.path === '/api/remote/transfer').pop();

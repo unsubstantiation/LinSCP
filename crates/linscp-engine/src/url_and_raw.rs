@@ -2216,6 +2216,7 @@ async fn connect_site_spec_inner(
                 path_style,
                 abort_multipart_on_error: false,
                 resume_store,
+                conditional_cleanup_dir: Some(config_dir.join("s3-conditional-cleanup")),
                 extra_signed_headers,
                 object_write_headers,
                 tls,

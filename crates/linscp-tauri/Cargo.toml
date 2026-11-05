@@ -8,7 +8,15 @@ publish.workspace = true
 
 [features]
 default = []
-native-shell = ["dep:tauri"]
+native-shell = ["dep:tauri", "dep:tauri-build", "tauri/custom-protocol"]
+
+[[bin]]
+name = "linscp-gui"
+path = "src/main.rs"
+required-features = ["native-shell"]
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true , features = [] }
 
 [dependencies]
 linscp-platform.workspace = true
@@ -16,7 +24,7 @@ linscp-service.workspace = true
 linscp-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tauri = { version = "2.1", optional = true }
+tauri = { version = "2.1", optional = true , features = [] }
 zeroize.workspace = true
 
 [lints]

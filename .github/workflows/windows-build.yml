@@ -10,13 +10,13 @@ jobs:
     name: Windows (MSVC)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
 
@@ -39,24 +39,30 @@ jobs:
         shell: bash
         run: python tools/run_cargo_ci.py cargo test --workspace
 
-      - name: Build the release CLI (linscp + linscp-gui)
+      - name: Build the portable Tauri application
         shell: bash
-        run: python tools/run_cargo_ci.py cargo build --release -p linscp-cli
+        run: python tools/run_cargo_ci.py cargo build --release -p linscp-tauri --features native-shell
 
-      - name: Check the Tauri native shell
-        shell: bash
-        run: python tools/run_cargo_ci.py cargo check -p linscp-tauri --features native-shell
-
-      - name: Smoke test the release binary
-        shell: bash
+      - name: Smoke test the native window
+        shell: pwsh
         run: |
-          ./target/release/linscp.exe -version
-          ./target/release/linscp.exe -batch -command="option batch; sessions list; presets; exit"
+          $app = Start-Process -FilePath "$PWD/target/release/linscp-gui.exe" -PassThru
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 1
+              $app.Refresh()
+              if ($app.HasExited) { throw "Application exited before opening a window: $($app.ExitCode)" }
+              if ($app.MainWindowHandle -ne 0 -and $app.MainWindowTitle -like 'LinSCP*') { $ready = $true; break }
+            }
+            if (-not $ready) { throw 'The LinSCP window did not open within 30 seconds' }
+          } finally {
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
+          }
 
-      - name: Upload the Windows binaries
-        uses: actions/upload-artifact@v4
+      - name: Upload the portable application
+        uses: actions/upload-artifact@v7
         with:
           name: linscp-windows
-          path: |
-            target/release/linscp.exe
-            target/release/linscp-gui.exe
+          path: target/release/linscp-gui.exe
+          if-no-files-found: error

@@ -9,7 +9,6 @@ members = [
     "crates/linscp-engine",
     "crates/linscp-service",
     "crates/linscp-http",
-    "crates/linscp-cli",
     "crates/linscp-tauri",
 ]
 

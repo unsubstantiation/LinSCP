@@ -346,6 +346,32 @@ pub trait RemoteSession: Send + Sync {
         sink: &mut (dyn AsyncWrite + Unpin + Send),
         progress: Option<&ProgressCallback>,
     ) -> Result<u64, ProtoError>;
+    /// Read only the representation matching the supplied strong ETag.
+    async fn download_if_match(
+        &self, _remote_path: &str, _etag: &str, _opts: TransferRequest,
+        _sink: &mut (dyn AsyncWrite + Unpin + Send), _progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        Err(ProtoError::UnsupportedCapability("conditional download", self.scheme()))
+    }
+    /// Compare a local prefix against an ETag-pinned remote representation.
+    async fn verify_prefix_if_match(
+        &self, _remote_path: &str, _etag: &str, _prefix_len: u64, _total_len: u64,
+        _prefix: &mut (dyn AsyncRead + Unpin + Send),
+    ) -> Result<(), ProtoError> {
+        Err(ProtoError::UnsupportedCapability("verified resume", self.scheme()))
+    }
+    /// Obtain WebDAV resource metadata and its ETag from the same PROPFIND.
+    async fn dav_stat_with_etag(&self, _remote_path: &str) -> Result<(Option<FileEntry>, Option<String>), ProtoError> {
+        Err(ProtoError::UnsupportedCapability("WebDAV stat with ETag", self.scheme()))
+    }
+    /// Move a WebDAV resource only if its source ETag matches and the target is absent.
+    async fn dav_move_if_match(&self, _from: &str, _to: &str, _etag: &str, _is_dir: bool) -> Result<(), ProtoError> {
+        Err(ProtoError::UnsupportedCapability("conditional no-replace move", self.scheme()))
+    }
+    /// Remove only the representation matching the supplied strong ETag.
+    async fn remove_if_match(&self, _remote_path: &str, _etag: &str) -> Result<(), ProtoError> {
+        Err(ProtoError::UnsupportedCapability("conditional delete", self.scheme()))
+    }
     async fn upload(
         &self,
         remote_path: &str,
@@ -354,6 +380,34 @@ pub trait RemoteSession: Send + Sync {
         total_size: Option<u64>,
         progress: Option<&ProgressCallback>,
     ) -> Result<u64, ProtoError>;
+    /// FTP STOU uploads to a server-created unique temporary name.
+    async fn upload_ftp_unique(
+        &self, _directory: &str, _opts: TransferRequest,
+        _source: &mut (dyn AsyncRead + Unpin + Send), _total_size: Option<u64>,
+        _progress: Option<&ProgressCallback>,
+    ) -> Result<(u64, String), ProtoError> {
+        Err(ProtoError::UnsupportedCapability("FTP unique upload", self.scheme()))
+    }
+    /// Create a new destination atomically, failing if any entry already exists.
+    /// Implementations must not silently fall back to an overwriting upload.
+    async fn upload_exclusive(
+        &self,
+        _remote_path: &str,
+        _opts: TransferRequest,
+        _source: &mut (dyn AsyncRead + Unpin + Send),
+        _total_size: Option<u64>,
+        _progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        Err(ProtoError::UnsupportedCapability("exclusive upload", self.scheme()))
+    }
+    /// Replace only if the server atomically matches the supplied strong ETag.
+    async fn upload_if_match(
+        &self, _remote_path: &str, _etag: &str, _opts: TransferRequest,
+        _source: &mut (dyn AsyncRead + Unpin + Send), _total_size: Option<u64>,
+        _progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        Err(ProtoError::UnsupportedCapability("conditional overwrite", self.scheme()))
+    }
     async fn probe_endpoint(&self, _initial_dir: &str) -> Result<(), ProtoError> {
         Ok(())
     }
@@ -378,6 +432,10 @@ pub trait RemoteSession: Send + Sync {
     }
     async fn dav_unlock(&self, _remote_path: &str, _token: Option<&str>) -> Result<(), ProtoError> {
         Err(ProtoError::UnsupportedCapability("dav_unlock", self.scheme()))
+    }
+    /// Return the current S3 object's ETag, or None if it does not exist.
+    async fn s3_get_etag(&self, _remote_path: &str) -> Result<Option<String>, ProtoError> {
+        Err(ProtoError::UnsupportedCapability("s3_etag", self.scheme()))
     }
     async fn dav_get_etag(&self, _remote_path: &str) -> Result<(Option<String>, bool), ProtoError> {
         Err(ProtoError::UnsupportedCapability("dav_etag", self.scheme()))

@@ -349,6 +349,7 @@ def matrix_report(inventory):
     features = inventory['features']
     lines = [
         '# Linux feature inventory', '',
+        '> **Historical:** This ledger predates the native GUI-only conversion. Its older verification claims and CLI-based test evidence do not establish current GUI behavior.', '',
         'Generated from [upstream-parity.json](upstream-parity.json). Baseline: ' +
         inventory['upstream']['repository'] + ' `' + inventory['upstream']['commit'] + '`.', '',
         '**Inventory completeness is not implementation completeness. Full upstream parity is not achieved.**', '',
@@ -421,6 +422,7 @@ def matrix_report(inventory):
 def plan_report(inventory):
     rows = [r for r in inventory['capabilities'] if r['status'] != 'verified']
     lines = ['# Remaining parity implementation plan', '',
+             '> **Historical:** This plan predates the native GUI-only conversion; removed CLI interfaces are not planned for restoration.', '',
              'Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. '
              'Full upstream parity is the target, **not a completed claim**.', '',
              f'{len(rows)} tracked capability gaps. Each requires implementation and acceptance evidence; '

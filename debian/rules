@@ -1,60 +1,31 @@
 #!/usr/bin/make -f
-# Debian build rules for LinSCP (pure-Rust + Tauri v2).
-#
-# This package now builds the Rust workspace (crates/* + ui/) with cargo.
-# The C++ Makefile and CMake are retained as thin wrappers over cargo for
-# developer convenience, but the .deb is produced from cargo.
-
+# Build the native Tauri GUI and its embedded frontend.
 package := linscp
 destdir := debian/$(package)
 
-# dpkg-buildpackage calls clean, build and binary; make everything else a
-# no-op so that extra targets it may probe do not fail the build.
 %:
 	@:
 
 build: build-stamp
 
 build-stamp:
+	npm --prefix ui ci --no-audit --no-fund
+	npm --prefix ui run build
 	cargo test --workspace --all-targets
-	cargo build --release --workspace
+	cargo build --release -p linscp-tauri --features native-shell
 	touch $@
 
-# The tree this package installs is the tree cargo produces plus the
-# desktop integration: the CLI in bin/ (linscp + linscp-gui are the same
-# Rust binary), the PowerShell module under share/linscp/automation/,
-# the .NET assembly sources under share/linscp/dotnet/, the manual page,
-# the desktop entry and the icons. The UI assets (ui/dist) are embedded
-# in the Rust binary via include_str, so no separate gui/web tree is
-# installed - the browser mode is served from the binary itself.
 binary: build
 	rm -rf $(destdir)
-	install -d $(destdir)/usr/bin
-	install -d $(destdir)/usr/share/man/man1
-	install -d $(destdir)/usr/share/doc/$(package)
-	install -d $(destdir)/usr/share/applications
-	install -d $(destdir)/usr/share/pixmaps
-	install -d $(destdir)/usr/share/icons/hicolor/scalable/apps
-	install -d $(destdir)/usr/share/linscp/automation
-	install -d $(destdir)/usr/share/linscp/dotnet
-	install -d $(destdir)/DEBIAN
-	install -m 0755 target/release/linscp $(destdir)/usr/bin/linscp
+	install -d $(destdir)/usr/bin $(destdir)/usr/share/doc/$(package) $(destdir)/usr/share/applications $(destdir)/usr/share/pixmaps $(destdir)/usr/share/icons/hicolor/scalable/apps $(destdir)/DEBIAN
 	install -m 0755 target/release/linscp-gui $(destdir)/usr/bin/linscp-gui
-	install -m 0644 automation/LinSCP.psm1 $(destdir)/usr/share/linscp/automation/
-	install -m 0644 automation/dotnet/LinSCP/LinSCP.csproj \
-		automation/dotnet/LinSCP/Session.cs \
-		automation/dotnet/LinSCP/LinSCPCompat.cs \
-		$(destdir)/usr/share/linscp/dotnet/
 	install -m 0644 debian/linscp.desktop $(destdir)/usr/share/applications/linscp.desktop
 	install -m 0644 debian/linscp.png $(destdir)/usr/share/pixmaps/linscp.png
 	install -m 0644 debian/linscp.svg $(destdir)/usr/share/icons/hicolor/scalable/apps/linscp.svg
-	install -m 0644 docs/linscp.1 $(destdir)/usr/share/man/man1/linscp.1
-	gzip -9f $(destdir)/usr/share/man/man1/linscp.1
 	install -m 0644 debian/copyright $(destdir)/usr/share/doc/$(package)/copyright
-	install -m 0644 LICENSE $(destdir)/usr/share/doc/$(package)/LICENSE
-	install -m 0644 NOTICE $(destdir)/usr/share/doc/$(package)/NOTICE
+	install -m 0644 LICENSE NOTICE $(destdir)/usr/share/doc/$(package)/
 	install -m 0644 docs/debian.md $(destdir)/usr/share/doc/$(package)/README.Debian
-	dpkg-shlibdeps -Tdebian/substvars $(destdir)/usr/bin/linscp
+	dpkg-shlibdeps -Tdebian/substvars $(destdir)/usr/bin/linscp-gui
 	dpkg-gencontrol -p$(package) -P$(destdir)
 	dpkg-deb --build $(destdir) ..
 

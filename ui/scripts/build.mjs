@@ -69,6 +69,11 @@ const dualModeShim = `  window.LinSCPTransport = window.LinSCPCore
       try {
         return await window.LinSCPTransport.request(method, url, parsedBody);
       } catch (error) {
+        // API errors can carry actionable data such as a host-key challenge
+        // or overwrite conflicts. Do not discard it as a transport failure.
+        if (error && error.payload && typeof error.payload === 'object') {
+          return Object.assign({}, error.payload, { success: false });
+        }
         if (error && (error.status === 401 || error.status === 403)) {
           toast(errorMessage(error.message, t("The backend refused this request.")), true);
           return { success: false, error: error.message || 'refused' };

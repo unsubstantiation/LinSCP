@@ -58,6 +58,7 @@ pub const SSH_FXF_WRITE: u32 = 0x0000_0002;
 pub const SSH_FXF_APPEND: u32 = 0x0000_0004;
 pub const SSH_FXF_CREAT: u32 = 0x0000_0008;
 pub const SSH_FXF_TRUNC: u32 = 0x0000_0010;
+pub const SSH_FXF_EXCL: u32 = 0x0000_0020;
 
 pub const SSH_FILEXFER_ATTR_SIZE: u32 = 0x0000_0001;
 pub const SSH_FILEXFER_ATTR_UIDGID: u32 = 0x0000_0002;
@@ -499,6 +500,97 @@ pub struct SftpClientSession {
 }
 
 impl SftpClientSession {
+    async fn upload_inner(
+        &self,
+        remote_path: &str,
+        opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send),
+        total_size: Option<u64>,
+        progress: Option<&ProgressCallback>,
+        exclusive: bool,
+    ) -> Result<u64, ProtoError> {
+        let mut t = self.sftp.lock().await;
+        let mut open_offset = opts.resume_offset;
+        if exclusive && (opts.append || opts.resume_offset != 0) {
+            return Err(ProtoError::Transport("Exclusive upload cannot resume or append.".to_string()));
+        }
+        let pflags = if exclusive {
+            SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_EXCL
+        } else if opts.append {
+            if open_offset == 0 {
+                open_offset = t
+                    .stat_internal(SSH_FXP_STAT, remote_path)
+                    .await?
+                    .map(|a| a.size)
+                    .unwrap_or(0);
+            }
+            SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_APPEND
+        } else if opts.resume_offset > 0 {
+            SSH_FXF_WRITE | SSH_FXF_CREAT
+        } else {
+            SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_TRUNC
+        };
+
+        let create_attrs = match opts.permissions {
+            Some(mode) => SftpWireAttrs {
+                flags: SSH_FILEXFER_ATTR_PERMISSIONS,
+                permissions: mode & 0o7777,
+                ..Default::default()
+            },
+            None => SftpWireAttrs::default(),
+        };
+
+        let handle = t.open_handle(remote_path, pflags, &create_attrs).await?;
+        let mut offset = open_offset;
+        let mut transferred = 0u64;
+        let mut buf = vec![0u8; SFTP_CHUNK_SIZE];
+        let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
+        let reported_total = total_size.unwrap_or(0);
+
+        let res: Result<u64, ProtoError> = async {
+            loop {
+                let n = source
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| ProtoError::Transport(format!("Reading upload source: {e}")))?;
+                if n == 0 {
+                    break;
+                }
+                let mut ww = SftpPacketWriter::new();
+                ww.push_bytes(&handle);
+                ww.push_u64(offset);
+                ww.push_bytes(&buf[..n]);
+                let (rtype, rbody) = t.request(SSH_FXP_WRITE, ww).await?;
+                SftpTransport::expect_ok_status(
+                    rtype,
+                    &rbody,
+                    &format!("Writing '{remote_path}'"),
+                )?;
+                offset += n as u64;
+                transferred += n as u64;
+                if let Some(cb) = progress {
+                    cb(open_offset + transferred, reported_total);
+                }
+                limiter.consume(n).await;
+            }
+            Ok(transferred)
+        }
+        .await;
+
+        let close_res = t.close_handle(&handle).await;
+        let bytes = res?;
+        close_res?;
+
+        if opts.preserve_time {
+            if let Some(mtime) = opts.mtime {
+                drop(t);
+                let _ = self.set_mtime(remote_path, mtime).await;
+            }
+        }
+        Ok(bytes)
+    }
+
+
     pub async fn connect(
         scheme: ProtocolScheme,
         dest_cfg: &SshConnectConfig,
@@ -1059,87 +1151,19 @@ impl RemoteSession for SftpClientSession {
     }
 
     async fn upload(
-        &self,
-        remote_path: &str,
-        opts: TransferRequest,
-        source: &mut (dyn AsyncRead + Unpin + Send),
-        total_size: Option<u64>,
+        &self, remote_path: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
         progress: Option<&ProgressCallback>,
     ) -> Result<u64, ProtoError> {
-        let mut t = self.sftp.lock().await;
-        let mut open_offset = opts.resume_offset;
-        let pflags = if opts.append {
-            if open_offset == 0 {
-                open_offset = t
-                    .stat_internal(SSH_FXP_STAT, remote_path)
-                    .await?
-                    .map(|a| a.size)
-                    .unwrap_or(0);
-            }
-            SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_APPEND
-        } else if opts.resume_offset > 0 {
-            SSH_FXF_WRITE | SSH_FXF_CREAT
-        } else {
-            SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_TRUNC
-        };
+        self.upload_inner(remote_path, opts, source, total_size, progress, false).await
+    }
 
-        let create_attrs = match opts.permissions {
-            Some(mode) => SftpWireAttrs {
-                flags: SSH_FILEXFER_ATTR_PERMISSIONS,
-                permissions: mode & 0o7777,
-                ..Default::default()
-            },
-            None => SftpWireAttrs::default(),
-        };
-
-        let handle = t.open_handle(remote_path, pflags, &create_attrs).await?;
-        let mut offset = open_offset;
-        let mut transferred = 0u64;
-        let mut buf = vec![0u8; SFTP_CHUNK_SIZE];
-        let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
-        let reported_total = total_size.unwrap_or(0);
-
-        let res: Result<u64, ProtoError> = async {
-            loop {
-                let n = source
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| ProtoError::Transport(format!("Reading upload source: {e}")))?;
-                if n == 0 {
-                    break;
-                }
-                let mut ww = SftpPacketWriter::new();
-                ww.push_bytes(&handle);
-                ww.push_u64(offset);
-                ww.push_bytes(&buf[..n]);
-                let (rtype, rbody) = t.request(SSH_FXP_WRITE, ww).await?;
-                SftpTransport::expect_ok_status(
-                    rtype,
-                    &rbody,
-                    &format!("Writing '{remote_path}'"),
-                )?;
-                offset += n as u64;
-                transferred += n as u64;
-                if let Some(cb) = progress {
-                    cb(open_offset + transferred, reported_total);
-                }
-                limiter.consume(n).await;
-            }
-            Ok(transferred)
-        }
-        .await;
-
-        let close_res = t.close_handle(&handle).await;
-        let bytes = res?;
-        close_res?;
-
-        if opts.preserve_time {
-            if let Some(mtime) = opts.mtime {
-                drop(t);
-                let _ = self.set_mtime(remote_path, mtime).await;
-            }
-        }
-        Ok(bytes)
+    async fn upload_exclusive(
+        &self, remote_path: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        self.upload_inner(remote_path, opts, source, total_size, progress, true).await
     }
 
     async fn realpath(&self, remote_path: &str) -> Result<String, ProtoError> {

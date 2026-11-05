@@ -298,7 +298,7 @@ impl Default for UserPreferences {
             filemask: String::new(),
             speed: 0,
             resumesupport: String::new(),
-            resume: true,
+            resume: false,
             preserve_time: true,
             newer_only: false,
             append: false,

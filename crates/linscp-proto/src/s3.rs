@@ -10,11 +10,14 @@
 //!   `?versionId=` stat, download, and delete)
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use fs2::FileExt;
+use rand::{Rng, RngCore};
 use linscp_crypto::digests::{compute_digest_hex, DigestAlgorithm, DigestHasher};
 use linscp_crypto::sigv4::{region_from_s3_host, sign_s3_request, S3SignParams};
 use linscp_types::{FileEntry, ProtocolScheme};
@@ -107,6 +110,95 @@ impl MultipartResumeStore {
     }
 }
 
+// One private file per owned multipart upload. The exclusive OS lock stays
+// held for the full transfer, so another running app instance cannot abort it.
+#[derive(Serialize, Deserialize)]
+struct ConditionalUploadRecord {
+    endpoint: String,
+    bucket: String,
+    key: String,
+    upload_id: String,
+}
+
+struct ConditionalUploadJournal {
+    file: std::fs::File,
+}
+
+// Open only ordinary, singly-linked journal files, never symlinks or other
+// special files. The lock is acquired before examining or updating contents.
+fn try_open_journal(path: &Path) -> Option<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK); }
+    #[cfg(windows)] { use std::os::windows::fs::OpenOptionsExt; options.custom_flags(0x0020_0000); }
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 64 * 1024 { return None; }
+    #[cfg(unix)] { use std::os::unix::fs::MetadataExt; if metadata.nlink() != 1 { return None; } }
+    #[cfg(windows)] {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT};
+        // MetadataExt does not expose the link count on our MSRV. Inspect the
+        // opened handle, not the pathname, and fail closed on unknown metadata.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0
+            || info.nNumberOfLinks != 1 || info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 { return None; }
+    }
+    file.try_lock_exclusive().ok()?;
+    Some(file)
+}
+
+// Uniform reservoir sampling gives every eligible record a chance on each
+// reconnect, without retaining more than the bounded number of file locks.
+fn sample_cleanup_record<T>(sample: &mut Vec<T>, item: T, seen: usize, rng: &mut impl Rng) {
+    const LIMIT: usize = 4;
+    if sample.len() < LIMIT { sample.push(item); }
+    else {
+        let slot = rng.gen_range(0..seen);
+        if slot < LIMIT { sample[slot] = item; }
+    }
+}
+
+impl ConditionalUploadJournal {
+    fn create(directory: &Path, record: &ConditionalUploadRecord) -> Result<Self, ProtoError> {
+        linscp_platform::create_private_dir(directory).map_err(|e| ProtoError::Transport(format!("Cannot create S3 cleanup journal: {e}")))?;
+        // Reuse a resolved tombstone if available; never unlink an arbitrary
+        // pathname, and keep the lock while writing the next upload record.
+        let reusable = std::fs::read_dir(directory).ok().and_then(|entries| entries.flatten().find_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("upload-") || !name.ends_with(".json") { return None; }
+            let file = try_open_journal(&entry.path())?;
+            if file.metadata().ok()?.len() == 0 { Some(file) } else { None }
+        }));
+        let mut file = if let Some(file) = reusable { file } else {
+            let mut random = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut random);
+            let path = directory.join(format!("upload-{}.json", random.iter().map(|b| format!("{b:02x}")).collect::<String>()));
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+            let file = options.open(&path).map_err(|e| ProtoError::Transport(format!("Cannot create S3 cleanup journal: {e}")))?;
+            file.lock_exclusive().map_err(|e| ProtoError::Transport(format!("Cannot lock S3 cleanup journal: {e}")))?;
+            file
+        };
+        let json = serde_json::to_vec(record).map_err(|e| ProtoError::Transport(format!("Cannot encode S3 cleanup journal: {e}")))?;
+        file.write_all(&json).and_then(|_| file.sync_all()).map_err(|e| ProtoError::Transport(format!("Cannot persist S3 cleanup journal: {e}")))?;
+        Ok(Self { file })
+    }
+
+    fn mark_resolved(&mut self) {
+        // Keep a zero-length tombstone instead of unlinking a pathname another
+        // local process might have replaced. It carries no upload information.
+        let _ = self.file.set_len(0).and_then(|_| self.file.sync_all());
+    }
+}
+
+fn valid_strong_s3_etag(tag: &str) -> bool {
+    tag.len() >= 2 && tag.starts_with('"') && tag.ends_with('"')
+        && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control)
+}
+
 #[derive(Clone)]
 pub struct S3ConnectConfig {
     pub use_https: bool,
@@ -127,6 +219,8 @@ pub struct S3ConnectConfig {
     /// the caller can retry and resume from the last completed part.
     pub abort_multipart_on_error: bool,
     pub resume_store: Arc<MultipartResumeStore>,
+    /// Private directory for conditional upload IDs that need crash recovery.
+    pub conditional_cleanup_dir: Option<PathBuf>,
     pub extra_signed_headers: BTreeMap<String, String>,
     /// Headers signed and sent exclusively on object write operations (`PUT`, `CreateMultipartUpload`, `CopyObject`).
     pub object_write_headers: BTreeMap<String, String>,
@@ -151,6 +245,7 @@ impl Default for S3ConnectConfig {
             min_part_size: DEFAULT_MIN_PART_SIZE,
             abort_multipart_on_error: true,
             resume_store: MultipartResumeStore::new_in_memory(),
+            conditional_cleanup_dir: None,
             extra_signed_headers: BTreeMap::new(),
             object_write_headers: BTreeMap::new(),
             tls: TlsSettings::default(),
@@ -273,6 +368,7 @@ impl S3Session {
 
         let tls_cfg = build_rustls_client_config(&cfg.tls)?;
         let mut builder = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .use_preconfigured_tls(tls_cfg)
             .connect_timeout(cfg.timeout);
 
@@ -290,13 +386,73 @@ impl S3Session {
             .build()
             .map_err(|e| ProtoError::Transport(format!("Failed to build S3 HTTP client: {e}")))?;
 
-        Ok(Self {
+        let session = Self {
             cfg,
             region,
             client,
             jump_tunnel,
             socks_relay: Mutex::new(socks_relay),
-        })
+        };
+        session.retry_abandoned_conditional_uploads().await;
+        Ok(session)
+    }
+
+    fn cleanup_endpoint_id(&self) -> String {
+        // Hash, rather than persist, the access key identifier. Secrets and
+        // session tokens are never recorded in the journal.
+        let identity = format!("{}\0{}\0{}\0{}\0{}\0{}", self.cfg.use_https, self.cfg.host.to_lowercase(), self.cfg.port, self.region, self.cfg.path_style, self.cfg.access_key_id);
+        compute_digest_hex(DigestAlgorithm::Sha256, identity.as_bytes())
+    }
+
+    async fn retry_abandoned_conditional_uploads(&self) {
+        let Some(directory) = self.cfg.conditional_cleanup_dir.as_ref() else { return; };
+        let Ok(entries) = std::fs::read_dir(directory) else { return; };
+        let endpoint = self.cleanup_endpoint_id();
+        let candidates = {
+            let mut selected = Vec::new();
+            let mut seen = 0usize;
+            let mut rng = rand::thread_rng();
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with("upload-") || !name.ends_with(".json") { continue; }
+                let Ok(meta) = entry.file_type() else { continue; };
+                if !meta.is_file() || meta.is_symlink() { continue; }
+                let Some(mut file) = try_open_journal(&entry.path()) else { continue; };
+                let mut bytes = Vec::new();
+                if (&mut file).take(64 * 1024).read_to_end(&mut bytes).is_err() || bytes.is_empty() { continue; }
+                let Ok(record) = serde_json::from_slice::<ConditionalUploadRecord>(&bytes) else { continue; };
+                if record.endpoint != endpoint || record.bucket.is_empty() || record.key.is_empty() || record.upload_id.is_empty() { continue; }
+                seen += 1;
+                sample_cleanup_record(&mut selected, (file, record), seen, &mut rng);
+            }
+            selected
+        };
+        for (file, record) in candidates {
+            let query = vec![("uploadId".to_string(), record.upload_id)];
+            // Bound both request and body consumption; a stalled or oversized
+            // error response must not hang reconnect or exhaust memory.
+            let resolved = tokio::time::timeout(Duration::from_secs(3), async {
+                let Ok(mut response) = self.send_signed(Method::DELETE, Some(&record.bucket), &record.key, &query, &[], Vec::new()).await else { return false; };
+                if response.status().as_u16() == 204 { return true; }
+                if response.status().as_u16() != 404 || response.content_length().is_some_and(|len| len > 64 * 1024) { return false; }
+                let mut body = Vec::new();
+                loop {
+                    match response.chunk().await {
+                        Ok(Some(chunk)) if body.len() + chunk.len() <= 64 * 1024 => body.extend_from_slice(&chunk),
+                        Ok(None) => break,
+                        _ => return false,
+                    }
+                }
+                let Ok(body) = std::str::from_utf8(&body) else { return false; };
+                reject_xxe_declarations(body).is_ok() && roxmltree::Document::parse(body).ok().is_some_and(|doc| {
+                    doc.root_element().tag_name().name() == "Error" && doc.root_element().children().any(|node| node.is_element() && node.tag_name().name() == "Code" && node.text() == Some("NoSuchUpload"))
+                })
+            }).await.unwrap_or(false);
+            if resolved { let _ = file.set_len(0).and_then(|_| file.sync_all()); }
+            // Ambiguous errors leave the record for later inspection rather
+            // than claiming cleanup succeeded.
+        }
     }
 
     pub fn region(&self) -> &str {
@@ -618,6 +774,144 @@ impl S3Session {
             ver_marker = Some(next_vm);
         }
         Ok(versions)
+    }
+
+    async fn conditional_put(
+        &self, remote_path: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
+        progress: Option<&ProgressCallback>, header_name: &str, header_value: &str,
+    ) -> Result<u64, ProtoError> {
+        // Multipart conditional completion is not implemented; fail closed.
+        const MAX_CONDITIONAL_BYTES: u64 = 16 * 1024 * 1024;
+        let Some(expected) = total_size else { return Err(ProtoError::UnsupportedCapability("conditional upload without known size", self.scheme())); };
+        if opts.append || opts.resume_offset != 0 {
+            return Err(ProtoError::UnsupportedCapability("conditional resume or append", self.scheme()));
+        }
+        if expected > 1024 * 1024 * 1024 {
+            return Err(ProtoError::UnsupportedCapability("conditional uploads over 1 GiB", self.scheme()));
+        }
+        if expected > MAX_CONDITIONAL_BYTES {
+            return self.conditional_multipart(remote_path, opts, source, expected, progress, header_name, header_value).await;
+        }
+        let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else {
+            return Err(ProtoError::Transport("S3 upload requires a bucket and object key.".to_string()));
+        };
+        if key.is_empty() { return Err(ProtoError::Transport("S3 object key must not be empty.".to_string())); }
+        let mut payload = Vec::with_capacity(expected as usize);
+        source.take(expected + 1).read_to_end(&mut payload).await
+            .map_err(|e| ProtoError::Transport(format!("Reading S3 upload source failed: {e}")))?;
+        if payload.len() as u64 != expected {
+            return Err(ProtoError::Transport("S3 upload source size changed during transfer.".to_string()));
+        }
+        let mut headers = self.write_headers_vec();
+        headers.push((header_name.to_string(), header_value.to_string()));
+        let response = self.send_signed(Method::PUT, Some(&bucket), &key, &[], &headers, payload).await?;
+        let status = response.status();
+        if status.as_u16() != 200 {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProtoError::Transport(format!("Conditional S3 PUT was not confirmed (HTTP {status}); destination may exist: {}", body.trim())));
+        }
+        if let Some(callback) = progress { callback(expected, expected); }
+        Ok(expected)
+    }
+
+    // Each attempt owns a fresh upload ID; no path-based cleanup or resume of
+    // another attempt is allowed. Completion carries the original precondition.
+    async fn conditional_multipart(
+        &self, remote_path: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), expected: u64,
+        progress: Option<&ProgressCallback>, header_name: &str, header_value: &str,
+    ) -> Result<u64, ProtoError> {
+        const PART_SIZE: usize = 8 * 1024 * 1024;
+        let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else {
+            return Err(ProtoError::Transport("S3 upload requires a bucket and object key.".to_string()));
+        };
+        if key.is_empty() { return Err(ProtoError::Transport("S3 object key must not be empty.".to_string())); }
+        let checkpoint = self.initiate_multipart(&bucket, &key, expected, PART_SIZE as u64).await
+            .map_err(|e| ProtoError::Transport(format!("S3 multipart initiation was not confirmed; an unfinished upload may remain: {e}")))?;
+        let upload_id = checkpoint.upload_id;
+        let mut journal = if let Some(directory) = self.cfg.conditional_cleanup_dir.as_ref() {
+            let record = ConditionalUploadRecord { endpoint: self.cleanup_endpoint_id(), bucket: bucket.clone(), key: key.clone(), upload_id: upload_id.clone() };
+            match ConditionalUploadJournal::create(directory, &record) {
+                Ok(journal) => Some(journal),
+                Err(error) => {
+                    let query = vec![("uploadId".to_string(), upload_id.clone())];
+                    let aborted = tokio::time::timeout(Duration::from_secs(3), self.send_signed(Method::DELETE, Some(&bucket), &key, &query, &[], Vec::new())).await;
+                    let confirmed = matches!(aborted, Ok(Ok(ref response)) if response.status().as_u16() == 204);
+                    return Err(ProtoError::Transport(format!("{error}; multipart abort {} (upload ID '{upload_id}').", if confirmed { "confirmed" } else { "was not confirmed" })));
+                }
+            }
+        } else { None };
+        let result: Result<u64, ProtoError> = async {
+            let mut parts: Vec<(u32, String)> = Vec::new();
+            let mut transferred = 0u64;
+            let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
+            while transferred < expected {
+                let size = ((expected - transferred) as usize).min(PART_SIZE);
+                let mut data = vec![0u8; size];
+                source.read_exact(&mut data).await.map_err(|e| ProtoError::Transport(format!("Reading S3 multipart source failed: {e}")))?;
+                let number = parts.len() as u32 + 1;
+                let query = vec![("partNumber".to_string(), number.to_string()), ("uploadId".to_string(), upload_id.clone())];
+                let response = self.send_signed(Method::PUT, Some(&bucket), &key, &query, &[], data).await?;
+                let status = response.status();
+                let etag = response.headers().get("etag").and_then(|v| v.to_str().ok()).unwrap_or("").trim().to_string();
+                if status.as_u16() != 200 || etag.is_empty() {
+                    return Err(ProtoError::Transport(format!("S3 multipart part {number} was not confirmed (HTTP {status}).")));
+                }
+                parts.push((number, etag));
+                transferred += size as u64;
+                if let Some(callback) = progress { callback(transferred, expected); }
+                limiter.consume(size).await;
+            }
+            // Detect growth and give an interruptible reader a final chance to
+            // notice cancellation before the irreversible completion request.
+            let mut extra = [0u8; 1];
+            if source.read(&mut extra).await.map_err(|e| ProtoError::Transport(format!("Checking S3 multipart source failed: {e}")))? != 0 {
+                return Err(ProtoError::Transport("S3 upload source size changed during transfer.".to_string()));
+            }
+            let mut xml = String::from("<CompleteMultipartUpload>");
+            for (number, etag) in &parts {
+                xml.push_str(&format!("<Part><PartNumber>{number}</PartNumber><ETag>{}</ETag></Part>", xml_escape(etag)));
+            }
+            xml.push_str("</CompleteMultipartUpload>");
+            let query = vec![("uploadId".to_string(), upload_id.clone())];
+            let headers = vec![("content-type".to_string(), "application/xml".to_string()), (header_name.to_string(), header_value.to_string())];
+            let response = self.send_signed(Method::POST, Some(&bucket), &key, &query, &headers, xml.into_bytes()).await?;
+            let status = response.status();
+            let body = response.text().await.map_err(|e| ProtoError::Transport(format!("S3 multipart completion response was not confirmed: {e}")))?;
+            if status.as_u16() != 200 { return Err(parse_s3_error_xml(status, &body)); }
+            reject_xxe_declarations(&body)?;
+            let document = roxmltree::Document::parse(&body).map_err(|e| ProtoError::Transport(format!("Malformed S3 completion response: {e}")))?;
+            let root = document.root_element();
+            let confirmed_bucket = root.children().find(|n| n.is_element() && n.tag_name().name() == "Bucket").and_then(|n| n.text());
+            let confirmed_key = root.children().find(|n| n.is_element() && n.tag_name().name() == "Key").and_then(|n| n.text());
+            if root.tag_name().name() != "CompleteMultipartUploadResult" || confirmed_bucket != Some(bucket.as_str()) || confirmed_key != Some(key.as_str()) {
+                return Err(ProtoError::Transport("S3 multipart completion was not confirmed for the requested object; destination may exist.".to_string()));
+            }
+            Ok(transferred)
+        }.await;
+        match result {
+            Ok(bytes) => {
+                if let Some(journal) = journal.as_mut() { journal.mark_resolved(); }
+                Ok(bytes)
+            }
+            Err(error) => {
+                // Abort only our upload ID; never delete the object pathname.
+                // A lost completion response can still mean the object exists.
+                let query = vec![("uploadId".to_string(), upload_id.clone())];
+                let aborted = tokio::time::timeout(Duration::from_secs(3), self.send_signed(Method::DELETE, Some(&bucket), &key, &query, &[], Vec::new())).await;
+                let cleanup = match aborted {
+                    Ok(Ok(response)) if response.status().as_u16() == 204 => {
+                        if let Some(journal) = journal.as_mut() { journal.mark_resolved(); }
+                        "Multipart upload was aborted; in-flight parts may still require lifecycle cleanup.".to_string()
+                    },
+                    Ok(Ok(response)) => format!("Multipart abort was not confirmed (HTTP {}); upload ID '{}' may remain.", response.status(), upload_id),
+                    Ok(Err(e)) => format!("Multipart abort was not confirmed; upload ID '{}' may remain: {e}", upload_id),
+                    Err(_) => format!("Multipart abort timed out and was not confirmed; upload ID '{}' may remain.", upload_id),
+                };
+                Err(ProtoError::Transport(format!("{error}; {cleanup} The destination may already exist if completion was unconfirmed.")))
+            }
+        }
     }
 
     pub async fn stat_version(
@@ -1522,6 +1816,78 @@ impl RemoteSession for S3Session {
         Ok(transferred)
     }
 
+    async fn download_if_match(
+        &self, remote_path: &str, etag: &str, opts: TransferRequest,
+        sink: &mut (dyn AsyncWrite + Unpin + Send), progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        if !valid_strong_s3_etag(etag) || opts.version_id.is_some() {
+            return Err(ProtoError::Transport("S3 conditional download requires a strong ETag and the current object.".to_string()));
+        }
+        let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else {
+            return Err(ProtoError::Transport("S3 download requires a bucket and object key.".to_string()));
+        };
+        let mut headers = vec![("if-match".to_string(), etag.to_string())];
+        if opts.resume_offset > 0 { headers.push(("range".to_string(), format!("bytes={}-", opts.resume_offset))); }
+        let mut response = self.send_signed(Method::GET, Some(&bucket), &key, &[], &headers, Vec::new()).await?;
+        let expected_status = if opts.resume_offset > 0 { 206 } else { 200 };
+        if response.status().as_u16() != expected_status {
+            return Err(ProtoError::Transport(format!("Conditional S3 download was not confirmed (HTTP {}).", response.status())));
+        }
+        if response.headers().get("etag").and_then(|value| value.to_str().ok()) != Some(etag) {
+            return Err(ProtoError::Transport("S3 conditional download returned a missing or different ETag.".to_string()));
+        }
+        if opts.resume_offset > 0 {
+            let range = response.headers().get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let (bounds, total) = range.strip_prefix("bytes ").and_then(|v| v.split_once('/')).ok_or_else(|| ProtoError::Transport("S3 returned an invalid Content-Range.".to_string()))?;
+            let (start, end) = bounds.split_once('-').and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))).ok_or_else(|| ProtoError::Transport("S3 returned an invalid Content-Range.".to_string()))?;
+            let total = total.parse::<u64>().map_err(|_| ProtoError::Transport("S3 returned an invalid Content-Range total.".to_string()))?;
+            if start != opts.resume_offset || end.checked_add(1) != Some(total) || start > end {
+                return Err(ProtoError::Transport("S3 returned an inconsistent resume range.".to_string()));
+            }
+        }
+        let total = opts.resume_offset.saturating_add(response.content_length().unwrap_or(0));
+        let mut transferred = 0u64;
+        while let Some(chunk) = response.chunk().await.map_err(|e| ProtoError::Transport(format!("S3 download stream failed: {e}")))? {
+            sink.write_all(&chunk).await.map_err(|e| ProtoError::Transport(format!("S3 sink write failed: {e}")))?;
+            transferred = transferred.checked_add(chunk.len() as u64).ok_or_else(|| ProtoError::Transport("S3 download length overflow.".to_string()))?;
+            if let Some(cb) = progress { cb(opts.resume_offset.saturating_add(transferred), total); }
+        }
+        sink.flush().await.map_err(|e| ProtoError::Transport(format!("S3 sink flush failed: {e}")))?;
+        Ok(transferred)
+    }
+
+    async fn verify_prefix_if_match(
+        &self, remote_path: &str, etag: &str, prefix_len: u64, total_len: u64,
+        prefix: &mut (dyn AsyncRead + Unpin + Send),
+    ) -> Result<(), ProtoError> {
+        if !valid_strong_s3_etag(etag) || prefix_len == 0 || prefix_len > total_len {
+            return Err(ProtoError::Transport("Invalid S3 resume prefix or ETag.".to_string()));
+        }
+        let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else {
+            return Err(ProtoError::Transport("S3 download requires a bucket and object key.".to_string()));
+        };
+        let headers = vec![("if-match".to_string(), etag.to_string()), ("range".to_string(), format!("bytes=0-{}", prefix_len - 1))];
+        let mut response = self.send_signed(Method::GET, Some(&bucket), &key, &[], &headers, Vec::new()).await?;
+        let expected = format!("bytes 0-{}/{}", prefix_len - 1, total_len);
+        let received = response.headers().get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if response.status().as_u16() != 206 || received != expected {
+            return Err(ProtoError::Transport("S3 did not return the expected conditional prefix range.".to_string()));
+        }
+        if response.headers().get("etag").and_then(|value| value.to_str().ok()) != Some(etag) {
+            return Err(ProtoError::Transport("S3 prefix verification returned a missing or different ETag.".to_string()));
+        }
+        let mut compared = 0u64;
+        while let Some(chunk) = response.chunk().await.map_err(|e| ProtoError::Transport(format!("S3 prefix stream failed: {e}")))? {
+            compared = compared.checked_add(chunk.len() as u64).ok_or_else(|| ProtoError::Transport("S3 prefix length overflow.".to_string()))?;
+            if compared > prefix_len { return Err(ProtoError::Transport("S3 returned too much prefix data.".to_string())); }
+            let mut local = vec![0u8; chunk.len()];
+            prefix.read_exact(&mut local).await.map_err(|e| ProtoError::Transport(format!("Reading local resume prefix failed: {e}")))?;
+            if local.as_slice() != chunk.as_ref() { return Err(ProtoError::Transport("Local partial file does not match the remote source.".to_string())); }
+        }
+        if compared != prefix_len { return Err(ProtoError::Transport("S3 returned an incomplete prefix.".to_string())); }
+        Ok(())
+    }
+
     async fn upload(
         &self,
         remote_path: &str,
@@ -1577,6 +1943,39 @@ impl RemoteSession for S3Session {
         Ok(total)
     }
 
+    async fn upload_exclusive(
+        &self,
+        remote_path: &str,
+        opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send),
+        total_size: Option<u64>,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        self.conditional_put(remote_path, opts, source, total_size, progress, "if-none-match", "*").await
+    }
+
+    async fn upload_if_match(
+        &self, remote_path: &str, etag: &str, opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        if !etag.starts_with('"') || !etag.ends_with('"') || etag.len() < 2 || etag[1..etag.len()-1].contains('"') || etag.chars().any(char::is_control) {
+            return Err(ProtoError::Transport("Conditional overwrite requires a single strong ETag.".to_string()));
+        }
+        self.conditional_put(remote_path, opts, source, total_size, progress, "if-match", etag).await
+    }
+
+    async fn s3_get_etag(&self, remote_path: &str) -> Result<Option<String>, ProtoError> {
+        let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else { return Ok(None); };
+        if key.is_empty() { return Ok(None); }
+        let resp = self.send_signed(Method::HEAD, Some(&bucket), &key, &[], &[], Vec::new()).await?;
+        if resp.status().as_u16() == 404 { return Ok(None); }
+        if !resp.status().is_success() {
+            return Err(ProtoError::Transport(format!("S3 HEAD '{remote_path}' failed with HTTP {}.", resp.status())));
+        }
+        Ok(resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(str::to_string))
+    }
+
     async fn probe_endpoint(&self, _initial_dir: &str) -> Result<(), ProtoError> {
         self.check_endpoint().await
     }
@@ -1609,5 +2008,77 @@ impl RemoteSession for S3Session {
             let _ = jump.close().await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cleanup_sampling_tests {
+    use super::sample_cleanup_record;
+    use rand::{rngs::StdRng, SeedableRng};
+
+    #[test]
+    fn journal_lock_released_after_process_termination() {
+        const CHILD_PATH: &str = "LSCP_TEST_JOURNAL_LOCK_CHILD";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let path = std::path::PathBuf::from(path);
+            let _locked = super::try_open_journal(&path).expect("child could not lock journal");
+            std::fs::write(path.with_extension("ready"), b"ready").unwrap();
+            loop { std::thread::sleep(std::time::Duration::from_secs(1)); }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upload-test.json");
+        std::fs::write(&path, b"record").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("s3::cleanup_sampling_tests::journal_lock_released_after_process_termination")
+            .env(CHILD_PATH, &path).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !path.with_extension("ready").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let ready = path.with_extension("ready").exists();
+        let locked = ready && super::try_open_journal(&path).is_none();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(ready, "child did not acquire the journal lock");
+        assert!(locked, "another process could open the active journal");
+        assert!(super::try_open_journal(&path).is_some(), "OS did not release the lock after process termination");
+    }
+
+    #[test]
+    fn journal_rejects_hardlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let path = dir.path().join("upload-hardlink.json");
+        std::fs::write(&target, b"unrelated").unwrap();
+        std::fs::hard_link(&target, &path).unwrap();
+        assert!(super::try_open_journal(&path).is_none());
+        assert_eq!(std::fs::read(&target).unwrap(), b"unrelated");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_rejects_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upload-fifo.json");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(super::try_open_journal(&path).is_none());
+    }
+
+    #[test]
+    fn bounded_sampling_can_reach_later_records() {
+        let mut rng = StdRng::seed_from_u64(9);
+        let mut reached = [false; 20];
+        for _ in 0..256 {
+            let mut sample = Vec::new();
+            for item in 0..reached.len() {
+                sample_cleanup_record(&mut sample, item, item + 1, &mut rng);
+            }
+            assert_eq!(sample.len(), 4);
+            for item in sample { reached[item] = true; }
+        }
+        assert!(reached.into_iter().all(|item| item));
     }
 }
