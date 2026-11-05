@@ -77,7 +77,10 @@ PUT or conditional multipart completion, relying on server enforcement; S3 condi
 An ETag is not necessarily a unique version: changes that retain the same ETag
 may not be detected. Other queued overwrites are rejected until they can be made
 safe. Other protocols and configurations require further verification.
-Unsupported operations return an error rather than reporting success.
+Unsupported operations return an error rather than reporting success. A current
+native feature audit, including visible but unwired actions, is in
+[`docs/native-feature-audit.md`](docs/native-feature-audit.md). Workspaces restore
+local tabs and remote tabs backed by saved sites; they do not store credentials.
 
 ## Build the desktop application
 

@@ -36,6 +36,7 @@ struct InnerState {
     active_tab_id: Option<u64>,
     tabs: HashMap<u64, TabRuntime>,
     challenges: HashMap<u64, TabRuntime>,
+    pending_connections: std::collections::HashSet<u64>,
     logs: Vec<Value>,
     preferences: UserPreferences,
     queue_transfers: Vec<Value>,
@@ -83,6 +84,7 @@ impl CommanderService {
                 active_tab_id: None,
                 tabs: HashMap::new(),
                 challenges: HashMap::new(),
+                pending_connections: std::collections::HashSet::new(),
                 logs: Vec::new(),
                 preferences,
                 queue_transfers: Vec::new(),
@@ -207,6 +209,10 @@ impl CommanderService {
         match (method.as_str(), raw_path.as_str()) {
             ("POST", "/api/tabs/open") => self.open_tab_async(req.body).await,
             ("POST", "/api/tabs/verify") => self.verify_tab_async(req.body).await,
+            ("POST", "/api/tabs/reconnect") => self.reconnect_tab_async(req.body).await,
+            ("POST", "/api/remote/mkdir") => self.mkdir_remote_async(req.body).await,
+            ("POST", "/api/remote/properties") => Box::pin(self.remote_properties_async(req.body)).await,
+            ("POST", "/api/workspaces/open") => Box::pin(self.open_workspace_async(req.body)).await,
             ("POST", "/api/transfer/upload") => self.queue_transfer_async(req.body, true, false).await,
             ("POST", "/api/transfer/download") => self.queue_transfer_async(req.body, false, false).await,
             ("POST", "/api/transfer/move") => {
@@ -254,6 +260,7 @@ impl CommanderService {
             let mut state = self.state.lock().expect("state mutex");
             let id = state.next_tab_id;
             state.next_tab_id += 1;
+            state.pending_connections.insert(id);
             TabRuntime {
                 id, name: body.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or(&spec.session.host).to_string(),
                 site_name: site_name.map(str::to_string), is_local: false, connected: false,
@@ -267,14 +274,21 @@ impl CommanderService {
 
     async fn connect_tab(&self, tab: &mut TabRuntime) -> ApiReply {
         let spec = match tab.spec.as_ref() { Some(s) => s, None => return api_error(400, "Missing session settings") };
-        match tabs::dial_gui_tab_session(spec, &self.config_root(), false, "en").await {
+        let result = tabs::dial_gui_tab_session(spec, &self.config_root(), false, "en").await;
+        let mut state = self.state.lock().expect("state mutex");
+        // Closing a tab or cancelling a challenge while dialing must not bring
+        // it back to life after the asynchronous connection completes.
+        if !state.pending_connections.contains(&tab.id) {
+            return api_error(400, "Connection was cancelled.");
+        }
+        match result {
             Ok((session, remote_dir, observed)) => {
                 tab.remote = Some(session);
                 tab.remote_dir = remote_dir;
                 tab.observed_hostkey = observed;
                 tab.connected = true;
                 tab.error.clear();
-                let mut state = self.state.lock().expect("state mutex");
+                state.pending_connections.remove(&tab.id);
                 state.challenges.remove(&tab.id);
                 state.active_tab_id = Some(tab.id);
                 state.tabs.insert(tab.id, tab.clone());
@@ -283,11 +297,130 @@ impl CommanderService {
             Err(GuiConnectError::HostKeyChallenge(challenge)) => {
                 tabs::apply_challenge_to_tab(tab, &challenge);
                 let response = tab.hostkey_challenge_json();
-                self.state.lock().expect("state mutex").challenges.insert(tab.id, tab.clone());
+                state.challenges.insert(tab.id, tab.clone());
                 ApiReply { status: 409, payload: json!({"success": false, "error": challenge.error, "challenge": response}) }
             }
-            Err(GuiConnectError::Failed(error)) => api_error(400, error),
+            Err(GuiConnectError::Failed(error)) => {
+                state.pending_connections.remove(&tab.id);
+                if let Some(current) = state.tabs.get_mut(&tab.id) {
+                    current.connected = false;
+                    current.remote = None;
+                    current.error = error.clone();
+                }
+                api_error(400, error)
+            }
         }
+    }
+
+    async fn reconnect_tab_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No such tab") };
+        let mut tab = {
+            let mut state = self.state.lock().expect("state mutex");
+            let tab = match state.tabs.get(&id).cloned() { Some(tab) => tab, None => return api_error(400, "No such tab") };
+            if tab.is_local { return ApiReply { status: 200, payload: json!({"success": true, "tab": tab.describe()}) }; }
+            if tab.spec.is_none() { return api_error(400, "Missing session settings"); }
+            if !state.pending_connections.insert(id) { return api_error(409, "Connection already in progress"); }
+            if let Some(current) = state.tabs.get_mut(&id) { current.connected = false; current.remote = None; current.error.clear(); }
+            tab
+        };
+        // Reconnect to the directory being viewed, not the original startup
+        // directory; credentials and approved host keys stay in the private spec.
+        if let Some(spec) = tab.spec.as_mut() { spec.session.initial_dir = tab.remote_dir.clone(); }
+        tab.connected = false;
+        tab.remote = None;
+        self.connect_tab(&mut tab).await
+    }
+
+    async fn mkdir_remote_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "Not connected") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
+        };
+        if tab.is_local { return self.handle_remote_mkdir(body); }
+        let name = match body.get("name").and_then(Value::as_str) {
+            Some(name) if !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\') && !name.contains(':') && !name.chars().any(char::is_control) => name,
+            _ => return api_error(400, "A single valid directory name is required."),
+        };
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        if !matches!(session.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes | linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs) {
+            return api_error(501, "Safe directory creation is not supported for this protocol.");
+        }
+        let path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
+        match session.mkdir(&path).await {
+            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
+            Err(error) => api_error(400, format!("Directory creation was not confirmed; the directory may already exist: {error}")),
+        }
+    }
+
+    async fn remote_properties_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "Not connected") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() { Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected") };
+        if tab.is_local { return self.handle_remote_properties(body); }
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        let names = match body.get("names").and_then(Value::as_array) { Some(names) if !names.is_empty() && names.len() <= 1000 => names, _ => return api_error(400, "Select at least one item") };
+        let mut rows = Vec::new();
+        for item in names {
+            let name = item.as_str().or_else(|| item.get("name").and_then(Value::as_str));
+            let name = match name {
+                Some(name) if !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\') && !name.contains(':') && !name.chars().any(char::is_control) => name,
+                _ => return api_error(400, "Invalid file name"),
+            };
+            let path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
+            match session.stat(&path).await {
+                Ok(Some(entry)) => {
+                    let is_link = entry.is_symlink;
+                    let mut row = json!(entry);
+                    row["path"] = json!(path);
+                    row["is_link"] = json!(is_link);
+                    rows.push(row);
+                }
+                Ok(None) => rows.push(json!({"name": name, "error": "No such item"})),
+                Err(error) => rows.push(json!({"name": name, "error": error.to_string()})),
+            }
+        }
+        ApiReply { status: 200, payload: json!({"success": true, "name": rows.first().and_then(|r| r.get("name")).cloned().unwrap_or(json!("")), "properties": rows}) }
+    }
+
+    async fn open_workspace_async(&self, body: Value) -> ApiReply {
+        let name = body.get("name").and_then(Value::as_str).unwrap_or("");
+        let path = self.config_root().join("workspaces.json");
+        let data: Value = match std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()) {
+            Some(data) => data, None => return api_error(400, "Workspace file cannot be read."),
+        };
+        let workspace = match data.get("workspaces").and_then(|w| w.get(name)) { Some(entry) => entry, None => return api_error(400, format!("No workspace named \"{name}\" exists.")) };
+        let entries = match workspace.get("tabs").and_then(Value::as_array) { Some(tabs) if !tabs.is_empty() && tabs.len() <= 100 => tabs, _ => return api_error(400, "Workspace has no valid tabs.") };
+        let active = workspace.get("active").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let mut opened = Vec::new();
+        let mut failed = Vec::new();
+        let mut active_id = None;
+        for (index, entry) in entries.iter().enumerate() {
+            let label = entry.get("name").and_then(Value::as_str).unwrap_or("Unnamed tab");
+            let local = entry.get("local_dir").and_then(Value::as_str).unwrap_or("");
+            let remote = entry.get("remote_dir").and_then(Value::as_str).unwrap_or("");
+            let result = match entry.get("kind").and_then(Value::as_str) {
+                Some("local") => self.create_local_tab(local.to_string(), remote.to_string()),
+                Some("remote") => {
+                    match entry.get("site").and_then(Value::as_str).filter(|name| !name.is_empty()) {
+                        Some(site) => self.open_tab_async(json!({"site_name": site, "name": label, "session": {"local_dir": local, "initial_dir": remote}})).await,
+                        None => api_error(400, "Remote workspace tabs require a saved site."),
+                    }
+                }
+                _ => api_error(400, "Invalid workspace tab type."),
+            };
+            if result.status == 200 && result.payload["success"] == true {
+                if let Some(id) = result.payload["tab"]["id"].as_u64() {
+                    if index == active { active_id = Some(id); }
+                    opened.push(json!({"name": label, "id": id}));
+                } else { failed.push(json!({"name": label, "error": "Opened tab has no ID."})); }
+            } else {
+                // Workspace opening cannot silently approve a new SSH key.
+                // Leave that tab unopened and let the user connect manually.
+                if let Some(id) = result.payload["challenge"]["tab"].as_u64() { self.handle_tabs_close(json!({"tab": id})); }
+                failed.push(json!({"name": label, "error": result.payload["error"].as_str().unwrap_or("Cannot open tab")}));
+            }
+        }
+        if let Some(id) = active_id { self.handle_tabs_select(json!({"tab": id})); }
+        ApiReply { status: 200, payload: json!({"success": true, "name": name, "opened": opened, "failed": failed, "active_tab": active_id}) }
     }
 
     async fn verify_tab_async(&self, body: Value) -> ApiReply {
@@ -306,14 +439,20 @@ impl CommanderService {
             let mut parts = fingerprint.split_whitespace();
             let (kind, key) = match (parts.next(), parts.next(), parts.next()) {
                 (Some(kind), Some(key), None) => (kind, key),
-                _ => return api_error(400, "Invalid host-key fingerprint"),
+                _ => {
+                    self.state.lock().expect("state mutex").challenges.insert(id, tab);
+                    return api_error(400, "Invalid host-key fingerprint");
+                }
             };
             let path = self.config_root().join("sshhostkeys");
             let result = linscp_engine::hostkeys::HostKeyCache::load_from_path(&path).and_then(|mut cache| {
                 cache.upsert(challenge["host"].as_str().unwrap_or(""), challenge["port"].as_u64().unwrap_or(22) as u16, kind, key)?;
                 cache.save_to_path(&path)
             });
-            if let Err(error) = result { return api_error(500, error); }
+            if let Err(error) = result {
+                self.state.lock().expect("state mutex").challenges.insert(id, tab);
+                return api_error(500, error);
+            }
         }
         let spec = tab.spec.as_mut().expect("challenge has session settings");
         if role == "tunnel" {
@@ -909,7 +1048,9 @@ impl CommanderService {
         let cfg = self.state.lock().expect("m").config_root.clone();
         let path = cfg.join("workspaces.json");
         let data: Value = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({"workspaces": {}}));
-        ApiReply{ status: 200, payload: json!({"success": true, "workspaces": data.get("workspaces").cloned().unwrap_or(json!([])), "file": path.to_string_lossy()})}
+        let mut workspaces: Vec<Value> = data.get("workspaces").and_then(Value::as_object).map(|entries| entries.iter().map(|(name, entry)| json!({"name": name, "tab_count": entry.get("tabs").and_then(Value::as_array).map_or(0, Vec::len)})).collect()).unwrap_or_default();
+        workspaces.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        ApiReply{ status: 200, payload: json!({"success": true, "workspaces": workspaces, "file": path.to_string_lossy()})}
     }
     fn handle_save_workspaces(&self, body: Value) -> ApiReply {
         let cfg = self.state.lock().expect("m").config_root.clone();
@@ -925,35 +1066,36 @@ impl CommanderService {
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         if name.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "workspace name required"})}; }
         let cfg = self.state.lock().expect("m").config_root.clone();
-        let tabs: Vec<Value> = {
+        let (tabs, active) = {
             let g = self.state.lock().expect("m");
-            g.tabs.values().map(|t| json!({"name": t.name, "kind": if t.is_local { "local"} else {"remote"}, "local_dir": t.local_dir, "remote_dir": t.remote_dir, "site": t.site_name})).collect()
+            let mut ordered: Vec<&TabRuntime> = g.tabs.values().collect();
+            ordered.sort_by_key(|tab| tab.id);
+            if ordered.iter().any(|tab| !tab.is_local && tab.site_name.as_deref().is_none_or(str::is_empty)) {
+                return api_error(400, "Save each remote session as a saved site before saving a workspace; credentials are not stored in workspaces.");
+            }
+            let active = ordered.iter().position(|tab| Some(tab.id) == g.active_tab_id).unwrap_or(0);
+            let tabs: Vec<Value> = ordered.iter().map(|t| json!({"name": t.name, "kind": if t.is_local { "local"} else {"remote"}, "local_dir": t.local_dir, "remote_dir": t.remote_dir, "site": t.site_name})).collect();
+            (tabs, active)
         };
         if tabs.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "There are no open tabs to save."})}; }
+        if tabs.len() > 100 { return api_error(400, "A workspace can contain at most 100 tabs."); }
         let path = cfg.join("workspaces.json");
         let mut data: Value = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({}));
         if !data.is_object() { data = json!({}); }
         if data.get("workspaces").is_none() { data["workspaces"] = json!({}); }
+        if !data["workspaces"].is_object() { return api_error(400, "Invalid workspace file."); }
         let overw = body.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false);
         if data["workspaces"].get(&name).is_some() && !overw {
             return ApiReply{ status: 409, payload: json!({"success": false, "error": format!("A workspace named \"{name}\" already exists."), "exists": true})};
         }
-        data["workspaces"][&name] = json!({"tabs": tabs, "active": 0, "updated": 0});
+        data["workspaces"][&name] = json!({"tabs": tabs, "active": active, "updated": 0});
         let bytes = serde_json::to_vec_pretty(&data).unwrap_or_default();
         if let Err(e) = write_private_file_atomic(&path, &bytes) {
             return ApiReply{ status: 500, payload: json!({"success": false, "error": e.to_string()})};
         }
         ApiReply{ status: 200, payload: json!({"success": true, "workspace": json!({"name": name})})}
     }
-    fn handle_workspaces_open(&self, body: Value) -> ApiReply {
-        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let cfg = self.state.lock().expect("m").config_root.clone();
-        let path = cfg.join("workspaces.json");
-        let data: Value = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({}));
-        let entry = data.get("workspaces").and_then(|w| w.get(&name));
-        if entry.is_none() { return ApiReply{ status: 400, payload: json!({"success": false, "error": format!("No workspace named \"{name}\" exists.")})}; }
-        ApiReply{ status: 200, payload: json!({"success": true, "name": name})}
-    }
+    fn handle_workspaces_open(&self, _body: Value) -> ApiReply { Self::not_implemented() }
     fn handle_workspaces_delete(&self, body: Value) -> ApiReply {
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let cfg = self.state.lock().expect("m").config_root.clone();
@@ -1014,6 +1156,7 @@ impl CommanderService {
         let mut g = self.state.lock().expect("m");
         g.tabs.remove(&tab_id);
         g.challenges.remove(&tab_id);
+        g.pending_connections.remove(&tab_id);
         if g.active_tab_id == Some(tab_id) { g.active_tab_id = g.tabs.keys().next().cloned(); }
         ApiReply{ status: 200, payload: json!({"success": true})}
     }
@@ -1032,7 +1175,8 @@ impl CommanderService {
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) }).unwrap_or(0);
         let g = self.state.lock().expect("m");
         if let Some(tab) = g.tabs.get(&tab_id) {
-            return ApiReply{ status: 200, payload: json!({"success": true, "tab": tab.describe()})};
+            if tab.is_local { return ApiReply{ status: 200, payload: json!({"success": true, "tab": tab.describe()})}; }
+            return api_error(501, "Remote reconnect requires asynchronous dispatch.");
         }
         ApiReply{ status: 400, payload: json!({"success": false, "error": "No such tab"})}
     }
@@ -1139,22 +1283,7 @@ impl CommanderService {
         let pending = ops::list_shell_manifests(&cfg);
         ApiReply{ status: 200, payload: json!({"success": true, "pending": pending})}
     }
-    fn handle_shell_consume(&self, body: Value) -> ApiReply {
-        let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
-        let cfg = self.state.lock().expect("m").config_root.clone();
-        let manifest = match ops::take_shell_manifest(&cfg, &id) {
-            Ok(v) => v, Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
-        };
-        // Validate tab
-        let g = self.state.lock().expect("m");
-        let tab = tab_id.and_then(|id| g.tabs.get(&id).cloned());
-        if tab.is_none() || tab.as_ref().map(|t| t.is_local).unwrap_or(true) {
-            return ApiReply{ status: 400, payload: json!({"success": false, "error": "Files from a file manager can only be sent to a session tab."})};
-        }
-        drop(g);
-        ApiReply{ status: 200, payload: json!({"success": true, "queued": manifest.get("items").cloned().unwrap_or(json!([])), "manifest": manifest})}
-    }
+    fn handle_shell_consume(&self, _body: Value) -> ApiReply { Self::not_implemented() }
     fn handle_shell_dismiss(&self, body: Value) -> ApiReply {
         let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let cfg = self.state.lock().expect("m").config_root.clone();
@@ -1246,9 +1375,10 @@ impl CommanderService {
         let tab = match tab_id.and_then(|id| g.tabs.get(&id).cloned()) { Some(t)=>t, None=> return ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})},};
         drop(g);
         let names: Vec<String> = body.get("names").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| e.get("name").and_then(|v| v.as_str()).or(e.as_str()).map(|s| s.to_string())).collect()).unwrap_or_else(|| body.get("name").and_then(|v| v.as_str()).map(|s| vec![s.to_string()]).unwrap_or_default());
+        if !tab.is_local { return Self::not_implemented(); }
         let mut rows=Vec::new();
         for n in names {
-            let p = if tab.is_local { resolve_contained(&tab.other_local_dir, &n).unwrap_or(n.clone()) } else { format!("{}/{}", tab.remote_dir, n) };
+            let p = match resolve_contained(&tab.other_local_dir, &n) { Ok(path) => path, Err(error) => return api_error(400, error) };
             let info = if tab.is_local {
                 match gui_os::stat_extended(Path::new(&p)) {
                     Ok(s)=> json!({"name": n, "size": s.size, "is_dir": s.is_dir, "permissions": s.permissions, "owner": s.owner, "group": s.group}),
@@ -1276,11 +1406,9 @@ impl CommanderService {
     fn handle_remote_transfer(&self, _body: Value) -> ApiReply { Self::not_implemented() }
     fn handle_copyid(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
     fn handle_session_terminal(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
-    fn handle_terminal_input(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
-    fn handle_terminal_close(&self, body: Value) -> ApiReply { ApiReply{ status:200, payload: json!({"success": true})}}
-    fn handle_terminal_output(&self, query: &BTreeMap<String,String>) -> ApiReply {
-        ApiReply{ status:200, payload: json!({"success": true, "data": "", "offset": 0, "alive": false, "exit_code": 0})}
-    }
+    fn handle_terminal_input(&self, _body: Value) -> ApiReply { Self::not_implemented() }
+    fn handle_terminal_close(&self, _body: Value) -> ApiReply { Self::not_implemented() }
+    fn handle_terminal_output(&self, _query: &BTreeMap<String,String>) -> ApiReply { Self::not_implemented() }
     fn handle_queue_pause(&self) -> ApiReply { self.queue.pause(); ApiReply{ status:200, payload: json!({"success": true})}}
     fn handle_queue_resume(&self) -> ApiReply { self.queue.resume(); ApiReply{ status:200, payload: json!({"success": true})}}
     fn handle_queue_cancel(&self, body: Value) -> ApiReply {
@@ -2097,6 +2225,48 @@ mod tests {
         assert!(view.get("s3_secret_key").is_none());
         assert!(view.get("s3_session_token").is_none());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn workspace_round_trip_and_unavailable_actions_fail_closed() {
+        let tmp = std::env::temp_dir().join(format!("linscp-workspace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let left = tmp.join("left"); let right = tmp.join("right");
+        std::fs::create_dir_all(&left).unwrap(); std::fs::create_dir_all(&right).unwrap();
+        let root = tmp.join("config");
+        let svc = CommanderService::new(root.clone(), Arc::new(NativeLocalFs::new()));
+        let request = |method: &str, path: &str, body: Value| ApiEnvelope { method: method.into(), path: path.into(), body };
+        let first = svc.dispatch_async(request("POST", "/api/tabs/local", json!({"local_dir": left, "remote_dir": right}))).await;
+        let first_id = first.payload["tab"]["id"].as_u64().unwrap();
+        let second = svc.dispatch_async(request("POST", "/api/tabs/local", json!({"local_dir": right, "remote_dir": left}))).await;
+        let second_id = second.payload["tab"]["id"].as_u64().unwrap();
+        svc.dispatch_async(request("POST", "/api/tabs/select", json!({"tab": first_id}))).await;
+        let saved = svc.dispatch_async(request("POST", "/api/workspaces/save", json!({"name": "My workspace"}))).await;
+        assert_eq!(saved.status, 200, "{}", saved.payload);
+        let listed = svc.dispatch_async(request("GET", "/api/workspaces", json!({}))).await;
+        assert_eq!(listed.payload["workspaces"][0]["name"], "My workspace");
+        assert_eq!(listed.payload["workspaces"][0]["tab_count"], 2);
+        let reopened = svc.dispatch_async(request("POST", "/api/workspaces/open", json!({"name": "My workspace"}))).await;
+        assert_eq!(reopened.status, 200, "{}", reopened.payload);
+        assert_eq!(reopened.payload["opened"].as_array().unwrap().len(), 2);
+        assert!(reopened.payload["failed"].as_array().unwrap().is_empty());
+        let restored = reopened.payload["opened"][0]["id"].as_u64().unwrap();
+        assert_eq!(reopened.payload["active_tab"], restored);
+        let state = svc.state.lock().unwrap();
+        assert_eq!(state.active_tab_id, Some(restored));
+        assert!(state.tabs.contains_key(&first_id) && state.tabs.contains_key(&second_id));
+        assert_eq!(state.tabs[&restored].local_dir, left.canonicalize().unwrap().to_string_lossy().into_owned());
+        drop(state);
+        let shell = root.join("shell-manifests"); std::fs::create_dir_all(&shell).unwrap();
+        let manifest = shell.join("pending.json"); std::fs::write(&manifest, b"{\"id\":\"pending\"}").unwrap();
+        for path in ["/api/shell/consume", "/api/terminal/input", "/api/terminal/close"] {
+            let reply = svc.dispatch_async(request("POST", path, json!({"id": "pending", "tab": first_id}))).await;
+            assert_eq!(reply.status, 501, "{path}");
+        }
+        assert!(manifest.exists());
+        let reply = svc.dispatch_async(request("GET", "/api/terminal/output", json!({}))).await;
+        assert_eq!(reply.status, 501);
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[tokio::test]
@@ -2997,8 +3167,32 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    async fn exercise_remote_mkdir(svc: &CommanderService, id: u64) {
+        let request = |body: Value| ApiEnvelope { method: "POST".into(), path: "/api/remote/mkdir".into(), body };
+        for name in ["", ".", "..", "../escape", "nested/name", "bad\\name", "bad\nname"] {
+            let response = svc.dispatch_async(request(json!({"tab": id, "name": name}))).await;
+            assert_eq!(response.status, 400, "accepted invalid name {name:?}: {}", response.payload);
+        }
+        let created = svc.dispatch_async(request(json!({"tab": id, "name": "gui-new-folder"}))).await;
+        assert_eq!(created.status, 200, "{}", created.payload);
+        let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        assert!(session.stat("/gui-new-folder").await.unwrap().unwrap().is_dir);
+        let duplicate = svc.dispatch_async(request(json!({"tab": id, "name": "gui-new-folder"}))).await;
+        assert_ne!(duplicate.status, 200, "existing directory was reported as newly created");
+        let properties = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/remote/properties".into(), body: json!({"tab": id, "names": ["gui-new-folder", "not-here"]}) }).await;
+        assert_eq!(properties.status, 200, "{}", properties.payload);
+        assert_eq!(properties.payload["properties"][0]["name"], "gui-new-folder");
+        assert_eq!(properties.payload["properties"][0]["path"], "/gui-new-folder");
+        assert_eq!(properties.payload["properties"][0]["is_dir"], true);
+        assert!(properties.payload["properties"][1]["error"].is_string());
+        let invalid = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/remote/properties".into(), body: json!({"tab": id, "names": ["../escape"]}) }).await;
+        assert_eq!(invalid.status, 400);
+    }
+
+    #[cfg(target_os = "linux")]
     async fn exercise_ftp_uploads(svc: &CommanderService, id: u64, local: &Path, remote: &Path) {
         let request = |body: Value| ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body };
+        Box::pin(exercise_remote_mkdir(svc, id)).await;
         std::fs::write(local.join("up.txt"), b"FTP upload payload").unwrap();
         // Direct callers must not bypass the FTP risk acknowledgment or fall
         // through ASCII conversion to an unguarded STOR.
@@ -3217,6 +3411,79 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    async fn exercise_saved_remote_workspace(root: &Path, port: u16) {
+        let config = root.join("workspace-config");
+        let svc = CommanderService::new(config.clone(), Arc::new(NativeLocalFs::new()));
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        let save = svc.dispatch_async(request("/api/sessions/save", json!({"name": "Saved FTP", "session": {"protocol": "ftp", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": root, "initial_dir": "/"}}))).await;
+        assert_eq!(save.status, 200, "{}", save.payload);
+        let open = svc.dispatch_async(request("/api/tabs/open", json!({"site_name": "Saved FTP", "name": "Saved FTP", "session": {"local_dir": root, "initial_dir": "/"}}))).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let original = open.payload["tab"]["id"].as_u64().unwrap();
+        let saved = svc.dispatch_async(request("/api/workspaces/save", json!({"name": "FTP workspace"}))).await;
+        assert_eq!(saved.status, 200, "{}", saved.payload);
+        let serialized = std::fs::read_to_string(config.join("workspaces.json")).unwrap();
+        assert!(!serialized.contains("testpass"));
+        let reopened = svc.dispatch_async(request("/api/workspaces/open", json!({"name": "FTP workspace"}))).await;
+        assert_eq!(reopened.status, 200, "{}", reopened.payload);
+        assert!(reopened.payload["failed"].as_array().unwrap().is_empty(), "{}", reopened.payload);
+        let restored = reopened.payload["opened"][0]["id"].as_u64().unwrap();
+        assert_ne!(restored, original);
+        assert_eq!(reopened.payload["active_tab"], restored);
+        let session = svc.state.lock().unwrap().tabs.get(&restored).unwrap().remote.as_ref().unwrap().clone();
+        assert!(session.stat("/gui-new-folder").await.unwrap().is_some());
+        // Workspaces do not persist transient credentials; an unsaved remote
+        // session must not be silently saved in an unrecoverable form.
+        let unsaved = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "ftp", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": root, "initial_dir": "/"}}))).await;
+        assert_eq!(unsaved.status, 200, "{}", unsaved.payload);
+        let rejected = svc.dispatch_async(request("/api/workspaces/save", json!({"name": "unsaved"}))).await;
+        assert_eq!(rejected.status, 400);
+        assert!(rejected.payload["error"].as_str().unwrap().contains("saved"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_ftp_reconnect_close_race() {
+        if std::env::var_os("LSCP_LIVE_FTP").is_none() { return; }
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        struct Server(std::process::Child);
+        impl Drop for Server { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let tmp = std::env::temp_dir().join(format!("linscp-ftp-reconnect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp); std::fs::create_dir_all(&tmp).unwrap();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestFtpServer.py");
+        let child = Command::new("/usr/bin/python3").arg(path).env("LSCP_TEST_ROOT", &tmp).env("LSCP_TEST_FTP_LOGIN_DELAY", "0.3")
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut server = Server(child); let mut line = String::new();
+        BufReader::new(server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let port: u16 = line.trim().strip_prefix("READY ").unwrap().parse().unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        let opened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "ftp", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": tmp, "initial_dir": "/"}}))).await;
+        assert_eq!(opened.status, 200, "{}", opened.payload);
+        let id = opened.payload["tab"]["id"].as_u64().unwrap();
+        let other = svc.clone();
+        let task = tokio::spawn(async move {
+            other.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/reconnect".into(), body: json!({"tab": id}) }).await
+        });
+        let mut started = false;
+        for _ in 0..1000 {
+            if svc.state.lock().unwrap().pending_connections.contains(&id) { started = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(started, "reconnect did not start");
+        let duplicate = svc.dispatch_async(request("/api/tabs/reconnect", json!({"tab": id}))).await;
+        assert_eq!(duplicate.status, 409);
+        let closed = svc.dispatch_async(request("/api/tabs/close", json!({"tab": id}))).await;
+        assert_eq!(closed.status, 200);
+        let response = task.await.unwrap();
+        assert_ne!(response.status, 200, "closed tab was reconnected");
+        assert!(!svc.state.lock().unwrap().tabs.contains_key(&id));
+        assert!(!svc.state.lock().unwrap().pending_connections.contains(&id));
+        drop(server); let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn live_ftp_gui_download() {
         if std::env::var_os("LSCP_LIVE_FTP").is_none() { return; }
@@ -3257,6 +3524,7 @@ mod tests {
         assert!(done, "FTP download timed out");
         assert_eq!(std::fs::read(local.join("download.txt")).unwrap(), b"FTP roundtrip");
         exercise_ftp_uploads(&svc, id, &local, &remote).await;
+        Box::pin(exercise_saved_remote_workspace(&local, port)).await;
         let slow_index = svc.queue.snapshot().0.len();
         let slow = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["slow.bin"]}))).await;
         assert_eq!(slow.status, 200, "{}", slow.payload);
@@ -3287,9 +3555,13 @@ mod tests {
         let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
         let err = session.stat("/download.txt").await.expect_err("interrupted FTP control channel must not be reused");
         assert!(err.to_string().contains("reconnect"), "{err}");
-        let reopened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "ftp", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
+        let reopened = svc.dispatch_async(request("/api/tabs/reconnect", json!({"tab": id}))).await;
         assert_eq!(reopened.status, 200, "{}", reopened.payload);
         let new_id = reopened.payload["tab"]["id"].as_u64().unwrap();
+        assert_eq!(new_id, id);
+        let fresh = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        assert!(!Arc::ptr_eq(&session, &fresh));
+        assert!(fresh.stat("/download.txt").await.unwrap().is_some());
         // Running FTP uploads must accept cancellation through the public
         // queue, poison the control connection, and retain the reported stage.
         std::fs::write(local.join("queued-ftp-cancel.bin"), vec![43u8; 32 * 1024 * 1024]).unwrap();
@@ -3322,11 +3594,16 @@ mod tests {
         }
         assert!(stopped, "running FTP upload did not cancel");
         assert!(!remote.join("queued-ftp-cancel.bin").exists());
-        let reopened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "ftp", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
+        let reopened = svc.dispatch_async(request("/api/tabs/reconnect", json!({"tab": new_id}))).await;
         assert_eq!(reopened.status, 200, "{}", reopened.payload);
         let new_id = reopened.payload["tab"]["id"].as_u64().unwrap();
+        assert_eq!(new_id, id);
         exercise_ftp_upload_cancellation(&svc, new_id, &local, &remote).await;
-        drop(server); let _ = std::fs::remove_dir_all(tmp);
+        drop(server);
+        let failed = svc.dispatch_async(request("/api/tabs/reconnect", json!({"tab": id}))).await;
+        assert_ne!(failed.status, 200, "offline reconnect must not report success");
+        assert_eq!(svc.state.lock().unwrap().tabs.get(&id).unwrap().connected, false);
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[cfg(target_os = "linux")]
@@ -3504,6 +3781,7 @@ mod tests {
         let open = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "dav", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
         assert_eq!(open.status, 200, "{}", open.payload);
         let id = open.payload["tab"]["id"].as_u64().unwrap();
+        Box::pin(exercise_remote_mkdir(&svc, id)).await;
         std::fs::write(local.join("upload.txt"), b"WebDAV roundtrip").unwrap();
         let upload = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["upload.txt"]}))).await;
         assert_eq!(upload.status, 200, "{}", upload.payload);
@@ -4373,6 +4651,13 @@ mod tests {
         assert_eq!(connected.status, 200, "{}", connected.payload);
         assert!(connected.payload["tab"]["session"].get("password").is_none());
         assert!(!tmp.join("config/sshhostkeys").exists());
+        Box::pin(exercise_remote_mkdir(&svc, id)).await;
+        let previous = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        let reconnected = svc.dispatch_async(request("/api/tabs/reconnect", json!({"tab": id}))).await;
+        assert_eq!(reconnected.status, 200, "{}", reconnected.payload);
+        let current = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        assert!(!Arc::ptr_eq(&previous, &current), "reconnect reused the old connection");
+        assert_eq!(reconnected.payload["tab"]["id"], id);
         std::fs::write(local.join("upload.txt"), b"hello from native").unwrap();
         let upload = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["upload.txt"]}))).await;
         assert_eq!(upload.status, 200, "{}", upload.payload);

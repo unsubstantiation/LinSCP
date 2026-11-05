@@ -1641,6 +1641,8 @@
       await loadRemote(state.remote.path);
     } else {
       toast(errorMessage(result.error, t("Cannot reconnect.")), true);
+      if (result.challenge) showHostKeyChallenge(result.challenge);
+      await refreshStatus();
     }
   }
 
@@ -2686,7 +2688,7 @@
       {count: (result.opened || []).length, failed: failed}), failed > 0);
     if (failed && $('workspaceStatus')) {
       $('workspaceStatus').textContent = t('Could not open: {names}', {
-        names: result.failed.map(item => item.name).join(', ')
+        names: result.failed.map(item => item.error ? `${item.name}: ${item.error}` : item.name).join('; ')
       });
     }
   }
@@ -4479,6 +4481,10 @@
       return;
     }
     for (const row of result.properties || []) {
+      if (row.error) {
+        body.appendChild(propertyTable([[t('Name'), row.name], [t('Error'), row.error]]));
+        continue;
+      }
       body.appendChild(propertyTable([
         [t('Name'), row.name],
         [t('Path on the server'), row.path],

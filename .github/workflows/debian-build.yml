@@ -38,6 +38,9 @@ jobs:
       - name: Exercise atomic local moves
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service local_moves_are_atomic_no_replace -- --nocapture
 
+      - name: Exercise workspace persistence and unavailable-action handling
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service workspace_round_trip_and_unavailable_actions_fail_closed -- --nocapture
+
       - name: Exercise owned local download cleanup
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-engine owned_stage_cleanup_tests -- --nocapture
 
@@ -54,7 +57,7 @@ jobs:
       - name: Exercise native FTP connection and download
         env:
           LSCP_LIVE_FTP: "1"
-        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ftp_gui_download -- --nocapture
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ftp_ -- --nocapture --test-threads=1
 
       - name: Exercise native explicit FTPS connection and download
         env:

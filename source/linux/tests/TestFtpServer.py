@@ -1,5 +1,6 @@
 """Disposable FTP server for native service integration tests (test credentials only)."""
 import os
+import time
 from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.handlers import FTPHandler, TLS_FTPHandler, ThrottledDTPHandler
 from pyftpdlib.servers import FTPServer
@@ -23,6 +24,13 @@ if os.environ.get("LSCP_TEST_FTP_TLS") == "1":
     handler.tls_data_required = True
 else:
     handler = FTPHandler
+if os.environ.get("LSCP_TEST_FTP_LOGIN_DELAY"):
+    base_handler = handler
+    class SlowLoginHandler(base_handler):
+        def ftp_PASS(self, line):
+            time.sleep(float(os.environ["LSCP_TEST_FTP_LOGIN_DELAY"]))
+            return super().ftp_PASS(line)
+    handler = SlowLoginHandler
 if os.environ.get("LSCP_TEST_FTP_THROTTLE") == "1":
     class SlowDTPHandler(ThrottledDTPHandler):
         write_limit = 256 * 1024
