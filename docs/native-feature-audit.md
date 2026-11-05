@@ -41,8 +41,9 @@ transfer limitations in `readme.md` before using remote operations.
   cancelled transfer may leave remote files or partial trees; guarantees depend
   on the server and are not equivalent to transactions.
 - Native account/login features are not implemented. Android has a Rust-backed
-  experimental debug APK but lacks SAF, sharing, background transfers and
-  Keystore integration; see `docs/android.md`. Desktop integration, import sources,
+  experimental debug APK with document-picker copy-in/copy-out, but lacks direct
+  SAF folder browsing, sharing, background transfers and Keystore integration;
+  see `docs/android.md`. Desktop integration, import sources,
   and other legacy UI actions require further native end-to-end validation.
 - SSH host-key changes during workspace restoration are not auto-accepted or
   interactively resolved as part of a batch; the failed tab must be connected
@@ -55,5 +56,5 @@ workflow exercises live SFTP, WebDAV, FTP/FTPS and S3 fixtures, workspace
 round-tripping, folder creation, and reconnect/cancellation regressions, then
 builds and smoke-tests the package. The Windows workflow runs Rust workspace
 unit tests, frontend tests, and a portable native-window smoke test. Android CI
-runs Rust compatibility checks only. These tests do not establish correctness
+builds a debug APK and runs a WebView, protocol and document-picker emulator smoke test. These tests do not establish correctness
 against every server, concurrent actor, network failure, or platform.

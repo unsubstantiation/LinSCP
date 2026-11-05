@@ -4,9 +4,13 @@ The Android target builds the same Tauri WebView and Rust `CommanderService` as
 the desktop application. This is an **experimental, debug-signed APK**, not a
 production or Play Store release. Android support is incomplete:
 
-- Only app-private storage is exposed. The Android Storage Access Framework,
-  document picker, share intents and Downloads/shared storage are not wired in.
-  Uninstalling the app removes app-private files and configuration.
+- The file panes browse app-private storage. **Import files** copies selected
+  documents from the Android picker into an app-private import directory;
+  **Export file** copies one selected regular file to a location chosen in the
+  system picker. These are copies, not direct folder browsing or synchronization.
+  Directory import, share intents and persisted SAF folder grants are not yet
+  supported. Uninstalling the app removes its private copies and configuration.
+  If export fails, the chosen destination document may be incomplete.
 - Background/foreground-service transfer survival and Android Keystore/biometric
   integration are not wired in. Keep the app open during transfers. The session
   master key is stored in the app sandbox, not backed by Android Keystore.

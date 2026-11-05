@@ -39,6 +39,8 @@ jobs:
         run: python3 ../../tools/run_cargo_ci.py npm run tauri -- android build --ci --debug --apk true --aab false --target aarch64 x86_64 --features native-shell
       - name: Verify APK contents and signature
         run: python3 tools/run_cargo_ci.py python3 tools/verify_android_apk.py
+      - name: Install SFTP test server dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-paramiko
       - name: Enable emulator acceleration
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules

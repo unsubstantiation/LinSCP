@@ -2,6 +2,7 @@
 // is reached through adb reverse; all IPC executes inside the installed APK.
 import assert from 'node:assert/strict';
 const port = Number(process.argv[2]);
+const sftpPort = Number(process.argv[3]);
 let pages;
 for (let i = 0; i < 60; i++) {
   try {
@@ -60,7 +61,27 @@ const expression = `
   const contents = await invoke('GET', '/api/local/edit?tab=' + local.tab.id + '&path=smoke-upload.txt');
   if (contents.content !== 'Android Rust-backed transfer') throw new Error('Downloaded bytes differ');
   await invoke('POST', '/api/local/rename', {tab: local.tab.id, old_name: 'smoke-upload.txt', new_name: 'renamed.txt'});
-  return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, conflict: true};
+  // Exercise an unknown SSH host-key challenge and SFTP transfers on Android.
+  await invoke('POST', '/api/local/save', {path: root + '/smoke-sftp.txt', content: 'Android SFTP transfer'});
+  await invoke('POST', '/api/local/mkdir', {name: 'smoke-sftp-download'});
+  let challenge;
+  try {
+    await invoke('POST', '/api/tabs/open', {session: {protocol: 'sftp', host: '127.0.0.1', port: ${sftpPort}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
+    throw new Error('Unknown SSH host key was accepted without a challenge');
+  } catch (error) {
+    challenge = error.payload?.challenge;
+    if (error.status !== 409 || !challenge?.fingerprint) throw error;
+  }
+  const ssh = await invoke('POST', '/api/tabs/verify', {tab: challenge.tab, fingerprint: challenge.fingerprint, role: challenge.role, remember: false});
+  if (!ssh.tab?.connected) throw new Error('SFTP host-key approval did not connect');
+  await invoke('POST', '/api/transfer/upload', {tab: ssh.tab.id, local_dir: root, remote_dir: '/', names: ['smoke-sftp.txt']});
+  await waitTransfer(3);
+  await invoke('POST', '/api/transfer/download', {tab: ssh.tab.id, local_dir: root + '/smoke-sftp-download', remote_dir: '/', names: ['smoke-sftp.txt']});
+  await waitTransfer(4);
+  const sftpLocal = await invoke('POST', '/api/tabs/local', {local_dir: root + '/smoke-sftp-download', remote_dir: root});
+  const sftpContent = await invoke('GET', '/api/local/edit?tab=' + sftpLocal.tab.id + '&path=smoke-sftp.txt');
+  if (sftpContent.content !== 'Android SFTP transfer') throw new Error('SFTP downloaded bytes differ');
+  return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, conflict: true, sftp: true};
 })()`;
 let nextId = 0;
 async function evaluate(expression, timeout = 10000) {
