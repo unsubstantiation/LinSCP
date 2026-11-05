@@ -211,8 +211,8 @@ impl CommanderService {
             ("POST", "/api/tabs/verify") => self.verify_tab_async(req.body).await,
             ("POST", "/api/tabs/reconnect") => self.reconnect_tab_async(req.body).await,
             ("POST", "/api/remote/mkdir") => self.mkdir_remote_async(req.body).await,
-            ("POST", "/api/remote/properties") => self.remote_properties_async(req.body).await,
-            ("POST", "/api/workspaces/open") => self.open_workspace_async(req.body).await,
+            ("POST", "/api/remote/properties") => Box::pin(self.remote_properties_async(req.body)).await,
+            ("POST", "/api/workspaces/open") => Box::pin(self.open_workspace_async(req.body)).await,
             ("POST", "/api/transfer/upload") => self.queue_transfer_async(req.body, true, false).await,
             ("POST", "/api/transfer/download") => self.queue_transfer_async(req.body, false, false).await,
             ("POST", "/api/transfer/move") => {
