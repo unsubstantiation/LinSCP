@@ -1,0 +1,7 @@
+{
+  "name": "linscp-native-shell",
+  "private": true,
+  "scripts": {
+    "tauri": "node ../../ui/node_modules/@tauri-apps/cli/tauri.js"
+  }
+}

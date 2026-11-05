@@ -1,9 +1,5 @@
-//! Android-specific Tauri plugin wiring.
-//!
-//! This module bridges the Kotlin Android layer (`gen/android/app/src/main/java/io/linscp/commander/*`)
-//! with the pure-Rust platform abstractions in `linscp-platform::android`.
-//! On non-Android hosts (Linux/Windows CI) the same types compile as no-op
-//! stubs so `cargo test --workspace` remains green everywhere.
+//! Android bridge contracts. Platform integration is not registered yet;
+//! unsupported Android operations must fail rather than fabricate results.
 
 #[cfg(target_os = "android")]
 mod imp {
@@ -64,44 +60,27 @@ mod imp {
             if uris.is_empty() {
                 return Err(PlatformError::SecretVault("No files shared".to_string()));
             }
-            // Fallback staging for tests / when no ShareBridge is registered:
-            // create temp files under the system temp dir (mirrors the
-            // non-Android stub so `cargo test --workspace` stays green).
-            let root = std::env::temp_dir().join(format!("linscp-share-{}", std::process::id()));
-            std::fs::create_dir_all(&root).map_err(PlatformError::Io)?;
-            let mut out = Vec::new();
-            for (idx, uri) in uris.iter().enumerate() {
-                let name = uri
-                    .rsplit('/')
-                    .next()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("shared-file")
-                    .replace(['/', '\\', '\0'], "_");
-                let path = root.join(format!("{idx}-{name}"));
-                std::fs::write(&path, b"stub").map_err(PlatformError::Io)?;
-                out.push(path);
-            }
-            Ok(out)
+            Err(PlatformError::UnsupportedUri("Android share integration is not available".to_string()))
         }
         pub fn foreground_start(&self, title: &str, ongoing: usize) -> Result<(), PlatformError> {
             if let Some(bridge) = self.fg.lock().unwrap().as_deref() {
                 bridge.start(title, ongoing)
             } else {
-                Ok(())
+                Err(PlatformError::UnsupportedUri("Android foreground service is not available".to_string()))
             }
         }
         pub fn foreground_update(&self, done: u64, total: u64) -> Result<(), PlatformError> {
             if let Some(bridge) = self.fg.lock().unwrap().as_deref() {
                 bridge.update_progress(done, total)
             } else {
-                Ok(())
+                Err(PlatformError::UnsupportedUri("Android foreground service is not available".to_string()))
             }
         }
         pub fn foreground_stop(&self) -> Result<(), PlatformError> {
             if let Some(bridge) = self.fg.lock().unwrap().as_deref() {
                 bridge.stop()
             } else {
-                Ok(())
+                Err(PlatformError::UnsupportedUri("Android foreground service is not available".to_string()))
             }
         }
         pub fn is_foreground_running(&self) -> bool {
@@ -217,7 +196,9 @@ pub fn validate_saf_tree_uri(uri: &str) -> Result<(), String> {
 pub fn register_saf_tree(state: &AndroidState, uri: &str) -> Result<linscp_types::LocalRootEntry, String> {
     validate_saf_tree_uri(uri).map_err(|e| e.to_string())?;
     match state.list_tree(uri) {
-        Ok(_) | Err(linscp_platform::PlatformError::UnsupportedUri(_)) => {},
+        Ok(_) => {},
+        #[cfg(not(target_os = "android"))]
+        Err(linscp_platform::PlatformError::UnsupportedUri(_)) => {},
         Err(e) => return Err(e.to_string()),
     }
     let label = uri

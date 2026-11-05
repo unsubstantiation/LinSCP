@@ -4,10 +4,8 @@
 //! (`invoke("linscp_invoke", ...)`), eliminating localhost TCP sockets and
 //! bearer tokens when running as a native Linux, Windows, or Android app.
 //!
-//! The `android` submodule wires the Kotlin Android layer
-//! (`gen/android/app/src/main/java/io/linscp/commander/*`) to the
-//! pure-Rust platform bridges (`SafBridge`, `ShareBridge`,
-//! `ForegroundServiceBridge`, `KeystoreBridge`) defined in `linscp-platform`.
+//! Android runs the same service in app-private storage. SAF, sharing,
+//! Keystore and background-transfer bridges are not yet connected.
 
 use linscp_service::CommanderService;
 use linscp_types::{ApiEnvelope, ApiReply};
@@ -34,10 +32,6 @@ impl TauriBridge {
 
     /// Direct IPC entrypoint invoked by `TauriTransport` in `ui/src/transport/tauri.ts`.
     pub fn invoke(&self, envelope: ApiEnvelope) -> ApiReply {
-        // Android SAF roots are surfaced through the normal /api/local/roots
-        // dispatch; no special-casing needed here because CommanderService reads
-        // from NativeLocalFs which already consults the SAF bridge when
-        // running on Android. This method remains the single IPC chokepoint.
         self.service.dispatch(envelope)
     }
 
@@ -129,9 +123,24 @@ pub mod commands {
 
 #[cfg(feature = "native-shell")]
 pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
-    tauri::Builder::default()
-        .manage(TauriBridge::default())
-        .invoke_handler(tauri::generate_handler![
+    let builder = tauri::Builder::default();
+    #[cfg(not(target_os = "android"))]
+    let builder = builder.manage(TauriBridge::default());
+    #[cfg(target_os = "android")]
+    let builder = builder.setup(|app| {
+        use tauri::Manager;
+        let files = app.path().app_data_dir()?;
+        let cache = app.path().app_cache_dir()?;
+        std::fs::create_dir_all(&files)?;
+        std::fs::create_dir_all(&cache)?;
+        // Android's default /data/local/tmp is not writable to app processes.
+        // Set paths before constructing the service or starting any transfers.
+        std::env::set_var("LINSCP_ANDROID_FILES_DIR", &files);
+        std::env::set_var("TMPDIR", &cache);
+        app.manage(TauriBridge::default());
+        Ok(())
+    });
+    builder.invoke_handler(tauri::generate_handler![
             commands::linscp_invoke,
             commands::linscp_request_saf_tree,
             commands::linscp_handle_share_intent,
@@ -146,6 +155,12 @@ pub fn run_native_app(context: tauri::Context<tauri::Wry>) {
     build_native_app()
         .run(context)
         .expect("failed to run LinSCP Tauri shell");
+}
+
+#[cfg(all(feature = "native-shell", target_os = "android"))]
+#[tauri::mobile_entry_point]
+pub fn run() {
+    run_native_app(tauri::generate_context!());
 }
 
 #[cfg(test)]

@@ -6,6 +6,9 @@ rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
 
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
 [features]
 default = []
 native-shell = ["dep:tauri", "dep:tauri-build", "tauri/custom-protocol"]

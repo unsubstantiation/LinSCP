@@ -155,6 +155,9 @@ fn merge_staged_local_tree(stage: &Path, target: &Path, cancel: &AtomicBool, dep
             }
             merge_staged_local_tree(&src, &dst, cancel, depth + 1)?;
         } else if meta.is_file() {
+            #[cfg(target_os = "android")]
+            linscp_platform::gui_os::rename_no_replace(&src, &dst).map_err(|e| format!("Cannot publish merge file '{}': {e}", dst.display()))?;
+            #[cfg(not(target_os = "android"))]
             std::fs::hard_link(&src, &dst).map_err(|e| format!("Cannot publish merge file '{}': {e}", dst.display()))?;
         } else { return Err("Refusing a staged non-file.".to_string()); }
     }
@@ -1272,8 +1275,13 @@ fn local_copy_recursive(
         }
         if policy == ConflictPolicy::Ask || policy == ConflictPolicy::Skip || policy == ConflictPolicy::Rename {
             // Publish without replacing a destination created after preflight.
-            std::fs::hard_link(&tmp_path, target).map_err(|e| e.to_string())?;
-            let _ = std::fs::remove_file(&tmp_path);
+            #[cfg(target_os = "android")]
+            linscp_platform::gui_os::rename_no_replace(&tmp_path, target).map_err(|e| e.to_string())?;
+            #[cfg(not(target_os = "android"))]
+            {
+                std::fs::hard_link(&tmp_path, target).map_err(|e| e.to_string())?;
+                let _ = std::fs::remove_file(&tmp_path);
+            }
         } else {
             std::fs::rename(&tmp_path, target).map_err(|e| e.to_string())?;
         }

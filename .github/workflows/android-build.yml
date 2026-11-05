@@ -1,4 +1,4 @@
-name: Android compatibility checks
+name: Android build
 
 on:
   push:
@@ -7,51 +7,53 @@ on:
 
 jobs:
   build:
-    name: Android Rust checks
+    name: Android debug APK
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
-
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
-
-      - name: Build and test the TypeScript UI
-        run: |
-          npm --prefix ui install --no-audit --no-fund
-          npm --prefix ui run build
-          python3 tools/run_cargo_ci.py npm --prefix ui test
-
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,x86_64-linux-android
-
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-ndk
-        uses: taiki-e/install-action@v2
+      - name: Build and test the UI
+        run: |
+          npm ci --prefix ui --no-audit --no-fund
+          python3 tools/run_cargo_ci.py npm --prefix ui test
+      - name: Prepare Android SDK
+        run: python3 tools/run_cargo_ci.py bash tools/prepare_android_sdk.sh
+      - name: Generate Tauri Android project
+        working-directory: crates/linscp-tauri
+        run: |
+          python3 ../../tools/run_cargo_ci.py npm run tauri -- android init --ci --skip-targets-install
+          python3 ../../tools/prepare_android_project.py
+      - name: Build real Rust-backed APK
+        working-directory: crates/linscp-tauri
+        run: python3 ../../tools/run_cargo_ci.py npm run tauri -- android build --ci --debug --apk true --aab false --target aarch64 x86_64 --features native-shell
+      - name: Verify APK contents and signature
+        run: python3 tools/run_cargo_ci.py python3 tools/verify_android_apk.py
+      - name: Enable emulator acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Exercise APK WebView, Rust IPC and WebDAV transfers on an emulator
+        uses: reactivecircus/android-emulator-runner@v2
         with:
-          tool: cargo-ndk
-
-      - name: Check the Rust workspace for Android (arm64-v8a + x86_64)
-        run: |
-          if [ -z "${ANDROID_NDK_HOME:-}" ] && [ -d /usr/local/lib/android/sdk/ndk ]; then
-            echo "ANDROID_NDK_HOME=$(ls -d /usr/local/lib/android/sdk/ndk/* | sort -V | tail -n 1)" >> "$GITHUB_ENV"
-          fi
-          python3 tools/run_cargo_ci.py cargo ndk -t arm64-v8a -t x86_64 check \
-            -p linscp-types \
-            -p linscp-i18n \
-            -p linscp-crypto \
-            -p linscp-platform \
-            -p linscp-proto \
-            -p linscp-engine \
-            -p linscp-service \
-            -p linscp-http
-
-      - name: Run Android bridge unit tests (host)
-        run: |
-          python3 tools/run_cargo_ci.py cargo test -p linscp-platform --lib
-          python3 tools/run_cargo_ci.py cargo test -p linscp-tauri --lib
-
-      # The checked-in Android Gradle project is a scaffold, not a Tauri app.
-      # Do not publish its APK as a release until it hosts the Rust backend.
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: python3 tools/run_cargo_ci.py bash tools/android_emulator_smoke.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linscp-android-debug
+          path: android-artifacts/linscp-android-debug.apk
+          if-no-files-found: error
