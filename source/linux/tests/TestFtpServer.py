@@ -37,6 +37,9 @@ if os.environ.get("LSCP_TEST_FTP_THROTTLE") == "1":
         read_limit = 256 * 1024
     handler.dtp_handler = SlowDTPHandler
 handler.authorizer = authorizer
+if os.environ.get("LSCP_TEST_FTP_PASSIVE_START"):
+    start = int(os.environ["LSCP_TEST_FTP_PASSIVE_START"])
+    handler.passive_ports = range(start, start + 16)
 server = FTPServer(("127.0.0.1", 0), handler)
 print("READY %d" % server.socket.getsockname()[1], flush=True)
 try:

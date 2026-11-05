@@ -3,6 +3,8 @@
 import assert from 'node:assert/strict';
 const port = Number(process.argv[2]);
 const sftpPort = Number(process.argv[3]);
+const ftpPort = Number(process.argv[4]);
+const ftpsPort = Number(process.argv[5]);
 let pages;
 for (let i = 0; i < 60; i++) {
   try {
@@ -81,7 +83,28 @@ const expression = `
   const sftpLocal = await invoke('POST', '/api/tabs/local', {local_dir: root + '/smoke-sftp-download', remote_dir: root});
   const sftpContent = await invoke('GET', '/api/local/edit?tab=' + sftpLocal.tab.id + '&path=smoke-sftp.txt');
   if (sftpContent.content !== 'Android SFTP transfer') throw new Error('SFTP downloaded bytes differ');
-  return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, conflict: true, sftp: true};
+  await invoke('POST', '/api/local/save', {path: root + '/smoke-ftp.txt', content: 'Android FTP transfer'});
+  await invoke('POST', '/api/local/mkdir', {name: 'smoke-ftp-download'});
+  const ftp = await invoke('POST', '/api/tabs/open', {session: {protocol: 'ftp', host: '127.0.0.1', port: ${ftpPort}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
+  let riskRejected = false;
+  try { await invoke('POST', '/api/transfer/upload', {tab: ftp.tab.id, local_dir: root, remote_dir: '/', names: ['smoke-ftp.txt']}); }
+  catch (error) { riskRejected = error.status === 409; }
+  if (!riskRejected) throw new Error('FTP upload risk was not disclosed');
+  await invoke('POST', '/api/transfer/upload', {tab: ftp.tab.id, local_dir: root, remote_dir: '/', names: ['smoke-ftp.txt'], accept_ftp_rename_risk: true});
+  await waitTransfer(5);
+  await invoke('POST', '/api/transfer/download', {tab: ftp.tab.id, local_dir: root + '/smoke-ftp-download', remote_dir: '/', names: ['smoke-ftp.txt']});
+  await waitTransfer(6);
+  const ftpLocal = await invoke('POST', '/api/tabs/local', {local_dir: root + '/smoke-ftp-download', remote_dir: root});
+  const ftpContent = await invoke('GET', '/api/local/edit?tab=' + ftpLocal.tab.id + '&path=smoke-ftp.txt');
+  if (ftpContent.content !== 'Android FTP transfer') throw new Error('FTP downloaded bytes differ');
+  await invoke('POST', '/api/local/mkdir', {name: 'smoke-ftps-download'});
+  const ftps = await invoke('POST', '/api/tabs/open', {session: {protocol: 'ftpes', host: '127.0.0.1', port: ${ftpsPort}, username: 'testuser', password: 'testpass', tls_ca_file: root + '/files/test-ca.pem', local_dir: root, initial_dir: '/'}});
+  await invoke('POST', '/api/transfer/download', {tab: ftps.tab.id, local_dir: root + '/smoke-ftps-download', remote_dir: '/', names: ['smoke-ftp.txt']});
+  await waitTransfer(7);
+  const ftpsLocal = await invoke('POST', '/api/tabs/local', {local_dir: root + '/smoke-ftps-download', remote_dir: root});
+  const ftpsContent = await invoke('GET', '/api/local/edit?tab=' + ftpsLocal.tab.id + '&path=smoke-ftp.txt');
+  if (ftpsContent.content !== 'Android FTP transfer') throw new Error('FTPS downloaded bytes differ');
+  return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, conflict: true, sftp: true, ftp: true, ftps: true};
 })()`;
 let nextId = 0;
 async function evaluate(expression, timeout = 10000) {
