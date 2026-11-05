@@ -110,6 +110,15 @@ mod fallback_unix {
         Ok(())
     }
 
+    pub fn list_roots() -> Vec<LocalRootEntry> {
+        vec![LocalRootEntry {
+            path: "/".to_string(),
+            label: "/".to_string(),
+            kind: "filesystem".to_string(),
+            read_only: false,
+        }]
+    }
+
     pub fn open_regular_file_no_follow(path: &Path) -> Option<File> {
         let file = OpenOptions::new().read(true).write(true).open(path).ok()?;
         let metadata = file.metadata().ok()?;
@@ -413,11 +422,23 @@ fn entry_from_symlink_meta(
 
 impl LocalFs for NativeLocalFs {
     fn list_roots(&self) -> Result<Vec<LocalRootEntry>, PlatformError> {
-        let mut roots = sys::list_roots()?;
-        if let Some(bridge) = self.saf.as_deref() {
-            roots.extend(bridge.granted_trees()?);
+        // Each target collects its own roots and tree grants; a grant the
+        // shell cannot enumerate is left out rather than hiding the roots that
+        // did resolve.
+        #[cfg(target_os = "android")]
+        {
+            sys::list_roots(self.saf.as_deref())
         }
-        Ok(roots)
+        #[cfg(not(target_os = "android"))]
+        {
+            // Only a host with a SAF bridge (a test on a desktop) can have
+            // granted trees on top of its own filesystem roots.
+            let mut roots = sys::list_roots();
+            if let Some(bridge) = self.saf.as_deref() {
+                roots.extend(bridge.granted_trees()?);
+            }
+            Ok(roots)
+        }
     }
 
     fn list_dir(&self, path: &str) -> Result<Vec<FileEntry>, PlatformError> {
