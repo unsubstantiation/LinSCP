@@ -39,11 +39,6 @@ jobs:
         run: python3 ../../tools/run_cargo_ci.py npm run tauri -- android build --ci --debug --apk true --aab false --target aarch64 x86_64 --features native-shell
       - name: Verify APK contents and signature
         run: python3 tools/run_cargo_ci.py python3 tools/verify_android_apk.py
-      - uses: actions/upload-artifact@v7
-        with:
-          name: linscp-android-debug
-          path: android-artifacts/linscp-android-debug.apk
-          if-no-files-found: error
       - name: Enable emulator acceleration
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -57,3 +52,8 @@ jobs:
           target: google_apis
           disable-animations: true
           script: python3 tools/run_cargo_ci.py bash tools/android_emulator_smoke.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linscp-android-debug
+          path: android-artifacts/linscp-android-debug.apk
+          if-no-files-found: error
