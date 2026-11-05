@@ -21,3 +21,7 @@ if text.count(needle) != 1:
 # A debug-only DevTools endpoint lets CI verify the actual WebView-to-Rust IPC.
 text = text.replace(needle, 'if (BuildConfig.DEBUG) android.webkit.WebView.setWebContentsDebuggingEnabled(true)\n        ' + needle)
 activity.write_text(text)
+
+# The plugin is compiled as part of the generated Android app.
+storage = root / 'crates/linscp-tauri/android/StoragePlugin.kt'
+(activities[0].parent / 'StoragePlugin.kt').write_text(storage.read_text())

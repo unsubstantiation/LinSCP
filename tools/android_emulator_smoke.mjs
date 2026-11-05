@@ -87,6 +87,16 @@ for (let i = 0; i < 60 && stable < 2; i++) {
 }
 assert.equal(stable, 2, 'WebView did not become ready');
 const reply = await evaluate(expression, 120000);
-socket.close();
 if (reply.error || reply.result?.exceptionDetails) throw new Error(JSON.stringify(reply));
-console.log('Android WebView and Rust service smoke test passed:', JSON.stringify(reply.result.result.value));
+// Reject paths outside private storage before opening any system picker.
+const invalidExport = await evaluate(`window.__TAURI_INTERNALS__.invoke('linscp_android_export', {path: '/sdcard/not-private.txt'}).then(() => false, () => true)`, 15000);
+assert.equal(invalidExport.result?.result?.value, true, 'Unsafe export path was accepted');
+// Launch the actual system document picker, then cancel it from the emulator.
+const cancellation = evaluate(`window.__TAURI_INTERNALS__.invoke('linscp_android_import').then(() => false, () => true)`, 30000);
+await new Promise(resolve => setTimeout(resolve, 4000));
+const { execFileSync } = await import('node:child_process');
+execFileSync('adb', ['shell', 'input', 'keyevent', 'BACK']);
+const cancelled = await cancellation;
+assert.equal(cancelled.result?.result?.value, true, 'Cancelled document picker did not reject');
+socket.close();
+console.log('Android WebView, document picker and Rust service smoke tests passed:', JSON.stringify(reply.result.result.value));

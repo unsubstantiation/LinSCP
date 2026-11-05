@@ -804,6 +804,7 @@ impl CommanderService {
             "other_local_dir": "",
             "is_local": g.tabs.values().next().map(|t| t.is_local).unwrap_or(false),
             "binary": "linscp",
+            "platform": std::env::consts::OS,
             "paused": false,
             "preferences": g.preferences,
             "sessions_file": g.config_root.join("sessions.ini").to_string_lossy(),
@@ -819,7 +820,8 @@ impl CommanderService {
 
     fn handle_local_list(&self, query: &BTreeMap<String,String>) -> ApiReply {
         let requested = query.get("path").cloned().filter(|s| !s.is_empty()).unwrap_or_else(|| self.default_local_dir());
-        let tab = query.get("tab").and_then(|id| parse_tab_id_str(Some(id))).and_then(|id| self.state.lock().expect("m").tabs.get(&id).cloned());
+        let tab_id = query.get("tab").and_then(|id| parse_tab_id_str(Some(id)));
+        let tab = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).cloned());
         let base_path = tab.map(|t| t.local_dir).unwrap_or(requested.clone());
         let path_to_list = if query.contains_key("path") { requested } else { base_path };
         let resolved = match resolve_local_path_for_list(&path_to_list) {
@@ -827,7 +829,12 @@ impl CommanderService {
             Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e, "path": path_to_list})},
         };
         match self.local_fs.list_dir(&resolved) {
-            Ok(entries) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "entries": entries})},
+            Ok(entries) => {
+                if let Some(id) = tab_id {
+                    if let Some(tab) = self.state.lock().expect("m").tabs.get_mut(&id) { tab.local_dir = resolved.clone(); }
+                }
+                ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "entries": entries})}
+            },
             Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string(), "path": resolved})},
         }
     }
@@ -2225,6 +2232,25 @@ mod tests {
         assert!(view.get("s3_secret_key").is_none());
         assert!(view.get("s3_session_token").is_none());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn local_navigation_updates_tab_only_after_success() {
+        let tmp = std::env::temp_dir().join(format!("linscp-local-navigation-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let left = tmp.join("left"); let sub = left.join("sub"); let right = tmp.join("right");
+        std::fs::create_dir_all(&sub).unwrap(); std::fs::create_dir_all(&right).unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let open = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/local".into(), body: json!({"local_dir": left, "remote_dir": right}) }).await;
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        let listing = |path: &Path| ApiEnvelope { method: "GET".into(), path: format!("/api/local/list?tab={id}&path={}", path.display()), body: json!({}) };
+        let viewed = svc.dispatch_async(listing(&sub)).await;
+        assert_eq!(viewed.status, 200, "{}", viewed.payload);
+        assert_eq!(svc.state.lock().unwrap().tabs[&id].local_dir, sub.to_string_lossy().into_owned());
+        let failed = svc.dispatch_async(listing(&left.join("missing"))).await;
+        assert_ne!(failed.status, 200);
+        assert_eq!(svc.state.lock().unwrap().tabs[&id].local_dir, sub.to_string_lossy().into_owned());
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[tokio::test]

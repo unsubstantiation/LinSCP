@@ -238,6 +238,8 @@
       <div class="pane-footer">
         <span id="localSummary">No files</span>
         <span class="pane-actions">
+          <button class="btn" id="androidImportBtn" style="display:none" onclick="androidImportFiles()">Import files</button>
+          <button class="btn" id="androidExportBtn" style="display:none" onclick="androidExportFile()">Export file</button>
           <button class="btn" onclick="newFolderPrompt('local')">New folder</button>
           <button class="btn" onclick="renamePrompt('local')">Rename</button>
           <button class="btn" onclick="deletePrompt('local')">Delete</button>
@@ -1470,6 +1472,9 @@
   async function refreshStatus() {
     const data = await apiGet('/api/status');
     if (!data) return;
+    for (const id of ['androidImportBtn', 'androidExportBtn']) {
+      if ($(id)) $(id).style.display = data.platform === 'android' ? '' : 'none';
+    }
     // 'data.tabs || []' handed back any truthy value, so an object or a
     // string reached state.tabs and the first activeTab() threw
     // 'state.tabs.find is not a function' out of an async poll: the tab
@@ -1658,6 +1663,25 @@
     return Array.isArray(value)
       ? value.filter(entry => entry && typeof entry === 'object')
       : [];
+  }
+
+  async function androidImportFiles() {
+    try {
+      const result = await window.__TAURI_INTERNALS__.invoke('linscp_android_import');
+      if (!result || !result.directory || !(await loadLocal(result.directory))) throw new Error('Imported directory is unavailable');
+      toast(t('Imported {count} file(s) into app storage.', {count: result.count}));
+    } catch (error) { toast(errorMessage(String(error), t('Could not import files.')), true); }
+  }
+
+  async function androidExportFile() {
+    const names = selectedNames('local');
+    const entry = names.length === 1 && state.local.entries.find(item => item.name === names[0]);
+    if (!entry || entry.is_dir || entry.is_symlink) { toast(t('Select exactly one regular local file.'), true); return; }
+    try {
+      const path = state.local.path.replace(/\/+$/, '') + '/' + entry.name;
+      await window.__TAURI_INTERNALS__.invoke('linscp_android_export', {path});
+      toast(t('File exported.'));
+    } catch (error) { toast(errorMessage(String(error), t('Could not export the file.')), true); }
   }
 
   async function loadLocal(path) {

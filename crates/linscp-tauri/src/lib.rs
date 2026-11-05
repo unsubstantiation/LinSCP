@@ -44,12 +44,39 @@ impl TauriBridge {
     }
 }
 
+#[cfg(all(feature = "native-shell", target_os = "android"))]
+struct AndroidStorage(tauri::plugin::PluginHandle<tauri::Wry>);
+
 #[cfg(feature = "native-shell")]
 pub mod commands {
     use linscp_types::{ApiEnvelope, ApiReply};
     use serde_json::json;
 
     use super::TauriBridge;
+
+    #[tauri::command]
+    pub async fn linscp_android_import(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+        #[cfg(target_os = "android")]
+        {
+            use tauri::Manager;
+            let handle = app.state::<super::AndroidStorage>().0.clone();
+            handle.run_mobile_plugin_async("importFiles", json!({})).await.map_err(|e| e.to_string())
+        }
+        #[cfg(not(target_os = "android"))]
+        { let _ = app; Err("Android document picker is unavailable on this platform".into()) }
+    }
+
+    #[tauri::command]
+    pub async fn linscp_android_export(app: tauri::AppHandle, path: String) -> Result<serde_json::Value, String> {
+        #[cfg(target_os = "android")]
+        {
+            use tauri::Manager;
+            let handle = app.state::<super::AndroidStorage>().0.clone();
+            handle.run_mobile_plugin_async("exportFile", json!({"path": path})).await.map_err(|e| e.to_string())
+        }
+        #[cfg(not(target_os = "android"))]
+        { let _ = (app, path); Err("Android document picker is unavailable on this platform".into()) }
+    }
 
     #[tauri::command]
     pub async fn linscp_invoke(
@@ -127,6 +154,14 @@ pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
     #[cfg(not(target_os = "android"))]
     let builder = builder.manage(TauriBridge::default());
     #[cfg(target_os = "android")]
+    let builder = builder.plugin(tauri::plugin::Builder::<tauri::Wry, ()>::new("linscp-storage")
+        .setup(|app, api| {
+            use tauri::Manager;
+            let handle = api.register_android_plugin("io.linscp.commander", "StoragePlugin")?;
+            app.manage(AndroidStorage(handle));
+            Ok(())
+        }).build());
+    #[cfg(target_os = "android")]
     let builder = builder.setup(|app| {
         use tauri::Manager;
         let files = app.path().app_data_dir()?;
@@ -142,6 +177,8 @@ pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
     });
     builder.invoke_handler(tauri::generate_handler![
             commands::linscp_invoke,
+            commands::linscp_android_import,
+            commands::linscp_android_export,
             commands::linscp_request_saf_tree,
             commands::linscp_handle_share_intent,
             commands::linscp_foreground_start,
