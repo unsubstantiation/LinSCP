@@ -7,4 +7,4 @@ echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
 echo "ANDROID_SDK_ROOT=$sdk" >> "$GITHUB_ENV"
 echo "NDK_HOME=$ndk" >> "$GITHUB_ENV"
 yes | "$sdk/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
-"$sdk/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37" "build-tools;36.0.0"
+"$sdk/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0"
