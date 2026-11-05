@@ -318,7 +318,7 @@ pub async fn download_verified_resume(
     let parent = local_dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let temp = tempfile::Builder::new().prefix(".linscp-download-").rand_bytes(16).tempfile_in(parent)
         .map_err(|e| format!("Cannot create temporary download: {e}"))?;
-    let (std_file, stage) = temp.into_parts();
+    let (std_file, mut stage) = temp.into_parts();
     let mut file = tokio::fs::File::from_std(std_file);
     let mut offset = 0u64;
     if existing {
@@ -347,7 +347,7 @@ pub async fn download_verified_resume(
         Err(error) => {
             let cancelled = flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst));
             if !existing && !cancelled && flush.is_ok() && std::fs::metadata(&stage).is_ok_and(|m| m.len() > 0) {
-                if std::fs::hard_link(&stage, &checkpoint).is_ok() {
+                if publish_owned_stage_no_replace(&mut stage, &checkpoint).is_ok() {
                     return Err(format!("{error}; a partial file was saved at '{}'.", checkpoint.display()));
                 }
             }
@@ -357,10 +357,26 @@ pub async fn download_verified_resume(
     flush.map_err(|e| format!("Cannot flush resume staging file: {e}"))?;
     if offset.checked_add(received) != Some(info.size) { return Err("Remote file length changed during verified resume.".to_string()); }
     if flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) { return Err("Transfer cancelled before publication.".to_string()); }
-    std::fs::hard_link(&stage, local_dest).map_err(|e| format!("Cannot publish resumed file '{}': {e}", local_dest.display()))?;
+    publish_owned_stage_no_replace(&mut stage, local_dest).map_err(|e| format!("Cannot publish resumed file '{}': {e}", local_dest.display()))?;
     apply_downloaded_attrs(local_dest, info, flags);
     logger.record_transfer(false, remote_path, &local_dest.display().to_string(), Some(info.size), Ok(()));
     Ok(())
+}
+
+// Android SELinux denies app hard links, even within private storage. Use the
+// kernel's atomic no-replace rename there, and disarm cleanup after the rename
+// so it cannot unlink a new file created at the old staging pathname.
+fn publish_owned_stage_no_replace(stage: &mut tempfile::TempPath, destination: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        linscp_platform::gui_os::rename_no_replace(stage.as_ref(), destination)?;
+        stage.disable_cleanup(true);
+        Ok(())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        std::fs::hard_link(stage.as_ref(), destination)
+    }
 }
 
 // Consume a private TempPath when publishing it. Otherwise its Drop would
@@ -371,13 +387,22 @@ fn publish_download_stage(
     cleanup: &mut Option<tempfile::TempPath>,
 ) -> std::io::Result<()> {
     if no_clobber {
-        std::fs::hard_link(stage, destination)?;
-        if let Some(path) = cleanup.take() {
-            let _ = path.close();
-        } else {
-            let _ = std::fs::remove_file(stage);
+        #[cfg(target_os = "android")]
+        {
+            linscp_platform::gui_os::rename_no_replace(stage, destination)?;
+            if let Some(mut path) = cleanup.take() { path.disable_cleanup(true); }
+            Ok(())
         }
-        Ok(())
+        #[cfg(not(target_os = "android"))]
+        {
+            std::fs::hard_link(stage, destination)?;
+            if let Some(path) = cleanup.take() {
+                let _ = path.close();
+            } else {
+                let _ = std::fs::remove_file(stage);
+            }
+            Ok(())
+        }
     } else if let Some(path) = cleanup.take() {
         path.persist(destination).map_err(|error| error.error)
     } else {
