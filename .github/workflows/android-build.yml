@@ -38,17 +38,7 @@ jobs:
         working-directory: crates/linscp-tauri
         run: python3 ../../tools/run_cargo_ci.py npm run tauri -- android build --ci --debug --apk true --aab false --target aarch64 x86_64 --features native-shell
       - name: Verify APK contents and signature
-        shell: bash
-        run: |
-          set -euo pipefail
-          apk=$(find crates/linscp-tauri/gen/android/app/build/outputs/apk -name '*.apk' -type f | head -n 1)
-          test -n "$apk"
-          unzip -l "$apk" | grep 'lib/arm64-v8a/liblinscp_tauri.so'
-          unzip -l "$apk" | grep 'lib/x86_64/liblinscp_tauri.so'
-          unzip -l "$apk" | grep 'assets/.*index.html'
-          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose "$apk"
-          mkdir -p android-artifacts
-          cp "$apk" android-artifacts/linscp-android-debug.apk
+        run: python3 tools/run_cargo_ci.py python3 tools/verify_android_apk.py
       - uses: actions/upload-artifact@v7
         with:
           name: linscp-android-debug
