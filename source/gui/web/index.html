@@ -4481,6 +4481,10 @@
       return;
     }
     for (const row of result.properties || []) {
+      if (row.error) {
+        body.appendChild(propertyTable([[t('Name'), row.name], [t('Error'), row.error]]));
+        continue;
+      }
       body.appendChild(propertyTable([
         [t('Name'), row.name],
         [t('Path on the server'), row.path],
