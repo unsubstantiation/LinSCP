@@ -153,7 +153,7 @@ impl CommanderService {
             ("POST", "/api/local/rename") => self.handle_local_rename(req.body),
             ("POST", "/api/local/chmod") => self.handle_local_chmod(req.body),
             ("POST", "/api/local/save") => self.handle_local_save(req.body),
-            ("POST", "/api/local/drop") => self.handle_local_drop(req.body),
+            ("POST", "/api/local/drop") => self.handle_local_drop(&query, req.body),
             ("POST", "/api/local/drop-dir") => self.handle_local_drop_dir(req.body),
             ("GET", "/api/logs") => self.handle_logs(),
             ("GET", "/api/cleanup") => self.handle_cleanup_get(),
@@ -850,7 +850,7 @@ impl CommanderService {
         if contents && query.is_empty() { return api_error(400, "Enter text to search for.") }
         let case_sensitive = body.get("case_sensitive").and_then(Value::as_bool).unwrap_or(false);
         // A name search also matches directories; a content search only files.
-        match ops::search_remote_bounded(session.as_ref().as_ref(), &root, &mask,
+        match ops::search_remote_bounded(session.as_ref(), &root, &mask,
             if contents { Some(query.as_str()) } else { None }, case_sensitive, 500).await
         {
             Ok(stats) => ApiReply { status: 200, payload: json!({
@@ -1000,7 +1000,7 @@ impl CommanderService {
         let config_root = self.state.lock().expect("state mutex").config_root.clone();
         let state_file = SyncState::state_path(&config_root, &SyncState::make_key(&host_key, &local_root.to_string_lossy(), &remote_root));
         let state = SyncState::load(&state_file).unwrap_or_default();
-        match plan_synchronization(session.as_ref().as_ref(), &local_root, &remote_root, &opts, &state).await {
+        match plan_synchronization(session.as_ref(), &local_root, &remote_root, &opts, &state).await {
             Ok(items) => ApiReply { status: 200, payload: json!({"success": true, "plan": sync_plan_json(&items)}) },
             Err(error) => api_error(400, error),
         }
@@ -1203,7 +1203,7 @@ impl CommanderService {
                 "File is too large for the built-in editor ({} bytes; maximum {} bytes).",
                 entry.size, ops::MAX_GUI_EDIT_BYTES));
         }
-        let bytes = match linscp_proto::download_bytes(session.as_ref().as_ref(), &path,
+        let bytes = match linscp_proto::download_bytes(session.as_ref(), &path,
             linscp_proto::TransferRequest::default()).await
         {
             Ok(bytes) => bytes,
@@ -1267,7 +1267,7 @@ impl CommanderService {
         }
         // The editor writes through the same upload path as a queued
         // transfer, so the transport's own atomic replace is what the user gets.
-        match linscp_proto::upload_bytes(session.as_ref().as_ref(), &path, content.as_bytes(),
+        match linscp_proto::upload_bytes(session.as_ref(), &path, content.as_bytes(),
             linscp_proto::TransferRequest::default()).await
         {
             Ok(_) => match session.stat(&path).await {
@@ -3238,25 +3238,30 @@ fn resolve_contained(base: &str, name: &str) -> Result<String, String> {
 fn remote_names(body: &Value) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    let mut push = |name: &str| {
-        let name = name.trim();
-        if !name.is_empty() && seen.insert(name.to_string()) { out.push(name.to_string()); }
-    };
-    match body.get("names") {
-        Some(Value::Array(items)) => {
-            for item in items {
-                if let Some(name) = item.as_str() {
-                    push(name);
-                } else if let Some(name) = item.get("name").and_then(Value::as_str) {
-                    push(name);
+    {
+        let mut push = |name: &str| {
+            let name = name.trim();
+            if !name.is_empty() && seen.insert(name.to_string()) { out.push(name.to_string()); }
+        };
+        match body.get("names") {
+            Some(Value::Array(items)) => {
+                for item in items {
+                    if let Some(name) = item.as_str() {
+                        push(name);
+                    } else if let Some(name) = item.get("name").and_then(Value::as_str) {
+                        push(name);
+                    }
                 }
             }
+            Some(Value::String(name)) => push(name),
+            _ => {}
         }
-        Some(Value::String(name)) => push(name),
-        _ => {}
     }
     if out.is_empty() {
-        if let Some(name) = body.get("name").and_then(Value::as_str) { push(name); }
+        if let Some(name) = body.get("name").and_then(Value::as_str) {
+            let name = name.trim();
+            if !name.is_empty() && seen.insert(name.to_string()) { out.push(name.to_string()); }
+        }
     }
     out
 }
@@ -6726,7 +6731,7 @@ mod tests {
             for (key, value) in extra.as_object().expect("object").iter() {
                 body[key] = value.clone();
             }
-            Self::sync_options_from(&body)
+            Service::sync_options_from(&body)
         };
         let (_, remote, opts) = with(json!({})).expect("the defaults are valid");
         assert_eq!(remote, "/remote");

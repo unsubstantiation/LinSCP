@@ -3,6 +3,10 @@
 
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::Write;
+// The SAF bridge is compiled on every host so a desktop build can test the
+// `content://` paths; only a real Unix host can enforce POSIX modes, so those
+// calls stay behind `cfg(unix)` and the portable fallbacks take over.
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -86,15 +90,35 @@ pub fn list_roots(saf: Option<&dyn SafBridge>) -> Result<Vec<LocalRootEntry>, Pl
     Ok(roots)
 }
 
+#[cfg(unix)]
 pub fn format_permissions(meta: &std::fs::Metadata) -> String {
     format!("{:04o}", meta.mode() & 0o7777)
 }
 
+#[cfg(not(unix))]
+pub fn format_permissions(meta: &std::fs::Metadata) -> String {
+    if meta.permissions().readonly() {
+        "r--r--r--".to_string()
+    } else {
+        "rw-rw-rw-".to_string()
+    }
+}
+
+#[cfg(unix)]
 pub fn set_mode(path: &Path, mode: u32) -> Result<(), PlatformError> {
     std::fs::set_permissions(path, Permissions::from_mode(mode & 0o7777))?;
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub fn set_mode(path: &Path, mode: u32) -> Result<(), PlatformError> {
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_readonly((mode & 0o200) == 0);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+#[cfg(unix)]
 pub fn ensure_private_dir(dir: &Path) -> Result<(), PlatformError> {
     let existed = dir.exists();
     std::fs::create_dir_all(dir)?;
@@ -106,12 +130,30 @@ pub fn ensure_private_dir(dir: &Path) -> Result<(), PlatformError> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub fn ensure_private_dir(dir: &Path) -> Result<(), PlatformError> {
+    std::fs::create_dir_all(dir)?;
+    Ok(())
+}
+
+/// Options for a file only this app may read (`0600`). Elsewhere the app-private
+/// directory is the guard, so the mode request simply does not apply.
+#[cfg_attr(not(unix), allow(unused_mut))]
+fn private_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+}
+
 pub fn open_private_temp_file(path: &Path) -> Result<File, PlatformError> {
-    let file = OpenOptions::new()
+    let file = private_options()
         .write(true)
         .create(true)
         .truncate(true)
-        .mode(0o600)
         .open(path)?;
     Ok(file)
 }
@@ -120,10 +162,9 @@ pub fn create_exclusive_private_file(path: &Path, content: &[u8]) -> Result<(), 
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new()
+    let mut file = private_options()
         .write(true)
         .create_new(true)
-        .mode(0o600)
         .open(path)
         .map_err(|err| {
             if err.kind() == std::io::ErrorKind::AlreadyExists {
@@ -142,6 +183,7 @@ pub fn create_exclusive_private_file(path: &Path, content: &[u8]) -> Result<(), 
 /// Android is Unix underneath, but an app may not create a FIFO or a device
 /// node in its own directory, so the `O_NOFOLLOW`/link-count inspection of
 /// `linux.rs` is enough here too.
+#[cfg(unix)]
 pub fn open_regular_file_no_follow(path: &Path) -> Option<File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let file = OpenOptions::new()
@@ -157,7 +199,19 @@ pub fn open_regular_file_no_follow(path: &Path) -> Option<File> {
     Some(file)
 }
 
+#[cfg(not(unix))]
+pub fn open_regular_file_no_follow(path: &Path) -> Option<File> {
+    // No `O_NOFOLLOW` here, so the link count is checked after the open the way
+    // the Windows backend does it.
+    let file = OpenOptions::new().read(true).write(true).open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    Some(file)
+}
+
 /// Creates a FIFO (`mkfifo`) so a test can prove a special file is refused.
+#[cfg(unix)]
 pub fn create_fifo(path: &Path) -> Result<(), PlatformError> {
     use std::os::unix::ffi::OsStrExt;
     let name = std::ffi::CString::new(path.as_os_str().as_bytes())
@@ -170,13 +224,19 @@ pub fn create_fifo(path: &Path) -> Result<(), PlatformError> {
     }
 }
 
+#[cfg(not(unix))]
+pub fn create_fifo(_path: &Path) -> Result<(), PlatformError> {
+    Err(PlatformError::Unsupported(
+        "this host cannot create a FIFO".to_string(),
+    ))
+}
+
 /// Creates a file that only this app may read (`0600`).
 pub fn create_private_file(path: &Path) -> Result<File, PlatformError> {
-    Ok(OpenOptions::new()
+    Ok(private_options()
         .read(true)
         .write(true)
         .create_new(true)
-        .mode(0o600)
         .open(path)?)
 }
 

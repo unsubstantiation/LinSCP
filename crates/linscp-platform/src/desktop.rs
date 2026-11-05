@@ -114,7 +114,7 @@ fn detect_desktop_session_kind() -> DesktopSession {
         if std::env::var_os("DISPLAY").filter(|v| !v.is_empty()).is_some() {
             return DesktopSession::X11;
         }
-        return DesktopSession::Headless;
+        DesktopSession::Headless
     }
     #[cfg(not(target_os = "linux"))]
     {
