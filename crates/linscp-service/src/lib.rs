@@ -1071,7 +1071,7 @@ impl CommanderService {
             let mut ordered: Vec<&TabRuntime> = g.tabs.values().collect();
             ordered.sort_by_key(|tab| tab.id);
             if ordered.iter().any(|tab| !tab.is_local && tab.site_name.as_deref().is_none_or(str::is_empty)) {
-                return api_error(400, "Save each remote session as a site before saving a workspace; credentials are not stored in workspaces.");
+                return api_error(400, "Save each remote session as a saved site before saving a workspace; credentials are not stored in workspaces.");
             }
             let active = ordered.iter().position(|tab| Some(tab.id) == g.active_tab_id).unwrap_or(0);
             let tabs: Vec<Value> = ordered.iter().map(|t| json!({"name": t.name, "kind": if t.is_local { "local"} else {"remote"}, "local_dir": t.local_dir, "remote_dir": t.remote_dir, "site": t.site_name})).collect();
