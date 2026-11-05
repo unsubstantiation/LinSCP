@@ -116,9 +116,9 @@ desktop entry; see [docs/debian.md](docs/debian.md).
 
 ## Android
 
-The Android Gradle project is an experimental WebView scaffold, not a complete
-native Tauri application. Its debug APK should not be treated as a functioning
-release of the desktop client.
+The experimental Android target uses the Tauri WebView and Rust backend. See
+[docs/android.md](docs/android.md) for debug APK build instructions and important
+limitations, including app-private storage only and no background transfers.
 
 ## Historical material
 

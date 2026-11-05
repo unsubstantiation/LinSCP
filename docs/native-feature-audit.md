@@ -40,8 +40,9 @@ transfer limitations in `readme.md` before using remote operations.
   staged publication requires an explicit race acknowledgement. A failed or
   cancelled transfer may leave remote files or partial trees; guarantees depend
   on the server and are not equivalent to transactions.
-- Native account/login features are not implemented. The Android project is a
-  scaffold, not a working Rust-backed APK. Desktop integration, import sources,
+- Native account/login features are not implemented. Android has a Rust-backed
+  experimental debug APK but lacks SAF, sharing, background transfers and
+  Keystore integration; see `docs/android.md`. Desktop integration, import sources,
   and other legacy UI actions require further native end-to-end validation.
 - SSH host-key changes during workspace restoration are not auto-accepted or
   interactively resolved as part of a batch; the failed tab must be connected
