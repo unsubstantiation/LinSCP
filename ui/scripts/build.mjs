@@ -58,6 +58,16 @@ const dualModeShim = `  window.LinSCPTransport = window.LinSCPCore
     ? window.LinSCPCore.createTransport({ host: window, bearerToken: window.LSCP_TOKEN || '' })
     : null;
 
+  // The local root switcher is a real component with behaviour (SAF picker,
+  // root matching, empty-list handling), so it is not re-implemented in the
+  // page. The page only borrows an instance and owns the DOM element.
+  window.LinSCPCore.localRootSwitcher = function (options) {
+    return new window.LinSCPCore.LocalRootSwitcher(options);
+  };
+  window.LinSCPCore.requestAndroidFolder = function () {
+    return window.LinSCPCore.requestSafTree();
+  };
+
   async function api(url, options) {
     options = options || {};
     if (window.LinSCPTransport && window.LinSCPTransport.mode === 'tauri') {

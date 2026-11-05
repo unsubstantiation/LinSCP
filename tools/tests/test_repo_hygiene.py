@@ -59,6 +59,26 @@ class RepoHygieneTests(unittest.TestCase):
         )
         self.assertEqual(hygiene.check_crate_boundaries(self.root), [])
 
+    def test_os_fixture_inside_crate_unit_tests_is_allowed(self):
+        # A unit test may build an OS-specific fixture (a FIFO, a symlink) to
+        # prove a fail-closed path; that is not production OS code.
+        self.write(
+            'crates/linscp-proto/src/s3.rs',
+            'pub fn guarded() {}\n'
+            '#[cfg(test)]\nmod tests {\n'
+            '    #[cfg(unix)]\n    #[test]\n    fn rejects_fifo() {}\n'
+            '}\n',
+        )
+        self.assertEqual(hygiene.check_crate_boundaries(self.root), [])
+
+    def test_os_cfg_after_the_unit_test_module_is_still_rejected(self):
+        self.write(
+            'crates/linscp-proto/src/s3.rs',
+            '#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n'
+            '#[cfg(target_os = "windows")]\npub fn shipped() {}\n',
+        )
+        self.assertIn('crate-os-cfg', self.names(hygiene.check_crate_boundaries(self.root)))
+
     def test_raw_fetch_or_tauri_outside_ui_transport_is_rejected(self):
         self.write(
             'ui/src/components/pane.ts',

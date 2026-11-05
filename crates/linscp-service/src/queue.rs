@@ -21,7 +21,9 @@ use linscp_engine::transfer::{
 };
 use linscp_engine::xml_log::SessionLogger;
 use linscp_platform::gui_os::create_local_symlink;
-use linscp_platform::terminal::{set_local_file_times, set_local_permissions};
+use linscp_platform::terminal::{
+    clear_interrupted, is_interrupted, set_local_file_times, set_local_permissions,
+};
 use linscp_proto::{ProgressCallback, RemoteSession};
 use linscp_types::ProtocolScheme;
 use rand::RngCore;
@@ -155,10 +157,10 @@ fn merge_staged_local_tree(stage: &Path, target: &Path, cancel: &AtomicBool, dep
             }
             merge_staged_local_tree(&src, &dst, cancel, depth + 1)?;
         } else if meta.is_file() {
-            #[cfg(target_os = "android")]
-            linscp_platform::gui_os::rename_no_replace(&src, &dst).map_err(|e| format!("Cannot publish merge file '{}': {e}", dst.display()))?;
-            #[cfg(not(target_os = "android"))]
-            std::fs::hard_link(&src, &dst).map_err(|e| format!("Cannot publish merge file '{}': {e}", dst.display()))?;
+            // Publication is atomic and never replaces an existing file, on
+            // every platform: the platform crate picks the primitive.
+            linscp_platform::publish_no_replace(&src, &dst)
+                .map_err(|e| format!("Cannot publish merge file '{}': {e}", dst.display()))?;
         } else { return Err("Refusing a staged non-file.".to_string()); }
     }
     Ok(())
@@ -734,6 +736,22 @@ impl QueueManager {
         if task.cancel_flag.load(Ordering::SeqCst) {
             return Err("Cancelled by user.".to_string());
         }
+        // A pause holds the next item, but a single transfer cannot be frozen
+        // midway; saying so is better than a row that reports running while
+        // nothing moves. The watcher is a queue item like any other, so this
+        // guard is what lets the page pause it without a special case here.
+        if matches!(task.job, QueueJob::KeepUpToDate { .. }) {
+            while !task.cancel_flag.load(Ordering::SeqCst) {
+                let paused = self.inner.lock().map(|g| g.paused).unwrap_or(false);
+                if !paused {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if task.cancel_flag.load(Ordering::SeqCst) {
+                return Err("Cancelled by user.".to_string());
+            }
+        }
         let progress = self.make_progress_cb(task.id, Arc::clone(&task.cancel_flag));
         let mut logger = SessionLogger::open(None, 0, false, None, None, false, "").unwrap();
 
@@ -968,7 +986,13 @@ impl QueueManager {
                 remote_root,
                 opts,
             } => {
-                run_keep_up_to_date(
+                // The watcher stops on the process-wide interrupt flag, which
+                // is what cancelling this queue item sets. A flag left over
+                // from an earlier cancelled task would make it exit before its
+                // first pass, so it is cleared first and the flag is what
+                // reports the stop afterwards.
+                clear_interrupted();
+                let result = run_keep_up_to_date(
                     session.as_ref(),
                     local_root,
                     remote_root,
@@ -976,8 +1000,15 @@ impl QueueManager {
                     &mut logger,
                     |_| {},
                 )
-                .await
-                .map(|_| ())
+                .await;
+                if is_interrupted() {
+                    clear_interrupted();
+                    // An error here, not a success: the queue's own cancel
+                    // flag turns it into "cancelled by user" so the row does
+                    // not claim the watch finished on its own.
+                    return Err("Watching the directory stopped.".to_string());
+                }
+                result.map(|_| ())
             }
         }
     }
@@ -1275,13 +1306,10 @@ fn local_copy_recursive(
         }
         if policy == ConflictPolicy::Ask || policy == ConflictPolicy::Skip || policy == ConflictPolicy::Rename {
             // Publish without replacing a destination created after preflight.
-            #[cfg(target_os = "android")]
-            linscp_platform::gui_os::rename_no_replace(&tmp_path, target).map_err(|e| e.to_string())?;
-            #[cfg(not(target_os = "android"))]
-            {
-                std::fs::hard_link(&tmp_path, target).map_err(|e| e.to_string())?;
-                let _ = std::fs::remove_file(&tmp_path);
-            }
+            linscp_platform::publish_no_replace(&tmp_path, target).map_err(|e| e.to_string())?;
+            // Android's publication moves the staged name; elsewhere it is a
+            // second link, and the staged copy has to go.
+            let _ = std::fs::remove_file(&tmp_path);
         } else {
             std::fs::rename(&tmp_path, target).map_err(|e| e.to_string())?;
         }

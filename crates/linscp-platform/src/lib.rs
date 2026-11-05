@@ -33,7 +33,6 @@ pub mod windows;
 #[cfg(target_os = "windows")]
 use windows as sys;
 
-#[cfg(target_os = "android")]
 pub mod android;
 #[cfg(target_os = "android")]
 use android as sys;
@@ -111,6 +110,27 @@ mod fallback_unix {
         Ok(())
     }
 
+    pub fn open_regular_file_no_follow(path: &Path) -> Option<File> {
+        let file = OpenOptions::new().read(true).write(true).open(path).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return None;
+        }
+        Some(file)
+    }
+
+    pub fn create_private_file(path: &Path) -> Result<File, PlatformError> {
+        Ok(OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?)
+    }
+
+    pub fn create_fifo(_path: &Path) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("no FIFO on this platform".to_string()))
+    }
+
     pub async fn connect_ssh_agent() -> Result<Option<Box<dyn crate::AsyncStream>>, PlatformError> {
         Ok(None)
     }
@@ -137,6 +157,8 @@ pub enum PlatformError {
     SecretVault(String),
     #[error("Directory watcher error: {0}")]
     Watch(String),
+    #[error("Not supported on this platform: {0}")]
+    Unsupported(String),
 }
 
 /// Bidirectional async byte stream (e.g. Unix `SSH_AUTH_SOCK`, Windows
@@ -177,7 +199,9 @@ pub trait SecretVault: Send + Sync {
 
 #[derive(Default)]
 pub struct NativeLocalFs {
-    #[cfg(target_os = "android")]
+    /// Android Storage Access Framework bridge. On every other platform this is
+    /// `None`, but the field and the `content://` paths below exist everywhere so
+    /// the same code can be unit-tested against a mock bridge on a desktop host.
     saf: Option<std::sync::Arc<dyn android::SafBridge>>,
 }
 
@@ -186,10 +210,159 @@ impl NativeLocalFs {
         Self::default()
     }
 
-    #[cfg(target_os = "android")]
+    /// Local filesystem that can also reach user-granted SAF document trees.
     pub fn with_saf(saf: std::sync::Arc<dyn android::SafBridge>) -> Self {
         Self { saf: Some(saf) }
     }
+
+    /// The registered SAF bridge, if the shell installed one.
+    pub fn saf_bridge(&self) -> Option<&std::sync::Arc<dyn android::SafBridge>> {
+        self.saf.as_ref()
+    }
+}
+
+/// A `content://` tree or document URI split into the pieces `DocumentsContract`
+/// needs: the authority, the granted tree id, and the document ids below it.
+///
+/// Only the URI structure is inspected here - never the decoded path segments -
+/// so a document id that happens to contain `/` or `:` cannot be mistaken for a
+/// traversal, and a name is always passed to the bridge as a single component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafDocumentPath<'a> {
+    pub authority: &'a str,
+    /// The granted tree id, as it appears after `/tree/` (`primary:Documents`).
+    pub tree: &'a str,
+    /// Document ids below the tree, outermost first.
+    pub documents: Vec<&'a str>,
+}
+
+impl<'a> SafDocumentPath<'a> {
+    /// The URI of the granted tree itself.
+    pub fn tree_uri(&self) -> String {
+        format!("content://{}/tree/{}", self.authority, self.tree)
+    }
+
+    /// The URI of the directory holding this document, or the tree when the
+    /// URI names the tree itself.
+    pub fn parent_uri(&self) -> String {
+        let mut uri = self.tree_uri();
+        for document in self.documents.iter().take(self.documents.len().saturating_sub(1)) {
+            uri.push_str("/document/");
+            uri.push_str(document);
+        }
+        uri
+    }
+
+    /// The URI's own leaf: a document id, or the tree id for a bare tree URI.
+    pub fn leaf(&self) -> &'a str {
+        self.documents.last().copied().unwrap_or(self.tree)
+    }
+
+    /// The leaf name with Android's `%XX` escapes resolved (`primary%3ADocs`).
+    pub fn leaf_name(&self) -> String {
+        percent_decode_saf(self.leaf())
+    }
+}
+
+/// Parses `content://authority/tree/<tree>[/document/<id>[/document/<id>...]]`.
+pub fn parse_saf_document_uri(uri: &str) -> Result<SafDocumentPath<'_>, PlatformError> {
+    let unsupported = || PlatformError::UnsupportedUri(uri.to_string());
+    if uri.contains("..") || uri.contains('\0') || uri.chars().any(char::is_control) {
+        return Err(unsupported());
+    }
+    let rest = uri.strip_prefix("content://").ok_or_else(unsupported)?;
+    let (authority, path) = rest.split_once('/').ok_or_else(unsupported)?;
+    if authority.is_empty() {
+        return Err(unsupported());
+    }
+    let tree_and_rest = path.strip_prefix("tree/").ok_or_else(unsupported)?;
+    let (tree, tail) = match tree_and_rest.split_once('/') {
+        Some((tree, tail)) => (tree, tail),
+        None => (tree_and_rest, ""),
+    };
+    if tree.is_empty() {
+        return Err(unsupported());
+    }
+    let mut documents = Vec::new();
+    if !tail.is_empty() {
+        let document = tail.strip_prefix("document/").ok_or_else(unsupported)?;
+        for segment in document.split("/document/") {
+            if segment.is_empty() {
+                return Err(unsupported());
+            }
+            documents.push(segment);
+        }
+    }
+    Ok(SafDocumentPath { authority, tree, documents })
+}
+
+fn saf_mkdir_all(bridge: &dyn android::SafBridge, path: &str) -> Result<(), PlatformError> {
+    let parsed = parse_saf_document_uri(path)?;
+    // The bridge creates one directory below a parent, so walk from the granted
+    // tree down. An intermediate directory is created once, never twice, and an
+    // existing one is accepted by the bridge.
+    let mut parent = parsed.tree_uri();
+    for document in &parsed.documents {
+        let name = percent_decode_saf(document);
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return Err(PlatformError::UnsupportedUri(path.to_string()));
+        }
+        parent = bridge.mkdir_uri(&parent, &name)?;
+    }
+    Ok(())
+}
+
+fn saf_write_bytes(
+    bridge: &dyn android::SafBridge,
+    path: &str,
+    data: &[u8],
+) -> Result<(), PlatformError> {
+    let parsed = parse_saf_document_uri(path)?;
+    if parsed.documents.is_empty() {
+        // A granted tree is a directory; writing over it would replace a whole
+        // subtree with one file.
+        return Err(PlatformError::UnsupportedUri(path.to_string()));
+    }
+    let name = parsed.leaf_name();
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(PlatformError::UnsupportedUri(path.to_string()));
+    }
+    bridge.write_uri_bytes(&parsed.parent_uri(), &name, data)?;
+    Ok(())
+}
+
+fn saf_rename(
+    bridge: &dyn android::SafBridge,
+    from: &str,
+    to: &str,
+) -> Result<(), PlatformError> {
+    if to.starts_with("content://") || to.contains('/') || to == "." || to == ".." {
+        return Err(PlatformError::UnsupportedUri(to.to_string()));
+    }
+    bridge.rename_uri(from, to)?;
+    Ok(())
+}
+
+/// Decodes the `%XX` escapes Android writes into a document id (`primary%3A`).
+fn percent_decode_saf(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (
+                (bytes[index + 1] as char).to_digit(16),
+                (bytes[index + 2] as char).to_digit(16),
+            ) {
+                out.push(((high << 4) | low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn resolve_os_path(path: &str) -> PathBuf {
@@ -240,19 +413,15 @@ fn entry_from_symlink_meta(
 
 impl LocalFs for NativeLocalFs {
     fn list_roots(&self) -> Result<Vec<LocalRootEntry>, PlatformError> {
-        #[cfg(target_os = "android")]
-        {
-            sys::list_roots(self.saf.as_deref())
+        let mut roots = sys::list_roots()?;
+        if let Some(bridge) = self.saf.as_deref() {
+            roots.extend(bridge.granted_trees()?);
         }
-        #[cfg(not(target_os = "android"))]
-        {
-            Ok(sys::list_roots())
-        }
+        Ok(roots)
     }
 
     fn list_dir(&self, path: &str) -> Result<Vec<FileEntry>, PlatformError> {
         if path.starts_with("content://") {
-            #[cfg(target_os = "android")]
             if let Some(bridge) = self.saf.as_deref() {
                 return bridge.list_tree(path);
             }
@@ -274,7 +443,6 @@ impl LocalFs for NativeLocalFs {
 
     fn stat(&self, path: &str) -> Result<FileEntry, PlatformError> {
         if path.starts_with("content://") {
-            #[cfg(target_os = "android")]
             if let Some(bridge) = self.saf.as_deref() {
                 return bridge.stat_uri(path);
             }
@@ -291,6 +459,9 @@ impl LocalFs for NativeLocalFs {
 
     fn mkdir_all(&self, path: &str) -> Result<(), PlatformError> {
         if path.starts_with("content://") {
+            if let Some(bridge) = self.saf.as_deref() {
+                return saf_mkdir_all(bridge, path);
+            }
             return Err(PlatformError::UnsupportedUri(path.to_string()));
         }
         std::fs::create_dir_all(resolve_os_path(path))?;
@@ -299,7 +470,6 @@ impl LocalFs for NativeLocalFs {
 
     fn remove_file(&self, path: &str) -> Result<(), PlatformError> {
         if path.starts_with("content://") {
-            #[cfg(target_os = "android")]
             if let Some(bridge) = self.saf.as_deref() {
                 return bridge.delete_uri(path);
             }
@@ -311,7 +481,6 @@ impl LocalFs for NativeLocalFs {
 
     fn remove_dir_all(&self, path: &str) -> Result<(), PlatformError> {
         if path.starts_with("content://") {
-            #[cfg(target_os = "android")]
             if let Some(bridge) = self.saf.as_deref() {
                 return bridge.delete_uri(path);
             }
@@ -323,6 +492,9 @@ impl LocalFs for NativeLocalFs {
 
     fn rename(&self, from: &str, to: &str) -> Result<(), PlatformError> {
         if from.starts_with("content://") || to.starts_with("content://") {
+            if let Some(bridge) = self.saf.as_deref() {
+                return saf_rename(bridge, from, to);
+            }
             return Err(PlatformError::UnsupportedUri(from.to_string()));
         }
         sys::atomic_replace(Path::new(from), Path::new(to))
@@ -330,7 +502,6 @@ impl LocalFs for NativeLocalFs {
 
     fn read_bytes(&self, path: &str) -> Result<Vec<u8>, PlatformError> {
         if path.starts_with("content://") {
-            #[cfg(target_os = "android")]
             if let Some(bridge) = self.saf.as_deref() {
                 return bridge.read_uri_bytes(path);
             }
@@ -341,6 +512,11 @@ impl LocalFs for NativeLocalFs {
 
     fn write_bytes_atomic(&self, path: &str, data: &[u8]) -> Result<(), PlatformError> {
         if path.starts_with("content://") {
+            // A SAF document has no pathname to rename onto, so the bridge
+            // writes the bytes itself instead of stage-then-rename.
+            if let Some(bridge) = self.saf.as_deref() {
+                return saf_write_bytes(bridge, path, data);
+            }
             return Err(PlatformError::UnsupportedUri(path.to_string()));
         }
         let target = Path::new(path);
@@ -374,7 +550,12 @@ impl LocalFs for NativeLocalFs {
 
     fn set_mtime(&self, path: &str, mtime: i64) -> Result<(), PlatformError> {
         if path.starts_with("content://") {
-            return Err(PlatformError::UnsupportedUri(path.to_string()));
+            // `DocumentsContract` has no last-modified column the caller can
+            // write, so preserving a timestamp fails loudly instead of
+            // reporting a transfer as complete when it was not preserved.
+            return Err(PlatformError::UnsupportedUri(
+                "Timestamps cannot be set on a granted Android folder.".to_string(),
+            ));
         }
         set_file_mtime(resolve_os_path(path), FileTime::from_unix_time(mtime, 0))?;
         Ok(())
@@ -382,7 +563,9 @@ impl LocalFs for NativeLocalFs {
 
     fn set_permissions_mode(&self, path: &str, mode: u32) -> Result<(), PlatformError> {
         if path.starts_with("content://") {
-            return Err(PlatformError::UnsupportedUri(path.to_string()));
+            return Err(PlatformError::UnsupportedUri(
+                "POSIX permissions do not exist on a granted Android folder.".to_string(),
+            ));
         }
         sys::set_mode(Path::new(path), mode)
     }
@@ -431,6 +614,40 @@ pub fn write_private_file_atomic(target: &Path, content: &[u8]) -> Result<(), Pl
     Ok(())
 }
 
+/// Publishes `source` at `target` when, and only when, nothing exists there.
+///
+/// Publication happens on the destination's filesystem, so a crash leaves
+/// either no file or the whole file - never a half-written one - and a
+/// concurrent actor that created `target` first is reported as
+/// [`PlatformError::AlreadyExists`] instead of being overwritten.
+///
+/// Linux and Windows use a hard link, which is atomic and fails on an existing
+/// name. Android's SELinux policy denies app hard links even inside private
+/// storage, so the Android backend uses the kernel's atomic no-replace rename
+/// instead; both callers get the same contract.
+#[cfg(not(target_os = "android"))]
+pub fn publish_no_replace(source: &Path, target: &Path) -> Result<(), PlatformError> {
+    match std::fs::hard_link(source, target) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(PlatformError::AlreadyExists(target.display().to_string()))
+        }
+        Err(error) => Err(PlatformError::Io(error)),
+    }
+}
+
+/// Android's no-replace publication; see the non-Android definition above.
+#[cfg(target_os = "android")]
+pub fn publish_no_replace(source: &Path, target: &Path) -> Result<(), PlatformError> {
+    match gui_os::rename_no_replace(source, target) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(PlatformError::AlreadyExists(target.display().to_string()))
+        }
+        Err(error) => Err(PlatformError::Io(error)),
+    }
+}
+
 /// Creates `path` (and missing parent directories) with owner-only (`0700` on Unix) permissions.
 pub fn create_private_dir(path: &Path) -> Result<(), PlatformError> {
     sys::ensure_private_dir(path)
@@ -440,6 +657,29 @@ pub fn create_private_dir(path: &Path) -> Result<(), PlatformError> {
 /// refusing to overwrite an existing file (used by `ConvertPpkToOpenSsh`).
 pub fn write_exclusive_private_file(target: &Path, content: &[u8]) -> Result<(), PlatformError> {
     sys::create_exclusive_private_file(target, content)
+}
+
+/// Opens an existing file for read/write that the caller locks or truncates,
+/// refusing symbolic links, reparse points, special files, and files that are
+/// hard-linked more than once. `None` means "not a private, ordinary file".
+pub fn open_private_file_no_follow(target: &Path) -> Result<std::fs::File, PlatformError> {
+    sys::open_regular_file_no_follow(target)
+        .ok_or_else(|| PlatformError::Io(std::io::Error::other(
+            "not an ordinary, singly-linked file")))
+}
+
+/// Creates a brand-new owner-only file (`0600` on Unix) for content the caller
+/// writes and locks itself; unlike `write_exclusive_private_file` the handle
+/// stays open, so the caller keeps an exclusive `flock` for its lifetime.
+pub fn create_private_file(target: &Path) -> Result<std::fs::File, PlatformError> {
+    sys::create_private_file(target)
+}
+
+/// Creates a FIFO at `target` for tests that must prove a special file is
+/// refused. Only Unix can make one, so Windows reports `Unsupported` and the
+/// caller skips the assertion instead of pretending the case is covered.
+pub fn create_fifo_fixture(target: &Path) -> Result<(), PlatformError> {
+    sys::create_fifo(target)
 }
 
 #[derive(Default)]
@@ -591,6 +831,164 @@ impl SecretVault for NativeSecretVault {
 mod tests {
     use super::*;
 
+    /// In-memory SAF tree. It is deliberately strict: a name containing a
+    /// separator is refused, so a caller that passes a path instead of a single
+    /// component fails the test instead of silently creating a document id.
+    #[derive(Default)]
+    struct MockSaf {
+        documents: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    impl MockSaf {
+        fn names(&self) -> Vec<String> {
+            self.documents
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(uri, _)| uri.rsplit('/').next().unwrap_or_default().to_string())
+                .collect()
+        }
+    }
+
+    impl android::SafBridge for MockSaf {
+        fn request_tree(&self) -> Result<Option<String>, PlatformError> {
+            Ok(Some(
+                "content://mock.tree/tree/primary%3ADownload".to_string(),
+            ))
+        }
+        fn granted_trees(&self) -> Result<Vec<LocalRootEntry>, PlatformError> {
+            Ok(vec![LocalRootEntry {
+                path: "content://mock.tree/tree/primary%3ADownload".to_string(),
+                label: "Downloads (SAF)".to_string(),
+                kind: "saf_tree".to_string(),
+                read_only: false,
+            }])
+        }
+        fn list_tree(&self, _tree_uri: &str) -> Result<Vec<linscp_types::FileEntry>, PlatformError> {
+            Ok(self
+                .documents
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(uri, data)| linscp_types::FileEntry {
+                    name: uri.rsplit('/').next().unwrap_or_default().to_string(),
+                    size: data.len() as u64,
+                    is_dir: false,
+                    is_symlink: false,
+                    broken_link: false,
+                    date: String::new(),
+                    mtime: 0,
+                    permissions: String::new(),
+                    owner: None,
+                    group: None,
+                })
+                .collect())
+        }
+        fn stat_uri(&self, uri: &str) -> Result<linscp_types::FileEntry, PlatformError> {
+            self.documents
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(name, _)| name == uri)
+                .map(|(_, data)| linscp_types::FileEntry {
+                    name: uri.rsplit('/').next().unwrap_or_default().to_string(),
+                    size: data.len() as u64,
+                    is_dir: false,
+                    is_symlink: false,
+                    broken_link: false,
+                    date: String::new(),
+                    mtime: 0,
+                    permissions: String::new(),
+                    owner: None,
+                    group: None,
+                })
+                .ok_or_else(|| PlatformError::UnsupportedUri(uri.to_string()))
+        }
+        fn read_uri_bytes(&self, uri: &str) -> Result<Vec<u8>, PlatformError> {
+            self.documents
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(name, _)| name == uri)
+                .map(|(_, data)| data.clone())
+                .ok_or_else(|| PlatformError::UnsupportedUri(uri.to_string()))
+        }
+        fn write_uri_bytes(
+            &self,
+            parent_uri: &str,
+            name: &str,
+            data: &[u8],
+        ) -> Result<String, PlatformError> {
+            if name.is_empty() || name.contains('/') || name.contains(char::is_control) {
+                return Err(PlatformError::UnsupportedUri(name.to_string()));
+            }
+            let uri = format!("{parent_uri}/document/{name}");
+            self.documents.lock().unwrap().push((uri.clone(), data.to_vec()));
+            Ok(uri)
+        }
+        fn mkdir_uri(&self, parent_uri: &str, name: &str) -> Result<String, PlatformError> {
+            if name.is_empty() || name.contains('/') {
+                return Err(PlatformError::UnsupportedUri(name.to_string()));
+            }
+            Ok(format!("{parent_uri}/document/{name}"))
+        }
+        fn delete_uri(&self, uri: &str) -> Result<(), PlatformError> {
+            self.documents.lock().unwrap().retain(|(name, _)| name != uri);
+            Ok(())
+        }
+        fn rename_uri(&self, uri: &str, new_name: &str) -> Result<String, PlatformError> {
+            if new_name.contains('/') {
+                return Err(PlatformError::UnsupportedUri(new_name.to_string()));
+            }
+            let mut documents = self.documents.lock().unwrap();
+            let Some((name, _)) = documents.iter_mut().find(|(name, _)| name == uri) else {
+                return Err(PlatformError::UnsupportedUri(uri.to_string()));
+            };
+            let parent = name.rsplit_once('/').map(|(parent, _)| parent).unwrap_or_default().to_string();
+            *name = format!("{parent}/document/{new_name}");
+            Ok(name.clone())
+        }
+    }
+
+    #[test]
+    fn saf_trees_are_local_roots_and_support_the_whole_file_lifecycle() {
+        let bridge = std::sync::Arc::new(MockSaf::default());
+        let fs = NativeLocalFs::with_saf(bridge);
+        let roots = fs.list_roots().unwrap();
+        assert!(
+            roots.iter().any(|root| root.kind == "saf_tree"),
+            "a granted tree has to appear next to the app's own roots: {roots:?}"
+        );
+
+        let tree = "content://mock.tree/tree/primary%3ADownload";
+        let created = format!("{tree}/document/photos");
+        fs.mkdir_all(&created).expect("mkdir inside a granted tree");
+
+        let file = format!("{created}/document/note.txt");
+        fs.write_bytes_atomic(&file, b"granted folder bytes").expect("write");
+        assert_eq!(fs.read_bytes(&file).unwrap(), b"granted folder bytes");
+        assert_eq!(fs.stat(&file).unwrap().size, 19);
+
+        let renamed = "renamed.txt";
+        fs.rename(&file, renamed).expect("rename is a single component");
+        assert!(fs.read_bytes(renamed).is_err());
+        assert_eq!(
+            fs.read_bytes(&format!("{created}/document/{renamed}")).unwrap(),
+            b"granted folder bytes"
+        );
+
+        fs.remove_file(&format!("{created}/document/{renamed}")).unwrap();
+        assert!(fs.stat(&format!("{created}/document/{renamed}")).is_err());
+
+        // An encoded separator in the leaf decodes to a path, so it is refused
+        // before it can reach the bridge as a document name - and the
+        // POSIX-only attributes fail closed instead of pretending to work.
+        assert!(fs.write_bytes_atomic(&format!("{created}/document/evil%2Fname.txt"), b"x").is_err());
+        assert!(fs.write_bytes_atomic(tree, b"x").is_err(), "a granted tree is not a file");
+        assert!(fs.set_mtime(&file, 1_700_000_000).is_err());
+        assert!(fs.set_permissions_mode(&file, 0o644).is_err());
+    }
+
     #[test]
     fn atomic_private_write_and_local_fs_operations_round_trip() {
         let dir = std::env::temp_dir().join(format!(
@@ -625,5 +1023,73 @@ mod tests {
         assert_eq!(*k1, *k2);
 
         fs.remove_dir_all(&dir.to_string_lossy()).unwrap();
+    }
+
+    #[test]
+    fn no_replace_publication_never_overwrites_and_reports_a_conflict() {
+        let dir = std::env::temp_dir().join(format!(
+            "linscp-publish-test-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let staged = dir.join("staged");
+        std::fs::write(&staged, b"new bytes").unwrap();
+        let target = dir.join("target");
+
+        publish_no_replace(&staged, &target).expect("fresh destination is published");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new bytes");
+
+        // A second publication onto the same name is refused, not merged, and
+        // the bytes already there stay untouched.
+        std::fs::write(&staged, b"replacement").unwrap();
+        let error = publish_no_replace(&staged, &target).unwrap_err();
+        assert!(matches!(error, PlatformError::AlreadyExists(_)), "{error}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new bytes");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saf_document_uris_split_into_tree_parent_and_leaf() {
+        let tree = parse_saf_document_uri(
+            "content://com.android.externalstorage.documents/tree/primary%3ADownload",
+        )
+        .unwrap();
+        assert_eq!(tree.authority, "com.android.externalstorage.documents");
+        assert_eq!(tree.tree, "primary%3ADownload");
+        assert!(tree.documents.is_empty());
+        assert_eq!(tree.leaf(), "primary%3ADownload");
+        assert_eq!(tree.tree_uri(), "content://com.android.externalstorage.documents/tree/primary%3ADownload");
+
+        let nested = parse_saf_document_uri(
+            "content://com.android.externalstorage.documents/tree/primary%3ADownload/document/primary%3ADownload%2Fphotos/document/inner",
+        )
+        .unwrap();
+        assert_eq!(nested.documents, vec!["primary%3ADownload%2Fphotos", "inner"]);
+        assert_eq!(nested.leaf(), "inner");
+        // The parent keeps the encoded document id exactly as Android wrote it.
+        assert_eq!(
+            nested.parent_uri(),
+            "content://com.android.externalstorage.documents/tree/primary%3ADownload/document/primary%3ADownload%2Fphotos"
+        );
+        assert_eq!(nested.leaf_name(), "inner");
+    }
+
+    #[test]
+    fn saf_document_uris_reject_non_tree_and_traversal_forms() {
+        for bad in [
+            "file:///sdcard/Download",
+            "content://authority/document/only",
+            "content://authority/tree/",
+            "content://authority/tree/primary%3ADownload/document/",
+            "content://authority/tree/primary%3ADownload/../../etc",
+            "content://authority/tree/primary%3ADownload/document/a\0b",
+        ] {
+            assert!(
+                parse_saf_document_uri(bad).is_err(),
+                "{bad} must not be accepted as a SAF tree"
+            );
+        }
     }
 }

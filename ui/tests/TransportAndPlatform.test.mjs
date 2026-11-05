@@ -8,6 +8,10 @@ import { JSDOM } from 'jsdom';
 import {
   EXTRA_KEYS,
   HttpTransport,
+  SHARED_FEATURES,
+  ForegroundTransferBridge,
+  hostCapabilities,
+  hostDifferenceReason,
   I18nCatalog,
   LocalRootSwitcher,
   MobileShellController,
@@ -17,6 +21,8 @@ import {
   createTransport,
   detectTransportMode,
   normalizeLocale,
+  requestSafTree,
+  sharedFeatureSet,
 } from '../dist/linscp-core.mjs';
 
 const testsDir = path.dirname(fileURLToPath(import.meta.url));
@@ -230,6 +236,148 @@ test('MobileShellController handles touch pane switching and terminal extra-key 
   assert.equal(mobile.transformTextInput('c'), '\x03');
   assert.equal(mobile.isCtrlLatched, false);
   assert.equal(applyCtrlModifier('d'), '\x04');
+});
+
+test('Built ui/dist/index.html mounts the local root switcher in the browser app too', async () => {
+  const distHtml = fs.readFileSync(path.join(repoRoot, 'ui', 'dist', 'index.html'), 'utf8');
+  const requested = [];
+
+  const dom = new JSDOM(distHtml, {
+    url: 'http://127.0.0.1:8080/',
+    runScripts: 'dangerously',
+    pretendToBeVisual: true,
+    beforeParse(window) {
+      window.fetch = async (url) => {
+        const target = String(url);
+        requested.push(target);
+        let payload = { success: true };
+        if (target.includes('/api/status')) {
+          payload = { connected: false, active_tab: null, tabs: [], local_dir: '/home/alice' };
+        } else if (target.includes('/api/local/roots')) {
+          payload = {
+            success: true,
+            roots: [
+              { path: '/', label: '/', kind: 'posix', read_only: false },
+              { path: '/home/alice', label: 'Home', kind: 'posix', read_only: false },
+            ],
+          };
+        } else if (target.includes('/api/local/list')) {
+          payload = { success: true, path: '/home/alice', entries: [] };
+        } else if (target.includes('/api/accounts')) {
+          payload = { enabled: false };
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => payload,
+          text: async () => JSON.stringify(payload),
+        };
+      };
+    },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  const select = dom.window.document.getElementById('localRootSelect');
+  assert.ok(select, 'the local pane header owns the root selector');
+  assert.ok(requested.some((url) => url.includes('/api/local/roots')));
+  assert.deepEqual(
+    [...select.options].map((option) => option.textContent),
+    ['/', 'Home'],
+  );
+  // More than one root means the control is visible; one root hides it again.
+  assert.equal(select.hidden, false);
+  dom.window.close();
+});
+
+test('every host exposes the same feature surface and explains each real difference', () => {
+  const desktop = hostCapabilities({ transport: 'tauri', platform: 'linux' });
+  const android = hostCapabilities({ transport: 'tauri', platform: 'android' });
+  const browser = hostCapabilities({ transport: 'http', platform: 'browser' });
+
+  // The same fourteen features in all three apps: that is the parity promise.
+  assert.deepEqual(sharedFeatureSet(), [...SHARED_FEATURES]);
+  assert.equal(sharedFeatureSet().length, 14);
+
+  for (const caps of [desktop, android, browser]) {
+    for (const feature of ['localRoots', 'fileDrop', 'terminal']) {
+      assert.equal(caps[feature], true, `${feature} must exist on every host`);
+    }
+  }
+
+  // Android replaces the desktop's remote-desktop viewers with the SAF,
+  // share-sheet and foreground-service bridges; the browser keeps a subset
+  // because it cannot reach the user's machine at all.
+  assert.equal(android.safTrees, true);
+  assert.equal(android.desktopLaunchers, false);
+  assert.equal(desktop.safTrees, false);
+  assert.equal(desktop.desktopLaunchers, true);
+  assert.equal(browser.nativeIpc, false);
+  assert.equal(browser.nativeFileDrop, false);
+
+  // A missing control always has a stated reason; a silent, unexplained gap is
+  // the bug this list exists to catch.
+  assert.match(hostDifferenceReason('safTrees', desktop) ?? '', /Android/);
+  assert.match(hostDifferenceReason('desktopLaunchers', android) ?? '', /desktop/);
+  assert.match(hostDifferenceReason('accounts', desktop) ?? '', /sign-in/);
+  // Nothing is claimed missing for a capability the host actually has.
+  assert.equal(hostDifferenceReason('safTrees', android), null);
+  assert.equal(hostDifferenceReason('terminal', android), null);
+});
+
+test('the SAF picker degrades to null where no shell can open one', async () => {
+  // No `__TAURI_INTERNALS__`: the browser build must not throw or claim a
+  // folder. This is what lets the same bundle serve the HTTP app.
+  assert.equal(await requestSafTree({ invoker: null }), null);
+
+  const invoked = [];
+  const granted = await requestSafTree({
+    registerTree: async (uri) => {
+      invoked.push(uri);
+      return { path: uri, label: 'Granted', kind: 'saf_tree', read_only: false };
+    },
+    invoker: {
+      invoke: async (cmd) => {
+        assert.equal(cmd, 'linscp_pick_saf_tree');
+        return { uri: 'content://com.android.externalstorage.documents/tree/primary%3ADownload' };
+      },
+    },
+  });
+  assert.equal(granted?.kind, 'saf_tree');
+  assert.deepEqual(invoked, ['content://com.android.externalstorage.documents/tree/primary%3ADownload']);
+
+  // A cancelled picker is not an error and not a root.
+  assert.equal(
+    await requestSafTree({ invoker: { invoke: async () => ({ cancelled: true }) } }),
+    null,
+  );
+});
+
+test('the foreground bridge drops duplicate percentages and stops cleanly', async () => {
+  const calls = [];
+  const bridge = new ForegroundTransferBridge({
+    invoke: async (cmd, args) => {
+      calls.push([cmd, args]);
+      return {};
+    },
+  });
+  assert.equal(bridge.available, true);
+  assert.equal(await bridge.start('Uploading 3 files', 3), true);
+  assert.equal(await bridge.update(1, 10), true);
+  assert.equal(await bridge.update(1, 10), true); // same percent: no invoke
+  assert.equal(await bridge.update(5, 10), true);
+  assert.equal(await bridge.stop(), true);
+  assert.deepEqual(
+    calls.map(([cmd]) => cmd),
+    ['linscp_foreground_start', 'linscp_foreground_update', 'linscp_foreground_update', 'linscp_foreground_stop'],
+  );
+  assert.equal(bridge.isRunning, false);
+
+  // Without a shell the bridge is inert rather than throwing at every call.
+  const absent = new ForegroundTransferBridge(null);
+  assert.equal(absent.available, false);
+  assert.equal(await absent.start('x', 1), false);
+  assert.equal(await absent.update(1, 2), false);
+  assert.equal(await absent.stop(), false);
 });
 
 test('Built ui/dist/index.html boots inside Tauri IPC mode with zero HTTP calls', async () => {

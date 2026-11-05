@@ -32,3 +32,23 @@ export function createTransport(options: CreateTransportOptions = {}): Transport
     bearerToken: options.bearerToken ?? host?.__LINSCP_TOKEN__ ?? '',
   });
 }
+
+/**
+ * The native command bridge, when the bundle is running inside the Tauri shell
+ * and `null` in a browser.
+ *
+ * Platform modules need to call shell commands that are not part of the
+ * `CommanderService` envelope (the Android folder picker, the share hand-off
+ * and the foreground service). They must not reach for the global themselves:
+ * `tools/check_repo_hygiene.py` keeps the transport boundary in this directory,
+ * so this is the one door, and it reports the same thing
+ * `detectTransportMode` does.
+ */
+export function nativeInvoker(
+  host: unknown = globalThis,
+): TauriInternalsLike | null {
+  const candidate = host as HostGlobal | null | undefined;
+  return candidate && typeof candidate.__TAURI_INTERNALS__?.invoke === 'function'
+    ? candidate.__TAURI_INTERNALS__
+    : null;
+}

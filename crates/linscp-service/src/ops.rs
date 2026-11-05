@@ -418,6 +418,9 @@ async fn search_remote_walk(
                     "permissions": entry.permissions,
                     "line": line_no,
                     "preview": preview,
+                    // The page draws the match as `snippet`; both keys carry the
+                    // same text so an older caller keeps working.
+                    "snippet": preview,
                 }));
             }
         } else {

@@ -11,12 +11,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use linscp_engine::{
-    parse_filezilla_xml, parse_openssh_config, PreferencesStore, SessionStore, StoredSite,
+    filemask::FileMask, parse_filezilla_xml, parse_openssh_config, PreferencesStore,
+    SessionStore, StoredSite,
 };
 use linscp_platform::{
     config_dir, gui_os, write_private_file_atomic, LocalFs, NativeLocalFs, NativeSecretVault,
     SecretVault,
 };
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
+use base64::Engine as _;
 use linscp_types::{
     ApiEnvelope, ApiReply, SessionConfig, TabSummary, TransferQueueItem, UserPreferences,
 };
@@ -40,6 +43,8 @@ struct InnerState {
     logs: Vec<Value>,
     preferences: UserPreferences,
     queue_transfers: Vec<Value>,
+    /// Embedded terminals, one per open `xterm.js` window.
+    terminals: terminal_bridge::TerminalRegistry,
 }
 
 #[derive(Clone)]
@@ -88,6 +93,7 @@ impl CommanderService {
                 logs: Vec::new(),
                 preferences,
                 queue_transfers: Vec::new(),
+                terminals: terminal_bridge::TerminalRegistry::default(),
             })),
             event_tx: Arc::new(Mutex::new(None)),
             queue: queue::QueueManager::new(tokio::sync::broadcast::channel(64).0),
@@ -134,7 +140,6 @@ impl CommanderService {
             ("GET", "/api/workspaces") => self.handle_get_workspaces(),
             ("POST", "/api/workspaces") => self.handle_save_workspaces(req.body),
             ("POST", "/api/workspaces/save") => self.handle_workspaces_save(req.body),
-            ("POST", "/api/workspaces/open") => self.handle_workspaces_open(req.body),
             ("POST", "/api/workspaces/delete") => self.handle_workspaces_delete(req.body),
             ("GET", "/api/transfers") => self.handle_list_transfers(),
             ("POST", "/api/tabs/local") => self.handle_open_local_tab(req.body),
@@ -148,25 +153,23 @@ impl CommanderService {
             ("POST", "/api/local/rename") => self.handle_local_rename(req.body),
             ("POST", "/api/local/chmod") => self.handle_local_chmod(req.body),
             ("POST", "/api/local/save") => self.handle_local_save(req.body),
+            ("POST", "/api/local/drop") => self.handle_local_drop(req.body),
+            ("POST", "/api/local/drop-dir") => self.handle_local_drop_dir(req.body),
             ("GET", "/api/logs") => self.handle_logs(),
             ("GET", "/api/cleanup") => self.handle_cleanup_get(),
             ("POST", "/api/cleanup") => self.handle_cleanup_post(req.body),
             ("GET", "/api/shell/pending") => self.handle_shell_pending(),
-            ("POST", "/api/shell/consume") => self.handle_shell_consume(req.body),
             ("POST", "/api/shell/dismiss") => self.handle_shell_dismiss(req.body),
             ("GET", "/api/session/url") => self.handle_session_url(&query),
             ("GET", "/api/remote/transfer/targets") => self.handle_remote_transfer_targets(&query),
             ("POST", "/api/remote/mkdir") => self.handle_remote_mkdir(req.body),
             ("POST", "/api/remote/delete") => self.handle_remote_delete(req.body),
             ("POST", "/api/remote/rename") => self.handle_remote_rename(req.body),
-            ("POST", "/api/remote/chmod") => self.handle_remote_chmod(req.body),
-            ("POST", "/api/remote/properties") => self.handle_remote_properties(req.body),
-            ("POST", "/api/remote/rights") => self.handle_remote_rights(req.body),
-            ("POST", "/api/remote/search") => self.handle_remote_search(req.body),
-            ("POST", "/api/remote/checksum") => self.handle_remote_checksum(req.body),
-            ("POST", "/api/remote/save") => self.handle_remote_save(req.body),
             ("POST", "/api/remote/copy") => self.handle_remote_copy(req.body),
             ("POST", "/api/remote/link") => self.handle_remote_link(req.body),
+            ("POST", "/api/remote/properties") => self.handle_remote_properties(req.body),
+            ("POST", "/api/remote/rights") => self.handle_remote_rights(req.body),
+            ("POST", "/api/remote/checksum") => self.handle_remote_checksum(req.body),
             ("POST", "/api/sync/preview") => self.handle_sync_preview(req.body),
             ("POST", "/api/sync/run") => self.handle_sync_run(req.body),
             ("POST", "/api/transfer/upload") => self.handle_transfer_upload(req.body),
@@ -174,11 +177,6 @@ impl CommanderService {
             ("POST", "/api/transfer/move") => self.handle_transfer_move(req.body),
             ("POST", "/api/transfer/keepuptodate") => self.handle_keepuptodate(req.body),
             ("POST", "/api/remote/transfer") => self.handle_remote_transfer(req.body),
-            ("POST", "/api/session/copyid") => self.handle_copyid(req.body),
-            ("POST", "/api/session/terminal") => self.handle_session_terminal(req.body),
-            ("POST", "/api/terminal/input") => self.handle_terminal_input(req.body),
-            ("POST", "/api/terminal/close") => self.handle_terminal_close(req.body),
-            ("GET", "/api/terminal/output") => self.handle_terminal_output(&query),
             ("POST", "/api/queue/pause") => self.handle_queue_pause(),
             ("POST", "/api/queue/resume") => self.handle_queue_resume(),
             ("POST", "/api/queue/cancel") => self.handle_queue_cancel(req.body),
@@ -186,7 +184,12 @@ impl CommanderService {
             ("POST", "/api/queue/retry") => self.handle_queue_retry(req.body),
             ("POST", "/api/queue/priority") => self.handle_queue_priority(req.body),
             ("GET", "/api/accounts") => self.handle_accounts(),
+            ("GET", "/api/login") => ApiReply{ status: 200, payload: json!({"success": true, "logged_in": false, "username": "", "csrf_token": ""})},
             ("POST", "/api/login") => ApiReply{ status: 400, payload: json!({"success": false, "error": "Accounts not enabled"})},
+            // Signing out has to answer on every app: the browser page, the
+            // native window and the Android app all offer the menu entry, and
+            // an unauthenticated run has nothing to end, so it succeeds.
+            ("POST", "/api/logout") => ApiReply{ status: 200, payload: json!({"success": true})},
             ("POST", "/api/custom-commands") => self.handle_custom_commands(req.body),
             ("POST", "/api/command/exec") => self.handle_command_exec(req.body),
             ("GET", "/api/desktop/recommendations") => self.handle_desktop_recommendations(),
@@ -213,6 +216,29 @@ impl CommanderService {
             ("POST", "/api/remote/mkdir") => self.mkdir_remote_async(req.body).await,
             ("POST", "/api/remote/properties") => Box::pin(self.remote_properties_async(req.body)).await,
             ("POST", "/api/workspaces/open") => Box::pin(self.open_workspace_async(req.body)).await,
+            // These need a live session, so they resolve here rather than in the
+            // synchronous table, which only answers local and file-backed calls.
+            ("POST", "/api/remote/chmod") => self.chmod_remote_async(req.body).await,
+            ("POST", "/api/remote/copy") => self.copy_remote_async(req.body).await,
+            ("POST", "/api/remote/rights") => self.rights_remote_async(req.body).await,
+            ("POST", "/api/transfer/keepuptodate") => self.keep_up_to_date_async(req.body).await,
+            ("POST", "/api/session/copyid") => self.copy_id_async(req.body).await,
+            ("POST", "/api/remote/link") => self.link_remote_async(req.body).await,
+            ("POST", "/api/remote/checksum") => self.checksum_remote_async(req.body).await,
+            ("POST", "/api/remote/search") => self.search_remote_async(req.body).await,
+            ("POST", "/api/remote/rename") => self.rename_remote_any_async(req.body).await,
+            ("POST", "/api/session/terminal") => self.open_terminal_async(req.body).await,
+            ("POST", "/api/terminal/input") => self.terminal_write(req.body),
+            ("POST", "/api/terminal/close") => self.terminal_close(req.body),
+            ("GET", "/api/terminal/output") => self.terminal_read(&parse_query(req.path.split_once('?').map(|(_, q)| q).unwrap_or(""))),
+            ("POST", "/api/shell/consume") => self.consume_shell_offer_async(req.body).await,
+            ("GET", "/api/remote/edit") => self.remote_edit_read_async(&parse_query(req.path.split_once('?').map(|(_, q)| q).unwrap_or(""))).await,
+            ("POST", "/api/remote/save") => self.remote_save_async(req.body).await,
+            ("POST", "/api/command/exec") => Box::pin(self.exec_cli_command_async(req.body)).await,
+            ("POST", "/api/sync/preview") => Box::pin(self.sync_preview_async(req.body)).await,
+            ("POST", "/api/sync/run") => Box::pin(self.sync_run_async(req.body)).await,
+            ("POST", "/api/transfer/drop") => self.handle_transfer_drop(req.body).await,
+            ("POST", "/api/transfer/drop-dir") => self.handle_transfer_drop_dir(req.body).await,
             ("POST", "/api/transfer/upload") => self.queue_transfer_async(req.body, true, false).await,
             ("POST", "/api/transfer/download") => self.queue_transfer_async(req.body, false, false).await,
             ("POST", "/api/transfer/move") => {
@@ -223,7 +249,6 @@ impl CommanderService {
                 self.queue_transfer_async(req.body, upload, true).await
             }
             ("GET", "/api/remote/list") => self.list_remote_async(&req.path).await,
-            ("POST", "/api/remote/rename") => self.rename_remote_async(req.body).await,
             ("POST", "/api/remote/transfer") => self.remote_transfer_async(req.body).await,
             ("POST", "/api/desktop/check") => self.handle_desktop_check_async(req.body).await,
             ("POST", "/api/desktop/install") => self.handle_desktop_install_async(req.body).await,
@@ -332,6 +357,13 @@ impl CommanderService {
     }
 
     async fn mkdir_remote_async(&self, body: Value) -> ApiReply {
+        self.mkdir_remote_async_with_base(body).await
+    }
+
+    /// Creates one directory below `remote_dir` (default: the tab's current
+    /// directory). A dropped folder tree is built segment by segment through
+    /// this, so each level is confirmed before the next one is attempted.
+    async fn mkdir_remote_async_with_base(&self, body: Value) -> ApiReply {
         let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "Not connected") };
         let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
             Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
@@ -345,7 +377,10 @@ impl CommanderService {
         if !matches!(session.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes | linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs) {
             return api_error(501, "Safe directory creation is not supported for this protocol.");
         }
-        let path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
+        let base = body.get("remote_dir").and_then(Value::as_str)
+            .filter(|dir| !dir.is_empty() && dir.starts_with('/') && !dir.chars().any(char::is_control))
+            .unwrap_or(tab.remote_dir.as_str());
+        let path = format!("{}/{}", base.trim_end_matches('/'), name);
         match session.mkdir(&path).await {
             Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
             Err(error) => api_error(400, format!("Directory creation was not confirmed; the directory may already exist: {error}")),
@@ -510,17 +545,27 @@ impl CommanderService {
         if source_is_sftp && !body.get("accept_sftp_copy_risk").and_then(Value::as_bool).unwrap_or(false) {
             return ApiReply { status: 409, payload: json!({"success": false, "error": "SFTP copy requires confirmation", "sftp_copy_risk": true}) };
         }
-        if body.get("filemask").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) { return api_error(400, "File masks are not supported for remote moves."); }
+        // A mask narrows a copy; ignoring it on a move would move files the
+        // user excluded, so the move keeps refusing it.
+        let mask = body.get("filemask").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        if !mask.is_empty() && move_item {
+            return api_error(400, "File masks are not supported for remote moves.");
+        }
         let directory = body.get("directory").and_then(Value::as_str).unwrap_or("");
         if !directory.starts_with('/') || directory.contains("//") || directory.chars().any(char::is_control) || directory.contains('\\') || directory.split('/').any(|part| part == "." || part == "..") {
             return api_error(400, "An absolute remote directory without dot segments is required.");
         }
         let names = match body.get("names").and_then(Value::as_array) { Some(names) if !names.is_empty() && names.len() <= 1000 => names, _ => return api_error(400, "Select at least one file") };
+        if !mask.is_empty() && !names.iter().filter_map(Value::as_str).any(|name| linscp_engine::filemask_matches(&mask, name, false)) {
+            return api_error(400, "The mask does not select any of the selected files.");
+        }
         let mut jobs = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for value in names {
             let name = match value.as_str() { Some(name) if !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\') && !name.contains(':') && !name.chars().any(char::is_control) => name, _ => return api_error(400, "Invalid file name") };
             if !seen.insert(name) { return api_error(400, "Duplicate file name"); }
+            // Outside the mask nothing is copied; the dialog's own text says so.
+            if !mask.is_empty() && !linscp_engine::filemask_matches(&mask, name, false) { continue; }
             let source = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
             let target = format!("{}/{}", directory.trim_end_matches('/'), name);
             if same_tab && source == target { return api_error(400, "Source and destination are the same file."); }
@@ -601,6 +646,757 @@ impl CommanderService {
         match session.dav_move_if_match(&from, &to, &tag, is_dir).await {
             Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
             Err(error) => api_error(400, error.to_string()),
+        }
+    }
+
+    /// `chmod` on the active tab. A local tab is the other pane of a local
+    /// pair, so it keeps using the local filesystem; a remote tab asks the
+    /// server, exactly as the console client's `chmod` does.
+    async fn chmod_remote_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
+        };
+        if tab.is_local { return self.handle_remote_chmod(body); }
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        let names = remote_names(&body);
+        if names.is_empty() { return api_error(400, "Select at least one file") }
+        if names.len() > 1000 { return api_error(400, "Too many files selected") }
+        // A recursive change would alter a whole tree from one click; the
+        // console asks the user to select the entries instead, and so do we.
+        let mut modes = Vec::new();
+        for name in &names {
+            let leaf = match ops::validate_leaf_name(name) { Ok(leaf) => leaf, Err(error) => return api_error(400, error) };
+            let raw = body.get("permissions").and_then(Value::as_str).unwrap_or("");
+            let mode = match parse_octal_mode(raw) { Some(mode) => mode, None => return api_error(400, "A symbolic or malformed mode is not supported here; enter an octal mode such as 644.") };
+            modes.push((leaf.to_string(), mode));
+        }
+        let mut failures = Vec::new();
+        for (name, mode) in modes {
+            let path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
+            let entry = match session.stat(&path).await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => { failures.push(format!("{name}: not found")); continue; }
+                Err(error) => { failures.push(format!("{name}: {error}")); continue; }
+            };
+            if entry.is_symlink { failures.push(format!("{name}: a symbolic link is changed through its target")); continue; }
+            if let Err(error) = session.chmod(&path, mode).await { failures.push(format!("{name}: {error}")); }
+        }
+        if failures.is_empty() { ApiReply { status: 200, payload: json!({"success": true}) } }
+        else { ApiReply { status: 400, payload: json!({"success": false, "error": failures.join("; ")}) } }
+    }
+
+    /// Starts watching a local directory and copying changes to the server.
+    /// It runs as a queue item, so cancelling it is the queue's cancel and a
+    /// pause holds it before its next pass.
+    async fn keep_up_to_date_async(&self, body: Value) -> ApiReply {
+        use linscp_engine::keepuptodate::KeepUpToDateOptions;
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected"),
+        };
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        let local_root = body.get("local_dir").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        if local_root.is_empty() || !Path::new(&local_root).is_absolute() {
+            return api_error(400, "An absolute local directory is required.");
+        }
+        if !Path::new(&local_root).is_dir() { return api_error(400, "The local directory does not exist.") }
+        let remote_root = match validate_remote_absolute_path(body.get("remote_dir").and_then(Value::as_str).unwrap_or("")) {
+            Ok(path) => path, Err(error) => return api_error(400, error),
+        };
+        let mask_text = body.get("filemask").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let file_mask = if mask_text.is_empty() {
+            linscp_engine::filemask::FileMask::default()
+        } else {
+            match linscp_engine::filemask::FileMask::parse(&mask_text) {
+                Ok(mask) => mask, Err(error) => return api_error(400, error),
+            }
+        };
+        let seconds = body.get("interval").and_then(Value::as_u64).unwrap_or(0);
+        // The dialogue asks for seconds; the engine works in milliseconds, and
+        // a zero interval means "as often as the watcher can".
+        let interval_ms = seconds.saturating_mul(1000).clamp(500, 86_400_000);
+        let opts = KeepUpToDateOptions {
+            interval_ms,
+            max_passes: body.get("count").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32,
+            preserve_time: true,
+            file_mask,
+            ..KeepUpToDateOptions::default()
+        };
+        let job = crate::queue::QueueJob::KeepUpToDate {
+            session,
+            local_root: std::path::PathBuf::from(&local_root),
+            remote_root: remote_root.clone(),
+            opts,
+        };
+        let task_id = self.queue.enqueue(Some(id), "keepuptodate",
+            format!("Watch {local_root}"), local_root.clone(), remote_root, 0,
+            body.get("priority").and_then(Value::as_bool).unwrap_or(false), job);
+        ApiReply { status: 200, payload: json!({"success": true, "task_id": task_id}) }
+    }
+
+    /// The properties dialogue sends the mode as `mode`, the permissions
+    /// dialogue as `permissions`; both end at the same server call.
+    async fn rights_remote_async(&self, mut body: Value) -> ApiReply {
+        if let Some(mode) = body.get("mode").and_then(Value::as_str).map(|s| s.to_string()) {
+            body["permissions"] = json!(mode);
+        }
+        self.chmod_remote_async(body).await
+    }
+
+    /// Server-side copy: one source name and one absolute destination path.
+    async fn copy_remote_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
+        };
+        if tab.is_local { return self.handle_remote_copy(body); }
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        let source = body.get("source").and_then(Value::as_str).unwrap_or("");
+        let source = match ops::validate_leaf_name(source) { Ok(leaf) => leaf, Err(error) => return api_error(400, error) };
+        let destination = body.get("destination").and_then(Value::as_str).unwrap_or("");
+        let destination = match validate_remote_absolute_path(destination) {
+            Ok(path) => path,
+            Err(error) => return api_error(400, error),
+        };
+        let from = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), source);
+        if from == destination { return api_error(400, "Source and destination are the same file.") }
+        match session.stat(&from).await {
+            Ok(Some(entry)) if entry.is_dir => return api_error(400, "Only a single file can be copied on the server; select the files instead."),
+            Ok(Some(entry)) if entry.is_symlink => return api_error(400, "A symbolic link is not copied by name; copy its target."),
+            Ok(Some(_)) => {}
+            Ok(None) => return api_error(400, "The source file does not exist."),
+            Err(error) => return api_error(400, error.to_string()),
+        }
+        // Never replace an existing file from a dialogue that did not say so.
+        if let Ok(Some(_)) = session.stat(&destination).await { return api_error(400, "The destination already exists.") }
+        match session.copy_file(&from, &destination).await {
+            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
+            Err(error) => api_error(400, error.to_string()),
+        }
+    }
+
+    /// Creates a symbolic link next to the selected file.
+    async fn link_remote_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
+        };
+        if tab.is_local { return self.handle_remote_link(body); }
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        if !matches!(session.scheme(), linscp_types::ProtocolScheme::Sftp) {
+            return api_error(501, "Symbolic links can be created only over SFTP.");
+        }
+        let target = body.get("target").and_then(Value::as_str).unwrap_or("");
+        let target = match ops::validate_leaf_name(target) { Ok(leaf) => leaf, Err(error) => return api_error(400, error) };
+        let name = body.get("name").and_then(Value::as_str).unwrap_or("");
+        let name = match ops::validate_leaf_name(name) { Ok(leaf) => leaf, Err(error) => return api_error(400, error) };
+        if target == name { return api_error(400, "A link and its target need two different names.") }
+        let dir = tab.remote_dir.trim_end_matches('/');
+        let link = format!("{dir}/{name}");
+        if let Ok(Some(_)) = session.stat(&link).await { return api_error(400, "The link name already exists.") }
+        // The target is relative to the link's directory, which is what a
+        // server-side link means; an absolute target is passed through as is.
+        match session.symlink(target, &link).await {
+            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
+            Err(error) => api_error(400, error.to_string()),
+        }
+    }
+
+    /// Checksums of the selected remote files.
+    async fn checksum_remote_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
+        };
+        if tab.is_local { return self.handle_remote_checksum(body); }
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        let algorithm = match checksum_algorithm(body.get("algorithm").and_then(Value::as_str).unwrap_or("sha-256")) {
+            Some(algorithm) => algorithm,
+            None => return api_error(400, "Unsupported checksum algorithm; use sha-256, sha-1, md5 or crc32."),
+        };
+        let names = remote_names(&body);
+        if names.is_empty() { return api_error(400, "Select at least one file") }
+        if names.len() > 1000 { return api_error(400, "Too many files selected") }
+        let mut results = Vec::new();
+        for name in names {
+            let leaf = match ops::validate_leaf_name(&name) { Ok(leaf) => leaf, Err(error) => return api_error(400, error) };
+            let path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), leaf);
+            // A directory has no checksum; report it per file instead of
+            // failing the whole selection.
+            let item = match session.checksum(&algorithm, &path).await {
+                Ok(hex) => json!({"name": leaf, "checksum": hex}),
+                Err(error) => json!({"name": leaf, "error": error.to_string()}),
+            };
+            results.push(item);
+        }
+        ApiReply { status: 200, payload: json!({"success": true, "algorithm": algorithm, "results": results}) }
+    }
+
+    /// Recursive search of the remote tree by name mask and/or content.
+    async fn search_remote_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
+        };
+        if tab.is_local { return self.handle_remote_search(body); }
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        let root = body.get("path").and_then(Value::as_str).filter(|p| !p.is_empty()).unwrap_or(&tab.remote_dir);
+        let root = match validate_remote_absolute_path(root) { Ok(path) => path, Err(error) => return api_error(400, error) };
+        let mask_spec = body.get("pattern").and_then(Value::as_str).unwrap_or("*");
+        let mask = match FileMask::parse(mask_spec) { Ok(mask) => mask, Err(error) => return api_error(400, error) };
+        let contents = body.get("search_contents").and_then(Value::as_bool).unwrap_or(false);
+        let query = body.get("content_query").and_then(Value::as_str).unwrap_or("").to_string();
+        if contents && query.is_empty() { return api_error(400, "Enter text to search for.") }
+        let case_sensitive = body.get("case_sensitive").and_then(Value::as_bool).unwrap_or(false);
+        // A name search also matches directories; a content search only files.
+        match ops::search_remote_bounded(session.as_ref().as_ref(), &root, &mask,
+            if contents { Some(query.as_str()) } else { None }, case_sensitive, 500).await
+        {
+            Ok(stats) => ApiReply { status: 200, payload: json!({
+                "success": true,
+                "matches": stats.matches,
+                "truncated": stats.truncated,
+                "scanned": stats.scanned,
+                "skipped": stats.skipped,
+                "bytes_scanned": stats.bytes_scanned,
+            })},
+            Err(error) => api_error(400, error),
+        }
+    }
+
+    /// Renames on any protocol. A same-directory rename is a plain server
+    /// `rename`; WebDAV keeps its ETag-checked path so a concurrent change is
+    /// still detected, and a directory move that could lose children keeps
+    /// asking for the confirmation the dialogue offers.
+    async fn rename_remote_any_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
+        };
+        if tab.is_local { return self.handle_remote_rename(body); }
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        if matches!(session.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs) {
+            return self.rename_remote_async(body).await;
+        }
+        let old = match ops::validate_leaf_name(body.get("old_name").and_then(Value::as_str).unwrap_or("")) {
+            Ok(name) => name, Err(error) => return api_error(400, error),
+        };
+        let new = match ops::validate_leaf_name(body.get("new_name").and_then(Value::as_str).unwrap_or("")) {
+            Ok(name) => name, Err(error) => return api_error(400, error),
+        };
+        if old == new { return api_error(400, "Select two different single file names.") }
+        let dir = tab.remote_dir.trim_end_matches('/');
+        let from = format!("{dir}/{old}");
+        let to = format!("{dir}/{new}");
+        let entry = match session.stat(&from).await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return api_error(400, "The selected item does not exist."),
+            Err(error) => return api_error(400, error.to_string()),
+        };
+        if entry.is_symlink { return api_error(400, "A symbolic link is renamed through its target.") }
+        if entry.is_dir && !body.get("accept_directory_move_risk").and_then(Value::as_bool).unwrap_or(false) {
+            return ApiReply { status: 409, payload: json!({
+                "success": false, "directory_move_risk": true,
+                "error": "The server may rename a directory without its children being listed first. Continue?"}) };
+        }
+        // Renaming onto an existing name would replace it on most servers.
+        if let Ok(Some(_)) = session.stat(&to).await { return api_error(400, "The new name already exists.") }
+        match session.rename(&from, &to).await {
+            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
+            Err(error) => api_error(400, error.to_string()),
+        }
+    }
+
+    /// Reads the request a `sync/preview` or `sync/run` call carries into the
+    /// planner's options. The page's three-way `mode` is the console's
+    /// `-direction`, and the criteria string is `-criteria`.
+    fn sync_options_from(body: &Value) -> Result<(std::path::PathBuf, String, linscp_engine::sync_planner::SyncOptions), String> {
+        use linscp_engine::sync_planner::{SyncConflictPolicy, SyncCriteria, SyncMode, SyncOptions};
+        let mode = match body.get("mode").and_then(Value::as_str).unwrap_or("local") {
+            "local" => SyncMode::Local,
+            "remote" => SyncMode::Remote,
+            "both" => SyncMode::Both,
+            other => return Err(format!("Unknown synchronization direction '{other}'.")),
+        };
+        let raw_criteria = body.get("criteria").and_then(Value::as_str).unwrap_or("time").trim().to_ascii_lowercase();
+        let mut criteria = SyncCriteria { time: false, size: false, checksum: false };
+        let mut recognised = false;
+        for part in raw_criteria.split([';', ',', ' ']).filter(|p| !p.is_empty()) {
+            recognised = true;
+            match part {
+                "time" => criteria.time = true,
+                "size" => criteria.size = true,
+                "checksum" => criteria.checksum = true,
+                "either" => { criteria.time = true; criteria.size = true; }
+                // 'none' means "copy whatever differs", which the planner
+                // expresses by comparing nothing but existence.
+                "none" => {}
+                other => return Err(format!("Unknown synchronization criteria '{other}'.")),
+            }
+        }
+        if !recognised { criteria.time = true; }
+        let conflict_policy = match body.get("conflict").and_then(Value::as_str).unwrap_or("skip") {
+            "skip" => SyncConflictPolicy::Skip,
+            "local" => SyncConflictPolicy::Local,
+            "remote" => SyncConflictPolicy::Remote,
+            "newer" => SyncConflictPolicy::Newer,
+            other => return Err(format!("Unknown conflict policy '{other}'.")),
+        };
+        // An empty mask is the dialogue's "every file", the same default the
+        // engine carries; only a mask the user typed is parsed.
+        let mask_text = body.get("filemask").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let file_mask = if mask_text.is_empty() {
+            linscp_engine::filemask::FileMask::default()
+        } else {
+            linscp_engine::filemask::FileMask::parse(&mask_text).map_err(|error| error.to_string())?
+        };
+        // The dialogue offers a mirror of the source tree, which is a one-way
+        // copy that deletes what the source no longer has.
+        let mirror = body.get("mirror").and_then(Value::as_bool).unwrap_or(false);
+        let delete_obsolete = body.get("delete").and_then(Value::as_bool).unwrap_or(false) || mirror;
+        let local_root = body.get("local_dir").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        if local_root.is_empty() || !Path::new(&local_root).is_absolute() {
+            return Err("An absolute local directory is required.".to_string());
+        }
+        let remote_root = validate_remote_absolute_path(body.get("remote_dir").and_then(Value::as_str).unwrap_or(""))?;
+        let recursive = body.get("recursive").and_then(Value::as_bool).unwrap_or(true);
+        let opts = SyncOptions {
+            mode,
+            criteria,
+            conflict_policy,
+            delete_obsolete,
+            mirror,
+            recursive,
+            preserve_time: true,
+            file_mask,
+            // The planner never writes: a preview stops before applying, and
+            // a queued run applies through `apply_sync_plan`, which is the
+            // only path that decides to stop.
+            preview_only: true,
+            ..SyncOptions::default()
+        };
+        Ok((std::path::PathBuf::from(local_root), remote_root, opts))
+    }
+
+    /// The session and the state key a synchronization of this tab uses.
+    fn sync_target(&self, body: &Value) -> Result<(Arc<dyn linscp_proto::RemoteSession>, u64, String, String), ApiReply> {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return Err(api_error(400, "No active tab")) };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected && !tab.is_local => tab, _ => return Err(api_error(400, "Not connected")),
+        };
+        let session = match tab.remote { Some(session) => session, None => return Err(api_error(400, "Not connected")) };
+        // The previous record is kept per endpoint and directory pair, so a
+        // second run with the same tab finds the first run's state.
+        let host_key = tab.spec.as_ref().map(|spec| format!("{}:{}", spec.session.host, spec.session.port))
+            .unwrap_or_else(|| format!("tab:{id}"));
+        Ok((session, id, host_key, tab.remote_dir.clone()))
+    }
+
+    async fn sync_preview_async(&self, body: Value) -> ApiReply {
+        use linscp_engine::sync_planner::{plan_synchronization, SyncState};
+        let (session, _id, host_key, _dir) = match self.sync_target(&body) { Ok(t) => t, Err(reply) => return reply };
+        let (local_root, remote_root, opts) = match Self::sync_options_from(&body) { Ok(t) => t, Err(error) => return api_error(400, error) };
+        let config_root = self.state.lock().expect("state mutex").config_root.clone();
+        let state_file = SyncState::state_path(&config_root, &SyncState::make_key(&host_key, &local_root.to_string_lossy(), &remote_root));
+        let state = SyncState::load(&state_file).unwrap_or_default();
+        match plan_synchronization(session.as_ref().as_ref(), &local_root, &remote_root, &opts, &state).await {
+            Ok(items) => ApiReply { status: 200, payload: json!({"success": true, "plan": sync_plan_json(&items)}) },
+            Err(error) => api_error(400, error),
+        }
+    }
+
+    /// Queues a synchronization as one task, so the queue's pause, cancel and
+    /// progress apply to it exactly as they do to a transfer.
+    async fn sync_run_async(&self, body: Value) -> ApiReply {
+        let (session, id, host_key, _dir) = match self.sync_target(&body) { Ok(t) => t, Err(reply) => return reply };
+        let (local_root, remote_root, opts) = match Self::sync_options_from(&body) { Ok(t) => t, Err(error) => return api_error(400, error) };
+        // The same options a preview used, so what the user saw is what runs.
+        let config_root = self.state.lock().expect("state mutex").config_root.clone();
+        if !local_root.is_dir() { return api_error(400, "The local directory does not exist.") }
+        let job = crate::queue::QueueJob::SyncRun {
+            session,
+            config_dir: config_root,
+            host_key,
+            local_root: local_root.clone(),
+            remote_root: remote_root.clone(),
+            opts,
+        };
+        let task_id = self.queue.enqueue(Some(id), "sync", format!("Synchronize {remote_root}"),
+            local_root.to_string_lossy().into_owned(), remote_root.clone(), 0,
+            body.get("priority").and_then(Value::as_bool).unwrap_or(false), job);
+        ApiReply { status: 200, payload: json!({"success": true, "task_id": task_id}) }
+    }
+
+    /// Opens an embedded terminal on a tab's pooled SSH connection.
+    async fn open_terminal_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected"),
+        };
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        let ssh = match session.ssh_connection() {
+            Some(ssh) => ssh.clone(),
+            // A terminal is an SSH shell; FTP, WebDAV and S3 have none, and
+            // saying so is better than opening a window that cannot work.
+            None => return api_error(501, "This connection has no SSH shell; open an SSH or SFTP session for a terminal."),
+        };
+        let cols = body.get("cols").and_then(Value::as_u64).unwrap_or(100) as u32;
+        let rows = body.get("rows").and_then(Value::as_u64).unwrap_or(30) as u32;
+        let (terminal_id, event_tx) = {
+            let mut g = self.state.lock().expect("state mutex");
+            let terminal_id = g.terminals.allocate_id();
+            let event_tx = self.event_sender();
+            (terminal_id, event_tx)
+        };
+        match terminal_bridge::EmbeddedTerminal::open_over_ssh(
+            terminal_id.clone(), id, &ssh, cols, rows, Some(tab.remote_dir.as_str()), event_tx,
+        ).await {
+            Ok(terminal) => {
+                self.state.lock().expect("state mutex").terminals.insert(terminal);
+                ApiReply { status: 200, payload: json!({"success": true, "terminal": terminal_id}) }
+            }
+            Err(error) => api_error(400, error),
+        }
+    }
+
+    fn terminal_write(&self, body: Value) -> ApiReply {
+        let terminal_id = body.get("terminal").and_then(Value::as_str).unwrap_or("");
+        let terminal = match self.state.lock().expect("state mutex").terminals.get(terminal_id) {
+            Some(terminal) => terminal, None => return api_error(400, "This terminal is no longer open."),
+        };
+        // Input is base64 so a paste of arbitrary text and control bytes
+        // arrives byte for byte; plain text is accepted for a simple caller.
+        let data = match body.get("data").and_then(Value::as_str) {
+            Some(encoded) if !encoded.is_empty() => match BASE64_STD.decode(encoded) {
+                Ok(bytes) => bytes,
+                Err(_) => body.get("data").and_then(Value::as_str).unwrap_or("").as_bytes().to_vec(),
+            },
+            // A resize arrives as the same call with empty data.
+            _ => Vec::new(),
+        };
+        let cols = body.get("cols").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let rows = body.get("rows").and_then(Value::as_u64).unwrap_or(0) as u32;
+        if cols > 0 && rows > 0 && !terminal.resize(cols, rows) {
+            return api_error(400, "Invalid terminal size.");
+        }
+        if !data.is_empty() && !terminal.write(&data) {
+            return api_error(400, "The terminal session ended.");
+        }
+        ApiReply { status: 200, payload: json!({"success": true}) }
+    }
+
+    fn terminal_read(&self, query: &BTreeMap<String,String>) -> ApiReply {
+        let terminal_id = query.get("terminal").map(String::as_str).unwrap_or("");
+        let terminal = match self.state.lock().expect("state mutex").terminals.get(terminal_id) {
+            Some(terminal) => terminal, None => return api_error(400, "This terminal is no longer open."),
+        };
+        let after = query.get("after").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let (data, offset, alive, exit_code) = terminal.poll(after);
+        ApiReply { status: 200, payload: json!({
+            "success": true,
+            "data": BASE64_STD.encode(&data),
+            "offset": offset,
+            "alive": alive,
+            "exit_code": exit_code,
+        })}
+    }
+
+    fn terminal_close(&self, body: Value) -> ApiReply {
+        let terminal_id = body.get("terminal").and_then(Value::as_str).unwrap_or("");
+        // Closing twice is not an error: the window can be closed while a poll
+        // already reported the end of the session, so the answer is the same
+        // whether or not there was anything left to close.
+        self.state.lock().expect("state mutex").terminals.close(terminal_id);
+        ApiReply { status: 200, payload: json!({"success": true}) }
+    }
+
+    /// Queues the files a file manager handed over. Nothing is uploaded until
+    /// the user confirms in the page, which is what this call is.
+    async fn consume_shell_offer_async(&self, body: Value) -> ApiReply {
+        let id = match body.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+            Some(id) => id.to_string(),
+            None => return api_error(400, "A pending selection is required."),
+        };
+        let tab_id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&tab_id).cloned() {
+            Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected"),
+        };
+        let config_root = self.state.lock().expect("state mutex").config_root.clone();
+        // `take` removes the manifest, so a selection is offered and queued at
+        // most once even if two windows poll at the same time.
+        let manifest = match ops::take_shell_manifest(&config_root, &id) {
+            Ok(manifest) => manifest,
+            Err(error) => return api_error(400, error),
+        };
+        let items = manifest.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+        let mut queued = Vec::new();
+        let mut missing = Vec::new();
+        let mut refused = Vec::new();
+        for item in items {
+            let path = item.get("path").and_then(Value::as_str).unwrap_or("");
+            let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+            if name.is_empty() || !Path::new(path).exists() {
+                if !name.is_empty() { missing.push(name.to_string()); }
+                continue;
+            }
+            let request = json!({
+                "tab": tab.id,
+                "local_dir": Path::new(path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+                "remote_dir": tab.remote_dir,
+                "names": [name],
+            });
+            let reply = self.queue_transfer_async(request, true, false).await;
+            if reply.payload.get("success").and_then(Value::as_bool).unwrap_or(false) {
+                queued.push(name.to_string());
+            } else {
+                // The file is there but the transfer was refused (a name the
+                // panel cannot take, a destination that changed). Saying
+                // "missing" would send the user looking for a file that exists.
+                let reason = reply.payload.get("error").and_then(Value::as_str)
+                    .unwrap_or("The transfer was refused.").to_string();
+                refused.push(json!({"name": name, "error": reason}));
+            }
+        }
+        ApiReply { status: 200, payload: json!({
+            "success": true, "queued": queued, "missing": missing, "refused": refused,
+        }) }
+    }
+
+    /// The broadcast sender the page and the native window listen on. Created
+    /// once and shared, so a terminal opened on any request reaches the same
+    /// listeners as the queue's progress.
+    fn event_sender(&self) -> tokio::sync::broadcast::Sender<Value> {
+        let mut slot = self.event_tx.lock().expect("event sender mutex");
+        match slot.as_ref() {
+            Some(sender) => sender.clone(),
+            None => {
+                let (sender, _) = tokio::sync::broadcast::channel(128);
+                *slot = Some(sender.clone());
+                sender
+            }
+        }
+    }
+
+    /// Reads a remote file into the page's editor.
+    async fn remote_edit_read_async(&self, query: &BTreeMap<String,String>) -> ApiReply {
+        let id = match query.get("tab").and_then(|s| parse_tab_id_str(Some(s))) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
+        };
+        if tab.is_local { return self.handle_remote_edit_get(query); }
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        let path = match validate_remote_absolute_path(query.get("path").map(String::as_str).unwrap_or("")) {
+            Ok(path) => path, Err(error) => return api_error(400, error),
+        };
+        let entry = match session.stat(&path).await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return api_error(400, "The file does not exist."),
+            Err(error) => return api_error(400, error.to_string()),
+        };
+        if entry.is_dir { return api_error(400, "Cannot open a directory in the text editor.") }
+        if entry.is_symlink { return api_error(400, "Refusing to edit a symbolic link.") }
+        // The limit is the local editor's, so a file it accepts over SFTP is
+        // accepted here too, and a larger one is refused before downloading it.
+        if entry.size > ops::MAX_GUI_EDIT_BYTES {
+            return api_error(400, format!(
+                "File is too large for the built-in editor ({} bytes; maximum {} bytes).",
+                entry.size, ops::MAX_GUI_EDIT_BYTES));
+        }
+        let bytes = match linscp_proto::download_bytes(session.as_ref().as_ref(), &path,
+            linscp_proto::TransferRequest::default()).await
+        {
+            Ok(bytes) => bytes,
+            Err(error) => return api_error(400, error.to_string()),
+        };
+        if bytes.contains(&0) { return api_error(400, "Refusing to edit binary file containing NUL bytes.") }
+        let content = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => return api_error(400, "File is not valid UTF-8 binary/encoded text."),
+        };
+        ApiReply { status: 200, payload: json!({
+            "success": true,
+            "path": path,
+            "content": content,
+            "info": {"size": entry.size, "mtime": entry.mtime, "mtime_ns": entry.mtime.to_string()},
+        })}
+    }
+
+    /// Saves the editor's content to a remote path. A remote file has no
+    /// nanosecond mtime on every protocol, so the guard is the second-precision
+    /// mtime the listing shows; comparing it catches the edit that lost a race.
+    async fn remote_save_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
+        };
+        if tab.is_local {
+            // "Save as" on a local tab writes to the other pane's directory,
+            // which is the local filesystem the tab already owns.
+            let mut local_body = body.clone();
+            if let Some(path) = body.get("path").and_then(Value::as_str) {
+                if path.starts_with('/') { local_body["path"] = json!(path); }
+                else {
+                    let joined = format!("{}/{}", tab.other_local_dir.trim_end_matches('/'), path);
+                    local_body["path"] = json!(joined);
+                }
+            }
+            return self.handle_local_save(local_body);
+        }
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        let path = match validate_remote_absolute_path(body.get("path").and_then(Value::as_str).unwrap_or("")) {
+            Ok(path) => path, Err(error) => return api_error(400, error),
+        };
+        let content = body.get("content").and_then(Value::as_str).unwrap_or("");
+        if content.len() as u64 > ops::MAX_GUI_EDIT_BYTES {
+            return api_error(400, "Edited content is too large for the built-in editor.");
+        }
+        let expected = body.get("base_mtime").and_then(Value::as_i64);
+        let existing = match session.stat(&path).await {
+            Ok(entry) => entry,
+            Err(error) => return api_error(400, error.to_string()),
+        };
+        if let Some(entry) = existing.as_ref() {
+            if entry.is_dir { return api_error(400, "Cannot overwrite a directory.") }
+            if entry.is_symlink { return api_error(400, "Refusing to overwrite a symbolic link from the editor.") }
+            if let Some(expected) = expected.filter(|seconds| *seconds > 0) {
+                if entry.mtime != expected {
+                    return api_error(400, "The file changed while it was open in the editor; reload before saving.");
+                }
+            }
+        }
+        // The editor writes through the same upload path as a queued
+        // transfer, so the transport's own atomic replace is what the user gets.
+        match linscp_proto::upload_bytes(session.as_ref().as_ref(), &path, content.as_bytes(),
+            linscp_proto::TransferRequest::default()).await
+        {
+            Ok(_) => match session.stat(&path).await {
+                Ok(Some(entry)) => ApiReply { status: 200, payload: json!({
+                    "success": true,
+                    "info": {"size": entry.size, "mtime": entry.mtime, "mtime_ns": entry.mtime.to_string()},
+                })},
+                _ => ApiReply { status: 200, payload: json!({"success": true}) },
+            },
+            Err(error) => api_error(400, error.to_string()),
+        }
+    }
+
+    /// Builds a console interpreter wired to the tab the user is looking at.
+    /// Its output goes to an attached collector rather than to the process's
+    /// own terminal; the caller attaches one with `capture_console`.
+    fn console_interpreter(
+        &self,
+        tab: Option<tabs::TabRuntime>,
+    ) -> Result<linscp_engine::script::ScriptInterpreter, ApiReply> {
+        let config_root = self.state.lock().expect("state mutex").config_root.clone();
+        let cfg = linscp_engine::script::ScriptRunConfig {
+            config_dir: config_root,
+            // The GUI already asked before anything destructive; a confirm
+            // inside the panel cannot be answered, so it must not wait.
+            batch_mode: linscp_engine::script::BatchMode::Abort,
+            echo: false,
+            log_level: 0,
+            ..linscp_engine::script::ScriptRunConfig::default()
+        };
+        let logger = linscp_engine::xml_log::SessionLogger::open(None, 0, false, None, None, false, "")
+            .map_err(|error| api_error(500, error.to_string()))?;
+        let mut interpreter = linscp_engine::script::ScriptInterpreter::new(cfg, logger);
+        if let Some(tab) = tab.filter(|tab| tab.connected) {
+            // The local directory is the panel's, so `lcd`/`lpwd` start where
+            // the user is looking rather than at the process's own directory.
+            if Path::new(&tab.local_dir).is_dir() {
+                interpreter.set_local_dir(PathBuf::from(&tab.local_dir));
+            }
+            // The tab's own session is shared, not reconnected: the
+            // interpreter only needs the directories around it.
+            if let (Some(session), Some(spec)) = (tab.remote.clone(), tab.spec.clone()) {
+                interpreter.adopt_session(spec, session, tab.remote_dir.clone(), PathBuf::from(&tab.local_dir));
+            }
+        }
+        Ok(interpreter)
+    }
+
+    /// Runs one console-client command from the GUI's CLI panel. The same
+    /// `ScriptInterpreter` the `linscp -command` runner uses executes the line,
+    /// so `ls`, `option`, `put` and the rest cannot drift between the two
+    /// applications; the active tab's session is adopted as the first slot.
+    async fn exec_cli_command_async(&self, body: Value) -> ApiReply {
+        let line = body.get("command").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        if line.is_empty() { return api_error(400, "Type a command.") }
+        if line.len() > 4096 { return api_error(400, "The command is too long.") }
+        // A line with a newline would run a second command nobody typed.
+        if line.contains('\n') || line.contains('\r') {
+            return api_error(400, "A command with a newline is never written.");
+        }
+        let tab = body.get("tab").and_then(|value| tabs::parse_tab_id_value(Some(value)))
+            .and_then(|id| self.state.lock().expect("state mutex").tabs.get(&id).cloned());
+        let mut interpreter = match self.console_interpreter(tab.clone()) {
+            Ok(interpreter) => interpreter,
+            Err(reply) => return reply,
+        };
+        let (ok, stdout, stderr) = interpreter.run_captured(&line).await;
+        // `cd` and `lcd` move the panes, so the tab's directories follow the
+        // interpreter's own working directories after the line ran.
+        if let Some((local_cwd, remote_cwd)) = interpreter.working_directories() {
+            if let Some(tab) = tab.filter(|tab| tab.connected && !tab.is_local) {
+                if let Some(current) = self.state.lock().expect("state mutex").tabs.get_mut(&tab.id) {
+                    current.remote_dir = remote_cwd;
+                    current.local_dir = local_cwd.to_string_lossy().into_owned();
+                }
+            }
+        }
+        let exit_code = if ok && interpreter.error_count() == 0 { 0 } else { 1 };
+        ApiReply { status: 200, payload: json!({
+            "success": ok,
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": exit_code,
+        })}
+    }
+
+    /// Installs the current key on the server by running the interpreter's
+    /// own `copyid`, so the GUI and the console cannot install a key
+    /// differently.
+    async fn copy_id_async(&self, body: Value) -> ApiReply {
+        let tab_id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&tab_id).cloned() {
+            Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected"),
+        };
+        let keyfile = body.get("keyfile").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        // `copyid` works in the console only on an SSH session whose site
+        // names a private key; it installs the matching public key, and with
+        // no key configured the command would need an argument nobody typed.
+        // Refusing here explains that instead of running a command whose
+        // answer is a syntax hint.
+        if !matches!(
+            tab.remote.as_ref().map(|session| session.scheme()),
+            Some(linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)
+        ) {
+            return api_error(400, "Installing a key needs an SSH, SFTP or SCP session.");
+        }
+        let configured_key = tab
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.session.keyfile.clone())
+            .filter(|key| !key.trim().is_empty());
+        // The dialogue accepts blank for "the key this session uses".
+        let line = match (keyfile.is_empty(), configured_key) {
+            (true, Some(_)) => "copyid".to_string(),
+            (true, None) => {
+                return api_error(400, "This site names no private key; the dialogue needs a key file.")
+            }
+            (false, _) => format!("copyid \"{}\"", keyfile.replace('"', "")),
+        };
+        let mut interpreter = match self.console_interpreter(Some(tab)) {
+            Ok(interpreter) => interpreter,
+            Err(reply) => return reply,
+        };
+        let (ok, stdout, stderr) = interpreter.run_captured(&line).await;
+        if ok {
+            ApiReply { status: 200, payload: json!({"success": true, "output": stdout}) }
+        } else {
+            let error = if stderr.trim().is_empty() { stdout.trim().to_string() } else { stderr.trim().to_string() };
+            ApiReply { status: 400, payload: json!({"success": false, "error": error, "output": stdout}) }
         }
     }
 
@@ -1095,7 +1891,6 @@ impl CommanderService {
         }
         ApiReply{ status: 200, payload: json!({"success": true, "workspace": json!({"name": name})})}
     }
-    fn handle_workspaces_open(&self, _body: Value) -> ApiReply { Self::not_implemented() }
     fn handle_workspaces_delete(&self, body: Value) -> ApiReply {
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let cfg = self.state.lock().expect("m").config_root.clone();
@@ -1157,6 +1952,9 @@ impl CommanderService {
         g.tabs.remove(&tab_id);
         g.challenges.remove(&tab_id);
         g.pending_connections.remove(&tab_id);
+        // A terminal lives in a tab's connection; closing the tab must not
+        // leave the shell running with no window to show it.
+        g.terminals.close_for_tab(tab_id);
         if g.active_tab_id == Some(tab_id) { g.active_tab_id = g.tabs.keys().next().cloned(); }
         ApiReply{ status: 200, payload: json!({"success": true})}
     }
@@ -1188,7 +1986,9 @@ impl CommanderService {
         let target = match resolve_contained(&base, &name) {
             Ok(p) => p, Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
         };
-        match std::fs::create_dir_all(&target) {
+        // `LocalFs`, not `std::fs`: a granted Android folder has no pathname,
+        // and the pane must be able to create a directory there too.
+        match self.local_fs.mkdir_all(&target) {
             Ok(_) => ApiReply{ status: 200, payload: json!({"success": true})},
             Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})},
         }
@@ -1202,8 +2002,10 @@ impl CommanderService {
         for name in names {
             match resolve_contained(&base, &name) {
                 Ok(p) => {
-                    let path = Path::new(&p);
-                    let res = if path.is_dir() && !path.is_symlink() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+                    // The kind comes from `LocalFs`, so this works for a
+                    // granted Android folder as well as for a POSIX path.
+                    let is_dir = self.local_fs.stat(&p).map(|entry| entry.is_dir).unwrap_or(false);
+                    let res = if is_dir { self.local_fs.remove_dir_all(&p) } else { self.local_fs.remove_file(&p) };
                     if let Err(e) = res { errs.push(format!("{name}: {e}")); }
                 },
                 Err(e) => errs.push(format!("{name}: {e}")),
@@ -1219,7 +2021,7 @@ impl CommanderService {
         if old.is_empty() || new.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Both names are required"})}; }
         let src = match resolve_contained(&base, &old) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
         let dst = match resolve_contained(&base, &new) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
-        match gui_os::rename_no_replace(Path::new(&src), Path::new(&dst)) {
+        match self.local_fs.rename(&src, &dst) {
             Ok(_) => ApiReply{ status: 200, payload: json!({"success": true})},
             Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})},
         }
@@ -1283,7 +2085,6 @@ impl CommanderService {
         let pending = ops::list_shell_manifests(&cfg);
         ApiReply{ status: 200, payload: json!({"success": true, "pending": pending})}
     }
-    fn handle_shell_consume(&self, _body: Value) -> ApiReply { Self::not_implemented() }
     fn handle_shell_dismiss(&self, body: Value) -> ApiReply {
         let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let cfg = self.state.lock().expect("m").config_root.clone();
@@ -1292,6 +2093,235 @@ impl CommanderService {
             Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
         }
     }
+    /// Body of a desktop drop.
+    ///
+    /// The apps reach this handler differently: a browser posts raw bytes, the
+    /// shared bundle posts JSON over Tauri IPC, and a test can post a file. One
+    /// representation inside the service keeps the drop identical everywhere
+    /// instead of working only where the HTTP layer happened to listen.
+    fn drop_payload(body: &Value) -> Result<Vec<u8>, String> {
+        if let Some(text) = body.get("data_base64").and_then(Value::as_str) {
+            return BASE64_STD
+                .decode(text)
+                .map_err(|_| "The dropped file is not valid base64.".to_string());
+        }
+        if let Some(items) = body.as_array() {
+            return Ok(json!(items).to_string().into_bytes());
+        }
+        if !body.is_object() {
+            return Ok(body.to_string().into_bytes());
+        }
+        Err("The dropped file arrived without any content.".to_string())
+    }
+
+    /// Saves one dropped file into the local panel.
+    ///
+    /// The bytes go through the same `LocalFs` the panes use, so a drop into a
+    /// granted Android folder, a Windows drive or a POSIX directory behaves the
+    /// same way and never bypasses the write rules (`content://` included).
+    fn handle_local_drop(&self, query: &BTreeMap<String,String>, body: Value) -> ApiReply {
+        let (base, name, relative) = match self.drop_target(query, &body, true) {
+            Ok(parts) => parts,
+            Err(reply) => return reply,
+        };
+        let bytes = match Self::drop_payload(&body) {
+            Ok(bytes) => bytes,
+            Err(error) => return api_error(400, error),
+        };
+        let target = match self.drop_destination(&base, &name, &relative) {
+            Ok(path) => path,
+            Err(error) => return api_error(400, error),
+        };
+        if let Some(parent) = target.parent() {
+            let parent = parent.to_string_lossy();
+            if !parent.is_empty() {
+                if let Err(error) = self.local_fs.mkdir_all(&parent) {
+                    return api_error(400, format!("Cannot create the drop folder: {error}"));
+                }
+            }
+        }
+        let target_path = target.to_string_lossy().into_owned();
+        if let Err(error) = self.local_fs.write_bytes_atomic(&target_path, &bytes) {
+            return api_error(400, format!("Cannot save the dropped file: {error}"));
+        }
+        self.add_log(&format!("Saved the dropped file '{target_path}'."), "info");
+        ApiReply{ status: 200, payload: json!({"success": true, "path": target_path, "size": bytes.len()})}
+    }
+
+    /// Creates the folders a dropped directory contained, including empty ones.
+    fn handle_local_drop_dir(&self, body: Value) -> ApiReply {
+        let (base, _name, relative) = match self.drop_target(&BTreeMap::new(), &body, true) {
+            Ok(parts) => parts,
+            Err(reply) => return reply,
+        };
+        if relative.is_empty() {
+            return api_error(400, "A relative path is required.");
+        }
+        let target = match self.drop_destination(&base, "", &relative) {
+            Ok(path) => path,
+            Err(error) => return api_error(400, error),
+        };
+        let target_path = target.to_string_lossy().into_owned();
+        match self.local_fs.mkdir_all(&target_path) {
+            Ok(_) => ApiReply{ status: 200, payload: json!({"success": true, "path": target_path})},
+            Err(error) => api_error(400, format!("Cannot create the dropped folder: {error}")),
+        }
+    }
+
+    /// Stages a dropped file and queues it for the remote panel.
+    ///
+    /// A drop is not a second transfer implementation: the bytes are written
+    /// into app-private staging under the name the user dropped, and then the
+    /// ordinary upload endpoint is called. Pause, cancel, retry, conflict
+    /// detection and the overwrite rules therefore behave exactly as they do
+    /// for a file copied out of the local pane.
+    async fn handle_transfer_drop(&self, body: Value) -> ApiReply {
+        let (remote_dir, name, relative) = match self.drop_target(&BTreeMap::new(), &body, false) {
+            Ok(parts) => parts,
+            Err(reply) => return reply,
+        };
+        let tab_id = match tabs::parse_tab_id_value(body.get("tab")) {
+            Some(id) => id,
+            None => return api_error(400, "Not connected"),
+        };
+        let tab = match self.state.lock().expect("m").tabs.get(&tab_id).cloned() {
+            Some(tab) if tab.connected => tab,
+            _ => return api_error(400, "Not connected"),
+        };
+        if tab.is_local {
+            return api_error(400, "This panel has no server to upload to.");
+        }
+        let bytes = match Self::drop_payload(&body) {
+            Ok(bytes) => bytes,
+            Err(error) => return api_error(400, error),
+        };
+        // The panel directory plus the folder the drop carried. The leaf name
+        // stays in the file name, so staging and destination agree.
+        let destination_dir = if relative.is_empty() {
+            remote_dir
+        } else {
+            match ops::validate_relative_subpath(&relative) {
+                Ok(sub) => format!("{}/{}", remote_dir.trim_end_matches('/'), sub.to_string_lossy().replace('\\', "/")),
+                Err(error) => return api_error(400, error),
+            }
+        };
+        let staging = match self.drop_staging_dir() {
+            Ok(path) => path,
+            Err(error) => return api_error(500, error),
+        };
+        let staged = staging.join(&name);
+        if let Err(error) = std::fs::write(&staged, &bytes) {
+            return api_error(500, format!("Cannot stage the dropped file: {error}"));
+        }
+        let request = json!({
+            "tab": tab.id,
+            "local_dir": staging.to_string_lossy(),
+            "remote_dir": destination_dir,
+            "names": [name],
+        });
+        let reply = self.queue_transfer_async(request, true, false).await;
+        if !reply.payload.get("success").and_then(Value::as_bool).unwrap_or(false) {
+            // The queue never took it, so the staged copy is ours to remove.
+            let _ = std::fs::remove_file(&staged);
+        }
+        reply
+    }
+
+    /// Creates the remote directories a dropped folder contained.
+    async fn handle_transfer_drop_dir(&self, body: Value) -> ApiReply {
+        let remote_dir = body.get("remote_dir").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        if remote_dir.is_empty() || !remote_dir.starts_with('/') {
+            return api_error(400, "A destination directory is required.");
+        }
+        if remote_dir.chars().any(char::is_control) {
+            return api_error(400, "The destination must not contain control characters.");
+        }
+        let relative = match body.get("relative_path").and_then(Value::as_str) {
+            Some(rel) => match ops::validate_relative_subpath(rel) {
+                Ok(path) => path.to_string_lossy().replace('\\', "/"),
+                Err(error) => return api_error(400, error),
+            },
+            None => return api_error(400, "A relative path is required."),
+        };
+        // An empty dropped folder has no files to carry it, so each segment is
+        // created deliberately; MKCOL/mkdir on an existing one is not an error.
+        let mut created = remote_dir.trim_end_matches('/').to_string();
+        for segment in relative.split('/').filter(|part| !part.is_empty()) {
+            let leaf = match ops::validate_leaf_name(segment) {
+                Ok(name) => name,
+                Err(error) => return api_error(400, error),
+            };
+            created.push('/');
+            created.push_str(&leaf);
+            let request = json!({
+                "tab": body.get("tab").cloned().unwrap_or(json!(0)),
+                "name": leaf,
+                "remote_dir": created.rsplit_once('/').map(|(parent, _)| parent.to_string()).unwrap_or_default(),
+            });
+            let reply = self.mkdir_remote_async_with_base(request).await;
+            let ok = reply.payload.get("success").and_then(Value::as_bool).unwrap_or(false);
+            // "Already exists" proves the folder is there, which is all a
+            // merge into an existing tree needs.
+            if !ok && !reply.payload.get("error").and_then(Value::as_str).is_some_and(|error| error.to_lowercase().contains("exist")) {
+                return reply;
+            }
+        }
+        ApiReply{ status: 200, payload: json!({"success": true, "path": created})}
+    }
+
+    /// The private directory a dropped file waits in until its upload runs.
+    fn drop_staging_dir(&self) -> Result<PathBuf, String> {
+        let staging = self.config_root().join("drop-staging");
+        std::fs::create_dir_all(&staging).map_err(|error| format!("Cannot stage the dropped file: {error}"))?;
+        Ok(staging)
+    }
+
+
+    /// Reads the panel directory, the leaf name and the relative sub-path of a
+    /// drop, from the query string or from the JSON body.
+    fn drop_target(&self, query: &BTreeMap<String,String>, body: &Value, local: bool) -> Result<(String, String, String), ApiReply> {
+        let dir_key = if local { "local_dir" } else { "remote_dir" };
+        let tab_id = query.get("tab").and_then(|value| parse_tab_id_str(Some(value)))
+            .or_else(|| body.get("tab").and_then(|value| {
+                if value.is_number() { value.as_u64() } else { value.as_str().and_then(|text| text.parse().ok()) }
+            }));
+        let tab = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).cloned());
+        let base = query.get(dir_key).cloned()
+            .or_else(|| body.get(dir_key).and_then(Value::as_str).map(str::to_string))
+            .or_else(|| tab.as_ref().map(|tab| if local { tab.local_dir.clone() } else { tab.remote_dir.clone() }))
+            .unwrap_or_else(|| if local { self.default_local_dir() } else { "/".to_string() });
+        let base = base.trim().to_string();
+        if base.is_empty() {
+            return Err(api_error(400, "The panel directory of this drop is not set."));
+        }
+        if base.chars().any(char::is_control) {
+            return Err(api_error(400, "The panel directory must not contain control characters."));
+        }
+        let raw_name = query.get("name").cloned()
+            .or_else(|| body.get("name").and_then(Value::as_str).map(str::to_string));
+        let name = match raw_name {
+            Some(name) => ops::validate_leaf_name(&name).map_err(|error| api_error(400, error))?,
+            None => return Err(api_error(400, "A file name is required.")),
+        };
+        let relative = query.get("relative_path").cloned()
+            .or_else(|| body.get("relative_path").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default();
+        Ok((base, name, relative))
+    }
+
+    /// The local path a drop lands on: the panel directory, the relative
+    /// sub-path a folder drop carried, and the leaf name.
+    fn drop_destination(&self, base: &str, name: &str, relative: &str) -> Result<PathBuf, String> {
+        let mut target = PathBuf::from(base);
+        if !relative.is_empty() {
+            target.push(ops::validate_relative_subpath(relative)?);
+        }
+        if !name.is_empty() {
+            target.push(ops::validate_leaf_name(name)?);
+        }
+        Ok(target)
+    }
+
     fn handle_session_url(&self, query: &BTreeMap<String,String>) -> ApiReply {
         let tab_id = query.get("tab").and_then(|s| parse_tab_id_str(Some(s)));
         let g = self.state.lock().expect("m");
@@ -1331,7 +2361,7 @@ impl CommanderService {
         if name.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "A name is required"})}; }
         if tab.is_local {
             let target = match resolve_contained(&tab.other_local_dir, &name) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
-            match std::fs::create_dir_all(&target) { Ok(_)=> ApiReply{ status:200, payload: json!({"success": true})}, Err(e)=> ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})}}
+            match self.local_fs.mkdir_all(&target) { Ok(_)=> ApiReply{ status:200, payload: json!({"success": true})}, Err(e)=> ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})}}
         } else { ApiReply{ status:400, payload: json!({"success": false, "error": "Remote mkdir not implemented"})}}
     }
     fn handle_remote_delete(&self, body: Value) -> ApiReply {
@@ -1345,8 +2375,8 @@ impl CommanderService {
             for n in names {
                 match resolve_contained(&tab.other_local_dir, &n) {
                     Ok(p) => {
-                        let path=Path::new(&p);
-                        let res = if path.is_dir() && !path.is_symlink() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+                        let is_dir = self.local_fs.stat(&p).map(|entry| entry.is_dir).unwrap_or(false);
+                        let res = if is_dir { self.local_fs.remove_dir_all(&p) } else { self.local_fs.remove_file(&p) };
                         if let Err(e)=res { errs.push(format!("{n}: {e}")); }
                     },
                     Err(e)=> errs.push(format!("{n}: {e}")),
@@ -1365,10 +2395,44 @@ impl CommanderService {
         if tab.is_local {
             let src = match resolve_contained(&tab.other_local_dir, &old) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
             let dst = match resolve_contained(&tab.other_local_dir, &new) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
-            match gui_os::rename_no_replace(Path::new(&src), Path::new(&dst)) { Ok(_)=> ApiReply{ status:200, payload: json!({"success": true})}, Err(e)=> ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})}}
+            match self.local_fs.rename(&src, &dst) { Ok(_)=> ApiReply{ status:200, payload: json!({"success": true})}, Err(e)=> ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})}}
         } else { ApiReply{ status:400, payload: json!({"success": false, "error": "not implemented"})}}
     }
-    fn handle_remote_chmod(&self, _body: Value) -> ApiReply { Self::not_implemented() }
+    // The panel's own mutation calls arrive through `dispatch_async`, which
+    // has the session; only a local tab reaches this table, and a local tab
+    // has no server-side permissions to change.
+    fn handle_remote_chmod(&self, body: Value) -> ApiReply { self.handle_local_chmod_for_other_pane(body) }
+
+    fn handle_local_chmod_for_other_pane(&self, body: Value) -> ApiReply {
+        let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64() } else { v.as_str().and_then(|s| s.parse().ok()) });
+        let tab = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).cloned());
+        match tab {
+            Some(tab) if tab.is_local => {
+                // A local tab's "remote" side is the other local directory.
+                let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if name.is_empty() { return api_error(400, "Select an item first."); }
+                let perm = body.get("permissions").or_else(|| body.get("mode"))
+                    .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let target = match resolve_contained(&tab.other_local_dir, &name) {
+                    Ok(path) => path,
+                    Err(error) => return api_error(400, error),
+                };
+                let current = match gui_os::stat_extended(Path::new(&target)) {
+                    Ok(info) => info.mode,
+                    Err(error) => return api_error(400, error.to_string()),
+                };
+                let new_mode = match linscp_engine::parse_chmod_spec(&perm, current) {
+                    Ok(mode) => mode,
+                    Err(error) => return api_error(400, error),
+                };
+                match linscp_platform::terminal::set_local_permissions(Path::new(&target), new_mode) {
+                    Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
+                    Err(error) => api_error(400, error.to_string()),
+                }
+            }
+            _ => api_error(400, "Not connected"),
+        }
+    }
     fn handle_remote_properties(&self, body: Value) -> ApiReply {
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
         let g = self.state.lock().expect("m");
@@ -1390,25 +2454,28 @@ impl CommanderService {
         ApiReply{ status:200, payload: json!({"success": true, "properties": rows, "name": rows.get(0).and_then(|v| v.get("name")).cloned().unwrap_or(json!(""))})}
     }
     fn handle_remote_rights(&self, body: Value) -> ApiReply { self.handle_remote_chmod(body) }
-    fn handle_remote_search(&self, _body: Value) -> ApiReply { Self::not_implemented() }
+    // Reaching this table means no connected session, and a search walks a
+    // server tree; there is nothing local to search here.
+    fn handle_remote_search(&self, _body: Value) -> ApiReply { api_error(400, "Not connected") }
     fn handle_remote_checksum(&self, body: Value) -> ApiReply {
         ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}
     }
-    fn handle_remote_save(&self, _body: Value) -> ApiReply { Self::not_implemented() }
-    fn handle_remote_copy(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "not implemented"})}}
-    fn handle_remote_link(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "not implemented"})}}
+    // The editor's save is answered in `dispatch_async`; without a session
+    // there is no remote path to write to.
+    fn handle_remote_save(&self, _body: Value) -> ApiReply { api_error(400, "Not connected") }
+    // The remote forms of these need a session, so they are answered in
+    // `dispatch_async`; reaching the synchronous table means a local tab.
+    fn handle_remote_copy(&self, _body: Value) -> ApiReply { api_error(501, "A server-side copy needs a remote session.") }
+    fn handle_remote_link(&self, _body: Value) -> ApiReply { api_error(501, "A symbolic link needs an SFTP session.") }
     fn handle_sync_preview(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
     fn handle_sync_run(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
     fn handle_transfer_upload(&self, _body: Value) -> ApiReply { Self::not_implemented() }
     fn handle_transfer_download(&self, _body: Value) -> ApiReply { Self::not_implemented() }
     fn handle_transfer_move(&self, _body: Value) -> ApiReply { Self::not_implemented() }
-    fn handle_keepuptodate(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
+    // Answered in `dispatch_async`: asking the queue to watch a directory is
+    // what the synchronous table cannot do. A local tab has no server.
+    fn handle_keepuptodate(&self, _body: Value) -> ApiReply { api_error(400, "Not connected") }
     fn handle_remote_transfer(&self, _body: Value) -> ApiReply { Self::not_implemented() }
-    fn handle_copyid(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
-    fn handle_session_terminal(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
-    fn handle_terminal_input(&self, _body: Value) -> ApiReply { Self::not_implemented() }
-    fn handle_terminal_close(&self, _body: Value) -> ApiReply { Self::not_implemented() }
-    fn handle_terminal_output(&self, _query: &BTreeMap<String,String>) -> ApiReply { Self::not_implemented() }
     fn handle_queue_pause(&self) -> ApiReply { self.queue.pause(); ApiReply{ status:200, payload: json!({"success": true})}}
     fn handle_queue_resume(&self) -> ApiReply { self.queue.resume(); ApiReply{ status:200, payload: json!({"success": true})}}
     fn handle_queue_cancel(&self, body: Value) -> ApiReply {
@@ -1464,7 +2531,9 @@ impl CommanderService {
         let cmd = body.get("command").and_then(|v| v.as_str()).unwrap_or("");
         if cmd.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Empty command"})}; }
         if cmd.contains('\n') || cmd.contains('\r') { return ApiReply{ status:400, payload: json!({"success": false, "error": "A command with a newline is never written"})}; }
-        Self::not_implemented()
+        // The panel's console runs through `exec_cli_command_async`; a caller
+        // that reached the synchronous table still gets a real answer.
+        api_error(501, "The console needs the asynchronous service entry point.")
     }
 
     fn handle_desktop_recommendations(&self) -> ApiReply {
@@ -2128,6 +3197,14 @@ fn api_error(status: u16, error: impl Into<String>) -> ApiReply {
 
 fn resolve_local_path_for_list(path: &str) -> Result<String, String> {
     if path.trim().is_empty() { return Err("No path given".to_string()); }
+    // A granted Android folder is a `content://` tree, not a filesystem path:
+    // `Path::is_absolute` is false for it, but the `LocalFs` can list it. The
+    // URI is validated structurally, so a malformed one is refused with the
+    // same message a relative path gets.
+    if is_saf_path(path) {
+        linscp_platform::parse_saf_document_uri(path).map_err(|error| error.to_string())?;
+        return Ok(path.to_string());
+    }
     let p = Path::new(path);
     if !p.is_absolute() { return Err("The local directory of this panel is not set.".to_string()); }
     let abs = p.to_path_buf();
@@ -2139,6 +3216,11 @@ fn resolve_contained(base: &str, name: &str) -> Result<String, String> {
         return Err(format!("\"{name}\" is not a single file name in this directory."));
     }
     if name.chars().any(|c| c.is_control()) { return Err("A file name must not contain a control character.".to_string()); }
+    if is_saf_path(base) {
+        let base = base.trim_end_matches('/');
+        linscp_platform::parse_saf_document_uri(base).map_err(|error| error.to_string())?;
+        return Ok(format!("{base}/document/{name}"));
+    }
     if base.is_empty() || !Path::new(base).is_absolute() { return Err("The local directory of this panel is not set.".to_string()); }
     let base_path = Path::new(base);
     let target = base_path.join(name);
@@ -2151,10 +3233,165 @@ fn resolve_contained(base: &str, name: &str) -> Result<String, String> {
     if !target_str.starts_with(&base_str) { return Err("The path is outside the panel directory.".to_string()); }
     Ok(target_str)
 }
+/// The names a remote operation targets: an object list (`names: [{name}]`),
+/// a string list, or a single `name`. Order is kept and duplicates removed.
+fn remote_names(body: &Value) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut push = |name: &str| {
+        let name = name.trim();
+        if !name.is_empty() && seen.insert(name.to_string()) { out.push(name.to_string()); }
+    };
+    match body.get("names") {
+        Some(Value::Array(items)) => {
+            for item in items {
+                if let Some(name) = item.as_str() {
+                    push(name);
+                } else if let Some(name) = item.get("name").and_then(Value::as_str) {
+                    push(name);
+                }
+            }
+        }
+        Some(Value::String(name)) => push(name),
+        _ => {}
+    }
+    if out.is_empty() {
+        if let Some(name) = body.get("name").and_then(Value::as_str) { push(name); }
+    }
+    out
+}
+
+/// An absolute remote path without dot segments, control characters or
+/// backslashes – the shape every server accepts and the one the page shows.
+fn validate_remote_absolute_path(path: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || !trimmed.starts_with('/') {
+        return Err("An absolute remote path is required.".to_string());
+    }
+    if trimmed.contains('\\') || trimmed.contains("//") || trimmed.chars().any(char::is_control) {
+        return Err("A remote path must not contain backslashes, empty segments or control characters.".to_string());
+    }
+    if trimmed.split('/').any(|part| part == "." || part == "..") {
+        return Err("A remote path must not contain dot segments.".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Parses an octal permission string (`644`, `0644`, `4755`) into a mode.
+/// Symbolic modes (`u=rw,go=r`) are accepted by the console client only; here
+/// the dialogue asks for octal, so anything else is refused rather than
+/// guessed at.
+fn parse_octal_mode(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 4 || !trimmed.chars().all(|c| ('0'..='7').contains(&c)) {
+        return None;
+    }
+    u32::from_str_radix(trimmed, 8).ok().filter(|mode| *mode <= 0o7777)
+}
+
+/// The canonical spelling of a checksum algorithm, when it is one the
+/// protocols implement.
+fn checksum_algorithm(raw: &str) -> Option<String> {
+    match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "sha256" | "sha-256" => Some("sha-256".to_string()),
+        "sha1" | "sha-1" => Some("sha-1".to_string()),
+        "md5" => Some("md5".to_string()),
+        "crc32" => Some("crc32".to_string()),
+        _ => None,
+    }
+}
+
+/// The plan as the page draws it: one item per path with the action, the
+/// relative path and the reason, plus the counts the summary line shows. The
+/// action names match the page's own (`delete-local`, not `deletelocal`).
+fn sync_plan_json(items: &[linscp_engine::sync_planner::SyncItem]) -> Value {
+    use linscp_engine::sync_planner::SyncAction;
+    let mut counts: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    let mut rows = Vec::with_capacity(items.len());
+    for item in items {
+        let action = match item.action {
+            SyncAction::None => "unchanged",
+            SyncAction::Upload => "upload",
+            SyncAction::Download => "download",
+            SyncAction::DeleteLocal => "delete-local",
+            SyncAction::DeleteRemote => "delete-remote",
+            SyncAction::Conflict => "conflict",
+        };
+        *counts.entry(action).or_insert(0) += 1;
+        rows.push(json!({
+            "action": action,
+            "path": item.rel_path,
+            "is_dir": item.is_directory,
+            "size": item.local_size.max(item.remote_size),
+            "reason": sync_reason_for_page(&item.reason),
+        }));
+    }
+    let summary: serde_json::Map<String, Value> =
+        counts.into_iter().map(|(action, count)| (action.to_string(), json!(count))).collect();
+    json!({"items": rows, "summary": Value::Object(summary), "truncated": false})
+}
+
+/// The plan's reason as the page expects it: a sentence the GUI catalogs carry
+/// a translation for. The planner's own wording is the console client's and
+/// stays there; a phrase the catalogs do not know is passed through unchanged,
+/// so a new reason shows up untranslated rather than missing.
+fn sync_reason_for_page(reason: &str) -> String {
+    let key = match reason {
+        "up to date" => "unchanged",
+        "missing locally" => "the other side does not have it",
+        "missing on remote" => "the other side does not have it",
+        "new locally" => "it is new on the local side",
+        "new on remote" => "it is new on the remote side",
+        "deleted locally" => "it was removed on the other side since the last synchronization",
+        "deleted on remote" => "it was removed on the other side since the last synchronization",
+        "removed locally since last sync" => {
+            "it was removed on the other side since the last synchronization"
+        }
+        "removed on remote since last sync" => {
+            "it was removed on the other side since the last synchronization"
+        }
+        "modified locally" => "it changed locally since the last synchronization",
+        "modified on remote" => "it changed remotely since the last synchronization",
+        "modified on both sides (conflict)" => {
+            "it changed on both sides since the last synchronization"
+        }
+        "modified on both sides with identical timestamps" => {
+            "it changed on both sides since the last synchronization"
+        }
+        "local is newer" => "the local file is newer",
+        "remote is newer" => "the remote file is newer",
+        "size differs" => "the sizes differ",
+        "contents differ" => "the local file differs",
+        "timestamp differs (-mirror)" => "the local file is newer",
+        "type mismatch (file vs directory)" => "it is a directory on one side and a file on the other",
+        "conflict resolved in favour of local" => "conflict resolved in favour of the local file",
+        "conflict resolved in favour of remote" => "conflict resolved in favour of the remote file",
+        "conflict resolved in favour of newer local file" => {
+            "conflict resolved in favour of the newer local file"
+        }
+        "conflict resolved in favour of newer remote file" => {
+            "conflict resolved in favour of the newer remote file"
+        }
+        other => other,
+    };
+    key.to_string()
+}
+
+/// True when `path` is a granted Android folder (`content://` tree URI).
+fn is_saf_path(path: &str) -> bool {
+    path.starts_with("content://")
+}
+
 fn check_local_pane_directory(raw: &str, label: &str) -> Result<String, String> {
     let t = raw.trim();
     if t.is_empty() { return Err(format!("The {label} is required.")); }
     if t.chars().any(|c| c.is_control()) { return Err(format!("The {label} must not contain control characters.")); }
+    // A granted Android folder has no pathname to canonicalize; it is kept
+    // verbatim and `LocalFs` is what proves it is a real root.
+    if is_saf_path(t) {
+        linscp_platform::parse_saf_document_uri(t).map_err(|error| error.to_string())?;
+        return Ok(t.to_string());
+    }
     let p = Path::new(t);
     let abs = if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir().unwrap_or(PathBuf::from(".")).join(p) };
     if !abs.is_dir() { return Err(format!("The {label} does not exist or is not a directory.")); }
@@ -2192,17 +3429,20 @@ mod tests {
     #[test]
     fn unsupported_operations_never_report_success_or_write_files() {
         let svc = CommanderService::default();
+        // Every endpoint the page offers is implemented now. With no
+        // connected tab each must still refuse instead of pretending.
         for path in [
-            "/api/transfer/upload", "/api/transfer/download", "/api/transfer/move",
-            "/api/remote/transfer", "/api/remote/save", "/api/remote/chmod",
-            "/api/remote/rights", "/api/remote/search", "/api/command/exec",
+            "/api/remote/chmod", "/api/remote/search", "/api/remote/checksum",
+            "/api/remote/copy", "/api/remote/link", "/api/remote/rename", "/api/remote/rights",
+            "/api/remote/save", "/api/sync/preview", "/api/sync/run",
+            "/api/session/terminal", "/api/shell/consume", "/api/command/exec",
         ] {
             let reply = svc.dispatch(ApiEnvelope {
                 method: "POST".into(), path: path.into(),
-                body: json!({"command": "test", "path": "nonexistent-test-file"}),
+                body: json!({"tab": 0, "path": "/", "name": "x", "names": ["x"], "data": ""}),
             });
-            assert_eq!(reply.status, 501, "{path}");
-            assert_eq!(reply.payload["success"], false, "{path}");
+            assert_ne!(reply.payload["success"], true, "{path}");
+            assert!((400..500).contains(&reply.status), "{path} answered {}", reply.status);
         }
     }
 
@@ -2257,15 +3497,33 @@ mod tests {
         assert!(state.tabs.contains_key(&first_id) && state.tabs.contains_key(&second_id));
         assert_eq!(state.tabs[&restored].local_dir, left.canonicalize().unwrap().to_string_lossy().into_owned());
         drop(state);
-        let shell = root.join("shell-manifests"); std::fs::create_dir_all(&shell).unwrap();
-        let manifest = shell.join("pending.json"); std::fs::write(&manifest, b"{\"id\":\"pending\"}").unwrap();
-        for path in ["/api/shell/consume", "/api/terminal/input", "/api/terminal/close"] {
-            let reply = svc.dispatch_async(request("POST", path, json!({"id": "pending", "tab": first_id}))).await;
-            assert_eq!(reply.status, 501, "{path}");
-        }
-        assert!(manifest.exists());
-        let reply = svc.dispatch_async(request("GET", "/api/terminal/output", json!({}))).await;
-        assert_eq!(reply.status, 501);
+        // A file manager's selection is staged, offered and only then queued:
+        // a local tab has no server to upload to, so it must refuse and leave
+        // the request in place rather than reporting an upload that cannot run.
+        let shell = root.join("shell-manifests");
+        std::fs::create_dir_all(&shell).unwrap();
+        let manifest = shell.join("pending.json");
+        std::fs::write(&manifest, b"{\"id\":\"pending\",\"items\":[]}").unwrap();
+        let refused = svc.dispatch_async(request("POST", "/api/shell/consume", json!({"id": "pending", "tab": first_id}))).await;
+        assert_eq!(refused.status, 400, "{}", refused.payload);
+        assert_eq!(refused.payload["error"], "Not connected");
+        assert!(manifest.exists(), "a refused offer must stay available");
+
+        // A terminal needs an SSH connection; a local tab has none and says so
+        // instead of opening a window that could never type anything.
+        let terminal = svc.dispatch_async(request("POST", "/api/session/terminal", json!({"tab": first_id}))).await;
+        assert_eq!(terminal.status, 400, "{}", terminal.payload);
+        // Typing into a terminal that is gone is an error the page may
+        // swallow; closing one that is already closed is not, because a poll
+        // that saw the end and the window closing both get here.
+        let typed = svc.dispatch_async(request("POST", "/api/terminal/input", json!({"terminal": "term-1", "data": "bHM="}))).await;
+        assert_eq!(typed.status, 400, "{}", typed.payload);
+        let closed = svc.dispatch_async(request("POST", "/api/terminal/close", json!({"terminal": "term-1"}))).await;
+        assert_eq!(closed.status, 200);
+        assert_eq!(closed.payload["success"], true);
+        let output = svc.dispatch_async(request("GET", "/api/terminal/output?terminal=term-1", json!({}))).await;
+        assert_eq!(output.status, 400, "an unknown terminal is not a success");
+        assert_eq!(output.payload["success"], false);
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -2891,12 +4149,16 @@ mod tests {
         std::fs::write(&foreign_path, &foreign_bytes).unwrap();
         // A forged journal pathname must not cause an unrelated local file to
         // be opened and truncated, even when its content looks legitimate.
-        #[cfg(unix)]
         {
             let target = tmp.join("unrelated-journal-content");
             std::fs::write(&target, &records[0]).unwrap();
-            std::os::unix::fs::symlink(&target, journal_dir.join("upload-symlink.json")).unwrap();
-            std::fs::hard_link(&target, journal_dir.join("upload-hardlink.json")).unwrap();
+            // Symlink creation is a platform helper (Windows needs the
+            // file/directory distinction); this test only cares that a journal
+            // path which is a link is never opened and truncated.
+            gui_os::create_local_symlink(&target.to_string_lossy(), &journal_dir.join("upload-symlink.json")).unwrap();
+            // A volume without hard links cannot build this fixture; the
+            // symlink below still proves a linked journal path is refused.
+            let _ = std::fs::hard_link(&target, journal_dir.join("upload-hardlink.json"));
         }
         // Seed another client's upload for the same destination key. Only our
         // journaled upload ID may be aborted on reconnect.
@@ -2907,7 +4169,6 @@ mod tests {
         let reopened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "s3", "host": "127.0.0.1", "port": port, "s3_access_key": "AKIDTEST", "s3_secret_key": "testsecret42", "s3_region": "us-east-1", "tls_ca_file": tests.join("fixtures/s3-server-cert.pem"), "local_dir": local, "initial_dir": "/"}}))).await;
         assert_eq!(reopened.status, 200, "{}", reopened.payload);
         assert_eq!(std::fs::read(&foreign_path).unwrap(), foreign_bytes, "other endpoints must not be touched");
-        #[cfg(unix)]
         assert_eq!(std::fs::read(tmp.join("unrelated-journal-content")).unwrap(), records[0], "linked paths must not be modified");
         let nonempty_owned_records = std::fs::read_dir(&journal_dir).unwrap().filter_map(Result::ok).filter(|entry| {
             let name = entry.file_name();
@@ -5274,4 +6535,233 @@ mod tests {
         assert_eq!(list_reply.payload["folders"][0], "prod");
         let _ = std::fs::remove_dir_all(&tmp);
     }
+    #[test]
+    fn desktop_drops_are_saved_by_the_same_endpoint_in_every_app() {
+        // The page sends one JSON body (base64 bytes) on both transports, so
+        // the browser and the native window reach this handler; the HTTP layer
+        // only has to turn a raw browser upload into the same body.
+        let tmp = std::env::temp_dir().join(format!("linscp-drop-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let local = tmp.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+
+        let saved = svc.dispatch(ApiEnvelope {
+            method: "POST".to_string(),
+            path: "/api/local/drop".to_string(),
+            body: json!({
+                "local_dir": local.to_string_lossy(),
+                "name": "dropped.txt",
+                "relative_path": "folder/nested",
+                "data_base64": BASE64_STD.encode(b"dropped bytes"),
+            }),
+        });
+        assert_eq!(saved.status, 200, "{}", saved.payload);
+        assert_eq!(
+            std::fs::read(local.join("folder/nested/dropped.txt")).unwrap(),
+            b"dropped bytes",
+            "a drop keeps the folder it was dragged from"
+        );
+
+        // An empty dropped folder still exists afterwards.
+        let created = svc.dispatch(ApiEnvelope {
+            method: "POST".to_string(),
+            path: "/api/local/drop-dir".to_string(),
+            body: json!({
+                "local_dir": local.to_string_lossy(),
+                "relative_path": "tree/empty",
+            }),
+        });
+        assert_eq!(created.status, 200, "{}", created.payload);
+        assert!(local.join("tree/empty").is_dir());
+
+        // Every unsafe shape is refused, and nothing is written outside.
+        for body in [
+            json!({"local_dir": local.to_string_lossy(), "name": "../escape.txt", "data_base64": ""}),
+            json!({"local_dir": local.to_string_lossy(), "name": "ok.txt", "relative_path": "../../etc", "data_base64": ""}),
+            json!({"local_dir": local.to_string_lossy(), "name": "ok.txt"}),
+            json!({"local_dir": local.to_string_lossy(), "data_base64": "AAAA"}),
+        ] {
+            let reply = svc.dispatch(ApiEnvelope { method: "POST".to_string(), path: "/api/local/drop".to_string(), body });
+            assert_eq!(reply.status, 400, "{}", reply.payload);
+        }
+        assert!(!tmp.join("escape.txt").exists());
+
+        // Signing out answers in the native app too, where there is no account
+        // server; the page offers the menu entry on every host.
+        let logout = svc.dispatch(ApiEnvelope { method: "POST".to_string(), path: "/api/logout".to_string(), body: json!({}) });
+        assert_eq!(logout.status, 200);
+        let session = svc.dispatch(ApiEnvelope { method: "GET".to_string(), path: "/api/login".to_string(), body: json!({}) });
+        assert_eq!(session.status, 200);
+        assert_eq!(session.payload["logged_in"], false);
+
+        // An upload drop needs a connected remote tab and says so instead of
+        // reporting success or writing a file.
+        let upload = svc.dispatch(ApiEnvelope {
+            method: "POST".to_string(),
+            path: "/api/transfer/drop".to_string(),
+            body: json!({"tab": 0, "remote_dir": "/incoming", "name": "x.txt", "data_base64": "eA=="}),
+        });
+        assert_eq!(upload.status, 400, "{}", upload.payload);
+        assert!(!tmp.join("config/drop-staging/x.txt").exists(), "a refused drop leaves no staged file");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The console panel can only run something that is one command line.
+    /// Anything else is refused before an interpreter is built, so a pasted
+    /// script cannot run as a series of commands nobody confirmed.
+    #[tokio::test]
+    async fn the_console_refuses_an_empty_or_multi_line_command() {
+        let svc = CommanderService::default();
+        let request = |body: Value| ApiEnvelope {
+            method: "POST".into(), path: "/api/command/exec".into(), body,
+        };
+        // The command stays on one line: the interpreter is not a script
+        // runner, so a server-mode line is never built here.
+        let long = "x".repeat(4097);
+        for body in [
+            json!({"command": "   ", "tab": 0}),
+            json!({"command": "lpwd\nrm /", "tab": 0}),
+            json!({"command": "lpwd\rrm /", "tab": 0}),
+            json!({"command": long, "tab": 0}),
+        ] {
+            let reply = svc.dispatch_async(request(body.clone())).await;
+            assert_eq!(reply.status, 400, "{body}: {}", reply.payload);
+            assert_eq!(reply.payload["success"], false, "{body}");
+        }
+    }
+
+    /// A command that needs a server says so instead of failing obscurely.
+    #[tokio::test]
+    async fn a_console_command_without_a_session_refuses_the_remote_side() {
+        let svc = CommanderService::default();
+        let reply = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(), path: "/api/command/exec".into(),
+            body: json!({"command": "ls", "tab": 0}),
+        }).await;
+        assert_eq!(reply.status, 200, "the console itself answers");
+        assert_eq!(reply.payload["success"], false);
+        assert_eq!(reply.payload["exit_code"], 1);
+        assert!(
+            reply.payload["stderr"].as_str().unwrap_or("").contains("Not connected"),
+            "the error explains the missing connection: {}",
+            reply.payload
+        );
+    }
+
+    /// `copyid` and keep-up-to-date both need a live server; with no tab they
+    /// must refuse rather than report a task that cannot run.
+    #[tokio::test]
+    async fn copyid_and_keep_up_to_date_refuse_without_a_connection() {
+        let svc = CommanderService::default();
+        for (path, body) in [
+            ("/api/session/copyid", json!({"tab": 0, "keyfile": ""})),
+            ("/api/session/copyid", json!({"tab": 99, "keyfile": "id_ed25519.pub"})),
+            ("/api/transfer/keepuptodate", json!({"tab": 0, "local_dir": "/tmp", "remote_dir": "/"})),
+        ] {
+            let reply = svc.dispatch_async(ApiEnvelope {
+                method: "POST".into(), path: path.into(), body: body.clone(),
+            }).await;
+            assert_eq!(reply.status, 400, "{path} {body}: {}", reply.payload);
+            assert_ne!(reply.payload["success"], true, "{path} {body}");
+            assert!(reply.payload.get("task_id").is_none(), "{path} queued nothing");
+        }
+    }
+
+    /// The page passes a plan's reason through the GUI catalogs. A reason the
+    /// catalogs do not carry shows up in English in every other language, so
+    /// every phrase the planner can produce has to have a key.
+    #[test]
+    fn every_plan_reason_has_a_gui_translation() {
+        let catalog: Value =
+            serde_json::from_str(include_str!("../../../locales/en.json")).expect("catalog parses");
+        let gui = &catalog["gui"];
+        // The planner's own vocabulary, as `sync_planner.rs` writes it.
+        let planner = [
+            "up to date",
+            "missing locally",
+            "missing on remote",
+            "new locally",
+            "new on remote",
+            "deleted locally",
+            "deleted on remote",
+            "removed locally since last sync",
+            "removed on remote since last sync",
+            "modified locally",
+            "modified on remote",
+            "modified on both sides (conflict)",
+            "modified on both sides with identical timestamps",
+            "local is newer",
+            "remote is newer",
+            "size differs",
+            "contents differ",
+            "timestamp differs (-mirror)",
+            "type mismatch (file vs directory)",
+            "conflict resolved in favour of local",
+            "conflict resolved in favour of remote",
+            "conflict resolved in favour of newer local file",
+            "conflict resolved in favour of newer remote file",
+        ];
+        for reason in planner {
+            let key = sync_reason_for_page(reason);
+            assert_ne!(key, reason, "{reason} was left in the planner's own words");
+            assert!(
+                gui.get(&key).is_some(),
+                "the GUI catalog has no translation for '{key}' (from '{reason}')"
+            );
+        }
+    }
+
+    /// The synchronize dialogue's settings reach the planner as the planner
+    /// defines them: an empty mask is "every file", a mirror is one-way and
+    /// deletes, and the plan call itself never writes anything.
+    #[test]
+    fn sync_settings_follow_the_dialogue() {
+        use linscp_engine::sync_planner::SyncMode;
+        let dir = std::env::temp_dir().join(format!("linscp-sync-options-{}", std::process::id()));
+        let base = json!({"local_dir": dir.to_string_lossy(), "remote_dir": "/remote", "criteria": "time"});
+        let with = |extra: Value| {
+            let mut body = base.clone();
+            for (key, value) in extra.as_object().expect("object").iter() {
+                body[key] = value.clone();
+            }
+            Self::sync_options_from(&body)
+        };
+        let (_, remote, opts) = with(json!({})).expect("the defaults are valid");
+        assert_eq!(remote, "/remote");
+        assert_eq!(opts.mode, SyncMode::Local);
+        assert!(opts.file_mask.is_empty(), "an empty mask selects every file");
+        assert!(opts.preview_only, "the planner never writes on its own");
+        assert!(!opts.delete_obsolete && !opts.mirror);
+
+        let (_, _, mirror) = with(json!({"mirror": true, "mode": "remote"})).expect("a mirror is valid");
+        assert!(mirror.mirror, "the dialogue's mirror reaches the planner");
+        assert!(mirror.delete_obsolete, "and a mirror deletes what the source lacks");
+
+        // What the page cannot express is still judged: a criteria it never
+        // offers, and a local directory that is not absolute, are refused
+        // rather than silently defaulted.
+        assert!(with(json!({"criteria": "colour"})).is_err());
+        assert!(with(json!({"local_dir": "relative/path"})).is_err());
+        assert!(with(json!({"remote_dir": "relative/path"})).is_err(),
+            "a remote root has to be absolute too");
+        // A mask the user typed is parsed, and a bad one is refused.
+        assert!(with(json!({"filemask": "*.txt"})).is_ok());
+        // A trailing operator has no value to compare against.
+        assert!(with(json!({"filemask": "*.txt>"})).is_err());
+    }
+
+    /// The keep-up-to-date dialogue asks for seconds; the engine counts
+    /// milliseconds, and the conversion is clamped so a zero or absurd
+    /// interval cannot spin or sleep forever.
+    #[test]
+    fn a_keep_up_to_date_interval_is_seconds_clamped_to_milliseconds() {
+        let convert = |seconds: u64| seconds.saturating_mul(1000).clamp(500, 86_400_000);
+        assert_eq!(convert(0), 500, "zero means as often as the watcher can");
+        assert_eq!(convert(1), 1000);
+        assert_eq!(convert(90), 90_000);
+        assert_eq!(convert(u64::MAX), 86_400_000, "a day is the longest wait");
+    }
 }
+

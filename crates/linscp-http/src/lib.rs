@@ -20,6 +20,8 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
+use base64::Engine as _;
 use linscp_service::CommanderService;
 use linscp_types::ApiEnvelope;
 use rand::RngCore;
@@ -306,9 +308,15 @@ async fn api_handler(
     resp
 }
 
+/// A browser posts a dropped file as raw bytes, because a `File` cannot be
+/// JSON-encoded without first reading it into memory twice.
+///
+/// The body is turned into the one representation the service accepts and then
+/// dispatched like any other request, so the drop endpoint exists once: the
+/// desktop window, the browser and the Android app all reach the same handler.
 async fn handle_octet_drop(
     State(state): State<Arc<HttpAppState>>,
-    _method: Method,
+    method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
@@ -323,41 +331,19 @@ async fn handle_octet_drop(
     if body.len() > MAX_BROWSER_UPLOAD_BYTES {
         return (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({"error": "Browser uploads are limited to 1 GiB"}))).into_response();
     }
-    let query = uri.query().unwrap_or("");
-    let mut params = std::collections::HashMap::new();
-    for pair in query.split('&') {
-        if pair.is_empty() { continue; }
-        let (k,v) = match pair.split_once('=') {
-            Some((k,v)) => (k.to_string(), v.to_string()),
-            None => (pair.to_string(), String::new()),
-        };
-        // percent-decode '+' and %XX minimal
-        let k = k.replace('+', " ");
-        let v = v.replace('+', " ");
-        params.insert(k, v);
-    }
-    let _is_local = uri.path() == "/api/local/drop";
-    // Validate tab if present? For now accept
-    // Write to staging dir: use temp dir
-    let staging = std::env::temp_dir().join("linscp-http-staging");
-    let _ = std::fs::create_dir_all(&staging);
-    let name = params.get("name").map(|s| s.as_str()).unwrap_or("upload.bin");
-    // Validate name is single file name
-    if name.contains('/') || name.contains('\\') || name.contains('\0') || name == "." || name == ".." {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "Invalid file name"}))).into_response();
-    }
-    let mut dest = staging.join(format!("{}_{}", std::process::id(), name));
-    // If relative_path present, ensure it doesn't escape
-    if let Some(rel) = params.get("relative_path") {
-        if rel.contains("..") {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": "Relative path escapes directory"}))).into_response();
-        }
-        dest = staging.join(rel.replace('/', "_"));
-    }
-    match std::fs::write(&dest, &body) {
-        Ok(_) => (StatusCode::OK, Json(json!({"success": true, "path": dest.to_string_lossy()}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
-    }
+    let full_path = uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+    let reply = state.service.dispatch_async(ApiEnvelope {
+        method: method.as_str().to_string(),
+        path: full_path,
+        body: json!({ "data_base64": BASE64_STD.encode(&body) }),
+    }).await;
+    let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut resp = (status, Json(reply.payload)).into_response();
+    resp.headers_mut().insert(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate".parse().unwrap());
+    resp
 }
 
 #[cfg(test)]

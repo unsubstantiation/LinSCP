@@ -15,6 +15,13 @@ use crate::PlatformError;
 /// user-granted Storage Access Framework (`content://`) document trees without
 /// leaking JNI types into shared Rust crates.
 pub trait SafBridge: Send + Sync {
+    /// Opens the system document picker and waits for the user's answer.
+    ///
+    /// `Ok(None)` means the user cancelled. The plugin keeps the pending
+    /// activity-result callback; Rust only sees the decision.
+    fn request_tree(&self) -> Result<Option<String>, PlatformError>;
+    /// Every tree whose permission the app still holds, including trees granted
+    /// in an earlier run, so a persisted root is still listed after a restart.
     fn granted_trees(&self) -> Result<Vec<LocalRootEntry>, PlatformError>;
     fn list_tree(&self, tree_uri: &str) -> Result<Vec<FileEntry>, PlatformError>;
     fn stat_uri(&self, uri: &str) -> Result<FileEntry, PlatformError>;
@@ -130,6 +137,47 @@ pub fn create_exclusive_private_file(path: &Path, content: &[u8]) -> Result<(), 
         return Err(PlatformError::Io(err));
     }
     Ok(())
+}
+
+/// Android is Unix underneath, but an app may not create a FIFO or a device
+/// node in its own directory, so the `O_NOFOLLOW`/link-count inspection of
+/// `linux.rs` is enough here too.
+pub fn open_regular_file_no_follow(path: &Path) -> Option<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.mode() & libc::S_IFMT != libc::S_IFREG {
+        return None;
+    }
+    Some(file)
+}
+
+/// Creates a FIFO (`mkfifo`) so a test can prove a special file is refused.
+pub fn create_fifo(path: &Path) -> Result<(), PlatformError> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| PlatformError::Unsupported("path contains a NUL byte".to_string()))?;
+    // SAFETY: `name` is a NUL-terminated C string and the mode is a plain int.
+    if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } == 0 {
+        Ok(())
+    } else {
+        Err(PlatformError::Io(std::io::Error::last_os_error()))
+    }
+}
+
+/// Creates a file that only this app may read (`0600`).
+pub fn create_private_file(path: &Path) -> Result<File, PlatformError> {
+    Ok(OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?)
 }
 
 pub fn atomic_replace(temp_path: &Path, target_path: &Path) -> Result<(), PlatformError> {

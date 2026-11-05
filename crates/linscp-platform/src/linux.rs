@@ -122,6 +122,54 @@ pub fn create_exclusive_private_file(path: &Path, content: &[u8]) -> Result<(), 
     Ok(())
 }
 
+/// Opens an existing file for read/write without following a symbolic link
+/// and without blocking on a FIFO; `None` means "not an ordinary file".
+/// `O_NOFOLLOW` refuses a symlink at the last path component, `O_NONBLOCK`
+/// keeps a special file from hanging the open, and a file that is not singly
+/// linked is refused so a hard link to someone else's file is never truncated.
+pub fn open_regular_file_no_follow(path: &Path) -> Option<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.nlink() != 1 || file_type_is_special(&metadata) {
+        return None;
+    }
+    Some(file)
+}
+
+/// Rejects sockets, FIFOs and device nodes. On Linux the mode bits carry the
+/// file kind, so no extra metadata call is needed.
+fn file_type_is_special(metadata: &std::fs::Metadata) -> bool {
+    metadata.mode() & libc::S_IFMT != libc::S_IFREG
+}
+
+/// Creates a FIFO (`mkfifo`) so a test can prove a special file is refused.
+pub fn create_fifo(path: &Path) -> Result<(), PlatformError> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| PlatformError::Unsupported("path contains a NUL byte".to_string()))?;
+    // SAFETY: `name` is a NUL-terminated C string and the mode is a plain int.
+    if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } == 0 {
+        Ok(())
+    } else {
+        Err(PlatformError::Io(std::io::Error::last_os_error()))
+    }
+}
+
+/// Creates a file that only its owner may read (`0600`).
+pub fn create_private_file(path: &Path) -> Result<File, PlatformError> {
+    Ok(OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?)
+}
+
 pub fn atomic_replace(temp_path: &Path, target_path: &Path) -> Result<(), PlatformError> {
     std::fs::rename(temp_path, target_path)?;
     Ok(())

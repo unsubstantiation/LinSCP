@@ -2668,10 +2668,11 @@
       "id": "sync.criteria-and-mirror",
       "area": "Synchronization",
       "status": "verified",
-      "notes": "Time/size/checksum criteria, -mirror and two-way conflict policies are validated in script and unit suites and exercised against a live SFTP server.",
+      "notes": "Time/size/checksum criteria, -mirror and two-way conflict policies are validated in script and unit suites and exercised against a live SFTP server. The Commander's synchronize dialogue offers the same mirror as a one-way copy that deletes what the source no longer has, and its settings are held to the planner's own rules by a service unit test.",
       "source": [
         "crates/linscp-engine/src/sync_planner.rs",
-        "crates/linscp-engine/src/script.rs"
+        "crates/linscp-engine/src/script.rs",
+        "crates/linscp-service/src/lib.rs"
       ],
       "checks": {
         "unit": [
@@ -3330,7 +3331,7 @@
       "id": "gui.sync-preview",
       "area": "GUI",
       "status": "verified",
-      "notes": "The preview renders planned actions and posts the chosen comparison on run.",
+      "notes": "The preview renders planned actions in the catalogs' own words, posts the chosen comparison on run, and offers a mirror that is one-way and says it deletes.",
       "source": [
         "crates/linscp-http/src/lib.rs",
         "ui/src/index.ts"
@@ -3338,7 +3339,9 @@
       "checks": {
         "gui": [
           "plan listed four items",
-          "the chosen comparison is posted with the plan"
+          "the chosen comparison is posted with the plan",
+          "a mirror is one-way",
+          "the mirror choice reaches the backend"
         ]
       },
       "verified_on": {
