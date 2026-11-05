@@ -1,4 +1,4 @@
-name: Android compatibility checks
+name: Android build
 
 on:
   push:
@@ -7,51 +7,52 @@ on:
 
 jobs:
   build:
-    name: Android Rust checks
+    name: Android debug APK
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
-
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
-
-      - name: Build and test the TypeScript UI
-        run: |
-          npm --prefix ui install --no-audit --no-fund
-          npm --prefix ui run build
-          python3 tools/run_cargo_ci.py npm --prefix ui test
-
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,x86_64-linux-android
-
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-ndk
-        uses: taiki-e/install-action@v2
+      - name: Build and test the UI
+        run: |
+          npm ci --prefix ui --no-audit --no-fund
+          python3 tools/run_cargo_ci.py npm --prefix ui test
+      - name: Prepare Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$(ls -d "$ANDROID_SDK_ROOT"/ndk/* | sort -V | tail -n 1)" >> "$GITHUB_ENV"
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37" "build-tools;36.0.0"
+      - name: Generate Tauri Android project
+        working-directory: crates/linscp-tauri
+        run: ../../ui/node_modules/.bin/tauri android init --ci --skip-targets-install
+      - name: Build real Rust-backed APK
+        working-directory: crates/linscp-tauri
+        run: ../../ui/node_modules/.bin/tauri android build --ci --debug --apk --target aarch64 x86_64 --features native-shell
+      - name: Verify APK contents and signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=$(find crates/linscp-tauri/gen/android/app/build/outputs/apk -name '*.apk' -type f | head -n 1)
+          test -n "$apk"
+          unzip -l "$apk" | grep 'lib/arm64-v8a/liblinscp_tauri.so'
+          unzip -l "$apk" | grep 'lib/x86_64/liblinscp_tauri.so'
+          unzip -l "$apk" | grep 'assets/.*index.html'
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose "$apk"
+          mkdir -p android-artifacts
+          cp "$apk" android-artifacts/linscp-android-debug.apk
+      - uses: actions/upload-artifact@v7
         with:
-          tool: cargo-ndk
-
-      - name: Check the Rust workspace for Android (arm64-v8a + x86_64)
-        run: |
-          if [ -z "${ANDROID_NDK_HOME:-}" ] && [ -d /usr/local/lib/android/sdk/ndk ]; then
-            echo "ANDROID_NDK_HOME=$(ls -d /usr/local/lib/android/sdk/ndk/* | sort -V | tail -n 1)" >> "$GITHUB_ENV"
-          fi
-          python3 tools/run_cargo_ci.py cargo ndk -t arm64-v8a -t x86_64 check \
-            -p linscp-types \
-            -p linscp-i18n \
-            -p linscp-crypto \
-            -p linscp-platform \
-            -p linscp-proto \
-            -p linscp-engine \
-            -p linscp-service \
-            -p linscp-http
-
-      - name: Run Android bridge unit tests (host)
-        run: |
-          python3 tools/run_cargo_ci.py cargo test -p linscp-platform --lib
-          python3 tools/run_cargo_ci.py cargo test -p linscp-tauri --lib
-
-      # The checked-in Android Gradle project is a scaffold, not a Tauri app.
-      # Do not publish its APK as a release until it hosts the Rust backend.
+          name: linscp-android-debug
+          path: android-artifacts/linscp-android-debug.apk
+          if-no-files-found: error
