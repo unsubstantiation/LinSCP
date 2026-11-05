@@ -458,3 +458,19 @@ test('WebDAV directory copy requires explicit non-snapshot confirmation', async 
     if (accepted) assert.equal(calls[1].accept_directory_copy_risk, true);
   }
 });
+
+test('reconnect surfaces host-key challenges instead of reporting success', async () => {
+  const html = fs.readFileSync(path.join(repoRoot, 'source/gui/web/index.html'), 'utf8').replace(/\r\n/g, '\n');
+  const match = html.match(/async function reconnectTab\(\) \{[\s\S]*?\n  \}\n\n  \/\*/);
+  assert.ok(match);
+  const source = match[0].replace(/\n\n  \/\*$/, '');
+  const challenge = { tab: 8, fingerprint: 'ssh-ed25519 SHA256:test' };
+  let shown, refreshes = 0, toasts = [];
+  const reconnect = new Function('activeTab', 'apiPost', 'toast', 't', 'refreshStatus', 'loadRemote', 'state', 'errorMessage', 'showHostKeyChallenge', `${source}; return reconnectTab;`)(
+    () => ({ id: 8 }), async () => ({ success: false, error: 'Host key changed', challenge }),
+    message => toasts.push(message), s => s, async () => { refreshes++; }, async () => {}, { remote: { path: '/' } }, s => s, ch => { shown = ch; });
+  await reconnect();
+  assert.equal(shown, challenge);
+  assert.equal(refreshes, 1);
+  assert.deepEqual(toasts, ['Host key changed']);
+});

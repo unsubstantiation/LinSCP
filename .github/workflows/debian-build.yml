@@ -54,7 +54,7 @@ jobs:
       - name: Exercise native FTP connection and download
         env:
           LSCP_LIVE_FTP: "1"
-        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ftp_gui_download -- --nocapture
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ftp_ -- --nocapture --test-threads=1
 
       - name: Exercise native explicit FTPS connection and download
         env:

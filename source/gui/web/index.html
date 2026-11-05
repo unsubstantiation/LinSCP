@@ -1641,6 +1641,8 @@
       await loadRemote(state.remote.path);
     } else {
       toast(errorMessage(result.error, t("Cannot reconnect.")), true);
+      if (result.challenge) showHostKeyChallenge(result.challenge);
+      await refreshStatus();
     }
   }
 

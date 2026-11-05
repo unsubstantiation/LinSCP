@@ -36,6 +36,7 @@ struct InnerState {
     active_tab_id: Option<u64>,
     tabs: HashMap<u64, TabRuntime>,
     challenges: HashMap<u64, TabRuntime>,
+    pending_connections: std::collections::HashSet<u64>,
     logs: Vec<Value>,
     preferences: UserPreferences,
     queue_transfers: Vec<Value>,
@@ -83,6 +84,7 @@ impl CommanderService {
                 active_tab_id: None,
                 tabs: HashMap::new(),
                 challenges: HashMap::new(),
+                pending_connections: std::collections::HashSet::new(),
                 logs: Vec::new(),
                 preferences,
                 queue_transfers: Vec::new(),
@@ -207,6 +209,8 @@ impl CommanderService {
         match (method.as_str(), raw_path.as_str()) {
             ("POST", "/api/tabs/open") => self.open_tab_async(req.body).await,
             ("POST", "/api/tabs/verify") => self.verify_tab_async(req.body).await,
+            ("POST", "/api/tabs/reconnect") => self.reconnect_tab_async(req.body).await,
+            ("POST", "/api/remote/mkdir") => self.mkdir_remote_async(req.body).await,
             ("POST", "/api/transfer/upload") => self.queue_transfer_async(req.body, true, false).await,
             ("POST", "/api/transfer/download") => self.queue_transfer_async(req.body, false, false).await,
             ("POST", "/api/transfer/move") => {
@@ -254,6 +258,7 @@ impl CommanderService {
             let mut state = self.state.lock().expect("state mutex");
             let id = state.next_tab_id;
             state.next_tab_id += 1;
+            state.pending_connections.insert(id);
             TabRuntime {
                 id, name: body.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or(&spec.session.host).to_string(),
                 site_name: site_name.map(str::to_string), is_local: false, connected: false,
@@ -267,14 +272,21 @@ impl CommanderService {
 
     async fn connect_tab(&self, tab: &mut TabRuntime) -> ApiReply {
         let spec = match tab.spec.as_ref() { Some(s) => s, None => return api_error(400, "Missing session settings") };
-        match tabs::dial_gui_tab_session(spec, &self.config_root(), false, "en").await {
+        let result = tabs::dial_gui_tab_session(spec, &self.config_root(), false, "en").await;
+        let mut state = self.state.lock().expect("state mutex");
+        // Closing a tab or cancelling a challenge while dialing must not bring
+        // it back to life after the asynchronous connection completes.
+        if !state.pending_connections.contains(&tab.id) {
+            return api_error(400, "Connection was cancelled.");
+        }
+        match result {
             Ok((session, remote_dir, observed)) => {
                 tab.remote = Some(session);
                 tab.remote_dir = remote_dir;
                 tab.observed_hostkey = observed;
                 tab.connected = true;
                 tab.error.clear();
-                let mut state = self.state.lock().expect("state mutex");
+                state.pending_connections.remove(&tab.id);
                 state.challenges.remove(&tab.id);
                 state.active_tab_id = Some(tab.id);
                 state.tabs.insert(tab.id, tab.clone());
@@ -283,10 +295,58 @@ impl CommanderService {
             Err(GuiConnectError::HostKeyChallenge(challenge)) => {
                 tabs::apply_challenge_to_tab(tab, &challenge);
                 let response = tab.hostkey_challenge_json();
-                self.state.lock().expect("state mutex").challenges.insert(tab.id, tab.clone());
+                state.challenges.insert(tab.id, tab.clone());
                 ApiReply { status: 409, payload: json!({"success": false, "error": challenge.error, "challenge": response}) }
             }
-            Err(GuiConnectError::Failed(error)) => api_error(400, error),
+            Err(GuiConnectError::Failed(error)) => {
+                state.pending_connections.remove(&tab.id);
+                if let Some(current) = state.tabs.get_mut(&tab.id) {
+                    current.connected = false;
+                    current.remote = None;
+                    current.error = error.clone();
+                }
+                api_error(400, error)
+            }
+        }
+    }
+
+    async fn reconnect_tab_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No such tab") };
+        let mut tab = {
+            let mut state = self.state.lock().expect("state mutex");
+            let tab = match state.tabs.get(&id).cloned() { Some(tab) => tab, None => return api_error(400, "No such tab") };
+            if tab.is_local { return ApiReply { status: 200, payload: json!({"success": true, "tab": tab.describe()}) }; }
+            if tab.spec.is_none() { return api_error(400, "Missing session settings"); }
+            if !state.pending_connections.insert(id) { return api_error(409, "Connection already in progress"); }
+            if let Some(current) = state.tabs.get_mut(&id) { current.connected = false; current.remote = None; current.error.clear(); }
+            tab
+        };
+        // Reconnect to the directory being viewed, not the original startup
+        // directory; credentials and approved host keys stay in the private spec.
+        if let Some(spec) = tab.spec.as_mut() { spec.session.initial_dir = tab.remote_dir.clone(); }
+        tab.connected = false;
+        tab.remote = None;
+        self.connect_tab(&mut tab).await
+    }
+
+    async fn mkdir_remote_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "Not connected") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
+        };
+        if tab.is_local { return self.handle_remote_mkdir(body); }
+        let name = match body.get("name").and_then(Value::as_str) {
+            Some(name) if !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\') && !name.contains(':') && !name.chars().any(char::is_control) => name,
+            _ => return api_error(400, "A single valid directory name is required."),
+        };
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        if !matches!(session.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes | linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs) {
+            return api_error(501, "Safe directory creation is not supported for this protocol.");
+        }
+        let path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
+        match session.mkdir(&path).await {
+            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
+            Err(error) => api_error(400, format!("Directory creation was not confirmed; the directory may already exist: {error}")),
         }
     }
 
@@ -306,14 +366,20 @@ impl CommanderService {
             let mut parts = fingerprint.split_whitespace();
             let (kind, key) = match (parts.next(), parts.next(), parts.next()) {
                 (Some(kind), Some(key), None) => (kind, key),
-                _ => return api_error(400, "Invalid host-key fingerprint"),
+                _ => {
+                    self.state.lock().expect("state mutex").challenges.insert(id, tab);
+                    return api_error(400, "Invalid host-key fingerprint");
+                }
             };
             let path = self.config_root().join("sshhostkeys");
             let result = linscp_engine::hostkeys::HostKeyCache::load_from_path(&path).and_then(|mut cache| {
                 cache.upsert(challenge["host"].as_str().unwrap_or(""), challenge["port"].as_u64().unwrap_or(22) as u16, kind, key)?;
                 cache.save_to_path(&path)
             });
-            if let Err(error) = result { return api_error(500, error); }
+            if let Err(error) = result {
+                self.state.lock().expect("state mutex").challenges.insert(id, tab);
+                return api_error(500, error);
+            }
         }
         let spec = tab.spec.as_mut().expect("challenge has session settings");
         if role == "tunnel" {
@@ -1014,6 +1080,7 @@ impl CommanderService {
         let mut g = self.state.lock().expect("m");
         g.tabs.remove(&tab_id);
         g.challenges.remove(&tab_id);
+        g.pending_connections.remove(&tab_id);
         if g.active_tab_id == Some(tab_id) { g.active_tab_id = g.tabs.keys().next().cloned(); }
         ApiReply{ status: 200, payload: json!({"success": true})}
     }
@@ -1032,7 +1099,8 @@ impl CommanderService {
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) }).unwrap_or(0);
         let g = self.state.lock().expect("m");
         if let Some(tab) = g.tabs.get(&tab_id) {
-            return ApiReply{ status: 200, payload: json!({"success": true, "tab": tab.describe()})};
+            if tab.is_local { return ApiReply{ status: 200, payload: json!({"success": true, "tab": tab.describe()})}; }
+            return api_error(501, "Remote reconnect requires asynchronous dispatch.");
         }
         ApiReply{ status: 400, payload: json!({"success": false, "error": "No such tab"})}
     }
@@ -2997,8 +3065,24 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    async fn exercise_remote_mkdir(svc: &CommanderService, id: u64) {
+        let request = |body: Value| ApiEnvelope { method: "POST".into(), path: "/api/remote/mkdir".into(), body };
+        for name in ["", ".", "..", "../escape", "nested/name", "bad\\name", "bad\nname"] {
+            let response = svc.dispatch_async(request(json!({"tab": id, "name": name}))).await;
+            assert_eq!(response.status, 400, "accepted invalid name {name:?}: {}", response.payload);
+        }
+        let created = svc.dispatch_async(request(json!({"tab": id, "name": "gui-new-folder"}))).await;
+        assert_eq!(created.status, 200, "{}", created.payload);
+        let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        assert!(session.stat("/gui-new-folder").await.unwrap().unwrap().is_dir);
+        let duplicate = svc.dispatch_async(request(json!({"tab": id, "name": "gui-new-folder"}))).await;
+        assert_ne!(duplicate.status, 200, "existing directory was reported as newly created");
+    }
+
+    #[cfg(target_os = "linux")]
     async fn exercise_ftp_uploads(svc: &CommanderService, id: u64, local: &Path, remote: &Path) {
         let request = |body: Value| ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body };
+        Box::pin(exercise_remote_mkdir(svc, id)).await;
         std::fs::write(local.join("up.txt"), b"FTP upload payload").unwrap();
         // Direct callers must not bypass the FTP risk acknowledgment or fall
         // through ASCII conversion to an unguarded STOR.
@@ -3218,6 +3302,48 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn live_ftp_reconnect_close_race() {
+        if std::env::var_os("LSCP_LIVE_FTP").is_none() { return; }
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        struct Server(std::process::Child);
+        impl Drop for Server { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let tmp = std::env::temp_dir().join(format!("linscp-ftp-reconnect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp); std::fs::create_dir_all(&tmp).unwrap();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestFtpServer.py");
+        let child = Command::new("/usr/bin/python3").arg(path).env("LSCP_TEST_ROOT", &tmp).env("LSCP_TEST_FTP_LOGIN_DELAY", "0.3")
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut server = Server(child); let mut line = String::new();
+        BufReader::new(server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let port: u16 = line.trim().strip_prefix("READY ").unwrap().parse().unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        let opened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "ftp", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": tmp, "initial_dir": "/"}}))).await;
+        assert_eq!(opened.status, 200, "{}", opened.payload);
+        let id = opened.payload["tab"]["id"].as_u64().unwrap();
+        let other = svc.clone();
+        let task = tokio::spawn(async move {
+            other.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/reconnect".into(), body: json!({"tab": id}) }).await
+        });
+        let mut started = false;
+        for _ in 0..1000 {
+            if svc.state.lock().unwrap().pending_connections.contains(&id) { started = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(started, "reconnect did not start");
+        let duplicate = svc.dispatch_async(request("/api/tabs/reconnect", json!({"tab": id}))).await;
+        assert_eq!(duplicate.status, 409);
+        let closed = svc.dispatch_async(request("/api/tabs/close", json!({"tab": id}))).await;
+        assert_eq!(closed.status, 200);
+        let response = task.await.unwrap();
+        assert_ne!(response.status, 200, "closed tab was reconnected");
+        assert!(!svc.state.lock().unwrap().tabs.contains_key(&id));
+        assert!(!svc.state.lock().unwrap().pending_connections.contains(&id));
+        drop(server); let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn live_ftp_gui_download() {
         if std::env::var_os("LSCP_LIVE_FTP").is_none() { return; }
         use std::io::{BufRead, BufReader};
@@ -3287,9 +3413,13 @@ mod tests {
         let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
         let err = session.stat("/download.txt").await.expect_err("interrupted FTP control channel must not be reused");
         assert!(err.to_string().contains("reconnect"), "{err}");
-        let reopened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "ftp", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
+        let reopened = svc.dispatch_async(request("/api/tabs/reconnect", json!({"tab": id}))).await;
         assert_eq!(reopened.status, 200, "{}", reopened.payload);
         let new_id = reopened.payload["tab"]["id"].as_u64().unwrap();
+        assert_eq!(new_id, id);
+        let fresh = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        assert!(!Arc::ptr_eq(&session, &fresh));
+        assert!(fresh.stat("/download.txt").await.unwrap().is_some());
         // Running FTP uploads must accept cancellation through the public
         // queue, poison the control connection, and retain the reported stage.
         std::fs::write(local.join("queued-ftp-cancel.bin"), vec![43u8; 32 * 1024 * 1024]).unwrap();
@@ -3322,11 +3452,16 @@ mod tests {
         }
         assert!(stopped, "running FTP upload did not cancel");
         assert!(!remote.join("queued-ftp-cancel.bin").exists());
-        let reopened = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "ftp", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
+        let reopened = svc.dispatch_async(request("/api/tabs/reconnect", json!({"tab": new_id}))).await;
         assert_eq!(reopened.status, 200, "{}", reopened.payload);
         let new_id = reopened.payload["tab"]["id"].as_u64().unwrap();
+        assert_eq!(new_id, id);
         exercise_ftp_upload_cancellation(&svc, new_id, &local, &remote).await;
-        drop(server); let _ = std::fs::remove_dir_all(tmp);
+        drop(server);
+        let failed = svc.dispatch_async(request("/api/tabs/reconnect", json!({"tab": id}))).await;
+        assert_ne!(failed.status, 200, "offline reconnect must not report success");
+        assert_eq!(svc.state.lock().unwrap().tabs.get(&id).unwrap().connected, false);
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[cfg(target_os = "linux")]
@@ -3504,6 +3639,7 @@ mod tests {
         let open = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "dav", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
         assert_eq!(open.status, 200, "{}", open.payload);
         let id = open.payload["tab"]["id"].as_u64().unwrap();
+        Box::pin(exercise_remote_mkdir(&svc, id)).await;
         std::fs::write(local.join("upload.txt"), b"WebDAV roundtrip").unwrap();
         let upload = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["upload.txt"]}))).await;
         assert_eq!(upload.status, 200, "{}", upload.payload);
@@ -4373,6 +4509,13 @@ mod tests {
         assert_eq!(connected.status, 200, "{}", connected.payload);
         assert!(connected.payload["tab"]["session"].get("password").is_none());
         assert!(!tmp.join("config/sshhostkeys").exists());
+        Box::pin(exercise_remote_mkdir(&svc, id)).await;
+        let previous = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        let reconnected = svc.dispatch_async(request("/api/tabs/reconnect", json!({"tab": id}))).await;
+        assert_eq!(reconnected.status, 200, "{}", reconnected.payload);
+        let current = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        assert!(!Arc::ptr_eq(&previous, &current), "reconnect reused the old connection");
+        assert_eq!(reconnected.payload["tab"]["id"], id);
         std::fs::write(local.join("upload.txt"), b"hello from native").unwrap();
         let upload = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["upload.txt"]}))).await;
         assert_eq!(upload.status, 200, "{}", upload.payload);
