@@ -62,17 +62,31 @@ const expression = `
   await invoke('POST', '/api/local/rename', {tab: local.tab.id, old_name: 'smoke-upload.txt', new_name: 'renamed.txt'});
   return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, conflict: true};
 })()`;
-const reply = await new Promise((resolve, reject) => {
-  const timer = setTimeout(() => reject(new Error('DevTools evaluation timed out')), 120000);
-  socket.onmessage = event => {
-    const message = JSON.parse(event.data);
-    if (message.id !== 1) return;
-    clearTimeout(timer);
-    resolve(message);
-  };
-  socket.onerror = reject;
-  socket.send(JSON.stringify({id: 1, method: 'Runtime.evaluate', params: {expression, awaitPromise: true, returnByValue: true}}));
-});
+let nextId = 0;
+async function evaluate(expression, timeout = 10000) {
+  const id = ++nextId;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('DevTools evaluation timed out')), timeout);
+    socket.onmessage = event => {
+      const message = JSON.parse(event.data);
+      if (message.id !== id) return;
+      clearTimeout(timer);
+      resolve(message);
+    };
+    socket.onerror = reject;
+    socket.send(JSON.stringify({id, method: 'Runtime.evaluate', params: {expression, awaitPromise: true, returnByValue: true}}));
+  });
+}
+// Tauri can navigate its initial document while the DevTools endpoint is
+// already available. Only start mutating state after two stable ready probes.
+let stable = 0;
+for (let i = 0; i < 60 && stable < 2; i++) {
+  const probe = await evaluate("document.readyState === 'complete' && window.LinSCPTransport?.mode === 'tauri'");
+  stable = probe.result?.result?.value === true ? stable + 1 : 0;
+  if (stable < 2) await new Promise(resolve => setTimeout(resolve, 1000));
+}
+assert.equal(stable, 2, 'WebView did not become ready');
+const reply = await evaluate(expression, 120000);
 socket.close();
 if (reply.error || reply.result?.exceptionDetails) throw new Error(JSON.stringify(reply));
 console.log('Android WebView and Rust service smoke test passed:', JSON.stringify(reply.result.result.value));
