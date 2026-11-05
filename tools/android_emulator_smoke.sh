@@ -43,7 +43,8 @@ for passive in $(seq 49000 49031); do adb reverse "tcp:$passive" "tcp:$passive";
 adb reverse "tcp:$sftp_port" "tcp:$sftp_port"
 adb reverse "tcp:$port" "tcp:$port"
 adb install -r android-artifacts/linscp-android-debug.apk
-adb shell run-as io.linscp.commander sh -c 'mkdir -p files && cat > files/test-ca.pem' < source/linux/tests/fixtures/s3-server-cert.pem
+adb shell run-as io.linscp.commander mkdir -p files
+adb exec-out run-as io.linscp.commander tee files/test-ca.pem < source/linux/tests/fixtures/s3-server-cert.pem >/dev/null
 adb shell am start -n io.linscp.commander/.MainActivity
 for _ in $(seq 1 90); do
   pid=$(adb shell pidof io.linscp.commander | tr -d '\r' || true)
