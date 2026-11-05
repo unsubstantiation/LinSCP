@@ -44,3 +44,16 @@ jobs:
           name: linscp-android-debug
           path: android-artifacts/linscp-android-debug.apk
           if-no-files-found: error
+      - name: Enable emulator acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Exercise APK WebView, Rust IPC and WebDAV transfers on an emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: python3 tools/run_cargo_ci.py bash tools/android_emulator_smoke.sh

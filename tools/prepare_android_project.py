@@ -9,3 +9,15 @@ if text.count('<application') != 1 or 'android:allowBackup=' in text:
     raise SystemExit('Unexpected Tauri Android manifest; review backup policy')
 text = text.replace('<application', '<application\n        android:allowBackup="false"', 1)
 manifest.write_text(text)
+
+activities = list((root / 'crates/linscp-tauri/gen/android/app/src/main').rglob('MainActivity.kt'))
+if len(activities) != 1:
+    raise SystemExit('Unexpected Tauri Android activity layout')
+activity = activities[0]
+text = activity.read_text()
+needle = 'super.onCreate(savedInstanceState)'
+if text.count(needle) != 1:
+    raise SystemExit('Unexpected Tauri activity; review debug WebView inspection')
+# A debug-only DevTools endpoint lets CI verify the actual WebView-to-Rust IPC.
+text = text.replace(needle, 'if (BuildConfig.DEBUG) android.webkit.WebView.setWebContentsDebuggingEnabled(true)\n        ' + needle)
+activity.write_text(text)

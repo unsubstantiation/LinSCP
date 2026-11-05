@@ -476,6 +476,18 @@ pub fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<(
         let result = unsafe { libc::renameat2(libc::AT_FDCWD, source.as_ptr(), libc::AT_FDCWD, destination.as_ptr(), libc::RENAME_NOREPLACE) };
         if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
     }
+    #[cfg(target_os = "android")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in source path"))?;
+        let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in destination path"))?;
+        // The syscall avoids depending on a newer Android libc symbol. If the
+        // kernel or filesystem lacks RENAME_NOREPLACE, fail without replacing.
+        // SAFETY: both paths remain valid NUL-terminated strings for the call.
+        let result = unsafe { libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD, source.as_ptr(), libc::AT_FDCWD, destination.as_ptr(), libc::RENAME_NOREPLACE) };
+        if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    }
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -491,7 +503,7 @@ pub fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<(
         let result = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) };
         if result != 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
     {
         let _ = (source, destination);
         Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Atomic no-replace move is unavailable on this platform"))
