@@ -53,7 +53,7 @@ for _ in $(seq 1 90); do
 done
 if [[ -z "${pid:-}" ]]; then adb logcat -d -t 500; exit 1; fi
 adb forward tcp:9222 "localabstract:webview_devtools_remote_${pid}"
-if ! node tools/android_emulator_smoke.mjs "$port" "$sftp_port" "$ftp_port" "$ftps_port"; then
+if ! timeout 180s node tools/android_emulator_smoke.mjs "$port" "$sftp_port" "$ftp_port" "$ftps_port"; then
   adb logcat -d --pid="$pid" -t 200 || true
   exit 1
 fi
