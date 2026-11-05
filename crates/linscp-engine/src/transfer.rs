@@ -375,7 +375,7 @@ fn publish_owned_stage_no_replace(stage: &mut tempfile::TempPath, destination: &
     }
     #[cfg(not(target_os = "android"))]
     {
-        std::fs::hard_link(stage.as_ref(), destination)
+        std::fs::hard_link(&*stage, destination)
     }
 }
 
