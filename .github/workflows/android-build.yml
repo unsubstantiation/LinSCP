@@ -12,7 +12,7 @@ jobs:
   build:
     name: Signed Android release APK
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 60
     # The release keystore and its password are secrets of this environment, so
     # only a job that names it can read them. The identity that signs the APK
     # users install should not be reachable from an arbitrary run.
