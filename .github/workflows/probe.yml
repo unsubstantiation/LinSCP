@@ -17,14 +17,4 @@ jobs:
         shell: bash
         run: |
           CARGO_TERM_COLOR=never cargo check -p linscp-http > probe.log 2>&1 || true
-          python -c "
-import re
-t = open('probe.log', errors='replace').read().splitlines()
-out = []
-grab = 0
-for line in t:
-    if 'not \`Send\`' in line or 'cannot be sent between threads' in line or 'Send' in line and 'note' in line:
-        out.extend(t[max(0, t.index(line) - 3): t.index(line) + 3])
-sel = '\n'.join(out)
-print('\n'.join('::error title=send (%d)::%s' % (i // 2500 + 1, sel[i:i + 2500].replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')) for i in range(0, min(len(sel), 15000), 2500)))
-"
+          python3 tools/probe_send.py probe.log
