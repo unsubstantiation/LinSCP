@@ -16,5 +16,5 @@ jobs:
       - name: Check the http crate and surface the Send notes
         shell: bash
         run: |
-          CARGO_TERM_COLOR=never cargo check -p linscp-http > probe.log 2>&1 || true
+          CARGO_TERM_COLOR=never cargo check --workspace --all-targets > probe.log 2>&1 || true
           python3 tools/probe_send.py probe.log
