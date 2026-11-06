@@ -19,6 +19,7 @@ linscp-platform = { path = "../linscp-platform" }
 linscp-proto = { path = "../linscp-proto", features = ["gssapi"] }
 linscp-types = { path = "../linscp-types" }
 roxmltree.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
