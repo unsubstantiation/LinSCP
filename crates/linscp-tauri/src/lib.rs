@@ -36,10 +36,26 @@ impl TauriBridge {
 
     /// Direct IPC entrypoint invoked by `TauriTransport` in `ui/src/transport/tauri.ts`.
     pub fn invoke(&self, envelope: ApiEnvelope) -> ApiReply {
+        self.stage_incoming_android_shares(&envelope);
         self.service.dispatch(envelope)
     }
 
+    fn stage_incoming_android_shares(&self, envelope: &ApiEnvelope) {
+        if envelope.method.eq_ignore_ascii_case("GET")
+            && envelope.path.split('?').next() == Some("/api/shell/pending")
+        {
+            if let Ok(paths) = self.android_state().staged_share_paths() {
+                if !paths.is_empty() {
+                    let _ = linscp_service::ops::record_shell_upload_manifest(
+                        &linscp_platform::config_dir(), &paths,
+                    );
+                }
+            }
+        }
+    }
+
     pub async fn invoke_async(&self, envelope: ApiEnvelope) -> ApiReply {
+        self.stage_incoming_android_shares(&envelope);
         self.service.dispatch_async(envelope).await
     }
 
@@ -149,6 +165,8 @@ pub mod commands {
 #[cfg(feature = "native-shell")]
 pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
     let builder = tauri::Builder::default();
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(android::mobile_plugin());
     #[cfg(not(target_os = "android"))]
     let builder = builder.manage(TauriBridge::default());
     #[cfg(target_os = "android")]
@@ -166,7 +184,9 @@ pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
         // filesystem see the SAF bridge registered by the Kotlin plugin. A
         // granted tree then behaves like any other local root: listing,
         // creating, writing, renaming and deleting go through `LocalFs`.
-        let state = std::sync::Arc::new(android::AndroidState::new());
+        // The mobile plugin registers SAF/share/foreground bridges before this
+        // setup hook; the exact same state must back both service and commands.
+        let state = app.state::<std::sync::Arc<android::AndroidState>>().inner().clone();
         let filesystem = android::local_filesystem(&state);
         let service = CommanderService::new(
             linscp_platform::default_config_dir(),

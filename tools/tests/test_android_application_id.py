@@ -12,6 +12,7 @@ to be a deliberate edit of this test as well, not a side effect.
 """
 import json
 import pathlib
+import re
 import sys
 import unittest
 
@@ -100,6 +101,34 @@ class AndroidApplicationIdTests(unittest.TestCase):
         docs = (ROOT / 'docs/android.md').read_text(encoding='utf-8')
         self.assertIn('/data/user/0/' + EXPECTED, docs)
         self.assertIn('app_data_dir', docs)
+
+    def test_android_native_bridge_is_copied_and_registered(self):
+        source = ROOT / 'crates/linscp-tauri/android/LinSCPAndroidPlugin.kt'
+        self.assertTrue(source.is_file())
+        kotlin = source.read_text(encoding='utf-8')
+        for command in ['pickTree', 'grantedTrees', 'listTree', 'statUri', 'readUri',
+                        'writeUri', 'mkdirUri', 'deleteUri', 'renameUri',
+                        'stageUris', 'takePendingShares', 'foregroundStart',
+                        'foregroundUpdate', 'foregroundStop']:
+            self.assertIn('fun ' + command + '(', kotlin)
+        # Content providers may block for remote/cloud-backed documents. Keep
+        # their work off the Activity thread and marshal only the result back.
+        for command in ['grantedTrees', 'listTree', 'statUri', 'readUri',
+                        'writeUri', 'mkdirUri', 'deleteUri', 'renameUri', 'stageUris']:
+            match = re.search(
+                r'fun ' + command + r'\(invoke: Invoke\) \{(.*?)(?=\n  @Command|\n  private fun)',
+                kotlin, re.DOTALL)
+            self.assertIsNotNone(match, command)
+            self.assertIn('runIo(invoke,', match.group(1), command)
+        self.assertIn('activity.runOnUiThread', kotlin)
+        self.assertIn('synchronized(stageLock)', kotlin)
+        self.assertIn('Thread({', kotlin[kotlin.index('private fun stageShareIntent'):])
+        prepare = (ROOT / 'tools/prepare_android_project.py').read_text(encoding='utf-8')
+        self.assertIn('plugin_source', prepare)
+        self.assertIn('android.intent.action.SEND_MULTIPLE', prepare)
+        self.assertIn('LinSCPTransferService', prepare)
+        host = (ROOT / 'crates/linscp-tauri/src/lib.rs').read_text(encoding='utf-8')
+        self.assertIn('android::mobile_plugin()', host)
 
     def test_the_android_workflow_installs_the_cli_and_builds_the_frontend(self):
         # `tauri android init` runs the locally installed Tauri CLI, and the APK

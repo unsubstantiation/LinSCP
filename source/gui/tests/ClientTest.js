@@ -1243,7 +1243,7 @@ function options(id) {
    * it queues anything, and names are shown as text, never markup. */
   responses['/api/shell/pending'] = { success: true, pending: [{
     id: 'a'.repeat(32), created: 1,
-    files: [ { name: 'a.txt', path: '/home/u/a.txt', is_dir: false, size: 3 },
+    items: [ { name: 'a.txt', path: '/home/u/a.txt', is_dir: false, size: 3 },
              { name: 'folder', path: '/home/u/folder', is_dir: true, size: 0 },
              { name: '<img>.png', path: '/home/u/x.png', is_dir: false, size: 1 } ] }] };
   await window.checkShellPending();
@@ -1271,7 +1271,7 @@ function options(id) {
   // reason, not described as missing.
   responses['/api/shell/pending'] = { success: true, pending: [{
     id: 'b'.repeat(32), created: 1,
-    files: [ { name: 'locked.txt', path: '/home/u/locked.txt', is_dir: false, size: 3 }] }] };
+    items: [ { name: 'locked.txt', path: '/home/u/locked.txt', is_dir: false, size: 3 }] }] };
   await window.checkShellPending();
   responses['/api/shell/consume'] = { success: true, queued: [], missing: [],
     refused: [{ name: 'locked.txt', error: 'The destination already exists.' }] };

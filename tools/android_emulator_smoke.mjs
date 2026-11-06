@@ -28,6 +28,14 @@ const expression = `
   for (let i = 0; i < 60 && !window.LinSCPTransport; i++) await sleep(1000);
   if (window.LinSCPTransport?.mode !== 'tauri') throw new Error('Tauri frontend transport not initialized');
   const invoke = (method, path, body = {}) => window.LinSCPTransport.request(method, path, body);
+  const caps = window.LinSCPCore.hostCapabilities({host: window});
+  for (const bridge of ['safTrees', 'shareIntents', 'foregroundTransfers']) {
+    if (!caps[bridge]) throw new Error('Native Android capability not registered: ' + bridge);
+  }
+  const nativeInvoke = window.__TAURI_INTERNALS__.invoke;
+  await nativeInvoke('linscp_foreground_start', {title: 'Android smoke transfer', ongoing: 1});
+  await nativeInvoke('linscp_foreground_update', {done: 512, total: 1024});
+  await nativeInvoke('linscp_foreground_stop');
   const status = await invoke('GET', '/api/status');
   const root = status.local_dir;
   if (!root || !root.includes(${JSON.stringify(application)})) throw new Error('Not using app-private storage: ' + root);

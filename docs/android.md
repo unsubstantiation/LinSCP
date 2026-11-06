@@ -4,30 +4,29 @@ The Android target builds the same Tauri WebView and Rust `CommanderService` as
 the desktop application. This is an **experimental, debug-signed APK**, not a
 production or Play Store release. Android support is incomplete:
 
-- Only app-private storage is exposed. The Rust shell contains the Storage
-  Access Framework and share-hand-off command contracts
-  (`linscp_request_saf_tree`, `linscp_pick_saf_tree`,
-  `linscp_handle_share_intent`), but this repository does not register their
-  Kotlin implementations, picker activity result, or share intent filter.
-  Android capability detection therefore keeps folder grants and share intents
-  disabled instead of presenting controls that fail when used. Downloads/shared
-  storage is not exposed. Uninstalling the app removes app-private files and
-  configuration.
-- Background/foreground-service transfer survival and Android Keystore/biometric
-  integration are not wired in. The Rust shell exposes foreground-service
-  commands, but no Android service implements them. The page now keeps these
-  capabilities disabled unless an embedder explicitly reports a real
-  implementation; keep the app open during transfers. The session master key
-  is stored in the app sandbox, not backed by Android Keystore.
-- The page no longer probes the native bridge at each call site. One
-  `hostCapabilities()` description drives host-dependent controls. Android-only
-  integrations stay off until explicitly enabled by a host that has registered
-  them; desktop launchers and OS drop listeners are desktop-only. A control the
-  current host cannot serve is omitted with the reason
-  `hostDifferenceReason()` provides. This prevents false capability claims; it
-  does not establish feature parity while the integrations remain unimplemented.
+- The generated Android host registers the Storage Access Framework picker,
+  persists the returned tree grants, and routes `content://` list/stat/read/write/
+  create/rename/delete operations through the local filesystem. It also accepts
+  `ACTION_SEND` and `ACTION_SEND_MULTIPLE`, stages received content URIs in the
+  app-private cache, and presents them through the existing upload-offer flow.
+  Shared files are not written to public Downloads; uninstalling the app removes
+  app-private files and configuration.
+- An Android foreground service displays an ongoing transfer notification while
+  queued work is active, so the Rust process can continue when the activity is
+  backgrounded. Android can still stop work after a force-stop, device shutdown,
+  or other process termination; this is not a durable job queue. Android
+  Keystore/biometric integration remains unwired, and the session master key is
+  stored in the app sandbox rather than backed by Android Keystore.
+- One `hostCapabilities()` description drives host-dependent controls. SAF,
+  share intents, and foreground transfers are reported for the registered native
+  Android build; a browser running on Android does not inherit those native
+  capabilities. Desktop launchers and OS drop listeners remain desktop-only.
+  `hostDifferenceReason()` explains integrations unavailable on the current
+  host.
 - Remote transfer restrictions and cleanup caveats in the main README still
-  apply. Other native GUI actions remain incomplete; see the feature audit.
+  apply. The shared GUI actions listed in the native feature audit are routed
+  through the service, but some remain protocol-limited or lack Android
+  end-to-end coverage; see that audit before relying on them.
 - The debug APK is signed with a development key. It is intended for testing,
   not distribution, updates to a release-signed installation, or sensitive data.
 
