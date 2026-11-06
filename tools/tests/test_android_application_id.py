@@ -114,8 +114,9 @@ class AndroidApplicationIdTests(unittest.TestCase):
         self.assertIn('"rdp", "vnc", "spice"', kotlin)
         self.assertIn('commands::linscp_open_external_uri',
                       (ROOT / 'crates/linscp-tauri/src/lib.rs').read_text(encoding='utf-8'))
-        self.assertIn('set_external_uri(bridge.clone())',
-                      (ROOT / 'crates/linscp-tauri/src/android.rs').read_text(encoding='utf-8'))
+        rust_bridge = (ROOT / 'crates/linscp-tauri/src/android.rs').read_text(encoding='utf-8')
+        self.assertIn('use super::AndroidState;', rust_bridge)
+        self.assertIn('set_external_uri(bridge.clone())', rust_bridge)
         smoke = (ROOT / 'tools/android_emulator_smoke.mjs').read_text(encoding='utf-8')
         self.assertIn("'linscp_open_external_uri'", smoke)
         self.assertIn('unsafeUriRejected', smoke)

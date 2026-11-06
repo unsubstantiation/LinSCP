@@ -130,6 +130,7 @@ fn detect_desktop_session_kind() -> DesktopSession {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DesktopSession {
     Wayland,
+    #[cfg(target_os = "linux")]
     X11,
     Headless,
 }
