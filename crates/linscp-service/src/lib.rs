@@ -16,8 +16,8 @@ use linscp_engine::{
     parse_filezilla_xml, parse_openssh_config, PreferencesStore, SessionStore, StoredSite,
 };
 use linscp_platform::{
-    config_dir, create_exclusive_private_file, gui_os, write_private_file_atomic, LocalFs, NativeLocalFs, NativeSecretVault,
-    SecretVault,
+    config_dir, gui_os, write_exclusive_private_file, write_private_file_atomic, LocalFs,
+    NativeLocalFs, NativeSecretVault, SecretVault,
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine as _;
@@ -4406,7 +4406,7 @@ fn protect_one_ssh_key(
         rand::thread_rng().fill_bytes(&mut random);
         let id = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         let encrypted_path = key_dir.join(format!("{id}.key.vault"));
-        match create_exclusive_private_file(&encrypted_path, &encrypted) {
+        match write_exclusive_private_file(&encrypted_path, &encrypted) {
             Ok(()) => created.push(encrypted_path.clone()),
             Err(linscp_platform::PlatformError::AlreadyExists(_)) => continue 'attempt,
             Err(error) => {
@@ -4416,7 +4416,7 @@ fn protect_one_ssh_key(
         }
         if !public_text.is_empty() {
             let public_path = key_dir.join(format!("{id}.pub"));
-            match create_exclusive_private_file(&public_path, public_text.as_bytes()) {
+            match write_exclusive_private_file(&public_path, public_text.as_bytes()) {
                 Ok(()) => created.push(public_path),
                 Err(linscp_platform::PlatformError::AlreadyExists(_)) => {
                     let _ = std::fs::remove_file(&encrypted_path);
@@ -4484,7 +4484,7 @@ fn materialize_one_vault_key(
         rand::thread_rng().fill_bytes(&mut random);
         let suffix = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         let path = temp_dir.join(format!("{id}-{suffix}.key"));
-        match create_exclusive_private_file(&path, &plaintext) {
+        match write_exclusive_private_file(&path, &plaintext) {
             Ok(()) => created.push(path.clone()),
             Err(linscp_platform::PlatformError::AlreadyExists(_)) => continue,
             Err(error) => {
@@ -4499,7 +4499,7 @@ fn materialize_one_vault_key(
         };
         if !public.is_empty() {
             let public_path = PathBuf::from(format!("{}.pub", path.display()));
-            match create_exclusive_private_file(&public_path, public.as_bytes()) {
+            match write_exclusive_private_file(&public_path, public.as_bytes()) {
                 Ok(()) => created.push(public_path),
                 Err(linscp_platform::PlatformError::AlreadyExists(_)) => {
                     let _ = std::fs::remove_file(&path);
@@ -4538,7 +4538,7 @@ fn stage_offlineotp_key(
             let encrypted = secret_vault.seal_local_blob(key.private_key.as_bytes())
                 .map_err(|error| error.to_string())?;
             let path = dir.join(format!("{stem}.key.vault"));
-            match create_exclusive_private_file(&path, &encrypted) {
+            match write_exclusive_private_file(&path, &encrypted) {
                 Ok(()) => {
                     created.push(path.clone());
                     private_file_path = Some(path);
@@ -4553,7 +4553,7 @@ fn stage_offlineotp_key(
         }
         if !key.public_key.is_empty() {
             let path = dir.join(format!("{stem}.pub"));
-            match create_exclusive_private_file(&path, key.public_key.as_bytes()) {
+            match write_exclusive_private_file(&path, key.public_key.as_bytes()) {
                 Ok(()) => {
                     created.push(path.clone());
                     public_path = Some(format!("vaultpub://{stem}"));
