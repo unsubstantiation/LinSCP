@@ -138,8 +138,9 @@ desktop entry; see [docs/debian.md](docs/debian.md).
 ## Android
 
 The experimental Android target uses the Tauri WebView and Rust backend. See
-[docs/android.md](docs/android.md) for debug APK build instructions and important
-limitations, including app-private storage only and no background transfers.
+[docs/android.md](docs/android.md) for the signed release APK's build and signing
+instructions and important limitations, including app-private storage only and
+no background transfers.
 
 ## Historical material
 

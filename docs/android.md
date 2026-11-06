@@ -1,8 +1,10 @@
 # Experimental Android APK
 
 The Android target builds the same Tauri WebView and Rust `CommanderService` as
-the desktop application. This is an **experimental, debug-signed APK**, not a
-production or Play Store release. Android support is incomplete:
+the desktop application. The APK CI publishes is an **experimental build signed
+with the project's release key**: it installs, updates and can be sideloaded like
+any other APK, but it is not a production or Play Store release (no AAB, no
+upload). Android support is incomplete:
 
 - The generated Android host registers the Storage Access Framework picker,
   persists the returned tree grants, and routes `content://` list/stat/read/write/
@@ -30,8 +32,11 @@ production or Play Store release. Android support is incomplete:
   apply. The shared GUI actions listed in the native feature audit are routed
   through the service, but some remain protocol-limited or lack Android
   end-to-end coverage; see that audit before relying on them.
-- The debug APK is signed with a development key. It is intended for testing,
-  not distribution, updates to a release-signed installation, or sensitive data.
+- The published APK is a **release** build: R8-minified, not debuggable, and
+  signed with the release keystore (see [Signing](#signing)). A debug build -
+  still signed with the development key - is used only by CI, where the
+  emulator smoke test needs the WebView DevTools endpoint that a release build
+  deliberately does not expose.
 
 ## Application ID and install directory
 
@@ -75,6 +80,65 @@ uninstall the old app. A generated `gen/android` project from before the rename
 must be regenerated (`tauri android init`) or the build stops with the mismatch
 rather than shipping the old name.
 
+## Signing
+
+Tauri's Android template configures no signing at all, so `tauri android build`
+without `--debug` writes `app-release-unsigned.apk`: an APK no device installs
+and whose bytes anything can replace. `tools/android_release_signing.py` fills
+that gap. It decodes the keystore from the environment, refuses bytes that are
+not a keystore, a keystore the password does not open, or an alias that is not a
+private key, and writes the two files Gradle needs into the generated (ignored)
+project:
+
+```
+crates/linscp-tauri/gen/android/linscp-release.jks       the keystore, mode 0600
+crates/linscp-tauri/gen/android/app/keystore.properties  storeFile, storePassword, keyAlias, keyPassword
+```
+
+It also patches `signingConfigs { create("release") { … } }` and
+`signingConfig = signingConfigs.getByName("release")` into
+`app/build.gradle.kts`. The patch is anchored on the template it expects, so a
+Tauri template that moves fails the build instead of quietly producing an
+unsigned release. The debug build type keeps the development key.
+
+| Environment variable | Meaning |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | required; base64 of the `.jks`/`.keystore` file itself |
+| `ANDROID_KEYSTORE_PASSWORD` | required; the keystore password |
+| `ANDROID_KEY_ALIAS` | optional; when unset, the single private-key entry is used |
+| `ANDROID_KEY_PASSWORD` | optional; defaults to the store password |
+
+GitHub Actions keeps the first two as secrets of the **`android-release`**
+environment, which the build job names (`environment: android-release`) so that
+no other run can reach the key that signs the app users install. An empty
+secret fails the signing step before the build starts.
+
+A maintainer creates the keystore once, outside the repository, and pastes its
+base64 into the environment secret:
+
+```sh
+keytool -genkeypair -v -keystore linscp-release.jks -alias linscp \
+  -keyalg RSA -keysize 4096 -validity 10000 \
+  -dname "CN=LinSCP, O=Fair Universal"
+base64 -w0 linscp-release.jks        # ANDROID_KEYSTORE_BASE64
+```
+
+That file and its password are the only things that can sign an update an
+existing installation accepts: lose them and the next APK is, to Android, a
+different app whose users have to uninstall first. Back them up, and keep them
+out of the repository - `.gitignore` refuses `*.jks`, `*.keystore`, `*.p12`,
+`*.pfx` and `keystore.properties`, and the generated `gen/android` project they
+are written into is ignored as a whole.
+
+`tools/verify_android_apk.py --build-type release` then checks the output
+against the keystore rather than trusting the build that produced it: the
+package is the configured application ID, each requested ABI carries an
+`index.html`-embedding `liblinscp_tauri.so`, the APK is **not**
+`application-debuggable`, `apksigner` accepts it under the v2 scheme, and the
+signing certificate's SHA-256 digest is the one `keytool` reports for the
+configured alias. An APK signed with the debug key, or with any other key, fails
+the run.
+
 ## Build
 
 Install Node.js 22, Rust stable, Java 17, Android SDK platform 36/build-tools
@@ -87,16 +151,34 @@ npm ci --prefix ui
 npm run build --prefix ui
 cd crates/linscp-tauri
 npm run tauri -- android init --ci --skip-targets-install
-python3 ../../tools/prepare_android_project.py
-npm run tauri -- android build --ci --debug --apk true --aab false --target aarch64 x86_64 --features native-shell
+cd ../..
+python3 tools/prepare_android_project.py
+python3 tools/android_release_signing.py     # reads the signing environment above
+cd crates/linscp-tauri
+npm run tauri -- android build --ci --apk true --aab false --target aarch64 x86_64 --features native-shell
+cd ../..
+python3 tools/verify_android_apk.py --build-type release
 ```
 
 The Android Gradle project under `gen/android` is generated and ignored; the
 pinned Tauri CLI version is in `ui/package-lock.json`. The preparation script
 turns off Android backup so the app-private session key and settings are not
 silently included in Android backups. Generate a fresh project when changing
-Tauri CLI versions. The APK is under `gen/android/app/build/outputs/apk/`.
+Tauri CLI versions. The signed APK is under
+`gen/android/app/build/outputs/apk/release/`.
 
-The Android GitHub Actions workflow builds and verifies an APK for ARM64 and
-x86-64 and publishes the `linscp-android-debug` artifact. It does not create a
-release-signed APK or AAB.
+Adding `--debug` to the build command instead produces the debuggable APK the
+emulator smoke test runs against, signed with the development key:
+
+```sh
+npm run tauri -- android build --ci --debug --apk true --aab false --target aarch64 x86_64 --features native-shell
+```
+
+The Android GitHub Actions workflow runs on every push to `master` and builds,
+verifies and publishes `android-artifacts/linscp-android-release.apk` as the
+`linscp-android-release` artifact. It then builds an x86-64 debug APK, exercises
+the WebView, Rust IPC and WebDAV transfers on an emulator through the debug
+build's DevTools endpoint, and finally installs the release APK itself with
+`tools/android_release_launch_check.sh`, which proves it starts, keeps running,
+is not debuggable and installs under the configured application ID. It does not
+create an AAB.
