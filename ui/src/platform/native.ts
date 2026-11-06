@@ -50,8 +50,8 @@ export function androidDesktopViewerUri(
   if (!scheme || tunneled) return null;
   try {
     const target = new URL(`${scheme}://${endpoint}`);
-    if (!target.hostname || target.username || target.password || target.pathname !== '/' ||
-        target.search || target.hash) return null;
+    if (!target.hostname || target.username || target.password ||
+        (target.pathname !== '' && target.pathname !== '/') || target.search || target.hash) return null;
     return `${scheme}://${target.host}`;
   } catch {
     return null;
