@@ -63,9 +63,12 @@ transfer limitations in `readme.md` before using remote operations.
   cancelled transfer may leave remote files or partial trees; guarantees depend
   on the server and are not equivalent to transactions.
 - Native account/login features are not implemented. Android has a Rust-backed
-  experimental debug APK with SAF, share-intent, and foreground-service bridges;
-  Android Keystore remains unwired. Desktop integration, import sources, and
-  other legacy UI actions require further native end-to-end validation.
+  experimental debug APK with SAF, incoming share-intent, foreground-service,
+  and external-intent bridges. Direct RDP/VNC/SPICE targets can be handed to
+  installed Android viewers; X2Go/X11 and jump-tunnel viewer launches remain
+  unsupported there. Android Keystore remains unwired. Desktop file-manager
+  integrations, import sources, and other legacy UI actions still need
+  platform-specific end-to-end validation.
 - SSH host-key changes during workspace restoration are not auto-accepted or
   interactively resolved as part of a batch; the failed tab must be connected
   separately.
@@ -78,8 +81,10 @@ implementation, not complete product parity: the `SHARED_FEATURES` list is a
 contract for intended common UI surface, not evidence that every listed action
 is wired end to end. The incomplete paths above apply to all native hosts unless
 called out otherwise. Android additionally provides registered SAF,
-share-intent, and foreground-service integrations, while Android Keystore and
-real-device parity coverage remain outstanding.
+incoming-share, foreground-service, and external-viewer intent integrations.
+The viewer hand-off currently covers direct RDP/VNC/SPICE only. Android
+Keystore, Android outgoing share, X2Go/X11 viewer intents, real-device SAF/share
+coverage, and Windows/Linux-versus-Android integration parity remain outstanding.
 
 Parity should only be called complete after each shared feature has equivalent
 behavioral acceptance coverage on Windows, Debian, and Android, and each

@@ -822,5 +822,9 @@
   "Vault password": "Vault password",
   "Confirm vault password": "Confirm vault password",
   "Choose an encrypted credential backup file first.": "Choose an encrypted credential backup file first.",
-  "Encrypted credential backups are limited to 16 MiB.": "Encrypted credential backups are limited to 16 MiB."
+  "Encrypted credential backups are limited to 16 MiB.": "Encrypted credential backups are limited to 16 MiB.",
+  "Android viewer apps cannot use this SSH jump tunnel. Connect directly to the desktop host.": "Android viewer apps cannot use this SSH jump tunnel. Connect directly to the desktop host.",
+  "No Android viewer app can open this {kind} connection.": "No Android viewer app can open this {kind} connection.",
+  "The remote desktop target cannot be opened by an Android viewer.": "The remote desktop target cannot be opened by an Android viewer.",
+  "This remote desktop type is not available on Android.": "This remote desktop type is not available on Android."
 }

@@ -18,11 +18,14 @@ production or Play Store release. Android support is incomplete:
   Keystore/biometric integration remains unwired, and the session master key is
   stored in the app sandbox rather than backed by Android Keystore.
 - One `hostCapabilities()` description drives host-dependent controls. SAF,
-  share intents, and foreground transfers are reported for the registered native
-  Android build; a browser running on Android does not inherit those native
-  capabilities. Desktop launchers and OS drop listeners remain desktop-only.
-  `hostDifferenceReason()` explains integrations unavailable on the current
-  host.
+  incoming share intents, foreground transfers, and external viewer intents are
+  reported for the registered native Android build; a browser running on Android
+  does not inherit those native capabilities. Android can hand direct RDP, VNC,
+  and SPICE targets to installed viewer apps. X2Go/X11 and SSH jump-tunnel viewer
+  launches are not supported by Android intents yet. Debian/Windows use native
+  desktop viewers and OS file-drop events; Android uses document grants and the
+  Share Sheet instead. `hostDifferenceReason()` explains unavailable
+  integrations.
 - Remote transfer restrictions and cleanup caveats in the main README still
   apply. The shared GUI actions listed in the native feature audit are routed
   through the service, but some remain protocol-limited or lack Android

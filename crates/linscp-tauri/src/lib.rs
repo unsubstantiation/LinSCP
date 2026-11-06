@@ -127,6 +127,17 @@ pub mod commands {
         Ok(json!({ "success": true, "staged": staged_buf, "manifest": manifest }))
     }
 
+    /// Opens an external URI through Android's activity resolver. The Kotlin
+    /// plugin allowlists HTTP(S) and supported remote-desktop viewer schemes.
+    #[tauri::command]
+    pub async fn linscp_open_external_uri(
+        state: tauri::State<'_, TauriBridge>,
+        uri: String,
+    ) -> Result<serde_json::Value, String> {
+        state.android_state().open_external_uri(&uri).map_err(|e| e.to_string())?;
+        Ok(json!({ "opened": true }))
+    }
+
     #[tauri::command]
     pub async fn linscp_foreground_start(
         state: tauri::State<'_, TauriBridge>,
@@ -217,6 +228,7 @@ pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
             commands::linscp_request_saf_tree,
             commands::linscp_pick_saf_tree,
             commands::linscp_handle_share_intent,
+            commands::linscp_open_external_uri,
             commands::linscp_foreground_start,
             commands::linscp_foreground_update,
             commands::linscp_foreground_stop

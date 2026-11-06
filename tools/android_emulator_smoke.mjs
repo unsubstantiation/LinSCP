@@ -29,10 +29,14 @@ const expression = `
   if (window.LinSCPTransport?.mode !== 'tauri') throw new Error('Tauri frontend transport not initialized');
   const invoke = (method, path, body = {}) => window.LinSCPTransport.request(method, path, body);
   const caps = window.LinSCPCore.hostCapabilities({host: window});
-  for (const bridge of ['safTrees', 'shareIntents', 'foregroundTransfers']) {
+  for (const bridge of ['safTrees', 'shareIntents', 'foregroundTransfers', 'desktopLaunchers']) {
     if (!caps[bridge]) throw new Error('Native Android capability not registered: ' + bridge);
   }
   const nativeInvoke = window.__TAURI_INTERNALS__.invoke;
+  let unsafeUriRejected = false;
+  try { await nativeInvoke('linscp_open_external_uri', {uri: 'javascript:alert(1)'}); }
+  catch (_) { unsafeUriRejected = true; }
+  if (!unsafeUriRejected) throw new Error('Android external URI bridge accepted an unsafe scheme');
   await nativeInvoke('linscp_foreground_start', {title: 'Android smoke transfer', ongoing: 1});
   await nativeInvoke('linscp_foreground_update', {done: 512, total: 1024});
   await nativeInvoke('linscp_foreground_stop');
@@ -81,7 +85,7 @@ const expression = `
   const contents = await invoke('GET', '/api/local/edit?tab=' + local.tab.id + '&path=smoke-upload.txt');
   if (contents.content !== 'Android Rust-backed transfer') throw new Error('Downloaded bytes differ');
   await invoke('POST', '/api/local/rename', {tab: local.tab.id, old_name: 'smoke-upload.txt', new_name: 'renamed.txt'});
-  return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, conflict: true};
+  return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, conflict: true, externalUriValidation: true};
 })()`;
 let nextId = 0;
 async function evaluate(expression, timeout = 10000) {

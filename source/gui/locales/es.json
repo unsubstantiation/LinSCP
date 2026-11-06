@@ -822,5 +822,9 @@
   "Vault password": "Contraseña del almacén",
   "Confirm vault password": "Confirmar contraseña del almacén",
   "Choose an encrypted credential backup file first.": "Seleccione primero un archivo cifrado de copia de credenciales.",
-  "Encrypted credential backups are limited to 16 MiB.": "Las copias cifradas de credenciales están limitadas a 16 MiB."
+  "Encrypted credential backups are limited to 16 MiB.": "Las copias cifradas de credenciales están limitadas a 16 MiB.",
+  "Android viewer apps cannot use this SSH jump tunnel. Connect directly to the desktop host.": "Las aplicaciones de visualización de Android no pueden usar este túnel SSH de salto. Conéctese directamente al host de escritorio.",
+  "No Android viewer app can open this {kind} connection.": "Ninguna aplicación de Android puede abrir esta conexión {kind}.",
+  "The remote desktop target cannot be opened by an Android viewer.": "No se puede abrir el destino del escritorio remoto con una aplicación de Android.",
+  "This remote desktop type is not available on Android.": "Este tipo de escritorio remoto no está disponible en Android."
 }

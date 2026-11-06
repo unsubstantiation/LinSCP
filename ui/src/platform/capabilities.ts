@@ -122,7 +122,8 @@ export interface HostCapabilityOptions {
  * transfer plugin in `build_native_app`; only a native Android WebView may
  * advertise those integrations. A browser running on Android is still an HTTP
  * host and does not receive these capabilities. Native desktop launchers and
- * OS drop events remain desktop-only.
+ * OS drop events are distinct from Android's intent-based viewer launch and
+ * incoming share-sheet handling.
  */
 export function hostCapabilities(options: HostCapabilityOptions = {}): HostCapabilities {
   const host = options.host ?? globalThis;
@@ -145,7 +146,9 @@ export function hostCapabilities(options: HostCapabilityOptions = {}): HostCapab
     fileDrop: true,
     nativeFileDrop: options.nativeFileDrop ?? (native && !android),
     accounts: options.accounts ?? !native,
-    desktopLaunchers: options.desktopLaunchers ?? (native && !android),
+    desktopLaunchers: options.desktopLaunchers ?? (
+      native && ['linux', 'windows', 'macos', 'android'].includes(platform)
+    ),
     terminal: options.terminal ?? true,
     backgroundTransfers: foregroundTransfers || !android,
   };
@@ -204,7 +207,7 @@ export function hostDifferenceReason(
     return 'Operating-system file drops require a native desktop window.';
   }
   if (capability === 'desktopLaunchers' && !caps.desktopLaunchers) {
-    return 'Remote desktop viewers require a native desktop operating system.';
+    return 'Remote desktop viewers require a supported native launcher integration.';
   }
   if (capability === 'accounts' && !caps.accounts) {
     return 'The native application does not require a sign-in.';
