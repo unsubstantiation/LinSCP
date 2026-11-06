@@ -3,6 +3,9 @@ name: Debian build
 on:
   push:
     branches: [master]
+  # Run by hand from the Actions tab (or `gh workflow run`) to build a branch
+  # or re-run a build without waiting for a push to master.
+  workflow_dispatch:
 
 jobs:
   build:
@@ -33,6 +36,13 @@ jobs:
 
       - name: Check GUI distribution configuration
         run: python3 -m unittest discover -s tools/tests -p test_gui_distribution.py
+
+      # Every workflow in this directory is also startable by hand; a build that
+      # only runs on a push to master cannot be tried on the branch that
+      # changes it. The test reads the `on:` mappings so a trigger cannot be
+      # dropped without failing here.
+      - name: Check that every workflow can be started by hand
+        run: python3 -m unittest discover -s tools/tests -p test_workflow_triggers.py
 
       # The same page is served by two hosts. The frontend suite builds
       # `ui/dist` and drives it in jsdom, the translation compiler rejects an

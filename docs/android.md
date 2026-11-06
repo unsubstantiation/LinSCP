@@ -175,8 +175,10 @@ emulator smoke test runs against, signed with the development key:
 npm run tauri -- android build --ci --debug --apk true --aab false --target aarch64 x86_64 --features native-shell
 ```
 
-The Android GitHub Actions workflow runs on every push to `master` and builds,
-verifies and publishes `android-artifacts/linscp-android-release.apk` as the
+The Android GitHub Actions workflow runs on every push to `master` - and by
+hand, from the Actions tab or `gh workflow run "Android build" --ref <branch>`,
+which is how a branch is built before it is merged - and builds, verifies and
+publishes `android-artifacts/linscp-android-release.apk` as the
 `linscp-android-release` artifact. It then builds an x86-64 debug APK, exercises
 the WebView, Rust IPC and WebDAV transfers on an emulator through the debug
 build's DevTools endpoint, and finally installs the release APK itself with

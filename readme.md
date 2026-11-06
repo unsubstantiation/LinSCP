@@ -142,6 +142,16 @@ The experimental Android target uses the Tauri WebView and Rust backend. See
 instructions and important limitations, including app-private storage only and
 no background transfers.
 
+## Continuous integration
+
+The workflows in `.github/workflows/` build the Debian package, the Windows
+application and the signed Android APK. Each runs on a push to `master` and can
+also be started by hand, from the Actions tab ("Run workflow", where the branch
+to build can be chosen) or with `gh workflow run "Android build" --ref <branch>`.
+GitHub only offers that button for workflows whose default-branch copy declares
+`workflow_dispatch`, which all three do; a run of the Android build uses the
+`android-release` environment and therefore its release keystore.
+
 ## Historical material
 
 Older parity reports, scripts and live-test harnesses in `docs/` and `source/`

@@ -3,6 +3,9 @@ name: Windows build
 on:
   push:
     branches: [master]
+  # Run by hand from the Actions tab (or `gh workflow run`) to build a branch
+  # or re-run a build without waiting for a push to master.
+  workflow_dispatch:
 
 jobs:
   build:

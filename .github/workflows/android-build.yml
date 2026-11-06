@@ -3,9 +3,9 @@ name: Android build
 on:
   push:
     branches: [master]
-  # Lets a branch build the signed APK and run the emulator checks before it is
-  # merged, which is the only way to try the release keystore and signing
-  # configuration without pushing to master.
+  # Run by hand from the Actions tab (or `gh workflow run`) to build a branch or
+  # re-run a build without waiting for a push to master. This is how the release
+  # keystore and signing configuration are tried before they land on master.
   workflow_dispatch:
 
 jobs:
