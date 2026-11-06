@@ -4,16 +4,72 @@ The Android target builds the same Tauri WebView and Rust `CommanderService` as
 the desktop application. This is an **experimental, debug-signed APK**, not a
 production or Play Store release. Android support is incomplete:
 
-- Only app-private storage is exposed. The Android Storage Access Framework,
-  document picker, share intents and Downloads/shared storage are not wired in.
-  Uninstalling the app removes app-private files and configuration.
+- Only app-private storage is exposed unless a folder is granted. The Storage
+  Access Framework bridge and the share hand-off exist in the Rust shell
+  (`linscp_request_saf_tree`, `linscp_pick_saf_tree`,
+  `linscp_handle_share_intent`), but the generated Kotlin project has to register
+  the picker and the intent filter for them to be reachable; until it does, a
+  share or a folder grant fails closed instead of silently doing nothing.
+  Downloads/shared storage is not exposed. Uninstalling the app removes
+  app-private files and configuration.
 - Background/foreground-service transfer survival and Android Keystore/biometric
-  integration are not wired in. Keep the app open during transfers. The session
-  master key is stored in the app sandbox, not backed by Android Keystore.
+  integration are not wired in. The page starts and stops the service from the
+  transfer queue (`ForegroundTransferBridge`, gated on the `foregroundTransfers`
+  capability) and the Rust shell exposes the three commands, but nothing
+  implements the service itself yet, so the calls fail closed. Keep the app open
+  during transfers. The session master key is stored in the app sandbox, not
+  backed by Android Keystore.
+- The page no longer probes the native bridge at each call site. One
+  `hostCapabilities()` description drives the controls that differ between
+  hosts (folder grants, share hand-offs, the foreground service, the OS drop
+  listener), and a control this host cannot serve is left out with the reason
+  `hostDifferenceReason()` gives.
 - Remote transfer restrictions and cleanup caveats in the main README still
   apply. Other native GUI actions remain incomplete; see the feature audit.
 - The debug APK is signed with a development key. It is intended for testing,
   not distribution, updates to a release-signed installation, or sensitive data.
+
+## Application ID and install directory
+
+The app is installed as **`com.fairuniversal.linscp`**, defined once in
+`crates/linscp-tauri/tauri.conf.json` (`identifier`). Tauri renders that into the
+Gradle `applicationId` of the generated project
+(`namespace`/`applicationId = "<identifier>"`, no `applicationIdSuffix` unless
+`bundle.android.debugApplicationIdSuffix` is configured — this repository does
+not configure it) and into the `MainActivity` package directory. Android then
+places the installed app in the sandbox named after that `applicationId`:
+
+```
+/data/user/0/com.fairuniversal.linscp         Activity.dataDir (`/data/data/...` is the same dir)
+/data/user/0/com.fairuniversal.linscp/config  linscp_platform::default_config_dir()
+/data/user/0/com.fairuniversal.linscp/cache   TMPDIR (Activity.cacheDir)
+```
+
+Tauri's `app_data_dir()` on Android is `Activity.dataDir` itself, not a
+`files/config` subdirectory: `PathPlugin.getDataDir()` resolves
+`activity.dataDir`, and `app.path().app_data_dir()` in
+`crates/linscp-tauri/src/lib.rs` is what the shell exports as
+`LINSCP_ANDROID_FILES_DIR`. The `App Storage` local root the page shows and the
+`config_root()` the service loads preferences and sessions from are therefore
+both inside the folder named after the application ID, with no `app >
+appDirectoriesOverride` in the configuration pointing anywhere else.
+
+The emulator harness proves this on the device rather than assuming it. After
+the WebView smoke test writes a marker file through the Rust service,
+`tools/android_emulator_smoke.sh` asks the system package manager for the
+installed package, enters that package's sandbox (`adb shell run-as`), checks
+the sandbox is `/data/user/0/com.fairuniversal.linscp`, and looks for the marker
+there. A build installed under another name, or reading another package's
+storage, fails the run; nothing in that check comes from this repository's own
+configuration.
+
+Two consequences of a rename are worth stating: the new package installs
+*beside* an older build rather than updating it, and an older build's
+app-private settings and stored sessions live under `/data/user/0/io.linscp.commander`,
+so they are not carried over — re-import or re-enter the sites you need, then
+uninstall the old app. A generated `gen/android` project from before the rename
+must be regenerated (`tauri android init`) or the build stops with the mismatch
+rather than shipping the old name.
 
 ## Build
 

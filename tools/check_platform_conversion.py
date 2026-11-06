@@ -231,6 +231,7 @@ REMOVED_ARTEFACTS = [
 # were updated to ship the Rust binaries instead.
 INSTALLED_FILES = [
     'debian/linscp.desktop',
+    'debian/linscp-web.desktop',
     'debian/linscp.png',
     'debian/linscp.svg',
 ]

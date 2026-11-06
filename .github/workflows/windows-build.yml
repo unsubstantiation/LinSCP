@@ -60,9 +60,55 @@ jobs:
             if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
           }
 
+      # The same page in a browser: build the HTTP host and prove it serves the
+      # page and refuses an API request that carries no token. Windows is where
+      # the two hosts are most likely to drift, because only one of them gets a
+      # native window here.
+      - name: Build the browser host
+        shell: bash
+        run: python tools/run_cargo_ci.py cargo build --release -p linscp-http
+
+      - name: Smoke test the browser host
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'linscp-web.log'
+          $app = Start-Process -FilePath "$PWD/target/release/linscp-web.exe" `
+            -ArgumentList '--port=8792', '--print-token' -PassThru `
+            -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+          try {
+            $token = $null
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 1
+              $app.Refresh()
+              if ($app.HasExited) { throw "linscp-web exited: $((Get-Content $log) -join ' ')" }
+              if (Test-Path $log) {
+                $line = Select-String -Path $log -Pattern '^Token: (.+)$' | Select-Object -First 1
+                if ($line) { $token = $line.Matches[0].Groups[1].Value.Trim(); break }
+              }
+            }
+            if (-not $token) { throw 'linscp-web printed no token' }
+            $page = Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:8792/' -TimeoutSec 30
+            if ($page.Content -notmatch 'LSCP_TOKEN') { throw 'the served page carries no token' }
+            # A token-less API request is refused, and the printed token is
+            # answered: the token is the whole access control of this mode.
+            $refused = $false
+            try {
+              Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:8792/api/status' -TimeoutSec 30 | Out-Null
+            } catch { $refused = $_.Exception.Response.StatusCode.value__ -eq 401 }
+            if (-not $refused) { throw 'an API request without the token was not refused with 401' }
+            $status = Invoke-RestMethod -Uri 'http://127.0.0.1:8792/api/status' -TimeoutSec 30 `
+              -Headers @{ 'X-LSCP-Token' = $token }
+            if ($null -eq $status.tabs) { throw '/api/status did not answer the session list' }
+            Write-Host 'linscp-web served the page and answered the API'
+          } finally {
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
+          }
+
       - name: Upload the portable application
         uses: actions/upload-artifact@v7
         with:
           name: linscp-windows
-          path: target/release/linscp-gui.exe
+          path: |
+            target/release/linscp-gui.exe
+            target/release/linscp-web.exe
           if-no-files-found: error

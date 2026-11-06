@@ -244,21 +244,29 @@ fn mime_for_path(path: &Path) -> String {
     }
 }
 
+/// The path and query the service dispatches on, as the request carried them.
+fn full_path(uri: &Uri) -> String {
+    uri.path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| uri.path().to_string())
+}
+
+#[axum::debug_handler]
 async fn api_handler(
     State(state): State<Arc<HttpAppState>>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
+    request: axum::extract::Request,
 ) -> Response {
+    // axum 0.7 requires a handler's last extractor to implement `FromRequest`,
+    // which `HeaderMap` does not, so the request is taken whole and read here.
+    let (parts, body) = request.into_parts();
+    let method = parts.method;
+    let uri = parts.uri;
+    let headers = parts.headers;
+    // The Host/Origin allowlist and the token are decided once, before any body
+    // is read: an unauthenticated caller must not be able to make the server
+    // buffer a gigabyte it will refuse to dispatch.
     if let Err(reason) = check_host_and_origin(&headers, &state.config.allowed_hosts) {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": reason }))).into_response();
-    }
-    // Binary upload handling for browser drops
-    let path_only = uri.path().to_string();
-    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
-    if (path_only == "/api/transfer/drop" || path_only == "/api/local/drop") && ct == "application/octet-stream" {
-        return handle_octet_drop(State(state), method, uri, headers, body).await;
     }
     let provided = supplied_token(&headers);
     if !constant_time_str_eq(&provided, &state.config.bearer_token) {
@@ -268,8 +276,30 @@ async fn api_handler(
         )
             .into_response();
     }
-    if body.len() > MAX_JSON_BODY_BYTES {
-        return (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({"error": "JSON body too large"}))).into_response();
+    // A browser posts a dropped file as raw bytes, because a `File` cannot be
+    // JSON-encoded without first reading it into memory twice. That body may be
+    // large; every other body is JSON and stays small.
+    let path_only = uri.path().to_string();
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let is_octet_drop = (path_only == "/api/transfer/drop" || path_only == "/api/local/drop")
+        && content_type == "application/octet-stream";
+    let limit = if is_octet_drop { MAX_BROWSER_UPLOAD_BYTES } else { MAX_JSON_BODY_BYTES };
+    let body = match axum::body::to_bytes(body, limit).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let error = if is_octet_drop {
+                "Browser uploads are limited to 1 GiB"
+            } else {
+                "JSON body too large"
+            };
+            return (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({ "error": error }))).into_response();
+        }
+    };
+    if is_octet_drop {
+        return dispatch_octet_drop(&state, method, uri, body).await;
     }
     let parsed_body: Value = if body.is_empty() {
         json!({})
@@ -290,15 +320,11 @@ async fn api_handler(
             }
         }
     };
-    let full_path = uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| uri.path().to_string());
     // Enforce JSON object for POST body (like Python)
     let body_for_service = if parsed_body.is_object() { parsed_body } else if parsed_body.is_null() { json!({}) } else { parsed_body };
     let reply = state.service.dispatch_async(ApiEnvelope {
         method: method.as_str().to_string(),
-        path: full_path,
+        path: full_path(&uri),
         body: body_for_service,
     }).await;
     let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -308,36 +334,18 @@ async fn api_handler(
     resp
 }
 
-/// A browser posts a dropped file as raw bytes, because a `File` cannot be
-/// JSON-encoded without first reading it into memory twice.
-///
-/// The body is turned into the one representation the service accepts and then
-/// dispatched like any other request, so the drop endpoint exists once: the
-/// desktop window, the browser and the Android app all reach the same handler.
-async fn handle_octet_drop(
-    State(state): State<Arc<HttpAppState>>,
+/// The already-authenticated body of a browser drop, in the one representation
+/// the service accepts, so the drop endpoint exists once: the desktop window,
+/// the browser and the Android app all reach the same handler.
+async fn dispatch_octet_drop(
+    state: &Arc<HttpAppState>,
     method: Method,
     uri: Uri,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(reason) = check_host_and_origin(&headers, &state.config.allowed_hosts) {
-        return (StatusCode::FORBIDDEN, Json(json!({ "error": reason }))).into_response();
-    }
-    let provided = supplied_token(&headers);
-    if !constant_time_str_eq(&provided, &state.config.bearer_token) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid or missing X-LSCP-Token"}))).into_response();
-    }
-    if body.len() > MAX_BROWSER_UPLOAD_BYTES {
-        return (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({"error": "Browser uploads are limited to 1 GiB"}))).into_response();
-    }
-    let full_path = uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| uri.path().to_string());
     let reply = state.service.dispatch_async(ApiEnvelope {
         method: method.as_str().to_string(),
-        path: full_path,
+        path: full_path(&uri),
         body: json!({ "data_base64": BASE64_STD.encode(&body) }),
     }).await;
     let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -375,5 +383,154 @@ mod tests {
         ok_headers.insert("host", "127.0.0.1:8080".parse().unwrap());
         ok_headers.insert("origin", "http://127.0.0.1:8080".parse().unwrap());
         assert!(check_host_and_origin(&ok_headers, &cfg.allowed_hosts).is_ok());
+    }
+}
+
+/// A bound browser server, for the binary that offers browser mode.
+///
+/// The desktop window is a Tauri application; a browser, a headless host and a
+/// multi-user deployment are the same page served by this crate over HTTP. The
+/// startup lives here rather than in a `main.rs` so the address and the token a
+/// test reads are the ones the launcher really used, and so the two apps cannot
+/// drift in how they embed the page.
+pub struct BrowserServer {
+    pub addr: SocketAddr,
+    /// The bearer token the page has to send with every `/api` request.
+    pub token: String,
+    listener: std::net::TcpListener,
+    config: HttpServerConfig,
+}
+
+impl BrowserServer {
+    /// Binds a port (`0` lets the kernel pick one) and keeps the token.
+    ///
+    /// The listener is bound here, once: a second bind could land on a
+    /// different port than the one printed for the user, which is the kind of
+    /// difference a smoke test that reads the printed address would not catch.
+    pub fn bind(port: u16, allowed_hosts: &[String], bind_addr: Option<SocketAddr>) -> std::io::Result<Self> {
+        let mut config = HttpServerConfig::loopback(port);
+        if let Some(addr) = bind_addr {
+            config.bind_addr = addr;
+        }
+        for host in allowed_hosts {
+            let host = host.trim();
+            if !host.is_empty() {
+                config.allowed_hosts.insert(host.to_ascii_lowercase());
+            }
+        }
+        let listener = std::net::TcpListener::bind(config.bind_addr)?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        config.bind_addr = addr;
+        let token = config.bearer_token.clone();
+        Ok(Self { addr, token, listener, config })
+    }
+
+    /// The URL the user opens. A port the kernel picked is already resolved.
+    pub fn url(&self) -> String {
+        let ip = self.addr.ip();
+        let host = if ip.is_unspecified() {
+            "127.0.0.1".to_string()
+        } else if ip.is_ipv6() {
+            format!("[{ip}]")
+        } else {
+            ip.to_string()
+        };
+        format!("http://{host}:{}/", self.addr.port())
+    }
+
+    /// Serves the page and the API until the listener fails.
+    pub async fn serve(self) -> std::io::Result<()> {
+        let listener = tokio::net::TcpListener::from_std(self.listener)?;
+        let state = Arc::new(HttpAppState {
+            service: CommanderService::default(),
+            config: self.config,
+        });
+        serve(listener, state).await
+    }
+}
+
+#[cfg(test)]
+mod browser_server_tests {
+    use super::*;
+
+    /// The address printed for the user and the address actually bound are the
+    /// same one, and the token the page carries is the token the API checks.
+    #[test]
+    fn the_browser_server_prints_the_address_it_bound() {
+        let server = BrowserServer::bind(0, &[], None).expect("bind a loopback port");
+        assert_ne!(server.addr.port(), 0, "the kernel picked a port");
+        let expected = format!("http://127.0.0.1:{}/", server.addr.port());
+        assert_eq!(server.url(), expected);
+        // Opening the printed URL and sending the printed token has to pass
+        // the check the API makes; anything else means a page that cannot talk.
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "127.0.0.1:8765".parse().unwrap());
+        headers.insert("origin", "http://127.0.0.1:8765".parse().unwrap());
+        assert!(check_host_and_origin(&headers, &server.config.allowed_hosts).is_ok());
+        assert!(constant_time_str_eq(&server.token, &server.config.bearer_token));
+        assert!(!server.token.is_empty());
+    }
+
+    /// A request that reaches the router really is dispatched, and the two
+    /// guards refuse before any work happens: the bearer token, and a `Host`
+    /// the server does not answer to. Fetching the page alone would not show
+    /// that the `/api` route is wired at all.
+    #[tokio::test]
+    async fn the_api_route_dispatches_and_guards_itself() {
+        let server = BrowserServer::bind(0, &[], None).expect("bind a loopback port");
+        let port = server.addr.port();
+        let token = server.token.clone();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/api/status");
+        let local_host = format!("127.0.0.1:{port}");
+        // Without the token the API refuses instead of dispatching.
+        let refused = client
+            .get(&url)
+            .header("host", &local_host)
+            .send()
+            .await
+            .expect("reach the server");
+        assert_eq!(refused.status().as_u16(), 401);
+        // With it, the same request reaches the service and is answered.
+        let answered = client
+            .get(&url)
+            .header("host", &local_host)
+            .header("x-lscp-token", &token)
+            .send()
+            .await
+            .expect("reach the server");
+        assert_eq!(answered.status().as_u16(), 200);
+        let body: Value = serde_json::from_str(&answered.text().await.expect("an answer"))
+            .expect("a JSON answer");
+        assert_eq!(body["binary"], "linscp");
+        // A foreign `Host` is refused even with the token, so a DNS rebinding
+        // page cannot borrow the caller's credentials.
+        let rebound = client
+            .get(&url)
+            .header("host", "attacker.example.com")
+            .header("x-lscp-token", &token)
+            .send()
+            .await
+            .expect("reach the server");
+        assert_eq!(rebound.status().as_u16(), 403);
+    }
+
+    /// An extra host is accepted only by name, and it does not widen the list
+    /// to everything: the token is still the only thing guarding the API.
+    #[test]
+    fn an_extra_allowed_host_is_named_not_wildcarded() {
+        let server = BrowserServer::bind(0, &[" LinSCP.Internal ".to_string(), String::new()], None)
+            .expect("bind a loopback port");
+        assert!(server.config.allowed_hosts.contains("linscp.internal"));
+        assert!(!server.config.allowed_hosts.contains("*"));
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "linscp.internal:8765".parse().unwrap());
+        assert!(check_host_and_origin(&headers, &server.config.allowed_hosts).is_ok());
+        headers.insert("host", "other.example:8765".parse().unwrap());
+        assert!(check_host_and_origin(&headers, &server.config.allowed_hosts).is_err());
     }
 }

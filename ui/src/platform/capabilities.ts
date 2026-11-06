@@ -97,6 +97,8 @@ export function detectHostPlatform(host: unknown = globalThis): HostPlatform {
 }
 
 export interface HostCapabilityOptions {
+  /** The window to inspect; defaults to `globalThis`. */
+  host?: unknown;
   /** Overrides the detected transport (used by tests and by the native shell). */
   transport?: TransportMode;
   /** Overrides the detected platform (the backend may know better). */
@@ -124,8 +126,9 @@ export interface HostCapabilityOptions {
  * viewers and with the SAF, share and foreground bridges in their place.
  */
 export function hostCapabilities(options: HostCapabilityOptions = {}): HostCapabilities {
-  const transport = options.transport ?? detectHostKind();
-  const platform = options.platform ?? detectHostPlatform();
+  const host = options.host ?? globalThis;
+  const transport = options.transport ?? detectHostKind(host);
+  const platform = options.platform ?? detectHostPlatform(host);
   const native = transport === 'tauri';
   const android = platform === 'android';
   return {

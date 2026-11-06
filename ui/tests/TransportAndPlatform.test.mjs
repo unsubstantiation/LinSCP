@@ -20,6 +20,10 @@ import {
   applyCtrlModifier,
   createTransport,
   detectTransportMode,
+  dropPaths,
+  dropRequest,
+  droppedLeafName,
+  normalizeDropPayload,
   normalizeLocale,
   requestSafTree,
   sharedFeatureSet,
@@ -322,6 +326,28 @@ test('every host exposes the same feature surface and explains each real differe
   // Nothing is claimed missing for a capability the host actually has.
   assert.equal(hostDifferenceReason('safTrees', android), null);
   assert.equal(hostDifferenceReason('terminal', android), null);
+
+  // The description is derived from the window the page runs in, so the page
+  // can ask it instead of probing the native bridge at each call site.
+  const fakeBrowser = { navigator: { userAgent: 'Mozilla/5.0 (X11; Linux x86_64)' } };
+  assert.deepEqual(
+    [hostCapabilities({ host: fakeBrowser }).transport, hostCapabilities({ host: fakeBrowser }).platform],
+    ['http', 'linux'],
+  );
+  const fakeAndroid = {
+    navigator: { userAgent: 'Mozilla/5.0 (Linux; Android 14)' },
+    __TAURI_INTERNALS__: { invoke: async () => ({}) },
+  };
+  const detected = hostCapabilities({ host: fakeAndroid });
+  assert.equal(detected.transport, 'tauri');
+  assert.equal(detected.platform, 'android');
+  // Every Android-only bridge follows from the one detection, so a page that
+  // gates on a capability cannot offer a bridge this host does not have.
+  assert.equal(detected.safTrees, true);
+  assert.equal(detected.shareIntents, true);
+  assert.equal(detected.foregroundTransfers, true);
+  assert.equal(hostCapabilities({ host: fakeBrowser }).shareIntents, false);
+  assert.equal(hostCapabilities({ host: fakeBrowser }).foregroundTransfers, false);
 });
 
 test('the SAF picker degrades to null where no shell can open one', async () => {
@@ -378,6 +404,43 @@ test('the foreground bridge drops duplicate percentages and stops cleanly', asyn
   assert.equal(await absent.start('x', 1), false);
   assert.equal(await absent.update(1, 2), false);
   assert.equal(await absent.stop(), false);
+});
+
+test('the page gates each Android-only bridge on the capability it needs', () => {
+  // The page asks the bundle what this host can do instead of probing the
+  // native bridge at each call site. A bridge that is not offered here is one
+  // the host cannot serve, and the difference is explained rather than hidden.
+  const html = fs.readFileSync(path.join(repoRoot, 'source', 'gui', 'web', 'index.html'), 'utf8');
+  assert.match(html, /function hostCaps\(\)/, 'the page asks the bundle for capabilities');
+  assert.match(html, /typeof window\.LinSCPCore\.hostCapabilities !== 'function'/);
+  assert.match(html, /hostDifferenceReason/);
+
+  // Folder grants, share hand-offs and the foreground service each read the
+  // capability that names them, so a host without the bridge never calls it.
+  const canGrant = html.match(/const canGrantFolders = \(\) => Boolean\([\s\S]*?\);/);
+  assert.ok(canGrant, 'the SAF control is gated');
+  assert.match(canGrant[0], /safTrees/);
+
+  const share = html.match(/async function queueSharedFiles\(item\) \{[\s\S]*?\n  \}/);
+  assert.ok(share, 'the share hand-off exists');
+  assert.match(share[0], /shareIntents/);
+
+  const foreground = html.match(/function foregroundService\(\) \{[\s\S]*?\n  \}/);
+  assert.ok(foreground, 'the foreground service is started from the queue');
+  assert.match(foreground[0], /foregroundTransfers/);
+  assert.match(html, /syncForegroundService\(\);/, 'the queue drives the service');
+
+  const drops = html.match(/function listenForNativeDrops\(\) \{[\s\S]*?\n  \}/);
+  assert.ok(drops, 'the native drop listener exists');
+  assert.match(drops[0], /nativeFileDrop/);
+
+  // Every capability the page asks about is one the bundle actually reports,
+  // so a rename cannot leave the gate silently always-false.
+  const caps = hostCapabilities({ transport: 'tauri', platform: 'android' });
+  for (const name of ['safTrees', 'shareIntents', 'foregroundTransfers', 'nativeFileDrop']) {
+    assert.equal(typeof caps[name], 'boolean', `${name} is reported`);
+    assert.ok(html.includes(name), `${name} is consulted by the page`);
+  }
 });
 
 test('Built ui/dist/index.html boots inside Tauri IPC mode with zero HTTP calls', async () => {
@@ -447,11 +510,31 @@ test('Built ui/dist/index.html boots inside Tauri IPC mode with zero HTTP calls'
   dom.window.close();
 });
 
+/**
+ * The page's one conflict/approval loop, as a function the tests can call.
+ *
+ * Every way a file arrives (a pane transfer, a browser byte drop, a native
+ * path drop) goes through `applyDropApprovals`, so the tests load that and the
+ * transfer wrapper together instead of a copy that could drift.
+ */
+function loadApprovalDecision(apiPost, preferences, confirm, t) {
+  const html = fs
+    .readFileSync(path.join(repoRoot, 'source', 'gui', 'web', 'index.html'), 'utf8')
+    .replace(/\r\n/g, '\n');
+  const approvals = html.match(/async function applyDropApprovals\(send, options\) \{[\s\S]*?\n  \}\n/);
+  const pane = html.match(/async function queueWithOverwriteDecision\(endpoint, payload\) \{[\s\S]*?\n  \}\n/);
+  assert.ok(approvals, 'the shared approval loop exists');
+  assert.ok(pane, 'a pane transfer uses the shared approval loop');
+  return new Function(
+    'apiPost',
+    'preferences',
+    'confirm',
+    't',
+    `${approvals[0]}\n${pane[0]}; return queueWithOverwriteDecision;`,
+  )(apiPost, preferences, confirm, t);
+}
+
 test('overwrite confirmation forwards the original WebDAV conflict ETag', async () => {
-  const html = fs.readFileSync(path.join(repoRoot, 'source', 'gui', 'web', 'index.html'), 'utf8').replace(/\r\n/g, '\n');
-  const match = html.match(/async function queueWithOverwriteDecision\(endpoint, payload, conflicts\) \{[\s\S]*?\n  \}\n\n  async function transfer/);
-  assert.ok(match, 'overwrite decision handler exists');
-  const handlerSource = match[0].replace(/\n\n  async function transfer$/, '');
   const calls = [];
   const apiPost = async (endpoint, payload) => {
     calls.push({ endpoint, payload });
@@ -459,33 +542,25 @@ test('overwrite confirmation forwards the original WebDAV conflict ETag', async 
       ? { success: false, conflicts: ['file.txt'], conflict_versions: { 'file.txt': '"original"' } }
       : { success: true };
   };
-  const handler = new Function('apiPost', 'preferences', 'confirm', 't', `${handlerSource}; return queueWithOverwriteDecision;`)(apiPost, {}, () => true, s => s);
+  const handler = loadApprovalDecision(apiPost, {}, () => true, s => s);
   assert.equal((await handler('/api/transfer/upload', { overwrite: 'ask' }, [])).success, true);
   assert.deepEqual(calls[1].payload, { overwrite: 'overwrite', conflict_versions: { 'file.txt': '"original"' } });
 });
 
 test('directory merge requires explicit approval and forwards only approved roots', async () => {
-  const html = fs.readFileSync(path.join(repoRoot, 'source', 'gui', 'web', 'index.html'), 'utf8').replace(/\r\n/g, '\n');
-  const match = html.match(/async function queueWithOverwriteDecision\(endpoint, payload, conflicts\) \{[\s\S]*?\n  \}\n\n  async function transfer/);
-  assert.ok(match);
-  const source = match[0].replace(/\n\n  async function transfer$/, '');
   const calls = [];
   const apiPost = async (_endpoint, payload) => {
     calls.push(payload);
     return calls.length === 1 ? { success: false, directory_conflicts: ['tree'] } : { success: true };
   };
   let confirmations = 0;
-  const handler = new Function('apiPost', 'preferences', 'confirm', 't', `${source}; return queueWithOverwriteDecision;`)(apiPost, { confirm_overwrite: false }, () => { confirmations++; return true; }, s => s);
+  const handler = loadApprovalDecision(apiPost, { confirm_overwrite: false }, () => { confirmations++; return true; }, s => s);
   assert.equal((await handler('/api/transfer/upload', { names: ['tree', 'other'] }, [])).success, true);
   assert.equal(confirmations, 1);
   assert.deepEqual(calls[1].merge_directories, ['tree']);
 });
 
 test('WebDAV tree downloads separately confirm snapshot and merge risks', async () => {
-  const html = fs.readFileSync(path.join(repoRoot, 'source/gui/web/index.html'), 'utf8').replace(/\r\n/g, '\n');
-  const match = html.match(/async function queueWithOverwriteDecision\(endpoint, payload, conflicts\) \{[\s\S]*?\n  \}\n\n  async function transfer/);
-  assert.ok(match);
-  const source = match[0].replace(/\n\n  async function transfer$/, '');
   for (const accepted of [false, true]) {
     const calls = [];
     const apiPost = async (_endpoint, payload) => {
@@ -494,7 +569,7 @@ test('WebDAV tree downloads separately confirm snapshot and merge risks', async 
       if (!payload.merge_directories) return { success: false, directory_conflicts: ['tree'] };
       return { success: true };
     };
-    const handler = new Function('apiPost', 'preferences', 'confirm', 't', `${source}; return queueWithOverwriteDecision;`)(apiPost, {}, () => accepted, s => s);
+    const handler = loadApprovalDecision(apiPost, {}, () => accepted, s => s);
     const result = await handler('/api/transfer/download', { names: ['tree'] }, []);
     assert.equal(calls.length, accepted ? 3 : 1);
     if (accepted) {
@@ -506,10 +581,6 @@ test('WebDAV tree downloads separately confirm snapshot and merge risks', async 
 });
 
 test('FTP uploads require risk confirmation and separately confirm existing files', async () => {
-  const html = fs.readFileSync(path.join(repoRoot, 'source/gui/web/index.html'), 'utf8').replace(/\r\n/g, '\n');
-  const match = html.match(/async function queueWithOverwriteDecision\(endpoint, payload, conflicts\) \{[\s\S]*?\n  \}\n\n  async function transfer/);
-  assert.ok(match);
-  const source = match[0].replace(/\n\n  async function transfer$/, '');
   const calls = [];
   let confirmations = 0;
   const apiPost = async (_endpoint, payload) => {
@@ -518,12 +589,12 @@ test('FTP uploads require risk confirmation and separately confirm existing file
     if (!payload.overwrite) return { success: false, conflicts: ['file.txt'] };
     return { success: true };
   };
-  const handler = new Function('apiPost', 'preferences', 'confirm', 't', `${source}; return queueWithOverwriteDecision;`)(apiPost, { confirm_overwrite: false }, () => { confirmations++; return true; }, s => s);
+  const handler = loadApprovalDecision(apiPost, { confirm_overwrite: false }, () => { confirmations++; return true; }, s => s);
   assert.equal((await handler('/api/transfer/upload', {}, [])).success, true);
   assert.equal(confirmations, 2);
   assert.equal(calls[1].accept_ftp_rename_risk, true);
   assert.equal(calls[2].overwrite, 'overwrite');
-  const reject = new Function('apiPost', 'preferences', 'confirm', 't', `${source}; return queueWithOverwriteDecision;`)(apiPost, {}, () => false, s => s);
+  const reject = loadApprovalDecision(apiPost, {}, () => false, s => s);
   const before = calls.length;
   await reject('/api/transfer/upload', {}, []);
   assert.equal(calls.length, before + 1);
@@ -621,4 +692,206 @@ test('reconnect surfaces host-key challenges instead of reporting success', asyn
   assert.equal(shown, challenge);
   assert.equal(refreshes, 1);
   assert.deepEqual(toasts, ['Host key changed']);
+});
+
+test('the touch shell is mounted from the shared bundle in every host', async () => {
+  const { AppShell, SHELL_ACTIONS, isTouchLayout, mountAppShell } = await import(
+    '../dist/linscp-core.mjs'
+  );
+
+  // The reviewed order of the floating bar; nothing here is host specific.
+  assert.deepEqual(SHELL_ACTIONS, ['copy', 'delete', 'selectAll', 'clear', 'cancel']);
+  assert.equal(typeof mountAppShell, 'function');
+  assert.equal(typeof AppShell, 'function');
+
+  // A coarse pointer or a narrow window is the touch layout; a wide, fine
+  // pointer window is not. This is the same question the stylesheet asks.
+  assert.equal(isTouchLayout({ matchMedia: () => ({ matches: true }), innerWidth: 1400 }), true);
+  assert.equal(isTouchLayout({ matchMedia: () => ({ matches: false }), innerWidth: 420 }), true);
+  assert.equal(isTouchLayout({ matchMedia: () => ({ matches: false }), innerWidth: 1400 }), false);
+  assert.equal(isTouchLayout({}), false);
+
+  const dom = new JSDOM(`<!doctype html><body>
+    <div id="app"></div>
+    <div class="commander-main"><div class="pane" id="localPane"></div><div class="pane" id="remotePane"></div></div>
+    <nav id="nav"></nav><div id="bar"></div><div id="keys"></div>
+    <table><tbody id="localFileList"></tbody></table>
+  </body>`, { url: 'http://127.0.0.1:8080/' });
+  const doc = dom.window.document;
+  // A 375px phone viewport: the app runs in this, so the shell must build for it.
+  Object.defineProperty(dom.window, 'innerWidth', { value: 375, configurable: true });
+  const input = [];
+  const selections = [];
+  const actions = [];
+  const panes = [];
+
+  const shell = new AppShell({
+    rootElement: doc.getElementById('app'),
+    bottomNavElement: doc.getElementById('nav'),
+    swipeContainer: doc.querySelector('.commander-main'),
+    extraKeysElement: doc.getElementById('keys'),
+    actionBarElement: doc.getElementById('bar'),
+    paneLabel: (pane) => pane,
+    actionLabel: (action) => action,
+    onTerminalInput: (data) => input.push(data),
+    onSelectionChange: (selection) => selections.push(selection),
+    onAction: (action) => actions.push(action),
+    onPaneChange: (pane) => panes.push(pane),
+  });
+
+  assert.equal(shell.touchLayout, true);
+  // Four panes, drawn from the shared controller rather than by each host.
+  assert.deepEqual(
+    [...doc.querySelectorAll('#nav [data-pane]')].map((b) => b.dataset.pane),
+    ['local', 'remote', 'queue', 'terminal'],
+  );
+  // Twelve extra keys, in the reviewed order, with the modifiers marked.
+  assert.equal(doc.querySelectorAll('#keys .extra-key').length, 12);
+  assert.equal(doc.querySelector('#keys .extra-key[data-extra-key="ctrl"]').getAttribute('aria-pressed'), 'false');
+
+  // Bottom navigation drives the pane, and the page is told once.
+  doc.querySelector('#nav [data-pane="remote"]').dispatchEvent(
+    new dom.window.MouseEvent('click', { bubbles: true }),
+  );
+  assert.equal(shell.pane, 'remote');
+  assert.deepEqual(panes, ['remote']);
+  // A pane change the page made itself is not echoed back to it.
+  shell.syncPane('local');
+  assert.deepEqual(panes, ['remote']);
+
+  // A latched Ctrl turns the next key into a control byte, and the key row
+  // and the keyboard share the encoding.
+  doc.querySelector('#keys .extra-key[data-extra-key="ctrl"]').dispatchEvent(
+    new dom.window.MouseEvent('click', { bubbles: true }),
+  );
+  assert.equal(doc.querySelector('#keys [data-extra-key="ctrl"]').getAttribute('aria-pressed'), 'true');
+  assert.equal(shell.transformTextInput('c'), '\x03');
+  // The latch is spent, so the next key is literal again.
+  assert.equal(shell.transformTextInput('c'), 'c');
+  doc.querySelector('#keys .extra-key[data-extra-key="up"]').dispatchEvent(
+    new dom.window.MouseEvent('click', { bubbles: true }),
+  );
+  assert.deepEqual(input, ['\x1b[A']);
+
+  // A long press selects a row and raises the floating bar; a second long
+  // press on the same row removes it again.
+  const tbody = doc.getElementById('localFileList');
+  tbody.innerHTML = '<tr data-name="a.txt"></tr><tr data-name="b.txt"></tr>';
+  shell.refreshRows('local', tbody);
+  const row = tbody.querySelector('tr[data-name="a.txt"]');
+  row.dispatchEvent(new dom.window.MouseEvent('mousedown', { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 520));
+  row.dispatchEvent(new dom.window.MouseEvent('mouseup', { bubbles: true }));
+  assert.deepEqual(shell.selection('local'), ['a.txt']);
+  assert.equal(doc.getElementById('bar').classList.contains('visible'), true);
+  assert.equal(doc.querySelector('#bar .fab-count').textContent, '1');
+  assert.deepEqual(selections.at(-1), { pane: 'local', names: ['a.txt'] });
+  row.classList.contains('selected-touch');
+
+  // The floating bar is wired to the same actions the function keys run.
+  for (const action of SHELL_ACTIONS) {
+    doc.querySelector(`#bar [data-shell-action="${action}"]`).dispatchEvent(
+      new dom.window.MouseEvent('click', { bubbles: true }),
+    );
+  }
+  assert.deepEqual(actions, [...SHELL_ACTIONS]);
+
+  // Replacing the selection is reflected in the bar, and clearing hides it.
+  shell.setSelection('local', ['a.txt', 'b.txt']);
+  assert.equal(doc.querySelector('#bar .fab-count').textContent, '2');
+  shell.setSelection('local', []);
+  assert.equal(doc.getElementById('bar').classList.contains('visible'), false);
+
+  shell.destroy();
+  dom.window.close();
+});
+
+test('an operating-system drop names paths once and the queue answers once', async () => {
+  // The desktop window and the Android share sheet hand over paths; a browser
+  // hands over bytes. The request shape is what keeps them one behaviour, so it
+  // is asserted directly instead of through a window that cannot drop.
+  const requests = [];
+  const transport = {
+    post: async (endpoint, body) => {
+      requests.push({ endpoint, body });
+      return { success: true, task_id: 't1' };
+    },
+  };
+  const items = normalizeDropPayload({
+    paths: ['/home/me/report.txt', '/home/me/project', ''],
+    directories: ['/home/me/project'],
+  });
+  assert.deepEqual(items, [
+    { path: '/home/me/report.txt', isDirectory: false },
+    { path: '/home/me/project', isDirectory: true },
+  ]);
+
+  // One request for the whole drop, into the remote panel of a tab, with the
+  // folder of every directory named so the backend copies trees as trees.
+  const request = dropRequest(items, { target: 'remote', directory: '/incoming', tab: 3 });
+  assert.equal(request.endpoint, '/api/transfer/drop');
+  assert.deepEqual(request.payload.source_paths, ['/home/me/report.txt', '/home/me/project']);
+  assert.deepEqual(request.payload.directories, ['/home/me/project']);
+  assert.equal(request.payload.remote_dir, '/incoming');
+  assert.equal(request.payload.tab, 3);
+  assert.equal(request.payload.name, 'report.txt');
+  // Several items are not reported as one folder, whichever order they come in.
+  assert.equal(request.payload.source_kind, 'file');
+
+  const outcome = await dropPaths(transport, items, { target: 'remote', directory: '/incoming', tab: 3 });
+  assert.equal(requests.length, 1, 'one drop is one request');
+  assert.equal(outcome.queued, 2);
+  assert.deepEqual(outcome.failed, []);
+  assert.equal(requests[0].endpoint, '/api/transfer/drop');
+
+  // The local panel is a different endpoint and carries no tab, and a refusal
+  // keeps the backend's answer so the page can ask the same question it asks
+  // for a byte drop.
+  const local = dropRequest(items, { target: 'local', directory: '/home/me' });
+  assert.equal(local.endpoint, '/api/local/drop');
+  assert.equal(local.payload.local_dir, '/home/me');
+  assert.equal(local.payload.tab, undefined);
+
+  const refusing = {
+    post: async () => ({ success: false, error: 'Destination exists', conflicts: ['project'] }),
+  };
+  const refused = await dropPaths(refusing, items, { target: 'local', directory: '/home/me' });
+  assert.equal(refused.queued, 0);
+  assert.deepEqual(refused.result.conflicts, ['project']);
+  assert.equal(refused.failed.length, 2);
+  assert.equal(refused.failed[0].error, 'Destination exists');
+
+  // An approval is the same request plus one decision, which is what makes a
+  // retry safe: nothing else about the drop changes.
+  const approved = dropRequest(items, {
+    target: 'local',
+    directory: '/home/me',
+    approvals: { overwrite: 'overwrite' },
+  });
+  assert.deepEqual(approved.payload, { ...local.payload, overwrite: 'overwrite' });
+
+  // A drop that wrote some of its items says so, and the page reports the
+  // same count the endpoint does instead of claiming the whole drop landed.
+  const partial = {
+    post: async () => ({ success: true, saved: ['report.txt'], refused: ["Cannot save 'project': denied"] }),
+  };
+  const partly = await dropPaths(partial, items, { target: 'local', directory: '/home/me' });
+  assert.equal(partly.queued, 1);
+  assert.equal(partly.failed.length, 1);
+  assert.match(partly.failed[0].error, /denied/);
+  // A host that only refusals without a `saved` list still counts what landed.
+  const counted = await dropPaths(
+    { post: async () => ({ success: true, refused: ['nope'] }) },
+    items,
+    { target: 'local', directory: '/home/me' },
+  );
+  assert.equal(counted.queued, 1);
+  assert.equal(counted.failed.length, 1);
+
+  // A path with a control character is not a drop, on either separator.
+  assert.deepEqual(normalizeDropPayload({ paths: ['bad\u0000path'] }), []);
+  assert.deepEqual(normalizeDropPayload('not a payload'), []);
+  assert.deepEqual(normalizeDropPayload({ paths: 'nope' }), []);
+  assert.equal(droppedLeafName('/home/me/project/'), 'project');
+  assert.equal(droppedLeafName('C:\\Users\\me\\report.txt'), 'report.txt');
 });

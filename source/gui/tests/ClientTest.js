@@ -575,6 +575,49 @@ function options(id) {
   doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
   check('Escape closes the modal', doc.getElementById('helpModal').className.indexOf('open') < 0);
 
+  // F8 deletes the selection. The request carries the tab and, for the remote
+  // side, the kind of each name as the pane listed it, because a delete of a
+  // directory has to remove what is inside it and a rename to a file must not
+  // be attempted on a tree.
+  const deletesBefore = calls.filter(c => c.path === '/api/local/delete').length;
+  const asksBefore = confirmMessages.length;
+  // F9 above ran against the local pane, so the focus is already there; the
+  // selection may have been consumed by the transfer the key asked for.
+  doc.getElementById('localFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'F8', bubbles: true }));
+  await new Promise(resolve => setTimeout(resolve, 120));
+  const localDelete = calls.filter(c => c.path === '/api/local/delete').pop();
+  const localDeleteBody = localDelete ? JSON.parse(localDelete.options.body) : {};
+  check('F8 deletes the selected local entry after asking',
+    calls.filter(c => c.path === '/api/local/delete').length === deletesBefore + 1 &&
+      confirmMessages.length === asksBefore + 1 &&
+      localDeleteBody.tab === 1 && (localDeleteBody.names || []).join(',') === 'a.txt',
+    localDelete ? localDelete.options.body : 'no delete request');
+  doc.getElementById('remotePane').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  doc.getElementById('remoteFileList').children[1]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'F8', bubbles: true }));
+  await new Promise(resolve => setTimeout(resolve, 120));
+  const remoteDelete = calls.filter(c => c.path === '/api/remote/delete').pop();
+  const remoteDeleteBody = remoteDelete ? JSON.parse(remoteDelete.options.body) : {};
+  check('F8 deletes a remote directory by its listed kind',
+    !!remoteDelete && remoteDeleteBody.tab === 1 &&
+      (remoteDeleteBody.names || []).length === 1 &&
+      remoteDeleteBody.names[0].name === 'testdir' && remoteDeleteBody.names[0].is_dir === true,
+    remoteDelete ? remoteDelete.options.body : 'no delete request');
+  // Declining the question sends nothing at all.
+  const declinedBefore = calls.filter(c =>
+    c.path === '/api/remote/delete' || c.path === '/api/local/delete').length;
+  confirmResult = false;
+  doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'F8', bubbles: true }));
+  await new Promise(resolve => setTimeout(resolve, 80));
+  confirmResult = true;
+  check('declining the delete question sends nothing',
+    calls.filter(c => c.path === '/api/remote/delete' || c.path === '/api/local/delete')
+      .length === declinedBefore);
+  doc.getElementById('localPane').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+
   // ---- Synchronized browsing ------------------------------------------
   // The boot stub answers every list call with one fixed response, which
   // cannot show navigation; switch to a path-aware stub for this section.

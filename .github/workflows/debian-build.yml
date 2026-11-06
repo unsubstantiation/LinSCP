@@ -35,6 +35,28 @@ jobs:
       - name: Check GUI distribution configuration
         run: python3 -m unittest discover -s tools/tests -p test_gui_distribution.py
 
+      # The same page is served by two hosts. The frontend suite builds
+      # `ui/dist` and drives it in jsdom, the translation compiler rejects an
+      # uncatalogued message, and the shared-frontend check keeps a page
+      # endpoint that no route serves from shipping. None of them needs the
+      # Tauri build, so they run before it.
+      - name: Install the frontend dependencies
+        run: npm --prefix ui ci --no-audit --no-fund
+
+      - name: Test the shared frontend
+        run: npm --prefix ui test
+
+      - name: Check the translation catalogs are compiled and current
+        run: python3 tools/compile_translations.py --check && python3 tools/check_shared_frontend.py
+
+      # A crate that nothing in the packaging path builds can be broken for
+      # weeks while every targeted test passes. Compiling and testing the
+      # browser host crate in one go is what keeps that from happening: the
+      # axum handler signatures the browser mode depends on are checked here,
+      # not only when a smoke test happens to reach them.
+      - name: Compile and test the browser host crate
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-http
+
       - name: Exercise atomic local moves
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service local_moves_are_atomic_no_replace -- --nocapture
 
@@ -52,11 +74,15 @@ jobs:
       - name: Exercise native WebDAV connection and transfers
         env:
           LSCP_LIVE_WEBDAV: "1"
+          # The dispatch future has grown with every endpoint added to it; a
+          # debug build of this case needs more than the 2 MiB test-thread floor.
+          RUST_MIN_STACK: "16777216"
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_webdav_ -- --nocapture --test-threads=1
 
       - name: Exercise native FTP connection and download
         env:
           LSCP_LIVE_FTP: "1"
+          RUST_MIN_STACK: "16777216"
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ftp_ -- --nocapture --test-threads=1
 
       - name: Exercise native explicit FTPS connection and download
@@ -75,6 +101,7 @@ jobs:
       - name: Exercise native S3 TLS connection and download
         env:
           LSCP_LIVE_S3: "1"
+          RUST_MIN_STACK: "16777216"
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_s3_ -- --nocapture --test-threads=1
 
       - name: Build the binary package
@@ -87,7 +114,9 @@ jobs:
           dpkg-deb --contents "$deb"
           contents=$(dpkg-deb --contents "$deb" | awk '{print $NF}' | sed 's|^\./||' | sort)
           for path in usr/bin/linscp-gui \
+                      usr/bin/linscp-web \
                       usr/share/applications/linscp.desktop \
+                      usr/share/applications/linscp-web.desktop \
                       usr/share/pixmaps/linscp.png \
                       usr/share/icons/hicolor/scalable/apps/linscp.svg; do
             echo "$contents" | grep -qx "$path" ||
@@ -100,6 +129,52 @@ jobs:
         run: |
           sudo dpkg -i ../linscp_*_*.deb
           test -x /usr/bin/linscp-gui
+          test -x /usr/bin/linscp-web
+
+      # The browser host is the same page without a native window: start it on
+      # a loopback port, read the token it prints, and ask it for the page and
+      # for one API answer. A host that serves the page but not the API would
+      # otherwise only be noticed by a user.
+      - name: Smoke test the browser host
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          linscp-web --port=8791 --print-token >"$log" 2>&1 &
+          app=$!
+          trap 'kill "$app" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 60); do
+            grep -q '^Token: ' "$log" && break
+            kill -0 "$app" 2>/dev/null || { cat "$log"; echo "::error::linscp-web exited before printing its token"; exit 1; }
+            sleep 1
+          done
+          token=$(sed -n 's/^Token: //p' "$log" | head -n 1)
+          test -n "$token" || { cat "$log"; echo "::error::linscp-web printed no token"; exit 1; }
+          for _ in $(seq 1 60); do
+            curl -fsS -o /dev/null "http://127.0.0.1:8791/" && break
+            sleep 1
+          done
+          # The page is read whole before it is searched: `curl | grep -q` lets
+          # grep close the pipe early, which turns curl into a SIGPIPE failure
+          # under `pipefail` and makes a page that does carry the token look
+          # like one that does not.
+          page=$(curl -fsS "http://127.0.0.1:8791/")
+          case "$page" in
+            *LSCP_TOKEN*) ;;
+            *) echo "::error::the served page carries no token"; exit 1 ;;
+          esac
+          # A request without the bearer token is refused, and one with it is
+          # answered: the token is the whole access control of this mode.
+          status=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8791/api/status")
+          test "$status" = 401 || { echo "::error::/api/status answered $status without a token"; exit 1; }
+          status_answer=$(curl -fsS -H "X-LSCP-Token: $token" "http://127.0.0.1:8791/api/status")
+          case "$status_answer" in
+            *'"tabs"'*) ;;
+            *) echo "::error::/api/status did not answer the session list"; exit 1 ;;
+          esac
+          # A Host header that is not allowed must not be treated as loopback.
+          status=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: attacker.example' "http://127.0.0.1:8791/api/status")
+          test "$status" = 403 || { echo "::error::a foreign Host header answered $status"; exit 1; }
+          echo "linscp-web served the page and answered the API"
 
       - name: Smoke test the native window
         run: |

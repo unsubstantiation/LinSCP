@@ -33,6 +33,17 @@ pub mod terminal_bridge;
 use tabs::{TabRuntime, parse_tab_id_str, session_is_local, collect_session_folders, stored_site_to_gui_json};
 use linscp_engine::url_and_raw::GuiConnectError;
 
+/// What a dropped path turned out to be, once the filesystem was asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DroppedKind {
+    /// A regular file the backend can read itself.
+    File,
+    /// A directory: copied as a tree, never read as bytes.
+    Directory,
+    /// A granted Android folder; its bytes come from the document provider.
+    SafUri,
+}
+
 struct InnerState {
     config_root: PathBuf,
     next_tab_id: u64,
@@ -227,6 +238,7 @@ impl CommanderService {
             ("POST", "/api/remote/checksum") => self.checksum_remote_async(req.body).await,
             ("POST", "/api/remote/search") => self.search_remote_async(req.body).await,
             ("POST", "/api/remote/rename") => self.rename_remote_any_async(req.body).await,
+            ("POST", "/api/remote/delete") => self.delete_remote_any_async(req.body).await,
             ("POST", "/api/session/terminal") => self.open_terminal_async(req.body).await,
             ("POST", "/api/terminal/input") => self.terminal_write(req.body),
             ("POST", "/api/terminal/close") => self.terminal_close(req.body),
@@ -869,6 +881,67 @@ impl CommanderService {
     /// `rename`; WebDAV keeps its ETag-checked path so a concurrent change is
     /// still detected, and a directory move that could lose children keeps
     /// asking for the confirmation the dialogue offers.
+    /// Deletes the selected entries of the remote panel.
+    ///
+    /// The pane's own mutation table only reaches a local tab, so a remote
+    /// delete used to answer "not implemented" while the button stayed
+    /// visible. The session is the same one every other remote operation uses,
+    /// and the tree walk is the queue's own: a directory is emptied before it
+    /// is removed, a symbolic link is unlinked rather than followed, and the
+    /// server's own refusal is reported per name instead of swallowed.
+    async fn delete_remote_any_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
+        };
+        if tab.is_local { return self.handle_remote_delete(body); }
+        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        let names: Vec<String> = match body.get("names").and_then(Value::as_array) {
+            Some(items) if !items.is_empty() && items.len() <= 1000 => items.iter()
+                .filter_map(|item| item.as_str().or_else(|| item.get("name").and_then(Value::as_str)))
+                .map(str::to_string)
+                .collect(),
+            _ => return api_error(400, "Select at least one item"),
+        };
+        if names.is_empty() { return api_error(400, "Select at least one item"); }
+        let directory = body.get("remote_dir").and_then(Value::as_str)
+            .filter(|dir| !dir.is_empty())
+            .unwrap_or(tab.remote_dir.as_str());
+        if directory.chars().any(char::is_control) {
+            return api_error(400, "The directory must not contain control characters.");
+        }
+        let mut removed = Vec::new();
+        let mut failed = Vec::new();
+        for raw in names {
+            let name = match ops::validate_leaf_name(&raw) {
+                Ok(name) => name,
+                Err(error) => { failed.push(json!({"name": raw, "error": error})); continue; }
+            };
+            let path = format!("{}/{}", directory.trim_end_matches('/'), name);
+            match queue::delete_remote_recursive_quiet(session.as_ref(), &path).await {
+                Ok(()) => {
+                    self.add_log(&format!("Deleted '{path}'."), "info");
+                    removed.push(name);
+                }
+                // A name that is already gone is the state the user asked for.
+                Err(error) if error.to_lowercase().contains("not found") => {
+                    removed.push(name);
+                }
+                Err(error) => failed.push(json!({"name": name, "error": error})),
+            }
+        }
+        if removed.is_empty() && !failed.is_empty() {
+            let reason = failed.iter()
+                .filter_map(|row| row.get("error").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return api_error(400, reason);
+        }
+        ApiReply { status: 200, payload: json!({
+            "success": true, "deleted": removed, "failed": failed,
+        }) }
+    }
+
     async fn rename_remote_any_async(&self, body: Value) -> ApiReply {
         let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
         let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
@@ -2019,12 +2092,56 @@ impl CommanderService {
         let old = body.get("old_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let new = body.get("new_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if old.is_empty() || new.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Both names are required"})}; }
+        let overwrite = body.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
         let src = match resolve_contained(&base, &old) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
         let dst = match resolve_contained(&base, &new) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
-        match self.local_fs.rename(&src, &dst) {
-            Ok(_) => ApiReply{ status: 200, payload: json!({"success": true})},
-            Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})},
+        // A rename is not an overwrite: replacing the destination would destroy
+        // the entry the user asked to keep. A granted SAF document has no
+        // pathname to move, so its rename stays the bridge's own operation.
+        if src.starts_with("content://") || dst.starts_with("content://") {
+            return match self.local_fs.rename(&src, &dst) {
+                Ok(_) => ApiReply{ status: 200, payload: json!({"success": true})},
+                Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})},
+            };
         }
+        match Self::rename_local_path(Path::new(&src), Path::new(&dst), overwrite) {
+            Ok(()) => ApiReply{ status: 200, payload: json!({"success": true})},
+            // `conflict` is the answer the page asks about; the message is for
+            // the person who cancelled the prompt instead.
+            Err(e) => ApiReply{ status: 400, payload: json!({
+                "success": false,
+                "conflict": e.ends_with(":conflict"),
+                "error": Self::rename_error_message(&e),
+            })},
+        }
+    }
+
+    /// The message for a refused rename, with the conflict marker removed.
+    fn rename_error_message(error: &str) -> String {
+        match error.strip_suffix(":conflict") {
+            Some(path) => format!("An item already exists at {path}."),
+            None => error.to_string(),
+        }
+    }
+
+    /// Moves a local entry, never replacing one unless the caller confirmed it.
+    ///
+    /// The no-replace move is the rule for every path (a dropped item, a file
+    /// out of the panel, a rename); `overwrite` is only ever set from an answer
+    /// the page collected. A refused move says which name is taken, so the page
+    /// can ask about that one instead of guessing at the error text.
+    fn rename_local_path(from: &Path, to: &Path, overwrite: bool) -> Result<(), String> {
+        if overwrite && std::fs::symlink_metadata(to).is_ok() {
+            return std::fs::remove_file(to)
+                .map_err(|error| format!("Cannot replace '{}': {error}", to.display()));
+        }
+        linscp_platform::gui_os::rename_no_replace(from, to).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("{}:conflict", to.display())
+            } else {
+                error.to_string()
+            }
+        })
     }
     fn handle_local_chmod(&self, body: Value) -> ApiReply {
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
@@ -2093,13 +2210,43 @@ impl CommanderService {
             Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
         }
     }
-    /// Body of a desktop drop.
+    /// Every path a drop carried, in the order the shell produced it.
     ///
-    /// The apps reach this handler differently: a browser posts raw bytes, the
-    /// shared bundle posts JSON over Tauri IPC, and a test can post a file. One
-    /// representation inside the service keeps the drop identical everywhere
-    /// instead of working only where the HTTP layer happened to listen.
+    /// The apps reach the drop handlers differently: a browser posts one item's
+    /// bytes or one staged folder, while a native window posts a list of paths
+    /// the operating system handed it. Both are read here, and the list form is
+    /// the authority when it is present, so a drop of twenty files is one
+    /// request and one conflict answer in every app.
+    fn drop_source_paths(body: &Value) -> Vec<String> {
+        let mut paths = Vec::new();
+        if let Some(list) = body.get("source_paths").and_then(Value::as_array) {
+            paths.extend(list.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+        if let Some(single) = body.get("source_path").and_then(Value::as_str) {
+            paths.push(single.to_string());
+        }
+        paths
+            .into_iter()
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty() && !path.chars().any(char::is_control))
+            .collect()
+    }
+
+    /// Reads the bytes of the one file a drop named.
+    ///
+    /// A drop that named no path carries its content instead: base64 from the
+    /// page, a bare value, or an array. One representation inside the service
+    /// keeps the drop identical everywhere.
     fn drop_payload(body: &Value) -> Result<Vec<u8>, String> {
+        // Bound first: a borrow of a temporary would tie the path to the end of
+        // the `if let`, which is exactly where it is needed longest.
+        let paths = Self::drop_source_paths(body);
+        if let Some(path) = paths.first() {
+            // A native window's drop is a path, not bytes: the backend reads
+            // the file itself, so the page never has to hold a whole file in
+            // memory and the same endpoint serves both kinds of drop.
+            return Self::read_dropped_path(path);
+        }
         if let Some(text) = body.get("data_base64").and_then(Value::as_str) {
             return BASE64_STD
                 .decode(text)
@@ -2114,16 +2261,128 @@ impl CommanderService {
         Err("The dropped file arrived without any content.".to_string())
     }
 
-    /// Saves one dropped file into the local panel.
+    /// Reads one file a drop named.
+    fn read_dropped_path(path: &str) -> Result<Vec<u8>, String> {
+        if is_saf_path(path) {
+            // A granted Android folder is not a pathname: its bytes come from
+            // the document provider, so the ordinary local filesystem reads
+            // them rather than `std::fs` guessing at a `content://` string.
+            return NativeLocalFs::new()
+                .read_bytes(path)
+                .map_err(|error| format!("The dropped file cannot be read: {error}"));
+        }
+        let meta = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("The dropped file cannot be read: {error}"))?;
+        if meta.file_type().is_symlink() {
+            return Err("A symbolic link cannot be dropped as a file.".to_string());
+        }
+        if !meta.is_file() {
+            return Err("Only a regular file can be dropped as a file.".to_string());
+        }
+        std::fs::read(path).map_err(|error| format!("The dropped file cannot be read: {error}"))
+    }
+
+    /// What one dropped path is, asked of the filesystem rather than trusted.
+    fn dropped_path_kind(path: &str) -> Result<DroppedKind, String> {
+        if is_saf_path(path) {
+            return Ok(DroppedKind::SafUri);
+        }
+        let meta = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("The dropped item cannot be read: {error}"))?;
+        if meta.file_type().is_symlink() {
+            return Err("A symbolic link cannot be dropped.".to_string());
+        }
+        if meta.is_dir() {
+            Ok(DroppedKind::Directory)
+        } else if meta.is_file() {
+            Ok(DroppedKind::File)
+        } else {
+            Err("Only a file or a folder can be dropped.".to_string())
+        }
+    }
+
+    /// The parent directory of a dropped path and its leaf name.
+    fn dropped_path_split(path: &str) -> Result<(String, String), String> {
+        let path = Path::new(path);
+        let leaf = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "The dropped item has no usable name.".to_string())?
+            .to_string();
+        let parent = path
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned())
+            .filter(|parent| !parent.is_empty())
+            .ok_or_else(|| "The dropped item has no usable folder.".to_string())?;
+        Ok((parent, leaf))
+    }
+
+    /// The panel directory a drop lands in, with no leaf name required.
     ///
-    /// The bytes go through the same `LocalFs` the panes use, so a drop into a
-    /// granted Android folder, a Windows drive or a POSIX directory behaves the
-    /// same way and never bypasses the write rules (`content://` included).
-    fn handle_local_drop(&self, query: &BTreeMap<String,String>, body: Value) -> ApiReply {
+    /// `drop_target` names one file; a drop of paths has no single leaf, and a
+    /// folder-only drop has none either, so the directory is resolved on its
+    /// own and each caller asks for the name it actually needs.
+    fn drop_base_directory(&self, query: &BTreeMap<String,String>, body: &Value, local: bool) -> Result<String, ApiReply> {
+        let dir_key = if local { "local_dir" } else { "remote_dir" };
+        let tab_id = query.get("tab").and_then(|value| parse_tab_id_str(Some(value)))
+            .or_else(|| body.get("tab").and_then(|value| {
+                if value.is_number() { value.as_u64() } else { value.as_str().and_then(|text| text.parse().ok()) }
+            }));
+        let tab = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).cloned());
+        let base = query.get(dir_key).cloned()
+            .or_else(|| body.get(dir_key).and_then(Value::as_str).map(str::to_string))
+            .or_else(|| tab.as_ref().map(|tab| if local { tab.local_dir.clone() } else { tab.remote_dir.clone() }))
+            .unwrap_or_else(|| if local { self.default_local_dir() } else { "/".to_string() });
+        let base = base.trim().to_string();
+        if base.is_empty() {
+            return Err(api_error(400, "The panel directory of this drop is not set."));
+        }
+        if base.chars().any(char::is_control) {
+            return Err(api_error(400, "The panel directory must not contain control characters."));
+        }
+        Ok(base)
+    }
+
+    /// Saves a drop into the local panel.
+    ///
+    /// A browser posts bytes; a native window posts paths, one per item. Both
+    /// land in the panel's own directory, and the bytes go through the same
+    /// `LocalFs` the panes use, so a drop into a granted Android folder, a
+    /// Windows drive or a POSIX directory behaves the same way and never
+    /// bypasses the write rules (`content://` included).
+    fn handle_local_drop(&self, query: &BTreeMap<String, String>, body: Value) -> ApiReply {
+        // A drop is one of two shapes: the page's bytes for one file, or the
+        // paths a native window hands over. Only the first has a leaf name of
+        // its own; the second names every item, so requiring a name up front
+        // would refuse every desktop drop. The target is therefore resolved
+        // without demanding one, and the byte path asks for it before it
+        // writes anything.
+        let paths = Self::drop_source_paths(&body);
         let (base, name, relative) = match self.drop_target(query, &body, true) {
             Ok(parts) => parts,
             Err(reply) => return reply,
         };
+        let destination_dir = match self.drop_destination(&base, "", &relative) {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(error) => return api_error(400, error),
+        };
+        if !paths.is_empty() {
+            // A path drop is not a byte drop: the items keep their own names.
+            // Whether they can be read is decided when they are copied, and a
+            // path that cannot be read is refused there with its own reason.
+            if !is_saf_path(&destination_dir) {
+                if let Err(error) = self.local_fs.mkdir_all(&destination_dir) {
+                    return api_error(400, format!("Cannot create the drop folder: {error}"));
+                }
+            }
+            return self.save_dropped_paths(&destination_dir, &paths, &body);
+        }
+        if name.is_empty() {
+            return api_error(400, "A file name is required.");
+        }
+        if let Err(error) = ops::validate_leaf_name(&name) {
+            return api_error(400, error);
+        }
         let bytes = match Self::drop_payload(&body) {
             Ok(bytes) => bytes,
             Err(error) => return api_error(400, error),
@@ -2145,15 +2404,134 @@ impl CommanderService {
             return api_error(400, format!("Cannot save the dropped file: {error}"));
         }
         self.add_log(&format!("Saved the dropped file '{target_path}'."), "info");
-        ApiReply{ status: 200, payload: json!({"success": true, "path": target_path, "size": bytes.len()})}
+        ApiReply {
+            status: 200,
+            payload: json!({"success": true, "path": target_path, "size": bytes.len()}),
+        }
+    }
+
+    /// Writes every path of a drop into `target_dir`, under its own leaf name.
+    ///
+    /// A name the destination already holds is reported, not replaced: the page
+    /// asks the same question it asks for a byte drop and repeats the drop with
+    /// the answer, so one overwrite rule governs every way a file arrives.
+    fn save_dropped_paths(&self, target_dir: &str, paths: &[String], body: &Value) -> ApiReply {
+        let overwrite = body.get("overwrite").and_then(Value::as_str) == Some("overwrite");
+        let mut saved: Vec<String> = Vec::new();
+        let mut conflicts: Vec<String> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for path in paths {
+            let (_, leaf) = match Self::dropped_path_split(path) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    refused.push(error);
+                    continue;
+                }
+            };
+            let target = match self.drop_destination(target_dir, &leaf, "") {
+                Ok(target) => target,
+                Err(error) => {
+                    refused.push(error);
+                    continue;
+                }
+            };
+            let exists = std::fs::symlink_metadata(&target).is_ok();
+            if exists && !overwrite {
+                conflicts.push(leaf);
+                continue;
+            }
+            match Self::dropped_path_kind(path) {
+                Ok(DroppedKind::Directory) => {
+                    if exists {
+                        // A replacement was approved for this name, so the old
+                        // tree goes first; the copy itself still refuses to
+                        // replace anything inside the new one.
+                        let removed = if std::fs::symlink_metadata(&target)
+                            .is_ok_and(|meta| meta.is_dir())
+                        {
+                            std::fs::remove_dir_all(&target)
+                        } else {
+                            std::fs::remove_file(&target)
+                        };
+                        if let Err(error) = removed {
+                            refused.push(format!("Cannot replace '{leaf}': {error}"));
+                            continue;
+                        }
+                    }
+                    match Self::copy_dropped_tree(path, &target) {
+                        Ok(_) => saved.push(leaf),
+                        Err(error) => {
+                            // A half-copied tree is not left behind: the page
+                            // reports the refusal, and nothing the drop wrote
+                            // stays where the next attempt would find it.
+                            let _ = std::fs::remove_dir_all(&target);
+                            refused.push(error);
+                        }
+                    }
+                }
+                Ok(DroppedKind::SafUri) | Ok(DroppedKind::File) => {
+                    let bytes = match Self::read_dropped_path(path) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            refused.push(error);
+                            continue;
+                        }
+                    };
+                    let target_path = target.to_string_lossy().into_owned();
+                    match self.local_fs.write_bytes_atomic(&target_path, &bytes) {
+                        Ok(()) => saved.push(leaf),
+                        Err(error) => refused.push(format!("Cannot save '{leaf}': {error}")),
+                    }
+                }
+                Err(error) => refused.push(error),
+            }
+        }
+        if !conflicts.is_empty() {
+            return ApiReply {
+                status: 409,
+                payload: json!({
+                    "success": false,
+                    "error": "Destination exists",
+                    "conflicts": conflicts,
+                    "saved": saved,
+                }),
+            };
+        }
+        if saved.is_empty() && !refused.is_empty() {
+            return api_error(400, refused.join("\n"));
+        }
+        self.add_log(&format!("Saved {} dropped item(s) into '{target_dir}'.", saved.len()), "info");
+        ApiReply {
+            status: 200,
+            payload: json!({
+                "success": true,
+                "saved": saved,
+                "refused": refused,
+                "path": target_dir,
+            }),
+        }
     }
 
     /// Creates the folders a dropped directory contained, including empty ones.
     fn handle_local_drop_dir(&self, query: &BTreeMap<String,String>, body: Value) -> ApiReply {
-        let (base, _name, relative) = match self.drop_target(query, &body, true) {
-            Ok(parts) => parts,
+        // A dropped folder names no file, so no leaf name is asked for. The
+        // relative sub-path is what the folder lands under; a native window
+        // sends the folder's own name as that sub-path, and a folder drop with
+        // neither is refused rather than guessed at.
+        let base = match self.drop_base_directory(query, &body, true) {
+            Ok(base) => base,
             Err(reply) => return reply,
         };
+        let relative = query.get("relative_path").cloned()
+            .or_else(|| body.get("relative_path").and_then(Value::as_str).map(str::to_string))
+            .or_else(|| {
+                // A native window names the dropped folder and nothing else,
+                // so the folder keeps the name it has on the machine.
+                Self::drop_source_paths(&body)
+                    .first()
+                    .and_then(|path| Path::new(path).file_name().map(|leaf| leaf.to_string_lossy().into_owned()))
+            })
+            .unwrap_or_default();
         if relative.is_empty() {
             return api_error(400, "A relative path is required.");
         }
@@ -2176,7 +2554,7 @@ impl CommanderService {
     /// detection and the overwrite rules therefore behave exactly as they do
     /// for a file copied out of the local pane.
     async fn handle_transfer_drop(&self, body: Value) -> ApiReply {
-        let (remote_dir, name, relative) = match self.drop_target(&BTreeMap::new(), &body, false) {
+        let (remote_dir, mut name, relative) = match self.drop_target(&BTreeMap::new(), &body, false) {
             Ok(parts) => parts,
             Err(reply) => return reply,
         };
@@ -2191,10 +2569,98 @@ impl CommanderService {
         if tab.is_local {
             return api_error(400, "This panel has no server to upload to.");
         }
+        // An operating-system drop is a list of paths: a native window hands
+        // over one path per item, and the page only names them. Each item is
+        // staged under its own leaf name and the queue is asked once, so one
+        // drop is one queue entry, one conflict answer and the same overwrite
+        // rules a transfer out of the local pane obeys. A lone plain file is
+        // left to the byte path below, which has staged files since before
+        // paths existed.
+        let source_paths = Self::drop_source_paths(&body);
+        let single_plain_file = source_paths.len() == 1
+            && matches!(Self::dropped_path_kind(&source_paths[0]), Ok(DroppedKind::File));
+        if !source_paths.is_empty() && !single_plain_file {
+            let staging = match self.drop_staging_dir() {
+                Ok(path) => path,
+                Err(error) => return api_error(500, error),
+            };
+            let mut names: Vec<String> = Vec::new();
+            let mut staged_paths: Vec<PathBuf> = Vec::new();
+            // A failed drop removes what it already staged: the queue never saw
+            // those names, so nothing else will.
+            let tidy = |staged: &[PathBuf]| {
+                for path in staged {
+                    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
+                        let _ = std::fs::remove_dir_all(path);
+                    } else {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            };
+            for path in &source_paths {
+                let relative = match Self::stage_dropped_path(path, &staging) {
+                    Ok(relative) => relative,
+                    Err(error) => {
+                        tidy(&staged_paths);
+                        return api_error(400, error);
+                    }
+                };
+                if names.contains(&relative) {
+                    // Two items of one drop cannot share a name: the queue
+                    // would upload the same staging path twice.
+                    tidy(&staged_paths);
+                    return api_error(400, "Two dropped items have the same name.");
+                }
+                staged_paths.push(staging.join(&relative));
+                names.push(relative);
+            }
+            if names.is_empty() {
+                tidy(&staged_paths);
+                return api_error(400, "The drop contained nothing that can be uploaded.");
+            }
+            let mut request = json!({
+                "tab": tab.id,
+                "local_dir": staging.to_string_lossy(),
+                "remote_dir": remote_dir,
+                "names": names,
+            });
+            // The approvals a dialog collected belong to the same request, so a
+            // retry is the same drop plus one decision.
+            for key in ["accept_directory_copy_risk", "accept_ftp_rename_risk", "merge_directories",
+                        "overwrite", "priority", "preserve_time", "conflict_versions", "resume",
+                        "transfer", "speed", "filemask", "resumesupport"] {
+                if let Some(value) = body.get(key) {
+                    request[key] = value.clone();
+                }
+            }
+            let reply = self.queue_transfer_async(request, true, false).await;
+            if !reply.payload.get("success").and_then(Value::as_bool).unwrap_or(false) {
+                // The queue took nothing (a conflict it wants confirmed, or a
+                // refusal), so the staged copy is ours again. It has to go now:
+                // the page retries the same drop with the decision, and a
+                // staging entry that already exists would refuse that retry.
+                tidy(&staged_paths);
+            }
+            return reply;
+        }
         let bytes = match Self::drop_payload(&body) {
             Ok(bytes) => bytes,
             Err(error) => return api_error(400, error),
         };
+        // A byte drop is one file, so it needs the name it lands under. A drop
+        // that named one path already carries it.
+        if name.is_empty() {
+            name = source_paths
+                .first()
+                .and_then(|path| Path::new(path).file_name().map(|leaf| leaf.to_string_lossy().into_owned()))
+                .unwrap_or_default();
+        }
+        if name.is_empty() {
+            return api_error(400, "A file name is required.");
+        }
+        if let Err(error) = ops::validate_leaf_name(&name) {
+            return api_error(400, error);
+        }
         // The panel directory plus the folder the drop carried. The leaf name
         // stays in the file name, so staging and destination agree.
         let destination_dir = if relative.is_empty() {
@@ -2269,6 +2735,97 @@ impl CommanderService {
         ApiReply{ status: 200, payload: json!({"success": true, "path": created})}
     }
 
+    /// Copies a dropped folder into `target`, never replacing what is there.
+    ///
+    /// `create_new` is the no-replace publication the rest of the app uses, so
+    /// a staged tree cannot overwrite a file another transfer is reading. A
+    /// link inside the tree is refused rather than followed: it is not a copy
+    /// of the bytes the folder owns, and it would point outside the staging
+    /// directory.
+    fn copy_dropped_tree(source: &str, target: &Path) -> Result<(usize, u64), String> {
+        let mut stack = vec![(PathBuf::from(source), target.to_path_buf())];
+        let mut files = 0usize;
+        let mut bytes = 0u64;
+        while let Some((from, to)) = stack.pop() {
+            let meta = std::fs::symlink_metadata(&from)
+                .map_err(|error| format!("The dropped folder cannot be read: {error}"))?;
+            if meta.file_type().is_symlink() {
+                return Err("A dropped folder must not contain symbolic links.".to_string());
+            }
+            if meta.is_dir() {
+                std::fs::create_dir(&to)
+                    .map_err(|error| format!("Cannot create the dropped folder: {error}"))?;
+                let entries = std::fs::read_dir(&from)
+                    .map_err(|error| format!("The dropped folder cannot be listed: {error}"))?;
+                for entry in entries {
+                    let entry =
+                        entry.map_err(|error| format!("Cannot read a dropped entry: {error}"))?;
+                    stack.push((entry.path(), to.join(entry.file_name())));
+                }
+            } else if meta.is_file() {
+                let data = std::fs::read(&from)
+                    .map_err(|error| format!("The dropped file cannot be read: {error}"))?;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&to)
+                    .map_err(|error| format!("Cannot write the dropped file: {error}"))?;
+                use std::io::Write as _;
+                file.write_all(&data)
+                    .map_err(|error| format!("Cannot write the dropped file: {error}"))?;
+                files += 1;
+                bytes += data.len() as u64;
+            } else {
+                return Err("A dropped folder may contain only files and folders.".to_string());
+            }
+        }
+        Ok((files, bytes))
+    }
+
+    /// Copies one path a drop named into the staging tree, under its leaf name.
+    ///
+    /// The queue only reads local paths, and a granted Android URI is not one,
+    /// so the bytes are brought into the app's private staging first. The item
+    /// keeps its own leaf name - `report.txt`, `project/` - because that is the
+    /// name the destination should show; the folders above it on the machine
+    /// are not part of the drop.
+    ///
+    /// The staged root is created exclusively: a drop must not replace a
+    /// staging entry another request is uploading from.
+    fn stage_dropped_path(source: &str, staging: &Path) -> Result<String, String> {
+        let (_, leaf) = Self::dropped_path_split(source)?;
+        let relative = leaf.clone();
+        let staged = staging.join(&leaf);
+        match Self::dropped_path_kind(source) {
+            Ok(DroppedKind::Directory) => {
+                if std::fs::symlink_metadata(&staged).is_ok() {
+                    return Err(format!("'{leaf}' is already being uploaded."));
+                }
+                match Self::copy_dropped_tree(source, &staged) {
+                    Ok(_) => Ok(relative),
+                    Err(error) => {
+                        // A half-copied tree is not left behind for the queue.
+                        let _ = std::fs::remove_dir_all(&staged);
+                        Err(error)
+                    }
+                }
+            }
+            Ok(_) => {
+                let bytes = Self::read_dropped_path(source)?;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&staged)
+                    .map_err(|_| format!("'{leaf}' is already being uploaded."))?;
+                use std::io::Write as _;
+                file.write_all(&bytes)
+                    .map_err(|error| format!("Cannot stage the dropped file: {error}"))?;
+                Ok(relative)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// The private directory a dropped file waits in until its upload runs.
     fn drop_staging_dir(&self) -> Result<PathBuf, String> {
         let staging = self.config_root().join("drop-staging");
@@ -2277,32 +2834,16 @@ impl CommanderService {
     }
 
 
-    /// Reads the panel directory, the leaf name and the relative sub-path of a
-    /// drop, from the query string or from the JSON body.
+    /// Reads the panel directory, the leaf name a byte drop is written under
+    /// and the relative sub-path, from the query string or the JSON body.
+    ///
+    /// The name is optional: a drop that names paths, or a folder-only drop,
+    /// carries no single leaf, and each caller asks for the name it needs.
     fn drop_target(&self, query: &BTreeMap<String,String>, body: &Value, local: bool) -> Result<(String, String, String), ApiReply> {
-        let dir_key = if local { "local_dir" } else { "remote_dir" };
-        let tab_id = query.get("tab").and_then(|value| parse_tab_id_str(Some(value)))
-            .or_else(|| body.get("tab").and_then(|value| {
-                if value.is_number() { value.as_u64() } else { value.as_str().and_then(|text| text.parse().ok()) }
-            }));
-        let tab = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).cloned());
-        let base = query.get(dir_key).cloned()
-            .or_else(|| body.get(dir_key).and_then(Value::as_str).map(str::to_string))
-            .or_else(|| tab.as_ref().map(|tab| if local { tab.local_dir.clone() } else { tab.remote_dir.clone() }))
-            .unwrap_or_else(|| if local { self.default_local_dir() } else { "/".to_string() });
-        let base = base.trim().to_string();
-        if base.is_empty() {
-            return Err(api_error(400, "The panel directory of this drop is not set."));
-        }
-        if base.chars().any(char::is_control) {
-            return Err(api_error(400, "The panel directory must not contain control characters."));
-        }
-        let raw_name = query.get("name").cloned()
-            .or_else(|| body.get("name").and_then(Value::as_str).map(str::to_string));
-        let name = match raw_name {
-            Some(name) => ops::validate_leaf_name(&name).map_err(|error| api_error(400, error))?,
-            None => return Err(api_error(400, "A file name is required.")),
-        };
+        let base = self.drop_base_directory(query, body, local)?;
+        let name = query.get("name").cloned()
+            .or_else(|| body.get("name").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default();
         let relative = query.get("relative_path").cloned()
             .or_else(|| body.get("relative_path").and_then(Value::as_str).map(str::to_string))
             .unwrap_or_default();
@@ -2383,7 +2924,14 @@ impl CommanderService {
                 }
             }
             if errs.is_empty() { ApiReply{ status:200, payload: json!({"success": true})}} else { ApiReply{ status:400, payload: json!({"success": false, "error": errs.join("; ")})}}
-        } else { ApiReply{ status:400, payload: json!({"success": false, "error": "Remote delete not implemented"})}}
+        } else {
+            // A remote tab is deleted by `delete_remote_any_async`, which has
+            // the session; reaching this table with one means the caller used
+            // the synchronous dispatcher, which cannot await it.
+            ApiReply{ status:400, payload: json!({
+                "success": false,
+                "error": "The remote delete needs the session-capable request path."})}
+        }
     }
     fn handle_remote_rename(&self, body: Value) -> ApiReply {
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
@@ -2395,7 +2943,14 @@ impl CommanderService {
         if tab.is_local {
             let src = match resolve_contained(&tab.other_local_dir, &old) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
             let dst = match resolve_contained(&tab.other_local_dir, &new) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
-            match self.local_fs.rename(&src, &dst) { Ok(_)=> ApiReply{ status:200, payload: json!({"success": true})}, Err(e)=> ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})}}
+            // The other local pane renames through the same move, so neither
+            // pane can overwrite an entry without the confirmation the other one
+            // requires.
+            let overwrite = body.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
+            match Self::rename_local_path(Path::new(&src), Path::new(&dst), overwrite) {
+                Ok(())=> ApiReply{ status:200, payload: json!({"success": true})},
+                Err(e)=> ApiReply{ status:400, payload: json!({"success": false, "conflict": e.ends_with(":conflict"), "error": Self::rename_error_message(&e)})},
+            }
         } else { ApiReply{ status:400, payload: json!({"success": false, "error": "not implemented"})}}
     }
     // The panel's own mutation calls arrive through `dispatch_async`, which
@@ -3453,8 +4008,13 @@ mod tests {
                 method: "POST".into(), path: path.into(),
                 body: json!({"tab": 0, "path": "/", "name": "x", "names": ["x"], "data": ""}),
             });
+            // Every one of these refuses, and none of them reports success.
+            // The status says why - 400 needs a connection, 404 is a route only
+            // the asynchronous dispatcher serves, 501 is an operation this host
+            // cannot perform - so the assertion is that it is an error status
+            // and not a success, not that each endpoint picked one spelling.
+            assert!(!(200..300).contains(&reply.status), "{path} answered {} with {}", reply.status, reply.payload);
             assert_ne!(reply.payload["success"], true, "{path}");
-            assert!((400..500).contains(&reply.status), "{path} answered {}", reply.status);
         }
     }
 
@@ -4879,6 +5439,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp);
     }
 
+    /// Deletes through the session, which is what the panes' Delete does.
+    ///
+    /// Every path here went wrong at some point: a name that is not a leaf, a
+    /// link that pointed out of the tree, a directory that is not empty, a name
+    /// the server no longer has, and a delete mixed with one refusal.
+    #[cfg(target_os = "linux")]
+    async fn exercise_remote_delete(svc: &CommanderService, id: u64) {
+        let request = |body: Value| ApiEnvelope { method: "POST".into(), path: "/api/remote/delete".into(), body };
+        let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        // A PUT of `a/b/c.txt` is not a directory creation on any server, so
+        // the tree is made first and then filled the way a batch upload does.
+        for dir in ["/delete-tree", "/delete-tree/nested", "/delete-dir"] {
+            session.mkdir(dir).await.unwrap();
+        }
+        for (path, bytes) in [
+            ("/delete-file.txt", b"one".as_slice()),
+            ("/delete-tree/keep.txt", b"two".as_slice()),
+            ("/delete-tree/nested/deep.txt", b"three".as_slice()),
+            ("/delete-scoped.txt", b"four".as_slice()),
+        ] {
+            linscp_proto::upload_bytes(session.as_ref(), path, bytes, Default::default())
+                .await
+                .unwrap();
+        }
+        // A name that is not a leaf is refused per name, and the valid name in
+        // the same request still runs: one bad entry does not cancel the drop
+        // of the whole selection.
+        let mixed = svc.dispatch_async(request(json!({
+            "tab": id, "names": ["delete-file.txt", "../escape", ""]
+        }))).await;
+        assert_eq!(mixed.status, 200, "{}", mixed.payload);
+        assert_eq!(mixed.payload["deleted"], json!(["delete-file.txt"]));
+        let failed = mixed.payload["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 2, "{}", mixed.payload);
+        assert!(session.stat("/delete-file.txt").await.unwrap().is_none());
+        // A directory is emptied before it is removed, and its children go too.
+        let tree = svc.dispatch_async(request(json!({
+            "tab": id, "names": [{"name": "delete-tree", "is_dir": true}]
+        }))).await;
+        assert_eq!(tree.status, 200, "{}", tree.payload);
+        assert_eq!(tree.payload["deleted"], json!(["delete-tree"]));
+        assert!(session.stat("/delete-tree").await.unwrap().is_none());
+        assert!(session.stat("/delete-tree/nested/deep.txt").await.unwrap().is_none());
+        // A name the server no longer has is the state the caller asked for.
+        let gone = svc.dispatch_async(request(json!({
+            "tab": id, "names": ["delete-file.txt"]
+        }))).await;
+        assert_eq!(gone.status, 200, "{}", gone.payload);
+        assert_eq!(gone.payload["deleted"], json!(["delete-file.txt"]));
+        assert!(gone.payload["failed"].as_array().unwrap().is_empty());
+        // Nothing selected, and a request that names nothing usable, are
+        // refusals rather than an empty success.
+        for body in [json!({"tab": id, "names": []}), json!({"tab": id})] {
+            assert_eq!(
+                svc.dispatch_async(request(body.clone())).await.status,
+                400,
+                "{body}"
+            );
+        }
+        // A name is resolved against the directory the request names, and a
+        // name that only exists elsewhere is left alone: the panel directory is
+        // not a suggestion.
+        linscp_proto::upload_bytes(session.as_ref(), "/delete-dir/inner.txt", b"five", Default::default())
+            .await
+            .unwrap();
+        let elsewhere = svc.dispatch_async(request(json!({
+            "tab": id, "names": ["inner.txt"], "remote_dir": "/delete-dir"
+        }))).await;
+        assert_eq!(elsewhere.status, 200, "{}", elsewhere.payload);
+        assert!(session.stat("/delete-dir/inner.txt").await.unwrap().is_none());
+        let scoped = svc.dispatch_async(request(json!({
+            "tab": id, "names": ["delete-scoped.txt"], "remote_dir": "/"
+        }))).await;
+        assert_eq!(scoped.status, 200, "{}", scoped.payload);
+        assert!(session.stat("/delete-scoped.txt").await.unwrap().is_none());
+    }
+
     #[cfg(target_os = "linux")]
     async fn exercise_webdav_local_trees(svc: &CommanderService, id: u64, local: &Path, downloaded: &Path, session: &dyn linscp_proto::RemoteSession) {
         let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
@@ -5077,6 +5714,7 @@ mod tests {
         assert!(list.payload["entries"].as_array().unwrap().iter().any(|e| e["name"] == "upload.txt"));
         assert_eq!(std::fs::read(downloaded.join("upload.txt")).unwrap(), b"WebDAV roundtrip");
         let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        Box::pin(exercise_remote_delete(&svc, id)).await;
         Box::pin(exercise_webdav_local_trees(&svc, id, &local, &downloaded, session.as_ref())).await;
         Box::pin(exercise_webdav_remote_trees(&svc, id, session.as_ref())).await;
         Box::pin(exercise_webdav_upload_trees(&svc, id, &local, session.as_ref())).await;
@@ -6548,7 +7186,131 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
     #[test]
-    fn desktop_drops_are_saved_by_the_same_endpoint_in_every_app() {
+    fn a_native_window_drop_names_paths_and_the_backend_reads_them() {
+        // The desktop shell consumes the drop before the page sees it and
+        // arrives over Tauri's event channel with paths, while a browser sends
+        // bytes. Both reach the same endpoint, so where a dropped item lands
+        // cannot drift between the apps.
+        let tmp = std::env::temp_dir().join(format!("linscp-path-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let local = tmp.join("local");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let drop_local = |body: Value| {
+            svc.dispatch(ApiEnvelope {
+                method: "POST".to_string(),
+                path: "/api/local/drop".to_string(),
+                body,
+            })
+        };
+
+        // One file the operating system dropped lands under its own name.
+        let dropped = outside.join("report.txt");
+        std::fs::write(&dropped, b"native drop bytes").unwrap();
+        let saved = drop_local(json!({
+            "local_dir": local.to_string_lossy(),
+            "name": "report.txt",
+            "source_path": dropped.to_string_lossy(),
+        }));
+        assert_eq!(saved.status, 200, "{}", saved.payload);
+        assert_eq!(std::fs::read(local.join("report.txt")).unwrap(), b"native drop bytes");
+
+        // A drop that names nothing usable is refused instead of being written
+        // as an empty file.
+        for body in [
+            json!({"local_dir": local.to_string_lossy(), "name": "missing.txt",
+                   "source_path": outside.join("not-there.txt").to_string_lossy()}),
+            json!({"local_dir": local.to_string_lossy(), "name": "control",
+                   "source_path": "bad\u{0}path"}),
+            json!({"local_dir": local.to_string_lossy(), "name": "report.txt"}),
+        ] {
+            let reply = drop_local(body);
+            assert_eq!(reply.status, 400, "{}", reply.payload);
+        }
+
+        // A path drop is refused, now, when the destination already holds the
+        // name: the page asks the one overwrite question and repeats the same
+        // drop with the answer, so nothing is replaced before it is asked.
+        let dropped_again = drop_local(json!({
+            "local_dir": local.to_string_lossy(), "name": "report.txt",
+            "source_path": dropped.to_string_lossy(),
+        }));
+        assert_eq!(dropped_again.status, 409, "{}", dropped_again.payload);
+        assert_eq!(dropped_again.payload["conflicts"], json!(["report.txt"]));
+        // The name alone is not taken: a second file of the same drop is new,
+        // so the refusal is about the destination, not about the gesture.
+        let second = outside.join("notes.txt");
+        std::fs::write(&second, b"notes").unwrap();
+        let both = drop_local(json!({
+            "local_dir": local.to_string_lossy(),
+            "name": "report.txt",
+            "source_paths": [dropped.to_string_lossy(), second.to_string_lossy()],
+        }));
+        assert_eq!(both.status, 409, "{}", both.payload);
+        assert_eq!(both.payload["conflicts"], json!(["report.txt"]));
+        assert_eq!(std::fs::read(local.join("notes.txt")).unwrap(), b"notes");
+
+        // The page's approval is what turns a conflict into a replacement, and
+        // the retry is the same request plus that decision.
+        std::fs::write(&dropped, b"changed").unwrap();
+        let approved = drop_local(json!({
+            "local_dir": local.to_string_lossy(), "name": "report.txt",
+            "source_path": dropped.to_string_lossy(), "overwrite": "overwrite",
+        }));
+        assert_eq!(approved.status, 200, "{}", approved.payload);
+        assert_eq!(std::fs::read(local.join("report.txt")).unwrap(), b"changed");
+
+        // A folder travels under its own leaf name, with its contents: the
+        // directories above it on the machine are not part of the drop, which
+        // is what made the same gesture land at a different depth before.
+        let tree = outside.join("project");
+        std::fs::create_dir_all(tree.join("nested")).unwrap();
+        std::fs::write(tree.join("one.txt"), b"one").unwrap();
+        std::fs::write(tree.join("nested/two.txt"), b"two").unwrap();
+        let copied = drop_local(json!({
+            "local_dir": local.to_string_lossy(), "name": "project",
+            "source_path": tree.to_string_lossy(),
+        }));
+        assert_eq!(copied.status, 200, "{}", copied.payload);
+        assert_eq!(copied.payload["saved"], json!(["project"]));
+        assert_eq!(std::fs::read(local.join("project/nested/two.txt")).unwrap(), b"two");
+        // The second drop of the same folder is the conflict, and the approval
+        // replaces the old tree rather than merging into it.
+        let folder_again = drop_local(json!({
+            "local_dir": local.to_string_lossy(), "name": "project",
+            "source_path": tree.to_string_lossy(),
+        }));
+        assert_eq!(folder_again.status, 409, "{}", folder_again.payload);
+        assert_eq!(folder_again.payload["conflicts"], json!(["project"]));
+        std::fs::write(tree.join("one.txt"), b"replaced").unwrap();
+        let folder_approved = drop_local(json!({
+            "local_dir": local.to_string_lossy(), "name": "project",
+            "source_path": tree.to_string_lossy(), "overwrite": "overwrite",
+        }));
+        assert_eq!(folder_approved.status, 200, "{}", folder_approved.payload);
+        assert_eq!(std::fs::read(local.join("project/one.txt")).unwrap(), b"replaced");
+
+        // A link is not a copy of bytes the folder owns, so a tree that
+        // contains one is refused and leaves nothing half-written behind.
+        #[cfg(unix)]
+        {
+            let linked = outside.join("linked");
+            std::fs::create_dir_all(&linked).unwrap();
+            std::os::unix::fs::symlink("/etc/passwd", linked.join("escape")).unwrap();
+            let refused = drop_local(json!({
+                "local_dir": local.to_string_lossy(), "name": "linked",
+                "source_path": linked.to_string_lossy(),
+            }));
+            assert_eq!(refused.status, 400, "{}", refused.payload);
+            assert!(!local.join("linked/escape").exists());
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn desktop_drops_are_saved_by_the_same_endpoint_in_every_app() {
         // The page sends one JSON body (base64 bytes) on both transports, so
         // the browser and the native window reach this handler; the HTTP layer
         // only has to turn a raw browser upload into the same body.
@@ -6608,12 +7370,13 @@ mod tests {
         assert_eq!(session.payload["logged_in"], false);
 
         // An upload drop needs a connected remote tab and says so instead of
-        // reporting success or writing a file.
-        let upload = svc.dispatch(ApiEnvelope {
+        // reporting success or writing a file. A remote drop is dispatched
+        // asynchronously, which is what both apps call for one.
+        let upload = svc.dispatch_async(ApiEnvelope {
             method: "POST".to_string(),
             path: "/api/transfer/drop".to_string(),
             body: json!({"tab": 0, "remote_dir": "/incoming", "name": "x.txt", "data_base64": "eA=="}),
-        });
+        }).await;
         assert_eq!(upload.status, 400, "{}", upload.payload);
         assert!(!tmp.join("config/drop-staging/x.txt").exists(), "a refused drop leaves no staged file");
 

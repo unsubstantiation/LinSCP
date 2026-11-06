@@ -195,9 +195,24 @@ pub fn terminal_size() -> (u32, u32) {
 pub struct RawTerminalGuard {
     #[cfg(unix)]
     saved: libc::termios,
+    /// Held as `isize` rather than as the raw `HANDLE`, so the guard is `Send`.
+    ///
+    /// The interactive shell holds this guard across the SSH channel awaits, and
+    /// the command that runs it is spawned as a boxed `Send` future; a raw
+    /// pointer in the guard made that future `!Send` on Windows alone, which
+    /// silently made every caller that awaits it, up to the axum handler,
+    /// unusable there. The value is only passed back to `SetConsoleMode`, which
+    /// acts on the console rather than on the calling thread.
     #[cfg(windows)]
-    saved_in: (windows_sys::Win32::Foundation::HANDLE, u32),
+    saved_in: (isize, u32),
 }
+
+// The property the async command chain depends on, asserted where it broke.
+#[cfg(windows)]
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<RawTerminalGuard>();
+};
 
 impl RawTerminalGuard {
     pub fn enter() -> Option<Self> {
@@ -236,7 +251,7 @@ impl RawTerminalGuard {
                 return None;
             }
             Some(Self {
-                saved_in: (h_in, mode),
+                saved_in: (h_in as isize, mode),
             })
         }
     }
@@ -253,7 +268,7 @@ impl Drop for RawTerminalGuard {
         // SAFETY: Restores the Win32 console mode captured in `enter`.
         unsafe {
             let _ = windows_sys::Win32::System::Console::SetConsoleMode(
-                self.saved_in.0,
+                self.saved_in.0 as windows_sys::Win32::Foundation::HANDLE,
                 self.saved_in.1,
             );
         }

@@ -5,3 +5,5 @@ export * from './platform/capabilities.js';
 export * from './platform/native.js';
 export * from './platform/roots.js';
 export * from './platform/mobile.js';
+export * from './platform/shell.js';
+export * from './platform/drops.js';

@@ -62,7 +62,10 @@ html, body { width: 100%; height: 100%; }
 body {
   display: flex;
   flex-direction: column;
-  min-width: 720px;
+  /* The narrow layout is a supported window size, not an accident: the same
+   * page runs in a phone-sized WebView, so the floor has to fit that viewport
+   * instead of forcing a 720px document onto it. */
+  min-width: 320px;
   min-height: 520px;
   overflow: hidden;
   margin: 0;
