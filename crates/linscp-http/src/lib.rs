@@ -377,3 +377,105 @@ mod tests {
         assert!(check_host_and_origin(&ok_headers, &cfg.allowed_hosts).is_ok());
     }
 }
+
+/// A bound browser server, for the binary that offers browser mode.
+///
+/// The desktop window is a Tauri application; a browser, a headless host and a
+/// multi-user deployment are the same page served by this crate over HTTP. The
+/// startup lives here rather than in a `main.rs` so the address and the token a
+/// test reads are the ones the launcher really used, and so the two apps cannot
+/// drift in how they embed the page.
+pub struct BrowserServer {
+    pub addr: SocketAddr,
+    /// The bearer token the page has to send with every `/api` request.
+    pub token: String,
+    listener: std::net::TcpListener,
+    config: HttpServerConfig,
+}
+
+impl BrowserServer {
+    /// Binds a port (`0` lets the kernel pick one) and keeps the token.
+    ///
+    /// The listener is bound here, once: a second bind could land on a
+    /// different port than the one printed for the user, which is the kind of
+    /// difference a smoke test that reads the printed address would not catch.
+    pub fn bind(port: u16, allowed_hosts: &[String], bind_addr: Option<SocketAddr>) -> std::io::Result<Self> {
+        let mut config = HttpServerConfig::loopback(port);
+        if let Some(addr) = bind_addr {
+            config.bind_addr = addr;
+        }
+        for host in allowed_hosts {
+            let host = host.trim();
+            if !host.is_empty() {
+                config.allowed_hosts.insert(host.to_ascii_lowercase());
+            }
+        }
+        let listener = std::net::TcpListener::bind(config.bind_addr)?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        config.bind_addr = addr;
+        let token = config.bearer_token.clone();
+        Ok(Self { addr, token, listener, config })
+    }
+
+    /// The URL the user opens. A port the kernel picked is already resolved.
+    pub fn url(&self) -> String {
+        let ip = self.addr.ip();
+        let host = if ip.is_unspecified() {
+            "127.0.0.1".to_string()
+        } else if ip.is_ipv6() {
+            format!("[{ip}]")
+        } else {
+            ip.to_string()
+        };
+        format!("http://{host}:{}/", self.addr.port())
+    }
+
+    /// Serves the page and the API until the listener fails.
+    pub async fn serve(self) -> std::io::Result<()> {
+        let listener = tokio::net::TcpListener::from_std(self.listener)?;
+        let state = Arc::new(HttpAppState {
+            service: CommanderService::default(),
+            config: self.config,
+        });
+        serve(listener, state).await
+    }
+}
+
+#[cfg(test)]
+mod browser_server_tests {
+    use super::*;
+
+    /// The address printed for the user and the address actually bound are the
+    /// same one, and the token the page carries is the token the API checks.
+    #[test]
+    fn the_browser_server_prints_the_address_it_bound() {
+        let server = BrowserServer::bind(0, &[], None).expect("bind a loopback port");
+        assert_ne!(server.addr.port(), 0, "the kernel picked a port");
+        let expected = format!("http://127.0.0.1:{}/", server.addr.port());
+        assert_eq!(server.url(), expected);
+        // Opening the printed URL and sending the printed token has to pass
+        // the check the API makes; anything else means a page that cannot talk.
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "127.0.0.1:8765".parse().unwrap());
+        headers.insert("origin", "http://127.0.0.1:8765".parse().unwrap());
+        assert!(check_host_and_origin(&headers, &server.config.allowed_hosts).is_ok());
+        assert!(constant_time_str_eq(&server.token, &server.config.bearer_token));
+        assert!(!server.token.is_empty());
+    }
+
+    /// An extra host is accepted only by name, and it does not widen the list
+    /// to everything: the token is still the only thing guarding the API.
+    #[test]
+    fn an_extra_allowed_host_is_named_not_wildcarded() {
+        let server = BrowserServer::bind(0, &[" LinSCP.Internal ", ""], None)
+            .expect("bind a loopback port");
+        assert!(server.config.allowed_hosts.contains("linscp.internal"));
+        assert!(!server.config.allowed_hosts.contains("*"));
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "linscp.internal:8765".parse().unwrap());
+        assert!(check_host_and_origin(&headers, &server.config.allowed_hosts).is_ok());
+        headers.insert("host", "other.example:8765".parse().unwrap());
+        assert!(check_host_and_origin(&headers, &server.config.allowed_hosts).is_err());
+    }
+}

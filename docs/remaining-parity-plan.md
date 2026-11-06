@@ -4,7 +4,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-7 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+9 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -20,6 +20,20 @@ Authenticated SSH jump-host connections work for SFTP/SCP/SSH and for FTP/FTPS/W
 
 - [ ] Run the isolated-realm GSSAPI cases in CI with a GSSAPI-enabled libssh and no skipped cases; cover principal selection, missing/expired credentials, service mutual authentication, default-off delegation and opt-in TGT delegation.
 - [ ] Obtain an independent security review of delegated TGT handling and validate cross-realm/production-KDC behavior before claiming general Kerberos parity.
+
+## gui.native-path-drop
+
+**Area:** GUI · **Status:** partial
+
+An operating-system drop in a native window arrives as paths, not as a File: `dragDropEnabled` makes the Tauri window consume the drop before the page sees it. The shell emits `native:file-drop` with those paths, the shared bundle turns them into one request (the first path plus the list, with the folders named), and the service stages and queues exactly what the browser's byte drop would - the same endpoints, the same queue, the same conflict answer, so one set of overwrite rules answers for all three apps. A local drop copies the tree directly; a grant-URI source is read through `LocalFs`; a link inside a dropped folder is refused rather than followed. Android's share hand-off records the desktop's pending manifest and the page queues it through the same path. What the drop still lacks is end-to-end evidence on a real window: the jsdom suite drives the request shape and the service test drives the filesystem, but neither can produce a WebKit drop event, and the share intent filter is registered by the generated Kotlin project rather than by this tree.
+
+**Next:** The path a native window drops is queued and copied, but no test drives a real WebKit drop event or the Android share filter, and a large dropped folder is staged in the app's private directory with no bound on the space it takes.
+
+**Acceptance criteria:**
+
+- [ ] Drive a real WebKit/GTK drop onto the native window and show the queued task names the dropped paths (the shell's `dragDropEnabled` handler cannot be exercised by jsdom).
+- [ ] Register the Android share intent filter in the generated Kotlin project and prove a shared file reaches the same drop path, including the conflict question and the queue entry.
+- [ ] Prove a dropped folder larger than memory is staged without holding it in the page, and that a partial staging tree is removed when the queue refuses the drop.
 
 ## automation.command-interpreter
 
@@ -80,6 +94,18 @@ English, Spanish, German and French catalogs cover the browser interface (menus,
 **Acceptance criteria:**
 
 - [ ] Ship a catalog for every language the project claims to support and translate the whole interface into it, starting with the languages the upstream project already ships.
+
+## gui.remote-delete
+
+**Area:** GUI · **Status:** partial
+
+The panes' delete runs on the session: each selected name is validated as a leaf, joined to the panel directory and removed with the queue's own tree walk, which empties a directory before removing it and unlinks a symbolic link instead of following it. A name the server no longer has counts as deleted; a refusal is reported per name, and the valid names of the same request still run. A local tab keeps its contained path resolution. It is not transactional: an interruption can leave part of a tree, which the row states as its gap.
+
+**Next:** Remote deletion is not transactional: a directory is emptied before it is removed, so an interruption can leave part of a tree.
+
+**Acceptance criteria:**
+
+- [ ] Prove an interruption leaves the partial tree reported rather than presented as a completed delete.
 
 ## desktop.remote
 

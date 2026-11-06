@@ -64,7 +64,9 @@
           "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
           "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English.",
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
-          "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs."
+          "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs.",
+          "ui-transport": "ui/tests/TransportAndPlatform.test.mjs under node against the built bundle (ui/dist/linscp-core.mjs): the dual transport selection and error mapping, the host capability matrix and the difference reasons, the touch shell (pane order, the extra-key row and its latched Ctrl, long-press selection, the floating action bar and destroy), the local root switcher, and the operating-system path drop - the request shape one drop produces, the approvals a retry repeats, and what an unusable payload is refused for.",
+          "service": "crates/linscp-service/src/lib.rs - the service's own tests, which drive the same `CommanderService::dispatch` the three hosts call: the local and remote drop endpoints (a path drop writes what it names, a folder keeps its shape, an existing destination is a conflict rather than a replacement, a link inside a dropped tree is refused), remote delete against a live WebDAV server (a leaf-invalid name refused per name while the valid one runs, a directory tree emptied and removed, a name the server no longer has counted as deleted, the request's own directory honoured), and the transfer, queue and workspace behaviour the live suites exercise over SFTP, FTP, FTPS, S3 and WebDAV."
         }
       },
       "windows": {
@@ -92,7 +94,9 @@
           "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
           "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English.",
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
-          "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs."
+          "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs.",
+          "ui-transport": "ui/tests/TransportAndPlatform.test.mjs under node against the built bundle (ui/dist/linscp-core.mjs): the dual transport selection and error mapping, the host capability matrix and the difference reasons, the touch shell (pane order, the extra-key row and its latched Ctrl, long-press selection, the floating action bar and destroy), the local root switcher, and the operating-system path drop - the request shape one drop produces, the approvals a retry repeats, and what an unusable payload is refused for.",
+          "service": "crates/linscp-service/src/lib.rs - `cargo test --workspace` on Windows runs the same service tests the Linux job runs, including the drop staging and the request shapes; the live-server cases need the Python fixtures and are enabled on Linux."
         }
       },
       "android": {
@@ -120,7 +124,9 @@
           "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
           "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English.",
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
-          "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs."
+          "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs.",
+          "ui-transport": "ui/tests/TransportAndPlatform.test.mjs under node against the built bundle (ui/dist/linscp-core.mjs): the dual transport selection and error mapping, the host capability matrix and the difference reasons, the touch shell (pane order, the extra-key row and its latched Ctrl, long-press selection, the floating action bar and destroy), the local root switcher, and the operating-system path drop - the request shape one drop produces, the approvals a retry repeats, and what an unusable payload is refused for.",
+          "service": "crates/linscp-service/src/lib.rs - the service is compiled into the APK and `tools/android_emulator_smoke.mjs` drives it inside the installed app through the WebView's IPC, so the same dispatch path is exercised on the emulator."
         }
       }
     }
@@ -1038,37 +1044,9 @@
     },
     {
       "name": "GUI",
-      "status": "verified",
+      "status": "partial",
       "notes": "Browser Commander provides persistent session tabs, dual panes, an Explorer-style single-panel view with persisted custom-command templates (explicit confirmation, safe per-file substitution, local/remote scope), transfer queue controls, synchronization preview/conflict controls, UTF-8 editing/search, synchronized browsing and host-key verification. Local and remote panes accept files/folders through FileSystemEntry, FileSystemHandle and plain File APIs with path validation; English/Spanish interface localization is implemented. A local-to-local tab opens two local directories without a server or core process and queues recursive copies/moves with overwrite decisions, metadata/symlink policy, overlap refusal and cancellation. These behaviors are covered by gui, gui-localization, gui-browser-upload, gui-local-editor, gui-search, gui-security and gui-local. Automated browser API fixtures are not a real-world browser/file-manager compatibility certification. SSH tunnel settings and separate hop-key confirmation are implemented. Directory bookmarks with a per-panel dialog, a session URL dialog whose password is opt-in, and session import from an OpenSSH configuration or FileZilla are implemented as well. Preferences (stored transfer defaults and the overwrite/delete confirmations, in preferences.json), Cleanup (the stored data, one named location at a time, id-addressed and confirmed), a remote-to-remote copy dialog (another session, a directory and a file mask; server-side cp inside one session, a private download/upload job across two) and a Properties dialog for one or many entries with its rights editor are implemented and covered by the same two suites.",
-      "verified_on": {
-        "linux": [
-          "gui",
-          "gui-localization",
-          "gui-browser-upload",
-          "gui-local-editor",
-          "gui-search",
-          "gui-security",
-          "gui-local"
-        ],
-        "windows": [
-          "gui",
-          "gui-localization",
-          "gui-browser-upload",
-          "gui-local-editor",
-          "gui-search",
-          "gui-security",
-          "gui-local"
-        ],
-        "android": [
-          "gui",
-          "gui-localization",
-          "gui-browser-upload",
-          "gui-local-editor",
-          "gui-search",
-          "gui-security",
-          "gui-local"
-        ]
-      }
+      "gap": "Path drops are queued through the shared endpoint but no test drives a real window drop or the Android share filter, and remote deletion is not transactional and has no live-server test."
     },
     {
       "name": "Editing/search",
@@ -3441,6 +3419,42 @@
       }
     },
     {
+      "id": "gui.native-path-drop",
+      "area": "GUI",
+      "status": "partial",
+      "notes": "An operating-system drop in a native window arrives as paths, not as a File: `dragDropEnabled` makes the Tauri window consume the drop before the page sees it. The shell emits `native:file-drop` with those paths, the shared bundle turns them into one request (the first path plus the list, with the folders named), and the service stages and queues exactly what the browser's byte drop would - the same endpoints, the same queue, the same conflict answer, so one set of overwrite rules answers for all three apps. A local drop copies the tree directly; a grant-URI source is read through `LocalFs`; a link inside a dropped folder is refused rather than followed. Android's share hand-off records the desktop's pending manifest and the page queues it through the same path. What the drop still lacks is end-to-end evidence on a real window: the jsdom suite drives the request shape and the service test drives the filesystem, but neither can produce a WebKit drop event, and the share intent filter is registered by the generated Kotlin project rather than by this tree.",
+      "source": [
+        "crates/linscp-tauri/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
+        "ui/src/platform/drops.ts",
+        "source/gui/web/index.html"
+      ],
+      "checks": {
+        "gui": [
+          "desktop file bytes are queued for remote upload"
+        ],
+        "ui-transport": [
+          "an operating-system drop names paths once and the queue answers once"
+        ],
+        "service": [
+          "a_native_window_drop_names_paths_and_the_backend_reads_them"
+        ]
+      },
+      "gap": "The path a native window drops is queued and copied, but no test drives a real WebKit drop event or the Android share filter, and a large dropped folder is staged in the app's private directory with no bound on the space it takes.",
+      "acceptance": [
+        "Drive a real WebKit/GTK drop onto the native window and show the queued task names the dropped paths (the shell's `dragDropEnabled` handler cannot be exercised by jsdom).",
+        "Register the Android share intent filter in the generated Kotlin project and prove a shared file reaches the same drop path, including the conflict question and the queue entry.",
+        "Prove a dropped folder larger than memory is staged without holding it in the page, and that a partial staging tree is removed when the queue refuses the drop."
+      ],
+      "verified_on": {
+        "linux": [
+          "gui",
+          "ui-transport",
+          "service"
+        ]
+      }
+    },
+    {
       "id": "gui.desktop-folder-drop",
       "area": "GUI",
       "status": "verified",
@@ -4933,6 +4947,35 @@
         "android": [
           "gui",
           "gui-local"
+        ]
+      }
+    },
+    {
+      "id": "gui.remote-delete",
+      "area": "GUI",
+      "status": "partial",
+      "notes": "The panes' delete runs on the session: each selected name is validated as a leaf, joined to the panel directory and removed with the queue's own tree walk, which empties a directory before removing it and unlinks a symbolic link instead of following it. A name the server no longer has counts as deleted; a refusal is reported per name, and the valid names of the same request still run. A local tab keeps its contained path resolution. It is not transactional: an interruption can leave part of a tree, which the row states as its gap.",
+      "source": [
+        "crates/linscp-service/src/lib.rs",
+        "crates/linscp-service/src/queue.rs"
+      ],
+      "checks": {
+        "gui": [
+          "F8 deletes a remote directory by its listed kind",
+          "declining the delete question sends nothing"
+        ],
+        "service": [
+          "exercise_remote_delete"
+        ]
+      },
+      "gap": "Remote deletion is not transactional: a directory is emptied before it is removed, so an interruption can leave part of a tree.",
+      "acceptance": [
+        "Prove an interruption leaves the partial tree reported rather than presented as a completed delete."
+      ],
+      "verified_on": {
+        "linux": [
+          "gui",
+          "service"
         ]
       }
     },

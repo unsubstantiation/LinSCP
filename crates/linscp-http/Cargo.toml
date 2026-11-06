@@ -6,6 +6,10 @@ rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "linscp-web"
+path = "src/main.rs"
+
 [dependencies]
 axum.workspace = true
 base64.workspace = true

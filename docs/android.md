@@ -4,12 +4,26 @@ The Android target builds the same Tauri WebView and Rust `CommanderService` as
 the desktop application. This is an **experimental, debug-signed APK**, not a
 production or Play Store release. Android support is incomplete:
 
-- Only app-private storage is exposed. The Android Storage Access Framework,
-  document picker, share intents and Downloads/shared storage are not wired in.
-  Uninstalling the app removes app-private files and configuration.
+- Only app-private storage is exposed unless a folder is granted. The Storage
+  Access Framework bridge and the share hand-off exist in the Rust shell
+  (`linscp_request_saf_tree`, `linscp_pick_saf_tree`,
+  `linscp_handle_share_intent`), but the generated Kotlin project has to register
+  the picker and the intent filter for them to be reachable; until it does, a
+  share or a folder grant fails closed instead of silently doing nothing.
+  Downloads/shared storage is not exposed. Uninstalling the app removes
+  app-private files and configuration.
 - Background/foreground-service transfer survival and Android Keystore/biometric
-  integration are not wired in. Keep the app open during transfers. The session
-  master key is stored in the app sandbox, not backed by Android Keystore.
+  integration are not wired in. The page starts and stops the service from the
+  transfer queue (`ForegroundTransferBridge`, gated on the `foregroundTransfers`
+  capability) and the Rust shell exposes the three commands, but nothing
+  implements the service itself yet, so the calls fail closed. Keep the app open
+  during transfers. The session master key is stored in the app sandbox, not
+  backed by Android Keystore.
+- The page no longer probes the native bridge at each call site. One
+  `hostCapabilities()` description drives the controls that differ between
+  hosts (folder grants, share hand-offs, the foreground service, the OS drop
+  listener), and a control this host cannot serve is left out with the reason
+  `hostDifferenceReason()` gives.
 - Remote transfer restrictions and cleanup caveats in the main README still
   apply. Other native GUI actions remain incomplete; see the feature audit.
 - The debug APK is signed with a development key. It is intended for testing,

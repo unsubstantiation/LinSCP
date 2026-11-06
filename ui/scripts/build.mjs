@@ -68,6 +68,16 @@ const dualModeShim = `  window.LinSCPTransport = window.LinSCPCore
     return window.LinSCPCore.requestSafTree();
   };
 
+  // The touch shell (bottom navigation, swipe, long-press selection and the
+  // terminal extra-key row) is one component with real behaviour, so it lives
+  // in the shared bundle as well. The page owns the elements and the actions;
+  // every host - the desktop window, the browser page and the Android app -
+  // mounts this same object, which is why the narrow layout behaves the same
+  // in all three.
+  window.LinSCPCore.mountAppShell = function (options) {
+    return new window.LinSCPCore.AppShell(options);
+  };
+
   async function api(url, options) {
     options = options || {};
     if (window.LinSCPTransport && window.LinSCPTransport.mode === 'tauri') {

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=LinSCP (browser)
+GenericName=Secure File Transfer Client
+Comment=Run LinSCP in a browser, serving the same page the desktop window shows
+Exec=linscp-web
+TryExec=linscp-web
+Icon=linscp
+Terminal=true
+Categories=Network;FileTransfer;
+Keywords=sftp;ftp;ftps;webdav;s3;scp;browser;server;
+StartupNotify=false

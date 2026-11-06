@@ -66,6 +66,12 @@ export interface MobileShellOptions {
   swipeContainer?: HTMLElement;
   /** Localizes a pane name for the bottom navigation. */
   paneLabel?: (pane: MobilePaneId) => string;
+  /**
+   * The visible pane changed because the user tapped, swiped or used a
+   * shortcut. The host uses it to move its own focus; a change the host makes
+   * itself (`syncPane`) does not call it.
+   */
+  onPaneChange?: (pane: MobilePaneId) => void;
 }
 
 export const MOBILE_PANE_ORDER: readonly MobilePaneId[] = ['local', 'remote', 'queue', 'terminal'] as const;
@@ -100,6 +106,7 @@ export class MobileShellController {
   private readonly root: HTMLElement;
   private readonly onTerminalInput?: (data: string) => void;
   private readonly paneLabel?: (pane: MobilePaneId) => string;
+  private readonly onPaneChange?: (pane: MobilePaneId) => void;
   private activePane: MobilePaneId = 'local';
   private ctrlLatched = false;
   private altLatched = false;
@@ -119,6 +126,7 @@ export class MobileShellController {
     this.root = options.rootElement;
     this.onTerminalInput = options.onTerminalInput;
     this.paneLabel = options.paneLabel;
+    this.onPaneChange = options.onPaneChange;
     this.root.dataset['mobilePane'] = this.activePane;
     if (options.bottomNavElement) {
       this.attachBottomNav(options.bottomNavElement);
@@ -150,10 +158,14 @@ export class MobileShellController {
   }
 
   public setActivePane(pane: MobilePaneId): void {
+    const changed = this.activePane !== pane;
     this.activePane = pane;
     this.root.dataset['mobilePane'] = pane;
     this.syncBottomNav();
     this.syncSwipeScroll();
+    if (changed) {
+      this.onPaneChange?.(pane);
+    }
   }
 
   /**
@@ -291,17 +303,19 @@ export class MobileShellController {
 
   private onMouseDown = (event: MouseEvent): void => {
     // Simple mouse drag swipe for desktop testing: track 40px drag.
+    const view = (this.swipeContainer?.ownerDocument?.defaultView ?? globalThis) as
+      Window & typeof globalThis;
     const startX = event.clientX;
     const startY = event.clientY;
     const onUp = (up: MouseEvent): void => {
-      window.removeEventListener('mouseup', onUp);
+      view.removeEventListener('mouseup', onUp);
       const dx = up.clientX - startX;
       const dy = up.clientY - startY;
       if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.2) return;
       if (dx < 0) this.setActivePane(nextPane(this.activePane));
       else this.setActivePane(prevPane(this.activePane));
     };
-    window.addEventListener('mouseup', onUp, { once: true });
+    view.addEventListener('mouseup', onUp, { once: true });
   };
 
   private syncSwipeScroll(): void {
@@ -386,6 +400,10 @@ export class MobileShellController {
     onSingleTap: () => void,
     delayMs = 500,
   ): () => void {
+    // The row's own window, so the timer and its clearing come from the same
+    // realm: a timer created by the page and cleared by the bundle would leak
+    // a pending long press into the next render.
+    const view = (row.ownerDocument?.defaultView ?? globalThis) as Window & typeof globalThis;
     let timer: number | null = null;
     let moved = false;
     let longPressed = false;
@@ -398,7 +416,7 @@ export class MobileShellController {
       const point = (event as TouchEvent).touches?.[0] ?? (event as MouseEvent);
       startX = (point as { clientX: number }).clientX ?? 0;
       startY = (point as { clientY: number }).clientY ?? 0;
-      timer = window.setTimeout(() => {
+      timer = view.setTimeout(() => {
         longPressed = true;
         this.setSelectionMode(true, 1);
         onLongPress();
@@ -411,14 +429,14 @@ export class MobileShellController {
       if (Math.abs(x - startX) > 10 || Math.abs(y - startY) > 10) {
         moved = true;
         if (timer !== null) {
-          clearTimeout(timer as unknown as number);
+          view.clearTimeout(timer as unknown as number);
           timer = null;
         }
       }
     };
     const end = (): void => {
       if (timer !== null) {
-        clearTimeout(timer as unknown as number);
+        view.clearTimeout(timer as unknown as number);
         timer = null;
       }
       if (!moved && !longPressed) {
@@ -427,7 +445,7 @@ export class MobileShellController {
     };
     const cancel = (): void => {
       if (timer !== null) {
-        clearTimeout(timer as unknown as number);
+        view.clearTimeout(timer as unknown as number);
         timer = null;
       }
     };
@@ -449,7 +467,7 @@ export class MobileShellController {
       row.removeEventListener('mousedown', start as EventListener);
       row.removeEventListener('mousemove', move as EventListener);
       row.removeEventListener('mouseup', end as EventListener);
-      if (timer !== null) clearTimeout(timer as unknown as number);
+      if (timer !== null) view.clearTimeout(timer as unknown as number);
     };
     this.cleanupFns.push(cleanup);
     return cleanup;

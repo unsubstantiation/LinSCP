@@ -66,7 +66,7 @@ FIXTURE_DIRECTORIES = ('tests', 'fixtures')
 TEXT_SUFFIXES = {'.c', '.h', '.cpp', '.rs', '.py', '.psm1', '.md', '.txt', '.json',
                  '.yml', '.yaml', '.mk', '.in', '.desktop', '.rules', '.1'}
 EXTRA_TEXT_FILES = {'Makefile', 'CMakeLists.txt', 'rules', 'linscp-gui',
-                    'linscp.desktop'}
+                    'linscp.desktop', 'linscp-web.desktop'}
 
 # The environment variables that say which display server a session runs. A
 # client that reads one of them has to have looked at the other, and the two

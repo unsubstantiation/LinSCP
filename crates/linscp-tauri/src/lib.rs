@@ -175,6 +175,23 @@ pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
         app.manage(TauriBridge::with_android_state(service, state));
         Ok(())
     });
+    // A window with `dragDropEnabled` consumes the drop before the page sees it,
+    // so the page's HTML5 handler never runs in the native window. The paths the
+    // operating system produced are handed to the page instead, and the page
+    // queues them through the same endpoint a browser's byte drop uses: one
+    // queue, one conflict answer, one overwrite rule in all three apps.
+    #[cfg(not(target_os = "android"))]
+    let builder = builder.on_window_event(|window, event| {
+        use tauri::{Emitter, WindowEvent};
+        if let WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+            // The side is the pane the page last focused; the shell cannot
+            // know which pane is under the cursor, and the page can.
+            let payload = serde_json::json!({
+                "paths": paths.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),
+            });
+            let _ = window.emit("native:file-drop", payload);
+        }
+    });
     builder.invoke_handler(tauri::generate_handler![
             commands::linscp_invoke,
             commands::linscp_request_saf_tree,

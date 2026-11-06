@@ -13,19 +13,22 @@ build-stamp:
 	npm --prefix ui run build
 	cargo test --workspace --all-targets
 	cargo build --release -p linscp-tauri --features native-shell
+	cargo build --release -p linscp-http
 	touch $@
 
 binary: build
 	rm -rf $(destdir)
 	install -d $(destdir)/usr/bin $(destdir)/usr/share/doc/$(package) $(destdir)/usr/share/applications $(destdir)/usr/share/pixmaps $(destdir)/usr/share/icons/hicolor/scalable/apps $(destdir)/DEBIAN
 	install -m 0755 target/release/linscp-gui $(destdir)/usr/bin/linscp-gui
+	install -m 0755 target/release/linscp-web $(destdir)/usr/bin/linscp-web
 	install -m 0644 debian/linscp.desktop $(destdir)/usr/share/applications/linscp.desktop
+	install -m 0644 debian/linscp-web.desktop $(destdir)/usr/share/applications/linscp-web.desktop
 	install -m 0644 debian/linscp.png $(destdir)/usr/share/pixmaps/linscp.png
 	install -m 0644 debian/linscp.svg $(destdir)/usr/share/icons/hicolor/scalable/apps/linscp.svg
 	install -m 0644 debian/copyright $(destdir)/usr/share/doc/$(package)/copyright
 	install -m 0644 LICENSE NOTICE $(destdir)/usr/share/doc/$(package)/
 	install -m 0644 docs/debian.md $(destdir)/usr/share/doc/$(package)/README.Debian
-	dpkg-shlibdeps -Tdebian/substvars $(destdir)/usr/bin/linscp-gui
+	dpkg-shlibdeps -Tdebian/substvars $(destdir)/usr/bin/linscp-gui $(destdir)/usr/bin/linscp-web
 	dpkg-gencontrol -p$(package) -P$(destdir)
 	dpkg-deb --build $(destdir) ..
 

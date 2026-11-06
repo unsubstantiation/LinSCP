@@ -69,6 +69,15 @@ CASE_SOURCES = {
     "wayland-compatibility": "tools/tests/test_wayland_compatibility.py",
     "backup": "crates/linscp-engine/src/backup.rs",
     "live-desktop": "source/linux/tests/LiveDesktopTest.py",
+    # The shared TypeScript bundle every host embeds: the touch shell, the dual
+    # transport, the path-drop request and the capability matrix live here, so
+    # their behaviour is asserted by node against the built bundle instead of
+    # through a page that would only reach the parts jsdom can run.
+    "ui-transport": "ui/tests/TransportAndPlatform.test.mjs",
+    # The service's own Rust tests drive the same dispatch the three hosts call,
+    # so a handler they share (the drop endpoints, remote delete) is evidenced
+    # by the code that serves it rather than by a host that happens to wrap it.
+    "service": "crates/linscp-service/src/lib.rs",
 }
 
 
@@ -267,6 +276,13 @@ def check_capabilities(inventory, errors, root=ROOT):
                 if suite in ("gui", "gui-localization"):
                     # The JS harness calls check('description', condition).
                     expression = r"check\(\s*['\"]" + re.escape(case) + r"['\"]"
+                elif suite == "ui-transport":
+                    # The bundle's own suite is node:test, so a case is a test().
+                    expression = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
+                elif suite == "service":
+                    # A Rust test is a #[test]/#[tokio::test] function, not a
+                    # `test_*` ffi symbol; the drop helpers are `async fn`.
+                    expression = r"\b(?:async\s+)?fn\s+" + re.escape(case) + r"\s*\("
                 else:
                     # Python's test_* / C++ Test* / Rust fn test_*.
                     expression = r"\b(?:def|void|fn)\s+" + re.escape(case) + r"\s*\("
@@ -331,6 +347,8 @@ def case_links(row):
         for case in cases:
             if suite in ('gui', 'gui-localization'):
                 pattern = r"check\(\s*['\"]" + re.escape(case) + r"['\"]"
+            elif suite == 'ui-transport':
+                pattern = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
             else:
                 pattern = r'\b(?:def|void|fn)\s+' + re.escape(case) + r'\s*\('
             match = re.search(pattern, text)
