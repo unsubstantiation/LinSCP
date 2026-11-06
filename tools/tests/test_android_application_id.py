@@ -63,6 +63,43 @@ class AndroidApplicationIdTests(unittest.TestCase):
         prepare = (ROOT / 'tools/prepare_android_project.py').read_text(encoding='utf-8')
         self.assertIn('application_id()', prepare)
         self.assertIn('applicationId', prepare)
+        self.assertIn('applicationIdSuffix', prepare)
+
+    def test_the_emulator_harness_checks_the_install_directory_on_the_device(self):
+        # The package name in the configuration only decides the install
+        # directory if the built APK carries it, so the harness asks the device
+        # which directory belongs to the running package and looks for a file
+        # the app wrote there. Nothing in this check comes from the repository's
+        # own configuration, so a build installed under another name fails.
+        harness = (ROOT / 'tools/android_emulator_smoke.sh').read_text(encoding='utf-8')
+        self.assertIn('cmd package list packages', harness)
+        self.assertIn('run-as', harness)
+        self.assertIn('android-smoke-marker.txt', harness)
+        smoke = (ROOT / 'tools/android_emulator_smoke.mjs').read_text(encoding='utf-8')
+        self.assertIn('android-smoke-marker.txt', smoke)
+        # The root the service reported and the directory the device reports for
+        # the installed package have to be the same path.
+        self.assertIn('process.argv[4]', smoke)
+        self.assertIn('"$app_root" != "$sandbox"', harness)
+        # `/data/user/0/<application ID>` is the install directory, assembled
+        # from the variable, never typed out.
+        self.assertIn('/data/user/0/$application', harness)
+        self.assertIn('Not using app-private storage', smoke)
+
+    def test_no_configuration_moves_the_install_directory(self):
+        # `appDirectoriesOverride` would relocate the storage, and a debug
+        # `applicationIdSuffix` would install under a different name than the
+        # one asserted here. Neither is configured, so the folder keeps the
+        # application ID's name in both debug and release builds.
+        config = json.loads((ROOT / 'crates/linscp-tauri/tauri.conf.json').read_text())
+        self.assertNotIn('appDirectoriesOverride', config.get('app', {}))
+        android = config.get('bundle', {}).get('android', {})
+        self.assertNotIn('debugApplicationIdSuffix', android)
+
+    def test_the_docs_name_the_install_directory(self):
+        docs = (ROOT / 'docs/android.md').read_text(encoding='utf-8')
+        self.assertIn('/data/user/0/' + EXPECTED, docs)
+        self.assertIn('app_data_dir', docs)
 
     def test_a_launcher_does_not_claim_the_old_identifier(self):
         # The desktop entries name executables, not the bundle identifier, so a

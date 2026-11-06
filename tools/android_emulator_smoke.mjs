@@ -1,10 +1,14 @@
 // Runs against the debug WebView through Chrome DevTools. The WebDAV fixture
 // is reached through adb reverse; all IPC executes inside the installed APK.
 import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
 const port = Number(process.argv[2]);
 // The installed package, handed over by the harness that read it from the
 // configuration, so the storage this run finds is the storage of *this* app.
 const application = process.argv[3];
+// Where to record the app-private root the service reported, so the harness can
+// compare it with the directory the device reports for the installed package.
+const rootFile = process.argv[4];
 assert.ok(application && application.includes('.'), 'the harness must pass the application ID');
 let pages;
 for (let i = 0; i < 60; i++) {
@@ -31,6 +35,11 @@ const expression = `
   if (!mkdir.success) throw new Error('Local mkdir failed: ' + JSON.stringify(mkdir));
   const save = await invoke('POST', '/api/local/save', {path: root + '/smoke-upload.txt', content: 'Android Rust-backed transfer'});
   if (!save.success) throw new Error('Local save failed: ' + JSON.stringify(save));
+  // Keep one file the harness can look for from the device side: the DevTools
+  // check and the sandbox listing then report the same directory instead of
+  // trusting the path string alone.
+  const marker = await invoke('POST', '/api/local/save', {path: root + '/android-smoke-marker.txt', content: 'android-smoke'});
+  if (!marker.success) throw new Error('Marker write failed: ' + JSON.stringify(marker));
   const opened = await invoke('POST', '/api/tabs/open', {session: {protocol: 'dav', host: '127.0.0.1', port: ${port}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
   if (!opened.success || !opened.tab?.connected) throw new Error('WebDAV connect failed: ' + JSON.stringify(opened));
   const tab = opened.tab.id;
@@ -93,4 +102,5 @@ assert.equal(stable, 2, 'WebView did not become ready');
 const reply = await evaluate(expression, 120000);
 socket.close();
 if (reply.error || reply.result?.exceptionDetails) throw new Error(JSON.stringify(reply));
+if (rootFile) writeFileSync(rootFile, String(reply.result.result.value.root));
 console.log('Android WebView and Rust service smoke test passed:', JSON.stringify(reply.result.result.value));

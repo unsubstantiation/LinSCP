@@ -29,24 +29,47 @@ production or Play Store release. Android support is incomplete:
 - The debug APK is signed with a development key. It is intended for testing,
   not distribution, updates to a release-signed installation, or sensitive data.
 
-## Application ID
+## Application ID and install directory
 
 The app is installed as **`com.fairuniversal.linscp`**, defined once in
-`crates/linscp-tauri/tauri.conf.json` (`identifier`). Tauri derives the Gradle
-`applicationId`, the `MainActivity` package and the app's private data directory
-from it, so the emulator harness, the APK check and the smoke test all read it
-through `tools/android_application_id.py` instead of repeating the string.
-`tools/prepare_android_project.py` refuses a generated project whose
-`applicationId` or `MainActivity` package disagrees, and
-`tools/verify_android_apk.py` refuses an APK built under another name.
+`crates/linscp-tauri/tauri.conf.json` (`identifier`). Tauri renders that into the
+Gradle `applicationId` of the generated project
+(`namespace`/`applicationId = "<identifier>"`, no `applicationIdSuffix` unless
+`bundle.android.debugApplicationIdSuffix` is configured — this repository does
+not configure it) and into the `MainActivity` package directory. Android then
+places the installed app in the sandbox named after that `applicationId`:
+
+```
+/data/user/0/com.fairuniversal.linscp         Activity.dataDir (`/data/data/...` is the same dir)
+/data/user/0/com.fairuniversal.linscp/config  linscp_platform::default_config_dir()
+/data/user/0/com.fairuniversal.linscp/cache   TMPDIR (Activity.cacheDir)
+```
+
+Tauri's `app_data_dir()` on Android is `Activity.dataDir` itself, not a
+`files/config` subdirectory: `PathPlugin.getDataDir()` resolves
+`activity.dataDir`, and `app.path().app_data_dir()` in
+`crates/linscp-tauri/src/lib.rs` is what the shell exports as
+`LINSCP_ANDROID_FILES_DIR`. The `App Storage` local root the page shows and the
+`config_root()` the service loads preferences and sessions from are therefore
+both inside the folder named after the application ID, with no `app >
+appDirectoriesOverride` in the configuration pointing anywhere else.
+
+The emulator harness proves this on the device rather than assuming it. After
+the WebView smoke test writes a marker file through the Rust service,
+`tools/android_emulator_smoke.sh` asks the system package manager for the
+installed package, enters that package's sandbox (`adb shell run-as`), checks
+the sandbox is `/data/user/0/com.fairuniversal.linscp`, and looks for the marker
+there. A build installed under another name, or reading another package's
+storage, fails the run; nothing in that check comes from this repository's own
+configuration.
 
 Two consequences of a rename are worth stating: the new package installs
 *beside* an older build rather than updating it, and an older build's
-app-private settings and stored sessions live under the old directory, so they
-are not carried over — re-import or re-enter the sites you need, then uninstall
-the old app. A generated `gen/android` project from before the rename must be
-regenerated (`tauri android init`) or the build stops with the mismatch rather
-than shipping the old name.
+app-private settings and stored sessions live under `/data/user/0/io.linscp.commander`,
+so they are not carried over — re-import or re-enter the sites you need, then
+uninstall the old app. A generated `gen/android` project from before the rename
+must be regenerated (`tauri android init`) or the build stops with the mismatch
+rather than shipping the old name.
 
 ## Build
 

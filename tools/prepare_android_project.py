@@ -27,6 +27,14 @@ if f'applicationId = "{application}"' not in gradle_text and \
         f'The generated Android project does not use the configured application '
         f'identifier {application}; regenerate it (tauri android init) after an '
         f'identifier change')
+# A debug `applicationIdSuffix` would install the APK as a different package, and
+# with it a different install directory, while the configuration kept naming the
+# plain identifier. Tauri only writes one when the configuration asks for it.
+if 'applicationIdSuffix' in gradle_text:
+    raise SystemExit(
+        'The generated Android project installs under a suffixed application ID, '
+        'so its data directory would not be the configured identifier; remove '
+        'bundle.android.debugApplicationIdSuffix and regenerate the project')
 activities = list((root / 'crates/linscp-tauri/gen/android/app/src/main').rglob('MainActivity.kt'))
 if len(activities) != 1:
     raise SystemExit('Unexpected Tauri Android activity layout')
