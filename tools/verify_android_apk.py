@@ -40,6 +40,16 @@ ABI_LIBRARIES = {
 }
 DEFAULT_ABIS = ('aarch64', 'x86_64')
 
+# `--print-certs` names the certificate digest the same way across releases, but
+# the report around it is not stable: build-tools 28-30 say "Verified using v2
+# scheme (APK Signature Scheme v2)" where 31 and later say "Verified using v2
+# APK Signature Scheme v2". Both spellings count as signed.
+CERTIFICATE_DIGEST = re.compile(
+    r'certificate\s+SHA-?256\s+digest:\s*([0-9a-fA-F:]{64,95})', re.IGNORECASE)
+V2_SCHEME = re.compile(
+    r'Verified using v2 (?:APK Signature Scheme v2|'
+    r'scheme \(APK Signature Scheme v2\)):\s*true')
+
 
 def sdk_tool(name):
     """The newest `name` in the SDK's build-tools, whatever version it is."""
@@ -92,24 +102,40 @@ def badging(apk):
 
 
 def signature(apk):
-    """`apksigner verify` output for the APK, refusing one that does not verify."""
+    """`apksigner verify`'s report for the APK, refusing one that does not verify.
+
+    The report is read from both streams: apksigner writes it on stdout in most
+    build-tools releases, but sends warnings - and, in some releases, the whole
+    report - to stderr. What matters is what it said, not which stream carried
+    it, and a report this tool cannot read has to say so rather than fail with
+    "no digest".
+    """
     result = subprocess.run(
         [str(sdk_tool('apksigner')), 'verify', '--verbose', '--print-certs', str(apk)],
         capture_output=True, text=True)
+    report = (result.stdout or '') + (result.stderr or '')
     if result.returncode != 0:
-        detail = (result.stdout + result.stderr).strip().splitlines()
+        detail = [line.strip() for line in report.splitlines() if line.strip()][:4]
         raise SystemExit(
             f'{apk.name} is not signed by a key Android would accept: '
-            + (' / '.join(line for line in detail[-3:]) or 'no output'))
-    return result.stdout
+            + (' / '.join(detail) or 'no output'))
+    return report
 
 
 def signer_digest(apksigner_output):
-    found = re.search(r'Signer #1 certificate SHA-256 digest: ([0-9a-fA-F]+)',
-                      apksigner_output)
+    """The signing certificate's SHA-256, however apksigner spelled it.
+
+    The line is "Signer #1 certificate SHA-256 digest: <hex>" across releases
+    (uppercase, colons and all); the report around it is not, so the digest is
+    matched on its own terms and nothing is assumed about its neighbours.
+    """
+    found = CERTIFICATE_DIGEST.search(apksigner_output)
     if not found:
-        raise SystemExit('apksigner printed no signer certificate digest')
-    return found.group(1).lower()
+        raise SystemExit(
+            'apksigner verified the APK but reported no signing certificate '
+            'digest, so the APK cannot be compared with the keystore. It said: '
+            + (apksigner_output.strip()[-1200:] or 'nothing'))
+    return found.group(1).replace(':', '').lower()
 
 
 def expected_release_digest():
@@ -166,10 +192,11 @@ def inspect(apk, build_type, required, expected_digest):
                 f'{apk.name} is signed by certificate {digest}, not by the '
                 f'release certificate {expected_digest} of the configured '
                 f'keystore; the APK was signed with some other key')
-        if 'Verified using v2 APK Signature Scheme v2: true' not in apksigner_output:
+        if not V2_SCHEME.search(apksigner_output):
             raise SystemExit(
                 f'{apk.name} is not signed with the v2 scheme; Android 7+ '
-                f'expects it and the app updates would not verify')
+                f'expects it and the app updates would not verify. apksigner '
+                f'said: ' + (apksigner_output.strip()[-800:] or 'nothing'))
         print(f'Signed by the release certificate {digest}', flush=True)
     return True
 
