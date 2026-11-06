@@ -26,6 +26,7 @@ async function page({ saved, server, browsers = ['en-US'], blocked = false } = {
       window.fetch = async (url, options = {}) => {
         calls.push({ url, options });
         let data = {success: true};
+        if (url === '/api/vault/status') data = {success: true, vault: 'unlocked'};
         if (url === '/api/status') data = {tabs: [{id: 1, name: 'Delete', connected: true,
           session: {hostkey: 'SHA256:abc'}, remote_dir: '/Remote', local_dir: '/Local'}], active_tab: 1};
         if (String(url).startsWith('/api/local/list')) data = {success: true, path: '/Local', entries: [

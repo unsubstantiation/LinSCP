@@ -30,6 +30,7 @@ use subtle::ConstantTimeEq;
 
 pub const MAX_BROWSER_UPLOAD_BYTES: usize = 1024 * 1024 * 1024;
 pub const MAX_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_OFFLINEOTP_IMPORT_JSON_BYTES: usize = 24 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct HttpServerConfig {
@@ -286,7 +287,14 @@ async fn api_handler(
         .unwrap_or("");
     let is_octet_drop = (path_only == "/api/transfer/drop" || path_only == "/api/local/drop")
         && content_type == "application/octet-stream";
-    let limit = if is_octet_drop { MAX_BROWSER_UPLOAD_BYTES } else { MAX_JSON_BODY_BYTES };
+    let is_offlineotp_import = method == Method::POST && path_only == "/api/vault/import";
+    let limit = if is_octet_drop {
+        MAX_BROWSER_UPLOAD_BYTES
+    } else if is_offlineotp_import {
+        MAX_OFFLINEOTP_IMPORT_JSON_BYTES
+    } else {
+        MAX_JSON_BODY_BYTES
+    };
     let body = match axum::body::to_bytes(body, limit).await {
         Ok(bytes) => bytes,
         Err(_) => {

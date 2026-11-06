@@ -118,12 +118,13 @@ export interface HostCapabilityOptions {
 /**
  * The capability set for one embedder.
  *
- * Defaults describe the desktop builds, where every feature is reachable: the
- * native window has local roots, terminal and remote-desktop launchers, and
- * only lacks the Android-specific bridges. The browser app has the same feature
- * surface except for the bridges that need a process on the user's machine and
- * the OS-level drop event. Android is the native app minus remote-desktop
- * viewers and with the SAF, share and foreground bridges in their place.
+ * Defaults describe capabilities that are actually registered by this tree.
+ * Android SAF/share/foreground bridges remain opt-in until the generated
+ * Android host registers real implementations; merely compiling Rust bridge
+ * traits must not make the UI advertise them. Native desktop launchers and OS
+ * drop events are available only in native desktop windows, not in a browser
+ * or Android WebView. Host-specific options can enable integrations after the
+ * corresponding native implementation is installed.
  */
 export function hostCapabilities(options: HostCapabilityOptions = {}): HostCapabilities {
   const host = options.host ?? globalThis;
@@ -136,22 +137,26 @@ export function hostCapabilities(options: HostCapabilityOptions = {}): HostCapab
     platform,
     nativeIpc: native,
     localRoots: options.localRoots ?? true,
-    safTrees: options.safTrees ?? (native && android),
-    shareIntents: options.shareIntents ?? (native && android),
-    foregroundTransfers: options.foregroundTransfers ?? (native && android),
+    // Traits and Tauri commands are not proof that Android's generated host
+    // registered the matching Kotlin implementation. Keep these disabled until
+    // the embedder explicitly reports the integration as available.
+    safTrees: options.safTrees ?? false,
+    shareIntents: options.shareIntents ?? false,
+    foregroundTransfers: options.foregroundTransfers ?? false,
     fileDrop: true,
-    nativeFileDrop: options.nativeFileDrop ?? native,
+    nativeFileDrop: options.nativeFileDrop ?? (native && !android),
     accounts: options.accounts ?? !native,
-    desktopLaunchers: options.desktopLaunchers ?? !android,
+    desktopLaunchers: options.desktopLaunchers ?? (native && !android),
     terminal: options.terminal ?? true,
-    backgroundTransfers: (options.foregroundTransfers ?? (native && android)) || !android,
+    backgroundTransfers: (options.foregroundTransfers ?? false) || !android,
   };
 }
 
 /**
- * The features every app must expose the same way. A capability that is only
- * reachable in one embedder is a parity bug, not a platform difference, so the
- * test suite compares these across desktop, browser and Android.
+ * Intended common workflows across the native apps. This list is a contract,
+ * not runtime evidence that each workflow is fully wired; behavioral parity
+ * still requires per-platform acceptance tests. Platform-specific host
+ * integrations are reported separately below.
  */
 export const SHARED_FEATURES = [
   'paneListings',
@@ -186,10 +191,21 @@ export function hostDifferenceReason(
   caps: HostCapabilities,
 ): string | null {
   if (capability === 'safTrees' && !caps.safTrees) {
-    return 'Folder grants are an Android feature.';
+    return caps.platform === 'android'
+      ? 'Android folder grants are not available in this build.'
+      : 'Folder grants require the Android Storage Access Framework.';
+  }
+  if (capability === 'shareIntents' && !caps.shareIntents) {
+    return 'File sharing from other apps is not integrated in this build.';
+  }
+  if ((capability === 'foregroundTransfers' || capability === 'backgroundTransfers') && !caps[capability]) {
+    return 'Background transfer support is not available in this build.';
+  }
+  if (capability === 'nativeFileDrop' && !caps.nativeFileDrop) {
+    return 'Operating-system file drops require a native desktop window.';
   }
   if (capability === 'desktopLaunchers' && !caps.desktopLaunchers) {
-    return 'Remote desktop viewers need a desktop operating system.';
+    return 'Remote desktop viewers require a native desktop operating system.';
   }
   if (capability === 'accounts' && !caps.accounts) {
     return 'The native application does not require a sign-in.';

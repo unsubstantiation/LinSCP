@@ -4,26 +4,28 @@ The Android target builds the same Tauri WebView and Rust `CommanderService` as
 the desktop application. This is an **experimental, debug-signed APK**, not a
 production or Play Store release. Android support is incomplete:
 
-- Only app-private storage is exposed unless a folder is granted. The Storage
-  Access Framework bridge and the share hand-off exist in the Rust shell
+- Only app-private storage is exposed. The Rust shell contains the Storage
+  Access Framework and share-hand-off command contracts
   (`linscp_request_saf_tree`, `linscp_pick_saf_tree`,
-  `linscp_handle_share_intent`), but the generated Kotlin project has to register
-  the picker and the intent filter for them to be reachable; until it does, a
-  share or a folder grant fails closed instead of silently doing nothing.
-  Downloads/shared storage is not exposed. Uninstalling the app removes
-  app-private files and configuration.
+  `linscp_handle_share_intent`), but this repository does not register their
+  Kotlin implementations, picker activity result, or share intent filter.
+  Android capability detection therefore keeps folder grants and share intents
+  disabled instead of presenting controls that fail when used. Downloads/shared
+  storage is not exposed. Uninstalling the app removes app-private files and
+  configuration.
 - Background/foreground-service transfer survival and Android Keystore/biometric
-  integration are not wired in. The page starts and stops the service from the
-  transfer queue (`ForegroundTransferBridge`, gated on the `foregroundTransfers`
-  capability) and the Rust shell exposes the three commands, but nothing
-  implements the service itself yet, so the calls fail closed. Keep the app open
-  during transfers. The session master key is stored in the app sandbox, not
-  backed by Android Keystore.
+  integration are not wired in. The Rust shell exposes foreground-service
+  commands, but no Android service implements them. The page now keeps these
+  capabilities disabled unless an embedder explicitly reports a real
+  implementation; keep the app open during transfers. The session master key
+  is stored in the app sandbox, not backed by Android Keystore.
 - The page no longer probes the native bridge at each call site. One
-  `hostCapabilities()` description drives the controls that differ between
-  hosts (folder grants, share hand-offs, the foreground service, the OS drop
-  listener), and a control this host cannot serve is left out with the reason
-  `hostDifferenceReason()` gives.
+  `hostCapabilities()` description drives host-dependent controls. Android-only
+  integrations stay off until explicitly enabled by a host that has registered
+  them; desktop launchers and OS drop listeners are desktop-only. A control the
+  current host cannot serve is omitted with the reason
+  `hostDifferenceReason()` provides. This prevents false capability claims; it
+  does not establish feature parity while the integrations remain unimplemented.
 - Remote transfer restrictions and cleanup caveats in the main README still
   apply. Other native GUI actions remain incomplete; see the feature audit.
 - The debug APK is signed with a development key. It is intended for testing,

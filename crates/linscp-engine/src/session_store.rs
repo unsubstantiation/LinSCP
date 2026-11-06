@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use linscp_crypto::{decrypt_password, encrypt_password, is_encrypted_password, SessionMasterKey};
 use linscp_platform::{write_private_file_atomic, SecretVault};
 use linscp_types::{ProtocolScheme, SessionConfig, StoredSessionSummary, TunnelConfig};
@@ -47,7 +48,7 @@ pub fn unescape_ini_value(escaped: &str) -> String {
     out
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredSite {
     pub name: String,
     pub protocol: ProtocolScheme,

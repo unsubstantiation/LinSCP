@@ -7,6 +7,7 @@ pub mod editor;
 pub mod filemask;
 pub mod hostkeys;
 pub mod importers;
+pub mod offlineotp_vault;
 pub mod keepuptodate;
 pub mod presets;
 pub mod script;
