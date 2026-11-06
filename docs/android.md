@@ -164,8 +164,9 @@ The Android Gradle project under `gen/android` is generated and ignored; the
 pinned Tauri CLI version is in `ui/package-lock.json`. The preparation script
 turns off Android backup so the app-private session key and settings are not
 silently included in Android backups. Generate a fresh project when changing
-Tauri CLI versions. The signed APK is under
-`gen/android/app/build/outputs/apk/release/`.
+Tauri CLI versions. The signed APK is the `universal` flavor Tauri's Gradle
+plugin defines for the requested ABIs:
+`gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk`.
 
 Adding `--debug` to the build command instead produces the debuggable APK the
 emulator smoke test runs against, signed with the development key:

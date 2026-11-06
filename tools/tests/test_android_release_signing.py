@@ -10,6 +10,8 @@ and the docs to the environment the secrets actually live in.
 """
 import base64
 import pathlib
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -316,6 +318,92 @@ class RepositoryConfigurationTests(unittest.TestCase):
                          'android-release', 'tools/android_release_signing.py',
                          'linscp-android-release.apk'):
             self.assertIn(expected, docs)
+
+
+@unittest.skipUnless(shutil.which('keytool'), 'needs a JDK to create a keystore')
+class KeytoolIntegrationTests(unittest.TestCase):
+    """The real keytool on a real keystore, because the parser above reads it.
+
+    A JDK that words `Alias name:` or the fingerprint differently has to fail
+    here rather than in the release build. CI installs Java 17 for the Android
+    job, so this runs there; elsewhere it is skipped.
+    """
+
+    PASSWORD = 'store-secret'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        self.generated = self.root / 'crates/linscp-tauri/gen/android'
+        (self.generated / 'app').mkdir(parents=True)
+        self.gradle = self.generated / 'app/build.gradle.kts'
+        self.gradle.write_text(TEMPLATE, encoding='utf-8')
+        self.keystore = self.root / 'release.jks'
+
+    def make_keystore(self, *aliases):
+        for alias in aliases:
+            subprocess.run(
+                ['keytool', '-genkeypair', '-keystore', str(self.keystore),
+                 '-alias', alias, '-keyalg', 'RSA', '-keysize', '2048',
+                 '-validity', '100', '-storetype', 'PKCS12',
+                 '-storepass', self.PASSWORD, '-keypass', self.PASSWORD,
+                 '-dname', f'CN={alias}'],
+                check=True, capture_output=True)
+
+    def environment(self, **extra):
+        return {
+            'ANDROID_KEYSTORE_BASE64':
+                base64.b64encode(self.keystore.read_bytes()).decode(),
+            'ANDROID_KEYSTORE_PASSWORD': self.PASSWORD,
+            **extra,
+        }
+
+    def test_a_real_keystore_signs_the_release_build_type(self):
+        self.make_keystore('linscp')
+        configured = signing.configure(self.generated, self.environment())
+        self.assertEqual(configured['alias'], 'linscp')
+        # The digest is what verify_android_apk.py compares an APK against, so
+        # it has to be the certificate's, not a hash of something else.
+        self.assertEqual(configured['digest'],
+                         signing.certificate_digest(self.keystore, self.PASSWORD, 'linscp'))
+        self.assertEqual(len(configured['digest']), 64)
+        self.assertEqual(configured['keystore'].stat().st_mode & 0o777, 0o600)
+        self.assertEqual(configured['properties'].stat().st_mode & 0o777, 0o600)
+        self.assertIn(signing.RELEASE_SIGNING, configured['gradle'].read_text())
+        properties = signing.read_signing_properties(configured['properties'])
+        self.assertEqual(properties[signing.STOREPASSWORD], self.PASSWORD)
+        self.assertEqual(pathlib.Path(properties[signing.STOREFILE]).read_bytes(),
+                         self.keystore.read_bytes())
+
+    def test_running_it_twice_changes_nothing(self):
+        self.make_keystore('linscp')
+        first = signing.configure(self.generated, self.environment())
+        patched = first['gradle'].read_text()
+        second = signing.configure(self.generated, self.environment())
+        self.assertEqual(second['digest'], first['digest'])
+        self.assertEqual(second['gradle'].read_text(), patched)
+
+    def test_a_wrong_password_fails_and_leaves_the_project_unsigned(self):
+        self.make_keystore('linscp')
+        environment = dict(self.environment(), ANDROID_KEYSTORE_PASSWORD='not-the-password')
+        with self.assertRaises(SystemExit) as raised:
+            signing.configure(self.generated, environment)
+        self.assertIn('keytool error', str(raised.exception))
+        self.assertFalse((self.generated / 'linscp-release.jks').exists())
+        self.assertFalse((self.generated / 'linscp-release.staged').exists())
+        self.assertEqual(self.gradle.read_text(encoding='utf-8'), TEMPLATE)
+
+    def test_two_keys_need_an_alias_and_the_alias_picks_the_certificate(self):
+        self.make_keystore('first', 'second')
+        with self.assertRaises(SystemExit) as raised:
+            signing.configure(self.generated, self.environment())
+        self.assertIn('ANDROID_KEY_ALIAS', str(raised.exception))
+        configured = signing.configure(
+            self.generated, self.environment(ANDROID_KEY_ALIAS='second'))
+        self.assertEqual(configured['alias'], 'second')
+        self.assertEqual(configured['digest'],
+                         signing.certificate_digest(self.keystore, self.PASSWORD, 'second'))
 
 
 if __name__ == '__main__':

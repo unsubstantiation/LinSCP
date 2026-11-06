@@ -148,16 +148,29 @@ def keytool(arguments, password):
         capture_output=True, text=True, env=environment, check=False)
 
 
+def keytool_failure(result):
+    """The one line of a failed keytool run that says what went wrong.
+
+    keytool prints its errors on stdout, followed by a Java stack trace whose
+    last line ("... 8 more") explains nothing, so the summary line is picked
+    out rather than taken from the end.
+    """
+    lines = [line.strip() for line in (result.stdout + result.stderr).splitlines()
+             if line.strip()]
+    for line in lines:
+        if line.startswith('keytool error:'):
+            return line
+    return lines[0] if lines else 'no output'
+
+
 def keystore_entries(keystore, password):
     """Map each alias in the keystore to its entry type, as keytool reports it."""
     result = keytool(['-list', '-v', '-keystore', str(keystore),
                       '-storepass:env', 'LINSCP_KEYSTORE_PASSWORD'], password)
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip().splitlines()
         raise SystemExit(
-            f'keytool could not open {keystore}: '
-            + (detail[-1] if detail else 'no output')
-            + ' (is ANDROID_KEYSTORE_PASSWORD the password of this keystore?)')
+            f'keytool could not open {keystore}: {keytool_failure(result)} '
+            f'(is ANDROID_KEYSTORE_PASSWORD the password of this keystore?)')
     entries = {}
     alias = None
     for line in result.stdout.splitlines():
@@ -205,10 +218,9 @@ def certificate_digest(keystore, password, alias):
     result = keytool(['-list', '-v', '-alias', alias, '-keystore', str(keystore),
                       '-storepass:env', 'LINSCP_KEYSTORE_PASSWORD'], password)
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip().splitlines()
         raise SystemExit(
             f'keytool could not read the certificate of alias {alias!r}: '
-            + (detail[-1] if detail else 'no output'))
+            f'{keytool_failure(result)}')
     for line in result.stdout.splitlines():
         found = SHA256_LINE.match(line.strip())
         if found:
@@ -284,23 +296,49 @@ def write_private(path, text):
     path.chmod(0o600)
 
 
-def main():
-    signing = credentials()
+def configure(generated=GENERATED, environment=None):
+    """Configure release signing for a generated Android project.
+
+    Returns the alias, the certificate digest and the paths it wrote, so the
+    caller can report them and a test can check them against keytool.
+    """
+    signing = credentials(environment)
     data = decode_keystore(signing.encoded_keystore)
-    if not GRADLE.is_file():
+    gradle = generated / 'app/build.gradle.kts'
+    keystore = generated / 'linscp-release.jks'
+    properties = generated / 'app/keystore.properties'
+    if not gradle.is_file():
         raise SystemExit(
-            f'The generated Android project is missing ({GRADLE}); run '
+            f'The generated Android project is missing ({gradle}); run '
             f'`tauri android init` before configuring release signing')
-    KEYSTORE.write_bytes(data)
-    KEYSTORE.chmod(0o600)
-    alias = resolve_alias(keystore_entries(KEYSTORE, signing.password), signing.alias)
-    digest = certificate_digest(KEYSTORE, signing.password, alias)
-    write_private(PROPERTIES, signing_properties(
-        KEYSTORE, alias, signing.password, signing.key_password))
-    GRADLE.write_text(gradle_signing_configuration(GRADLE.read_text(encoding='utf-8')),
+    # The bytes are checked in a scratch file first: a keystore that does not
+    # open has to fail the step, not stay behind in the project for a later
+    # build to sign with.
+    staged = keystore.with_suffix('.staged')
+    staged.write_bytes(data)
+    staged.chmod(0o600)
+    try:
+        entries = keystore_entries(staged, signing.password)
+        alias = resolve_alias(entries, signing.alias)
+        digest = certificate_digest(staged, signing.password, alias)
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
+    staged.replace(keystore)
+    keystore.chmod(0o600)
+    write_private(properties, signing_properties(
+        keystore, alias, signing.password, signing.key_password))
+    gradle.write_text(gradle_signing_configuration(gradle.read_text(encoding='utf-8')),
                       encoding='utf-8')
-    print(f'Release signing configured: alias {alias!r}, '
-          f'certificate SHA-256 {digest}, keystore {KEYSTORE.relative_to(ROOT)}')
+    return {'alias': alias, 'digest': digest, 'keystore': keystore,
+            'properties': properties, 'gradle': gradle}
+
+
+def main():
+    configured = configure()
+    print(f"Release signing configured: alias {configured['alias']!r}, "
+          f"certificate SHA-256 {configured['digest']}, "
+          f"keystore {configured['keystore'].relative_to(ROOT)}")
     return 0
 
 
