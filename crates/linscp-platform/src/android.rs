@@ -45,6 +45,13 @@ pub trait ShareBridge: Send + Sync {
     fn stage_uris(&self, uris: &[String]) -> Result<Vec<PathBuf>, PlatformError>;
 }
 
+/// Opens a safe external URI through Android's package resolver. This is used
+/// for Android RDP/VNC/SPICE viewer apps and ordinary web URLs; the native
+/// plugin validates the scheme and never starts a shell command.
+pub trait ExternalUriBridge: Send + Sync {
+    fn open_external_uri(&self, uri: &str) -> Result<(), PlatformError>;
+}
+
 /// Bridge for the Android `ForegroundService` that keeps the process alive
 /// while transfers or `keepuptodate` watches are active.
 pub trait ForegroundServiceBridge: Send + Sync {

@@ -39,6 +39,43 @@ interface SafTreeReply {
 
 export { nativeInvoker };
 
+/** Builds a direct Android viewer URI; Android viewer apps cannot reuse an SSH jump tunnel. */
+export function androidDesktopViewerUri(
+  kind: string,
+  endpoint: string,
+  tunneled = false,
+): string | null {
+  const normalizedKind = kind.toLowerCase();
+  const scheme = ['rdp', 'vnc', 'spice'].includes(normalizedKind) ? normalizedKind : null;
+  if (!scheme || tunneled) return null;
+  try {
+    const target = new URL(`${scheme}://${endpoint}`);
+    if (!target.hostname || target.username || target.password || target.pathname !== '/' ||
+        target.search || target.hash) return null;
+    return `${scheme}://${target.host}`;
+  } catch {
+    return null;
+  }
+}
+
+/** Opens a validated URL in an Android app registered for that scheme. */
+export async function openExternalUri(
+  uri: string,
+  options: { invoker?: NativeInvoker | null } = {},
+): Promise<boolean> {
+  const invoker = options.invoker ?? nativeInvoker();
+  if (!invoker) return false;
+  try {
+    const parsed = new URL(uri);
+    if (!['http:', 'https:', 'rdp:', 'vnc:', 'spice:'].includes(parsed.protocol) ||
+        !parsed.hostname || parsed.username || parsed.password) return false;
+    const reply = await invoker.invoke<{ opened?: boolean }>('linscp_open_external_uri', { uri });
+    return reply?.opened === true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Opens the Android folder picker and registers the granted tree as a local
  * root. Resolves to `null` when the shell has no SAF bridge, when the user

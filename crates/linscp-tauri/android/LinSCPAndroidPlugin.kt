@@ -194,6 +194,27 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   @Command
+  fun openExternalUri(invoke: Invoke) {
+    val raw = invoke.parseArgs(SingleUriArgs::class.java).uri
+    val uri = Uri.parse(raw)
+    val allowedSchemes = setOf("http", "https", "rdp", "vnc", "spice")
+    val scheme = uri.scheme?.lowercase(Locale.ROOT) ?: ""
+    val hasUserInfo = uri.encodedAuthority?.contains('@') == true
+    if (scheme !in allowedSchemes || hasUserInfo || uri.host.isNullOrBlank()) {
+      invoke.reject("External URI is invalid or uses an unsupported scheme")
+      return
+    }
+    activity.runOnUiThread {
+      try {
+        activity.startActivity(Intent(Intent.ACTION_VIEW, uri))
+        invoke.resolveObject(mapOf("opened" to true))
+      } catch (e: Exception) {
+        invoke.reject("No Android app can open this URI: ${e.message}")
+      }
+    }
+  }
+
+  @Command
   fun stageUris(invoke: Invoke) {
     val uris = invoke.parseArgs(UriArgs::class.java).uris
     runIo(invoke, "Cannot stage shared files") { mapOf("paths" to stageUris(uris)) }

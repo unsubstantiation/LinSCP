@@ -3343,15 +3343,15 @@ impl CommanderService {
         };
         match linscp_platform::desktop::launch_remote_desktop(&ticket, &config_root, false) {
             Ok(linscp_platform::desktop::DesktopLaunchResult::Spawned { pid, viewer, argv }) => {
-                ApiReply{ status:200, payload: json!({"success": true, "launched": true, "pid": pid, "viewer": viewer.display().to_string(), "argv": argv})}
+                ApiReply{ status:200, payload: json!({"success": true, "launched": true, "pid": pid, "viewer": viewer.display().to_string(), "argv": argv, "kind": ticket.kind, "target": ticket.target, "local_endpoint": ticket.local_endpoint, "tunneled": ticket.tunneled})}
             },
             Ok(linscp_platform::desktop::DesktopLaunchResult::FileTicket { path, viewer_hint }) => {
                 // Read file content for HTTP clients that cannot read server filesystem.
                 let file_content = proto_ticket.file_content.clone().or_else(|| std::fs::read_to_string(&path).ok());
-                ApiReply{ status:200, payload: json!({"success": true, "launched": false, "file": path.display().to_string(), "file_content": file_content, "file_extension": proto_ticket.file_extension, "viewer_hint": viewer_hint, "kind": ticket.kind})}
+                ApiReply{ status:200, payload: json!({"success": true, "launched": false, "file": path.display().to_string(), "file_content": file_content, "file_extension": proto_ticket.file_extension, "viewer_hint": viewer_hint, "kind": ticket.kind, "target": ticket.target, "local_endpoint": ticket.local_endpoint, "tunneled": ticket.tunneled})}
             },
             Ok(linscp_platform::desktop::DesktopLaunchResult::BrowserGateway { url_hint }) => {
-                ApiReply{ status:200, payload: json!({"success": true, "launched": false, "gateway": url_hint, "kind": ticket.kind, "viewer": ticket.viewer, "argv": ticket.argv})}
+                ApiReply{ status:200, payload: json!({"success": true, "launched": false, "gateway": url_hint, "kind": ticket.kind, "viewer": ticket.viewer, "argv": ticket.argv, "target": ticket.target, "local_endpoint": ticket.local_endpoint, "tunneled": ticket.tunneled})}
             },
             Err(e) => ApiReply{ status:500, payload: json!({"success": false, "error": e})},
         }
@@ -3880,12 +3880,12 @@ impl CommanderService {
         let ticket = linscp_platform::desktop::DesktopTicket{ kind: proto_ticket.kind.clone(), target: proto_ticket.target.clone(), viewer: proto_ticket.viewer.clone(), argv: proto_ticket.argv.clone(), file_content: proto_ticket.file_content.clone(), file_extension: proto_ticket.file_extension.clone(), tunneled: proto_ticket.tunneled, local_endpoint: proto_ticket.local_endpoint.clone() };
         let config_root = self.state.lock().expect("m").config_root.clone();
         match linscp_platform::desktop::launch_remote_desktop(&ticket, &config_root, false) {
-            Ok(linscp_platform::desktop::DesktopLaunchResult::Spawned{ pid, viewer, argv }) => ApiReply{ status:200, payload: json!({"success": true, "launched": true, "available": true, "pid": pid, "viewer": viewer.display().to_string(), "argv": argv, "kind": kind.as_str(), "host": target_host})},
+            Ok(linscp_platform::desktop::DesktopLaunchResult::Spawned{ pid, viewer, argv }) => ApiReply{ status:200, payload: json!({"success": true, "launched": true, "available": true, "pid": pid, "viewer": viewer.display().to_string(), "argv": argv, "kind": kind.as_str(), "host": target_host, "target": ticket.target, "local_endpoint": ticket.local_endpoint, "tunneled": ticket.tunneled})},
             Ok(linscp_platform::desktop::DesktopLaunchResult::FileTicket{ path, viewer_hint }) => {
                 let file_content = proto_ticket.file_content.clone().or_else(|| std::fs::read_to_string(&path).ok());
-                ApiReply{ status:200, payload: json!({"success": true, "launched": false, "available": true, "file": path.display().to_string(), "file_content": file_content, "file_extension": proto_ticket.file_extension, "viewer_hint": viewer_hint, "kind": ticket.kind})}
+                ApiReply{ status:200, payload: json!({"success": true, "launched": false, "available": true, "file": path.display().to_string(), "file_content": file_content, "file_extension": proto_ticket.file_extension, "viewer_hint": viewer_hint, "kind": ticket.kind, "target": ticket.target, "local_endpoint": ticket.local_endpoint, "tunneled": ticket.tunneled})}
             },
-            Ok(linscp_platform::desktop::DesktopLaunchResult::BrowserGateway{ url_hint }) => ApiReply{ status:200, payload: json!({"success": true, "launched": false, "available": true, "gateway": url_hint, "kind": ticket.kind, "viewer": ticket.viewer, "argv": ticket.argv})},
+            Ok(linscp_platform::desktop::DesktopLaunchResult::BrowserGateway{ url_hint }) => ApiReply{ status:200, payload: json!({"success": true, "launched": false, "available": true, "gateway": url_hint, "kind": ticket.kind, "viewer": ticket.viewer, "argv": ticket.argv, "target": ticket.target, "local_endpoint": ticket.local_endpoint, "tunneled": ticket.tunneled})},
             Err(e) => ApiReply{ status:500, payload: json!({"success": false, "error": e})},
         }
     }

@@ -108,9 +108,21 @@ class AndroidApplicationIdTests(unittest.TestCase):
         kotlin = source.read_text(encoding='utf-8')
         for command in ['pickTree', 'grantedTrees', 'listTree', 'statUri', 'readUri',
                         'writeUri', 'mkdirUri', 'deleteUri', 'renameUri',
-                        'stageUris', 'takePendingShares', 'foregroundStart',
-                        'foregroundUpdate', 'foregroundStop']:
+                        'stageUris', 'takePendingShares', 'openExternalUri',
+                        'foregroundStart', 'foregroundUpdate', 'foregroundStop']:
             self.assertIn('fun ' + command + '(', kotlin)
+        self.assertIn('"rdp", "vnc", "spice"', kotlin)
+        self.assertIn('commands::linscp_open_external_uri',
+                      (ROOT / 'crates/linscp-tauri/src/lib.rs').read_text(encoding='utf-8'))
+        self.assertIn('set_external_uri(bridge.clone())',
+                      (ROOT / 'crates/linscp-tauri/src/android.rs').read_text(encoding='utf-8'))
+        smoke = (ROOT / 'tools/android_emulator_smoke.mjs').read_text(encoding='utf-8')
+        self.assertIn("'linscp_open_external_uri'", smoke)
+        self.assertIn('unsafeUriRejected', smoke)
+        page = (ROOT / 'source/gui/web/index.html').read_text(encoding='utf-8')
+        self.assertIn('LinSCPCore.androidDesktopViewerUri(kind, endpoint, false)', page)
+        self.assertIn("androidViewers.includes(option.value)", page)
+        self.assertIn("kindSelect.value = 'rdp'", page)
         # Content providers may block for remote/cloud-backed documents. Keep
         # their work off the Activity thread and marshal only the result back.
         for command in ['grantedTrees', 'listTree', 'statUri', 'readUri',

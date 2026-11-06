@@ -18,6 +18,7 @@ import {
   TauriTransport,
   TransportError,
   applyCtrlModifier,
+  androidDesktopViewerUri,
   createTransport,
   detectTransportMode,
   dropPaths,
@@ -25,6 +26,7 @@ import {
   droppedLeafName,
   normalizeDropPayload,
   normalizeLocale,
+  openExternalUri,
   requestSafTree,
   sharedFeatureSet,
 } from '../dist/linscp-core.mjs';
@@ -315,7 +317,7 @@ test('all native targets expose the shared feature contract and report only inst
 
   assert.equal(debian.desktopLaunchers, true);
   assert.equal(windows.desktopLaunchers, true);
-  assert.equal(android.desktopLaunchers, false);
+  assert.equal(android.desktopLaunchers, true);
   assert.equal(browser.desktopLaunchers, false);
   assert.equal(debian.nativeFileDrop, true);
   assert.equal(windows.nativeFileDrop, true);
@@ -325,7 +327,7 @@ test('all native targets expose the shared feature contract and report only inst
 
   // The native Android shell registers these implementations. OS detection
   // alone is insufficient: an Android browser remains an HTTP host below.
-  for (const bridge of ['safTrees', 'shareIntents', 'foregroundTransfers']) {
+  for (const bridge of ['safTrees', 'shareIntents', 'foregroundTransfers', 'desktopLaunchers']) {
     assert.equal(android[bridge], true, `${bridge} is registered by the Android host`);
   }
   assert.equal(android.backgroundTransfers, true);
@@ -335,7 +337,8 @@ test('all native targets expose the shared feature contract and report only inst
 
   // A missing control always has a stated reason; silent capability gaps are
   // the parity bug this inventory exists to catch.
-  assert.match(hostDifferenceReason('desktopLaunchers', android) ?? '', /native desktop/);
+  assert.equal(hostDifferenceReason('desktopLaunchers', android), null);
+  assert.match(hostDifferenceReason('desktopLaunchers', browser) ?? '', /launcher integration/);
   assert.match(hostDifferenceReason('accounts', debian) ?? '', /sign-in/);
   assert.equal(hostDifferenceReason('terminal', android), null);
 
@@ -357,8 +360,46 @@ test('all native targets expose the shared feature contract and report only inst
   assert.equal(detected.safTrees, true);
   assert.equal(detected.shareIntents, true);
   assert.equal(detected.foregroundTransfers, true);
+  assert.equal(detected.desktopLaunchers, true);
   assert.equal(hostCapabilities({ host: fakeBrowser }).shareIntents, false);
   assert.equal(hostCapabilities({ host: fakeBrowser }).foregroundTransfers, false);
+});
+
+test('Android desktop viewer URIs allow direct RDP/VNC/SPICE targets and reject unsupported or unsafe targets', () => {
+  assert.equal(androidDesktopViewerUri('rdp', 'desktop.example:3389'), 'rdp://desktop.example:3389');
+  assert.equal(androidDesktopViewerUri('vnc', 'desktop.example:5900'), 'vnc://desktop.example:5900');
+  assert.equal(androidDesktopViewerUri('spice', 'desktop.example:5900'), 'spice://desktop.example:5900');
+  assert.equal(androidDesktopViewerUri('x2go', 'desktop.example:22'), null);
+  assert.equal(androidDesktopViewerUri('toString', 'desktop.example:3389'), null);
+  assert.equal(androidDesktopViewerUri('rdp', 'desktop.example:3389', true), null);
+  assert.equal(androidDesktopViewerUri('rdp', 'user:secret@desktop.example:3389'), null);
+  assert.equal(androidDesktopViewerUri('rdp', 'desktop.example/path'), null);
+  assert.equal(androidDesktopViewerUri('rdp', 'desktop.example:3389?password=secret'), null);
+});
+
+test('Android external URI dispatch allows supported viewers and rejects unsafe or credential-bearing URIs', async () => {
+  const calls = [];
+  const invoker = {
+    invoke: async (command, payload) => {
+      calls.push({ command, payload });
+      return { opened: true };
+    },
+  };
+  assert.equal(await openExternalUri('rdp://server.example:3389', { invoker }), true);
+  assert.equal(await openExternalUri('vnc://server.example:5900', { invoker }), true);
+  assert.equal(await openExternalUri('spice://server.example:5900', { invoker }), true);
+  assert.deepEqual(calls.map((call) => call.command), Array(3).fill('linscp_open_external_uri'));
+  assert.deepEqual(calls.map((call) => call.payload.uri), [
+    'rdp://server.example:3389',
+    'vnc://server.example:5900',
+    'spice://server.example:5900',
+  ]);
+
+  assert.equal(await openExternalUri('javascript:alert(1)', { invoker }), false);
+  assert.equal(await openExternalUri('rdp://user:password@server.example:3389', { invoker }), false);
+  assert.equal(await openExternalUri('rdp:///missing-host', { invoker }), false);
+  assert.equal(await openExternalUri('rdp://server.example:3389', { invoker: null }), false);
+  assert.equal(calls.length, 3);
 });
 
 test('the SAF picker degrades to null where no shell can open one', async () => {

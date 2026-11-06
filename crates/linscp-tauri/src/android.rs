@@ -14,7 +14,7 @@ mod imp {
     use std::sync::{Arc, Mutex};
 
     use linscp_platform::android::{
-        ForegroundServiceBridge, KeystoreBridge, SafBridge, ShareBridge,
+        ExternalUriBridge, ForegroundServiceBridge, KeystoreBridge, SafBridge, ShareBridge,
     };
     use linscp_platform::PlatformError;
     use linscp_types::{FileEntry, LocalRootEntry};
@@ -24,6 +24,7 @@ mod imp {
     pub struct AndroidState {
         saf: Mutex<Option<Arc<dyn SafBridge>>>,
         share: Mutex<Option<Arc<dyn ShareBridge>>>,
+        external_uri: Mutex<Option<Arc<dyn ExternalUriBridge>>>,
         fg: Mutex<Option<Arc<dyn ForegroundServiceBridge>>>,
         keystore: Mutex<Option<Arc<dyn KeystoreBridge>>>,
     }
@@ -37,6 +38,15 @@ mod imp {
         }
         pub fn set_share(&self, bridge: Arc<dyn ShareBridge>) {
             *self.share.lock().unwrap() = Some(bridge);
+        }
+        pub fn set_external_uri(&self, bridge: Arc<dyn ExternalUriBridge>) {
+            *self.external_uri.lock().unwrap() = Some(bridge);
+        }
+        pub fn open_external_uri(&self, uri: &str) -> Result<(), PlatformError> {
+            match self.external_uri.lock().unwrap().as_deref() {
+                Some(bridge) => bridge.open_external_uri(uri),
+                None => Err(PlatformError::Unsupported("Android external URI bridge is not available".to_string())),
+            }
         }
         pub fn set_foreground_service(&self, bridge: Arc<dyn ForegroundServiceBridge>) {
             *self.fg.lock().unwrap() = Some(bridge);
@@ -170,6 +180,9 @@ mod imp {
             // keep a bridge, and pretending otherwise would make a desktop
             // build list folders it cannot open.
         }
+        pub fn open_external_uri(&self, _uri: &str) -> Result<(), PlatformError> {
+            Err(PlatformError::Unsupported("External Android URI intents are only available on Android".to_string()))
+        }
         pub fn granted_trees(&self) -> Result<Vec<LocalRootEntry>, PlatformError> {
             Ok(Vec::new())
         }
@@ -231,7 +244,7 @@ mod mobile_plugin {
     use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 
     use base64::Engine as _;
-    use linscp_platform::{android::{ForegroundServiceBridge, SafBridge, ShareBridge}, PlatformError};
+    use linscp_platform::{android::{ExternalUriBridge, ForegroundServiceBridge, SafBridge, ShareBridge}, PlatformError};
     use linscp_types::{FileEntry, LocalRootEntry};
     use serde::{Deserialize, Serialize};
     use tauri::{plugin::{Builder, PluginHandle, TauriPlugin}, Manager, Wry};
@@ -288,6 +301,12 @@ mod mobile_plugin {
             Ok(self.call::<PathList, _>("stageUris", Args { uris })?.paths)
         }
     }
+    impl ExternalUriBridge for MobileBridge {
+        fn open_external_uri(&self, uri: &str) -> Result<(), PlatformError> {
+            let _: serde_json::Value = self.call("openExternalUri", UriArg { uri })?;
+            Ok(())
+        }
+    }
     impl ForegroundServiceBridge for MobileBridge {
         fn start(&self, title: &str, ongoing_transfers: usize) -> Result<(), PlatformError> {
             #[derive(Serialize)] struct Args<'a> { title: &'a str, ongoing: usize }
@@ -313,6 +332,7 @@ mod mobile_plugin {
                 let state = Arc::new(AndroidState::new());
                 state.set_saf(bridge.clone());
                 state.set_share(bridge.clone());
+                state.set_external_uri(bridge.clone());
                 state.set_foreground_service(bridge);
                 app.manage(state);
                 Ok(())
