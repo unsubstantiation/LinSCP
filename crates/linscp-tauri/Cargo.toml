@@ -22,6 +22,7 @@ required-features = ["native-shell"]
 tauri-build = { version = "2", optional = true , features = [] }
 
 [dependencies]
+base64.workspace = true
 linscp-platform.workspace = true
 linscp-service.workspace = true
 linscp-types.workspace = true

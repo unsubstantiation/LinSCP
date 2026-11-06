@@ -29,10 +29,15 @@ transfer limitations in `readme.md` before using remote operations.
 
 ## Known incomplete or restricted paths
 
-- Remote editing/saving, permissions changes, checksum, search, symlink
-  creation, synchronize/keep-up-to-date and terminal/command execution are not
-  wired into every native path; several corresponding GUI controls are still
-  visible and return errors.
+- The shared native/HTTP service now dispatches remote editing/saving,
+  permission changes, checksum, search, symlink creation, synchronize and
+  keep-up-to-date, and terminal/command execution through `dispatch_async`.
+  These controls are wired to service handlers in the shared GUI; this is not a
+  claim that every operation is supported by every protocol or is fully
+  validated on every native OS. Unsupported protocols, server capabilities,
+  disconnected sessions, and incomplete end-to-end coverage can still produce
+  errors. Continue to treat the per-feature and protocol restrictions below and
+  in `readme.md` as authoritative.
 - Remote deletion goes through the session and the queue's own tree walk, and is
   exercised against a live WebDAV server (a leaf-invalid name refused per name
   while the valid names still run, a tree emptied and removed, a name the server
@@ -58,9 +63,9 @@ transfer limitations in `readme.md` before using remote operations.
   cancelled transfer may leave remote files or partial trees; guarantees depend
   on the server and are not equivalent to transactions.
 - Native account/login features are not implemented. Android has a Rust-backed
-  experimental debug APK but lacks SAF, sharing, background transfers and
-  Keystore integration; see `docs/android.md`. Desktop integration, import sources,
-  and other legacy UI actions require further native end-to-end validation.
+  experimental debug APK with SAF, share-intent, and foreground-service bridges;
+  Android Keystore remains unwired. Desktop integration, import sources, and
+  other legacy UI actions require further native end-to-end validation.
 - SSH host-key changes during workspace restoration are not auto-accepted or
   interactively resolved as part of a batch; the failed tab must be connected
   separately.
@@ -72,9 +77,9 @@ Android also builds that service and bundle. This gives the core API a shared
 implementation, not complete product parity: the `SHARED_FEATURES` list is a
 contract for intended common UI surface, not evidence that every listed action
 is wired end to end. The incomplete paths above apply to all native hosts unless
-called out otherwise. Android additionally lacks registered SAF, share-intent,
-foreground-service, and Keystore implementations; its UI now reports those
-capabilities unavailable rather than advertising nonfunctional controls.
+called out otherwise. Android additionally provides registered SAF,
+share-intent, and foreground-service integrations, while Android Keystore and
+real-device parity coverage remain outstanding.
 
 Parity should only be called complete after each shared feature has equivalent
 behavioral acceptance coverage on Windows, Debian, and Android, and each
@@ -89,7 +94,8 @@ round-tripping, folder creation, and reconnect/cancellation regressions, then
 builds and smoke-tests the package. The Windows workflow runs Rust workspace
 unit tests, frontend tests, and a portable native-window smoke test. Android CI
 builds/verifies the debug APK and runs a WebView/Rust IPC plus WebDAV transfer
-smoke test in an emulator. None of these runs exercises the absent Android SAF,
-share-intent, foreground-service, or Keystore implementations, and they do not
-establish correctness against every server, concurrent actor, network failure,
-or platform.
+smoke test in an emulator. The smoke test checks that Android host capabilities
+are registered and calls foreground-service start/update/stop. It does not yet
+automate SAF provider operations or a real incoming share intent, and it does
+not establish correctness against every server, concurrent actor, network
+failure, or platform.

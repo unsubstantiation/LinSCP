@@ -323,19 +323,18 @@ test('all native targets expose the shared feature contract and report only inst
   assert.equal(browser.nativeFileDrop, false);
   assert.equal(browser.nativeIpc, false);
 
-  // Android bridge traits are not yet registered by the generated project.
-  // Never advertise them merely because the WebView runs on Android.
+  // The native Android shell registers these implementations. OS detection
+  // alone is insufficient: an Android browser remains an HTTP host below.
   for (const bridge of ['safTrees', 'shareIntents', 'foregroundTransfers']) {
-    assert.equal(android[bridge], false, `${bridge} needs a real Android host implementation`);
+    assert.equal(android[bridge], true, `${bridge} is registered by the Android host`);
   }
-  assert.equal(android.backgroundTransfers, false);
-  assert.equal(hostCapabilities({ transport: 'tauri', platform: 'android', safTrees: true }).safTrees, true,
-    'an embedder can opt in after registering the implementation');
+  assert.equal(android.backgroundTransfers, true);
+  const missingAndroidBridge = hostCapabilities({ transport: 'tauri', platform: 'android', safTrees: false, shareIntents: false });
+  assert.match(hostDifferenceReason('safTrees', missingAndroidBridge) ?? '', /not available/);
+  assert.match(hostDifferenceReason('shareIntents', missingAndroidBridge) ?? '', /not integrated/);
 
   // A missing control always has a stated reason; silent capability gaps are
   // the parity bug this inventory exists to catch.
-  assert.match(hostDifferenceReason('safTrees', android) ?? '', /not available/);
-  assert.match(hostDifferenceReason('shareIntents', android) ?? '', /not integrated/);
   assert.match(hostDifferenceReason('desktopLaunchers', android) ?? '', /native desktop/);
   assert.match(hostDifferenceReason('accounts', debian) ?? '', /sign-in/);
   assert.equal(hostDifferenceReason('terminal', android), null);
@@ -354,11 +353,10 @@ test('all native targets expose the shared feature contract and report only inst
   const detected = hostCapabilities({ host: fakeAndroid });
   assert.equal(detected.transport, 'tauri');
   assert.equal(detected.platform, 'android');
-  // OS detection alone must not claim generated Kotlin integrations that have
-  // not been implemented and registered by this repository.
-  assert.equal(detected.safTrees, false);
-  assert.equal(detected.shareIntents, false);
-  assert.equal(detected.foregroundTransfers, false);
+  // The actual native Android build registers the Kotlin host plugin.
+  assert.equal(detected.safTrees, true);
+  assert.equal(detected.shareIntents, true);
+  assert.equal(detected.foregroundTransfers, true);
   assert.equal(hostCapabilities({ host: fakeBrowser }).shareIntents, false);
   assert.equal(hostCapabilities({ host: fakeBrowser }).foregroundTransfers, false);
 });

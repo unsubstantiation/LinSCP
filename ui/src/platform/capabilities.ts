@@ -118,13 +118,11 @@ export interface HostCapabilityOptions {
 /**
  * The capability set for one embedder.
  *
- * Defaults describe capabilities that are actually registered by this tree.
- * Android SAF/share/foreground bridges remain opt-in until the generated
- * Android host registers real implementations; merely compiling Rust bridge
- * traits must not make the UI advertise them. Native desktop launchers and OS
- * drop events are available only in native desktop windows, not in a browser
- * or Android WebView. Host-specific options can enable integrations after the
- * corresponding native implementation is installed.
+ * The Android native build registers its SAF, share-intent, and foreground
+ * transfer plugin in `build_native_app`; only a native Android WebView may
+ * advertise those integrations. A browser running on Android is still an HTTP
+ * host and does not receive these capabilities. Native desktop launchers and
+ * OS drop events remain desktop-only.
  */
 export function hostCapabilities(options: HostCapabilityOptions = {}): HostCapabilities {
   const host = options.host ?? globalThis;
@@ -132,23 +130,24 @@ export function hostCapabilities(options: HostCapabilityOptions = {}): HostCapab
   const platform = options.platform ?? detectHostPlatform(host);
   const native = transport === 'tauri';
   const android = platform === 'android';
+  const androidNative = native && android;
+  const safTrees = options.safTrees ?? androidNative;
+  const shareIntents = options.shareIntents ?? androidNative;
+  const foregroundTransfers = options.foregroundTransfers ?? androidNative;
   return {
     transport,
     platform,
     nativeIpc: native,
     localRoots: options.localRoots ?? true,
-    // Traits and Tauri commands are not proof that Android's generated host
-    // registered the matching Kotlin implementation. Keep these disabled until
-    // the embedder explicitly reports the integration as available.
-    safTrees: options.safTrees ?? false,
-    shareIntents: options.shareIntents ?? false,
-    foregroundTransfers: options.foregroundTransfers ?? false,
+    safTrees,
+    shareIntents,
+    foregroundTransfers,
     fileDrop: true,
     nativeFileDrop: options.nativeFileDrop ?? (native && !android),
     accounts: options.accounts ?? !native,
     desktopLaunchers: options.desktopLaunchers ?? (native && !android),
     terminal: options.terminal ?? true,
-    backgroundTransfers: (options.foregroundTransfers ?? false) || !android,
+    backgroundTransfers: foregroundTransfers || !android,
   };
 }
 

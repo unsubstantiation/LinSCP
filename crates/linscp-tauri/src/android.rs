@@ -1,11 +1,8 @@
 //! Android bridge contracts.
 //!
-//! The Kotlin side of the generated Tauri project implements these traits and
-//! registers them before the WebView loads (`register_bridges`). Until a bridge
-//! is registered, every operation it would serve fails instead of fabricating a
-//! result, which is what the desktop builds rely on: there is no SAF tree, no
-//! share sheet and no foreground service there, and the same page code has to
-//! keep working.
+//! The generated Tauri Android host registers the Kotlin mobile plugin during
+//! app setup; its Rust adapter implements these platform traits. Desktop builds
+//! have no Android plugin, so their fallback state remains inert and safe.
 //!
 //! `storage` exposes the registered SAF bridge to the Rust filesystem, so a
 //! `content://` root is a first-class local root on the Android app just as a
@@ -84,6 +81,14 @@ mod imp {
                 return Err(PlatformError::SecretVault("No files shared".to_string()));
             }
             Err(PlatformError::UnsupportedUri("Android share integration is not available".to_string()))
+        }
+        /// Share files received by ACTION_SEND/ACTION_SEND_MULTIPLE, staged by
+        /// the Android plugin when its activity is created or receives an intent.
+        pub fn staged_share_paths(&self) -> Result<Vec<PathBuf>, PlatformError> {
+            match self.share.lock().unwrap().as_deref() {
+                Some(bridge) => bridge.staged_share_paths(),
+                None => Ok(Vec::new()),
+            }
         }
         pub fn foreground_start(&self, title: &str, ongoing: usize) -> Result<(), PlatformError> {
             if let Some(bridge) = self.fg.lock().unwrap().as_deref() {
@@ -171,6 +176,7 @@ mod imp {
         pub fn list_tree(&self, _tree_uri: &str) -> Result<Vec<FileEntry>, PlatformError> {
             Err(PlatformError::UnsupportedUri("SAF only on Android".to_string()))
         }
+        pub fn staged_share_paths(&self) -> Result<Vec<PathBuf>, PlatformError> { Ok(Vec::new()) }
         pub fn stage_share_uris(&self, uris: &[String]) -> Result<Vec<PathBuf>, PlatformError> {
             if uris.is_empty() {
                 return Err(PlatformError::SecretVault("No files shared".to_string()));
@@ -218,6 +224,105 @@ mod imp {
 }
 
 pub use imp::AndroidState;
+
+#[cfg(all(target_os = "android", feature = "native-shell"))]
+mod mobile_plugin {
+    use std::path::PathBuf;
+    use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+
+    use base64::Engine as _;
+    use linscp_platform::{android::{ForegroundServiceBridge, SafBridge, ShareBridge}, PlatformError};
+    use linscp_types::{FileEntry, LocalRootEntry};
+    use serde::{Deserialize, Serialize};
+    use tauri::{plugin::{Builder, PluginHandle, TauriPlugin}, Manager, Wry};
+
+    #[derive(Clone)]
+    struct MobileBridge {
+        handle: PluginHandle<Wry>,
+        foreground_running: Arc<AtomicBool>,
+    }
+    #[derive(Serialize)] struct UriArg<'a> { uri: &'a str }
+    #[derive(Deserialize)] struct UriResult { uri: String }
+    #[derive(Deserialize)] struct PathList { paths: Vec<PathBuf> }
+    #[derive(Deserialize)] struct Base64Result { base64: String }
+
+    impl MobileBridge {
+        fn call<T: serde::de::DeserializeOwned, P: Serialize>(&self, command: &str, payload: P) -> Result<T, PlatformError> {
+            self.handle.run_mobile_plugin(command, payload)
+                .map_err(|error| PlatformError::Unsupported(error.to_string()))
+        }
+    }
+    impl SafBridge for MobileBridge {
+        fn request_tree(&self) -> Result<Option<String>, PlatformError> {
+            #[derive(Deserialize)] struct Pick { uri: Option<String>, cancelled: Option<bool> }
+            let value: Pick = self.call("pickTree", ())?;
+            Ok(if value.cancelled.unwrap_or(false) { None } else { value.uri })
+        }
+        fn granted_trees(&self) -> Result<Vec<LocalRootEntry>, PlatformError> { self.call("grantedTrees", ()) }
+        fn list_tree(&self, tree_uri: &str) -> Result<Vec<FileEntry>, PlatformError> { self.call("listTree", UriArg { uri: tree_uri }) }
+        fn stat_uri(&self, uri: &str) -> Result<FileEntry, PlatformError> { self.call("statUri", UriArg { uri }) }
+        fn read_uri_bytes(&self, uri: &str) -> Result<Vec<u8>, PlatformError> {
+            let result: Base64Result = self.call("readUri", UriArg { uri })?;
+            base64::engine::general_purpose::STANDARD.decode(result.base64)
+                .map_err(|error| PlatformError::Unsupported(error.to_string()))
+        }
+        fn write_uri_bytes(&self, parent_uri: &str, name: &str, data: &[u8]) -> Result<String, PlatformError> {
+            #[derive(Serialize)] struct Args<'a> { parent_uri: &'a str, name: &'a str, data_base64: String }
+            let result: UriResult = self.call("writeUri", Args { parent_uri, name, data_base64: base64::engine::general_purpose::STANDARD.encode(data) })?;
+            Ok(result.uri)
+        }
+        fn mkdir_uri(&self, parent_uri: &str, name: &str) -> Result<String, PlatformError> {
+            #[derive(Serialize)] struct Args<'a> { parent_uri: &'a str, name: &'a str }
+            Ok(self.call::<UriResult, _>("mkdirUri", Args { parent_uri, name })?.uri)
+        }
+        fn delete_uri(&self, uri: &str) -> Result<(), PlatformError> { let _: serde_json::Value = self.call("deleteUri", UriArg { uri })?; Ok(()) }
+        fn rename_uri(&self, uri: &str, new_name: &str) -> Result<String, PlatformError> {
+            #[derive(Serialize)] struct Args<'a> { uri: &'a str, new_name: &'a str }
+            Ok(self.call::<UriResult, _>("renameUri", Args { uri, new_name })?.uri)
+        }
+    }
+    impl ShareBridge for MobileBridge {
+        fn staged_share_paths(&self) -> Result<Vec<PathBuf>, PlatformError> { Ok(self.call::<PathList, _>("takePendingShares", ())?.paths) }
+        fn stage_uris(&self, uris: &[String]) -> Result<Vec<PathBuf>, PlatformError> {
+            #[derive(Serialize)] struct Args<'a> { uris: &'a [String] }
+            Ok(self.call::<PathList, _>("stageUris", Args { uris })?.paths)
+        }
+    }
+    impl ForegroundServiceBridge for MobileBridge {
+        fn start(&self, title: &str, ongoing_transfers: usize) -> Result<(), PlatformError> {
+            #[derive(Serialize)] struct Args<'a> { title: &'a str, ongoing: usize }
+            let _: serde_json::Value = self.call("foregroundStart", Args { title, ongoing: ongoing_transfers })?;
+            self.foreground_running.store(true, Ordering::SeqCst); Ok(())
+        }
+        fn update_progress(&self, bytes_done: u64, bytes_total: u64) -> Result<(), PlatformError> {
+            #[derive(Serialize)] struct Args { done: u64, total: u64 }
+            let _: serde_json::Value = self.call("foregroundUpdate", Args { done: bytes_done, total: bytes_total })?; Ok(())
+        }
+        fn stop(&self) -> Result<(), PlatformError> {
+            let _: serde_json::Value = self.call("foregroundStop", ())?;
+            self.foreground_running.store(false, Ordering::SeqCst); Ok(())
+        }
+        fn is_running(&self) -> bool { self.foreground_running.load(Ordering::SeqCst) }
+    }
+
+    pub fn plugin() -> TauriPlugin<Wry> {
+        Builder::new("linscp-android")
+            .setup(|app, api| {
+                let handle = api.register_android_plugin("com.fairuniversal.linscp", "LinSCPAndroidPlugin")?;
+                let bridge = Arc::new(MobileBridge { handle, foreground_running: Arc::new(AtomicBool::new(false)) });
+                let state = Arc::new(AndroidState::new());
+                state.set_saf(bridge.clone());
+                state.set_share(bridge.clone());
+                state.set_foreground_service(bridge);
+                app.manage(state);
+                Ok(())
+            })
+            .build()
+    }
+}
+
+#[cfg(all(target_os = "android", feature = "native-shell"))]
+pub use mobile_plugin::plugin as mobile_plugin;
 
 /// Local filesystem for the running app: the native one, plus the SAF bridge
 /// once the Android shell has registered it.

@@ -17,6 +17,9 @@ test -n "$port"
 application=$(python3 tools/android_application_id.py)
 adb reverse "tcp:$port" "tcp:$port"
 adb install -r android-artifacts/linscp-android-debug.apk
+# Avoid an interactive Android 13+ notification permission prompt in the
+# emulator smoke run; production installs still request it on the first queue.
+adb shell pm grant "$application" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
 adb shell am start -n "$application/.MainActivity"
 for _ in $(seq 1 90); do
   pid=$(adb shell pidof "$application" | tr -d '\r' || true)

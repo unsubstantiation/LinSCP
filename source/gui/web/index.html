@@ -5250,9 +5250,13 @@
       if (await queueSharedFiles(item)) return;
       shellOffer = item;
       shellOfferedOnTab[item.id] = state.activeTab;
-      $('shellUploadList').innerHTML = item.files.map(file =>
+      // Rust shell-upload manifests persist their entries under `items`;
+      // accept the older `files` shape too for existing host integrations.
+      const offeredFiles = Array.isArray(item.items) ? item.items :
+        (Array.isArray(item.files) ? item.files : []);
+      $('shellUploadList').innerHTML = offeredFiles.filter(file => file && typeof file === 'object').map(file =>
         '<div class="site-list-item">' +
-        escapeHtml(file.name + (file.is_dir ? '/' : '')) + '</div>').join('');
+        escapeHtml(String(file.name || '') + (file.is_dir ? '/' : '')) + '</div>').join('');
       $('shellUploadButton').textContent =
         t("Upload to {dir}", {dir: state.remote.path || '/'});
       openModal('shellUploadModal');
