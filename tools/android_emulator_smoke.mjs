@@ -2,6 +2,10 @@
 // is reached through adb reverse; all IPC executes inside the installed APK.
 import assert from 'node:assert/strict';
 const port = Number(process.argv[2]);
+// The installed package, handed over by the harness that read it from the
+// configuration, so the storage this run finds is the storage of *this* app.
+const application = process.argv[3];
+assert.ok(application && application.includes('.'), 'the harness must pass the application ID');
 let pages;
 for (let i = 0; i < 60; i++) {
   try {
@@ -22,7 +26,7 @@ const expression = `
   const invoke = (method, path, body = {}) => window.LinSCPTransport.request(method, path, body);
   const status = await invoke('GET', '/api/status');
   const root = status.local_dir;
-  if (!root || !root.includes('io.linscp.commander')) throw new Error('Not using app-private storage: ' + root);
+  if (!root || !root.includes(${JSON.stringify(application)})) throw new Error('Not using app-private storage: ' + root);
   const mkdir = await invoke('POST', '/api/local/mkdir', {name: 'smoke-download'});
   if (!mkdir.success) throw new Error('Local mkdir failed: ' + JSON.stringify(mkdir));
   const save = await invoke('POST', '/api/local/save', {path: root + '/smoke-upload.txt', content: 'Android Rust-backed transfer'});

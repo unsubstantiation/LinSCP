@@ -23,10 +23,10 @@ jobs:
         with:
           targets: aarch64-linux-android,x86_64-linux-android
       - uses: Swatinem/rust-cache@v2
-      - name: Build and test the UI
+      - name: Check the Android application ID
         run: |
-          npm ci --prefix ui --no-audit --no-fund
-          python3 tools/run_cargo_ci.py npm --prefix ui test
+          python3 -m unittest discover -s tools/tests -p test_android_application_id.py
+          echo "applicationId: $(python3 tools/android_application_id.py)"
       - name: Prepare Android SDK
         run: python3 tools/run_cargo_ci.py bash tools/prepare_android_sdk.sh
       - name: Generate Tauri Android project

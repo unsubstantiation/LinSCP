@@ -29,6 +29,25 @@ production or Play Store release. Android support is incomplete:
 - The debug APK is signed with a development key. It is intended for testing,
   not distribution, updates to a release-signed installation, or sensitive data.
 
+## Application ID
+
+The app is installed as **`com.fairuniversal.linscp`**, defined once in
+`crates/linscp-tauri/tauri.conf.json` (`identifier`). Tauri derives the Gradle
+`applicationId`, the `MainActivity` package and the app's private data directory
+from it, so the emulator harness, the APK check and the smoke test all read it
+through `tools/android_application_id.py` instead of repeating the string.
+`tools/prepare_android_project.py` refuses a generated project whose
+`applicationId` or `MainActivity` package disagrees, and
+`tools/verify_android_apk.py` refuses an APK built under another name.
+
+Two consequences of a rename are worth stating: the new package installs
+*beside* an older build rather than updating it, and an older build's
+app-private settings and stored sessions live under the old directory, so they
+are not carried over — re-import or re-enter the sites you need, then uninstall
+the old app. A generated `gen/android` project from before the rename must be
+regenerated (`tauri android init`) or the build stops with the mismatch rather
+than shipping the old name.
+
 ## Build
 
 Install Node.js 22, Rust stable, Java 17, Android SDK platform 36/build-tools
