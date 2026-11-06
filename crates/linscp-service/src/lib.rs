@@ -6738,7 +6738,7 @@ mod tests {
             for (key, value) in extra.as_object().expect("object").iter() {
                 body[key] = value.clone();
             }
-            Service::sync_options_from(&body)
+            CommanderService::sync_options_from(&body)
         };
         let (_, remote, opts) = with(json!({})).expect("the defaults are valid");
         assert_eq!(remote, "/remote");

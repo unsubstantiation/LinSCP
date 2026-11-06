@@ -1,0 +1,20 @@
+name: Probe
+
+on:
+  push:
+    branches:
+      - 'arena/c82dca30-linscp'
+
+jobs:
+  probe:
+    name: Probe diagnostics
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the http crate and surface every error
+        shell: bash
+        run: |
+          CARGO_TERM_COLOR=never cargo check -p linscp-http > probe.log 2>&1 || true
+          python -c "import re,sys;t=open('probe.log',errors='replace').read();keep=[l for l in t.splitlines() if re.match(r'^(error|note|help|\\s+= note|\\s+= help|\\s+-->|\\s+\\||\\s+\\d+ \\|)',l)];b='\\n'.join(keep);print('\\n'.join('::error title=probe (%d)::%s'%(i//2500+1,b[i:i+2500].replace('%','%25').replace('\\r','%0D').replace('\\n','%0A')) for i in range(0,min(len(b),25000),2500)))"
