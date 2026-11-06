@@ -8,10 +8,11 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use linscp_types::LocalRootEntry;
-use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
+use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HLOCAL};
 use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
 };
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows_sys::Win32::Storage::FileSystem::{
     GetLogicalDrives, MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
@@ -20,6 +21,20 @@ use zeroize::Zeroizing;
 use crate::PlatformError;
 
 const EXTENDED_PATH_THRESHOLD: usize = 240;
+
+/// Returns whether a process identifier currently resolves to a live process.
+pub fn process_is_running(pid: u32) -> bool {
+    // SAFETY: OpenProcess receives only a PID and requests query-only access;
+    // the returned handle is closed immediately and no process memory is read.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            false
+        } else {
+            CloseHandle(process) != 0
+        }
+    }
+}
 
 pub fn default_config_dir() -> PathBuf {
     if let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {

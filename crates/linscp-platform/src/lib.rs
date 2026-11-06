@@ -18,6 +18,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 pub mod desktop;
+pub mod password_vault;
 pub mod gssapi_sys;
 pub mod gui_os;
 pub mod terminal;
@@ -606,6 +607,17 @@ pub fn config_dir() -> PathBuf {
     default_config_dir()
 }
 
+/// Whether a process identifier is still live; used to reap private per-process
+/// key material left behind by an unclean shutdown.
+pub fn process_is_running(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    { return windows::process_is_running(pid); }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    { return Path::new("/proc").join(pid.to_string()).exists(); }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "android")))]
+    { let _ = pid; true }
+}
+
 /// Atomically writes sensitive configuration files (`sessions.ini`,
 /// `sessions.key`, `sshhostkeys`) with owner-only permissions.
 pub fn write_private_file_atomic(target: &Path, content: &[u8]) -> Result<(), PlatformError> {
@@ -726,6 +738,11 @@ fn decode_stored_master_key(
     raw_bytes: &[u8],
     #[cfg(target_os = "android")] keystore: Option<&dyn android::KeystoreBridge>,
 ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
+    if raw_bytes.starts_with(b"LSCPVLT1") {
+        return Err(PlatformError::SecretVault(
+            "sessions.key is protected by the local vault; unlock it in LinSCP Commander first".to_string(),
+        ));
+    }
     if raw_bytes.len() == MASTER_KEY_LEN {
         let mut out = Zeroizing::new([0u8; 32]);
         out.copy_from_slice(raw_bytes);

@@ -10,12 +10,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use rand::RngCore;
 use linscp_engine::{
-    filemask::FileMask, parse_filezilla_xml, parse_openssh_config, PreferencesStore,
-    SessionStore, StoredSite,
+    filemask::FileMask, offlineotp_vault::{self, CredentialEntry, LoginRecord, SshKeyRecord},
+    parse_filezilla_xml, parse_openssh_config, PreferencesStore, SessionStore, StoredSite,
 };
 use linscp_platform::{
-    config_dir, gui_os, write_private_file_atomic, LocalFs, NativeLocalFs, NativeSecretVault,
+    config_dir, create_exclusive_private_file, gui_os, write_private_file_atomic, LocalFs, NativeLocalFs, NativeSecretVault,
     SecretVault,
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
@@ -61,7 +62,8 @@ struct InnerState {
 #[derive(Clone)]
 pub struct CommanderService {
     local_fs: Arc<dyn LocalFs>,
-    secret_vault: Arc<dyn SecretVault>,
+    secret_vault: Arc<linscp_platform::password_vault::PasswordSecretVault>,
+    legacy_secret_vault: Arc<dyn SecretVault>,
     state: Arc<Mutex<InnerState>>,
     event_tx: Arc<Mutex<Option<tokio::sync::broadcast::Sender<Value>>>>,
     queue: queue::QueueManager,
@@ -90,10 +92,12 @@ impl CommanderService {
         local_fs: Arc<dyn LocalFs>,
         secret_vault: Arc<dyn SecretVault>,
     ) -> Self {
+        cleanup_stale_temporary_keys(&config_root);
         let preferences = PreferencesStore::load(&config_root).unwrap_or_default();
         Self {
             local_fs,
-            secret_vault,
+            secret_vault: Arc::new(linscp_platform::password_vault::PasswordSecretVault::new()),
+            legacy_secret_vault: secret_vault,
             state: Arc::new(Mutex::new(InnerState {
                 config_root,
                 next_tab_id: 1,
@@ -131,6 +135,9 @@ impl CommanderService {
         let query = parse_query(query_str);
         match (method.as_str(), raw_path) {
             ("GET", "/api/status") => self.handle_status(),
+            ("GET", "/api/vault/status") => self.handle_vault_status(),
+            ("POST", "/api/vault/unlock") => self.handle_vault_unlock(req.body),
+            ("POST", "/api/vault/lock") => self.handle_vault_lock(),
             ("GET", "/api/local/roots") => self.handle_local_roots(),
             ("GET", "/api/local/list") => self.handle_local_list(&query),
             ("GET", "/api/local/edit") => self.handle_local_edit_get(&query),
@@ -139,6 +146,8 @@ impl CommanderService {
             ("GET", "/api/preferences") => self.handle_get_preferences(),
             ("POST", "/api/preferences") => self.handle_save_preferences(req.body),
             ("GET", "/api/sessions") => self.handle_list_sessions(),
+            ("POST", "/api/vault/export") => self.handle_export_offlineotp_vault(req.body),
+            ("POST", "/api/vault/import") => self.handle_import_offlineotp_vault(req.body),
             ("POST", "/api/sessions/save") => self.handle_save_session(req.body),
             ("POST", "/api/sessions/delete") => self.handle_delete_session(req.body),
             ("GET", "/api/sessions/import") => self.handle_sessions_import_get(&query),
@@ -310,8 +319,13 @@ impl CommanderService {
     }
 
     async fn connect_tab(&self, tab: &mut TabRuntime) -> ApiReply {
-        let spec = match tab.spec.as_ref() { Some(s) => s, None => return api_error(400, "Missing session settings") };
-        let result = tabs::dial_gui_tab_session(spec, &self.config_root(), false, "en").await;
+        let mut dial_spec = match tab.spec.as_ref() { Some(s) => s.clone(), None => return api_error(400, "Missing session settings") };
+        let config_root = self.config_root();
+        let _temporary_keys = match materialize_vault_key_paths(&mut dial_spec, &config_root, self.secret_vault.as_ref()) {
+            Ok(files) => files,
+            Err(error) => return api_error(400, error),
+        };
+        let result = tabs::dial_gui_tab_session(&dial_spec, &config_root, false, "en").await;
         let mut state = self.state.lock().expect("state mutex");
         // Closing a tab or cancelling a challenge while dialing must not bring
         // it back to life after the asynchronous connection completes.
@@ -1374,6 +1388,7 @@ impl CommanderService {
         let logger = linscp_engine::xml_log::SessionLogger::open(None, 0, false, None, None, false, "")
             .map_err(|error| api_error(500, error.to_string()))?;
         let mut interpreter = linscp_engine::script::ScriptInterpreter::new(cfg, logger);
+        interpreter.set_secret_vault(self.secret_vault.clone());
         if let Some(tab) = tab.filter(|tab| tab.connected) {
             // The local directory is the panel's, so `lcd`/`lpwd` start where
             // the user is looking rather than at the process's own directory.
@@ -1432,9 +1447,16 @@ impl CommanderService {
     /// differently.
     async fn copy_id_async(&self, body: Value) -> ApiReply {
         let tab_id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
-        let tab = match self.state.lock().expect("state mutex").tabs.get(&tab_id).cloned() {
+        let mut tab = match self.state.lock().expect("state mutex").tabs.get(&tab_id).cloned() {
             Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected"),
         };
+        let config_root = self.config_root();
+        let _temporary_keys = if let Some(spec) = tab.spec.as_mut() {
+            match materialize_vault_key_paths(spec, &config_root, self.secret_vault.as_ref()) {
+                Ok(files) => Some(files),
+                Err(error) => return api_error(400, error),
+            }
+        } else { None };
         let keyfile = body.get("keyfile").and_then(Value::as_str).unwrap_or("").trim().to_string();
         // `copyid` works in the console only on an SSH session whose site
         // names a private key; it installs the matching public key, and with
@@ -1659,6 +1681,49 @@ impl CommanderService {
         "/".to_string()
     }
 
+    fn handle_vault_status(&self) -> ApiReply {
+        let config_root = self.config_root();
+        match self.secret_vault.status(&config_root) {
+            Ok(status) => ApiReply { status: 200, payload: json!({"success": true, "vault": status}) },
+            Err(error) => api_error(500, error.to_string()),
+        }
+    }
+
+    fn handle_vault_unlock(&self, mut body: Value) -> ApiReply {
+        let config_root = self.config_root();
+        let unlock_result = {
+            let password = body.get("password").and_then(Value::as_str).unwrap_or("");
+            self.secret_vault.unlock_or_setup(&config_root, password, self.legacy_secret_vault.as_ref())
+        };
+        if let Some(Value::String(password)) = body.get_mut("password") {
+            zeroize::Zeroize::zeroize(password);
+        }
+        if let Err(error) = unlock_result {
+            return api_error(400, error.to_string());
+        }
+        let stale_temp_dir = config_root.join("tmp").join("unlocked-keys").join(std::process::id().to_string());
+        let _ = std::fs::remove_dir_all(stale_temp_dir);
+        ApiReply { status: 200, payload: json!({"success": true, "vault": "unlocked"}) }
+    }
+
+    fn handle_vault_lock(&self) -> ApiReply {
+        if let Err(error) = self.secret_vault.lock() {
+            return api_error(500, error.to_string());
+        }
+        let mut state = self.state.lock().expect("state mutex");
+        let tab_ids: Vec<u64> = state.tabs.keys().copied().collect();
+        for tab_id in tab_ids {
+            self.queue.cancel_for_tab(tab_id);
+            state.terminals.close_for_tab(tab_id);
+        }
+        self.queue.clear_finished();
+        state.tabs.clear();
+        state.challenges.clear();
+        state.pending_connections.clear();
+        state.active_tab_id = None;
+        ApiReply { status: 200, payload: json!({"success": true, "vault": "locked"}) }
+    }
+
     fn handle_status(&self) -> ApiReply {
         let g = self.state.lock().expect("state mutex");
         let roots = self.local_fs.list_roots().unwrap_or_default();
@@ -1674,6 +1739,7 @@ impl CommanderService {
             "is_local": g.tabs.values().next().map(|t| t.is_local).unwrap_or(false),
             "binary": "linscp",
             "paused": false,
+            "vault": self.secret_vault.status(&g.config_root).unwrap_or("locked"),
             "preferences": g.preferences,
             "sessions_file": g.config_root.join("sessions.ini").to_string_lossy(),
         })}
@@ -1779,6 +1845,72 @@ impl CommanderService {
         ApiReply{ status: 200, payload: json!({"success": true, "preferences": parsed})}
     }
 
+    fn handle_export_offlineotp_vault(&self, body: Value) -> ApiReply {
+        let password = body.get("password").and_then(Value::as_str).unwrap_or("");
+        if password.is_empty() {
+            return api_error(400, "Choose a non-empty backup password.");
+        }
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let store = match SessionStore::load_from_dir(&cfg, self.secret_vault.as_ref()) {
+            Ok(store) => store,
+            Err(error) => return api_error(500, &error),
+        };
+        let entries = match offlineotp_entries_from_sessions(&store, &cfg, self.secret_vault.as_ref()) {
+            Ok(entries) => entries,
+            Err(error) => return api_error(400, &error),
+        };
+        let data = match offlineotp_vault::seal(&entries, password) {
+            Ok(data) => data,
+            Err(error) => return api_error(400, &error),
+        };
+        let unix_seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        ApiReply {
+            status: 200,
+            payload: json!({
+                "success": true,
+                "filename": offlineotp_vault::timestamped_filename(unix_seconds),
+                "data_base64": BASE64_STD.encode(data),
+                "entry_count": entries.len(),
+            }),
+        }
+    }
+
+    fn handle_import_offlineotp_vault(&self, body: Value) -> ApiReply {
+        let password = body.get("password").and_then(Value::as_str).unwrap_or("");
+        let encoded = body.get("data_base64").and_then(Value::as_str).unwrap_or("");
+        if encoded.len() > 22 * 1024 * 1024 {
+            return api_error(413, "The encrypted vault exceeds the 16 MiB OfflineOTP file limit.");
+        }
+        let bytes = match BASE64_STD.decode(encoded.as_bytes()) {
+            Ok(bytes) => bytes,
+            Err(_) => return api_error(400, "The selected file is not valid base64 data."),
+        };
+        let imported = match offlineotp_vault::open(&bytes, password) {
+            Ok(imported) => imported,
+            Err(error) => return api_error(400, &error),
+        };
+        let replace = body.get("replace").and_then(Value::as_bool).unwrap_or(false);
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let existing = if replace {
+            SessionStore::new()
+        } else {
+            match SessionStore::load_from_dir(&cfg, self.secret_vault.as_ref()) {
+                Ok(store) => store,
+                Err(error) => return api_error(500, &error),
+            }
+        };
+        match import_offlineotp_entries(&cfg, existing, imported, self.secret_vault.as_ref()) {
+            Ok((count, skipped, ignored)) => ApiReply {
+                status: 200,
+                payload: json!({ "success": true, "imported": count, "skipped_existing": skipped, "ignored_entries": ignored }),
+            },
+            Err(error) => api_error(400, &error),
+        }
+    }
+
     fn handle_list_sessions(&self) -> ApiReply {
         let g = self.state.lock().expect("m");
         let cfg = g.config_root.clone();
@@ -1809,10 +1941,16 @@ impl CommanderService {
         if spec.raw_fields.get("s3_session_token").is_some_and(|token| !token.is_empty()) {
             return api_error(400, "Saving S3 session tokens is not supported; supply the token when connecting instead.");
         }
-        let stored = tabs::build_stored_site_for_save(&final_name, &spec);
+        let mut stored = tabs::build_stored_site_for_save(&final_name, &spec);
+        let mut protected_key_files = Vec::new();
+        if let Err(error) = protect_stored_ssh_keys(&mut stored, &cfg_root, self.secret_vault.as_ref(), &mut protected_key_files) {
+            for path in protected_key_files { let _ = std::fs::remove_file(path); }
+            return api_error(400, error);
+        }
         let mut store = SessionStore::load_from_dir(&cfg_root, self.secret_vault.as_ref()).unwrap_or_default();
         store.upsert(stored);
         if let Err(e) = store.save_to_dir(&cfg_root, self.secret_vault.as_ref()) {
+            for path in protected_key_files { let _ = std::fs::remove_file(path); }
             return ApiReply{ status: 500, payload: json!({"success": false, "error": e})};
         }
         self.add_log(&format!("Saved session {final_name}"), "success");
@@ -3753,6 +3891,695 @@ impl CommanderService {
     }
 }
 
+const OFFLINEOTP_SESSION_JSON: &str = "linscp_session_json";
+const LOCAL_VAULT_KEY_PREFIX: &str = "vaultkey://";
+const OFFLINEOTP_SSH_KEY_LABEL: &str = "linscp_ssh_key_label";
+const OFFLINEOTP_TUNNEL_KEY_LABEL: &str = "linscp_tunnel_key_label";
+const OFFLINEOTP_SSH_SUFFIX: &str = " [LinSCP SSH key]";
+const OFFLINEOTP_TUNNEL_SUFFIX: &str = " [LinSCP jump-host key]";
+
+fn offlineotp_entries_from_sessions(
+    store: &SessionStore,
+    config_root: &Path,
+    secret_vault: &linscp_platform::password_vault::PasswordSecretVault,
+) -> Result<Vec<CredentialEntry>, String> {
+    let mut entries = Vec::new();
+    for site in store.sites() {
+        if site.name.trim().is_empty() || site.name.len() > 1024
+            || site.name.contains(']') || site.name.chars().any(char::is_control)
+        {
+            return Err(format!("Saved session '{}' has a name that cannot be represented safely in an OfflineOTP import.", site.name));
+        }
+        if site.password_raw.is_some()
+            || site.proxy_password_raw.is_some()
+            || site.tunnel_password_raw.is_some()
+            || site.tunnel_passphrase_raw.is_some()
+            || site.password_error.is_some()
+            || site.proxy_error.is_some()
+            || site.tunnel_error.is_some()
+            || site.setting_error.is_some()
+        {
+            return Err(format!(
+                "Cannot export '{}' because one or more saved secrets or settings could not be read safely. Fix the affected session first.",
+                site.name
+            ));
+        }
+        if site.extra_fields.get("s3_session_token").is_some_and(|token| !token.is_empty()) {
+            return Err(format!("Cannot export '{}' because LinSCP does not persist S3 session tokens in saved sessions.", site.name));
+        }
+        for (key, value) in &site.extra_fields {
+            if !value.is_empty() && is_sensitive_vault_field(key) && key != "s3_secret_key" {
+                return Err(format!("Cannot export '{}' because saved setting '{key}' is a credential that LinSCP cannot safely restore as a session.", site.name));
+            }
+        }
+        let mut exported_password = site.password.clone();
+        if exported_password.as_deref().is_none_or(str::is_empty) {
+            exported_password = site.extra_fields.get("s3_secret_key").cloned();
+        }
+        let mut exported_username = site.username.clone();
+        if exported_username.is_empty() {
+            exported_username = site.extra_fields.get("s3_access_key").cloned().unwrap_or_default();
+        }
+        // Keep paths local to the exporting machine out of the portable file; key material is
+        // carried in sibling SSH_KEY entries and gets a fresh private path on import.
+        let mut portable_site = site.clone();
+        portable_site.private_key = None;
+        portable_site.tunnel.keyfile = None;
+        portable_site.local_directory.clear();
+        portable_site.password = exported_password.clone();
+        portable_site.username = exported_username.clone();
+        portable_site.extra_fields.retain(|key, _| {
+            !key.eq_ignore_ascii_case("s3_access_key") && !is_sensitive_vault_field(key) && !is_local_path_vault_field(key)
+        });
+        validate_imported_site(&portable_site)?;
+        let session_json = serde_json::to_string(&portable_site)
+            .map_err(|error| format!("Cannot encode saved session '{}': {error}", site.name))?;
+        let mut metadata = BTreeMap::from([(OFFLINEOTP_SESSION_JSON.to_string(), session_json)]);
+
+        if let Some(path) = site.private_key.as_deref().filter(|path| !path.is_empty()) {
+            let label = format!("{}{}", site.name, OFFLINEOTP_SSH_SUFFIX);
+            let (public_key, private_key) = read_offlineotp_keypair(path, config_root, secret_vault)?;
+            entries.push(CredentialEntry::SshKey(SshKeyRecord {
+                label: label.clone(),
+                public_key,
+                private_key,
+                host: site.host.clone(),
+                port: site.port,
+                username: site.username.clone(),
+                password: String::new(),
+            }));
+            metadata.insert(OFFLINEOTP_SSH_KEY_LABEL.to_string(), label);
+        }
+        if let Some(path) = site.tunnel.keyfile.as_deref().filter(|path| !path.is_empty()) {
+            let label = format!("{}{}", site.name, OFFLINEOTP_TUNNEL_SUFFIX);
+            let (public_key, private_key) = read_offlineotp_keypair(path, config_root, secret_vault)?;
+            entries.push(CredentialEntry::SshKey(SshKeyRecord {
+                label: label.clone(),
+                public_key,
+                private_key,
+                host: site.tunnel.host.clone(),
+                port: site.tunnel.port,
+                username: site.tunnel.username.clone(),
+                password: String::new(),
+            }));
+            metadata.insert(OFFLINEOTP_TUNNEL_KEY_LABEL.to_string(), label);
+        }
+
+        let host = if site.host.contains(':') && !site.host.starts_with('[') {
+            format!("[{}]", site.host)
+        } else {
+            site.host.clone()
+        };
+        let port = if site.port == 0 { site.protocol.default_port() } else { site.port };
+        let url = if host.is_empty() {
+            "linscp://saved-session".to_string()
+        } else {
+            format!("{}://{}:{port}", site.protocol.as_str(), host)
+        };
+        entries.push(CredentialEntry::Login(LoginRecord {
+            label: site.name.clone(),
+            url,
+            username: exported_username,
+            password: exported_password.unwrap_or_default(),
+            metadata,
+        }));
+    }
+    if entries.is_empty() {
+        return Err("There are no saved sessions or SSH keys to export.".to_string());
+    }
+    Ok(entries)
+}
+
+fn read_offlineotp_keypair(
+    path: &str,
+    config_root: &Path,
+    secret_vault: &linscp_platform::password_vault::PasswordSecretVault,
+) -> Result<(String, String), String> {
+    const LIMIT: u64 = 32 * 1024;
+    if let Some(id) = path.strip_prefix(LOCAL_VAULT_KEY_PREFIX) {
+        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("Saved encrypted SSH key reference is invalid.".to_string());
+        }
+        let encrypted_path = config_root.join("keys").join(format!("{id}.key.vault"));
+        let metadata = std::fs::metadata(&encrypted_path)
+            .map_err(|error| format!("Cannot read encrypted SSH key: {error}"))?;
+        if metadata.len() > 1024 * 1024 + 64 {
+            return Err("Encrypted SSH key file is unexpectedly large.".to_string());
+        }
+        let encrypted = std::fs::read(&encrypted_path)
+            .map_err(|error| format!("Cannot read encrypted SSH key: {error}"))?;
+        let private = secret_vault.open_local_blob(&encrypted)
+            .map_err(|error| error.to_string())?;
+        if private.len() as u64 > LIMIT {
+            return Err("SSH key exceeds OfflineOTP's 32 KiB per-key limit.".to_string());
+        }
+        let private = String::from_utf8(private.to_vec())
+            .map_err(|_| "SSH private key is not UTF-8 text.".to_string())?;
+        let public_path = config_root.join("keys").join(format!("{id}.pub"));
+        let public = read_bounded_key_optional(&public_path, LIMIT)?;
+        return Ok((public, private));
+    }
+    let expanded = linscp_platform::terminal::expand_tilde(path);
+    let key_path = PathBuf::from(expanded);
+    let is_public_path = key_path.extension().and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pub"));
+    let (private_path, public_path) = if is_public_path {
+        (key_path.with_extension(""), key_path.clone())
+    } else {
+        let mut public = key_path.as_os_str().to_os_string();
+        public.push(".pub");
+        (key_path.clone(), PathBuf::from(public))
+    };
+    let (public, private) = if is_public_path {
+        (read_bounded_key(&public_path, LIMIT)?, read_bounded_key_optional(&private_path, LIMIT)?)
+    } else {
+        (read_bounded_key_optional(&public_path, LIMIT)?, read_bounded_key(&private_path, LIMIT)?)
+    };
+    if public.trim().is_empty() && private.trim().is_empty() {
+        return Err(format!("SSH key '{}' contains no key text.", path));
+    }
+    Ok((public, private))
+}
+
+fn read_bounded_key(path: &Path, limit: u64) -> Result<String, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("Cannot read SSH key '{}': {error}", path.display()))?;
+    if metadata.len() > limit {
+        return Err(format!("SSH key '{}' exceeds OfflineOTP's 32 KiB per-key limit.", path.display()));
+    }
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("Cannot read SSH key '{}': {error}", path.display()))?;
+    let mut bytes = Vec::with_capacity((limit + 1) as usize);
+    file.take(limit + 1).read_to_end(&mut bytes)
+        .map_err(|error| format!("Cannot read SSH key '{}': {error}", path.display()))?;
+    if bytes.len() as u64 > limit {
+        return Err(format!("SSH key '{}' exceeds OfflineOTP's 32 KiB per-key limit.", path.display()));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("SSH key '{}' is not UTF-8 text.", path.display()))
+}
+
+fn read_bounded_key_optional(path: &Path, limit: u64) -> Result<String, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() <= limit => read_bounded_key(path, limit)
+            .map_err(|error| error.replace("SSH key", "SSH public key")),
+        Ok(_) => Err(format!("SSH key '{}' exceeds OfflineOTP's 32 KiB per-key limit.", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(format!("Cannot read SSH public key '{}': {error}", path.display())),
+    }
+}
+
+struct OfflineOtpImportSite {
+    site: StoredSite,
+    ssh_key_label: Option<String>,
+    tunnel_key_label: Option<String>,
+    ssh_key: Option<SshKeyRecord>,
+    tunnel_key: Option<SshKeyRecord>,
+}
+
+fn import_offlineotp_entries(
+    config_root: &Path,
+    mut store: SessionStore,
+    imported: offlineotp_vault::ImportedCredentialVault,
+    secret_vault: &linscp_platform::password_vault::PasswordSecretVault,
+) -> Result<(usize, usize, usize), String> {
+    let mut ignored = imported.ignored_entries;
+    let mut sites = Vec::<OfflineOtpImportSite>::new();
+    let mut keys = Vec::<SshKeyRecord>::new();
+
+    for entry in imported.entries {
+        match entry {
+            CredentialEntry::Login(login) => {
+                let mut site = if let Some(encoded) = login.metadata.get(OFFLINEOTP_SESSION_JSON) {
+                    serde_json::from_str::<StoredSite>(encoded)
+                        .map_err(|error| format!("Saved LinSCP session metadata is invalid: {error}"))?
+                } else if login.url.trim().is_empty() {
+                    StoredSite::new(&login.label, linscp_types::ProtocolScheme::Sftp, "")
+                } else {
+                    match tabs::parse_desktop_uri(&login.url, true) {
+                        Ok((spec, _)) => StoredSite::from_session_config(&spec.session),
+                        Err(_) => {
+                            ignored += 1;
+                            continue;
+                        }
+                    }
+                };
+                site.name = login.label.clone();
+                if !login.username.is_empty() {
+                    site.username = login.username.clone();
+                }
+                site.password = (!login.password.is_empty()).then_some(login.password);
+                clear_imported_key_paths(&mut site);
+                validate_imported_site(&site)?;
+                sites.push(OfflineOtpImportSite {
+                    site,
+                    ssh_key_label: login.metadata.get(OFFLINEOTP_SSH_KEY_LABEL).cloned(),
+                    tunnel_key_label: login.metadata.get(OFFLINEOTP_TUNNEL_KEY_LABEL).cloned(),
+                    ssh_key: None,
+                    tunnel_key: None,
+                });
+            }
+            CredentialEntry::SshKey(key) => keys.push(key),
+        }
+    }
+
+    let mut created_files = Vec::<PathBuf>::new();
+    let result = (|| {
+        {
+            let mut key_labels = std::collections::HashSet::new();
+            for key in &keys {
+                if !key_labels.insert(key.label.clone()) {
+                    return Err(format!("The OfflineOTP backup contains duplicate SSH key label '{}'.", key.label));
+                }
+            }
+            let mut referenced_key_labels = std::collections::HashSet::new();
+            for candidate in &sites {
+                for label in [candidate.ssh_key_label.as_deref(), candidate.tunnel_key_label.as_deref()].into_iter().flatten() {
+                    if !key_labels.contains(label) {
+                        return Err(format!("Saved session '{}' refers to missing SSH key '{}'.", candidate.site.name, label));
+                    }
+                    if !referenced_key_labels.insert(label.to_string()) {
+                        return Err(format!("SSH key '{}' is linked to more than one saved session.", label));
+                    }
+                }
+            }
+        }
+
+        let mut paired_keys = std::collections::HashSet::new();
+        for key in &keys {
+            let explicit_main = sites.iter().position(|candidate|
+                candidate.ssh_key_label.as_deref() == Some(key.label.as_str()));
+            let explicit_tunnel = sites.iter().position(|candidate|
+                candidate.tunnel_key_label.as_deref() == Some(key.label.as_str()));
+            let fallback = sites.iter().position(|candidate| {
+                candidate.ssh_key.is_none() && !key.host.is_empty()
+                    && candidate.site.host == key.host
+                    && candidate.site.username == key.username
+            });
+            if let Some(index) = explicit_main.or(explicit_tunnel).or(fallback) {
+                let target = &mut sites[index];
+                if explicit_tunnel == Some(index) {
+                    target.tunnel_key = Some(key.clone());
+                } else {
+                    target.ssh_key = Some(key.clone());
+                }
+                if target.site.password.is_none() && !key.password.is_empty() {
+                    target.site.password = Some(key.password.clone());
+                }
+                paired_keys.insert(key.label.clone());
+            }
+        }
+
+        for key in &keys {
+            if paired_keys.contains(&key.label) { continue; }
+            let mut site = StoredSite::new(&key.label, linscp_types::ProtocolScheme::Sftp, &key.host);
+            site.port = if key.port == 0 { 22 } else { key.port };
+            site.username = key.username.clone();
+            site.password = (!key.password.is_empty()).then(|| key.password.clone());
+            validate_imported_site(&site)?;
+            sites.push(OfflineOtpImportSite {
+                site,
+                ssh_key_label: None,
+                tunnel_key_label: None,
+                ssh_key: Some(key.clone()),
+                tunnel_key: None,
+            });
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for candidate in &sites {
+            if !seen.insert(candidate.site.name.to_ascii_lowercase()) {
+                return Err("The OfflineOTP backup contains duplicate LinSCP session names.".to_string());
+            }
+        }
+        let mut skipped = 0usize;
+        let mut staged_site_names = Vec::new();
+        for mut candidate in sites {
+            if store.find(&candidate.site.name).is_some() {
+                skipped += 1;
+                continue;
+            }
+            // Serialized paths are local to the exporting computer and are never trusted on import.
+            clear_imported_key_paths(&mut candidate.site);
+            if let Some(key) = candidate.ssh_key.as_ref() {
+                let (private_path, public_path) = stage_offlineotp_key(config_root, key, secret_vault, &mut created_files)?;
+                candidate.site.private_key = private_path;
+                if let Some(public) = public_path {
+                    candidate.site.extra_fields.insert("linscp_public_key_file".into(), public);
+                }
+            }
+            if let Some(key) = candidate.tunnel_key.as_ref() {
+                let (private_path, public_path) = stage_offlineotp_key(config_root, key, secret_vault, &mut created_files)?;
+                candidate.site.tunnel.keyfile = private_path;
+                if let Some(public) = public_path {
+                    candidate.site.extra_fields.insert("linscp_tunnel_public_key_file".into(), public);
+                }
+            }
+            validate_imported_site(&candidate.site)?;
+            store.upsert(candidate.site.clone());
+            staged_site_names.push(candidate.site.name);
+        }
+        if staged_site_names.is_empty() {
+            return Ok((0, skipped, ignored));
+        }
+        store.save_to_dir(config_root, secret_vault)
+            .map_err(|error| format!("Cannot save imported sessions: {error}"))?;
+        Ok((staged_site_names.len(), skipped, ignored))
+    })();
+
+    if result.is_err() {
+        for path in created_files {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    result
+}
+
+fn is_sensitive_vault_field(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("password")
+        || key.contains("passphrase")
+        || key.contains("secret")
+        || key.contains("token")
+        || (key.contains("private") && key.contains("key"))
+}
+
+fn is_local_path_vault_field(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.ends_with("_file") || key.ends_with("_path") || key.contains("keyfile")
+}
+
+fn clear_imported_key_paths(site: &mut StoredSite) {
+    site.private_key = None;
+    site.tunnel.keyfile = None;
+    site.password_raw = None;
+    site.password_error = None;
+    site.proxy_password_raw = None;
+    site.tunnel_password_raw = None;
+    site.tunnel_passphrase_raw = None;
+    site.proxy_error = None;
+    site.tunnel_error = None;
+    site.setting_error = None;
+    site.extra_fields.retain(|key, _| {
+        !key.eq_ignore_ascii_case("s3_access_key") && !is_sensitive_vault_field(key) && !is_local_path_vault_field(key)
+    });
+}
+
+fn validate_imported_site(site: &StoredSite) -> Result<(), String> {
+    if site.name.trim().is_empty() || site.name.len() > 1024
+        || site.name.contains(']') || site.name.chars().any(char::is_control)
+    {
+        return Err("The imported session name is invalid.".to_string());
+    }
+    let text_values = [
+        ("host", site.host.as_str()),
+        ("username", site.username.as_str()),
+        ("password", site.password.as_deref().unwrap_or("")),
+        ("host key", site.hostkey.as_deref().unwrap_or("")),
+        ("remote directory", site.remote_directory.as_str()),
+        ("local directory", site.local_directory.as_str()),
+        ("preset", site.preset.as_str()),
+        ("proxy method", site.proxy_method.as_str()),
+        ("proxy host", site.proxy_host.as_str()),
+        ("proxy username", site.proxy_username.as_str()),
+        ("proxy password", site.proxy_password.as_deref().unwrap_or("")),
+        ("proxy command", site.proxy_command.as_str()),
+        ("proxy exclusions", site.proxy_exclude.as_str()),
+        ("proxy DNS mode", site.proxy_dns.as_str()),
+        ("tunnel host", site.tunnel.host.as_str()),
+        ("tunnel username", site.tunnel.username.as_str()),
+        ("tunnel password", site.tunnel.password.as_deref().unwrap_or("")),
+        ("tunnel host key", site.tunnel.hostkey.as_str()),
+        ("tunnel passphrase", site.tunnel_passphrase.as_deref().unwrap_or("")),
+    ];
+    for (label, value) in text_values {
+        validate_imported_ini_text(value, label)?;
+    }
+    for (key, value) in &site.extra_fields {
+        if key.is_empty() || key.len() > 128
+            || !key.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err("An imported session contains an invalid setting name.".to_string());
+        }
+        validate_imported_ini_text(value, key)?;
+    }
+    Ok(())
+}
+
+fn validate_imported_ini_text(value: &str, label: &str) -> Result<(), String> {
+    if value.chars().any(char::is_control) {
+        return Err(format!("Imported {label} contains unsupported control characters."));
+    }
+    Ok(())
+}
+
+fn cleanup_stale_temporary_keys(config_root: &Path) {
+    let root = config_root.join("tmp").join("unlocked-keys");
+    let Ok(entries) = std::fs::read_dir(root) else { return; };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue; };
+        if pid != std::process::id() && !linscp_platform::process_is_running(pid) {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn protect_stored_ssh_keys(
+    site: &mut StoredSite,
+    config_root: &Path,
+    vault: &linscp_platform::password_vault::PasswordSecretVault,
+    created: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    site.extra_fields.retain(|key, _| {
+        let key = key.to_ascii_lowercase();
+        !key.contains("keyfile") && !key.ends_with("private_key_file")
+    });
+    if let Some(path) = site.private_key.clone() {
+        site.private_key = Some(protect_one_ssh_key(&path, config_root, vault, created)?);
+    }
+    if let Some(path) = site.tunnel.keyfile.clone() {
+        site.tunnel.keyfile = Some(protect_one_ssh_key(&path, config_root, vault, created)?);
+    }
+    Ok(())
+}
+
+fn protect_one_ssh_key(
+    path: &str,
+    config_root: &Path,
+    vault: &linscp_platform::password_vault::PasswordSecretVault,
+    created: &mut Vec<PathBuf>,
+) -> Result<String, String> {
+    if let Some(id) = path.strip_prefix(LOCAL_VAULT_KEY_PREFIX) {
+        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("Saved encrypted SSH key reference is invalid.".to_string());
+        }
+        return Ok(path.to_string());
+    }
+    let expanded = linscp_platform::terminal::expand_tilde(path);
+    let source = PathBuf::from(expanded);
+    if source.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pub")) {
+        return Ok(path.to_string()); // Public keys are not confidential.
+    }
+    let metadata = std::fs::metadata(&source)
+        .map_err(|error| format!("Cannot read private SSH key '{}': {error}", source.display()))?;
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return Err(format!("Private SSH key '{}' is not a regular file under 1 MiB.", source.display()));
+    }
+    use std::io::Read as _;
+    let file = std::fs::File::open(&source)
+        .map_err(|error| format!("Cannot read private SSH key '{}': {error}", source.display()))?;
+    let mut plaintext = zeroize::Zeroizing::new(Vec::with_capacity(1024 * 1024 + 1));
+    file.take(1024 * 1024 + 1).read_to_end(&mut plaintext)
+        .map_err(|error| format!("Cannot read private SSH key '{}': {error}", source.display()))?;
+    if plaintext.len() > 1024 * 1024 {
+        return Err(format!("Private SSH key '{}' is not a regular file under 1 MiB.", source.display()));
+    }
+    let encrypted = vault.seal_local_blob(&plaintext).map_err(|error| error.to_string())?;
+    let mut public_source = source.as_os_str().to_os_string();
+    public_source.push(".pub");
+    let public_text = read_bounded_key_optional(&PathBuf::from(public_source), 32 * 1024)?;
+    let key_dir = config_root.join("keys");
+    linscp_platform::create_private_dir(&key_dir).map_err(|error| error.to_string())?;
+    'attempt: for _ in 0..8 {
+        let mut random = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut random);
+        let id = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let encrypted_path = key_dir.join(format!("{id}.key.vault"));
+        match create_exclusive_private_file(&encrypted_path, &encrypted) {
+            Ok(()) => created.push(encrypted_path.clone()),
+            Err(linscp_platform::PlatformError::AlreadyExists(_)) => continue 'attempt,
+            Err(error) => {
+                let _ = std::fs::remove_file(&encrypted_path);
+                return Err(error.to_string());
+            }
+        }
+        if !public_text.is_empty() {
+            let public_path = key_dir.join(format!("{id}.pub"));
+            match create_exclusive_private_file(&public_path, public_text.as_bytes()) {
+                Ok(()) => created.push(public_path),
+                Err(linscp_platform::PlatformError::AlreadyExists(_)) => {
+                    let _ = std::fs::remove_file(&encrypted_path);
+                    created.retain(|created_path| created_path != &encrypted_path);
+                    continue 'attempt;
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(&public_path);
+                    let _ = std::fs::remove_file(&encrypted_path);
+                    created.retain(|created_path| created_path != &encrypted_path);
+                    return Err(error.to_string());
+                }
+            }
+        }
+        return Ok(format!("{LOCAL_VAULT_KEY_PREFIX}{id}"));
+    }
+    Err("Cannot allocate a unique encrypted SSH key file.".to_string())
+}
+
+struct TemporaryVaultKeys(Vec<PathBuf>);
+
+impl Drop for TemporaryVaultKeys {
+    fn drop(&mut self) {
+        for path in &self.0 { let _ = std::fs::remove_file(path); }
+    }
+}
+
+fn materialize_vault_key_paths(
+    spec: &mut linscp_engine::url_and_raw::ParsedSiteSpec,
+    config_root: &Path,
+    vault: &linscp_platform::password_vault::PasswordSecretVault,
+) -> Result<TemporaryVaultKeys, String> {
+    let mut temporary = TemporaryVaultKeys(Vec::new());
+    materialize_one_vault_key(&mut spec.session.keyfile, config_root, vault, &mut temporary.0)?;
+    if let Some(tunnel) = spec.session.tunnel.as_mut() {
+        materialize_one_vault_key(&mut tunnel.keyfile, config_root, vault, &mut temporary.0)?;
+    }
+    Ok(temporary)
+}
+
+fn materialize_one_vault_key(
+    keyfile: &mut Option<String>,
+    config_root: &Path,
+    vault: &linscp_platform::password_vault::PasswordSecretVault,
+    created: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let Some(reference) = keyfile.as_deref() else { return Ok(()); };
+    let Some(id) = reference.strip_prefix(LOCAL_VAULT_KEY_PREFIX) else { return Ok(()); };
+    if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Saved encrypted SSH key reference is invalid.".to_string());
+    }
+    let encrypted_path = config_root.join("keys").join(format!("{id}.key.vault"));
+    let metadata = std::fs::metadata(&encrypted_path)
+        .map_err(|error| format!("Cannot read encrypted SSH key: {error}"))?;
+    if metadata.len() > 1024 * 1024 {
+        return Err("Encrypted SSH key file is unexpectedly large.".to_string());
+    }
+    let encrypted = std::fs::read(&encrypted_path)
+        .map_err(|error| format!("Cannot read encrypted SSH key: {error}"))?;
+    let plaintext = vault.open_local_blob(&encrypted).map_err(|error| error.to_string())?;
+    let temp_dir = config_root.join("tmp").join("unlocked-keys").join(std::process::id().to_string());
+    linscp_platform::create_private_dir(&temp_dir).map_err(|error| error.to_string())?;
+    for _ in 0..8 {
+        let mut random = [0u8; 8];
+        rand::thread_rng().fill_bytes(&mut random);
+        let suffix = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let path = temp_dir.join(format!("{id}-{suffix}.key"));
+        match create_exclusive_private_file(&path, &plaintext) {
+            Ok(()) => created.push(path.clone()),
+            Err(linscp_platform::PlatformError::AlreadyExists(_)) => continue,
+            Err(error) => {
+                let _ = std::fs::remove_file(&path);
+                return Err(error.to_string());
+            }
+        }
+        let source_public = config_root.join("keys").join(format!("{id}.pub"));
+        let public = match read_bounded_key_optional(&source_public, 32 * 1024) {
+            Ok(public) => public,
+            Err(error) => return Err(error),
+        };
+        if !public.is_empty() {
+            let public_path = PathBuf::from(format!("{}.pub", path.display()));
+            match create_exclusive_private_file(&public_path, public.as_bytes()) {
+                Ok(()) => created.push(public_path),
+                Err(linscp_platform::PlatformError::AlreadyExists(_)) => {
+                    let _ = std::fs::remove_file(&path);
+                    created.retain(|created_path| created_path != &path);
+                    continue;
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(&public_path);
+                    let _ = std::fs::remove_file(&path);
+                    created.retain(|created_path| created_path != &path);
+                    return Err(error.to_string());
+                }
+            }
+        }
+        *keyfile = Some(path.to_string_lossy().into_owned());
+        return Ok(());
+    }
+    Err("Cannot create a temporary SSH key file.".to_string())
+}
+
+fn stage_offlineotp_key(
+    config_root: &Path,
+    key: &SshKeyRecord,
+    secret_vault: &linscp_platform::password_vault::PasswordSecretVault,
+    created: &mut Vec<PathBuf>,
+) -> Result<(Option<String>, Option<String>), String> {
+    'attempt: for _ in 0..8 {
+        let mut random = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut random);
+        let stem = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let dir = config_root.join("keys");
+        let mut private_ref = None;
+        let mut private_file_path = None;
+        let mut public_path = None;
+        if !key.private_key.is_empty() {
+            let encrypted = secret_vault.seal_local_blob(key.private_key.as_bytes())
+                .map_err(|error| error.to_string())?;
+            let path = dir.join(format!("{stem}.key.vault"));
+            match create_exclusive_private_file(&path, &encrypted) {
+                Ok(()) => {
+                    created.push(path.clone());
+                    private_file_path = Some(path);
+                    private_ref = Some(format!("{LOCAL_VAULT_KEY_PREFIX}{stem}"));
+                }
+                Err(linscp_platform::PlatformError::AlreadyExists(_)) => continue 'attempt,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error.to_string());
+                }
+            }
+        }
+        if !key.public_key.is_empty() {
+            let path = dir.join(format!("{stem}.pub"));
+            match create_exclusive_private_file(&path, key.public_key.as_bytes()) {
+                Ok(()) => {
+                    created.push(path.clone());
+                    public_path = Some(format!("vaultpub://{stem}"));
+                }
+                Err(linscp_platform::PlatformError::AlreadyExists(_)) => {
+                    if let Some(private) = private_file_path.as_ref() {
+                        let _ = std::fs::remove_file(private);
+                        created.retain(|created_path| created_path != private);
+                    }
+                    continue 'attempt;
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(&path);
+                    if let Some(private) = private_file_path.as_ref() {
+                        let _ = std::fs::remove_file(private);
+                        created.retain(|created_path| created_path != private);
+                    }
+                    return Err(error.to_string());
+                }
+            }
+        }
+        return Ok((private_ref, public_path));
+    }
+    Err("Cannot allocate a unique imported SSH key filename.".to_string())
+}
+
 fn api_error(status: u16, error: impl Into<String>) -> ApiReply {
     ApiReply { status, payload: json!({"success": false, "error": error.into()}) }
 }
@@ -3993,6 +4820,80 @@ fn percent_decode(input: &str) -> String {
 mod tests {
     use super::*;
     use linscp_types::ProtocolScheme;
+
+    fn unlock_for_test(service: &CommanderService) {
+        let reply = service.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/vault/unlock".into(),
+            body: json!({"password": "correct horse battery staple"}),
+        });
+        assert_eq!(reply.status, 200, "{}", reply.payload);
+    }
+
+    #[test]
+    fn offlineotp_vault_round_trip_restores_login_and_ssh_key_without_source_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_key = temp.path().join("original-id_ed25519");
+        let source_public = temp.path().join("original-id_ed25519.pub");
+        std::fs::write(&source_key, "-----BEGIN OPENSSH PRIVATE KEY-----\nexample\n-----END OPENSSH PRIVATE KEY-----\n").unwrap();
+        std::fs::write(&source_public, "ssh-ed25519 AAAATEST user@example\n").unwrap();
+
+        let mut source = SessionStore::new();
+        let mut site = StoredSite::new("primary", ProtocolScheme::Sftp, "sftp.example.test");
+        site.username = "deploy".into();
+        site.password = Some("login-secret".into());
+        site.private_key = Some(source_key.to_string_lossy().into_owned());
+        site.local_directory = temp.path().join("local-source").to_string_lossy().into_owned();
+        source.upsert(site);
+
+        let source_path = source_key.to_string_lossy().into_owned();
+        let local_path = temp.path().join("local-source").to_string_lossy().into_owned();
+        let config_root = temp.path().join("config");
+        std::fs::create_dir_all(&config_root).unwrap();
+        let secret_vault = linscp_platform::password_vault::PasswordSecretVault::new();
+        secret_vault.unlock_or_setup(&config_root, "correct horse battery staple", &NativeSecretVault::new()).unwrap();
+        let entries = offlineotp_entries_from_sessions(&source, &config_root, &secret_vault).unwrap();
+        assert!(entries.iter().any(|entry| match entry {
+            CredentialEntry::Login(login) => {
+                !login.metadata[OFFLINEOTP_SESSION_JSON].contains(source_path.as_str())
+                    && !login.metadata[OFFLINEOTP_SESSION_JSON].contains(local_path.as_str())
+            }
+            _ => false,
+        }));
+        let encrypted = offlineotp_vault::seal(&entries, "correct horse battery staple").unwrap();
+        let opened = offlineotp_vault::open(&encrypted, "correct horse battery staple").unwrap();
+        let (imported, skipped, ignored) = import_offlineotp_entries(
+            &config_root,
+            SessionStore::new(),
+            opened,
+            &secret_vault,
+        ).unwrap();
+        assert_eq!((imported, skipped, ignored), (1, 0, 0));
+
+        let restored = SessionStore::load_from_dir(&config_root, &secret_vault).unwrap();
+        let restored = restored.find("primary").unwrap();
+        assert_eq!(restored.username, "deploy");
+        assert_eq!(restored.password.as_deref(), Some("login-secret"));
+        let restored_key_ref = restored.private_key.as_deref().unwrap();
+        let restored_key_id = restored_key_ref.strip_prefix(LOCAL_VAULT_KEY_PREFIX).unwrap();
+        let restored_key = config_root.join("keys").join(format!("{restored_key_id}.key.vault"));
+        let ciphertext = std::fs::read(&restored_key).unwrap();
+        assert!(!ciphertext.windows(b"OPENSSH PRIVATE KEY".len()).any(|window| window == b"OPENSSH PRIVATE KEY"));
+        let opened_private = secret_vault.open_local_blob(&ciphertext).unwrap();
+        let source_private = std::fs::read(&source_key).unwrap();
+        assert_eq!(opened_private.as_slice(), source_private.as_slice());
+        let mut connect_spec = linscp_engine::url_and_raw::ParsedSiteSpec::default();
+        connect_spec.session.keyfile = Some(restored_key_ref.to_string());
+        let temporary = materialize_vault_key_paths(&mut connect_spec, &config_root, &secret_vault).unwrap();
+        let temporary_path = PathBuf::from(connect_spec.session.keyfile.as_deref().unwrap());
+        assert_eq!(std::fs::read(&temporary_path).unwrap(), source_private);
+        drop(temporary);
+        assert!(!temporary_path.exists());
+        let sessions_ini = std::fs::read_to_string(config_root.join("sessions.ini")).unwrap();
+        assert!(!sessions_ini.contains("login-secret"));
+        assert!(!sessions_ini.contains(source_key.to_string_lossy().as_ref()));
+    }
+
     #[test]
     fn unsupported_operations_never_report_success_or_write_files() {
         let svc = CommanderService::default();
@@ -5247,6 +6148,7 @@ mod tests {
     async fn exercise_saved_remote_workspace(root: &Path, port: u16) {
         let config = root.join("workspace-config");
         let svc = CommanderService::new(config.clone(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
         let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
         let save = svc.dispatch_async(request("/api/sessions/save", json!({"name": "Saved FTP", "session": {"protocol": "ftp", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": root, "initial_dir": "/"}}))).await;
         assert_eq!(save.status, 200, "{}", save.payload);
@@ -7168,10 +8070,36 @@ mod tests {
     }
 
     #[test]
+    fn local_vault_requires_setup_then_unlock_and_can_be_locked() {
+        let root = std::env::temp_dir().join(format!("linscp-service-vault-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let service = CommanderService::new(root.clone(), Arc::new(NativeLocalFs::new()));
+        let status = |service: &CommanderService| service.dispatch(ApiEnvelope {
+            method: "GET".into(), path: "/api/vault/status".into(), body: json!({}),
+        });
+        assert_eq!(status(&service).payload["vault"], "setup_required");
+        let short = service.dispatch(ApiEnvelope {
+            method: "POST".into(), path: "/api/vault/unlock".into(), body: json!({"password": "short"}),
+        });
+        assert_eq!(short.status, 400);
+        unlock_for_test(&service);
+        assert_eq!(status(&service).payload["vault"], "unlocked");
+        let wrapped_key = std::fs::read(root.join("sessions.key")).unwrap();
+        assert!(wrapped_key.starts_with(b"LSCPVLT1"));
+        let locked = service.dispatch(ApiEnvelope {
+            method: "POST".into(), path: "/api/vault/lock".into(), body: json!({}),
+        });
+        assert_eq!(locked.status, 200);
+        assert_eq!(status(&service).payload["vault"], "locked");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn service_dispatches_status_roots_sessions_and_importers() {
         let tmp = std::env::temp_dir().join(format!("linscp-svc-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let svc = CommanderService::new(tmp.clone(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
         let roots_reply = svc.dispatch(ApiEnvelope { method: "GET".to_string(), path: "/api/local/roots".to_string(), body: json!({}) });
         assert_eq!(roots_reply.status, 200);
         assert!(!roots_reply.payload["roots"].as_array().unwrap().is_empty());

@@ -36,6 +36,7 @@ const REMOTE_ENTRIES = [
 ];
 
 const responses = {
+  '/api/vault/status': { success: true, vault: 'unlocked' },
   '/api/status': {
     tabs: [{
       id: 1, name: 'local test', connected: true,

@@ -255,7 +255,9 @@ test('Built ui/dist/index.html mounts the local root switcher in the browser app
         const target = String(url);
         requested.push(target);
         let payload = { success: true };
-        if (target.includes('/api/status')) {
+        if (target.includes('/api/vault/status')) {
+          payload = { success: true, vault: 'unlocked' };
+        } else if (target.includes('/api/status')) {
           payload = { connected: false, active_tab: null, tabs: [], local_dir: '/home/alice' };
         } else if (target.includes('/api/local/roots')) {
           payload = {
@@ -293,38 +295,49 @@ test('Built ui/dist/index.html mounts the local root switcher in the browser app
   dom.window.close();
 });
 
-test('every host exposes the same feature surface and explains each real difference', () => {
-  const desktop = hostCapabilities({ transport: 'tauri', platform: 'linux' });
+test('all native targets expose the shared feature contract and report only installed host integrations', () => {
+  const debian = hostCapabilities({ transport: 'tauri', platform: 'linux' });
+  const windows = hostCapabilities({ transport: 'tauri', platform: 'windows' });
   const android = hostCapabilities({ transport: 'tauri', platform: 'android' });
   const browser = hostCapabilities({ transport: 'http', platform: 'browser' });
 
-  // The same fourteen features in all three apps: that is the parity promise.
+  // The shared service/frontend contract is identical across Debian, Windows,
+  // and Android. Host integrations are checked separately and never inferred
+  // from an OS name if no implementation was registered.
   assert.deepEqual(sharedFeatureSet(), [...SHARED_FEATURES]);
   assert.equal(sharedFeatureSet().length, 14);
 
-  for (const caps of [desktop, android, browser]) {
+  for (const caps of [debian, windows, android, browser]) {
     for (const feature of ['localRoots', 'fileDrop', 'terminal']) {
-      assert.equal(caps[feature], true, `${feature} must exist on every host`);
+      assert.equal(caps[feature], true, `${feature} must exist on ${caps.platform}`);
     }
   }
 
-  // Android replaces the desktop's remote-desktop viewers with the SAF,
-  // share-sheet and foreground-service bridges; the browser keeps a subset
-  // because it cannot reach the user's machine at all.
-  assert.equal(android.safTrees, true);
+  assert.equal(debian.desktopLaunchers, true);
+  assert.equal(windows.desktopLaunchers, true);
   assert.equal(android.desktopLaunchers, false);
-  assert.equal(desktop.safTrees, false);
-  assert.equal(desktop.desktopLaunchers, true);
-  assert.equal(browser.nativeIpc, false);
+  assert.equal(browser.desktopLaunchers, false);
+  assert.equal(debian.nativeFileDrop, true);
+  assert.equal(windows.nativeFileDrop, true);
+  assert.equal(android.nativeFileDrop, false);
   assert.equal(browser.nativeFileDrop, false);
+  assert.equal(browser.nativeIpc, false);
 
-  // A missing control always has a stated reason; a silent, unexplained gap is
-  // the bug this list exists to catch.
-  assert.match(hostDifferenceReason('safTrees', desktop) ?? '', /Android/);
-  assert.match(hostDifferenceReason('desktopLaunchers', android) ?? '', /desktop/);
-  assert.match(hostDifferenceReason('accounts', desktop) ?? '', /sign-in/);
-  // Nothing is claimed missing for a capability the host actually has.
-  assert.equal(hostDifferenceReason('safTrees', android), null);
+  // Android bridge traits are not yet registered by the generated project.
+  // Never advertise them merely because the WebView runs on Android.
+  for (const bridge of ['safTrees', 'shareIntents', 'foregroundTransfers']) {
+    assert.equal(android[bridge], false, `${bridge} needs a real Android host implementation`);
+  }
+  assert.equal(android.backgroundTransfers, false);
+  assert.equal(hostCapabilities({ transport: 'tauri', platform: 'android', safTrees: true }).safTrees, true,
+    'an embedder can opt in after registering the implementation');
+
+  // A missing control always has a stated reason; silent capability gaps are
+  // the parity bug this inventory exists to catch.
+  assert.match(hostDifferenceReason('safTrees', android) ?? '', /not available/);
+  assert.match(hostDifferenceReason('shareIntents', android) ?? '', /not integrated/);
+  assert.match(hostDifferenceReason('desktopLaunchers', android) ?? '', /native desktop/);
+  assert.match(hostDifferenceReason('accounts', debian) ?? '', /sign-in/);
   assert.equal(hostDifferenceReason('terminal', android), null);
 
   // The description is derived from the window the page runs in, so the page
@@ -341,11 +354,11 @@ test('every host exposes the same feature surface and explains each real differe
   const detected = hostCapabilities({ host: fakeAndroid });
   assert.equal(detected.transport, 'tauri');
   assert.equal(detected.platform, 'android');
-  // Every Android-only bridge follows from the one detection, so a page that
-  // gates on a capability cannot offer a bridge this host does not have.
-  assert.equal(detected.safTrees, true);
-  assert.equal(detected.shareIntents, true);
-  assert.equal(detected.foregroundTransfers, true);
+  // OS detection alone must not claim generated Kotlin integrations that have
+  // not been implemented and registered by this repository.
+  assert.equal(detected.safTrees, false);
+  assert.equal(detected.shareIntents, false);
+  assert.equal(detected.foregroundTransfers, false);
   assert.equal(hostCapabilities({ host: fakeBrowser }).shareIntents, false);
   assert.equal(hostCapabilities({ host: fakeBrowser }).foregroundTransfers, false);
 });
@@ -464,6 +477,9 @@ test('Built ui/dist/index.html boots inside Tauri IPC mode with zero HTTP calls'
           }
           if (p === '/api/test-conflict') {
             return { status: 409, payload: { success: true, conflicts: ['file.txt'] } };
+          }
+          if (p === '/api/vault/status') {
+            return { status: 200, payload: { success: true, vault: 'unlocked' } };
           }
           if (p === '/api/status') {
             return {

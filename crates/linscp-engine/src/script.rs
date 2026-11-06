@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use linscp_i18n::{CatalogDomain, translate, translate_with};
+use linscp_platform::SecretVault;
 use linscp_platform::terminal::{
     RawTerminalGuard, expand_tilde, launch_desktop_ssh_terminal, read_stdin_chunk,
     stat_local_path, stdin_is_terminal, take_window_resized, terminal_size,
@@ -404,6 +407,7 @@ pub type ScriptConsoleSink = Arc<dyn Fn(&str, bool) + Send + Sync>;
 pub struct ScriptInterpreter {
     cfg: ScriptRunConfig,
     logger: SessionLogger,
+    secret_vault: Option<Arc<dyn SecretVault>>,
     console: Option<ScriptConsoleSink>,
     /// The slot this interpreter adopted from a tab the user already opened,
     /// so `ls` on the active tab lists that tab's directory, not the
@@ -435,6 +439,7 @@ impl ScriptInterpreter {
         Self {
             cfg,
             logger,
+            secret_vault: None,
             console: None,
             adopted_slot: None,
             local_cwd,
@@ -454,6 +459,13 @@ impl ScriptInterpreter {
             errors: 0,
             should_exit: false,
         }
+    }
+
+    /// Uses the Commander process's already-unlocked vault for saved-session
+    /// commands instead of attempting to read the password-wrapped key with
+    /// the standalone OS vault implementation.
+    pub fn set_secret_vault(&mut self, vault: Arc<dyn SecretVault>) {
+        self.secret_vault = Some(vault);
     }
 
     pub fn set_console(&mut self, sink: ScriptConsoleSink) {
@@ -2069,8 +2081,10 @@ impl ScriptInterpreter {
     }
 
     async fn cmd_sessions(&mut self, args: &[String]) -> Result<(), String> {
-        let vault = DefaultOsVault;
-        let mut store = SessionStore::load_from_dir(&self.cfg.config_dir, &vault)?;
+        let vault_override = self.secret_vault.clone();
+        let default_vault = DefaultOsVault;
+        let vault: &dyn SecretVault = vault_override.as_deref().unwrap_or(&default_vault);
+        let mut store = SessionStore::load_from_dir(&self.cfg.config_dir, vault)?;
         if args.is_empty() || (args.len() == 1 && args[0].eq_ignore_ascii_case("list")) {
             if store.sites().is_empty() {
                 self.out(&format!("{}",
@@ -2137,7 +2151,7 @@ impl ScriptInterpreter {
             for s in imported.sites() {
                 store.upsert(s.clone());
             }
-            store.save_to_dir(&self.cfg.config_dir, &vault)?;
+            store.save_to_dir(&self.cfg.config_dir, vault)?;
             self.out(&format!("Imported {count} session(s) from '{}'.", src.display()));
             return Ok(());
         }
@@ -2209,16 +2223,31 @@ impl ScriptInterpreter {
         }
         let sub = args[0].to_ascii_lowercase();
         let path = std::path::PathBuf::from(expand_tilde(&args[1]));
-        let vault = linscp_platform::NativeSecretVault::new();
+        let vault_override = self.secret_vault.clone();
+        let default_vault = linscp_platform::NativeSecretVault::new();
+        let vault: &dyn SecretVault = vault_override.as_deref().unwrap_or(&default_vault);
         match sub.as_str() {
             "export" => {
-                export_backup_to_file(&self.cfg.config_dir, &path, &vault)
+                export_backup_to_file(&self.cfg.config_dir, &path, vault)
                     .map_err(|e| self.trp("Cannot export backup to '{file}': {error}", &[("file", &args[1]), ("error", &e)]))?;
                 self.out(&format!("{}", self.trp("Full backup exported to '{file}'.", &[("file", &args[1])])));
                 Ok(())
             }
             "import" => {
-                import_backup_from_file(&self.cfg.config_dir, &path, &vault)
+                if vault_override.is_some() {
+                    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+                    let bundle = crate::backup::deserialize_backup(&bytes)?;
+                    if let Some(encoded_key) = bundle.sessions_key_b64.as_deref() {
+                        let backup_key = zeroize::Zeroizing::new(BASE64.decode(encoded_key.as_bytes()).map_err(|e| e.to_string())?);
+                        let active_key = vault.load_master_key(&self.cfg.config_dir)
+                            .map_err(|e| e.to_string())?
+                            .ok_or_else(|| "The local vault is locked.".to_string())?;
+                        if backup_key.as_slice() != &active_key[..] {
+                            return Err(self.tr("This backup uses a different sessions.key. Restoring it here would replace the active password-wrapped key. Restore it into a separate LinSCP config directory instead.").to_string());
+                        }
+                    }
+                }
+                import_backup_from_file(&self.cfg.config_dir, &path, vault)
                     .map_err(|e| self.trp("Cannot import backup from '{file}': {error}", &[("file", &args[1]), ("error", &e)]))?;
                 self.out(&format!("{}", self.trp("Full backup imported from '{file}'.", &[("file", &args[1])])));
                 Ok(())
@@ -2245,8 +2274,10 @@ impl ScriptInterpreter {
             return Err(self.wrong_args("savesession", &h));
         }
 
-        let vault = DefaultOsVault;
-        let mut store = SessionStore::load_from_dir(&self.cfg.config_dir, &vault)?;
+        let vault_override = self.secret_vault.clone();
+        let default_vault = DefaultOsVault;
+        let vault: &dyn SecretVault = vault_override.as_deref().unwrap_or(&default_vault);
+        let mut store = SessionStore::load_from_dir(&self.cfg.config_dir, vault)?;
 
         let connected = !self.slots.is_empty();
         let mut rest_idx = 1usize;
@@ -2447,7 +2478,7 @@ impl ScriptInterpreter {
         let site_user = site.username.clone();
         let site_host = site.host.clone();
         store.upsert(site);
-        store.save_to_dir(&self.cfg.config_dir, &vault)?;
+        store.save_to_dir(&self.cfg.config_dir, vault)?;
         let sessions_path = self.cfg.config_dir.join("sessions.ini");
         let sessions_loc = format!(" in {}", sessions_path.display());
         self.emit_status(&self.trp(
@@ -2472,8 +2503,10 @@ impl ScriptInterpreter {
     }
 
     fn cmd_rmsession(&mut self, args: &[String]) -> Result<(), String> {
-        let vault = DefaultOsVault;
-        let mut store = SessionStore::load_from_dir(&self.cfg.config_dir, &vault)?;
+        let vault_override = self.secret_vault.clone();
+        let default_vault = DefaultOsVault;
+        let vault: &dyn SecretVault = vault_override.as_deref().unwrap_or(&default_vault);
+        let mut store = SessionStore::load_from_dir(&self.cfg.config_dir, vault)?;
         if args.len() == 2 && args[0].eq_ignore_ascii_case("-folder") {
             let folder_clean = args[1].trim_end_matches('/');
             let removed = store.remove_folder(folder_clean);
@@ -2483,7 +2516,7 @@ impl ScriptInterpreter {
                     &[("folder", &args[1])],
                 ));
             }
-            store.save_to_dir(&self.cfg.config_dir, &vault)?;
+            store.save_to_dir(&self.cfg.config_dir, vault)?;
             let count_s = removed.to_string();
             self.emit_status(&self.trp(
                 "Removed {count} stored session(s) in folder '{folder}'.",
@@ -2506,7 +2539,7 @@ impl ScriptInterpreter {
                     &[("folder", &args[0])],
                 ));
             }
-            store.save_to_dir(&self.cfg.config_dir, &vault)?;
+            store.save_to_dir(&self.cfg.config_dir, vault)?;
             let count_s = removed.to_string();
             self.emit_status(&self.trp(
                 "Removed {count} stored session(s) in folder '{folder}'.",
@@ -2515,7 +2548,7 @@ impl ScriptInterpreter {
             return Ok(());
         }
         if store.remove(&args[0]) {
-            store.save_to_dir(&self.cfg.config_dir, &vault)?;
+            store.save_to_dir(&self.cfg.config_dir, vault)?;
             self.emit_status(&self.trp(
                 "Removed the stored session '{name}'.",
                 &[("name", &args[0])],
@@ -2623,8 +2656,10 @@ impl ScriptInterpreter {
         } else {
             let mut probe = ParsedSiteSpec::default();
             apply_open_switches(&mut probe, &switch_tokens, false, &self.cfg.locale)?;
-            let vault = DefaultOsVault;
-            let store = SessionStore::load_from_dir(&self.cfg.config_dir, &vault)?;
+            let vault_override = self.secret_vault.clone();
+            let default_vault = DefaultOsVault;
+            let vault: &dyn SecretVault = vault_override.as_deref().unwrap_or(&default_vault);
+            let store = SessionStore::load_from_dir(&self.cfg.config_dir, vault)?;
             let Some(site) = store.find(target) else {
                 return Err(format!(
                     "'{target}' is neither a session URL (scheme://host) nor a stored session."

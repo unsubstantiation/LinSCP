@@ -236,14 +236,18 @@ pub fn import_backup(
             )
             .map_err(|e| format!("Backup sessions.ini invalid with bundled key: {e}"))?;
         }
-        let encoded = format!("{b64}\n");
-        linscp_platform::write_private_file_atomic(
-            &config_dir.join("sessions.key"),
-            encoded.as_bytes(),
-        )
-        .map_err(|e| e.to_string())?;
-        // Touch the vault so a DPAPI/Keystore caller can verify the key is loadable
-        let _ = vault.load_master_key(config_dir);
+        let already_active = vault.load_master_key(config_dir).map_err(|e| e.to_string())?
+            .is_some_and(|current| &current[..] == raw.as_slice());
+        if !already_active {
+            let encoded = format!("{b64}\n");
+            linscp_platform::write_private_file_atomic(
+                &config_dir.join("sessions.key"),
+                encoded.as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+            // Touch the vault so a DPAPI/Keystore caller can verify the key is loadable
+            let _ = vault.load_master_key(config_dir);
+        }
     } else if bundle.sessions_ini.contains("lscp1$") {
         // Backup contains encrypted passwords but no key — import would
         // make them unreadable. Fail closed with guidance.
@@ -372,6 +376,7 @@ fn detect_distribution_id() -> String {
 mod tests {
     use super::*;
     use linscp_crypto::SessionMasterKey;
+    use linscp_platform::password_vault::PasswordSecretVault;
     use linscp_platform::NativeSecretVault;
     use linscp_types::ProtocolScheme;
 
@@ -474,6 +479,26 @@ mod tests {
             assert!(!acct.contains("\r\n"));
             let _ = std::fs::remove_dir_all(&base);
         }
+    }
+
+    #[test]
+    fn application_backup_restore_keeps_the_password_wrapped_master_key_when_it_matches() {
+        let base = std::env::temp_dir().join(format!(
+            "linscp-backup-vault-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let vault = PasswordSecretVault::new();
+        vault.unlock_or_setup(&base, "correct horse battery staple", &NativeSecretVault::new()).unwrap();
+        let wrapped_before = std::fs::read(base.join("sessions.key")).unwrap();
+        let bundle = export_backup(&base, &vault).unwrap();
+        import_backup(&base, &bundle, &vault).unwrap();
+        let wrapped_after = std::fs::read(base.join("sessions.key")).unwrap();
+        assert_eq!(wrapped_after, wrapped_before);
+        assert!(wrapped_after.starts_with(b"LSCPVLT1"));
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

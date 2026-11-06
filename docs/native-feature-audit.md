@@ -65,6 +65,22 @@ transfer limitations in `readme.md` before using remote operations.
   interactively resolved as part of a batch; the failed tab must be connected
   separately.
 
+## Windows, Debian, and Android parity status
+
+Windows and Debian run the same Rust `CommanderService` and frontend bundle;
+Android also builds that service and bundle. This gives the core API a shared
+implementation, not complete product parity: the `SHARED_FEATURES` list is a
+contract for intended common UI surface, not evidence that every listed action
+is wired end to end. The incomplete paths above apply to all native hosts unless
+called out otherwise. Android additionally lacks registered SAF, share-intent,
+foreground-service, and Keystore implementations; its UI now reports those
+capabilities unavailable rather than advertising nonfunctional controls.
+
+Parity should only be called complete after each shared feature has equivalent
+behavioral acceptance coverage on Windows, Debian, and Android, and each
+platform-specific integration has real-device evidence. The current CI and
+source-level checks do not meet that bar.
+
 ## Verification
 
 `npm test --prefix ui` tests the built frontend and legacy client. The Debian
@@ -72,5 +88,8 @@ workflow exercises live SFTP, WebDAV, FTP/FTPS and S3 fixtures, workspace
 round-tripping, folder creation, and reconnect/cancellation regressions, then
 builds and smoke-tests the package. The Windows workflow runs Rust workspace
 unit tests, frontend tests, and a portable native-window smoke test. Android CI
-runs Rust compatibility checks only. These tests do not establish correctness
-against every server, concurrent actor, network failure, or platform.
+builds/verifies the debug APK and runs a WebView/Rust IPC plus WebDAV transfer
+smoke test in an emulator. None of these runs exercises the absent Android SAF,
+share-intent, foreground-service, or Keystore implementations, and they do not
+establish correctness against every server, concurrent actor, network failure,
+or platform.
