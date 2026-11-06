@@ -3,12 +3,20 @@ name: Android build
 on:
   push:
     branches: [master]
+  # Run by hand from the Actions tab (or `gh workflow run`) to build a branch or
+  # re-run a build without waiting for a push to master. This is how the release
+  # keystore and signing configuration are tried before they land on master.
+  workflow_dispatch:
 
 jobs:
   build:
-    name: Android debug APK
+    name: Signed Android release APK
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 60
+    # The release keystore and its password are secrets of this environment, so
+    # only a job that names it can read them. The identity that signs the APK
+    # users install should not be reachable from an arbitrary run.
+    environment: android-release
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -26,9 +34,10 @@ jobs:
         run: |
           npm ci --prefix ui --no-audit --no-fund
           python3 tools/run_cargo_ci.py npm --prefix ui test
-      - name: Check the Android application ID
+      - name: Check the Android application ID and signing configuration
         run: |
           python3 -m unittest discover -s tools/tests -p test_android_application_id.py
+          python3 -m unittest discover -s tools/tests -p test_android_release_signing.py
           echo "applicationId: $(python3 tools/android_application_id.py)"
       - name: Prepare Android SDK
         run: python3 tools/run_cargo_ci.py bash tools/prepare_android_sdk.sh
@@ -37,26 +46,49 @@ jobs:
         run: |
           python3 ../../tools/run_cargo_ci.py npm run tauri -- android init --ci --skip-targets-install
           python3 ../../tools/prepare_android_project.py
-      - name: Build real Rust-backed APK
+      - name: Configure release signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        # Decodes the keystore into the generated (ignored) project and patches
+        # the signing configuration into Gradle; it refuses to continue when
+        # either secret is empty, so a run cannot quietly publish an unsigned
+        # or debug-signed APK.
+        run: python3 tools/run_cargo_ci.py python3 tools/android_release_signing.py
+      - name: Build signed release APK
         working-directory: crates/linscp-tauri
-        run: python3 ../../tools/run_cargo_ci.py npm run tauri -- android build --ci --debug --apk true --aab false --target aarch64 x86_64 --features native-shell
-      - name: Verify APK contents and signature
-        run: python3 tools/run_cargo_ci.py python3 tools/verify_android_apk.py
+        # No --debug: this is the build type users install and update.
+        run: python3 ../../tools/run_cargo_ci.py npm run tauri -- android build --ci --apk true --aab false --target aarch64 x86_64 --features native-shell
+      - name: Verify release APK contents, package and signature
+        run: python3 tools/run_cargo_ci.py python3 tools/verify_android_apk.py --build-type release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linscp-android-release
+          path: android-artifacts/linscp-android-release.apk
+          if-no-files-found: error
+      - name: Build debug APK for the WebView smoke test
+        working-directory: crates/linscp-tauri
+        # The smoke test drives the page through the WebView DevTools endpoint,
+        # which a release build does not expose. Only the emulator's ABI is
+        # built: the release APK above is the artifact, not this one.
+        run: python3 ../../tools/run_cargo_ci.py npm run tauri -- android build --ci --debug --apk true --aab false --target x86_64 --features native-shell
+      - name: Verify debug APK contents and package
+        run: python3 tools/run_cargo_ci.py python3 tools/verify_android_apk.py --build-type debug --abi x86_64
       - name: Enable emulator acceleration
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - name: Exercise APK WebView, Rust IPC and WebDAV transfers on an emulator
+      - name: Exercise the WebView, Rust IPC and WebDAV transfers, then the signed APK
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: python3 tools/run_cargo_ci.py bash tools/android_emulator_smoke.sh
-      - uses: actions/upload-artifact@v7
-        with:
-          name: linscp-android-debug
-          path: android-artifacts/linscp-android-debug.apk
-          if-no-files-found: error
+          # The debug build proves the Rust service and storage on the device;
+          # the release build that ships then has to install, start and stay
+          # running as a non-debuggable package.
+          script: |
+            python3 tools/run_cargo_ci.py bash tools/android_emulator_smoke.sh
+            python3 tools/run_cargo_ci.py bash tools/android_release_launch_check.sh
