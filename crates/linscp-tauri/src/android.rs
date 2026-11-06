@@ -1,5 +1,15 @@
-//! Android bridge contracts. Platform integration is not registered yet;
-//! unsupported Android operations must fail rather than fabricate results.
+//! Android bridge contracts.
+//!
+//! The Kotlin side of the generated Tauri project implements these traits and
+//! registers them before the WebView loads (`register_bridges`). Until a bridge
+//! is registered, every operation it would serve fails instead of fabricating a
+//! result, which is what the desktop builds rely on: there is no SAF tree, no
+//! share sheet and no foreground service there, and the same page code has to
+//! keep working.
+//!
+//! `storage` exposes the registered SAF bridge to the Rust filesystem, so a
+//! `content://` root is a first-class local root on the Android app just as a
+//! drive letter is on Windows.
 
 #[cfg(target_os = "android")]
 mod imp {
@@ -36,6 +46,19 @@ mod imp {
         }
         pub fn set_keystore(&self, bridge: Arc<dyn KeystoreBridge>) {
             *self.keystore.lock().unwrap() = Some(bridge);
+        }
+        /// The registered SAF bridge, for the local filesystem to use.
+        pub fn saf_bridge(&self) -> Option<Arc<dyn SafBridge>> {
+            self.saf.lock().unwrap().clone()
+        }
+        /// Opens the folder picker; `Ok(None)` when the user cancelled or the
+        /// shell has no bridge.
+        pub fn pick_saf_tree(&self) -> Result<Option<String>, PlatformError> {
+            let guard = self.saf.lock().unwrap();
+            match guard.as_deref() {
+                Some(bridge) => bridge.request_tree(),
+                None => Ok(None),
+            }
         }
         pub fn granted_trees(&self) -> Result<Vec<LocalRootEntry>, PlatformError> {
             let guard = self.saf.lock().unwrap();
@@ -127,6 +150,21 @@ mod imp {
         pub fn new() -> Self {
             Self
         }
+        /// Desktops have no Storage Access Framework; there is no bridge.
+        pub fn saf_bridge(&self) -> Option<std::sync::Arc<dyn linscp_platform::android::SafBridge>> {
+            None
+        }
+        /// Nothing to pick on a desktop, and that is not an error.
+        pub fn pick_saf_tree(&self) -> Result<Option<String>, PlatformError> {
+            Ok(None)
+        }
+        /// Desktop tests register a SAF bridge directly so the same
+        /// `content://` paths the Android app uses can be exercised here.
+        pub fn set_saf(&self, _bridge: std::sync::Arc<dyn linscp_platform::android::SafBridge>) {
+            // The desktop AndroidState is a unit struct: there is no slot to
+            // keep a bridge, and pretending otherwise would make a desktop
+            // build list folders it cannot open.
+        }
         pub fn granted_trees(&self) -> Result<Vec<LocalRootEntry>, PlatformError> {
             Ok(Vec::new())
         }
@@ -180,6 +218,19 @@ mod imp {
 }
 
 pub use imp::AndroidState;
+
+/// Local filesystem for the running app: the native one, plus the SAF bridge
+/// once the Android shell has registered it.
+///
+/// The desktop builds have no bridge, so this is the ordinary native
+/// filesystem; the Android build gets `content://` roots as soon as the picker
+/// hands one over.
+pub fn local_filesystem(state: &AndroidState) -> linscp_platform::NativeLocalFs {
+    match state.saf_bridge() {
+        Some(bridge) => linscp_platform::NativeLocalFs::with_saf(bridge),
+        None => linscp_platform::NativeLocalFs::new(),
+    }
+}
 
 /// Validates that a SAF tree URI looks like `content://...`
 pub fn validate_saf_tree_uri(uri: &str) -> Result<(), String> {
@@ -277,6 +328,9 @@ mod tests {
 
         struct MockSaf;
         impl SafBridge for MockSaf {
+            fn request_tree(&self) -> Result<Option<String>, PlatformError> {
+                Ok(Some("content://com.android.externalstorage.documents/tree/primary%3ADocuments".to_string()))
+            }
             fn granted_trees(&self) -> Result<Vec<LocalRootEntry>, PlatformError> {
                 Ok(vec![])
             }

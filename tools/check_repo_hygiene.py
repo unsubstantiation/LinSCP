@@ -63,6 +63,34 @@ def strip_code_comments(text):
     return LINE_COMMENT.sub('', text)
 
 
+def _test_module_line_ranges(text):
+    """Line ranges of a crate's own `#[cfg(test)] mod ...` blocks.
+
+    A crate's unit tests may build OS-specific fixtures (`#[cfg(unix)] mkfifo`)
+    to prove a fail-closed path; that is a test of the platform, not production
+    OS code leaking out of `linscp-platform`. The ranges are computed on the
+    comment-stripped text so line numbers stay comparable with the findings.
+    """
+    stripped = strip_code_comments(text)
+    ranges = []
+    for match in re.finditer(r'#\s*\[\s*cfg\(\s*test\s*\)\s*\]', stripped):
+        start = stripped.count('\n', 0, match.start()) + 1
+        mod = re.compile(r'\bmod\s+\w+\s*\{').search(stripped, match.end())
+        if not mod:
+            continue
+        depth = 0
+        for _, char in enumerate(stripped[mod.end() - 1:], start=mod.end() - 1):
+            if char == '{':
+                depth += 1
+            elif char == '}':
+                depth -= 1
+                if depth == 0:
+                    end = stripped.count('\n', 0, _) + 1
+                    ranges.append((start, end))
+                    break
+    return ranges
+
+
 def check_crate_boundaries(root=ROOT):
     """Ensure OS-specific gates and crates live only in platform/host crates."""
     findings = []
@@ -98,6 +126,7 @@ def check_crate_boundaries(root=ROOT):
             if any(part in legacy_check.SKIP_DIRECTORIES for part in rs_path.parts):
                 continue
             cleaned = strip_code_comments(rs_path.read_text(encoding='utf-8'))
+            test_ranges = _test_module_line_ranges(cleaned)
             for rule_name, regex, desc in (
                 ('crate-os-cfg', RUST_OS_CFG,
                  f'OS-specific #[cfg] in {crate_name}; isolate OS branches in linscp-platform'),
@@ -106,6 +135,8 @@ def check_crate_boundaries(root=ROOT):
             ):
                 for match in regex.finditer(cleaned):
                     line = cleaned.count('\n', 0, match.start()) + 1
+                    if any(start <= line <= end for start, end in test_ranges):
+                        continue
                     findings.append((
                         rs_path,
                         line,

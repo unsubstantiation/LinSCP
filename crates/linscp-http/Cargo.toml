@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 axum.workspace = true
+base64.workspace = true
 linscp-crypto.workspace = true
 linscp-service.workspace = true
 linscp-types.workspace = true

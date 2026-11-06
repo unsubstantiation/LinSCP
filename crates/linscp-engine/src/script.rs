@@ -4,7 +4,7 @@
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use linscp_i18n::{CatalogDomain, translate, translate_with};
@@ -342,7 +342,10 @@ impl BatchMode {
 
 struct ConnectedSlot {
     spec: ParsedSiteSpec,
-    session: Box<dyn RemoteSession>,
+    /// Shared so a slot can hold the very session a tab is already using: the
+    /// GUI's console panel runs a command on the connection the user picked,
+    /// instead of opening a second one to the same server.
+    session: Arc<dyn RemoteSession>,
     remote_cwd: String,
 }
 
@@ -393,9 +396,19 @@ impl Default for ScriptRunConfig {
     }
 }
 
+/// Where an embedded interpreter's messages go. The console client prints to
+/// the process's own streams; the GUI shows what a command wrote in its output
+/// panel, so it installs a sink instead of reading the terminal's stdout.
+pub type ScriptConsoleSink = Arc<dyn Fn(&str, bool) + Send + Sync>;
+
 pub struct ScriptInterpreter {
     cfg: ScriptRunConfig,
     logger: SessionLogger,
+    console: Option<ScriptConsoleSink>,
+    /// The slot this interpreter adopted from a tab the user already opened,
+    /// so `ls` on the active tab lists that tab's directory, not the
+    /// interpreter's own (empty) working directory.
+    adopted_slot: Option<usize>,
     local_cwd: PathBuf,
     slots: Vec<ConnectedSlot>,
     active_slot: usize,
@@ -422,6 +435,8 @@ impl ScriptInterpreter {
         Self {
             cfg,
             logger,
+            console: None,
+            adopted_slot: None,
             local_cwd,
             slots: Vec::new(),
             active_slot: 0,
@@ -439,6 +454,72 @@ impl ScriptInterpreter {
             errors: 0,
             should_exit: false,
         }
+    }
+
+    pub fn set_console(&mut self, sink: ScriptConsoleSink) {
+        self.console = Some(sink);
+    }
+
+    /// Keeps the output the sink is given, so a caller can read what a command
+    /// printed instead of only streaming it. The GUI's command panel needs
+    /// both: the stream while it runs, the collected text to answer with.
+    /// Runs a line and hands back what it printed on each channel.
+    ///
+    /// A GUI command panel cannot read a terminal and cannot answer a prompt,
+    /// so the line runs with a collector attached and the caller gets the text
+    /// as well as the output. Returns whether the line succeeded.
+    pub async fn run_captured(&mut self, raw_line: &str) -> (bool, String, String) {
+        let output = self.capture_console();
+        let ok = Box::pin(self.execute_line(raw_line)).await;
+        let (stdout, stderr) = Self::collected_console(&output);
+        (ok, stdout, stderr)
+    }
+
+    pub fn capture_console(&mut self) -> Arc<Mutex<Vec<(String, bool)>>> {
+        let seen: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        self.set_console(Arc::new(move |text: &str, is_error: bool| {
+            sink_seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((text.to_string(), is_error));
+        }));
+        seen
+    }
+
+    /// The lines the console has been given so far, joined into one string
+    /// per channel: what a command printed and what it reported as errors.
+    pub fn collected_console(output: &Arc<Mutex<Vec<(String, bool)>>>) -> (String, String) {
+        let seen = output.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        for (text, is_error) in seen.iter() {
+            if *is_error { stderr.push_str(text); } else { stdout.push_str(text); }
+        }
+        (stdout, stderr)
+    }
+
+    /// Adds the active tab's live session and working directories as the
+    /// interpreter's first slot, so a GUI command acts on the connection the
+    /// user is looking at.
+    pub fn adopt_session(&mut self, spec: ParsedSiteSpec, session: Arc<dyn RemoteSession>, remote_cwd: String, local_cwd: PathBuf) {
+        self.local_cwd = local_cwd;
+        self.slots = vec![ConnectedSlot { spec, session, remote_cwd }];
+        self.active_slot = 0;
+        self.adopted_slot = Some(0);
+    }
+
+    /// Sets the local working directory without opening a session, so `lpwd`
+    /// and `lcd` start in the panel the user is looking at.
+    pub fn set_local_dir(&mut self, local_cwd: PathBuf) {
+        self.local_cwd = local_cwd;
+    }
+
+    /// The working directories after a command ran, so the panes follow `cd`
+    /// and `lcd` exactly as they do in the console client.
+    pub fn working_directories(&self) -> Option<(PathBuf, String)> {
+        let slot = self.slots.get(self.active_slot)?;
+        Some((self.local_cwd.clone(), slot.remote_cwd.clone()))
     }
 
     pub fn error_count(&self) -> usize {
@@ -480,13 +561,25 @@ impl ScriptInterpreter {
     }
 
     pub async fn shutdown(&mut self) {
-        for slot in self.slots.drain(..) {
+        // An adopted session belongs to the caller (a GUI tab), which keeps
+        // using it after this interpreter is done; it must not be closed here.
+        let adopted = self.adopted_slot;
+        for (index, slot) in self.slots.drain(..).enumerate() {
+            if Some(index) == adopted {
+                continue;
+            }
             let _ = slot.session.close().await;
         }
         self.logger.finish();
     }
 
     fn emit_error(&mut self, msg: &str) {
+        if let Some(console) = self.console.clone() {
+            console(&format!("{msg}\n"), true);
+            self.logger.record_group_failure(msg);
+            self.errors += 1;
+            return;
+        }
         let _ = writeln!(std::io::stderr(), "{msg}");
         let _ = std::io::stderr().flush();
         self.logger.record_group_failure(msg);
@@ -494,9 +587,80 @@ impl ScriptInterpreter {
     }
 
     fn emit_status(&self, msg: &str) {
+        if let Some(console) = self.console.as_ref() {
+            if self.cfg.log_level >= 0 {
+                console(&format!("{msg}\n"), false);
+            }
+            return;
+        }
         if self.cfg.log_level >= 0 {
             println!("{msg}");
             let _ = std::io::stdout().flush();
+        }
+    }
+
+    /// Writes a command's normal output to whoever consumes it: the GUI's
+    /// output panel when one is attached, otherwise stdout as before.
+    fn out(&self, message: &str) {
+        match self.console.as_ref() {
+            Some(console) => console(&format!("{message}\n"), false),
+            None => println!("{message}"),
+        }
+    }
+
+    /// Writes an error line the same way, keeping it on the error channel.
+    fn err(&self, message: &str) {
+        match self.console.as_ref() {
+            Some(console) => console(&format!("{message}\n"), true),
+            None => eprintln!("{message}"),
+        }
+    }
+
+    /// A status line from a callback that runs while the interpreter's logger
+    /// is borrowed: the same routing as `out`, without needing `&self`.
+    fn status_to(console: Option<&ScriptConsoleSink>, message: &str) {
+        match console {
+            Some(console) => console(&format!("{message}\n"), false),
+            None => {
+                println!("{message}");
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
+
+    /// Progress output for a transfer: the panel when one is attached, and
+    /// the terminal's own progress meter when not. A free function because
+    /// the progress callback runs inside a `move` closure that must not hold
+    /// the whole interpreter.
+    fn progress_to(console: Option<&ScriptConsoleSink>, message: &str) {
+        match console {
+            Some(console) => console(message, false),
+            None => {
+                print!("{message}");
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
+
+    /// Writes part of a line (progress bars, prompts) with no trailing newline.
+    fn out_raw(&self, message: &str) {
+        match self.console.as_ref() {
+            Some(console) => console(message, false),
+            None => {
+                print!("{message}");
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
+
+    /// Writes part of a line to the error channel.
+    fn err_raw(&self, message: &str) {
+        match self.console.as_ref() {
+            Some(console) => console(message, true),
+            None => {
+                eprint!("{message}");
+                let _ = std::io::stderr().flush();
+            }
         }
     }
 
@@ -688,7 +852,7 @@ impl ScriptInterpreter {
         spec.timeout_secs = self.reconnect_time_secs.max(spec.timeout_secs);
         self.slots.push(ConnectedSlot {
             spec,
-            session,
+            session: Arc::from(session),
             remote_cwd: remote_cwd.clone(),
         });
         self.active_slot = self.slots.len() - 1;
@@ -1208,7 +1372,7 @@ impl ScriptInterpreter {
         };
 
         if self.cfg.echo && !self.cfg.server_mode {
-            println!("{}", crate::script_params::censored_for_log(&effective_line));
+            self.out(&crate::script_params::censored_for_log(&effective_line));
             let _ = std::io::stdout().flush();
         }
 
@@ -1265,26 +1429,23 @@ impl ScriptInterpreter {
             }
             "help" => self.cmd_help(args),
             "echo" => {
-                println!("{}", args.join(" "));
+                self.out(&args.join(" "));
                 let _ = std::io::stdout().flush();
                 Ok(())
             }
             "ascii" => {
                 self.transfer_mode = TransferMode::Ascii;
-                println!("{}", self.trp("{name} = {value}", &[("name", "transfer"), ("value", "ascii")]));
+                self.out(&self.trp("{name} = {value}", &[("name", "transfer"), ("value", "ascii")]));
                 Ok(())
             }
             "binary" => {
                 self.transfer_mode = TransferMode::Binary;
-                println!(
-                    "{}",
-                    self.trp("{name} = {value}", &[("name", "transfer"), ("value", "binary")])
-                );
+                self.out(&self.trp("{name} = {value}", &[("name", "transfer"), ("value", "binary")]));
                 Ok(())
             }
             "option" => self.cmd_option(args),
             "lpwd" => {
-                println!("{}", self.local_cwd.display());
+                self.out(&self.local_cwd.display().to_string());
                 Ok(())
             }
             "lcd" => self.cmd_lcd(args),
@@ -1355,7 +1516,7 @@ impl ScriptInterpreter {
                         SCRIPT_COMMAND_HELPS.iter().find(|(k, _)| *k == c)
                     });
                 if let Some((_, help_key)) = target {
-                    println!("{}", self.tr(help_key));
+                    self.out(&format!("{}", self.tr(help_key)));
                 } else {
                     let msg = self.trp(
                         "Unknown command '{command}'. Type 'help' for a list of commands.",
@@ -1382,7 +1543,7 @@ impl ScriptInterpreter {
                 }
             }
         }
-        println!("{output}");
+        self.out(&format!("{output}"));
         Ok(())
     }
 
@@ -1444,10 +1605,8 @@ impl ScriptInterpreter {
             "editmaxsize" => self.edit_max_size.to_string(),
             _ => String::new(),
         };
-        println!(
-            "{}",
-            self.trp("{name} = {value}", &[("name", name), ("value", &val)])
-        );
+        self.out(&format!("{}",
+            self.trp("{name} = {value}", &[("name", name), ("value", &val)])));
     }
 
     fn cmd_option(&mut self, args: &[String]) -> Result<(), String> {
@@ -1692,7 +1851,7 @@ impl ScriptInterpreter {
             return Err(format!("'{}' is not a directory.", args[0]));
         }
         self.local_cwd = canon;
-        println!("{}", self.local_cwd.display());
+        self.out(&format!("{}", self.local_cwd.display()));
         Ok(())
     }
 
@@ -1705,7 +1864,7 @@ impl ScriptInterpreter {
         if self.fail_on_nomatch {
             Err(msg)
         } else {
-            println!("{msg}");
+            self.out(&format!("{msg}"));
             Ok(())
         }
     }
@@ -1820,15 +1979,13 @@ impl ScriptInterpreter {
         }
 
         for r in rows {
-            println!(
-                "{:<dw$}  {:<tw$}    {} {}",
+            self.out(&format!("{:<dw$}  {:<tw$}    {} {}",
                 r.date,
                 r.time,
                 r.size,
                 r.name,
                 dw = date_len,
-                tw = time_len
-            );
+                tw = time_len));
         }
         Ok(())
     }
@@ -1841,13 +1998,11 @@ impl ScriptInterpreter {
         if store.presets().is_empty() {
             let p = TransferPresetStore::presets_path(&self.cfg.config_dir);
             let p_str = p.display().to_string();
-            println!(
-                "{}",
+            self.out(&format!("{}",
                 self.trp(
                     "There are no transfer presets in '{path}' (create one with 'savepreset').",
                     &[("path", &p_str)],
-                )
-            );
+                )));
             return Ok(());
         }
         for p in store.presets() {
@@ -1857,7 +2012,7 @@ impl ScriptInterpreter {
                     .as_deref()
                     .is_some_and(|a| a.eq_ignore_ascii_case(&p.name));
             let mark = if active { "* " } else { "  " };
-            println!("{mark}{}: {}", p.name, p.describe());
+            self.out(&format!("{mark}{}: {}", p.name, p.describe()));
         }
         Ok(())
     }
@@ -1883,10 +2038,8 @@ impl ScriptInterpreter {
         }
         store.add_or_update(preset)?;
         store.save_to_dir(&self.cfg.config_dir)?;
-        println!(
-            "{}",
-            self.trp("Preset '{name}' saved.", &[("name", &args[0])])
-        );
+        self.out(&format!("{}",
+            self.trp("Preset '{name}' saved.", &[("name", &args[0])])));
         Ok(())
     }
 
@@ -1911,7 +2064,7 @@ impl ScriptInterpreter {
         {
             self.active_preset_name = None;
         }
-        println!("Removed transfer preset '{}'.", args[0]);
+        self.out(&format!("Removed transfer preset '{}'.", args[0]));
         Ok(())
     }
 
@@ -1920,10 +2073,8 @@ impl ScriptInterpreter {
         let mut store = SessionStore::load_from_dir(&self.cfg.config_dir, &vault)?;
         if args.is_empty() || (args.len() == 1 && args[0].eq_ignore_ascii_case("list")) {
             if store.sites().is_empty() {
-                println!(
-                    "{}",
-                    self.tr("There are no stored sessions. Use 'savesession <name>' to store the current connection.")
-                );
+                self.out(&format!("{}",
+                    self.tr("There are no stored sessions. Use 'savesession <name>' to store the current connection.")));
                 return Ok(());
             }
             for s in store.sites() {
@@ -1942,15 +2093,13 @@ impl ScriptInterpreter {
                 } else {
                     format!(" (preset {})", s.preset)
                 };
-                println!(
-                    "{}  {}://{}{}:{}{}",
+                self.out(&format!("{}  {}://{}{}:{}{}",
                     s.name,
                     s.protocol.as_str(),
                     user_prefix,
                     s.host,
                     port,
-                    preset_suffix
-                );
+                    preset_suffix));
             }
             return Ok(());
         }
@@ -1973,11 +2122,9 @@ impl ScriptInterpreter {
             let text = portable.serialize_ini(None)?;
             linscp_platform::write_private_file_atomic(&dest, text.as_bytes())
                 .map_err(|e| e.to_string())?;
-            println!(
-                "Exported {} session(s) to '{}'.",
+            self.out(&format!("Exported {} session(s) to '{}'.",
                 store.sites().len(),
-                dest.display()
-            );
+                dest.display()));
             return Ok(());
         }
 
@@ -1991,18 +2138,18 @@ impl ScriptInterpreter {
                 store.upsert(s.clone());
             }
             store.save_to_dir(&self.cfg.config_dir, &vault)?;
-            println!("Imported {count} session(s) from '{}'.", src.display());
+            self.out(&format!("Imported {count} session(s) from '{}'.", src.display()));
             return Ok(());
         }
 
         if args.len() == 1 && args[0].eq_ignore_ascii_case("folders") {
             let folders = store.folders();
             if folders.is_empty() {
-                println!("{}", self.tr("There are no session folders."));
+                self.out(&format!("{}", self.tr("There are no session folders.")));
                 return Ok(());
             }
             for f in folders {
-                println!("  {f}/");
+                self.out(&format!("  {f}/"));
             }
             return Ok(());
         }
@@ -2031,7 +2178,7 @@ impl ScriptInterpreter {
                 ));
             }
             for m in matched {
-                println!("  {m}");
+                self.out(&format!("  {m}"));
             }
             return Ok(());
         }
@@ -2067,13 +2214,13 @@ impl ScriptInterpreter {
             "export" => {
                 export_backup_to_file(&self.cfg.config_dir, &path, &vault)
                     .map_err(|e| self.trp("Cannot export backup to '{file}': {error}", &[("file", &args[1]), ("error", &e)]))?;
-                println!("{}", self.trp("Full backup exported to '{file}'.", &[("file", &args[1])]));
+                self.out(&format!("{}", self.trp("Full backup exported to '{file}'.", &[("file", &args[1])])));
                 Ok(())
             }
             "import" => {
                 import_backup_from_file(&self.cfg.config_dir, &path, &vault)
                     .map_err(|e| self.trp("Cannot import backup from '{file}': {error}", &[("file", &args[1]), ("error", &e)]))?;
-                println!("{}", self.trp("Full backup imported from '{file}'.", &[("file", &args[1])]));
+                self.out(&format!("{}", self.trp("Full backup imported from '{file}'.", &[("file", &args[1])])));
                 Ok(())
             }
             _ => Err(self.tr("Syntax: backup export <file> | import <file>.").to_string())
@@ -2404,23 +2551,27 @@ impl ScriptInterpreter {
             let xml_name = xml_session_name(&self.slots[self.active_slot].spec);
             self.logger.set_session_name(&xml_name);
         } else {
-            for (idx, slot) in self.slots.iter().enumerate() {
-                println!(
-                    "{:3}  {}",
-                    idx + 1,
-                    slot_display_name_from_spec(&slot.spec)
-                );
+            // Collect first: `out` borrows the interpreter, which the
+            // session list is borrowed from while it is being walked.
+            let listing: Vec<String> = self
+                .slots
+                .iter()
+                .enumerate()
+                .map(|(idx, slot)| {
+                    format!("{:3}  {}", idx + 1, slot_display_name_from_spec(&slot.spec))
+                })
+                .collect();
+            for line in listing {
+                self.out(&line);
             }
         }
         let active_idx_s = (self.active_slot + 1).to_string();
         let active_name = slot_display_name_from_spec(&self.slots[self.active_slot].spec);
-        println!(
-            "{}",
+        self.out(&format!("{}",
             self.trp(
                 "Active session: {index} ({name})",
                 &[("index", &active_idx_s), ("name", &active_name)],
-            )
-        );
+            )));
         Ok(())
     }
 
@@ -2510,8 +2661,19 @@ impl ScriptInterpreter {
                 })?;
             n - 1
         };
+        if self.adopted_slot == Some(idx) {
+            // The panel's own connection is the tab's; closing it here would
+            // disconnect the window the user is typing in. Closing the tab
+            // is what closes this session.
+            return Err(self
+                .tr("The panel's session is closed by closing its tab.")
+                .to_string());
+        }
         let removed = self.slots.remove(idx);
         let _ = removed.session.close().await;
+        if let Some(adopted) = self.adopted_slot.filter(|&adopted| idx < adopted) {
+            self.adopted_slot = Some(adopted - 1);
+        }
         if self.active_slot >= self.slots.len() && !self.slots.is_empty() {
             self.active_slot = self.slots.len() - 1;
         }
@@ -2520,10 +2682,8 @@ impl ScriptInterpreter {
             self.logger.set_session_name(&xml_name);
         }
         let closed_name = slot_display_name_from_spec(&removed.spec);
-        println!(
-            "{}",
-            self.trp("Session '{name}' closed.", &[("name", &closed_name)])
-        );
+        self.out(&format!("{}",
+            self.trp("Session '{name}' closed.", &[("name", &closed_name)])));
         Ok(())
     }
 
@@ -2532,7 +2692,7 @@ impl ScriptInterpreter {
             return Err("Syntax: pwd".to_string());
         }
         let cwd = self.active_slot()?.remote_cwd.clone();
-        println!("{cwd}");
+        self.out(&format!("{cwd}"));
         self.logger.record_cwd(&cwd, Ok(()));
         Ok(())
     }
@@ -2603,7 +2763,7 @@ impl ScriptInterpreter {
                 .unwrap_or(candidate)
         };
         self.slots[self.active_slot].remote_cwd = next.clone();
-        println!("{next}");
+        self.out(&format!("{next}"));
         self.logger.record_cwd(&next, Ok(()));
         Ok(())
     }
@@ -2683,7 +2843,7 @@ impl ScriptInterpreter {
 
         for entry in &filtered {
             if names_only {
-                println!("{}", entry.name);
+                self.out(&format!("{}", entry.name));
             } else {
                 let link_target = if entry.is_symlink {
                     let full = join_remote_path(&dir_path, &entry.name);
@@ -2691,7 +2851,7 @@ impl ScriptInterpreter {
                 } else {
                     None
                 };
-                println!("{}", format_listing_line(entry, link_target.as_deref()));
+                self.out(&format!("{}", format_listing_line(entry, link_target.as_deref())));
             }
         }
         self.logger.record_ls(&dir_path, Some(&filtered), Ok(()));
@@ -2701,7 +2861,7 @@ impl ScriptInterpreter {
                 if self.fail_on_nomatch {
                     return Err(msg);
                 }
-                println!("{msg}");
+                self.out(&format!("{msg}"));
             }
         }
         let count_str = filtered.len().to_string();
@@ -2730,7 +2890,7 @@ impl ScriptInterpreter {
                 } else {
                     None
                 };
-                println!("{}", format_listing_line(&entry, link_target.as_deref()));
+                self.out(&format!("{}", format_listing_line(&entry, link_target.as_deref())));
                 self.logger.record_stat(&path, Some(&entry), Ok(()));
                 Ok(())
             }
@@ -2780,31 +2940,25 @@ impl ScriptInterpreter {
         };
         let sz_str = entry.size.to_string();
         let mod_str = format_ls_time(entry.mtime);
-        println!("{}", self.trp("Path:        {path}", &[("path", &path)]));
-        println!("{}", self.trp("Size:        {size}", &[("size", &sz_str)]));
-        println!(
-            "{}",
-            self.trp("Permissions: {permissions}", &[("permissions", &perms)])
-        );
-        println!("{}", self.trp("Modified:    {time}", &[("time", &mod_str)]));
-        println!("{}", self.trp("SizeBytes:   {size}", &[("size", &sz_str)]));
+        self.out(&format!("{}", self.trp("Path:        {path}", &[("path", &path)])));
+        self.out(&format!("{}", self.trp("Size:        {size}", &[("size", &sz_str)])));
+        self.out(&format!("{}",
+            self.trp("Permissions: {permissions}", &[("permissions", &perms)])));
+        self.out(&format!("{}", self.trp("Modified:    {time}", &[("time", &mod_str)])));
+        self.out(&format!("{}", self.trp("SizeBytes:   {size}", &[("size", &sz_str)])));
         if entry.mtime > 0 {
             let epoch = entry.mtime.to_string();
-            println!(
-                "{}",
-                self.trp("ModifiedEpoch: {time}", &[("time", &epoch)])
-            );
-            println!(
-                "{}",
-                self.trp("AccessedEpoch: {time}", &[("time", &epoch)])
-            );
+            self.out(&format!("{}",
+                self.trp("ModifiedEpoch: {time}", &[("time", &epoch)])));
+            self.out(&format!("{}",
+                self.trp("AccessedEpoch: {time}", &[("time", &epoch)])));
         }
         let owner = match (&entry.owner, &entry.group) {
             (Some(o), Some(g)) if !o.is_empty() && !g.is_empty() => format!("{o}:{g}"),
             (Some(o), _) if !o.is_empty() => o.clone(),
             _ => "unknown".to_string(),
         };
-        println!("{}", self.trp("Owner:       {owner}", &[("owner", &owner)]));
+        self.out(&format!("{}", self.trp("Owner:       {owner}", &[("owner", &owner)])));
         Ok(())
     }
 
@@ -3330,14 +3484,12 @@ impl ScriptInterpreter {
             }
         }
         if recursive {
-            println!(
-                "{changed} {}.",
+            self.out(&format!("{changed} {}.",
                 if changed == 1 {
                     "file changed"
                 } else {
                     "files changed"
-                }
-            );
+                }));
         }
         Ok(())
     }
@@ -3490,7 +3642,7 @@ impl ScriptInterpreter {
         if let Some(n) = note {
             self.emit_status(&n);
         }
-        println!("{hex} {path}");
+        self.out(&format!("{hex} {path}"));
         self.logger
             .record_checksum(&path, alg, Some(&hex), Ok(()));
         Ok(())
@@ -3533,16 +3685,16 @@ impl ScriptInterpreter {
         let stdout_txt = String::from_utf8_lossy(&out.stdout);
         let stderr_txt = String::from_utf8_lossy(&out.stderr);
         if !stdout_txt.is_empty() {
-            print!("{stdout_txt}");
+            self.out_raw(&format!("{stdout_txt}"));
             if !stdout_txt.ends_with('\n') {
-                println!();
+                self.out("");
             }
             let _ = std::io::stdout().flush();
         }
         if !stderr_txt.is_empty() {
-            eprint!("{stderr_txt}");
+            self.err_raw(&format!("{stderr_txt}"));
             if !stderr_txt.ends_with('\n') {
-                eprintln!();
+                self.err("");
             }
             let _ = std::io::stderr().flush();
         }
@@ -3928,14 +4080,17 @@ impl ScriptInterpreter {
                 };
                 let draw_prog = show_tty_progress && local_dest != Path::new("-");
                 if draw_prog && !is_synthetic_missing {
-                    print!("{}", rentry.name);
+                    self.out_raw(&format!("{}", rentry.name));
                     if rentry.size > 0 {
                         let pad = 24usize.saturating_sub(rentry.name.len()).max(1);
-                        print!("{:pad$}|          0.0%", "", pad = pad);
+                        self.out_raw(&format!("{:pad$}|          0.0%", "", pad = pad));
                     }
                     let _ = std::io::stdout().flush();
                 }
                 let last_permille = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                // The callback cannot borrow the interpreter: it is held by the
+                // transfer. A console handle is all the progress output needs.
+                let progress_console = self.console.clone();
                 let prog_fn = move |done: u64, tot: u64| {
                     if !draw_prog || tot == 0 {
                         return;
@@ -3943,7 +4098,7 @@ impl ScriptInterpreter {
                     let permille = ((done.saturating_mul(1000)) / tot).min(1000);
                     let prev = last_permille.swap(permille, std::sync::atomic::Ordering::Relaxed);
                     if permille != prev {
-                        print!("\r|  {:3}.{}%    ", permille / 10, permille % 10);
+                        Self::progress_to(progress_console.as_ref(), &format!("\r|  {:3}.{}%    ", permille / 10, permille % 10));
                         let _ = std::io::stdout().flush();
                     }
                 };
@@ -3964,9 +4119,9 @@ impl ScriptInterpreter {
                 .await;
                 if draw_prog && !is_synthetic_missing {
                     if dl_res.is_ok() {
-                        print!("\r|  100.0%    \n");
+                        self.out_raw(&format!("\r|  100.0%    \n"));
                     } else {
-                        println!();
+                        self.out("");
                     }
                     let _ = std::io::stdout().flush();
                 }
@@ -4109,14 +4264,17 @@ impl ScriptInterpreter {
             } else {
                 let draw_prog = show_tty_progress && lpath != Path::new("-");
                 if draw_prog {
-                    print!("{lname}");
+                    self.out_raw(&format!("{lname}"));
                     if sz > 0 {
                         let pad = 24usize.saturating_sub(lname.len()).max(1);
-                        print!("{:pad$}|          0.0%", "", pad = pad);
+                        self.out_raw(&format!("{:pad$}|          0.0%", "", pad = pad));
                     }
                     let _ = std::io::stdout().flush();
                 }
                 let last_permille = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                // The callback cannot borrow the interpreter: it is held by the
+                // transfer. A console handle is all the progress output needs.
+                let progress_console = self.console.clone();
                 let prog_fn = move |done: u64, tot: u64| {
                     if !draw_prog || tot == 0 {
                         return;
@@ -4124,7 +4282,7 @@ impl ScriptInterpreter {
                     let permille = ((done.saturating_mul(1000)) / tot).min(1000);
                     let prev = last_permille.swap(permille, std::sync::atomic::Ordering::Relaxed);
                     if permille != prev {
-                        print!("\r|  {:3}.{}%    ", permille / 10, permille % 10);
+                        Self::progress_to(progress_console.as_ref(), &format!("\r|  {:3}.{}%    ", permille / 10, permille % 10));
                         let _ = std::io::stdout().flush();
                     }
                 };
@@ -4144,9 +4302,9 @@ impl ScriptInterpreter {
                 .await;
                 if draw_prog {
                     if up_res.is_ok() {
-                        print!("\r|  100.0%    \n");
+                        self.out_raw(&format!("\r|  100.0%    \n"));
                     } else {
-                        println!();
+                        self.out("");
                     }
                     let _ = std::io::stdout().flush();
                 }
@@ -4570,14 +4728,12 @@ impl ScriptInterpreter {
         .await?;
 
         if opts.preview_only {
-            println!(
-                "SYNCPLAN local={}\tremote={}\tmode={}\tcriteria={}\tmask={}",
+            self.out(&format!("SYNCPLAN local={}\tremote={}\tmode={}\tcriteria={}\tmask={}",
                 local_root.display(),
                 remote_root,
                 opts.mode.as_str(),
                 opts.criteria.name(),
-                opts.file_mask.describe()
-            );
+                opts.file_mask.describe()));
             let mut n_dl = 0usize;
             let mut n_ul = 0usize;
             let mut n_del_l = 0usize;
@@ -4611,11 +4767,9 @@ impl ScriptInterpreter {
                         format_sync_time(item.remote_mtime)
                     ));
                 }
-                println!("{}\t{}\t{}", item.action.as_str(), item.rel_path, detail);
+                self.out(&format!("{}\t{}\t{}", item.action.as_str(), item.rel_path, detail));
             }
-            println!(
-                "SYNCSUMMARY download={n_dl} upload={n_ul} delete-local={n_del_l} delete-remote={n_del_r} conflict={n_conf} unchanged={n_none} bytes={bytes_total}"
-            );
+            self.out(&format!("SYNCSUMMARY download={n_dl} upload={n_ul} delete-local={n_del_l} delete-remote={n_del_r} conflict={n_conf} unchanged={n_none} bytes={bytes_total}"));
         }
 
         let actionable_count = plan
@@ -4643,7 +4797,7 @@ impl ScriptInterpreter {
         }
 
         if actionable_count == 0 {
-            println!("Nothing to synchronize.");
+            self.out(&format!("Nothing to synchronize."));
             return Ok(());
         }
 
@@ -4668,7 +4822,7 @@ impl ScriptInterpreter {
                 )
             }));
         }
-        println!("Synchronized {applied} item(s).");
+        self.out(&format!("Synchronized {applied} item(s)."));
         Ok(())
     }
 
@@ -4764,16 +4918,19 @@ impl ScriptInterpreter {
             remote_cwd
         };
         let verbose = self.cfg.log_level >= 0;
+        let console = self.console.clone();
         run_keep_up_to_date(
             self.slots[self.active_slot].session.as_ref(),
             &local_root,
             &remote_root,
             &opts,
             &mut self.logger,
+            // The callback cannot borrow the whole interpreter while the
+            // logger inside it is mutably borrowed; a console handle is
+            // enough to report progress.
             |msg| {
                 if verbose {
-                    println!("{msg}");
-                    let _ = std::io::stdout().flush();
+                    Self::status_to(console.as_ref(), msg);
                 }
             },
         )
@@ -4834,15 +4991,18 @@ impl ScriptInterpreter {
         let cwd = self.active_slot()?.remote_cwd.clone();
         let remote_path = resolve_remote_path(&cwd, &paths[0]);
         let verbose = self.cfg.log_level >= 0;
+        let console = self.console.clone();
         edit_remote_file(
             self.slots[self.active_slot].session.as_ref(),
             &remote_path,
             &opts,
             &mut self.logger,
+            // The callback cannot borrow the whole interpreter while the
+            // logger inside it is mutably borrowed; a console handle is
+            // enough to report progress.
             |msg| {
                 if verbose {
-                    println!("{msg}");
-                    let _ = std::io::stdout().flush();
+                    Self::status_to(console.as_ref(), msg);
                 }
             },
         )
@@ -4913,13 +5073,11 @@ impl ScriptInterpreter {
 
         if get_given {
             if !is_webdav_scheme(scheme) {
-                println!(
-                    "{}",
+                self.out(&format!("{}",
                     self.trp(
                         "(ETag not available for {protocol} protocol.)",
                         &[("protocol", proto_name)],
-                    )
-                );
+                    )));
                 return Ok(());
             }
             let (etag_opt, missing) = self.slots[self.active_slot]
@@ -4928,20 +5086,16 @@ impl ScriptInterpreter {
                 .await
                 .map_err(|e| e.to_string())?;
             if let Some(etag) = etag_opt.filter(|s| !s.is_empty()) {
-                println!("{etag}");
+                self.out(&format!("{etag}"));
             } else if missing {
-                println!(
-                    "{}",
-                    self.trp("No ETag: '{path}' does not exist.", &[("path", &path)])
-                );
+                self.out(&format!("{}",
+                    self.trp("No ETag: '{path}' does not exist.", &[("path", &path)])));
             } else {
-                println!(
-                    "{}",
+                self.out(&format!("{}",
                     self.trp(
                         "The server reported no ETag for '{path}'.",
                         &[("path", &path)],
-                    )
-                );
+                    )));
             }
             return Ok(());
         }
@@ -4959,10 +5113,8 @@ impl ScriptInterpreter {
                 .dav_set_etag_precondition(&path, None)
                 .await
                 .map_err(|e| e.to_string())?;
-            println!(
-                "{}",
-                self.trp("Cleared ETag precondition on {path}.", &[("path", &path)])
-            );
+            self.out(&format!("{}",
+                self.trp("Cleared ETag precondition on {path}.", &[("path", &path)])));
             return Ok(());
         }
 
@@ -4980,13 +5132,11 @@ impl ScriptInterpreter {
             .dav_set_etag_precondition(&path, Some(pre))
             .await
             .map_err(|e| e.to_string())?;
-        println!(
-            "{}",
+        self.out(&format!("{}",
             self.trp(
                 "{type}: {etag} on {path}.",
                 &[("type", hdr_kind), ("etag", &val), ("path", &path)],
-            )
-        );
+            )));
         Ok(())
     }
 
@@ -5023,13 +5173,11 @@ impl ScriptInterpreter {
             .dav_lock(&path, timeout_secs)
             .await
             .map_err(|e| e.to_string())?;
-        println!(
-            "{}",
+        self.out(&format!("{}",
             self.trp(
                 "Locked {path} with token {token}.",
                 &[("path", &path), ("token", &token)],
-            )
-        );
+            )));
         Ok(())
     }
 
@@ -5060,10 +5208,8 @@ impl ScriptInterpreter {
             .dav_unlock(&path, token_opt.as_deref())
             .await
             .map_err(|e| e.to_string())?;
-        println!(
-            "{}",
-            self.trp("Unlocked {path}.", &[("path", &path)])
-        );
+        self.out(&format!("{}",
+            self.trp("Unlocked {path}.", &[("path", &path)])));
         Ok(())
     }
 
@@ -5111,13 +5257,11 @@ impl ScriptInterpreter {
                 .dav_set_property(&path, &k, &v)
                 .await
                 .map_err(|e| e.to_string())?;
-            println!(
-                "{}",
+            self.out(&format!("{}",
                 self.trp(
                     "Set {name} on {path}.",
                     &[("name", &k), ("path", &path)],
-                )
-            );
+                )));
             return Ok(());
         }
 
@@ -5128,17 +5272,13 @@ impl ScriptInterpreter {
             .await
             .map_err(|e| e.to_string())?
         {
-            Some(val) => println!(
-                "{}",
-                self.trp("{name}={value}", &[("name", &name), ("value", &val)])
-            ),
-            None => println!(
-                "{}",
+            Some(val) => { self.out(&format!("{}",
+                self.trp("{name}={value}", &[("name", &name), ("value", &val)]))); }
+            None => { self.out(&format!("{}",
                 self.trp(
                     "{name} is not set on {path}.",
                     &[("name", &name), ("path", &path)],
-                )
-            ),
+                ))); }
         }
         Ok(())
     }
@@ -5171,19 +5311,15 @@ impl ScriptInterpreter {
                 )
             })?;
         if versions.is_empty() {
-            println!(
-                "{}",
+            self.out(&format!("{}",
                 self.trp(
                     "No S3 object versions found for '{path}'.",
                     &[("path", &path)],
-                )
-            );
+                )));
             return Ok(());
         }
-        println!(
-            "{}",
-            self.trp("Object versions for '{path}':", &[("path", &path)])
-        );
+        self.out(&format!("{}",
+            self.trp("Object versions for '{path}':", &[("path", &path)])));
         let bucket_root = match path[1..].find('/') {
             Some(idx) => &path[..idx + 1],
             None => path.as_str(),
@@ -5206,10 +5342,8 @@ impl ScriptInterpreter {
             } else {
                 format_ls_time(item.mtime)
             };
-            println!(
-                "{state}  {bucket_root}/{}  {}  {size_str}  {mod_str}",
-                item.key, item.version_id
-            );
+            self.out(&format!("{state}  {bucket_root}/{}  {}  {size_str}  {mod_str}",
+                item.key, item.version_id));
         }
         Ok(())
     }
@@ -5915,3 +6049,110 @@ fn ssh_key_identity(line: &str) -> String {
     format!("{alg} {blob}")
 }
 
+#[cfg(test)]
+mod console_sink_tests {
+    use super::*;
+
+    fn interpreter() -> ScriptInterpreter {
+        let cfg = ScriptRunConfig {
+            batch_mode: BatchMode::Abort,
+            echo: false,
+            log_level: 0,
+            ..ScriptRunConfig::default()
+        };
+        let logger = SessionLogger::open(None, 0, false, None, None, false, "")
+            .expect("an in-memory logger opens");
+        ScriptInterpreter::new(cfg, logger)
+    }
+
+    fn collector() -> (Arc<Mutex<Vec<(String, bool)>>>, ScriptInterpreter) {
+        let mut slot = interpreter();
+        let seen = slot.capture_console();
+        (seen, slot)
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("linscp-console-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir.canonicalize().expect("canonical temp dir")
+    }
+
+    /// Everything a command prints has to reach the console that is attached,
+    /// not the process's own terminal: the GUI's command panel reads the sink.
+    #[tokio::test]
+    async fn a_commands_output_reaches_the_attached_console() {
+        let dir = temp_dir("out");
+        let (seen, mut slot) = collector();
+        slot.set_local_dir(dir.clone());
+        assert!(slot.execute_line("lpwd").await, "lpwd needs no session");
+        let text: String = seen
+            .lock()
+            .expect("collector mutex")
+            .iter()
+            .map(|(line, _)| line.clone())
+            .collect();
+        assert!(
+            text.contains(&dir.display().to_string()),
+            "the panel shows the local directory, got {text:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A command failure is reported to the error side of the same console.
+    #[tokio::test]
+    async fn a_command_failure_is_written_to_the_error_side() {
+        let (seen, mut slot) = collector();
+        assert!(!slot.execute_line("lcd /nonexistent-linscp-console-test").await);
+        let seen = seen.lock().expect("collector mutex");
+        assert!(
+            seen.iter()
+                .any(|(line, is_error)| *is_error && line.contains("nonexistent")),
+            "the failure is on the error side, got {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|(_, is_error)| *is_error),
+            "and no line of a failed command claims success"
+        );
+    }
+
+    /// `run_captured` is the whole contract a command panel needs: the line
+    /// runs, and both channels come back without the caller managing a sink.
+    #[tokio::test]
+    async fn run_captured_returns_both_channels() {
+        let mut slot = interpreter();
+        let (ok, stdout, stderr) = slot.run_captured("lpwd").await;
+        assert!(ok, "lpwd succeeds");
+        assert!(!stdout.trim().is_empty(), "the directory is reported");
+        assert!(stderr.is_empty(), "and nothing is reported as an error: {stderr:?}");
+        let (ok, stdout, stderr) = slot.run_captured("lcd /nonexistent-linscp-console-test").await;
+        assert!(!ok);
+        assert!(stderr.contains("nonexistent"), "the failure is reported: {stderr:?}");
+        assert!(!stdout.contains("nonexistent"), "and not as output: {stdout:?}");
+    }
+
+    /// The two channels stay separate: what a command printed is not mixed
+    /// into what it reported as an error, which is what lets a caller answer
+    /// with both without guessing.
+    #[tokio::test]
+    async fn the_two_channels_are_collected_separately() {
+        let (seen, mut slot) = collector();
+        assert!(slot.execute_line("lpwd").await);
+        assert!(!slot.execute_line("lcd /nonexistent-linscp-console-test").await);
+        let (stdout, stderr) = ScriptInterpreter::collected_console(&seen);
+        assert!(!stdout.trim().is_empty(), "the directory was reported: {stdout:?}");
+        assert!(stderr.contains("nonexistent"), "the failure is on the error side: {stderr:?}");
+        assert!(!stdout.contains("nonexistent"), "and not on the output side: {stdout:?}");
+    }
+
+    /// Without a console the interpreter still works the way the console
+    /// client always did; the sink is an addition, not a replacement.
+    #[tokio::test]
+    async fn without_a_console_the_interpreter_still_runs() {
+        let dir = temp_dir("plain");
+        let mut slot = interpreter();
+        slot.set_local_dir(dir.clone());
+        assert!(slot.execute_line("lpwd").await);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

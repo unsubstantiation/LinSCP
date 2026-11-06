@@ -20,7 +20,6 @@ http.workspace = true
 linscp-crypto.workspace = true
 linscp-platform.workspace = true
 linscp-types.workspace = true
-libc = "0.2"
 md-5.workspace = true
 rand.workspace = true
 reqwest.workspace = true
@@ -38,9 +37,6 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true
 zeroize.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"

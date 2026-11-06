@@ -138,6 +138,61 @@ fn to_wide_null(path: &Path) -> Vec<u16> {
         .collect()
 }
 
+/// Opens an existing file for read/write without following a reparse point
+/// (symlink or junction) and without sharing a delete, which is what keeps a
+/// second process from swapping the file underneath us. `None` means "not an
+/// ordinary, singly-linked file": the caller must then treat it as untrusted.
+pub fn open_regular_file_no_follow(path: &Path) -> Option<File> {
+    use std::fs::OpenOptions as StdOpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    let file = StdOpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(to_extended_length_path(path))
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || !handle_is_singly_linked(&file) {
+        return None;
+    }
+    Some(file)
+}
+
+/// Reads the link count and reparse-point attribute of the *opened handle*
+/// rather than of the pathname, so a name swapped after the open cannot
+/// change the answer.
+fn handle_is_singly_linked(file: &File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+    // SAFETY: the handle is valid for `file`'s lifetime and `info` is a local
+    // zeroed struct of the exact size the API expects.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    ok != 0 && info.nNumberOfLinks == 1 && info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
+/// Windows has no FIFO; a test that needs one cannot run here.
+pub fn create_fifo(_path: &Path) -> Result<(), PlatformError> {
+    Err(PlatformError::Unsupported("FIFOs do not exist on Windows".to_string()))
+}
+
+/// Creates a file that only the current user may read, refusing to follow a
+/// reparse point at the final component.
+pub fn create_private_file(path: &Path) -> Result<File, PlatformError> {
+    use std::fs::OpenOptions as StdOpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    Ok(StdOpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(to_extended_length_path(path))?)
+}
+
 pub fn atomic_replace(temp_path: &Path, target_path: &Path) -> Result<(), PlatformError> {
     let ext_src = to_extended_length_path(temp_path);
     let ext_dst = to_extended_length_path(target_path);

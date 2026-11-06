@@ -126,24 +126,10 @@ struct ConditionalUploadJournal {
 
 // Open only ordinary, singly-linked journal files, never symlinks or other
 // special files. The lock is acquired before examining or updating contents.
+// The handle inspection is OS-specific and therefore lives in `linscp-platform`
+// (`open_regular_file_no_follow`); this function only adds the lock.
 fn try_open_journal(path: &Path) -> Option<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true);
-    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK); }
-    #[cfg(windows)] { use std::os::windows::fs::OpenOptionsExt; options.custom_flags(0x0020_0000); }
-    let file = options.open(path).ok()?;
-    let metadata = file.metadata().ok()?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 64 * 1024 { return None; }
-    #[cfg(unix)] { use std::os::unix::fs::MetadataExt; if metadata.nlink() != 1 { return None; } }
-    #[cfg(windows)] {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT};
-        // MetadataExt does not expose the link count on our MSRV. Inspect the
-        // opened handle, not the pathname, and fail closed on unknown metadata.
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0
-            || info.nNumberOfLinks != 1 || info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 { return None; }
-    }
+    let file = linscp_platform::open_private_file_no_follow(path).ok()?;
     file.try_lock_exclusive().ok()?;
     Some(file)
 }
@@ -175,10 +161,10 @@ impl ConditionalUploadJournal {
             let mut random = [0u8; 16];
             rand::thread_rng().fill_bytes(&mut random);
             let path = directory.join(format!("upload-{}.json", random.iter().map(|b| format!("{b:02x}")).collect::<String>()));
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true).write(true).create_new(true);
-            #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
-            let file = options.open(&path).map_err(|e| ProtoError::Transport(format!("Cannot create S3 cleanup journal: {e}")))?;
+            // Owner-only, brand new, and never through a link; the platform
+            // crate owns the OS flags for each target.
+            let file = linscp_platform::create_private_file(&path)
+                .map_err(|e| ProtoError::Transport(format!("Cannot create S3 cleanup journal: {e}")))?;
             file.lock_exclusive().map_err(|e| ProtoError::Transport(format!("Cannot lock S3 cleanup journal: {e}")))?;
             file
         };
@@ -2051,20 +2037,29 @@ mod cleanup_sampling_tests {
         let target = dir.path().join("target");
         let path = dir.path().join("upload-hardlink.json");
         std::fs::write(&target, b"unrelated").unwrap();
-        std::fs::hard_link(&target, &path).unwrap();
+        // FAT, exFAT and some network shares cannot hard-link; the journal is
+        // then still refused for not being a regular file elsewhere, so the
+        // case has nothing to assert on such a volume.
+        if std::fs::hard_link(&target, &path).is_err() {
+            return;
+        }
         assert!(super::try_open_journal(&path).is_none());
         assert_eq!(std::fs::read(&target).unwrap(), b"unrelated");
     }
 
-    #[cfg(unix)]
     #[test]
     fn journal_rejects_fifo_without_blocking() {
-        use std::os::unix::ffi::OsStrExt;
+        // A FIFO is a special file; creating one is a platform operation
+        // (Windows has no equivalent), so the fixture comes from the platform
+        // crate. If the platform cannot make one, the behaviour it guards
+        // cannot exist there and the test has nothing to assert.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("upload-fifo.json");
-        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-        assert!(super::try_open_journal(&path).is_none());
+        match linscp_platform::create_fifo_fixture(&path) {
+            Ok(()) => assert!(super::try_open_journal(&path).is_none()),
+            Err(linscp_platform::PlatformError::Unsupported(_)) => {}
+            Err(error) => panic!("cannot create FIFO fixture: {error}"),
+        }
     }
 
     #[test]

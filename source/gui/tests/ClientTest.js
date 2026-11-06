@@ -99,7 +99,7 @@ const responses = {
   '/api/transfer/move': { success: true },
   '/api/shell/pending': { success: true, pending: [] },
   '/api/shell/consume': { success: true, queued: ['a.txt', 'folder'],
-    missing: [], remote_dir: '/tmp/slowremote' },
+    missing: [], refused: [], remote_dir: '/tmp/slowremote' },
   '/api/shell/dismiss': { success: true },
   '/api/sync/preview': { success: true, plan: {
     header: { local: '/tmp/slowlocal', remote: '/tmp/slowremote', mode: 'both', criteria: 'time', mask: '(none)' },
@@ -800,18 +800,19 @@ function options(id) {
   const desktopCalls = calls.filter(call =>
     call.path === '/api/transfer/drop');
   const desktopRequest = desktopCalls[desktopCalls.length - 1];
-  const desktopUrl = desktopRequest ? new URL(desktopRequest.url,
-    'http://localhost:8080') : null;
+  const desktopBody = desktopRequest && desktopRequest.options.body
+    ? JSON.parse(desktopRequest.options.body) : {};
+  /* One request carries the bytes as base64 on every transport, so the same
+   * handler serves the browser, the native window and the Android app. */
   check('desktop file bytes are queued for remote upload',
-    !!desktopRequest && desktopRequest.options.body === desktopFile &&
-      desktopRequest.options.headers['Content-Type'] === 'application/octet-stream');
+    !!desktopRequest &&
+      Buffer.from(desktopBody.data_base64 || '', 'base64').toString() ===
+        'desktop upload');
   check('desktop upload targets the remote pane directory',
-    !!desktopUrl && desktopUrl.searchParams.get('name') === 'desktop.txt' &&
-      desktopUrl.searchParams.get('remote_dir') === '/tmp/slowremote' &&
-      desktopUrl.searchParams.get('tab') === '1',
-    desktopRequest ? desktopRequest.url + ' -> ' +
-      JSON.stringify(desktopUrl ? Array.from(desktopUrl.searchParams.entries()) : []) :
-      'no upload request');
+    desktopBody.name === 'desktop.txt' &&
+      desktopBody.remote_dir === '/tmp/slowremote' &&
+      desktopBody.tab === 1,
+    desktopRequest ? desktopRequest.options.body : 'no upload request');
 
   // A folder from the Linux file manager exposes FileSystemEntries. Some
   // browsers return directory children in batches, including an empty final
@@ -844,13 +845,14 @@ function options(id) {
     folders.join(',') === 'project,project/empty,project/src', folders.join(','));
   const folderFiles = calls.filter(c => c.path === '/api/transfer/drop')
     .slice(filesBefore);
-  const nestedFile = folderFiles.length ?
-    new URL(folderFiles[0].url, 'http://localhost:8080') : null;
+  const nestedBody = folderFiles.length ?
+    JSON.parse(folderFiles[0].options.body) : {};
   check('nested desktop file keeps its relative path and bytes',
-    folderFiles.length === 1 && !!nestedFile &&
-      nestedFile.searchParams.get('relative_path') ===
-        'project/src/read %TIMESTAMP%.txt' &&
-      folderFiles[0].options.body.name === 'read %TIMESTAMP%.txt');
+    folderFiles.length === 1 &&
+      nestedBody.relative_path === 'project/src/read %TIMESTAMP%.txt' &&
+      nestedBody.name === 'read %TIMESTAMP%.txt' &&
+      Buffer.from(nestedBody.data_base64 || '', 'base64').toString() ===
+        'preserve this literal name');
 
   // Enumeration failure is all-or-nothing, not a half-uploaded tree.
   const countBeforeInvalid = calls.filter(c =>
@@ -875,8 +877,8 @@ function options(id) {
   }, preventDefault() {} });
   const handleFile = calls.filter(c => c.path === '/api/transfer/drop').pop();
   check('file system handles retain the directory of their file',
-    !!handleFile && new URL(handleFile.url, 'http://localhost:8080')
-      .searchParams.get('relative_path') === 'via-handle/x.txt');
+    !!handleFile && JSON.parse(handleFile.options.body).relative_path ===
+      'via-handle/x.txt');
 
   // A drop on the pane the items came from queues nothing.
   const sameDt = fakeTransfer();
@@ -936,9 +938,15 @@ function options(id) {
     items: [{ kind: 'file', webkitGetAsEntry() { return localTree; } }],
     files: [], types: ['Files']
   }, preventDefault() {} });
+  const localDropBody = JSON.parse(
+    calls.filter(c => c.path === '/api/local/drop').pop().options.body);
   check('dropping a folder on the local pane calls /api/local/drop-dir and /api/local/drop',
     calls.filter(c => c.path === '/api/local/drop-dir').length === localDropDirBefore + 1 &&
-      calls.filter(c => c.path === '/api/local/drop').length === localDropBefore + 1);
+      calls.filter(c => c.path === '/api/local/drop').length === localDropBefore + 1 &&
+      localDropBody.local_dir === '/tmp/slowlocal' &&
+      localDropBody.relative_path === 'local-drop-dir/dropped-local.txt' &&
+      Buffer.from(localDropBody.data_base64, 'base64').toString() === 'hello local',
+    JSON.stringify({ ...localDropBody, data_base64: '...' }));
 
   // Site manager renders folder hierarchy and supports deleting a folder.
   check('site manager renders folder header for slash-delimited site',
@@ -1042,6 +1050,25 @@ function options(id) {
   check('a stored explicit-TLS site opens on FTP port 21',
     doc.getElementById('sitePort').value === '21' &&
       window.currentSiteForm().protocol === 'ftpes');
+
+  // A mirror deletes at the target, so the dialogue says so and is one-way.
+  window.openSynchronize();
+  check('the sync dialog is not still mirroring from a previous visit',
+    doc.getElementById('syncMirror').checked === false);
+  doc.getElementById('syncMode').value = 'both';
+  doc.getElementById('syncMirror').checked = true;
+  window.syncMirrorChanged();
+  check('a mirror is one-way', doc.getElementById('syncMode').value === 'remote',
+    doc.getElementById('syncMode').value);
+  check('a mirror deletes obsolete files', doc.getElementById('syncDelete').checked === true);
+  check('a mirror says that it deletes',
+    doc.getElementById('syncHint').textContent.indexOf('deletes') >= 0,
+    doc.getElementById('syncHint').textContent);
+  await window.previewSynchronization();
+  const mirrorPreview = calls.filter(c => c.path === '/api/sync/preview').pop();
+  check('the mirror choice reaches the backend',
+    mirrorPreview && JSON.parse(mirrorPreview.options.body).mirror === true);
+  window.closeModal('syncModal');
 
   // Synchronize conflict policy selector and resolution bar.
   window.openSynchronize();
@@ -1195,6 +1222,22 @@ function options(id) {
     JSON.stringify(shellPayload));
   check('confirmed shell upload closes the dialog',
     !doc.getElementById('shellUploadModal').classList.contains('open'));
+
+  // A file that is still there but cannot be queued is reported with the
+  // reason, not described as missing.
+  responses['/api/shell/pending'] = { success: true, pending: [{
+    id: 'b'.repeat(32), created: 1,
+    files: [ { name: 'locked.txt', path: '/home/u/locked.txt', is_dir: false, size: 3 }] }] };
+  await window.checkShellPending();
+  responses['/api/shell/consume'] = { success: true, queued: [], missing: [],
+    refused: [{ name: 'locked.txt', error: 'The destination already exists.' }] };
+  await window.shellUploadConfirm();
+  check('a refused file is reported with its reason',
+    text('toast').includes('locked.txt: The destination already exists.'),
+    text('toast'));
+  responses['/api/shell/consume'] = { success: true, queued: ['a.txt', 'folder'],
+    missing: [], refused: [], remote_dir: '/tmp/slowremote' };
+  responses['/api/shell/pending'] = { success: true, pending: [] };
 
   /* Directory bookmarks: one list per panel, stored by the backend; the
    * dialog jumps to a saved directory and never treats a name as markup. */
@@ -1381,8 +1424,9 @@ function options(id) {
     value('remoteTransferDirectory') === '/tmp/slowremote' &&
       value('remoteTransferMask') === '*.txt',
     value('remoteTransferDirectory') + ' / ' + value('remoteTransferMask'));
-  check('a copy inside the current session uses a local stage',
-    text('remoteTransferHint').includes('temporary local download'),
+  check('a copy inside the current session is done by the server',
+    text('remoteTransferHint').includes('done by the server') &&
+      !text('remoteTransferHint').includes('temporary local download'),
     text('remoteTransferHint'));
   doc.getElementById('remoteTransferTarget').value = 'tab:2';
   window.remoteTransferTargetChanged();

@@ -16,6 +16,8 @@ thiserror.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
 
+# The SAF bridge is compiled everywhere so a desktop host can test the
+# `content://` paths against a mock bridge; its file operations are POSIX.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

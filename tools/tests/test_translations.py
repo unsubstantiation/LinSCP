@@ -64,6 +64,17 @@ class TranslationTests(unittest.TestCase):
         that nobody translated is not.
         """
         allow = {
+            # Values, not words: paths, host patterns, ports and the commands
+            # the user types must keep their exact spelling in every locale.
+            "*.local, 192.168.*", "/etc/ssl/certs/ca.crt", "/tmp/linscp-backup.json",
+            "nc %host %port", "proxy.example.test", "sha256/...",
+            # Product names of the services and tools being launched. Their
+            # spelling is part of the name; only the surrounding words are
+            # translated.
+            "SPICE (remote-viewer :5900)", "SPICE — remote-viewer :5900",
+            "VNC (TigerVNC :5900)", "VNC — TigerVNC :5900",
+            "X11 — waypipe / ssh -X", "X2Go / NX (SSH)",
+            "RDP — xrdp :3389 (xfreerdp / mstsc)",
             "LinSCP", "SFTP", "SCP", "FTP", "FTPS", "WebDAV", "Amazon S3",
             "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10",
             "Ctrl+A", "Ctrl+L", "Ctrl+N", "Ctrl+R", "KiB", "ASCII", "Binary",
@@ -94,6 +105,30 @@ class TranslationTests(unittest.TestCase):
                         continue
                     leftover.append("%s:%s" % (locale, key[:80]))
         self.assertEqual(leftover, [], leftover[:20])
+
+    def test_every_sync_plan_reason_has_a_gui_catalog_key(self):
+        """The page translates a plan's reason, so the key has to exist.
+
+        `sync_reason_for_page` in the service maps the console client's wording
+        onto the phrase the GUI catalogs carry. A mapping added without a
+        catalog entry would show English in every other language, which no
+        longer fails loudly anywhere else.
+        """
+        source = (ROOT / "crates/linscp-service/src/lib.rs").read_text(encoding="utf-8")
+        start = source.index("fn sync_reason_for_page")
+        block = source[start:source.index("\n}\n", start)]
+        pairs = re.findall(r'"([^"]+)"\s*=>\s*(?:\{\s*)?"([^"]+)"', block)
+        self.assertGreater(len(pairs), 15, "the reason table was not found")
+        catalogs = load_catalogs(GUI_DIRECTORY)
+        english = catalogs["en"]
+        for planner_reason, page_phrase in pairs:
+            self.assertNotEqual(planner_reason, page_phrase,
+                                f"{planner_reason} is not translated for the page")
+            self.assertIn(page_phrase, english,
+                          f"no GUI catalog key for '{page_phrase}' (from '{planner_reason}')")
+            for locale, catalog in catalogs.items():
+                self.assertIn(page_phrase, catalog,
+                              f"{locale} has no entry for '{page_phrase}'")
 
     def test_cli_literals_survive_translation(self):
         """Switches, values, commands and protocol words stay verbatim.

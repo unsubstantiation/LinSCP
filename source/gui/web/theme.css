@@ -371,6 +371,22 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   font-size: 12px;
 }
 .path-input { flex: 1; font-family: "Cascadia Code", Consolas, "DejaVu Sans Mono", monospace; }
+/* Local root switcher: shown in every app that has more than one root, so the
+ * Android granted folders and the Windows drives sit in the same place. It
+ * stays narrow because the path box needs the room. */
+.root-select {
+  flex: 0 1 auto;
+  max-width: 34%;
+  min-width: 84px;
+  min-height: 29px;
+  padding: 4px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: var(--surface-input);
+  color: var(--text);
+  font-size: 12px;
+}
+.root-select:focus { border-color: var(--accent); outline: none; }
 .path-input:focus, .input-field:focus, .select-field:focus { border-color: var(--accent); outline: none; }
 input::placeholder, textarea::placeholder { color: var(--subtle); opacity: 1; }
 select option { background: var(--surface); color: var(--text); }

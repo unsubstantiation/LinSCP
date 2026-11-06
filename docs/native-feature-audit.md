@@ -1,7 +1,7 @@
 # Native desktop feature audit
 
-This is an audit of the native Tauri service, not a claim of upstream WinSCP
-parity or production readiness. An engine module or a legacy HTML control does
+This is an audit of the native Tauri service, not a claim of parity with the
+upstream client or of production readiness. An engine module or a legacy HTML control does
 not by itself mean a feature is wired into the native application. See the
 transfer limitations in `readme.md` before using remote operations.
 

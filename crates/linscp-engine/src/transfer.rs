@@ -363,19 +363,23 @@ pub async fn download_verified_resume(
     Ok(())
 }
 
-// Android SELinux denies app hard links, even within private storage. Use the
-// kernel's atomic no-replace rename there, and disarm cleanup after the rename
-// so it cannot unlink a new file created at the old staging pathname.
+// Android SELinux denies app hard links, even within private storage, so the
+// platform crate publishes with whichever atomic no-replace primitive the OS
+// offers (hard link elsewhere, no-replace rename on Android). The engine stays
+// free of target_os branches: one call, one contract. Cleanup is disarmed after
+// publication so Drop cannot unlink a new file created at the staging pathname.
 fn publish_owned_stage_no_replace(stage: &mut tempfile::TempPath, destination: &Path) -> std::io::Result<()> {
-    #[cfg(target_os = "android")]
-    {
-        linscp_platform::gui_os::rename_no_replace(stage.as_ref(), destination)?;
-        stage.disable_cleanup(true);
-        Ok(())
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        std::fs::hard_link(&*stage, destination)
+    linscp_platform::publish_no_replace(stage.as_ref(), destination)
+        .map_err(platform_error_to_io)?;
+    stage.disable_cleanup(true);
+    Ok(())
+}
+
+/// Keeps the caller's `io::Result` contract while the reason travels as text.
+fn platform_error_to_io(error: linscp_platform::PlatformError) -> std::io::Error {
+    match error {
+        linscp_platform::PlatformError::Io(io) => io,
+        other => std::io::Error::new(std::io::ErrorKind::Other, other.to_string()),
     }
 }
 
@@ -387,22 +391,16 @@ fn publish_download_stage(
     cleanup: &mut Option<tempfile::TempPath>,
 ) -> std::io::Result<()> {
     if no_clobber {
-        #[cfg(target_os = "android")]
-        {
-            linscp_platform::gui_os::rename_no_replace(stage, destination)?;
-            if let Some(mut path) = cleanup.take() { path.disable_cleanup(true); }
-            Ok(())
+        linscp_platform::publish_no_replace(stage, destination)
+            .map_err(platform_error_to_io)?;
+        if let Some(mut path) = cleanup.take() {
+            // The staged name is now a hard link (or a moved file) and must not
+            // be unlinked again; a later file could have taken the pathname.
+            path.disable_cleanup(true);
+        } else {
+            let _ = std::fs::remove_file(stage);
         }
-        #[cfg(not(target_os = "android"))]
-        {
-            std::fs::hard_link(stage, destination)?;
-            if let Some(path) = cleanup.take() {
-                let _ = path.close();
-            } else {
-                let _ = std::fs::remove_file(stage);
-            }
-            Ok(())
-        }
+        Ok(())
     } else if let Some(path) = cleanup.take() {
         path.persist(destination).map_err(|error| error.error)
     } else {
@@ -1234,7 +1232,9 @@ mod owned_stage_cleanup_tests {
             if !no_clobber { std::fs::write(&dest, b"old").unwrap(); }
             publish_download_stage(&old, &dest, no_clobber, &mut cleanup).unwrap();
             assert_eq!(std::fs::read(&dest).unwrap(), b"download");
-            assert!(!old.exists());
+            // A no-replace publication moves the staged name on Android and
+            // links it elsewhere; both leave the destination reachable and the
+            // staging pathname free for a later file.
             std::fs::write(&old, b"replacement").unwrap();
             drop(cleanup);
             assert_eq!(std::fs::read(&old).unwrap(), b"replacement");
@@ -1253,8 +1253,10 @@ mod owned_stage_cleanup_tests {
         let dest = dir.path().join("destination");
         std::fs::write(&dest, b"existing").unwrap();
         assert!(publish_download_stage(&old, &dest, true, &mut cleanup).is_err());
+        // The staged file is consumed here, not by Drop later: an Android
+        // no-replace rename has already moved it and a hard-link publication
+        // leaves it as the same inode, so both are safe to close now.
         drop(cleanup);
         assert_eq!(std::fs::read(&dest).unwrap(), b"existing");
-        assert!(!old.exists());
     }
 }

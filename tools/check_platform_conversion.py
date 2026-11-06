@@ -192,8 +192,10 @@ RULES = [
     ('win32-project', 'packaging', r'\.(?:sln|vcxproj|vcproj|dsp|dsw)\b',
      'a Windows project file'),
 
-    ('win32-runner', 'packaging', r'runs-on:\s*windows',
-     'a Windows CI runner'),
+    # A Windows CI runner is intentional: the Rust + Tauri client builds for
+    # Windows from the same tree, and `.github/workflows/windows-build.yml`
+    # compiles it. Only the *artefacts* of the retired Windows port (project
+    # files, toolchain scripts) are leftovers, and those stay flagged above.
 
     # --- Documentation that tells the reader to use Windows ---------
     # The two executable names here are external Windows program names;
