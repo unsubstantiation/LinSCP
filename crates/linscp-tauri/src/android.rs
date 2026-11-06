@@ -240,6 +240,7 @@ pub use imp::AndroidState;
 
 #[cfg(all(target_os = "android", feature = "native-shell"))]
 mod mobile_plugin {
+    use super::AndroidState;
     use std::path::PathBuf;
     use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 

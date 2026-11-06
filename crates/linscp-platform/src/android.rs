@@ -9,7 +9,7 @@ use std::io::Write;
 // `content://` paths; only a real Unix host can enforce POSIX modes, so those
 // calls stay behind `cfg(unix)` and the portable fallbacks take over.
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use linscp_types::{FileEntry, LocalRootEntry};
