@@ -218,12 +218,14 @@ class PropertiesTests(unittest.TestCase):
 class ApkVerificationTests(unittest.TestCase):
     """The digest the APK is compared against comes from the keystore."""
 
+    # The shape build-tools 31 and later print, with a real-length digest.
+    DIGEST = '0123456789abcdef' * 4
     APKSIGNER = ('Verifies\n'
                  'Verified using v1 scheme (JAR signing): false\n'
                  'Verified using v2 APK Signature Scheme v2: true\n'
                  'Number of signers: 1\n'
                  'Signer #1 certificate DN: CN=LinSCP\n'
-                 'Signer #1 certificate SHA-256 digest: 0123abcd\n'
+                 f'Signer #1 certificate SHA-256 digest: {DIGEST}\n'
                  'Signer #1 certificate SHA-1 digest: abcd0123\n')
 
     def proof(self, keystore='release.jks', password='secret', alias='linscp'):
@@ -246,11 +248,29 @@ class ApkVerificationTests(unittest.TestCase):
         self.addCleanup(restore)
 
     def test_the_signer_digest_is_read_from_apksigner(self):
-        self.assertEqual(self.verify.signer_digest(self.APKSIGNER), '0123abcd')
+        self.assertEqual(self.verify.signer_digest(self.APKSIGNER), self.DIGEST)
+
+    def test_a_colon_separated_uppercase_digest_is_normalised(self):
+        # `keytool` prints fingerprints this way, and some apksigner builds do
+        # too; the comparison against the keystore is on lowercase hex.
+        fingerprint = ':'.join(self.DIGEST[i:i + 2] for i in range(0, 64, 2)).upper()
+        self.assertEqual(
+            self.verify.signer_digest(
+                f'Signer #1 certificate SHA-256 digest: {fingerprint}\n'),
+            self.DIGEST)
+
+    def test_the_older_v2_scheme_spelling_counts_as_signed(self):
+        # build-tools 28-30 word the line differently; a release APK signed by
+        # hand with an older SDK is still a v2-signed APK.
+        self.assertTrue(self.verify.V2_SCHEME.search(
+            'Verified using v2 scheme (APK Signature Scheme v2): true'))
 
     def test_apksigner_output_without_a_signer_is_refused(self):
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(SystemExit) as raised:
             self.verify.signer_digest('Signer #1 certificate SHA-1 digest: abcd\n')
+        # The message has to carry what apksigner said, or the next failure in
+        # CI is another guess rather than a reading.
+        self.assertIn('It said:', str(raised.exception))
 
     def test_the_expected_digest_is_asked_of_the_keystore(self):
         self.proof(keystore='/keys/release.jks', password='store-secret', alias='linscp')
