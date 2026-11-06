@@ -49,6 +49,14 @@ jobs:
       - name: Check the translation catalogs are compiled and current
         run: python3 tools/compile_translations.py --check && python3 tools/check_shared_frontend.py
 
+      # A crate that nothing in the packaging path builds can be broken for
+      # weeks while every targeted test passes. Compiling and testing the
+      # browser host crate in one go is what keeps that from happening: the
+      # axum handler signatures the browser mode depends on are checked here,
+      # not only when a smoke test happens to reach them.
+      - name: Compile and test the browser host crate
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-http
+
       - name: Exercise atomic local moves
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service local_moves_are_atomic_no_replace -- --nocapture
 
@@ -66,11 +74,15 @@ jobs:
       - name: Exercise native WebDAV connection and transfers
         env:
           LSCP_LIVE_WEBDAV: "1"
+          # The dispatch future has grown with every endpoint added to it; a
+          # debug build of this case needs more than the 2 MiB test-thread floor.
+          RUST_MIN_STACK: "16777216"
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_webdav_ -- --nocapture --test-threads=1
 
       - name: Exercise native FTP connection and download
         env:
           LSCP_LIVE_FTP: "1"
+          RUST_MIN_STACK: "16777216"
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ftp_ -- --nocapture --test-threads=1
 
       - name: Exercise native explicit FTPS connection and download
@@ -89,6 +101,7 @@ jobs:
       - name: Exercise native S3 TLS connection and download
         env:
           LSCP_LIVE_S3: "1"
+          RUST_MIN_STACK: "16777216"
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_s3_ -- --nocapture --test-threads=1
 
       - name: Build the binary package
@@ -140,14 +153,24 @@ jobs:
             curl -fsS -o /dev/null "http://127.0.0.1:8791/" && break
             sleep 1
           done
-          curl -fsS "http://127.0.0.1:8791/" | grep -q 'LSCP_TOKEN' ||
-            { echo "::error::the served page carries no token"; exit 1; }
+          # The page is read whole before it is searched: `curl | grep -q` lets
+          # grep close the pipe early, which turns curl into a SIGPIPE failure
+          # under `pipefail` and makes a page that does carry the token look
+          # like one that does not.
+          page=$(curl -fsS "http://127.0.0.1:8791/")
+          case "$page" in
+            *LSCP_TOKEN*) ;;
+            *) echo "::error::the served page carries no token"; exit 1 ;;
+          esac
           # A request without the bearer token is refused, and one with it is
           # answered: the token is the whole access control of this mode.
           status=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8791/api/status")
           test "$status" = 401 || { echo "::error::/api/status answered $status without a token"; exit 1; }
-          curl -fsS -H "X-LSCP-Token: $token" "http://127.0.0.1:8791/api/status" | grep -q '"tabs"' ||
-            { echo "::error::/api/status did not answer the session list"; exit 1; }
+          status_answer=$(curl -fsS -H "X-LSCP-Token: $token" "http://127.0.0.1:8791/api/status")
+          case "$status_answer" in
+            *'"tabs"'*) ;;
+            *) echo "::error::/api/status did not answer the session list"; exit 1 ;;
+          esac
           # A Host header that is not allowed must not be treated as loopback.
           status=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: attacker.example' "http://127.0.0.1:8791/api/status")
           test "$status" = 403 || { echo "::error::a foreign Host header answered $status"; exit 1; }

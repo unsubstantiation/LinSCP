@@ -119,6 +119,7 @@
   "Cannot remove the folder.": "No se puede eliminar la carpeta.",
   "Cannot remove the site.": "No se puede eliminar el sitio.",
   "Cannot remove the stored data.": "No se pueden eliminar los datos almacenados.",
+  "An item named {name} already exists here. Replace it?": "Ya existe aquí un elemento llamado {name}. ¿Reemplazarlo?",
   "Cannot rename.": "No se puede renombrar.",
   "Cannot run the command.": "No se puede ejecutar el comando.",
   "Cannot save the bookmark.": "No se puede guardar el marcador.",

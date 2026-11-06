@@ -119,6 +119,7 @@
   "Cannot remove the folder.": "Der Ordner kann nicht entfernt werden.",
   "Cannot remove the site.": "Die Verbindung kann nicht entfernt werden.",
   "Cannot remove the stored data.": "Die gespeicherten Daten können nicht entfernt werden.",
+  "An item named {name} already exists here. Replace it?": "Ein Eintrag namens {name} existiert hier bereits. Ersetzen?",
   "Cannot rename.": "Umbenennen nicht möglich.",
   "Cannot run the command.": "Der Befehl kann nicht ausgeführt werden.",
   "Cannot save the bookmark.": "Das Lesezeichen kann nicht gespeichert werden.",

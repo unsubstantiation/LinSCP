@@ -244,21 +244,29 @@ fn mime_for_path(path: &Path) -> String {
     }
 }
 
+/// The path and query the service dispatches on, as the request carried them.
+fn full_path(uri: &Uri) -> String {
+    uri.path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| uri.path().to_string())
+}
+
+#[axum::debug_handler]
 async fn api_handler(
     State(state): State<Arc<HttpAppState>>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
+    request: axum::extract::Request,
 ) -> Response {
+    // axum 0.7 requires a handler's last extractor to implement `FromRequest`,
+    // which `HeaderMap` does not, so the request is taken whole and read here.
+    let (parts, body) = request.into_parts();
+    let method = parts.method;
+    let uri = parts.uri;
+    let headers = parts.headers;
+    // The Host/Origin allowlist and the token are decided once, before any body
+    // is read: an unauthenticated caller must not be able to make the server
+    // buffer a gigabyte it will refuse to dispatch.
     if let Err(reason) = check_host_and_origin(&headers, &state.config.allowed_hosts) {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": reason }))).into_response();
-    }
-    // Binary upload handling for browser drops
-    let path_only = uri.path().to_string();
-    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
-    if (path_only == "/api/transfer/drop" || path_only == "/api/local/drop") && ct == "application/octet-stream" {
-        return handle_octet_drop(State(state), method, uri, headers, body).await;
     }
     let provided = supplied_token(&headers);
     if !constant_time_str_eq(&provided, &state.config.bearer_token) {
@@ -268,8 +276,30 @@ async fn api_handler(
         )
             .into_response();
     }
-    if body.len() > MAX_JSON_BODY_BYTES {
-        return (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({"error": "JSON body too large"}))).into_response();
+    // A browser posts a dropped file as raw bytes, because a `File` cannot be
+    // JSON-encoded without first reading it into memory twice. That body may be
+    // large; every other body is JSON and stays small.
+    let path_only = uri.path().to_string();
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let is_octet_drop = (path_only == "/api/transfer/drop" || path_only == "/api/local/drop")
+        && content_type == "application/octet-stream";
+    let limit = if is_octet_drop { MAX_BROWSER_UPLOAD_BYTES } else { MAX_JSON_BODY_BYTES };
+    let body = match axum::body::to_bytes(body, limit).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let error = if is_octet_drop {
+                "Browser uploads are limited to 1 GiB"
+            } else {
+                "JSON body too large"
+            };
+            return (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({ "error": error }))).into_response();
+        }
+    };
+    if is_octet_drop {
+        return dispatch_octet_drop(&state, method, uri, body).await;
     }
     let parsed_body: Value = if body.is_empty() {
         json!({})
@@ -290,15 +320,11 @@ async fn api_handler(
             }
         }
     };
-    let full_path = uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| uri.path().to_string());
     // Enforce JSON object for POST body (like Python)
     let body_for_service = if parsed_body.is_object() { parsed_body } else if parsed_body.is_null() { json!({}) } else { parsed_body };
     let reply = state.service.dispatch_async(ApiEnvelope {
         method: method.as_str().to_string(),
-        path: full_path,
+        path: full_path(&uri),
         body: body_for_service,
     }).await;
     let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -308,36 +334,18 @@ async fn api_handler(
     resp
 }
 
-/// A browser posts a dropped file as raw bytes, because a `File` cannot be
-/// JSON-encoded without first reading it into memory twice.
-///
-/// The body is turned into the one representation the service accepts and then
-/// dispatched like any other request, so the drop endpoint exists once: the
-/// desktop window, the browser and the Android app all reach the same handler.
-async fn handle_octet_drop(
-    State(state): State<Arc<HttpAppState>>,
+/// The already-authenticated body of a browser drop, in the one representation
+/// the service accepts, so the drop endpoint exists once: the desktop window,
+/// the browser and the Android app all reach the same handler.
+async fn dispatch_octet_drop(
+    state: &Arc<HttpAppState>,
     method: Method,
     uri: Uri,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(reason) = check_host_and_origin(&headers, &state.config.allowed_hosts) {
-        return (StatusCode::FORBIDDEN, Json(json!({ "error": reason }))).into_response();
-    }
-    let provided = supplied_token(&headers);
-    if !constant_time_str_eq(&provided, &state.config.bearer_token) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid or missing X-LSCP-Token"}))).into_response();
-    }
-    if body.len() > MAX_BROWSER_UPLOAD_BYTES {
-        return (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({"error": "Browser uploads are limited to 1 GiB"}))).into_response();
-    }
-    let full_path = uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| uri.path().to_string());
     let reply = state.service.dispatch_async(ApiEnvelope {
         method: method.as_str().to_string(),
-        path: full_path,
+        path: full_path(&uri),
         body: json!({ "data_base64": BASE64_STD.encode(&body) }),
     }).await;
     let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -464,11 +472,58 @@ mod browser_server_tests {
         assert!(!server.token.is_empty());
     }
 
+    /// A request that reaches the router really is dispatched, and the two
+    /// guards refuse before any work happens: the bearer token, and a `Host`
+    /// the server does not answer to. Fetching the page alone would not show
+    /// that the `/api` route is wired at all.
+    #[tokio::test]
+    async fn the_api_route_dispatches_and_guards_itself() {
+        let server = BrowserServer::bind(0, &[], None).expect("bind a loopback port");
+        let port = server.addr.port();
+        let token = server.token.clone();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/api/status");
+        let local_host = format!("127.0.0.1:{port}");
+        // Without the token the API refuses instead of dispatching.
+        let refused = client
+            .get(&url)
+            .header("host", &local_host)
+            .send()
+            .await
+            .expect("reach the server");
+        assert_eq!(refused.status().as_u16(), 401);
+        // With it, the same request reaches the service and is answered.
+        let answered = client
+            .get(&url)
+            .header("host", &local_host)
+            .header("x-lscp-token", &token)
+            .send()
+            .await
+            .expect("reach the server");
+        assert_eq!(answered.status().as_u16(), 200);
+        let body: Value = serde_json::from_str(&answered.text().await.expect("an answer"))
+            .expect("a JSON answer");
+        assert_eq!(body["binary"], "linscp");
+        // A foreign `Host` is refused even with the token, so a DNS rebinding
+        // page cannot borrow the caller's credentials.
+        let rebound = client
+            .get(&url)
+            .header("host", "attacker.example.com")
+            .header("x-lscp-token", &token)
+            .send()
+            .await
+            .expect("reach the server");
+        assert_eq!(rebound.status().as_u16(), 403);
+    }
+
     /// An extra host is accepted only by name, and it does not widen the list
     /// to everything: the token is still the only thing guarding the API.
     #[test]
     fn an_extra_allowed_host_is_named_not_wildcarded() {
-        let server = BrowserServer::bind(0, &[" LinSCP.Internal ", ""], None)
+        let server = BrowserServer::bind(0, &[" LinSCP.Internal ".to_string(), String::new()], None)
             .expect("bind a loopback port");
         assert!(server.config.allowed_hosts.contains("linscp.internal"));
         assert!(!server.config.allowed_hosts.contains("*"));

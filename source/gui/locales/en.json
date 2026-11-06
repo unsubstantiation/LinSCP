@@ -119,6 +119,7 @@
   "Cannot remove the folder.": "Cannot remove the folder.",
   "Cannot remove the site.": "Cannot remove the site.",
   "Cannot remove the stored data.": "Cannot remove the stored data.",
+  "An item named {name} already exists here. Replace it?": "An item named {name} already exists here. Replace it?",
   "Cannot rename.": "Cannot rename.",
   "Cannot run the command.": "Cannot run the command.",
   "Cannot save the bookmark.": "Cannot save the bookmark.",

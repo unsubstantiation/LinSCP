@@ -2092,12 +2092,56 @@ impl CommanderService {
         let old = body.get("old_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let new = body.get("new_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if old.is_empty() || new.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Both names are required"})}; }
+        let overwrite = body.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
         let src = match resolve_contained(&base, &old) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
         let dst = match resolve_contained(&base, &new) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
-        match self.local_fs.rename(&src, &dst) {
-            Ok(_) => ApiReply{ status: 200, payload: json!({"success": true})},
-            Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})},
+        // A rename is not an overwrite: replacing the destination would destroy
+        // the entry the user asked to keep. A granted SAF document has no
+        // pathname to move, so its rename stays the bridge's own operation.
+        if src.starts_with("content://") || dst.starts_with("content://") {
+            return match self.local_fs.rename(&src, &dst) {
+                Ok(_) => ApiReply{ status: 200, payload: json!({"success": true})},
+                Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})},
+            };
         }
+        match Self::rename_local_path(Path::new(&src), Path::new(&dst), overwrite) {
+            Ok(()) => ApiReply{ status: 200, payload: json!({"success": true})},
+            // `conflict` is the answer the page asks about; the message is for
+            // the person who cancelled the prompt instead.
+            Err(e) => ApiReply{ status: 400, payload: json!({
+                "success": false,
+                "conflict": e.ends_with(":conflict"),
+                "error": Self::rename_error_message(&e),
+            })},
+        }
+    }
+
+    /// The message for a refused rename, with the conflict marker removed.
+    fn rename_error_message(error: &str) -> String {
+        match error.strip_suffix(":conflict") {
+            Some(path) => format!("An item already exists at {path}."),
+            None => error.to_string(),
+        }
+    }
+
+    /// Moves a local entry, never replacing one unless the caller confirmed it.
+    ///
+    /// The no-replace move is the rule for every path (a dropped item, a file
+    /// out of the panel, a rename); `overwrite` is only ever set from an answer
+    /// the page collected. A refused move says which name is taken, so the page
+    /// can ask about that one instead of guessing at the error text.
+    fn rename_local_path(from: &Path, to: &Path, overwrite: bool) -> Result<(), String> {
+        if overwrite && std::fs::symlink_metadata(to).is_ok() {
+            return std::fs::remove_file(to)
+                .map_err(|error| format!("Cannot replace '{}': {error}", to.display()));
+        }
+        linscp_platform::gui_os::rename_no_replace(from, to).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("{}:conflict", to.display())
+            } else {
+                error.to_string()
+            }
+        })
     }
     fn handle_local_chmod(&self, body: Value) -> ApiReply {
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
@@ -2273,6 +2317,32 @@ impl CommanderService {
         Ok((parent, leaf))
     }
 
+    /// The panel directory a drop lands in, with no leaf name required.
+    ///
+    /// `drop_target` names one file; a drop of paths has no single leaf, and a
+    /// folder-only drop has none either, so the directory is resolved on its
+    /// own and each caller asks for the name it actually needs.
+    fn drop_base_directory(&self, query: &BTreeMap<String,String>, body: &Value, local: bool) -> Result<String, ApiReply> {
+        let dir_key = if local { "local_dir" } else { "remote_dir" };
+        let tab_id = query.get("tab").and_then(|value| parse_tab_id_str(Some(value)))
+            .or_else(|| body.get("tab").and_then(|value| {
+                if value.is_number() { value.as_u64() } else { value.as_str().and_then(|text| text.parse().ok()) }
+            }));
+        let tab = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).cloned());
+        let base = query.get(dir_key).cloned()
+            .or_else(|| body.get(dir_key).and_then(Value::as_str).map(str::to_string))
+            .or_else(|| tab.as_ref().map(|tab| if local { tab.local_dir.clone() } else { tab.remote_dir.clone() }))
+            .unwrap_or_else(|| if local { self.default_local_dir() } else { "/".to_string() });
+        let base = base.trim().to_string();
+        if base.is_empty() {
+            return Err(api_error(400, "The panel directory of this drop is not set."));
+        }
+        if base.chars().any(char::is_control) {
+            return Err(api_error(400, "The panel directory must not contain control characters."));
+        }
+        Ok(base)
+    }
+
     /// Saves a drop into the local panel.
     ///
     /// A browser posts bytes; a native window posts paths, one per item. Both
@@ -2281,25 +2351,37 @@ impl CommanderService {
     /// Windows drive or a POSIX directory behaves the same way and never
     /// bypasses the write rules (`content://` included).
     fn handle_local_drop(&self, query: &BTreeMap<String, String>, body: Value) -> ApiReply {
+        // A drop is one of two shapes: the page's bytes for one file, or the
+        // paths a native window hands over. Only the first has a leaf name of
+        // its own; the second names every item, so requiring a name up front
+        // would refuse every desktop drop. The target is therefore resolved
+        // without demanding one, and the byte path asks for it before it
+        // writes anything.
+        let paths = Self::drop_source_paths(&body);
         let (base, name, relative) = match self.drop_target(query, &body, true) {
             Ok(parts) => parts,
             Err(reply) => return reply,
         };
-        let paths = Self::drop_source_paths(&body);
+        let destination_dir = match self.drop_destination(&base, "", &relative) {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(error) => return api_error(400, error),
+        };
         if !paths.is_empty() {
-            // The panel directory, plus the folder a staged browser drop
-            // carried. A native drop names items, not a sub-path, so this is
-            // the panel's own directory in that case.
-            let target_dir = match self.drop_destination(&base, "", &relative) {
-                Ok(path) => path.to_string_lossy().into_owned(),
-                Err(error) => return api_error(400, error),
-            };
-            if !is_saf_path(&target_dir) {
-                if let Err(error) = self.local_fs.mkdir_all(&target_dir) {
+            // A path drop is not a byte drop: the items keep their own names.
+            // Whether they can be read is decided when they are copied, and a
+            // path that cannot be read is refused there with its own reason.
+            if !is_saf_path(&destination_dir) {
+                if let Err(error) = self.local_fs.mkdir_all(&destination_dir) {
                     return api_error(400, format!("Cannot create the drop folder: {error}"));
                 }
             }
-            return self.save_dropped_paths(&target_dir, &paths, &body);
+            return self.save_dropped_paths(&destination_dir, &paths, &body);
+        }
+        if name.is_empty() {
+            return api_error(400, "A file name is required.");
+        }
+        if let Err(error) = ops::validate_leaf_name(&name) {
+            return api_error(400, error);
         }
         let bytes = match Self::drop_payload(&body) {
             Ok(bytes) => bytes,
@@ -2432,10 +2514,24 @@ impl CommanderService {
 
     /// Creates the folders a dropped directory contained, including empty ones.
     fn handle_local_drop_dir(&self, query: &BTreeMap<String,String>, body: Value) -> ApiReply {
-        let (base, _name, relative) = match self.drop_target(query, &body, true) {
-            Ok(parts) => parts,
+        // A dropped folder names no file, so no leaf name is asked for. The
+        // relative sub-path is what the folder lands under; a native window
+        // sends the folder's own name as that sub-path, and a folder drop with
+        // neither is refused rather than guessed at.
+        let base = match self.drop_base_directory(query, &body, true) {
+            Ok(base) => base,
             Err(reply) => return reply,
         };
+        let relative = query.get("relative_path").cloned()
+            .or_else(|| body.get("relative_path").and_then(Value::as_str).map(str::to_string))
+            .or_else(|| {
+                // A native window names the dropped folder and nothing else,
+                // so the folder keeps the name it has on the machine.
+                Self::drop_source_paths(&body)
+                    .first()
+                    .and_then(|path| Path::new(path).file_name().map(|leaf| leaf.to_string_lossy().into_owned()))
+            })
+            .unwrap_or_default();
         if relative.is_empty() {
             return api_error(400, "A relative path is required.");
         }
@@ -2458,7 +2554,7 @@ impl CommanderService {
     /// detection and the overwrite rules therefore behave exactly as they do
     /// for a file copied out of the local pane.
     async fn handle_transfer_drop(&self, body: Value) -> ApiReply {
-        let (remote_dir, name, relative) = match self.drop_target(&BTreeMap::new(), &body, false) {
+        let (remote_dir, mut name, relative) = match self.drop_target(&BTreeMap::new(), &body, false) {
             Ok(parts) => parts,
             Err(reply) => return reply,
         };
@@ -2551,6 +2647,20 @@ impl CommanderService {
             Ok(bytes) => bytes,
             Err(error) => return api_error(400, error),
         };
+        // A byte drop is one file, so it needs the name it lands under. A drop
+        // that named one path already carries it.
+        if name.is_empty() {
+            name = source_paths
+                .first()
+                .and_then(|path| Path::new(path).file_name().map(|leaf| leaf.to_string_lossy().into_owned()))
+                .unwrap_or_default();
+        }
+        if name.is_empty() {
+            return api_error(400, "A file name is required.");
+        }
+        if let Err(error) = ops::validate_leaf_name(&name) {
+            return api_error(400, error);
+        }
         // The panel directory plus the folder the drop carried. The leaf name
         // stays in the file name, so staging and destination agree.
         let destination_dir = if relative.is_empty() {
@@ -2724,32 +2834,16 @@ impl CommanderService {
     }
 
 
-    /// Reads the panel directory, the leaf name and the relative sub-path of a
-    /// drop, from the query string or from the JSON body.
+    /// Reads the panel directory, the leaf name a byte drop is written under
+    /// and the relative sub-path, from the query string or the JSON body.
+    ///
+    /// The name is optional: a drop that names paths, or a folder-only drop,
+    /// carries no single leaf, and each caller asks for the name it needs.
     fn drop_target(&self, query: &BTreeMap<String,String>, body: &Value, local: bool) -> Result<(String, String, String), ApiReply> {
-        let dir_key = if local { "local_dir" } else { "remote_dir" };
-        let tab_id = query.get("tab").and_then(|value| parse_tab_id_str(Some(value)))
-            .or_else(|| body.get("tab").and_then(|value| {
-                if value.is_number() { value.as_u64() } else { value.as_str().and_then(|text| text.parse().ok()) }
-            }));
-        let tab = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).cloned());
-        let base = query.get(dir_key).cloned()
-            .or_else(|| body.get(dir_key).and_then(Value::as_str).map(str::to_string))
-            .or_else(|| tab.as_ref().map(|tab| if local { tab.local_dir.clone() } else { tab.remote_dir.clone() }))
-            .unwrap_or_else(|| if local { self.default_local_dir() } else { "/".to_string() });
-        let base = base.trim().to_string();
-        if base.is_empty() {
-            return Err(api_error(400, "The panel directory of this drop is not set."));
-        }
-        if base.chars().any(char::is_control) {
-            return Err(api_error(400, "The panel directory must not contain control characters."));
-        }
-        let raw_name = query.get("name").cloned()
-            .or_else(|| body.get("name").and_then(Value::as_str).map(str::to_string));
-        let name = match raw_name {
-            Some(name) => ops::validate_leaf_name(&name).map_err(|error| api_error(400, error))?,
-            None => return Err(api_error(400, "A file name is required.")),
-        };
+        let base = self.drop_base_directory(query, body, local)?;
+        let name = query.get("name").cloned()
+            .or_else(|| body.get("name").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default();
         let relative = query.get("relative_path").cloned()
             .or_else(|| body.get("relative_path").and_then(Value::as_str).map(str::to_string))
             .unwrap_or_default();
@@ -2849,7 +2943,14 @@ impl CommanderService {
         if tab.is_local {
             let src = match resolve_contained(&tab.other_local_dir, &old) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
             let dst = match resolve_contained(&tab.other_local_dir, &new) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
-            match self.local_fs.rename(&src, &dst) { Ok(_)=> ApiReply{ status:200, payload: json!({"success": true})}, Err(e)=> ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})}}
+            // The other local pane renames through the same move, so neither
+            // pane can overwrite an entry without the confirmation the other one
+            // requires.
+            let overwrite = body.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
+            match Self::rename_local_path(Path::new(&src), Path::new(&dst), overwrite) {
+                Ok(())=> ApiReply{ status:200, payload: json!({"success": true})},
+                Err(e)=> ApiReply{ status:400, payload: json!({"success": false, "conflict": e.ends_with(":conflict"), "error": Self::rename_error_message(&e)})},
+            }
         } else { ApiReply{ status:400, payload: json!({"success": false, "error": "not implemented"})}}
     }
     // The panel's own mutation calls arrive through `dispatch_async`, which
@@ -3907,8 +4008,13 @@ mod tests {
                 method: "POST".into(), path: path.into(),
                 body: json!({"tab": 0, "path": "/", "name": "x", "names": ["x"], "data": ""}),
             });
+            // Every one of these refuses, and none of them reports success.
+            // The status says why - 400 needs a connection, 404 is a route only
+            // the asynchronous dispatcher serves, 501 is an operation this host
+            // cannot perform - so the assertion is that it is an error status
+            // and not a success, not that each endpoint picked one spelling.
+            assert!(!(200..300).contains(&reply.status), "{path} answered {} with {}", reply.status, reply.payload);
             assert_ne!(reply.payload["success"], true, "{path}");
-            assert!((400..500).contains(&reply.status), "{path} answered {}", reply.status);
         }
     }
 
@@ -5386,7 +5492,11 @@ mod tests {
         // Nothing selected, and a request that names nothing usable, are
         // refusals rather than an empty success.
         for body in [json!({"tab": id, "names": []}), json!({"tab": id})] {
-            assert_eq!(svc.dispatch_async(request(body)).status, 400);
+            assert_eq!(
+                svc.dispatch_async(request(body.clone())).await.status,
+                400,
+                "{body}"
+            );
         }
         // A name is resolved against the directory the request names, and a
         // name that only exists elsewhere is left alone: the panel directory is
@@ -7199,8 +7309,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    #[test]
-    fn desktop_drops_are_saved_by_the_same_endpoint_in_every_app() {
+    #[tokio::test]
+    async fn desktop_drops_are_saved_by_the_same_endpoint_in_every_app() {
         // The page sends one JSON body (base64 bytes) on both transports, so
         // the browser and the native window reach this handler; the HTTP layer
         // only has to turn a raw browser upload into the same body.
@@ -7260,12 +7370,13 @@ mod tests {
         assert_eq!(session.payload["logged_in"], false);
 
         // An upload drop needs a connected remote tab and says so instead of
-        // reporting success or writing a file.
-        let upload = svc.dispatch(ApiEnvelope {
+        // reporting success or writing a file. A remote drop is dispatched
+        // asynchronously, which is what both apps call for one.
+        let upload = svc.dispatch_async(ApiEnvelope {
             method: "POST".to_string(),
             path: "/api/transfer/drop".to_string(),
             body: json!({"tab": 0, "remote_dir": "/incoming", "name": "x.txt", "data_base64": "eA=="}),
-        });
+        }).await;
         assert_eq!(upload.status, 400, "{}", upload.payload);
         assert!(!tmp.join("config/drop-staging/x.txt").exists(), "a refused drop leaves no staged file");
 

@@ -512,6 +512,7 @@
     "Always copy": "Copiar siempre",
     "Always resume": "Reanudar siempre",
     "Amazon S3": "Amazon S3",
+    "An item named {name} already exists here. Replace it?": "Ya existe aquí un elemento llamado {name}. ¿Reemplazarlo?",
     "An upload to this server renames a temporary file; the server may replace a destination that changed since the last check. Continue?": "Una subida a este servidor renombra un archivo temporal; el servidor puede reemplazar un destino que cambió desde la última comprobación. ¿Continuar?",
     "Another session is copied through a temporary local download: each file is downloaded to a private temporary directory, uploaded to the target and then removed. Cross-session moves are not transactional.": "Otra sesión se copia mediante una descarga local temporal: cada archivo se descarga en un directorio temporal privado, se sube al destino y luego se elimina. Los traslados entre sesiones no son transaccionales.",
     "Append to the destination instead of replacing it (SFTP)": "Añadir al destino en lugar de reemplazarlo (SFTP)",

@@ -642,23 +642,14 @@ pub fn write_private_file_atomic(target: &Path, content: &[u8]) -> Result<(), Pl
 /// concurrent actor that created `target` first is reported as
 /// [`PlatformError::AlreadyExists`] instead of being overwritten.
 ///
-/// Linux and Windows use a hard link, which is atomic and fails on an existing
-/// name. Android's SELinux policy denies app hard links even inside private
-/// storage, so the Android backend uses the kernel's atomic no-replace rename
-/// instead; both callers get the same contract.
-#[cfg(not(target_os = "android"))]
-pub fn publish_no_replace(source: &Path, target: &Path) -> Result<(), PlatformError> {
-    match std::fs::hard_link(source, target) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(PlatformError::AlreadyExists(target.display().to_string()))
-        }
-        Err(error) => Err(PlatformError::Io(error)),
-    }
-}
-
-/// Android's no-replace publication; see the non-Android definition above.
-#[cfg(target_os = "android")]
+/// The no-replace move is the one primitive: a hard link is not. A link fails
+/// on filesystems that do not support them (FAT, some network shares) and on
+/// Android's own storage, where they are unavailable by policy, and the
+/// fallback that would replace the destination is exactly what must not
+/// happen. `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows,
+/// `renameat2(RENAME_NOREPLACE)` on Linux and Android, and `renamex_np` on
+/// macOS all answer `EEXIST`/`ERROR_ALREADY_EXISTS` for an occupied name and
+/// never replace it.
 pub fn publish_no_replace(source: &Path, target: &Path) -> Result<(), PlatformError> {
     match gui_os::rename_no_replace(source, target) {
         Ok(()) => Ok(()),
@@ -974,7 +965,7 @@ mod tests {
     #[test]
     fn saf_trees_are_local_roots_and_support_the_whole_file_lifecycle() {
         let bridge = std::sync::Arc::new(MockSaf::default());
-        let fs = NativeLocalFs::with_saf(bridge);
+        let fs = NativeLocalFs::with_saf(bridge.clone());
         let roots = fs.list_roots().unwrap();
         assert!(
             roots.iter().any(|root| root.kind == "saf_tree"),
@@ -986,20 +977,32 @@ mod tests {
         fs.mkdir_all(&created).expect("mkdir inside a granted tree");
 
         let file = format!("{created}/document/note.txt");
-        fs.write_bytes_atomic(&file, b"granted folder bytes").expect("write");
-        assert_eq!(fs.read_bytes(&file).unwrap(), b"granted folder bytes");
-        assert_eq!(fs.stat(&file).unwrap().size, 19);
+        let bytes = b"granted folder bytes";
+        fs.write_bytes_atomic(&file, bytes).expect("write");
+        assert_eq!(fs.read_bytes(&file).unwrap(), bytes);
+        // A size is bytes, so it comes from the fixture instead of a hand count.
+        assert_eq!(fs.stat(&file).unwrap().size, bytes.len() as u64);
 
-        let renamed = "renamed.txt";
-        fs.rename(&file, renamed).expect("rename is a single component");
-        assert!(fs.read_bytes(renamed).is_err());
-        assert_eq!(
-            fs.read_bytes(&format!("{created}/document/{renamed}")).unwrap(),
-            b"granted folder bytes"
+        // A rename inside a granted tree names one entry: `LocalFs` accepts a
+        // bare new name and nothing else, so a name carrying a path cannot
+        // escape the directory the caller is looking at.
+        assert!(fs.rename(&file, "photos/escaped.txt").is_err());
+        assert!(fs.rename(&file, "..").is_err());
+        // The move itself is the provider's, and the bridge reports the id the
+        // document has afterwards. The claim worth asserting is that the
+        // document is at the returned id and the previous id no longer
+        // resolves - not a guess at how a provider spells a document id.
+        let renamed_uri = android::SafBridge::rename_uri(&*bridge, &file, "renamed.txt")
+            .expect("the bridge renames a document inside a granted tree");
+        assert_eq!(fs.read_bytes(&renamed_uri).unwrap(), bytes);
+        assert!(fs.stat(&file).is_err(), "the renamed document's old id must be gone");
+        assert!(
+            fs.read_bytes("renamed.txt").is_err(),
+            "a bare name is not a document id; LocalFs takes URIs or paths"
         );
 
-        fs.remove_file(&format!("{created}/document/{renamed}")).unwrap();
-        assert!(fs.stat(&format!("{created}/document/{renamed}")).is_err());
+        fs.remove_file(&renamed_uri).unwrap();
+        assert!(fs.stat(&renamed_uri).is_err());
 
         // An encoded separator in the leaf decodes to a path, so it is refused
         // before it can reach the bridge as a document name - and the

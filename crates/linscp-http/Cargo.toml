@@ -22,5 +22,8 @@ serde_json.workspace = true
 subtle.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+reqwest = { workspace = true }
+
 [lints]
 workspace = true

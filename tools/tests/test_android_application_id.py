@@ -101,6 +101,16 @@ class AndroidApplicationIdTests(unittest.TestCase):
         self.assertIn('/data/user/0/' + EXPECTED, docs)
         self.assertIn('app_data_dir', docs)
 
+    def test_the_android_workflow_installs_the_cli_and_builds_the_frontend(self):
+        # `tauri android init` runs the locally installed Tauri CLI, and the APK
+        # embeds `ui/dist`. A workflow that checks the application ID but no
+        # longer installs either fails at the generation step, which says
+        # nothing about the ID it was meant to check.
+        workflow = (ROOT / '.github/workflows/android-build.yml').read_text(encoding='utf-8')
+        self.assertIn('npm ci --prefix ui', workflow)
+        self.assertIn('npm --prefix ui test', workflow)
+        self.assertIn('tauri', workflow)
+
     def test_a_launcher_does_not_claim_the_old_identifier(self):
         # The desktop entries name executables, not the bundle identifier, so a
         # rename must not have left a launcher pointing at the old name.
