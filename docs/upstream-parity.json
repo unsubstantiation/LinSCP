@@ -4827,7 +4827,7 @@
       "id": "platform.android-saf-refusals",
       "area": "Packaging/platforms",
       "status": "verified",
-      "notes": "Every local action the granted-folder bridge does not implement fails closed with a message that names the limitation, and the page stops offering those actions for granted folders. The service refuses editing, saving, properties, synchronization, keep-up-to-date, transfers and local copy/move with one shared refusal (a folder in app storage, not a granted folder); chmod is routed through LocalFs.set_permissions_mode, so the bridge owns its POSIX-permissions message instead of the user getting a raw I/O error. The page asks the shared bundle (safLimitationReason, next to hostCapabilities) before opening the editor, the synchronize and keep-up-to-date dialogues, queueing a transfer or move, prompting for permissions, or drawing the properties rights editor, and shows the reason instead. (The other pane of a local tab keeps its older behaviour for plain paths, which never resolved there; only granted other panes changed, from a path error to the named refusal.)",
+      "notes": "Every local action the granted-folder bridge does not implement fails closed with a message that names the limitation, and the page stops offering those actions for granted folders. The service refuses synchronization, keep-up-to-date, transfers and local copy/move with one shared refusal (a folder in app storage, not a granted folder); chmod is routed through LocalFs.set_permissions_mode, so the bridge owns its POSIX-permissions message instead of the user getting a raw I/O error. The page asks the shared bundle (safLimitationReason, next to hostCapabilities) before opening the synchronize and keep-up-to-date dialogues, queueing a transfer or move, prompting for permissions, or drawing the properties rights editor, and shows the reason instead. (The other pane of a local tab keeps its older behaviour for joined paths, which never resolved there as a leaf, on plain and granted panes alike.) Editing, saving and reading properties route through LocalFs instead \u2014 see platform.android-saf-editing.",
       "source": [
         "crates/linscp-service/src/lib.rs",
         "ui/src/platform/capabilities.ts",
@@ -4835,8 +4835,7 @@
       ],
       "checks": {
         "service": [
-          "saf_editor_and_permissions_refuse_granted_folders",
-          "saf_other_pane_refuses_edit_properties_and_rights",
+          "saf_chmod_still_refuses_granted_folders",
           "saf_local_copy_and_move_refuse_granted_folders",
           "sync_and_watch_refuse_granted_folders"
         ],
@@ -4844,7 +4843,6 @@
           "granted Android folders name the app-storage limitation per action"
         ],
         "gui": [
-          "a granted folder is not offered the editor",
           "a granted folder is not offered synchronization",
           "a granted folder is not offered keep-up-to-date",
           "a granted folder is not offered transfers",
@@ -4870,6 +4868,44 @@
           "gui"
         ]
       }
+    },
+    {
+      "id": "platform.android-saf-editing",
+      "area": "Packaging/platforms",
+      "status": "partial",
+      "notes": "Opening, saving and reading properties in a granted Android folder go through LocalFs to the SAF bridge instead of the refusal: the editor reads the document bytes, saves create-or-replace the document, and properties rows carry the bridge's stat, on the main pane and on a granted other pane alike. The stale-save guard compares at the bridge's seconds precision, the same granularity remote saves use. A save whose stat fails proceeds to the bridge write, because a missing document and an unreadable one are indistinguishable there and the write creates what is missing; a genuinely broken write still surfaces its own error. The page offers the editor for granted folders again; chmod, synchronization, transfers, copy/move and watching keep their named refusals (see platform.android-saf-refusals).",
+      "source": [
+        "crates/linscp-service/src/lib.rs",
+        "crates/linscp-service/src/ops.rs",
+        "ui/src/platform/capabilities.ts",
+        "source/gui/web/index.html"
+      ],
+      "checks": {
+        "service": [
+          "saf_editor_reads_and_saves_through_the_bridge",
+          "saf_other_pane_edits_and_reads_properties"
+        ],
+        "gui": [
+          "a granted folder offers the editor"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "service",
+          "gui"
+        ],
+        "windows": [
+          "service",
+          "gui"
+        ],
+        "android": [
+          "gui"
+        ]
+      },
+      "gap": "No suite has touched a real DocumentsProvider: the bridge is an in-memory mock, so provider behaviour (mtime precision, create-or-replace error cases, large documents) is unproven on a device.",
+      "acceptance": [
+        "Open, edit, save and re-read a file in a granted folder on an Android device or emulator, covering the stale-save refusal and the properties rows the dialog shows."
+      ]
     },
     {
       "id": "ftp.non-unix-listings",

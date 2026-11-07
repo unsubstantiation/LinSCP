@@ -1361,15 +1361,19 @@ impl CommanderService {
             let mut local_body = body.clone();
             if let Some(path) = body.get("path").and_then(Value::as_str) {
                 if path.starts_with('/') { local_body["path"] = json!(path); }
+                else if is_saf_path(&tab.other_local_dir) {
+                    // "Save as" into a granted other pane: a leaf resolves
+                    // to a document URI, which saves verbatim (without a
+                    // tab), while a joined path keeps the pane's path error.
+                    let resolved = match resolve_contained(&tab.other_local_dir, path) {
+                        Ok(resolved) => resolved,
+                        Err(error) => return api_error(400, error),
+                    };
+                    local_body["path"] = json!(resolved);
+                    if let Some(obj) = local_body.as_object_mut() { obj.remove("tab"); }
+                }
                 else {
                     let joined = format!("{}/{}", tab.other_local_dir.trim_end_matches('/'), path);
-                    // The destination decides: a leaf saved into a granted
-                    // other pane names the limitation instead of failing on
-                    // the join, while an absolute plain path keeps the old
-                    // behaviour of the pane it names.
-                    if is_saf_path(&joined) {
-                        return api_error(400, saf_unsupported("Saving files"));
-                    }
                     local_body["path"] = json!(joined);
                 }
             }
@@ -1919,8 +1923,13 @@ impl CommanderService {
             Ok(p) => p,
             Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
         };
+        // A granted document reads through the bridge; a plain path keeps the
+        // direct reader.
         if is_saf_path(&resolved) {
-            return ApiReply{ status: 400, payload: json!({"success": false, "error": saf_unsupported("Editing files")})};
+            return match ops::read_local_text_file_via_fs(self.local_fs.as_ref(), &resolved, ops::MAX_GUI_EDIT_BYTES) {
+                Ok((content, info)) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "content": content, "info": info})},
+                Err(error) => ApiReply{ status: 400, payload: json!({"success": false, "error": error})},
+            };
         }
         match ops::read_local_text_file(Path::new(&resolved), ops::MAX_GUI_EDIT_BYTES) {
             Ok((content, info)) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "content": content, "info": info})},
@@ -1961,18 +1970,17 @@ impl CommanderService {
         };
         drop(g);
         if tab.is_local {
-            // The page sends the other pane's path joined, which never
-            // resolves as a leaf; a granted other pane is refused by name
-            // before that, so it never reports a path error for a file the
-            // bridge cannot open anyway.
-            if is_saf_path(&tab.other_local_dir) {
-                return ApiReply{ status: 400, payload: json!({"success": false, "error": saf_unsupported("Editing files")})};
-            }
+            // A leaf resolves against the granted other pane to a document
+            // URI and reads through the bridge; a joined path keeps the
+            // pane's path error, as on plain directories.
             let resolved = match resolve_contained(&tab.other_local_dir, &path) {
                 Ok(p) => p, Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
             };
             if is_saf_path(&resolved) {
-                return ApiReply{ status: 400, payload: json!({"success": false, "error": saf_unsupported("Editing files")})};
+                return match ops::read_local_text_file_via_fs(self.local_fs.as_ref(), &resolved, ops::MAX_GUI_EDIT_BYTES) {
+                    Ok((content, info)) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "content": content, "info": info})},
+                    Err(error) => ApiReply{ status: 400, payload: json!({"success": false, "error": error})},
+                };
             }
             match ops::read_local_text_file(Path::new(&resolved), ops::MAX_GUI_EDIT_BYTES) {
                 Ok((c,i)) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "content": c, "info": i})},
@@ -2482,13 +2490,16 @@ impl CommanderService {
         let resolved = if let Some(b) = base {
             match resolve_contained(&b, &path) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},}
         } else { path.clone() };
-        // Without a tab the path is used verbatim, so a granted-folder URI
-        // arrives here unvalidated; either way saving one is refused by name.
-        if is_saf_path(&resolved) {
-            return ApiReply{ status:400, payload: json!({"success": false, "error": saf_unsupported("Saving files")})};
-        }
         let content = body.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let mtime_ns = body.get("base_mtime_ns").and_then(|v| v.as_i64()).map(|v| v as i128).or_else(|| body.get("base_mtime").and_then(|v| v.as_i64()).map(|v| (v as i128)*1_000_000_000));
+        // A granted document writes through the bridge; a plain path keeps
+        // the direct writer and its permission-bit recovery.
+        if is_saf_path(&resolved) {
+            return match ops::write_local_text_file_via_fs(self.local_fs.as_ref(), &resolved, &content, mtime_ns) {
+                Ok(info) => ApiReply{ status: 200, payload: json!({"success": true, "info": info})},
+                Err(error) => ApiReply{ status: 400, payload: json!({"success": false, "error": error})},
+            };
+        }
         match ops::write_local_text_file(Path::new(&resolved), &content, mtime_ns) {
             Ok(info) => ApiReply{ status: 200, payload: json!({"success": true, "info": info})},
             Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
@@ -3330,10 +3341,14 @@ impl CommanderService {
         let mut rows=Vec::new();
         for n in names {
             let p = match resolve_contained(&tab.other_local_dir, &n) { Ok(path) => path, Err(error) => return api_error(400, error) };
-            // A granted entry keeps the row shape a stat failure uses, so the
-            // dialogue shows the limitation beside the name instead of dying.
+            // A granted entry is statted through the bridge; a failure keeps
+            // the row shape a plain stat failure uses, so the dialogue
+            // shows the error beside the name instead of dying.
             if is_saf_path(&p) {
-                rows.push(json!({"name": n, "error": saf_unsupported("Reading file properties")}));
+                match self.local_fs.stat(&p) {
+                    Ok(entry) => rows.push(json!({"name": n, "size": entry.size, "is_dir": entry.is_dir, "permissions": entry.permissions, "owner": entry.owner.clone().unwrap_or_default(), "group": entry.group.clone().unwrap_or_default()})),
+                    Err(error) => rows.push(json!({"name": n, "error": error.to_string()})),
+                }
                 continue;
             }
             let info = if tab.is_local {
@@ -4983,12 +4998,12 @@ fn is_saf_path(path: &str) -> bool {
 }
 
 /// The refusal for a local action the granted-folder bridge does not
-/// implement. Listing, creating, renaming and deleting inside a granted
-/// folder go through `LocalFs`; everything else — editing, properties,
-/// permissions, transfers, synchronization and directory watching — needs a
-/// plain filesystem path, so the refusal names the limitation instead of
-/// failing later with a path error. `action` is a gerund phrase such as
-/// `"Synchronizing"` or `"Editing files"`.
+/// implement. Listing, creating, renaming, deleting, editing, saving and
+/// reading properties inside a granted folder go through `LocalFs`;
+/// everything else — transfers, synchronization and directory watching —
+/// needs a plain filesystem path, so the refusal names the limitation
+/// instead of failing later with a path error. `action` is a gerund
+/// phrase such as `"Synchronizing"` or `"Moving files"`.
 fn saf_unsupported(action: &str) -> String {
     format!("{action} needs a folder in app storage, not a granted Android folder.")
 }
@@ -5073,7 +5088,8 @@ fn percent_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use linscp_types::ProtocolScheme;
+    use linscp_platform::PlatformError;
+    use linscp_types::{FileEntry, LocalRootEntry, ProtocolScheme};
 
     fn unlock_for_test(service: &CommanderService) {
         let reply = service.dispatch(ApiEnvelope {
@@ -8879,62 +8895,163 @@ mod tests {
     }
 
     /// A structurally valid granted-folder URI, the same shape the platform
-    /// tests use for the mock bridge. No bridge is registered here, which is
-    /// the point: every refusal below must fire before anything touches the
-    /// bridge or the filesystem.
+    /// tests use for the mock bridge. The editor tests below register a
+    /// bridge over it; the chmod test registers none, proving the message
+    /// comes from the `content://` branch and not from any provider.
     const SAF_GRANTED_DIR: &str = "content://mock.tree/tree/primary%3ADownload";
 
-    /// Opening, saving or chmodding inside a granted folder is refused with
-    /// the limitation's name. The editor paths use the shared refusal; chmod
-    /// goes through the bridge's own `set_permissions_mode`, whose message
-    /// was previously unreachable outside its own test.
+    /// In-memory `SafBridge` for the editor tests: documents are keyed by
+    /// leaf name, writes create-or-replace like the Kotlin plugin, and a
+    /// missing document errors like a provider that cannot find it.
+    struct MockBridge {
+        files: Mutex<HashMap<String, Vec<u8>>>,
+        mtime: i64,
+    }
+
+    impl MockBridge {
+        fn with_file(name: &str, content: &[u8]) -> Self {
+            let mut files = HashMap::new();
+            files.insert(name.to_string(), content.to_vec());
+            MockBridge { files: Mutex::new(files), mtime: 1_791_875_271 }
+        }
+
+        fn leaf_of(uri: &str) -> String {
+            uri.rsplit("/document/").next().unwrap_or("").to_string()
+        }
+
+        fn entry_for(&self, name: &str, size: u64) -> FileEntry {
+            FileEntry { name: name.to_string(), size, is_dir: false, is_symlink: false, broken_link: false, date: String::new(), mtime: self.mtime, permissions: String::new(), owner: None, group: None }
+        }
+
+        fn bytes_of(&self, name: &str) -> Option<Vec<u8>> {
+            self.files.lock().expect("m").get(name).cloned()
+        }
+    }
+
+    impl linscp_platform::android::SafBridge for MockBridge {
+        fn request_tree(&self) -> Result<Option<String>, PlatformError> { Ok(None) }
+        fn granted_trees(&self) -> Result<Vec<LocalRootEntry>, PlatformError> { Ok(Vec::new()) }
+        fn list_tree(&self, _tree_uri: &str) -> Result<Vec<FileEntry>, PlatformError> {
+            let files = self.files.lock().expect("m");
+            let mut names: Vec<String> = files.keys().cloned().collect();
+            names.sort();
+            Ok(names.iter().map(|name| self.entry_for(name, files[name].len() as u64)).collect())
+        }
+        fn stat_uri(&self, uri: &str) -> Result<FileEntry, PlatformError> {
+            let name = Self::leaf_of(uri);
+            let files = self.files.lock().expect("m");
+            match files.get(&name) {
+                Some(bytes) => Ok(self.entry_for(&name, bytes.len() as u64)),
+                None => Err(PlatformError::Unsupported(format!("Unknown document: {uri}"))),
+            }
+        }
+        fn read_uri_bytes(&self, uri: &str) -> Result<Vec<u8>, PlatformError> {
+            let name = Self::leaf_of(uri);
+            self.files.lock().expect("m").get(&name).cloned()
+                .ok_or_else(|| PlatformError::Unsupported(format!("Unknown document: {uri}")))
+        }
+        fn write_uri_bytes(&self, _parent_uri: &str, name: &str, data: &[u8]) -> Result<String, PlatformError> {
+            self.files.lock().expect("m").insert(name.to_string(), data.to_vec());
+            Ok(format!("{SAF_GRANTED_DIR}/document/{name}"))
+        }
+        fn mkdir_uri(&self, _parent_uri: &str, name: &str) -> Result<String, PlatformError> {
+            Err(PlatformError::Unsupported(format!("MockBridge has no directories: {name}")))
+        }
+        fn delete_uri(&self, uri: &str) -> Result<(), PlatformError> {
+            self.files.lock().expect("m").remove(&Self::leaf_of(uri));
+            Ok(())
+        }
+        fn rename_uri(&self, uri: &str, new_name: &str) -> Result<String, PlatformError> {
+            let old = Self::leaf_of(uri);
+            let mut files = self.files.lock().expect("m");
+            if let Some(bytes) = files.remove(&old) { files.insert(new_name.to_string(), bytes); }
+            Ok(format!("{SAF_GRANTED_DIR}/document/{new_name}"))
+        }
+    }
+
+    /// Opening and saving in a granted main pane go through the bridge: the
+    /// editor reads the document, a save with a fresh stamp replaces it, a
+    /// stale stamp is refused, and a new name is created.
     #[tokio::test]
-    async fn saf_editor_and_permissions_refuse_granted_folders() {
+    async fn saf_editor_reads_and_saves_through_the_bridge() {
         let tmp = std::env::temp_dir().join(format!("linscp-saf-edit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("other")).unwrap();
-        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let bridge = Arc::new(MockBridge::with_file("note.txt", b"granted text\n"));
+        let fs = NativeLocalFs::with_saf(bridge.clone());
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(fs));
         let open = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": SAF_GRANTED_DIR, "other_local_dir": tmp.join("other")}}) }).await;
         assert_eq!(open.status, 200, "{}", open.payload);
         let id = open.payload["tab"]["id"].as_u64().unwrap();
         let edit = svc.dispatch(ApiEnvelope { method: "GET".into(), path: format!("/api/local/edit?tab={id}&path=note.txt"), body: json!({}) });
-        assert_eq!(edit.status, 400, "{}", edit.payload);
-        assert!(edit.payload["error"].as_str().unwrap_or("").contains("app storage"), "{}", edit.payload);
-        let save = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/local/save".into(), body: json!({"tab": id, "path": "note.txt", "content": "no"}) });
-        assert_eq!(save.status, 400, "{}", save.payload);
-        assert!(save.payload["error"].as_str().unwrap_or("").contains("app storage"), "{}", save.payload);
-        let chmod = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/local/chmod".into(), body: json!({"tab": id, "name": "note.txt", "permissions": "644"}) });
-        assert_eq!(chmod.status, 400, "{}", chmod.payload);
-        assert!(chmod.payload["error"].as_str().unwrap_or("").contains("POSIX permissions do not exist"), "{}", chmod.payload);
+        assert_eq!(edit.status, 200, "{}", edit.payload);
+        assert_eq!(edit.payload["content"], json!("granted text\n"), "{}", edit.payload);
+        assert_eq!(edit.payload["info"]["mtime"], json!(1_791_875_271), "{}", edit.payload);
+        let stamp = 1_791_875_271_000_000_000i64;
+        let save = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/local/save".into(), body: json!({"tab": id, "path": "note.txt", "content": "edited\n", "base_mtime_ns": stamp}) });
+        assert_eq!(save.status, 200, "{}", save.payload);
+        assert_eq!(bridge.bytes_of("note.txt").as_deref(), Some(b"edited\n".as_slice()), "the bridge holds the replacement");
+        let stale = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/local/save".into(), body: json!({"tab": id, "path": "note.txt", "content": "lost\n", "base_mtime_ns": stamp - 1}) });
+        assert_eq!(stale.status, 400, "{}", stale.payload);
+        assert!(stale.payload["error"].as_str().unwrap_or("").contains("changed while it was open"), "{}", stale.payload);
+        let created = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/local/save".into(), body: json!({"tab": id, "path": "fresh.txt", "content": "new\n"}) });
+        assert_eq!(created.status, 200, "{}", created.payload);
+        assert_eq!(bridge.bytes_of("fresh.txt").as_deref(), Some(b"new\n".as_slice()), "a missing document is created");
         let _ = std::fs::remove_dir_all(tmp);
     }
 
-    /// The other pane of a local tab refuses the same way: opening and saving
-    /// name the limitation, chmod carries the bridge's message, and
-    /// properties keeps its per-row shape with the refusal beside the name.
+    /// The granted other pane edits and reports properties the same way: a
+    /// leaf opens and saves through the bridge, and the properties rows
+    /// carry the bridge's stat instead of a refusal.
     #[tokio::test]
-    async fn saf_other_pane_refuses_edit_properties_and_rights() {
+    async fn saf_other_pane_edits_and_reads_properties() {
         let tmp = std::env::temp_dir().join(format!("linscp-saf-other-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("left")).unwrap();
-        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let bridge = Arc::new(MockBridge::with_file("note.txt", b"other text\n"));
+        let fs = NativeLocalFs::with_saf(bridge.clone());
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(fs));
         let open = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp.join("left"), "other_local_dir": SAF_GRANTED_DIR}}) }).await;
         assert_eq!(open.status, 200, "{}", open.payload);
         let id = open.payload["tab"]["id"].as_u64().unwrap();
         let edit = svc.dispatch_async(ApiEnvelope { method: "GET".into(), path: format!("/api/remote/edit?tab={id}&path=note.txt"), body: json!({}) }).await;
-        assert_eq!(edit.status, 400, "{}", edit.payload);
-        assert!(edit.payload["error"].as_str().unwrap_or("").contains("app storage"), "{}", edit.payload);
-        let save = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/remote/save".into(), body: json!({"tab": id, "path": "note.txt", "content": "no"}) }).await;
-        assert_eq!(save.status, 400, "{}", save.payload);
-        assert!(save.payload["error"].as_str().unwrap_or("").contains("app storage"), "{}", save.payload);
+        assert_eq!(edit.status, 200, "{}", edit.payload);
+        assert_eq!(edit.payload["content"], json!("other text\n"), "{}", edit.payload);
+        let save = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/remote/save".into(), body: json!({"tab": id, "path": "note.txt", "content": "saved\n"}) }).await;
+        assert_eq!(save.status, 200, "{}", save.payload);
+        assert_eq!(bridge.bytes_of("note.txt").as_deref(), Some(b"saved\n".as_slice()), "save-as reaches the bridge");
         let properties = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/remote/properties".into(), body: json!({"tab": id, "names": ["note.txt"]}) }).await;
         assert_eq!(properties.status, 200, "{}", properties.payload);
         let row = &properties.payload["properties"][0];
         assert_eq!(row["name"], json!("note.txt"), "{}", properties.payload);
-        assert!(row["error"].as_str().unwrap_or("").contains("app storage"), "{}", properties.payload);
-        let chmod = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/remote/chmod".into(), body: json!({"tab": id, "name": "note.txt", "permissions": "644"}) }).await;
+        assert_eq!(row["size"], json!(6), "{}", properties.payload);
+        assert_eq!(row["is_dir"], json!(false), "{}", properties.payload);
+        assert!(row.get("error").is_none(), "{}", properties.payload);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Permissions are the editor-adjacent action that stays refused: with
+    /// no bridge registered, chmod on a granted main pane and on a granted
+    /// other pane both carry the bridge's own message.
+    #[tokio::test]
+    async fn saf_chmod_still_refuses_granted_folders() {
+        let tmp = std::env::temp_dir().join(format!("linscp-saf-chmod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("left")).unwrap();
+        std::fs::create_dir_all(tmp.join("right")).unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let open = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": SAF_GRANTED_DIR, "other_local_dir": tmp.join("right")}}) }).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        let chmod = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/local/chmod".into(), body: json!({"tab": id, "name": "note.txt", "permissions": "644"}) });
         assert_eq!(chmod.status, 400, "{}", chmod.payload);
         assert!(chmod.payload["error"].as_str().unwrap_or("").contains("POSIX permissions do not exist"), "{}", chmod.payload);
+        let open_other = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp.join("left"), "other_local_dir": SAF_GRANTED_DIR}}) }).await;
+        assert_eq!(open_other.status, 200, "{}", open_other.payload);
+        let other_id = open_other.payload["tab"]["id"].as_u64().unwrap();
+        let chmod_other = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/remote/chmod".into(), body: json!({"tab": other_id, "name": "note.txt", "permissions": "644"}) }).await;
+        assert_eq!(chmod_other.status, 400, "{}", chmod_other.payload);
+        assert!(chmod_other.payload["error"].as_str().unwrap_or("").contains("POSIX permissions do not exist"), "{}", chmod_other.payload);
         let _ = std::fs::remove_dir_all(tmp);
     }
 

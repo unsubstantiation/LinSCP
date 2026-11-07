@@ -979,8 +979,6 @@ test('granted Android folders name the app-storage limitation per action', () =>
   const granted = 'content://com.android.externalstorage.documents/tree/primary%3ADownload';
   const document = granted + '/document/primary%3ADownload%2Fnote.txt';
   const leads = {
-    edit: 'Editing files',
-    properties: 'Reading file properties',
     transfer: 'Transferring files',
     copyMove: 'Copying or moving files',
     move: 'Moving files',

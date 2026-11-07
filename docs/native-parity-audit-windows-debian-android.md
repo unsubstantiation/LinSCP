@@ -2,10 +2,11 @@
 
 **Date:** 2026-11-06 · **Branch:** `arena/a4f5fe10-linscp` · **Mode:** audit, then A1 fixed on request.
 
-> **Update (same day):** A1, A2, A3, A4, A5, A6, A7(b), A8 and A9 below have been implemented, and
-> the §3 suites have been triaged (B) — see their **Status** notes for what changed and what still
-> needs a compiler to confirm. The rest of this document is the audit as written, so only the
-> A7(a) `LocalFs` routing still describes the tree as it was before those changes.
+> **Update (same day):** A1, A2, A3, A4, A5, A6, A7(b), A7(a) slice 1, A8 and A9 below have been
+> implemented, and the §3 suites have been triaged (B) — see their **Status** notes for what changed
+> and what still needs a compiler to confirm. The rest of this document is the audit as written, so
+> only the A7(a) engine routing (sync, transfers, copy/move) still describes the tree as it was
+> before those changes.
 
 **Question asked:** "Make sure we have full feature parity between the builds."
 **Scope, as confirmed:** the three native builds — `linscp-gui` on Windows (MSVC), `linscp-gui` on
@@ -490,6 +491,33 @@ refusal. And the bridge already reads and writes document bytes (`read_bytes`,
 Both are reading-level claims: no Rust toolchain here, so the new tests compile for the first time
 in CI.
 
+**Status, continued** (option (a), first slice: the editor and properties). The bridge's document
+read, write and stat now back the whole-file actions the audit listed as silent failures.
+`ops.rs` grew `read_local_text_file_via_fs` / `write_local_text_file_via_fs` over `&dyn LocalFs`,
+mirroring the plain helpers' caps and checks: a stale save is refused, but at the bridge's seconds
+precision (the same granularity remote saves use); a save whose stat fails proceeds to the bridge
+write, because a missing document and an unreadable one are indistinguishable there and the write
+creates-or-replaces; permission bits are not preserved, because a granted folder has none. The
+main-pane handlers (`handle_local_edit_get`, `handle_local_save`), the other pane's
+`handle_remote_edit_get` and `remote_save_async` (save-as resolves a leaf to a document URI),
+and `handle_remote_properties` (rows carry the bridge's stat) all route `content://` paths through
+`self.local_fs`, with reply shapes matching the plain endpoints. The bundle dropped the `edit` and
+`properties` actions from `SafLimitedAction`, the page offers the editor for granted folders again,
+and the properties dialogue — which was never page-gated, only backend-driven — shows real rows
+while its rights editor stays refused. Two in-memory-bridge service tests
+(`saf_editor_reads_and_saves_through_the_bridge`, `saf_other_pane_edits_and_reads_properties`)
+prove the routing including the stale-save refusal and document creation; the (b) chmod halves
+were split into `saf_chmod_still_refuses_granted_folders`, the copy/move and sync tests are
+unchanged, and the page's editor check flipped to a positive while the properties-rights check
+survived. The refusals ledger row was re-scoped to what still refuses, and the new capability is
+`platform.android-saf-editing` = `partial`: the bridge is a mock, so a device or emulator run that
+opens, edits, saves and re-reads a granted file is the acceptance item. Still refused, as the rest
+of option (a): synchronization, keep-up-to-date, transfers and copy/move, which need the engine
+routing the audit named (the planner's `std::fs` walk, transfer file I/O, the queue walker) plus
+bridge behaviour no suite can prove without a device. `chmod` and symlinks stay refused
+permanently — a granted folder has no POSIX modes and links cannot point into it. As with (b),
+no Rust toolchain here, so the new tests compile for the first time in CI.
+
 ### A8. Kerberos/GSSAPI exists only on Linux; Windows has no SSPI backend at all
 **Platforms:** Windows ✗, Android ✗ (fail closed), Debian ✓
 **Evidence:** `crates/linscp-platform/src/gssapi_sys.rs` is `#[cfg(target_os = "linux")]` for the
@@ -721,7 +749,10 @@ Ordered by (user impact × confidence) ÷ effort. All are small except where not
    **done**, see A7's *Status: fixed*: one shared refusal for edit/save/properties/sync/watch/
    transfer/copy/move, `chmod` routed through the bridge's own message, the page gating every one
    of those through a new bundle reason next to `hostCapabilities`, and the boundary recorded as
-   `platform.android-saf-refusals` = `verified`.
+   `platform.android-saf-refusals` = `verified`. Option (a) has since begun — see A7's
+   continued *Status*: the editor and properties route through `LocalFs` (first slice,
+   `platform.android-saf-editing` = `partial` pending a device run), while sync, transfers
+   and copy/move keep their refusals for the engine-routing slice.
 7. **A4 local symlink** — **done**, see A4's *Status: fixed*: a shared `create_local_link` helper
    behind `/api/local/link` and a local branch in `link_remote_async`, one pane-aware page dialog,
    and the granted-folder refusal in both layers. **A9 Android agent message** — **done**, see

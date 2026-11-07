@@ -1629,11 +1629,11 @@ function options(id) {
 
   const editsBefore = posted('/api/local/edit');
   await window.openEditor(SAF_DIR + '/document/primary%3ADownload%2Fnote.txt', 'local');
-  check('a granted folder is not offered the editor',
-    text('toast').includes(safReason('edit')) &&
-      doc.getElementById('editorModal').className.indexOf('open') < 0 &&
-      posted('/api/local/edit') === editsBefore,
+  check('a granted folder offers the editor',
+    doc.getElementById('editorModal').className.indexOf('open') >= 0 &&
+      posted('/api/local/edit') === editsBefore + 1,
     text('toast'));
+  window.closeModal('editorModal');
 
   window.openSynchronize();
   check('a granted folder is not offered synchronization',

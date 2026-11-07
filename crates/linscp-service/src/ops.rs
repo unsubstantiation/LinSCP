@@ -13,7 +13,7 @@ use linscp_engine::transfer::{upload_single_file, TransferFlags};
 use linscp_engine::xml_log::SessionLogger;
 use linscp_platform::gui_os::{create_local_symlink, format_listing_date, stat_extended};
 use linscp_platform::terminal::set_local_permissions;
-use linscp_platform::{create_private_dir, write_private_file_atomic};
+use linscp_platform::{create_private_dir, write_private_file_atomic, LocalFs};
 use linscp_proto::ssh::extract_openssh_public_key_line;
 use linscp_proto::{download_bytes, RemoteSession, TransferRequest};
 use rand::RngCore;
@@ -159,6 +159,95 @@ pub fn write_local_text_file(
         "mtime": saved.mtime_secs,
         "mtime_ns": saved.mtime_ns.to_string(),
         "mtime_ns_num": saved.mtime_ns as i64,
+        "permissions": saved.permissions,
+    }))
+}
+
+/// Reads a UTF-8 text file through `LocalFs` for the Commander editor: the
+/// same caps and checks as `read_local_text_file`, but the bytes come from
+/// the granted-folder bridge when the path is a `content://` URI. The
+/// bridge reports whole seconds, so `mtime_ns` is seconds precision.
+pub fn read_local_text_file_via_fs(
+    fs: &dyn LocalFs,
+    path: &str,
+    max_bytes: u64,
+) -> Result<(String, Value), String> {
+    let info = fs
+        .stat(path)
+        .map_err(|e| format!("Cannot read '{path}': {e}"))?;
+    if info.is_dir {
+        return Err("Cannot open a directory in the text editor.".to_string());
+    }
+    if info.size > max_bytes {
+        return Err(format!(
+            "File is too large for the built-in editor ({} bytes; maximum {} bytes).",
+            info.size, max_bytes
+        ));
+    }
+    let bytes = fs
+        .read_bytes(path)
+        .map_err(|e| format!("Cannot read '{path}': {e}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err("File is too large for the built-in editor.".to_string());
+    }
+    if bytes.contains(&0) {
+        return Err("Refusing to edit binary file containing NUL bytes.".to_string());
+    }
+    let content =
+        String::from_utf8(bytes).map_err(|_| "File is not valid UTF-8 binary/encoded text.".to_string())?;
+    let mtime_ns = (info.mtime as i128) * 1_000_000_000;
+    let meta_json = json!({
+        "size": info.size,
+        "mtime": info.mtime,
+        "mtime_ns": mtime_ns.to_string(),
+        "mtime_ns_num": mtime_ns as i64,
+        "permissions": info.permissions,
+    });
+    Ok((content, meta_json))
+}
+
+/// Saves edited UTF-8 text through `LocalFs`, mirroring
+/// `write_local_text_file`: symlinks and directories are refused, and a
+/// stale `expected_mtime_ns` is refused at the bridge's seconds precision
+/// (the same granularity remote saves use). A stat failure proceeds to the
+/// write instead of failing: the bridge cannot distinguish a missing
+/// document from an unreadable one, and its write creates-or-replaces, so a
+/// genuinely broken write still surfaces its own error. Permission bits are
+/// not copied: a granted folder has no modes to preserve.
+pub fn write_local_text_file_via_fs(
+    fs: &dyn LocalFs,
+    path: &str,
+    content: &str,
+    expected_mtime_ns: Option<i128>,
+) -> Result<Value, String> {
+    if content.len() as u64 > MAX_GUI_EDIT_BYTES {
+        return Err("Edited content is too large for the built-in editor.".to_string());
+    }
+    if let Ok(info) = fs.stat(path) {
+        if info.is_symlink {
+            return Err("Refusing to overwrite a symbolic link from the editor.".to_string());
+        }
+        if info.is_dir {
+            return Err("Cannot overwrite a directory.".to_string());
+        }
+        if let Some(exp) = expected_mtime_ns {
+            if exp > 0 && (info.mtime as i128) * 1_000_000_000 != exp {
+                return Err(
+                    "The file changed while it was open in the editor; reload before saving."
+                        .to_string(),
+                );
+            }
+        }
+    }
+    fs.write_bytes_atomic(path, content.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let saved = fs.stat(path).map_err(|e| e.to_string())?;
+    let mtime_ns = (saved.mtime as i128) * 1_000_000_000;
+    Ok(json!({
+        "size": saved.size,
+        "mtime": saved.mtime,
+        "mtime_ns": mtime_ns.to_string(),
+        "mtime_ns_num": mtime_ns as i64,
         "permissions": saved.permissions,
     }))
 }

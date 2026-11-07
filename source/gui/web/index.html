@@ -3612,8 +3612,6 @@
   async function openEditor(path, side, readOnly) {
     side = side || 'remote';
     readOnly = !!readOnly;
-    const gap = safGap('edit', path);
-    if (gap) { toast(gap, true); return; }
     const endpoint = side === 'local' ? '/api/local/edit' : '/api/remote/edit';
     const data = await apiGet(endpoint + '?tab=' + tabId() + '&path=' + encodePath(path));
     if (!data || !data.success) { toast(errorMessage(data && data.error, t("Cannot open the file.")), true); return; }
