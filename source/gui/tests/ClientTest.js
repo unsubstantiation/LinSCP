@@ -1688,6 +1688,40 @@ function options(id) {
   window.closeModal('syncModal');
   if (safStubInstalled) window.LinSCPCore.safLimitationReason = undefined;
 
+  // ---- Local symbolic links ---------------------------------------------
+  // The link dialog works on the local pane through /api/local/link and is
+  // not offered for a granted folder, where links cannot exist.
+  window.prompt = () => 'asked';
+  window.focusPane('local');
+  doc.getElementById('localFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  await window.promptLink('local');
+  const linkCall = calls.filter(call => call.path === '/api/local/link').pop();
+  check('the local pane offers symbolic links',
+    linkCall && JSON.parse(linkCall.options.body).target === 'a.txt' &&
+      JSON.parse(linkCall.options.body).name === 'asked' &&
+      text('toast').includes('Created the symbolic link'),
+    text('toast'));
+
+  if (!window.LinSCPCore || typeof window.LinSCPCore.safLimitationReason !== 'function') {
+    window.LinSCPCore = window.LinSCPCore || {};
+    window.LinSCPCore.safLimitationReason = (action, path) =>
+      (typeof path === 'string' && path.startsWith('content://') ? 'stub refuses ' + action : null);
+    safStubInstalled = true;
+  }
+  await window.loadLocal(SAF_DIR);
+  window.focusPane('local');
+  doc.getElementById('localFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  const linksBefore = posted('/api/local/link');
+  await window.promptLink('local');
+  check('a granted folder is not offered symbolic links',
+    text('toast').includes(safReason('symlink')) &&
+      posted('/api/local/link') === linksBefore,
+    text('toast'));
+  await window.loadLocal('/tmp/slowlocal');
+  if (safStubInstalled) window.LinSCPCore.safLimitationReason = undefined;
+
   check('no script errors', errors.length === 0, errors.join(' | '));
   window.close();
 })();

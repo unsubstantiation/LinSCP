@@ -4,7 +4,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-83 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+84 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -1061,6 +1061,19 @@ A local-to-local session is a tab whose protocol is 'local' and which names two 
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests.
+
+## gui.local-symlink
+
+**Area:** GUI · **Status:** partial
+
+Symbolic links can be created in a local pane, not just over SFTP: the other pane of a local tab goes through a new local branch in link_remote_async, the main pane through a new /api/local/link endpoint, and both share one helper (create_local_link) that validates two different single-leaf names, refuses a taken link name, and calls gui_os.create_local_symlink after resolve_contained. The page dialog is one pane-aware promptLink(side), offered from the Local menu for the local pane and the Commands menu for the remote pane with no new translatable strings; a granted folder is refused by the shared app-storage message in both layers.
+
+**Next:** Link creation itself is proven only on Unix: the creation test is cfg(unix) because Windows needs a symlink privilege (or developer mode) this suite cannot grant itself, and Android runs no Rust tests. Validation and the granted-folder refusal run on every platform.
+
+**Acceptance criteria:**
+
+- [ ] A Windows CI run proving link creation in a plain directory, or a documented privilege requirement the backend reports.
+- [ ] A device or emulator run proving link creation in Android app storage.
 
 ## sessions.workspaces
 

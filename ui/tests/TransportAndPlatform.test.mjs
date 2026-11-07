@@ -963,6 +963,7 @@ test('granted Android folders name the app-storage limitation per action', () =>
     move: 'Moving files',
     synchronize: 'Synchronizing',
     keepUpToDate: 'Keep up to date',
+    symlink: 'Creating symbolic links',
   };
   for (const [action, lead] of Object.entries(leads)) {
     // The tree root and a document below it are limited alike.

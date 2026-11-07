@@ -2,9 +2,9 @@
 
 **Date:** 2026-11-06 · **Branch:** `arena/a4f5fe10-linscp` · **Mode:** audit, then A1 fixed on request.
 
-> **Update (same day):** A1, A2, A3, A6 and A7(b) below have been implemented, and the §3 suites
-> have been triaged (B) — see their **Status** notes for what changed and what still needs a
-> compiler to confirm. The rest of this document is the audit as written, so A4–A5, A8–A9 and the
+> **Update (same day):** A1, A2, A3, A4, A6 and A7(b) below have been implemented, and the §3
+> suites have been triaged (B) — see their **Status** notes for what changed and what still needs
+> a compiler to confirm. The rest of this document is the audit as written, so A5, A8–A9 and the
 > A7(a) `LocalFs` routing still describe the tree as it was before those changes.
 
 **Question asked:** "Make sure we have full feature parity between the builds."
@@ -308,6 +308,19 @@ Windows dir/file probe) has exactly one caller: the local-copy queue's symlink p
 (`queue.rs:1220`). So a symlink can be *copied* but never *created* locally, on any build.
 **Fix:** a local branch in `link_remote_async` that calls `create_local_symlink` after
 `resolve_contained`, and a local variant of the page dialog. **Effort:** S.
+
+**Status: fixed.** Both local panes can create symbolic links now: the other pane of a local tab
+goes through a new local branch in `link_remote_async`, and the main pane through a new
+`/api/local/link` endpoint (`handle_local_link`); both share one helper, `create_local_link`,
+which validates two different single-leaf names, refuses a taken link name, and calls the
+previously copy-only `gui_os::create_local_symlink` after `resolve_contained`. The page dialog is
+one pane-aware `promptLink(side)` — the Local menu offers it for the local pane, the Commands menu
+keeps offering it for the remote pane — reusing the remote form's strings, so no locale changes
+were needed. Second-order, same commit: a granted folder is refused by the shared app-storage
+message in both layers (a new bundle `symlink` action), since links cannot point into a
+`content://` tree. Ledger row `gui.local-symlink` is `partial`: creation is proven on Unix, while
+Windows creation needs a symlink privilege the suite cannot grant itself and Android runs no Rust
+tests. Reading-level for the Rust, as usual: CI compiles it first.
 
 ### A5. Vault is password-only on every build; the two hardware-backed wrappers are dead code
 **Platforms:** Windows ✗ (no DPAPI), Android ✗ (no Keystore), Debian n/a (no equivalent)
@@ -671,7 +684,10 @@ Ordered by (user impact × confidence) ÷ effort. All are small except where not
    transfer/copy/move, `chmod` routed through the bridge's own message, the page gating every one
    of those through a new bundle reason next to `hostCapabilities`, and the boundary recorded as
    `platform.android-saf-refusals` = `verified`.
-7. **A4 local symlink**, **A9 Android agent message** — small completions. *S* each
+7. **A4 local symlink** — **done**, see A4's *Status: fixed*: a shared `create_local_link` helper
+   behind `/api/local/link` and a local branch in `link_remote_async`, one pane-aware page dialog,
+   and the granted-folder refusal in both layers. **A9 Android agent message** still open (small
+   completion, *S*).
 8. **A5 vault** — decide: wire DPAPI (S) and Keystore (M), or delete the dead surface and correct
    `docs/cross-platform-rust-migration.md:181,202,287`. Either is fine; the current state (code that
    says it is protected, docs that say it is protected, nothing that protects it) is not.

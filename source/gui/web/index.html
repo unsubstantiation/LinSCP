@@ -38,6 +38,7 @@
           <button role="menuitem" onclick="menuAction(() => newFolderPrompt('local'))">New directory <span class="shortcut">F7</span></button>
           <button role="menuitem" onclick="menuAction(() => renamePrompt('local'))">Rename <span class="shortcut">F2</span></button>
           <button role="menuitem" onclick="menuAction(() => deletePrompt('local'))">Delete <span class="shortcut">F8</span></button>
+          <button role="menuitem" onclick="menuAction(() => promptLink('local'))">Create symbolic link</button>
           <div class="menu-separator"></div>
           <button role="menuitem" onclick="menuAction(() => addBookmark('local'))">Bookmark this directory...</button>
           <button role="menuitem" onclick="menuAction(() => openBookmarks('local'))">Bookmarks...</button>
@@ -84,7 +85,7 @@
           <button role="menuitem" onclick="menuAction(openProperties)">Properties</button>
           <button role="menuitem" onclick="menuAction(openChecksum)">Calculate checksum</button>
           <button role="menuitem" onclick="menuAction(promptRemoteCopy)">Copy on the server</button>
-          <button role="menuitem" onclick="menuAction(promptRemoteLink)">Create symbolic link</button>
+          <button role="menuitem" onclick="menuAction(() => promptLink('remote'))">Create symbolic link</button>
           <button role="menuitem" onclick="menuAction(promptCopyId)">Upload public key to the server</button>
           <div class="menu-separator"></div>
           <button role="menuitem" onclick="menuAction(toggleSyncBrowse)">Toggle synchronized browsing</button>
@@ -5225,19 +5226,27 @@
     await refreshPanes('remote');
   }
 
-  async function promptRemoteLink() {
+  async function promptLink(side) {
     const tab = activeTab();
     if (!tab || !tab.connected) { toast(t('Not connected.'), true); return; }
-    const names = selectedNames('remote');
+    const target = side || state.focusPane;
+    const names = selectedNames(target);
     if (names.length !== 1) {
       toast(t('Select exactly one item in the {side} panel.',
-        { side: t('Remote') }), true);
+        { side: sideLabel(target) }), true);
       return;
     }
+    // The remote pane of a local tab is the other local directory, so it is
+    // checked too; a server path can never be a granted folder.
+    const linkPath = target === 'local' ? state.local.path :
+      (tab.is_local ? state.remote.path : null);
+    const linkGap = linkPath === null ? null : safGap('symlink', linkPath);
+    if (linkGap) { toast(linkGap, true); return; }
     const linkName = prompt(t('Name of the symbolic link to "{target}":',
       { target: names[0] }), names[0] + '.lnk');
     if (!linkName) return;
-    const result = await apiPost('/api/remote/link', {
+    const endpoint = target === 'local' ? '/api/local/link' : '/api/remote/link';
+    const result = await apiPost(endpoint, {
       tab: tab.id, target: names[0], name: linkName.trim()
     });
     if (!result.success) {
@@ -5245,7 +5254,7 @@
       return;
     }
     toast(t('Created the symbolic link.'));
-    await refreshPanes('remote');
+    await refreshPanes(target);
   }
 
   async function promptCopyId() {

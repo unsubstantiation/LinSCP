@@ -200,6 +200,7 @@ impl CommanderService {
             ("POST", "/api/local/delete") => self.handle_local_delete(req.body),
             ("POST", "/api/local/rename") => self.handle_local_rename(req.body),
             ("POST", "/api/local/chmod") => self.handle_local_chmod(req.body),
+            ("POST", "/api/local/link") => self.handle_local_link(req.body),
             ("POST", "/api/local/save") => self.handle_local_save(req.body),
             ("POST", "/api/local/drop") => self.handle_local_drop(&query, req.body),
             ("POST", "/api/local/drop-dir") => self.handle_local_drop_dir(&query, req.body),
@@ -839,7 +840,16 @@ impl CommanderService {
         let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
             Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
         };
-        if tab.is_local { return self.handle_remote_link(body); }
+        if tab.is_local {
+            // A local tab's "remote" side is the other local directory: the
+            // link is created there with the same rules as the main pane.
+            let target = body.get("target").and_then(Value::as_str).unwrap_or("");
+            let name = body.get("name").and_then(Value::as_str).unwrap_or("");
+            return match create_local_link(&tab.other_local_dir, target, name) {
+                Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
+                Err(error) => api_error(400, error),
+            };
+        }
         let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
         if !matches!(session.scheme(), linscp_types::ProtocolScheme::Sftp) {
             return api_error(501, "Symbolic links can be created only over SFTP.");
@@ -2348,6 +2358,16 @@ impl CommanderService {
         match self.local_fs.mkdir_all(&target) {
             Ok(_) => ApiReply{ status: 200, payload: json!({"success": true})},
             Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})},
+        }
+    }
+    fn handle_local_link(&self, body: Value) -> ApiReply {
+        let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
+        let base = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).map(|t| t.local_dir.clone())).unwrap_or_else(|| self.default_local_dir());
+        let target = body.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        match create_local_link(&base, &target, &name) {
+            Ok(_) => ApiReply{ status: 200, payload: json!({"success": true})},
+            Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
         }
     }
     fn handle_local_delete(&self, body: Value) -> ApiReply {
@@ -4987,6 +5007,27 @@ fn check_plain_local_dir(raw: &str, action: &str) -> Result<String, String> {
         return Err("An absolute local directory is required.".to_string());
     }
     Ok(dir)
+}
+
+/// Creates `name` as a symbolic link to `target` inside one local pane
+/// directory. Both are single leaves, like the remote form: the target is
+/// relative to the link's directory, the two names must differ, and the
+/// link name must not exist yet. A granted folder has no links to create,
+/// so it gets the limitation's name instead of a filesystem error.
+fn create_local_link(base: &str, target: &str, name: &str) -> Result<(), String> {
+    if is_saf_path(base) {
+        return Err(saf_unsupported("Creating symbolic links"));
+    }
+    let target = ops::validate_leaf_name(target)?;
+    let name = ops::validate_leaf_name(name)?;
+    if target == name {
+        return Err("A link and its target need two different names.".to_string());
+    }
+    let link = resolve_contained(base, &name)?;
+    if std::fs::symlink_metadata(&link).is_ok() {
+        return Err("The link name already exists.".to_string());
+    }
+    gui_os::create_local_symlink(&target, Path::new(&link)).map_err(|error| error.to_string())
 }
 
 fn check_local_pane_directory(raw: &str, label: &str) -> Result<String, String> {
@@ -8936,6 +8977,64 @@ mod tests {
         let plain = std::env::temp_dir().to_string_lossy().into_owned();
         assert!(check_plain_local_dir(&plain, "Synchronizing").is_ok(), "a plain absolute directory still passes");
         assert!(CommanderService::sync_options_from(&json!({"local_dir": plain, "remote_dir": "/"})).is_ok());
+    }
+
+    /// Link creation validates before it touches the filesystem, on every
+    /// platform: the two names must differ and be single leaves, the link
+    /// name must be free, and a granted folder gets the limitation's name.
+    #[tokio::test]
+    async fn local_symlink_validation_refuses_bad_names() {
+        let tmp = std::env::temp_dir().join(format!("linscp-link-validate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let left = tmp.join("left"); let right = tmp.join("right");
+        std::fs::create_dir_all(&left).unwrap(); std::fs::create_dir_all(&right).unwrap();
+        std::fs::write(left.join("taken.txt"), b"occupied").unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let open = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": left, "other_local_dir": right}}) }).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        let link = |target: &str, name: &str| ApiEnvelope { method: "POST".into(), path: "/api/local/link".into(), body: json!({"tab": id, "target": target, "name": name}) };
+        let same = svc.dispatch(link("real.txt", "real.txt"));
+        assert_eq!(same.status, 400, "{}", same.payload);
+        assert!(same.payload["error"].as_str().unwrap_or("").contains("two different names"), "{}", same.payload);
+        let separators = svc.dispatch(link("sub/real.txt", "alias.txt"));
+        assert_eq!(separators.status, 400, "{}", separators.payload);
+        let taken = svc.dispatch(link("real.txt", "taken.txt"));
+        assert_eq!(taken.status, 400, "{}", taken.payload);
+        assert!(taken.payload["error"].as_str().unwrap_or("").contains("already exists"), "{}", taken.payload);
+        let granted = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": SAF_GRANTED_DIR, "other_local_dir": right}}) }).await;
+        assert_eq!(granted.status, 200, "{}", granted.payload);
+        let granted_id = granted.payload["tab"]["id"].as_u64().unwrap();
+        let refused = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/local/link".into(), body: json!({"tab": granted_id, "target": "real.txt", "name": "alias.txt"}) });
+        assert_eq!(refused.status, 400, "{}", refused.payload);
+        assert!(refused.payload["error"].as_str().unwrap_or("").contains("app storage"), "{}", refused.payload);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// On Unix both panes link: the main pane through `/api/local/link`,
+    /// the other pane of a local tab through `/api/remote/link`. Windows
+    /// creation needs a privilege this suite cannot grant itself, so it
+    /// stays review-level there while validation runs everywhere.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_symlink_creation_links_leaves() {
+        let tmp = std::env::temp_dir().join(format!("linscp-link-create-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let left = tmp.join("left"); let right = tmp.join("right");
+        std::fs::create_dir_all(&left).unwrap(); std::fs::create_dir_all(&right).unwrap();
+        std::fs::write(left.join("real.txt"), b"target").unwrap();
+        std::fs::write(right.join("other.txt"), b"other target").unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let open = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": left, "other_local_dir": right}}) }).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        let made = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/local/link".into(), body: json!({"tab": id, "target": "real.txt", "name": "alias.txt"}) });
+        assert_eq!(made.status, 200, "{}", made.payload);
+        assert_eq!(std::fs::read_link(left.join("alias.txt")).unwrap().to_string_lossy(), "real.txt");
+        let other = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/remote/link".into(), body: json!({"tab": id, "target": "other.txt", "name": "other-alias.txt"}) }).await;
+        assert_eq!(other.status, 200, "{}", other.payload);
+        assert_eq!(std::fs::read_link(right.join("other-alias.txt")).unwrap().to_string_lossy(), "other.txt");
+        let _ = std::fs::remove_dir_all(tmp);
     }
 }
 

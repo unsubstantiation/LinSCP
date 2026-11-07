@@ -218,7 +218,8 @@ export function hostDifferenceReason(
 /**
  * Local actions the granted-folder bridge cannot perform. Listing, creating,
  * renaming and deleting inside a granted folder work through `LocalFs`;
- * these need a plain filesystem path, so the backend refuses them with a
+ * these need a plain filesystem path (symlinks cannot point into a
+ * `content://` tree), so the backend refuses them with a
  * message that names the limitation - and the page asks here first so it
  * does not offer a control that could only fail.
  */
@@ -230,7 +231,8 @@ export type SafLimitedAction =
   | 'copyMove'
   | 'move'
   | 'synchronize'
-  | 'keepUpToDate';
+  | 'keepUpToDate'
+  | 'symlink';
 
 /**
  * The reason a local action is not offered for `path`, or null when the path
@@ -263,6 +265,8 @@ export function safLimitationReason(
       return 'Synchronizing needs a folder in app storage, not a granted Android folder.';
     case 'keepUpToDate':
       return 'Keep up to date needs a folder in app storage, not a granted Android folder.';
+    case 'symlink':
+      return 'Creating symbolic links needs a folder in app storage, not a granted Android folder.';
     default:
       return 'This action needs a folder in app storage, not a granted Android folder.';
   }

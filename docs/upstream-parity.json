@@ -5008,6 +5008,51 @@
       ]
     },
     {
+      "id": "gui.local-symlink",
+      "area": "GUI",
+      "status": "partial",
+      "notes": "Symbolic links can be created in a local pane, not just over SFTP: the other pane of a local tab goes through a new local branch in link_remote_async, the main pane through a new /api/local/link endpoint, and both share one helper (create_local_link) that validates two different single-leaf names, refuses a taken link name, and calls gui_os.create_local_symlink after resolve_contained. The page dialog is one pane-aware promptLink(side), offered from the Local menu for the local pane and the Commands menu for the remote pane with no new translatable strings; a granted folder is refused by the shared app-storage message in both layers.",
+      "source": [
+        "crates/linscp-service/src/lib.rs",
+        "source/gui/web/index.html",
+        "ui/src/platform/capabilities.ts"
+      ],
+      "checks": {
+        "service": [
+          "local_symlink_validation_refuses_bad_names",
+          "local_symlink_creation_links_leaves"
+        ],
+        "ui-transport": [
+          "granted Android folders name the app-storage limitation per action"
+        ],
+        "gui": [
+          "the local pane offers symbolic links",
+          "a granted folder is not offered symbolic links"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "service",
+          "ui-transport",
+          "gui"
+        ],
+        "windows": [
+          "service",
+          "ui-transport",
+          "gui"
+        ],
+        "android": [
+          "ui-transport",
+          "gui"
+        ]
+      },
+      "gap": "Link creation itself is proven only on Unix: the creation test is cfg(unix) because Windows needs a symlink privilege (or developer mode) this suite cannot grant itself, and Android runs no Rust tests. Validation and the granted-folder refusal run on every platform.",
+      "acceptance": [
+        "A Windows CI run proving link creation in a plain directory, or a documented privilege requirement the backend reports.",
+        "A device or emulator run proving link creation in Android app storage."
+      ]
+    },
+    {
       "id": "sessions.workspaces",
       "area": "Sessions/configuration",
       "status": "partial",
