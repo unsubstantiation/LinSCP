@@ -1233,8 +1233,9 @@ pub fn safe_tree_name(name: &str) -> Result<(), String> {
 
 /// Joins one listed name onto a granted document URI, mirroring
 /// `Path::join` for the URI side. Callers only ever pass URIs the service
-/// built, so every `/document/` segment inverts exactly.
-fn join_saf_child(dir_uri: &str, name: &str) -> String {
+/// built, so every `/document/` segment inverts exactly. Shared with the
+/// sync planner, which walks granted trees the same way.
+pub(crate) fn join_saf_child(dir_uri: &str, name: &str) -> String {
     format!("{}/document/{}", dir_uri.trim_end_matches('/'), name)
 }
 

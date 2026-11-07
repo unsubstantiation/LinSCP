@@ -3452,8 +3452,8 @@
    * ------------------------------------------------------------------ */
 
   function openSynchronize() {
-    const syncGap = safGap('synchronize', state.local.path);
-    if (syncGap) { toast(syncGap, true); return; }
+    // A granted side plans through LocalFs and stages file bytes, so the
+    // dialogue is offered for granted folders too.
     $('syncLocal').value = state.local.path;
     $('syncRemote').value = state.remote.path;
     $('syncPreviewBox').style.display = 'none';
@@ -3515,8 +3515,6 @@
   }
 
   async function previewSynchronization() {
-    const previewGap = safGap('synchronize', $('syncLocal').value.trim());
-    if (previewGap) { toast(previewGap, true); return; }
     const result = await apiPost('/api/sync/preview', syncSettings());
     if (!result.success) {
       toast(errorMessage(result.error, t("Cannot read the plan.")), true);
@@ -3557,8 +3555,6 @@
 
   async function runSynchronization() {
     const settings = syncSettings();
-    const runGap = safGap('synchronize', settings.local_dir);
-    if (runGap) { toast(runGap, true); return; }
     if (settings.delete && !confirm(t("Delete obsolete files as part of this synchronization?"))) return;
     const result = await apiPost('/api/sync/run', settings);
     if (result.success) {
@@ -5324,8 +5320,8 @@
   function openKeepUpToDate() {
     const tab = activeTab();
     if (!tab || !tab.connected) { toast(t('Not connected.'), true); return; }
-    const gap = safGap('keepUpToDate', state.local.path);
-    if (gap) { toast(gap, true); return; }
+    // A granted folder has no watcher to attach, so the backend polls it;
+    // the dialogue is offered for granted folders too.
     $('kudLocal').value = state.local.path;
     $('kudRemote').value = state.remote.path;
     $('kudMask').value = '';
@@ -5343,8 +5339,6 @@
       toast(t('Both directories are required.'), true);
       return;
     }
-    const kudGap = safGap('keepUpToDate', localDir);
-    if (kudGap) { toast(kudGap, true); return; }
     const result = await apiPost('/api/transfer/keepuptodate', {
       tab: tab.id, local_dir: localDir, remote_dir: remoteDir,
       filemask: $('kudMask').value.trim(),

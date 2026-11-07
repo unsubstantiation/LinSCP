@@ -4827,7 +4827,7 @@
       "id": "platform.android-saf-refusals",
       "area": "Packaging/platforms",
       "status": "verified",
-      "notes": "Every local action the granted-folder bridge does not implement fails closed with a message that names the limitation, and the page stops offering those actions for granted folders. The service refuses synchronization and keep-up-to-date with one shared refusal (a folder in app storage, not a granted folder); chmod is routed through LocalFs.set_permissions_mode, so the bridge owns its POSIX-permissions message instead of the user getting a raw I/O error. The page asks the shared bundle (safLimitationReason, next to hostCapabilities) before opening the synchronize and keep-up-to-date dialogues, prompting for permissions, or drawing the properties rights editor, and shows the reason instead. (The other pane of a local tab keeps its older behaviour for joined paths, which never resolved there as a leaf, on plain and granted panes alike.) Editing, saving, reading properties, local copies and moves and session transfers route through LocalFs or staged temporary files instead \u2014 see platform.android-saf-editing, platform.android-saf-local-copy-move and platform.android-saf-session-transfers.",
+      "notes": "Every local action the granted-folder bridge does not implement fails closed with a message that names the limitation, and the page stops offering those actions for granted folders. chmod is routed through LocalFs.set_permissions_mode, so the bridge owns its POSIX-permissions message instead of the user getting a raw I/O error, and symlink creation is refused before it touches the bridge. The page asks the shared bundle (safLimitationReason, next to hostCapabilities) before prompting for permissions or drawing the properties rights editor, and shows the reason instead. (The other pane of a local tab keeps its older behaviour for joined paths, which never resolved there as a leaf, on plain and granted panes alike.) Editing, saving, reading properties, local copies and moves, session transfers, synchronization and keep-up-to-date route through LocalFs or staged temporary files instead \u2014 see platform.android-saf-editing, platform.android-saf-local-copy-move, platform.android-saf-session-transfers and platform.android-saf-synchronization.",
       "source": [
         "crates/linscp-service/src/lib.rs",
         "ui/src/platform/capabilities.ts",
@@ -4835,15 +4835,12 @@
       ],
       "checks": {
         "service": [
-          "saf_chmod_still_refuses_granted_folders",
-          "sync_and_watch_refuse_granted_folders"
+          "saf_chmod_still_refuses_granted_folders"
         ],
         "ui-transport": [
           "granted Android folders name the app-storage limitation per action"
         ],
         "gui": [
-          "a granted folder is not offered synchronization",
-          "a granted folder is not offered keep-up-to-date",
           "a granted folder is not offered chmod",
           "properties on a granted folder explain the missing rights editor",
           "leaving the granted folder offers the actions again"
@@ -5660,6 +5657,48 @@
         "Live VNC (5900) and SPICE (5900/.vv) launches verify viewer resolution (tigervnc/remote-viewer), TLS port, and headless .vv/.rdp ticket generation (live-desktop).",
         "Live X2Go/NX and X11/Waypipe launches verify SSH-transported NX compression over direct-tcpip, WAYLAND_DISPLAY detection, and that jump-host proxy/TLS/SPKI settings are inherited without fallback (live-desktop).",
         "Obtain independent review that ironrdp WASM / Guacamole gateway fallback correctly isolates credentials and that XDMCP (UDP 177) remains refusing/not recommended."
+      ]
+    },
+    {
+      "id": "platform.android-saf-synchronization",
+      "area": "Packaging/platforms",
+      "status": "partial",
+      "notes": "Synchronization with a granted local side plans and applies through LocalFs: the planner walks the tree through the bridge, checksum criteria stat each document fresh and refuse an over-cap file naming it before its bytes are read, downloads land in a private stage and publish across the bridge replacing like the plain path, and uploads stage the granted source and run the guarded upload unchanged from the stage. Granted-side deletions stay lenient; keep-up-to-date cannot watch a content:// tree, so it polls it on the interval instead. The page offers both dialogues for granted folders.",
+      "source": [
+        "crates/linscp-engine/src/sync_planner.rs",
+        "crates/linscp-engine/src/keepuptodate.rs",
+        "crates/linscp-service/src/lib.rs",
+        "crates/linscp-service/src/queue.rs",
+        "ui/src/platform/capabilities.ts",
+        "source/gui/web/index.html"
+      ],
+      "checks": {
+        "service": [
+          "saf_sync_preview_and_run_moves_bytes_both_ways",
+          "saf_sync_checksum_criteria_reads_through_the_bridge",
+          "saf_keep_up_to_date_polls_a_granted_folder"
+        ],
+        "gui": [
+          "a granted folder is offered synchronization",
+          "a granted folder is offered keep-up-to-date"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "service",
+          "gui"
+        ],
+        "windows": [
+          "service",
+          "gui"
+        ],
+        "android": [
+          "gui"
+        ]
+      },
+      "gap": "The bridge and both remotes are in-memory mocks: no suite has planned against or published into a real DocumentsProvider, so provider behaviour (mtime fidelity after a publish, nested document URIs, large-tree walk time, polling cadence with no watcher) is unproven on a device.",
+      "acceptance": [
+        "Synchronize both directions with delete against a granted folder on an Android device or emulator, covering a checksum comparison, the over-cap refusal and one keep-up-to-date pass."
       ]
     }
   ],

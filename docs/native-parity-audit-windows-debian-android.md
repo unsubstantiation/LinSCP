@@ -2,11 +2,11 @@
 
 **Date:** 2026-11-06 · **Branch:** `arena/a4f5fe10-linscp` · **Mode:** audit, then A1 fixed on request.
 
-> **Update (same day):** A1, A2, A3, A4, A5, A6, A7(b), A7(a) slices 1, 2a and 2b, A8 and A9
+> **Update (same day):** A1, A2, A3, A4, A5, A6, A7(b), A7(a) slices 1, 2a, 2b and 2c, A8 and A9
 > below have been implemented, and the §3 suites have been triaged (B) — see their **Status**
 > notes for what changed and what still needs a compiler to confirm. The rest of this document
-> is the audit as written, so only the A7(a) sync and keep-up-to-date routing still describes
-> the tree as it was before those changes.
+> is the audit as written; its A7(a) option-(b) remainder (chmod, symlink creation) is the
+> finished boundary, not stale prose.
 
 **Question asked:** "Make sure we have full feature parity between the builds."
 **Scope, as confirmed:** the three native builds — `linscp-gui` on Windows (MSVC), `linscp-gui` on
@@ -548,9 +548,25 @@ files), in preflight and in the worker; WebDAV moves delete the remote source by
 the staged download publishes. The bundle dropped `transfer`, the page offers transfers and
 moves for granted folders on both tab kinds, and the new capability is
 `platform.android-saf-session-transfers` = `partial`, evidenced by three mock-session
-service tests and two page checks. Still refused, as the rest of option (a):
-synchronization and keep-up-to-date. As before, no Rust toolchain here, so the new tests
+service tests and two page checks. As before, no Rust toolchain here, so the new tests
 compile for the first time in CI.
+
+**Status, continued a fourth time** (option (a), fourth slice: synchronization and
+keep-up-to-date). The planner and the applier take an optional `LocalFs`: a granted root is
+walked through the bridge (a separator in a provider name refuses the plan, links are
+skipped), checksum criteria stat each document fresh and refuse an over-cap file naming it
+before its bytes are read, downloads land in a private stage and publish across the bridge
+replacing like the plain path, and uploads stage the granted source and run the guarded
+upload unchanged from the stage, while granted-side deletions stay lenient. Keep-up-to-date
+cannot watch a `content://` tree, so it polls it on the interval through the same no-watcher
+path the CLI already uses; the service passes a filesystem only for granted roots, the CLI
+passes none. The bundle lost `synchronize` and `keepUpToDate`, the page offers both dialogues
+for granted folders, and the new capability is `platform.android-saf-synchronization` =
+`partial`, evidenced by three mock-bridge service tests and two page checks. That finishes
+option (a): what stays refused — chmod and symlink creation — is the option-(b) boundary the
+audit asked to keep, recorded by `platform.android-saf-refusals`. As before, no Rust toolchain
+here, so the new tests compile for the first time where a toolchain exists
+(`cargo test -p linscp-service saf_`).
 
 ### A8. Kerberos/GSSAPI exists only on Linux; Windows has no SSPI backend at all
 **Platforms:** Windows ✗, Android ✗ (fail closed), Debian ✓
@@ -675,7 +691,9 @@ a *Linux runner*.
 `any(target_os = "linux", target_os = "android")`
 (`notify/src/lib.rs`, `RecommendedWatcher` cfg). The code is right either way (`RecommendedWatcher`
 is used), but the comment would mislead the next person testing Android; and `sync.keepuptodate-inotify`
-is `verified` on Android where keep-up-to-date cannot start at all (A7).
+is `verified` on Android where keep-up-to-date could not start at all when the audit was
+written (A7); slice 2c has since taught it to poll granted trees, so that premise is spent
+while the triage stands.
 
 **Status: triaged.** Every suite the audit found unrunnable is now flagged `not_runnable`, per
 platform, in `docs/upstream-parity.json` — 16 on Linux, 20 on Windows, 25 on Android — each with the
@@ -745,7 +763,7 @@ evidence").
 | `POST_NOTIFICATIONS` (Android 13+) | yes, requested at first queue (`LinSCPAndroidPlugin.kt:233-235`) | smoke pre-grants it via `pm grant` "to avoid an interactive prompt" (`tools/android_emulator_smoke.sh`), i.e. the request path is deliberately never exercised |
 | Keystore | **no** (A5) | — |
 | Android application ID | `com.fairuniversal.linscp`, read from `tools/android_application_id.py`, asserted in `test_android_application_id.py:23` | consistent: `tauri.conf.json:5`, the Kotlin `package`, and `register_android_plugin("com.fairuniversal.linscp", …)` (`android.rs:331`). The Rust literal is *not* in the "defined once" list (`test_android_application_id.py` readers list only shell/mjs/py), so a rename in `tauri.conf.json` would leave a silent mismatch in `android.rs:331` — worth adding to that test's reader list. |
-| Keep-up-to-date over SAF | **no**, refused by name (A7(b) done) | `platform.android-saf-refusals` is `verified`; the refusal — not a run — is what is evidenced |
+| Keep-up-to-date over SAF | **polls** — no watcher attaches to a `content://` tree (A7(a) slice 2c) | `platform.android-saf-synchronization` is `partial`; the run is mock-evidenced, the device run is the acceptance |
 | Windows file-drop into the window | yes (`linscp-tauri/src/lib.rs:209-224`) | `gui.native-path-drop` is `partial` and its own note admits jsdom cannot produce a WebKit drop |
 
 ---
@@ -786,10 +804,12 @@ Ordered by (user impact × confidence) ÷ effort. All are small except where not
    `platform.android-saf-refusals` = `verified`. Option (a) has since begun — see A7's
    continued *Status*: the editor and properties route through `LocalFs` (first slice,
    `platform.android-saf-editing` = `partial` pending a device run), local copy/move
-   follows (second slice, `platform.android-saf-local-copy-move` = `partial`) and
+   follows (second slice, `platform.android-saf-local-copy-move` = `partial`),
    session transfers stage through temporary files (third slice,
-   `platform.android-saf-session-transfers` = `partial`), while sync and
-   keep-up-to-date keep their refusals for the rest of the engine routing.
+   `platform.android-saf-session-transfers` = `partial`), and synchronization
+   plans and applies through `LocalFs` while keep-up-to-date polls granted
+   trees (fourth slice, `platform.android-saf-synchronization` = `partial`),
+   which leaves chmod and symlink creation as the finished refusal boundary.
 7. **A4 local symlink** — **done**, see A4's *Status: fixed*: a shared `create_local_link` helper
    behind `/api/local/link` and a local branch in `link_remote_async`, one pane-aware page dialog,
    and the granted-folder refusal in both layers. **A9 Android agent message** — **done**, see

@@ -4,15 +4,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use linscp_crypto::digests::sha256_hex;
 use linscp_platform::terminal::stat_local_path;
 use linscp_platform::write_private_file_atomic;
+use linscp_platform::{saf_document_too_large, LocalFs, MAX_SAF_DOCUMENT_BYTES};
 use linscp_proto::RemoteSession;
 use linscp_types::TransferMode;
 
 use crate::filemask::{FileMask, join_remote_path, mode_from_permissions_str};
-use crate::transfer::{TransferFlags, download_single_file, upload_single_file};
+use crate::transfer::{
+    TransferFlags, download_single_file, join_saf_child, publish_staged_file_to_saf,
+    stage_saf_upload_source, upload_single_file,
+};
 use crate::xml_log::{SessionLogger, XmlDiffRecord};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,6 +396,77 @@ struct TreeEntry {
     mode: u32,
 }
 
+/// True when a sync root is a granted Android folder (`content://` tree URI).
+fn is_saf_sync_root(root: &str) -> bool {
+    root.starts_with("content://")
+}
+
+/// Joins a `/`-separated plan path onto a granted root URI, one document
+/// segment per level. Plan paths from the local walk carry names the walk
+/// checked for separators, so no segment can escape the tree.
+fn join_saf_rel(root_uri: &str, rel: &str) -> String {
+    let mut uri = root_uri.trim_end_matches('/').to_string();
+    if rel.is_empty() {
+        return uri;
+    }
+    for segment in rel.split('/') {
+        uri = join_saf_child(&uri, segment);
+    }
+    uri
+}
+
+/// The `collect_local_tree` walk over `LocalFs`, for a granted root: same
+/// skips, same mask, same map. Provider names are untrusted, so a separator
+/// in one refuses the plan — it would join onto the wrong document — while
+/// links are skipped, as they refuse on transfer anyway.
+fn collect_local_tree_fs(
+    fs: &dyn LocalFs,
+    root_uri: &str,
+    rel_prefix: &str,
+    recursive: bool,
+    mask: &FileMask,
+    out: &mut BTreeMap<String, TreeEntry>,
+) -> Result<(), String> {
+    let mut children = fs.list_dir(root_uri).map_err(|e| format!("Cannot read local directory '{root_uri}': {e}"))?;
+    children.sort_by(|a, b| a.name.cmp(&b.name));
+    for child in children {
+        if child.name == "."
+            || child.name == ".."
+            || child.name.ends_with(".filepart")
+            || child.name.contains(".filepart.v")
+        {
+            continue;
+        }
+        if child.name.contains('/') {
+            return Err("Invalid directory entry name.".to_string());
+        }
+        if child.is_symlink {
+            continue;
+        }
+        let rel = if rel_prefix.is_empty() {
+            child.name.clone()
+        } else {
+            format!("{rel_prefix}/{}", child.name)
+        };
+        if !mask.accepts(&child.name, child.is_dir, child.size, child.mtime.max(0) as u64, &rel) {
+            continue;
+        }
+        out.insert(
+            rel.clone(),
+            TreeEntry {
+                is_dir: child.is_dir,
+                size: child.size,
+                mtime: child.mtime,
+                mode: mode_from_permissions_str(&child.permissions),
+            },
+        );
+        if child.is_dir && recursive {
+            collect_local_tree_fs(fs, &join_saf_child(root_uri, &child.name), &rel, true, mask, out)?;
+        }
+    }
+    Ok(())
+}
+
 fn collect_local_tree(
     root: &Path,
     rel_prefix: &str,
@@ -485,12 +561,15 @@ async fn collect_remote_tree(
 }
 
 /// Builds a deterministic, sorted synchronization plan without mutating either filesystem.
+/// A granted local root is walked through `local_fs`; any other root walks the
+/// direct path, whether a filesystem was passed or not.
 pub async fn plan_synchronization(
     session: &dyn RemoteSession,
     local_root: &Path,
     remote_root: &str,
     opts: &SyncOptions,
     state: &SyncState,
+    local_fs: Option<&dyn LocalFs>,
 ) -> Result<Vec<SyncItem>, String> {
     if opts.mode == SyncMode::Both {
         if opts.criteria.checksum {
@@ -513,9 +592,15 @@ pub async fn plan_synchronization(
         }
     }
 
+    let local_root_str = local_root.to_string_lossy();
+    let saf_fs = local_fs.filter(|_| is_saf_sync_root(&local_root_str));
     let mut local_map = BTreeMap::new();
     let mut remote_map = BTreeMap::new();
-    collect_local_tree(local_root, "", opts.recursive, &opts.file_mask, &mut local_map)?;
+    if let Some(fs) = saf_fs {
+        collect_local_tree_fs(fs, &local_root_str, "", opts.recursive, &opts.file_mask, &mut local_map)?;
+    } else {
+        collect_local_tree(local_root, "", opts.recursive, &opts.file_mask, &mut local_map)?;
+    }
     collect_remote_tree(
         session,
         remote_root,
@@ -557,6 +642,7 @@ pub async fn plan_synchronization(
                 }
                 let action_and_reason = match opts.mode {
                     SyncMode::Local => {
+                        let local_uri = join_saf_rel(&local_root_str, &rel);
                         let diff = one_way_differs(
                             session,
                             &join_remote_path(remote_root, &rel),
@@ -565,11 +651,13 @@ pub async fn plan_synchronization(
                             l,
                             opts.criteria,
                             opts.mirror,
+                            saf_fs.map(|fs| (fs, local_uri.as_str())),
                         )
                         .await?;
                         diff.map(|reason| (SyncAction::Download, reason))
                     }
                     SyncMode::Remote => {
+                        let local_uri = join_saf_rel(&local_root_str, &rel);
                         let diff = one_way_differs_upload(
                             session,
                             &local_root.join(&rel),
@@ -578,6 +666,7 @@ pub async fn plan_synchronization(
                             r,
                             opts.criteria,
                             opts.mirror,
+                            saf_fs.map(|fs| (fs, local_uri.as_str())),
                         )
                         .await?;
                         diff.map(|reason| (SyncAction::Upload, reason))
@@ -695,6 +784,7 @@ async fn one_way_differs(
     dst_local: &TreeEntry,
     criteria: SyncCriteria,
     mirror: bool,
+    local_saf: Option<(&dyn LocalFs, &str)>,
 ) -> Result<Option<String>, String> {
     if criteria.is_empty() {
         return Ok(Some("criteria=none".to_string()));
@@ -711,8 +801,19 @@ async fn one_way_differs(
         return Ok(Some("size differs".to_string()));
     }
     if criteria.checksum {
-        let local_bytes = std::fs::read(local_path)
-            .map_err(|e| format!("Cannot read '{}' for checksum: {e}", local_path.display()))?;
+        // The bridge carries whole documents, so an over-cap file refuses
+        // the plan on its fresh stat, before the read spends the memory.
+        let local_bytes = match local_saf {
+            Some((fs, uri)) => {
+                let size = fs.stat(uri).map_err(|e| format!("Cannot inspect '{uri}' for checksum: {e}"))?.size;
+                if size > MAX_SAF_DOCUMENT_BYTES {
+                    return Err(saf_document_too_large(uri.rsplit('/').next().unwrap_or(uri), size));
+                }
+                fs.read_bytes(uri).map_err(|e| format!("Cannot read '{uri}' for checksum: {e}"))?
+            }
+            None => std::fs::read(local_path)
+                .map_err(|e| format!("Cannot read '{}' for checksum: {e}", local_path.display()))?,
+        };
         let local_hex = sha256_hex(&local_bytes);
         let remote_hex = session
             .checksum("sha-256", remote_path)
@@ -733,6 +834,7 @@ async fn one_way_differs_upload(
     dst_remote: &TreeEntry,
     criteria: SyncCriteria,
     mirror: bool,
+    local_saf: Option<(&dyn LocalFs, &str)>,
 ) -> Result<Option<String>, String> {
     if criteria.is_empty() {
         return Ok(Some("criteria=none".to_string()));
@@ -749,8 +851,19 @@ async fn one_way_differs_upload(
         return Ok(Some("size differs".to_string()));
     }
     if criteria.checksum {
-        let local_bytes = std::fs::read(local_path)
-            .map_err(|e| format!("Cannot read '{}' for checksum: {e}", local_path.display()))?;
+        // The bridge carries whole documents, so an over-cap file refuses
+        // the plan on its fresh stat, before the read spends the memory.
+        let local_bytes = match local_saf {
+            Some((fs, uri)) => {
+                let size = fs.stat(uri).map_err(|e| format!("Cannot inspect '{uri}' for checksum: {e}"))?.size;
+                if size > MAX_SAF_DOCUMENT_BYTES {
+                    return Err(saf_document_too_large(uri.rsplit('/').next().unwrap_or(uri), size));
+                }
+                fs.read_bytes(uri).map_err(|e| format!("Cannot read '{uri}' for checksum: {e}"))?
+            }
+            None => std::fs::read(local_path)
+                .map_err(|e| format!("Cannot read '{}' for checksum: {e}", local_path.display()))?,
+        };
         let local_hex = sha256_hex(&local_bytes);
         let remote_hex = session
             .checksum("sha-256", remote_path)
@@ -880,7 +993,8 @@ fn sort_sync_items(items: &mut [SyncItem]) {
 }
 
 /// Applies `items` (after recording XML `<difference>` entries), updates `state`, and returns
-/// `(applied_count, conflict_count)`.
+/// `(applied_count, conflict_count)`. A granted local root applies through `local_fs`,
+/// staging file bytes both ways; any other root applies through the direct path.
 pub async fn apply_sync_plan(
     session: &dyn RemoteSession,
     local_root: &Path,
@@ -889,6 +1003,7 @@ pub async fn apply_sync_plan(
     opts: &SyncOptions,
     state: &mut SyncState,
     logger: &mut SessionLogger,
+    local_fs: Option<&dyn LocalFs>,
 ) -> Result<(usize, usize), String> {
     let mut applied = 0usize;
     let mut conflicts = 0usize;
@@ -930,6 +1045,12 @@ pub async fn apply_sync_plan(
         ..TransferFlags::default()
     };
 
+    let local_root_str = local_root.to_string_lossy();
+    let saf_fs = local_fs.filter(|_| is_saf_sync_root(&local_root_str));
+    // Synchronization predates cancellation: the staging helpers take a
+    // switch, and this one stays off.
+    let no_cancel = AtomicBool::new(false);
+
     for item in items {
         let local_path = local_root.join(&item.rel_path);
         let remote_path = join_remote_path(remote_root, &item.rel_path);
@@ -949,9 +1070,37 @@ pub async fn apply_sync_plan(
             SyncAction::Conflict => {}
             SyncAction::Download => {
                 if item.is_directory {
-                    std::fs::create_dir_all(&local_path).map_err(|e| {
-                        format!("Cannot create local directory '{}': {e}", local_path.display())
-                    })?;
+                    if let Some(fs) = saf_fs {
+                        fs.mkdir_all(&join_saf_rel(&local_root_str, &item.rel_path)).map_err(|e| e.to_string())?;
+                    } else {
+                        std::fs::create_dir_all(&local_path).map_err(|e| {
+                            format!("Cannot create local directory '{}': {e}", local_path.display())
+                        })?;
+                    }
+                } else if let Some(fs) = saf_fs {
+                    // The guarded download lands in a private stage and
+                    // publishes across the bridge, replacing like the plain
+                    // path does.
+                    let stage = tempfile::Builder::new().prefix("linscp-sync-download-").rand_bytes(16).tempdir()
+                        .map_err(|e| format!("Cannot create download staging directory: {e}"))?;
+                    let staged_file = stage.path().join("contents");
+                    download_single_file(session, &remote_path, None, &staged_file, &tflags, logger, None).await?;
+                    let dest_uri = join_saf_rel(&local_root_str, &item.rel_path);
+                    publish_staged_file_to_saf(fs, &staged_file, &dest_uri, false, &no_cancel)?;
+                    let l_after = fs.stat(&dest_uri).map_err(|e| e.to_string())?;
+                    let r_mtime = if item.remote_mtime > 0 {
+                        item.remote_mtime as u64
+                    } else {
+                        l_after.mtime.max(0) as u64
+                    };
+                    state.update(
+                        item.rel_path.clone(),
+                        SyncStateEntry {
+                            local_time: l_after.mtime.max(0) as u64,
+                            remote_time: r_mtime,
+                            size: l_after.size,
+                        },
+                    );
                 } else {
                     download_single_file(
                         session,
@@ -995,8 +1144,13 @@ pub async fn apply_sync_plan(
                         logger.record_mkdir(&remote_path, Ok(()));
                     }
                 } else {
-                    upload_single_file(session, &local_path, &remote_path, &tflags, logger, None)
-                        .await?;
+                    if let Some(fs) = saf_fs {
+                        let stage = stage_saf_upload_source(fs, &join_saf_rel(&local_root_str, &item.rel_path), &no_cancel)?;
+                        upload_single_file(session, &stage.root, &remote_path, &tflags, logger, None).await?;
+                    } else {
+                        upload_single_file(session, &local_path, &remote_path, &tflags, logger, None)
+                            .await?;
+                    }
                     let r_after = session
                         .stat(&remote_path)
                         .await
@@ -1021,7 +1175,14 @@ pub async fn apply_sync_plan(
                 if conflicts > 0 {
                     continue;
                 }
-                if item.is_directory {
+                if let Some(fs) = saf_fs {
+                    let uri = join_saf_rel(&local_root_str, &item.rel_path);
+                    if item.is_directory {
+                        let _ = fs.remove_dir_all(&uri);
+                    } else if fs.stat(&uri).is_ok() {
+                        fs.remove_file(&uri).map_err(|e| e.to_string())?;
+                    }
+                } else if item.is_directory {
                     let _ = std::fs::remove_dir_all(&local_path);
                 } else if local_path.exists() {
                     std::fs::remove_file(&local_path).map_err(|e| {

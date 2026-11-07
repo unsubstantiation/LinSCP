@@ -1637,16 +1637,16 @@ function options(id) {
   window.closeModal('editorModal');
 
   window.openSynchronize();
-  check('a granted folder is not offered synchronization',
-    text('toast').includes(safReason('synchronize')) &&
-      doc.getElementById('syncModal').className.indexOf('open') < 0,
+  check('a granted folder is offered synchronization',
+    doc.getElementById('syncModal').className.indexOf('open') >= 0,
     text('toast'));
+  window.closeModal('syncModal');
 
   window.openKeepUpToDate();
-  check('a granted folder is not offered keep-up-to-date',
-    text('toast').includes(safReason('keepUpToDate')) &&
-      doc.getElementById('keepUpToDateModal').className.indexOf('open') < 0,
+  check('a granted folder is offered keep-up-to-date',
+    doc.getElementById('keepUpToDateModal').className.indexOf('open') >= 0,
     text('toast'));
+  window.closeModal('keepUpToDateModal');
 
   window.focusPane('local');
   doc.getElementById('localFileList').children[0]

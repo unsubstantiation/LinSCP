@@ -754,11 +754,16 @@ impl CommanderService {
             Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected"),
         };
         let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
-        let local_root = match check_plain_local_dir(body.get("local_dir").and_then(Value::as_str).unwrap_or(""), "Keep up to date") {
+        let local_root = match check_sync_local_dir(body.get("local_dir").and_then(Value::as_str).unwrap_or("")) {
             Ok(dir) => dir,
             Err(error) => return api_error(400, error),
         };
-        if !Path::new(&local_root).is_dir() { return api_error(400, "The local directory does not exist.") }
+        let local_is_dir = if is_saf_path(&local_root) {
+            self.local_fs.stat(&local_root).is_ok_and(|info| info.is_dir && !info.is_symlink)
+        } else {
+            Path::new(&local_root).is_dir()
+        };
+        if !local_is_dir { return api_error(400, "The local directory does not exist.") }
         let remote_root = match validate_remote_absolute_path(body.get("remote_dir").and_then(Value::as_str).unwrap_or("")) {
             Ok(path) => path, Err(error) => return api_error(400, error),
         };
@@ -1083,7 +1088,7 @@ impl CommanderService {
         // copy that deletes what the source no longer has.
         let mirror = body.get("mirror").and_then(Value::as_bool).unwrap_or(false);
         let delete_obsolete = body.get("delete").and_then(Value::as_bool).unwrap_or(false) || mirror;
-        let local_root = check_plain_local_dir(body.get("local_dir").and_then(Value::as_str).unwrap_or(""), "Synchronizing")?;
+        let local_root = check_sync_local_dir(body.get("local_dir").and_then(Value::as_str).unwrap_or(""))?;
         let remote_root = validate_remote_absolute_path(body.get("remote_dir").and_then(Value::as_str).unwrap_or(""))?;
         let recursive = body.get("recursive").and_then(Value::as_bool).unwrap_or(true);
         let opts = SyncOptions {
@@ -1125,7 +1130,8 @@ impl CommanderService {
         let config_root = self.state.lock().expect("state mutex").config_root.clone();
         let state_file = SyncState::state_path(&config_root, &SyncState::make_key(&host_key, &local_root.to_string_lossy(), &remote_root));
         let state = SyncState::load(&state_file).unwrap_or_default();
-        match plan_synchronization(session.as_ref(), &local_root, &remote_root, &opts, &state).await {
+        let saf_fs = if is_saf_path(&local_root.to_string_lossy()) { Some(self.local_fs.as_ref()) } else { None };
+        match plan_synchronization(session.as_ref(), &local_root, &remote_root, &opts, &state, saf_fs).await {
             Ok(items) => ApiReply { status: 200, payload: json!({"success": true, "plan": sync_plan_json(&items)}) },
             Err(error) => api_error(400, error),
         }
@@ -1138,7 +1144,12 @@ impl CommanderService {
         let (local_root, remote_root, opts) = match Self::sync_options_from(&body) { Ok(t) => t, Err(error) => return api_error(400, error) };
         // The same options a preview used, so what the user saw is what runs.
         let config_root = self.state.lock().expect("state mutex").config_root.clone();
-        if !local_root.is_dir() { return api_error(400, "The local directory does not exist.") }
+        let local_is_dir = if is_saf_path(&local_root.to_string_lossy()) {
+            self.local_fs.stat(&local_root.to_string_lossy()).is_ok_and(|info| info.is_dir && !info.is_symlink)
+        } else {
+            local_root.is_dir()
+        };
+        if !local_is_dir { return api_error(400, "The local directory does not exist.") }
         let job = crate::queue::QueueJob::SyncRun {
             session,
             config_dir: config_root,
@@ -5048,10 +5059,15 @@ fn saf_unsupported(action: &str) -> String {
 /// check so it gets the limitation's name, not "an absolute directory is
 /// required", which is true but explains nothing about a tree the system
 /// picker legitimately granted.
-fn check_plain_local_dir(raw: &str, action: &str) -> Result<String, String> {
+/// The local root a synchronization or keep-up-to-date run accepts: a plain
+/// absolute directory, or a granted folder kept verbatim (`LocalFs` is what
+/// proves it is a real root). Existence is checked by the callers, which own
+/// the filesystem.
+fn check_sync_local_dir(raw: &str) -> Result<String, String> {
     let dir = raw.trim().to_string();
     if is_saf_path(&dir) {
-        return Err(saf_unsupported(action));
+        linscp_platform::parse_saf_document_uri(&dir).map_err(|error| error.to_string())?;
+        return Ok(dir);
     }
     if dir.is_empty() || !Path::new(&dir).is_absolute() {
         return Err("An absolute local directory is required.".to_string());
@@ -9010,6 +9026,9 @@ mod tests {
             let docs = self.docs.lock().expect("m");
             match docs.get(uri) {
                 Some(doc) => Ok(self.entry_for_uri(uri, doc)),
+                // A tree root (no `/document/` segment) always stats as a
+                // directory, like the plugin's tree-to-document conversion.
+                None if !uri.contains("/document/") => Ok(self.entry_for_uri(uri, &MockDoc { bytes: None })),
                 None => Err(PlatformError::Unsupported(format!("Unknown document: {uri}"))),
             }
         }
@@ -9433,10 +9452,16 @@ mod tests {
 
         async fn chmod(&self, _remote_path: &str, _mode: u32) -> Result<(), ProtoError> { Ok(()) }
 
-        async fn set_mtime(&self, _remote_path: &str, _mtime: i64) -> Result<(), ProtoError> { Ok(()) }
+        async fn set_mtime(&self, remote_path: &str, mtime: i64) -> Result<(), ProtoError> {
+            let mut docs = self.docs.lock().expect("m");
+            let doc = docs.get_mut(remote_path).ok_or_else(|| Self::missing(remote_path))?;
+            doc.mtime = mtime;
+            Ok(())
+        }
 
-        async fn checksum(&self, _algorithm: &str, _remote_path: &str) -> Result<String, ProtoError> {
-            Err(ProtoError::UnsupportedCapability("checksum", self.scheme()))
+        async fn checksum(&self, _algorithm: &str, remote_path: &str) -> Result<String, ProtoError> {
+            let bytes = self.bytes_of(remote_path).ok_or_else(|| Self::missing(remote_path))?;
+            Ok(linscp_crypto::digests::sha256_hex(&bytes))
         }
 
         async fn download(&self, remote_path: &str, opts: TransferRequest, sink: &mut (dyn AsyncWrite + Unpin + Send), progress: Option<&ProgressCallback>) -> Result<u64, ProtoError> {
@@ -9629,23 +9654,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp);
     }
 
-    /// Synchronization and keep-up-to-date share one local-directory check: a
-    /// granted folder is refused with the limitation's name, a relative one
-    /// still needs an absolute path, and a plain absolute one still passes.
-    #[test]
-    fn sync_and_watch_refuse_granted_folders() {
-        let granted = json!({"local_dir": SAF_GRANTED_DIR, "remote_dir": "/"});
-        match CommanderService::sync_options_from(&granted) {
-            Ok(_) => panic!("a sync preview must refuse a granted folder"),
-            Err(error) => assert!(error.contains("app storage"), "the refusal names the limitation: {error}"),
-        }
-        let watch = check_plain_local_dir(SAF_GRANTED_DIR, "Keep up to date");
-        assert!(watch.is_err(), "watching must refuse a granted folder");
-        assert!(watch.unwrap_err().contains("Keep up to date"), "the refusal names the action");
-        assert_eq!(check_plain_local_dir("relative/dir", "Synchronizing").unwrap_err(), "An absolute local directory is required.");
+    /// Synchronization plans and applies against a granted folder: a preview
+    /// names the download and the unchanged file while the granted-only
+    /// files need no action without delete; a run with delete downloads the
+    /// remote-only file and removes the deleted ones; an upload run carries
+    /// a granted-only file up.
+    #[tokio::test]
+    async fn saf_sync_preview_and_run_moves_bytes_both_ways() {
+        // The shared check keeps its plain rules and accepts a granted root.
+        assert!(check_sync_local_dir(SAF_GRANTED_DIR).is_ok(), "a granted root passes structurally");
+        assert_eq!(check_sync_local_dir("relative/dir").unwrap_err(), "An absolute local directory is required.");
         let plain = std::env::temp_dir().to_string_lossy().into_owned();
-        assert!(check_plain_local_dir(&plain, "Synchronizing").is_ok(), "a plain absolute directory still passes");
-        assert!(CommanderService::sync_options_from(&json!({"local_dir": plain, "remote_dir": "/"})).is_ok());
+        assert!(check_sync_local_dir(&plain).is_ok(), "a plain absolute directory still passes");
+
+        let tmp = std::env::temp_dir().join(format!("linscp-saf-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let bridge = Arc::new(MockBridge::with_file("up.txt", b"upload me"));
+        bridge.add_file(&MockBridge::doc_uri("same.txt"), b"same");
+        bridge.add_file(&MockBridge::doc_uri("extra.txt"), b"deleted on remote");
+        let fs = NativeLocalFs::with_saf(bridge.clone());
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(fs));
+        let session = Arc::new(MockSession::new());
+        session.add_file("/down.txt", b"download me");
+        session.add_file("/same.txt", b"same");
+        session.set_mtime("/same.txt", 1_791_875_271).await.unwrap();
+        let id = insert_remote_tab(&svc, session.clone(), SAF_GRANTED_DIR);
+        let planned = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/sync/preview".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "mode": "local"}) }).await;
+        assert_eq!(planned.status, 200, "{}", planned.payload);
+        let items = planned.payload["plan"]["items"].as_array().unwrap();
+        assert!(items.iter().any(|i| i["action"] == "download" && i["path"] == "down.txt"), "{}", planned.payload);
+        assert!(items.iter().any(|i| i["action"] == "unchanged" && i["path"] == "same.txt"), "{}", planned.payload);
+        assert!(!items.iter().any(|i| i["path"] == "up.txt"), "no delete, no action: {}", planned.payload);
+        // A run with delete downloads and removes.
+        let run = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/sync/run".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "mode": "local", "delete": true}) }).await;
+        assert_eq!(run.status, 200, "{}", run.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(bridge.bytes_of("down.txt").as_deref(), Some(b"download me".as_slice()), "the granted folder holds the download");
+        assert!(bridge.bytes_of("extra.txt").is_none() && bridge.bytes_of("up.txt").is_none(), "deleted files are gone from the granted folder");
+        // An upload run carries a granted-only file up.
+        bridge.add_file(&MockBridge::doc_uri("up2.txt"), b"upload too");
+        let run_up = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/sync/run".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "mode": "remote"}) }).await;
+        assert_eq!(run_up.status, 200, "{}", run_up.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(session.bytes_of("/up2.txt").as_deref(), Some(b"upload too".as_slice()), "the remote holds the upload");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Checksum criteria read the granted side through the bridge: contents
+    /// that differ plan an upload, while an over-cap file refuses the plan
+    /// naming the file, before its bytes are read.
+    #[tokio::test]
+    async fn saf_sync_checksum_criteria_reads_through_the_bridge() {
+        let tmp = std::env::temp_dir().join(format!("linscp-saf-sum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let bridge = Arc::new(MockBridge::with_file("a.txt", b"aaa"));
+        let fs = NativeLocalFs::with_saf(bridge.clone());
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(fs));
+        let session = Arc::new(MockSession::new());
+        session.add_file("/a.txt", b"bbb");
+        let id = insert_remote_tab(&svc, session.clone(), SAF_GRANTED_DIR);
+        let preview = |body: Value| ApiEnvelope { method: "POST".into(), path: "/api/sync/preview".into(), body };
+        let planned = svc.dispatch_async(preview(json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "mode": "remote", "criteria": "checksum"}))).await;
+        assert_eq!(planned.status, 200, "{}", planned.payload);
+        let items = planned.payload["plan"]["items"].as_array().unwrap();
+        assert!(items.iter().any(|i| i["action"] == "upload" && i["path"] == "a.txt"), "{}", planned.payload);
+        // The same contents plan no action.
+        session.add_file("/a.txt", b"aaa");
+        let clean = svc.dispatch_async(preview(json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "mode": "remote", "criteria": "checksum"}))).await;
+        assert_eq!(clean.status, 200, "{}", clean.payload);
+        assert!(clean.payload["plan"]["items"].as_array().unwrap().iter().any(|i| i["action"] == "unchanged" && i["path"] == "a.txt"), "{}", clean.payload);
+        // An over-cap file refuses the plan naming the file.
+        let big = vec![0u8; (linscp_platform::MAX_SAF_DOCUMENT_BYTES + 1) as usize];
+        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/big.bin"), &big);
+        session.add_file("/big.bin", b"small");
+        let refused = svc.dispatch_async(preview(json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "mode": "remote", "criteria": "checksum"}))).await;
+        assert_eq!(refused.status, 400, "{}", refused.payload);
+        assert!(refused.payload["error"].as_str().unwrap_or("").contains("larger than a granted folder can carry"), "{}", refused.payload);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Keep-up-to-date polls a granted folder it cannot watch: one pass
+    /// carries a granted-only file up and the task completes.
+    #[tokio::test]
+    async fn saf_keep_up_to_date_polls_a_granted_folder() {
+        let tmp = std::env::temp_dir().join(format!("linscp-saf-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let bridge = Arc::new(MockBridge::with_file("watch.txt", b"watch me"));
+        let fs = NativeLocalFs::with_saf(bridge.clone());
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(fs));
+        let session = Arc::new(MockSession::new());
+        let id = insert_remote_tab(&svc, session.clone(), SAF_GRANTED_DIR);
+        let watch = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/keepuptodate".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "count": 1}) }).await;
+        assert_eq!(watch.status, 200, "{}", watch.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(session.bytes_of("/watch.txt").as_deref(), Some(b"watch me".as_slice()), "one pass carries the file up");
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     /// Link creation validates before it touches the filesystem, on every

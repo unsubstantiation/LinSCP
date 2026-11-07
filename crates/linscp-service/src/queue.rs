@@ -1034,12 +1034,20 @@ impl QueueManager {
                 );
                 let state_file = SyncState::state_path(config_dir, &state_key);
                 let mut state = SyncState::load(&state_file).unwrap_or_default();
+                // A granted root plans and applies through `LocalFs`; a
+                // plain root keeps the direct path, byte for byte as before.
+                let saf_fs = if crate::is_saf_path(&local_root.to_string_lossy()) {
+                    Some(self.local_fs.as_ref())
+                } else {
+                    None
+                };
                 let items = plan_synchronization(
                     session.as_ref(),
                     local_root,
                     remote_root,
                     opts,
                     &state,
+                    saf_fs,
                 )
                 .await?;
                 apply_sync_plan(
@@ -1050,6 +1058,7 @@ impl QueueManager {
                     opts,
                     &mut state,
                     &mut logger,
+                    saf_fs,
                 )
                 .await?;
                 let _ = state.save(&state_file);
@@ -1067,10 +1076,16 @@ impl QueueManager {
                 // first pass, so it is cleared first and the flag is what
                 // reports the stop afterwards.
                 clear_interrupted();
+                let saf_fs = if crate::is_saf_path(&local_root.to_string_lossy()) {
+                    Some(self.local_fs.as_ref())
+                } else {
+                    None
+                };
                 let result = run_keep_up_to_date(
                     session.as_ref(),
                     local_root,
                     remote_root,
+                    saf_fs,
                     opts,
                     &mut logger,
                     |_| {},

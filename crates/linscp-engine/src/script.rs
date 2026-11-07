@@ -4763,6 +4763,7 @@ impl ScriptInterpreter {
             &remote_root,
             &opts,
             &state,
+            None,
         )
         .await?;
 
@@ -4824,6 +4825,7 @@ impl ScriptInterpreter {
             &opts,
             &mut state,
             &mut self.logger,
+            None,
         )
         .await?;
 
@@ -4962,6 +4964,7 @@ impl ScriptInterpreter {
             self.slots[self.active_slot].session.as_ref(),
             &local_root,
             &remote_root,
+            None,
             &opts,
             &mut self.logger,
             // The callback cannot borrow the whole interpreter while the

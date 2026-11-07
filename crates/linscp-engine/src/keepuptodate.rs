@@ -8,6 +8,7 @@ use linscp_platform::terminal::{
     clear_interrupted, install_cli_signal_handlers, is_interrupted, restore_default_signal_handlers,
 };
 use linscp_platform::watcher::LocalDirWatcher;
+use linscp_platform::LocalFs;
 use linscp_proto::RemoteSession;
 use linscp_types::TransferMode;
 
@@ -68,11 +69,14 @@ impl Default for KeepUpToDateOptions {
 
 /// Performs an initial local->remote sync pass and then watches `local_root` for
 /// modifications, creations, and (with `-delete`) removals until interrupted or
-/// `max_passes` watch cycles have completed.
+/// `max_passes` watch cycles have completed. A granted root is statted through
+/// `local_fs` and polled — the watcher cannot observe a `content://` tree —
+/// while any other root keeps the direct path.
 pub async fn run_keep_up_to_date<F>(
     session: &dyn RemoteSession,
     local_root: &Path,
     remote_root: &str,
+    local_fs: Option<&dyn LocalFs>,
     opts: &KeepUpToDateOptions,
     logger: &mut SessionLogger,
     mut on_status: F,
@@ -80,7 +84,16 @@ pub async fn run_keep_up_to_date<F>(
 where
     F: FnMut(&str),
 {
-    if !local_root.is_dir() {
+    let saf_fs = local_fs.filter(|_| local_root.to_string_lossy().starts_with("content://"));
+    if let Some(fs) = saf_fs {
+        match fs.stat(&local_root.to_string_lossy()) {
+            Ok(info) if info.is_dir && !info.is_symlink => {},
+            _ => return Err(format!(
+                "Local directory '{}' does not exist.",
+                local_root.display()
+            )),
+        }
+    } else if !local_root.is_dir() {
         return Err(format!(
             "Local directory '{}' does not exist.",
             local_root.display()
@@ -108,7 +121,9 @@ where
     let mut total_applied = 0usize;
     let mut passes = 1u32;
 
-    let watcher = if opts.max_passes == 1 {
+    // A granted tree has no watcher to attach: the passes below poll it on
+    // the interval instead, through the same no-watcher path.
+    let watcher = if opts.max_passes == 1 || saf_fs.is_some() {
         None
     } else {
         LocalDirWatcher::watch(local_root, true).ok()
@@ -126,7 +141,7 @@ where
     }
 
     // Initial catch-up pass (Pass 1)
-    let pass1_status = match plan_synchronization(session, local_root, remote_root, &sync_opts, &dummy_state).await {
+    let pass1_status = match plan_synchronization(session, local_root, remote_root, &sync_opts, &dummy_state, local_fs).await {
         Ok(plan) if plan.iter().any(|i| i.action != SyncAction::None) => {
             match apply_sync_plan(
                 session,
@@ -136,6 +151,7 @@ where
                 &sync_opts,
                 &mut dummy_state,
                 logger,
+                local_fs,
             )
             .await
             {
@@ -197,7 +213,7 @@ where
         }
         passes += 1;
 
-        match plan_synchronization(session, local_root, remote_root, &sync_opts, &dummy_state).await
+        match plan_synchronization(session, local_root, remote_root, &sync_opts, &dummy_state, local_fs).await
         {
             Ok(plan) if plan.iter().any(|i| i.action != SyncAction::None) => {
                 match apply_sync_plan(
@@ -208,6 +224,7 @@ where
                     &sync_opts,
                     &mut dummy_state,
                     logger,
+                    local_fs,
                 )
                 .await
                 {
