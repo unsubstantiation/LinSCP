@@ -1252,6 +1252,7 @@
     "the timestamps are equal but the sizes differ, and there is no previous synchronization to compare with": "las fechas son iguales pero los tamaños difieren y no hay una sincronización anterior con la que comparar",
     "unchanged": "sin cambios",
     "upload": "subir",
+    "{command} is saved for the {saved} side, and the {pane} panel is selected. Select the files in the {saved} panel, or save the command for the {pane} side.": "{command} está guardado para el lado {saved}, y está seleccionado el panel {pane}. Seleccione los archivos en el panel {saved}, o guarde el comando para el lado {pane}.",
     "{count} command failed.": "Falló {count} comando.",
     "{count} commands failed.": "Fallaron {count} comandos.",
     "{count} desktop item refused.": "Se rechazó {count} elemento del escritorio.",

@@ -17,6 +17,7 @@ use rand::RngCore;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+pub mod cli_args;
 pub mod desktop;
 pub mod password_vault;
 pub mod gssapi_sys;
@@ -141,6 +142,10 @@ mod fallback_unix {
         Err(PlatformError::Unsupported("no FIFO on this platform".to_string()))
     }
 
+    pub fn ssh_agent_missing_reason() -> Option<&'static str> {
+        None
+    }
+
     pub async fn connect_ssh_agent() -> Result<Option<Box<dyn crate::AsyncStream>>, PlatformError> {
         Ok(None)
     }
@@ -151,9 +156,31 @@ use fallback_unix as sys;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const MASTER_KEY_LEN: usize = 32;
-const DPAPI_KEY_PREFIX: &str = "dpapi1$";
-#[cfg(target_os = "android")]
-const ANDROID_KEYSTORE_PREFIX: &str = "aks1$";
+
+/// User-facing reason reported when SSH agent authentication fails on a
+/// platform that has no agent at all. Linux and Windows builds probe for an
+/// agent socket instead, so they report no static reason.
+pub const SSH_AGENT_MISSING_MESSAGE: &str = "SSH agent authentication is not available on Android: the platform has no agent. Use a private key file instead.";
+
+/// Largest single document the granted-folder bridge carries (64 MiB). The
+/// bridge has no streaming reads or appends: every document crosses as one
+/// base64 value inside one plugin call, so the bytes transiently occupy
+/// several times their size in RAM. Callers enforce this with a stat before
+/// they read — the bridge itself cannot, because by the time it sees the
+/// bytes the memory is already spent — and refuse larger documents naming
+/// the cap and the app-storage workaround.
+pub const MAX_SAF_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Names the document, its size and the bridge cap when a file is too large
+/// to cross into or out of a granted folder. Every refusal that enforces
+/// `MAX_SAF_DOCUMENT_BYTES` uses this sentence so the cap reads the same
+/// from copies, transfers and synchronization.
+pub fn saf_document_too_large(name: &str, size: u64) -> String {
+    format!(
+        "'{name}' is larger than a granted folder can carry ({} bytes; maximum 64 MiB per file). Move it to app storage first.",
+        size
+    )
+}
 
 #[derive(Debug, Error)]
 pub enum PlatformError {
@@ -200,8 +227,9 @@ pub trait LocalFs: Send + Sync {
     fn set_permissions_mode(&self, path: &str, mode: u32) -> Result<(), PlatformError>;
 }
 
-/// Platform-neutral `sessions.key` master-key vault (`0600` private file on
-/// Linux, optional DPAPI wrapping on Windows, optional Keystore wrapping on Android).
+/// Platform-neutral `sessions.key` master-key vault. The key file itself is an
+/// owner-only private file; secrecy comes from the password wrap (`LSCPVLT1`),
+/// which is the only wrapping on every build.
 pub trait SecretVault: Send + Sync {
     fn load_master_key(&self, config_dir: &Path) -> Result<Option<Zeroizing<[u8; 32]>>, PlatformError>;
     fn load_or_create_master_key(&self, config_dir: &Path) -> Result<Zeroizing<[u8; 32]>, PlatformError>;
@@ -593,6 +621,12 @@ impl LocalFs for NativeLocalFs {
     }
 }
 
+/// Static reason a platform reports when it has no SSH agent to ask, or
+/// `None` when the build probes for an agent socket instead.
+pub fn ssh_agent_missing_reason() -> Option<&'static str> {
+    sys::ssh_agent_missing_reason()
+}
+
 /// Default per-user configuration directory (`~/.config/linscp` on Linux,
 /// `%APPDATA%\LinSCP` on Windows, app-private `config` on Android).
 pub fn default_config_dir() -> PathBuf {
@@ -706,38 +740,20 @@ pub fn create_fifo_fixture(target: &Path) -> Result<(), PlatformError> {
     sys::create_fifo(target)
 }
 
+/// Legacy master-key loader: reads `sessions.key` in the formats old builds
+/// wrote (raw bytes or base64). The vault itself is password-only on every
+/// build — the hardware-backed wrappers were never wired and have been
+/// removed rather than left as dead surface.
 #[derive(Default)]
-pub struct NativeSecretVault {
-    #[cfg(target_os = "windows")]
-    wrap_new_keys_with_dpapi: bool,
-    #[cfg(target_os = "android")]
-    keystore: Option<std::sync::Arc<dyn android::KeystoreBridge>>,
-}
+pub struct NativeSecretVault {}
 
 impl NativeSecretVault {
     pub fn new() -> Self {
         Self::default()
     }
-
-    #[cfg(target_os = "windows")]
-    pub fn with_windows_dpapi() -> Self {
-        Self {
-            wrap_new_keys_with_dpapi: true,
-        }
-    }
-
-    #[cfg(target_os = "android")]
-    pub fn with_android_keystore(keystore: std::sync::Arc<dyn android::KeystoreBridge>) -> Self {
-        Self {
-            keystore: Some(keystore),
-        }
-    }
 }
 
-fn decode_stored_master_key(
-    raw_bytes: &[u8],
-    #[cfg(target_os = "android")] keystore: Option<&dyn android::KeystoreBridge>,
-) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
+fn decode_stored_master_key(raw_bytes: &[u8]) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
     if raw_bytes.starts_with(b"LSCPVLT1") {
         return Err(PlatformError::SecretVault(
             "sessions.key is protected by the local vault; unlock it in LinSCP Commander first".to_string(),
@@ -751,44 +767,6 @@ fn decode_stored_master_key(
     let text = std::str::from_utf8(raw_bytes)
         .map_err(|_| PlatformError::SecretVault("Invalid master key encoding".to_string()))?
         .trim();
-
-    if let Some(dpapi_b64) = text.strip_prefix(DPAPI_KEY_PREFIX) {
-        #[cfg(target_os = "windows")]
-        {
-            let blob = BASE64
-                .decode(dpapi_b64.as_bytes())
-                .map_err(|_| PlatformError::SecretVault("Corrupted DPAPI master key".to_string()))?;
-            let unwrapped = windows::dpapi_unprotect(&blob)?;
-            if unwrapped.len() != MASTER_KEY_LEN {
-                return Err(PlatformError::SecretVault(
-                    "Invalid DPAPI master key length".to_string(),
-                ));
-            }
-            let mut out = Zeroizing::new([0u8; 32]);
-            out.copy_from_slice(&unwrapped);
-            return Ok(out);
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = dpapi_b64;
-            return Err(PlatformError::SecretVault(
-                "DPAPI-protected sessions.key can only be unlocked on Windows".to_string(),
-            ));
-        }
-    }
-
-    #[cfg(target_os = "android")]
-    if let Some(aks_b64) = text.strip_prefix(ANDROID_KEYSTORE_PREFIX) {
-        let Some(bridge) = keystore else {
-            return Err(PlatformError::SecretVault(
-                "Android Keystore bridge is required to unlock sessions.key".to_string(),
-            ));
-        };
-        let blob = BASE64
-            .decode(aks_b64.as_bytes())
-            .map_err(|_| PlatformError::SecretVault("Corrupted Keystore master key".to_string()))?;
-        return bridge.unwrap_master_key(&blob);
-    }
 
     let decoded = Zeroizing::new(
         BASE64
@@ -816,9 +794,6 @@ impl SecretVault for NativeSecretVault {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(PlatformError::Io(err)),
         };
-        #[cfg(target_os = "android")]
-        let key = decode_stored_master_key(&raw, self.keystore.as_deref())?;
-        #[cfg(not(target_os = "android"))]
         let key = decode_stored_master_key(&raw)?;
         Ok(Some(key))
     }
@@ -834,22 +809,8 @@ impl SecretVault for NativeSecretVault {
         rand::thread_rng().fill_bytes(&mut *generated);
         let key_path = config_dir.join("sessions.key");
 
-        #[cfg(target_os = "windows")]
-        if self.wrap_new_keys_with_dpapi {
-            let wrapped = windows::dpapi_protect(&*generated)?;
-            let encoded = format!("{DPAPI_KEY_PREFIX}{}\n", BASE64.encode(wrapped));
-            write_private_file_atomic(&key_path, encoded.as_bytes())?;
-            return Ok(generated);
-        }
-
-        #[cfg(target_os = "android")]
-        if let Some(bridge) = self.keystore.as_deref() {
-            let wrapped = bridge.wrap_master_key(&generated)?;
-            let encoded = format!("{ANDROID_KEYSTORE_PREFIX}{}\n", BASE64.encode(wrapped));
-            write_private_file_atomic(&key_path, encoded.as_bytes())?;
-            return Ok(generated);
-        }
-
+        // New legacy keys are plain base64: the hardware-backed wrappers were
+        // never wired and have been removed, so there is nothing to wrap with.
         let encoded = format!("{}\n", BASE64.encode(*generated));
         write_private_file_atomic(&key_path, encoded.as_bytes())?;
         Ok(generated)
@@ -1132,5 +1093,18 @@ mod tests {
                 "{bad} must not be accepted as a SAF tree"
             );
         }
+    }
+
+    #[test]
+    fn ssh_agent_missing_message_names_platform_and_key_fallback() {
+        assert!(SSH_AGENT_MISSING_MESSAGE.contains("Android"));
+        assert!(SSH_AGENT_MISSING_MESSAGE.contains("private key"));
+        #[cfg(not(target_os = "android"))]
+        assert_eq!(ssh_agent_missing_reason(), None);
+        #[cfg(target_os = "android")]
+        assert_eq!(
+            ssh_agent_missing_reason(),
+            Some(SSH_AGENT_MISSING_MESSAGE)
+        );
     }
 }

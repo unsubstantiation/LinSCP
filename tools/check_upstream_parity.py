@@ -78,6 +78,38 @@ CASE_SOURCES = {
     # so a handler they share (the drop endpoints, remote delete) is evidenced
     # by the code that serves it rather than by a host that happens to wrap it.
     "service": "crates/linscp-service/src/lib.rs",
+    # The native window's own command line: `main.rs` starts the window and the
+    # platform crate decides what else the arguments mean. A shell-integration claim
+    # is only evidence if the shipped binary actually parses its arguments, so the
+    # tests cited for it live in those two crates.
+    "gui-cli": "crates/linscp-platform/src/cli_args.rs",
+    "gui-cli-host": "crates/linscp-tauri/src/main.rs",
+    # The file-manager definitions themselves, written by the platform crate.
+    "gui-shell-definitions": "crates/linscp-platform/src/gui_os.rs",
+    # What those actions *do* once the arguments are decided: stage a manifest,
+    # refuse an empty selection, report an install that cannot be carried out.
+    "gui-shell-actions": "crates/linscp-service/src/cli_actions.rs",
+    # The saved-command run path: the endpoint the page's Run button posts to and
+    # the expansion/interpreter layer behind it. Nothing here reaches a shell, so
+    # the tests assert the tokenizer's view of the expanded line, not a string a
+    # shell would have read.
+    "service-commands": "crates/linscp-service/src/ops.rs",
+    # The owner-only DACL on the Windows configuration directory: the tests read
+    # the ACL back (exactly one ACE, allow + full-access + inherit flags) rather
+    # than trusting the call that set it, so they fail on an inherited DACL even
+    # where only one user exists. Windows-only; the other platforms flag it.
+    "platform-windows-acl": "crates/linscp-platform/src/windows.rs",
+    # The SSH/SFTP/SCP/tunnel protocol behaviour against the mock server.
+    # Android runs no Rust tests, so Android rows cite other suites instead.
+    "proto-ssh": "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs",
+    # The password-only vault: setup/unlock/lock and the retired prefixes.
+    # Android runs no Rust tests, so Android rows cite other suites instead.
+    "vault-password": "crates/linscp-platform/src/password_vault.rs",
+    # The GUI session parser: the site manager's settings must reach the
+    # engine's raw fields instead of being dropped, and explicit Kerberos
+    # settings must fail closed naming Linux where no runtime exists.
+    # Android runs no Rust tests, so Android rows cite other suites instead.
+    "service-tabs": "crates/linscp-service/src/tabs.rs",
 }
 
 
@@ -137,6 +169,7 @@ def check_verification(inventory, entries, errors):
                       "evidence to cite, so nothing may be verified")
         return None
     suites = {}
+    blocked = {}
     for name, record in sorted(platforms.items()):
         for field in ("how", "date"):
             if not str(record.get(field, "")).strip():
@@ -153,7 +186,27 @@ def check_verification(inventory, entries, errors):
             if not str(description).strip():
                 errors.append(f"'{name}' suite '{suite}' is not described: "
                               "say what it proves")
+        # A suite the platform cannot run is not evidence on that platform. The
+        # flag is the machine-readable form of the suite-registry note, and a
+        # verified entry may not cite a flagged suite (enforced below, where the
+        # citations are). Partial and missing entries may still name flagged
+        # suites: that is how the ledger records which cases would cover them
+        # once the suite runs again.
+        flagged = record.get("not_runnable", {})
+        if not isinstance(flagged, dict):
+            errors.append(f"Verification record for '{name}' has a 'not_runnable' "
+                          "that is not a map of suite to reason")
+            flagged = {}
+        for suite, reason in sorted(flagged.items()):
+            if suite not in listed:
+                errors.append(f"Verification record for '{name}' flags an unlisted "
+                              f"suite as not runnable: {suite}")
+            if not str(reason).strip():
+                errors.append(f"'{name}' suite '{suite}' is flagged not runnable "
+                              "without a reason: say why it cannot run there")
         suites[name] = set(listed)
+        blocked[name] = {suite: reason for suite, reason in flagged.items()
+                         if suite in listed}
     covered = {name: 0 for name in suites}
     for entry in entries:
         label = entry.get("name", entry.get("id", entry.get("command", "?")))
@@ -179,6 +232,12 @@ def check_verification(inventory, entries, errors):
             for suite in sorted(unknown):
                 errors.append(f"'{platform}' has no suite '{suite}' to cite "
                               f"for {label}")
+            if entry["status"] == "verified":
+                for suite in sorted(set(cited) & set(blocked[platform])):
+                    errors.append(
+                        f"'{platform}' suite '{suite}' cited for {label} does not "
+                        f"run there ({blocked[platform][suite]}), so it is not "
+                        "evidence")
             covered[platform] += 1
         if entry["status"] == "verified" and set(claimed) != set(suites):
             missing = sorted(set(suites) - set(claimed))
@@ -254,10 +313,32 @@ def check_capabilities(inventory, errors, root=ROOT):
             errors.append(f"{label}: missing yet cites test cases")
         if status == "verified" and not checks:
             errors.append(f"{label}: verified without a test case")
-        cited = set(row.get("verified_on", {}).get("linux", [])) if isinstance(
-            row.get("verified_on"), dict) else set()
-        if checks and set(checks) != cited:
-            errors.append(f"{label}: verified_on.linux must match checked suites")
+        claimed = row.get("verified_on", {})
+        if not isinstance(claimed, dict):
+            claimed = {}
+        if checks:
+            # Every platform is validated against the named cases, not just
+            # linux: a citation is a claim that the suite ran there, so it may
+            # only name suites whose cases the row lists, and every listed
+            # suite has to be cited by at least one platform. Platforms may
+            # cite different subsets - a Linux-only suite cannot be evidence
+            # on Windows - but no platform may cite what the row never names.
+            cited_union = set()
+            for platform in sorted(claimed):
+                cited = claimed[platform]
+                if not isinstance(cited, list):
+                    continue  # check_verification reports the shape, not this rule
+                cited_union |= set(cited)
+                extra = sorted(set(cited) - set(checks))
+                if extra:
+                    errors.append(
+                        f"{label}: verified_on.{platform} names suites without "
+                        f"named cases: {', '.join(extra)}")
+            uncited = sorted(set(checks) - cited_union)
+            if uncited:
+                errors.append(
+                    f"{label}: checked suites are cited by no platform: "
+                    f"{', '.join(uncited)}")
         if not checks and row.get("verified_on"):
             errors.append(f"{label}: cites evidence without test cases")
         for suite, cases in checks.items():
@@ -279,7 +360,10 @@ def check_capabilities(inventory, errors, root=ROOT):
                 elif suite == "ui-transport":
                     # The bundle's own suite is node:test, so a case is a test().
                     expression = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
-                elif suite == "service":
+                elif suite in ("service", "service-commands", "gui-cli",
+                               "gui-shell-definitions", "gui-shell-actions",
+                               "platform-windows-acl", "proto-ssh",
+                               "vault-password", "service-tabs"):
                     # A Rust test is a #[test]/#[tokio::test] function, not a
                     # `test_*` ffi symbol; the drop helpers are `async fn`.
                     expression = r"\b(?:async\s+)?fn\s+" + re.escape(case) + r"\s*\("
@@ -349,6 +433,11 @@ def case_links(row):
                 pattern = r"check\(\s*['\"]" + re.escape(case) + r"['\"]"
             elif suite == 'ui-transport':
                 pattern = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
+            elif suite == 'gui-cli-host':
+                # The host binary is a `main.rs`: its evidence is the attributes and
+                # calls that make the argument path exist, not a test function of
+                # its own (the decisions are tested in `gui-cli`).
+                pattern = re.escape(case)
             else:
                 pattern = r'\b(?:def|void|fn)\s+' + re.escape(case) + r'\s*\('
             match = re.search(pattern, text)
@@ -432,8 +521,14 @@ def matrix_report(inventory):
               'are recorded per platform in the ledger.', '']
     for platform, record in sorted(inventory['verification']['platforms'].items()):
         lines += ['### ' + platform, '', '**Reproduce:** ' + record['how'], '']
+        flagged = record.get('not_runnable', {})
         for suite, description in sorted(record['suites'].items()):
-            lines.append('- [' + suite + '](../' + CASE_SOURCES[suite] + '): ' + markdown_cell(description))
+            line = ('- [' + suite + '](../' + CASE_SOURCES[suite] + '): ' +
+                    markdown_cell(description))
+            if suite in flagged:
+                line += (' **(Not runnable on ' + platform + ': ' +
+                         markdown_cell(flagged[suite]) + '.)**')
+            lines.append(line)
     return '\n'.join(lines) + '\n'
 
 

@@ -27,8 +27,7 @@ pub const fn is_gssapi_kex_supported() -> bool {
 pub fn ensure_gssapi_available(require_kex: bool) -> Result<(), ProtoError> {
     if require_kex && !is_gssapi_kex_supported() {
         return Err(ProtoError::Transport(
-            "This build's libssh does not support GSSAPI key exchange, so AuthGSSAPIKEX cannot be honored."
-                .to_string(),
+            "GSSAPI key exchange is not supported, so AuthGSSAPIKEX cannot be honored.".to_string(),
         ));
     }
     if !is_gssapi_supported() {

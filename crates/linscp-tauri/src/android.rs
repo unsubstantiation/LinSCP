@@ -14,11 +14,10 @@ mod imp {
     use std::sync::{Arc, Mutex};
 
     use linscp_platform::android::{
-        ExternalUriBridge, ForegroundServiceBridge, KeystoreBridge, SafBridge, ShareBridge,
+        ExternalUriBridge, ForegroundServiceBridge, SafBridge, ShareBridge,
     };
     use linscp_platform::PlatformError;
     use linscp_types::{FileEntry, LocalRootEntry};
-    use zeroize::Zeroizing;
 
     #[derive(Default)]
     pub struct AndroidState {
@@ -26,7 +25,6 @@ mod imp {
         share: Mutex<Option<Arc<dyn ShareBridge>>>,
         external_uri: Mutex<Option<Arc<dyn ExternalUriBridge>>>,
         fg: Mutex<Option<Arc<dyn ForegroundServiceBridge>>>,
-        keystore: Mutex<Option<Arc<dyn KeystoreBridge>>>,
     }
 
     impl AndroidState {
@@ -50,9 +48,6 @@ mod imp {
         }
         pub fn set_foreground_service(&self, bridge: Arc<dyn ForegroundServiceBridge>) {
             *self.fg.lock().unwrap() = Some(bridge);
-        }
-        pub fn set_keystore(&self, bridge: Arc<dyn KeystoreBridge>) {
-            *self.keystore.lock().unwrap() = Some(bridge);
         }
         /// The registered SAF bridge, for the local filesystem to use.
         pub fn saf_bridge(&self) -> Option<Arc<dyn SafBridge>> {
@@ -129,24 +124,6 @@ mod imp {
                 .map(|b| b.is_running())
                 .unwrap_or(false)
         }
-        pub fn wrap_key(&self, raw: &[u8; 32]) -> Result<Vec<u8>, PlatformError> {
-            if let Some(bridge) = self.keystore.lock().unwrap().as_deref() {
-                bridge.wrap_master_key(raw)
-            } else {
-                Err(PlatformError::SecretVault(
-                    "Android Keystore bridge not registered".to_string(),
-                ))
-            }
-        }
-        pub fn unwrap_key(&self, wrapped: &[u8]) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-            if let Some(bridge) = self.keystore.lock().unwrap().as_deref() {
-                bridge.unwrap_master_key(wrapped)
-            } else {
-                Err(PlatformError::SecretVault(
-                    "Android Keystore bridge not registered".to_string(),
-                ))
-            }
-        }
     }
 }
 
@@ -156,7 +133,6 @@ mod imp {
 
     use linscp_platform::PlatformError;
     use linscp_types::{FileEntry, LocalRootEntry};
-    use zeroize::Zeroizing;
 
     #[derive(Default)]
     pub struct AndroidState;
@@ -222,16 +198,6 @@ mod imp {
         }
         pub fn is_foreground_running(&self) -> bool {
             false
-        }
-        pub fn wrap_key(&self, _raw: &[u8; 32]) -> Result<Vec<u8>, PlatformError> {
-            Err(PlatformError::SecretVault(
-                "Android Keystore only on Android".to_string(),
-            ))
-        }
-        pub fn unwrap_key(&self, _wrapped: &[u8]) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-            Err(PlatformError::SecretVault(
-                "Android Keystore only on Android".to_string(),
-            ))
         }
     }
 }
@@ -446,7 +412,7 @@ mod tests {
     #[cfg(target_os = "android")]
     #[test]
     fn android_bridge_mock() {
-        use linscp_platform::android::{SafBridge, KeystoreBridge};
+        use linscp_platform::android::SafBridge;
         use linscp_platform::PlatformError;
         use linscp_types::{FileEntry, LocalRootEntry};
         use std::sync::{Arc, Mutex};

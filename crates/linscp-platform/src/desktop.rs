@@ -4,12 +4,29 @@
 //! with `viewer + argv + file_content`. This module turns that ticket into an
 //! actual OS process or a file download, handling:
 //!
-//! * Wayland vs X11 vs headless detection (mirrors `linux::detect_desktop_session`)
+//! * Whether this host can start a GUI viewer at all — `host_can_spawn_gui_viewer`.
+//!   On Linux that follows `linux::detect_desktop_session`; Windows and macOS can
+//!   always start one even though neither defines `DISPLAY`; Android never can.
 //! * Viewer binary resolution via `$PATH` (`xfreerdp`, `xfreerdp3`, `wlfreerdp`,
 //!   `vncviewer`/`tigervnc`, `remote-viewer`/`spicy`, `x2goclient`, `waypipe`, `ssh`)
-//! * `mstsc.exe` on Windows (`%SystemRoot%\\System32\\mstsc.exe`)
-//! * Headless/HTTP mode fallback: write `.rdp`/`.vv` file next to `config_dir`
-//!   and print `DESKTOP_TICKET` line for the browser transport.
+//! * `mstsc.exe` on Windows (`SystemRoot\System32\mstsc.exe`)
+//! * Ticket-file fallback for a host that cannot show a viewer: write `.rdp`/`.vv`
+//!   next to `config_dir` and return it so the caller can download or print it.
+//!
+//! # Who decides between "spawn a viewer" and "write a ticket file"
+//!
+//! Two different questions were once answered by the same test, which made every
+//! Windows launch write a file instead of starting `mstsc.exe`:
+//!
+//! * *May this process start a GUI viewer?* — a property of the **host**:
+//!   `host_can_spawn_gui_viewer`. True on Windows and macOS; on Linux true only
+//!   with a live `WAYLAND_DISPLAY`/`DISPLAY`; never on Android (the host is a
+//!   phone and the page opens an intent instead).
+//! * *Can this client show a file?* — a property of the **transport**, and only
+//!   the caller knows it. `launch_remote_desktop`'s `force_file_ticket` carries
+//!   the answer and must be set by a headless/browser host; the scripting engine
+//!   used to answer the host question itself (from `DISPLAY`) and pass the result
+//!   here, which is how a Windows desktop came to be called headless.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -101,38 +118,35 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-fn detect_desktop_session_kind() -> DesktopSession {
+/// Whether this host can start a GUI viewer process at all.
+///
+/// This is a property of the *host*, and it used to be answered by an X11 test on
+/// every platform: `WAYLAND_DISPLAY`/`DISPLAY` are never set on Windows, so the
+/// launcher decided it was headless and wrote a `.rdp` file instead of starting the
+/// `System32\\mstsc.exe` it had just resolved. Only Linux can answer this from the
+/// environment it inherits:
+///
+/// * **Linux** — `linux::detect_desktop_session`: a live Wayland or X11 session
+///   means a viewer can be shown; without one the box is headless, and a session
+///   over SSH is exactly the case a ticket file exists for.
+/// * **Windows / macOS** — always yes: a process with a window station can start
+///   `mstsc.exe` / `open`, and neither platform defines `DISPLAY`.
+/// * **Android** (and any other target) — always no: there is no viewer binary to
+///   start, and the page answers with a `rdp://`-style intent instead
+///   (`source/gui/web/index.html`, `caps.platform === 'android'`).
+pub fn host_can_spawn_gui_viewer() -> bool {
     #[cfg(target_os = "linux")]
     {
-        if std::env::var_os("WAYLAND_DISPLAY").filter(|v| !v.is_empty()).is_some()
-            || std::env::var("XDG_SESSION_TYPE")
-                .map(|v| v.eq_ignore_ascii_case("wayland"))
-                .unwrap_or(false)
-        {
-            return DesktopSession::Wayland;
-        }
-        if std::env::var_os("DISPLAY").filter(|v| !v.is_empty()).is_some() {
-            return DesktopSession::X11;
-        }
-        DesktopSession::Headless
+        crate::linux::detect_desktop_session() != crate::linux::DesktopSessionKind::Headless
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
-        if std::env::var_os("WAYLAND_DISPLAY").is_some()
-            || std::env::var_os("DISPLAY").is_some()
-        {
-            return DesktopSession::Wayland;
-        }
-        DesktopSession::Headless
+        true
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DesktopSession {
-    Wayland,
-    #[cfg(target_os = "linux")]
-    X11,
-    Headless,
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        false
+    }
 }
 
 /// Resolves the viewer binary for `ticket.viewer`, trying ordered fallbacks per OS:
@@ -144,7 +158,6 @@ enum DesktopSession {
 /// * X11: `waypipe` (Wayland) or `ssh -X` fallback
 pub fn resolve_viewer_binary(ticket: &DesktopTicket) -> Option<PathBuf> {
     let kind = ticket.viewer_kind()?;
-    let session = detect_desktop_session_kind();
     match kind {
         DesktopViewerKind::Rdp => {
             #[cfg(windows)]
@@ -221,7 +234,14 @@ pub fn resolve_viewer_binary(ticket: &DesktopTicket) -> Option<PathBuf> {
             find_executable_on_path(&ticket.viewer)
         }
         DesktopViewerKind::X11 => {
-            if session == DesktopSession::Wayland {
+            // Wayland needs `waypipe`; on Windows/macOS/Android the session is not a
+            // Linux one, so the `ssh -X` fallback below is the only answer.
+            #[cfg(target_os = "linux")]
+            let wayland = crate::linux::detect_desktop_session()
+                == crate::linux::DesktopSessionKind::Wayland;
+            #[cfg(not(target_os = "linux"))]
+            let wayland = false;
+            if wayland {
                 if let Some(p) = find_executable_on_path("waypipe") {
                     return Some(p);
                 }
@@ -240,73 +260,107 @@ pub enum DesktopLaunchResult {
     BrowserGateway { url_hint: String },
 }
 
+/// What `launch_remote_desktop` is about to do, decided without touching the
+/// filesystem or starting a process so the rule is testable on any target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchPlan {
+    /// Start the resolved viewer binary.
+    Spawn,
+    /// Write `.rdp`/`.vv` content under the config directory.
+    WriteFile,
+    /// Hand the client a hint (HTML5 gateway / copyable command line).
+    Gateway,
+}
+
+/// Picks the outcome from three facts: may this host start a GUI viewer, is there
+/// a viewer binary to start, and does the ticket carry file content.
+///
+/// The important property — the one A1 violated on Windows — is that
+/// "this host can show a window" outranks "the ticket has a `.rdp` body". A
+/// Windows install always has `mstsc.exe`, so it must spawn and never fall back to
+/// writing a file just because `DISPLAY` is unset.
+pub fn plan_launch(ticket: &DesktopTicket, spawn_allowed: bool, viewer_resolved: bool) -> LaunchPlan {
+    if spawn_allowed && viewer_resolved {
+        LaunchPlan::Spawn
+    } else if ticket.file_content.is_some() {
+        LaunchPlan::WriteFile
+    } else {
+        LaunchPlan::Gateway
+    }
+}
+
 /// Launches `ticket`'s viewer in the current desktop session, or in headless/HTTP mode
 /// writes a `.rdp`/`.vv` ticket file under `config_dir` and returns `FileTicket` so the
 /// caller can emit a download or a WebSocket gateway URL.
 ///
-/// When `force_file_ticket` is `true` (HTTP `POST /api/open` with `Prefer: file`), we
-/// never spawn a local viewer even if the server has one in `$PATH`.
+/// When `force_file_ticket` is `true` — the caller cannot show a window (the browser
+/// server, a server-mode script run) — we never spawn a local viewer even if this host
+/// has one in `$PATH`; the caller gets the `.rdp`/`.vv` body or a gateway hint.
+///
+/// Whether *this host* can show a window is decided here by
+/// `host_can_spawn_gui_viewer`, not by the caller: a caller that guesses from
+/// `DISPLAY` (as the scripting engine did) declares every Windows launch headless.
 pub fn launch_remote_desktop(
     ticket: &DesktopTicket,
     config_dir: &Path,
     force_file_ticket: bool,
 ) -> Result<DesktopLaunchResult, String> {
-    let session = detect_desktop_session_kind();
     let viewer_bin = resolve_viewer_binary(ticket);
+    let spawn_allowed = !force_file_ticket && host_can_spawn_gui_viewer();
+    let plan = plan_launch(ticket, spawn_allowed, viewer_bin.is_some());
 
-    // Headless or forced file mode: write ticket file and return it.
-    let is_headless = session == DesktopSession::Headless;
-    if force_file_ticket || is_headless || viewer_bin.is_none() {
-        // If we have file content (RDP on Windows/macOS, SPICE .vv), write that.
-        // Otherwise emit argv as a shell line for the browser to copy.
-        if let Some(content) = ticket.file_content.as_deref() {
-            let ext = ticket.file_extension.as_deref().unwrap_or(".rdp");
-            let safe_target = ticket
-                .target
-                .replace('/', "_")
-                .replace(':', "_")
-                .replace(' ', "_");
-            let file_name = format!("linscp-{safe_target}{ext}");
-            let path = config_dir.join(file_name);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("Cannot create config dir {}: {e}", parent.display()))?;
-            }
-            std::fs::write(&path, content)
-                .map_err(|e| format!("Cannot write desktop ticket '{}': {e}", path.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-            }
-            return Ok(DesktopLaunchResult::FileTicket {
-                path,
-                viewer_hint: ticket.viewer.clone(),
-            });
+    if plan == LaunchPlan::WriteFile {
+        let content = ticket
+            .file_content
+            .as_deref()
+            .ok_or_else(|| format!("No file content for a {} ticket", ticket.kind))?;
+        let ext = ticket.file_extension.as_deref().unwrap_or(".rdp");
+        let safe_target = ticket
+            .target
+            .replace('/', "_")
+            .replace(':', "_")
+            .replace(' ', "_");
+        let file_name = format!("linscp-{safe_target}{ext}");
+        let path = config_dir.join(file_name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Cannot create config dir {}: {e}", parent.display()))?;
         }
-        if viewer_bin.is_none() {
-            // No viewer and no file content — emit a gateway hint for the browser.
-            // In HTTP mode the frontend can open an HTML5 gateway (Apache Guacamole
-            // or `ironrdp` WASM) pointed at `local_endpoint`.
-            let hint = format!(
-                "{}://{} (viewer '{}' not found on server; open with local {} client or HTML5 gateway)",
-                ticket.kind,
-                ticket.local_endpoint,
-                ticket.viewer,
-                ticket.kind.to_uppercase()
-            );
-            return Ok(DesktopLaunchResult::BrowserGateway { url_hint: hint });
+        std::fs::write(&path, content)
+            .map_err(|e| format!("Cannot write desktop ticket '{}': {e}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         }
-        // Fall through to spawn when forced but we have no file content — still spawn is not possible in headless.
-        if is_headless {
-            let hint = format!(
-                "{} {} via {} -> {}",
-                ticket.kind, ticket.target, ticket.viewer, ticket.local_endpoint
-            );
-            return Ok(DesktopLaunchResult::BrowserGateway { url_hint: hint });
-        }
+        return Ok(DesktopLaunchResult::FileTicket {
+            path,
+            viewer_hint: ticket.viewer.clone(),
+        });
     }
 
+    // Nothing to start and nothing to write: describe the endpoint instead. A file
+    // body would have gone to `WriteFile`; this branch only carries a hint.
+    if plan == LaunchPlan::Gateway {
+        let reason = if viewer_bin.is_some() {
+            format!(
+                "this host cannot open a window; open it with a local {} client or an HTML5 gateway",
+                ticket.kind.to_uppercase()
+            )
+        } else {
+            format!(
+                "no {} viewer on this host; open it with a local {} client or an HTML5 gateway",
+                ticket.viewer,
+                ticket.kind.to_uppercase()
+            )
+        };
+        return Ok(DesktopLaunchResult::BrowserGateway {
+            url_hint: format!("{}://{} ({reason})", ticket.kind, ticket.local_endpoint),
+        });
+    }
+
+    // `plan_launch` returns `Spawn` only when a viewer was resolved, so this is the
+    // "spawn" path and the binary is present.
     let bin = viewer_bin.ok_or_else(|| {
         format!(
             "No viewer found for {} (tried '{}'); install {} or use headless file mode.",
@@ -322,12 +376,18 @@ pub fn launch_remote_desktop(
         argv.push(bin.to_string_lossy().into_owned());
     }
 
+    // `open` must not be handed the FreeRDP flag list. A ticket built on macOS
+    // already carries `open rdp://…`; this only repairs a ticket that came from
+    // elsewhere (a stored session written on another platform).
     #[cfg(target_os = "macos")]
-    if bin.file_name().and_then(|n| n.to_str()) == Some("open") && ticket.file_content.is_some() {
-        // macOS `open` needs a file — we already wrote it above, so launch with that file if present.
+    if bin.file_name().and_then(|n| n.to_str()) == Some("open")
+        && argv.iter().skip(1).any(|arg| arg.starts_with('/'))
+    {
+        argv.truncate(1);
+        argv.push(format!("{}://{}", ticket.kind, ticket.local_endpoint));
     }
 
-    // Headless check already handled; spawn detached so the LinSCP process does not wait.
+    // Detach from the LinSCP process so the viewer outlives it.
     let mut cmd = Command::new(&bin);
     if argv.len() > 1 {
         cmd.args(&argv[1..]);
@@ -385,6 +445,71 @@ mod tests {
         assert_eq!(DesktopViewerKind::from_str("x11"), Some(DesktopViewerKind::X11));
         assert_eq!(DesktopViewerKind::Rdp.as_str(), "rdp");
     }
+
+    fn rdp_ticket(file_content: Option<&str>) -> DesktopTicket {
+        DesktopTicket {
+            kind: "rdp".to_string(),
+            target: "win.example.com:3389".to_string(),
+            viewer: "mstsc".to_string(),
+            argv: vec!["mstsc".to_string(), "/v:win.example.com:3389".to_string()],
+            file_content: file_content.map(|s| s.to_string()),
+            file_extension: Some(".rdp".to_string()),
+            tunneled: false,
+            local_endpoint: "win.example.com:3389".to_string(),
+        }
+    }
+
+    /// A1: on a host that can show a window, an `.rdp` body in the ticket must not
+    /// turn the launch into a file. This is exactly the Windows case: `mstsc.exe`
+    /// resolves, `DISPLAY` never exists, and the old code wrote a ticket file.
+    #[test]
+    fn resolved_viewer_wins_over_file_content() {
+        let ticket = rdp_ticket(Some("full address:s:win.example.com:3389\r\n"));
+        assert_eq!(plan_launch(&ticket, true, true), LaunchPlan::Spawn);
+        // The same ticket on a host that cannot show a window still writes the file,
+        // so the Windows fix does not take the headless path away from the browser.
+        assert_eq!(plan_launch(&ticket, false, true), LaunchPlan::WriteFile);
+    }
+
+    /// A caller that cannot show a window (headless host, `Prefer: file`) still gets
+    /// the file — the A1 fix must not remove the headless path.
+    #[test]
+    fn forced_file_ticket_still_writes_the_file() {
+        let ticket = rdp_ticket(Some("full address:s:win.example.com:3389\r\n"));
+        assert_eq!(plan_launch(&ticket, false, true), LaunchPlan::WriteFile);
+        // No viewer installed but file content present: writing a file is the
+        // best available outcome, on every platform.
+        assert_eq!(plan_launch(&ticket, true, false), LaunchPlan::WriteFile);
+    }
+
+    /// Nothing to spawn and nothing to write: hand the client a hint rather than
+    /// pretending to have launched anything.
+    #[test]
+    fn no_viewer_and_no_content_yields_a_gateway() {
+        let ticket = rdp_ticket(None);
+        assert_eq!(plan_launch(&ticket, true, false), LaunchPlan::Gateway);
+        assert_eq!(plan_launch(&ticket, false, false), LaunchPlan::Gateway);
+    }
+
+    /// Windows and macOS are never headless: the process owns a window station even
+    /// though neither platform defines `DISPLAY`/`WAYLAND_DISPLAY`. On Linux the
+    /// answer still follows the environment, so a CI container stays headless.
+    #[test]
+    fn host_gui_capability_matches_the_platform() {
+        if cfg!(target_os = "windows") || cfg!(target_os = "macos") {
+            assert!(host_can_spawn_gui_viewer(), "a desktop target must be able to open a viewer");
+        }
+        if cfg!(target_os = "linux") {
+            // The same three variables `linux::detect_desktop_session` reads.
+            let has_display = std::env::var_os("WAYLAND_DISPLAY").filter(|v| !v.is_empty()).is_some()
+                || std::env::var("XDG_SESSION_TYPE")
+                    .map(|v| v.eq_ignore_ascii_case("wayland"))
+                    .unwrap_or(false)
+                || std::env::var_os("DISPLAY").filter(|v| !v.is_empty()).is_some();
+            assert_eq!(host_can_spawn_gui_viewer(), has_display);
+        }
+    }
+
     #[test]
     fn recommendations_mention_all_protocols() {
         let rec = desktop_recommendations();

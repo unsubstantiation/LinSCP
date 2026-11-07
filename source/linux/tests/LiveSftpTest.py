@@ -1947,7 +1947,7 @@ class LiveGssapiRealmTests(unittest.TestCase):
         local_copy = cls.base / "probe-download.bin"
         result, log = cls._run_client(
             cache, "get %s %s" % (cls.remote_file, local_copy), label="probe")
-        if "The server offers GSSAPI, but this build's libssh cannot use it" in log:
+        if "The server offers GSSAPI, but " in log:
             cls.gssapi_supported = False
             if cls.REQUIRE:
                 raise RuntimeError(

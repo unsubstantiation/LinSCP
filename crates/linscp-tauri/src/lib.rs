@@ -5,7 +5,7 @@
 //! bearer tokens when running as a native Linux, Windows, or Android app.
 //!
 //! Android runs the same service in app-private storage. The Storage Access
-//! Framework, share sheet, foreground service and Keystore bridges are traits
+//! Framework, share sheet, and foreground service bridges are traits
 //! in `linscp-platform`; the generated Kotlin project registers them, and every
 //! operation they would serve fails closed until it does. Granted SAF trees are
 //! ordinary local roots and its documents go through the same `LocalFs` calls
@@ -16,10 +16,28 @@ use linscp_types::{ApiEnvelope, ApiReply};
 
 pub mod android;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TauriBridge {
     service: CommanderService,
     android: std::sync::Arc<android::AndroidState>,
+}
+
+impl Default for TauriBridge {
+    /// The bridge always belongs to one of the two apps this crate builds: the
+    /// desktop window, which can show a viewer it starts, or the Android app, which
+    /// cannot. There is no third, unknown host at runtime — a bare
+    /// `CommanderService::default()` keeps viewer spawning off, and only the two
+    /// constructors below decide to turn it on.
+    fn default() -> Self {
+        #[cfg(not(target_os = "android"))]
+        {
+            Self::for_desktop_window(CommanderService::default())
+        }
+        #[cfg(target_os = "android")]
+        {
+            Self::new(CommanderService::default()).for_no_viewer()
+        }
+    }
 }
 
 impl TauriBridge {
@@ -32,6 +50,32 @@ impl TauriBridge {
 
     pub fn with_android_state(service: CommanderService, android: std::sync::Arc<android::AndroidState>) -> Self {
         Self { service, android }
+    }
+
+    /// Bridge for a *windowed* host: the desktop app. A remote-desktop viewer
+    /// started here appears on the machine the user is looking at, which is what
+    /// the HTTP host cannot promise and what the old code never allowed (A1).
+    #[cfg(not(target_os = "android"))]
+    pub fn for_desktop_window(service: CommanderService) -> Self {
+        Self {
+            service: service.with_desktop_spawn(true),
+            android: std::sync::Arc::new(android::AndroidState::new()),
+        }
+    }
+
+    /// Bridge for the Android app: no viewer binary exists, so the page answers
+    /// with an intent and the service must never try to spawn one.
+    pub fn for_android_app(service: CommanderService, android: std::sync::Arc<android::AndroidState>) -> Self {
+        Self::with_android_state(service, android).for_no_viewer()
+    }
+
+    /// Marks this bridge as not being able to show a viewer it starts. Used for the
+    /// Android app, whose answers all come from the page's `rdp://` intent branch.
+    pub fn for_no_viewer(self) -> Self {
+        Self {
+            service: self.service.with_desktop_spawn(false),
+            android: self.android,
+        }
     }
 
     /// Direct IPC entrypoint invoked by `TauriTransport` in `ui/src/transport/tauri.ts`.
@@ -178,6 +222,9 @@ pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
     let builder = tauri::Builder::default();
     #[cfg(target_os = "android")]
     let builder = builder.plugin(android::mobile_plugin());
+    // The desktop window can show what it launches; the Android app cannot. The
+    // bridge's `Default` already knows which of the two this build is, so a future
+    // host cannot forget to say it (A1 was exactly that kind of omission).
     #[cfg(not(target_os = "android"))]
     let builder = builder.manage(TauriBridge::default());
     #[cfg(target_os = "android")]
@@ -203,7 +250,7 @@ pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
             linscp_platform::default_config_dir(),
             std::sync::Arc::new(filesystem),
         );
-        app.manage(TauriBridge::with_android_state(service, state));
+        app.manage(TauriBridge::for_android_app(service, state));
         Ok(())
     });
     // A window with `dragDropEnabled` consumes the drop before the page sees it,
@@ -407,6 +454,27 @@ mod tests {
         });
         assert_eq!(listing.status, 200, "{}", listing.payload);
         assert_eq!(listing.payload["path"], json!(tree));
+    }
+
+    /// A1 regression: the desktop window's bridge must be built with viewer spawning
+    /// allowed, otherwise every remote-desktop launch writes a ticket file instead of
+    /// starting `mstsc.exe`. The default has to agree with the app that ships.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn desktop_window_bridge_may_spawn_a_viewer() {
+        for bridge in [
+            TauriBridge::for_desktop_window(CommanderService::default()),
+            TauriBridge::default(),
+        ] {
+            assert!(
+                bridge.service.desktop_spawn_allowed(),
+                "the desktop window has to be allowed to start a viewer it can show"
+            );
+        }
+        assert!(
+            !CommanderService::default().desktop_spawn_allowed(),
+            "a service that was never told where it runs must not spawn viewers"
+        );
     }
 
     #[test]

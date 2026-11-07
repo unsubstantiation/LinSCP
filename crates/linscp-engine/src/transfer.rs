@@ -10,6 +10,7 @@ use linscp_crypto::digests::sha256_hex;
 use linscp_platform::terminal::{
     is_interrupted, set_local_file_times, set_local_permissions, stat_local_path,
 };
+use linscp_platform::{saf_document_too_large, LocalFs, MAX_SAF_DOCUMENT_BYTES};
 use linscp_proto::{ProgressCallback, RemoteSession, TransferRequest};
 use linscp_types::{FileEntry, ProtocolScheme, TransferMode};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
@@ -1212,6 +1213,177 @@ pub async fn upload_directory_recursive(
         let _ = std::fs::remove_dir(local_dir);
     }
     Ok(count)
+}
+
+// Granted-folder (`content://`) transfers stage through private temporary
+// files: the bridge carries whole documents, while the guarded transfer
+// paths above only speak plain paths. Uploads stage the granted source and
+// run unchanged from the stage; downloads land in a stage and are published
+// across the bridge. Synchronization reuses these same helpers.
+
+/// Directory entries that are safe to join onto a staged tree, on either
+/// side of it. Shared with the queue's tree transfers so both refuse the
+/// same names with the same message.
+pub fn safe_tree_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name == "." || name == ".." || (name.contains('/') || name.contains('\\') || name.contains(':')) || name.chars().any(char::is_control) || Path::new(name).components().count() != 1 {
+        return Err("Invalid directory entry name.".to_string());
+    }
+    Ok(())
+}
+
+/// Joins one listed name onto a granted document URI, mirroring
+/// `Path::join` for the URI side. Callers only ever pass URIs the service
+/// built, so every `/document/` segment inverts exactly. Shared with the
+/// sync planner, which walks granted trees the same way.
+pub(crate) fn join_saf_child(dir_uri: &str, name: &str) -> String {
+    format!("{}/document/{}", dir_uri.trim_end_matches('/'), name)
+}
+
+/// The leaf of a granted URI, for messages that name a file.
+fn saf_leaf(uri: &str) -> &str {
+    uri.rsplit('/').next().unwrap_or(uri)
+}
+
+/// A granted upload source staged onto a plain path. The guard deletes the
+/// private directory when the transfer ends, whatever happens; `root` is
+/// the staged file, or the staged tree's root for a directory source.
+pub struct SafUploadStage {
+    _guard: tempfile::TempDir,
+    pub root: PathBuf,
+}
+
+/// Stages a granted file or tree for upload: every document crosses the
+/// bridge whole into a private directory, keeping the source's seconds so
+/// the remote keeps its stamps, and the guarded upload paths run unchanged
+/// from the stage. Links refuse, as they do for plain sources.
+pub fn stage_saf_upload_source(
+    fs: &dyn LocalFs, uri: &str, cancel: &AtomicBool,
+) -> Result<SafUploadStage, String> {
+    if cancel.load(Ordering::SeqCst) { return Err("Transfer cancelled.".to_string()); }
+    let info = fs.stat(uri).map_err(|e| format!("Cannot inspect '{uri}': {e}"))?;
+    if info.is_symlink { return Err("Refusing to transfer a local symlink.".to_string()); }
+    let guard = tempfile::Builder::new().prefix("linscp-saf-upload-").rand_bytes(16).tempdir()
+        .map_err(|e| format!("Cannot create upload staging directory: {e}"))?;
+    let root = guard.path().join("contents");
+    if info.is_dir {
+        std::fs::create_dir(&root).map_err(|e| format!("Cannot create upload staging directory: {e}"))?;
+        stage_saf_tree(fs, uri, &root, cancel, 0)?;
+    } else {
+        if info.size > MAX_SAF_DOCUMENT_BYTES {
+            return Err(saf_document_too_large(saf_leaf(uri), info.size));
+        }
+        let bytes = fs.read_bytes(uri).map_err(|e| e.to_string())?;
+        std::fs::write(&root, &bytes).map_err(|e| format!("Cannot stage '{uri}' for upload: {e}"))?;
+        let _ = set_local_file_times(&root, info.mtime, info.mtime);
+    }
+    Ok(SafUploadStage { _guard: guard, root })
+}
+
+fn stage_saf_tree(
+    fs: &dyn LocalFs, uri: &str, stage: &Path, cancel: &AtomicBool, depth: usize,
+) -> Result<(), String> {
+    if depth > 64 { return Err("Directory nesting limit exceeded.".to_string()); }
+    if cancel.load(Ordering::SeqCst) { return Err("Transfer cancelled.".to_string()); }
+    let mut children = fs.list_dir(uri).map_err(|e| e.to_string())?;
+    if children.len() > 100_000 { return Err("Directory entry limit exceeded.".to_string()); }
+    children.sort_by(|a, b| a.name.cmp(&b.name));
+    for child in children {
+        if cancel.load(Ordering::SeqCst) { return Err("Transfer cancelled.".to_string()); }
+        safe_tree_name(&child.name)?;
+        // The listing may have gone stale; the fresh stat below decides.
+        let from = join_saf_child(uri, &child.name);
+        let to = stage.join(&child.name);
+        let info = fs.stat(&from).map_err(|e| format!("Cannot inspect '{from}': {e}"))?;
+        if info.is_symlink { return Err("Refusing to transfer a local symlink.".to_string()); }
+        if info.is_dir {
+            std::fs::create_dir(&to).map_err(|e| format!("Cannot stage '{from}' for upload: {e}"))?;
+            stage_saf_tree(fs, &from, &to, cancel, depth + 1)?;
+        } else {
+            if info.size > MAX_SAF_DOCUMENT_BYTES {
+                return Err(saf_document_too_large(&child.name, info.size));
+            }
+            let bytes = fs.read_bytes(&from).map_err(|e| e.to_string())?;
+            std::fs::write(&to, &bytes).map_err(|e| format!("Cannot stage '{from}' for upload: {e}"))?;
+            let _ = set_local_file_times(&to, info.mtime, info.mtime);
+        }
+    }
+    let mtime = fs.stat(uri).map_err(|e| format!("Cannot inspect '{uri}': {e}"))?.mtime;
+    let _ = set_local_file_times(stage, mtime, mtime);
+    Ok(())
+}
+
+/// Publishes one staged download across the bridge: the staged length is
+/// judged against the document cap before its bytes are read, and a
+/// no-replace publish refuses a destination that appeared after preflight.
+pub fn publish_staged_file_to_saf(
+    fs: &dyn LocalFs, staged: &Path, dest_uri: &str, no_replace: bool,
+    cancel: &AtomicBool,
+) -> Result<u64, String> {
+    if cancel.load(Ordering::SeqCst) { return Err("Transfer cancelled before publication.".to_string()); }
+    let meta = std::fs::symlink_metadata(staged).map_err(|e| format!("Cannot inspect staged download '{}': {e}", staged.display()))?;
+    if meta.file_type().is_symlink() { return Err("Refusing a staged symlink.".to_string()); }
+    if !meta.is_file() { return Err("Refusing a staged non-file.".to_string()); }
+    if no_replace && fs.stat(dest_uri).is_ok() {
+        return Err(format!("Destination '{dest_uri}' already exists."));
+    }
+    if meta.len() > MAX_SAF_DOCUMENT_BYTES {
+        return Err(saf_document_too_large(saf_leaf(dest_uri), meta.len()));
+    }
+    let bytes = std::fs::read(staged).map_err(|e| format!("Cannot read staged download '{}': {e}", staged.display()))?;
+    if cancel.load(Ordering::SeqCst) { return Err("Transfer cancelled before publication.".to_string()); }
+    fs.write_bytes_atomic(dest_uri, &bytes).map_err(|e| e.to_string())?;
+    Ok(bytes.len() as u64)
+}
+
+/// Publishes a staged download tree across the bridge. A fresh publish
+/// refuses a destination that appeared after preflight; a merge publishes
+/// into the existing granted tree without replacing any file, and may leave
+/// already-published entries behind on error, like the plain merge. A stat
+/// outage surfaces at the next bridge call with its real error.
+pub fn publish_staged_tree_to_saf(
+    fs: &dyn LocalFs, staged_root: &Path, dest_uri: &str, merge: bool,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    if cancel.load(Ordering::SeqCst) { return Err("Transfer cancelled before publication.".to_string()); }
+    if merge {
+        match fs.stat(dest_uri) {
+            Ok(info) if info.is_dir && !info.is_symlink => {},
+            _ => return Err(format!("Merge destination '{dest_uri}' is not a directory.")),
+        }
+    } else if fs.stat(dest_uri).is_ok() {
+        return Err(format!("Destination '{dest_uri}' already exists."));
+    } else {
+        fs.mkdir_all(dest_uri).map_err(|e| e.to_string())?;
+    }
+    publish_saf_tree(fs, staged_root, dest_uri, cancel, 0)
+}
+
+fn publish_saf_tree(
+    fs: &dyn LocalFs, staged: &Path, dest_uri: &str, cancel: &AtomicBool, depth: usize,
+) -> Result<(), String> {
+    if depth > 64 { return Err("Directory nesting limit exceeded.".to_string()); }
+    if cancel.load(Ordering::SeqCst) { return Err("Transfer cancelled.".to_string()); }
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(staged).map_err(|e| format!("Cannot read staged tree: {e}"))?
+        .collect::<Result<_, _>>().map_err(|e| format!("Cannot read staged entry: {e}"))?;
+    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    for entry in entries {
+        if cancel.load(Ordering::SeqCst) { return Err("Transfer cancelled.".to_string()); }
+        let name = entry.file_name().into_string().map_err(|_| "Non-UTF-8 file name is not supported.".to_string())?;
+        safe_tree_name(&name)?;
+        let from = entry.path();
+        let to = join_saf_child(dest_uri, &name);
+        let meta = std::fs::symlink_metadata(&from).map_err(|e| format!("Cannot inspect staged entry: {e}"))?;
+        if meta.file_type().is_symlink() { return Err("Refusing a staged symlink.".to_string()); }
+        if meta.is_dir() {
+            fs.mkdir_all(&to).map_err(|e| e.to_string())?;
+            publish_saf_tree(fs, &from, &to, cancel, depth + 1)?;
+        } else if meta.is_file() {
+            publish_staged_file_to_saf(fs, &from, &to, true, cancel)?;
+        } else {
+            return Err("Refusing a staged non-file.".to_string());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

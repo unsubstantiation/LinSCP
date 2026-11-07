@@ -826,5 +826,6 @@
   "Android viewer apps cannot use this SSH jump tunnel. Connect directly to the desktop host.": "Android viewer apps cannot use this SSH jump tunnel. Connect directly to the desktop host.",
   "No Android viewer app can open this {kind} connection.": "No Android viewer app can open this {kind} connection.",
   "The remote desktop target cannot be opened by an Android viewer.": "The remote desktop target cannot be opened by an Android viewer.",
-  "This remote desktop type is not available on Android.": "This remote desktop type is not available on Android."
+  "This remote desktop type is not available on Android.": "This remote desktop type is not available on Android.",
+  "{command} is saved for the {saved} side, and the {pane} panel is selected. Select the files in the {saved} panel, or save the command for the {pane} side.": "{command} is saved for the {saved} side, and the {pane} panel is selected. Select the files in the {saved} panel, or save the command for the {pane} side."
 }

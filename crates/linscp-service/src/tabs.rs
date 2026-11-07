@@ -542,7 +542,7 @@ pub fn parse_gui_session_spec(
         spec.passphrase = Some(pp.to_string());
     }
 
-    // Extra protocol fields (`s3_*`, `ftp_*`, `tls_*`, `proxy_*`)
+    // Extra protocol fields (`s3_*`, `ftp_*`, `tls_*`, `proxy_*`, Kerberos)
     let extra_keys = [
         "s3_access_key",
         "s3_secret_key",
@@ -575,6 +575,10 @@ pub fn parse_gui_session_spec(
         "proxy_exclude",
         "proxy_dns",
         "proxy_localhost",
+        "auth_gssapi",
+        "auth_gssapi_kex",
+        "gssapi_fwd_tgt",
+        "logical_host",
     ];
     for k in extra_keys {
         if let Some(v) = session.get(k) {
@@ -790,4 +794,110 @@ pub fn collect_session_folders(sessions: &[Value]) -> Vec<String> {
         }
     }
     folders.into_keys().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "linscp-tabs-gssapi-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn gui_session_spec_keeps_gssapi_settings() {
+        // The page sends four Kerberos settings; the parser must carry them
+        // into raw_fields instead of dropping them, or the site manager's
+        // Kerberos section is decorative. Try-only settings validate on every
+        // build, so this asserts on all hosts.
+        let dir = test_config_dir("keep");
+        let vault = linscp_platform::NativeSecretVault::new();
+        let session = json!({
+            "protocol": "sftp",
+            "host": "kerberos.example",
+            "auth_gssapi": true,
+            "auth_gssapi_kex": false,
+            "gssapi_fwd_tgt": false,
+            "logical_host": "",
+        });
+        let (spec, _) =
+            parse_gui_session_spec(&session, None, &dir, &vault).expect("try-only settings validate");
+        assert_eq!(
+            spec.raw_fields.get("auth_gssapi").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            spec.raw_fields.get("auth_gssapi_kex").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            spec.raw_fields.get("gssapi_fwd_tgt").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            spec.raw_fields.get("logical_host").map(String::as_str),
+            Some("")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gui_session_kerberos_refusal_names_linux() {
+        // Explicit Kerberos settings fail closed where no Kerberos runtime
+        // exists, and the refusal names the requirement (Linux plus a
+        // Kerberos runtime) instead of blaming libssh. Each setting is
+        // exercised alone so a dropped key cannot hide behind another.
+        let gssapi_here = linscp_platform::gssapi_sys::is_system_gssapi_available();
+        for (key, value) in [
+            ("gssapi_fwd_tgt", json!(true)),
+            ("logical_host", json!("kerberos.example")),
+        ] {
+            let dir = test_config_dir("refuse");
+            let vault = linscp_platform::NativeSecretVault::new();
+            let mut session = json!({
+                "protocol": "sftp",
+                "host": "kerberos.example",
+                "auth_gssapi": true,
+                "auth_gssapi_kex": false,
+                "gssapi_fwd_tgt": false,
+                "logical_host": "",
+            });
+            session[key] = value;
+            let result = parse_gui_session_spec(&session, None, &dir, &vault);
+            if gssapi_here {
+                assert!(result.is_ok(), "{key} must validate where Kerberos exists");
+            } else {
+                let err = result.unwrap_err();
+                assert!(
+                    err.contains("Linux"),
+                    "{key} must fail closed naming Linux, got: {err}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // Key exchange is refused on every build, with or without Kerberos.
+        let dir = test_config_dir("kex");
+        let vault = linscp_platform::NativeSecretVault::new();
+        let session = json!({
+            "protocol": "sftp",
+            "host": "kerberos.example",
+            "auth_gssapi": true,
+            "auth_gssapi_kex": true,
+            "gssapi_fwd_tgt": false,
+            "logical_host": "",
+        });
+        let err = parse_gui_session_spec(&session, None, &dir, &vault).unwrap_err();
+        if gssapi_here {
+            assert!(err.contains("key exchange"), "kex refusal, got: {err}");
+        } else {
+            assert!(err.contains("Linux"), "kex refusal names Linux, got: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

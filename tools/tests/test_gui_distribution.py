@@ -73,6 +73,63 @@ class GuiDistributionTests(unittest.TestCase):
         for name in ['CMakeLists.txt', 'source/linux/Makefile', 'debian/rules']:
             self.assertIn('linscp-web.desktop', (ROOT / name).read_text(), name)
 
+    def test_the_shipped_binary_reads_the_command_line_it_documents(self):
+        # A3: `--install-shell-integration` and `--shell-upload` were documented,
+        # written into the file-manager definitions and implemented in the service,
+        # and no shipped entry point looked at argv, so none of it could ever run.
+        # The gate is that the binary parses its arguments before it starts the
+        # window, and that both desktop workflows drive the real binary.
+        main = (ROOT / 'crates/linscp-tauri/src/main.rs').read_text()
+        self.assertIn('cli_args::parse(&std::env::args()', main)
+        self.assertLess(
+            main.index('cli_args::parse'),
+            main.index('run_native_app(tauri::generate_context!())'),
+            'the window must not start before the arguments are read',
+        )
+        for action in ['InstallShellIntegration', 'UninstallShellIntegration',
+                       'ShellUpload', 'Help']:
+            self.assertIn('Action::' + action, main, action)
+        # The parser is pure Rust in the platform crate, so the same code decides
+        # on every target; it must carry its own tests.
+        parser = (ROOT / 'crates/linscp-platform/src/cli_args.rs').read_text()
+        self.assertIn('#[cfg(test)]', parser)
+        self.assertIn('"--shell-upload"', parser)
+        self.assertIn('pub mod cli_args;', (ROOT / 'crates/linscp-platform/src/lib.rs').read_text())
+        self.assertIn('pub mod cli_actions;',
+                      (ROOT / 'crates/linscp-service/src/lib.rs').read_text())
+
+    def test_ci_exercises_the_file_manager_actions_on_both_desktops(self):
+        debian = (ROOT / '.github/workflows/debian-build.yml').read_text()
+        self.assertIn('Smoke test the file-manager actions', debian)
+        for flag in ['--install-shell-integration', '--shell-upload',
+                     '--uninstall-shell-integration']:
+            self.assertIn(flag, debian, flag)
+        # The GNOME Files script is driven the way GNOME Files drives it, through
+        # the environment variable, not through argv.
+        self.assertIn('NAUTILUS_SCRIPT_SELECTED_FILE_PATHS', debian)
+        windows = (ROOT / '.github/workflows/windows-build.yml').read_text()
+        self.assertIn('Smoke test the Explorer action', windows)
+        self.assertIn('Upload with LinSCP.cmd', windows)
+        self.assertIn('--shell-upload', windows)
+
+    def test_shell_integration_is_not_offered_where_there_is_no_file_manager(self):
+        # The definitions are written to an XDG data directory. Android would have
+        # compiled the "not Windows" arm and created that directory inside the app
+        # sandbox, so the arms are narrowed to Linux/Windows and everything else
+        # refuses by name.
+        gui_os = (ROOT / 'crates/linscp-platform/src/gui_os.rs').read_text()
+        start = gui_os.index('pub fn install_shell_integration')
+        end = gui_os.index('pub fn rename_no_replace')
+        section = gui_os[start:end]
+        self.assertNotIn('#[cfg(not(target_os = "windows"))]', section,
+                         'the "not Windows" arm would compile for Android')
+        self.assertEqual(
+            section.count('#[cfg(not(any(target_os = "linux", target_os = "windows")))]'), 2,
+            'both install and uninstall refuse on every other platform',
+        )
+        self.assertIn('Shell integration is available on Linux and Windows only.', section)
+        self.assertIn('#[cfg(target_os = "linux")]\nfn linux_shell_targets', gui_os)
+
     def test_active_distribution_paths_do_not_build_or_ship_cli(self):
         for name in ['.github/workflows/windows-build.yml',
                      '.github/workflows/debian-build.yml',

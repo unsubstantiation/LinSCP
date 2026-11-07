@@ -1127,6 +1127,65 @@ impl SshAgentConnector for DuplexAgentConnector {
     }
 }
 
+/// Connector with no agent at all, optionally reporting the reason instead.
+struct NoAgentConnector {
+    reason: Option<String>,
+}
+
+#[async_trait]
+impl SshAgentConnector for NoAgentConnector {
+    async fn connect(&self) -> Result<Option<Box<dyn AsyncStream>>, ProtoError> {
+        Ok(None)
+    }
+
+    fn missing_reason(&self) -> Option<String> {
+        self.reason.clone()
+    }
+}
+
+#[tokio::test]
+async fn sftp_agent_absence_names_its_reason() {
+    let user_key = common::generate_ed25519_ssh_key(0x77, "tester@linscp");
+    let (port, host_sha256, _host_md5, _fs) =
+        start_mock_ssh_server(0x11, user_key.private_key.public_key().clone(), false).await;
+
+    // No password, no key, no agent: the connector's reason becomes the error.
+    let agent_cfg = SshConnectConfig {
+        tab_id: 1,
+        role: "destination".to_string(),
+        host: "127.0.0.1".to_string(),
+        port,
+        username: "tester".to_string(),
+        pinned_host_key: Some(host_sha256),
+        try_agent: true,
+        agent_connector: Some(Arc::new(NoAgentConnector {
+            reason: Some("stub has no agent".to_string()),
+        })),
+        ..Default::default()
+    };
+    assert_eq!(
+        SftpClientSession::connect(ProtocolScheme::Sftp, &agent_cfg, None, 0)
+            .await
+            .err(),
+        Some(ProtoError::Transport("stub has no agent".to_string()))
+    );
+
+    // A connector with no reason falls back to the generic auth failure.
+    let silent_cfg = SshConnectConfig {
+        agent_connector: Some(Arc::new(NoAgentConnector { reason: None })),
+        ..agent_cfg
+    };
+    match SftpClientSession::connect(ProtocolScheme::Sftp, &silent_cfg, None, 0).await {
+        Err(ProtoError::Transport(message)) => {
+            assert!(
+                message.contains("Authentication failed for tester@"),
+                "unexpected auth error: {message}"
+            );
+        }
+        other => panic!("expected a transport auth error, got {other:?}"),
+    }
+}
+
 struct TestVecStream<T> {
     items: std::collections::VecDeque<T>,
 }

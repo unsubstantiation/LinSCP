@@ -75,6 +75,12 @@ impl PtyShellHandle {
 #[async_trait]
 pub trait SshAgentConnector: Send + Sync {
     async fn connect(&self) -> Result<Option<Box<dyn AsyncStream>>, ProtoError>;
+
+    /// User-facing reason the connector reports when it has no agent to ask
+    /// at all, or `None` when absence is unremarkable (no socket was found).
+    fn missing_reason(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Default OS SSH agent connector delegating to `linscp_platform::connect_system_ssh_agent`.
@@ -87,6 +93,10 @@ impl SshAgentConnector for SystemSshAgentConnector {
         linscp_platform::connect_system_ssh_agent()
             .await
             .map_err(|e| ProtoError::Transport(format!("SSH agent connection failed: {e}")))
+    }
+
+    fn missing_reason(&self) -> Option<String> {
+        linscp_platform::ssh_agent_missing_reason().map(str::to_string)
     }
 }
 
@@ -537,13 +547,13 @@ impl SshConnection {
                             .to_string(),
                     ));
                 } else if let Some(ref logger) = cfg.event_logger {
-                    logger("The server offers GSSAPI, but this build's libssh cannot use it");
+                    logger("The server offers GSSAPI, but Kerberos needs a Linux build with a Kerberos runtime");
                 }
             }
             #[cfg(not(feature = "gssapi"))]
             {
                 if let Some(ref logger) = cfg.event_logger {
-                    logger("The server offers GSSAPI, but this build's libssh cannot use it");
+                    logger("The server offers GSSAPI, but Kerberos needs a Linux build with a Kerberos runtime");
                 }
             }
         }
@@ -627,6 +637,8 @@ impl SshConnection {
                     }
                     last_error = Some("SSH agent keys were rejected by server.".to_string());
                 }
+            } else if let Some(reason) = connector.missing_reason() {
+                last_error = Some(reason);
             }
         }
 

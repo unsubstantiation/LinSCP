@@ -28,6 +28,7 @@ import {
   normalizeLocale,
   openExternalUri,
   requestSafTree,
+  safLimitationReason,
   sharedFeatureSet,
 } from '../dist/linscp-core.mjs';
 
@@ -334,6 +335,29 @@ test('all native targets expose the shared feature contract and report only inst
   const missingAndroidBridge = hostCapabilities({ transport: 'tauri', platform: 'android', safTrees: false, shareIntents: false });
   assert.match(hostDifferenceReason('safTrees', missingAndroidBridge) ?? '', /not available/);
   assert.match(hostDifferenceReason('shareIntents', missingAndroidBridge) ?? '', /not integrated/);
+
+  // SSH agent lookup is the inverse: every build assumes an agent except the
+  // Android backend, which has none, and the gap always has a stated reason.
+  assert.equal(debian.sshAgent, true);
+  assert.equal(windows.sshAgent, true);
+  assert.equal(browser.sshAgent, true);
+  assert.equal(android.sshAgent, false);
+  assert.equal(hostDifferenceReason('sshAgent', debian), null);
+  assert.match(hostDifferenceReason('sshAgent', android) ?? '', /private key file/);
+
+  // Kerberos is a Linux-backend ability: native non-Linux builds lack it, a
+  // browser fails open because the page cannot see the server OS, and key
+  // exchange is unwired everywhere so it is off on all four hosts.
+  assert.equal(debian.gssapi, true);
+  assert.equal(windows.gssapi, false);
+  assert.equal(android.gssapi, false);
+  assert.equal(browser.gssapi, true);
+  assert.equal(hostDifferenceReason('gssapi', debian), null);
+  assert.match(hostDifferenceReason('gssapi', windows) ?? '', /only available on Linux/);
+  for (const caps of [debian, windows, android, browser]) {
+    assert.equal(caps.gssapiKex, false, `key exchange is unwired on ${caps.platform}`);
+  }
+  assert.match(hostDifferenceReason('gssapiKex', debian) ?? '', /not supported/);
 
   // A missing control always has a stated reason; silent capability gaps are
   // the parity bug this inventory exists to catch.
@@ -949,4 +973,34 @@ test('an operating-system drop names paths once and the queue answers once', asy
   assert.deepEqual(normalizeDropPayload({ paths: 'nope' }), []);
   assert.equal(droppedLeafName('/home/me/project/'), 'project');
   assert.equal(droppedLeafName('C:\\Users\\me\\report.txt'), 'report.txt');
+});
+
+test('granted Android folders name the app-storage limitation per action', () => {
+  const granted = 'content://com.android.externalstorage.documents/tree/primary%3ADownload';
+  const document = granted + '/document/primary%3ADownload%2Fnote.txt';
+  const leads = {
+    symlink: 'Creating symbolic links',
+  };
+  for (const [action, lead] of Object.entries(leads)) {
+    // The tree root and a document below it are limited alike.
+    for (const path of [granted, document]) {
+      const reason = safLimitationReason(action, path);
+      assert.ok(reason.startsWith(lead), `${action}: ${reason}`);
+      assert.match(reason, /app storage/);
+      assert.match(reason, /granted Android folder/);
+    }
+  }
+  // chmod carries the bridge's own message, shared with the service refusal.
+  assert.equal(
+    safLimitationReason('permissions', document),
+    'POSIX permissions do not exist on a granted Android folder.',
+  );
+  // A plain path is never limited, on either separator, whatever the action.
+  for (const plain of ['/home/user/photos', 'C:\\Photos', '', null, undefined]) {
+    for (const action of [...Object.keys(leads), 'permissions']) {
+      assert.equal(safLimitationReason(action, plain), null, `${action} on ${plain}`);
+    }
+  }
+  // An unknown action still fails closed with the generic limitation.
+  assert.match(safLimitationReason('watch', granted) ?? '', /app storage/);
 });

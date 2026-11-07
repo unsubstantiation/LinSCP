@@ -26,7 +26,12 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
-    "Win32_Security_Cryptography",
+    # `Win32_Security` (SDDL parsing, DACL reads) and
+    # `Win32_Security_Authorization` (`SetNamedSecurityInfoW`) exist so
+    # `ensure_private_dir` can lock the configuration directory to its owner;
+    # without them the ACL calls below do not compile.
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Threading",

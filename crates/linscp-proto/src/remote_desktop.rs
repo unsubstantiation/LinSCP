@@ -333,6 +333,38 @@ impl RemoteDesktopSession {
     }
 }
 
+/// The viewer binary and argument vector a ticket carries, per platform.
+///
+/// RDP is the one protocol whose client is not the same program on Windows and on
+/// Linux: `mstsc.exe` takes an `.rdp` **file**, while FreeRDP takes flags. This enum
+/// keeps that decision where the ticket is built, so a launcher that resolved
+/// `mstsc.exe` is never handed an `xfreerdp` command line (which used to happen on
+/// Windows: the ticket said `mstsc`, the arguments said `xfreerdp`, and a "headless"
+/// branch wrote the file instead of starting anything).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopViewerPlan {
+    /// `mstsc.exe /v:host:port`, or `<rdp file>` when the file has been written.
+    WindowsMstsc,
+    /// macOS `open` with a URL or a document.
+    MacOpen,
+    /// FreeRDP on Linux. Android does not start a viewer at all: the page turns the
+    /// ticket's `local_endpoint` into an `rdp://`-style intent, so FreeRDP argv is
+    /// unused there and `file_content` is what the page reads.
+    FreeRdp,
+}
+
+/// Which viewer plan this build of LinSCP uses. Compile-time, because the choice is
+/// the operating system's, not a runtime preference.
+pub const fn desktop_viewer_plan() -> DesktopViewerPlan {
+    if cfg!(target_os = "windows") {
+        DesktopViewerPlan::WindowsMstsc
+    } else if cfg!(target_os = "macos") {
+        DesktopViewerPlan::MacOpen
+    } else {
+        DesktopViewerPlan::FreeRdp
+    }
+}
+
 /// Builds a ticket from a `RemoteDesktopConnectConfig` without a live `RemoteDesktopSession` —
 /// used by `linscp-engine` script layer (`open rdp://…`) where the generic `RemoteSession`
 /// erases the concrete type. `tunneled` should reflect `spec.session.tunnel.enabled`.
@@ -351,9 +383,13 @@ pub fn ticket_from_config(
         target.to_string()
     };
     let viewer = match kind {
-        RemoteDesktopKind::Rdp => {
-            if cfg!(target_os = "windows") { "mstsc" } else { "xfreerdp" }
-        }
+        RemoteDesktopKind::Rdp => match desktop_viewer_plan() {
+            DesktopViewerPlan::WindowsMstsc => "mstsc",
+            // `open` is not an RDP client; it dispatches the URL to the viewer the
+            // user installed, which is how macOS RDP works.
+            DesktopViewerPlan::MacOpen => "open",
+            DesktopViewerPlan::FreeRdp => "xfreerdp",
+        },
         RemoteDesktopKind::Vnc => "vncviewer",
         RemoteDesktopKind::Spice => "remote-viewer",
         RemoteDesktopKind::X2Go => "x2goclient",
@@ -374,6 +410,9 @@ pub fn ticket_from_config(
     };
     let (argv, file_content, file_extension) = match kind {
         RemoteDesktopKind::Rdp => {
+            // The `.rdp` body is built for every plan: `mstsc.exe` opens it, and a
+            // host that cannot show a viewer (the browser transport) offers it as a
+            // download. Only the argv differs by plan.
             let (argv, content) = build_rdp_argv(&viewer, &tmp, tunneled, &local_endpoint);
             (argv, content, Some(".rdp".to_string()))
         }
@@ -395,19 +434,33 @@ pub fn ticket_from_config(
     }
 }
 
+/// The `.rdp` document for a target: address, user, domain, security level, depth
+/// and geometry. It deliberately carries **no password** — a ticket file lands in a
+/// directory the user may share or sync, and the credentials live in the vault.
+fn rdp_file_body(sess: &RemoteDesktopSession, endpoint: &str) -> String {
+    let opts = &sess.config.desktop_opts;
+    format!(
+        "full address:s:{}\r\nusername:s:{}\r\n{domain}{sec}{bpp}{screen}\r\n",
+        endpoint,
+        sess.config.username.as_deref().unwrap_or(""),
+        domain = opts.domain.as_deref().map(|d| format!("domain:s:{d}\r\n")).unwrap_or_default(),
+        sec = opts.security.as_deref().map(|s| format!("authentication level:i:{}\r\n", if s=="nla"{2} else {1})).unwrap_or_default(),
+        bpp = opts.color_depth.map(|d| format!("session bpp:i:{d}\r\n")).unwrap_or_default(),
+        screen = if opts.fullscreen { "screen mode id:i:2\r\n".to_string() } else { format!("desktopwidth:i:{}\r\ndesktopheight:i:{}\r\n", opts.width.unwrap_or(1024), opts.height.unwrap_or(768)) },
+    )
+}
+
 fn build_rdp_argv(viewer: &str, sess: &RemoteDesktopSession, tunneled: bool, endpoint: &str) -> (Vec<String>, Option<String>) {
     let opts = &sess.config.desktop_opts;
+    if desktop_viewer_plan() == DesktopViewerPlan::MacOpen {
+        // `open rdp://host:port` dispatches to whichever RDP client the user has.
+        // The body is still built so the browser transport can offer the download.
+        let body = rdp_file_body(sess, endpoint);
+        return (vec![viewer.to_string(), format!("rdp://{endpoint}")], Some(body));
+    }
     if viewer == "mstsc" {
         // Windows mstsc.exe expects an .rdp file. Generate minimal file content and argv = [mstsc, /v:host:port]
-        let rdp_content = format!(
-            "full address:s:{}\r\nusername:s:{}\r\n{domain}{sec}{bpp}{screen}\r\n",
-            endpoint,
-            sess.config.username.as_deref().unwrap_or(""),
-            domain = opts.domain.as_deref().map(|d| format!("domain:s:{d}\r\n")).unwrap_or_default(),
-            sec = opts.security.as_deref().map(|s| format!("authentication level:i:{}\r\n", if s=="nla"{2} else {1})).unwrap_or_default(),
-            bpp = opts.color_depth.map(|d| format!("session bpp:i:{d}\r\n")).unwrap_or_default(),
-            screen = if opts.fullscreen { "screen mode id:i:2\r\n".to_string() } else { format!("desktopwidth:i:{}\r\ndesktopheight:i:{}\r\n", opts.width.unwrap_or(1024), opts.height.unwrap_or(768)) },
-        );
+        let rdp_content = rdp_file_body(sess, endpoint);
         let argv = vec![viewer.to_string(), format!("/v:{endpoint}")];
         let _ = tunneled;
         (argv, Some(rdp_content))
@@ -818,5 +871,51 @@ mod tests {
         let ticket = sess.launch_ticket();
         assert!(ticket.argv.iter().any(|a| a.contains("3389")));
         assert_eq!(ticket.kind, "rdp");
+    }
+
+    /// A1's neighbour: the viewer named in the ticket and the argument vector built
+    /// for it must belong to the same program. On Windows the ticket names `mstsc`
+    /// and must not carry FreeRDP-only switches (`/u:`, `/bpp:`, `/clipboard`); on
+    /// Linux it must not claim `mstsc` and hand over a command line it cannot use.
+    #[test]
+    fn the_viewer_name_and_its_arguments_agree() {
+        let cfg = RemoteDesktopConnectConfig {
+            scheme: ProtocolScheme::Rdp,
+            kind: RemoteDesktopKind::Rdp,
+            host: "win.example.com".to_string(),
+            port: 3389,
+            username: Some("alice".to_string()),
+            password: None,
+            domain: None,
+            desktop_opts: DesktopOptions::default(),
+            tls: crate::tls::TlsSettings::default(),
+            proxy: None,
+            timeout: std::time::Duration::from_secs(15),
+        };
+        let ticket = ticket_from_config(&cfg, RemoteDesktopKind::Rdp, "win.example.com:3389", false, None);
+        let freerdp_only = ["/u:alice", "/clipboard", "/bpp:", "/sec:", "/drive:", "/audio-mode:"];
+        let carries_freerdp = |argv: &[String]| {
+            argv.iter().any(|arg| freerdp_only.iter().any(|flag| arg.starts_with(flag)))
+        };
+        match desktop_viewer_plan() {
+            DesktopViewerPlan::WindowsMstsc => {
+                assert_eq!(ticket.viewer, "mstsc");
+                assert!(ticket.argv[0].ends_with("mstsc"), "{:?}", ticket.argv);
+                assert!(!carries_freerdp(&ticket.argv), "mstsc cannot read FreeRDP flags: {:?}", ticket.argv);
+            }
+            DesktopViewerPlan::MacOpen => {
+                assert_eq!(ticket.viewer, "open");
+                assert_eq!(ticket.argv, vec!["open".to_string(), "rdp://win.example.com:3389".to_string()]);
+            }
+            DesktopViewerPlan::FreeRdp => {
+                assert_eq!(ticket.viewer, "xfreerdp");
+                assert!(!ticket.argv[0].ends_with("mstsc"), "{:?}", ticket.argv);
+                assert!(carries_freerdp(&ticket.argv), "FreeRDP argv: {:?}", ticket.argv);
+            }
+        }
+        // Every plan offers the `.rdp` document: it is what `mstsc.exe` opens and what
+        // the browser transport downloads, and it never contains the password.
+        assert_eq!(ticket.file_extension.as_deref(), Some(".rdp"));
+        assert!(ticket.file_content.is_some());
     }
 }

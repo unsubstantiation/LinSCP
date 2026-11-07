@@ -1252,6 +1252,7 @@
     "the timestamps are equal but the sizes differ, and there is no previous synchronization to compare with": "the timestamps are equal but the sizes differ, and there is no previous synchronization to compare with",
     "unchanged": "unchanged",
     "upload": "upload",
+    "{command} is saved for the {saved} side, and the {pane} panel is selected. Select the files in the {saved} panel, or save the command for the {pane} side.": "{command} is saved for the {saved} side, and the {pane} panel is selected. Select the files in the {saved} panel, or save the command for the {pane} side.",
     "{count} command failed.": "{count} command failed.",
     "{count} commands failed.": "{count} commands failed.",
     "{count} desktop item refused.": "{count} desktop item refused.",

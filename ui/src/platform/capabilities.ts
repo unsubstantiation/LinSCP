@@ -49,6 +49,12 @@ export interface HostCapabilities {
   terminal: boolean;
   /** Transfers keep running after the app is closed or backgrounded. */
   backgroundTransfers: boolean;
+  /** The backend can ask an SSH agent for keys during login. */
+  sshAgent: boolean;
+  /** The backend can attempt Kerberos (GSSAPI) authentication. */
+  gssapi: boolean;
+  /** The backend honors GSSAPI key exchange. */
+  gssapiKex: boolean;
 }
 
 export interface HostGlobals {
@@ -113,6 +119,12 @@ export interface HostCapabilityOptions {
   accounts?: boolean;
   desktopLaunchers?: boolean;
   terminal?: boolean;
+  /** Backend can reach an SSH agent (the shell may know better). */
+  sshAgent?: boolean;
+  /** Backend can attempt Kerberos (the shell may know better). */
+  gssapi?: boolean;
+  /** Backend honors GSSAPI key exchange (the shell may know better). */
+  gssapiKex?: boolean;
 }
 
 /**
@@ -143,6 +155,13 @@ export function hostCapabilities(options: HostCapabilityOptions = {}): HostCapab
     safTrees,
     shareIntents,
     foregroundTransfers,
+    sshAgent: options.sshAgent ?? !android,
+    // Only a native non-Linux build is known to lack Kerberos; anything else
+    // fails open because the page cannot see the server OS, and the backend
+    // refuses explicit Kerberos settings where it cannot honor them. Key
+    // exchange is unwired on every build, so it stays off unless overridden.
+    gssapi: options.gssapi ?? !(native && platform !== 'linux'),
+    gssapiKex: options.gssapiKex ?? false,
     fileDrop: true,
     nativeFileDrop: options.nativeFileDrop ?? (native && !android),
     accounts: options.accounts ?? !native,
@@ -212,5 +231,52 @@ export function hostDifferenceReason(
   if (capability === 'accounts' && !caps.accounts) {
     return 'The native application does not require a sign-in.';
   }
+  if (capability === 'sshAgent' && !caps.sshAgent) {
+    return 'SSH agent authentication is not available on this build; use a private key file instead.';
+  }
+  if (capability === 'gssapi' && !caps.gssapi) {
+    return 'Kerberos (GSSAPI) authentication is only available on Linux; this build cannot use these settings.';
+  }
+  if (capability === 'gssapiKex' && !caps.gssapiKex) {
+    return 'GSSAPI key exchange is not supported; leave it off or the connection is refused.';
+  }
   return null;
+}
+
+/**
+ * Local actions the granted-folder bridge cannot perform. Listing, creating,
+ * renaming, deleting, editing, reading properties, copying, moving,
+ * transferring and synchronizing inside a granted folder work through
+ * `LocalFs` or staged temporary files; these need a plain filesystem path
+ * (symlinks cannot point into a `content://` tree, and POSIX modes do not
+ * exist there), so the backend refuses them with a message that names the
+ * limitation - and the page asks here first so it does not offer a control
+ * that could only fail.
+ */
+export type SafLimitedAction =
+  | 'permissions'
+  | 'symlink';
+
+/**
+ * The reason a local action is not offered for `path`, or null when the path
+ * is not a granted Android folder. The wording mirrors the service's own
+ * refusals (`saf_unsupported` plus the bridge's permissions message) so the
+ * page and the backend tell one story; an unknown action still gets the
+ * generic limitation rather than silence.
+ */
+export function safLimitationReason(
+  action: SafLimitedAction,
+  path: string | null | undefined,
+): string | null {
+  if (typeof path !== 'string' || !path.startsWith('content://')) {
+    return null;
+  }
+  switch (action) {
+    case 'permissions':
+      return 'POSIX permissions do not exist on a granted Android folder.';
+    case 'symlink':
+      return 'Creating symbolic links needs a folder in app storage, not a granted Android folder.';
+    default:
+      return 'This action needs a folder in app storage, not a granted Android folder.';
+  }
 }

@@ -18,7 +18,12 @@ dpkg-buildpackage -b -us -uc
 ```
 
 The resulting package installs `linscp-gui`, `linscp-web`, two desktop entries
-and icons. The frontend is embedded in the executable, but WebKitGTK and other
+and icons. `linscp-gui` also carries the optional, per-user file-manager
+integration: `linscp-gui --install-shell-integration` adds an "Upload with LinSCP"
+entry to Dolphin, GNOME Files and Nemo, which stages the selection and returns,
+and `linscp-gui --uninstall-shell-integration` removes exactly what it wrote. The
+window then offers the staged selection for confirmation; nothing is transferred
+without it. The frontend is embedded in the executable, but WebKitGTK and other
 shared libraries are runtime dependencies. Launch LinSCP from the desktop menu
 or run `linscp-gui` in a graphical session; settings live in the normal user
 configuration directory.

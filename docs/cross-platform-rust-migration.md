@@ -178,7 +178,7 @@ All OS-dependent behavior sits behind traits in `crates/linscp-platform` (`Local
   - Atomic `.filepart` completion via `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` (since CRT `rename` fails when the destination exists on Windows).
 - **Configuration & secret protection:**
   - Defaults `ConfigDirectory()` to `%APPDATA%\LinSCP` (`FOLDERID_RoamingAppData`) when `LINSCP_CONFIG_DIR` is unset.
-  - Replaces no-op `_chmod(0600)` with an explicit owner-only Windows DACL (`D:P(A;;FA;;;OW)`) on the configuration and upload-staging directories, plus optional **Windows DPAPI** (`CryptProtectData`) wrapping for `sessions.key`.
+  - Replaces no-op `_chmod(0600)` with an explicit owner-only Windows DACL (`D:P(A;OICI;FA;;;OW)`, applied by `ensure_private_dir` in `crates/linscp-platform/src/windows.rs`) on the configuration and upload-staging directories. `sessions.key` itself is password-wrapped only (`LSCPVLT1`); an earlier draft described DPAPI wrapping that was never wired and has been removed. The `OICI` inherit flags are load-bearing: bypass-traverse-checking means a file reached by direct path is governed by its own DACL, so children created inside must carry the owner-only ACE themselves.
 - **Console, SSH agent & shell integration:**
   - Console UTF-8 input/output (`SetConsoleCP(CP_UTF8)` / `SetConsoleOutputCP(CP_UTF8)`), `CTRL_C_EVENT`/`CTRL_BREAK_EVENT` graceful interrupt handling, and password echo suppression via `SetConsoleMode`.
   - Connects to Windows OpenSSH Agent (`\\.\pipe\openssh-ssh-agent`) and Pageant shared memory for key authentication.
@@ -198,8 +198,8 @@ All OS-dependent behavior sits behind traits in `crates/linscp-platform` (`Local
   - **Android Share Sheet (`ACTION_SEND` / `ACTION_SEND_MULTIPLE`):** Incoming shared files from other Android apps register into the exact same validated pending-upload manifest flow used by Linux's `--shell-upload` dialog, prompting the user to confirm the target session tab before transferring bytes.
 - **Background transfer survival (`ForegroundService`):**
   - Android suspends WebView and background sockets within seconds when the screen locks or the user switches apps. When a session is connected with active transfers or `keepuptodate` running, the Kotlin plugin promotes the process via an Android `ForegroundService` (`dataSync` / `connectedDevice`), holding a partial `WakeLock` and `WifiLock` and displaying a live transfer-progress notification with a **Cancel** action.
-- **Hardware-backed credential security:**
-  - `sessions.key` is sealed inside `context.filesDir` using an **Android Keystore** AES-256-GCM master key, with optional `BiometricPrompt` lock before opening stored sessions.
+- **Credential security:**
+  - `sessions.key` lives in `context.filesDir` under the same password wrap (`LSCPVLT1`) as desktop; Android Keystore / `BiometricPrompt` integration remains unwired (see `docs/android.md`).
   - `.ppk` and OpenSSH private keys can be imported through the Android system document picker into encrypted app-private key storage.
 - **Mobile & touch UX in `ui/`:**
   - **Responsive single-pane default:** On `pointer: coarse` or viewports `< 720px`, the Commander defaults to single-pane mode with a persistent bottom navigation bar (`Local`, `Remote`, `Queue`, `Terminal`) and horizontal swipe switching, while keeping dual-pane side-by-side mode on tablets/foldables and desktop.
@@ -259,7 +259,7 @@ Each phase is self-contained, keeps CI green, and has explicit acceptance criter
 - **Scope:**
   - Implement `linscp-crypto`: `lscp1$` session encryption (cross-tested against C++ and `linscp_crypto.py` test vectors), PBKDF2 account hashes, PPK v2/v3 + Argon2 parser/PEM converter, SHA-256/SHA-1/MD5/CRC32 digests, and AWS SigV4 signing.
   - Implement `linscp-i18n`: unified `locales/{en,es,de,fr}.json` compiler and parity walker.
-  - Implement `linscp-platform`: `LocalFs` (Linux POSIX, Windows UTF-16/drive-roots/atomic `MoveFileExW`/DACL+DPAPI, Android `LocalFs` + SAF trait boundary), `notify` directory watcher, and Linux Wayland/X11 session detection.
+  - Implement `linscp-platform`: `LocalFs` (Linux POSIX, Windows UTF-16/drive-roots/atomic `MoveFileExW`/DACL, Android `LocalFs` + SAF trait boundary), `notify` directory watcher, and Linux Wayland/X11 session detection.
   - Implement `sessions.ini`, `workspaces.json`, `bookmarks.json`, `preferences.json`, and OpenSSH/FileZilla session importers.
 - **Acceptance gate:** Cross-language round-trip tests prove `sessions.ini` / `sessions.key` and `.ppk` files written by C++/Python open in Rust and vice versa on Linux and Windows; `test_translations.py` passes on unified catalogs.
 
@@ -284,7 +284,7 @@ Each phase is self-contained, keeps CI green, and has explicit acceptance criter
 
 ### Phase 5: Android Native App & Touch UX
 - **Scope:**
-  - Generate and wire `crates/linscp-tauri/gen/android` with the Kotlin plugin for SAF (`ContentResolver` / `ACTION_OPEN_DOCUMENT_TREE`), Share Sheet upload staging (`ACTION_SEND`), `ForegroundService` background transfer lock + notification, and Android Keystore wrapping for `sessions.key`.
+  - Generate and wire `crates/linscp-tauri/gen/android` with the Kotlin plugin for SAF (`ContentResolver` / `ACTION_OPEN_DOCUMENT_TREE`), Share Sheet upload staging (`ACTION_SEND`), `ForegroundService` background transfer lock + notification. (Android Keystore wrapping for `sessions.key` was descoped: the vault is password-only.)
   - Deliver mobile single-pane swipe navigation, touch selection/long-press gestures, safe-area insets, and the `xterm.js` extra-keys bar in `ui/`.
   - Add Termux build recipe/job (`aarch64-linux-android` `linscp-cli`).
 - **Acceptance gate:** Android `.apk`/`.aab` builds cleanly in CI; headless Android Emulator (or JVM/instrumented test) verifies session open, SAF local transfer, host-key prompt, and background service lifecycle; mobile viewport/touch tests pass in `ClientTest.js`.

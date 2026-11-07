@@ -16,11 +16,13 @@ use linscp_engine::sync_planner::{
     apply_sync_plan, plan_synchronization, SyncOptions, SyncState,
 };
 use linscp_engine::transfer::{
-    download_directory_recursive, download_single_file, upload_directory_recursive,
-    upload_single_file, TransferFlags,
+    download_directory_recursive, download_single_file, publish_staged_file_to_saf,
+    publish_staged_tree_to_saf, safe_tree_name, stage_saf_upload_source,
+    upload_directory_recursive, upload_single_file, TransferFlags,
 };
 use linscp_engine::xml_log::SessionLogger;
 use linscp_platform::gui_os::create_local_symlink;
+use linscp_platform::{saf_document_too_large, LocalFs, MAX_SAF_DOCUMENT_BYTES};
 use linscp_platform::terminal::{
     clear_interrupted, is_interrupted, set_local_file_times, set_local_permissions,
 };
@@ -125,13 +127,6 @@ pub enum QueueJob {
 // Directory copies reject symlinks and use no-replace publication for files.
 // Approved merges do not replace files and may leave already-copied entries on
 // error. New downloaded trees are staged privately before atomic publication.
-fn safe_tree_name(name: &str) -> Result<(), String> {
-    if name.is_empty() || name == "." || name == ".." || (name.contains('/') || name.contains('\\') || name.contains(':')) || name.chars().any(char::is_control) || Path::new(name).components().count() != 1 {
-        return Err("Invalid directory entry name.".to_string());
-    }
-    Ok(())
-}
-
 // The staged tree is on the destination filesystem. Publication uses atomic
 // create-if-absent hard links; never delete entries already merged on failure,
 // since another actor may have replaced them in the meantime.
@@ -348,10 +343,11 @@ pub struct QueueManager {
     inner: Arc<Mutex<QueueState>>,
     notify: Arc<Notify>,
     event_tx: broadcast::Sender<Value>,
+    local_fs: Arc<dyn LocalFs>,
 }
 
 impl QueueManager {
-    pub fn new(event_tx: broadcast::Sender<Value>) -> Self {
+    pub fn new(event_tx: broadcast::Sender<Value>, local_fs: Arc<dyn LocalFs>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(QueueState {
                 next_id: 1,
@@ -361,6 +357,7 @@ impl QueueManager {
             })),
             notify: Arc::new(Notify::new()),
             event_tx,
+            local_fs,
         }
     }
 
@@ -769,7 +766,14 @@ impl QueueManager {
                     .await
                     .map_err(|e| e.to_string())?
                     .ok_or_else(|| format!("Remote item '{remote_path}' does not exist."))?;
-                if let Ok(meta) = std::fs::symlink_metadata(local_dest) {
+                let saf_dest = crate::is_saf_path(&local_dest.to_string_lossy());
+                if saf_dest {
+                    if let Ok(info) = self.local_fs.stat(&local_dest.to_string_lossy()) {
+                        let allowed_dir = entry.is_dir && flags.merge_directories && info.is_dir && !info.is_symlink;
+                        let allowed_file = !entry.is_dir && *allow_overwrite && !info.is_dir && !info.is_symlink;
+                        if !allowed_dir && !allowed_file { return Err("Destination changed or merge/overwrite was not approved.".to_string()); }
+                    }
+                } else if let Ok(meta) = std::fs::symlink_metadata(local_dest) {
                     let allowed_dir = entry.is_dir && flags.merge_directories && meta.is_dir() && !meta.file_type().is_symlink();
                     let allowed_file = !entry.is_dir && *allow_overwrite && meta.is_file() && !meta.file_type().is_symlink();
                     if !allowed_dir && !allowed_file { return Err("Destination changed or merge/overwrite was not approved.".to_string()); }
@@ -784,24 +788,64 @@ impl QueueManager {
                 if entry.is_dir {
                     if !matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs) || *delete_source { return Err("Directory downloads require SFTP or WebDAV and cannot delete the source.".to_string()); }
                     f.no_clobber = true;
-                    // Stage both new trees and merges privately. Cancelling a
-                    // download before publication leaves an existing tree alone.
-                    let parent = local_dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-                    let stage = tempfile::Builder::new().prefix(".linscp-tree-").rand_bytes(16).tempdir_in(parent)
-                        .map_err(|e| format!("Cannot create temporary directory in '{}': {e}", parent.display()))?;
-                    let staged_tree = stage.path().join("contents");
                     let mut stage_flags = f.clone(); stage_flags.merge_directories = false;
-                    download_staged_remote_tree(session.as_ref(), remote_path, &staged_tree, &stage_flags, &mut logger, Some(&*progress), 0).await?;
-                    if task.cancel_flag.load(Ordering::SeqCst) { return Err("Transfer cancelled before publication.".to_string()); }
-                    if f.merge_directories {
-                        merge_staged_local_tree(&staged_tree, local_dest, &task.cancel_flag, 0)?;
+                    if saf_dest {
+                        // A granted tree has no parent directory to stage in:
+                        // the tree lands in a private directory and is
+                        // published file by file across the bridge.
+                        let stage = tempfile::Builder::new().prefix("linscp-saf-download-").rand_bytes(16).tempdir()
+                            .map_err(|e| format!("Cannot create download staging directory: {e}"))?;
+                        let staged_tree = stage.path().join("contents");
+                        download_staged_remote_tree(session.as_ref(), remote_path, &staged_tree, &stage_flags, &mut logger, Some(&*progress), 0).await?;
+                        if task.cancel_flag.load(Ordering::SeqCst) { return Err("Transfer cancelled before publication.".to_string()); }
+                        let fs = self.local_fs.clone();
+                        let dest = local_dest.to_string_lossy().into_owned();
+                        let merge = f.merge_directories;
+                        let cancel = Arc::clone(&task.cancel_flag);
+                        let published = tokio::task::spawn_blocking(move || {
+                            publish_staged_tree_to_saf(fs.as_ref(), &staged_tree, &dest, merge, &cancel)
+                        })
+                        .await
+                        .map_err(|e| format!("Local worker panicked: {e}"))?;
+                        published?;
                     } else {
-                        linscp_platform::gui_os::rename_no_replace(&staged_tree, local_dest)
-                            .map_err(|e| format!("Cannot publish downloaded directory '{}': {e}", local_dest.display()))?;
+                        // Stage both new trees and merges privately. Cancelling a
+                        // download before publication leaves an existing tree alone.
+                        let parent = local_dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+                        let stage = tempfile::Builder::new().prefix(".linscp-tree-").rand_bytes(16).tempdir_in(parent)
+                            .map_err(|e| format!("Cannot create temporary directory in '{}': {e}", parent.display()))?;
+                        let staged_tree = stage.path().join("contents");
+                        download_staged_remote_tree(session.as_ref(), remote_path, &staged_tree, &stage_flags, &mut logger, Some(&*progress), 0).await?;
+                        if task.cancel_flag.load(Ordering::SeqCst) { return Err("Transfer cancelled before publication.".to_string()); }
+                        if f.merge_directories {
+                            merge_staged_local_tree(&staged_tree, local_dest, &task.cancel_flag, 0)?;
+                        } else {
+                            linscp_platform::gui_os::rename_no_replace(&staged_tree, local_dest)
+                                .map_err(|e| format!("Cannot publish downloaded directory '{}': {e}", local_dest.display()))?;
+                        }
                     }
                 } else {
                     if entry.is_symlink { return Err("Refusing to transfer a remote symlink.".to_string()); }
-                    if f.resume {
+                    if saf_dest {
+                        // The bridge has no appends and no partial files, so a
+                        // granted download never resumes; preflight refuses
+                        // this combination, and the worker fails closed too.
+                        if f.resume { return Err("Verified resume is not supported for granted folders.".to_string()); }
+                        let stage = tempfile::Builder::new().prefix("linscp-saf-download-").rand_bytes(16).tempdir()
+                            .map_err(|e| format!("Cannot create download staging directory: {e}"))?;
+                        let staged_file = stage.path().join("contents");
+                        download_single_file(session.as_ref(), remote_path, Some(&entry), &staged_file, &f, &mut logger, Some(&*progress)).await?;
+                        let fs = self.local_fs.clone();
+                        let dest = local_dest.to_string_lossy().into_owned();
+                        let no_replace = !*allow_overwrite;
+                        let cancel = Arc::clone(&task.cancel_flag);
+                        let published = tokio::task::spawn_blocking(move || {
+                            publish_staged_file_to_saf(fs.as_ref(), &staged_file, &dest, no_replace, &cancel)
+                        })
+                        .await
+                        .map_err(|e| format!("Local worker panicked: {e}"))?;
+                        published?;
+                    } else if f.resume {
                         linscp_engine::transfer::download_verified_resume(session.as_ref(), remote_path, &entry, local_dest, &f, &mut logger, Some(&*progress)).await?;
                     } else {
                         download_single_file(session.as_ref(), remote_path, Some(&entry), local_dest, &f, &mut logger, Some(&*progress)).await?;
@@ -822,6 +866,23 @@ impl QueueManager {
                 flags,
                 ..
             } => {
+                // A granted source cannot go through the engine's path I/O:
+                // it is staged onto a plain path first, and the guarded
+                // upload below runs unchanged from the stage.
+                let upload_stage = if crate::is_saf_path(&local_src.to_string_lossy()) {
+                    let fs = self.local_fs.clone();
+                    let uri = local_src.to_string_lossy().into_owned();
+                    let cancel = Arc::clone(&task.cancel_flag);
+                    let staged = tokio::task::spawn_blocking(move || {
+                        stage_saf_upload_source(fs.as_ref(), &uri, &cancel)
+                    })
+                    .await
+                    .map_err(|e| format!("Local worker panicked: {e}"))?;
+                    Some(staged?)
+                } else {
+                    None
+                };
+                let local_src: &Path = upload_stage.as_ref().map(|stage| stage.root.as_path()).unwrap_or(local_src);
                 let source_meta = std::fs::symlink_metadata(local_src).map_err(|e| format!("Cannot inspect local source '{}': {e}", local_src.display()))?;
                 if let Some(entry) = session.stat(remote_dest).await.map_err(|e| e.to_string())? {
                     let allowed_dir = source_meta.is_dir() && !source_meta.file_type().is_symlink() && flags.merge_directories && entry.is_dir && !entry.is_symlink;
@@ -865,17 +926,31 @@ impl QueueManager {
                 move_item,
                 policy,
             } => {
-                let src = source.clone();
-                let dst = target.clone();
                 let mv = *move_item;
                 let pol = *policy;
                 let cancel = Arc::clone(&task.cancel_flag);
                 let prog = progress.clone();
-                tokio::task::spawn_blocking(move || {
-                    execute_local_item(&src, &dst, mv, pol, &cancel, &*prog)
-                })
-                .await
-                .map_err(|e| format!("Local worker panicked: {e}"))?
+                // A `content://` endpoint cannot go through `std::fs`: the
+                // whole item runs on `LocalFs`, which serves the plain side
+                // of a mixed copy the same calls.
+                if crate::is_saf_path(&source.to_string_lossy()) || crate::is_saf_path(&target.to_string_lossy()) {
+                    let fs = self.local_fs.clone();
+                    let src = source.to_string_lossy().into_owned();
+                    let dst = target.to_string_lossy().into_owned();
+                    tokio::task::spawn_blocking(move || {
+                        execute_local_item_fs(fs.as_ref(), &src, &dst, mv, pol, &cancel, &*prog)
+                    })
+                    .await
+                    .map_err(|e| format!("Local worker panicked: {e}"))?
+                } else {
+                    let src = source.clone();
+                    let dst = target.clone();
+                    tokio::task::spawn_blocking(move || {
+                        execute_local_item(&src, &dst, mv, pol, &cancel, &*prog)
+                    })
+                    .await
+                    .map_err(|e| format!("Local worker panicked: {e}"))?
+                }
             }
             QueueJob::StagedRemoteTransfer { source_session, target_session, source, target, etag, source_entry, move_item } => {
                 let stage = tempfile::Builder::new().prefix("linscp-cross-move-").rand_bytes(16).tempdir()
@@ -959,12 +1034,20 @@ impl QueueManager {
                 );
                 let state_file = SyncState::state_path(config_dir, &state_key);
                 let mut state = SyncState::load(&state_file).unwrap_or_default();
+                // A granted root plans and applies through `LocalFs`; a
+                // plain root keeps the direct path, byte for byte as before.
+                let saf_fs = if crate::is_saf_path(&local_root.to_string_lossy()) {
+                    Some(self.local_fs.as_ref())
+                } else {
+                    None
+                };
                 let items = plan_synchronization(
                     session.as_ref(),
                     local_root,
                     remote_root,
                     opts,
                     &state,
+                    saf_fs,
                 )
                 .await?;
                 apply_sync_plan(
@@ -975,6 +1058,7 @@ impl QueueManager {
                     opts,
                     &mut state,
                     &mut logger,
+                    saf_fs,
                 )
                 .await?;
                 let _ = state.save(&state_file);
@@ -992,10 +1076,16 @@ impl QueueManager {
                 // first pass, so it is cleared first and the flag is what
                 // reports the stop afterwards.
                 clear_interrupted();
+                let saf_fs = if crate::is_saf_path(&local_root.to_string_lossy()) {
+                    Some(self.local_fs.as_ref())
+                } else {
+                    None
+                };
                 let result = run_keep_up_to_date(
                     session.as_ref(),
                     local_root,
                     remote_root,
+                    saf_fs,
                     opts,
                     &mut logger,
                     |_| {},
@@ -1320,6 +1410,242 @@ fn local_copy_recursive(
         let _ = std::fs::remove_file(&tmp_path);
     }
     copy_res
+}
+
+/// Splits a granted document URI into its parent URI and leaf name. Only
+/// URIs the service itself built are ever split here — `resolve_contained`
+/// leaves and `join_fs_child` joins — so every `/document/` segment is one
+/// leaf and `rsplit_once` inverts the join exactly.
+fn saf_split_uri(uri: &str) -> Option<(String, String)> {
+    let (parent, leaf) = uri.rsplit_once("/document/")?;
+    if parent.is_empty() || leaf.is_empty() || leaf.contains('/') {
+        return None;
+    }
+    Some((parent.to_string(), leaf.to_string()))
+}
+
+/// Joins one listed name onto a directory that is either a granted document
+/// URI or a plain path, mirroring `Path::join` for the URI side.
+fn join_fs_child(dir: &str, name: &str) -> String {
+    if crate::is_saf_path(dir) {
+        format!("{}/document/{}", dir.trim_end_matches('/'), name)
+    } else {
+        Path::new(dir).join(name).to_string_lossy().into_owned()
+    }
+}
+
+/// Splits a copy target into the parent and leaf a unique-name search
+/// needs, for either side of a mixed copy.
+fn split_fs_parent(target: &str) -> (String, String) {
+    if crate::is_saf_path(target) {
+        if let Some((parent, leaf)) = saf_split_uri(target) {
+            return (parent, leaf);
+        }
+        return (target.to_string(), "item".to_string());
+    }
+    let path = Path::new(target);
+    let parent = path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| ".".to_string());
+    let leaf = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "item".to_string());
+    (parent, leaf)
+}
+
+/// The `{stem} ({n}){ext}` search of `unique_local_target` over `LocalFs`,
+/// so a renamed copy lands on the same name whatever side it lands on.
+fn unique_fs_target(fs: &dyn LocalFs, target: &str) -> String {
+    if fs.stat(target).is_err() {
+        return target.to_string();
+    }
+    let (parent, file_name) = split_fs_parent(target);
+    let (stem, ext) = match file_name.rfind('.') {
+        Some(idx) if idx > 0 => (file_name[..idx].to_string(), file_name[idx..].to_string()),
+        _ => (file_name.clone(), String::new()),
+    };
+    for n in 1..10_000 {
+        let candidate = join_fs_child(&parent, &format!("{stem} ({n}){ext}"));
+        if fs.stat(&candidate).is_err() {
+            return candidate;
+        }
+    }
+    let mut rnd = [0u8; 4];
+    rand::thread_rng().fill_bytes(&mut rnd);
+    join_fs_child(&parent, &format!("{stem}-{}{ext}", rnd.iter().map(|b| format!("{b:02x}")).collect::<String>()))
+}
+
+/// The `compute_local_size` walk over `LocalFs`: stats only, so the bridge
+/// cap does not apply until bytes actually move.
+fn compute_fs_size(fs: &dyn LocalFs, path: &str) -> u64 {
+    let Ok(info) = fs.stat(path) else {
+        return 0;
+    };
+    if info.is_symlink {
+        return 0;
+    }
+    if !info.is_dir {
+        return info.size;
+    }
+    let mut sum = 0u64;
+    if let Ok(entries) = fs.list_dir(path) {
+        for entry in entries {
+            sum = sum.saturating_add(compute_fs_size(fs, &join_fs_child(path, &entry.name)));
+        }
+    }
+    sum
+}
+
+fn execute_local_item_fs(
+    fs: &dyn LocalFs,
+    source: &str,
+    target: &str,
+    move_item: bool,
+    policy: ConflictPolicy,
+    cancel: &AtomicBool,
+    progress: &ProgressCallback,
+) -> Result<(), String> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err("Cancelled by user.".to_string());
+    }
+    let src = fs.stat(source).map_err(|e| format!("Cannot inspect '{source}': {e}"))?;
+    if src.is_symlink {
+        let verb = if move_item { "move" } else { "copy" };
+        return Err(format!("Cannot {verb} a symbolic link into or out of a granted folder."));
+    }
+    if move_item {
+        if policy != ConflictPolicy::Ask {
+            return Err("Local moves require a new destination and a non-symlink source.".to_string());
+        }
+        // Every granted move is a copy that deletes its source: queue jobs
+        // always carry the same leaf on both sides, so a provider-side
+        // rename could only ever retarget a name onto itself. Same-directory
+        // renames are `/api/local/rename`'s job, which renames directly.
+        if fs.stat(target).is_ok() {
+            return Err(format!("Destination '{target}' already exists."));
+        }
+        let mut copied = 0u64;
+        let total = compute_fs_size(fs, source);
+        local_copy_recursive_fs(fs, source, target, policy, cancel, &mut copied, total, progress)?;
+        if src.is_dir {
+            fs.remove_dir_all(source).map_err(|e| e.to_string())?;
+        } else {
+            fs.remove_file(source).map_err(|e| e.to_string())?;
+        }
+        return Ok(());
+    }
+
+    let mut effective_target = target.to_string();
+    if fs.stat(&effective_target).is_ok() {
+        match policy {
+            ConflictPolicy::Skip => {
+                if !src.is_dir {
+                    return Ok(());
+                }
+            }
+            ConflictPolicy::Rename => {
+                effective_target = unique_fs_target(fs, &effective_target);
+            }
+            ConflictPolicy::Overwrite => {}
+            ConflictPolicy::Ask => {
+                return Err(format!("Destination '{effective_target}' already exists."));
+            }
+        }
+    }
+
+    let mut copied = 0u64;
+    let total = compute_fs_size(fs, source);
+    local_copy_recursive_fs(fs, source, &effective_target, policy, cancel, &mut copied, total, progress)?;
+    Ok(())
+}
+
+fn local_copy_recursive_fs(
+    fs: &dyn LocalFs,
+    source: &str,
+    target: &str,
+    policy: ConflictPolicy,
+    cancel: &AtomicBool,
+    copied: &mut u64,
+    total: u64,
+    progress: &ProgressCallback,
+) -> Result<(), String> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err("Cancelled by user.".to_string());
+    }
+    let meta = fs.stat(source).map_err(|e| e.to_string())?;
+    if meta.is_symlink {
+        // Reached for links nested inside a moved directory; top-level links
+        // are refused at enqueue time, for copies and moves alike.
+        return Err("Cannot carry a symbolic link into or out of a granted folder.".to_string());
+    }
+
+    if meta.is_dir {
+        if let Ok(existing) = fs.stat(target) {
+            if existing.is_symlink || !existing.is_dir {
+                match policy {
+                    ConflictPolicy::Skip => return Ok(()),
+                    ConflictPolicy::Overwrite => {
+                        if existing.is_dir {
+                            fs.remove_dir_all(target).map_err(|e| e.to_string())?;
+                        } else {
+                            fs.remove_file(target).map_err(|e| e.to_string())?;
+                        }
+                    }
+                    ConflictPolicy::Rename => {
+                        let alt = unique_fs_target(fs, target);
+                        return local_copy_recursive_fs(fs, source, &alt, policy, cancel, copied, total, progress);
+                    }
+                    ConflictPolicy::Ask => {
+                        return Err("Destination is not a directory.".to_string());
+                    }
+                }
+            }
+        }
+        fs.mkdir_all(target).map_err(|e| e.to_string())?;
+        let mut children = fs.list_dir(source).map_err(|e| e.to_string())?;
+        children.sort_by(|a, b| a.name.cmp(&b.name));
+        for child in children {
+            let child_src = join_fs_child(source, &child.name);
+            let child_dst = join_fs_child(target, &child.name);
+            local_copy_recursive_fs(fs, &child_src, &child_dst, policy, cancel, copied, total, progress)?;
+        }
+        return Ok(());
+    }
+
+    if let Ok(existing) = fs.stat(target) {
+        match policy {
+            ConflictPolicy::Skip => return Ok(()),
+            ConflictPolicy::Overwrite if !existing.is_dir && !existing.is_symlink => {}
+            ConflictPolicy::Overwrite => return Err("Refusing to overwrite a symlink or non-file.".to_string()),
+            ConflictPolicy::Rename => {
+                let alt = unique_fs_target(fs, target);
+                return local_copy_recursive_fs(fs, source, &alt, policy, cancel, copied, total, progress);
+            }
+            ConflictPolicy::Ask => {
+                return Err(format!("Destination '{target}' already exists."));
+            }
+        }
+    }
+
+    // One side of this copy is always a granted folder, so these bytes
+    // always cross the bridge whole: the cap is checked on the stat, before
+    // the read spends the memory.
+    if meta.size > MAX_SAF_DOCUMENT_BYTES {
+        let name = source.rsplit('/').next().unwrap_or(source);
+        return Err(saf_document_too_large(name, meta.size));
+    }
+    let bytes = fs.read_bytes(source).map_err(|e| e.to_string())?;
+    if cancel.load(Ordering::SeqCst) {
+        return Err("Cancelled by user.".to_string());
+    }
+    fs.write_bytes_atomic(target, &bytes).map_err(|e| e.to_string())?;
+    // A granted target has no timestamps to set; a plain target keeps the
+    // source's seconds, modes aside (a granted source has none to give).
+    if !crate::is_saf_path(target) {
+        let _ = fs.set_mtime(target, meta.mtime);
+    }
+    *copied = copied.saturating_add(bytes.len() as u64);
+    progress(*copied, total);
+    if cancel.load(Ordering::SeqCst) {
+        return Err("Cancelled by user.".to_string());
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

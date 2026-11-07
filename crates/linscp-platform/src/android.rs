@@ -1,5 +1,5 @@
-//! Android-specific app-private filesystem paths, Storage Access Framework
-//! (`content://`) bridge contract, and Android Keystore secret-wrapping bridge.
+//! Android-specific app-private filesystem paths and the Storage Access
+//! Framework (`content://`) bridge contract.
 
 use std::fs::{File, OpenOptions};
 #[cfg(unix)]
@@ -13,7 +13,6 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use linscp_types::{FileEntry, LocalRootEntry};
-use zeroize::Zeroizing;
 
 use crate::PlatformError;
 
@@ -59,13 +58,6 @@ pub trait ForegroundServiceBridge: Send + Sync {
     fn update_progress(&self, bytes_done: u64, bytes_total: u64) -> Result<(), PlatformError>;
     fn stop(&self) -> Result<(), PlatformError>;
     fn is_running(&self) -> bool;
-}
-
-/// Optional Android Keystore hardware-backed AES-256-GCM wrapper supplied by
-/// the Tauri Android plugin when running inside the Android app runtime.
-pub trait KeystoreBridge: Send + Sync {
-    fn wrap_master_key(&self, raw_key: &[u8; 32]) -> Result<Vec<u8>, PlatformError>;
-    fn unwrap_master_key(&self, wrapped: &[u8]) -> Result<Zeroizing<[u8; 32]>, PlatformError>;
 }
 
 pub fn default_config_dir() -> PathBuf {
@@ -252,6 +244,10 @@ pub fn create_private_file(path: &Path) -> Result<File, PlatformError> {
 pub fn atomic_replace(temp_path: &Path, target_path: &Path) -> Result<(), PlatformError> {
     std::fs::rename(temp_path, target_path)?;
     Ok(())
+}
+
+pub fn ssh_agent_missing_reason() -> Option<&'static str> {
+    Some(crate::SSH_AGENT_MISSING_MESSAGE)
 }
 
 pub async fn connect_ssh_agent() -> Result<Option<Box<dyn crate::AsyncStream>>, PlatformError> {

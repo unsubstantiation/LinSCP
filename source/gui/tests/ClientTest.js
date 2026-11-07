@@ -168,9 +168,13 @@ function customCommandsBody(options) {
     return { success: true, commands: stored };
   }
   if (request.action === 'run') {
+    /* The backend answers with what each file's run printed, and only the
+     * names it actually ran on; the page shows that verbatim. */
     return { success: true, scope: 'remote',
-      results: (request.filenames || []).map(name => (
-        { file: name, success: true, exit_code: 0, stdout: 'SHA-256 verified', stderr: '' })) };
+      results: (request.filenames || []).map(name => ({
+        file: name, command: 'checksum sha-256 ' + name, success: true,
+        exit_code: 0, stdout: 'SHA-256 verified', stderr: '', error: ''
+      })) };
   }
   return { success: true, commands: stored };
 }
@@ -1223,6 +1227,28 @@ function options(id) {
   check('declining a custom command confirmation queues no work',
     declinedRuns === priorRuns);
 
+  /* A template saved for one side must not run on the other side's names:
+   * remote `checksum sha-256 keep.txt` against the local pane would check a
+   * different file. The page refuses it by name instead of posting it. */
+  const beforeMismatch = calls.filter(call => call.path === '/api/custom-commands' &&
+    JSON.parse(call.options.body || '{}').action === 'run').length;
+  window.selectCustomCommand(0);
+  doc.getElementById('localPane')
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  doc.getElementById('localFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  await window.runCustomCommand();
+  const refusals = text('toast');
+  const afterMismatch = calls.filter(call => call.path === '/api/custom-commands' &&
+    JSON.parse(call.options.body || '{}').action === 'run').length;
+  check('a template saved for one side is refused on the other side by name',
+    afterMismatch === beforeMismatch && refusals.includes('Checksum') &&
+      refusals.toLowerCase().includes('remote'), refusals);
+  window.selectCustomCommand(0);
+  window.focusPane('remote');
+  doc.getElementById('remoteFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+
   confirmResult = true;
   await window.runCustomCommand();
   const customRun = calls.filter(call => call.path === '/api/custom-commands' &&
@@ -1230,6 +1256,7 @@ function options(id) {
   const customPayload = customRun ? JSON.parse(customRun.options.body) : {};
   check('confirmed custom command runs only on the selected remote entry',
     customPayload.action === 'run' && customPayload.tab === 1 &&
+      customPayload.pane === 'remote' &&
       Array.isArray(customPayload.filenames) &&
       customPayload.filenames.length === 1 &&
       customPayload.filenames[0] === 'keep.txt', JSON.stringify(customPayload));
@@ -1576,6 +1603,208 @@ function options(id) {
       text('logOutput').includes('kept line'),
     text('logOutput'));
   responses['/api/logs'] = savedLogs;
+
+  // ---- Granted Android folders ------------------------------------------
+  // A granted folder browses, edits, copies and moves, but cannot sync,
+  // watch, transfer to a session, or chmod. The page asks the shared bundle
+  // for the reason and offers nothing that could only fail; the backend
+  // refuses the same way when called.
+  const SAF_DIR = 'content://mock.tree/tree/primary%3ADownload';
+  LOCAL_DIRS[SAF_DIR] = [
+    { name: 'note.txt', size: 4, is_dir: false, date: 'Oct 13 08:00', permissions: '' }
+  ];
+  await window.loadLocal(SAF_DIR);
+  check('the local pane navigated into the granted folder',
+    text('localFileList').includes('note.txt'), text('localFileList'));
+  // dist/index.html inlines the real bundle; the source page has none, so a
+  // stub standing in for its contract proves the wiring in both runs.
+  let safStubInstalled = false;
+  if (!window.LinSCPCore || typeof window.LinSCPCore.safLimitationReason !== 'function') {
+    window.LinSCPCore = window.LinSCPCore || {};
+    window.LinSCPCore.safLimitationReason = (action, path) =>
+      (typeof path === 'string' && path.startsWith('content://') ? 'stub refuses ' + action : null);
+    safStubInstalled = true;
+  }
+  const safReason = action => window.LinSCPCore.safLimitationReason(action, SAF_DIR);
+  const posted = path => calls.filter(call => call.path === path).length;
+
+  const editsBefore = posted('/api/local/edit');
+  await window.openEditor(SAF_DIR + '/document/primary%3ADownload%2Fnote.txt', 'local');
+  check('a granted folder offers the editor',
+    doc.getElementById('editorModal').className.indexOf('open') >= 0 &&
+      posted('/api/local/edit') === editsBefore + 1,
+    text('toast'));
+  window.closeModal('editorModal');
+
+  window.openSynchronize();
+  check('a granted folder is offered synchronization',
+    doc.getElementById('syncModal').className.indexOf('open') >= 0,
+    text('toast'));
+  window.closeModal('syncModal');
+
+  window.openKeepUpToDate();
+  check('a granted folder is offered keep-up-to-date',
+    doc.getElementById('keepUpToDateModal').className.indexOf('open') >= 0,
+    text('toast'));
+  window.closeModal('keepUpToDateModal');
+
+  window.focusPane('local');
+  doc.getElementById('localFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  const safUploadsBefore = posted('/api/transfer/upload');
+  await window.transfer('upload');
+  check('a granted folder is offered transfers',
+    posted('/api/transfer/upload') === safUploadsBefore + 1,
+    text('toast'));
+
+  const confirmsBefore = confirmMessages.length;
+  const movesBefore = posted('/api/transfer/move');
+  await window.moveToOtherPane();
+  check('a granted folder is offered moves',
+    confirmMessages.length === confirmsBefore + 1 &&
+      posted('/api/transfer/move') === movesBefore + 1,
+    text('toast'));
+
+  const chmodsBefore = posted('/api/local/chmod');
+  await window.permissionsPrompt('local');
+  check('a granted folder is not offered chmod',
+    text('toast').includes(safReason('permissions')) &&
+      posted('/api/local/chmod') === chmodsBefore,
+    text('toast'));
+
+  await window.openProperties();
+  check('properties on a granted folder explain the missing rights editor',
+    doc.getElementById('propertiesModal').className.indexOf('open') >= 0 &&
+      !doc.getElementById('propertiesMode') &&
+      text('propertiesBody').includes(safReason('permissions')),
+    text('propertiesBody'));
+  window.closeModal('propertiesModal');
+
+  await window.loadLocal('/tmp/slowlocal');
+  window.openSynchronize();
+  check('leaving the granted folder offers the actions again',
+    doc.getElementById('syncModal').className.indexOf('open') >= 0);
+  window.closeModal('syncModal');
+
+  // Both tab kinds offer transfers and moves now; the local tab below
+  // proves the same granted folder is served there too.
+  const savedStatusForLocalTab = responses['/api/status'];
+  responses['/api/status'] = {
+    tabs: [{ id: 1, name: 'local tab', connected: true, is_local: true,
+      local_dir: SAF_DIR, remote_dir: '/tmp/slowlocal', error: '' }],
+    active_tab: 1, paused: false, binary: '/usr/bin/linscp',
+    local_dir: SAF_DIR, remote_dir: '/tmp/slowlocal',
+    sessions_file: '/tmp/cfg/sessions.ini'
+  };
+  await window.refreshStatus();
+  await window.loadLocal(SAF_DIR);
+  await window.loadRemote('/tmp/slowlocal');
+  window.focusPane('local');
+  doc.getElementById('localFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  const localUploadsBefore = posted('/api/transfer/upload');
+  await window.transfer('upload');
+  check('a local tab offers transfers out of a granted folder',
+    posted('/api/transfer/upload') === localUploadsBefore + 1,
+    text('toast'));
+  const localConfirmsBefore = confirmMessages.length;
+  const localMovesBefore = posted('/api/transfer/move');
+  await window.moveToOtherPane();
+  check('a local tab offers moves out of a granted folder',
+    confirmMessages.length === localConfirmsBefore + 1 &&
+      posted('/api/transfer/move') === localMovesBefore + 1,
+    text('toast'));
+  responses['/api/status'] = savedStatusForLocalTab;
+  await window.refreshStatus();
+  await window.loadLocal('/tmp/slowlocal');
+  if (safStubInstalled) window.LinSCPCore.safLimitationReason = undefined;
+
+  // ---- Local symbolic links ---------------------------------------------
+  // The link dialog works on the local pane through /api/local/link and is
+  // not offered for a granted folder, where links cannot exist.
+  window.prompt = () => 'asked';
+  window.focusPane('local');
+  doc.getElementById('localFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  await window.promptLink('local');
+  const linkCall = calls.filter(call => call.path === '/api/local/link').pop();
+  check('the local pane offers symbolic links',
+    linkCall && JSON.parse(linkCall.options.body).target === 'a.txt' &&
+      JSON.parse(linkCall.options.body).name === 'asked' &&
+      text('toast').includes('Created the symbolic link'),
+    text('toast'));
+
+  if (!window.LinSCPCore || typeof window.LinSCPCore.safLimitationReason !== 'function') {
+    window.LinSCPCore = window.LinSCPCore || {};
+    window.LinSCPCore.safLimitationReason = (action, path) =>
+      (typeof path === 'string' && path.startsWith('content://') ? 'stub refuses ' + action : null);
+    safStubInstalled = true;
+  }
+  await window.loadLocal(SAF_DIR);
+  window.focusPane('local');
+  doc.getElementById('localFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  const linksBefore = posted('/api/local/link');
+  await window.promptLink('local');
+  check('a granted folder is not offered symbolic links',
+    text('toast').includes(safReason('symlink')) &&
+      posted('/api/local/link') === linksBefore,
+    text('toast'));
+  await window.loadLocal('/tmp/slowlocal');
+  if (safStubInstalled) window.LinSCPCore.safLimitationReason = undefined;
+
+  // ---- Missing SSH agent ------------------------------------------------
+  // The site dialog names the reason agent login is not offered instead of
+  // failing the connection later; the wording comes from the shared bundle.
+  window.updateAgentHint('stub no agent');
+  check('the site dialog explains a missing SSH agent',
+    doc.getElementById('siteAgentHint').hidden === false &&
+      text('siteAgentHint') === 'stub no agent',
+    text('siteAgentHint'));
+  window.updateAgentHint(null);
+  check('the agent hint hides when the host has an agent',
+    doc.getElementById('siteAgentHint').hidden === true,
+    String(doc.getElementById('siteAgentHint').hidden));
+
+  let agentStubInstalled = false;
+  if (!window.LinSCPCore || typeof window.LinSCPCore.hostDifferenceReason !== 'function') {
+    window.LinSCPCore = window.LinSCPCore || {};
+    window.LinSCPCore.hostDifferenceReason = () => 'stub no agent';
+    agentStubInstalled = true;
+  }
+  const agentReason = window.sshAgentGap({ sshAgent: false });
+  check('the agent gap asks the bundle for the reason',
+    (agentStubInstalled ? agentReason === 'stub no agent' : agentReason.includes('private key')) &&
+      window.sshAgentGap({ sshAgent: true }) === null,
+    String(agentReason));
+  if (agentStubInstalled) window.LinSCPCore.hostDifferenceReason = undefined;
+
+  // ---- Kerberos limits --------------------------------------------------
+  // The Kerberos section names its Linux-only limit, and key exchange — the
+  // one setting no build honors — is noted where the Linux-only note is not.
+  let gssapiStubInstalled = false;
+  if (!window.LinSCPCore || typeof window.LinSCPCore.hostDifferenceReason !== 'function') {
+    window.LinSCPCore = window.LinSCPCore || {};
+    window.LinSCPCore.hostDifferenceReason = (capability) => 'stub no ' + capability;
+    gssapiStubInstalled = true;
+  }
+  const kerberosReason = window.gssapiGap({ gssapi: false });
+  check('the Kerberos gap names Linux-only builds',
+    (gssapiStubInstalled ? kerberosReason === 'stub no gssapi' : kerberosReason.includes('Linux')) &&
+      window.gssapiGap({ gssapi: true }) === null,
+    String(kerberosReason));
+  const kexReason = window.gssapiKexGap({ gssapi: true });
+  check('the key-exchange gap applies on every build',
+    (gssapiStubInstalled ? kexReason === 'stub no gssapiKex' : kexReason.includes('key exchange')) &&
+      window.gssapiKexGap({ gssapi: false }) === null,
+    String(kexReason));
+  window.updateGssapiHint();
+  const gssapiHintHidden = doc.getElementById('siteGssapiHint').hidden;
+  check('the Kerberos hint shows the gap reason',
+    gssapiStubInstalled ? gssapiHintHidden === true :
+      (gssapiHintHidden === false && text('siteGssapiHint').includes('key exchange')),
+    text('siteGssapiHint'));
+  if (gssapiStubInstalled) window.LinSCPCore.hostDifferenceReason = undefined;
 
   check('no script errors', errors.length === 0, errors.join(' | '));
   window.close();
