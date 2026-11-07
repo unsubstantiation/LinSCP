@@ -102,6 +102,9 @@ CASE_SOURCES = {
     # The SSH/SFTP/SCP/tunnel protocol behaviour against the mock server.
     # Android runs no Rust tests, so Android rows cite other suites instead.
     "proto-ssh": "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs",
+    # The password-only vault: setup/unlock/lock and the retired prefixes.
+    # Android runs no Rust tests, so Android rows cite other suites instead.
+    "vault-password": "crates/linscp-platform/src/password_vault.rs",
 }
 
 
@@ -354,7 +357,8 @@ def check_capabilities(inventory, errors, root=ROOT):
                     expression = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
                 elif suite in ("service", "service-commands", "gui-cli",
                                "gui-shell-definitions", "gui-shell-actions",
-                               "platform-windows-acl", "proto-ssh"):
+                               "platform-windows-acl", "proto-ssh",
+                               "vault-password"):
                     # A Rust test is a #[test]/#[tokio::test] function, not a
                     # `test_*` ffi symbol; the drop helpers are `async fn`.
                     expression = r"\b(?:async\s+)?fn\s+" + re.escape(case) + r"\s*\("

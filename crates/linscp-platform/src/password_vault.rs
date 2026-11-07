@@ -200,4 +200,27 @@ mod tests {
         vault.lock().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn retired_hardware_key_prefixes_are_rejected() {
+        // The DPAPI/Keystore wrappers were never wired; their `dpapi1$` and
+        // `aks1$` prefixes were removed from the decoder, so a sessions.key
+        // carrying one must fail closed instead of loading a wrong key.
+        let dir = std::env::temp_dir().join(format!(
+            "linscp-retired-prefix-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = NativeSecretVault::new();
+        for prefix in ["dpapi1$", "aks1$"] {
+            std::fs::write(dir.join("sessions.key"), format!("{prefix}AAAA\n")).unwrap();
+            let err = legacy.load_master_key(&dir).unwrap_err();
+            assert!(
+                matches!(err, PlatformError::SecretVault(ref message) if message.contains("base64")),
+                "{prefix} must fail closed, got {err:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

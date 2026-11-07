@@ -5,7 +5,7 @@
 //! bearer tokens when running as a native Linux, Windows, or Android app.
 //!
 //! Android runs the same service in app-private storage. The Storage Access
-//! Framework, share sheet, foreground service and Keystore bridges are traits
+//! Framework, share sheet, and foreground service bridges are traits
 //! in `linscp-platform`; the generated Kotlin project registers them, and every
 //! operation they would serve fails closed until it does. Granted SAF trees are
 //! ordinary local roots and its documents go through the same `LocalFs` calls

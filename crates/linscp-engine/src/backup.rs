@@ -11,12 +11,11 @@
 //!   via `SessionStore` helpers) — the INI parser accepts both LF and
 //!   CRLF on import, but export always uses LF.
 //! - `sessions.key` is exported as *unwrapped* base64 (raw 32 bytes).
-//!   On Windows DPAPI (`dpapi1$…`) and Android Keystore (`aks1$…`) the
-//!   vault is asked for the unwrapped key so the backup is portable.
-//!   On import the key is written as raw base64 (`<b64>\n`) which every
-//!   platform understands; Windows will re-wrap on next write if DPAPI
-//!   is enabled, Android likewise. This keeps `lscp1$` passwords
-//!   decryptable after a cross-distribution restore.
+//!   The vault is asked for the raw key so the backup stays portable
+//!   across distributions: import writes the same base64 (`<b64>\n`)
+//!   which every platform reads. The vault is password-only on all
+//!   three builds, so there is no OS-credential wrapping to preserve.
+//!   This keeps `lscp1$` passwords decryptable after a restore.
 //! - `workspaces.json`, `bookmarks.json`, `preferences.json` are stored
 //!   as their Rust structs (already platform-agnostic) and serialized
 //!   via the same pretty JSON path as `PreferencesStore` et al.
@@ -58,8 +57,8 @@ pub struct BackupBundle {
     /// sessions existed.
     #[serde(default)]
     pub sessions_ini: String,
-    /// Base64 of the raw 32-byte master key, independent of
-    /// DPAPI/Keystore wrapping. `None` if no `sessions.key` existed.
+    /// Base64 of the raw 32-byte master key.
+    /// `None` if no `sessions.key` existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sessions_key_b64: Option<String>,
     /// `workspaces.json` content.
@@ -123,8 +122,8 @@ fn read_optional_text(path: &Path) -> Option<String> {
 /// Collects all per-user configuration from `config_dir` into a
 /// distribution-compatible `BackupBundle`.
 ///
-/// The master key is read via `vault` so DPAPI/Keystore wrapping is
-/// unwrapped to raw base64 for portability.
+/// The master key is read via `vault` and stored as raw base64 so the
+/// bundle restores on every platform.
 pub fn export_backup(
     config_dir: &Path,
     vault: &dyn SecretVault,
@@ -134,8 +133,8 @@ pub fn export_backup(
         .unwrap_or_default();
 
     // Export the *unwrapped* master key as portable base64. This is what
-    // makes the backup cross-distribution: a Windows DPAPI key restored on
-    // Linux remains usable because we store the raw key.
+    // makes the backup cross-distribution: every platform reads the same
+    // raw key.
     #[allow(clippy::needless_borrows_for_generic_args)]
     let sessions_key_b64 = match vault.load_master_key(config_dir) {
         Ok(Some(k)) => Some(BASE64.encode(&*k)),
@@ -201,10 +200,7 @@ pub fn deserialize_backup(bytes: &[u8]) -> Result<BackupBundle, String> {
 /// atomically with owner-only permissions where applicable.
 ///
 /// The master key is written as portable base64 (`<b64>\n`), which every
-/// platform accepts. On Windows with DPAPI enabled and Android with
-/// Keystore, the next `load_or_create_master_key` will re-wrap if the
-/// caller uses those vault variants — the backup itself stays unwrapped
-/// for portability.
+/// platform accepts; the backup itself stays unwrapped for portability.
 pub fn import_backup(
     config_dir: &Path,
     bundle: &BackupBundle,
@@ -245,7 +241,7 @@ pub fn import_backup(
                 encoded.as_bytes(),
             )
             .map_err(|e| e.to_string())?;
-            // Touch the vault so a DPAPI/Keystore caller can verify the key is loadable
+            // Touch the vault so the freshly written key is exercised once
             let _ = vault.load_master_key(config_dir);
         }
     } else if bundle.sessions_ini.contains("lscp1$") {

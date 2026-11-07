@@ -2,9 +2,9 @@
 
 **Date:** 2026-11-06 · **Branch:** `arena/a4f5fe10-linscp` · **Mode:** audit, then A1 fixed on request.
 
-> **Update (same day):** A1, A2, A3, A4, A6, A7(b) and A9 below have been implemented, and the §3
-> suites have been triaged (B) — see their **Status** notes for what changed and what still needs
-> a compiler to confirm. The rest of this document is the audit as written, so A5, A8 and the
+> **Update (same day):** A1, A2, A3, A4, A5, A6, A7(b) and A9 below have been implemented, and the
+> §3 suites have been triaged (B) — see their **Status** notes for what changed and what still
+> needs a compiler to confirm. The rest of this document is the audit as written, so A8 and the
 > A7(a) `LocalFs` routing still describe the tree as it was before those changes.
 
 **Question asked:** "Make sure we have full feature parity between the builds."
@@ -343,6 +343,19 @@ DPAPI/Keystore as implemented; `docs/android.md:20-21` correctly admits Keystore
 `with_windows_dpapi()` called at vault construction; Android needs a new Kotlin `wrapKey`/`unwrapKey`
 command plus `set_keystore`), or delete the dead surface and correct the docs. **Effort:** M (Android
 side is the real work) / S (delete-and-document).
+
+**Status: fixed** via the audit's S fallback: delete-and-document. Recon showed the wrappers were
+doubly dead — beyond the zero call sites, the only consumer of the DPAPI flag
+(`NativeSecretVault::load_or_create_master_key`) never runs in production, because the service
+passes the password vault everywhere and uses the native vault only as a migration source. Calling
+the constructors would have changed nothing observable, so real wiring would have meant designing
+passwordless unlock as a product feature instead. Removed: both constructors, the decoder and
+creation branches, the Windows DPAPI functions (plus the `Win32_Security_Cryptography` feature),
+the `KeystoreBridge` trait, the Tauri keystore state, and the stale backup and migration-guide
+claims, which now say the wrapping was removed or descoped; `android.md`'s honest wording stands.
+Ledger row `sessions.vault-password-only` is `partial`: the `LSCPVLT1` round-trip and the new
+retired-prefix rejection test run on Linux and Windows CI, while Android runs no Rust tests.
+Reading-level for the Rust, as usual: CI compiles it first.
 
 ### A6. On Windows the configuration directory is created without an owner-only DACL
 **Platforms:** Windows ✗
@@ -700,9 +713,10 @@ Ordered by (user impact × confidence) ÷ effort. All are small except where not
    and the granted-folder refusal in both layers. **A9 Android agent message** — **done**, see
    A9's *Status: fixed*: a defaulted `missing_reason` on the connector trait, the Android platform
    message, and a site-dialog hint on a new bundle `sshAgent` flag.
-8. **A5 vault** — decide: wire DPAPI (S) and Keystore (M), or delete the dead surface and correct
-   `docs/cross-platform-rust-migration.md:181,202,287`. Either is fine; the current state (code that
-   says it is protected, docs that say it is protected, nothing that protects it) is not.
+8. **A5 vault** — **done**, see A5's *Status: fixed*: decided delete-and-document (the wrappers
+   were doubly dead, so wiring would have been a product feature, not a fix). Dead constructors,
+   decoder branches, DPAPI functions, the `KeystoreBridge` trait, and Tauri keystore state
+   removed; migration-guide claims corrected.
 9. **A8 SSPI** — the only item here that is genuinely large. It should stay `partial`, with the
    ledger finally saying *linux-only*, until someone does it.
 

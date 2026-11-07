@@ -4,7 +4,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-85 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+86 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -556,6 +556,18 @@ Stored site passwords are encrypted under sessions.key and shared between the CL
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
 - [ ] Cover the encryption half (sessions.key sealing and opening) with a runnable suite on all three platforms.
+
+## sessions.vault-password-only
+
+**Area:** Sessions/configuration · **Status:** partial
+
+The vault is password-only on every build, and the tree finally says so: the never-wired DPAPI/Keystore constructors, decoder branches, Windows DPAPI functions, KeystoreBridge trait, and Tauri keystore state were removed instead of left as dead surface. sessions.key is LSCPVLT1 (Argon2id plus AES-256-GCM) with legacy raw/base64 migration, and the migration guide claims that described hardware wrapping as implemented now say it was removed or descoped.
+
+**Next:** No Android step executes the Rust vault tests, so the password-only behaviour is unproven on device; and the doc corrections are prose, not runnable evidence.
+
+**Acceptance criteria:**
+
+- [ ] An emulator or device run executing the vault tests, or a native harness that runs Rust cases on Android.
 
 ## sessions.proxy-settings
 
@@ -1116,7 +1128,7 @@ The panes' delete runs on the session: each selected name is validated as a leaf
 
 **Area:** Sessions/configuration · **Status:** partial
 
-Full application backup as a distribution-compatible JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute config_dir, unwrapped base64 sessions.key via SecretVault for dpapi1$/aks1$ portability, LF-normalized INI/JSON/text). Covers sessions.ini + sessions.key, workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Exported on Debian (LF) restores identically on Fedora, Arch, Windows (CRLF) and Android and vice versa; backup_is_distribution_compatible_between_linux_windows_and_android proves Debian→Windows→Android round-trip, raw base64 key, LF-only decryptable INI and JSON stores, plus fail-closed without key and CRLF file tolerance. Implemented via crates/linscp-engine/src/backup.rs and `backup export|import <file>` in script.rs.
+Full application backup as a distribution-compatible JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute config_dir, unwrapped base64 sessions.key via SecretVault for cross-platform portability, LF-normalized INI/JSON/text). Covers sessions.ini + sessions.key, workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Exported on Debian (LF) restores identically on Fedora, Arch, Windows (CRLF) and Android and vice versa; backup_is_distribution_compatible_between_linux_windows_and_android proves Debian→Windows→Android round-trip, raw base64 key, LF-only decryptable INI and JSON stores, plus fail-closed without key and CRLF file tolerance. Implemented via crates/linscp-engine/src/backup.rs and `backup export|import <file>` in script.rs.
 
 **Next:** No runnable suite evidences this on Android: script needs a `linscp` binary this repo does not build. Runnable residue: backup on Linux and Windows.
 
