@@ -16,8 +16,9 @@ use linscp_engine::sync_planner::{
     apply_sync_plan, plan_synchronization, SyncOptions, SyncState,
 };
 use linscp_engine::transfer::{
-    download_directory_recursive, download_single_file, upload_directory_recursive,
-    upload_single_file, TransferFlags,
+    download_directory_recursive, download_single_file, publish_staged_file_to_saf,
+    publish_staged_tree_to_saf, safe_tree_name, stage_saf_upload_source,
+    upload_directory_recursive, upload_single_file, TransferFlags,
 };
 use linscp_engine::xml_log::SessionLogger;
 use linscp_platform::gui_os::create_local_symlink;
@@ -126,13 +127,6 @@ pub enum QueueJob {
 // Directory copies reject symlinks and use no-replace publication for files.
 // Approved merges do not replace files and may leave already-copied entries on
 // error. New downloaded trees are staged privately before atomic publication.
-fn safe_tree_name(name: &str) -> Result<(), String> {
-    if name.is_empty() || name == "." || name == ".." || (name.contains('/') || name.contains('\\') || name.contains(':')) || name.chars().any(char::is_control) || Path::new(name).components().count() != 1 {
-        return Err("Invalid directory entry name.".to_string());
-    }
-    Ok(())
-}
-
 // The staged tree is on the destination filesystem. Publication uses atomic
 // create-if-absent hard links; never delete entries already merged on failure,
 // since another actor may have replaced them in the meantime.
@@ -772,7 +766,14 @@ impl QueueManager {
                     .await
                     .map_err(|e| e.to_string())?
                     .ok_or_else(|| format!("Remote item '{remote_path}' does not exist."))?;
-                if let Ok(meta) = std::fs::symlink_metadata(local_dest) {
+                let saf_dest = crate::is_saf_path(&local_dest.to_string_lossy());
+                if saf_dest {
+                    if let Ok(info) = self.local_fs.stat(&local_dest.to_string_lossy()) {
+                        let allowed_dir = entry.is_dir && flags.merge_directories && info.is_dir && !info.is_symlink;
+                        let allowed_file = !entry.is_dir && *allow_overwrite && !info.is_dir && !info.is_symlink;
+                        if !allowed_dir && !allowed_file { return Err("Destination changed or merge/overwrite was not approved.".to_string()); }
+                    }
+                } else if let Ok(meta) = std::fs::symlink_metadata(local_dest) {
                     let allowed_dir = entry.is_dir && flags.merge_directories && meta.is_dir() && !meta.file_type().is_symlink();
                     let allowed_file = !entry.is_dir && *allow_overwrite && meta.is_file() && !meta.file_type().is_symlink();
                     if !allowed_dir && !allowed_file { return Err("Destination changed or merge/overwrite was not approved.".to_string()); }
@@ -787,24 +788,64 @@ impl QueueManager {
                 if entry.is_dir {
                     if !matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs) || *delete_source { return Err("Directory downloads require SFTP or WebDAV and cannot delete the source.".to_string()); }
                     f.no_clobber = true;
-                    // Stage both new trees and merges privately. Cancelling a
-                    // download before publication leaves an existing tree alone.
-                    let parent = local_dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-                    let stage = tempfile::Builder::new().prefix(".linscp-tree-").rand_bytes(16).tempdir_in(parent)
-                        .map_err(|e| format!("Cannot create temporary directory in '{}': {e}", parent.display()))?;
-                    let staged_tree = stage.path().join("contents");
                     let mut stage_flags = f.clone(); stage_flags.merge_directories = false;
-                    download_staged_remote_tree(session.as_ref(), remote_path, &staged_tree, &stage_flags, &mut logger, Some(&*progress), 0).await?;
-                    if task.cancel_flag.load(Ordering::SeqCst) { return Err("Transfer cancelled before publication.".to_string()); }
-                    if f.merge_directories {
-                        merge_staged_local_tree(&staged_tree, local_dest, &task.cancel_flag, 0)?;
+                    if saf_dest {
+                        // A granted tree has no parent directory to stage in:
+                        // the tree lands in a private directory and is
+                        // published file by file across the bridge.
+                        let stage = tempfile::Builder::new().prefix("linscp-saf-download-").rand_bytes(16).tempdir()
+                            .map_err(|e| format!("Cannot create download staging directory: {e}"))?;
+                        let staged_tree = stage.path().join("contents");
+                        download_staged_remote_tree(session.as_ref(), remote_path, &staged_tree, &stage_flags, &mut logger, Some(&*progress), 0).await?;
+                        if task.cancel_flag.load(Ordering::SeqCst) { return Err("Transfer cancelled before publication.".to_string()); }
+                        let fs = self.local_fs.clone();
+                        let dest = local_dest.to_string_lossy().into_owned();
+                        let merge = f.merge_directories;
+                        let cancel = Arc::clone(&task.cancel_flag);
+                        let published = tokio::task::spawn_blocking(move || {
+                            publish_staged_tree_to_saf(fs.as_ref(), &staged_tree, &dest, merge, &cancel)
+                        })
+                        .await
+                        .map_err(|e| format!("Local worker panicked: {e}"))?;
+                        published?;
                     } else {
-                        linscp_platform::gui_os::rename_no_replace(&staged_tree, local_dest)
-                            .map_err(|e| format!("Cannot publish downloaded directory '{}': {e}", local_dest.display()))?;
+                        // Stage both new trees and merges privately. Cancelling a
+                        // download before publication leaves an existing tree alone.
+                        let parent = local_dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+                        let stage = tempfile::Builder::new().prefix(".linscp-tree-").rand_bytes(16).tempdir_in(parent)
+                            .map_err(|e| format!("Cannot create temporary directory in '{}': {e}", parent.display()))?;
+                        let staged_tree = stage.path().join("contents");
+                        download_staged_remote_tree(session.as_ref(), remote_path, &staged_tree, &stage_flags, &mut logger, Some(&*progress), 0).await?;
+                        if task.cancel_flag.load(Ordering::SeqCst) { return Err("Transfer cancelled before publication.".to_string()); }
+                        if f.merge_directories {
+                            merge_staged_local_tree(&staged_tree, local_dest, &task.cancel_flag, 0)?;
+                        } else {
+                            linscp_platform::gui_os::rename_no_replace(&staged_tree, local_dest)
+                                .map_err(|e| format!("Cannot publish downloaded directory '{}': {e}", local_dest.display()))?;
+                        }
                     }
                 } else {
                     if entry.is_symlink { return Err("Refusing to transfer a remote symlink.".to_string()); }
-                    if f.resume {
+                    if saf_dest {
+                        // The bridge has no appends and no partial files, so a
+                        // granted download never resumes; preflight refuses
+                        // this combination, and the worker fails closed too.
+                        if f.resume { return Err("Verified resume is not supported for granted folders.".to_string()); }
+                        let stage = tempfile::Builder::new().prefix("linscp-saf-download-").rand_bytes(16).tempdir()
+                            .map_err(|e| format!("Cannot create download staging directory: {e}"))?;
+                        let staged_file = stage.path().join("contents");
+                        download_single_file(session.as_ref(), remote_path, Some(&entry), &staged_file, &f, &mut logger, Some(&*progress)).await?;
+                        let fs = self.local_fs.clone();
+                        let dest = local_dest.to_string_lossy().into_owned();
+                        let no_replace = !*allow_overwrite;
+                        let cancel = Arc::clone(&task.cancel_flag);
+                        let published = tokio::task::spawn_blocking(move || {
+                            publish_staged_file_to_saf(fs.as_ref(), &staged_file, &dest, no_replace, &cancel)
+                        })
+                        .await
+                        .map_err(|e| format!("Local worker panicked: {e}"))?;
+                        published?;
+                    } else if f.resume {
                         linscp_engine::transfer::download_verified_resume(session.as_ref(), remote_path, &entry, local_dest, &f, &mut logger, Some(&*progress)).await?;
                     } else {
                         download_single_file(session.as_ref(), remote_path, Some(&entry), local_dest, &f, &mut logger, Some(&*progress)).await?;
@@ -825,6 +866,23 @@ impl QueueManager {
                 flags,
                 ..
             } => {
+                // A granted source cannot go through the engine's path I/O:
+                // it is staged onto a plain path first, and the guarded
+                // upload below runs unchanged from the stage.
+                let upload_stage = if crate::is_saf_path(&local_src.to_string_lossy()) {
+                    let fs = self.local_fs.clone();
+                    let uri = local_src.to_string_lossy().into_owned();
+                    let cancel = Arc::clone(&task.cancel_flag);
+                    let staged = tokio::task::spawn_blocking(move || {
+                        stage_saf_upload_source(fs.as_ref(), &uri, &cancel)
+                    })
+                    .await
+                    .map_err(|e| format!("Local worker panicked: {e}"))?;
+                    Some(staged?)
+                } else {
+                    None
+                };
+                let local_src: &Path = upload_stage.as_ref().map(|stage| stage.root.as_path()).unwrap_or(local_src);
                 let source_meta = std::fs::symlink_metadata(local_src).map_err(|e| format!("Cannot inspect local source '{}': {e}", local_src.display()))?;
                 if let Some(entry) = session.stat(remote_dest).await.map_err(|e| e.to_string())? {
                     let allowed_dir = source_meta.is_dir() && !source_meta.file_type().is_symlink() && flags.merge_directories && entry.is_dir && !entry.is_symlink;

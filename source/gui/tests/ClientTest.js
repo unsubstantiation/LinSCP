@@ -1653,18 +1653,16 @@ function options(id) {
     .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
   const safUploadsBefore = posted('/api/transfer/upload');
   await window.transfer('upload');
-  check('a granted folder is not offered transfers',
-    text('toast').includes(safReason('transfer')) &&
-      posted('/api/transfer/upload') === safUploadsBefore,
+  check('a granted folder is offered transfers',
+    posted('/api/transfer/upload') === safUploadsBefore + 1,
     text('toast'));
 
   const confirmsBefore = confirmMessages.length;
   const movesBefore = posted('/api/transfer/move');
   await window.moveToOtherPane();
-  check('a granted folder is not offered moves',
-    text('toast').includes(safReason('transfer')) &&
-      confirmMessages.length === confirmsBefore &&
-      posted('/api/transfer/move') === movesBefore,
+  check('a granted folder is offered moves',
+    confirmMessages.length === confirmsBefore + 1 &&
+      posted('/api/transfer/move') === movesBefore + 1,
     text('toast'));
 
   const chmodsBefore = posted('/api/local/chmod');
@@ -1688,9 +1686,8 @@ function options(id) {
     doc.getElementById('syncModal').className.indexOf('open') >= 0);
   window.closeModal('syncModal');
 
-  // A local tab copies and moves through LocalFs on both ends, so the
-  // granted folder is offered transfers and moves there; the remote-tab
-  // refusals above still stand.
+  // Both tab kinds offer transfers and moves now; the local tab below
+  // proves the same granted folder is served there too.
   const savedStatusForLocalTab = responses['/api/status'];
   responses['/api/status'] = {
     tabs: [{ id: 1, name: 'local tab', connected: true, is_local: true,

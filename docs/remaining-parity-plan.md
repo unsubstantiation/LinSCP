@@ -4,7 +4,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-88 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+89 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -1029,6 +1029,18 @@ Local copies and moves with a granted end run on LocalFs in the queue worker: by
 **Acceptance criteria:**
 
 - [ ] Copy and move files between a granted folder and app storage and between two granted trees on an Android device or emulator, covering the document-cap refusal and a move onto an existing name.
+
+## platform.android-saf-session-transfers
+
+**Area:** Packaging/platforms · **Status:** partial
+
+Session transfers with a granted local side stage through private temporary files in the queue worker: uploads stage the granted source (keeping its seconds, so the remote keeps its stamps) and run the guarded upload unchanged from the stage; downloads land in a stage and publish across the bridge file by file. Trees stage and publish whole in both directions; merges add to an existing granted tree without replacing any file and fail instead of replacing. Files over the 64 MiB document cap refuse at enqueue time naming the file; verified resume refuses for granted folders, since the bridge has no appends or partial files; WebDAV moves delete the remote source by ETag after the staged download publishes. The page offers transfers and moves for granted folders on both tab kinds.
+
+**Next:** Both remotes are in-memory mocks: no suite has uploaded from or downloaded into a real DocumentsProvider, so provider behaviour (nested document URIs, large-document memory pressure, concurrent writers during a merge) is unproven on a device.
+
+**Acceptance criteria:**
+
+- [ ] Upload, download and move files between a granted folder and a server on an Android device or emulator, covering a tree transfer, the document-cap refusal and the resume refusal.
 
 ## ftp.non-unix-listings
 

@@ -979,7 +979,6 @@ test('granted Android folders name the app-storage limitation per action', () =>
   const granted = 'content://com.android.externalstorage.documents/tree/primary%3ADownload';
   const document = granted + '/document/primary%3ADownload%2Fnote.txt';
   const leads = {
-    transfer: 'Transferring files',
     synchronize: 'Synchronizing',
     keepUpToDate: 'Keep up to date',
     symlink: 'Creating symbolic links',

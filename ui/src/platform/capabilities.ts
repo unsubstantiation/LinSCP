@@ -246,15 +246,15 @@ export function hostDifferenceReason(
 /**
  * Local actions the granted-folder bridge cannot perform. Listing, creating,
  * renaming, deleting, editing, reading properties, copying and moving
- * inside a granted folder work through `LocalFs`; these need a plain
- * filesystem path (symlinks cannot point into a `content://` tree, and
- * POSIX modes do not exist there), so the backend refuses them with a
- * message that names the limitation - and the page asks here first so it
- * does not offer a control that could only fail.
+ * inside a granted folder work through `LocalFs`, and session transfers
+ * stage through temporary files; these need a plain filesystem path
+ * (symlinks cannot point into a `content://` tree, and POSIX modes do not
+ * exist there), so the backend refuses them with a message that names the
+ * limitation - and the page asks here first so it does not offer a control
+ * that could only fail.
  */
 export type SafLimitedAction =
   | 'permissions'
-  | 'transfer'
   | 'synchronize'
   | 'keepUpToDate'
   | 'symlink';
@@ -276,8 +276,6 @@ export function safLimitationReason(
   switch (action) {
     case 'permissions':
       return 'POSIX permissions do not exist on a granted Android folder.';
-    case 'transfer':
-      return 'Transferring files needs a folder in app storage, not a granted Android folder.';
     case 'synchronize':
       return 'Synchronizing needs a folder in app storage, not a granted Android folder.';
     case 'keepUpToDate':

@@ -2,11 +2,11 @@
 
 **Date:** 2026-11-06 · **Branch:** `arena/a4f5fe10-linscp` · **Mode:** audit, then A1 fixed on request.
 
-> **Update (same day):** A1, A2, A3, A4, A5, A6, A7(b), A7(a) slices 1–2, A8 and A9 below have
-> been implemented, and the §3 suites have been triaged (B) — see their **Status** notes for what
-> changed and what still needs a compiler to confirm. The rest of this document is the audit as
-> written, so only the A7(a) session-transfer and sync routing still describes the tree as it was
-> before those changes.
+> **Update (same day):** A1, A2, A3, A4, A5, A6, A7(b), A7(a) slices 1, 2a and 2b, A8 and A9
+> below have been implemented, and the §3 suites have been triaged (B) — see their **Status**
+> notes for what changed and what still needs a compiler to confirm. The rest of this document
+> is the audit as written, so only the A7(a) sync and keep-up-to-date routing still describes
+> the tree as it was before those changes.
 
 **Question asked:** "Make sure we have full feature parity between the builds."
 **Scope, as confirmed:** the three native builds — `linscp-gui` on Windows (MSVC), `linscp-gui` on
@@ -535,6 +535,23 @@ moves on local tabs, and the new capability is `platform.android-saf-local-copy-
 the rest of option (a): session transfers, synchronization and keep-up-to-date. As before, no
 Rust toolchain here, so the new tests compile for the first time in CI.
 
+**Status, continued yet again** (option (a), third slice: session transfers). Uploads and
+downloads with a granted local side stage through private temporary files: the engine gained
+`stage_saf_upload_source` / `publish_staged_file_to_saf` / `publish_staged_tree_to_saf`
+(`safe_tree_name` moved there so the queue and the staging share its rule), the worker stages
+a granted upload source and runs the guarded upload unchanged from the stage, and granted
+downloads land in a stage and publish across the bridge file by file. Staged sources keep
+their seconds so the remote keeps its stamps; trees stage and publish whole both ways;
+merges add without replacing and fail instead of replacing; over-cap files refuse at enqueue
+time; verified resume refuses for granted folders (the bridge has no appends or partial
+files), in preflight and in the worker; WebDAV moves delete the remote source by ETag after
+the staged download publishes. The bundle dropped `transfer`, the page offers transfers and
+moves for granted folders on both tab kinds, and the new capability is
+`platform.android-saf-session-transfers` = `partial`, evidenced by three mock-session
+service tests and two page checks. Still refused, as the rest of option (a):
+synchronization and keep-up-to-date. As before, no Rust toolchain here, so the new tests
+compile for the first time in CI.
+
 ### A8. Kerberos/GSSAPI exists only on Linux; Windows has no SSPI backend at all
 **Platforms:** Windows ✗, Android ✗ (fail closed), Debian ✓
 **Evidence:** `crates/linscp-platform/src/gssapi_sys.rs` is `#[cfg(target_os = "linux")]` for the
@@ -768,10 +785,11 @@ Ordered by (user impact × confidence) ÷ effort. All are small except where not
    of those through a new bundle reason next to `hostCapabilities`, and the boundary recorded as
    `platform.android-saf-refusals` = `verified`. Option (a) has since begun — see A7's
    continued *Status*: the editor and properties route through `LocalFs` (first slice,
-   `platform.android-saf-editing` = `partial` pending a device run) and local copy/move
-   follows (second slice, `platform.android-saf-local-copy-move` = `partial`), while
-   session transfers, sync and keep-up-to-date keep their refusals for the rest of the
-   engine routing.
+   `platform.android-saf-editing` = `partial` pending a device run), local copy/move
+   follows (second slice, `platform.android-saf-local-copy-move` = `partial`) and
+   session transfers stage through temporary files (third slice,
+   `platform.android-saf-session-transfers` = `partial`), while sync and
+   keep-up-to-date keep their refusals for the rest of the engine routing.
 7. **A4 local symlink** — **done**, see A4's *Status: fixed*: a shared `create_local_link` helper
    behind `/api/local/link` and a local branch in `link_remote_async`, one pane-aware page dialog,
    and the granted-folder refusal in both layers. **A9 Android agent message** — **done**, see

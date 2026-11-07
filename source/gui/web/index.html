@@ -2640,11 +2640,8 @@
     }
     const direction = source === 'local' ? 'upload' : 'download';
     const destination = source === 'local' ? state.remote.path : state.local.path;
-    // Before asking: on a remote tab a move is a transfer that touches the
-    // local side, which may be granted; local-to-local moves go through
-    // LocalFs on both ends.
-    const moveGap = tab.is_local ? null : safGap('transfer', state.local.path);
-    if (moveGap) { toast(moveGap, true); return; }
+    // A granted local side stages through temporary files on the way in or
+    // out, so moves are offered for granted folders on both tab kinds.
     const question = tab.is_local ?
       t("Move {count} item(s) to {destination}?\n\nLocal moves require a new destination on the same filesystem.", {count: names.length, destination}) :
       t("Move {count} file(s) to {destination}?\n\nThe source is removed only after its transfer completes successfully.", {count: names.length, destination});
@@ -2697,10 +2694,8 @@
     }
     const tab = activeTab();
     if (!tab || !tab.connected) { toast(t("Not connected."), true); return; }
-    // A local tab copies through LocalFs on both ends; otherwise the local
-    // side may be a granted folder the session transfer cannot read.
-    const transferGap = tab.is_local ? null : safGap('transfer', state.local.path);
-    if (transferGap) { toast(transferGap, true); return; }
+    // A granted local side stages through temporary files on the way in or
+    // out, so transfers are offered for granted folders on both tab kinds.
     const endpoint = direction === 'upload' ? '/api/transfer/upload' : '/api/transfer/download';
     const payload = Object.assign({
       tab: tab.id,

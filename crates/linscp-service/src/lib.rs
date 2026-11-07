@@ -1657,14 +1657,10 @@ impl CommanderService {
             Some(path) => match check_local_pane_directory(path, "local_dir") { Ok(path) => path, Err(error) => return api_error(400, error) },
             None => return api_error(400, "Missing local directory"),
         };
-        // The pane check accepts a granted folder structurally. Remote tabs
-        // still transfer through the engine's plain-path I/O, so a granted
-        // local side refuses by name; local tabs copy and move through
-        // `LocalFs` in the queue worker.
-        if is_saf_path(&local_dir) && !tab.is_local {
-            let action = if move_item { "Moving files" } else { "Transferring files" };
-            return api_error(400, saf_unsupported(action));
-        }
+        // The pane check accepts a granted folder structurally. Session
+        // transfers stage its bytes through temporary files in the queue
+        // worker, so a granted local side is statted through `LocalFs`
+        // below instead of refused.
         let other_dir = body.get("remote_dir").and_then(Value::as_str).unwrap_or("");
         if other_dir.is_empty() || other_dir.chars().any(char::is_control) { return api_error(400, "Missing remote directory"); }
         let session = tab.remote.clone();
@@ -1724,9 +1720,22 @@ impl CommanderService {
                 size = src_len;
                 exists = if is_saf_path(&destination) { self.local_fs.stat(&destination).is_ok() } else { std::fs::symlink_metadata(&destination).is_ok() };
             } else if upload {
-                let meta = match std::fs::symlink_metadata(&local) { Ok(meta) if (meta.is_file() || meta.is_dir()) && !meta.file_type().is_symlink() => meta, Ok(_) => return api_error(400, "Only regular files and directories can be transferred"), Err(error) => return api_error(400, error.to_string()) };
-                is_dir = meta.is_dir();
-                size = if is_dir { 0 } else { meta.len() };
+                // A granted source is statted through `LocalFs`; the worker
+                // stages it before the guarded upload runs.
+                let local_str = local.to_string_lossy();
+                let (src_is_dir, src_len) = if is_saf_path(&local_str) {
+                    let info = match self.local_fs.stat(&local_str) {
+                        Ok(info) if !info.is_symlink => info,
+                        Ok(_) => return api_error(400, "Only regular files and directories can be transferred"),
+                        Err(error) => return api_error(400, error.to_string()),
+                    };
+                    (info.is_dir, if info.is_dir { 0 } else { info.size })
+                } else {
+                    let meta = match std::fs::symlink_metadata(&local) { Ok(meta) if (meta.is_file() || meta.is_dir()) && !meta.file_type().is_symlink() => meta, Ok(_) => return api_error(400, "Only regular files and directories can be transferred"), Err(error) => return api_error(400, error.to_string()) };
+                    (meta.is_dir(), if meta.is_dir() { 0 } else { meta.len() })
+                };
+                is_dir = src_is_dir;
+                size = src_len;
                 exists = match session.as_ref().unwrap().stat(&other).await {
                     Ok(Some(entry)) if entry.is_symlink || entry.is_dir != is_dir => return api_error(400, "Destination type conflicts with source or is a symlink"),
                     Ok(entry) => entry.is_some(), Err(error) => return api_error(400, error.to_string()),
@@ -1735,9 +1744,10 @@ impl CommanderService {
                 let entry = match session.as_ref().unwrap().stat(&other).await { Ok(Some(entry)) if !entry.is_symlink => entry, Ok(_) => return api_error(400, "Only existing files and directories can be transferred"), Err(error) => return api_error(400, error.to_string()) };
                 is_dir = entry.is_dir;
                 size = if is_dir { 0 } else { entry.size };
-                exists = std::fs::symlink_metadata(&local).is_ok();
+                exists = if is_saf_path(&local.to_string_lossy()) { self.local_fs.stat(&local.to_string_lossy()).is_ok() } else { std::fs::symlink_metadata(&local).is_ok() };
             }
             if resume && is_dir { return api_error(400, "Verified resume is supported only for individual files."); }
+            if resume && is_saf_path(&local.to_string_lossy()) { return api_error(400, "Verified resume is not supported for granted folders."); }
             if move_item && !tab.is_local && is_dir { return api_error(400, "WebDAV directory moves are not supported."); }
             if is_dir && !move_item {
                 let scheme = session.as_ref().map(|s| s.scheme());
@@ -1752,8 +1762,9 @@ impl CommanderService {
                 return api_error(409, "Moves require a new destination; overwriting is not supported.");
             }
             if !upload || tab.is_local {
-                // A granted destination only reaches here on a local tab;
-                // remote tabs with a granted local side were refused above.
+                // A granted destination — a copy target or a download
+                // landing — is statted through `LocalFs`; uploads check the
+                // remote side instead, above.
                 let conflict = if is_saf_path(&destination) {
                     self.local_fs.stat(&destination).is_ok_and(|info| info.is_symlink || (is_dir && !info.is_dir) || (!is_dir && info.is_dir))
                 } else {
@@ -1762,10 +1773,11 @@ impl CommanderService {
                 };
                 if conflict { return api_error(400, "Destination type conflicts with source or is a symlink"); }
             }
-            // Granted copies and moves always carry bytes across the bridge,
-            // so an over-cap file refuses here; directories report size zero
-            // and are judged per file in the worker instead.
-            if tab.is_local && !is_dir && (is_saf_path(&source) || is_saf_path(&destination)) && size > linscp_platform::MAX_SAF_DOCUMENT_BYTES {
+            // A granted end always carries bytes across the bridge whole,
+            // so an over-cap file refuses here — on a copy, an upload or a
+            // download; directories report size zero and are judged per
+            // file in the worker instead.
+            if !is_dir && (is_saf_path(&source) || is_saf_path(&destination)) && size > linscp_platform::MAX_SAF_DOCUMENT_BYTES {
                 return api_error(400, linscp_platform::saf_document_too_large(name, size));
             }
             let is_dav_upload = !tab.is_local && upload && matches!(session.as_ref().unwrap().scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs);
@@ -9268,6 +9280,352 @@ mod tests {
         let failed = wait_for_task(&svc, "Failed").await;
         assert!(failed["error"].as_str().unwrap_or("").contains("symbolic link"), "{}", failed);
         assert!(tmp.join("linked/real.txt").is_file(), "the source survives a failed move");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    use linscp_proto::{ProtoError, RemoteSession, TransferRequest};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    /// One in-memory remote file or directory for the session-transfer tests.
+    struct MockRemoteDoc {
+        bytes: Vec<u8>,
+        is_dir: bool,
+        mtime: i64,
+    }
+
+    /// In-memory `RemoteSession` for the session-transfer tests: paths are
+    /// absolute `/`-joined names, uploads record the offered mtime so the
+    /// tests see the staged stamps, and unneeded operations fail like a
+    /// server that refuses them.
+    struct MockSession {
+        docs: Mutex<HashMap<String, MockRemoteDoc>>,
+    }
+
+    impl MockSession {
+        /// The strong ETag every mock document answers to.
+        const ETAG: &'static str = "\"mock-etag\"";
+
+        fn new() -> Self {
+            let session = MockSession { docs: Mutex::new(HashMap::new()) };
+            session.add_dir("/");
+            session
+        }
+
+        fn add_file(&self, path: &str, content: &[u8]) {
+            self.docs.lock().expect("m").insert(path.to_string(), MockRemoteDoc { bytes: content.to_vec(), is_dir: false, mtime: 0 });
+        }
+
+        fn add_dir(&self, path: &str) {
+            self.docs.lock().expect("m").insert(path.to_string(), MockRemoteDoc { bytes: Vec::new(), is_dir: true, mtime: 0 });
+        }
+
+        fn bytes_of(&self, path: &str) -> Option<Vec<u8>> {
+            self.docs.lock().expect("m").get(path).filter(|doc| !doc.is_dir).map(|doc| doc.bytes.clone())
+        }
+
+        fn mtime_of(&self, path: &str) -> Option<i64> {
+            self.docs.lock().expect("m").get(path).map(|doc| doc.mtime)
+        }
+
+        fn leaf_of(path: &str) -> &str {
+            path.rsplit('/').next().unwrap_or(path)
+        }
+
+        fn parent_of(path: &str) -> &str {
+            match path.rsplit_once('/') {
+                Some(("", _)) | None => "/",
+                Some((parent, _)) => parent,
+            }
+        }
+
+        fn entry_for(path: &str, doc: &MockRemoteDoc) -> FileEntry {
+            FileEntry { name: Self::leaf_of(path).to_string(), size: doc.bytes.len() as u64, is_dir: doc.is_dir, is_symlink: false, broken_link: false, date: String::new(), mtime: doc.mtime, permissions: String::new(), owner: None, group: None }
+        }
+
+        fn missing(path: &str) -> ProtoError {
+            ProtoError::Transport(format!("No such file or directory: '{path}'."))
+        }
+
+        async fn serve(&self, path: &str, offset: u64, sink: &mut (dyn AsyncWrite + Unpin + Send), progress: Option<&ProgressCallback>) -> Result<u64, ProtoError> {
+            let bytes = self.bytes_of(path).ok_or_else(|| Self::missing(path))?;
+            let from = offset.min(bytes.len() as u64) as usize;
+            sink.write_all(&bytes[from..]).await.map_err(|e| ProtoError::Transport(e.to_string()))?;
+            let sent = (bytes.len() - from) as u64;
+            if let Some(report) = progress { report(sent, bytes.len() as u64); }
+            Ok(sent)
+        }
+
+        async fn store(&self, path: &str, opts: TransferRequest, source: &mut (dyn AsyncRead + Unpin + Send), progress: Option<&ProgressCallback>) -> Result<u64, ProtoError> {
+            let mut bytes = Vec::new();
+            source.read_to_end(&mut bytes).await.map_err(|e| ProtoError::Transport(e.to_string()))?;
+            let sent = bytes.len() as u64;
+            let mtime = if opts.preserve_time { opts.mtime.unwrap_or(0) } else { 0 };
+            self.docs.lock().expect("m").insert(path.to_string(), MockRemoteDoc { bytes, is_dir: false, mtime });
+            if let Some(report) = progress { report(sent, sent); }
+            Ok(sent)
+        }
+    }
+
+    impl RemoteSession for MockSession {
+        fn scheme(&self) -> ProtocolScheme { ProtocolScheme::Dav }
+
+        async fn pwd(&self) -> Result<String, ProtoError> { Ok("/".to_string()) }
+
+        async fn stat(&self, remote_path: &str) -> Result<Option<FileEntry>, ProtoError> {
+            let docs = self.docs.lock().expect("m");
+            Ok(docs.get(remote_path).map(|doc| Self::entry_for(remote_path, doc)))
+        }
+
+        async fn list_dir(&self, remote_path: &str) -> Result<Vec<FileEntry>, ProtoError> {
+            let docs = self.docs.lock().expect("m");
+            let mut paths: Vec<String> = docs.keys()
+                .filter(|path| Self::parent_of(path) == remote_path && path.as_str() != remote_path)
+                .cloned().collect();
+            paths.sort();
+            Ok(paths.iter().map(|path| Self::entry_for(path, &docs[path])).collect())
+        }
+
+        async fn mkdir(&self, remote_path: &str) -> Result<(), ProtoError> {
+            let mut docs = self.docs.lock().expect("m");
+            if docs.contains_key(remote_path) {
+                return Err(ProtoError::Transport(format!("Cannot create directory '{remote_path}': it already exists.")));
+            }
+            docs.insert(remote_path.to_string(), MockRemoteDoc { bytes: Vec::new(), is_dir: true, mtime: 0 });
+            Ok(())
+        }
+
+        async fn remove_file(&self, remote_path: &str) -> Result<(), ProtoError> {
+            let mut docs = self.docs.lock().expect("m");
+            match docs.get(remote_path) {
+                Some(doc) if !doc.is_dir => { docs.remove(remote_path); Ok(()) }
+                _ => Err(Self::missing(remote_path)),
+            }
+        }
+
+        async fn remove_dir(&self, remote_path: &str) -> Result<(), ProtoError> {
+            let prefix = format!("{}/", remote_path.trim_end_matches('/'));
+            let mut docs = self.docs.lock().expect("m");
+            if !docs.contains_key(remote_path) { return Err(Self::missing(remote_path)); }
+            docs.retain(|key, _| key.as_str() != remote_path && !key.as_str().starts_with(prefix.as_str()));
+            Ok(())
+        }
+
+        async fn rename(&self, from: &str, to: &str) -> Result<(), ProtoError> {
+            let mut docs = self.docs.lock().expect("m");
+            let doc = docs.remove(from).ok_or_else(|| Self::missing(from))?;
+            docs.insert(to.to_string(), doc);
+            Ok(())
+        }
+
+        async fn copy_file(&self, from: &str, to: &str) -> Result<(), ProtoError> {
+            let mut docs = self.docs.lock().expect("m");
+            let doc = docs.get(from).ok_or_else(|| Self::missing(from))?;
+            if doc.is_dir { return Err(ProtoError::Transport(format!("Cannot copy directory '{from}' as a file."))); }
+            let bytes = doc.bytes.clone();
+            let mtime = doc.mtime;
+            docs.insert(to.to_string(), MockRemoteDoc { bytes, is_dir: false, mtime });
+            Ok(())
+        }
+
+        async fn symlink(&self, _target: &str, _link_path: &str) -> Result<(), ProtoError> {
+            Err(ProtoError::UnsupportedCapability("symlink", self.scheme()))
+        }
+
+        async fn chmod(&self, _remote_path: &str, _mode: u32) -> Result<(), ProtoError> { Ok(()) }
+
+        async fn set_mtime(&self, _remote_path: &str, _mtime: i64) -> Result<(), ProtoError> { Ok(()) }
+
+        async fn checksum(&self, _algorithm: &str, _remote_path: &str) -> Result<String, ProtoError> {
+            Err(ProtoError::UnsupportedCapability("checksum", self.scheme()))
+        }
+
+        async fn download(&self, remote_path: &str, opts: TransferRequest, sink: &mut (dyn AsyncWrite + Unpin + Send), progress: Option<&ProgressCallback>) -> Result<u64, ProtoError> {
+            self.serve(remote_path, opts.resume_offset, sink, progress).await
+        }
+
+        async fn download_if_match(&self, remote_path: &str, etag: &str, opts: TransferRequest, sink: &mut (dyn AsyncWrite + Unpin + Send), progress: Option<&ProgressCallback>) -> Result<u64, ProtoError> {
+            if etag != Self::ETAG { return Err(ProtoError::Transport(format!("Remote file '{remote_path}' changed; conditional download refused."))); }
+            self.serve(remote_path, opts.resume_offset, sink, progress).await
+        }
+
+        async fn dav_stat_with_etag(&self, remote_path: &str) -> Result<(Option<FileEntry>, Option<String>), ProtoError> {
+            Ok((self.stat(remote_path).await?, Some(Self::ETAG.to_string())))
+        }
+
+        async fn dav_get_etag(&self, _remote_path: &str) -> Result<(Option<String>, bool), ProtoError> {
+            Ok((Some(Self::ETAG.to_string()), false))
+        }
+
+        async fn remove_if_match(&self, remote_path: &str, etag: &str) -> Result<(), ProtoError> {
+            if etag != Self::ETAG { return Err(ProtoError::Transport(format!("Remote file '{remote_path}' changed; conditional delete refused."))); }
+            self.remove_file(remote_path).await
+        }
+
+        async fn upload(&self, remote_path: &str, opts: TransferRequest, source: &mut (dyn AsyncRead + Unpin + Send), _total_size: Option<u64>, progress: Option<&ProgressCallback>) -> Result<u64, ProtoError> {
+            self.store(remote_path, opts, source, progress).await
+        }
+
+        async fn upload_exclusive(&self, remote_path: &str, opts: TransferRequest, source: &mut (dyn AsyncRead + Unpin + Send), _total_size: Option<u64>, progress: Option<&ProgressCallback>) -> Result<u64, ProtoError> {
+            if self.docs.lock().expect("m").contains_key(remote_path) {
+                return Err(ProtoError::Transport(format!("Remote file '{remote_path}' already exists.")));
+            }
+            self.store(remote_path, opts, source, progress).await
+        }
+    }
+
+    /// Opens a remote tab against `session` without dialling anywhere: the
+    /// tab row is inserted directly, so session transfers run the real
+    /// preflight and worker against the mock.
+    fn insert_remote_tab(service: &CommanderService, session: Arc<MockSession>, local_dir: &str) -> u64 {
+        let tab = TabRuntime { id: 7, name: "mock".to_string(), site_name: None, is_local: false, connected: true, local_dir: local_dir.to_string(), remote_dir: "/".to_string(), other_local_dir: String::new(), observed_hostkey: String::new(), hostkey_role: "destination".to_string(), hostkey_changed: false, error: String::new(), spec: None, session_json: json!({"protocol": "dav"}), remote: Some(session) };
+        service.state.lock().expect("state mutex").tabs.insert(tab.id, tab);
+        7
+    }
+
+    /// A session-download request body with the WebDAV tree options set.
+    fn download_body(id: u64, name: &str, accept_risk: bool, merge: bool) -> Value {
+        let mut body = json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "names": [name]});
+        if accept_risk { body["accept_directory_copy_risk"] = json!(true); }
+        if merge { body["merge_directories"] = json!([name]); }
+        body
+    }
+
+    /// The `linscp-saf-*` staging directories currently in the system
+    /// temporary directory, for before/after leak checks.
+    fn saf_stage_names() -> std::collections::BTreeSet<std::ffi::OsString> {
+        std::fs::read_dir(std::env::temp_dir()).map(|entries| {
+            entries.filter_map(Result::ok)
+                .map(|entry| entry.file_name())
+                .filter(|name| name.to_string_lossy().starts_with("linscp-saf-"))
+                .collect()
+        }).unwrap_or_default()
+    }
+
+    /// Uploads from a granted folder stage through temporary files: a file
+    /// keeps its bytes and its seconds, a tree uploads whole, an over-cap
+    /// file refuses at enqueue time naming the file, and no stage leaks.
+    #[tokio::test]
+    async fn saf_session_upload_stages_through_temp_files() {
+        let tmp = std::env::temp_dir().join(format!("linscp-saf-up-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let bridge = Arc::new(MockBridge::with_file("up.txt", b"upload bytes"));
+        bridge.add_dir(&format!("{SAF_GRANTED_DIR}/document/tree"));
+        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/tree/nested.txt"), b"nested upload");
+        let fs = NativeLocalFs::with_saf(bridge.clone());
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(fs));
+        let session = Arc::new(MockSession::new());
+        let id = insert_remote_tab(&svc, session.clone(), SAF_GRANTED_DIR);
+        let stages_before = saf_stage_names();
+        // A file keeps its bytes and its seconds.
+        let queued = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "names": ["up.txt"]}) }).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(session.bytes_of("/up.txt").as_deref(), Some(b"upload bytes".as_slice()), "the remote holds the upload");
+        assert_eq!(session.mtime_of("/up.txt"), Some(1_791_875_271), "the remote keeps the granted seconds");
+        // A tree uploads whole, after the WebDAV risk dance.
+        let risk = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "names": ["tree"]}) }).await;
+        assert_eq!(risk.status, 409, "{}", risk.payload);
+        assert_eq!(risk.payload["directory_copy_risk"], true);
+        let queued_tree = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "names": ["tree"], "accept_directory_copy_risk": true}) }).await;
+        assert_eq!(queued_tree.status, 200, "{}", queued_tree.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(session.bytes_of("/tree/nested.txt").as_deref(), Some(b"nested upload".as_slice()), "the remote holds the tree");
+        assert!(session.stat("/tree").await.unwrap().unwrap().is_dir);
+        // An over-cap file refuses at enqueue time, naming the file.
+        let big = vec![0u8; (linscp_platform::MAX_SAF_DOCUMENT_BYTES + 1) as usize];
+        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/big.bin"), &big);
+        let refused = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "names": ["big.bin"]}) }).await;
+        assert_eq!(refused.status, 400, "{}", refused.payload);
+        assert!(refused.payload["error"].as_str().unwrap_or("").contains("larger than a granted folder can carry"), "{}", refused.payload);
+        assert!(saf_stage_names().difference(&stages_before).next().is_none(), "a session upload leaked its staging directory");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Downloads into a granted folder land in a stage and publish across
+    /// the bridge: a file, a fresh tree, and a merge that adds without
+    /// replacing; an overlapping merge fails, and an over-cap remote file
+    /// and a resume refuse at enqueue time.
+    #[tokio::test]
+    async fn saf_session_download_stages_through_temp_files() {
+        let tmp = std::env::temp_dir().join(format!("linscp-saf-down-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let bridge = Arc::new(MockBridge::with_file("seed.txt", b"seed"));
+        let fs = NativeLocalFs::with_saf(bridge.clone());
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(fs));
+        let session = Arc::new(MockSession::new());
+        session.add_file("/down.txt", b"download bytes");
+        session.add_dir("/tree");
+        session.add_file("/tree/a.txt", b"tree a");
+        session.add_dir("/tree/sub");
+        session.add_file("/tree/sub/b.txt", b"tree b");
+        session.add_dir("/mtree");
+        session.add_file("/mtree/new.txt", b"merged in");
+        session.add_dir("/mtree2");
+        session.add_file("/mtree2/x.txt", b"remote x");
+        let big = vec![0u8; (linscp_platform::MAX_SAF_DOCUMENT_BYTES + 1) as usize];
+        session.add_file("/huge.bin", &big);
+        let id = insert_remote_tab(&svc, session.clone(), SAF_GRANTED_DIR);
+        let stages_before = saf_stage_names();
+        let download = |body: Value| ApiEnvelope { method: "POST".into(), path: "/api/transfer/download".into(), body };
+        // A file lands across the bridge.
+        let queued = svc.dispatch_async(download(download_body(id, "down.txt", false, false))).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(bridge.bytes_of("down.txt").as_deref(), Some(b"download bytes".as_slice()), "the granted folder holds the download");
+        // A fresh tree publishes whole, after the WebDAV risk dance.
+        let risk = svc.dispatch_async(download(download_body(id, "tree", false, false))).await;
+        assert_eq!(risk.status, 409, "{}", risk.payload);
+        let queued_tree = svc.dispatch_async(download(download_body(id, "tree", true, false))).await;
+        assert_eq!(queued_tree.status, 200, "{}", queued_tree.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/tree/a.txt")).as_deref(), Some(b"tree a".as_slice()));
+        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/tree/sub/b.txt")).as_deref(), Some(b"tree b".as_slice()));
+        // A merge adds without replacing.
+        bridge.add_dir(&format!("{SAF_GRANTED_DIR}/document/mtree"));
+        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/mtree/old.txt"), b"stays");
+        let merged = svc.dispatch_async(download(download_body(id, "mtree", true, true))).await;
+        assert_eq!(merged.status, 200, "{}", merged.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/mtree/new.txt")).as_deref(), Some(b"merged in".as_slice()));
+        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/mtree/old.txt")).as_deref(), Some(b"stays".as_slice()), "the merge keeps granted files");
+        // An overlapping merge fails instead of replacing.
+        bridge.add_dir(&format!("{SAF_GRANTED_DIR}/document/mtree2"));
+        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/mtree2/x.txt"), b"granted x");
+        let overlap = svc.dispatch_async(download(download_body(id, "mtree2", true, true))).await;
+        assert_eq!(overlap.status, 200, "{}", overlap.payload);
+        let failed = wait_for_task(&svc, "Failed").await;
+        assert!(failed["error"].as_str().unwrap_or("").contains("already exists"), "{}", failed);
+        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/mtree2/x.txt")).as_deref(), Some(b"granted x".as_slice()), "the failed merge keeps the granted file");
+        // An over-cap remote file and a resume refuse at enqueue time.
+        let refused = svc.dispatch_async(download(download_body(id, "huge.bin", false, false))).await;
+        assert_eq!(refused.status, 400, "{}", refused.payload);
+        assert!(refused.payload["error"].as_str().unwrap_or("").contains("larger than a granted folder can carry"), "{}", refused.payload);
+        let mut resume_body = download_body(id, "down.txt", false, false);
+        resume_body["resume"] = json!(true);
+        let resumed = svc.dispatch_async(download(resume_body)).await;
+        assert_eq!(resumed.status, 400, "{}", resumed.payload);
+        assert!(resumed.payload["error"].as_str().unwrap_or("").contains("Verified resume is not supported for granted folders"), "{}", resumed.payload);
+        assert!(saf_stage_names().difference(&stages_before).next().is_none(), "a session download leaked its staging directory");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// A WebDAV move into a granted folder stages the download, publishes
+    /// across the bridge, then deletes the remote source by ETag.
+    #[tokio::test]
+    async fn saf_webdav_move_to_granted_folder_deletes_remote_source() {
+        let tmp = std::env::temp_dir().join(format!("linscp-saf-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let bridge = Arc::new(MockBridge::with_file("seed.txt", b"seed"));
+        let fs = NativeLocalFs::with_saf(bridge.clone());
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(fs));
+        let session = Arc::new(MockSession::new());
+        session.add_file("/gone.txt", b"moving down");
+        let id = insert_remote_tab(&svc, session.clone(), SAF_GRANTED_DIR);
+        let moved = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": id, "direction": "download", "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "names": ["gone.txt"]}) }).await;
+        assert_eq!(moved.status, 200, "{}", moved.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(bridge.bytes_of("gone.txt").as_deref(), Some(b"moving down".as_slice()), "the granted folder holds the move");
+        assert!(session.stat("/gone.txt").await.unwrap().is_none(), "the remote source is deleted");
         let _ = std::fs::remove_dir_all(tmp);
     }
 
