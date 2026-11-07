@@ -4716,6 +4716,54 @@
       ]
     },
     {
+      "id": "platform.android-saf-refusals",
+      "area": "Packaging/platforms",
+      "status": "verified",
+      "notes": "Every local action the granted-folder bridge does not implement fails closed with a message that names the limitation, and the page stops offering those actions for granted folders. The service refuses editing, saving, properties, synchronization, keep-up-to-date, transfers and local copy/move with one shared refusal (a folder in app storage, not a granted folder); chmod is routed through LocalFs.set_permissions_mode, so the bridge owns its POSIX-permissions message instead of the user getting a raw I/O error. The page asks the shared bundle (safLimitationReason, next to hostCapabilities) before opening the editor, the synchronize and keep-up-to-date dialogues, queueing a transfer or move, prompting for permissions, or drawing the properties rights editor, and shows the reason instead. (The other pane of a local tab keeps its older behaviour for plain paths, which never resolved there; only granted other panes changed, from a path error to the named refusal.)",
+      "source": [
+        "crates/linscp-service/src/lib.rs",
+        "ui/src/platform/capabilities.ts",
+        "source/gui/web/index.html"
+      ],
+      "checks": {
+        "service": [
+          "saf_editor_and_permissions_refuse_granted_folders",
+          "saf_other_pane_refuses_edit_properties_and_rights",
+          "saf_local_copy_and_move_refuse_granted_folders",
+          "sync_and_watch_refuse_granted_folders"
+        ],
+        "ui-transport": [
+          "granted Android folders name the app-storage limitation per action"
+        ],
+        "gui": [
+          "a granted folder is not offered the editor",
+          "a granted folder is not offered synchronization",
+          "a granted folder is not offered keep-up-to-date",
+          "a granted folder is not offered transfers",
+          "a granted folder is not offered moves",
+          "a granted folder is not offered chmod",
+          "properties on a granted folder explain the missing rights editor",
+          "leaving the granted folder offers the actions again"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "service",
+          "ui-transport",
+          "gui"
+        ],
+        "windows": [
+          "service",
+          "ui-transport",
+          "gui"
+        ],
+        "android": [
+          "ui-transport",
+          "gui"
+        ]
+      }
+    },
+    {
       "id": "ftp.non-unix-listings",
       "area": "FTP/FTPS",
       "status": "partial",

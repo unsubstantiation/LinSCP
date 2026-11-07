@@ -2,10 +2,10 @@
 
 **Date:** 2026-11-06 · **Branch:** `arena/a4f5fe10-linscp` · **Mode:** audit, then A1 fixed on request.
 
-> **Update (same day):** A1, A2, A3 and A6 below have been implemented, and the §3 suites have
-> been triaged (B) — see their **Status** notes for what changed and what still needs a compiler to
-> confirm. The rest of this document is the audit as written, so A4–A5 and A7–A9 still describe the
-> tree as it was before those changes.
+> **Update (same day):** A1, A2, A3, A6 and A7(b) below have been implemented, and the §3 suites
+> have been triaged (B) — see their **Status** notes for what changed and what still needs a
+> compiler to confirm. The rest of this document is the audit as written, so A4–A5, A8–A9 and the
+> A7(a) `LocalFs` routing still describe the tree as it was before those changes.
 
 **Question asked:** "Make sure we have full feature parity between the builds."
 **Scope, as confirmed:** the three native builds — `linscp-gui` on Windows (MSVC), `linscp-gui` on
@@ -436,6 +436,34 @@ app storage, not a granted folder"), and stop *offering* those actions for SAF r
 **Ledger status:** `sync.*` and `transfer.*` rows are `verified` on all three platforms and cite
 `live-sftp` / `live-dav` — Linux-only suites. Nothing records this boundary.
 
+**Status: fixed** (option (b), the honest refusal; the full `LocalFs` routing stays a separate
+decision). Every action of the audit's list now fails closed with a message that names the
+limitation, from one helper (`saf_unsupported` in `crates/linscp-service/src/lib.rs`): editing and
+saving (`handle_local_edit_get`, `handle_local_save`, plus the other pane's `handle_remote_edit_get`
+and `remote_save_async`), properties (a per-row refusal in `handle_remote_properties`, so the
+dialogue shows the reason beside the name), synchronization preview and run plus keep-up-to-date
+(one shared directory check, `check_plain_local_dir`, used by `sync_options_from` and
+`keep_up_to_date_async`), and transfers with local copy/move (both ends checked in
+`queue_transfer_async`, with the message naming the transfer, the copy or the move). `chmod` is
+routed through the bridge's own `LocalFs::set_permissions_mode`, so the audit's unreachable message
+(*"POSIX permissions do not exist on a granted Android folder."*) is now the refusal both panes
+return; the method finally has callers outside its test. The page stops offering all of these for
+granted folders through the shared bundle (`safLimitationReason` in
+`ui/src/platform/capabilities.ts`, next to `hostCapabilities`): the editor, the synchronize and
+keep-up-to-date dialogues, transfers, moves, the permissions prompt and the properties rights editor
+each show the bundle's reason instead of a control that could only fail. The boundary the audit
+found unrecorded is now ledger row `platform.android-saf-refusals` = `verified`, evidenced by four
+service tests, one bundle test and eight page checks; Android cites the tests that run there
+(`ui-transport`, `gui`) and not the Rust suite, which executes nothing in the Android job.
+
+Two things this deliberately did not do. The other pane of a local tab still cannot edit or save
+plain (non-granted) paths — the page sends joined paths where the handlers resolve leaves, so those
+fail as before with a path error; only granted other panes changed, from that error to the named
+refusal. And the bridge already reads and writes document bytes (`read_bytes`,
+`write_bytes_atomic`), which a future option (a) could build the editor on; this fix only refuses.
+Both are reading-level claims: no Rust toolchain here, so the new tests compile for the first time
+in CI.
+
 ### A8. Kerberos/GSSAPI exists only on Linux; Windows has no SSPI backend at all
 **Platforms:** Windows ✗, Android ✗ (fail closed), Debian ✓
 **Evidence:** `crates/linscp-platform/src/gssapi_sys.rs` is `#[cfg(target_os = "linux")]` for the
@@ -604,7 +632,7 @@ evidence").
 | `POST_NOTIFICATIONS` (Android 13+) | yes, requested at first queue (`LinSCPAndroidPlugin.kt:233-235`) | smoke pre-grants it via `pm grant` "to avoid an interactive prompt" (`tools/android_emulator_smoke.sh`), i.e. the request path is deliberately never exercised |
 | Keystore | **no** (A5) | — |
 | Android application ID | `com.fairuniversal.linscp`, read from `tools/android_application_id.py`, asserted in `test_android_application_id.py:23` | consistent: `tauri.conf.json:5`, the Kotlin `package`, and `register_android_plugin("com.fairuniversal.linscp", …)` (`android.rs:331`). The Rust literal is *not* in the "defined once" list (`test_android_application_id.py` readers list only shell/mjs/py), so a rename in `tauri.conf.json` would leave a silent mismatch in `android.rs:331` — worth adding to that test's reader list. |
-| Keep-up-to-date over SAF | **no** (A7) | `sync.keepuptodate-inotify` cites `live-dav` |
+| Keep-up-to-date over SAF | **no**, refused by name (A7(b) done) | `platform.android-saf-refusals` is `verified`; the refusal — not a run — is what is evidenced |
 | Windows file-drop into the window | yes (`linscp-tauri/src/lib.rs:209-224`) | `gui.native-path-drop` is `partial` and its own note admits jsdom cannot produce a WebKit drop |
 
 ---
@@ -638,7 +666,11 @@ Ordered by (user impact × confidence) ÷ effort. All are small except where not
    manifest staging directories routed through `create_private_dir`, and read-back tests that fail
    on an inherited DACL even for a single user.
 6. **A7 (b) honest refusal for SAF roots** — stop offering sync/keep-up-to-date on a granted folder
-   and say why. *S*; the full `LocalFs` routing is *L* and should be a separate decision.
+   and say why. *S*; the full `LocalFs` routing is *L* and should be a separate decision. —
+   **done**, see A7's *Status: fixed*: one shared refusal for edit/save/properties/sync/watch/
+   transfer/copy/move, `chmod` routed through the bridge's own message, the page gating every one
+   of those through a new bundle reason next to `hostCapabilities`, and the boundary recorded as
+   `platform.android-saf-refusals` = `verified`.
 7. **A4 local symlink**, **A9 Android agent message** — small completions. *S* each
 8. **A5 vault** — decide: wire DPAPI (S) and Keystore (M), or delete the dead surface and correct
    `docs/cross-platform-rust-migration.md:181,202,287`. Either is fine; the current state (code that

@@ -214,3 +214,56 @@ export function hostDifferenceReason(
   }
   return null;
 }
+
+/**
+ * Local actions the granted-folder bridge cannot perform. Listing, creating,
+ * renaming and deleting inside a granted folder work through `LocalFs`;
+ * these need a plain filesystem path, so the backend refuses them with a
+ * message that names the limitation - and the page asks here first so it
+ * does not offer a control that could only fail.
+ */
+export type SafLimitedAction =
+  | 'edit'
+  | 'properties'
+  | 'permissions'
+  | 'transfer'
+  | 'copyMove'
+  | 'move'
+  | 'synchronize'
+  | 'keepUpToDate';
+
+/**
+ * The reason a local action is not offered for `path`, or null when the path
+ * is not a granted Android folder. The wording mirrors the service's own
+ * refusals (`saf_unsupported` plus the bridge's permissions message) so the
+ * page and the backend tell one story; an unknown action still gets the
+ * generic limitation rather than silence.
+ */
+export function safLimitationReason(
+  action: SafLimitedAction,
+  path: string | null | undefined,
+): string | null {
+  if (typeof path !== 'string' || !path.startsWith('content://')) {
+    return null;
+  }
+  switch (action) {
+    case 'edit':
+      return 'Editing files needs a folder in app storage, not a granted Android folder.';
+    case 'properties':
+      return 'Reading file properties needs a folder in app storage, not a granted Android folder.';
+    case 'permissions':
+      return 'POSIX permissions do not exist on a granted Android folder.';
+    case 'transfer':
+      return 'Transferring files needs a folder in app storage, not a granted Android folder.';
+    case 'copyMove':
+      return 'Copying or moving files needs a folder in app storage, not a granted Android folder.';
+    case 'move':
+      return 'Moving files needs a folder in app storage, not a granted Android folder.';
+    case 'synchronize':
+      return 'Synchronizing needs a folder in app storage, not a granted Android folder.';
+    case 'keepUpToDate':
+      return 'Keep up to date needs a folder in app storage, not a granted Android folder.';
+    default:
+      return 'This action needs a folder in app storage, not a granted Android folder.';
+  }
+}

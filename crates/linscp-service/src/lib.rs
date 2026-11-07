@@ -753,10 +753,10 @@ impl CommanderService {
             Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected"),
         };
         let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
-        let local_root = body.get("local_dir").and_then(Value::as_str).unwrap_or("").trim().to_string();
-        if local_root.is_empty() || !Path::new(&local_root).is_absolute() {
-            return api_error(400, "An absolute local directory is required.");
-        }
+        let local_root = match check_plain_local_dir(body.get("local_dir").and_then(Value::as_str).unwrap_or(""), "Keep up to date") {
+            Ok(dir) => dir,
+            Err(error) => return api_error(400, error),
+        };
         if !Path::new(&local_root).is_dir() { return api_error(400, "The local directory does not exist.") }
         let remote_root = match validate_remote_absolute_path(body.get("remote_dir").and_then(Value::as_str).unwrap_or("")) {
             Ok(path) => path, Err(error) => return api_error(400, error),
@@ -1073,10 +1073,7 @@ impl CommanderService {
         // copy that deletes what the source no longer has.
         let mirror = body.get("mirror").and_then(Value::as_bool).unwrap_or(false);
         let delete_obsolete = body.get("delete").and_then(Value::as_bool).unwrap_or(false) || mirror;
-        let local_root = body.get("local_dir").and_then(Value::as_str).unwrap_or("").trim().to_string();
-        if local_root.is_empty() || !Path::new(&local_root).is_absolute() {
-            return Err("An absolute local directory is required.".to_string());
-        }
+        let local_root = check_plain_local_dir(body.get("local_dir").and_then(Value::as_str).unwrap_or(""), "Synchronizing")?;
         let remote_root = validate_remote_absolute_path(body.get("remote_dir").and_then(Value::as_str).unwrap_or(""))?;
         let recursive = body.get("recursive").and_then(Value::as_bool).unwrap_or(true);
         let opts = SyncOptions {
@@ -1356,6 +1353,13 @@ impl CommanderService {
                 if path.starts_with('/') { local_body["path"] = json!(path); }
                 else {
                     let joined = format!("{}/{}", tab.other_local_dir.trim_end_matches('/'), path);
+                    // The destination decides: a leaf saved into a granted
+                    // other pane names the limitation instead of failing on
+                    // the join, while an absolute plain path keeps the old
+                    // behaviour of the pane it names.
+                    if is_saf_path(&joined) {
+                        return api_error(400, saf_unsupported("Saving files"));
+                    }
                     local_body["path"] = json!(joined);
                 }
             }
@@ -1639,6 +1643,13 @@ impl CommanderService {
             Some(path) => match check_local_pane_directory(path, "local_dir") { Ok(path) => path, Err(error) => return api_error(400, error) },
             None => return api_error(400, "Missing local directory"),
         };
+        // The pane check accepts a granted folder structurally; the queue
+        // cannot copy from or to one, so it is refused here by name, before
+        // anything is statted or queued.
+        if is_saf_path(&local_dir) {
+            let action = if move_item { "Moving files" } else if tab.is_local { "Copying or moving files" } else { "Transferring files" };
+            return api_error(400, saf_unsupported(action));
+        }
         let other_dir = body.get("remote_dir").and_then(Value::as_str).unwrap_or("");
         if other_dir.is_empty() || other_dir.chars().any(char::is_control) { return api_error(400, "Missing remote directory"); }
         let session = tab.remote.clone();
@@ -1670,6 +1681,10 @@ impl CommanderService {
             let local = match resolve_contained(&local_dir, name) { Ok(path) => PathBuf::from(path), Err(error) => return api_error(400, error) };
             let other = if tab.is_local {
                 let directory = match check_local_pane_directory(other_dir, "other_local_dir") { Ok(path) => path, Err(error) => return api_error(400, error) };
+                if is_saf_path(&directory) {
+                    let action = if move_item { "Moving files" } else { "Copying or moving files" };
+                    return api_error(400, saf_unsupported(action));
+                }
                 match resolve_contained(&directory, name) { Ok(path) => path, Err(error) => return api_error(400, error) }
             } else {
                 format!("{}/{}", other_dir.trim_end_matches('/'), name)
@@ -1894,6 +1909,9 @@ impl CommanderService {
             Ok(p) => p,
             Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
         };
+        if is_saf_path(&resolved) {
+            return ApiReply{ status: 400, payload: json!({"success": false, "error": saf_unsupported("Editing files")})};
+        }
         match ops::read_local_text_file(Path::new(&resolved), ops::MAX_GUI_EDIT_BYTES) {
             Ok((content, info)) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "content": content, "info": info})},
             Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
@@ -1933,9 +1951,19 @@ impl CommanderService {
         };
         drop(g);
         if tab.is_local {
+            // The page sends the other pane's path joined, which never
+            // resolves as a leaf; a granted other pane is refused by name
+            // before that, so it never reports a path error for a file the
+            // bridge cannot open anyway.
+            if is_saf_path(&tab.other_local_dir) {
+                return ApiReply{ status: 400, payload: json!({"success": false, "error": saf_unsupported("Editing files")})};
+            }
             let resolved = match resolve_contained(&tab.other_local_dir, &path) {
                 Ok(p) => p, Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
             };
+            if is_saf_path(&resolved) {
+                return ApiReply{ status: 400, payload: json!({"success": false, "error": saf_unsupported("Editing files")})};
+            }
             match ops::read_local_text_file(Path::new(&resolved), ops::MAX_GUI_EDIT_BYTES) {
                 Ok((c,i)) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "content": c, "info": i})},
                 Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
@@ -2406,6 +2434,19 @@ impl CommanderService {
         let perm = body.get("permissions").or_else(|| body.get("mode")).and_then(|v| v.as_str()).unwrap_or("").to_string();
         if name.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Select an item first."})}; }
         let target = match resolve_contained(&base, &name) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
+        if is_saf_path(&target) {
+            // `set_permissions_mode` is the bridge's own refusal: permissions
+            // do not exist on a granted folder, so it answers before reading
+            // the mode and the 0 marks the argument unused. Routing chmod
+            // through it keeps the message in one place instead of restating
+            // it here, and a success would mean the bridge grew a permission
+            // model worth honouring.
+            return match self.local_fs.set_permissions_mode(&target, 0) {
+                Ok(()) => ApiReply{ status: 200, payload: json!({"success": true})},
+                Err(linscp_platform::PlatformError::UnsupportedUri(message)) => ApiReply{ status:400, payload: json!({"success": false, "error": message})},
+                Err(error) => ApiReply{ status:400, payload: json!({"success": false, "error": error.to_string()})},
+            };
+        }
         // Validate permission mode via ops
         let current = match gui_os::stat_extended(Path::new(&target)) { Ok(s)=> s.mode, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})},};
         let new_mode = match linscp_engine::parse_chmod_spec(&perm, current) { Ok(m)=>m, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
@@ -2421,6 +2462,11 @@ impl CommanderService {
         let resolved = if let Some(b) = base {
             match resolve_contained(&b, &path) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},}
         } else { path.clone() };
+        // Without a tab the path is used verbatim, so a granted-folder URI
+        // arrives here unvalidated; either way saving one is refused by name.
+        if is_saf_path(&resolved) {
+            return ApiReply{ status:400, payload: json!({"success": false, "error": saf_unsupported("Saving files")})};
+        }
         let content = body.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let mtime_ns = body.get("base_mtime_ns").and_then(|v| v.as_i64()).map(|v| v as i128).or_else(|| body.get("base_mtime").and_then(|v| v.as_i64()).map(|v| (v as i128)*1_000_000_000));
         match ops::write_local_text_file(Path::new(&resolved), &content, mtime_ns) {
@@ -3228,6 +3274,16 @@ impl CommanderService {
                     Ok(path) => path,
                     Err(error) => return api_error(400, error),
                 };
+                if is_saf_path(&target) {
+                    // The other pane refuses through the bridge, exactly as
+                    // the main pane does: the mode is unread, the 0 only
+                    // satisfies a trait written for filesystems with modes.
+                    return match self.local_fs.set_permissions_mode(&target, 0) {
+                        Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
+                        Err(linscp_platform::PlatformError::UnsupportedUri(message)) => api_error(400, message),
+                        Err(error) => api_error(400, error.to_string()),
+                    };
+                }
                 let current = match gui_os::stat_extended(Path::new(&target)) {
                     Ok(info) => info.mode,
                     Err(error) => return api_error(400, error.to_string()),
@@ -3254,6 +3310,12 @@ impl CommanderService {
         let mut rows=Vec::new();
         for n in names {
             let p = match resolve_contained(&tab.other_local_dir, &n) { Ok(path) => path, Err(error) => return api_error(400, error) };
+            // A granted entry keeps the row shape a stat failure uses, so the
+            // dialogue shows the limitation beside the name instead of dying.
+            if is_saf_path(&p) {
+                rows.push(json!({"name": n, "error": saf_unsupported("Reading file properties")}));
+                continue;
+            }
             let info = if tab.is_local {
                 match gui_os::stat_extended(Path::new(&p)) {
                     Ok(s)=> json!({"name": n, "size": s.size, "is_dir": s.is_dir, "permissions": s.permissions, "owner": s.owner, "group": s.group}),
@@ -4898,6 +4960,33 @@ fn sync_reason_for_page(reason: &str) -> String {
 /// True when `path` is a granted Android folder (`content://` tree URI).
 fn is_saf_path(path: &str) -> bool {
     path.starts_with("content://")
+}
+
+/// The refusal for a local action the granted-folder bridge does not
+/// implement. Listing, creating, renaming and deleting inside a granted
+/// folder go through `LocalFs`; everything else — editing, properties,
+/// permissions, transfers, synchronization and directory watching — needs a
+/// plain filesystem path, so the refusal names the limitation instead of
+/// failing later with a path error. `action` is a gerund phrase such as
+/// `"Synchronizing"` or `"Editing files"`.
+fn saf_unsupported(action: &str) -> String {
+    format!("{action} needs a folder in app storage, not a granted Android folder.")
+}
+
+/// A local directory synchronization or directory watching may use: an
+/// absolute plain path. A granted folder is refused before the absolute-path
+/// check so it gets the limitation's name, not "an absolute directory is
+/// required", which is true but explains nothing about a tree the system
+/// picker legitimately granted.
+fn check_plain_local_dir(raw: &str, action: &str) -> Result<String, String> {
+    let dir = raw.trim().to_string();
+    if is_saf_path(&dir) {
+        return Err(saf_unsupported(action));
+    }
+    if dir.is_empty() || !Path::new(&dir).is_absolute() {
+        return Err("An absolute local directory is required.".to_string());
+    }
+    Ok(dir)
 }
 
 fn check_local_pane_directory(raw: &str, label: &str) -> Result<String, String> {
@@ -8746,6 +8835,107 @@ mod tests {
         assert_eq!(convert(1), 1000);
         assert_eq!(convert(90), 90_000);
         assert_eq!(convert(u64::MAX), 86_400_000, "a day is the longest wait");
+    }
+
+    /// A structurally valid granted-folder URI, the same shape the platform
+    /// tests use for the mock bridge. No bridge is registered here, which is
+    /// the point: every refusal below must fire before anything touches the
+    /// bridge or the filesystem.
+    const SAF_GRANTED_DIR: &str = "content://mock.tree/tree/primary%3ADownload";
+
+    /// Opening, saving or chmodding inside a granted folder is refused with
+    /// the limitation's name. The editor paths use the shared refusal; chmod
+    /// goes through the bridge's own `set_permissions_mode`, whose message
+    /// was previously unreachable outside its own test.
+    #[tokio::test]
+    async fn saf_editor_and_permissions_refuse_granted_folders() {
+        let tmp = std::env::temp_dir().join(format!("linscp-saf-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("other")).unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let open = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": SAF_GRANTED_DIR, "other_local_dir": tmp.join("other")}}) }).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        let edit = svc.dispatch(ApiEnvelope { method: "GET".into(), path: format!("/api/local/edit?tab={id}&path=note.txt"), body: json!({}) });
+        assert_eq!(edit.status, 400, "{}", edit.payload);
+        assert!(edit.payload["error"].as_str().unwrap_or("").contains("app storage"), "{}", edit.payload);
+        let save = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/local/save".into(), body: json!({"tab": id, "path": "note.txt", "content": "no"}) });
+        assert_eq!(save.status, 400, "{}", save.payload);
+        assert!(save.payload["error"].as_str().unwrap_or("").contains("app storage"), "{}", save.payload);
+        let chmod = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/local/chmod".into(), body: json!({"tab": id, "name": "note.txt", "permissions": "644"}) });
+        assert_eq!(chmod.status, 400, "{}", chmod.payload);
+        assert!(chmod.payload["error"].as_str().unwrap_or("").contains("POSIX permissions do not exist"), "{}", chmod.payload);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// The other pane of a local tab refuses the same way: opening and saving
+    /// name the limitation, chmod carries the bridge's message, and
+    /// properties keeps its per-row shape with the refusal beside the name.
+    #[tokio::test]
+    async fn saf_other_pane_refuses_edit_properties_and_rights() {
+        let tmp = std::env::temp_dir().join(format!("linscp-saf-other-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("left")).unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let open = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp.join("left"), "other_local_dir": SAF_GRANTED_DIR}}) }).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        let edit = svc.dispatch_async(ApiEnvelope { method: "GET".into(), path: format!("/api/remote/edit?tab={id}&path=note.txt"), body: json!({}) }).await;
+        assert_eq!(edit.status, 400, "{}", edit.payload);
+        assert!(edit.payload["error"].as_str().unwrap_or("").contains("app storage"), "{}", edit.payload);
+        let save = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/remote/save".into(), body: json!({"tab": id, "path": "note.txt", "content": "no"}) }).await;
+        assert_eq!(save.status, 400, "{}", save.payload);
+        assert!(save.payload["error"].as_str().unwrap_or("").contains("app storage"), "{}", save.payload);
+        let properties = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/remote/properties".into(), body: json!({"tab": id, "names": ["note.txt"]}) }).await;
+        assert_eq!(properties.status, 200, "{}", properties.payload);
+        let row = &properties.payload["properties"][0];
+        assert_eq!(row["name"], json!("note.txt"), "{}", properties.payload);
+        assert!(row["error"].as_str().unwrap_or("").contains("app storage"), "{}", properties.payload);
+        let chmod = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/remote/chmod".into(), body: json!({"tab": id, "name": "note.txt", "permissions": "644"}) }).await;
+        assert_eq!(chmod.status, 400, "{}", chmod.payload);
+        assert!(chmod.payload["error"].as_str().unwrap_or("").contains("POSIX permissions do not exist"), "{}", chmod.payload);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Copying and moving between two plain local panes may queue; either end
+    /// being a granted folder refuses before anything is statted or queued.
+    #[tokio::test]
+    async fn saf_local_copy_and_move_refuse_granted_folders() {
+        let tmp = std::env::temp_dir().join(format!("linscp-saf-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let left = tmp.join("left"); let right = tmp.join("right");
+        std::fs::create_dir_all(&left).unwrap(); std::fs::create_dir_all(&right).unwrap();
+        std::fs::write(left.join("note.txt"), b"plain").unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+        let open = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": left, "other_local_dir": right}}) }).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        let copy = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": right, "names": ["note.txt"]}) }).await;
+        assert_eq!(copy.status, 400, "{}", copy.payload);
+        assert!(copy.payload["error"].as_str().unwrap_or("").contains("Copying or moving files"), "{}", copy.payload);
+        let moved = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": id, "direction": "upload", "local_dir": left, "remote_dir": SAF_GRANTED_DIR, "names": ["note.txt"]}) }).await;
+        assert_eq!(moved.status, 400, "{}", moved.payload);
+        assert!(moved.payload["error"].as_str().unwrap_or("").contains("Moving files"), "{}", moved.payload);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Synchronization and keep-up-to-date share one local-directory check: a
+    /// granted folder is refused with the limitation's name, a relative one
+    /// still needs an absolute path, and a plain absolute one still passes.
+    #[test]
+    fn sync_and_watch_refuse_granted_folders() {
+        let granted = json!({"local_dir": SAF_GRANTED_DIR, "remote_dir": "/"});
+        match CommanderService::sync_options_from(&granted) {
+            Ok(_) => panic!("a sync preview must refuse a granted folder"),
+            Err(error) => assert!(error.contains("app storage"), "the refusal names the limitation: {error}"),
+        }
+        let watch = check_plain_local_dir(SAF_GRANTED_DIR, "Keep up to date");
+        assert!(watch.is_err(), "watching must refuse a granted folder");
+        assert!(watch.unwrap_err().contains("Keep up to date"), "the refusal names the action");
+        assert_eq!(check_plain_local_dir("relative/dir", "Synchronizing").unwrap_err(), "An absolute local directory is required.");
+        let plain = std::env::temp_dir().to_string_lossy().into_owned();
+        assert!(check_plain_local_dir(&plain, "Synchronizing").is_ok(), "a plain absolute directory still passes");
+        assert!(CommanderService::sync_options_from(&json!({"local_dir": plain, "remote_dir": "/"})).is_ok());
     }
 }
 

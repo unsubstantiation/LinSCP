@@ -28,6 +28,7 @@ import {
   normalizeLocale,
   openExternalUri,
   requestSafTree,
+  safLimitationReason,
   sharedFeatureSet,
 } from '../dist/linscp-core.mjs';
 
@@ -949,4 +950,40 @@ test('an operating-system drop names paths once and the queue answers once', asy
   assert.deepEqual(normalizeDropPayload({ paths: 'nope' }), []);
   assert.equal(droppedLeafName('/home/me/project/'), 'project');
   assert.equal(droppedLeafName('C:\\Users\\me\\report.txt'), 'report.txt');
+});
+
+test('granted Android folders name the app-storage limitation per action', () => {
+  const granted = 'content://com.android.externalstorage.documents/tree/primary%3ADownload';
+  const document = granted + '/document/primary%3ADownload%2Fnote.txt';
+  const leads = {
+    edit: 'Editing files',
+    properties: 'Reading file properties',
+    transfer: 'Transferring files',
+    copyMove: 'Copying or moving files',
+    move: 'Moving files',
+    synchronize: 'Synchronizing',
+    keepUpToDate: 'Keep up to date',
+  };
+  for (const [action, lead] of Object.entries(leads)) {
+    // The tree root and a document below it are limited alike.
+    for (const path of [granted, document]) {
+      const reason = safLimitationReason(action, path);
+      assert.ok(reason.startsWith(lead), `${action}: ${reason}`);
+      assert.match(reason, /app storage/);
+      assert.match(reason, /granted Android folder/);
+    }
+  }
+  // chmod carries the bridge's own message, shared with the service refusal.
+  assert.equal(
+    safLimitationReason('permissions', document),
+    'POSIX permissions do not exist on a granted Android folder.',
+  );
+  // A plain path is never limited, on either separator, whatever the action.
+  for (const plain of ['/home/user/photos', 'C:\\Photos', '', null, undefined]) {
+    for (const action of [...Object.keys(leads), 'permissions']) {
+      assert.equal(safLimitationReason(action, plain), null, `${action} on ${plain}`);
+    }
+  }
+  // An unknown action still fails closed with the generic limitation.
+  assert.match(safLimitationReason('watch', granted) ?? '', /app storage/);
 });

@@ -1604,6 +1604,90 @@ function options(id) {
     text('logOutput'));
   responses['/api/logs'] = savedLogs;
 
+  // ---- Granted Android folders ------------------------------------------
+  // A granted folder browses but cannot edit, sync, watch, transfer, move or
+  // chmod. The page asks the shared bundle for the reason and offers nothing
+  // that could only fail; the backend refuses the same way when called.
+  const SAF_DIR = 'content://mock.tree/tree/primary%3ADownload';
+  LOCAL_DIRS[SAF_DIR] = [
+    { name: 'note.txt', size: 4, is_dir: false, date: 'Oct 13 08:00', permissions: '' }
+  ];
+  await window.loadLocal(SAF_DIR);
+  check('the local pane navigated into the granted folder',
+    text('localFileList').includes('note.txt'), text('localFileList'));
+  // dist/index.html inlines the real bundle; the source page has none, so a
+  // stub standing in for its contract proves the wiring in both runs.
+  let safStubInstalled = false;
+  if (!window.LinSCPCore || typeof window.LinSCPCore.safLimitationReason !== 'function') {
+    window.LinSCPCore = window.LinSCPCore || {};
+    window.LinSCPCore.safLimitationReason = (action, path) =>
+      (typeof path === 'string' && path.startsWith('content://') ? 'stub refuses ' + action : null);
+    safStubInstalled = true;
+  }
+  const safReason = action => window.LinSCPCore.safLimitationReason(action, SAF_DIR);
+  const posted = path => calls.filter(call => call.path === path).length;
+
+  const editsBefore = posted('/api/local/edit');
+  await window.openEditor(SAF_DIR + '/document/primary%3ADownload%2Fnote.txt', 'local');
+  check('a granted folder is not offered the editor',
+    text('toast').includes(safReason('edit')) &&
+      doc.getElementById('editorModal').className.indexOf('open') < 0 &&
+      posted('/api/local/edit') === editsBefore,
+    text('toast'));
+
+  window.openSynchronize();
+  check('a granted folder is not offered synchronization',
+    text('toast').includes(safReason('synchronize')) &&
+      doc.getElementById('syncModal').className.indexOf('open') < 0,
+    text('toast'));
+
+  window.openKeepUpToDate();
+  check('a granted folder is not offered keep-up-to-date',
+    text('toast').includes(safReason('keepUpToDate')) &&
+      doc.getElementById('keepUpToDateModal').className.indexOf('open') < 0,
+    text('toast'));
+
+  window.focusPane('local');
+  doc.getElementById('localFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  const safUploadsBefore = posted('/api/transfer/upload');
+  await window.transfer('upload');
+  check('a granted folder is not offered transfers',
+    text('toast').includes(safReason('transfer')) &&
+      posted('/api/transfer/upload') === safUploadsBefore,
+    text('toast'));
+
+  const confirmsBefore = confirmMessages.length;
+  const movesBefore = posted('/api/transfer/move');
+  await window.moveToOtherPane();
+  check('a granted folder is not offered moves',
+    text('toast').includes(safReason('move')) &&
+      confirmMessages.length === confirmsBefore &&
+      posted('/api/transfer/move') === movesBefore,
+    text('toast'));
+
+  const chmodsBefore = posted('/api/local/chmod');
+  await window.permissionsPrompt('local');
+  check('a granted folder is not offered chmod',
+    text('toast').includes(safReason('permissions')) &&
+      posted('/api/local/chmod') === chmodsBefore,
+    text('toast'));
+
+  await window.openProperties();
+  check('properties on a granted folder explain the missing rights editor',
+    doc.getElementById('propertiesModal').className.indexOf('open') >= 0 &&
+      !doc.getElementById('propertiesMode') &&
+      text('propertiesBody').includes(safReason('permissions')),
+    text('propertiesBody'));
+  window.closeModal('propertiesModal');
+
+  await window.loadLocal('/tmp/slowlocal');
+  window.openSynchronize();
+  check('leaving the granted folder offers the actions again',
+    doc.getElementById('syncModal').className.indexOf('open') >= 0);
+  window.closeModal('syncModal');
+  if (safStubInstalled) window.LinSCPCore.safLimitationReason = undefined;
+
   check('no script errors', errors.length === 0, errors.join(' | '));
   window.close();
 })();
