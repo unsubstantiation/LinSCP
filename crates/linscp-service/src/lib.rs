@@ -1141,7 +1141,11 @@ impl CommanderService {
     /// progress apply to it exactly as they do to a transfer.
     async fn sync_run_async(&self, body: Value) -> ApiReply {
         let (session, id, host_key, _dir) = match self.sync_target(&body) { Ok(t) => t, Err(reply) => return reply };
-        let (local_root, remote_root, opts) = match Self::sync_options_from(&body) { Ok(t) => t, Err(error) => return api_error(400, error) };
+        let (local_root, remote_root, mut opts) = match Self::sync_options_from(&body) { Ok(t) => t, Err(error) => return api_error(400, error) };
+        // The shared reader above defaults to preview-only so a preview can
+        // never write; a run applies the plan, so it opts back out. Without
+        // this the queued run plans, applies nothing, and reports success.
+        opts.preview_only = false;
         // The same options a preview used, so what the user saw is what runs.
         let config_root = self.state.lock().expect("state mutex").config_root.clone();
         let local_is_dir = if is_saf_path(&local_root.to_string_lossy()) {
@@ -9550,7 +9554,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let bridge = Arc::new(MockBridge::with_file("up.txt", b"upload bytes"));
         bridge.add_dir(&format!("{SAF_GRANTED_DIR}/document/tree"));
-        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/tree/nested.txt"), b"nested upload");
+        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/tree/document/nested.txt"), b"nested upload");
         let fs = NativeLocalFs::with_saf(bridge.clone());
         let svc = CommanderService::new(tmp.join("config"), Arc::new(fs));
         let session = Arc::new(MockSession::new());
@@ -9618,24 +9622,24 @@ mod tests {
         let queued_tree = svc.dispatch_async(download(download_body(id, "tree", true, false))).await;
         assert_eq!(queued_tree.status, 200, "{}", queued_tree.payload);
         wait_for_task(&svc, "Completed").await;
-        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/tree/a.txt")).as_deref(), Some(b"tree a".as_slice()));
-        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/tree/sub/b.txt")).as_deref(), Some(b"tree b".as_slice()));
+        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/tree/document/a.txt")).as_deref(), Some(b"tree a".as_slice()));
+        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/tree/document/sub/document/b.txt")).as_deref(), Some(b"tree b".as_slice()));
         // A merge adds without replacing.
         bridge.add_dir(&format!("{SAF_GRANTED_DIR}/document/mtree"));
-        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/mtree/old.txt"), b"stays");
+        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/mtree/document/old.txt"), b"stays");
         let merged = svc.dispatch_async(download(download_body(id, "mtree", true, true))).await;
         assert_eq!(merged.status, 200, "{}", merged.payload);
         wait_for_task(&svc, "Completed").await;
-        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/mtree/new.txt")).as_deref(), Some(b"merged in".as_slice()));
-        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/mtree/old.txt")).as_deref(), Some(b"stays".as_slice()), "the merge keeps granted files");
+        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/mtree/document/new.txt")).as_deref(), Some(b"merged in".as_slice()));
+        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/mtree/document/old.txt")).as_deref(), Some(b"stays".as_slice()), "the merge keeps granted files");
         // An overlapping merge fails instead of replacing.
         bridge.add_dir(&format!("{SAF_GRANTED_DIR}/document/mtree2"));
-        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/mtree2/x.txt"), b"granted x");
+        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/mtree2/document/x.txt"), b"granted x");
         let overlap = svc.dispatch_async(download(download_body(id, "mtree2", true, true))).await;
         assert_eq!(overlap.status, 200, "{}", overlap.payload);
         let failed = wait_for_task(&svc, "Failed").await;
         assert!(failed["error"].as_str().unwrap_or("").contains("already exists"), "{}", failed);
-        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/mtree2/x.txt")).as_deref(), Some(b"granted x".as_slice()), "the failed merge keeps the granted file");
+        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/mtree2/document/x.txt")).as_deref(), Some(b"granted x".as_slice()), "the failed merge keeps the granted file");
         // An over-cap remote file and a resume refuse at enqueue time.
         let refused = svc.dispatch_async(download(download_body(id, "huge.bin", false, false))).await;
         assert_eq!(refused.status, 400, "{}", refused.payload);
