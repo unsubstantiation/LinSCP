@@ -192,6 +192,7 @@ export const SHARED_FEATURES = [
   'synchronize',
   'keepUpToDate',
   'terminal',
+  'serverMonitor',
   'preferences',
   'logs',
 ] as const;

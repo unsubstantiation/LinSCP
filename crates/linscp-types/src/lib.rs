@@ -398,3 +398,94 @@ mod tests {
         assert_eq!(decoded, prefs);
     }
 }
+
+/// One logical CPU's contribution to a physical core. Percentages are null
+/// until two valid counters have been observed on the same SSH connection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorCpuThread {
+    pub id: u32,
+    pub percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorCpuCore {
+    pub socket: Option<u32>,
+    pub core: u32,
+    pub threads: Vec<MonitorCpuThread>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MonitorCpu {
+    pub model: String,
+    pub logical_count: u32,
+    pub percent: Option<f64>,
+    pub cores: Vec<MonitorCpuCore>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorMemory {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+    pub percent: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorDisk {
+    pub device: String,
+    pub mount: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+    pub percent: f64,
+}
+
+/// Vendor-neutral telemetry. An absent sensor is null, never an invented
+/// zero or a vendor-independent guessed power/thermal limit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorGpu {
+    pub index: u32,
+    pub vendor: String,
+    pub name: String,
+    pub percent: Option<f64>,
+    pub memory_used_bytes: Option<u64>,
+    pub memory_total_bytes: Option<u64>,
+    pub power_watts: Option<f64>,
+    pub power_limit_watts: Option<f64>,
+    pub temperature_c: Option<f64>,
+    pub temperature_limit_c: Option<f64>,
+    pub temperature_sensor: String,
+    pub driver: String,
+    pub pcie_generation: Option<u32>,
+    pub pcie_width: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MonitorSnapshot {
+    pub hostname: String,
+    pub primary_ip: String,
+    pub uptime_seconds: Option<f64>,
+    pub load_average: Vec<f64>,
+    pub cpu: MonitorCpu,
+    pub memory: Option<MonitorMemory>,
+    pub disks: Vec<MonitorDisk>,
+    pub gpus: Vec<MonitorGpu>,
+    pub cuda_version: String,
+    /// Missing optional tools/sensors, distinct from a failed SSH sample.
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorSample {
+    pub tab: u64,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub protocol: String,
+    /// ok, error, disconnected, unsupported or busy.
+    pub status: String,
+    pub sampled_at: u64,
+    pub latency_ms: u64,
+    pub error: String,
+    pub snapshot: Option<MonitorSnapshot>,
+}

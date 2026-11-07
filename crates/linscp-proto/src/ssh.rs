@@ -822,6 +822,61 @@ impl SshConnection {
         })
     }
 
+    /// Executes a fixed command with a total deadline and a combined output
+    /// cap. On timeout/error the channel is closed best-effort; the SSH
+    /// connection remains usable. A server is still responsible for stopping
+    /// its child process when its exec channel closes.
+    pub async fn exec_command_bounded(
+        &self,
+        command: &str,
+        limit: Duration,
+        max_output_bytes: usize,
+    ) -> Result<ExecOutput, ProtoError> {
+        let deadline = tokio::time::Instant::now() + limit;
+        let mut channel = tokio::time::timeout_at(deadline, self.open_session_channel())
+            .await
+            .map_err(|_| ProtoError::Transport("Timed out opening the monitoring channel.".into()))??;
+        let result = async {
+            tokio::time::timeout_at(deadline, channel.exec(true, command))
+                .await
+                .map_err(|_| ProtoError::Transport("Timed out starting the monitoring probe.".into()))?
+                .map_err(|error| ProtoError::Transport(format!("SSH monitoring exec failed: {error}")))?;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut exit_code = None;
+            let mut eof = false;
+            loop {
+                let message = tokio::time::timeout_at(deadline, channel.wait())
+                    .await
+                    .map_err(|_| ProtoError::Transport("Timed out reading the monitoring probe.".into()))?;
+                match message {
+                    Some(ChannelMsg::Data { data }) => stdout.extend_from_slice(&data),
+                    Some(ChannelMsg::ExtendedData { data, ext: 1 }) => stderr.extend_from_slice(&data),
+                    Some(ChannelMsg::ExitStatus { exit_status }) => {
+                        exit_code = Some(exit_status);
+                        if eof { break; }
+                    }
+                    Some(ChannelMsg::Eof) => {
+                        eof = true;
+                        if exit_code.is_some() { break; }
+                    }
+                    Some(ChannelMsg::Close) | None => break,
+                    _ => {}
+                }
+                if stdout.len().saturating_add(stderr.len()) > max_output_bytes {
+                    return Err(ProtoError::Transport(format!(
+                        "Monitoring output exceeded the {max_output_bytes}-byte limit."
+                    )));
+                }
+            }
+            Ok(ExecOutput { exit_code, stdout, stderr })
+        }.await;
+        if result.is_err() {
+            let _ = tokio::time::timeout(Duration::from_millis(250), channel.close()).await;
+        }
+        result
+    }
+
     pub async fn open_pty_shell(
         &self,
         term: &str,

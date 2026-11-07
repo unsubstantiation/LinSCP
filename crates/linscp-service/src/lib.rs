@@ -27,6 +27,7 @@ use linscp_types::{
 use serde_json::{json, Value};
 
 pub mod cli_actions;
+pub mod monitor;
 pub mod ops;
 pub mod queue;
 pub mod tabs;
@@ -58,6 +59,7 @@ struct InnerState {
     queue_transfers: Vec<Value>,
     /// Embedded terminals, one per open `xterm.js` window.
     terminals: terminal_bridge::TerminalRegistry,
+    monitors: monitor::Monitors,
 }
 
 #[derive(Clone)]
@@ -119,6 +121,7 @@ impl CommanderService {
                 preferences,
                 queue_transfers: Vec::new(),
                 terminals: terminal_bridge::TerminalRegistry::default(),
+                monitors: monitor::Monitors::default(),
             })),
             event_tx: Arc::new(Mutex::new(None)),
             queue: queue::QueueManager::new(tokio::sync::broadcast::channel(64).0, local_fs),
@@ -174,6 +177,7 @@ impl CommanderService {
             ("GET", "/api/preferences") => self.handle_get_preferences(),
             ("POST", "/api/preferences") => self.handle_save_preferences(req.body),
             ("GET", "/api/sessions") => self.handle_list_sessions(),
+            ("GET", "/api/monitor/hosts") => self.monitor_hosts(),
             ("POST", "/api/vault/export") => self.handle_export_offlineotp_vault(req.body),
             ("POST", "/api/vault/import") => self.handle_import_offlineotp_vault(req.body),
             ("POST", "/api/sessions/save") => self.handle_save_session(req.body),
@@ -280,6 +284,7 @@ impl CommanderService {
             ("POST", "/api/remote/search") => self.search_remote_async(req.body).await,
             ("POST", "/api/remote/rename") => self.rename_remote_any_async(req.body).await,
             ("POST", "/api/remote/delete") => self.delete_remote_any_async(req.body).await,
+            ("POST", "/api/monitor/sample") => self.monitor_sample_async(req.body).await,
             ("POST", "/api/session/terminal") => self.open_terminal_async(req.body).await,
             ("POST", "/api/terminal/input") => self.terminal_write(req.body),
             ("POST", "/api/terminal/close") => self.terminal_close(req.body),
@@ -312,14 +317,22 @@ impl CommanderService {
     }
 
     async fn open_tab_async(&self, body: Value) -> ApiReply {
+        if let Some(value) = body.get("connect_timeout") {
+            if !value.as_u64().is_some_and(|n| (1..=60).contains(&n)) {
+                return api_error(400, "Connection timeout must be an integer from 1 to 60 seconds.");
+            }
+        }
         let session = body.get("session").cloned().unwrap_or(json!({}));
         if session_is_local(&session) { return self.handle_tabs_open(body); }
         let site_name = body.get("site_name").and_then(Value::as_str).filter(|s| !s.is_empty());
         let root = self.config_root();
-        let (spec, mut clean) = match tabs::parse_gui_session_spec(&session, site_name, &root, self.secret_vault.as_ref()) {
+        let (mut spec, mut clean) = match tabs::parse_gui_session_spec(&session, site_name, &root, self.secret_vault.as_ref()) {
             Ok(value) => value,
             Err(error) => return api_error(400, error),
         };
+        if let Some(seconds) = body.get("connect_timeout").and_then(Value::as_u64) {
+            spec.timeout_secs = seconds;
+        }
         if spec.session.hostkey.trim() == "*" || spec.session.tunnel.as_ref().is_some_and(|t| t.hostkey.trim() == "*") {
             return api_error(400, "Wildcard SSH host keys are not supported");
         }
@@ -357,7 +370,15 @@ impl CommanderService {
             Ok(files) => files,
             Err(error) => return api_error(400, error),
         };
-        let result = tabs::dial_gui_tab_session(&dial_spec, &config_root, false, "en").await;
+        let result = match tokio::time::timeout(
+            std::time::Duration::from_secs(dial_spec.timeout_secs.max(1)),
+            tabs::dial_gui_tab_session(&dial_spec, &config_root, false, "en"),
+        ).await {
+            Ok(result) => result,
+            Err(_) => Err(GuiConnectError::Failed(format!(
+                "Connection timed out after {} seconds.", dial_spec.timeout_secs.max(1)
+            ))),
+        };
         let mut state = self.state.lock().expect("state mutex");
         // Closing a tab or cancelling a challenge while dialing must not bring
         // it back to life after the asynchronous connection completes.
@@ -399,6 +420,7 @@ impl CommanderService {
         let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No such tab") };
         let mut tab = {
             let mut state = self.state.lock().expect("state mutex");
+            state.monitors.forget(id);
             let tab = match state.tabs.get(&id).cloned() { Some(tab) => tab, None => return api_error(400, "No such tab") };
             if tab.is_local { return ApiReply { status: 200, payload: json!({"success": true, "tab": tab.describe()}) }; }
             if tab.spec.is_none() { return api_error(400, "Missing session settings"); }
@@ -1166,6 +1188,79 @@ impl CommanderService {
             local_root.to_string_lossy().into_owned(), remote_root.clone(), 0,
             body.get("priority").and_then(Value::as_bool).unwrap_or(false), job);
         ApiReply { status: 200, payload: json!({"success": true, "task_id": task_id}) }
+    }
+
+    /// Lists monitorable open sessions and saved SSH sites, without credentials.
+    fn monitor_hosts(&self) -> ApiReply {
+        let state = self.state.lock().expect("state mutex");
+        let mut tabs = state.tabs.values().filter(|tab| {
+            tab.connected && tab.remote.as_ref().and_then(|remote| remote.ssh_connection()).is_some()
+        }).map(|tab| {
+            let session = &tab.spec.as_ref().expect("remote tab has settings").session;
+            json!({"tab": tab.id, "name": tab.name, "host": session.host, "port": session.port,
+                "protocol": session.protocol.as_str(), "site": tab.site_name})
+        }).collect::<Vec<_>>();
+        tabs.sort_by_key(|tab| tab["tab"].as_u64().unwrap_or(0));
+        let mut sites = SessionStore::load_from_dir(&state.config_root, self.secret_vault.as_ref())
+            .unwrap_or_default().sites().iter().filter(|site| {
+                matches!(site.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)
+            }).map(|site| json!({"name": site.name, "host": site.host, "port": site.port,
+                "protocol": site.protocol.as_str()})).collect::<Vec<_>>();
+        sites.sort_by(|a,b| a["name"].as_str().cmp(&b["name"].as_str()));
+        ApiReply { status: 200, payload: json!({"success": true, "tabs": tabs, "sites": sites,
+            "max_hosts": monitor::MAX_HOSTS, "default_interval": monitor::DEFAULT_INTERVAL_SECS,
+            "default_timeout": monitor::DEFAULT_TIMEOUT_SECS}) }
+    }
+
+    /// Samples selected open tabs concurrently. Selection and polling live in
+    /// the shared UI; closing the display stops requests, not SSH sessions.
+    async fn monitor_sample_async(&self, body: Value) -> ApiReply {
+        let timeout = match monitor::validate_timeout(body.get("timeout")) {
+            Ok(timeout) => timeout, Err(error) => return api_error(400, error),
+        };
+        let Some(requested) = body.get("tabs").and_then(Value::as_array) else {
+            return api_error(400, "Select one or more open server tabs.");
+        };
+        if requested.is_empty() || requested.len() > monitor::MAX_HOSTS {
+            return api_error(400, format!("Select between 1 and {} servers.", monitor::MAX_HOSTS));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for id in requested {
+            let Some(id) = tabs::parse_tab_id_value(Some(id)) else { return api_error(400, "Invalid monitor tab ID."); };
+            if !ids.insert(id) { return api_error(400, "Duplicate monitor tab ID."); }
+        }
+        let targets = {
+            let state = self.state.lock().expect("state mutex");
+            ids.iter().map(|id| {
+                let tab = state.tabs.get(id);
+                let session = tab.and_then(|tab| tab.spec.as_ref()).map(|spec| &spec.session);
+                (state.monitors.clone(), *id,
+                    tab.map(|tab| tab.name.clone()).unwrap_or_default(),
+                    session.map(|s| s.host.clone()).unwrap_or_default(),
+                    session.map(|s| s.port).unwrap_or(22),
+                    session.map(|s| s.protocol.as_str()).unwrap_or("unknown").to_string(),
+                    tab.is_some_and(|tab| tab.connected),
+                    tab.filter(|tab| tab.connected).and_then(|tab| tab.remote.as_ref())
+                        .and_then(|remote| remote.ssh_connection()).cloned())
+            }).collect::<Vec<_>>()
+        };
+        let mut jobs = tokio::task::JoinSet::new();
+        for (monitors, id, name, host, port, protocol, connected, ssh) in targets {
+            jobs.spawn(async move {
+                let sample = monitors.sample(id, &name, &host, port, &protocol, ssh, connected, timeout).await;
+                if matches!(sample.status.as_str(), "disconnected" | "unsupported") { monitors.forget(id); }
+                sample
+            });
+        }
+        let mut samples = Vec::new();
+        while let Some(result) = jobs.join_next().await {
+            match result {
+                Ok(sample) => samples.push(sample),
+                Err(error) => return api_error(500, format!("Monitoring task failed: {error}")),
+            }
+        }
+        samples.sort_by_key(|sample: &linscp_types::MonitorSample| ids.iter().position(|id| *id == sample.tab).unwrap_or(usize::MAX));
+        ApiReply { status: 200, payload: json!({"success": true, "samples": samples}) }
     }
 
     /// Opens an embedded terminal on a tab's pooled SSH connection.
@@ -2380,6 +2475,7 @@ impl CommanderService {
         // A terminal lives in a tab's connection; closing the tab must not
         // leave the shell running with no window to show it.
         g.terminals.close_for_tab(tab_id);
+        g.monitors.forget(tab_id);
         if g.active_tab_id == Some(tab_id) { g.active_tab_id = g.tabs.keys().next().cloned(); }
         ApiReply{ status: 200, payload: json!({"success": true})}
     }
@@ -9841,5 +9937,42 @@ mod tests {
         assert_eq!(std::fs::read_link(right.join("other-alias.txt")).unwrap().to_string_lossy(), "other.txt");
         let _ = std::fs::remove_dir_all(tmp);
     }
-}
 
+    #[tokio::test]
+    async fn monitor_routes_validate_selection_and_never_expose_site_secrets() {
+        let tmp = std::env::temp_dir().join(format!("linscp-monitor-routes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let config = tmp.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let svc = CommanderService::new(config.clone(), Arc::new(NativeLocalFs::new()));
+        let mut store = SessionStore::new();
+        let mut site = StoredSite::new("worker", linscp_types::ProtocolScheme::Sftp, "worker.example");
+        site.username = "alice".into();
+        site.password = Some("do-not-list".into());
+        store.upsert(site);
+        store.save_to_dir(&config, svc.secret_vault.as_ref()).unwrap();
+        let hosts = svc.dispatch_async(ApiEnvelope { method: "GET".into(), path: "/api/monitor/hosts".into(), body: json!({}) }).await;
+        assert_eq!(hosts.status, 200, "{}", hosts.payload);
+        assert_eq!(hosts.payload["sites"][0]["name"], "worker");
+        assert!(!hosts.payload.to_string().contains("do-not-list"));
+        assert!(!hosts.payload.to_string().contains("alice"));
+        let sample = |body: Value| ApiEnvelope { method: "POST".into(), path: "/api/monitor/sample".into(), body };
+        for body in [json!({"tabs": []}), json!({"tabs": [1, 1]}), json!({"tabs": ["x"]}),
+            json!({"tabs": [1], "timeout": 0}), json!({"tabs": [1], "timeout": "5"}),
+            json!({"tabs": (0..33).collect::<Vec<u32>>()})] {
+            assert_eq!(svc.dispatch_async(sample(body.clone())).await.status, 400, "{body}");
+        }
+        let missing = svc.dispatch_async(sample(json!({"tabs": [999]}))).await;
+        assert_eq!(missing.status, 200);
+        assert_eq!(missing.payload["samples"][0]["status"], "disconnected");
+        let local = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp}}) }).await;
+        let id = local.payload["tab"]["id"].as_u64().unwrap();
+        let unsupported = svc.dispatch_async(sample(json!({"tabs": [id]}))).await;
+        assert_eq!(unsupported.payload["samples"][0]["status"], "unsupported");
+        for timeout in [json!(0), json!(61), json!("10"), json!(1.5)] {
+            let refused = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp}, "connect_timeout": timeout}) }).await;
+            assert_eq!(refused.status, 400);
+        }
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+}

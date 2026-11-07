@@ -11,6 +11,12 @@ transfer limitations in `readme.md` before using remote operations.
   bookmarks, and the transfer queue have native handlers. Local moves and
   no-replace publication rely on platform support and a trusted destination
   directory.
+- The multi-server monitor is wired through the shared service in both hosts:
+  connected SSH/SFTP/SCP tabs and saved SSH sites, bounded concurrent Linux
+  probes, CPU/per-core/RAM/disk/GPU telemetry, stale/error display, configurable
+  refresh, compact GPU cards and reuse of the embedded terminal. Saved-site
+  connections keep the normal host-key challenge. See `docs/server-monitor.md`
+  for sensor, protocol and import limitations.
 - Remote connections, host-key approval, listings, reconnect, SFTP/FTP/FTPS/
   WebDAV folder creation, and remote properties use native sessions. Reconnect
   makes a new connection; a changed SSH key requires approval. Cancelling or

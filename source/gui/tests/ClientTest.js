@@ -37,6 +37,15 @@ const REMOTE_ENTRIES = [
 
 const responses = {
   '/api/vault/status': { success: true, vault: 'unlocked' },
+  '/api/monitor/hosts': { success: true, max_hosts: 32, default_interval: 5, default_timeout: 10,
+    tabs: [{ tab: 1, name: 'local test', host: '127.0.0.1', port: 2222, protocol: 'sftp', site: null }], sites: [] },
+  '/api/monitor/sample': { success: true, samples: [{ tab: 1, name: 'local test', host: '127.0.0.1', port: 2222,
+    protocol: 'sftp', status: 'ok', sampled_at: Date.now(), latency_ms: 5, error: '', snapshot: {
+      hostname: 'worker', primary_ip: '127.0.0.1', uptime_seconds: 10, load_average: [0.1],
+      cpu: { model: 'Test CPU', logical_count: 1, percent: 25, cores: [] }, memory: null, disks: [], gpus: [], cuda_version: '', warnings: [] } }] },
+  '/api/session/terminal': { success: true, terminal: 77, cols: 80, rows: 24 },
+  '/api/terminal/output': { success: true, data: '', offset: 0, alive: true },
+  '/api/terminal/close': { success: true },
   '/api/status': {
     tabs: [{
       id: 1, name: 'local test', connected: true,
@@ -1805,6 +1814,37 @@ function options(id) {
       (gssapiHintHidden === false && text('siteGssapiHint').includes('key exchange')),
     text('siteGssapiHint'));
   if (gssapiStubInstalled) window.LinSCPCore.hostDifferenceReason = undefined;
+
+  // ---- Shared multi-server monitor --------------------------------------
+  // xterm is a browser vendor asset; the monitor test exercises the page's
+  // terminal lifecycle, not the renderer's canvas implementation.
+  window.Terminal = class {
+    constructor() { this.cols = 80; this.rows = 24; }
+    loadAddon() {} open() {} focus() {} write() {} dispose() {}
+    onData() {} onResize() {}
+  };
+  window.FitAddon = { FitAddon: class { fit() {} } };
+  await window.openServerMonitor();
+  await new Promise(resolve => setTimeout(resolve, 80));
+  check('monitor opens its shared component', doc.getElementById('serverMonitorModal').classList.contains('open') &&
+    doc.querySelectorAll('#serverMonitorScreen .monitor-picker-item').length === 1);
+  doc.querySelector('#serverMonitorScreen .monitor-picker-item input').click();
+  [...doc.querySelectorAll('#serverMonitorScreen button')].find(b => b.textContent === 'Monitor selected servers').click();
+  await new Promise(resolve => setTimeout(resolve, 80)); await new Promise(resolve => setTimeout(resolve, 80));
+  check('monitor samples the selected session', calls.some(call => call.path === '/api/monitor/sample' &&
+    JSON.parse(call.options.body).tabs.join() === '1'));
+  check('monitor renders telemetry', text('serverMonitorScreen').includes('25.0%'));
+  [...doc.querySelectorAll('#serverMonitorScreen button')].find(b => b.textContent === 'SSH shell').click();
+  await new Promise(resolve => setTimeout(resolve, 80));
+  check('monitor shell reuses the terminal endpoint', calls.some(call => call.path === '/api/session/terminal' &&
+    JSON.parse(call.options.body).tab === 1) && doc.getElementById('terminalModal').classList.contains('open'));
+  window.closeTerminal();
+  await new Promise(resolve => setTimeout(resolve, 80));
+  check('closing the monitor shell resumes monitoring', text('serverMonitorScreen').includes('Sampling selected servers') ||
+    text('serverMonitorScreen').includes('servers selected'));
+  window.closeServerMonitor();
+  check('closing the monitor keeps the session tab', !doc.getElementById('serverMonitorModal').classList.contains('open') &&
+    doc.getElementById('tabStrip').children.length === 1);
 
   check('no script errors', errors.length === 0, errors.join(' | '));
   window.close();

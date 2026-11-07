@@ -1106,3 +1106,80 @@ body {
 /* Feature tour hint: subtle “what's new” pulse for Remote Desktop after first load */
 @keyframes pulseGlow { 0%,100% { box-shadow: 0 0 0 0 rgba(85,168,237,0); } 50% { box-shadow: 0 0 0 6px rgba(85,168,237,.18); } }
 #remoteDesktopToolbarBtn.is-new { animation: pulseGlow 1.8s ease 1.2s 3; }
+
+/* Shared multi-server monitor: one component, native/browser/touch hosts. */
+.monitor-overlay { z-index: 1050; }
+#terminalModal { z-index: 1100; }
+#hostKeyModal { z-index: 1200; }
+.monitor-box { width: min(1220px, 96vw); max-height: 94vh; height: min(860px, 94vh); }
+.monitor-body { padding: 0; overflow: hidden; }
+#serverMonitorScreen { display: flex; flex-direction: column; flex: 1; min-height: 0; outline: none; }
+.monitor-controls, .monitor-settings { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; padding: 12px 16px 8px; }
+.monitor-controls .btn[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.monitor-settings { padding-top: 3px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+.monitor-number { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; }
+.monitor-number input { width: 66px; min-height: 27px; padding: 3px 6px; }
+.monitor-status { padding: 9px 16px; color: var(--accent); font-size: 11px; }
+.monitor-content { flex: 1; min-height: 0; overflow: auto; padding: 0 16px 16px; }
+.monitor-help { flex: none; margin: 0 !important; padding: 9px 16px; border-top: 1px solid var(--border); font-size: 10px; }
+.monitor-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 12px; align-items: start; }
+.monitor-card { min-width: 0; padding: 15px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-raised); }
+.monitor-card-header { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 15px; }
+.monitor-identity { flex: 1; min-width: 0; }
+.monitor-identity h3 { margin: 0 0 4px; font-size: 15px; overflow-wrap: anywhere; }
+.monitor-identity h3[role="button"] { cursor: pointer; color: var(--accent-hover); }
+.monitor-identity p { margin: 0 0 2px !important; overflow-wrap: anywhere; }
+.monitor-badge { flex: none; padding: 3px 6px; border-radius: 4px; background: var(--accent-soft); color: var(--accent); font-size: 9px; font-weight: 650; }
+.monitor-badge-ok { color: var(--success); background: color-mix(in srgb, var(--success) 10%, transparent); }
+.monitor-badge-warn { color: var(--warning); background: color-mix(in srgb, var(--warning) 10%, transparent); }
+.monitor-stale { border-color: var(--warning); }
+.monitor-stale .monitor-meter { opacity: .5; }
+.monitor-error { color: var(--danger); overflow-wrap: anywhere; font-size: 11px; }
+.monitor-stale-time { color: var(--warning); font-size: 10px; }
+.monitor-metric { margin: 12px 0; min-width: 0; }
+.monitor-metric-label { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 5px; font-size: 11px; }
+.monitor-metric-label strong { font-weight: 600; overflow-wrap: anywhere; }
+.monitor-metric small { display: block; margin-top: 4px; overflow-wrap: anywhere; font-size: 10px; }
+.monitor-meter { height: 6px; overflow: hidden; border-radius: 3px; background: var(--surface-input); border: 1px solid var(--border); }
+.monitor-meter-fill { display: block; height: 100%; background: var(--accent); transition: width .2s ease; }
+.monitor-meter-hot { background: var(--danger); }
+.monitor-power, .monitor-gpu-stat { font-size: 11px; color: var(--muted); }
+.monitor-card-footer { margin-top: 14px; padding-top: 8px; border-top: 1px solid var(--border); font-size: 10px; }
+.monitor-picker-list { display: grid; gap: 7px; margin: 12px 0; }
+.monitor-picker-item { display: flex; align-items: center; gap: 11px; padding: 11px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-raised); cursor: pointer; }
+.monitor-picker-item:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.monitor-picker-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 3px; overflow-wrap: anywhere; }
+.monitor-picker-actions { display: flex; justify-content: flex-end; gap: 8px; position: sticky; bottom: 0; padding: 10px 0; background: var(--surface); }
+.monitor-empty { padding: 30px 15px; text-align: center; color: var(--muted); }
+.monitor-detail .monitor-card { max-width: 100%; }
+.monitor-sparkline { display: block; width: 100%; height: 48px; color: var(--accent); background: var(--surface-input); border-radius: 4px; }
+.monitor-section { margin-top: 22px; padding-top: 12px; border-top: 1px solid var(--border); }
+.monitor-section h4 { margin: 0 0 12px; font-size: 12px; }
+.monitor-core-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(42px, 1fr)); gap: 7px; }
+.monitor-core { display: flex; flex-wrap: wrap; justify-content: center; gap: 3px; padding: 5px; border: 1px solid var(--border); border-radius: 4px; }
+.monitor-core small { flex-basis: 100%; text-align: center; color: var(--muted); font-size: 8px; }
+.monitor-core-thread { display: flex; align-items: flex-end; width: 9px; height: 32px; background: var(--surface-input); border-radius: 2px; overflow: hidden; }
+.monitor-core-thread span { width: 100%; background: var(--accent); }
+.monitor-gpu-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
+.monitor-gpu-card { min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+.monitor-gpu-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; font-size: 11px; }
+.monitor-gpu-heading strong { overflow-wrap: anywhere; }
+.monitor-pcie { font: 10px monospace; }
+.monitor-thermal { height: 4px; }
+.monitor-gpu-compact { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+.monitor-gpu-compact .monitor-gpu-card { padding: 9px; }
+.monitor-gpu-compact .monitor-metric { margin: 7px 0; }
+.monitor-gpu-compact .monitor-gpu-stat { font-size: 10px; margin: 5px 0; }
+.monitor-warning { font-size: 10px; }
+@media (max-width: 600px) {
+  .monitor-overlay { padding: 5px; }
+  .monitor-box { width: 100%; max-height: 98vh; height: 98vh; }
+  .monitor-controls, .monitor-settings { padding-left: 10px; padding-right: 10px; }
+  .monitor-controls .btn { min-height: 34px; }
+  .monitor-content { padding: 0 9px 12px; }
+  .monitor-grid { grid-template-columns: minmax(0, 1fr); }
+  .monitor-card { padding: 11px; }
+  .monitor-number { flex-wrap: wrap; }
+  .monitor-help { font-size: 9px; }
+}
+@media (prefers-reduced-motion: reduce) { .monitor-meter-fill { transition: none; } }

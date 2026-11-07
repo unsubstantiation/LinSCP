@@ -421,6 +421,21 @@ async fn handle_mock_exec(channel: Channel<Msg>, cmd: String, fs: Arc<Mutex<MemF
     let mut stdout = String::new();
     let mut stderr = String::new();
 
+    if cmd.contains("__LINSCP_MONITOR_STAT") {
+        stdout.push_str("__LINSCP_MONITOR_STAT\ncpu 100 0 100 800 0 0 0 0\ncpu0 100 0 100 800 0 0 0 0\n__LINSCP_MONITOR_MEMORY\nMemTotal: 1024 kB\nMemAvailable: 512 kB\n__LINSCP_MONITOR_END\n");
+    } else if cmd == "__LINSCP_TEST_HANG__" {
+        let _ = channel.data(b"partial" as &[u8]).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let _ = channel.close().await;
+        return;
+    } else if cmd == "__LINSCP_TEST_FLOOD__" {
+        let block = vec![b'x'; 64 * 1024];
+        for _ in 0..1024 {
+            if channel.data(block.as_slice()).await.is_err() { return; }
+        }
+        let _ = channel.close().await;
+        return;
+    } else {
     match prog {
         "pwd" => {
             stdout.push_str("/home/tester\n");
@@ -561,6 +576,7 @@ async fn handle_mock_exec(channel: Channel<Msg>, cmd: String, fs: Arc<Mutex<MemF
     }
     if !stderr.is_empty() {
         let _ = channel.extended_data(1, stderr.as_bytes()).await;
+    }
     }
     let _ = channel.exit_status(code).await;
     let _ = channel.eof().await;
@@ -1529,4 +1545,42 @@ async fn scp_engine_jump_tunnel_and_proxy_dialers_work_end_to_end() {
         .expect("SFTP over HTTP CONNECT proxy");
     assert_eq!(proxied_sftp.pwd().await.unwrap(), "/home/tester");
     proxied_sftp.close().await.unwrap();
+}
+
+
+#[tokio::test]
+async fn bounded_exec_collects_caps_and_closes_without_killing_ssh() {
+    let user_key = common::generate_ed25519_ssh_key(0x79, "monitor@test");
+    let (port, host_sha256, _host_md5, _fs) =
+        start_mock_ssh_server(0x19, user_key.private_key.public_key().clone(), false).await;
+    let cfg = SshConnectConfig {
+        tab_id: 90,
+        role: "destination".into(),
+        host: "127.0.0.1".into(),
+        port,
+        username: "tester".into(),
+        password: Some(Zeroizing::new("correct-horse-battery".into())),
+        pinned_host_key: Some(host_sha256),
+        ..Default::default()
+    };
+    let session = SftpClientSession::connect(ProtocolScheme::Sftp, &cfg, None, 0)
+        .await.expect("pinned SSH connection");
+    let ssh = session.ssh_connection();
+    let output = ssh.exec_command_bounded(
+        "printf '__LINSCP_MONITOR_STAT\n'; true",
+        Duration::from_secs(2), 1024,
+    ).await.expect("bounded probe");
+    assert_eq!(output.exit_code, Some(0));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("__LINSCP_MONITOR_STAT"));
+
+    let started = std::time::Instant::now();
+    let timeout = ssh.exec_command_bounded("__LINSCP_TEST_HANG__", Duration::from_millis(100), 1024).await;
+    assert!(timeout.unwrap_err().to_string().contains("Timed out"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    // Closing the expired exec channel must leave the authenticated session usable.
+    assert_eq!(ssh.exec_command_bounded("pwd", Duration::from_secs(2), 1024).await.unwrap().stdout, b"/home/tester\n");
+
+    let capped = ssh.exec_command_bounded("__LINSCP_TEST_FLOOD__", Duration::from_secs(2), 1024).await;
+    assert!(capped.unwrap_err().to_string().contains("1024-byte limit"));
+    assert_eq!(ssh.exec_command_bounded("pwd", Duration::from_secs(2), 1024).await.unwrap().exit_code, Some(0));
 }

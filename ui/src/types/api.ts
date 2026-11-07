@@ -223,3 +223,93 @@ export interface TransportEventMap {
   'terminal:output': { tab_id: number; data: string };
   'native:file-drop': { paths: string[] };
 }
+
+export interface MonitorCpuThread { id: number; percent: number | null }
+export interface MonitorCpuCore {
+  socket: number | null;
+  core: number;
+  threads: MonitorCpuThread[];
+}
+export interface MonitorCpu {
+  model: string;
+  logical_count: number;
+  percent: number | null;
+  cores: MonitorCpuCore[];
+}
+export interface MonitorMemory {
+  total_bytes: number;
+  used_bytes: number;
+  available_bytes: number;
+  percent: number;
+}
+export interface MonitorDisk {
+  device: string;
+  mount: string;
+  total_bytes: number;
+  used_bytes: number;
+  available_bytes: number;
+  percent: number;
+}
+export interface MonitorGpu {
+  index: number;
+  vendor: string;
+  name: string;
+  percent: number | null;
+  memory_used_bytes: number | null;
+  memory_total_bytes: number | null;
+  power_watts: number | null;
+  power_limit_watts: number | null;
+  temperature_c: number | null;
+  temperature_limit_c: number | null;
+  temperature_sensor: string;
+  driver: string;
+  pcie_generation: number | null;
+  pcie_width: number | null;
+}
+export interface MonitorSnapshot {
+  hostname: string;
+  primary_ip: string;
+  uptime_seconds: number | null;
+  load_average: number[];
+  cpu: MonitorCpu;
+  memory: MonitorMemory | null;
+  disks: MonitorDisk[];
+  gpus: MonitorGpu[];
+  cuda_version: string;
+  warnings: string[];
+}
+export interface MonitorSample {
+  tab: number;
+  name: string;
+  host: string;
+  port: number;
+  protocol: string;
+  status: 'ok' | 'error' | 'disconnected' | 'unsupported' | 'busy';
+  sampled_at: number;
+  latency_ms: number;
+  error: string;
+  snapshot: MonitorSnapshot | null;
+}
+export interface MonitorTabCandidate {
+  tab: number;
+  name: string;
+  host: string;
+  port: number;
+  protocol: ProtocolScheme;
+  site: string | null;
+}
+export interface MonitorSiteCandidate {
+  name: string;
+  host: string;
+  port: number;
+  protocol: ProtocolScheme;
+}
+export interface MonitorHostsResponse {
+  success: boolean;
+  tabs: MonitorTabCandidate[];
+  sites: MonitorSiteCandidate[];
+  max_hosts: number;
+  default_interval: number;
+  default_timeout: number;
+}
+export interface MonitorSampleResponse { success: boolean; samples: MonitorSample[] }
