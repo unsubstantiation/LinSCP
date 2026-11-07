@@ -67,6 +67,15 @@ pub struct CommanderService {
     state: Arc<Mutex<InnerState>>,
     event_tx: Arc<Mutex<Option<tokio::sync::broadcast::Sender<Value>>>>,
     queue: queue::QueueManager,
+    /// Whether the caller that built this service can show a *server-side* window.
+    ///
+    /// A launch is only allowed to start a viewer when the transport that asked for
+    /// it can also display it: the native window can, the HTTP host cannot (its
+    /// browser is on some other machine), and Android always answers through a
+    /// `hostCapabilities` intent. Default is `false` for exactly that reason — a
+    /// service built by code that never said where it runs must not spawn viewers
+    /// on the user's behalf.
+    desktop_spawn_allowed: bool,
 }
 
 impl Default for CommanderService {
@@ -112,7 +121,25 @@ impl CommanderService {
             })),
             event_tx: Arc::new(Mutex::new(None)),
             queue: queue::QueueManager::new(tokio::sync::broadcast::channel(64).0),
+            desktop_spawn_allowed: false,
         }
+    }
+
+    /// Declares that the caller can show a viewer window on this machine, so
+    /// `/api/desktop/launch` may start it instead of writing a ticket file.
+    ///
+    /// Only the native window host may pass `true`. The HTTP host cannot: the
+    /// browser may be on another computer, so a viewer started here would be
+    /// invisible to the person who clicked. Android does not reach this either —
+    /// the page opens a `hostCapabilities` intent before it reads the ticket.
+    pub fn with_desktop_spawn(mut self, allowed: bool) -> Self {
+        self.desktop_spawn_allowed = allowed;
+        self
+    }
+
+    /// Whether `/api/desktop/launch` may start the resolved viewer on this machine.
+    pub fn desktop_spawn_allowed(&self) -> bool {
+        self.desktop_spawn_allowed
     }
 
     pub fn config_root(&self) -> PathBuf {
@@ -3341,7 +3368,10 @@ impl CommanderService {
             tunneled: proto_ticket.tunneled,
             local_endpoint: proto_ticket.local_endpoint.clone(),
         };
-        match linscp_platform::desktop::launch_remote_desktop(&ticket, &config_root, false) {
+        // A file ticket is the honest answer here: this host cannot show the viewer
+        // (or the caller said it cannot), so the client gets the `.rdp`/`.vv` body.
+        let force_file_ticket = !self.desktop_spawn_allowed;
+        match linscp_platform::desktop::launch_remote_desktop(&ticket, &config_root, force_file_ticket) {
             Ok(linscp_platform::desktop::DesktopLaunchResult::Spawned { pid, viewer, argv }) => {
                 ApiReply{ status:200, payload: json!({"success": true, "launched": true, "pid": pid, "viewer": viewer.display().to_string(), "argv": argv, "kind": ticket.kind, "target": ticket.target, "local_endpoint": ticket.local_endpoint, "tunneled": ticket.tunneled})}
             },
@@ -3879,7 +3909,8 @@ impl CommanderService {
         let proto_ticket = ticket_from_config(&cfg, kind, &target, tunneled, None);
         let ticket = linscp_platform::desktop::DesktopTicket{ kind: proto_ticket.kind.clone(), target: proto_ticket.target.clone(), viewer: proto_ticket.viewer.clone(), argv: proto_ticket.argv.clone(), file_content: proto_ticket.file_content.clone(), file_extension: proto_ticket.file_extension.clone(), tunneled: proto_ticket.tunneled, local_endpoint: proto_ticket.local_endpoint.clone() };
         let config_root = self.state.lock().expect("m").config_root.clone();
-        match linscp_platform::desktop::launch_remote_desktop(&ticket, &config_root, false) {
+        let force_file_ticket = !self.desktop_spawn_allowed;
+        match linscp_platform::desktop::launch_remote_desktop(&ticket, &config_root, force_file_ticket) {
             Ok(linscp_platform::desktop::DesktopLaunchResult::Spawned{ pid, viewer, argv }) => ApiReply{ status:200, payload: json!({"success": true, "launched": true, "available": true, "pid": pid, "viewer": viewer.display().to_string(), "argv": argv, "kind": kind.as_str(), "host": target_host, "target": ticket.target, "local_endpoint": ticket.local_endpoint, "tunneled": ticket.tunneled})},
             Ok(linscp_platform::desktop::DesktopLaunchResult::FileTicket{ path, viewer_hint }) => {
                 let file_content = proto_ticket.file_content.clone().or_else(|| std::fs::read_to_string(&path).ok());
@@ -4917,6 +4948,60 @@ mod tests {
             assert!(!(200..300).contains(&reply.status), "{path} answered {} with {}", reply.status, reply.payload);
             assert_ne!(reply.payload["success"], true, "{path}");
         }
+    }
+
+    /// A1: whether a launch may start a viewer is a property of the host, and it
+    /// has to be off unless the host said otherwise — a service built by code that
+    /// does not know where it runs must write a ticket, not open a window.
+    #[test]
+    fn desktop_spawn_permission_is_off_until_the_host_grants_it() {
+        let root = std::env::temp_dir().join(format!("linscp-desktop-spawn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let svc = CommanderService::new(root.clone(), Arc::new(NativeLocalFs::new()));
+        assert!(!svc.desktop_spawn_allowed(), "default has to be file-ticket");
+        let svc = svc.with_desktop_spawn(true);
+        assert!(svc.desktop_spawn_allowed());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A1, from the service's side of the contract: when the service says "I cannot
+    /// show a viewer", the `.rdp` body handed to the client must be writeable — and
+    /// must not contain the login it describes. That is the answer the browser host
+    /// and a server-mode script depend on, and it is the branch Windows used to take
+    /// *by accident*.
+    #[test]
+    fn a_host_that_cannot_show_a_viewer_gets_a_safe_ticket_body() {
+        use linscp_proto::remote_desktop::{
+            ticket_from_config, DesktopOptions, RemoteDesktopConnectConfig, RemoteDesktopKind,
+        };
+        // A written ticket exists only where the platform has a document to write.
+        if linscp_proto::remote_desktop::desktop_viewer_plan()
+            != linscp_proto::remote_desktop::DesktopViewerPlan::WindowsMstsc
+        {
+            return;
+        }
+        let secret = "not-in-the-ticket";
+        let cfg = RemoteDesktopConnectConfig {
+            scheme: linscp_types::ProtocolScheme::Rdp,
+            kind: RemoteDesktopKind::Rdp,
+            host: "example.test".to_string(),
+            port: 3389,
+            username: Some("deploy".to_string()),
+            password: Some(zeroize::Zeroizing::new(secret.to_string())),
+            domain: None,
+            desktop_opts: DesktopOptions::default(),
+            tls: linscp_proto::tls::TlsSettings::default(),
+            proxy: None,
+            timeout: std::time::Duration::from_secs(15),
+        };
+        let ticket = ticket_from_config(&cfg, RemoteDesktopKind::Rdp, "example.test:3389", false, None);
+        let content = ticket.file_content.as_deref().expect("mstsc is given a .rdp document");
+        assert!(
+            !content.contains(secret),
+            "the .rdp body must not embed the password: {content}"
+        );
+        assert!(content.contains("example.test:3389"), "ticket content: {content}");
+        assert!(content.contains("username:s:deploy"), "ticket content: {content}");
     }
 
     #[test]

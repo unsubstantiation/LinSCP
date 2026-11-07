@@ -4402,8 +4402,13 @@
         closeModal('remoteDesktopModal');
         return;
       }
-      if (data && data.ticket) toast(t('Headless ticket written: {path}', {path: data.ticket}));
-      else if (data && data.url) window.open(data.url, '_blank');
+      // The service reports a written ticket as `file` (with the body alongside
+      // it). Reading only `ticket` — a key no launch answer has ever set — made a
+      // written `.rdp` look like a launched window.
+      if (data && (data.ticket || data.file)) {
+        toast(t('Headless ticket written: {path}', {path: data.ticket || data.file}));
+      } else if (data && data.url) window.open(data.url, '_blank');
+      else if (data && data.gateway) toast(t(data.gateway));
       else toast(t('Desktop launched'));
       closeModal('remoteDesktopModal');
     } catch(e) {

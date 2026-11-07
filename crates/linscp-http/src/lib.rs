@@ -451,7 +451,10 @@ impl BrowserServer {
     pub async fn serve(self) -> std::io::Result<()> {
         let listener = tokio::net::TcpListener::from_std(self.listener)?;
         let state = Arc::new(HttpAppState {
-            service: CommanderService::default(),
+            // The browser may be on another machine, so this host must not start a
+            // viewer the user cannot see: `/api/desktop/launch` answers with a
+            // `.rdp`/`.vv` ticket the browser can hand to its own client.
+            service: CommanderService::default().with_desktop_spawn(false),
             config: self.config,
         });
         serve(listener, state).await

@@ -1,0 +1,440 @@
+# Native parity audit — Windows, Debian, Android
+
+**Date:** 2026-11-06 · **Branch:** `arena/a4f5fe10-linscp` · **Mode:** audit, then A1 fixed on request.
+
+> **Update (same day):** A1 below has been implemented — see its **Status: fixed** note for what
+> changed and what still needs a compiler to confirm. The rest of this document is the audit as
+> written, so A2–A9 still describe the tree as it was before that change.
+
+**Question asked:** "Make sure we have full feature parity between the builds."
+**Scope, as confirmed:** the three native builds — `linscp-gui` on Windows (MSVC), `linscp-gui` on
+Debian, and the Android APK. The browser server (`linscp-web` / `crates/linscp-http`) is **not** in
+scope, so HTTP-vs-window asymmetries are excluded by instruction.
+
+**Two different things are being asked in one sentence, and they fail differently:**
+
+| | Meaning | State |
+|---|---|---|
+| **A. Behavioural parity** | the same click does the same thing on all three builds | **9 defects**, all in shipped code: Windows hit by 7, Debian by 3, Android by 6; 2 are broken on all three. **A1 is fixed** (see §2) |
+| **B. Evidence parity** | the claim "verified on Windows, Debian *and* Android" is true | **not true today**: of the 24 suites cited for every platform, 8 need a binary this repo does not build, 1 has no build target, 7 are currently failing, and Android executes no Rust test at all |
+
+A build can be behaviourally at parity and still fail B, and vice versa. Both are reported below,
+separately, because they are fixed by different work.
+
+**Method.** Static reading of the whole Rust workspace plus the two build systems; the Python check
+scripts and the UI suite were executed; three of the Python GUI suites were executed to see what
+they actually do. **No Rust toolchain exists in this sandbox** (`rustup` install fails:
+`curl: (35) … SSL_ERROR_SYSCALL` against `static.rust-lang.org`), so every Rust statement below is a
+reading of the source with `file:line`, not a test result. Nothing was compiled or run under cargo.
+
+What *was* executed (all from the repo root, branch `arena/a4f5fe10-linscp`):
+
+```
+python3 tools/check_upstream_parity.py            # exit 0 — inventory validates, no behavioural claim
+python3 tools/check_platform_conversion.py        # exit 0
+python3 tools/check_repo_hygiene.py               # exit 0
+(cd ui && npm ci && npm test)                     # exit 0 — typecheck, build, jsdom suites
+python3 source/gui/tests/ShellIntegrationTest.py  # 12 ran, 12 failed, exit 0
+python3 source/gui/tests/LocalWorkspaceTest.py    # 26 ran, 26 errors + 8 skipped, exit 0
+python3 source/gui/tests/SecurityTest.py          # 124 ran, 123 failed, exit 0
+```
+
+The last three are the point of §3: they fail, they print an `evidence:` line, and they exit 0.
+
+---
+
+## 1. What is genuinely shared (so the report does not overstate the gap)
+
+One `CommanderService`, one service dispatch table, one `ui/dist` bundle, one page
+(`source/gui/web/index.html`, 5480 lines). The per-OS code is confined to `crates/linscp-platform`
+(`sys` = `linux.rs` / `windows.rs` / `android.rs`) plus the Tauri/Android bridge. Measured:
+
+- `crates/linscp-engine`, `linscp-proto`, `linscp-http` contain **zero** `cfg(target_os = …)` branches.
+- `crates/linscp-service` contains **one**: `lib.rs:8225` (a test).
+- All 81 distinct `/api/...` paths the page calls exist as routes in the service dispatch table
+  (checked mechanically: every path literal in the page is a quoted route in `linscp-service/src/lib.rs`).
+- All three hosts call the **async** dispatcher: `linscp-http/src/lib.rs:333,354`,
+  `linscp-tauri/src/lib.rs:59`. So the question "does the native window take a different service
+  path than the browser?" answers **no**.
+
+**Checked and cleared** (do not spend effort here):
+
+- `/api/command/exec` sync-table stub returning 501 (`linscp-service/src/lib.rs:3223-3230`) is
+  **unreachable from every shipped host**, because all three go through `dispatch_async`, whose table
+  serves the real handler at `:258` → `exec_cli_command_async` (`:1411`). The stub is defensive only;
+  the service test at `:4908` asserts exactly that an error, not a success, comes back.
+- Desktop launch exists in both a sync (`:3294`) and an async (`:3717`) form. Not a gap.
+- `platform.rs` symbol coverage is complete: `ensure_private_dir`, `set_mode`, `atomic_replace`,
+  `open_private_temp_file`, `create_private_file`, `create_exclusive_private_file`,
+  `open_regular_file_no_follow`, `create_fifo`, `format_permissions`, `connect_ssh_agent` all exist
+  in `linux.rs`, `windows.rs` **and** `android.rs`. The gaps below are *behaviour inside* those
+  functions, not missing symbols.
+
+---
+
+## 2. Behavioural parity defects (Tier A) — same build, different result
+
+Each row is a place where a user on one target gets a different outcome from the same action on
+another target. Ordered by user impact.
+
+### A1. On Windows, remote-desktop launch can never start `mstsc.exe` — it always writes a ticket file
+**Platforms:** Windows ✗, Debian ✓, Android ✓ (by a different route — see below)
+**Evidence:** `crates/linscp-platform/src/desktop.rs:104-128` — `detect_desktop_session_kind()` decides
+"Wayland / X11 / Headless", and on `#[cfg(not(target_os = "linux"))]` it returns `Headless` whenever
+`WAYLAND_DISPLAY` and `DISPLAY` are unset. Neither variable exists on Windows. `launch_remote_desktop`
+then takes `if force_file_ticket || is_headless || viewer_bin.is_none()` (`desktop.rs:258-259`), which
+writes the `.rdp` ticket and returns `FileTicket`. `resolve_viewer_binary` (`desktop.rs:150-162`) *does*
+resolve `System32\mstsc.exe` — it is simply never reached.
+**User-visible:** on Windows, "Remote desktop" writes a `.rdp` file into the config directory and the
+page reports *"Headless ticket written"*; `mstsc.exe` is never spawned, so the user has to find the file
+and double-click it. On Debian the same click opens `xfreerdp3` directly.
+**Android is not affected by A1** — the page branches on `caps.platform === 'android'` before reading
+the result (`source/gui/web/index.html:4377-4404`) and opens an intent with the ticket's
+`local_endpoint`, which `ticket_from_config` populates regardless of the headless branch. The two
+platforms fail differently, so do not fix them as one.
+**Fix:** on Windows let "a viewer exists" decide: check `resolve_viewer_binary(&ticket).is_some()`
+before the headless test, or add a `#[cfg(windows)]` non-headless default. **Effort:** S (~10 lines in
+`detect_desktop_session_kind` / `launch_remote_desktop`, plus a unit test in the existing `desktop.rs`
+test module).
+**Why no test caught it:** `desktop.remote` is `partial` and cites `live-desktop`
+(`source/linux/tests/LiveDesktopTest.py`) — a Linux-only suite, cited for `windows` and `android` too.
+
+**Status: fixed.** The decision now lives in `plan_launch` (`desktop.rs`), which takes "may this host
+start a viewer" as an input instead of deriving it from `DISPLAY`; `host_can_spawn_gui_viewer()` is
+`true` unconditionally on Windows and macOS and follows `linux::detect_desktop_session` on Linux. The
+scripting engine's private `DISPLAY` guess is gone (it now asks the platform layer), and the service
+carries an explicit `with_desktop_spawn(bool)` that the Tauri desktop host sets and the HTTP host
+clears, so the browser transport keeps its `.rdp` ticket. Tests: `plan_launch` truth table, a
+`host_gui_capability_matches_the_platform` assertion, a bridge-level check, and a service test that a
+host which may not spawn still gets a written ticket. One adjacent defect was found while moving the
+code: on Windows the ticket said `mstsc` while `build_rdp_argv` built the **FreeRDP** flag list, so a
+spawned `mstsc.exe` would have received `/v:host:port` plus `/u:`, `/bpp:`, `/clipboard`. The ticket
+now carries a `desktop_viewer_plan()` (mstsc / macOS `open` / FreeRDP) and name and argv cannot
+disagree; macOS also stopped writing an `.rdp` body it had no use for, and Linux stopped claiming one it could
+not open. Covered by `the_viewer_name_and_its_arguments_agree` (proto) and
+`a_host_that_cannot_show_a_viewer_gets_a_safe_ticket_body` (service). **Not verified here:** no Rust
+toolchain in this sandbox, so these are reading-level changes — the Windows CI job is the first real
+compile.
+
+### A2. Custom commands can be saved and listed but never run — on every platform
+**Platforms:** Windows ✗, Debian ✗, Android ✗ (all three)
+**Evidence:** the page's Run button posts `{action:'run'}` (`source/gui/web/index.html:4231-4233`).
+The handler answers **unconditionally** `400 "Not connected"`
+(`crates/linscp-service/src/lib.rs:3219`) — it never looks at the tab. The function that would do
+the work, `ops::execute_custom_command_template` (`crates/linscp-service/src/ops.rs:810`), has
+**no caller anywhere in `crates/`** (verified by `grep -rn`); neither does
+`ops::exec_raw_remote_or_local_command` (`ops.rs:872`). So `list`, `save`, `delete` work and `run`
+cannot.
+**User-visible:** "Run this command on N item(s)?" → confirm → *"Cannot run the command."* The
+ledger nevertheless records `gui.explorer-custom-commands` as **verified** on all three platforms,
+citing the jsdom suite (which mocks `/api/custom-commands`) and `SecurityTest.py` (which tests the
+legacy Python `gui.execute_custom_command`, not this table).
+**Fix:** wire `action: 'run'` to `execute_custom_command_template` with the tab and selection.
+**Effort:** S.
+**Second-order defect that will surface the moment it is wired:** the local branch of both `ops.rs`
+functions spawns `Command::new("sh").arg("-c")` with **no `cfg` split** (`ops.rs:837` and
+`ops.rs:886`). On Windows there is no `sh`, so "run a local custom command" would fail there while
+working on Debian. Fixing A2 without this makes the gap *worse* (a working feature on 2 platforms,
+an unexplained failure on the third). Fix both together; the correct pattern already exists in
+`terminal.rs:659-672` (`/bin/sh -c` vs `cmd /C`).
+
+### A3. The whole shell-integration feature is unreachable — the shipped binary ignores its arguments
+**Platforms:** Windows ✗, Debian ✗, Android n/a
+**Evidence:** `crates/linscp-tauri/src/main.rs` is five lines —
+`fn main() { linscp_tauri::run_native_app(tauri::generate_context!()); }`. There is **no argv parsing**
+anywhere in `crates/linscp-tauri` (`grep -rn "env::args"` → only `linscp-http/src/main.rs:49` and
+`terminal.rs:734-811`). `gui_os::install_shell_integration` (`gui_os.rs:352`) and
+`uninstall_shell_integration` (`:424`) have **zero callers**. The page and `locales/en.json` contain
+no mention of Dolphin, Nautilus, Nemo, "Send To" or `--install-shell-integration` (0 hits), so there
+is no UI route either.
+**User-visible:** the documented Dolphin/GNOME Files/Nemo "Upload with LinSCP" actions and the Windows
+*Send To* shortcut cannot be installed by any shipped artifact. The definitions themselves are
+written correctly (`gui_os.rs:357-420`), and the receiving half of the protocol is fully implemented
+— `--shell-upload` manifest recording (`ops.rs:1039`), `/api/shell/pending` (`lib.rs:181`),
+`/api/shell/consume` (`:255`), and the Android share flow reusing it (`linscp-tauri/src/lib.rs:43-55`).
+Only the entry point is missing.
+**Note:** `desktop.shell-and-extensions` is marked **verified** on all three platforms. It is not
+reachable on any of them. This is the largest single claim/reality gap in the tree.
+**Fix:** parse argv in `main.rs` before `run_native_app`: `--install-shell-integration`,
+`--uninstall-shell-integration`, `--shell-upload FILES…` (exit before opening a window), and let
+`--shell-upload` write the manifest and exit 0. **Effort:** M (the argv surface plus its own tests;
+the platform bodies already exist).
+**One trap when wiring it:** both integration functions are split `#[cfg(target_os = "windows")]` /
+`#[cfg(not(target_os = "windows"))]`, so the "not Windows" arm — which writes Dolphin/KDE, GNOME Files
+and Nemo definitions into `$XDG_DATA_HOME` — is also what an **Android** build would compile
+(`gui_os.rs:380-420`, `:448-462`, and `#[allow(dead_code)] fn linux_shell_targets` at `:312`). If the
+argv entry point is added without tightening those cfgs to `target_os = "linux"`, the first Android
+`--install-shell-integration` would try to create XDG directories inside the app sandbox. Keep Android
+out of it (n/a is the correct answer there, not an implementation).
+**Then:** `docs/native-feature-audit.md` should stop describing this as available, or A3's fix should
+land before the next release note.
+
+### A4. Local symlink creation has no local implementation
+**Platforms:** all three (the feature exists only for a *remote* pane)
+**Evidence:** the page only offers the remote form (`source/gui/web/index.html:5154-5175`,
+`promptRemoteLink`). If a local tab reaches the endpoint, `link_remote_async`
+(`crates/linscp-service/src/lib.rs:806`) sends `tab.is_local` to `handle_remote_link` (`:811`), which
+is a hard `501 "A symbolic link needs an SFTP session."` (declared `:3162`).
+`gui_os::create_local_symlink` (`gui_os.rs:131`, correct `std::os::unix::fs::symlink` +
+Windows dir/file probe) has exactly one caller: the local-copy queue's symlink preservation
+(`queue.rs:1220`). So a symlink can be *copied* but never *created* locally, on any build.
+**Fix:** a local branch in `link_remote_async` that calls `create_local_symlink` after
+`resolve_contained`, and a local variant of the page dialog. **Effort:** S.
+
+### A5. Vault is password-only on every build; the two hardware-backed wrappers are dead code
+**Platforms:** Windows ✗ (no DPAPI), Android ✗ (no Keystore), Debian n/a (no equivalent)
+**Evidence:** `NativeSecretVault::with_windows_dpapi` (`linscp-platform/src/lib.rs:723`) and
+`with_android_keystore` (`:730`) have **zero call sites**; `AndroidState::set_keystore`
+(`linscp-tauri/src/android.rs:54`) has **zero call sites** and `LinSCPAndroidPlugin.kt` has **no
+keystore `@Command`** (the 16 commands are SAF/share/external-uri/foreground only), so
+`wrap_key` always fails with *"Android Keystore bridge not registered"*.
+`decode_stored_master_key` (`lib.rs:737-791`) still accepts the dead `dpapi1$` and `aks1$` prefixes
+and produces a clear error for them, i.e. the read path exists and the write path never ran.
+**What actually protects `sessions.key` on all three builds:** `LSCPVLT1` — AES-256-GCM under an
+Argon2id key from `PasswordSecretVault::unlock_or_setup`
+(`crates/linscp-service/src/lib.rs:1696`). That is real and uniform.
+**User-visible:** on Windows and Android the master key is only password-protected; there is no
+"unlock with Windows Hello / device credential" behaviour that the docs suggest.
+**Docs contradicting the tree:** `docs/cross-platform-rust-migration.md:181,202,287` describe
+DPAPI/Keystore as implemented; `docs/android.md:20-21` correctly admits Keystore is unwired. Keep the
+`android.md` wording, fix the other two.
+**Fix:** either wire both (Windows: `CryptProtectData` is already written in `windows.rs`, just needs
+`with_windows_dpapi()` called at vault construction; Android needs a new Kotlin `wrapKey`/`unwrapKey`
+command plus `set_keystore`), or delete the dead surface and correct the docs. **Effort:** M (Android
+side is the real work) / S (delete-and-document).
+
+### A6. On Windows the configuration directory is created without an owner-only DACL
+**Platforms:** Windows ✗
+**Evidence:** `crates/linscp-platform/src/windows.rs:112-115` —
+`ensure_private_dir` is `create_dir_all()` and nothing else. It is the function that guards the
+config root and the upload staging area (`linscp-platform/src/lib.rs:628`, `:677`).
+`docs/cross-platform-rust-migration.md:181` claims an explicit `D:P(A;;FA;;;OW)` DACL there.
+`grep -rn "DACL\|SetNamedSecurityInfo\|SDDL"` over `crates/` → **no hits**. Linux applies `0700`
+(`linux.rs:81-86`); Android applies `0700` (`android.rs:131`). Windows inherits `%APPDATA%`'s ACL.
+**User-visible:** on a shared Windows machine, `%APPDATA%\LinSCP` (sessions, host keys, manifests,
+custom commands) is readable by any account that can traverse the profile — a genuine
+cross-user confidentiality difference, not a theoretical one. `sessions.ini` and host keys are the
+payload.
+**Fix:** create the directory, then apply the owner-only DACL with `SetNamedSecurityInfoW` /
+`SetFileSecurityW`, or set it via a `SECURITY_ATTRIBUTES` with
+`ConvertStringSecurityDescriptorToSecurityDescriptorW`. **Cost note:** `crates/linscp-platform/Cargo.toml:26-33`
+enables only `Win32_Foundation`, `Win32_Security_Cryptography`, `Win32_Storage_FileSystem`,
+`Win32_System_Console`, `Win32_System_Threading` — the authorization/SDDL features must be **added**,
+so this is not a one-liner. **Effort:** S–M.
+**Why no test caught it:** the two tests in `windows.rs` (`:322`, `:331`) do not touch permissions,
+and `windows-build.yml:42` runs `cargo test --workspace` on a single-user runner where the difference
+is invisible.
+
+### A7. On Android a granted SAF folder supports browsing and create/rename/delete, but not editing, properties, chmod, sync, keep-up-to-date, transfers or copy/move
+**Platforms:** Android ✗ (desktop ✓)
+**Evidence — the boundary is exactly `LocalFs` vs `std::fs`:**
+- SAF-aware, i.e. works on a granted tree: **list**, **new folder**, **delete**, **rename**
+  (`handle_local_list`/`_mkdir`/`_delete`/`_rename` all go through `self.local_fs`, `lib.rs:1764`,
+  `:2202`, `:2218-2219`, `:2240`) and the drop path (`:2541`). `LocalFs`'s own methods branch on
+  `content://` (`linscp-platform/src/lib.rs:446-540`); `resolve_contained` and
+  `check_local_pane_directory` have explicit SAF branches (`lib.rs:4608-4611`, `:4785-4788`).
+- **Also broken on SAF, and easy to miss because it looks like plain file I/O:** opening or saving a
+  file in the built-in editor. `handle_local_edit_get`/`handle_local_save` (`lib.rs:1779`, `:2308`)
+  call `ops::read_local_text_file`/`write_local_text_file` (`ops.rs:69`, `:101`), which start with
+  `stat_extended(...)` — `std::fs` (`gui_os.rs:51-57`). Properties (`gui_os::stat_extended` at
+  `lib.rs:3140`) and `chmod` (`:2292-2294`, `:3113-3121`) take the same bypass. For `chmod` the result
+  is worse than a generic failure: the user gets a raw I/O error instead of the message
+  `LocalFs::set_permissions_mode` was written to give (`linscp-platform/src/lib.rs:586-590`,
+  *"POSIX permissions do not exist on a granted Android folder."*) — and that method has **no caller**
+  outside its own test (`:1030`), so the correct message is currently unreachable.
+- Not SAF-aware (fails): `SyncOptions` requires `Path::new(&local_root).is_absolute()`
+  (`lib.rs:726`, `:1046`) — a `content://` URI is **not** absolute, so `/api/sync/preview`,
+  `/api/sync/run` and `/api/transfer/keepuptodate` all answer `400 "An absolute local directory is
+  required."` even for a legitimately granted tree; `sync_run_async` additionally requires
+  `local_root.is_dir()` (`:1103`); the planner walks with `std::fs::read_dir`
+  (`linscp-engine/src/sync_planner.rs:401`); uploads open with `std::fs::File::open`
+  (`linscp-engine/src/transfer.rs:990`) and downloads write with `std::fs`
+  (`transfer.rs:515-561`); local copy/move walks `std::fs` (`linscp-service/src/queue.rs:1190-1240`).
+- Why the editor/save failure is *silent* rather than loud: `write_local_text_file` starts with
+  `let existing = stat_extended(path).ok();` (`ops.rs:109`). On a `content://` string `std::fs`
+  returns `NotFound`, so `.ok()` yields `None` and the function treats it as a **new** file and goes on
+  to create a temp file and rename onto a "path" that is not a pathname. The user sees either a
+  confusing error or a write that does not land in the granted folder — never "granted folders cannot
+  be edited here". (Per the `std::path` docs `PathBuf::push` does not normalise separators, so the
+  `content://` prefix should survive this path; I could not run it here, and it is worth one assertion
+  in a unit test before relying on it. The defect is `std::fs`, not normalisation.)
+
+**User-visible:** on Android, a folder the user picked with the system picker can be browsed, and
+files can be created, renamed and deleted — but **opening one in the editor**, **properties**,
+**chmod**, **Synchronize**, **Keep up to date**, **uploading/downloading out of it** and
+**copy/move inside it** all fail, while every one of those works on the same folder on Debian.
+**Fix:** two options. (a) Route the transfer and sync trees through `LocalFs` (large, touches
+`linscp-engine`). (b) Fail closed with a message that names the limitation ("Sync needs a folder in
+app storage, not a granted folder"), and stop *offering* those actions for SAF roots in the page via
+`hostCapabilities`. (b) is honest and small; (a) is the real parity fix. **Effort:** S (b) / L (a).
+**Ledger status:** `sync.*` and `transfer.*` rows are `verified` on all three platforms and cite
+`live-sftp` / `live-dav` — Linux-only suites. Nothing records this boundary.
+
+### A8. Kerberos/GSSAPI exists only on Linux; Windows has no SSPI backend at all
+**Platforms:** Windows ✗, Android ✗ (fail closed), Debian ✓
+**Evidence:** `crates/linscp-platform/src/gssapi_sys.rs` is `#[cfg(target_os = "linux")]` for the
+whole dlopen path (`:27`, `:31`, `:42`, `:47`, `:54`); engine refuses rather than silently downgrades
+(`linscp-engine/src/url_and_raw.rs:811,824,1390,1817-1829`).
+`docs/cross-platform-rust-migration.md:96` names an "optional `sspi` crate (or `secur32.dll`)"
+integration — `grep -rn sspi Cargo.toml crates/*/Cargo.toml` → **no dependency**.
+**User-visible:** an Active Directory environment — the *normal* Windows case — cannot authenticate
+with Kerberos through LinSCP on Windows, while the same site works from Debian. This is the single
+most Windows-specific functionality gap.
+**Status:** already tracked as `security.gssapi-and-tunnels` = `partial`, with **linux-only**
+`verified_on` (the only four rows in the ledger that are honest about being Linux-only — see §3).
+**Fix:** the SSPI work, or leave it partial and say "Linux only" in the site manager.
+**Effort:** L (a real SSPI context provider, not a wrapper).
+
+### A9. SSH agent: two of three builds have one, Android has a hard `None`
+**Platforms:** Android ✗
+**Evidence:** `linscp-platform/src/android.rs:257-259` — `connect_ssh_agent` is `Ok(None)`.
+Linux uses `SSH_AUTH_SOCK` (`linux.rs:179`), Windows the
+`\\.\pipe\openssh-ssh-agent` named pipe (`windows.rs:231-233`).
+**User-visible:** a site configured for agent authentication works on Debian and Windows and fails on
+Android with the generic "no key" path. On Android this is arguably correct (no agent exists on a
+stock device), so the parity fix is not a bridge but a **clearer refusal** naming the platform —
+right now the user is told nothing about *why*.
+**Effort:** S (message + a capability flag), or leave as documented behaviour.
+
+---
+
+## 3. Evidence parity (Tier B) — the "verified on all three" claim does not survive inspection
+
+This is the part that matters most for "make sure we have parity", because without it nobody can tell
+whether §2 is complete.
+
+`docs/upstream-parity.json` holds 109 capabilities. 100 are `verified`; the
+`verification.policy` says a `verified` row must name suites that ran on `linux`, `windows` **and**
+`android`. `python3 tools/check_upstream_parity.py` passes (exit 0) and reports
+`android: 164, linux: 170, windows: 164` evidence citations.
+
+**B1. The platform suite lists are identical by construction, not by measurement.**
+All three platforms list the **same 24 suites**, and **101 of 109** capabilities carry the *identical*
+linux/windows/android triple. Only four differ, and all four are missing `windows`+`android`:
+`security.gssapi-and-tunnels`, `gui.native-path-drop`, `locale.translations`, `gui.remote-delete`.
+A `unit` suite cited for Android, and a Wayland-compatibility suite cited for Windows, are not things
+that happened; they are the same list copied. Real per-platform evidence cannot be identical for
+`desktop.wayland-session` on Windows.
+
+**B2. The checker never validates the Windows or Android citations.**
+`tools/check_upstream_parity.py:257` reads `row.get("verified_on", {}).get("linux", [])` and compares
+*that* with `checks`. The `windows` and `android` lists are only checked against the platform's own
+suite whitelist (`:170-181`), never against the cited test cases. So an entry can name a suite for
+Windows that does not contain the test it cites, and the gate is silent. Also
+`check_upstream_parity.py` itself **is not run by any workflow** (`grep` over `.github/workflows/` →
+absent), nor is `test_parity_inventory.py`, `test_platform_conversion.py`,
+`test_wayland_compatibility.py`, `test_translations.py` or `test_repo_hygiene.py`. CI runs exactly
+four `tools/tests` files: `test_android_application_id.py`, `test_android_release_signing.py`
+(android-build.yml:39-40), `test_gui_distribution.py`, `test_workflow_triggers.py`
+(debian-build.yml:38,45).
+
+**B3. What each cited suite can actually do today.**
+
+| Suite (cited by N caps) | Runs in CI? | Runs here? | Truth |
+|---|---|---|---|
+| `gui` (ClientTest.js) — 77 | **yes**, all 3 workflows (`npm --prefix ui test` → `node ../source/gui/tests/ClientTest.js dist/index.html`) | passes (part of `ui && npm test`, exit 0) | jsdom against the built page. Real, but it mocks `fetch` — it cannot see a platform. |
+| `gui-localization` (LocalizationTest.js) — ≤6 | **yes**, same command | passes | as above |
+| `service` (Rust tests in `linscp-service/src/lib.rs`) — 2 | linux: yes (`debian/rules:14` `cargo test --workspace --all-targets`), windows: yes (`windows-build.yml:42`), **android: no** | not run (no toolchain) | the only suite that tests the shared dispatch; genuinely runs on 2 of 3 platforms |
+| `unit` (UnitTest.cpp) — 101 | **no** | no | no build target: `CMakeLists.txt:3` is `project(LinSCP VERSION 1.0 LANGUAGES NONE)`, `source/linux/Makefile` builds only cargo. It also needs `<libssh/libssh.h>` and `PathUtil.h` (neither vendored). Cited more than any other file in the repo and cannot be compiled. |
+| `script`, `live-sftp`, `live-scp`, `live-s3`, `live-dav`, `live-curl`, `live-tunnel`, `live-desktop` — 8 suites, cited by most transfer/protocol rows | **no** | no | all argv-driven: `BINARY = str(pathlib.Path(sys.argv.pop(1)).resolve())` (e.g. `ScriptTest.py:17`). There is **no `linscp` binary** — `crates/linscp-cli` does not exist and `tools/tests/test_gui_distribution.py:13-14` *forbids* it. `linscp-gui` parses no arguments (A3). `LiveDesktopTest.py:188` runs `[$BINARY, "--serve-http", …]`, which nothing accepts (`linscp-web` takes `--port/--print-token/--bind/--allow-host/--allow-remote`, `linscp-http/src/main.rs:52-77`). |
+| `gui-security`, `gui-local`, `gui-search`, `gui-browser-upload`, `gui-local-editor`, `gui-desktop-uri`, `gui-shell` — 7 Python suites | **no** | **fail en masse** (measured) | they import `source/gui/linscp_gui.py`, a 116-line docstring shim exporting four helpers and nothing else. Measured: `ShellIntegrationTest` 12 run / 12 failed; `LocalWorkspaceTest` 26 run / 26 errors + 8 skipped (`module 'linscp_gui' has no attribute validate_workspace_name`); `SecurityTest` 124 run / 123 failed. **All three exit 0 anyway**, and each prints `evidence: suite=… platform=linux ran=N failed=N` — a line that reads like evidence regardless of the numbers. |
+| `platform-conversion`, `wayland-compatibility`, `translation-tests`, `backup` | **no** | **pass** (exit 0) | real, but Linux-shaped checks of repo state; `wayland-compatibility` cannot mean anything on Windows |
+| `ui-transport` (TransportAndPlatform.test.mjs) | **yes**, all 3 (`npm test`) | passes | real, host-agnostic unit tests of the bundle |
+| `powershell`, `dotnet` | — | — | `automation/test_psmodule.py` and `automation/test_dotnet.py` **do not exist**. No capability cites them (both rows are `missing`), so the checker stays quiet. |
+
+**Net effect:** of 24 suites cited for every platform, **3 run on all three** (`gui`,
+`gui-localization`, `ui-transport` — all via `npm --prefix ui test`), **1 runs on two** (`service`:
+Debian via `debian/rules:14`, Windows via `windows-build.yml:42`, not Android), **1 is
+unreproducible by construction** (`unit`), **3 are green but Linux-shaped**
+(`platform-conversion`, `wayland-compatibility`, `translation-tests`; `backup` is a Rust test file, so
+it rides with `service`), **8 need a binary that does not exist** (`script` + the seven `live-*`),
+and **7 are currently red** (the Python `gui-*` suites). Android executes **no Rust test
+whatsoever** — `android-build.yml` runs `npm run tauri -- android build` (a compile+package check),
+`verify_android_apk.py`, and an emulator smoke script; `grep -n cargo .github/workflows/android-build.yml`
+shows only the tauri wrapper.
+
+**B4. The reproduce lines in the generated inventory are unrunnable.**
+`docs/linux-feature-inventory.md:342` says *"`cargo run -p linscp-cli --release` drives ScriptTest.py …
+evidence lines … are emitted as CI annotations on Linux, Windows and Android"*, and `:370` repeats it
+for Windows. There is no `linscp-cli`, no `--serve-http`, and no workflow that runs any
+`source/*/tests/*.py`. The same text is embedded three times in `docs/upstream-parity.json`
+(`verification.platforms.*.how`), including for **android**, whose `how` claims an NDK cross-check on
+a *Linux runner*.
+
+**B5. One stale structural claim in the watcher.**
+`crates/linscp-platform/src/watcher.rs:1-3` says Android uses `PollWatcher`, "inotify on Linux,
+`ReadDirectoryChangesW` on Windows". `notify` 6.1.1 selects `INotifyWatcher` for
+`any(target_os = "linux", target_os = "android")`
+(`notify/src/lib.rs`, `RecommendedWatcher` cfg). The code is right either way (`RecommendedWatcher`
+is used), but the comment would mislead the next person testing Android; and `sync.keepuptodate-inotify`
+is `verified` on Android where keep-up-to-date cannot start at all (A7).
+
+---
+
+## 4. Platform integrations that need a real device before anyone can claim them
+
+These are not defects — they are claims with no acceptance evidence, which is the second half of the
+audit's bar (`docs/native-feature-audit.md`: "each platform-specific integration needs real-device
+evidence").
+
+| Integration | Implemented? | Evidence today |
+|---|---|---|
+| SAF picker + persisted grants | yes (`LinSCPAndroidPlugin.kt:pickTree/grantedTrees`, `android.rs` traits) | emulator smoke lists only app-private storage; no granted-tree run |
+| Share intents (`ACTION_SEND`/`SEND_MULTIPLE`) | yes (`stageUris`, `takePendingShares`) | intent filter is added by `tools/prepare_android_project.py:8-51` to a *generated* manifest — nothing in this tree can be inspected as the shipped filter; no test drives a real share |
+| Foreground service | yes (`LinSCPTransferService`, `foregroundStart/Update/Stop`) | smoke starts/updates/stops it; nobody verifies a transfer *survives backgrounding* |
+| `POST_NOTIFICATIONS` (Android 13+) | yes, requested at first queue (`LinSCPAndroidPlugin.kt:233-235`) | smoke pre-grants it via `pm grant` "to avoid an interactive prompt" (`tools/android_emulator_smoke.sh`), i.e. the request path is deliberately never exercised |
+| Keystore | **no** (A5) | — |
+| Android application ID | `com.fairuniversal.linscp`, read from `tools/android_application_id.py`, asserted in `test_android_application_id.py:23` | consistent: `tauri.conf.json:5`, the Kotlin `package`, and `register_android_plugin("com.fairuniversal.linscp", …)` (`android.rs:331`). The Rust literal is *not* in the "defined once" list (`test_android_application_id.py` readers list only shell/mjs/py), so a rename in `tauri.conf.json` would leave a silent mismatch in `android.rs:331` — worth adding to that test's reader list. |
+| Keep-up-to-date over SAF | **no** (A7) | `sync.keepuptodate-inotify` cites `live-dav` |
+| Windows file-drop into the window | yes (`linscp-tauri/src/lib.rs:209-224`) | `gui.native-path-drop` is `partial` and its own note admits jsdom cannot produce a WebKit drop |
+
+---
+
+## 5. What I would fix, in order
+
+Ordered by (user impact × confidence) ÷ effort. All are small except where noted.
+
+1. **A1 Windows remote desktop** — 10 lines, restores a documented feature on one platform, and it is
+   provable with a unit test on the existing `desktop.rs` test module. *S*
+2. **A3 argv + shell integration** — reintroduces an entire documented feature on Debian and Windows,
+   and is a prerequisite for ever running the `gui-shell` / `--shell-upload` cases the ledger already
+   cites. *M*
+3. **A2 custom-command run (+ the `sh` hardcode in the same commit)** — one action that is broken
+   today on all three builds. *S*
+4. **B-suite triage**: mark `unit`, all `live-*`, `script`, and the 7 Python `gui-*` suites as
+   **not runnable** in `docs/upstream-parity.json` (they are not evidence), and make
+   `check_upstream_parity.py` validate `windows`/`android` against `checks` the way it already
+   validates linux. This is the change that makes every other number in the ledger mean something.
+   *S, high leverage.*
+5. **A6 Windows DACL** — a real confidentiality difference on shared machines. *S–M*
+6. **A7 (b) honest refusal for SAF roots** — stop offering sync/keep-up-to-date on a granted folder
+   and say why. *S*; the full `LocalFs` routing is *L* and should be a separate decision.
+7. **A4 local symlink**, **A9 Android agent message** — small completions. *S* each
+8. **A5 vault** — decide: wire DPAPI (S) and Keystore (M), or delete the dead surface and correct
+   `docs/cross-platform-rust-migration.md:181,202,287`. Either is fine; the current state (code that
+   says it is protected, docs that say it is protected, nothing that protects it) is not.
+9. **A8 SSPI** — the only item here that is genuinely large. It should stay `partial`, with the
+   ledger finally saying *linux-only*, until someone does it.
+
+**Acceptance criterion I propose for "parity" as a claim:** for every row in §2, one test that runs on
+all three targets (or a device/emulator run recorded for the platform-only ones), and
+`check_upstream_parity.py` in CI with the Windows and Android citations validated. Until then the
+honest sentence is: *the three builds share one implementation and one page; Windows has one
+GUI-blocking defect and no Kerberos; Android cannot sync a granted folder and has no agent; and the
+evidence ledger records Linux-only suites as evidence for all three.*
+
+---
+
+## Appendix — files this report leans on
+
+`crates/linscp-platform/src/{desktop,windows,gui_os,terminal,android,lib,watcher}.rs`,
+`crates/linscp-service/src/{lib,ops,queue}.rs`,
+`crates/linscp-engine/src/{transfer,sync_planner,script}.rs`,
+`crates/linscp-tauri/src/{main,lib,android}.rs` + `android/LinSCPAndroidPlugin.kt`,
+`crates/linscp-http/src/main.rs`,
+`source/gui/web/index.html`, `source/gui/linscp_gui.py`,
+`source/linux/tests/UnitTest.cpp`, `source/linux/tests/ScriptTest.py`,
+`.github/workflows/{windows,debian,android}-build.yml`, `debian/rules`, `CMakeLists.txt`,
+`tools/check_upstream_parity.py`, `tools/android_emulator_smoke.{sh,mjs}`,
+`tools/tests/test_android_application_id.py`, `tools/tests/test_gui_distribution.py`,
+`docs/{upstream-parity.json,native-feature-audit.md,linux-feature-inventory.md,android.md,cross-platform-rust-migration.md}`.

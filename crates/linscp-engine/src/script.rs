@@ -1172,10 +1172,14 @@ impl ScriptInterpreter {
             local_endpoint: proto_ticket.local_endpoint.clone(),
         };
 
-        // In batch / headless mode we emit a file ticket rather than failing.
-        let is_headless = std::env::var_os("WAYLAND_DISPLAY").is_none()
-            && std::env::var_os("DISPLAY").is_none();
-        let launch = launch_remote_desktop(&ticket, &self.cfg.config_dir, is_headless)
+        // A server-mode run has no client to show a viewer, so it asks for a file
+        // ticket and keeps working when no viewer exists. Interactive runs let the
+        // platform decide: it is the only layer that knows whether *this* host can
+        // start a GUI process. Guessing here from `DISPLAY`/`WAYLAND_DISPLAY` is
+        // what made every Windows `open rdp://…` write a file instead of starting
+        // `mstsc.exe`.
+        let force_file_ticket = self.cfg.server_mode;
+        let launch = launch_remote_desktop(&ticket, &self.cfg.config_dir, force_file_ticket)
             .map_err(|e| {
                 self.trp(
                     "Cannot open session to {host}: {reason}",
