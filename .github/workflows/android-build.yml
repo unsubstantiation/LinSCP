@@ -3,6 +3,11 @@ name: Android build
 on:
   push:
     branches: [master]
+  # A pull request has to prove itself before it merges: without this trigger
+  # a PR lands with every build unrun, and master is where the red is found.
+  # (Release signing needs the keystore secrets, so a fork PR without them
+  # fails at the signing step; same-repo branches are unaffected.)
+  pull_request:
   # Run by hand from the Actions tab (or `gh workflow run`) to build a branch or
   # re-run a build without waiting for a push to master. This is how the release
   # keystore and signing configuration are tried before they land on master.
