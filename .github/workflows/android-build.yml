@@ -38,6 +38,12 @@ jobs:
         with:
           targets: aarch64-linux-android,x86_64-linux-android
       - uses: Swatinem/rust-cache@v2
+      # Same as the release job: the Tauri CLI lives in ui/node_modules and
+      # the APK build bundles the built UI, so the check job needs both.
+      - name: Build and test the UI
+        run: |
+          npm ci --prefix ui --no-audit --no-fund
+          python3 tools/run_cargo_ci.py npm --prefix ui test
       - name: Check the Android application ID and signing configuration
         run: |
           python3 -m unittest discover -s tools/tests -p test_android_application_id.py

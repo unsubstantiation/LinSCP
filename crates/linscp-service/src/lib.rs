@@ -9315,7 +9315,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp);
     }
 
-    use linscp_proto::{ProtoError, RemoteSession, TransferRequest};
+    use async_trait::async_trait;
+    use linscp_proto::{ProgressCallback, ProtoError, RemoteSession, TransferRequest};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     /// One in-memory remote file or directory for the session-transfer tests.
