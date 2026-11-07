@@ -2,9 +2,9 @@
 
 **Date:** 2026-11-06 · **Branch:** `arena/a4f5fe10-linscp` · **Mode:** audit, then A1 fixed on request.
 
-> **Update (same day):** A1 and A3 below have been implemented — see their **Status: fixed** notes
-> for what changed and what still needs a compiler to confirm. The rest of this document is the
-> audit as written, so A2, A4–A9 still describe the tree as it was before those changes.
+> **Update (same day):** A1, A2 and A3 below have been implemented — see their **Status: fixed**
+> notes for what changed and what still needs a compiler to confirm. The rest of this document is the
+> audit as written, so A4–A9 still describe the tree as it was before those changes.
 
 **Question asked:** "Make sure we have full feature parity between the builds."
 **Scope, as confirmed:** the three native builds — `linscp-gui` on Windows (MSVC), `linscp-gui` on
@@ -15,7 +15,7 @@ scope, so HTTP-vs-window asymmetries are excluded by instruction.
 
 | | Meaning | State |
 |---|---|---|
-| **A. Behavioural parity** | the same click does the same thing on all three builds | **9 defects**, all in shipped code: Windows hit by 7, Debian by 3, Android by 6; 2 are broken on all three. **A1 and A3 are fixed** (see §2) |
+| **A. Behavioural parity** | the same click does the same thing on all three builds | **9 defects**, all in shipped code: Windows hit by 7, Debian by 3, Android by 6; 2 are broken on all three. **A1, A2 and A3 are fixed** (see §2) |
 | **B. Evidence parity** | the claim "verified on Windows, Debian *and* Android" is true | **not true today**: of the 24 suites cited for every platform, 8 need a binary this repo does not build, 1 has no build target, 7 are currently failing, and Android executes no Rust test at all |
 
 A build can be behaviourally at parity and still fail B, and vice versa. Both are reported below,
@@ -121,7 +121,8 @@ compile.
 **Evidence:** the page's Run button posts `{action:'run'}` (`source/gui/web/index.html:4231-4233`).
 The handler answers **unconditionally** `400 "Not connected"`
 (`crates/linscp-service/src/lib.rs:3219`) — it never looks at the tab. The function that would do
-the work, `ops::execute_custom_command_template` (`crates/linscp-service/src/ops.rs:810`), has
+the work, `ops::execute_custom_command_template` (`crates/linscp-service/src/ops.rs:810` — since
+replaced, see the *Status: fixed* note below), has
 **no caller anywhere in `crates/`** (verified by `grep -rn`); neither does
 `ops::exec_raw_remote_or_local_command` (`ops.rs:872`). So `list`, `save`, `delete` work and `run`
 cannot.
@@ -137,6 +138,71 @@ functions spawns `Command::new("sh").arg("-c")` with **no `cfg` split** (`ops.rs
 working on Debian. Fixing A2 without this makes the gap *worse* (a working feature on 2 platforms,
 an unexplained failure on the third). Fix both together; the correct pattern already exists in
 `terminal.rs:659-672` (`/bin/sh -c` vs `cmd /C`).
+
+**Status: fixed.** The run path exists on all three builds, and the `sh` problem is gone by
+deletion rather than by a `cfg` split, because the split would have been the wrong fix. The dialog
+has always said a template "is quoted the way the LinSCP command line reads quotes, **never handed
+to a shell**" (`index.html:968-971`), and the interpreter that reads that command line already
+exists on every build: `checksum`, `chmod`, `edit`, `lls`, `lcd`, `ls`, `call` and the rest are
+dispatched by `linscp-engine`. So a template is now expanded and handed to a fresh
+`ScriptInterpreter` per file — `ops::execute_custom_command_template`, which finally has a caller —
+and nothing interpolated from a file name reaches a process. `exec_raw_remote_or_local_command` was
+replaced by `exec_raw_remote_command`, which *only* runs on a remote session shell and refuses a
+local one by name, so the two un-cfg'd `Command::new("sh").arg("-c")` sites (`ops.rs:837`,
+`ops.rs:886`) no longer exist. `call`/`!` inside a template stays the single, explicit way a
+template reaches a shell.
+
+The routing was the other half: `run` was a stub in the **synchronous** table, and the work needs
+the async interpreter (it adopts a live session), so `dispatch_async` gained
+`POST /api/custom-commands` → `handle_custom_commands_async`; the sync table keeps
+`list`/`save`/`delete` and now answers `run` with "needs the asynchronous service entry point"
+rather than the misleading "Not connected".
+
+Seven defects surfaced while wiring it, all inside the same gap:
+
+* **The shipped templates were not the dialect the code expanded.** `explorer-commands.json` writes
+  `{file}` (all four defaults); `expand_command_template` only understood upstream's bare `!` and its
+  `!!`, `!/`, `!@`, `!#`, `!U`, `!S` escapes. Run would have executed `checksum sha-256 {file}`
+  literally. `{file}` and `{files}` are now expanded alongside the `!` forms, and a test asserts
+  every shipped template starts with a command the interpreter knows and uses a placeholder
+  something expands — so a fifth default cannot be added in a dialect nothing reads.
+* **Quoting was for the wrong reader.** The old expansion used `shell_quote_single`, which produces
+  POSIX `'…'''…'` — correct for a shell, wrong for the LinSCP tokenizer, which *drops* inner
+  quotes and treats backslash as an escape (so `'''` came out as `'`). `quote_operand` now quotes
+  for that tokenizer and nothing else: a name with a space, a quote or a backslash stays one operand
+  and the entry the user selected comes back byte for byte.
+* **A hostile name could not fail its own file.** The audit expected "a hostile name fails its file
+  and runs the rest", but nothing validated the names first, so a `..` from a stale page would have
+  been pasted into the command line. Each name now goes through `validate_leaf_name`, and a name that
+  cannot be an entry of a panel gets its own failed result with the reason and the rest of the
+  selection still runs.
+* **Scope and pane could disagree.** The template says which side it is for; the selection comes from
+  whichever pane has focus. A remote `checksum sha-256 keep.txt` run from the local pane would have
+  checked a *different file of the same name* on the server and reported success. That is now
+  refused by name, on the page before it posts and again in `resolve_command_target` — the backend
+  does not trust the page to have checked. A local-only tab still gets its remote-scoped templates:
+  they apply to the pane the page draws on the right.
+* **Nothing ran once.** With three files selected, a template like the shipped `terminal` (no `{file}`
+  at all) would have run three times. Only a template that names the file runs per file.
+* **One interpreter, many files.** A single interpreter reused across the selection keeps the `cd`
+  of a failed run, so file 2 would run somewhere file 1 left it. Each file gets a fresh interpreter
+  started in the pane's own directory.
+* **The ledger cited tests that no longer exist.** `gui.explorer-custom-commands` cited seven
+  `SecurityTest.py` cases for the *legacy Python* implementation (`gui.execute_custom_command`), which
+  is not in `source/gui/linscp_gui.py` at all — `python3 -m unittest tests.SecurityTest` errors with
+  `module 'linscp_gui' has no attribute 'quote_remote'`. Those citations are removed rather than
+  re-pointed: the behaviour they described is now covered by tests that run against the code that
+  ships, and `desktop.shell-and-extensions` had four of the same dead citations removed too.
+
+Evidence: `service-commands` (`ops.rs`: the tokenizer's view of an expanded hostile name, `{files}`
+covering the selection, once-against-per-file, a failure and a refused name not stopping the rest,
+every shipped template being a real command, the side/pane refusal, and the store the dialog saves
+into being the one the run reads), `service` (`lib.rs`: the page's exact payload answered per file,
+a name with a space, an unknown name, and the pane mismatch refused), and `gui` (`ClientTest.js`:
+the new side-mismatch refusal, plus the run payload carrying the pane). **Not verified here:** still
+no Rust toolchain in this sandbox, so the Rust above is reading-level; the CI jobs are the first
+compile. The jsdom suite *was* run (`npm --prefix ui test`, 215 checks) and the refusal it asserts
+fails without the page change.
 
 ### A3. The whole shell-integration feature is unreachable — the shipped binary ignores its arguments
 **Platforms:** Windows ✗, Debian ✗, Android n/a
@@ -395,7 +461,8 @@ four `tools/tests` files: `test_android_application_id.py`, `test_android_releas
 |---|---|---|---|
 | `gui` (ClientTest.js) — 77 | **yes**, all 3 workflows (`npm --prefix ui test` → `node ../source/gui/tests/ClientTest.js dist/index.html`) | passes (part of `ui && npm test`, exit 0) | jsdom against the built page. Real, but it mocks `fetch` — it cannot see a platform. |
 | `gui-localization` (LocalizationTest.js) — ≤6 | **yes**, same command | passes | as above |
-| `service` (Rust tests in `linscp-service/src/lib.rs`) — 2 | linux: yes (`debian/rules:14` `cargo test --workspace --all-targets`), windows: yes (`windows-build.yml:42`), **android: no** | not run (no toolchain) | the only suite that tests the shared dispatch; genuinely runs on 2 of 3 platforms |
+| `service` (Rust tests in `linscp-service/src/lib.rs`) — 3 | linux: yes (`debian/rules:14` `cargo test --workspace --all-targets`), windows: yes (`windows-build.yml:42`), **android: no** | not run (no toolchain) | the only suite that tests the shared dispatch; genuinely runs on 2 of 3 platforms |
+| `service-commands` (Rust tests in `linscp-service/src/ops.rs`, added with A2) | same two workflows, same gap | not run (no toolchain) | `ops.rs` already had no `#[cfg(test)]` module, so this suite is new; Android still runs no Rust test |
 | `unit` (UnitTest.cpp) — 101 | **no** | no | no build target: `CMakeLists.txt:3` is `project(LinSCP VERSION 1.0 LANGUAGES NONE)`, `source/linux/Makefile` builds only cargo. It also needs `<libssh/libssh.h>` and `PathUtil.h` (neither vendored). Cited more than any other file in the repo and cannot be compiled. |
 | `script`, `live-sftp`, `live-scp`, `live-s3`, `live-dav`, `live-curl`, `live-tunnel`, `live-desktop` — 8 suites, cited by most transfer/protocol rows | **no** | no | all argv-driven: `BINARY = str(pathlib.Path(sys.argv.pop(1)).resolve())` (e.g. `ScriptTest.py:17`). There is **no `linscp` binary** — `crates/linscp-cli` does not exist and `tools/tests/test_gui_distribution.py:13-14` *forbids* it. `linscp-gui` parses no arguments (A3). `LiveDesktopTest.py:188` runs `[$BINARY, "--serve-http", …]`, which nothing accepts (`linscp-web` takes `--port/--print-token/--bind/--allow-host/--allow-remote`, `linscp-http/src/main.rs:52-77`). |
 | `gui-security`, `gui-local`, `gui-search`, `gui-browser-upload`, `gui-local-editor`, `gui-desktop-uri`, `gui-shell` — 7 Python suites | **no** | **fail en masse** (measured) | they import `source/gui/linscp_gui.py`, a 116-line docstring shim exporting four helpers and nothing else. Measured: `ShellIntegrationTest` 12 run / 12 failed; `LocalWorkspaceTest` 26 run / 26 errors + 8 skipped (`module 'linscp_gui' has no attribute validate_workspace_name`); `SecurityTest` 124 run / 123 failed. **All three exit 0 anyway**, and each prints `evidence: suite=… platform=linux ran=N failed=N` — a line that reads like evidence regardless of the numbers. |
@@ -461,7 +528,9 @@ Ordered by (user impact × confidence) ÷ effort. All are small except where not
    and is a prerequisite for ever running the `gui-shell` / `--shell-upload` cases the ledger already
    cites. *M*
 3. **A2 custom-command run (+ the `sh` hardcode in the same commit)** — one action that is broken
-   today on all three builds. *S*
+   today on all three builds. *S* — **done**, see A2's *Status: fixed*: the shell was removed rather
+   than `cfg`-split, seven second-order defects went with it, and the seven dead `SecurityTest.py`
+   citations were removed from two ledger rows.
 4. **B-suite triage**: mark `unit`, all `live-*`, `script`, and the 7 Python `gui-*` suites as
    **not runnable** in `docs/upstream-parity.json` (they are not evidence), and make
    `check_upstream_parity.py` validate `windows`/`android` against `checks` the way it already

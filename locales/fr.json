@@ -1252,6 +1252,7 @@
     "the timestamps are equal but the sizes differ, and there is no previous synchronization to compare with": "les horodatages sont identiques mais les tailles diffèrent, et il n’y a pas de synchronisation précédente pour comparer",
     "unchanged": "inchangé",
     "upload": "envoyer",
+    "{command} is saved for the {saved} side, and the {pane} panel is selected. Select the files in the {saved} panel, or save the command for the {pane} side.": "{command} est enregistré pour le côté {saved}, et le panneau {pane} est sélectionné. Sélectionnez les fichiers dans le panneau {saved}, ou enregistrez la commande pour le côté {pane}.",
     "{count} command failed.": "{count} commande a échoué.",
     "{count} commands failed.": "{count} commandes ont échoué.",
     "{count} desktop item refused.": "{count} élément du bureau refusé.",

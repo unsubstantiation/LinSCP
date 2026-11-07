@@ -89,6 +89,11 @@ CASE_SOURCES = {
     # What those actions *do* once the arguments are decided: stage a manifest,
     # refuse an empty selection, report an install that cannot be carried out.
     "gui-shell-actions": "crates/linscp-service/src/cli_actions.rs",
+    # The saved-command run path: the endpoint the page's Run button posts to and
+    # the expansion/interpreter layer behind it. Nothing here reaches a shell, so
+    # the tests assert the tokenizer's view of the expanded line, not a string a
+    # shell would have read.
+    "service-commands": "crates/linscp-service/src/ops.rs",
 }
 
 
@@ -290,7 +295,8 @@ def check_capabilities(inventory, errors, root=ROOT):
                 elif suite == "ui-transport":
                     # The bundle's own suite is node:test, so a case is a test().
                     expression = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
-                elif suite in ("service", "gui-cli", "gui-shell-definitions", "gui-shell-actions"):
+                elif suite in ("service", "service-commands", "gui-cli",
+                               "gui-shell-definitions", "gui-shell-actions"):
                     # A Rust test is a #[test]/#[tokio::test] function, not a
                     # `test_*` ffi symbol; the drop helpers are `async fn`.
                     expression = r"\b(?:async\s+)?fn\s+" + re.escape(case) + r"\s*\("

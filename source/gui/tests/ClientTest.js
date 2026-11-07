@@ -168,9 +168,13 @@ function customCommandsBody(options) {
     return { success: true, commands: stored };
   }
   if (request.action === 'run') {
+    /* The backend answers with what each file's run printed, and only the
+     * names it actually ran on; the page shows that verbatim. */
     return { success: true, scope: 'remote',
-      results: (request.filenames || []).map(name => (
-        { file: name, success: true, exit_code: 0, stdout: 'SHA-256 verified', stderr: '' })) };
+      results: (request.filenames || []).map(name => ({
+        file: name, command: 'checksum sha-256 ' + name, success: true,
+        exit_code: 0, stdout: 'SHA-256 verified', stderr: '', error: ''
+      })) };
   }
   return { success: true, commands: stored };
 }
@@ -1223,6 +1227,28 @@ function options(id) {
   check('declining a custom command confirmation queues no work',
     declinedRuns === priorRuns);
 
+  /* A template saved for one side must not run on the other side's names:
+   * remote `checksum sha-256 keep.txt` against the local pane would check a
+   * different file. The page refuses it by name instead of posting it. */
+  const beforeMismatch = calls.filter(call => call.path === '/api/custom-commands' &&
+    JSON.parse(call.options.body || '{}').action === 'run').length;
+  window.selectCustomCommand(0);
+  doc.getElementById('localPane')
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  doc.getElementById('localFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  await window.runCustomCommand();
+  const refusals = text('toast');
+  const afterMismatch = calls.filter(call => call.path === '/api/custom-commands' &&
+    JSON.parse(call.options.body || '{}').action === 'run').length;
+  check('a template saved for one side is refused on the other side by name',
+    afterMismatch === beforeMismatch && refusals.includes('Checksum') &&
+      refusals.toLowerCase().includes('remote'), refusals);
+  window.selectCustomCommand(0);
+  window.focusPane('remote');
+  doc.getElementById('remoteFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+
   confirmResult = true;
   await window.runCustomCommand();
   const customRun = calls.filter(call => call.path === '/api/custom-commands' &&
@@ -1230,6 +1256,7 @@ function options(id) {
   const customPayload = customRun ? JSON.parse(customRun.options.body) : {};
   check('confirmed custom command runs only on the selected remote entry',
     customPayload.action === 'run' && customPayload.tab === 1 &&
+      customPayload.pane === 'remote' &&
       Array.isArray(customPayload.filenames) &&
       customPayload.filenames.length === 1 &&
       customPayload.filenames[0] === 'keep.txt', JSON.stringify(customPayload));

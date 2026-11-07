@@ -719,13 +719,103 @@ pub fn normalize_custom_command(body: &Value) -> Option<Value> {
     }))
 }
 
-fn shell_quote_single(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+/// Quotes one word for the LinSCP command line's own tokenizer.
+///
+/// This is **not** shell quoting and must never be described as such. Nothing
+/// interpolated here reaches a shell: the words are handed to
+/// `linscp_engine::script::tokenize_script_line`, which drops the quotes and keeps
+/// one token. Single quotes work there (`'a b'` is one word) and so do backslash
+/// escapes, so a name holding a quote needs neither doubled quotes nor `'\''`.
+fn quote_operand(word: &str) -> String {
+    let needs_quotes = word.is_empty()
+        || word
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\'));
+    if !needs_quotes {
+        return word.to_string();
+    }
+    let mut out = String::with_capacity(word.len() + 2);
+    out.push('\'');
+    for c in word.chars() {
+        if c == '\'' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
 }
 
-fn expand_command_template(
+/// Which side of the tab a command runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandSide {
+    Local,
+    Remote,
+}
+
+/// Where a template runs and which directory its names are relative to.
+///
+/// Two inputs decide this and they can disagree: the template's own `scope` says
+/// what the command is written for, and the page's focused pane says which pane
+/// the names came from. Running a remote `checksum` on the local pane's names
+/// would check a different file of the same name on the server, so a disagreement
+/// is refused instead of guessed.
+pub fn resolve_command_target(
+    scope: &str,
+    pane: &str,
+    tab: &TabRuntime,
+) -> Result<(CommandSide, String), String> {
+    // A local-only tab has no server: a remote-scoped template falls back to the
+    // tab's other local pane, which is what the page shows in its right-hand
+    // ("remote") panel.
+    let run_side = if scope == "local" || tab.is_local {
+        CommandSide::Local
+    } else {
+        CommandSide::Remote
+    };
+    let pane = match pane {
+        "local" | "remote" => pane,
+        _ => return Ok((run_side, side_directory(run_side, pane, tab))),
+    };
+    let selection_side = if pane == "local" || tab.is_local {
+        CommandSide::Local
+    } else {
+        CommandSide::Remote
+    };
+    if selection_side != run_side {
+        let where_it_runs = if run_side == CommandSide::Remote { "remote" } else { "local" };
+        return Err(format!(
+            "This command is saved for the {where_it_runs} side, and the {pane} panel is selected. \
+             Select the files in the {where_it_runs} panel, or save the command for the {pane} side."
+        ));
+    }
+    Ok((run_side, side_directory(selection_side, pane, tab)))
+}
+
+/// The directory a side's names are relative to, as the page's panes show it.
+fn side_directory(side: CommandSide, pane: &str, tab: &TabRuntime) -> String {
+    match side {
+        // The right-hand panel of a local-only tab is the tab's other local dir.
+        CommandSide::Local if pane == "remote" && tab.is_local => tab.other_local_dir.clone(),
+        CommandSide::Local => tab.local_dir.clone(),
+        CommandSide::Remote => tab.remote_dir.clone(),
+    }
+}
+
+/// Expands one saved template for one selected entry.
+///
+/// The placeholders are the documented ones (`{file}` and `{files}`, plus
+/// upstream's `!`/`!/`/`!@`/`!#`/`!U`/`!S` forms). Every substituted value is
+/// quoted for the command line's tokenizer, so a name with a space, a quote or a
+/// backslash stays one operand and never starts a second command.
+///
+/// `{files}` is the whole selection; the caller expands it once per run and hands
+/// the result in as `all_files`, so a template written for a multi-file command
+/// (`tar czf out.tgz {files}`) runs once rather than once per file.
+pub fn expand_custom_command(
     template_cmd: &str,
     filename: &str,
+    all_files: &[String],
     dir: &str,
     tab: &TabRuntime,
 ) -> String {
@@ -756,11 +846,36 @@ fn expand_command_template(
     } else {
         format!("{dir}/")
     };
+    let joined: Vec<String> = all_files.iter().map(|name| quote_operand(name)).collect();
+    let all_quoted = joined.join(" ");
 
     let mut out = String::with_capacity(template_cmd.len() + 32);
     let chars: Vec<char> = template_cmd.chars().collect();
     let mut i = 0;
     while i < chars.len() {
+        // `{file}` / `{files}`: the form this GUI documents, and the one a saved
+        // template from a previous version is most likely to use.
+        if chars[i] == '{' {
+            // Scan the character vector, not the string: `{` and `}` are ASCII,
+            // but the template between them need not be, and a byte offset into
+            // a multi-byte character would slice a name in half.
+            if let Some(rel) = chars[i..].iter().position(|c| *c == '}') {
+                let name: String = chars[i + 1..i + rel].iter().collect();
+                let replacement = match name.as_str() {
+                    "file" => Some(quote_operand(filename)),
+                    "files" => Some(all_quoted.clone()),
+                    _ => None,
+                };
+                if let Some(replacement) = replacement {
+                    out.push_str(&replacement);
+                    i += rel + 1;
+                    continue;
+                }
+            }
+            out.push('{');
+            i += 1;
+            continue;
+        }
         if chars[i] == '!' {
             if i + 1 < chars.len() {
                 match chars[i + 1] {
@@ -770,12 +885,12 @@ fn expand_command_template(
                         continue;
                     }
                     '/' => {
-                        out.push_str(&shell_quote_single(&dir_slash));
+                        out.push_str(&quote_operand(&dir_slash));
                         i += 2;
                         continue;
                     }
                     '@' => {
-                        out.push_str(&shell_quote_single(host));
+                        out.push_str(&quote_operand(host));
                         i += 2;
                         continue;
                     }
@@ -785,19 +900,19 @@ fn expand_command_template(
                         continue;
                     }
                     'U' => {
-                        out.push_str(&shell_quote_single(user));
+                        out.push_str(&quote_operand(user));
                         i += 2;
                         continue;
                     }
                     'S' => {
-                        out.push_str(&shell_quote_single(&tab.name));
+                        out.push_str(&quote_operand(&tab.name));
                         i += 2;
                         continue;
                     }
                     _ => {}
                 }
             }
-            out.push_str(&shell_quote_single(filename));
+            out.push_str(&quote_operand(filename));
             i += 1;
         } else {
             out.push(chars[i]);
@@ -807,112 +922,159 @@ fn expand_command_template(
     out
 }
 
+/// One entry of the page's result list: a file, what ran, and what it printed.
+///
+/// `error` carries only a reason the command never ran (a name the page should
+/// not have sent). What the command itself reported is on `stdout`/`stderr`, so
+/// the page's `error + stdout + stderr` detail block does not print it twice.
+fn command_result(file: &str, command: &str, exit_code: i32, stdout: String, stderr: String) -> Value {
+    json!({
+        "file": file,
+        "command": command,
+        "success": exit_code == 0,
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "error": "",
+    })
+}
+
+/// A refusal that never reached the interpreter, reported against one file.
+fn rejected_result(file: &str, error: String) -> Value {
+    json!({
+        "file": file,
+        "command": "",
+        "success": false,
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": "",
+        "error": error,
+    })
+}
+
+/// The tab as one command should see it: the pane the template applies to is
+/// the pane its names are relative to, whichever side that is.
+fn tab_for_side(tab: &TabRuntime, side: CommandSide, work_dir: &str) -> TabRuntime {
+    let mut tab = tab.clone();
+    match side {
+        CommandSide::Local => tab.local_dir = work_dir.to_string(),
+        CommandSide::Remote => tab.remote_dir = work_dir.to_string(),
+    }
+    // A command on a tab's local side runs with or without a server: `checksum`,
+    // `chmod`, `lls` and `call` act on the local pane through the interpreter's
+    // own local paths. A local-only tab never had a session to be missing, so it
+    // is presented as connected; a remote tab that dropped its connection keeps
+    // saying so, because its remote side really is gone.
+    if side == CommandSide::Local && tab.is_local {
+        tab.connected = true;
+    }
+    tab
+}
+
+/// Runs one saved command template over the selection.
+///
+/// The command is a **LinSCP command line**, not a shell line: it goes through the
+/// same `ScriptInterpreter` the console panel uses, so `checksum`, `chmod`, `lls`,
+/// `call` and the rest mean exactly what they mean there, on all three builds.
+///
+/// The previous implementation built a `sh -c` string and ran it with
+/// `std::process::Command`, which meant a Windows build had no way to run a local
+/// command at all and a POSIX build handed the selection to a shell. Nothing here
+/// spawns a process directly; the interpreter's own `call` (`!`) command is the
+/// single, opt-in way a template reaches a shell.
+///
+/// When a template names no `{file}`/`{files}`/`!` operand the command does not
+/// depend on the selection, so it runs once instead of once per selected file.
 pub async fn execute_custom_command_template(
+    make_interpreter: &mut dyn FnMut(&TabRuntime) -> Result<linscp_engine::script::ScriptInterpreter, String>,
     template: &Value,
     filenames: &[String],
+    pane: &str,
     tab: &TabRuntime,
+    on_command: &mut dyn FnMut(&str),
 ) -> Result<Vec<Value>, String> {
     let raw_cmd = template
         .get("command")
         .and_then(Value::as_str)
         .ok_or_else(|| "Invalid command template.".to_string())?;
-    let scope = template
-        .get("scope")
-        .and_then(Value::as_str)
-        .unwrap_or("remote");
+    let scope = template.get("scope").and_then(Value::as_str).unwrap_or("remote");
+    let (side, work_dir) = resolve_command_target(scope, pane, tab)?;
 
-    let mut results = Vec::with_capacity(filenames.len());
-    for raw_name in filenames {
-        let leaf = validate_leaf_name(raw_name)?;
-        if scope == "local" || tab.is_local {
-            let work_dir = if scope == "remote" && tab.is_local {
-                &tab.other_local_dir
-            } else {
-                &tab.local_dir
-            };
-            let expanded = expand_command_template(raw_cmd, &leaf, work_dir, tab);
-            let full_cmd = format!("cd -- {} && {expanded}", shell_quote_single(work_dir));
-            let full_clone = full_cmd.clone();
-            let output = tokio::task::spawn_blocking(move || {
-                std::process::Command::new("sh").arg("-c").arg(&full_clone).output().map_err(|e| e.to_string())
-            })
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
-            results.push(json!({
-                "file": leaf,
-                "command": expanded,
-                "exit_code": output.status.code().unwrap_or(1),
-                "stdout": String::from_utf8_lossy(&output.stdout).into_owned(),
-                "stderr": String::from_utf8_lossy(&output.stderr).into_owned(),
-            }));
-        } else {
-            let session = tab
-                .remote
-                .as_ref()
-                .ok_or_else(|| "Not connected.".to_string())?;
-            let ssh = session
-                .ssh_connection()
-                .ok_or_else(|| "Remote custom commands require an SSH/SFTP/SCP session.".to_string())?;
-            let expanded = expand_command_template(raw_cmd, &leaf, &tab.remote_dir, tab);
-            let full_cmd = format!("cd -- {} && {expanded}", shell_quote_single(&tab.remote_dir));
-            let out = ssh.exec_command(&full_cmd).await.map_err(|e| e.to_string())?;
-            results.push(json!({
-                "file": leaf,
-                "command": expanded,
-                "exit_code": out.exit_code.unwrap_or(0),
-                "stdout": String::from_utf8_lossy(&out.stdout),
-                "stderr": String::from_utf8_lossy(&out.stderr),
-            }));
-        }
+    // Every name is checked before anything runs: a hostile entry must not stop
+    // the rest of the selection, but it must not be substituted either. The group
+    // operand is built from the validated names only.
+    let validated: Vec<String> = filenames
+        .iter()
+        .filter_map(|name| validate_leaf_name(name).ok())
+        .collect();
+
+    let per_file = raw_cmd.contains("{file}") || names_an_operand(raw_cmd);
+    let targets: Vec<Option<String>> = if per_file {
+        filenames.iter().map(|name| Some(name.clone())).collect()
+    } else {
+        // The command does not mention the selection: run it exactly once.
+        vec![None]
+    };
+
+    let mut results = Vec::with_capacity(targets.len());
+    for target in targets {
+        let leaf = match &target {
+            Some(name) => match validate_leaf_name(name) {
+                Ok(leaf) => leaf,
+                Err(error) => {
+                    results.push(rejected_result(name, error));
+                    continue;
+                }
+            },
+            None => String::new(),
+        };
+        let expanded = expand_custom_command(raw_cmd, &leaf, &validated, &work_dir, tab);
+        // One interpreter per file, starting in the pane's directory: a command
+        // that fails half way must not leave the next file running in its
+        // wreckage, and a `cd` in one template run is that run's own business.
+        let mut interpreter = match make_interpreter(&tab_for_side(tab, side, &work_dir)) {
+            Ok(interpreter) => interpreter,
+            Err(error) => {
+                results.push(rejected_result(&leaf, error));
+                break;
+            }
+        };
+        on_command(&expanded);
+        let (ok, stdout, stderr) = Box::pin(interpreter.run_captured(&expanded)).await;
+        let exit_code = if ok && interpreter.error_count() == 0 { 0 } else { 1 };
+        results.push(command_result(&leaf, &expanded, exit_code, stdout, stderr));
     }
     Ok(results)
 }
 
-pub async fn exec_raw_remote_or_local_command(
-    command: &str,
-    scope: &str,
-    tab: Option<&TabRuntime>,
-) -> Result<(i32, String, String), String> {
-    if scope == "local" || tab.is_some_and(|t| t.is_local) {
-        let cwd = tab.map(|t| t.local_dir.clone());
-        let cmd_str = if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
-            format!("cd -- {} && {command}", shell_quote_single(&dir))
-        } else {
-            command.to_string()
-        };
-        let cmd_clone = cmd_str.clone();
-        let output = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("sh").arg("-c").arg(&cmd_clone).output().map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
-        return Ok((
-            output.status.code().unwrap_or(1),
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ));
+/// Whether a template names the selection, and so needs one to run.
+pub fn template_names_a_file(template: &Value) -> bool {
+    template
+        .get("command")
+        .and_then(Value::as_str)
+        .map(|cmd| cmd.contains("{file}") || cmd.contains("{files}") || names_an_operand(cmd))
+        .unwrap_or(false)
+}
+
+/// Whether a template line mentions the current entry at all. `!` on its own does;
+/// the escapes `!!`, `!/`, `!@`, `!#`, `!U` and `!S` do not, because they name the
+/// directory, the host, the port, the user or the session rather than the file.
+fn names_an_operand(template_cmd: &str) -> bool {
+    let chars: Vec<char> = template_cmd.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '!' {
+            match chars.get(i + 1) {
+                Some('!') | Some('/') | Some('@') | Some('#') | Some('U') | Some('S') => {
+                    i += 2;
+                    continue;
+                }
+                _ => return true,
+            }
+        }
+        i += 1;
     }
-    let tab = tab.ok_or_else(|| "Not connected".to_string())?;
-    let session = tab
-        .remote
-        .as_ref()
-        .ok_or_else(|| "Not connected".to_string())?;
-    let ssh = session
-        .ssh_connection()
-        .ok_or_else(|| "Shell command execution requires an SSH/SFTP/SCP session.".to_string())?;
-    let full = if tab.remote_dir.is_empty() || tab.remote_dir == "~" {
-        command.to_string()
-    } else {
-        format!("cd -- {} && {command}", shell_quote_single(&tab.remote_dir))
-    };
-    let out = ssh.exec_command(&full).await.map_err(|e| e.to_string())?;
-    Ok((
-        out.exit_code.unwrap_or(0) as i32,
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    ))
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,4 +1303,319 @@ pub fn resolve_chmod_mode(mode_spec: &str, current_mode: u32) -> Result<u32, Str
     }
     let new_mode = parse_chmod_spec(trimmed, current_mode)?;
     Ok(new_mode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use linscp_engine::script::{ScriptInterpreter, ScriptRunConfig};
+    use linscp_engine::xml_log::SessionLogger;
+    use serde_json::json;
+
+    fn tab(is_local: bool) -> TabRuntime {
+        TabRuntime {
+            id: 1,
+            name: "session".into(),
+            site_name: None,
+            is_local,
+            connected: true,
+            local_dir: "/home/u/Local".into(),
+            remote_dir: "/srv/Remote".into(),
+            other_local_dir: "/home/u/Other".into(),
+            observed_hostkey: String::new(),
+            hostkey_role: String::new(),
+            hostkey_changed: false,
+            error: String::new(),
+            spec: None,
+            session_json: json!({}),
+            remote: None,
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "linscp-custom-commands-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        dir.canonicalize().expect("canonical scratch directory")
+    }
+
+    /// An interpreter that has no session and therefore only reaches local
+    /// commands, which is the only thing a template must need to work.
+    fn local_interpreter(tab: &TabRuntime) -> Result<ScriptInterpreter, String> {
+        let logger = SessionLogger::open(None, 0, false, None, None, false, "")
+            .map_err(|e| e.to_string())?;
+        let mut cfg = ScriptRunConfig::default();
+        // Nothing behind the window can answer a question, and the page already
+        // asked before it posted the run.
+        cfg.batch_mode = linscp_engine::script::BatchMode::Abort;
+        let mut interpreter = ScriptInterpreter::new(cfg, logger);
+        interpreter.set_local_dir(PathBuf::from(&tab.local_dir));
+        Ok(interpreter)
+    }
+
+    /// A name with a space is one operand, not two, and a name that starts a
+    /// second command stays inside its quotes: the quote the template gets is
+    /// the command line's own, and it is what the interpreter's tokenizer reads.
+    #[test]
+    fn a_hostile_name_stays_one_operand_of_the_command_line() {
+        let tab = tab(true);
+        let cases = [
+            ("my report.txt", "'my report.txt'"),
+            ("`whoami`.txt", "`whoami`.txt"),
+            ("a; rm -rf ~.txt", "'a; rm -rf ~.txt'"),
+            ("it's.txt", "'it\\'s.txt'"),
+            ("a\"b.txt", "'a\"b.txt'"),
+            ("plain.txt", "plain.txt"),
+            // A non-ASCII name must not be sliced by the placeholder scanner.
+            ("für alle.txt", "'für alle.txt'"),
+        ];
+        for (raw, expected) in cases {
+            let expanded = expand_custom_command("chmod 644 {file}", raw, &[], "/tmp", &tab);
+            assert_eq!(expanded, format!("chmod 644 {expected}"), "{raw}");
+            // And the tokenizer the interpreter uses agrees: one operand, with
+            // the original name intact.
+            let tokens =
+                linscp_engine::script_params::tokenize_script_line(&expanded).expect("tokens");
+            assert_eq!(tokens.len(), 3, "{expanded}");
+            assert_eq!(tokens[2], raw, "the name survives quoting: {expanded}");
+        }
+    }
+
+    /// `{files}` is the whole selection in one run, quoted per operand.
+    #[test]
+    fn the_group_placeholder_quotes_every_member() {
+        let prefixed =
+            expand_custom_command("call echo größer {file}", "a.txt", &[], "/tmp", &tab(true));
+        assert_eq!(prefixed, "call echo größer a.txt");
+
+        let expanded = expand_custom_command(
+            "call tar czf out.tgz {files}",
+            "",
+            &["a.txt".to_string(), "two words.txt".to_string()],
+            "/tmp",
+            &tab(true),
+        );
+        assert_eq!(expanded, "call tar czf out.tgz a.txt 'two words.txt'");
+    }
+
+    /// A template with no operand at all runs once, even with a whole selection,
+    /// and a template that names the file runs once per file - in the pane the
+    /// template applies to.
+    #[tokio::test]
+    async fn only_a_template_that_names_the_file_runs_once_per_file() {
+        let dir = scratch("once");
+        std::fs::write(dir.join("a.txt"), b"payload").expect("write a test file");
+        std::fs::write(dir.join("two words.txt"), b"payload").expect("write a test file");
+        let mut test_tab = tab(true);
+        test_tab.local_dir = dir.to_string_lossy().into_owned();
+        let files = vec!["a.txt".to_string(), "two words.txt".to_string()];
+
+        let once = json!({"name": "where", "command": "lpwd", "scope": "local"});
+        let results = execute_custom_command_template(
+            &mut local_interpreter,
+            &once,
+            &files,
+            "local",
+            &test_tab,
+            &mut |_| {},
+        )
+        .await
+        .expect("the template runs");
+        assert_eq!(results.len(), 1, "a template that names no file runs once");
+        assert_eq!(results[0]["success"], true, "{}", results[0]);
+        assert!(
+            results[0]["stdout"]
+                .as_str()
+                .unwrap_or("")
+                .contains(&dir.display().to_string()),
+            "and it starts in the pane's directory: {}",
+            results[0]
+        );
+
+        // `lls` prints the entry it listed, so a name with a space shows up as
+        // one name rather than as two names that are both missing.
+        let per_file = json!({"name": "look", "command": "lls {file}", "scope": "local"});
+        let results = execute_custom_command_template(
+            &mut local_interpreter,
+            &per_file,
+            &files,
+            "local",
+            &test_tab,
+            &mut |_| {},
+        )
+        .await
+        .expect("the template runs");
+        assert_eq!(results.len(), 2, "one result per selected file: {results:?}");
+        let ran: Vec<&str> = results
+            .iter()
+            .map(|r| r["file"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(ran, vec!["a.txt", "two words.txt"]);
+        for result in &results {
+            assert_eq!(result["success"], true, "{}", result);
+            let file = result["file"].as_str().unwrap_or("");
+            assert!(
+                result["stdout"].as_str().unwrap_or("").contains(file),
+                "the entry it listed is the one that was selected: {result}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One file's refusal or failure never stops the rest of the selection, and
+    /// the failure is reported against the file it happened to.
+    #[tokio::test]
+    async fn one_files_failure_does_not_stop_the_others() {
+        let dir = scratch("continue");
+        std::fs::create_dir_all(dir.join("sub")).expect("a directory to select");
+        let mut test_tab = tab(true);
+        test_tab.local_dir = dir.to_string_lossy().into_owned();
+        // The first entry exists, the second cannot be an entry of the panel at
+        // all, and the third is a name that is simply not there.
+        let files = vec![
+            "sub".to_string(),
+            "../escape".to_string(),
+            "missing".to_string(),
+        ];
+        let template = json!({"name": "go", "command": "lcd {file}", "scope": "local"});
+        let results = execute_custom_command_template(
+            &mut local_interpreter,
+            &template,
+            &files,
+            "local",
+            &test_tab,
+            &mut |_| {},
+        )
+        .await
+        .expect("the run itself succeeds");
+        assert_eq!(results.len(), 3, "every file is answered: {results:?}");
+        assert_eq!(results[0]["success"], true, "{}", results[0]);
+        assert_eq!(results[1]["success"], false, "{}", results[1]);
+        assert_eq!(results[1]["file"], "../escape");
+        assert_eq!(
+            results[1]["command"], "",
+            "a refused name never becomes a command line: {}",
+            results[1]
+        );
+        assert!(
+            !results[1]["error"].as_str().unwrap_or("").is_empty(),
+            "the refused name says why: {}",
+            results[1]
+        );
+        assert_eq!(results[2]["success"], false, "{}", results[2]);
+        assert_eq!(results[2]["file"], "missing");
+        assert!(
+            results[2]["stderr"].as_str().unwrap_or("").contains("missing"),
+            "the command's own failure is on its own channel: {}",
+            results[2]
+        );
+        assert_eq!(
+            results[2]["error"], "",
+            "and is not repeated as a refusal: {}",
+            results[2]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The shipped templates are lines this interpreter actually understands.
+    /// They are the ones the dialog offers on a fresh install, so a command the
+    /// interpreter would reject by name would make Run fail out of the box.
+    #[test]
+    fn every_shipped_template_is_a_command_the_interpreter_knows() {
+        use linscp_engine::script::COMMAND_NAMES;
+        use linscp_engine::script_params::{resolve_prefixed_name, PrefixMatch};
+        let shipped: Value =
+            serde_json::from_str(DEFAULT_EXPLORER_COMMANDS_JSON).expect("shipped defaults parse");
+        let commands = shipped.as_array().expect("an array of templates");
+        assert!(!commands.is_empty(), "a fresh install offers something to run");
+        for template in commands {
+            let line = template["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a template without a command: {template}"));
+            let first = line.split_whitespace().next().unwrap_or("");
+            assert!(
+                matches!(resolve_prefixed_name(COMMAND_NAMES, first), PrefixMatch::ExactOrUnique(_)),
+                "'{line}' starts with a command the interpreter does not know"
+            );
+            // And the placeholder it uses is one this expansion implements.
+            for placeholder in line.split_whitespace().filter(|word| word.contains('{')) {
+                assert!(
+                    placeholder.contains("{file}") || placeholder.contains("{files}"),
+                    "'{line}' uses a placeholder nothing expands: {placeholder}"
+                );
+            }
+        }
+    }
+
+    /// The template's side and the pane the selection came from have to agree,
+    /// or a remote command silently acts on a same-named file that is not the
+    /// one the user selected.
+    #[test]
+    fn a_side_mismatch_is_refused_rather_than_guessed() {
+        let remote_tab = tab(false);
+        let (side, dir) =
+            resolve_command_target("remote", "remote", &remote_tab).expect("both remote");
+        assert_eq!(side, CommandSide::Remote);
+        assert_eq!(dir, "/srv/Remote");
+
+        let (side, dir) = resolve_command_target("local", "local", &remote_tab).expect("both local");
+        assert_eq!(side, CommandSide::Local);
+        assert_eq!(dir, "/home/u/Local");
+
+        let error = resolve_command_target("remote", "local", &remote_tab)
+            .expect_err("remote template, local selection");
+        assert!(error.contains("remote side"), "{error}");
+        assert!(error.contains("local panel"), "{error}");
+
+        // A local-only tab has no server, so a remote-scoped template applies to
+        // the pane the page draws on the right.
+        let local_tab = tab(true);
+        let (side, dir) =
+            resolve_command_target("remote", "remote", &local_tab).expect("local-only tab");
+        assert_eq!(side, CommandSide::Local);
+        assert_eq!(dir, "/home/u/Other");
+
+        // A page that sends no pane (an older client) keeps the saved scope.
+        let (side, _) = resolve_command_target("remote", "", &remote_tab).expect("no pane given");
+        assert_eq!(side, CommandSide::Remote);
+    }
+
+    /// The store the dialog saves into is the store the run reads from.
+    #[test]
+    fn a_saved_template_is_the_one_that_runs() {
+        let config = scratch("store");
+        assert!(
+            read_custom_commands(&config)
+                .iter()
+                .any(|c| c["name"] == "Checksum"),
+            "the shipped defaults are what an empty store lists"
+        );
+        let saved = normalize_custom_command(&json!({
+            "name": " Word count ", "command": " call wc {file} ",
+            "scope": "local", "apply_to_directories": true,
+            "description": " counts lines "
+        }))
+        .expect("a one-line command with a name");
+        assert_eq!(saved["name"], "Word count");
+        assert_eq!(saved["command"], "call wc {file}");
+        assert_eq!(saved["scope"], "local");
+        assert_eq!(saved["apply_to_directories"], true);
+        assert_eq!(saved["description"], "counts lines");
+        assert!(
+            normalize_custom_command(&json!({"name": "x", "command": "one\ntwo"})).is_none(),
+            "a command with a newline would run a second command nobody typed"
+        );
+        assert!(
+            normalize_custom_command(&json!({"name": "  ", "command": "ls"})).is_none(),
+            "a nameless command cannot be selected or run"
+        );
+        write_custom_commands(&config, &[saved.clone()]).expect("write the store");
+        let reloaded = read_custom_commands(&config);
+        assert_eq!(reloaded.len(), 1, "{reloaded:?}");
+        assert_eq!(reloaded[0]["command"], "call wc {file}");
+        let _ = std::fs::remove_dir_all(config);
+    }
 }

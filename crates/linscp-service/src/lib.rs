@@ -238,6 +238,8 @@ impl CommanderService {
             // native window and the Android app all offer the menu entry, and
             // an unauthenticated run has nothing to end, so it succeeds.
             ("POST", "/api/logout") => ApiReply{ status: 200, payload: json!({"success": true})},
+            // `list`/`save`/`delete` only. `run` needs the console interpreter,
+            // which is async, so it is answered by the asynchronous entry point.
             ("POST", "/api/custom-commands") => self.handle_custom_commands(req.body),
             ("POST", "/api/command/exec") => self.handle_command_exec(req.body),
             ("GET", "/api/desktop/recommendations") => self.handle_desktop_recommendations(),
@@ -258,6 +260,7 @@ impl CommanderService {
             (m, p)
         };
         match (method.as_str(), raw_path.as_str()) {
+            ("POST", "/api/custom-commands") => self.handle_custom_commands_async(req.body).await,
             ("POST", "/api/tabs/open") => self.open_tab_async(req.body).await,
             ("POST", "/api/tabs/verify") => self.verify_tab_async(req.body).await,
             ("POST", "/api/tabs/reconnect") => self.reconnect_tab_async(req.body).await,
@@ -1468,6 +1471,93 @@ impl CommanderService {
             "stderr": stderr,
             "exit_code": exit_code,
         })}
+    }
+
+    /// Runs one saved Explorer command over the selected files.
+    ///
+    /// The page posts `{action:"run", name, filenames, tab}` and shows what each
+    /// file's run printed, so this answers with one result per file and never
+    /// lets one file's failure stop the rest. The command itself is a LinSCP
+    /// command line (`checksum ...`, `chmod ...`, `lls ...`, `call ...`), run by
+    /// the same `ScriptInterpreter` as the CLI panel: it is never handed to a
+    /// local shell, which is what made "run a local command" work on Debian and
+    /// fail on Windows.
+    async fn handle_custom_commands_async(&self, body: Value) -> ApiReply {
+        let action = body.get("action").and_then(Value::as_str).unwrap_or("list");
+        if action != "run" {
+            return self.handle_custom_commands(body);
+        }
+        let config_root = self.state.lock().expect("state mutex").config_root.clone();
+        let name = body.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        if name.is_empty() {
+            return api_error(400, "A command name is required.");
+        }
+        let template = match ops::read_custom_commands(&config_root)
+            .into_iter()
+            .find(|entry| entry.get("name").and_then(Value::as_str) == Some(name.as_str()))
+        {
+            Some(template) => template,
+            None => return api_error(404, format!("There is no command '{name}'.")),
+        };
+        let filenames: Vec<String> = body
+            .get("filenames")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A template that names the file needs a selection to name. One that
+        // does not (`terminal`, `presets`) runs once with nothing selected.
+        if filenames.is_empty() && ops::template_names_a_file(&template) {
+            return api_error(400, "Select at least one file or folder.");
+        }
+        let tab = body
+            .get("tab")
+            .and_then(|value| tabs::parse_tab_id_value(Some(value)))
+            .and_then(|id| self.state.lock().expect("state mutex").tabs.get(&id).cloned());
+        let Some(tab) = tab else {
+            return api_error(400, "Open a tab first.");
+        };
+        let scope = template.get("scope").and_then(Value::as_str).unwrap_or("remote").to_string();
+        // The page sends the panel the selection came from; a template saved for
+        // the other side would otherwise act on a same-named file that is not the
+        // one the user selected.
+        let pane = body.get("pane").and_then(Value::as_str).unwrap_or("");
+        if let Err(error) = ops::resolve_command_target(&scope, pane, &tab) {
+            return api_error(400, error);
+        }
+        if scope != "local" && !tab.is_local && !tab.connected {
+            return api_error(400, "Not connected");
+        }
+        // One interpreter per file, starting in the pane the template applies
+        // to. `console_interpreter` only adopts a tab it considers connected, so
+        // a local-only tab is presented as connected: it has no session to be
+        // disconnected from, and its local pane is what the command acts on.
+        let mut factory = |target: &tabs::TabRuntime| match self.console_interpreter(Some(target.clone())) {
+            Ok(interpreter) => Ok(interpreter),
+            Err(reply) => Err(reply
+                .payload
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("The command interpreter could not be started.")
+                .to_string()),
+        };
+        let results =
+            match ops::execute_custom_command_template(&mut factory, &template, &filenames, pane, &tab, &mut |_| {}).await {
+                Ok(results) => results,
+                Err(error) => return api_error(400, error),
+            };
+        // Nothing is written back into the tab's directories: the page refreshes
+        // both panes after a run, and the interpreter started in the pane the
+        // template applies to, so a `cd` inside a template moves the command's
+        // own working directory rather than the user's panes.
+        ApiReply {
+            status: 200,
+            payload: json!({"success": true, "results": results}),
+        }
     }
 
     /// Installs the current key on the server by running the interpreter's
@@ -3244,7 +3334,9 @@ impl CommanderService {
                 }
                 ApiReply{ status:200, payload: json!({"success": true, "commands": cmds})}
             },
-            "run" => ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})},
+            // The async handler answers `run`; a caller that reached this table
+            // asked a shell-less page for a command, so say why it cannot.
+            "run" => api_error(400, "Running a command needs the asynchronous service entry point."),
             _ => ApiReply{ status:400, payload: json!({"success": false, "error": format!("Unknown action '{action}'")})},
         }
     }
@@ -5083,6 +5175,109 @@ mod tests {
         let output = svc.dispatch_async(request("GET", "/api/terminal/output?terminal=term-1", json!({}))).await;
         assert_eq!(output.status, 400, "an unknown terminal is not a success");
         assert_eq!(output.payload["success"], false);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// The Custom commands page's Run button posts `{action:"run", ...}` and has
+    /// to get an answer about the files it named. It used to get "Not connected"
+    /// for every tab, connected or not, because the page's endpoint was a stub
+    /// in the synchronous table and nothing ran.
+    #[tokio::test]
+    async fn the_custom_command_run_button_answers_for_each_selected_file() {
+        let tmp = std::env::temp_dir().join(format!("linscp-custom-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let left = tmp.join("left");
+        let right = tmp.join("right");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        std::fs::write(left.join("a.txt"), b"one").unwrap();
+        std::fs::write(right.join("b.txt"), b"two").unwrap();
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
+
+        let run = |tab: u64, name: &str, files: Value, pane: &str| ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/custom-commands".into(),
+            body: json!({"action": "run", "name": name, "filenames": files,
+                "pane": pane, "tab": tab}),
+        };
+
+        // Nothing saved answers to that name, and the reason says so instead of
+        // claiming the tab is not connected.
+        let unknown = svc
+            .dispatch_async(run(1, "Nope", json!(["a.txt"]), "local"))
+            .await;
+        assert_eq!(unknown.status, 404, "{}", unknown.payload);
+        assert!(
+            unknown.payload["error"].as_str().unwrap_or("").contains("Nope"),
+            "{}",
+            unknown.payload
+        );
+
+        let save = svc
+            .dispatch(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/custom-commands".into(),
+                body: json!({"action": "save", "name": "Look", "command": "lcd {file}",
+                    "scope": "local"}),
+            });
+        assert_eq!(save.status, 200, "{}", save.payload);
+
+        let open = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/tabs/open".into(),
+                body: json!({"session": {"protocol": "local", "local_dir": left,
+                    "other_local_dir": right}}),
+            })
+            .await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+
+        // Both selected entries are answered, one result each, and the command
+        // the interpreter was given is reported with the file it ran for.
+        let replied = svc
+            .dispatch_async(run(id, "Look", json!(["a.txt", "b.txt"]), "local"))
+            .await;
+        assert_eq!(replied.status, 200, "{}", replied.payload);
+        let results = replied.payload["results"].as_array().expect("results");
+        assert_eq!(results.len(), 2, "{}", replied.payload);
+        for result in results {
+            assert_eq!(result["success"], true, "{}", result);
+            assert_eq!(result["exit_code"], 0, "{}", result);
+            assert_eq!(result["error"], "", "{}", result);
+        }
+        assert_eq!(results[0]["file"], "a.txt");
+        assert_eq!(results[1]["file"], "b.txt");
+        assert!(
+            results[0]["command"].as_str().unwrap_or("").contains("lcd"),
+            "the answer shows the line that ran: {:?}",
+            results[0]
+        );
+
+        // A name with a space is one operand, so the command runs against the
+        // file the user selected rather than two names that are not there.
+        std::fs::write(left.join("two words.txt"), b"three").unwrap();
+        let spaced = svc
+            .dispatch_async(run(id, "Look", json!(["two words.txt"]), "local"))
+            .await;
+        assert_eq!(spaced.status, 200, "{}", spaced.payload);
+        assert_eq!(
+            spaced.payload["results"][0]["success"], true,
+            "a name with a space stays one operand: {}",
+            spaced.payload
+        );
+
+        // A local selection is not where a remote template looks.
+        let mismatch = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/custom-commands".into(),
+                body: json!({"action": "run", "name": "Look", "filenames": ["a.txt"],
+                    "pane": "remote", "tab": id}),
+            })
+            .await;
+        assert_eq!(mismatch.status, 400, "{}", mismatch.payload);
+        assert_eq!(mismatch.payload["success"], false);
         let _ = std::fs::remove_dir_all(tmp);
     }
 
