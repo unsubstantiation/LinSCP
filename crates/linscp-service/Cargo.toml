@@ -21,5 +21,8 @@ tempfile = "3"
 tokio.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+async-trait.workspace = true
+
 [lints]
 workspace = true

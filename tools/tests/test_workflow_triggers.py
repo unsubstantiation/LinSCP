@@ -63,6 +63,48 @@ def workflow_files():
     return sorted(WORKFLOWS.glob('*.yml'))
 
 
+def job_blocks(text):
+    """The `jobs:` mapping as {job name: raw block text}.
+
+    Text-based like trigger_names: a job starts at a two-space `name:` line
+    under `jobs:` and runs until the next one.
+    """
+    lines = text.splitlines()
+    start = None
+    for number, line in enumerate(lines):
+        if line.rstrip() == 'jobs:':
+            start = number
+            break
+    if start is None:
+        raise AssertionError('the workflow has no `jobs:` section')
+    blocks = {}
+    current = None
+    for line in lines[start + 1:]:
+        if not line.startswith(' '):
+            break                                     # the next top-level key
+        if line.startswith('  ') and not line.startswith('   ') \
+                and line.rstrip().endswith(':'):
+            current = line.strip()[:-1]
+            blocks[current] = []
+        elif current is not None:
+            blocks[current].append(line)
+    return {name: '\n'.join(body) for name, body in blocks.items()}
+
+
+def job_runs_on_pull_request(block):
+    """Whether the job's `if:` gates (if any) let a pull request through.
+
+    A job with no gate runs; a gate that names pull_request without `!=`
+    includes it. Anything fancier than that fails closed: write the gate
+    plainly.
+    """
+    gates = [line.strip() for line in block.splitlines()
+             if line.strip().startswith('if:')]
+    if not gates:
+        return True
+    return any('pull_request' in gate and '!=' not in gate for gate in gates)
+
+
 class WorkflowTriggerTests(unittest.TestCase):
     def test_the_repository_has_workflows(self):
         self.assertTrue(workflow_files(), f'no workflows in {WORKFLOWS}')
@@ -111,6 +153,37 @@ class WorkflowTriggerTests(unittest.TestCase):
                     any(test_file.stem in body for body in bodies),
                     f'{test_file.name} runs in no CI job; wire it into a '
                     f'workflow step')
+
+    def test_a_protected_environment_never_runs_on_a_pull_request(self):
+        # The PR #93 Android failure, locked in: a job that names a protected
+        # environment is rejected for a pull-request ref before any step runs,
+        # so such a job has to gate itself off pull requests. The unsigned
+        # work belongs in a separate job that names no environment.
+        for path in workflow_files():
+            text = path.read_text(encoding='utf-8')
+            with self.subTest(workflow=path.name):
+                for job, block in job_blocks(text).items():
+                    if 'environment:' in block:
+                        self.assertFalse(
+                            job_runs_on_pull_request(block),
+                            f'{path.name} job {job!r} names an environment but '
+                            f'no `if:` keeps it off pull requests')
+
+    def test_some_job_actually_runs_on_a_pull_request(self):
+        # The mirror image: gating every job off pull requests would turn the
+        # pull_request trigger into green skips, which is the no-checks
+        # problem wearing a passing badge.
+        for path in workflow_files():
+            text = path.read_text(encoding='utf-8')
+            if 'pull_request' not in trigger_names(text):
+                continue
+            with self.subTest(workflow=path.name):
+                capable = [job for job, block in job_blocks(text).items()
+                           if job_runs_on_pull_request(block)]
+                self.assertTrue(
+                    capable,
+                    f'{path.name} triggers on pull_request but no job runs on '
+                    f'one; every job is gated off')
 
     def test_a_scalar_trigger_is_reported(self):
         with self.assertRaises(AssertionError):

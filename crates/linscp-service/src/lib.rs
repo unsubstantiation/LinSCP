@@ -9398,6 +9398,7 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl RemoteSession for MockSession {
         fn scheme(&self) -> ProtocolScheme { ProtocolScheme::Dav }
 
