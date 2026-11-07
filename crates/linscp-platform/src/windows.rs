@@ -9,8 +9,12 @@ use std::path::{Path, PathBuf};
 
 use linscp_types::LocalRootEntry;
 use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HLOCAL};
+use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
 use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+};
+use windows_sys::Win32::Security::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityDescriptorDacl, ACL,
 };
 use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
@@ -134,8 +138,100 @@ pub fn set_mode(path: &Path, mode: u32) -> Result<(), PlatformError> {
     Ok(())
 }
 
+/// SDDL for the configuration-directory DACL: protected (`P`, nothing inherited
+/// from the parent), one ACE allowing (`A`) full access (`FA`) to the owner
+/// (`OW`), with object+container inherit (`OICI`) so files created inside carry
+/// their own owner-only ACE. The inherit flags are the point on Windows:
+/// `SeChangeNotifyPrivilege` ("bypass traverse checking") is held by everyone,
+/// so a file reached by direct path is governed by *its* DACL, not the
+/// directory's — a directory-only ACE would leave `sessions.ini` readable.
+const OWNER_ONLY_DACL_SDDL: &str = "D:P(A;OICI;FA;;;OW)";
+
+// Small integer constants from the Windows SDK (`accctrl.h`, `WinNT.h`,
+// `sddl.h`), kept as literals so the DACL this module applies can be verified
+// by reading, without depending on constant paths in the bindings crate.
+const SE_FILE_OBJECT: i32 = 1;
+const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+const SDDL_REVISION_1: u32 = 1;
+#[cfg(test)]
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x0;
+#[cfg(test)]
+const OBJECT_INHERIT_ACE: u8 = 0x1;
+#[cfg(test)]
+const CONTAINER_INHERIT_ACE: u8 = 0x2;
+#[cfg(test)]
+const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+
+/// NUL-terminated UTF-16 for a Rust string (the `Path` form is `to_wide_null`).
+fn str_to_wide_null(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Replaces the DACL of `dir` with the owner-only one, creating nothing.
+/// Failing closed: a directory whose ACL cannot be locked down is an error,
+/// never a silently shared one.
+pub fn apply_owner_only_dacl(dir: &Path) -> Result<(), PlatformError> {
+    let path = to_wide_null(dir);
+    let sddl = str_to_wide_null(OWNER_ONLY_DACL_SDDL);
+    // SAFETY: both buffers are NUL-terminated UTF-16 that outlive the calls;
+    // `sd` is only read after a success return and is `LocalFree`'d exactly
+    // once however the inner block below exits.
+    unsafe {
+        let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut sd_len: u32 = 0;
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd,
+            &mut sd_len,
+        ) == 0
+        {
+            return Err(PlatformError::Io(std::io::Error::last_os_error()));
+        }
+        let mut present: i32 = 0;
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut defaulted: i32 = 0;
+        // SAFETY: `sd` is a valid self-relative descriptor from the call above.
+        if GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) == 0
+            || present == 0
+            || dacl.is_null()
+        {
+            // SAFETY: `sd` was allocated by the conversion call above.
+            LocalFree(sd as HLOCAL);
+            return Err(PlatformError::Io(std::io::Error::last_os_error()));
+        }
+        // SAFETY: `path` names the directory, the DACL pointer comes from the
+        // live descriptor, and owner/group/SACL are NULL because only the
+        // DACL is being set (`DACL_SECURITY_INFORMATION`).
+        let status = SetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null(),
+        );
+        // SAFETY: `sd` was allocated by the conversion call above; the DACL
+        // pointer is not read after this.
+        LocalFree(sd as HLOCAL);
+        if status != 0 {
+            // `SetNamedSecurityInfoW` returns the DOS error itself; it does
+            // not go through `GetLastError`.
+            return Err(PlatformError::Io(std::io::Error::from_raw_os_error(
+                status as i32,
+            )));
+        }
+        Ok(())
+    }
+}
+
 pub fn ensure_private_dir(dir: &Path) -> Result<(), PlatformError> {
-    std::fs::create_dir_all(to_extended_length_path(dir))?;
+    let ext = to_extended_length_path(dir);
+    std::fs::create_dir_all(&ext)?;
+    // Every call, not just creation: a configuration directory written before
+    // this fix carries an inherited DACL until it is replaced.
+    apply_owner_only_dacl(&ext)?;
     Ok(())
 }
 
@@ -343,6 +439,63 @@ pub fn dpapi_unprotect(ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, Platform
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::c_void;
+    use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
+    use windows_sys::Win32::Security::{GetAce, ACCESS_ALLOWED_ACE};
+
+    /// Reads back what the DACL actually says: (ACE count, first ACE type,
+    /// inherit flags, access mask). A directory that merely inherited its
+    /// parent's DACL answers several ACEs here even for a single user, so the
+    /// count alone tells "locked down" from "left as created".
+    fn dacl_summary(path: &Path) -> Result<(u16, u8, u8, u32), PlatformError> {
+        let wide = to_wide_null(path);
+        // SAFETY: `wide` is NUL-terminated and outlives the call; `sd` is
+        // `LocalFree`'d exactly once below, and the DACL/ACE pointers are only
+        // read while it is alive.
+        unsafe {
+            let mut sd: *mut c_void = std::ptr::null_mut();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let status = GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            );
+            if status != 0 {
+                return Err(PlatformError::Io(std::io::Error::from_raw_os_error(
+                    status as i32,
+                )));
+            }
+            if dacl.is_null() {
+                LocalFree(sd as HLOCAL);
+                return Err(PlatformError::Io(std::io::Error::other(
+                    "no DACL on a directory that must have one",
+                )));
+            }
+            // SAFETY: `dacl` is a valid ACL owned by the live descriptor `sd`.
+            let count = (*dacl).AceCount;
+            let mut ace: *mut c_void = std::ptr::null_mut();
+            // SAFETY: same descriptor; the ACE pointer is only read below.
+            if GetAce(dacl, 0, &mut ace) == 0 || ace.is_null() {
+                LocalFree(sd as HLOCAL);
+                return Err(PlatformError::Io(std::io::Error::other(
+                    "the owner ACE is missing",
+                )));
+            }
+            // SAFETY: `ace` points at the first ACE of the live DACL; the
+            // allow/deny layouts share the header and mask offsets.
+            let first = &*(ace as *const ACCESS_ALLOWED_ACE);
+            let summary = (count, first.Header.AceType, first.Header.AceFlags, first.Mask);
+            // SAFETY: `sd` was allocated by the query above; nothing read from
+            // it outlives this call.
+            LocalFree(sd as HLOCAL);
+            Ok(summary)
+        }
+    }
 
     #[test]
     fn windows_dpapi_round_trip_protects_and_recovers_master_key() {
@@ -358,5 +511,47 @@ mod tests {
         let deep = format!(r"C:\{}", "segment\\".repeat(35));
         let converted = to_extended_length_path(Path::new(&deep));
         assert!(converted.to_string_lossy().starts_with(r"\\?\C:\"));
+    }
+
+    #[test]
+    fn a_private_dir_carries_only_the_owner_ace() {
+        let dir = std::env::temp_dir().join(format!("linscp-acl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Pre-create it bare so the test covers the upgrade path too: a
+        // configuration directory written before this fix carries an inherited
+        // DACL until `ensure_private_dir` replaces it.
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        ensure_private_dir(&dir).expect("owner-only DACL applies");
+        let (count, ace_type, ace_flags, mask) =
+            dacl_summary(&dir).expect("the DACL reads back");
+        assert_eq!(count, 1, "exactly the owner ACE, nothing inherited");
+        assert_eq!(ace_type, ACCESS_ALLOWED_ACE_TYPE, "an allow ACE");
+        assert_eq!(
+            ace_flags,
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+            "children created inside inherit it"
+        );
+        assert_eq!(mask, FILE_ALL_ACCESS, "the owner keeps full access");
+        // The child is what actually holds secrets, and bypass-traverse
+        // checking means the directory's own ACE is not what protects it: the
+        // file must carry the inherited owner-only ACE itself.
+        let child = dir.join("sessions.ini");
+        std::fs::write(&child, b"pretend secret").expect("child writes");
+        let (child_count, _, _, child_mask) =
+            dacl_summary(&child).expect("the child DACL reads back");
+        assert_eq!(child_count, 1, "the child inherits exactly the owner ACE");
+        assert_eq!(child_mask, FILE_ALL_ACCESS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locking_a_private_dir_twice_changes_nothing() {
+        let dir = std::env::temp_dir().join(format!("linscp-acl-idem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).expect("first lock-down");
+        ensure_private_dir(&dir).expect("second lock-down");
+        let (count, _, _, _) = dacl_summary(&dir).expect("the DACL reads back");
+        assert_eq!(count, 1, "re-applying replaces the DACL, never appends");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

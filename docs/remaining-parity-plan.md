@@ -547,14 +547,15 @@ Stored sites can be saved, opened, removed, exported and imported.
 
 **Area:** Sessions/configuration · **Status:** partial
 
-Stored site passwords are encrypted under sessions.key and shared between the CLI and GUI.
+Stored site passwords are encrypted under sessions.key and shared between the CLI and GUI. On Windows the configuration directory carrying sessions.key is additionally owner-only: `ensure_private_dir` applies `D:P(A;OICI;FA;;;OW)`, and children created inside inherit the ACE, because bypass-traverse-checking makes the directory's own ACE insufficient protection for the files.
 
-**Next:** No runnable suite evidences this: live-sftp needs a `linscp` binary this repo does not build.
+**Next:** The encryption half has no runnable evidence: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: platform-windows-acl on Windows covers the configuration-directory DACL only.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
+- [ ] Cover the encryption half (sessions.key sealing and opening) with a runnable suite on all three platforms.
 
 ## sessions.proxy-settings
 

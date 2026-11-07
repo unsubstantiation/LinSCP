@@ -94,6 +94,11 @@ CASE_SOURCES = {
     # the tests assert the tokenizer's view of the expanded line, not a string a
     # shell would have read.
     "service-commands": "crates/linscp-service/src/ops.rs",
+    # The owner-only DACL on the Windows configuration directory: the tests read
+    # the ACL back (exactly one ACE, allow + full-access + inherit flags) rather
+    # than trusting the call that set it, so they fail on an inherited DACL even
+    # where only one user exists. Windows-only; the other platforms flag it.
+    "platform-windows-acl": "crates/linscp-platform/src/windows.rs",
 }
 
 
@@ -345,7 +350,8 @@ def check_capabilities(inventory, errors, root=ROOT):
                     # The bundle's own suite is node:test, so a case is a test().
                     expression = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
                 elif suite in ("service", "service-commands", "gui-cli",
-                               "gui-shell-definitions", "gui-shell-actions"):
+                               "gui-shell-definitions", "gui-shell-actions",
+                               "platform-windows-acl"):
                     # A Rust test is a #[test]/#[tokio::test] function, not a
                     # `test_*` ffi symbol; the drop helpers are `async fn`.
                     expression = r"\b(?:async\s+)?fn\s+" + re.escape(case) + r"\s*\("

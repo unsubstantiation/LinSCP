@@ -13,7 +13,7 @@ use linscp_engine::transfer::{upload_single_file, TransferFlags};
 use linscp_engine::xml_log::SessionLogger;
 use linscp_platform::gui_os::{create_local_symlink, format_listing_date, stat_extended};
 use linscp_platform::terminal::set_local_permissions;
-use linscp_platform::write_private_file_atomic;
+use linscp_platform::{create_private_dir, write_private_file_atomic};
 use linscp_proto::ssh::extract_openssh_public_key_line;
 use linscp_proto::{download_bytes, RemoteSession, TransferRequest};
 use rand::RngCore;
@@ -184,7 +184,7 @@ pub async fn read_remote_text_file(
         ));
     }
     let edit_tmp = config_root.join("edit-tmp");
-    std::fs::create_dir_all(&edit_tmp).map_err(|e| e.to_string())?;
+    create_private_dir(&edit_tmp).map_err(|e| e.to_string())?;
     let bytes = download_bytes(session, remote_path, TransferRequest::default())
         .await
         .map_err(|e| e.to_string())?;
@@ -226,7 +226,7 @@ pub async fn write_remote_text_file(
     }
 
     let edit_tmp = config_root.join("edit-tmp");
-    std::fs::create_dir_all(&edit_tmp).map_err(|e| e.to_string())?;
+    create_private_dir(&edit_tmp).map_err(|e| e.to_string())?;
     let mut rnd = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut rnd);
     let stage = edit_tmp.join(format!(
@@ -1231,7 +1231,7 @@ pub fn record_shell_upload_manifest(
     }
 
     let manifests_dir = config_root.join("shell-manifests");
-    std::fs::create_dir_all(&manifests_dir).map_err(|e| e.to_string())?;
+    create_private_dir(&manifests_dir).map_err(|e| e.to_string())?;
     let mut rnd = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut rnd);
     let id = rnd.iter().map(|b| format!("{b:02x}")).collect::<String>();

@@ -70,7 +70,8 @@
           "gui-cli": "crates/linscp-platform/src/cli_args.rs - the native window's whole command line, decided without a window: --install-shell-integration, --uninstall-shell-integration, --shell-upload FILES... and --help, plus the guarantee that a bare launch, an unknown flag or a contradictory command line opens the window. Pure Rust, so the same tests decide the same way on every target.",
           "gui-shell-definitions": "crates/linscp-platform/src/gui_os.rs - the per-user file-manager definitions themselves: what install writes for Dolphin, GNOME Files and Nemo, that a launcher path with a space survives quoting, that the GNOME Files script is valid sh reading NAUTILUS_SCRIPT_SELECTED_FILE_PATHS, that a path no shell can carry is refused by name, and that uninstall removes exactly those three. Linux only: Windows writes one `.cmd` and every other platform refuses.",
           "gui-shell-actions": "crates/linscp-service/src/cli_actions.rs - what the actions do once the arguments are decided: a selection becomes a pending manifest the window reads back, a relative path resolves against the directory it was named in, an empty or vanished selection is refused with the reason on stderr and a failing exit code, and an install that cannot be carried out reports the reason instead of writing something wrong.",
-          "service-commands": "cargo test -p linscp-service's own Rust tests for the saved-command run path: the endpoint the page's Run button posts to (an unknown name, a saved template answered per selected file, a name with a space kept one operand, a side/pane mismatch refused) and the expansion layer behind it - one placeholder expansion quoted for the interpreter's tokenizer rather than for a shell, a hostile name proving to be one operand of the tokenized line and none other, {files} covering the whole selection, a template that names no file running once, one file's failure or refused name not stopping the rest, a side/pane disagreement refused by name instead of run on a same-named file of the other side, the store the dialog saves into being the one the run reads, and every shipped template starting with a command the interpreter knows."
+          "service-commands": "cargo test -p linscp-service's own Rust tests for the saved-command run path: the endpoint the page's Run button posts to (an unknown name, a saved template answered per selected file, a name with a space kept one operand, a side/pane mismatch refused) and the expansion layer behind it - one placeholder expansion quoted for the interpreter's tokenizer rather than for a shell, a hostile name proving to be one operand of the tokenized line and none other, {files} covering the whole selection, a template that names no file running once, one file's failure or refused name not stopping the rest, a side/pane disagreement refused by name instead of run on a same-named file of the other side, the store the dialog saves into being the one the run reads, and every shipped template starting with a command the interpreter knows.",
+          "platform-windows-acl": "crates/linscp-platform/src/windows.rs - the owner-only DACL on the configuration and staging directories: `ensure_private_dir` applies `D:P(A;OICI;FA;;;OW)` (protected, owner full access, inherited by children), and the tests read the DACL back - exactly one ACE, allow type, full-access mask, object+container inherit flags - for a pre-existing directory, a child created inside, and a second application. Windows-only suite: no Linux step can execute these tests, so Linux cites other suites instead."
         },
         "not_runnable": {
           "gui-browser-upload": "red: 10/10 fail against the shipped service",
@@ -87,6 +88,7 @@
           "live-scp": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
           "live-sftp": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
           "live-tunnel": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
+          "platform-windows-acl": "Windows-only suite (`#[cfg(target_os = \"windows\")]`); no Linux step can execute it",
           "script": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
           "unit": "no build target: CMakeLists.txt declares LANGUAGES NONE, and neither libssh nor PathUtil headers are vendored, so it cannot be compiled"
         }
@@ -122,7 +124,8 @@
           "gui-cli": "cargo test --workspace on Windows runs the same `cli_args` tests the Linux job runs, and the Windows job then drives the built `linscp-gui.exe` the way Explorer does: install into a redirected APPDATA, check the Send To `.cmd` names --shell-upload, run it with a selected file and read the manifest back, then uninstall.",
           "gui-shell-actions": "the same `cli_actions` tests, and the Windows job's Explorer smoke test, which runs the installed Send To shortcut on a real file and reads the manifest it produced.",
           "service-commands": "cargo test -p linscp-service's own Rust tests for the saved-command run path: the endpoint the page's Run button posts to (an unknown name, a saved template answered per selected file, a name with a space kept one operand, a side/pane mismatch refused) and the expansion layer behind it - one placeholder expansion quoted for the interpreter's tokenizer rather than for a shell, a hostile name proving to be one operand of the tokenized line and none other, {files} covering the whole selection, a template that names no file running once, one file's failure or refused name not stopping the rest, a side/pane disagreement refused by name instead of run on a same-named file of the other side, the store the dialog saves into being the one the run reads, and every shipped template starting with a command the interpreter knows.",
-          "gui-shell-definitions": "crates/linscp-platform/src/gui_os.rs - the per-user file-manager definitions themselves: what install writes for Dolphin, GNOME Files and Nemo, that a launcher path with a space survives quoting, that the GNOME Files script is valid sh reading NAUTILUS_SCRIPT_SELECTED_FILE_PATHS, that a path no shell can carry is refused by name, and that uninstall removes exactly those three. Linux only: Windows writes one `.cmd` and every other platform refuses. On Windows `cargo test` executes none of the four cases (they are Linux-only), so Windows cites other suites instead."
+          "gui-shell-definitions": "crates/linscp-platform/src/gui_os.rs - the per-user file-manager definitions themselves: what install writes for Dolphin, GNOME Files and Nemo, that a launcher path with a space survives quoting, that the GNOME Files script is valid sh reading NAUTILUS_SCRIPT_SELECTED_FILE_PATHS, that a path no shell can carry is refused by name, and that uninstall removes exactly those three. Linux only: Windows writes one `.cmd` and every other platform refuses. On Windows `cargo test` executes none of the four cases (they are Linux-only), so Windows cites other suites instead.",
+          "platform-windows-acl": "crates/linscp-platform/src/windows.rs - the owner-only DACL on the configuration and staging directories: `ensure_private_dir` applies `D:P(A;OICI;FA;;;OW)` (protected, owner full access, inherited by children), and the tests read the DACL back - exactly one ACE, allow type, full-access mask, object+container inherit flags - for a pre-existing directory, a child created inside, and a second application. Windows only."
         },
         "not_runnable": {
           "gui-browser-upload": "red: 10/10 fail against the shipped service",
@@ -178,7 +181,8 @@
           "gui-cli": "The `cli_args` parser is compiled for Android by the APK build, and Android's own entry point refuses shell integration by name instead of writing XDG directories inside the app sandbox - but no Android step executes these tests, so they are not cited for Android.",
           "gui-shell-actions": "The `cli_actions` behavior is Android-relevant (the share sheet records the same manifest the actions write), but no Android step executes these tests, so they are not cited for Android.",
           "service-commands": "cargo test -p linscp-service's own Rust tests for the saved-command run path: the endpoint the page's Run button posts to (an unknown name, a saved template answered per selected file, a name with a space kept one operand, a side/pane mismatch refused) and the expansion layer behind it - one placeholder expansion quoted for the interpreter's tokenizer rather than for a shell, a hostile name proving to be one operand of the tokenized line and none other, {files} covering the whole selection, a template that names no file running once, one file's failure or refused name not stopping the rest, a side/pane disagreement refused by name instead of run on a same-named file of the other side, the store the dialog saves into being the one the run reads, and every shipped template starting with a command the interpreter knows.",
-          "gui-shell-definitions": "The per-user file-manager definitions (Dolphin, GNOME Files, Nemo on Linux; one `.cmd` on Windows; Android refuses by name). No Android step executes these tests, so Android cites other suites instead."
+          "gui-shell-definitions": "The per-user file-manager definitions (Dolphin, GNOME Files, Nemo on Linux; one `.cmd` on Windows; Android refuses by name). No Android step executes these tests, so Android cites other suites instead.",
+          "platform-windows-acl": "crates/linscp-platform/src/windows.rs - the owner-only DACL on the configuration and staging directories: `ensure_private_dir` applies `D:P(A;OICI;FA;;;OW)` (protected, owner full access, inherited by children), and the tests read the DACL back - exactly one ACE, allow type, full-access mask, object+container inherit flags - for a pre-existing directory, a child created inside, and a second application. Windows-only suite: no Android step can execute these tests, so Android cites other suites instead."
         },
         "not_runnable": {
           "backup": "no Rust test executes in the Android job",
@@ -200,6 +204,7 @@
           "live-sftp": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
           "live-tunnel": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
           "platform-conversion": "Linux-shaped repo-state check; no Android step runs it",
+          "platform-windows-acl": "Windows-only suite (`#[cfg(target_os = \"windows\")]`); no Android step can execute it",
           "script": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
           "service": "no Rust test executes in the Android job",
           "service-commands": "no Rust test executes in the Android job",
@@ -3030,15 +3035,20 @@
       "id": "sessions.password-at-rest",
       "area": "Sessions/configuration",
       "status": "partial",
-      "notes": "Stored site passwords are encrypted under sessions.key and shared between the CLI and GUI.",
+      "notes": "Stored site passwords are encrypted under sessions.key and shared between the CLI and GUI. On Windows the configuration directory carrying sessions.key is additionally owner-only: `ensure_private_dir` applies `D:P(A;OICI;FA;;;OW)`, and children created inside inherit the ACE, because bypass-traverse-checking makes the directory's own ACE insufficient protection for the files.",
       "source": [
         "crates/linscp-engine/src/session_store.rs",
-        "crates/linscp-crypto/src/lib.rs"
+        "crates/linscp-crypto/src/lib.rs",
+        "crates/linscp-platform/src/windows.rs"
       ],
       "checks": {
         "live-sftp": [
           "test_password_encrypted_by_python_opens_the_core",
           "test_password_stored_by_the_core_decrypts_in_python"
+        ],
+        "platform-windows-acl": [
+          "a_private_dir_carries_only_the_owner_ace",
+          "locking_a_private_dir_twice_changes_nothing"
         ]
       },
       "verified_on": {
@@ -3046,16 +3056,18 @@
           "live-sftp"
         ],
         "windows": [
-          "live-sftp"
+          "live-sftp",
+          "platform-windows-acl"
         ],
         "android": [
           "live-sftp"
         ]
       },
-      "gap": "No runnable suite evidences this: live-sftp needs a `linscp` binary this repo does not build.",
+      "gap": "The encryption half has no runnable evidence: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: platform-windows-acl on Windows covers the configuration-directory DACL only.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
+        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
+        "Cover the encryption half (sessions.key sealing and opening) with a runnable suite on all three platforms."
       ]
     },
     {

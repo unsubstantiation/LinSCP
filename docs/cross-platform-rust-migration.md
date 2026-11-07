@@ -178,7 +178,7 @@ All OS-dependent behavior sits behind traits in `crates/linscp-platform` (`Local
   - Atomic `.filepart` completion via `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` (since CRT `rename` fails when the destination exists on Windows).
 - **Configuration & secret protection:**
   - Defaults `ConfigDirectory()` to `%APPDATA%\LinSCP` (`FOLDERID_RoamingAppData`) when `LINSCP_CONFIG_DIR` is unset.
-  - Replaces no-op `_chmod(0600)` with an explicit owner-only Windows DACL (`D:P(A;;FA;;;OW)`) on the configuration and upload-staging directories, plus optional **Windows DPAPI** (`CryptProtectData`) wrapping for `sessions.key`.
+  - Replaces no-op `_chmod(0600)` with an explicit owner-only Windows DACL (`D:P(A;OICI;FA;;;OW)`, applied by `ensure_private_dir` in `crates/linscp-platform/src/windows.rs`) on the configuration and upload-staging directories, plus optional **Windows DPAPI** (`CryptProtectData`) wrapping for `sessions.key`. The `OICI` inherit flags are load-bearing: bypass-traverse-checking means a file reached by direct path is governed by its own DACL, so children created inside must carry the owner-only ACE themselves.
 - **Console, SSH agent & shell integration:**
   - Console UTF-8 input/output (`SetConsoleCP(CP_UTF8)` / `SetConsoleOutputCP(CP_UTF8)`), `CTRL_C_EVENT`/`CTRL_BREAK_EVENT` graceful interrupt handling, and password echo suppression via `SetConsoleMode`.
   - Connects to Windows OpenSSH Agent (`\\.\pipe\openssh-ssh-agent`) and Pageant shared memory for key authentication.

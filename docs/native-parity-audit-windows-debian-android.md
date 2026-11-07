@@ -2,10 +2,10 @@
 
 **Date:** 2026-11-06 · **Branch:** `arena/a4f5fe10-linscp` · **Mode:** audit, then A1 fixed on request.
 
-> **Update (same day):** A1, A2 and A3 below have been implemented, and the §3 suites have been
-> triaged (B) — see their **Status** notes for what changed and what still needs a compiler to
-> confirm. The rest of this document is the audit as written, so A4–A9 still describe the tree as it
-> was before those changes.
+> **Update (same day):** A1, A2, A3 and A6 below have been implemented, and the §3 suites have
+> been triaged (B) — see their **Status** notes for what changed and what still needs a compiler to
+> confirm. The rest of this document is the audit as written, so A4–A5 and A7–A9 still describe the
+> tree as it was before those changes.
 
 **Question asked:** "Make sure we have full feature parity between the builds."
 **Scope, as confirmed:** the three native builds — `linscp-gui` on Windows (MSVC), `linscp-gui` on
@@ -16,7 +16,7 @@ scope, so HTTP-vs-window asymmetries are excluded by instruction.
 
 | | Meaning | State |
 |---|---|---|
-| **A. Behavioural parity** | the same click does the same thing on all three builds | **9 defects**, all in shipped code: Windows hit by 7, Debian by 3, Android by 6; 2 are broken on all three. **A1, A2 and A3 are fixed** (see §2) |
+| **A. Behavioural parity** | the same click does the same thing on all three builds | **9 defects**, all in shipped code: Windows hit by 7, Debian by 3, Android by 6; 2 are broken on all three. **A1, A2, A3 and A6 are fixed** (see §2) |
 | **B. Evidence parity** | the claim "verified on Windows, Debian *and* Android" is true | **triaged** (see §3): the 16 unrunnable suites are flagged per platform (16/20/25 flags), 28 of 176 entries remain verified citing only suites that run where cited, the checker validates every platform's citations and runs in the Debian job; Android still executes no Rust test |
 
 A build can be behaviourally at parity and still fail B, and vice versa. Both are reported below,
@@ -353,6 +353,44 @@ so this is not a one-liner. **Effort:** S–M.
 and `windows-build.yml:42` runs `cargo test --workspace` on a single-user runner where the difference
 is invisible.
 
+**Status: fixed.** `ensure_private_dir` on Windows is no longer a bare `create_dir_all`: after
+creating the directory it calls the new `apply_owner_only_dacl`, which parses
+`D:P(A;OICI;FA;;;OW)` with `ConvertStringSecurityDescriptorToSecurityDescriptorW` and installs the
+resulting DACL with `SetNamedSecurityInfoW` (`SE_FILE_OBJECT`, `DACL_SECURITY_INFORMATION`, owner /
+group / SACL untouched). The `windows-sys` features the audit's cost note predicted —
+`Win32_Security` and `Win32_Security_Authorization` — are added in
+`crates/linscp-platform/Cargo.toml`. The string differs from the documented `D:P(A;;FA;;;OW)` by the
+`OICI` inherit flags on purpose, and the document now says so: `SeChangeNotifyPrivilege` (bypass
+traverse checking) is held by everyone, so a file reached by direct path is governed by *its* DACL,
+not the directory's — without inheritance the lock would cover the directory listing while leaving
+`sessions.ini` itself readable. Children created inside therefore carry their own owner-only ACE,
+which is also what makes `create_private_file`'s "only the current user may read" comment true for
+everything under the config root. The small integer constants (`SE_FILE_OBJECT`,
+`DACL_SECURITY_INFORMATION`, `SDDL_REVISION_1`, the ACE bits) are local literals with SDK citations
+rather than bindings paths, so the applied DACL can be verified by reading.
+
+The DACL is applied on *every* call, not just on creation, so a config directory written before this
+fix is locked down on next use; failures fail closed (an error, never a silently shared directory),
+matching Linux, where a `chmod` failure propagates. Three second-order defects went with it, all in
+the same payload class: the editor staging directory and the shell-manifests directory in
+`crates/linscp-service/src/ops.rs` were created with bare `create_dir_all` — the read-path staging
+dir never even got a follow-up write that would have locked it — and all three now go through
+`create_private_dir`, the same call the `keys/` and `tmp/unlocked-keys/` paths already used; and
+`docs/cross-platform-rust-migration.md:181` claimed a DACL the code never applied, which is now true
+with the `OICI` reason recorded. Deliberately *not* changed: `create_exclusive_private_file` still
+creates user-chosen parents without locking them (re-ACLing a directory the user named would be
+wrong — only configuration paths go through `ensure_private_dir`), and pre-existing children keep
+their old DACLs, exactly as `chmod` does not recurse on Linux.
+
+Evidence: `platform-windows-acl` (`windows.rs`: a pre-created directory ends up with exactly one
+ACE — allow, full-access mask, `OI|CI` flags — a child created inside inherits exactly that ACE, and
+a second application changes nothing), cited from `sessions.password-at-rest` for Windows, the row
+whose files the DACL protects. The tests read the ACL back with `GetNamedSecurityInfoW` instead of
+trusting the call that set it, which answers the audit's "invisible on a single-user runner": an
+inherited DACL has several ACEs even for one user, so the count assertion fails pre-fix and passes
+post-fix. **Not verified here:** still no Rust toolchain in this sandbox — the FFI signatures, the
+new `windows-sys` features and both tests are reading-level; the Windows CI job is the first compile.
+
 ### A7. On Android a granted SAF folder supports browsing and create/rename/delete, but not editing, properties, chmod, sync, keep-up-to-date, transfers or copy/move
 **Platforms:** Android ✗ (desktop ✓)
 **Evidence — the boundary is exactly `LocalFs` vs `std::fs`:**
@@ -594,7 +632,11 @@ Ordered by (user impact × confidence) ÷ effort. All are small except where not
    suites wired into the Debian job, and 28 of 176 entries left verified. The audit's exit-0 claim
    about the Python GUI suites was a mis-measurement (all seven exit non-zero; the `ran>0`
    criterion was the real defect).
-5. **A6 Windows DACL** — a real confidentiality difference on shared machines. *S–M*
+5. **A6 Windows DACL** — a real confidentiality difference on shared machines. *S–M* — **done**,
+   see A6's *Status: fixed*: `D:P(A;OICI;FA;;;OW)` via `SetNamedSecurityInfoW` on every
+   `ensure_private_dir` call, the `OICI` flags justified by bypass-traverse-checking, the editor and
+   manifest staging directories routed through `create_private_dir`, and read-back tests that fail
+   on an inherited DACL even for a single user.
 6. **A7 (b) honest refusal for SAF roots** — stop offering sync/keep-up-to-date on a granted folder
    and say why. *S*; the full `LocalFs` routing is *L* and should be a separate decision.
 7. **A4 local symlink**, **A9 Android agent message** — small completions. *S* each
