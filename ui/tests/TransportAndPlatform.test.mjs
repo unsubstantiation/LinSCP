@@ -345,6 +345,20 @@ test('all native targets expose the shared feature contract and report only inst
   assert.equal(hostDifferenceReason('sshAgent', debian), null);
   assert.match(hostDifferenceReason('sshAgent', android) ?? '', /private key file/);
 
+  // Kerberos is a Linux-backend ability: native non-Linux builds lack it, a
+  // browser fails open because the page cannot see the server OS, and key
+  // exchange is unwired everywhere so it is off on all four hosts.
+  assert.equal(debian.gssapi, true);
+  assert.equal(windows.gssapi, false);
+  assert.equal(android.gssapi, false);
+  assert.equal(browser.gssapi, true);
+  assert.equal(hostDifferenceReason('gssapi', debian), null);
+  assert.match(hostDifferenceReason('gssapi', windows) ?? '', /only available on Linux/);
+  for (const caps of [debian, windows, android, browser]) {
+    assert.equal(caps.gssapiKex, false, `key exchange is unwired on ${caps.platform}`);
+  }
+  assert.match(hostDifferenceReason('gssapiKex', debian) ?? '', /not supported/);
+
   // A missing control always has a stated reason; silent capability gaps are
   // the parity bug this inventory exists to catch.
   assert.equal(hostDifferenceReason('desktopLaunchers', android), null);

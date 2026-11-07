@@ -73,7 +73,8 @@
           "service-commands": "cargo test -p linscp-service's own Rust tests for the saved-command run path: the endpoint the page's Run button posts to (an unknown name, a saved template answered per selected file, a name with a space kept one operand, a side/pane mismatch refused) and the expansion layer behind it - one placeholder expansion quoted for the interpreter's tokenizer rather than for a shell, a hostile name proving to be one operand of the tokenized line and none other, {files} covering the whole selection, a template that names no file running once, one file's failure or refused name not stopping the rest, a side/pane disagreement refused by name instead of run on a same-named file of the other side, the store the dialog saves into being the one the run reads, and every shipped template starting with a command the interpreter knows.",
           "platform-windows-acl": "crates/linscp-platform/src/windows.rs - the owner-only DACL on the configuration and staging directories: `ensure_private_dir` applies `D:P(A;OICI;FA;;;OW)` (protected, owner full access, inherited by children), and the tests read the DACL back - exactly one ACE, allow type, full-access mask, object+container inherit flags - for a pre-existing directory, a child created inside, and a second application. Windows-only suite: no Linux step can execute these tests, so Linux cites other suites instead.",
           "proto-ssh": "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs - the SSH/SFTP/SCP/tunnel protocol behaviour against the mock server: host-key acceptance and pins, the authentication chain (explicit key, agent, password, keyboard-interactive), and here the agent step - a connector with no agent contributes its reason to the terminal error, while a silent connector falls back to the generic auth failure.",
-          "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes."
+          "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes.",
+          "service-tabs": "crates/linscp-service/src/tabs.rs - the GUI session parser: the site manager settings must reach the engine raw fields (Kerberos settings included) instead of being dropped, and explicit Kerberos settings must fail closed naming Linux where no Kerberos runtime exists. Key exchange is refused on every build."
         },
         "not_runnable": {
           "gui-browser-upload": "red: 10/10 fail against the shipped service",
@@ -129,7 +130,8 @@
           "gui-shell-definitions": "crates/linscp-platform/src/gui_os.rs - the per-user file-manager definitions themselves: what install writes for Dolphin, GNOME Files and Nemo, that a launcher path with a space survives quoting, that the GNOME Files script is valid sh reading NAUTILUS_SCRIPT_SELECTED_FILE_PATHS, that a path no shell can carry is refused by name, and that uninstall removes exactly those three. Linux only: Windows writes one `.cmd` and every other platform refuses. On Windows `cargo test` executes none of the four cases (they are Linux-only), so Windows cites other suites instead.",
           "platform-windows-acl": "crates/linscp-platform/src/windows.rs - the owner-only DACL on the configuration and staging directories: `ensure_private_dir` applies `D:P(A;OICI;FA;;;OW)` (protected, owner full access, inherited by children), and the tests read the DACL back - exactly one ACE, allow type, full-access mask, object+container inherit flags - for a pre-existing directory, a child created inside, and a second application. Windows only.",
           "proto-ssh": "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs - the SSH/SFTP/SCP/tunnel protocol behaviour against the mock server: host-key acceptance and pins, the authentication chain (explicit key, agent, password, keyboard-interactive), and here the agent step - a connector with no agent contributes its reason to the terminal error, while a silent connector falls back to the generic auth failure.",
-          "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes."
+          "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes.",
+          "service-tabs": "crates/linscp-service/src/tabs.rs - the GUI session parser: the site manager settings must reach the engine raw fields (Kerberos settings included) instead of being dropped, and explicit Kerberos settings must fail closed naming Linux where no Kerberos runtime exists. Key exchange is refused on every build."
         },
         "not_runnable": {
           "gui-browser-upload": "red: 10/10 fail against the shipped service",
@@ -188,7 +190,8 @@
           "gui-shell-definitions": "The per-user file-manager definitions (Dolphin, GNOME Files, Nemo on Linux; one `.cmd` on Windows; Android refuses by name). No Android step executes these tests, so Android cites other suites instead.",
           "platform-windows-acl": "crates/linscp-platform/src/windows.rs - the owner-only DACL on the configuration and staging directories: `ensure_private_dir` applies `D:P(A;OICI;FA;;;OW)` (protected, owner full access, inherited by children), and the tests read the DACL back - exactly one ACE, allow type, full-access mask, object+container inherit flags - for a pre-existing directory, a child created inside, and a second application. Windows-only suite: no Android step can execute these tests, so Android cites other suites instead.",
           "proto-ssh": "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs - the SSH/SFTP/SCP/tunnel protocol behaviour against the mock server: host-key acceptance and pins, the authentication chain (explicit key, agent, password, keyboard-interactive), and here the agent step - a connector with no agent contributes its reason to the terminal error, while a silent connector falls back to the generic auth failure. No Android step executes these Rust cases, so Android cites other suites instead.",
-          "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes. No Android step executes these Rust cases, so Android cites other suites instead."
+          "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes. No Android step executes these Rust cases, so Android cites other suites instead.",
+          "service-tabs": "crates/linscp-service/src/tabs.rs - the GUI session parser: the site manager settings must reach the engine raw fields (Kerberos settings included) instead of being dropped, and explicit Kerberos settings must fail closed naming Linux where no Kerberos runtime exists. Key exchange is refused on every build. No Android step executes these Rust cases, so Android cites other suites instead."
         },
         "not_runnable": {
           "backup": "no Rust test executes in the Android job",
@@ -218,7 +221,8 @@
           "unit": "no build target: CMakeLists.txt declares LANGUAGES NONE, and neither libssh nor PathUtil headers are vendored, so it cannot be compiled",
           "wayland-compatibility": "Linux display-server guard; no Android step runs it",
           "proto-ssh": "no Rust test executes in the Android job",
-          "vault-password": "no Rust test executes in the Android job"
+          "vault-password": "no Rust test executes in the Android job",
+          "service-tabs": "no Rust test executes in the Android job"
         }
       }
     }
@@ -3498,11 +3502,12 @@
       "id": "security.gssapi-and-tunnels",
       "area": "Security/authentication",
       "status": "partial",
-      "notes": "Authenticated SSH jump-host connections work for SFTP/SCP/SSH and for FTP/FTPS/WebDAV/S3 destinations. SSH destinations still use a private socketpair (or TunnelLocalPortNumber on loopback); curl and native FTP/S3 sessions start a loopback SOCKS5 multiplexer on the jump so each CONNECT or data channel is a separate direct-tcpip, TLS SNI and S3 signing keep the original hostname, and a refused forward never falls back to a direct connection. Kerberos/GSSAPI settings persist and gssapi-with-mic is attempted before public-key with password fallback; credential delegation stays off unless GSSAPIFwdTGT=1. GSSAPI authentication support is detected through libssh's public ssh_gssapi_set_creds symbol, not its version string. RFC 4462 KEX support is probed independently; AuthGSSAPIKEX is refused if the loaded libssh cannot honor it or a host-key pin is configured, rather than silently skipping either policy. The live SFTP suite provisions an isolated loopback MIT KDC and OpenSSH server and tests principal selection, missing/expired tickets, the service identity, and default-off versus opt-in TGT delegation. A second realm, PARTNER.TEST, is trusted directly through krbtgt/LINSCP.TEST@PARTNER.TEST. It covers cross-realm login, refusal of an unmapped principal of the trusted realm, and default-off versus opt-in delegation of the partner realm's TGT. CI requires a GSSAPI-enabled libssh and zero skips for these cases. As upstream's CreateTunnelData does, the jump session inherits the destination's Kerberos settings except LogicalHostName, so GSSAPIFwdTGT=1 also delegates to the jump host. docs/gssapi-delegation-review.md is the brief for the independent review; that review and production-KDC validation remain open.",
-      "gap": "Production-KDC validation (for example Active Directory, FreeIPA or Heimdal) and an independent security review of opt-in TGT delegation remain outstanding; the review brief is docs/gssapi-delegation-review.md. The isolated CI realms already cover a direct cross-realm trust.",
+      "notes": "Authenticated SSH jump-host connections work for SFTP/SCP/SSH and for FTP/FTPS/WebDAV/S3 destinations. SSH destinations still use a private socketpair (or TunnelLocalPortNumber on loopback); curl and native FTP/S3 sessions start a loopback SOCKS5 multiplexer on the jump so each CONNECT or data channel is a separate direct-tcpip, TLS SNI and S3 signing keep the original hostname, and a refused forward never falls back to a direct connection. Kerberos/GSSAPI settings persist and gssapi-with-mic is attempted before public-key with password fallback; credential delegation stays off unless GSSAPIFwdTGT=1. GSSAPI authentication support is detected through libssh's public ssh_gssapi_set_creds symbol, not its version string. RFC 4462 KEX support is probed independently; AuthGSSAPIKEX is refused if the loaded libssh cannot honor it or a host-key pin is configured, rather than silently skipping either policy. The live SFTP suite provisions an isolated loopback MIT KDC and OpenSSH server and tests principal selection, missing/expired tickets, the service identity, and default-off versus opt-in TGT delegation. A second realm, PARTNER.TEST, is trusted directly through krbtgt/LINSCP.TEST@PARTNER.TEST. It covers cross-realm login, refusal of an unmapped principal of the trusted realm, and default-off versus opt-in delegation of the partner realm's TGT. CI requires a GSSAPI-enabled libssh and zero skips for these cases. As upstream's CreateTunnelData does, the jump session inherits the destination's Kerberos settings except LogicalHostName, so GSSAPIFwdTGT=1 also delegates to the jump host. docs/gssapi-delegation-review.md is the brief for the independent review; that review and production-KDC validation remain open. On Linux the GUI settings now flow to a real GSSAPI attempt (the parser used to drop all four Kerberos keys); on Windows and Android the site manager labels the section Linux-only, key exchange is noted as unsupported on every build, and explicit settings fail closed naming the requirement. The Windows and Android citations below evidence that labeling and refusal, not Kerberos authentication itself.",
+      "gap": "Production-KDC validation (for example Active Directory, FreeIPA or Heimdal) and an independent security review of opt-in TGT delegation remain outstanding; the review brief is docs/gssapi-delegation-review.md. The isolated CI realms already cover a direct cross-realm trust. Windows has no SSPI backend, so Kerberos authentication is Linux-only; the site manager says so and explicit settings fail closed.",
       "acceptance": [
         "Run the isolated-realm GSSAPI cases in CI with a GSSAPI-enabled libssh and no skipped cases; cover principal selection, missing/expired credentials, service mutual authentication, default-off delegation and opt-in TGT delegation.",
-        "Obtain an independent security review of delegated TGT handling and validate cross-realm/production-KDC behavior before claiming general Kerberos parity."
+        "Obtain an independent security review of delegated TGT handling and validate cross-realm/production-KDC behavior before claiming general Kerberos parity.",
+        "Provide a Windows SSPI (or sspi-crate) context provider behind the GssapiTokenProvider trait, with tests against an AD or Samba KDC, before claiming Kerberos on Windows."
       ],
       "source": [
         "crates/linscp-proto/src/tunnel.rs",
@@ -3510,7 +3515,10 @@
         "crates/linscp-proto/src/ftp.rs",
         "crates/linscp-proto/src/webdav.rs",
         "crates/linscp-proto/src/s3.rs",
-        "crates/linscp-http/src/lib.rs"
+        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/tabs.rs",
+        "ui/src/platform/capabilities.ts",
+        "source/gui/web/index.html"
       ],
       "checks": {
         "unit": [
@@ -3542,6 +3550,15 @@
         "gui-security": [
           "test_gssapi_settings_reach_the_core_and_never_delegate_implicitly",
           "test_gssapi_and_local_port_validation"
+        ],
+        "service-tabs": [
+          "gui_session_spec_keeps_gssapi_settings",
+          "gui_session_kerberos_refusal_names_linux"
+        ],
+        "gui": [
+          "the Kerberos gap names Linux-only builds",
+          "the key-exchange gap applies on every build",
+          "the Kerberos hint shows the gap reason"
         ]
       },
       "verified_on": {
@@ -3550,7 +3567,16 @@
           "live-tunnel",
           "script",
           "live-sftp",
-          "gui-security"
+          "gui-security",
+          "service-tabs",
+          "gui"
+        ],
+        "windows": [
+          "service-tabs",
+          "gui"
+        ],
+        "android": [
+          "gui"
         ]
       }
     },

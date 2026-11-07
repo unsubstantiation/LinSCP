@@ -547,13 +547,13 @@ impl SshConnection {
                             .to_string(),
                     ));
                 } else if let Some(ref logger) = cfg.event_logger {
-                    logger("The server offers GSSAPI, but this build's libssh cannot use it");
+                    logger("The server offers GSSAPI, but Kerberos needs a Linux build with a Kerberos runtime");
                 }
             }
             #[cfg(not(feature = "gssapi"))]
             {
                 if let Some(ref logger) = cfg.event_logger {
-                    logger("The server offers GSSAPI, but this build's libssh cannot use it");
+                    logger("The server offers GSSAPI, but Kerberos needs a Linux build with a Kerberos runtime");
                 }
             }
         }

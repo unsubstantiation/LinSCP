@@ -51,6 +51,10 @@ export interface HostCapabilities {
   backgroundTransfers: boolean;
   /** The backend can ask an SSH agent for keys during login. */
   sshAgent: boolean;
+  /** The backend can attempt Kerberos (GSSAPI) authentication. */
+  gssapi: boolean;
+  /** The backend honors GSSAPI key exchange. */
+  gssapiKex: boolean;
 }
 
 export interface HostGlobals {
@@ -117,6 +121,10 @@ export interface HostCapabilityOptions {
   terminal?: boolean;
   /** Backend can reach an SSH agent (the shell may know better). */
   sshAgent?: boolean;
+  /** Backend can attempt Kerberos (the shell may know better). */
+  gssapi?: boolean;
+  /** Backend honors GSSAPI key exchange (the shell may know better). */
+  gssapiKex?: boolean;
 }
 
 /**
@@ -148,6 +156,12 @@ export function hostCapabilities(options: HostCapabilityOptions = {}): HostCapab
     shareIntents,
     foregroundTransfers,
     sshAgent: options.sshAgent ?? !android,
+    // Only a native non-Linux build is known to lack Kerberos; anything else
+    // fails open because the page cannot see the server OS, and the backend
+    // refuses explicit Kerberos settings where it cannot honor them. Key
+    // exchange is unwired on every build, so it stays off unless overridden.
+    gssapi: options.gssapi ?? !(native && platform !== 'linux'),
+    gssapiKex: options.gssapiKex ?? false,
     fileDrop: true,
     nativeFileDrop: options.nativeFileDrop ?? (native && !android),
     accounts: options.accounts ?? !native,
@@ -219,6 +233,12 @@ export function hostDifferenceReason(
   }
   if (capability === 'sshAgent' && !caps.sshAgent) {
     return 'SSH agent authentication is not available on this build; use a private key file instead.';
+  }
+  if (capability === 'gssapi' && !caps.gssapi) {
+    return 'Kerberos (GSSAPI) authentication is only available on Linux; this build cannot use these settings.';
+  }
+  if (capability === 'gssapiKex' && !caps.gssapiKex) {
+    return 'GSSAPI key exchange is not supported; leave it off or the connection is refused.';
   }
   return null;
 }

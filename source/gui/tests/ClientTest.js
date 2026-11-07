@@ -1748,6 +1748,33 @@ function options(id) {
     String(agentReason));
   if (agentStubInstalled) window.LinSCPCore.hostDifferenceReason = undefined;
 
+  // ---- Kerberos limits --------------------------------------------------
+  // The Kerberos section names its Linux-only limit, and key exchange — the
+  // one setting no build honors — is noted where the Linux-only note is not.
+  let gssapiStubInstalled = false;
+  if (!window.LinSCPCore || typeof window.LinSCPCore.hostDifferenceReason !== 'function') {
+    window.LinSCPCore = window.LinSCPCore || {};
+    window.LinSCPCore.hostDifferenceReason = (capability) => 'stub no ' + capability;
+    gssapiStubInstalled = true;
+  }
+  const kerberosReason = window.gssapiGap({ gssapi: false });
+  check('the Kerberos gap names Linux-only builds',
+    (gssapiStubInstalled ? kerberosReason === 'stub no gssapi' : kerberosReason.includes('Linux')) &&
+      window.gssapiGap({ gssapi: true }) === null,
+    String(kerberosReason));
+  const kexReason = window.gssapiKexGap({ gssapi: true });
+  check('the key-exchange gap applies on every build',
+    (gssapiStubInstalled ? kexReason === 'stub no gssapiKex' : kexReason.includes('key exchange')) &&
+      window.gssapiKexGap({ gssapi: false }) === null,
+    String(kexReason));
+  window.updateGssapiHint();
+  const gssapiHintHidden = doc.getElementById('siteGssapiHint').hidden;
+  check('the Kerberos hint shows the gap reason',
+    gssapiStubInstalled ? gssapiHintHidden === true :
+      (gssapiHintHidden === false && text('siteGssapiHint').includes('key exchange')),
+    text('siteGssapiHint'));
+  if (gssapiStubInstalled) window.LinSCPCore.hostDifferenceReason = undefined;
+
   check('no script errors', errors.length === 0, errors.join(' | '));
   window.close();
 })();

@@ -1820,13 +1820,13 @@ fn validate_ssh_gssapi_policy(spec: &ParsedSiteSpec) -> Result<(), String> {
     }
     if !is_system_gssapi_available() && (auth_kex || gss_delegate || has_logical_host) {
         return Err(
-            "This build's libssh cannot use GSSAPI, so the session's Kerberos settings (AuthGSSAPIKEX, GSSAPIFwdTGT, LogicalHostName) would be dropped."
+            "Kerberos (GSSAPI) authentication needs a Linux build with a Kerberos runtime, so this build cannot honor the session's Kerberos settings (AuthGSSAPIKEX, GSSAPIFwdTGT, LogicalHostName)."
                 .to_string(),
         );
     }
     if auth_kex {
         return Err(
-            "This build's libssh does not support GSSAPI key exchange, so AuthGSSAPIKEX cannot be honored."
+            "GSSAPI key exchange is not supported, so AuthGSSAPIKEX cannot be honored."
                 .to_string(),
         );
     }

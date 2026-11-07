@@ -105,6 +105,11 @@ CASE_SOURCES = {
     # The password-only vault: setup/unlock/lock and the retired prefixes.
     # Android runs no Rust tests, so Android rows cite other suites instead.
     "vault-password": "crates/linscp-platform/src/password_vault.rs",
+    # The GUI session parser: the site manager's settings must reach the
+    # engine's raw fields instead of being dropped, and explicit Kerberos
+    # settings must fail closed naming Linux where no runtime exists.
+    # Android runs no Rust tests, so Android rows cite other suites instead.
+    "service-tabs": "crates/linscp-service/src/tabs.rs",
 }
 
 
@@ -358,7 +363,7 @@ def check_capabilities(inventory, errors, root=ROOT):
                 elif suite in ("service", "service-commands", "gui-cli",
                                "gui-shell-definitions", "gui-shell-actions",
                                "platform-windows-acl", "proto-ssh",
-                               "vault-password"):
+                               "vault-password", "service-tabs"):
                     # A Rust test is a #[test]/#[tokio::test] function, not a
                     # `test_*` ffi symbol; the drop helpers are `async fn`.
                     expression = r"\b(?:async\s+)?fn\s+" + re.escape(case) + r"\s*\("

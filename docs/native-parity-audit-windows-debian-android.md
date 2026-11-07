@@ -2,10 +2,10 @@
 
 **Date:** 2026-11-06 · **Branch:** `arena/a4f5fe10-linscp` · **Mode:** audit, then A1 fixed on request.
 
-> **Update (same day):** A1, A2, A3, A4, A5, A6, A7(b) and A9 below have been implemented, and the
-> §3 suites have been triaged (B) — see their **Status** notes for what changed and what still
-> needs a compiler to confirm. The rest of this document is the audit as written, so A8 and the
-> A7(a) `LocalFs` routing still describe the tree as it was before those changes.
+> **Update (same day):** A1, A2, A3, A4, A5, A6, A7(b), A8 and A9 below have been implemented, and
+> the §3 suites have been triaged (B) — see their **Status** notes for what changed and what still
+> needs a compiler to confirm. The rest of this document is the audit as written, so only the
+> A7(a) `LocalFs` routing still describes the tree as it was before those changes.
 
 **Question asked:** "Make sure we have full feature parity between the builds."
 **Scope, as confirmed:** the three native builds — `linscp-gui` on Windows (MSVC), `linscp-gui` on
@@ -505,6 +505,20 @@ most Windows-specific functionality gap.
 **Fix:** the SSPI work, or leave it partial and say "Linux only" in the site manager.
 **Effort:** L (a real SSPI context provider, not a wrapper).
 
+**Status: fixed** as far as honesty goes; the SSPI work itself stays open. Recon showed the GUI
+Kerberos settings never reached the backend on any platform — the session parser dropped all four
+keys — so labeling alone would have etched a falsehood into the UI. The parser now carries them,
+which makes Linux GUI attempts real and lets the existing fail-closed validation run for GUI
+connects; the refusal messages name the requirement (Linux plus a Kerberos runtime) instead of
+blaming libssh, and key exchange — refused on every build, including Linux — says it is
+unsupported rather than Linux-only. The site manager labels the section Linux-only on native
+non-Linux builds via new bundle `gssapi`/`gssapiKex` flags (a browser fails open, since the page
+cannot see the server OS, with the backend refusal as the fail-closed layer). Ledger row
+`security.gssapi-and-tunnels` stays `partial`, extended with runnable evidence: two parser tests
+under a new `service-tabs` checker suite plus three page checks, with the Windows and Android
+citations scoped to the labeling and refusal. The SSPI provider is recorded as an acceptance item.
+Reading-level for the Rust, as usual: CI compiles it first.
+
 ### A9. SSH agent: two of three builds have one, Android has a hard `None`
 **Platforms:** Android ✗
 **Evidence:** `linscp-platform/src/android.rs:257-259` — `connect_ssh_agent` is `Ok(None)`.
@@ -717,8 +731,10 @@ Ordered by (user impact × confidence) ÷ effort. All are small except where not
    were doubly dead, so wiring would have been a product feature, not a fix). Dead constructors,
    decoder branches, DPAPI functions, the `KeystoreBridge` trait, and Tauri keystore state
    removed; migration-guide claims corrected.
-9. **A8 SSPI** — the only item here that is genuinely large. It should stay `partial`, with the
-   ledger finally saying *linux-only*, until someone does it.
+9. **A8 SSPI** — **done** as honesty work, see A8's *Status: fixed*: the parser carries the four
+   Kerberos settings (Linux GUI attempts are real now), refusals name Linux, the site manager
+   labels the section Linux-only, and KEX is noted as unsupported everywhere. The row stays
+   `partial` with an SSPI acceptance item until someone builds the provider.
 
 **Acceptance criterion I propose for "parity" as a claim:** for every row in §2, one test that runs on
 all three targets (or a device/emulator run recorded for the platform-only ones), and

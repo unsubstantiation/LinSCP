@@ -729,6 +729,7 @@
           </details>
           <details id="siteGssapiSettings" class="remote-only-row">
             <summary>Kerberos (GSSAPI)</summary>
+            <div class="hint" id="siteGssapiHint" hidden></div>
             <div class="form-row"><label for="siteGssapiAuth">Try GSSAPI authentication:</label><input type="checkbox" id="siteGssapiAuth" checked></div>
             <div class="form-row"><label for="siteGssapiKex">GSSAPI key exchange:</label><input type="checkbox" id="siteGssapiKex"></div>
             <div class="form-row"><label for="siteGssapiFwdTgt">Forward the Kerberos ticket (delegate credentials):</label><input type="checkbox" id="siteGssapiFwdTgt"></div>
@@ -1792,6 +1793,33 @@
   function updateAgentHint(reason) {
     const hint = $('siteAgentHint');
     if (!hint) return;
+    hint.hidden = !reason;
+    hint.textContent = reason || '';
+  }
+
+  /* The reason the Kerberos settings cannot work here, or null when this
+   * host can attempt them. A unit can pass capabilities in; the live page
+   * reads the cached host set. */
+  function gssapiGap(caps) {
+    const c = caps || hostCaps();
+    if (!c || c.gssapi) return null;
+    if (!window.LinSCPCore || typeof window.LinSCPCore.hostDifferenceReason !== 'function') return null;
+    return window.LinSCPCore.hostDifferenceReason('gssapi', c);
+  }
+
+  /* Key exchange is the one Kerberos setting no build honors, so its note
+   * shows exactly where the Linux-only note does not: on Linux. */
+  function gssapiKexGap(caps) {
+    const c = caps || hostCaps();
+    if (!c || !c.gssapi) return null;
+    if (!window.LinSCPCore || typeof window.LinSCPCore.hostDifferenceReason !== 'function') return null;
+    return window.LinSCPCore.hostDifferenceReason('gssapiKex', c);
+  }
+
+  function updateGssapiHint() {
+    const hint = $('siteGssapiHint');
+    if (!hint) return;
+    const reason = gssapiGap() || gssapiKexGap();
     hint.hidden = !reason;
     hint.textContent = reason || '';
   }
@@ -5548,6 +5576,9 @@
     /* The agent hint is static per host: say once why agent login is not
      * offered instead of failing the connection later. */
     updateAgentHint(sshAgentGap());
+    /* The Kerberos hint is static per host: say once why the settings
+     * cannot work here instead of failing the connection later. */
+    updateGssapiHint();
     listenForNativeDrops();
     await checkAccounts();
     if (!accountsEnabled || signedInAs) {
