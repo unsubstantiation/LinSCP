@@ -67,8 +67,7 @@ impl Output {
     fn write_stdout(&mut self, text: &str) {
         #[cfg(windows)]
         if let Some(console) = self.console.as_mut() {
-            // `
-`, because the console translates nothing for a File.
+            // `\r\n`, because the console translates nothing for a File.
             let _ = console.write_all(text.replace('\n', "\r\n").as_bytes());
             let _ = console.flush();
             return;
