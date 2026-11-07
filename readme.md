@@ -107,6 +107,23 @@ required. User settings are stored in the normal platform configuration
 directory, not alongside the executable. Windows CI uploads the executable
 as a portable, uninstalled application.
 
+The binary also carries the file-manager integration, which is what its own
+command line is for:
+
+```sh
+linscp-gui --install-shell-integration    # add "Upload with LinSCP" for this user
+linscp-gui --shell-upload FILE...         # what that action runs; stages, then exits
+linscp-gui --uninstall-shell-integration  # remove exactly what install wrote
+linscp-gui --help
+```
+
+On Linux this writes a Dolphin service menu, a GNOME Files script and a Nemo
+action into the XDG data directory; on Windows it writes an Explorer *Send To*
+shortcut. A right-click stages the selection and returns immediately — nothing is
+transferred — and the running window offers it for confirmation, or the next
+launch does. Any other argument, including none, opens the window, so a desktop
+launcher's own flags are harmless.
+
 Run `cargo test --workspace --all-targets` and `npm --prefix ui test` for the
 Rust and frontend tests. CMake and `source/linux/Makefile` are convenience
 wrappers around the same build and install both hosts.

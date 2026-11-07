@@ -66,7 +66,10 @@
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
           "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs.",
           "ui-transport": "ui/tests/TransportAndPlatform.test.mjs under node against the built bundle (ui/dist/linscp-core.mjs): the dual transport selection and error mapping, the host capability matrix and the difference reasons, the touch shell (pane order, the extra-key row and its latched Ctrl, long-press selection, the floating action bar and destroy), the local root switcher, and the operating-system path drop - the request shape one drop produces, the approvals a retry repeats, and what an unusable payload is refused for.",
-          "service": "crates/linscp-service/src/lib.rs - the service's own tests, which drive the same `CommanderService::dispatch` the three hosts call: the local and remote drop endpoints (a path drop writes what it names, a folder keeps its shape, an existing destination is a conflict rather than a replacement, a link inside a dropped tree is refused), remote delete against a live WebDAV server (a leaf-invalid name refused per name while the valid one runs, a directory tree emptied and removed, a name the server no longer has counted as deleted, the request's own directory honoured), and the transfer, queue and workspace behaviour the live suites exercise over SFTP, FTP, FTPS, S3 and WebDAV."
+          "service": "crates/linscp-service/src/lib.rs - the service's own tests, which drive the same `CommanderService::dispatch` the three hosts call: the local and remote drop endpoints (a path drop writes what it names, a folder keeps its shape, an existing destination is a conflict rather than a replacement, a link inside a dropped tree is refused), remote delete against a live WebDAV server (a leaf-invalid name refused per name while the valid one runs, a directory tree emptied and removed, a name the server no longer has counted as deleted, the request's own directory honoured), and the transfer, queue and workspace behaviour the live suites exercise over SFTP, FTP, FTPS, S3 and WebDAV.",
+          "gui-cli": "crates/linscp-platform/src/cli_args.rs - the native window's whole command line, decided without a window: --install-shell-integration, --uninstall-shell-integration, --shell-upload FILES... and --help, plus the guarantee that a bare launch, an unknown flag or a contradictory command line opens the window. Pure Rust, so the same tests decide the same way on every target.",
+          "gui-shell-definitions": "crates/linscp-platform/src/gui_os.rs - the per-user file-manager definitions themselves: what install writes for Dolphin, GNOME Files and Nemo, that a launcher path with a space survives quoting, that the GNOME Files script is valid sh reading NAUTILUS_SCRIPT_SELECTED_FILE_PATHS, that a path no shell can carry is refused by name, and that uninstall removes exactly those three. Linux only: Windows writes one `.cmd` and every other platform refuses.",
+          "gui-shell-actions": "crates/linscp-service/src/cli_actions.rs - what the actions do once the arguments are decided: a selection becomes a pending manifest the window reads back, a relative path resolves against the directory it was named in, an empty or vanished selection is refused with the reason on stderr and a failing exit code, and an install that cannot be carried out reports the reason instead of writing something wrong."
         }
       },
       "windows": {
@@ -96,7 +99,9 @@
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
           "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs.",
           "ui-transport": "ui/tests/TransportAndPlatform.test.mjs under node against the built bundle (ui/dist/linscp-core.mjs): the dual transport selection and error mapping, the host capability matrix and the difference reasons, the touch shell (pane order, the extra-key row and its latched Ctrl, long-press selection, the floating action bar and destroy), the local root switcher, and the operating-system path drop - the request shape one drop produces, the approvals a retry repeats, and what an unusable payload is refused for.",
-          "service": "crates/linscp-service/src/lib.rs - `cargo test --workspace` on Windows runs the same service tests the Linux job runs, including the drop staging and the request shapes; the live-server cases need the Python fixtures and are enabled on Linux."
+          "service": "crates/linscp-service/src/lib.rs - `cargo test --workspace` on Windows runs the same service tests the Linux job runs, including the drop staging and the request shapes; the live-server cases need the Python fixtures and are enabled on Linux.",
+          "gui-cli": "cargo test --workspace on Windows runs the same `cli_args` tests the Linux job runs, and the Windows job then drives the built `linscp-gui.exe` the way Explorer does: install into a redirected APPDATA, check the Send To `.cmd` names --shell-upload, run it with a selected file and read the manifest back, then uninstall.",
+          "gui-shell-actions": "the same `cli_actions` tests, and the Windows job's Explorer smoke test, which runs the installed Send To shortcut on a real file and reads the manifest it produced."
         }
       },
       "android": {
@@ -126,7 +131,9 @@
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so Windows dpapi1$ and Android aks1$ backups restore on Linux), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
           "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs.",
           "ui-transport": "ui/tests/TransportAndPlatform.test.mjs under node against the built bundle (ui/dist/linscp-core.mjs): the dual transport selection and error mapping, the host capability matrix and the difference reasons, the touch shell (pane order, the extra-key row and its latched Ctrl, long-press selection, the floating action bar and destroy), the local root switcher, and the operating-system path drop - the request shape one drop produces, the approvals a retry repeats, and what an unusable payload is refused for.",
-          "service": "crates/linscp-service/src/lib.rs - the service is compiled into the APK and `tools/android_emulator_smoke.mjs` drives it inside the installed app through the WebView's IPC, so the same dispatch path is exercised on the emulator."
+          "service": "crates/linscp-service/src/lib.rs - the service is compiled into the APK and `tools/android_emulator_smoke.mjs` drives it inside the installed app through the WebView's IPC, so the same dispatch path is exercised on the emulator.",
+          "gui-cli": "the same `cli_args` tests, compiled for the Android target by `cargo ndk ... check` and run on the host by `cargo test --workspace --all-targets`: the parser is target-independent, and Android's own entry point refuses shell integration by name instead of writing XDG directories inside the app sandbox.",
+          "gui-shell-actions": "the same `cli_actions` tests: Android's share sheet records the identical manifest, and its install path is the refusal case the suite asserts."
         }
       }
     }
@@ -1085,34 +1092,38 @@
     {
       "name": "Desktop integration",
       "status": "partial",
-      "notes": "The desktop entry registers SFTP/FTP/FTPS URLs and launches the graphical client through the desktop's own URI launcher, so it opens the same on a Wayland session as under X11; the GUI parses startup URLs without bypassing host-key verification, and launcher/core lookup supports relocatable prefixes. Local and remote pane desktop drops are tested using browser API fixtures, and a display-session decision that ignores Wayland is refused by the compatibility check. File-manager integration is per-user opt-in: 'linscp-gui --install-shell-integration' writes 'Upload with LinSCP' actions for Dolphin, GNOME Files and Nemo, which hold a validated selection for the Commander's confirmation dialog instead of transferring anything. Covered by gui-desktop-uri, gui-shell, script, gui, gui-browser-upload, unit and wayland-compatibility; real browser/desktop combinations and a live compositor still need acceptance validation, which no fixture here certifies.",
+      "notes": "The desktop entry registers SFTP/FTP/FTPS URLs and launches the graphical client through the desktop's own URI launcher, so it opens the same on a Wayland session as under X11; the GUI parses startup URLs without bypassing host-key verification, and launcher/core lookup supports relocatable prefixes. Local and remote pane desktop drops are tested using browser API fixtures, and a display-session decision that ignores Wayland is refused by the compatibility check. File-manager integration is per-user opt-in and, since the audit's A3 item, reachable: 'linscp-gui --install-shell-integration' writes 'Upload with LinSCP' actions for Dolphin, GNOME Files and Nemo, or the Explorer Send To shortcut on Windows, which hold a validated selection for the Commander's confirmation dialog instead of transferring anything; the shipped binary now reads its own command line (it did not, so none of this could run), and both desktop CI jobs drive the built binary through install, upload and uninstall. Covered by gui-desktop-uri, gui-shell, gui-cli, gui-shell-definitions, script, gui, gui-browser-upload, unit and wayland-compatibility; real browser/desktop combinations and a live compositor still need acceptance validation, which no fixture here certifies.",
       "verified_on": {
         "linux": [
           "gui-desktop-uri",
+          "gui-cli",
+          "gui-shell-definitions",
+          "gui-shell",
           "script",
           "gui",
           "gui-browser-upload",
           "unit",
-          "wayland-compatibility",
-          "gui-shell"
+          "wayland-compatibility"
         ],
         "windows": [
           "gui-desktop-uri",
+          "gui-cli",
+          "gui-shell",
           "script",
           "gui",
           "gui-browser-upload",
           "unit",
-          "wayland-compatibility",
-          "gui-shell"
+          "wayland-compatibility"
         ],
         "android": [
           "gui-desktop-uri",
+          "gui-cli",
+          "gui-shell",
           "script",
           "gui",
           "gui-browser-upload",
           "unit",
-          "wayland-compatibility",
-          "gui-shell"
+          "wayland-compatibility"
         ]
       },
       "gap": "Ironrdp/Guacamole gateway credential-isolation review remains; live launches are now gated via live-desktop."
@@ -4035,45 +4046,77 @@
       "id": "desktop.shell-and-extensions",
       "area": "Desktop integration",
       "status": "verified",
-      "notes": "Both shells exist, and both are inert until invoked. Inside the Commander, the persisted custom-command templates (explorer-commands.json ships defaults; the dialog adds, edits, deletes and reorders them) run against the selection with fixed-vocabulary substitution and an explicit confirmation - the security suite covers persistence, substitution and hostile names, and the client suite the dialog and its decline. Around the Commander, 'linscp-gui --install-shell-integration' writes one opt-in, per-user 'Upload with LinSCP' action per file manager - Dolphin service menus (both the kio/servicemenus and classic kservices5/ServiceMenus directories), a GNOME Files script and a Nemo action - into the XDG data directory, each carrying a marker so uninstall removes exactly what install wrote and never a definition of the user's own. The definitions hand the selection over as separate arguments (desktop %F, the Nautilus script's \"$@\"), never through a shell command line, and a launcher path a desktop Exec line cannot carry safely is refused by name. What a right-click runs, '--shell-upload FILES...', transfers nothing: it validates the selection (absolute, existing files and directories only, bounded, control-character-free) into a 0600 manifest under the user's configuration, and the page then offers it in a dialog - once per tab, so 'Later' holds it without nagging - queuing ordinary queue uploads into the confirmed session tab, naming anything that vanished in between, and refusing a local-only tab. A selection recorded while the GUI was already running is picked up by that running server, because pending selections are read from disk per request. The boundary: file-manager integration is offered for Dolphin, GNOME Files and Nemo (the managers that read per-user definitions of this shape); definitions are per-user opt-in, so nothing appears in any menu until the user installs it.",
+      "notes": "Both shells exist, and both are inert until invoked. Inside the Commander, the persisted custom-command templates (explorer-commands.json ships defaults; the dialog adds, edits, deletes and reorders them) run against the selection with fixed-vocabulary substitution and an explicit confirmation - the security suite covers persistence, substitution and hostile names, and the client suite the dialog and its decline. Around the Commander, 'linscp-gui --install-shell-integration' writes one opt-in, per-user 'Upload with LinSCP' action per file manager: Dolphin and Nemo service menus, a GNOME Files script (Linux) and the Explorer Send To shortcut (Windows), each carrying a marker so uninstall removes exactly what install wrote and never a definition of the user's own. Until the audit item A3 fix, no shipped entry point looked at its arguments at all, so none of these actions could be installed or run; 'crates/linscp-platform/src/cli_args.rs' now decides the action and 'crates/linscp-service/src/cli_actions.rs' performs it before Tauri starts, so a bare launch, a desktop Exec line and a launcher's own flags still open the window, and anything else is one shot. The definitions hand the whole selection over in one call (desktop %F, the GNOME Files script's environment variable read one path per line, the Windows .cmd a quoted list that the parser splits back), never through a shell command line, and a launcher path that the definitions cannot carry is refused by name instead of being written wrong. What a right-click runs, '--shell-upload FILES...', transfers nothing: it validates the selection (absolute or resolved against the directory it was named in, existing files and directories only, bounded, control-character-free) into a 0600 manifest under the user's configuration, and the page then offers it in a dialog - once per tab, so 'Later' holds it without nagging - queuing ordinary queue uploads into the confirmed session tab, naming anything that vanished in between, and refusing a local-only tab. A selection recorded while the GUI was already running is picked up by that running server, because pending selections are read from disk per request. The boundary: the definitions are written for Dolphin, GNOME Files, Nemo and the Windows Explorer Send To menu, and any other target refuses with 'Shell integration is available on Linux and Windows only.' rather than creating directories in a sandbox that no menu reads; Android keeps the share hand-off instead, which records the same manifest; definitions are per-user opt-in, so nothing appears in any menu until the user installs it.",
       "name": "Desktop shell integration and custom file-manager actions",
       "source": [
-        "crates/linscp-http/src/lib.rs",
-        "ui/src/index.ts",
-        "crates/linscp-service/src/ops.rs"
+        "crates/linscp-platform/src/cli_args.rs",
+        "crates/linscp-service/src/cli_actions.rs",
+        "crates/linscp-platform/src/gui_os.rs",
+        "crates/linscp-service/src/ops.rs",
+        "ui/src/index.ts"
       ],
       "checks": {
-        "gui-shell": [
-          "test_install_writes_one_definition_per_manager",
-          "test_reinstall_updates_and_uninstall_removes_only_ours",
-          "test_a_launcher_path_a_shell_could_read_is_refused",
-          "test_install_command_line",
-          "test_record_list_and_dismiss_round_trip",
-          "test_record_refusals",
-          "test_stale_and_foreign_manifests_are_ignored",
-          "test_a_shell_upload_invocation_records_without_sending",
-          "test_pending_consume_and_dismiss_over_http",
-          "test_consume_refusals"
+        "gui-cli": [
+          "a_bare_launch_opens_the_window",
+          "the_shell_actions_are_reachable",
+          "shell_upload_takes_the_whole_selection",
+          "shell_upload_without_a_selection_does_nothing",
+          "contradictory_actions_open_the_window",
+          "help_wins_because_it_cannot_do_anything"
+        ],
+        "gui-shell-definitions": [
+          "a_launcher_path_with_a_space_is_quoted_not_refused",
+          "the_gnome_files_script_is_a_shell_script_naming_the_upload_flag",
+          "a_launcher_path_a_shell_script_cannot_carry_is_refused_by_name",
+          "uninstalling_reports_every_definition_and_removes_them"
+        ],
+        "gui-shell-actions": [
+          "an_empty_selection_and_a_missing_file_are_refused_out_loud",
+          "an_install_that_cannot_be_carried_out_is_reported_not_swallowed"
         ],
         "gui-security": [
           "test_the_shipped_templates_are_there_on_a_first_run",
           "test_a_saved_command_replaces_the_shipped_ones_in_the_user_file",
           "test_a_template_that_is_not_one_command_line_is_refused",
           "test_a_local_template_quotes_its_name_as_a_local_path"
+        ],
+        "gui-shell": [
+          "test_record_list_and_dismiss_round_trip",
+          "test_record_refusals",
+          "test_stale_and_foreign_manifests_are_ignored",
+          "test_pending_consume_and_dismiss_over_http",
+          "test_consume_refusals"
+        ],
+        "gui": [
+          "shell offer dialog opened",
+          "shell offer lists the files",
+          "shell offer treats names as text",
+          "offering queues nothing",
+          "confirming posts the selection id against the active tab",
+          "a refused file is reported with its reason"
         ]
       },
       "verified_on": {
         "linux": [
+          "gui-cli",
+          "gui-shell-actions",
+          "gui-shell-definitions",
           "gui-shell",
-          "gui-security"
+          "gui-security",
+          "gui"
         ],
         "windows": [
+          "gui-cli",
+          "gui-shell-actions",
           "gui-shell",
-          "gui-security"
+          "gui-security",
+          "gui"
         ],
         "android": [
+          "gui-cli",
+          "gui-shell-actions",
           "gui-shell",
-          "gui-security"
+          "gui"
         ]
       }
     },

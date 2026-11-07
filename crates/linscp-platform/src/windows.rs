@@ -12,6 +12,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HLOCAL};
 use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
 };
+use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows_sys::Win32::Storage::FileSystem::{
     GetLogicalDrives, MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
@@ -34,6 +35,30 @@ pub fn process_is_running(pid: u32) -> bool {
             CloseHandle(process) != 0
         }
     }
+}
+
+/// Takes the console of the process that started this one, if it has one.
+///
+/// The release GUI is built with `windows_subsystem = "windows"`, so it has no
+/// console of its own. The one-shot actions (`--install-shell-integration`,
+/// `--shell-upload …`) are run *by* a file manager or a script, which do have a
+/// console and a user who wants to read the answer.
+///
+/// Attaching is not enough on its own: the inherited standard handles belong to the
+/// windowing parent and point nowhere, so writing to `stdout` would still discard
+/// the text. What is returned is the console itself (`CONOUT$`), which the caller
+/// writes to directly. `None` is not an error — it means this process was started
+/// without a console (a shortcut, a scheduled task) and has nobody to tell.
+pub fn attach_parent_console() -> Option<std::fs::File> {
+    // SAFETY: `AttachConsole` takes one constant; it either attaches this process to
+    // its parent's console or fails harmlessly. It allocates nothing the caller owns
+    // and does not touch any handle we keep.
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } == 0 {
+        return None;
+    }
+    // `CONOUT$` is the console screen buffer of whichever console this process is
+    // attached to, so it is exactly where a console program's output goes.
+    std::fs::OpenOptions::new().write(true).open("CONOUT$").ok()
 }
 
 pub fn default_config_dir() -> PathBuf {

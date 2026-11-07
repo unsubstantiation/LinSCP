@@ -219,6 +219,60 @@ jobs:
             exit 1
           fi
 
+      # A3: the shipped binary ignored its own command line, so the documented
+      # "--install-shell-integration" never ran and the actions it writes could not
+      # exist. This drives the installed binary the way a file manager does: install
+      # into a scratch data directory, check the definitions are there and carry the
+      # flag, stage a selection through the very same flag the definition contains,
+      # and uninstall. It fails if any of those steps stops doing something.
+      - name: Smoke test the file-manager actions
+        run: |
+          set -euo pipefail
+          # Separate config root for the manifest, so it cannot disturb (or be
+          # disturbed by) the window smoke test that runs after this.
+          export LINSCP_CONFIG_DIR=$(mktemp -d)
+          export XDG_DATA_HOME=$(mktemp -d)
+          linscp-gui --install-shell-integration
+          for path in "kio/servicemenus/linscp-upload.desktop" \
+                      "nautilus/scripts/Upload with LinSCP" \
+                      "nemo/actions/linscp-upload.nemo_action"; do
+            test -f "$XDG_DATA_HOME/$path" || { echo "::error::$path was not written"; exit 1; }
+          done
+          grep -q -- '--shell-upload' "$XDG_DATA_HOME/kio/servicemenus/linscp-upload.desktop" ||
+            { echo "::error::the Dolphin action does not call --shell-upload"; exit 1; }
+          # The action itself, with the selection a file manager would pass. The
+          # manifest lands in the config directory the running window polls, and the
+          # command returns instead of opening a window (a file manager would wait).
+          selection=$(mktemp)
+          timeout 60 linscp-gui --shell-upload "$selection"
+          manifests=$(find "$LINSCP_CONFIG_DIR" -path '*shell-manifests/*.json' -print -quit)
+          test -n "$manifests" || { echo "::error::--shell-upload recorded no manifest"; exit 1; }
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['items'], d" "$manifests"
+
+          # GNOME Files never passes the selection as arguments: the script reads it
+          # from the environment, one path per line. Run the installed script that way
+          # with two awkward names and check both survive verbatim.
+          first="$PWD/first file&odd.txt"
+          second="$PWD/second*.glob"
+          : > "$first"
+          : > "$second"
+          rm -rf "$LINSCP_CONFIG_DIR"/shell-manifests
+          selected=$(printf '%s\n%s' "$first" "$second")
+          NAUTILUS_SCRIPT_SELECTED_FILE_PATHS="$selected" \
+            timeout 60 "$XDG_DATA_HOME/nautilus/scripts/Upload with LinSCP"
+          staged=$(find "$LINSCP_CONFIG_DIR" -path '*shell-manifests/*.json' -print -quit)
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); paths=sorted(i['path'] for i in d['items']); assert len(paths)==2, paths; assert paths[0].endswith('first file&odd.txt'), paths; assert paths[1].endswith('second*.glob'), paths" "$staged"
+          linscp-gui --uninstall-shell-integration
+          test ! -f "$XDG_DATA_HOME/kio/servicemenus/linscp-upload.desktop" ||
+            { echo "::error::uninstall left the Dolphin action behind"; exit 1; }
+          # The help text is reachable without a display, so a user can discover the
+          # flags from a terminal and not only from the documentation.
+          usage=$(linscp-gui --help)
+          case "$usage" in
+            *--shell-upload*) ;;
+            *) echo "::error::--help did not document --shell-upload"; exit 1 ;;
+          esac
+
       - name: Upload the Debian package
         uses: actions/upload-artifact@v7
         with:

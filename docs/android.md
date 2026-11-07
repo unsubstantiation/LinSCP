@@ -27,7 +27,13 @@ upload). Android support is incomplete:
   launches are not supported by Android intents yet. Debian/Windows use native
   desktop viewers and OS file-drop events; Android uses document grants and the
   Share Sheet instead. `hostDifferenceReason()` explains unavailable
-  integrations.
+  integrations. `linscp-gui --install-shell-integration` is one of those
+  differences: it writes per-user file-manager menus into an XDG data directory,
+  which Android has neither of, so the command refuses by name ("available on
+  Linux and Windows only") rather than creating directories inside the sandbox.
+  The receiving half is shared: a Share Sheet selection and a desktop
+  `--shell-upload` end up in the same pending manifest, offered by the same
+  confirmation dialog.
 - Remote transfer restrictions and cleanup caveats in the main README still
   apply. The shared GUI actions listed in the native feature audit are routed
   through the service, but some remain protocol-limited or lack Android

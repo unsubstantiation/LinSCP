@@ -2,9 +2,9 @@
 
 **Date:** 2026-11-06 · **Branch:** `arena/a4f5fe10-linscp` · **Mode:** audit, then A1 fixed on request.
 
-> **Update (same day):** A1 below has been implemented — see its **Status: fixed** note for what
-> changed and what still needs a compiler to confirm. The rest of this document is the audit as
-> written, so A2–A9 still describe the tree as it was before that change.
+> **Update (same day):** A1 and A3 below have been implemented — see their **Status: fixed** notes
+> for what changed and what still needs a compiler to confirm. The rest of this document is the
+> audit as written, so A2, A4–A9 still describe the tree as it was before those changes.
 
 **Question asked:** "Make sure we have full feature parity between the builds."
 **Scope, as confirmed:** the three native builds — `linscp-gui` on Windows (MSVC), `linscp-gui` on
@@ -15,7 +15,7 @@ scope, so HTTP-vs-window asymmetries are excluded by instruction.
 
 | | Meaning | State |
 |---|---|---|
-| **A. Behavioural parity** | the same click does the same thing on all three builds | **9 defects**, all in shipped code: Windows hit by 7, Debian by 3, Android by 6; 2 are broken on all three. **A1 is fixed** (see §2) |
+| **A. Behavioural parity** | the same click does the same thing on all three builds | **9 defects**, all in shipped code: Windows hit by 7, Debian by 3, Android by 6; 2 are broken on all three. **A1 and A3 are fixed** (see §2) |
 | **B. Evidence parity** | the claim "verified on Windows, Debian *and* Android" is true | **not true today**: of the 24 suites cited for every platform, 8 need a binary this repo does not build, 1 has no build target, 7 are currently failing, and Android executes no Rust test at all |
 
 A build can be behaviourally at parity and still fail B, and vice versa. Both are reported below,
@@ -168,6 +168,67 @@ argv entry point is added without tightening those cfgs to `target_os = "linux"`
 out of it (n/a is the correct answer there, not an implementation).
 **Then:** `docs/native-feature-audit.md` should stop describing this as available, or A3's fix should
 land before the next release note.
+
+**Status: fixed.** The argument surface is small enough to be one tested function, so it is:
+`crates/linscp-platform/src/cli_args.rs` turns `argv` into an `Action` — `OpenWindow`,
+`InstallShellIntegration`, `UninstallShellIntegration`, `ShellUpload(Vec<PathBuf>)` or `Help` — and
+carries the usage text that `--help` prints. `crates/linscp-tauri/src/main.rs` now parses before it
+does anything else: a bare launch still reaches the single
+`run_native_app(tauri::generate_context!())` call, and every action runs, prints and exits **before**
+Tauri starts, so a right-click can no longer open a second window. The rule is that anything
+unrecognised opens the window (a desktop `Exec=` line and every existing launch path are unchanged);
+`--shell-upload` consumes all trailing arguments, flags included; two action flags at once is
+contradictory and opens the window rather than picking a winner; `--help` wins because it cannot do
+anything. Execution lives in `crates/linscp-service/src/cli_actions.rs` (`ActionOutcome` plus
+install / uninstall / `shell_upload_from`), so it is tested without a display: `install` reports each
+manager's path and outcome, `uninstall` reports what it found, and a selection either becomes a
+manifest the running window already polls for or fails with the reason on stderr and a non-zero exit.
+
+Five things surfaced while wiring it, all inside the same gap:
+
+* **Android could compile the definitions.** `install_shell_integration` /
+  `uninstall_shell_integration` branched on `cfg(not(target_os = "windows"))`, so an Android build
+  would have created `$XDG_DATA_HOME` directories inside the app sandbox for menus that do not exist
+  there. Both are now `linux` / `windows` / refuse-by-name, `linux_shell_targets` is `linux`-only,
+  and Android keeps its share hand-off (the same manifest contract).
+* **The Windows path would have been refused.** `validate_shell_launcher_path` rejected a backslash,
+  a dollar sign, `;`, `&`, `%`, a single quote and a double quote on every platform — which rejects
+  the ordinary install location, whose path contains both a space and a backslash. Each definition
+  now refuses only what its own quoting cannot carry, and a launcher path with a space is quoted
+  rather than rejected.
+* **GNOME Files never passes `"$@"`.** The generated script only read the selection from its
+  arguments, but GNOME Files sets `NAUTILUS_SCRIPT_SELECTED_FILE_PATHS` (one path per line) and passes
+  nothing. The script now reads the variable, splits on newlines with `set -f` so a `*` in a name
+  stays literal, and hands the whole selection over in one call; the argv branch remains for the
+  versions that do pass arguments.
+* **A `windows_subsystem = "windows"` build says nothing.** The release GUI has no
+  console, so `println!` in an action run from a terminal goes nowhere and the user
+  who typed `linscp-gui --shell-upload …` learns nothing. The process now attaches to
+  its parent's console (`AttachConsole(ATTACH_PARENT_PROCESS)`) and writes to
+  `CONOUT$` rather than to a `stdout` nobody inherited — attaching alone is not enough,
+  because the inherited handle still points at nothing.
+* **The Explorer shortcut's `%*` is left alone.** `%*` re-reads the line through `cmd`, so an
+  unquoted name containing `&` is still a hazard; wrapping it as `"%*"` was tried and rejected,
+  because that collapses a multi-file selection into one argument (the C runtime strips the inner
+  quotes and keeps the spaces). One argument per selected file is the contract the parser is tested
+  against, so the shortcut keeps `%*` and the residual `&` case is documented rather than traded for
+  a worse one.
+
+Evidence: `gui-cli` (`cli_args.rs`, seven cases: the bare-launch default, the three action flags,
+`--help`, a whole selection taken verbatim with each file its own argument, an empty selection, and
+two action flags at once), `gui-shell-definitions` (`gui_os.rs`, four cases: quoting a path with a
+space, the generated script's shape and executable bit plus `sh -n`, refusal by name, and an
+uninstall that removes exactly what install wrote), `gui-shell-actions` (`cli_actions.rs`: a selection
+becomes the manifest the window reads, a relative path resolves against the directory it was named in,
+an empty or vanished selection is refused out loud, and an install that cannot be carried out reports
+the reason), and `gui-shell` / `gui` for the receiving half that was already there. Because a unit test of a parser
+is weak evidence that a *shipped binary* runs it, both desktop CI jobs now drive the installed
+`linscp-gui`: Debian installs into a scratch `XDG_DATA_HOME`, runs the GNOME Files script the way
+GNOME Files runs it with two awkward names, stages a selection and uninstalls; Windows redirects
+`APPDATA`, checks the Send To `.cmd`, runs it on a file and reads the manifest back. The parity gate
+learned three suites for this (`gui-cli`, `gui-shell-definitions`, `gui-shell-actions`), so
+`desktop.shell-and-extensions` now cites evidence that can fail. **Not verified here:** still no Rust
+toolchain in this sandbox — nothing above has been compiled; the Debian job is the first real check.
 
 ### A4. Local symlink creation has no local implementation
 **Platforms:** all three (the feature exists only for a *remote* pane)

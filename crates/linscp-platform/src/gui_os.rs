@@ -289,26 +289,44 @@ pub fn open_url_in_browser(url: &str) -> Result<(), String> {
     }
 }
 
+/// Rejects launcher paths that cannot be carried into a file-manager action.
+///
+/// Two kinds of definition are written and they quote differently, so the rejection
+/// has to depend on which one: a `.desktop` `Exec=` token takes double quotes, while
+/// the GNOME Files script embeds the path in single quotes inside `sh`. A plain
+/// `C:\Program Files\LinSCP\linscp-gui.exe` contains a backslash and a space and is
+/// perfectly usable on Windows; a POSIX path is free to contain almost anything. The
+/// characters refused here are the ones no quoting can rescue.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn validate_shell_launcher_path(launcher: &Path) -> Result<String, String> {
     let text = launcher.to_string_lossy().into_owned();
     if text.is_empty() {
         return Err("Could not locate the LinSCP GUI launcher executable.".to_string());
     }
-    if text.chars().any(|c| {
-        c.is_control()
-            || matches!(
-                c,
-                '"' | '\'' | '\\' | '`' | '$' | ';' | '&' | '|' | '<' | '>' | '%'
-            )
-    }) {
+    let refused = if cfg!(target_os = "windows") {
+        // Windows: these are illegal in a path anyway, and `%` would be expanded by
+        // the `.cmd` wrapper before the path is used.
+        text.chars()
+            .any(|c| c.is_control() || matches!(c, '"' | '|' | '%' | '*' | '?'))
+    } else {
+        // POSIX: the desktop actions quote the path with double quotes, so only a
+        // control character or a double quote is impossible. A single quote is
+        // refused later, by name, by the one definition that wraps it in `sh`
+        // single quotes.
+        text.chars().any(|c| c.is_control() || c == '"')
+    };
+    if refused {
         return Err(format!(
-            "The launcher path '{text}' contains characters that cannot be carried safely in a desktop action."
+            "The launcher path '{text}' contains characters that cannot be carried safely in a file-manager action."
         ));
     }
     Ok(text)
 }
 
-#[allow(dead_code)]
+/// The per-user definitions each Linux file manager reads. Not reachable on
+/// Android or macOS: those have no XDG data directory to write them into, and
+/// `install_shell_integration` refuses the request on anything but Linux/Windows.
+#[cfg(target_os = "linux")]
 fn linux_shell_targets() -> Result<Vec<(String, PathBuf, bool)>, String> {
     let data_home = std::env::var_os("XDG_DATA_HOME")
         .filter(|v| !v.is_empty())
@@ -352,6 +370,27 @@ fn linux_shell_targets() -> Result<Vec<(String, PathBuf, bool)>, String> {
 pub fn install_shell_integration(
     launcher_path: &Path,
 ) -> Result<Vec<(String, String, String)>, String> {
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        // Refuse before validating anything: on Android and macOS there is no XDG
+        // data directory and no file manager reading these definitions, and an
+        // Android build must never create directories inside the app sandbox for a
+        // menu that does not exist.
+        let _ = launcher_path;
+        Err("Shell integration is available on Linux and Windows only.".to_string())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        install_on_this_platform(launcher_path)
+    }
+}
+
+/// The install body for the two platforms that have file managers to configure.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn install_on_this_platform(
+    launcher_path: &Path,
+) -> Result<Vec<(String, String, String)>, String> {
     let exec_path = validate_shell_launcher_path(launcher_path)?;
 
     #[cfg(target_os = "windows")]
@@ -368,6 +407,13 @@ pub fn install_shell_integration(
         if let Some(parent) = sendto.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
+        // `%*` forwards Explorer's own argument list verbatim, which is the only
+        // form that keeps one argument per selected file: wrapping it in quotes
+        // (`"%*"`) collapses the whole selection into a single argument, because the
+        // C runtime then strips the inner quotes and keeps the separating spaces.
+        // `%*` is not perfect - cmd re-reads the line, so an unquoted file name
+        // containing `&` would still be split - but it fails only for a name
+        // Explorer itself passed unquoted, and it never mangles a normal selection.
         let body = format!("@echo off\r\n\"{exec_path}\" --shell-upload %*\r\n");
         write_private_file_atomic(&sendto, body.as_bytes()).map_err(|e| e.to_string())?;
         Ok(vec![(
@@ -377,9 +423,16 @@ pub fn install_shell_integration(
         )])
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
-        let exec_token = if exec_path.contains(' ') {
+        // The GNOME Files script embeds the path in `sh` single quotes, so a quote
+        // in the path is the one thing it cannot carry; everything else is fine.
+        if exec_path.contains('\'') {
+            return Err(format!(
+                "The launcher path '{exec_path}' contains a quote, which a shell script cannot carry."
+            ));
+        }
+        let exec_token = if exec_path.contains(' ') || exec_path.contains('\\') {
             format!("\"{exec_path}\"")
         } else {
             exec_path.clone()
@@ -387,15 +440,39 @@ pub fn install_shell_integration(
         let dolphin = format!(
             "[Desktop Entry]\nType=Service\nMimeType=all/all;\nActions=LinScpUpload;\nX-KDE-Priority=TopLevel\n\n[Desktop Action LinScpUpload]\nName=Upload with LinSCP\nIcon=linscp\nExec={exec_token} --shell-upload %F\n"
         );
-        let nautilus = format!(
-            "#!/bin/sh\nset -eu\nif [ \"$#\" -gt 0 ]; then\n  exec '{exec_path}' --shell-upload \"$@\"\nfi\nif [ -n \"${{NAUTILUS_SCRIPT_SELECTED_FILE_PATHS:-}}\" ]; then\n  IFS='\n'\n  set -f\n  exec '{exec_path}' --shell-upload $NAUTILUS_SCRIPT_SELECTED_FILE_PATHS\nfi\nexit 0\n"
+        // GNOME Files hands a script the selection through an environment
+        // variable, one path per line; only some versions pass it as arguments. The
+        // fallback is therefore the normal path, not an edge case. The whole
+        // selection goes to one `--shell-upload` so the window is offered one batch.
+        let nautilus_script = format!(
+            "#!/bin/sh\n\
+# Written by LinSCP. GNOME Files runs this with the selection in\n\
+# NAUTILUS_SCRIPT_SELECTED_FILE_PATHS, one path per line.\n\
+set -eu\n\
+if [ \"$#\" -eq 0 ] && [ -n \"${{NAUTILUS_SCRIPT_SELECTED_FILE_PATHS:-}}\" ]; then\n\
+  newline='\n\
+'\n\
+  old_ifs=$IFS\n\
+  IFS=$newline\n\
+  set -f\n\
+  set --\n\
+  for selected in $NAUTILUS_SCRIPT_SELECTED_FILE_PATHS; do\n\
+    set -- \"$@\" \"$selected\"\n\
+  done\n\
+  set +f\n\
+  IFS=$old_ifs\n\
+fi\n\
+if [ \"$#\" -gt 0 ]; then\n\
+  exec '{exec_path}' --shell-upload \"$@\"\n\
+fi\n\
+exit 0\n"
         );
         let nemo = format!(
             "[Nemo Action]\nActive=true\nName=Upload with LinSCP\nComment=Stage selected files for LinSCP Commander\nExec={exec_token} --shell-upload %F\nIcon-Name=linscp\nSelection=notnone\nExtensions=any;\nQuote=double\n"
         );
 
         let targets = linux_shell_targets()?;
-        let bodies = [dolphin, nautilus, nemo];
+        let bodies = [dolphin, nautilus_script, nemo];
         let mut results = Vec::with_capacity(targets.len());
         for ((manager, path, executable), body) in targets.into_iter().zip(bodies) {
             let existed = path.symlink_metadata().is_ok();
@@ -422,6 +499,20 @@ pub fn install_shell_integration(
 
 /// Removes per-user file-manager context-menu actions (`--uninstall-shell-integration`).
 pub fn uninstall_shell_integration() -> Result<Vec<(String, String, String)>, String> {
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        Err("Shell integration is available on Linux and Windows only.".to_string())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        uninstall_on_this_platform()
+    }
+}
+
+/// The uninstall body for the two platforms that can have definitions to remove.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn uninstall_on_this_platform() -> Result<Vec<(String, String, String)>, String> {
     #[cfg(target_os = "windows")]
     {
         let appdata = std::env::var_os("APPDATA")
@@ -445,7 +536,7 @@ pub fn uninstall_shell_integration() -> Result<Vec<(String, String, String)>, St
         )])
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
         let targets = linux_shell_targets()?;
         let mut results = Vec::with_capacity(targets.len());
@@ -507,5 +598,156 @@ pub fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<(
     {
         let _ = (source, destination);
         Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Atomic no-replace move is unavailable on this platform"))
+    }
+}
+
+/// Serialises tests that edit `$XDG_DATA_HOME`.
+///
+/// Cargo runs a crate's tests as threads in one process, so the environment is
+/// shared: two tests installing into different scratch directories at the same time
+/// would each see the other's directory. Exposed to the crate's other test modules
+/// (see `cli_args`) because they install through the same functions.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn data_home_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod shell_integration_tests {
+    use super::*;
+
+    fn scratch_data_home(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("linscp-gui-os-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch data home");
+        dir
+    }
+
+    /// A launcher path with a space in it is the ordinary case — every install
+    /// directory on Windows contains one — and has to reach the definitions intact.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_launcher_path_with_a_space_is_quoted_not_refused() {
+        let _guard = data_home_lock();
+        let data_home = scratch_data_home("space");
+        let previous = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &data_home);
+        let installed = install_shell_integration(Path::new("/opt/Lin SCP/linscp-gui"));
+        match previous {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        let installed = installed.expect("a space in the path is not an error");
+        let dolphin = std::fs::read_to_string(&installed[0].1).expect("Dolphin definition");
+        assert!(
+            dolphin.contains("Exec=\"/opt/Lin SCP/linscp-gui\" --shell-upload %F"),
+            "{dolphin}"
+        );
+        let _ = std::fs::remove_dir_all(&data_home);
+    }
+
+    /// The GNOME Files script is shell code: whatever else changes, it has to be
+    /// valid `sh`, and it has to hand the executable the flag the parser knows.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_gnome_files_script_is_a_shell_script_naming_the_upload_flag() {
+        let _guard = data_home_lock();
+        let data_home = scratch_data_home("nautilus");
+        let previous = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &data_home);
+        let installed = install_shell_integration(Path::new("/opt/linscp/linscp-gui"));
+        match previous {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        let installed = installed.expect("install into the scratch directory");
+        let (_, script_path, _) = installed
+            .iter()
+            .find(|(manager, _, _)| manager.contains("GNOME"))
+            .expect("a GNOME Files entry");
+        let script = std::fs::read_to_string(script_path).expect("the script");
+        assert!(script.starts_with("#!/bin/sh\n"), "{script}");
+        assert!(script.contains("--shell-upload \"$@\""), "{script}");
+        assert!(
+            script.contains("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS"),
+            "GNOME Files passes the selection in this variable: {script}"
+        );
+        // The script is code, so the parser of the shell that will run it decides
+        // whether it is valid, not this test. `sh -n` reads it without running it.
+        if let Ok(output) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(script_path)
+            .output()
+        {
+            assert!(
+                output.status.success(),
+                "sh -n rejected the generated script: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(script_path)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o100, "the script must be executable");
+        }
+        let _ = std::fs::remove_dir_all(&data_home);
+    }
+
+    /// Refusals have to name the reason, because the launcher path is the only thing
+    /// the user could change.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_launcher_path_a_shell_script_cannot_carry_is_refused_by_name() {
+        let _guard = data_home_lock();
+        let data_home = scratch_data_home("refuse");
+        let previous = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &data_home);
+        let refused = install_shell_integration(Path::new("/opt/lin'scp/linscp-gui"));
+        match previous {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        let message = refused.expect_err("a quote cannot be carried");
+        assert!(message.contains("quote"), "{message}");
+        assert!(
+            std::fs::read_dir(&data_home).map(|mut d| d.next().is_none()).unwrap_or(true),
+            "nothing may be written when the path is refused"
+        );
+        let _ = std::fs::remove_dir_all(&data_home);
+    }
+
+    /// Uninstalling must remove what installing wrote and report what it found, so
+    /// `--uninstall-shell-integration` is not a silent no-op on a clean machine.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn uninstalling_reports_every_definition_and_removes_them() {
+        let _guard = data_home_lock();
+        let data_home = scratch_data_home("uninstall");
+        let previous = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &data_home);
+        let installed = install_shell_integration(Path::new("/opt/linscp/linscp-gui"));
+        let removed = uninstall_shell_integration();
+        let again = uninstall_shell_integration();
+        match previous {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        let installed = installed.expect("install");
+        let removed = removed.expect("uninstall");
+        assert_eq!(installed.len(), removed.len());
+        assert_eq!(installed.len(), 3, "Dolphin, GNOME Files and Nemo");
+        for (_, path, outcome) in &removed {
+            assert_eq!(outcome, "removed", "{path}");
+            assert!(!Path::new(path).exists(), "{path} survived the uninstall");
+        }
+        for (_, _, outcome) in again.expect("a second uninstall still answers") {
+            assert_eq!(outcome, "not installed");
+        }
+        let _ = std::fs::remove_dir_all(&data_home);
     }
 }

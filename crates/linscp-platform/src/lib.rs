@@ -17,6 +17,7 @@ use rand::RngCore;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+pub mod cli_args;
 pub mod desktop;
 pub mod password_vault;
 pub mod gssapi_sys;

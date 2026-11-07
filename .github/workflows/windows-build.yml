@@ -62,6 +62,49 @@ jobs:
             if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
           }
 
+      # A3: the shipped binary ignored its own command line, so the *Send To*
+      # shortcut could never be installed by any artifact Microsoft ships. Drive the
+      # built binary the way Explorer does. The GUI is a windows-subsystem program, so
+      # it writes nothing to this console; what is checked is the files it produces.
+      # APPDATA is redirected so the runner's own Send To menu is left alone.
+      - name: Smoke test the Explorer action
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "linscp-a3"
+          Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path (Join-Path $root "appdata"), (Join-Path $root "config") | Out-Null
+          $env:APPDATA = Join-Path $root "appdata"
+          $env:LINSCP_CONFIG_DIR = Join-Path $root "config"
+          $exe = "$PWD/target/release/linscp-gui.exe"
+          $sendto = Join-Path $env:APPDATA "Microsoft\Windows\SendTo\Upload with LinSCP.cmd"
+
+          # Wait for it: the GUI is a windows-subsystem binary, so PowerShell would
+          # otherwise not block on it and every check below would race the install.
+          $install = Start-Process -FilePath $exe -ArgumentList "--install-shell-integration" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "--install-shell-integration exited $($install.ExitCode)" }
+          if (-not (Test-Path $sendto)) { throw "the Send To shortcut was not written" }
+          if (-not (Select-String -Path $sendto -Pattern '--shell-upload' -Quiet)) {
+            throw "the Send To shortcut does not call --shell-upload"
+          }
+
+          # What Explorer does with a right-click: run it with the selection.
+          $selection = Join-Path $root "report.pdf"
+          Set-Content -Path $selection -Value "payload"
+          $process = Start-Process -FilePath $sendto -ArgumentList "`"$selection`"" -PassThru
+          if (-not $process.WaitForExit(60000)) { Stop-Process -Id $process.Id -Force; throw "the Send To action did not return" }
+          if ($process.ExitCode -ne 0) { throw "the Send To action exited $($process.ExitCode)" }
+
+          $manifest = Get-ChildItem -Path $env:LINSCP_CONFIG_DIR -Recurse -Filter "*.json" |
+            Where-Object { $_.FullName -like "*shell-manifests*" } | Select-Object -First 1
+          if (-not $manifest) { throw "--shell-upload recorded no manifest" }
+          $staged = Get-Content -Raw $manifest.FullName | ConvertFrom-Json
+          if (-not $staged.items) { throw "the manifest has no items" }
+          if ($staged.items[0].path -ne $selection) { throw "the manifest names $($staged.items[0].path)" }
+
+          $uninstall = Start-Process -FilePath $exe -ArgumentList "--uninstall-shell-integration" -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "--uninstall-shell-integration exited $($uninstall.ExitCode)" }
+          if (Test-Path $sendto) { throw "uninstall left the Send To shortcut behind" }
+
       # The same page in a browser: build the HTTP host and prove it serves the
       # page and refuses an API request that carries no token. Windows is where
       # the two hosts are most likely to drift, because only one of them gets a

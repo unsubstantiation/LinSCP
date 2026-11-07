@@ -78,6 +78,17 @@ CASE_SOURCES = {
     # so a handler they share (the drop endpoints, remote delete) is evidenced
     # by the code that serves it rather than by a host that happens to wrap it.
     "service": "crates/linscp-service/src/lib.rs",
+    # The native window's own command line: `main.rs` starts the window and the
+    # platform crate decides what else the arguments mean. A shell-integration claim
+    # is only evidence if the shipped binary actually parses its arguments, so the
+    # tests cited for it live in those two crates.
+    "gui-cli": "crates/linscp-platform/src/cli_args.rs",
+    "gui-cli-host": "crates/linscp-tauri/src/main.rs",
+    # The file-manager definitions themselves, written by the platform crate.
+    "gui-shell-definitions": "crates/linscp-platform/src/gui_os.rs",
+    # What those actions *do* once the arguments are decided: stage a manifest,
+    # refuse an empty selection, report an install that cannot be carried out.
+    "gui-shell-actions": "crates/linscp-service/src/cli_actions.rs",
 }
 
 
@@ -279,7 +290,7 @@ def check_capabilities(inventory, errors, root=ROOT):
                 elif suite == "ui-transport":
                     # The bundle's own suite is node:test, so a case is a test().
                     expression = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
-                elif suite == "service":
+                elif suite in ("service", "gui-cli", "gui-shell-definitions", "gui-shell-actions"):
                     # A Rust test is a #[test]/#[tokio::test] function, not a
                     # `test_*` ffi symbol; the drop helpers are `async fn`.
                     expression = r"\b(?:async\s+)?fn\s+" + re.escape(case) + r"\s*\("
@@ -349,6 +360,11 @@ def case_links(row):
                 pattern = r"check\(\s*['\"]" + re.escape(case) + r"['\"]"
             elif suite == 'ui-transport':
                 pattern = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
+            elif suite == 'gui-cli-host':
+                # The host binary is a `main.rs`: its evidence is the attributes and
+                # calls that make the argument path exist, not a test function of
+                # its own (the decisions are tested in `gui-cli`).
+                pattern = re.escape(case)
             else:
                 pattern = r'\b(?:def|void|fn)\s+' + re.escape(case) + r'\s*\('
             match = re.search(pattern, text)

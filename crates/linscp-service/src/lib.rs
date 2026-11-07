@@ -26,6 +26,7 @@ use linscp_types::{
 };
 use serde_json::{json, Value};
 
+pub mod cli_actions;
 pub mod ops;
 pub mod queue;
 pub mod tabs;
