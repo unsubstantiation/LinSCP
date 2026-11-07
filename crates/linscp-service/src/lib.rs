@@ -9534,13 +9534,24 @@ mod tests {
         body
     }
 
-    /// The `linscp-saf-*` staging directories currently in the system
-    /// temporary directory, for before/after leak checks.
+    /// Serializes the tests that stage granted transfers: the leak checks
+    /// below scan the shared temporary directory, so a stage from a
+    /// parallel test would read as a leak. Every test that runs a
+    /// session transfer against a granted folder holds this lock.
+    static SAF_STAGE_LEAK_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The granted-transfer staging directories currently in the system
+    /// temporary directory, for before/after leak checks. Only the two
+    /// stage prefixes count: the tests' own `linscp-saf-<name>-<pid>`
+    /// scratch directories share the family prefix but are not stages.
     fn saf_stage_names() -> std::collections::BTreeSet<std::ffi::OsString> {
         std::fs::read_dir(std::env::temp_dir()).map(|entries| {
             entries.filter_map(Result::ok)
                 .map(|entry| entry.file_name())
-                .filter(|name| name.to_string_lossy().starts_with("linscp-saf-"))
+                .filter(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with("linscp-saf-upload-") || name.starts_with("linscp-saf-download-")
+                })
                 .collect()
         }).unwrap_or_default()
     }
@@ -9550,6 +9561,7 @@ mod tests {
     /// file refuses at enqueue time naming the file, and no stage leaks.
     #[tokio::test]
     async fn saf_session_upload_stages_through_temp_files() {
+        let _leak_lock = SAF_STAGE_LEAK_LOCK.lock().expect("saf stage lock");
         let tmp = std::env::temp_dir().join(format!("linscp-saf-up-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let bridge = Arc::new(MockBridge::with_file("up.txt", b"upload bytes"));
@@ -9591,6 +9603,7 @@ mod tests {
     /// and a resume refuse at enqueue time.
     #[tokio::test]
     async fn saf_session_download_stages_through_temp_files() {
+        let _leak_lock = SAF_STAGE_LEAK_LOCK.lock().expect("saf stage lock");
         let tmp = std::env::temp_dir().join(format!("linscp-saf-down-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let bridge = Arc::new(MockBridge::with_file("seed.txt", b"seed"));
@@ -9657,6 +9670,7 @@ mod tests {
     /// across the bridge, then deletes the remote source by ETag.
     #[tokio::test]
     async fn saf_webdav_move_to_granted_folder_deletes_remote_source() {
+        let _leak_lock = SAF_STAGE_LEAK_LOCK.lock().expect("saf stage lock");
         let tmp = std::env::temp_dir().join(format!("linscp-saf-move-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let bridge = Arc::new(MockBridge::with_file("seed.txt", b"seed"));
