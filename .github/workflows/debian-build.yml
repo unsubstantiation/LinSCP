@@ -3,6 +3,9 @@ name: Debian build
 on:
   push:
     branches: [master]
+  # A pull request has to prove itself before it merges: without this trigger
+  # a PR lands with every build unrun, and master is where the red is found.
+  pull_request:
   # Run by hand from the Actions tab (or `gh workflow run`) to build a branch
   # or re-run a build without waiting for a push to master.
   workflow_dispatch:
@@ -70,6 +73,9 @@ jobs:
           python3 -m unittest discover -s tools/tests -p test_platform_conversion.py
           python3 -m unittest discover -s tools/tests -p test_wayland_compatibility.py
           python3 -m unittest discover -s tools/tests -p test_translations.py
+          python3 -m unittest discover -s tools/tests -p test_unified_locales.py
+          python3 -m unittest discover -s tools/tests -p test_shared_frontend.py
+          python3 -m unittest discover -s tools/tests -p test_rust_cross_lang_parity.py
           python3 -m unittest discover -s tools/tests -p test_repo_hygiene.py
 
       # A crate that nothing in the packaging path builds can be broken for
@@ -79,6 +85,28 @@ jobs:
       # not only when a smoke test happens to reach them.
       - name: Compile and test the browser host crate
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-http
+
+      # Targeted `cargo test -p <crate> <filter>` runs compile that crate's
+      # whole test harness, but a crate with no step at all never compiles
+      # its tests anywhere on Linux — and `#[cfg(unix)]` test bodies do not
+      # even exist to the Windows job. Building every test target without
+      # running it is what keeps a Unix-only test from rotting: it fails here
+      # on a type error instead of surprising the next full-workspace run.
+      # (`linscp-tauri` is left out: the Windows and Android jobs build it,
+      # and its test harness wants a desktop toolkit this runner lacks.)
+      - name: Compile every unit-test target on Linux
+        run: python3 tools/run_cargo_ci.py cargo test --no-run -p linscp-types -p linscp-i18n -p linscp-crypto -p linscp-platform -p linscp-proto -p linscp-engine -p linscp-service -p linscp-http
+
+      # The platform crate's own tests (shell-integration installers, the CLI
+      # parser, the desktop launcher, the vault, the agent message) run on no
+      # other job; without this step they are checked by reading alone.
+      - name: Exercise the platform unit tests
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-platform -- --nocapture
+
+      # Local symlink creation needs a privilege Windows CI cannot grant, so
+      # its test is Unix-only and this job is the one that runs it.
+      - name: Exercise local symlink validation and creation
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service local_symlink -- --nocapture
 
       - name: Exercise atomic local moves
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service local_moves_are_atomic_no_replace -- --nocapture

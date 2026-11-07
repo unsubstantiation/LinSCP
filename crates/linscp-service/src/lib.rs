@@ -1141,7 +1141,11 @@ impl CommanderService {
     /// progress apply to it exactly as they do to a transfer.
     async fn sync_run_async(&self, body: Value) -> ApiReply {
         let (session, id, host_key, _dir) = match self.sync_target(&body) { Ok(t) => t, Err(reply) => return reply };
-        let (local_root, remote_root, opts) = match Self::sync_options_from(&body) { Ok(t) => t, Err(error) => return api_error(400, error) };
+        let (local_root, remote_root, mut opts) = match Self::sync_options_from(&body) { Ok(t) => t, Err(error) => return api_error(400, error) };
+        // The shared reader above defaults to preview-only so a preview can
+        // never write; a run applies the plan, so it opts back out. Without
+        // this the queued run plans, applies nothing, and reports success.
+        opts.preview_only = false;
         // The same options a preview used, so what the user saw is what runs.
         let config_root = self.state.lock().expect("state mutex").config_root.clone();
         let local_is_dir = if is_saf_path(&local_root.to_string_lossy()) {
@@ -5389,6 +5393,9 @@ mod tests {
         std::fs::create_dir_all(&right).unwrap();
         std::fs::write(left.join("a.txt"), b"one").unwrap();
         std::fs::write(right.join("b.txt"), b"two").unwrap();
+        // Both selections run in the local pane, so both names have to exist
+        // there for their runs to succeed.
+        std::fs::write(left.join("b.txt"), b"two").unwrap();
         let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
 
         let run = |tab: u64, name: &str, files: Value, pane: &str| ApiEnvelope {
@@ -5414,7 +5421,7 @@ mod tests {
             .dispatch(ApiEnvelope {
                 method: "POST".into(),
                 path: "/api/custom-commands".into(),
-                body: json!({"action": "save", "name": "Look", "command": "lcd {file}",
+                body: json!({"action": "save", "name": "Look", "command": "lls {file}",
                     "scope": "local"}),
             });
         assert_eq!(save.status, 200, "{}", save.payload);
@@ -5446,7 +5453,7 @@ mod tests {
         assert_eq!(results[0]["file"], "a.txt");
         assert_eq!(results[1]["file"], "b.txt");
         assert!(
-            results[0]["command"].as_str().unwrap_or("").contains("lcd"),
+            results[0]["command"].as_str().unwrap_or("").contains("lls"),
             "the answer shows the line that ran: {:?}",
             results[0]
         );
@@ -5464,17 +5471,28 @@ mod tests {
             spaced.payload
         );
 
-        // A local selection is not where a remote template looks.
-        let mismatch = svc
-            .dispatch_async(ApiEnvelope {
+        // A local selection is not where a remote template looks. (A local-only
+        // tab cannot mismatch — both its panes are local — so this needs a
+        // remote tab, which the mock session provides without dialling out.)
+        let save_remote = svc
+            .dispatch(ApiEnvelope {
                 method: "POST".into(),
                 path: "/api/custom-commands".into(),
-                body: json!({"action": "run", "name": "Look", "filenames": ["a.txt"],
-                    "pane": "remote", "tab": id}),
-            })
+                body: json!({"action": "save", "name": "Rem", "command": "ls {file}",
+                    "scope": "remote"}),
+            });
+        assert_eq!(save_remote.status, 200, "{}", save_remote.payload);
+        let remote_id = insert_remote_tab(&svc, Arc::new(MockSession::new()), "/tmp");
+        let mismatch = svc
+            .dispatch_async(run(remote_id, "Rem", json!(["a.txt"]), "local"))
             .await;
         assert_eq!(mismatch.status, 400, "{}", mismatch.payload);
         assert_eq!(mismatch.payload["success"], false);
+        assert!(
+            mismatch.payload["error"].as_str().unwrap_or("").contains("remote side"),
+            "the refusal names the side the command is saved for: {}",
+            mismatch.payload
+        );
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -9007,10 +9025,6 @@ mod tests {
         fn bytes_of_uri(&self, uri: &str) -> Option<Vec<u8>> {
             self.docs.lock().expect("m").get(uri).and_then(|doc| doc.bytes.clone())
         }
-
-        fn is_dir_uri(&self, uri: &str) -> bool {
-            self.docs.lock().expect("m").get(uri).is_some_and(|doc| doc.bytes.is_none())
-        }
     }
 
     impl linscp_platform::android::SafBridge for MockBridge {
@@ -9284,25 +9298,29 @@ mod tests {
         let other_doc = format!("{SAF_OTHER_TREE}/document/clash.txt");
         assert_eq!(bridge.bytes_of_uri(&other_doc).as_deref(), Some(b"stays".as_slice()), "the other tree holds the move");
         assert!(bridge.bytes_of("clash.txt").is_none(), "the source tree no longer holds it");
-        // A link nested in a moved directory fails the task by name. The
-        // link is created through the API, so the test works on Windows too.
-        std::fs::create_dir_all(tmp.join("linked")).unwrap();
-        std::fs::write(tmp.join("linked/real.txt"), b"real").unwrap();
-        let open_link = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp.join("linked"), "other_local_dir": right}}) }).await;
-        let link_id = open_link.payload["tab"]["id"].as_u64().unwrap();
-        let link = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/local/link".into(), body: json!({"tab": link_id, "target": "real.txt", "name": "alias.txt"}) });
-        assert_eq!(link.status, 200, "{}", link.payload);
-        let open_parent = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp, "other_local_dir": SAF_GRANTED_DIR}}) }).await;
-        let parent_id = open_parent.payload["tab"]["id"].as_u64().unwrap();
-        let moved_dir = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": parent_id, "direction": "upload", "local_dir": tmp, "remote_dir": SAF_GRANTED_DIR, "names": ["linked"]}) }).await;
-        assert_eq!(moved_dir.status, 200, "{}", moved_dir.payload);
-        let failed = wait_for_task(&svc, "Failed").await;
-        assert!(failed["error"].as_str().unwrap_or("").contains("symbolic link"), "{}", failed);
-        assert!(tmp.join("linked/real.txt").is_file(), "the source survives a failed move");
+        // A link nested in a moved directory fails the task by name. Unix-only:
+        // creating the link needs a privilege the Windows suite cannot grant
+        // itself, so asserting its creation there would fail the run.
+        if cfg!(unix) {
+            std::fs::create_dir_all(tmp.join("linked")).unwrap();
+            std::fs::write(tmp.join("linked/real.txt"), b"real").unwrap();
+            let open_link = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp.join("linked"), "other_local_dir": right}}) }).await;
+            let link_id = open_link.payload["tab"]["id"].as_u64().unwrap();
+            let link = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/local/link".into(), body: json!({"tab": link_id, "target": "real.txt", "name": "alias.txt"}) });
+            assert_eq!(link.status, 200, "{}", link.payload);
+            let open_parent = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp, "other_local_dir": SAF_GRANTED_DIR}}) }).await;
+            let parent_id = open_parent.payload["tab"]["id"].as_u64().unwrap();
+            let moved_dir = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": parent_id, "direction": "upload", "local_dir": tmp, "remote_dir": SAF_GRANTED_DIR, "names": ["linked"]}) }).await;
+            assert_eq!(moved_dir.status, 200, "{}", moved_dir.payload);
+            let failed = wait_for_task(&svc, "Failed").await;
+            assert!(failed["error"].as_str().unwrap_or("").contains("symbolic link"), "{}", failed);
+            assert!(tmp.join("linked/real.txt").is_file(), "the source survives a failed move");
+        }
         let _ = std::fs::remove_dir_all(tmp);
     }
 
-    use linscp_proto::{ProtoError, RemoteSession, TransferRequest};
+    use async_trait::async_trait;
+    use linscp_proto::{ProgressCallback, ProtoError, RemoteSession, TransferRequest};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     /// One in-memory remote file or directory for the session-transfer tests.
@@ -9385,6 +9403,7 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl RemoteSession for MockSession {
         fn scheme(&self) -> ProtocolScheme { ProtocolScheme::Dav }
 
@@ -9515,13 +9534,24 @@ mod tests {
         body
     }
 
-    /// The `linscp-saf-*` staging directories currently in the system
-    /// temporary directory, for before/after leak checks.
+    /// Serializes the tests that stage granted transfers: the leak checks
+    /// below scan the shared temporary directory, so a stage from a
+    /// parallel test would read as a leak. Every test that runs a
+    /// session transfer against a granted folder holds this lock.
+    static SAF_STAGE_LEAK_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The granted-transfer staging directories currently in the system
+    /// temporary directory, for before/after leak checks. Only the two
+    /// stage prefixes count: the tests' own `linscp-saf-<name>-<pid>`
+    /// scratch directories share the family prefix but are not stages.
     fn saf_stage_names() -> std::collections::BTreeSet<std::ffi::OsString> {
         std::fs::read_dir(std::env::temp_dir()).map(|entries| {
             entries.filter_map(Result::ok)
                 .map(|entry| entry.file_name())
-                .filter(|name| name.to_string_lossy().starts_with("linscp-saf-"))
+                .filter(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with("linscp-saf-upload-") || name.starts_with("linscp-saf-download-")
+                })
                 .collect()
         }).unwrap_or_default()
     }
@@ -9531,11 +9561,12 @@ mod tests {
     /// file refuses at enqueue time naming the file, and no stage leaks.
     #[tokio::test]
     async fn saf_session_upload_stages_through_temp_files() {
+        let _leak_lock = SAF_STAGE_LEAK_LOCK.lock().expect("saf stage lock");
         let tmp = std::env::temp_dir().join(format!("linscp-saf-up-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let bridge = Arc::new(MockBridge::with_file("up.txt", b"upload bytes"));
         bridge.add_dir(&format!("{SAF_GRANTED_DIR}/document/tree"));
-        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/tree/nested.txt"), b"nested upload");
+        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/tree/document/nested.txt"), b"nested upload");
         let fs = NativeLocalFs::with_saf(bridge.clone());
         let svc = CommanderService::new(tmp.join("config"), Arc::new(fs));
         let session = Arc::new(MockSession::new());
@@ -9572,6 +9603,7 @@ mod tests {
     /// and a resume refuse at enqueue time.
     #[tokio::test]
     async fn saf_session_download_stages_through_temp_files() {
+        let _leak_lock = SAF_STAGE_LEAK_LOCK.lock().expect("saf stage lock");
         let tmp = std::env::temp_dir().join(format!("linscp-saf-down-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let bridge = Arc::new(MockBridge::with_file("seed.txt", b"seed"));
@@ -9603,24 +9635,24 @@ mod tests {
         let queued_tree = svc.dispatch_async(download(download_body(id, "tree", true, false))).await;
         assert_eq!(queued_tree.status, 200, "{}", queued_tree.payload);
         wait_for_task(&svc, "Completed").await;
-        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/tree/a.txt")).as_deref(), Some(b"tree a".as_slice()));
-        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/tree/sub/b.txt")).as_deref(), Some(b"tree b".as_slice()));
+        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/tree/document/a.txt")).as_deref(), Some(b"tree a".as_slice()));
+        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/tree/document/sub/document/b.txt")).as_deref(), Some(b"tree b".as_slice()));
         // A merge adds without replacing.
         bridge.add_dir(&format!("{SAF_GRANTED_DIR}/document/mtree"));
-        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/mtree/old.txt"), b"stays");
+        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/mtree/document/old.txt"), b"stays");
         let merged = svc.dispatch_async(download(download_body(id, "mtree", true, true))).await;
         assert_eq!(merged.status, 200, "{}", merged.payload);
         wait_for_task(&svc, "Completed").await;
-        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/mtree/new.txt")).as_deref(), Some(b"merged in".as_slice()));
-        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/mtree/old.txt")).as_deref(), Some(b"stays".as_slice()), "the merge keeps granted files");
+        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/mtree/document/new.txt")).as_deref(), Some(b"merged in".as_slice()));
+        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/mtree/document/old.txt")).as_deref(), Some(b"stays".as_slice()), "the merge keeps granted files");
         // An overlapping merge fails instead of replacing.
         bridge.add_dir(&format!("{SAF_GRANTED_DIR}/document/mtree2"));
-        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/mtree2/x.txt"), b"granted x");
+        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/mtree2/document/x.txt"), b"granted x");
         let overlap = svc.dispatch_async(download(download_body(id, "mtree2", true, true))).await;
         assert_eq!(overlap.status, 200, "{}", overlap.payload);
         let failed = wait_for_task(&svc, "Failed").await;
         assert!(failed["error"].as_str().unwrap_or("").contains("already exists"), "{}", failed);
-        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/mtree2/x.txt")).as_deref(), Some(b"granted x".as_slice()), "the failed merge keeps the granted file");
+        assert_eq!(bridge.bytes_of_uri(&format!("{SAF_GRANTED_DIR}/document/mtree2/document/x.txt")).as_deref(), Some(b"granted x".as_slice()), "the failed merge keeps the granted file");
         // An over-cap remote file and a resume refuse at enqueue time.
         let refused = svc.dispatch_async(download(download_body(id, "huge.bin", false, false))).await;
         assert_eq!(refused.status, 400, "{}", refused.payload);
@@ -9638,6 +9670,7 @@ mod tests {
     /// across the bridge, then deletes the remote source by ETag.
     #[tokio::test]
     async fn saf_webdav_move_to_granted_folder_deletes_remote_source() {
+        let _leak_lock = SAF_STAGE_LEAK_LOCK.lock().expect("saf stage lock");
         let tmp = std::env::temp_dir().join(format!("linscp-saf-move-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let bridge = Arc::new(MockBridge::with_file("seed.txt", b"seed"));

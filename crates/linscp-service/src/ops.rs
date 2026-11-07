@@ -765,6 +765,11 @@ pub fn read_custom_commands(config_root: &Path) -> Vec<Value> {
             return arr.clone();
         }
     }
+    // The shipped defaults are a bare array, like a store file may be: an
+    // empty store lists them instead of listing nothing.
+    if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(DEFAULT_EXPLORER_COMMANDS_JSON) {
+        return arr;
+    }
     Vec::new()
 }
 
@@ -823,14 +828,25 @@ fn quote_operand(word: &str) -> String {
     if !needs_quotes {
         return word.to_string();
     }
+    // The interpreter's tokenizer gives a backslash no meaning inside single
+    // quotes, so a name holding a single quote is double-quoted instead, with
+    // `\` and `"` escaped — the two escapes the tokenizer honors there. Any
+    // other name keeps single quotes, where both stay literal.
+    if word.contains('\'') {
+        let mut out = String::with_capacity(word.len() + 2);
+        out.push('"');
+        for c in word.chars() {
+            if c == '"' || c == '\\' {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out.push('"');
+        return out;
+    }
     let mut out = String::with_capacity(word.len() + 2);
     out.push('\'');
-    for c in word.chars() {
-        if c == '\'' {
-            out.push('\\');
-        }
-        out.push(c);
-    }
+    out.push_str(word);
     out.push('\'');
     out
 }
@@ -1075,12 +1091,15 @@ fn tab_for_side(tab: &TabRuntime, side: CommandSide, work_dir: &str) -> TabRunti
 /// When a template names no `{file}`/`{files}`/`!` operand the command does not
 /// depend on the selection, so it runs once instead of once per selected file.
 pub async fn execute_custom_command_template(
-    make_interpreter: &mut dyn FnMut(&TabRuntime) -> Result<linscp_engine::script::ScriptInterpreter, String>,
+    make_interpreter: &mut (dyn FnMut(&TabRuntime) -> Result<linscp_engine::script::ScriptInterpreter, String>
+             + Send),
     template: &Value,
     filenames: &[String],
     pane: &str,
     tab: &TabRuntime,
-    on_command: &mut dyn FnMut(&str),
+    // Both callbacks are `Send` so the future stays `Send`: the Tauri command
+    // that runs a template awaits it, and Tauri only polls `Send` futures.
+    on_command: &mut (dyn FnMut(&str) + Send),
 ) -> Result<Vec<Value>, String> {
     let raw_cmd = template
         .get("command")
@@ -1455,7 +1474,8 @@ mod tests {
             ("my report.txt", "'my report.txt'"),
             ("`whoami`.txt", "`whoami`.txt"),
             ("a; rm -rf ~.txt", "'a; rm -rf ~.txt'"),
-            ("it's.txt", "'it\\'s.txt'"),
+            ("it's.txt", "\"it's.txt\""),
+            ("a'\"b.txt", "\"a'\\\"b.txt\""),
             ("a\"b.txt", "'a\"b.txt'"),
             ("plain.txt", "plain.txt"),
             // A non-ASCII name must not be sliced by the placeholder scanner.

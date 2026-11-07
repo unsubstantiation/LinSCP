@@ -1792,7 +1792,12 @@ fn build_tls_settings(spec: &ParsedSiteSpec) -> Result<TlsSettings, String> {
     Ok(tls)
 }
 
-fn validate_ssh_gssapi_policy(spec: &ParsedSiteSpec) -> Result<(), String> {
+/// Fails closed when a spec asks for Kerberos the build cannot honor: GSSAPI key
+/// exchange is refused everywhere, and explicit Kerberos settings need a Linux
+/// build with a Kerberos runtime. Non-SSH specs pass through untouched. The
+/// connect paths call this at session build; the GUI parser calls it too, so
+/// the site dialog refuses a Kerberos site it could never open.
+pub fn validate_ssh_gssapi_policy(spec: &ParsedSiteSpec) -> Result<(), String> {
     if !is_ssh_scheme(spec.session.protocol) {
         return Ok(());
     }
