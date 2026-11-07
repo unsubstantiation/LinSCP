@@ -829,17 +829,6 @@ mod tests {
         documents: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     }
 
-    impl MockSaf {
-        fn names(&self) -> Vec<String> {
-            self.documents
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(uri, _)| uri.rsplit('/').next().unwrap_or_default().to_string())
-                .collect()
-        }
-    }
-
     impl android::SafBridge for MockSaf {
         fn request_tree(&self) -> Result<Option<String>, PlatformError> {
             Ok(Some(

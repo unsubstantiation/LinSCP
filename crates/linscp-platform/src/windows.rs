@@ -147,6 +147,7 @@ const OWNER_ONLY_DACL_SDDL: &str = "D:P(A;OICI;FA;;;OW)";
 // by reading, without depending on constant paths in the bindings crate.
 const SE_FILE_OBJECT: i32 = 1;
 const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
 const SDDL_REVISION_1: u32 = 1;
 #[cfg(test)]
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x0;
@@ -197,11 +198,14 @@ pub fn apply_owner_only_dacl(dir: &Path) -> Result<(), PlatformError> {
         }
         // SAFETY: `path` names the directory, the DACL pointer comes from the
         // live descriptor, and owner/group/SACL are NULL because only the
-        // DACL is being set (`DACL_SECURITY_INFORMATION`).
+        // DACL is being set. The `P` in the SDDL protects the in-memory
+        // descriptor only — this call takes a bare ACL, not the descriptor,
+        // so without `PROTECTED_DACL_SECURITY_INFORMATION` the directory
+        // would keep inheriting its parent's ACEs beside the owner ACE.
         let status = SetNamedSecurityInfoW(
             path.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             dacl,

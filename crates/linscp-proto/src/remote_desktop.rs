@@ -510,7 +510,9 @@ fn build_rdp_argv(viewer: &str, sess: &RemoteDesktopSession, tunneled: bool, end
         if tunneled {
             argv.push("/network:auto".to_string());
         }
-        (argv, None)
+        // The body is built for every plan: a host that cannot show a viewer
+        // (the browser transport, the Android page) offers it as a download.
+        (argv, Some(rdp_file_body(sess, endpoint)))
     }
 }
 
