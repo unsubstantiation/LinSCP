@@ -308,7 +308,7 @@ test('all native targets expose the shared feature contract and report only inst
   // and Android. Host integrations are checked separately and never inferred
   // from an OS name if no implementation was registered.
   assert.deepEqual(sharedFeatureSet(), [...SHARED_FEATURES]);
-  assert.equal(sharedFeatureSet().length, 14);
+  assert.equal(sharedFeatureSet().length, 15);
 
   for (const caps of [debian, windows, android, browser]) {
     for (const feature of ['localRoots', 'fileDrop', 'terminal']) {
