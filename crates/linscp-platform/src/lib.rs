@@ -162,6 +162,26 @@ const MASTER_KEY_LEN: usize = 32;
 /// agent socket instead, so they report no static reason.
 pub const SSH_AGENT_MISSING_MESSAGE: &str = "SSH agent authentication is not available on Android: the platform has no agent. Use a private key file instead.";
 
+/// Largest single document the granted-folder bridge carries (64 MiB). The
+/// bridge has no streaming reads or appends: every document crosses as one
+/// base64 value inside one plugin call, so the bytes transiently occupy
+/// several times their size in RAM. Callers enforce this with a stat before
+/// they read — the bridge itself cannot, because by the time it sees the
+/// bytes the memory is already spent — and refuse larger documents naming
+/// the cap and the app-storage workaround.
+pub const MAX_SAF_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Names the document, its size and the bridge cap when a file is too large
+/// to cross into or out of a granted folder. Every refusal that enforces
+/// `MAX_SAF_DOCUMENT_BYTES` uses this sentence so the cap reads the same
+/// from copies, transfers and synchronization.
+pub fn saf_document_too_large(name: &str, size: u64) -> String {
+    format!(
+        "'{name}' is larger than a granted folder can carry ({} bytes; maximum 64 MiB per file). Move it to app storage first.",
+        size
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum PlatformError {
     #[error("Filesystem error: {0}")]

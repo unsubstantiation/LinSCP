@@ -980,8 +980,6 @@ test('granted Android folders name the app-storage limitation per action', () =>
   const document = granted + '/document/primary%3ADownload%2Fnote.txt';
   const leads = {
     transfer: 'Transferring files',
-    copyMove: 'Copying or moving files',
-    move: 'Moving files',
     synchronize: 'Synchronizing',
     keepUpToDate: 'Keep up to date',
     symlink: 'Creating symbolic links',

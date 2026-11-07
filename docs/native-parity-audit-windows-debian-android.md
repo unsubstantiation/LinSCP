@@ -2,10 +2,10 @@
 
 **Date:** 2026-11-06 · **Branch:** `arena/a4f5fe10-linscp` · **Mode:** audit, then A1 fixed on request.
 
-> **Update (same day):** A1, A2, A3, A4, A5, A6, A7(b), A7(a) slice 1, A8 and A9 below have been
-> implemented, and the §3 suites have been triaged (B) — see their **Status** notes for what changed
-> and what still needs a compiler to confirm. The rest of this document is the audit as written, so
-> only the A7(a) engine routing (sync, transfers, copy/move) still describes the tree as it was
+> **Update (same day):** A1, A2, A3, A4, A5, A6, A7(b), A7(a) slices 1–2, A8 and A9 below have
+> been implemented, and the §3 suites have been triaged (B) — see their **Status** notes for what
+> changed and what still needs a compiler to confirm. The rest of this document is the audit as
+> written, so only the A7(a) session-transfer and sync routing still describes the tree as it was
 > before those changes.
 
 **Question asked:** "Make sure we have full feature parity between the builds."
@@ -518,6 +518,23 @@ bridge behaviour no suite can prove without a device. `chmod` and symlinks stay 
 permanently — a granted folder has no POSIX modes and links cannot point into it. As with (b),
 no Rust toolchain here, so the new tests compile for the first time in CI.
 
+**Status, continued again** (option (a), second slice: local copy/move). The queue worker runs
+granted copies and moves on `LocalFs`: the manager holds the service's filesystem, `LocalFs`
+stats both sides of a granted pair at enqueue time, and whole documents cross the bridge between
+plain and granted panes and between two granted trees under the same conflict policies as plain
+pairs. Every granted move is a copy that deletes its source — queue jobs always carry the same
+leaf on both sides, so a provider-side rename could only retarget a name onto itself — while
+same-directory renames stay on the rename endpoint. The bridge carries no streams, so files over
+the 64 MiB document cap (`MAX_SAF_DOCUMENT_BYTES`, enforced on the stat before the read spends
+the memory) refuse naming the file, at enqueue time and in the worker; links refuse by name; a
+plain target keeps the source's seconds while a granted target gets fresh stamps; directory
+copies keep the plain panes' refusal word for word. The bundle dropped `copyMove` and `move`
+(the remote-tab move gate now names the session transfer it is), the page offers transfers and
+moves on local tabs, and the new capability is `platform.android-saf-local-copy-move` =
+`partial`, evidenced by two mock-bridge service tests and two page checks. Still refused, as
+the rest of option (a): session transfers, synchronization and keep-up-to-date. As before, no
+Rust toolchain here, so the new tests compile for the first time in CI.
+
 ### A8. Kerberos/GSSAPI exists only on Linux; Windows has no SSPI backend at all
 **Platforms:** Windows ✗, Android ✗ (fail closed), Debian ✓
 **Evidence:** `crates/linscp-platform/src/gssapi_sys.rs` is `#[cfg(target_os = "linux")]` for the
@@ -751,8 +768,10 @@ Ordered by (user impact × confidence) ÷ effort. All are small except where not
    of those through a new bundle reason next to `hostCapabilities`, and the boundary recorded as
    `platform.android-saf-refusals` = `verified`. Option (a) has since begun — see A7's
    continued *Status*: the editor and properties route through `LocalFs` (first slice,
-   `platform.android-saf-editing` = `partial` pending a device run), while sync, transfers
-   and copy/move keep their refusals for the engine-routing slice.
+   `platform.android-saf-editing` = `partial` pending a device run) and local copy/move
+   follows (second slice, `platform.android-saf-local-copy-move` = `partial`), while
+   session transfers, sync and keep-up-to-date keep their refusals for the rest of the
+   engine routing.
 7. **A4 local symlink** — **done**, see A4's *Status: fixed*: a shared `create_local_link` helper
    behind `/api/local/link` and a local branch in `link_remote_async`, one pane-aware page dialog,
    and the granted-folder refusal in both layers. **A9 Android agent message** — **done**, see

@@ -1605,9 +1605,10 @@ function options(id) {
   responses['/api/logs'] = savedLogs;
 
   // ---- Granted Android folders ------------------------------------------
-  // A granted folder browses but cannot edit, sync, watch, transfer, move or
-  // chmod. The page asks the shared bundle for the reason and offers nothing
-  // that could only fail; the backend refuses the same way when called.
+  // A granted folder browses, edits, copies and moves, but cannot sync,
+  // watch, transfer to a session, or chmod. The page asks the shared bundle
+  // for the reason and offers nothing that could only fail; the backend
+  // refuses the same way when called.
   const SAF_DIR = 'content://mock.tree/tree/primary%3ADownload';
   LOCAL_DIRS[SAF_DIR] = [
     { name: 'note.txt', size: 4, is_dir: false, date: 'Oct 13 08:00', permissions: '' }
@@ -1661,7 +1662,7 @@ function options(id) {
   const movesBefore = posted('/api/transfer/move');
   await window.moveToOtherPane();
   check('a granted folder is not offered moves',
-    text('toast').includes(safReason('move')) &&
+    text('toast').includes(safReason('transfer')) &&
       confirmMessages.length === confirmsBefore &&
       posted('/api/transfer/move') === movesBefore,
     text('toast'));
@@ -1686,6 +1687,39 @@ function options(id) {
   check('leaving the granted folder offers the actions again',
     doc.getElementById('syncModal').className.indexOf('open') >= 0);
   window.closeModal('syncModal');
+
+  // A local tab copies and moves through LocalFs on both ends, so the
+  // granted folder is offered transfers and moves there; the remote-tab
+  // refusals above still stand.
+  const savedStatusForLocalTab = responses['/api/status'];
+  responses['/api/status'] = {
+    tabs: [{ id: 1, name: 'local tab', connected: true, is_local: true,
+      local_dir: SAF_DIR, remote_dir: '/tmp/slowlocal', error: '' }],
+    active_tab: 1, paused: false, binary: '/usr/bin/linscp',
+    local_dir: SAF_DIR, remote_dir: '/tmp/slowlocal',
+    sessions_file: '/tmp/cfg/sessions.ini'
+  };
+  await window.refreshStatus();
+  await window.loadLocal(SAF_DIR);
+  await window.loadRemote('/tmp/slowlocal');
+  window.focusPane('local');
+  doc.getElementById('localFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  const localUploadsBefore = posted('/api/transfer/upload');
+  await window.transfer('upload');
+  check('a local tab offers transfers out of a granted folder',
+    posted('/api/transfer/upload') === localUploadsBefore + 1,
+    text('toast'));
+  const localConfirmsBefore = confirmMessages.length;
+  const localMovesBefore = posted('/api/transfer/move');
+  await window.moveToOtherPane();
+  check('a local tab offers moves out of a granted folder',
+    confirmMessages.length === localConfirmsBefore + 1 &&
+      posted('/api/transfer/move') === localMovesBefore + 1,
+    text('toast'));
+  responses['/api/status'] = savedStatusForLocalTab;
+  await window.refreshStatus();
+  await window.loadLocal('/tmp/slowlocal');
   if (safStubInstalled) window.LinSCPCore.safLimitationReason = undefined;
 
   // ---- Local symbolic links ---------------------------------------------

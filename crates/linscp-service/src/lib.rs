@@ -105,7 +105,7 @@ impl CommanderService {
         cleanup_stale_temporary_keys(&config_root);
         let preferences = PreferencesStore::load(&config_root).unwrap_or_default();
         Self {
-            local_fs,
+            local_fs: local_fs.clone(),
             secret_vault: Arc::new(linscp_platform::password_vault::PasswordSecretVault::new()),
             legacy_secret_vault: secret_vault,
             state: Arc::new(Mutex::new(InnerState {
@@ -121,7 +121,7 @@ impl CommanderService {
                 terminals: terminal_bridge::TerminalRegistry::default(),
             })),
             event_tx: Arc::new(Mutex::new(None)),
-            queue: queue::QueueManager::new(tokio::sync::broadcast::channel(64).0),
+            queue: queue::QueueManager::new(tokio::sync::broadcast::channel(64).0, local_fs),
             desktop_spawn_allowed: false,
         }
     }
@@ -1657,11 +1657,12 @@ impl CommanderService {
             Some(path) => match check_local_pane_directory(path, "local_dir") { Ok(path) => path, Err(error) => return api_error(400, error) },
             None => return api_error(400, "Missing local directory"),
         };
-        // The pane check accepts a granted folder structurally; the queue
-        // cannot copy from or to one, so it is refused here by name, before
-        // anything is statted or queued.
-        if is_saf_path(&local_dir) {
-            let action = if move_item { "Moving files" } else if tab.is_local { "Copying or moving files" } else { "Transferring files" };
+        // The pane check accepts a granted folder structurally. Remote tabs
+        // still transfer through the engine's plain-path I/O, so a granted
+        // local side refuses by name; local tabs copy and move through
+        // `LocalFs` in the queue worker.
+        if is_saf_path(&local_dir) && !tab.is_local {
+            let action = if move_item { "Moving files" } else { "Transferring files" };
             return api_error(400, saf_unsupported(action));
         }
         let other_dir = body.get("remote_dir").and_then(Value::as_str).unwrap_or("");
@@ -1695,10 +1696,6 @@ impl CommanderService {
             let local = match resolve_contained(&local_dir, name) { Ok(path) => PathBuf::from(path), Err(error) => return api_error(400, error) };
             let other = if tab.is_local {
                 let directory = match check_local_pane_directory(other_dir, "other_local_dir") { Ok(path) => path, Err(error) => return api_error(400, error) };
-                if is_saf_path(&directory) {
-                    let action = if move_item { "Moving files" } else { "Copying or moving files" };
-                    return api_error(400, saf_unsupported(action));
-                }
                 match resolve_contained(&directory, name) { Ok(path) => path, Err(error) => return api_error(400, error) }
             } else {
                 format!("{}/{}", other_dir.trim_end_matches('/'), name)
@@ -1709,10 +1706,23 @@ impl CommanderService {
             let exists;
             let is_dir;
             if tab.is_local {
-                let meta = match std::fs::symlink_metadata(&source) { Ok(meta) if (meta.is_file() || (move_item && meta.is_dir())) && !meta.file_type().is_symlink() => meta, Ok(_) => return api_error(400, "Only regular files and movable directories are supported"), Err(error) => return api_error(400, error.to_string()) };
-                size = if meta.is_dir() { 0 } else { meta.len() };
-                is_dir = meta.is_dir();
-                exists = std::fs::symlink_metadata(&destination).is_ok();
+                // Either end may be a granted folder; `LocalFs` stats both
+                // sides of a granted copy, while plain pairs keep the direct
+                // metadata and its exact rule.
+                let (src_is_dir, src_len) = if is_saf_path(&source) || is_saf_path(&destination) {
+                    let info = match self.local_fs.stat(&source) {
+                        Ok(info) if (!info.is_dir || move_item) && !info.is_symlink => info,
+                        Ok(_) => return api_error(400, "Only regular files and movable directories are supported"),
+                        Err(error) => return api_error(400, error.to_string()),
+                    };
+                    (info.is_dir, if info.is_dir { 0 } else { info.size })
+                } else {
+                    let meta = match std::fs::symlink_metadata(&source) { Ok(meta) if (meta.is_file() || (move_item && meta.is_dir())) && !meta.file_type().is_symlink() => meta, Ok(_) => return api_error(400, "Only regular files and movable directories are supported"), Err(error) => return api_error(400, error.to_string()) };
+                    (meta.is_dir(), if meta.is_dir() { 0 } else { meta.len() })
+                };
+                is_dir = src_is_dir;
+                size = src_len;
+                exists = if is_saf_path(&destination) { self.local_fs.stat(&destination).is_ok() } else { std::fs::symlink_metadata(&destination).is_ok() };
             } else if upload {
                 let meta = match std::fs::symlink_metadata(&local) { Ok(meta) if (meta.is_file() || meta.is_dir()) && !meta.file_type().is_symlink() => meta, Ok(_) => return api_error(400, "Only regular files and directories can be transferred"), Err(error) => return api_error(400, error.to_string()) };
                 is_dir = meta.is_dir();
@@ -1742,8 +1752,21 @@ impl CommanderService {
                 return api_error(409, "Moves require a new destination; overwriting is not supported.");
             }
             if !upload || tab.is_local {
-                let target = Path::new(&destination);
-                if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink() || (is_dir && !m.is_dir()) || (!is_dir && !m.is_file())) { return api_error(400, "Destination type conflicts with source or is a symlink"); }
+                // A granted destination only reaches here on a local tab;
+                // remote tabs with a granted local side were refused above.
+                let conflict = if is_saf_path(&destination) {
+                    self.local_fs.stat(&destination).is_ok_and(|info| info.is_symlink || (is_dir && !info.is_dir) || (!is_dir && info.is_dir))
+                } else {
+                    let target = Path::new(&destination);
+                    std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink() || (is_dir && !m.is_dir()) || (!is_dir && !m.is_file()))
+                };
+                if conflict { return api_error(400, "Destination type conflicts with source or is a symlink"); }
+            }
+            // Granted copies and moves always carry bytes across the bridge,
+            // so an over-cap file refuses here; directories report size zero
+            // and are judged per file in the worker instead.
+            if tab.is_local && !is_dir && (is_saf_path(&source) || is_saf_path(&destination)) && size > linscp_platform::MAX_SAF_DOCUMENT_BYTES {
+                return api_error(400, linscp_platform::saf_document_too_large(name, size));
             }
             let is_dav_upload = !tab.is_local && upload && matches!(session.as_ref().unwrap().scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs);
             let is_s3_upload = !tab.is_local && upload && session.as_ref().unwrap().scheme() == linscp_types::ProtocolScheme::S3;
@@ -4993,7 +5016,7 @@ fn sync_reason_for_page(reason: &str) -> String {
 }
 
 /// True when `path` is a granted Android folder (`content://` tree URI).
-fn is_saf_path(path: &str) -> bool {
+pub(crate) fn is_saf_path(path: &str) -> bool {
     path.starts_with("content://")
 }
 
@@ -8900,72 +8923,129 @@ mod tests {
     /// comes from the `content://` branch and not from any provider.
     const SAF_GRANTED_DIR: &str = "content://mock.tree/tree/primary%3ADownload";
 
-    /// In-memory `SafBridge` for the editor tests: documents are keyed by
-    /// leaf name, writes create-or-replace like the Kotlin plugin, and a
-    /// missing document errors like a provider that cannot find it.
+    /// In-memory `SafBridge` for the granted-folder tests: documents are
+    /// keyed by full URI, writes create-or-replace like the Kotlin plugin
+    /// (and refuse a file over a directory, as the provider does), and a
+    /// missing document errors like a provider that cannot find it. One
+    /// bridge serves every tree, as the real adapter does.
+    struct MockDoc {
+        bytes: Option<Vec<u8>>,
+    }
+
     struct MockBridge {
-        files: Mutex<HashMap<String, Vec<u8>>>,
+        docs: Mutex<HashMap<String, MockDoc>>,
         mtime: i64,
     }
 
+    /// A second granted tree, so cross-tree copies and moves have somewhere
+    /// to go without leaving the one mock bridge.
+    const SAF_OTHER_TREE: &str = "content://mock.tree/tree/primary%3APictures";
+
     impl MockBridge {
         fn with_file(name: &str, content: &[u8]) -> Self {
-            let mut files = HashMap::new();
-            files.insert(name.to_string(), content.to_vec());
-            MockBridge { files: Mutex::new(files), mtime: 1_791_875_271 }
+            let bridge = MockBridge { docs: Mutex::new(HashMap::new()), mtime: 1_791_875_271 };
+            bridge.add_file(&Self::doc_uri(name), content);
+            bridge
+        }
+
+        fn doc_uri(name: &str) -> String {
+            format!("{SAF_GRANTED_DIR}/document/{name}")
+        }
+
+        fn add_file(&self, uri: &str, content: &[u8]) {
+            self.docs.lock().expect("m").insert(uri.to_string(), MockDoc { bytes: Some(content.to_vec()) });
+        }
+
+        fn add_dir(&self, uri: &str) {
+            self.docs.lock().expect("m").insert(uri.to_string(), MockDoc { bytes: None });
         }
 
         fn leaf_of(uri: &str) -> String {
             uri.rsplit("/document/").next().unwrap_or("").to_string()
         }
 
-        fn entry_for(&self, name: &str, size: u64) -> FileEntry {
-            FileEntry { name: name.to_string(), size, is_dir: false, is_symlink: false, broken_link: false, date: String::new(), mtime: self.mtime, permissions: String::new(), owner: None, group: None }
+        fn parent_of(uri: &str) -> String {
+            uri.rsplit_once("/document/").map(|(parent, _)| parent.to_string()).unwrap_or_default()
+        }
+
+        fn entry_for_uri(&self, uri: &str, doc: &MockDoc) -> FileEntry {
+            FileEntry { name: Self::leaf_of(uri), size: doc.bytes.as_ref().map(|bytes| bytes.len() as u64).unwrap_or(0), is_dir: doc.bytes.is_none(), is_symlink: false, broken_link: false, date: String::new(), mtime: self.mtime, permissions: String::new(), owner: None, group: None }
         }
 
         fn bytes_of(&self, name: &str) -> Option<Vec<u8>> {
-            self.files.lock().expect("m").get(name).cloned()
+            self.bytes_of_uri(&Self::doc_uri(name))
+        }
+
+        fn bytes_of_uri(&self, uri: &str) -> Option<Vec<u8>> {
+            self.docs.lock().expect("m").get(uri).and_then(|doc| doc.bytes.clone())
+        }
+
+        fn is_dir_uri(&self, uri: &str) -> bool {
+            self.docs.lock().expect("m").get(uri).is_some_and(|doc| doc.bytes.is_none())
         }
     }
 
     impl linscp_platform::android::SafBridge for MockBridge {
         fn request_tree(&self) -> Result<Option<String>, PlatformError> { Ok(None) }
         fn granted_trees(&self) -> Result<Vec<LocalRootEntry>, PlatformError> { Ok(Vec::new()) }
-        fn list_tree(&self, _tree_uri: &str) -> Result<Vec<FileEntry>, PlatformError> {
-            let files = self.files.lock().expect("m");
-            let mut names: Vec<String> = files.keys().cloned().collect();
-            names.sort();
-            Ok(names.iter().map(|name| self.entry_for(name, files[name].len() as u64)).collect())
+        fn list_tree(&self, tree_uri: &str) -> Result<Vec<FileEntry>, PlatformError> {
+            let docs = self.docs.lock().expect("m");
+            let mut uris: Vec<String> = docs.keys().filter(|uri| Self::parent_of(uri) == tree_uri).cloned().collect();
+            uris.sort();
+            Ok(uris.iter().map(|uri| self.entry_for_uri(uri, &docs[uri])).collect())
         }
         fn stat_uri(&self, uri: &str) -> Result<FileEntry, PlatformError> {
-            let name = Self::leaf_of(uri);
-            let files = self.files.lock().expect("m");
-            match files.get(&name) {
-                Some(bytes) => Ok(self.entry_for(&name, bytes.len() as u64)),
+            let docs = self.docs.lock().expect("m");
+            match docs.get(uri) {
+                Some(doc) => Ok(self.entry_for_uri(uri, doc)),
                 None => Err(PlatformError::Unsupported(format!("Unknown document: {uri}"))),
             }
         }
         fn read_uri_bytes(&self, uri: &str) -> Result<Vec<u8>, PlatformError> {
-            let name = Self::leaf_of(uri);
-            self.files.lock().expect("m").get(&name).cloned()
-                .ok_or_else(|| PlatformError::Unsupported(format!("Unknown document: {uri}")))
+            self.bytes_of_uri(uri).ok_or_else(|| PlatformError::Unsupported(format!("Unknown document: {uri}")))
         }
-        fn write_uri_bytes(&self, _parent_uri: &str, name: &str, data: &[u8]) -> Result<String, PlatformError> {
-            self.files.lock().expect("m").insert(name.to_string(), data.to_vec());
-            Ok(format!("{SAF_GRANTED_DIR}/document/{name}"))
+        fn write_uri_bytes(&self, parent_uri: &str, name: &str, data: &[u8]) -> Result<String, PlatformError> {
+            let uri = format!("{parent_uri}/document/{name}");
+            let mut docs = self.docs.lock().expect("m");
+            if docs.get(&uri).is_some_and(|doc| doc.bytes.is_none()) {
+                return Err(PlatformError::Unsupported(format!("Cannot replace the directory: {uri}")));
+            }
+            docs.insert(uri.clone(), MockDoc { bytes: Some(data.to_vec()) });
+            Ok(uri)
         }
-        fn mkdir_uri(&self, _parent_uri: &str, name: &str) -> Result<String, PlatformError> {
-            Err(PlatformError::Unsupported(format!("MockBridge has no directories: {name}")))
+        fn mkdir_uri(&self, parent_uri: &str, name: &str) -> Result<String, PlatformError> {
+            let uri = format!("{parent_uri}/document/{name}");
+            let mut docs = self.docs.lock().expect("m");
+            if docs.get(&uri).is_some_and(|doc| doc.bytes.is_some()) {
+                return Err(PlatformError::Unsupported(format!("Cannot make a directory over the file: {uri}")));
+            }
+            docs.insert(uri.clone(), MockDoc { bytes: None });
+            Ok(uri)
         }
         fn delete_uri(&self, uri: &str) -> Result<(), PlatformError> {
-            self.files.lock().expect("m").remove(&Self::leaf_of(uri));
+            let prefix = format!("{uri}/document/");
+            self.docs.lock().expect("m").retain(|key, _| key.as_str() != uri && !key.as_str().starts_with(prefix.as_str()));
             Ok(())
         }
         fn rename_uri(&self, uri: &str, new_name: &str) -> Result<String, PlatformError> {
-            let old = Self::leaf_of(uri);
-            let mut files = self.files.lock().expect("m");
-            if let Some(bytes) = files.remove(&old) { files.insert(new_name.to_string(), bytes); }
-            Ok(format!("{SAF_GRANTED_DIR}/document/{new_name}"))
+            let new_uri = format!("{}/document/{new_name}", Self::parent_of(uri));
+            let old_prefix = format!("{uri}/document/");
+            let new_prefix = format!("{new_uri}/document/");
+            let mut docs = self.docs.lock().expect("m");
+            let mut moved: HashMap<String, MockDoc> = HashMap::new();
+            docs.retain(|key, doc| {
+                if key.as_str() == uri {
+                    moved.insert(new_uri.clone(), MockDoc { bytes: doc.bytes.clone() });
+                    false
+                } else if let Some(tail) = key.as_str().strip_prefix(old_prefix.as_str()) {
+                    moved.insert(format!("{new_prefix}{tail}"), MockDoc { bytes: doc.bytes.clone() });
+                    false
+                } else {
+                    true
+                }
+            });
+            docs.extend(moved);
+            Ok(new_uri)
         }
     }
 
@@ -9055,25 +9135,139 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp);
     }
 
-    /// Copying and moving between two plain local panes may queue; either end
-    /// being a granted folder refuses before anything is statted or queued.
+    /// Waits for the newest queue task to land on `want` (`Completed` or
+    /// `Failed`) and returns its row; the other terminal state panics with
+    /// the task's own error, so a failure never reads as a timeout.
+    async fn wait_for_task(service: &CommanderService, want: &str) -> Value {
+        for _ in 0..500 {
+            let (tasks, _) = service.queue.snapshot();
+            if let Some(task) = tasks.last() {
+                let status = task["status"].as_str().unwrap_or("");
+                if status == want {
+                    return task.clone();
+                }
+                if status == "Completed" || status == "Failed" {
+                    panic!("task landed on {status}, wanted {want}: {}", task["error"]);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no task reached {want}");
+    }
+
+    /// Copies across the granted/plain boundary move bytes through the
+    /// bridge in both directions, and between two granted trees; an
+    /// over-cap file refuses at enqueue time, and a directory copy keeps
+    /// the plain panes' refusal word for word.
     #[tokio::test]
-    async fn saf_local_copy_and_move_refuse_granted_folders() {
+    async fn saf_local_copy_moves_bytes_through_the_bridge() {
         let tmp = std::env::temp_dir().join(format!("linscp-saf-copy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let left = tmp.join("left"); let right = tmp.join("right");
         std::fs::create_dir_all(&left).unwrap(); std::fs::create_dir_all(&right).unwrap();
-        std::fs::write(left.join("note.txt"), b"plain").unwrap();
-        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
-        let open = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": left, "other_local_dir": right}}) }).await;
+        std::fs::write(left.join("plain.txt"), b"plain bytes").unwrap();
+        let bridge = Arc::new(MockBridge::with_file("note.txt", b"granted bytes"));
+        bridge.add_dir(&format!("{SAF_GRANTED_DIR}/document/folder"));
+        let fs = NativeLocalFs::with_saf(bridge.clone());
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(fs));
+        let open = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": SAF_GRANTED_DIR, "other_local_dir": right}}) }).await;
         assert_eq!(open.status, 200, "{}", open.payload);
         let id = open.payload["tab"]["id"].as_u64().unwrap();
+        // Granted pane to plain pane.
         let copy = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": right, "names": ["note.txt"]}) }).await;
-        assert_eq!(copy.status, 400, "{}", copy.payload);
-        assert!(copy.payload["error"].as_str().unwrap_or("").contains("Copying or moving files"), "{}", copy.payload);
-        let moved = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": id, "direction": "upload", "local_dir": left, "remote_dir": SAF_GRANTED_DIR, "names": ["note.txt"]}) }).await;
-        assert_eq!(moved.status, 400, "{}", moved.payload);
-        assert!(moved.payload["error"].as_str().unwrap_or("").contains("Moving files"), "{}", moved.payload);
+        assert_eq!(copy.status, 200, "{}", copy.payload);
+        let done = wait_for_task(&svc, "Completed").await;
+        assert_eq!(done["bytes_total"], json!(13), "{}", done);
+        assert_eq!(std::fs::read(right.join("note.txt")).unwrap(), b"granted bytes".to_vec());
+        // Plain pane to granted pane.
+        let open_plain = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": left, "other_local_dir": SAF_GRANTED_DIR}}) }).await;
+        assert_eq!(open_plain.status, 200, "{}", open_plain.payload);
+        let plain_id = open_plain.payload["tab"]["id"].as_u64().unwrap();
+        let copy_back = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": plain_id, "local_dir": left, "remote_dir": SAF_GRANTED_DIR, "names": ["plain.txt"]}) }).await;
+        assert_eq!(copy_back.status, 200, "{}", copy_back.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(bridge.bytes_of("plain.txt").as_deref(), Some(b"plain bytes".as_slice()), "the bridge holds the copy");
+        // Granted tree to granted tree.
+        let open_other = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": SAF_GRANTED_DIR, "other_local_dir": SAF_OTHER_TREE}}) }).await;
+        assert_eq!(open_other.status, 200, "{}", open_other.payload);
+        let other_id = open_other.payload["tab"]["id"].as_u64().unwrap();
+        let copy_tree = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": other_id, "local_dir": SAF_GRANTED_DIR, "remote_dir": SAF_OTHER_TREE, "names": ["note.txt"]}) }).await;
+        assert_eq!(copy_tree.status, 200, "{}", copy_tree.payload);
+        wait_for_task(&svc, "Completed").await;
+        let other_doc = format!("{SAF_OTHER_TREE}/document/note.txt");
+        assert_eq!(bridge.bytes_of_uri(&other_doc).as_deref(), Some(b"granted bytes".as_slice()), "the other tree holds the copy");
+        // Over the document cap refuses at enqueue time, naming the file.
+        let big = vec![0u8; (linscp_platform::MAX_SAF_DOCUMENT_BYTES + 1) as usize];
+        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/big.bin"), &big);
+        let refused = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": right, "names": ["big.bin"]}) }).await;
+        assert_eq!(refused.status, 400, "{}", refused.payload);
+        assert!(refused.payload["error"].as_str().unwrap_or("").contains("larger than a granted folder can carry"), "{}", refused.payload);
+        // A directory copy keeps the plain panes' refusal.
+        let dir_copy = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": right, "names": ["folder"]}) }).await;
+        assert_eq!(dir_copy.status, 400, "{}", dir_copy.payload);
+        assert!(dir_copy.payload["error"].as_str().unwrap_or("").contains("Only regular files and movable directories are supported"), "{}", dir_copy.payload);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Granted moves are copies that delete their source: across trees, to
+    /// a plain pane, and onto an existing name (refused). A link nested in
+    /// a moved directory fails the task by name while the source survives.
+    #[tokio::test]
+    async fn saf_local_move_copies_then_deletes_across_trees() {
+        let tmp = std::env::temp_dir().join(format!("linscp-saf-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let right = tmp.join("right");
+        std::fs::create_dir_all(&right).unwrap();
+        let bridge = Arc::new(MockBridge::with_file("gone.txt", b"moving bytes"));
+        bridge.add_file(&MockBridge::doc_uri("clash.txt"), b"stays");
+        std::fs::write(right.join("clash.txt"), b"taken").unwrap();
+        let fs = NativeLocalFs::with_saf(bridge.clone());
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(fs));
+        let open = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": SAF_GRANTED_DIR, "other_local_dir": right}}) }).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        let request = |name: &str| ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": id, "direction": "upload", "local_dir": SAF_GRANTED_DIR, "remote_dir": right, "names": [name]}) };
+        // Granted pane to plain pane: the bytes land, the source is gone.
+        let moved = svc.dispatch_async(request("gone.txt")).await;
+        assert_eq!(moved.status, 200, "{}", moved.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(std::fs::read(right.join("gone.txt")).unwrap(), b"moving bytes".to_vec());
+        assert!(bridge.bytes_of("gone.txt").is_none(), "the bridge no longer holds the source");
+        // A move onto an existing name refuses before anything is queued.
+        let clash = svc.dispatch_async(request("clash.txt")).await;
+        assert_eq!(clash.status, 409, "{}", clash.payload);
+        assert!(clash.payload["error"].as_str().unwrap_or("").contains("Moves require a new destination"), "{}", clash.payload);
+        // An over-cap move refuses at enqueue time like a copy.
+        let big = vec![0u8; (linscp_platform::MAX_SAF_DOCUMENT_BYTES + 1) as usize];
+        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/big.bin"), &big);
+        let refused = svc.dispatch_async(request("big.bin")).await;
+        assert_eq!(refused.status, 400, "{}", refused.payload);
+        assert!(refused.payload["error"].as_str().unwrap_or("").contains("larger than a granted folder can carry"), "{}", refused.payload);
+        // Granted tree to granted tree.
+        let open_other = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": SAF_GRANTED_DIR, "other_local_dir": SAF_OTHER_TREE}}) }).await;
+        assert_eq!(open_other.status, 200, "{}", open_other.payload);
+        let other_id = open_other.payload["tab"]["id"].as_u64().unwrap();
+        let moved_tree = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": other_id, "direction": "upload", "local_dir": SAF_GRANTED_DIR, "remote_dir": SAF_OTHER_TREE, "names": ["clash.txt"]}) }).await;
+        assert_eq!(moved_tree.status, 200, "{}", moved_tree.payload);
+        wait_for_task(&svc, "Completed").await;
+        let other_doc = format!("{SAF_OTHER_TREE}/document/clash.txt");
+        assert_eq!(bridge.bytes_of_uri(&other_doc).as_deref(), Some(b"stays".as_slice()), "the other tree holds the move");
+        assert!(bridge.bytes_of("clash.txt").is_none(), "the source tree no longer holds it");
+        // A link nested in a moved directory fails the task by name. The
+        // link is created through the API, so the test works on Windows too.
+        std::fs::create_dir_all(tmp.join("linked")).unwrap();
+        std::fs::write(tmp.join("linked/real.txt"), b"real").unwrap();
+        let open_link = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp.join("linked"), "other_local_dir": right}}) }).await;
+        let link_id = open_link.payload["tab"]["id"].as_u64().unwrap();
+        let link = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/local/link".into(), body: json!({"tab": link_id, "target": "real.txt", "name": "alias.txt"}) });
+        assert_eq!(link.status, 200, "{}", link.payload);
+        let open_parent = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp, "other_local_dir": SAF_GRANTED_DIR}}) }).await;
+        let parent_id = open_parent.payload["tab"]["id"].as_u64().unwrap();
+        let moved_dir = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": parent_id, "direction": "upload", "local_dir": tmp, "remote_dir": SAF_GRANTED_DIR, "names": ["linked"]}) }).await;
+        assert_eq!(moved_dir.status, 200, "{}", moved_dir.payload);
+        let failed = wait_for_task(&svc, "Failed").await;
+        assert!(failed["error"].as_str().unwrap_or("").contains("symbolic link"), "{}", failed);
+        assert!(tmp.join("linked/real.txt").is_file(), "the source survives a failed move");
         let _ = std::fs::remove_dir_all(tmp);
     }
 
