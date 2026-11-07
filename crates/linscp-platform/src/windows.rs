@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 
 use linscp_types::LocalRootEntry;
 use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HLOCAL};
-use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
-use windows_sys::Win32::Security::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityDescriptorDacl, ACL,
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
 };
+use windows_sys::Win32::Security::{GetSecurityDescriptorDacl, ACL};
 use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -205,6 +205,8 @@ pub fn apply_owner_only_dacl(dir: &Path) -> Result<(), PlatformError> {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             dacl,
+            // No SACL is set; the parameter takes a const ACL pointer, so a
+            // const NULL is exactly right.
             std::ptr::null(),
         );
         // SAFETY: `sd` was allocated by the conversion call above; the DACL

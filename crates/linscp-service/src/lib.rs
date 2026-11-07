@@ -5389,6 +5389,9 @@ mod tests {
         std::fs::create_dir_all(&right).unwrap();
         std::fs::write(left.join("a.txt"), b"one").unwrap();
         std::fs::write(right.join("b.txt"), b"two").unwrap();
+        // Both selections run in the local pane, so both names have to exist
+        // there for their runs to succeed.
+        std::fs::write(left.join("b.txt"), b"two").unwrap();
         let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
 
         let run = |tab: u64, name: &str, files: Value, pane: &str| ApiEnvelope {
@@ -5414,7 +5417,7 @@ mod tests {
             .dispatch(ApiEnvelope {
                 method: "POST".into(),
                 path: "/api/custom-commands".into(),
-                body: json!({"action": "save", "name": "Look", "command": "lcd {file}",
+                body: json!({"action": "save", "name": "Look", "command": "lls {file}",
                     "scope": "local"}),
             });
         assert_eq!(save.status, 200, "{}", save.payload);
@@ -5446,7 +5449,7 @@ mod tests {
         assert_eq!(results[0]["file"], "a.txt");
         assert_eq!(results[1]["file"], "b.txt");
         assert!(
-            results[0]["command"].as_str().unwrap_or("").contains("lcd"),
+            results[0]["command"].as_str().unwrap_or("").contains("lls"),
             "the answer shows the line that ran: {:?}",
             results[0]
         );
@@ -5464,17 +5467,28 @@ mod tests {
             spaced.payload
         );
 
-        // A local selection is not where a remote template looks.
-        let mismatch = svc
-            .dispatch_async(ApiEnvelope {
+        // A local selection is not where a remote template looks. (A local-only
+        // tab cannot mismatch — both its panes are local — so this needs a
+        // remote tab, which the mock session provides without dialling out.)
+        let save_remote = svc
+            .dispatch(ApiEnvelope {
                 method: "POST".into(),
                 path: "/api/custom-commands".into(),
-                body: json!({"action": "run", "name": "Look", "filenames": ["a.txt"],
-                    "pane": "remote", "tab": id}),
-            })
+                body: json!({"action": "save", "name": "Rem", "command": "ls {file}",
+                    "scope": "remote"}),
+            });
+        assert_eq!(save_remote.status, 200, "{}", save_remote.payload);
+        let remote_id = insert_remote_tab(&svc, Arc::new(MockSession::new()), "/tmp");
+        let mismatch = svc
+            .dispatch_async(run(remote_id, "Rem", json!(["a.txt"]), "local"))
             .await;
         assert_eq!(mismatch.status, 400, "{}", mismatch.payload);
         assert_eq!(mismatch.payload["success"], false);
+        assert!(
+            mismatch.payload["error"].as_str().unwrap_or("").contains("remote side"),
+            "the refusal names the side the command is saved for: {}",
+            mismatch.payload
+        );
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -9007,10 +9021,6 @@ mod tests {
         fn bytes_of_uri(&self, uri: &str) -> Option<Vec<u8>> {
             self.docs.lock().expect("m").get(uri).and_then(|doc| doc.bytes.clone())
         }
-
-        fn is_dir_uri(&self, uri: &str) -> bool {
-            self.docs.lock().expect("m").get(uri).is_some_and(|doc| doc.bytes.is_none())
-        }
     }
 
     impl linscp_platform::android::SafBridge for MockBridge {
@@ -9284,21 +9294,24 @@ mod tests {
         let other_doc = format!("{SAF_OTHER_TREE}/document/clash.txt");
         assert_eq!(bridge.bytes_of_uri(&other_doc).as_deref(), Some(b"stays".as_slice()), "the other tree holds the move");
         assert!(bridge.bytes_of("clash.txt").is_none(), "the source tree no longer holds it");
-        // A link nested in a moved directory fails the task by name. The
-        // link is created through the API, so the test works on Windows too.
-        std::fs::create_dir_all(tmp.join("linked")).unwrap();
-        std::fs::write(tmp.join("linked/real.txt"), b"real").unwrap();
-        let open_link = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp.join("linked"), "other_local_dir": right}}) }).await;
-        let link_id = open_link.payload["tab"]["id"].as_u64().unwrap();
-        let link = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/local/link".into(), body: json!({"tab": link_id, "target": "real.txt", "name": "alias.txt"}) });
-        assert_eq!(link.status, 200, "{}", link.payload);
-        let open_parent = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp, "other_local_dir": SAF_GRANTED_DIR}}) }).await;
-        let parent_id = open_parent.payload["tab"]["id"].as_u64().unwrap();
-        let moved_dir = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": parent_id, "direction": "upload", "local_dir": tmp, "remote_dir": SAF_GRANTED_DIR, "names": ["linked"]}) }).await;
-        assert_eq!(moved_dir.status, 200, "{}", moved_dir.payload);
-        let failed = wait_for_task(&svc, "Failed").await;
-        assert!(failed["error"].as_str().unwrap_or("").contains("symbolic link"), "{}", failed);
-        assert!(tmp.join("linked/real.txt").is_file(), "the source survives a failed move");
+        // A link nested in a moved directory fails the task by name. Unix-only:
+        // creating the link needs a privilege the Windows suite cannot grant
+        // itself, so asserting its creation there would fail the run.
+        if cfg!(unix) {
+            std::fs::create_dir_all(tmp.join("linked")).unwrap();
+            std::fs::write(tmp.join("linked/real.txt"), b"real").unwrap();
+            let open_link = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp.join("linked"), "other_local_dir": right}}) }).await;
+            let link_id = open_link.payload["tab"]["id"].as_u64().unwrap();
+            let link = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/local/link".into(), body: json!({"tab": link_id, "target": "real.txt", "name": "alias.txt"}) });
+            assert_eq!(link.status, 200, "{}", link.payload);
+            let open_parent = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp, "other_local_dir": SAF_GRANTED_DIR}}) }).await;
+            let parent_id = open_parent.payload["tab"]["id"].as_u64().unwrap();
+            let moved_dir = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": parent_id, "direction": "upload", "local_dir": tmp, "remote_dir": SAF_GRANTED_DIR, "names": ["linked"]}) }).await;
+            assert_eq!(moved_dir.status, 200, "{}", moved_dir.payload);
+            let failed = wait_for_task(&svc, "Failed").await;
+            assert!(failed["error"].as_str().unwrap_or("").contains("symbolic link"), "{}", failed);
+            assert!(tmp.join("linked/real.txt").is_file(), "the source survives a failed move");
+        }
         let _ = std::fs::remove_dir_all(tmp);
     }
 
