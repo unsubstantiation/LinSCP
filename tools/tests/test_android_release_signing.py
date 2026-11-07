@@ -305,11 +305,17 @@ class RepositoryConfigurationTests(unittest.TestCase):
         self.assertIn('path: android-artifacts/linscp-android-release.apk', workflow)
         self.assertNotIn('linscp-android-debug', workflow)
         # The release build is the one without --debug; the debug flag may only
-        # appear on the build that feeds the DevTools smoke test.
+        # appear on builds that feed a test (the DevTools smoke test, or the
+        # pull-request check job's unsigned verification) — never on the build
+        # whose APK is published. Exactly one build is published, and it is
+        # the release one.
         commands = [line for line in workflow.splitlines() if 'android build --ci' in line]
-        self.assertEqual(len(commands), 2, commands)
-        self.assertEqual([line for line in commands if '--debug' not in line], commands[:1])
-        self.assertIn('--debug', commands[1])
+        release = [line for line in commands if '--debug' not in line]
+        self.assertEqual(len(release), 1, commands)
+        for line in commands:
+            if line != release[0]:
+                self.assertIn('--debug', line)
+        self.assertEqual(workflow.count('actions/upload-artifact'), 1, workflow)
 
     def test_the_apk_checks_distinguish_debug_from_release(self):
         workflow = self.workflow()

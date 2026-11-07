@@ -10,8 +10,8 @@ use linscp_crypto::SessionMasterKey;
 use linscp_engine::session_store::{SessionStore, StoredSite};
 use linscp_engine::url_and_raw::{
     apply_env_credential_fallbacks, connect_gui_site_spec, parse_site_url, site_spec_from_stored,
-    stored_site_from_spec, validate_session_settings, GuiConnectError, GuiHostKeyChallenge,
-    ParsedSiteSpec,
+    stored_site_from_spec, validate_session_settings, validate_ssh_gssapi_policy, GuiConnectError,
+    GuiHostKeyChallenge, ParsedSiteSpec,
 };
 use linscp_platform::gui_os::default_os_username;
 use linscp_platform::SecretVault;
@@ -627,6 +627,10 @@ pub fn parse_gui_session_spec(
     apply_env_credential_fallbacks(&mut spec);
     if protocol != ProtocolScheme::Local {
         validate_session_settings(&spec)?;
+        // The dialog's Kerberos section writes real settings now, so the same
+        // fail-closed GSSAPI policy the connect paths run has to run here:
+        // otherwise a Kerberos site parses on a build that can never open it.
+        validate_ssh_gssapi_policy(&spec)?;
     }
 
     let mut clean_view = session.clone();

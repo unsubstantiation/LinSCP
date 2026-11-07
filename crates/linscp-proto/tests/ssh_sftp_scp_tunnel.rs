@@ -1182,7 +1182,8 @@ async fn sftp_agent_absence_names_its_reason() {
                 "unexpected auth error: {message}"
             );
         }
-        other => panic!("expected a transport auth error, got {other:?}"),
+        Err(other) => panic!("expected a transport auth error, got {other:?}"),
+        Ok(_) => panic!("expected a transport auth error, got a connected session"),
     }
 }
 
