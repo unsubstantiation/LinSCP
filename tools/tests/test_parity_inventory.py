@@ -137,6 +137,75 @@ class InventoryTests(unittest.TestCase):
                                  "notes": "works"}], errors)
         return errors
 
+    def test_verified_cannot_cite_a_suite_that_does_not_run_there(self):
+        """A suite flagged not runnable executes no case on that platform, so a
+        verified entry may not cite it there. A partial entry may: that is how
+        the ledger records which cases would cover it once the suite runs."""
+        platforms = {
+            "linux": {"how": "make check", "date": "2026-10-14",
+                      "suites": {"unit": "the C++ checks"},
+                      "not_runnable": {"unit": "no build target"}},
+            "bsd": {"how": "ctest", "date": "2026-10-14",
+                    "suites": {"unit": "the C++ checks"}},
+        }
+        verified = {"name": "get", "status": "verified", "notes": "works",
+                    "verified_on": {"linux": ["unit"], "bsd": ["unit"]}}
+        errors = self.ledger_errors([verified], platforms=platforms)
+        self.assertTrue(any("'linux' suite 'unit'" in error and
+                            "does not run" in error for error in errors),
+                        errors)
+        partial = dict(verified, status="partial")
+        self.assertEqual(self.ledger_errors([partial], platforms=platforms), [])
+
+    def test_not_runnable_flags_have_to_point_at_listed_suites(self):
+        errors = self.ledger_errors(
+            [], platforms={"linux": {"how": "make check", "date": "2026-10-14",
+                                     "suites": {"unit": "the C++ checks"},
+                                     "not_runnable": {"ghost": "no such suite",
+                                                      "unit": ""}}})
+        self.assertTrue(any("flags an unlisted suite" in error for error in errors),
+                        errors)
+        self.assertTrue(any("without a reason" in error for error in errors),
+                        errors)
+
+    def test_every_platform_citation_names_a_checked_suite(self):
+        """Windows and Android are validated against the named cases the same
+        way Linux is: a platform may cite a subset, but never a suite the row
+        never names, and a named suite has to be cited somewhere."""
+        base = {"id": "sftp.example", "area": "SFTP", "status": "verified",
+                "notes": "A narrowly checked behavior",
+                "source": ["crates/linscp-proto/src/sftp.rs"],
+                "checks": {"live-sftp": ["test_open_with_a_wrong_password_is_refused"]},
+                "verified_on": {"linux": ["live-sftp"]}}
+        errors = []
+        check_capabilities({"features": [{"name": "SFTP"}],
+                            "capabilities": [base]}, errors)
+        self.assertEqual(errors, [])
+        row = dict(base, verified_on={"linux": ["live-sftp"],
+                                      "windows": ["live-sftp", "unit"]})
+        errors = []
+        check_capabilities({"features": [{"name": "SFTP"}],
+                            "capabilities": [row]}, errors)
+        self.assertTrue(any("verified_on.windows names suites without named "
+                            "cases" in error for error in errors), errors)
+        row = dict(
+            base,
+            checks={"live-sftp": ["test_open_with_a_wrong_password_is_refused"],
+                    "unit": ["TestScpHeaderNamesCannotTraverse"]},
+            verified_on={"linux": ["live-sftp", "unit"],
+                         "windows": ["live-sftp"]})
+        errors = []
+        check_capabilities({"features": [{"name": "SFTP"}],
+                            "capabilities": [row]}, errors)
+        self.assertEqual(errors, [])
+        row = dict(row, verified_on={"linux": ["live-sftp"],
+                                     "windows": ["live-sftp"]})
+        errors = []
+        check_capabilities({"features": [{"name": "SFTP"}],
+                            "capabilities": [row]}, errors)
+        self.assertTrue(any("cited by no platform" in error for error in errors),
+                        errors)
+
     def test_capability_matrix_cannot_lose_areas_or_invent_evidence(self):
         valid = {"id": "sftp.example", "area": "SFTP", "status": "verified",
                  "notes": "A narrowly checked behavior", "source": ["crates/linscp-proto/src/sftp.rs"],
@@ -154,7 +223,7 @@ class InventoryTests(unittest.TestCase):
                 ({"checks": {"live-sftp": ["test_a_made_up_test"]}},
                  "has no test case"),
                 ({"checks": {"script": ["test_batch_modes"]}},
-                 "verified_on.linux must match"),
+                 "names suites without named cases"),
                 ({"checks": {}}, "verified without a test case"),
                 ({"status": "partial", "checks": {}, "verified_on": {}},
                  "needs a concrete gap"),
@@ -288,6 +357,51 @@ class InventoryTests(unittest.TestCase):
                  contextlib.redirect_stderr(error_output):
                 self.assertEqual(checker.main(), 1)
             self.assertIn('out of date', error_output.getvalue())
+
+    def test_verified_rows_cite_only_suites_that_run_where_they_are_cited(self):
+        """The B-suite triage guarantee: a verified row's citations are suites
+        that execute on the citing platform, naming only checked cases."""
+        inventory = json.loads((ROOT / "docs/upstream-parity.json").read_text())
+        platforms = inventory["verification"]["platforms"]
+        entries = (list(inventory["commands"].values()) + inventory["features"] +
+                   inventory.get("linscp_additions", []) +
+                   inventory["capabilities"])
+        for entry in entries:
+            if entry["status"] != "verified":
+                continue
+            label = entry.get("name") or entry.get("id") or "?"
+            for platform, cited in entry["verified_on"].items():
+                flagged = platforms[platform].get("not_runnable", {})
+                for suite in cited:
+                    self.assertNotIn(
+                        suite, flagged,
+                        label + ": verified on " + platform + " via " + suite +
+                        ", which does not run there")
+            if "checks" in entry:
+                checked = set(entry["checks"])
+                for platform, cited in entry["verified_on"].items():
+                    self.assertLessEqual(
+                        set(cited), checked,
+                        label + ": " + platform +
+                        " cites suites with no named cases")
+
+    def test_the_suite_registry_marks_what_does_not_run(self):
+        inventory = json.loads((ROOT / "docs/upstream-parity.json").read_text())
+        report = matrix_report(inventory)
+        platforms = inventory["verification"]["platforms"]
+        flagged = sum(len(record.get("not_runnable", {}))
+                      for record in platforms.values())
+        self.assertGreater(flagged, 0)
+        self.assertEqual(report.count("Not runnable on"), flagged)
+        # The suites the audit found unrunnable are flagged on every platform.
+        for suite in ("unit", "script", "live-sftp", "live-scp", "live-s3",
+                      "live-dav", "live-curl", "live-tunnel", "live-desktop",
+                      "gui-security", "gui-local", "gui-search",
+                      "gui-browser-upload", "gui-local-editor", "gui-desktop-uri",
+                      "gui-shell"):
+            for platform, record in platforms.items():
+                self.assertIn(suite, record.get("not_runnable", {}),
+                              suite + " reads as runnable on " + platform)
 
     def test_the_real_ledger_is_consistent(self):
         """The shipped inventory has to satisfy its own rules, and the evidence

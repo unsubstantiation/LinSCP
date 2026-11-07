@@ -2,9 +2,10 @@
 
 **Date:** 2026-11-06 · **Branch:** `arena/a4f5fe10-linscp` · **Mode:** audit, then A1 fixed on request.
 
-> **Update (same day):** A1, A2 and A3 below have been implemented — see their **Status: fixed**
-> notes for what changed and what still needs a compiler to confirm. The rest of this document is the
-> audit as written, so A4–A9 still describe the tree as it was before those changes.
+> **Update (same day):** A1, A2 and A3 below have been implemented, and the §3 suites have been
+> triaged (B) — see their **Status** notes for what changed and what still needs a compiler to
+> confirm. The rest of this document is the audit as written, so A4–A9 still describe the tree as it
+> was before those changes.
 
 **Question asked:** "Make sure we have full feature parity between the builds."
 **Scope, as confirmed:** the three native builds — `linscp-gui` on Windows (MSVC), `linscp-gui` on
@@ -16,7 +17,7 @@ scope, so HTTP-vs-window asymmetries are excluded by instruction.
 | | Meaning | State |
 |---|---|---|
 | **A. Behavioural parity** | the same click does the same thing on all three builds | **9 defects**, all in shipped code: Windows hit by 7, Debian by 3, Android by 6; 2 are broken on all three. **A1, A2 and A3 are fixed** (see §2) |
-| **B. Evidence parity** | the claim "verified on Windows, Debian *and* Android" is true | **not true today**: of the 24 suites cited for every platform, 8 need a binary this repo does not build, 1 has no build target, 7 are currently failing, and Android executes no Rust test at all |
+| **B. Evidence parity** | the claim "verified on Windows, Debian *and* Android" is true | **triaged** (see §3): the 16 unrunnable suites are flagged per platform (16/20/25 flags), 28 of 176 entries remain verified citing only suites that run where cited, the checker validates every platform's citations and runs in the Debian job; Android still executes no Rust test |
 
 A build can be behaviourally at parity and still fail B, and vice versa. Both are reported below,
 separately, because they are fixed by different work.
@@ -497,6 +498,58 @@ a *Linux runner*.
 is used), but the comment would mislead the next person testing Android; and `sync.keepuptodate-inotify`
 is `verified` on Android where keep-up-to-date cannot start at all (A7).
 
+**Status: triaged.** Every suite the audit found unrunnable is now flagged `not_runnable`, per
+platform, in `docs/upstream-parity.json` — 16 on Linux, 20 on Windows, 25 on Android — each with the
+reason it executes nothing there, and the generated registry renders the flag next to the suite, so a
+reader of the inventory meets the boundary where the citation used to be. The checker enforces what
+the flags say: a `verified` entry may not cite a suite that does not run on the citing platform, and
+every platform's citations are validated against the row's named cases the way only Linux was —
+`verified_on.<platform>` must name only checked suites, and every checked suite must be cited by at
+least one platform. That rule is deliberately subsets, not the strict equality the audit's §5.4
+sentence could be read as asking for: strict equality would force the ledger to cite a Wayland guard
+for Windows or to throw away the Rust suites that genuinely run on two jobs, and the A3 row had
+already anticipated subsets by omitting its Linux-only suite from the other two platforms. Partial
+rows are exempt from the runnable rule on purpose — naming the cases that *would* cover them is how
+the ledger records the way back — and all 74 downgraded capabilities keep their cases and citations
+intact for exactly that reason.
+
+The numbers changed the way the audit said they would: 28 of 176 entries are verified now (26
+capabilities, the `synchronize` command, the `terminal` addition), down from 162, and every one of
+the 28 cites only suites that run where they are cited. All 15 feature areas are `partial`, each with
+a gap naming its downgraded capabilities. The three reproduce lines were rewritten from the workflows
+that actually run — no `linscp-cli`, no `--serve-http` — and the evidence criterion is now an exit-0
+run with `failed=0`, not the `ran>0` the old lines accepted.
+
+Two corrections to the audit as written. First, the exit-0 claim was a mis-measurement: re-run on
+this tree, all seven Python GUI suites exit non-zero on failure (`sys.exit(0 if
+result.wasSuccessful() else 1)` was already at every `__main__` block, including at `80c6bef`), with
+measured counts from 5/5 to 123-of-124 red. The defect that survived into the ledger was never the
+exit code — it was the `ran>0` criterion treating a failing run as evidence, which the rewritten
+`how` lines fix. Second, the `service` suite's Android description and both A3 Android descriptions
+claimed execution the Android job never performs (`cargo test` runs in no Android step; the emulator
+smoke drives the dispatch path without running the Rust cases) — rewritten to state the boundary.
+
+Second-order defects fixed in the same commit: the A3 row's `verified` citations of five red
+`gui-shell` cases (dropped from `checks`, the case names preserved in the row's notes for re-citing);
+`gui-shell-definitions` silently absent from the Windows and Android suite maps (added, flagged, with
+the `#[cfg(target_os = "linux")]` reason a Windows `cargo test` run executes none of its cases);
+`backup.full-export-import`, `desktop.wayland-session` and `platform.conversion-completeness` verified
+on platforms with no runnable evidence for them (now partial, each naming its runnable residue —
+backup on Linux and Windows, the other two on Linux only); B5's watcher comment (it now follows the
+code, which uses `RecommendedWatcher` on every target, instead of naming backends per OS); and B2's
+silent gate — `check_upstream_parity.py` plus `test_parity_inventory.py`,
+`test_platform_conversion.py`, `test_wayland_compatibility.py`, `test_translations.py` and
+`test_repo_hygiene.py` now run in the Debian job, all pure-Python repo-state checks that pass here.
+Evidence: `tools/tests/test_parity_inventory.py` grew five cases (verified-cannot-cite-unrunnable
+with the partial exemption, dangling-flag and missing-reason rejection, per-platform subset
+validation in both directions, a whole-ledger runnable-citation invariant, and registry rendering of
+all 61 flags) — 23 tests, all passing — and both generated reports were regenerated from the ledger.
+What triage does *not* do is repair anything it flags: the live, script, unit and Python GUI suites
+are still unrunnable, Android still executes no Rust test (that is why the backup row is partial and
+why the A2/A3 rows cite only `gui` on Android), and there is still no platform-scoped `verified`
+state for genuinely Linux-only behavior such as the Wayland session — the downgraded rows' acceptance
+criteria name all three as the way back.
+
 ---
 
 ## 4. Platform integrations that need a real device before anyone can claim them
@@ -535,7 +588,12 @@ Ordered by (user impact × confidence) ÷ effort. All are small except where not
    **not runnable** in `docs/upstream-parity.json` (they are not evidence), and make
    `check_upstream_parity.py` validate `windows`/`android` against `checks` the way it already
    validates linux. This is the change that makes every other number in the ledger mean something.
-   *S, high leverage.*
+   *S, high leverage.* — **done**, see the *Status: triaged* note at the end of §3: per-platform
+   flags with reasons, subset validation on every platform plus a runnable rule for `verified`,
+   rewritten reproduce lines with a `failed=0` evidence criterion, the checker and five repo-state
+   suites wired into the Debian job, and 28 of 176 entries left verified. The audit's exit-0 claim
+   about the Python GUI suites was a mis-measurement (all seven exit non-zero; the `ran>0`
+   criterion was the real defect).
 5. **A6 Windows DACL** — a real confidentiality difference on shared machines. *S–M*
 6. **A7 (b) honest refusal for SAF roots** — stop offering sync/keep-up-to-date on a granted folder
    and say why. *S*; the full `LocalFs` routing is *L* and should be a separate decision.

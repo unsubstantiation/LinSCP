@@ -58,6 +58,20 @@ jobs:
       - name: Check the translation catalogs are compiled and current
         run: python3 tools/compile_translations.py --check && python3 tools/check_shared_frontend.py
 
+      # B-suite triage: the parity ledger is only as honest as its checker, and
+      # the checker only guards what CI runs. This validates the ledger itself
+      # (the inventory plus the checker's own regressions) and the repo-state
+      # suites the ledger cites as Linux evidence. All are pure-Python checks
+      # of repo state, so one job running them is enough.
+      - name: Check the parity ledger and its repo-state suites
+        run: |
+          python3 tools/check_upstream_parity.py
+          python3 -m unittest discover -s tools/tests -p test_parity_inventory.py
+          python3 -m unittest discover -s tools/tests -p test_platform_conversion.py
+          python3 -m unittest discover -s tools/tests -p test_wayland_compatibility.py
+          python3 -m unittest discover -s tools/tests -p test_translations.py
+          python3 -m unittest discover -s tools/tests -p test_repo_hygiene.py
+
       # A crate that nothing in the packaging path builds can be broken for
       # weeks while every targeted test passes. Compiling and testing the
       # browser host crate in one go is what keeps that from happening: the

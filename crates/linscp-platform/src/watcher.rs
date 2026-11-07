@@ -1,6 +1,6 @@
-//! Cross-platform local directory and file change watcher (`inotify` on Linux,
-//! `ReadDirectoryChangesW` on Windows, `PollWatcher` on Android) used by
-//! `keepuptodate` and `edit -monitor`.
+//! Cross-platform local directory and file change watcher (the `notify` crate's
+//! `RecommendedWatcher` on every target, so the backend follows the crate's
+//! per-platform default) used by `keepuptodate` and `edit -monitor`.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};

@@ -153,6 +153,7 @@ def check_verification(inventory, entries, errors):
                       "evidence to cite, so nothing may be verified")
         return None
     suites = {}
+    blocked = {}
     for name, record in sorted(platforms.items()):
         for field in ("how", "date"):
             if not str(record.get(field, "")).strip():
@@ -169,7 +170,27 @@ def check_verification(inventory, entries, errors):
             if not str(description).strip():
                 errors.append(f"'{name}' suite '{suite}' is not described: "
                               "say what it proves")
+        # A suite the platform cannot run is not evidence on that platform. The
+        # flag is the machine-readable form of the suite-registry note, and a
+        # verified entry may not cite a flagged suite (enforced below, where the
+        # citations are). Partial and missing entries may still name flagged
+        # suites: that is how the ledger records which cases would cover them
+        # once the suite runs again.
+        flagged = record.get("not_runnable", {})
+        if not isinstance(flagged, dict):
+            errors.append(f"Verification record for '{name}' has a 'not_runnable' "
+                          "that is not a map of suite to reason")
+            flagged = {}
+        for suite, reason in sorted(flagged.items()):
+            if suite not in listed:
+                errors.append(f"Verification record for '{name}' flags an unlisted "
+                              f"suite as not runnable: {suite}")
+            if not str(reason).strip():
+                errors.append(f"'{name}' suite '{suite}' is flagged not runnable "
+                              "without a reason: say why it cannot run there")
         suites[name] = set(listed)
+        blocked[name] = {suite: reason for suite, reason in flagged.items()
+                         if suite in listed}
     covered = {name: 0 for name in suites}
     for entry in entries:
         label = entry.get("name", entry.get("id", entry.get("command", "?")))
@@ -195,6 +216,12 @@ def check_verification(inventory, entries, errors):
             for suite in sorted(unknown):
                 errors.append(f"'{platform}' has no suite '{suite}' to cite "
                               f"for {label}")
+            if entry["status"] == "verified":
+                for suite in sorted(set(cited) & set(blocked[platform])):
+                    errors.append(
+                        f"'{platform}' suite '{suite}' cited for {label} does not "
+                        f"run there ({blocked[platform][suite]}), so it is not "
+                        "evidence")
             covered[platform] += 1
         if entry["status"] == "verified" and set(claimed) != set(suites):
             missing = sorted(set(suites) - set(claimed))
@@ -270,10 +297,32 @@ def check_capabilities(inventory, errors, root=ROOT):
             errors.append(f"{label}: missing yet cites test cases")
         if status == "verified" and not checks:
             errors.append(f"{label}: verified without a test case")
-        cited = set(row.get("verified_on", {}).get("linux", [])) if isinstance(
-            row.get("verified_on"), dict) else set()
-        if checks and set(checks) != cited:
-            errors.append(f"{label}: verified_on.linux must match checked suites")
+        claimed = row.get("verified_on", {})
+        if not isinstance(claimed, dict):
+            claimed = {}
+        if checks:
+            # Every platform is validated against the named cases, not just
+            # linux: a citation is a claim that the suite ran there, so it may
+            # only name suites whose cases the row lists, and every listed
+            # suite has to be cited by at least one platform. Platforms may
+            # cite different subsets - a Linux-only suite cannot be evidence
+            # on Windows - but no platform may cite what the row never names.
+            cited_union = set()
+            for platform in sorted(claimed):
+                cited = claimed[platform]
+                if not isinstance(cited, list):
+                    continue  # check_verification reports the shape, not this rule
+                cited_union |= set(cited)
+                extra = sorted(set(cited) - set(checks))
+                if extra:
+                    errors.append(
+                        f"{label}: verified_on.{platform} names suites without "
+                        f"named cases: {', '.join(extra)}")
+            uncited = sorted(set(checks) - cited_union)
+            if uncited:
+                errors.append(
+                    f"{label}: checked suites are cited by no platform: "
+                    f"{', '.join(uncited)}")
         if not checks and row.get("verified_on"):
             errors.append(f"{label}: cites evidence without test cases")
         for suite, cases in checks.items():
@@ -454,8 +503,14 @@ def matrix_report(inventory):
               'are recorded per platform in the ledger.', '']
     for platform, record in sorted(inventory['verification']['platforms'].items()):
         lines += ['### ' + platform, '', '**Reproduce:** ' + record['how'], '']
+        flagged = record.get('not_runnable', {})
         for suite, description in sorted(record['suites'].items()):
-            lines.append('- [' + suite + '](../' + CASE_SOURCES[suite] + '): ' + markdown_cell(description))
+            line = ('- [' + suite + '](../' + CASE_SOURCES[suite] + '): ' +
+                    markdown_cell(description))
+            if suite in flagged:
+                line += (' **(Not runnable on ' + platform + ': ' +
+                         markdown_cell(flagged[suite]) + '.)**')
+            lines.append(line)
     return '\n'.join(lines) + '\n'
 
 
