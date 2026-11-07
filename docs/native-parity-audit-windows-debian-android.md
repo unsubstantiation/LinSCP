@@ -2,9 +2,9 @@
 
 **Date:** 2026-11-06 · **Branch:** `arena/a4f5fe10-linscp` · **Mode:** audit, then A1 fixed on request.
 
-> **Update (same day):** A1, A2, A3, A4, A6 and A7(b) below have been implemented, and the §3
+> **Update (same day):** A1, A2, A3, A4, A6, A7(b) and A9 below have been implemented, and the §3
 > suites have been triaged (B) — see their **Status** notes for what changed and what still needs
-> a compiler to confirm. The rest of this document is the audit as written, so A5, A8–A9 and the
+> a compiler to confirm. The rest of this document is the audit as written, so A5, A8 and the
 > A7(a) `LocalFs` routing still describe the tree as it was before those changes.
 
 **Question asked:** "Make sure we have full feature parity between the builds."
@@ -503,6 +503,17 @@ stock device), so the parity fix is not a bridge but a **clearer refusal** namin
 right now the user is told nothing about *why*.
 **Effort:** S (message + a capability flag), or leave as documented behaviour.
 
+**Status: fixed.** The refusal now names the platform in both layers. The backend's auth chain
+asks the connector for a `missing_reason` when its stream comes back empty: `SshAgentConnector`
+gains a defaulted method, the system connector answers with a platform reason
+(`SSH_AGENT_MISSING_MESSAGE` on Android, none where the build probes for a socket), and the reason
+becomes the terminal error instead of the generic auth failure. The site dialog shows the same
+story up front through a hint wired to a new bundle `sshAgent` flag via a `hostGap`-style helper,
+failing open for non-Android hosts because the page cannot see the server OS. Ledger row
+`security.agent-android-refusal` is `partial`: the Android-Rust arm runs in no step, so message
+selection on device is review-level until an emulator run attempts agent auth. Reading-level for
+the Rust, as usual: CI compiles it first.
+
 ---
 
 ## 3. Evidence parity (Tier B) — the "verified on all three" claim does not survive inspection
@@ -686,8 +697,9 @@ Ordered by (user impact × confidence) ÷ effort. All are small except where not
    `platform.android-saf-refusals` = `verified`.
 7. **A4 local symlink** — **done**, see A4's *Status: fixed*: a shared `create_local_link` helper
    behind `/api/local/link` and a local branch in `link_remote_async`, one pane-aware page dialog,
-   and the granted-folder refusal in both layers. **A9 Android agent message** still open (small
-   completion, *S*).
+   and the granted-folder refusal in both layers. **A9 Android agent message** — **done**, see
+   A9's *Status: fixed*: a defaulted `missing_reason` on the connector trait, the Android platform
+   message, and a site-dialog hint on a new bundle `sshAgent` flag.
 8. **A5 vault** — decide: wire DPAPI (S) and Keystore (M), or delete the dead surface and correct
    `docs/cross-platform-rust-migration.md:181,202,287`. Either is fine; the current state (code that
    says it is protected, docs that say it is protected, nothing that protects it) is not.

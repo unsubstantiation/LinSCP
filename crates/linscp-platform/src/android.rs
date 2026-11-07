@@ -254,6 +254,10 @@ pub fn atomic_replace(temp_path: &Path, target_path: &Path) -> Result<(), Platfo
     Ok(())
 }
 
+pub fn ssh_agent_missing_reason() -> Option<&'static str> {
+    Some(crate::SSH_AGENT_MISSING_MESSAGE)
+}
+
 pub async fn connect_ssh_agent() -> Result<Option<Box<dyn crate::AsyncStream>>, PlatformError> {
     Ok(None)
 }

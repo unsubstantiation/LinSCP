@@ -175,6 +175,10 @@ pub fn atomic_replace(temp_path: &Path, target_path: &Path) -> Result<(), Platfo
     Ok(())
 }
 
+pub fn ssh_agent_missing_reason() -> Option<&'static str> {
+    None
+}
+
 pub async fn connect_ssh_agent() -> Result<Option<Box<dyn crate::AsyncStream>>, PlatformError> {
     let Some(sock) = std::env::var_os("SSH_AUTH_SOCK").filter(|v| !v.is_empty()) else {
         return Ok(None);

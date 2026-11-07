@@ -4,7 +4,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-84 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+85 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -610,6 +610,18 @@ Password, unencrypted and passphrase-protected private-key (-passphrase=), ssh-a
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
 - [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
+
+## security.agent-android-refusal
+
+**Area:** Security/authentication · **Status:** partial
+
+Agent authentication explains itself when there is no agent to ask. The auth chain asks the connector for a missing reason when its stream comes back empty: SshAgentConnector gains a defaulted missing_reason, SystemSshAgentConnector answers with a platform reason (SSH_AGENT_MISSING_MESSAGE on Android, none where the build probes for a socket), and the reason becomes the terminal error instead of the generic auth failure. The site dialog shows the same story up front through a hostDifferenceReason-backed hint wired to a new bundle sshAgent flag; the hint fails open (any non-Android host is assumed to have an agent) because the page cannot see the server OS, so the backend refusal is the layer that cannot be skipped.
+
+**Next:** The Android-Rust arm — the real connector reporting the platform message through the real chain — executes in no step: Android runs no Rust tests, and the emulator smoke does not attempt agent authentication. Message selection on device is review-level.
+
+**Acceptance criteria:**
+
+- [ ] An emulator or device run attempting agent authentication and showing the platform reason instead of the generic failure.
 
 ## security.curl-pins-and-tls
 

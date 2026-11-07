@@ -71,7 +71,8 @@
           "gui-shell-definitions": "crates/linscp-platform/src/gui_os.rs - the per-user file-manager definitions themselves: what install writes for Dolphin, GNOME Files and Nemo, that a launcher path with a space survives quoting, that the GNOME Files script is valid sh reading NAUTILUS_SCRIPT_SELECTED_FILE_PATHS, that a path no shell can carry is refused by name, and that uninstall removes exactly those three. Linux only: Windows writes one `.cmd` and every other platform refuses.",
           "gui-shell-actions": "crates/linscp-service/src/cli_actions.rs - what the actions do once the arguments are decided: a selection becomes a pending manifest the window reads back, a relative path resolves against the directory it was named in, an empty or vanished selection is refused with the reason on stderr and a failing exit code, and an install that cannot be carried out reports the reason instead of writing something wrong.",
           "service-commands": "cargo test -p linscp-service's own Rust tests for the saved-command run path: the endpoint the page's Run button posts to (an unknown name, a saved template answered per selected file, a name with a space kept one operand, a side/pane mismatch refused) and the expansion layer behind it - one placeholder expansion quoted for the interpreter's tokenizer rather than for a shell, a hostile name proving to be one operand of the tokenized line and none other, {files} covering the whole selection, a template that names no file running once, one file's failure or refused name not stopping the rest, a side/pane disagreement refused by name instead of run on a same-named file of the other side, the store the dialog saves into being the one the run reads, and every shipped template starting with a command the interpreter knows.",
-          "platform-windows-acl": "crates/linscp-platform/src/windows.rs - the owner-only DACL on the configuration and staging directories: `ensure_private_dir` applies `D:P(A;OICI;FA;;;OW)` (protected, owner full access, inherited by children), and the tests read the DACL back - exactly one ACE, allow type, full-access mask, object+container inherit flags - for a pre-existing directory, a child created inside, and a second application. Windows-only suite: no Linux step can execute these tests, so Linux cites other suites instead."
+          "platform-windows-acl": "crates/linscp-platform/src/windows.rs - the owner-only DACL on the configuration and staging directories: `ensure_private_dir` applies `D:P(A;OICI;FA;;;OW)` (protected, owner full access, inherited by children), and the tests read the DACL back - exactly one ACE, allow type, full-access mask, object+container inherit flags - for a pre-existing directory, a child created inside, and a second application. Windows-only suite: no Linux step can execute these tests, so Linux cites other suites instead.",
+          "proto-ssh": "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs - the SSH/SFTP/SCP/tunnel protocol behaviour against the mock server: host-key acceptance and pins, the authentication chain (explicit key, agent, password, keyboard-interactive), and here the agent step - a connector with no agent contributes its reason to the terminal error, while a silent connector falls back to the generic auth failure."
         },
         "not_runnable": {
           "gui-browser-upload": "red: 10/10 fail against the shipped service",
@@ -125,7 +126,8 @@
           "gui-shell-actions": "the same `cli_actions` tests, and the Windows job's Explorer smoke test, which runs the installed Send To shortcut on a real file and reads the manifest it produced.",
           "service-commands": "cargo test -p linscp-service's own Rust tests for the saved-command run path: the endpoint the page's Run button posts to (an unknown name, a saved template answered per selected file, a name with a space kept one operand, a side/pane mismatch refused) and the expansion layer behind it - one placeholder expansion quoted for the interpreter's tokenizer rather than for a shell, a hostile name proving to be one operand of the tokenized line and none other, {files} covering the whole selection, a template that names no file running once, one file's failure or refused name not stopping the rest, a side/pane disagreement refused by name instead of run on a same-named file of the other side, the store the dialog saves into being the one the run reads, and every shipped template starting with a command the interpreter knows.",
           "gui-shell-definitions": "crates/linscp-platform/src/gui_os.rs - the per-user file-manager definitions themselves: what install writes for Dolphin, GNOME Files and Nemo, that a launcher path with a space survives quoting, that the GNOME Files script is valid sh reading NAUTILUS_SCRIPT_SELECTED_FILE_PATHS, that a path no shell can carry is refused by name, and that uninstall removes exactly those three. Linux only: Windows writes one `.cmd` and every other platform refuses. On Windows `cargo test` executes none of the four cases (they are Linux-only), so Windows cites other suites instead.",
-          "platform-windows-acl": "crates/linscp-platform/src/windows.rs - the owner-only DACL on the configuration and staging directories: `ensure_private_dir` applies `D:P(A;OICI;FA;;;OW)` (protected, owner full access, inherited by children), and the tests read the DACL back - exactly one ACE, allow type, full-access mask, object+container inherit flags - for a pre-existing directory, a child created inside, and a second application. Windows only."
+          "platform-windows-acl": "crates/linscp-platform/src/windows.rs - the owner-only DACL on the configuration and staging directories: `ensure_private_dir` applies `D:P(A;OICI;FA;;;OW)` (protected, owner full access, inherited by children), and the tests read the DACL back - exactly one ACE, allow type, full-access mask, object+container inherit flags - for a pre-existing directory, a child created inside, and a second application. Windows only.",
+          "proto-ssh": "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs - the SSH/SFTP/SCP/tunnel protocol behaviour against the mock server: host-key acceptance and pins, the authentication chain (explicit key, agent, password, keyboard-interactive), and here the agent step - a connector with no agent contributes its reason to the terminal error, while a silent connector falls back to the generic auth failure."
         },
         "not_runnable": {
           "gui-browser-upload": "red: 10/10 fail against the shipped service",
@@ -182,7 +184,8 @@
           "gui-shell-actions": "The `cli_actions` behavior is Android-relevant (the share sheet records the same manifest the actions write), but no Android step executes these tests, so they are not cited for Android.",
           "service-commands": "cargo test -p linscp-service's own Rust tests for the saved-command run path: the endpoint the page's Run button posts to (an unknown name, a saved template answered per selected file, a name with a space kept one operand, a side/pane mismatch refused) and the expansion layer behind it - one placeholder expansion quoted for the interpreter's tokenizer rather than for a shell, a hostile name proving to be one operand of the tokenized line and none other, {files} covering the whole selection, a template that names no file running once, one file's failure or refused name not stopping the rest, a side/pane disagreement refused by name instead of run on a same-named file of the other side, the store the dialog saves into being the one the run reads, and every shipped template starting with a command the interpreter knows.",
           "gui-shell-definitions": "The per-user file-manager definitions (Dolphin, GNOME Files, Nemo on Linux; one `.cmd` on Windows; Android refuses by name). No Android step executes these tests, so Android cites other suites instead.",
-          "platform-windows-acl": "crates/linscp-platform/src/windows.rs - the owner-only DACL on the configuration and staging directories: `ensure_private_dir` applies `D:P(A;OICI;FA;;;OW)` (protected, owner full access, inherited by children), and the tests read the DACL back - exactly one ACE, allow type, full-access mask, object+container inherit flags - for a pre-existing directory, a child created inside, and a second application. Windows-only suite: no Android step can execute these tests, so Android cites other suites instead."
+          "platform-windows-acl": "crates/linscp-platform/src/windows.rs - the owner-only DACL on the configuration and staging directories: `ensure_private_dir` applies `D:P(A;OICI;FA;;;OW)` (protected, owner full access, inherited by children), and the tests read the DACL back - exactly one ACE, allow type, full-access mask, object+container inherit flags - for a pre-existing directory, a child created inside, and a second application. Windows-only suite: no Android step can execute these tests, so Android cites other suites instead.",
+          "proto-ssh": "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs - the SSH/SFTP/SCP/tunnel protocol behaviour against the mock server: host-key acceptance and pins, the authentication chain (explicit key, agent, password, keyboard-interactive), and here the agent step - a connector with no agent contributes its reason to the terminal error, while a silent connector falls back to the generic auth failure. No Android step executes these Rust cases, so Android cites other suites instead."
         },
         "not_runnable": {
           "backup": "no Rust test executes in the Android job",
@@ -210,7 +213,8 @@
           "service-commands": "no Rust test executes in the Android job",
           "translation-tests": "locale-catalog check; no Android step runs it",
           "unit": "no build target: CMakeLists.txt declares LANGUAGES NONE, and neither libssh nor PathUtil headers are vendored, so it cannot be compiled",
-          "wayland-compatibility": "Linux display-server guard; no Android step runs it"
+          "wayland-compatibility": "Linux display-server guard; no Android step runs it",
+          "proto-ssh": "no Rust test executes in the Android job"
         }
       }
     }
@@ -3251,6 +3255,51 @@
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
         "Give UnitTest.cpp a build target, or port its cases to Rust tests."
+      ]
+    },
+    {
+      "id": "security.agent-android-refusal",
+      "area": "Security/authentication",
+      "status": "partial",
+      "notes": "Agent authentication explains itself when there is no agent to ask. The auth chain asks the connector for a missing reason when its stream comes back empty: SshAgentConnector gains a defaulted missing_reason, SystemSshAgentConnector answers with a platform reason (SSH_AGENT_MISSING_MESSAGE on Android, none where the build probes for a socket), and the reason becomes the terminal error instead of the generic auth failure. The site dialog shows the same story up front through a hostDifferenceReason-backed hint wired to a new bundle sshAgent flag; the hint fails open (any non-Android host is assumed to have an agent) because the page cannot see the server OS, so the backend refusal is the layer that cannot be skipped.",
+      "source": [
+        "crates/linscp-proto/src/ssh.rs",
+        "crates/linscp-platform/src/lib.rs",
+        "ui/src/platform/capabilities.ts",
+        "source/gui/web/index.html"
+      ],
+      "checks": {
+        "proto-ssh": [
+          "sftp_agent_absence_names_its_reason"
+        ],
+        "ui-transport": [
+          "all native targets expose the shared feature contract and report only installed host integrations"
+        ],
+        "gui": [
+          "the site dialog explains a missing SSH agent",
+          "the agent hint hides when the host has an agent",
+          "the agent gap asks the bundle for the reason"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "proto-ssh",
+          "ui-transport",
+          "gui"
+        ],
+        "windows": [
+          "proto-ssh",
+          "ui-transport",
+          "gui"
+        ],
+        "android": [
+          "ui-transport",
+          "gui"
+        ]
+      },
+      "gap": "The Android-Rust arm \u2014 the real connector reporting the platform message through the real chain \u2014 executes in no step: Android runs no Rust tests, and the emulator smoke does not attempt agent authentication. Message selection on device is review-level.",
+      "acceptance": [
+        "An emulator or device run attempting agent authentication and showing the platform reason instead of the generic failure."
       ]
     },
     {

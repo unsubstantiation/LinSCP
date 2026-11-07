@@ -49,6 +49,8 @@ export interface HostCapabilities {
   terminal: boolean;
   /** Transfers keep running after the app is closed or backgrounded. */
   backgroundTransfers: boolean;
+  /** The backend can ask an SSH agent for keys during login. */
+  sshAgent: boolean;
 }
 
 export interface HostGlobals {
@@ -113,6 +115,8 @@ export interface HostCapabilityOptions {
   accounts?: boolean;
   desktopLaunchers?: boolean;
   terminal?: boolean;
+  /** Backend can reach an SSH agent (the shell may know better). */
+  sshAgent?: boolean;
 }
 
 /**
@@ -143,6 +147,7 @@ export function hostCapabilities(options: HostCapabilityOptions = {}): HostCapab
     safTrees,
     shareIntents,
     foregroundTransfers,
+    sshAgent: options.sshAgent ?? !android,
     fileDrop: true,
     nativeFileDrop: options.nativeFileDrop ?? (native && !android),
     accounts: options.accounts ?? !native,
@@ -211,6 +216,9 @@ export function hostDifferenceReason(
   }
   if (capability === 'accounts' && !caps.accounts) {
     return 'The native application does not require a sign-in.';
+  }
+  if (capability === 'sshAgent' && !caps.sshAgent) {
+    return 'SSH agent authentication is not available on this build; use a private key file instead.';
   }
   return null;
 }

@@ -99,6 +99,9 @@ CASE_SOURCES = {
     # than trusting the call that set it, so they fail on an inherited DACL even
     # where only one user exists. Windows-only; the other platforms flag it.
     "platform-windows-acl": "crates/linscp-platform/src/windows.rs",
+    # The SSH/SFTP/SCP/tunnel protocol behaviour against the mock server.
+    # Android runs no Rust tests, so Android rows cite other suites instead.
+    "proto-ssh": "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs",
 }
 
 
@@ -351,7 +354,7 @@ def check_capabilities(inventory, errors, root=ROOT):
                     expression = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
                 elif suite in ("service", "service-commands", "gui-cli",
                                "gui-shell-definitions", "gui-shell-actions",
-                               "platform-windows-acl"):
+                               "platform-windows-acl", "proto-ssh"):
                     # A Rust test is a #[test]/#[tokio::test] function, not a
                     # `test_*` ffi symbol; the drop helpers are `async fn`.
                     expression = r"\b(?:async\s+)?fn\s+" + re.escape(case) + r"\s*\("

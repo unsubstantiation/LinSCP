@@ -336,6 +336,15 @@ test('all native targets expose the shared feature contract and report only inst
   assert.match(hostDifferenceReason('safTrees', missingAndroidBridge) ?? '', /not available/);
   assert.match(hostDifferenceReason('shareIntents', missingAndroidBridge) ?? '', /not integrated/);
 
+  // SSH agent lookup is the inverse: every build assumes an agent except the
+  // Android backend, which has none, and the gap always has a stated reason.
+  assert.equal(debian.sshAgent, true);
+  assert.equal(windows.sshAgent, true);
+  assert.equal(browser.sshAgent, true);
+  assert.equal(android.sshAgent, false);
+  assert.equal(hostDifferenceReason('sshAgent', debian), null);
+  assert.match(hostDifferenceReason('sshAgent', android) ?? '', /private key file/);
+
   // A missing control always has a stated reason; silent capability gaps are
   // the parity bug this inventory exists to catch.
   assert.equal(hostDifferenceReason('desktopLaunchers', android), null);

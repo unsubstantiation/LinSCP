@@ -708,6 +708,7 @@
           <div class="form-row remote-only-row"><label>User name:</label><input type="text" id="siteUser" class="input-field" value="user"></div>
           <div class="form-row remote-only-row"><label>Password:</label><input type="password" id="sitePass" class="input-field" placeholder="(not stored by default)"></div>
           <div class="form-row remote-only-row"><label>Private key:</label><input type="text" id="siteKey" class="input-field" placeholder="path/to/key"></div>
+          <div class="hint remote-only-row" id="siteAgentHint" hidden></div>
           <div class="form-row remote-only-row"><label>Host key:</label><input type="text" id="siteHostKey" class="input-field" placeholder="empty = check it on the first connection"></div>
           <details id="siteTunnelSettings" class="remote-only-row">
             <summary>SSH tunnel</summary>
@@ -1775,6 +1776,24 @@
     if (!caps || caps[capability]) return null;
     const explain = window.LinSCPCore.hostDifferenceReason;
     return typeof explain === 'function' ? explain(capability, caps) : null;
+  }
+
+  /* The reason agent login is not offered, or null when this host has an
+   * agent. A unit can pass capabilities in; the live page reads the cached
+   * host set. The wording lives in the shared bundle so the hint and the
+   * backend's own refusal tell one story. */
+  function sshAgentGap(caps) {
+    const c = caps || hostCaps();
+    if (!c || c.sshAgent) return null;
+    if (!window.LinSCPCore || typeof window.LinSCPCore.hostDifferenceReason !== 'function') return null;
+    return window.LinSCPCore.hostDifferenceReason('sshAgent', c);
+  }
+
+  function updateAgentHint(reason) {
+    const hint = $('siteAgentHint');
+    if (!hint) return;
+    hint.hidden = !reason;
+    hint.textContent = reason || '';
   }
 
   /* The reason a local action is not offered for this path, or null when the
@@ -5526,6 +5545,9 @@
   async function boot() {
     applyExplorerMode();
     mountShell();
+    /* The agent hint is static per host: say once why agent login is not
+     * offered instead of failing the connection later. */
+    updateAgentHint(sshAgentGap());
     listenForNativeDrops();
     await checkAccounts();
     if (!accountsEnabled || signedInAs) {

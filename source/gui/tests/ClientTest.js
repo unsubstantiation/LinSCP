@@ -1722,6 +1722,32 @@ function options(id) {
   await window.loadLocal('/tmp/slowlocal');
   if (safStubInstalled) window.LinSCPCore.safLimitationReason = undefined;
 
+  // ---- Missing SSH agent ------------------------------------------------
+  // The site dialog names the reason agent login is not offered instead of
+  // failing the connection later; the wording comes from the shared bundle.
+  window.updateAgentHint('stub no agent');
+  check('the site dialog explains a missing SSH agent',
+    doc.getElementById('siteAgentHint').hidden === false &&
+      text('siteAgentHint') === 'stub no agent',
+    text('siteAgentHint'));
+  window.updateAgentHint(null);
+  check('the agent hint hides when the host has an agent',
+    doc.getElementById('siteAgentHint').hidden === true,
+    String(doc.getElementById('siteAgentHint').hidden));
+
+  let agentStubInstalled = false;
+  if (!window.LinSCPCore || typeof window.LinSCPCore.hostDifferenceReason !== 'function') {
+    window.LinSCPCore = window.LinSCPCore || {};
+    window.LinSCPCore.hostDifferenceReason = () => 'stub no agent';
+    agentStubInstalled = true;
+  }
+  const agentReason = window.sshAgentGap({ sshAgent: false });
+  check('the agent gap asks the bundle for the reason',
+    (agentStubInstalled ? agentReason === 'stub no agent' : agentReason.includes('private key')) &&
+      window.sshAgentGap({ sshAgent: true }) === null,
+    String(agentReason));
+  if (agentStubInstalled) window.LinSCPCore.hostDifferenceReason = undefined;
+
   check('no script errors', errors.length === 0, errors.join(' | '));
   window.close();
 })();

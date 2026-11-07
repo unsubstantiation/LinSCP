@@ -142,6 +142,10 @@ mod fallback_unix {
         Err(PlatformError::Unsupported("no FIFO on this platform".to_string()))
     }
 
+    pub fn ssh_agent_missing_reason() -> Option<&'static str> {
+        None
+    }
+
     pub async fn connect_ssh_agent() -> Result<Option<Box<dyn crate::AsyncStream>>, PlatformError> {
         Ok(None)
     }
@@ -155,6 +159,11 @@ const MASTER_KEY_LEN: usize = 32;
 const DPAPI_KEY_PREFIX: &str = "dpapi1$";
 #[cfg(target_os = "android")]
 const ANDROID_KEYSTORE_PREFIX: &str = "aks1$";
+
+/// User-facing reason reported when SSH agent authentication fails on a
+/// platform that has no agent at all. Linux and Windows builds probe for an
+/// agent socket instead, so they report no static reason.
+pub const SSH_AGENT_MISSING_MESSAGE: &str = "SSH agent authentication is not available on Android: the platform has no agent. Use a private key file instead.";
 
 #[derive(Debug, Error)]
 pub enum PlatformError {
@@ -592,6 +601,12 @@ impl LocalFs for NativeLocalFs {
         }
         sys::set_mode(Path::new(path), mode)
     }
+}
+
+/// Static reason a platform reports when it has no SSH agent to ask, or
+/// `None` when the build probes for an agent socket instead.
+pub fn ssh_agent_missing_reason() -> Option<&'static str> {
+    sys::ssh_agent_missing_reason()
 }
 
 /// Default per-user configuration directory (`~/.config/linscp` on Linux,
@@ -1133,5 +1148,18 @@ mod tests {
                 "{bad} must not be accepted as a SAF tree"
             );
         }
+    }
+
+    #[test]
+    fn ssh_agent_missing_message_names_platform_and_key_fallback() {
+        assert!(SSH_AGENT_MISSING_MESSAGE.contains("Android"));
+        assert!(SSH_AGENT_MISSING_MESSAGE.contains("private key"));
+        #[cfg(not(target_os = "android"))]
+        assert_eq!(ssh_agent_missing_reason(), None);
+        #[cfg(target_os = "android")]
+        assert_eq!(
+            ssh_agent_missing_reason(),
+            Some(SSH_AGENT_MISSING_MESSAGE)
+        );
     }
 }
