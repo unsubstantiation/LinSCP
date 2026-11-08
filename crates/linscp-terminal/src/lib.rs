@@ -256,6 +256,7 @@ enum Query {
     /// from the listener because the listener is called while the terminal is
     /// borrowed, and a report is the answer to a question the parse itself
     /// asked.
+    PtyWrite(String),
 }
 
 /// What the listener reports upwards, and what the screen answers with.
