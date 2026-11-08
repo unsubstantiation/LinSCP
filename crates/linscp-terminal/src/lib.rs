@@ -706,12 +706,18 @@ pub const DEFAULT_PALETTE: [Rgb; 16] = [
 /// answer falls back to the foreground, because text is what a renderer is
 /// drawing when it asks.
 pub fn named_color_rgb(named: i16) -> Rgb {
+    // `NamedColor` counts its bright half straight on from its normal half -
+    // BrightBlack is 8, BrightRed 9 - so the value is already the palette
+    // index. Subtracting one here would paint every bright colour with the
+    // grey that precedes it.
     match named {
-        0..=7 => DEFAULT_PALETTE[named as usize],
-        9..=15 => DEFAULT_PALETTE[(named - 1) as usize],
+        0..=15 => DEFAULT_PALETTE[named as usize],
         256 => DEFAULT_PALETTE[7],
         257 => DEFAULT_PALETTE[0],
         258 => DEFAULT_PALETTE[7],
+        259..=266 => DEFAULT_PALETTE[(named - 259) as usize],
+        267 => DEFAULT_PALETTE[15],
+        268 => DEFAULT_PALETTE[7],
         _ => DEFAULT_PALETTE[7],
     }
 }
@@ -756,8 +762,7 @@ pub fn resolve_color(color: &CellColor, theme: &Theme) -> Rgb {
     }
     if color.named >= 0 {
         return match color.named {
-            0..=7 => theme.palette[color.named as usize],
-            9..=15 => theme.palette[(color.named - 1) as usize],
+            0..=15 => theme.palette[color.named as usize],
             256 => theme.foreground,
             257 => theme.background,
             258 => theme.cursor,
@@ -838,7 +843,10 @@ mod tests {
         screen.advance(b"31mred");
         let frame = screen.snapshot();
         assert_eq!(lines_of(&frame)[0], "red");
-        assert_eq!(frame.cells[0].fg.indexed, 1, "SGR 31 selects palette colour 1");
+        // SGR 31 is a *named* colour, so the model reports it by name and the
+        // renderer resolves it against the theme; only SGR 38;5;n is indexed.
+        assert_eq!(frame.cells[0].fg.named, 1, "SGR 31 selects palette colour 1");
+        assert_eq!(frame.cells[0].fg.indexed, -1, "a named colour is not indexed");
         assert_eq!(frame.cells[0].text, vec!['r' as u32]);
     }
 
@@ -1065,8 +1073,40 @@ mod tests {
         // entries for both halves, and an off-by-one here recolours every
         // bright colour in the app.
         assert_eq!(named_color_rgb(8), DEFAULT_PALETTE[8]);
+        assert_eq!(named_color_rgb(9), DEFAULT_PALETTE[9]);
         assert_eq!(named_color_rgb(15), DEFAULT_PALETTE[15]);
         assert_eq!(named_color_rgb(0), DEFAULT_PALETTE[0]);
+        // The normal and bright halves are sixteen distinct palette entries; a
+        // bright colour that landed on the entry before it would make
+        // `ls --color` unreadable in the most literal way.
+        let mut seen = std::collections::HashSet::new();
+        for named in 0..16 {
+            assert!(seen.insert(named_color_rgb(named)), "named colour {named} shares a palette entry");
+        }
+        // The dim variants count on after the cursor, and the bright
+        // foreground answers with the bright white entry.
+        assert_eq!(named_color_rgb(259), DEFAULT_PALETTE[0]);
+        assert_eq!(named_color_rgb(266), DEFAULT_PALETTE[7]);
+        assert_eq!(named_color_rgb(267), DEFAULT_PALETTE[15]);
+        assert_eq!(named_color_rgb(256), DEFAULT_PALETTE[7]);
+        assert_eq!(named_color_rgb(257), DEFAULT_PALETTE[0]);
+    }
+
+    /// A shell that prints a normal and a bright colour and reads them back
+    /// must get two different colours, and the bright one must be the bright
+    /// palette entry. Named colours are what `ls --color` and every prompt
+    /// actually emit, so this is the path a person stares at all day.
+    #[test]
+    fn named_and_bright_named_colours_resolve_to_distinct_palette_entries() {
+        let mut screen = screen(20, 2);
+        screen.advance(b"\x1b[31mR\x1b[91mB");
+        let frame = screen.snapshot();
+        let theme = Theme::default();
+        let normal = resolve_color(&frame.cells[0].fg, &theme);
+        let bright = resolve_color(&frame.cells[1].fg, &theme);
+        assert_eq!(normal, DEFAULT_PALETTE[1]);
+        assert_eq!(bright, DEFAULT_PALETTE[9], "SGR 91 is bright red, not palette 8");
+        assert_ne!(normal, bright);
     }
 
     #[test]
