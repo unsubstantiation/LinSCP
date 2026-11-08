@@ -10013,7 +10013,10 @@ mod tests {
         let missing = svc.dispatch_async(sample(json!({"tabs": [999]}))).await;
         assert_eq!(missing.status, 200);
         assert_eq!(missing.payload["samples"][0]["status"], "disconnected");
-        let local = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp}}) }).await;
+        // A local tab has two panes, and opening one without its second
+        // directory is refused, so both are named here.
+        let local = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp, "other_local_dir": tmp}}) }).await;
+        assert_eq!(local.status, 200, "{}", local.payload);
         let id = local.payload["tab"]["id"].as_u64().unwrap();
         let unsupported = svc.dispatch_async(sample(json!({"tabs": [id]}))).await;
         assert_eq!(unsupported.payload["samples"][0]["status"], "unsupported");
