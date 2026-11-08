@@ -678,8 +678,8 @@ fn parse_amd(static_text: &str, metric_text: &str) -> Vec<MonitorGpu> {
     if !statics.is_empty() || !metrics.is_empty() {
         let ids = statics.keys().chain(metrics.keys()).copied().collect::<BTreeSet<_>>();
         return ids.into_iter().map(|id| {
-            let stat = statics.get(id);
-            let metric = metrics.get(id);
+            let stat = statics.get(&id);
+            let metric = metrics.get(&id);
             let field = |root: Option<&Value>, a: &str, b: &str| root.and_then(|v| v.get(a)).and_then(|v| v.get(b));
             let temp = metric.and_then(|v| v.get("temperature"));
             let hotspot = json_number(temp.and_then(|v| v.get("hotspot")));
