@@ -10,9 +10,10 @@ the same Rust transfer engine, so a control in the page is not one only one host
 can reach. No separate command-line client is built or distributed. **The native
 GUI is experimental and is not ready for production transfers.** Remote listing
 and queued file uploads and downloads are implemented. A shared multi-server
-monitor displays Linux CPU/per-core, RAM, disk and NVIDIA/AMD GPU telemetry over
-authenticated SSH sessions, with saved-site selection, configurable refresh,
-compact GPU cards and an embedded SSH shell; see `docs/server-monitor.md`. SFTP and plain HTTP
+monitor displays Linux CPU/per-core, RAM, swap, disk, load, network and NVIDIA/AMD
+GPU telemetry over authenticated SSH sessions, with saved-site selection,
+sparklines, custom metrics, outage alerts, persisted settings, compact GPU cards
+and an embedded SSH shell; see `docs/server-monitor.md`. SFTP and plain HTTP
 WebDAV connections and transfers have live integration tests; FTP, explicit FTPS
 and implicit FTPS staged uploads, plus FTP/explicit FTPS downloads and S3 small-file
 transfers, also have live tests. SFTP and WebDAV directories can be copied between

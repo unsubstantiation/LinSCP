@@ -13,8 +13,10 @@ transfer limitations in `readme.md` before using remote operations.
   directory.
 - The multi-server monitor is wired through the shared service in both hosts:
   connected SSH/SFTP/SCP tabs and saved SSH sites, bounded concurrent Linux
-  probes, CPU/per-core/RAM/disk/GPU telemetry, stale/error display, configurable
-  refresh, compact GPU cards and reuse of the embedded terminal. Saved-site
+  probes, CPU/per-core/RAM/swap/disk/load/network/GPU telemetry, sparklines,
+  custom metrics, outage/recovery alerts, persisted settings, per-server
+  pause/metric configuration, stale/error display, configurable refresh, compact
+  GPU cards and reuse of the embedded terminal. Saved-site
   connections keep the normal host-key challenge. See `docs/server-monitor.md`
   for sensor, protocol and import limitations.
 - Remote connections, host-key approval, listings, reconnect, SFTP/FTP/FTPS/

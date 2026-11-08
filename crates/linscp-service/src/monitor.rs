@@ -1,16 +1,23 @@
-//! Read-only Linux server telemetry over an existing authenticated SSH channel.
-//! No shell command contains user input. CPU usage uses counter deltas between
-//! polls, so the first poll reports unknown rather than a fabricated percentage.
+//! Linux server telemetry over an existing authenticated SSH channel.
+//! The built-in probe is fixed and read-only. User-approved custom metrics are
+//! isolated in subshells and delimited by a per-poll nonce. CPU and network
+//! rates use counter deltas, so the first poll reports unknown rather than a
+//! fabricated percentage.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use linscp_platform::write_private_file_atomic;
 use linscp_proto::ssh::SshConnection;
 use linscp_types::{
-    MonitorCpu, MonitorCpuCore, MonitorCpuThread, MonitorDisk, MonitorGpu,
-    MonitorMemory, MonitorSample, MonitorSnapshot,
+    MonitorCpu, MonitorCpuCore, MonitorCpuThread, MonitorCustomMetric, MonitorCustomReading,
+    MonitorDisk, MonitorGpu, MonitorHostConfig, MonitorMemory, MonitorMetricDisplay,
+    MonitorMetricParse, MonitorNetwork, MonitorSample, MonitorSettingsDocument, MonitorSnapshot,
+    MonitorSwap,
 };
+use rand::Rng;
 use serde_json::Value;
 
 pub const MAX_HOSTS: usize = 32;
@@ -20,6 +27,11 @@ pub const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CORES: usize = 4096;
 const MAX_DEVICES: usize = 256;
 const MARKER: &str = "__LINSCP_MONITOR_";
+const CUSTOM_BEGIN: &str = "__LINSCP_MONITOR_CUSTOM_BEGIN_";
+const CUSTOM_END: &str = "__LINSCP_MONITOR_CUSTOM_END_";
+pub const MAX_CUSTOM_METRICS: usize = 8;
+const MAX_CUSTOM_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_CUSTOM_TEXT_CHARS: usize = 4096;
 
 /// Fixed, non-mutating probe. Optional vendor failures do not fail Linux stats.
 /// Marker lines let parsers keep empty/error sections separate without trusting
@@ -33,6 +45,7 @@ pub const PROBE_COMMAND: &str = concat!(
     "printf '\\n__LINSCP_MONITOR_DISK\\n'; df -Pk 2>/dev/null; ",
     "printf '\\n__LINSCP_MONITOR_HOST\\n'; hostname 2>/dev/null; hostname -I 2>/dev/null; ",
     "printf '\\n__LINSCP_MONITOR_UPTIME\\n'; cat /proc/uptime /proc/loadavg 2>/dev/null; ",
+    "printf '\\n__LINSCP_MONITOR_NETWORK\\n'; cat /proc/net/dev 2>/dev/null; ",
     "printf '\\n__LINSCP_MONITOR_NVIDIA\\n'; ",
     "if command -v nvidia-smi >/dev/null 2>&1; then ",
     "nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu,power.draw,power.limit,temperature.gpu,temperature.gpu.tlimit,driver_version,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader,nounits 2>/dev/null || ",
@@ -56,6 +69,104 @@ pub fn validate_timeout(value: Option<&Value>) -> Result<Duration, String> {
     Ok(Duration::from_secs_f64(seconds))
 }
 
+pub fn config_key_for_session(site: Option<&str>, host: &str, port: u16) -> String {
+    match site.filter(|name| !name.is_empty()) {
+        Some(name) => format!("site:{name}"),
+        // deliberately omit the login name: monitor host lists stay credential-free
+        None => format!("ssh:{host}:{port}"),
+    }
+}
+
+pub fn load_settings(config_root: &Path) -> MonitorSettingsDocument {
+    let path = config_root.join("monitor.json");
+    let Ok(raw) = std::fs::read_to_string(path) else { return MonitorSettingsDocument::default() };
+    serde_json::from_str::<MonitorSettingsDocument>(&raw)
+        .ok()
+        .and_then(|doc| validate_settings(doc).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_settings(config_root: &Path, doc: MonitorSettingsDocument) -> Result<MonitorSettingsDocument, String> {
+    let doc = validate_settings(doc)?;
+    let mut rendered = serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?;
+    rendered.push(b'\n');
+    write_private_file_atomic(&config_root.join("monitor.json"), &rendered).map_err(|e| e.to_string())?;
+    Ok(doc)
+}
+
+pub fn validate_settings(mut doc: MonitorSettingsDocument) -> Result<MonitorSettingsDocument, String> {
+    if doc.version != 1 { return Err("Unsupported monitor settings version.".into()); }
+    let s = &doc.settings;
+    if !s.interval_secs.is_finite() || !(0.1..=60.0).contains(&s.interval_secs) {
+        return Err("Monitor interval must be between 0.1 and 60 seconds.".into());
+    }
+    if !s.connect_timeout_secs.is_finite() || !(1.0..=60.0).contains(&s.connect_timeout_secs) {
+        return Err("Monitor connect timeout must be between 1 and 60 seconds.".into());
+    }
+    if !s.poll_timeout_secs.is_finite() || !(0.1..=30.0).contains(&s.poll_timeout_secs) {
+        return Err("Monitor poll timeout must be between 0.1 and 30 seconds.".into());
+    }
+    if !(1..=100).contains(&s.outage_threshold) { return Err("Outage threshold must be between 1 and 100 polls.".into()); }
+    if s.beep_cooldown_secs > 600 { return Err("Beep cooldown must be between 0 and 600 seconds.".into()); }
+    if doc.hosts.len() > 256 { return Err("Too many monitored host configurations.".into()); }
+    for (key, host) in &mut doc.hosts {
+        if key.is_empty() || key.len() > 256 || key.chars().any(char::is_control) {
+            return Err("Invalid monitor host key.".into());
+        }
+        let mut seen = BTreeSet::new();
+        host.enabled_metrics.retain(|metric| matches!(metric.as_str(), "cpu" | "mem" | "swap" | "disk" | "load" | "net" | "gpu") && seen.insert(metric.clone()));
+        if host.custom_metrics.len() > MAX_CUSTOM_METRICS {
+            return Err(format!("At most {MAX_CUSTOM_METRICS} custom metrics are allowed per server."));
+        }
+        let mut ids = BTreeSet::new();
+        for metric in &mut host.custom_metrics {
+            metric.id = metric.id.trim().to_string();
+            metric.name = metric.name.trim().chars().take(80).collect();
+            metric.command = metric.command.replace('\r', "").trim().to_string();
+            metric.unit = metric.unit.trim().chars().take(16).collect();
+            if metric.id.is_empty() || metric.id.len() > 64 || !metric.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') || !ids.insert(metric.id.clone()) {
+                return Err("Custom metric IDs must be unique, 1-64 ASCII letters, digits, '-' or '_'.".into());
+            }
+            if metric.name.is_empty() { return Err("A custom metric name is required.".into()); }
+            if metric.command.is_empty() || metric.command.len() > 4096 || metric.command.contains('\0') {
+                return Err("A custom metric command must be 1-4096 characters and contain no NUL.".into());
+            }
+            if metric.unit.chars().any(char::is_control) { return Err("Custom metric units cannot contain control characters.".into()); }
+            if metric.parse == MonitorMetricParse::Regex {
+                let pattern = metric.regex.as_deref().unwrap_or("").trim();
+                if pattern.is_empty() || pattern.len() > 256 { return Err("A regex custom metric needs a pattern of 1-256 characters.".into()); }
+                regex::Regex::new(pattern).map_err(|e| format!("Invalid custom metric regex: {e}"))?;
+                metric.regex = Some(pattern.to_string());
+            } else {
+                metric.regex = None;
+            }
+            if metric.parse == MonitorMetricParse::Text { metric.display = MonitorMetricDisplay::Text; }
+        }
+    }
+    Ok(doc)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+fn probe_nonce() -> String {
+    let mut rng = rand::thread_rng();
+    format!("{:016x}{:016x}", rng.gen::<u64>(), rng.gen::<u64>())
+}
+
+pub fn build_probe_command(customs: &[MonitorCustomMetric], nonce: &str) -> String {
+    let mut script = String::from(PROBE_COMMAND);
+    for (idx, metric) in customs.iter().take(MAX_CUSTOM_METRICS).enumerate() {
+        let command = metric.command.replace('\r', "");
+        script.push_str(&format!(
+            "\nprintf '\\n%s\\n' '{CUSTOM_BEGIN}{nonce}_{idx}'\n(\n{command}\n) 2>/dev/null | command dd bs=1024 count={} 2>/dev/null\nprintf '\\n%s\\n' '{CUSTOM_END}{nonce}_{idx}'\n",
+            MAX_CUSTOM_OUTPUT_BYTES / 1024,
+        ));
+    }
+    script
+}
+
 #[derive(Default)]
 struct MonitorRegistry {
     hosts: BTreeMap<u64, Arc<tokio::sync::Mutex<MonitorState>>>,
@@ -66,6 +177,27 @@ struct MonitorState {
     connection: Option<Weak<SshConnection>>,
     counters: BTreeMap<u32, CpuTicks>,
     aggregate: Option<CpuTicks>,
+    network: Option<NetworkCounters>,
+    last_sample_ms: Option<u64>,
+    consecutive_failures: u32,
+    outage_since_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct NetworkCounters { rx: u64, tx: u64 }
+
+pub struct MonitorRequest<'a> {
+    pub tab: u64,
+    pub key: &'a str,
+    pub name: &'a str,
+    pub host: &'a str,
+    pub port: u16,
+    pub protocol: &'a str,
+    pub ssh: Option<Arc<SshConnection>>,
+    pub connected: bool,
+    pub timeout: Duration,
+    pub custom_metrics: &'a [MonitorCustomMetric],
+    pub outage_threshold: u32,
 }
 
 /// Per-tab state is held across await, but the registry lock is never held
@@ -84,59 +216,60 @@ impl Monitors {
         self.inner.lock().expect("monitor registry").hosts.retain(|id, _| live.contains(id));
     }
 
-    pub async fn sample(
-        &self,
-        tab: u64,
-        name: &str,
-        host: &str,
-        port: u16,
-        protocol: &str,
-        ssh: Option<Arc<SshConnection>>,
-        connected: bool,
-        timeout: Duration,
-    ) -> MonitorSample {
+    pub async fn sample(&self, request: MonitorRequest<'_>) -> MonitorSample {
         let start = Instant::now();
+        let sampled_at = now_ms();
         let mut sample = MonitorSample {
-            tab, name: name.to_string(), host: host.to_string(), port,
-            protocol: protocol.to_string(), status: "ok".into(),
-            sampled_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-            latency_ms: 0, error: String::new(), snapshot: None,
+            tab: request.tab, key: request.key.to_string(), name: request.name.to_string(),
+            host: request.host.to_string(), port: request.port, protocol: request.protocol.to_string(),
+            status: "ok".into(), sampled_at, latency_ms: 0, error: String::new(), snapshot: None,
+            consecutive_failures: 0, outage_since_ms: None, outage: false, outage_started: false, recovered: false,
         };
-        let Some(ssh) = ssh else {
-            sample.status = if connected { "unsupported" } else { "disconnected" }.into();
-            sample.error = if connected {
-                "Monitoring needs an SSH, SFTP or SCP session.".into()
-            } else {
-                "This server is disconnected. Reconnect its session before monitoring.".into()
-            };
-            sample.sampled_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-            return sample;
-        };
-        let state = self.inner.lock().expect("monitor registry").hosts.entry(tab).or_default().clone();
+        let state = self.inner.lock().expect("monitor registry").hosts.entry(request.tab).or_default().clone();
         let Ok(mut state) = state.try_lock() else {
             sample.status = "busy".into();
             sample.error = "A monitor sample is already running for this server.".into();
             return sample;
         };
+        let Some(ssh) = request.ssh else {
+            sample.status = if request.connected { "unsupported" } else { "disconnected" }.into();
+            sample.error = if request.connected {
+                "Monitoring needs an SSH, SFTP or SCP session.".into()
+            } else {
+                "This server is disconnected. Reconnect its session before monitoring.".into()
+            };
+            if !request.connected { record_failure(&mut state, &mut sample, request.outage_threshold, sampled_at); }
+            sample.sampled_at = now_ms();
+            return sample;
+        };
         if !state.connection.as_ref().and_then(Weak::upgrade).is_some_and(|old| Arc::ptr_eq(&old, &ssh)) {
             *state = MonitorState { connection: Some(Arc::downgrade(&ssh)), ..Default::default() };
         }
-        match ssh.exec_command_bounded(PROBE_COMMAND, timeout, MAX_OUTPUT_BYTES).await {
+        let nonce = probe_nonce();
+        let command = build_probe_command(request.custom_metrics, &nonce);
+        match ssh.exec_command_bounded(&command, request.timeout, MAX_OUTPUT_BYTES).await {
             Ok(output) if output.exit_code == Some(0) => {
-                match parse_snapshot(&String::from_utf8_lossy(&output.stdout), &mut state) {
-                    Ok(snapshot) => sample.snapshot = Some(snapshot),
-                    Err(error) => { sample.status = "error".into(); sample.error = error; }
+                match parse_snapshot_with_customs(&String::from_utf8_lossy(&output.stdout), &mut state, request.custom_metrics, &nonce, sampled_at) {
+                    Ok(snapshot) => {
+                        sample.snapshot = Some(snapshot);
+                        record_recovery(&mut state, &mut sample, request.outage_threshold);
+                    }
+                    Err(error) => {
+                        reset_rates(&mut state);
+                        record_failure(&mut state, &mut sample, request.outage_threshold, sampled_at);
+                        sample.status = "error".into(); sample.error = error;
+                    }
                 }
             }
             Ok(output) => {
-                state.counters.clear();
-                state.aggregate = None;
+                reset_rates(&mut state);
+                record_failure(&mut state, &mut sample, request.outage_threshold, sampled_at);
                 sample.status = "error".into();
                 sample.error = format!("The Linux monitoring probe failed (exit {:?}).", output.exit_code);
             }
             Err(error) => {
-                state.counters.clear();
-                state.aggregate = None;
+                reset_rates(&mut state);
+                record_failure(&mut state, &mut sample, request.outage_threshold, sampled_at);
                 sample.status = "error".into();
                 sample.error = error.to_string();
             }
@@ -144,6 +277,30 @@ impl Monitors {
         sample.latency_ms = start.elapsed().as_millis() as u64;
         sample
     }
+}
+
+fn reset_rates(state: &mut MonitorState) {
+    state.counters.clear();
+    state.aggregate = None;
+    state.network = None;
+    state.last_sample_ms = None;
+}
+
+fn record_failure(state: &mut MonitorState, sample: &mut MonitorSample, threshold: u32, at_ms: u64) {
+    let previous = state.consecutive_failures;
+    let threshold = threshold.max(1);
+    state.consecutive_failures = previous.saturating_add(1);
+    let since = *state.outage_since_ms.get_or_insert(at_ms);
+    sample.consecutive_failures = state.consecutive_failures;
+    sample.outage_since_ms = Some(since);
+    sample.outage = state.consecutive_failures >= threshold;
+    sample.outage_started = previous < threshold && state.consecutive_failures >= threshold;
+}
+
+fn record_recovery(state: &mut MonitorState, sample: &mut MonitorSample, threshold: u32) {
+    sample.recovered = state.outage_since_ms.is_some() && state.consecutive_failures >= threshold.max(1);
+    state.consecutive_failures = 0;
+    state.outage_since_ms = None;
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -180,8 +337,44 @@ fn sections(output: &str) -> BTreeMap<String, String> {
     result
 }
 
+fn split_custom_sections<'a>(output: &'a str, nonce: &str, customs: &[MonitorCustomMetric]) -> (&'a str, BTreeMap<usize, String>) {
+    let begin_prefix = format!("{CUSTOM_BEGIN}{nonce}_");
+    let end_prefix = format!("{CUSTOM_END}{nonce}_");
+    let base_end = output.find(&begin_prefix).unwrap_or(output.len());
+    let base = &output[..base_end];
+    let mut blocks = BTreeMap::new();
+    let mut next = 0usize;
+    let mut open: Option<usize> = None;
+    let mut current = String::new();
+    for line in output[base_end..].lines() {
+        let trimmed = line.trim();
+        if open.is_none() {
+            if let Some(rest) = trimmed.strip_prefix(&begin_prefix) {
+                if next < customs.len() && rest.parse::<usize>().ok() == Some(next) {
+                    open = Some(next); current.clear(); continue;
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix(&end_prefix) {
+            if open.is_some_and(|idx| rest.parse::<usize>().ok() == Some(idx)) {
+                blocks.insert(open.expect("open block"), current.trim().to_string());
+                open = None; next += 1; current.clear(); continue;
+            }
+        }
+        if open.is_some() {
+            if !current.is_empty() { current.push('\n'); }
+            if current.len() < MAX_CUSTOM_OUTPUT_BYTES { current.push_str(line); }
+        }
+    }
+    (base, blocks)
+}
+
 fn parse_snapshot(output: &str, state: &mut MonitorState) -> Result<MonitorSnapshot, String> {
-    let sections = sections(output);
+    parse_snapshot_with_customs(output, state, &[], "", now_ms())
+}
+
+fn parse_snapshot_with_customs(output: &str, state: &mut MonitorState, customs: &[MonitorCustomMetric], nonce: &str, sampled_at: u64) -> Result<MonitorSnapshot, String> {
+    let (builtin_output, custom_blocks) = split_custom_sections(output, nonce, customs);
+    let sections = sections(builtin_output);
     let get = |key: &str| sections.get(key).map(String::as_str).unwrap_or("");
     if !get("END").trim().is_empty() || !sections.contains_key("END") {
         return Err("The monitoring probe returned incomplete output.".into());
@@ -204,6 +397,9 @@ fn parse_snapshot(output: &str, state: &mut MonitorState) -> Result<MonitorSnaps
     state.counters = counters;
     state.aggregate = aggregate;
     snapshot.memory = parse_memory(get("MEMORY"));
+    snapshot.swap = parse_swap(get("MEMORY"));
+    snapshot.network = parse_network(get("NETWORK"), state, sampled_at);
+    state.last_sample_ms = Some(sampled_at);
     snapshot.disks = parse_disks(get("DISK"));
     let mut host_lines = get("HOST").lines().map(str::trim).filter(|s| !s.is_empty());
     snapshot.hostname = host_lines.next().unwrap_or("").chars().take(253).collect();
@@ -216,6 +412,7 @@ fn parse_snapshot(output: &str, state: &mut MonitorState) -> Result<MonitorSnaps
     let amd = parse_amd(get("AMD_STATIC"), get("AMD_METRIC"));
     if snapshot.gpus.is_empty() { snapshot.gpus = amd; }
     else { snapshot.gpus.extend(amd); }
+    snapshot.custom = parse_custom_metrics(customs, &custom_blocks);
     if snapshot.memory.is_none() { snapshot.warnings.push("RAM telemetry is unavailable.".into()); }
     if snapshot.disks.is_empty() { snapshot.warnings.push("Disk telemetry is unavailable.".into()); }
     if snapshot.gpus.is_empty() { snapshot.warnings.push("No GPU telemetry: install/vendor-enable nvidia-smi, amd-smi or rocm-smi, or this server has no supported GPU.".into()); }
@@ -269,6 +466,111 @@ fn parse_memory(text: &str) -> Option<MonitorMemory> {
     let available = values.get("MemAvailable").copied().unwrap_or_else(|| values.get("MemFree").copied().unwrap_or(0).saturating_add(values.get("Buffers").copied().unwrap_or(0)).saturating_add(values.get("Cached").copied().unwrap_or(0))).min(total);
     let used = total.saturating_sub(available);
     Some(MonitorMemory { total_bytes: total, used_bytes: used, available_bytes: available, percent: used as f64 * 100.0 / total as f64 })
+}
+
+fn parse_swap(text: &str) -> Option<MonitorSwap> {
+    let mut total = None;
+    let mut free = None;
+    for line in text.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() >= 2 && fields.get(2).unwrap_or(&"kB") == &"kB" {
+            let Ok(kib) = fields[1].parse::<u64>() else { continue };
+            let Some(bytes) = kib.checked_mul(1024) else { continue };
+            match fields[0].trim_end_matches(':') {
+                "SwapTotal" => total = Some(bytes),
+                "SwapFree" => free = Some(bytes),
+                _ => {}
+            }
+        }
+    }
+    let total = total?;
+    let free = free.unwrap_or(0).min(total);
+    let used = total.saturating_sub(free);
+    Some(MonitorSwap { total_bytes: total, used_bytes: used, free_bytes: free,
+        percent: if total == 0 { 0.0 } else { used as f64 * 100.0 / total as f64 } })
+}
+
+fn parse_network(text: &str, state: &mut MonitorState, sampled_at: u64) -> Option<MonitorNetwork> {
+    let mut counters = NetworkCounters::default();
+    let mut saw_interface = false;
+    for line in text.lines() {
+        let Some((iface, rest)) = line.split_once(':') else { continue };
+        let iface = iface.trim();
+        if iface.is_empty() || iface == "lo" { continue; }
+        let fields = rest.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 10 { continue; }
+        let (Ok(rx), Ok(tx)) = (fields[0].parse::<u64>(), fields[8].parse::<u64>()) else { continue };
+        counters.rx = counters.rx.saturating_add(rx);
+        counters.tx = counters.tx.saturating_add(tx);
+        saw_interface = true;
+    }
+    if !saw_interface { return None; }
+    let elapsed = state.last_sample_ms.and_then(|old| sampled_at.checked_sub(old)).filter(|ms| *ms > 0);
+    let previous = state.network;
+    let rate = |old: u64, new: u64| -> Option<f64> {
+        let ms = elapsed?;
+        if new < old { return None; }
+        Some((new - old) as f64 * 1000.0 / ms as f64)
+    };
+    let network = MonitorNetwork {
+        rx_bytes_total: counters.rx, tx_bytes_total: counters.tx,
+        rx_bytes_per_sec: previous.and_then(|old| rate(old.rx, counters.rx)),
+        tx_bytes_per_sec: previous.and_then(|old| rate(old.tx, counters.tx)),
+    };
+    state.network = Some(counters);
+    Some(network)
+}
+
+fn extract_number(text: &str) -> Option<f64> {
+    let mut token = String::new();
+    let mut started = false;
+    for c in text.chars() {
+        if !started {
+            if c == '-' || c == '+' || c.is_ascii_digit() { started = true; token.push(c); }
+        } else if c.is_ascii_digit() || c == '.' {
+            token.push(c);
+        } else { break; }
+    }
+    token.parse::<f64>().ok().filter(|n| n.is_finite())
+}
+
+fn parse_custom_metrics(customs: &[MonitorCustomMetric], blocks: &BTreeMap<usize, String>) -> Vec<MonitorCustomReading> {
+    customs.iter().enumerate().map(|(idx, metric)| {
+        let mut reading = MonitorCustomReading {
+            id: metric.id.clone(), name: metric.name.clone(), parse: metric.parse,
+            display: metric.display, unit: metric.unit.clone(), value: None,
+            text: String::new(), error: String::new(),
+        };
+        let Some(raw) = blocks.get(&idx) else {
+            reading.error = "The custom command returned no complete output block.".into();
+            return reading;
+        };
+        let raw = raw.trim();
+        match metric.parse {
+            MonitorMetricParse::Number => match extract_number(raw) {
+                Some(value) => reading.value = Some(value),
+                None => reading.error = "No finite numeric token in custom command output.".into(),
+            },
+            MonitorMetricParse::Regex => {
+                let pattern = metric.regex.as_deref().unwrap_or("");
+                match regex::Regex::new(pattern) {
+                    Ok(re) => match re.captures(raw).and_then(|caps| caps.get(1).or_else(|| caps.get(0))) {
+                        Some(capture) => match capture.as_str().trim().parse::<f64>().ok().filter(|n| n.is_finite()) {
+                            Some(value) => reading.value = Some(value),
+                            None => reading.error = "The regex capture is not a finite number.".into(),
+                        },
+                        None => reading.error = "The custom metric regex did not match.".into(),
+                    },
+                    Err(error) => reading.error = format!("Invalid custom metric regex: {error}"),
+                }
+            }
+            MonitorMetricParse::Text => {
+                reading.text = raw.chars().take(MAX_CUSTOM_TEXT_CHARS).collect();
+                if raw.chars().count() > MAX_CUSTOM_TEXT_CHARS { reading.error = "Custom text output was truncated for display.".into(); }
+            }
+        }
+        reading
+    }).collect()
 }
 
 fn df_unescape(text: &str) -> String {
@@ -506,6 +808,97 @@ mod tests {
         assert!(snapshot.memory.is_some());
         let overflow = "cpu 18446744073709551615 1 0 0 0 0 0 0\n";
         assert!(parse_snapshot(&probe(overflow, ""), &mut state).is_err());
+    }
+
+    #[test]
+    fn swap_and_network_rates_need_two_samples_and_reset_safely() {
+        let mut state = MonitorState::default();
+        let base = probe(STAT, "");
+        let with_net = |rx: u64, tx: u64| base.replace(
+            &format!("{MARKER}MEMORY\nMemTotal: 1024 kB\nMemAvailable: 256 kB\n"),
+            &format!("{MARKER}MEMORY\nMemTotal: 1024 kB\nMemAvailable: 256 kB\nSwapTotal: 100 kB\nSwapFree: 25 kB\n{MARKER}NETWORK\nInter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n    lo: 100 1 0 0 0 0 0 0 100 1 0 0 0 0 0 0\n  eth0: {rx} 1 0 0 0 0 0 0 {tx} 1 0 0 0 0 0 0\n"),
+        );
+        let first = parse_snapshot_with_customs(&with_net(1000, 2000), &mut state, &[], "", 1000).unwrap();
+        assert_eq!(first.swap.as_ref().unwrap().percent, 75.0);
+        assert_eq!(first.network.as_ref().unwrap().rx_bytes_per_sec, None);
+        let second = parse_snapshot_with_customs(&with_net(3000, 2500), &mut state, &[], "", 2000).unwrap();
+        assert_eq!(second.network.as_ref().unwrap().rx_bytes_per_sec, Some(2000.0));
+        assert_eq!(second.network.as_ref().unwrap().tx_bytes_per_sec, Some(500.0));
+        let reset = parse_snapshot_with_customs(&with_net(10, 20), &mut state, &[], "", 3000).unwrap();
+        assert_eq!(reset.network.as_ref().unwrap().rx_bytes_per_sec, None);
+    }
+
+    #[test]
+    fn custom_blocks_are_nonced_and_cannot_spoof_builtin_readings() {
+        let customs = vec![
+            MonitorCustomMetric { id: "n".into(), name: "Number".into(), command: "printf 42".into(),
+                parse: MonitorMetricParse::Number, regex: None, display: MonitorMetricDisplay::Sparkline, unit: "%".into() },
+            MonitorCustomMetric { id: "r".into(), name: "Regex".into(), command: "printf 'load: 1.25'".into(),
+                parse: MonitorMetricParse::Regex, regex: Some("load: ([0-9.]+)".into()), display: MonitorMetricDisplay::BigNumber, unit: String::new() },
+            MonitorCustomMetric { id: "t".into(), name: "Text".into(), command: "printf ok".into(),
+                parse: MonitorMetricParse::Text, regex: None, display: MonitorMetricDisplay::Text, unit: String::new() },
+        ];
+        let nonce = "testnonce";
+        let script = build_probe_command(&customs, nonce);
+        assert!(script.contains("__LINSCP_MONITOR_CUSTOM_BEGIN_testnonce_0"));
+        assert!(script.contains("command dd bs=1024 count=64"));
+        assert!(!script.contains("sudo"));
+        let output = format!("{}\n{CUSTOM_BEGIN}{nonce}_0\n42\n{CUSTOM_END}{nonce}_0\n{CUSTOM_BEGIN}{nonce}_1\nload: 1.25\n{CUSTOM_END}{nonce}_1\n{CUSTOM_BEGIN}{nonce}_2\nok\n{CUSTOM_END}{nonce}_2\n{MARKER}MEMORY\nMemTotal: 1 kB\nMemAvailable: 0 kB\n", probe(STAT, ""));
+        let snapshot = parse_snapshot_with_customs(&output, &mut MonitorState::default(), &customs, nonce, 1).unwrap();
+        assert_eq!(snapshot.memory.as_ref().unwrap().total_bytes, 1024 * 1024);
+        assert_eq!(snapshot.custom[0].value, Some(42.0));
+        assert_eq!(snapshot.custom[1].value, Some(1.25));
+        assert_eq!(snapshot.custom[2].text, "ok");
+        let fake = format!("{}\n{CUSTOM_BEGIN}{nonce}_0\n{MARKER}MEMORY\nMemTotal: 1 kB\nMemAvailable: 0 kB\n{MARKER}END\n", probe(STAT, ""));
+        let snapshot = parse_snapshot_with_customs(&fake, &mut MonitorState::default(), &customs, nonce, 1).unwrap();
+        assert!(snapshot.custom[0].error.contains("no complete output"));
+    }
+
+    #[test]
+    fn outage_threshold_fires_once_and_recovery_clears_it() {
+        let mut state = MonitorState::default();
+        let mut sample = MonitorSample {
+            tab: 1, key: String::new(), name: String::new(), host: String::new(), port: 22,
+            protocol: "ssh".into(), status: "error".into(), sampled_at: 0, latency_ms: 0,
+            error: String::new(), snapshot: None, consecutive_failures: 0, outage_since_ms: None,
+            outage: false, outage_started: false, recovered: false,
+        };
+        for i in 1..=3 {
+            sample.outage_started = false;
+            record_failure(&mut state, &mut sample, 3, 100 + i);
+            assert_eq!(sample.consecutive_failures, i);
+            assert_eq!(sample.outage_started, i == 3);
+            assert_eq!(sample.outage, i == 3);
+        }
+        record_recovery(&mut state, &mut sample, 3);
+        assert!(sample.recovered);
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.outage_since_ms, None);
+    }
+
+    #[test]
+    fn monitor_settings_validate_and_round_trip_privately() {
+        let root = std::env::temp_dir().join(format!("linscp-monitor-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut doc = MonitorSettingsDocument::default();
+        doc.hosts.insert("site:test".into(), MonitorHostConfig {
+            enabled_metrics: vec!["cpu".into(), "net".into(), "cpu".into(), "bogus".into()],
+            custom_metrics: vec![MonitorCustomMetric {
+                id: "users".into(), name: "Users".into(), command: "who | wc -l".into(),
+                parse: MonitorMetricParse::Number, regex: None, display: MonitorMetricDisplay::Sparkline, unit: String::new(),
+            }],
+            paused: false,
+        });
+        let saved = save_settings(&root, doc).unwrap();
+        assert_eq!(saved.hosts["site:test"].enabled_metrics, vec!["cpu", "net"]);
+        assert_eq!(load_settings(&root), saved);
+        let mut bad = saved.clone();
+        bad.hosts.get_mut("site:test").unwrap().custom_metrics[0].command = "rm -rf /".into();
+        // Commands are user-approved, but empty/NUL/oversized definitions are refused.
+        bad.hosts.get_mut("site:test").unwrap().custom_metrics[0].command = String::new();
+        assert!(save_settings(&root, bad).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

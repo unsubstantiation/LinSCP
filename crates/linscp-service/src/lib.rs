@@ -178,6 +178,8 @@ impl CommanderService {
             ("POST", "/api/preferences") => self.handle_save_preferences(req.body),
             ("GET", "/api/sessions") => self.handle_list_sessions(),
             ("GET", "/api/monitor/hosts") => self.monitor_hosts(),
+            ("GET", "/api/monitor/settings") => self.monitor_settings_get(),
+            ("POST", "/api/monitor/settings") => self.monitor_settings_post(req.body),
             ("POST", "/api/vault/export") => self.handle_export_offlineotp_vault(req.body),
             ("POST", "/api/vault/import") => self.handle_import_offlineotp_vault(req.body),
             ("POST", "/api/sessions/save") => self.handle_save_session(req.body),
@@ -1197,19 +1199,38 @@ impl CommanderService {
             tab.connected && tab.remote.as_ref().and_then(|remote| remote.ssh_connection()).is_some()
         }).map(|tab| {
             let session = &tab.spec.as_ref().expect("remote tab has settings").session;
+            let key = monitor::config_key_for_session(tab.site_name.as_deref(), &session.host, session.port);
             json!({"tab": tab.id, "name": tab.name, "host": session.host, "port": session.port,
-                "protocol": session.protocol.as_str(), "site": tab.site_name})
+                "protocol": session.protocol.as_str(), "site": tab.site_name, "key": key})
         }).collect::<Vec<_>>();
         tabs.sort_by_key(|tab| tab["tab"].as_u64().unwrap_or(0));
         let mut sites = SessionStore::load_from_dir(&state.config_root, self.secret_vault.as_ref())
             .unwrap_or_default().sites().iter().filter(|site| {
                 matches!(site.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)
             }).map(|site| json!({"name": site.name, "host": site.host, "port": site.port,
-                "protocol": site.protocol.as_str()})).collect::<Vec<_>>();
+                "protocol": site.protocol.as_str(), "key": format!("site:{}", site.name)})).collect::<Vec<_>>();
         sites.sort_by(|a,b| a["name"].as_str().cmp(&b["name"].as_str()));
         ApiReply { status: 200, payload: json!({"success": true, "tabs": tabs, "sites": sites,
             "max_hosts": monitor::MAX_HOSTS, "default_interval": monitor::DEFAULT_INTERVAL_SECS,
             "default_timeout": monitor::DEFAULT_TIMEOUT_SECS}) }
+    }
+
+    fn monitor_settings_get(&self) -> ApiReply {
+        let config_root = self.config_root();
+        ApiReply { status: 200, payload: json!({"success": true, "document": monitor::load_settings(&config_root)}) }
+    }
+
+    fn monitor_settings_post(&self, body: Value) -> ApiReply {
+        let value = body.get("document").cloned().unwrap_or(body);
+        let doc = match serde_json::from_value::<linscp_types::MonitorSettingsDocument>(value) {
+            Ok(doc) => doc,
+            Err(error) => return api_error(400, format!("Invalid monitor settings: {error}")),
+        };
+        let config_root = self.config_root();
+        match monitor::save_settings(&config_root, doc) {
+            Ok(doc) => ApiReply { status: 200, payload: json!({"success": true, "document": doc}) },
+            Err(error) => api_error(400, error),
+        }
     }
 
     /// Samples selected open tabs concurrently. Selection and polling live in
@@ -1229,26 +1250,36 @@ impl CommanderService {
             let Some(id) = tabs::parse_tab_id_value(Some(id)) else { return api_error(400, "Invalid monitor tab ID."); };
             if !ids.insert(id) { return api_error(400, "Duplicate monitor tab ID."); }
         }
+        let settings = monitor::load_settings(&self.config_root());
+        let threshold = settings.settings.outage_threshold;
         let targets = {
             let state = self.state.lock().expect("state mutex");
             ids.iter().map(|id| {
                 let tab = state.tabs.get(id);
                 let session = tab.and_then(|tab| tab.spec.as_ref()).map(|spec| &spec.session);
-                (state.monitors.clone(), *id,
+                let key = session.map(|s| monitor::config_key_for_session(
+                    tab.and_then(|tab| tab.site_name.as_deref()), &s.host, s.port))
+                    .unwrap_or_default();
+                let customs = settings.hosts.get(&key).cloned().unwrap_or_default().custom_metrics;
+                (state.monitors.clone(), *id, key,
                     tab.map(|tab| tab.name.clone()).unwrap_or_default(),
                     session.map(|s| s.host.clone()).unwrap_or_default(),
                     session.map(|s| s.port).unwrap_or(22),
                     session.map(|s| s.protocol.as_str()).unwrap_or("unknown").to_string(),
                     tab.is_some_and(|tab| tab.connected),
                     tab.filter(|tab| tab.connected).and_then(|tab| tab.remote.as_ref())
-                        .and_then(|remote| remote.ssh_connection()).cloned())
+                        .and_then(|remote| remote.ssh_connection()).cloned(),
+                    customs)
             }).collect::<Vec<_>>()
         };
         let mut jobs = tokio::task::JoinSet::new();
-        for (monitors, id, name, host, port, protocol, connected, ssh) in targets {
+        for (monitors, id, key, name, host, port, protocol, connected, ssh, customs) in targets {
             jobs.spawn(async move {
-                let sample = monitors.sample(id, &name, &host, port, &protocol, ssh, connected, timeout).await;
-                if matches!(sample.status.as_str(), "disconnected" | "unsupported") { monitors.forget(id); }
+                let sample = monitors.sample(monitor::MonitorRequest {
+                    tab: id, key: &key, name: &name, host: &host, port, protocol: &protocol,
+                    ssh, connected, timeout, custom_metrics: &customs, outage_threshold: threshold,
+                }).await;
+                if sample.status == "unsupported" { monitors.forget(id); }
                 sample
             });
         }
@@ -1260,6 +1291,15 @@ impl CommanderService {
             }
         }
         samples.sort_by_key(|sample: &linscp_types::MonitorSample| ids.iter().position(|id| *id == sample.tab).unwrap_or(usize::MAX));
+        for sample in &samples {
+            if sample.outage_started {
+                self.add_log(&format!("[Monitor] {} ({}) is offline after {} failed polls: {}",
+                    sample.name, sample.host, sample.consecutive_failures, sample.error), "error");
+            }
+            if sample.recovered {
+                self.add_log(&format!("[Monitor] {} ({}) recovered.", sample.name, sample.host), "success");
+            }
+        }
         ApiReply { status: 200, payload: json!({"success": true, "samples": samples}) }
     }
 
@@ -9973,6 +10013,25 @@ mod tests {
             let refused = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp}, "connect_timeout": timeout}) }).await;
             assert_eq!(refused.status, 400);
         }
+        let settings_get = svc.dispatch_async(ApiEnvelope { method: "GET".into(), path: "/api/monitor/settings".into(), body: json!({}) }).await;
+        assert_eq!(settings_get.status, 200);
+        assert_eq!(settings_get.payload["document"]["settings"]["outage_threshold"], 3);
+        let doc = json!({"version": 1, "settings": {"interval_secs": 5.0, "connect_timeout_secs": 10.0,
+            "poll_timeout_secs": 10.0, "outage_threshold": 1, "notify_on_outage": true,
+            "beep_on_outage": false, "beep_cooldown_secs": 10},
+            "hosts": {"site:worker": {"enabled_metrics": ["cpu", "net"], "custom_metrics": [
+                {"id": "users", "name": "Users", "command": "who | wc -l", "parse": "number", "display": "sparkline", "unit": ""}
+            ], "paused": false}}});
+        let saved = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/monitor/settings".into(), body: doc.clone() }).await;
+        assert_eq!(saved.status, 200, "{}", saved.payload);
+        let reread = svc.dispatch_async(ApiEnvelope { method: "GET".into(), path: "/api/monitor/settings".into(), body: json!({}) }).await;
+        assert_eq!(reread.payload["document"], doc);
+        let offline = svc.dispatch_async(sample(json!({"tabs": [998]}))).await;
+        assert_eq!(offline.payload["samples"][0]["outage_started"], true);
+        assert!(svc.dispatch(ApiEnvelope { method: "GET".into(), path: "/api/logs".into(), body: json!({}) }).payload.to_string().contains("is offline"));
+        let mut bad = doc.clone();
+        bad["settings"]["outage_threshold"] = json!(0);
+        assert_eq!(svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/monitor/settings".into(), body: bad }).await.status, 400);
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
