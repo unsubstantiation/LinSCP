@@ -1,5 +1,10 @@
 # Native parity audit — Windows, Debian, Android
 
+> **Historical report.** The browser server this audit refers to (`linscp-web` /
+> `crates/linscp-http`) and the Python GUI harness it cites have been removed;
+> LinSCP ships one native application. References to either are kept only as
+> the record of that audit.
+
 **Date:** 2026-11-06 · **Branch:** `arena/a4f5fe10-linscp` · **Mode:** audit, then A1 fixed on request.
 
 > **Update (same day):** A1, A2, A3, A4, A5, A6, A7(b), A7(a) slices 1, 2a, 2b and 2c, A8 and A9
@@ -10,8 +15,10 @@
 
 **Question asked:** "Make sure we have full feature parity between the builds."
 **Scope, as confirmed:** the three native builds — `linscp-gui` on Windows (MSVC), `linscp-gui` on
-Debian, and the Android APK. The browser server (`linscp-web` / `crates/linscp-http`) is **not** in
-scope, so HTTP-vs-window asymmetries are excluded by instruction.
+Debian, and the Android APK. This audit was written while a browser server
+(`linscp-web` / `crates/linscp-http`) still existed; it has since been removed,
+so every reference to it below is historical and no HTTP-vs-window asymmetry
+remains to be excluded.
 
 **Two different things are being asked in one sentence, and they fail differently:**
 

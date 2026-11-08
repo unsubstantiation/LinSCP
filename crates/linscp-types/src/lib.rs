@@ -1,8 +1,7 @@
-//! Shared serializable domain models and dual-mode RPC payloads for LinSCP.
+//! Shared serializable domain models and RPC payloads for LinSCP.
 //!
-//! Both `linscp-http` (standalone browser HTTP mode) and `linscp-tauri`
-//! (native Linux, Windows, and Android app shell) exchange these types with
-//! the TypeScript Commander frontend (`ui/`).
+//! `linscp-tauri` (native Linux, Windows, and Android app shell) exchanges
+//! these types with the TypeScript Commander frontend (`ui/`).
 
 use serde::{Deserialize, Serialize};
 
@@ -357,8 +356,7 @@ pub struct HostKeyChallenge {
     pub fingerprint: String,
 }
 
-/// Transport-neutral request envelope dispatched by both `TauriTransport` and
-/// `HttpTransport`.
+/// Transport-neutral request envelope dispatched by `TauriTransport`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiEnvelope {
     pub method: String,

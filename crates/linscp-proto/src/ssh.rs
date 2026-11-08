@@ -908,7 +908,7 @@ impl SshConnection {
     }
 
     /// Opens an interactive PTY shell channel backed by an async actor task for
-    /// embedded `xterm.js` bridges in `CommanderService`.
+    /// the embedded terminal in `CommanderService`.
     pub async fn open_pty_shell_session(
         &self,
         term: &str,

@@ -27,8 +27,7 @@ and a test has to be able to hold a name that a POSIX file system allows
 and a Windows one does not. The product-name rule searches them, subject
 to the external-identifier allowlist below.
 
-The vendored xterm.js files (source/gui/web/vendor) are upstream code
-that is not scanned; everything else in the tree is this project's own.
+Everything in the tree is this project's own code.
 
 Usage:
     python3 tools/check_platform_conversion.py
@@ -41,8 +40,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-# The files this check reads. The vendored xterm.js files under
-# source/gui/web/vendor are upstream code and are excluded on purpose.
+# The files this check reads.
 SCAN_ROOTS = [
     'source/linux',
     'source/gui',
@@ -226,12 +224,11 @@ REMOVED_ARTEFACTS = [
 # has to install every one of them.
 # Phase 6 pure-Rust: the Python GUI (linscp_gui.py/linscp_crypto.py) and the
 # explorer-commands.json template are now embedded in the Rust workspace
-# (crates/linscp-http, crates/linscp-service, ui/dist) and no longer installed
+# (crates/linscp-tauri, crates/linscp-service, ui/dist) and no longer installed
 # as loose files under /usr/share/linscp/gui/. The Debian/CMake/Make installers
-# were updated to ship the Rust binaries instead.
+# were updated to ship the Rust binary instead.
 INSTALLED_FILES = [
     'debian/linscp.desktop',
-    'debian/linscp-web.desktop',
     'debian/linscp.png',
     'debian/linscp.svg',
 ]

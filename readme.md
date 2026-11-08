@@ -2,12 +2,12 @@
 
 # LinSCP
 
-LinSCP is a noncommercial graphical file-transfer client. Its Commander UI is
-one page with two hosts in the same tree: a native Tauri window (`linscp-gui`)
-and a browser server (`linscp-web`) that serves that page to a browser on the
-same machine or, behind a proxy, on another. Both dispatch the same requests to
-the same Rust transfer engine, so a control in the page is not one only one host
-can reach. No separate command-line client is built or distributed. **The native
+LinSCP is a noncommercial graphical file-transfer client. Its Commander UI is a
+single page in a native Tauri window (`linscp-gui`) on Linux and Windows, and in
+the Android app. There is no browser or web build: the page reaches the Rust
+transfer engine only through the shell's in-process IPC, so there is no local
+HTTP server, no access token and no server-side sign-in. No separate
+command-line client is built or distributed. **The native
 GUI is experimental and is not ready for production transfers.** Remote listing
 and queued file uploads and downloads are implemented. A shared multi-server
 monitor displays Linux CPU/per-core, RAM, swap, disk, load, network and NVIDIA/AMD
@@ -130,25 +130,7 @@ launcher's own flags are harmless.
 
 Run `cargo test --workspace --all-targets` and `npm --prefix ui test` for the
 Rust and frontend tests. CMake and `source/linux/Makefile` are convenience
-wrappers around the same build and install both hosts.
-
-## Run it in a browser
-
-The page is the same one; only the host differs.
-
-```sh
-cargo build --release -p linscp-http
-./target/release/linscp-web              # 127.0.0.1:8765, prints the URL
-```
-
-The page is served with its access token, so opening the printed URL is enough;
-`--print-token` also prints the token for a script or another browser, and
-`--allow-remote` binds `0.0.0.0` for a container or a headless host (the token is
-then the only thing between the network and your sessions). `--allow-host=NAME`
-accepts a name other than loopback, which is what a reverse proxy in front of it
-needs. The security model is the one `crates/linscp-http` documents: a loopback
-bind, a `Host`/`Origin` allowlist against DNS rebinding, and a constant-time
-token check on every `/api` request.
+wrappers around the same build and install the one application.
 
 ## Debian package
 

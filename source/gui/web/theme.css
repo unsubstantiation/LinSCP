@@ -802,8 +802,6 @@ button.site-item { display: block; width: 100%; border: 0; background: transpare
 }
 
 /* ---- Sign-in ---------------------------------------------------------- */
-.login-modal .modal-box { width: 380px; }
-.login-error { margin-top: 8px; color: var(--danger); font-size: 11px; min-height: 14px; }
 
 /* ---- Transfer settings ------------------------------------------------ */
 .transfer-preset-row { display: flex; align-items: center; gap: 6px; }
@@ -1213,3 +1211,47 @@ body {
   .monitor-help { font-size: 9px; }
 }
 @media (prefers-reduced-motion: reduce) { .monitor-meter-fill { transition: none; } }
+
+/* The terminal. The cells are painted by the shared renderer, so the styles
+ * here only give it a box to fill and keep the page from scrolling around
+ * it: a terminal window is the terminal, and a stray scrollbar would resize
+ * the grid the remote PTY is told about. */
+.terminal-screen {
+  height: 480px;
+  max-height: 70vh;
+  background: #000;
+  overflow: hidden;
+}
+
+/* A terminal in its own window: no page around it, no scrollbars, and the
+ * canvas owns every pixel the window has. The window is resizable, and every
+ * resize is a grid change the shell has to be told about, so nothing may
+ * reflow here except the canvas itself. */
+body.terminal-only {
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+  overflow: hidden;
+  background: #000;
+}
+body.terminal-only > *:not(.terminal-window-screen):not(.terminal-window-ended) {
+  display: none !important;
+}
+.terminal-window-screen {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  overflow: hidden;
+}
+.terminal-window-ended {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 10;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: #fff;
+  background: #7f1d1d;
+}
+.terminal-canvas { display: block; }

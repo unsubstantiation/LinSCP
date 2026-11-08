@@ -1,20 +1,12 @@
 /**
  * Operating-system file drops, in the one form every host can deliver.
  *
- * The page drops a `File` through its own drag-and-drop handlers, and that is
- * the only path a browser has. A native window is different: the operating
- * system answers the drop with *paths* - a string per item, no bytes - and the
- * shell has to read them itself. The Android app gets paths the same way from
- * the share sheet, which stages each URI and records the same manifest.
- *
- * Without this module the same gesture behaved differently in each app: the
- * browser queued an upload, the desktop window did nothing at all (its
- * `dragDropEnabled` window consumes the drop before the page sees it) and the
- * Android app only offered the files after a restart of the pending check.
- * Reading a path is a backend operation, so it is dispatched through the
- * ordinary `TransferClient` instead of a private IPC call: whatever answers
- * `/api/transfer/drop` handles the browser's bytes and the desktop's path
- * through one implementation, with one set of conflict and overwrite rules.
+ * A native window receives the operating system's answer to a drop as
+ * *paths* - a string per item, no bytes - and the shell has to read them
+ * itself. The Android app gets paths the same way from the share sheet, which
+ * stages each URI and records the same manifest. Both go through the ordinary
+ * `TransferClient` instead of a private IPC call, so `/api/transfer/drop`
+ * handles either form with one set of conflict and overwrite rules.
  */
 
 import type { TransportClient } from '../transport/client.js';

@@ -40,7 +40,7 @@
     "policy": "A status of 'verified' means the behavior was checked, not that it looked right while somebody was reading the code. So an entry carries 'verified_on': for each platform LinSCP ships on, the suites whose tests cover it. LinSCP ships on Linux, Windows, and Android - the Rust workspace plus Tauri v2 - so an entry may be 'verified' only when 'linux', 'windows' and 'android' appear in that map naming the suites that actually ran it. The rule is still written for any number of platforms, and a suite that is not listed under a platform cannot be cited for it, because evidence nobody can reproduce is not evidence. The notes stay authoritative about what is missing either way - evidence for the parts that are covered does not certify the rest, which is why --require-full fails while any entry is not verified. A suite flagged not runnable under a platform executes no case there and cannot be cited for it; a capability's citations name only suites whose cases its checks list.",
     "platforms": {
       "linux": {
-        "how": "debian-build.yml: `npm --prefix ui test` (gui, gui-localization, ui-transport); `cargo test -p linscp-http` plus targeted `cargo test -p linscp-service` runs; dpkg-buildpackage runs debian/rules, which runs `cargo test --workspace --all-targets` (service, service-commands, backup, gui-cli, gui-shell-actions, gui-shell-definitions); `python3 tools/check_upstream_parity.py` and the repo-state suites tools/tests/test_parity_inventory.py, test_platform_conversion.py, test_wayland_compatibility.py, test_translations.py and test_repo_hygiene.py; the file-manager smoke drives the installed linscp-gui the way a file manager does. Evidence is an exit-0 run with failed=0 - a failing suite exits non-zero, and its `evidence:` line is not evidence. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
+        "how": "debian-build.yml: `npm --prefix ui test` (gui, gui-localization, ui-transport); `cargo test -p linscp-service` plus targeted `cargo test -p linscp-service` runs; dpkg-buildpackage runs debian/rules, which runs `cargo test --workspace --all-targets` (service, service-commands, backup, gui-cli, gui-shell-actions, gui-shell-definitions); `python3 tools/check_upstream_parity.py` and the repo-state suites tools/tests/test_parity_inventory.py, test_platform_conversion.py, test_wayland_compatibility.py, test_translations.py and test_repo_hygiene.py; the file-manager smoke drives the installed linscp-gui the way a file manager does. Evidence is an exit-0 run with failed=0 - a failing suite exits non-zero, and its `evidence:` line is not evidence. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
         "date": "2026-11-06",
         "suites": {
           "unit": "source/linux/tests/UnitTest.cpp - checks of the parts that need no I/O: permission and mode parsing, masks, path handling, the transfer and synchronization planners (every word and list '-criteria=' takes, the ones it refuses, a plan refused over a file nobody could hash, and '-conflict=skip|local|remote|newer' two-way resolution), the proxy session settings, the FTP engine and TLS policy settings, the S3 object write settings and multipart upload resume state sidecar, the SSH private-key passphrase option and XML action log elements, the host-key pin spellings, the native SCP engine's connection-free parts (the shell quoting a remote path needs, the paths it refuses to send, one 'ls -l' line as an entry including a symbolic link's own name, the exact date columns of '--full-time' with the offset they are in, the rcp header lines read and written byte for byte, header names that cannot traverse directories, and the 'touch -t' stamp), the WebDAV lock-token and dead-property XML, parameter and timestamp expansion, the stored-session file and folder hierarchy helpers, the editor content-comparison and EOL normalization helpers, the file-hash and HMAC helpers, and AWS Signature Version 4 signing. Includes English/Spanish help, security messages, named-placeholder safety, locale fallback and plural-count messages.",
@@ -51,20 +51,12 @@
           "gui": "source/gui/tests/ClientTest.js under node with jsdom - the real Commander page booted against a stubbed backend: rendering, selection, the editor, synchronization preview and run, filename and full-text search controls/results, the site manager, the embedded terminal (opened only once its modal is on screen, shell output reaching the screen, the poll using the id the backend answered with, a refused terminal reported instead of left black, and polling that stops rather than retrying for ever), queue, host-key verification, synchronized browsing (the counterpart probe, following and refusing when the other side has no such folder) and drag and drop between the panes (payload, drop-target highlight, queued upload with the dragged names, same-pane drop ignored), and browser file/folder drop enumeration with nested paths and explicit empty directories. It also checks the Explorer-style single-panel view (toggle, pane hiding, persisted choice) and the custom-commands dialog (persisted template list, save payload, explicit run confirmation and per-file run results).",
           "live-dav": "source/linux/tests/LiveDavTest.py against source/linux/tests/TestDavServer.py - a throwaway WebDAV endpoint over plain HTTP with Basic challenge authentication, which also implements LOCK/UNLOCK (refusing a write from a session that holds no token with 423), PROPPATCH and dead properties, so the lock and property behavior is asserted against the server's own state rather than against the client alone: PROPFIND listings, stat with real size/time/missing-path handling, mkdir/rmdir/MOVE/DELETE, and upload/download; single-file cp uses COPY with an absolute Destination and Overwrite header, verified by a server-side operation counter and an exact readback while the source remains; a 405 refusal also verifies the streamed fallback byte-for-byte. It also checks upstream-shaped console output, aliases and transfer presets. keepuptodate uploads local files to the remote side, and a nested file arrival wakes the inotify watcher rather than waiting for the 30-second rescan. The suite is standard-library-only and needs nothing but curl. It also covers -parents mkdir and literal remote names containing spaces, percent signs, question marks and hashes through DAV PROPFIND/GET/PUT/MOVE/COPY. ETag preconditions are asserted against the server's own recorded state and its If headers: a matching tag writes, a stale one is refused with 412 and changes nothing at the destination, If-None-Match writes only where the version differs, a lock token and a tag travel in one no-tag condition list, '*' is refused rather than sent, and a precondition recorded on a collection guards that collection alone.",
           "live-curl": "source/linux/tests/LiveCurlTest.py - throwaway pyftpdlib FTP, implicit FTPS and explicit-TLS (AUTH TLS) servers verify authenticated downloads/uploads and FTP .filepart completion; a recording handler proves which commands the session sent, so the suite checks that a listing is MLSD with LIST absent, that FtpUseMlsd=0 and a server refusing MLSD both fall back to LIST, that FtpUseMlsd=2 fails instead of listing without facts (and never sends LIST), and that FtpPasvMode=0 opens the data connection with PORT. The explicit-TLS case walks the TLS policy in one session: ftpes:// and Ftps=3 on an ftp:// URL, a refused handshake when the certificate is not accepted, CaCertificateFile, a PinnedPublicKey that matches, one that does not, MaxTlsVersion=1.1 refused against MinTlsVersion=1.2 accepted, and a host-key fingerprint refused with the setting to use instead. A saved site is stored and reopened by name to prove the FTP/TLS policy travels with it. No SSH protocol is served by curl any more, so none is tested here: sftp:// is LiveSftpTest.py's and scp:// is LiveScpTest.py's.",
-          "gui-search": "source/gui/tests/RemoteSearchTest.py - backend tests with a fake session covering literal UTF-8 content search, case sensitivity, filename-mask filtering, binary/non-UTF-8 and oversized-file skips, and scan-budget enforcement. The jsdom ClientTest.js also checks the GUI toggle, request payload, bounded-search summary and escaped result snippet.",
-          "gui-browser-upload": "source/gui/tests/BrowserUploadTest.py - rejects missing run tokens and invalid/traversal paths, stages exact bytes from HTTP to a private file, queues nested uploads and explicit empty directories with retry-safe parent creation, verifies that background tasks use -literal for percent-sign filenames, and removes partial staging on an incomplete upload. ClientTest.js exercises browser file/folder traversal, batches, and target selection.",
-          "gui-desktop-uri": "source/gui/tests/DesktopUriTest.py - validates sftp://, ftp:// and ftps:// desktop URLs, default and explicit ports, escaped credentials and paths, IPv6 authorities, rejected malformed/query URLs, and startup creation/activation of the site tab without trusting an unknown host key. It also checks core lookup under a relocated install prefix.",
-          "gui-local-editor": "source/gui/tests/LocalEditorTest.py - read and atomic local text save, stale-edit conflicts, rejection of binary/large files and symlink overwrite, and panel path confinement; standard library only.",
           "gui-localization": "source/gui/tests/LocalizationTest.js under node/jsdom - boots the real English/Spanish page with persisted, server and browser language selection; checks static text and ARIA, queue statuses, plural forms, literal placeholders, host-key verification, editor saves, sync preview and transfer API payloads, and unsaved-edit protection on language changes.",
           "platform-conversion": "tools/check_platform_conversion.py with tools/tests/test_platform_conversion.py - the guard that keeps the Windows-to-Linux conversion complete: it reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose wording contradicts the template it is filled into. Its own cases hold it to the same standard: it has to fail on the things it claims to catch and stay quiet about the ones it does not.",
-          "gui-security": "source/gui/tests/SecurityTest.py - offline boundary tests for the browser GUI: operand quoting for the client's command splitter (blanks, quotes, backslashes, control-character refusal), sync/chmod command building from fixed vocabularies, permission-mode validation, local panel containment and remote name validation, single-line server command stream, the client-side guards the page itself applies (a template has to be one line, a name has to be one entry of the panel), PBKDF2 account hashing with per-session CSRF tokens and login throttling, queue staging cleanup, browser upload mode validation, and Host/token/CORS guards.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "live-tunnel": "source/linux/tests/LiveTunnelTest.py uses two independently keyed Paramiko endpoints and a destination name resolvable only by the jump fixture. It verifies SFTP/SCP transfer bytes, one-shot exec, embedded-shell defaults, separate host-key failures before authentication, jump password/encrypted-key authentication, forwarding refusal without a direct fallback, inherited SOCKS5 settings applied to the jump host, interrupted download staging, repeated close/failure socket and thread cleanup, encrypted stored credentials and HTTP GUI verification of both hops plus background command routing. Requires paramiko; SCP transfers also require the OpenSSH scp program. No real Kerberos realm or external SSH server is certified by these fixtures. Also covers slow/backpressured upload/download bytes, forwarding timeout, cancelled download staging, no implicit global pin caching and all independent GUI Remember combinations without implicit credential storage.",
-          "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store.",
-          "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
           "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English.",
-          "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so backups restore on every platform), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) \u2192 Windows (CRLF edit) \u2192 Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
-          "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs.",
+          "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so backups restore on every platform), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
           "ui-transport": "ui/tests/TransportAndPlatform.test.mjs under node against the built bundle (ui/dist/linscp-core.mjs): the dual transport selection and error mapping, the host capability matrix and the difference reasons, the touch shell (pane order, the extra-key row and its latched Ctrl, long-press selection, the floating action bar and destroy), the local root switcher, and the operating-system path drop - the request shape one drop produces, the approvals a retry repeats, and what an unusable payload is refused for.",
           "service": "crates/linscp-service/src/lib.rs - the service's own tests, which drive the same `CommanderService::dispatch` the three hosts call: the local and remote drop endpoints (a path drop writes what it names, a folder keeps its shape, an existing destination is a conflict rather than a replacement, a link inside a dropped tree is refused), remote delete against a live WebDAV server (a leaf-invalid name refused per name while the valid one runs, a directory tree emptied and removed, a name the server no longer has counted as deleted, the request's own directory honoured), and the transfer, queue and workspace behaviour the live suites exercise over SFTP, FTP, FTPS, S3 and WebDAV.",
           "gui-cli": "crates/linscp-platform/src/cli_args.rs - the native window's whole command line, decided without a window: --install-shell-integration, --uninstall-shell-integration, --shell-upload FILES... and --help, plus the guarantee that a bare launch, an unknown flag or a contradictory command line opens the window. Pure Rust, so the same tests decide the same way on every target.",
@@ -77,16 +69,8 @@
           "service-tabs": "crates/linscp-service/src/tabs.rs - the GUI session parser: the site manager settings must reach the engine raw fields (Kerberos settings included) instead of being dropped, and explicit Kerberos settings must fail closed naming Linux where no Kerberos runtime exists. Key exchange is refused on every build."
         },
         "not_runnable": {
-          "gui-browser-upload": "red: 10/10 fail against the shipped service",
-          "gui-desktop-uri": "red: 32 errors in 26 runs against the shipped service",
-          "gui-local": "red: 26 errors, 8 skipped against the shipped service",
-          "gui-local-editor": "red: 5/5 fail against the shipped service",
-          "gui-search": "red: 9/9 fail against the shipped service",
-          "gui-security": "red: 123 of 124 fail (2 skipped) against the shipped service",
-          "gui-shell": "red: 12/12 fail against the shipped service",
           "live-curl": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
           "live-dav": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
-          "live-desktop": "needs `linscp --serve-http` (LiveDesktopTest.py:188), which no shipped binary accepts",
           "live-s3": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
           "live-scp": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
           "live-sftp": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
@@ -108,20 +92,12 @@
           "gui": "source/gui/tests/ClientTest.js under node with jsdom - the real Commander page booted against a stubbed backend: rendering, selection, the editor, synchronization preview and run, filename and full-text search controls/results, the site manager, the embedded terminal (opened only once its modal is on screen, shell output reaching the screen, the poll using the id the backend answered with, a refused terminal reported instead of left black, and polling that stops rather than retrying for ever), queue, host-key verification, synchronized browsing (the counterpart probe, following and refusing when the other side has no such folder) and drag and drop between the panes (payload, drop-target highlight, queued upload with the dragged names, same-pane drop ignored), and browser file/folder drop enumeration with nested paths and explicit empty directories. It also checks the Explorer-style single-panel view (toggle, pane hiding, persisted choice) and the custom-commands dialog (persisted template list, save payload, explicit run confirmation and per-file run results).",
           "live-dav": "source/linux/tests/LiveDavTest.py against source/linux/tests/TestDavServer.py - a throwaway WebDAV endpoint over plain HTTP with Basic challenge authentication, which also implements LOCK/UNLOCK (refusing a write from a session that holds no token with 423), PROPPATCH and dead properties, so the lock and property behavior is asserted against the server's own state rather than against the client alone: PROPFIND listings, stat with real size/time/missing-path handling, mkdir/rmdir/MOVE/DELETE, and upload/download; single-file cp uses COPY with an absolute Destination and Overwrite header, verified by a server-side operation counter and an exact readback while the source remains; a 405 refusal also verifies the streamed fallback byte-for-byte. It also checks upstream-shaped console output, aliases and transfer presets. keepuptodate uploads local files to the remote side, and a nested file arrival wakes the inotify watcher rather than waiting for the 30-second rescan. The suite is standard-library-only and needs nothing but curl. It also covers -parents mkdir and literal remote names containing spaces, percent signs, question marks and hashes through DAV PROPFIND/GET/PUT/MOVE/COPY. ETag preconditions are asserted against the server's own recorded state and its If headers: a matching tag writes, a stale one is refused with 412 and changes nothing at the destination, If-None-Match writes only where the version differs, a lock token and a tag travel in one no-tag condition list, '*' is refused rather than sent, and a precondition recorded on a collection guards that collection alone.",
           "live-curl": "source/linux/tests/LiveCurlTest.py - throwaway pyftpdlib FTP, implicit FTPS and explicit-TLS (AUTH TLS) servers verify authenticated downloads/uploads and FTP .filepart completion; a recording handler proves which commands the session sent, so the suite checks that a listing is MLSD with LIST absent, that FtpUseMlsd=0 and a server refusing MLSD both fall back to LIST, that FtpUseMlsd=2 fails instead of listing without facts (and never sends LIST), and that FtpPasvMode=0 opens the data connection with PORT. The explicit-TLS case walks the TLS policy in one session: ftpes:// and Ftps=3 on an ftp:// URL, a refused handshake when the certificate is not accepted, CaCertificateFile, a PinnedPublicKey that matches, one that does not, MaxTlsVersion=1.1 refused against MinTlsVersion=1.2 accepted, and a host-key fingerprint refused with the setting to use instead. A saved site is stored and reopened by name to prove the FTP/TLS policy travels with it. No SSH protocol is served by curl any more, so none is tested here: sftp:// is LiveSftpTest.py's and scp:// is LiveScpTest.py's.",
-          "gui-search": "source/gui/tests/RemoteSearchTest.py - backend tests with a fake session covering literal UTF-8 content search, case sensitivity, filename-mask filtering, binary/non-UTF-8 and oversized-file skips, and scan-budget enforcement. The jsdom ClientTest.js also checks the GUI toggle, request payload, bounded-search summary and escaped result snippet.",
-          "gui-browser-upload": "source/gui/tests/BrowserUploadTest.py - rejects missing run tokens and invalid/traversal paths, stages exact bytes from HTTP to a private file, queues nested uploads and explicit empty directories with retry-safe parent creation, verifies that background tasks use -literal for percent-sign filenames, and removes partial staging on an incomplete upload. ClientTest.js exercises browser file/folder traversal, batches, and target selection.",
-          "gui-desktop-uri": "source/gui/tests/DesktopUriTest.py - validates sftp://, ftp:// and ftps:// desktop URLs, default and explicit ports, escaped credentials and paths, IPv6 authorities, rejected malformed/query URLs, and startup creation/activation of the site tab without trusting an unknown host key. It also checks core lookup under a relocated install prefix.",
-          "gui-local-editor": "source/gui/tests/LocalEditorTest.py - read and atomic local text save, stale-edit conflicts, rejection of binary/large files and symlink overwrite, and panel path confinement; standard library only.",
           "gui-localization": "source/gui/tests/LocalizationTest.js under node/jsdom - boots the real English/Spanish page with persisted, server and browser language selection; checks static text and ARIA, queue statuses, plural forms, literal placeholders, host-key verification, editor saves, sync preview and transfer API payloads, and unsaved-edit protection on language changes.",
           "platform-conversion": "tools/check_platform_conversion.py with tools/tests/test_platform_conversion.py - the guard that keeps the Windows-to-Linux conversion complete: it reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose wording contradicts the template it is filled into. Its own cases hold it to the same standard: it has to fail on the things it claims to catch and stay quiet about the ones it does not.",
-          "gui-security": "source/gui/tests/SecurityTest.py - offline boundary tests for the browser GUI: operand quoting for the client's command splitter (blanks, quotes, backslashes, control-character refusal), sync/chmod command building from fixed vocabularies, permission-mode validation, local panel containment and remote name validation, single-line server command stream, the client-side guards the page itself applies (a template has to be one line, a name has to be one entry of the panel), PBKDF2 account hashing with per-session CSRF tokens and login throttling, queue staging cleanup, browser upload mode validation, and Host/token/CORS guards.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "live-tunnel": "source/linux/tests/LiveTunnelTest.py uses two independently keyed Paramiko endpoints and a destination name resolvable only by the jump fixture. It verifies SFTP/SCP transfer bytes, one-shot exec, embedded-shell defaults, separate host-key failures before authentication, jump password/encrypted-key authentication, forwarding refusal without a direct fallback, inherited SOCKS5 settings applied to the jump host, interrupted download staging, repeated close/failure socket and thread cleanup, encrypted stored credentials and HTTP GUI verification of both hops plus background command routing. Requires paramiko; SCP transfers also require the OpenSSH scp program. No real Kerberos realm or external SSH server is certified by these fixtures. Also covers slow/backpressured upload/download bytes, forwarding timeout, cancelled download staging, no implicit global pin caching and all independent GUI Remember combinations without implicit credential storage.",
-          "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store.",
-          "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
           "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English.",
-          "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so backups restore on every platform), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) \u2192 Windows (CRLF edit) \u2192 Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
-          "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs.",
+          "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so backups restore on every platform), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
           "ui-transport": "ui/tests/TransportAndPlatform.test.mjs under node against the built bundle (ui/dist/linscp-core.mjs): the dual transport selection and error mapping, the host capability matrix and the difference reasons, the touch shell (pane order, the extra-key row and its latched Ctrl, long-press selection, the floating action bar and destroy), the local root switcher, and the operating-system path drop - the request shape one drop produces, the approvals a retry repeats, and what an unusable payload is refused for.",
           "service": "crates/linscp-service/src/lib.rs - `cargo test --workspace` on Windows runs the same service tests the Linux job runs, including the drop staging and the request shapes; the live-server cases need the Python fixtures and are enabled on Linux.",
           "gui-cli": "cargo test --workspace on Windows runs the same `cli_args` tests the Linux job runs, and the Windows job then drives the built `linscp-gui.exe` the way Explorer does: install into a redirected APPDATA, check the Send To `.cmd` names --shell-upload, run it with a selected file and read the manifest back, then uninstall.",
@@ -134,17 +110,9 @@
           "service-tabs": "crates/linscp-service/src/tabs.rs - the GUI session parser: the site manager settings must reach the engine raw fields (Kerberos settings included) instead of being dropped, and explicit Kerberos settings must fail closed naming Linux where no Kerberos runtime exists. Key exchange is refused on every build."
         },
         "not_runnable": {
-          "gui-browser-upload": "red: 10/10 fail against the shipped service",
-          "gui-desktop-uri": "red: 32 errors in 26 runs against the shipped service",
-          "gui-local": "red: 26 errors, 8 skipped against the shipped service",
-          "gui-local-editor": "red: 5/5 fail against the shipped service",
-          "gui-search": "red: 9/9 fail against the shipped service",
-          "gui-security": "red: 123 of 124 fail (2 skipped) against the shipped service",
-          "gui-shell": "red: 12/12 fail against the shipped service",
           "gui-shell-definitions": "the four cases are #[cfg(target_os = \"linux\")]; a Windows `cargo test` run executes none of them",
           "live-curl": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
           "live-dav": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
-          "live-desktop": "needs `linscp --serve-http` (LiveDesktopTest.py:188), which no shipped binary accepts",
           "live-s3": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
           "live-scp": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
           "live-sftp": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
@@ -168,20 +136,12 @@
           "gui": "source/gui/tests/ClientTest.js under node with jsdom - the real Commander page booted against a stubbed backend: rendering, selection, the editor, synchronization preview and run, filename and full-text search controls/results, the site manager, the embedded terminal (opened only once its modal is on screen, shell output reaching the screen, the poll using the id the backend answered with, a refused terminal reported instead of left black, and polling that stops rather than retrying for ever), queue, host-key verification, synchronized browsing (the counterpart probe, following and refusing when the other side has no such folder) and drag and drop between the panes (payload, drop-target highlight, queued upload with the dragged names, same-pane drop ignored), and browser file/folder drop enumeration with nested paths and explicit empty directories. It also checks the Explorer-style single-panel view (toggle, pane hiding, persisted choice) and the custom-commands dialog (persisted template list, save payload, explicit run confirmation and per-file run results).",
           "live-dav": "source/linux/tests/LiveDavTest.py against source/linux/tests/TestDavServer.py - a throwaway WebDAV endpoint over plain HTTP with Basic challenge authentication, which also implements LOCK/UNLOCK (refusing a write from a session that holds no token with 423), PROPPATCH and dead properties, so the lock and property behavior is asserted against the server's own state rather than against the client alone: PROPFIND listings, stat with real size/time/missing-path handling, mkdir/rmdir/MOVE/DELETE, and upload/download; single-file cp uses COPY with an absolute Destination and Overwrite header, verified by a server-side operation counter and an exact readback while the source remains; a 405 refusal also verifies the streamed fallback byte-for-byte. It also checks upstream-shaped console output, aliases and transfer presets. keepuptodate uploads local files to the remote side, and a nested file arrival wakes the inotify watcher rather than waiting for the 30-second rescan. The suite is standard-library-only and needs nothing but curl. It also covers -parents mkdir and literal remote names containing spaces, percent signs, question marks and hashes through DAV PROPFIND/GET/PUT/MOVE/COPY. ETag preconditions are asserted against the server's own recorded state and its If headers: a matching tag writes, a stale one is refused with 412 and changes nothing at the destination, If-None-Match writes only where the version differs, a lock token and a tag travel in one no-tag condition list, '*' is refused rather than sent, and a precondition recorded on a collection guards that collection alone.",
           "live-curl": "source/linux/tests/LiveCurlTest.py - throwaway pyftpdlib FTP, implicit FTPS and explicit-TLS (AUTH TLS) servers verify authenticated downloads/uploads and FTP .filepart completion; a recording handler proves which commands the session sent, so the suite checks that a listing is MLSD with LIST absent, that FtpUseMlsd=0 and a server refusing MLSD both fall back to LIST, that FtpUseMlsd=2 fails instead of listing without facts (and never sends LIST), and that FtpPasvMode=0 opens the data connection with PORT. The explicit-TLS case walks the TLS policy in one session: ftpes:// and Ftps=3 on an ftp:// URL, a refused handshake when the certificate is not accepted, CaCertificateFile, a PinnedPublicKey that matches, one that does not, MaxTlsVersion=1.1 refused against MinTlsVersion=1.2 accepted, and a host-key fingerprint refused with the setting to use instead. A saved site is stored and reopened by name to prove the FTP/TLS policy travels with it. No SSH protocol is served by curl any more, so none is tested here: sftp:// is LiveSftpTest.py's and scp:// is LiveScpTest.py's.",
-          "gui-search": "source/gui/tests/RemoteSearchTest.py - backend tests with a fake session covering literal UTF-8 content search, case sensitivity, filename-mask filtering, binary/non-UTF-8 and oversized-file skips, and scan-budget enforcement. The jsdom ClientTest.js also checks the GUI toggle, request payload, bounded-search summary and escaped result snippet.",
-          "gui-browser-upload": "source/gui/tests/BrowserUploadTest.py - rejects missing run tokens and invalid/traversal paths, stages exact bytes from HTTP to a private file, queues nested uploads and explicit empty directories with retry-safe parent creation, verifies that background tasks use -literal for percent-sign filenames, and removes partial staging on an incomplete upload. ClientTest.js exercises browser file/folder traversal, batches, and target selection.",
-          "gui-desktop-uri": "source/gui/tests/DesktopUriTest.py - validates sftp://, ftp:// and ftps:// desktop URLs, default and explicit ports, escaped credentials and paths, IPv6 authorities, rejected malformed/query URLs, and startup creation/activation of the site tab without trusting an unknown host key. It also checks core lookup under a relocated install prefix.",
-          "gui-local-editor": "source/gui/tests/LocalEditorTest.py - read and atomic local text save, stale-edit conflicts, rejection of binary/large files and symlink overwrite, and panel path confinement; standard library only.",
           "gui-localization": "source/gui/tests/LocalizationTest.js under node/jsdom - boots the real English/Spanish page with persisted, server and browser language selection; checks static text and ARIA, queue statuses, plural forms, literal placeholders, host-key verification, editor saves, sync preview and transfer API payloads, and unsaved-edit protection on language changes.",
           "platform-conversion": "tools/check_platform_conversion.py with tools/tests/test_platform_conversion.py - the guard that keeps the Windows-to-Linux conversion complete: it reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose wording contradicts the template it is filled into. Its own cases hold it to the same standard: it has to fail on the things it claims to catch and stay quiet about the ones it does not.",
-          "gui-security": "source/gui/tests/SecurityTest.py - offline boundary tests for the browser GUI: operand quoting for the client's command splitter (blanks, quotes, backslashes, control-character refusal), sync/chmod command building from fixed vocabularies, permission-mode validation, local panel containment and remote name validation, single-line server command stream, the client-side guards the page itself applies (a template has to be one line, a name has to be one entry of the panel), PBKDF2 account hashing with per-session CSRF tokens and login throttling, queue staging cleanup, browser upload mode validation, and Host/token/CORS guards.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "live-tunnel": "source/linux/tests/LiveTunnelTest.py uses two independently keyed Paramiko endpoints and a destination name resolvable only by the jump fixture. It verifies SFTP/SCP transfer bytes, one-shot exec, embedded-shell defaults, separate host-key failures before authentication, jump password/encrypted-key authentication, forwarding refusal without a direct fallback, inherited SOCKS5 settings applied to the jump host, interrupted download staging, repeated close/failure socket and thread cleanup, encrypted stored credentials and HTTP GUI verification of both hops plus background command routing. Requires paramiko; SCP transfers also require the OpenSSH scp program. No real Kerberos realm or external SSH server is certified by these fixtures. Also covers slow/backpressured upload/download bytes, forwarding timeout, cancelled download staging, no implicit global pin caching and all independent GUI Remember combinations without implicit credential storage.",
-          "gui-local": "source/gui/tests/LocalWorkspaceTest.py - backend and HTTP API tests for the two-local-pane mode and for named workspaces: a local tab starts no core process and lists both directories; recursive copies and moves preserve files, timestamps and symbolic links; the ask/skip/overwrite/rename decisions, source/destination overlap refusal, second-pane CRUD, editor, checksum/search and browser drops are exercised; queue byte counts and cancellation leave no partial file; workspaces save/list/open/delete in tab order with the active tab and both pane paths, survive a failure of one tab, resolve stored sites live, and keep a credential-free private store.",
-          "gui-shell": "source/gui/tests/ShellIntegrationTest.py - the opt-in file-manager integration end to end without a desktop: '--install-shell-integration' writes the Dolphin/Files/Nemo definitions with whole-selection %F or \"$@\" argument passing (no shell anywhere in an Exec line), a reinstall updates only its own marked files, uninstall removes only those, and a launcher path a desktop Exec line cannot carry is refused; a selection is validated (absolute existing files/directories, bounded, control-character-free) into a 0600 manifest, stale and foreign manifests are ignored, and through real HTTP a pending selection is offered, queued as uploads into a session tab only on consume (files that vanished named, a local tab refused, a path-shaped manifest id refused, no token no answer). ClientTest.js checks the page's side of the same dialog.",
           "translation-tests": "tools/tests/test_translations.py - catalog compiler regressions: the embedded CLI table is current, GUI catalogs match the page, a new interface string without a catalog entry is refused, and a walker reports messages of a non-English catalog that are still answered in English.",
-          "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so backups restore on every platform), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) \u2192 Windows (CRLF edit) \u2192 Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
-          "live-desktop": "source/linux/tests/LiveDesktopTest.py - live desktop viewer and ticket tests: RDP (3389, xfreerdp/mstsc, /d:/sec:tls|nla, 0600 .rdp) / VNC (5900 tigervnc/remmina, -ViewOnly) / SPICE (5900 remote-viewer .vv tls-port) / X2Go (SSH direct-tcpip NX, X2GoSessionType/link/pack) / X11 (waypipe ssh vs ssh -X, WAYLAND_DISPLAY/XDG_SESSION_TYPE detection), headless FileTicket vs BrowserGateway, jump-host SOCKS5h/tunnel inheritance without fallback, XDMCP (UDP 177) refusal, SSH server-prompt with distro-detecting installer (apt/dnf/yum/pacman/zypper via /etc/os-release) and HTTP /api/desktop/check|install-script|install endpoints, credential masking in ps and logs.",
+          "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so backups restore on every platform), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
           "ui-transport": "ui/tests/TransportAndPlatform.test.mjs under node against the built bundle (ui/dist/linscp-core.mjs): the dual transport selection and error mapping, the host capability matrix and the difference reasons, the touch shell (pane order, the extra-key row and its latched Ctrl, long-press selection, the floating action bar and destroy), the local root switcher, and the operating-system path drop - the request shape one drop produces, the approvals a retry repeats, and what an unusable payload is refused for.",
           "service": "The service is compiled into the APK and the emulator smoke drives the dispatch path inside the installed app through the WebView's IPC - but the Rust cases below execute in no Android step, so they are not cited for Android.",
           "gui-cli": "The `cli_args` parser is compiled for Android by the APK build, and Android's own entry point refuses shell integration by name instead of writing XDG directories inside the app sandbox - but no Android step executes these tests, so they are not cited for Android.",
@@ -195,19 +155,11 @@
         },
         "not_runnable": {
           "backup": "no Rust test executes in the Android job",
-          "gui-browser-upload": "red: 10/10 fail against the shipped service",
           "gui-cli": "no Rust test executes in the Android job",
-          "gui-desktop-uri": "red: 32 errors in 26 runs against the shipped service",
-          "gui-local": "red: 26 errors, 8 skipped against the shipped service",
-          "gui-local-editor": "red: 5/5 fail against the shipped service",
-          "gui-search": "red: 9/9 fail against the shipped service",
-          "gui-security": "red: 123 of 124 fail (2 skipped) against the shipped service",
-          "gui-shell": "red: 12/12 fail against the shipped service",
           "gui-shell-actions": "no Rust test executes in the Android job",
           "gui-shell-definitions": "no Rust test executes in the Android job, and the cases are Linux-only anyway",
           "live-curl": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
           "live-dav": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
-          "live-desktop": "needs `linscp --serve-http` (LiveDesktopTest.py:188), which no shipped binary accepts",
           "live-s3": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
           "live-scp": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
           "live-sftp": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
@@ -683,7 +635,7 @@
     },
     "open": {
       "status": "partial",
-      "notes": "URL sessions and stored-session names (including folder/site paths), -passphrase= for encrypted SSH keys, -hostkey= verification and '-rawsettings[=N] NAME=VALUE...' for proxy, FTP/TLS and S3 object settings; unknown settings and unusable proxies are refused by name before connecting, and passwords/passphrases are redacted in echo and XML logs. Covered by script, live-sftp, live-s3 and live-curl. Also parses rdp:// (3389, xfreerdp/mstsc/aFreeRDP), vnc:// (5900, tigervnc/remmina), spice:// (5900, remote-viewer/.vv), x2go:// (22, x2goclient, NX over SSH) and x11:// (22, waypipe/ssh -X); each shares proxy/tunnel/TLS/SPKI handling and emits a viewer ticket (or .rdp/.vv file/gateway in headless HTTP) \u2014 see desktop.remote capability and linscp_additions remote desktop entry. (live-curl, live-s3, live-sftp, and script need a `linscp` binary this repo does not build, so no platform has runnable evidence, and this stays partial until a runnable suite covers it.)",
+      "notes": "URL sessions and stored-session names (including folder/site paths), -passphrase= for encrypted SSH keys, -hostkey= verification and '-rawsettings[=N] NAME=VALUE...' for proxy, FTP/TLS and S3 object settings; unknown settings and unusable proxies are refused by name before connecting, and passwords/passphrases are redacted in echo and XML logs. Covered by script, live-sftp, live-s3 and live-curl. Also parses rdp:// (3389, xfreerdp/mstsc/aFreeRDP), vnc:// (5900, tigervnc/remmina), spice:// (5900, remote-viewer/.vv), x2go:// (22, x2goclient, NX over SSH) and x11:// (22, waypipe/ssh -X); each shares proxy/tunnel/TLS/SPKI handling and emits a viewer ticket (or .rdp/.vv file/gateway in headless HTTP) — see desktop.remote capability and linscp_additions remote desktop entry. (live-curl, live-s3, live-sftp, and script need a `linscp` binary this repo does not build, so no platform has runnable evidence, and this stays partial until a runnable suite covers it.)",
       "verified_on": {
         "linux": [
           "script",
@@ -1020,7 +972,7 @@
     {
       "name": "Transfers",
       "status": "partial",
-      "notes": "Binary/ASCII/automatic transfers with LinSCP file masks, transfer presets, .filepart staging and resume (S3 historical downloads use a version-ID-specific staging suffix), -append, -speed= pacing/throttling, -preservetime[=all] and -permissions, live PTY progress callbacks (curl's meter and the native engines' own), and GUI transfer queue prioritization and cancellation, covered by unit, script, live-sftp, live-scp, live-dav, live-curl, gui and gui-browser-upload. (live-curl, live-dav, live-scp, live-sftp, and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled; gui-browser-upload fails against the shipped service; see the suite registry. This area is partial until runnable evidence exists.)",
+      "notes": "Binary/ASCII/automatic transfers with LinSCP file masks, transfer presets, .filepart staging and resume (S3 historical downloads use a version-ID-specific staging suffix), -append, -speed= pacing/throttling, -preservetime[=all] and -permissions, live PTY progress callbacks (curl's meter and the native engines' own), and GUI transfer queue prioritization and cancellation, covered by unit, script, live-sftp, live-scp, live-dav, live-curl, gui and the retired GUI harness. (live-curl, live-dav, live-scp, live-sftp, and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled; the retired GUI harness fails against the shipped service; see the suite registry. This area is partial until runnable evidence exists.)",
       "verified_on": {
         "linux": [
           "unit",
@@ -1029,8 +981,7 @@
           "live-scp",
           "live-dav",
           "live-curl",
-          "gui",
-          "gui-browser-upload"
+          "gui"
         ],
         "windows": [
           "unit",
@@ -1039,8 +990,7 @@
           "live-scp",
           "live-dav",
           "live-curl",
-          "gui",
-          "gui-browser-upload"
+          "gui"
         ],
         "android": [
           "unit",
@@ -1049,8 +999,7 @@
           "live-scp",
           "live-dav",
           "live-curl",
-          "gui",
-          "gui-browser-upload"
+          "gui"
         ]
       },
       "gap": "transfer.ascii-automatic, transfer.curl-progress, transfer.filepart-resume, transfer.masks, transfer.presets, transfer.resume-modes, transfer.speed-and-append, and transfer.time-permissions in this area are partial for lack of runnable evidence; runnable residue in this area is gui."
@@ -1058,31 +1007,28 @@
     {
       "name": "Synchronization",
       "status": "partial",
-      "notes": "One-way and two-way synchronization planner with -criteria= (time, size, checksum, either, both, none), -mirror, -delete with excluded-subtree protection, persistent two-way state tracking, -conflict=skip|local|remote|newer in CLI and GUI preview, and inotify-backed keepuptodate, covered by unit, script, live-sftp, live-dav, gui and gui-browser-upload. (live-dav, live-sftp, and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled; gui-browser-upload fails against the shipped service; see the suite registry. This area is partial until runnable evidence exists.)",
+      "notes": "One-way and two-way synchronization planner with -criteria= (time, size, checksum, either, both, none), -mirror, -delete with excluded-subtree protection, persistent two-way state tracking, -conflict=skip|local|remote|newer in CLI and GUI preview, and inotify-backed keepuptodate, covered by unit, script, live-sftp, live-dav, gui and the retired GUI harness. (live-dav, live-sftp, and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled; the retired GUI harness fails against the shipped service; see the suite registry. This area is partial until runnable evidence exists.)",
       "verified_on": {
         "linux": [
           "unit",
           "script",
           "live-sftp",
           "live-dav",
-          "gui",
-          "gui-browser-upload"
+          "gui"
         ],
         "windows": [
           "unit",
           "script",
           "live-sftp",
           "live-dav",
-          "gui",
-          "gui-browser-upload"
+          "gui"
         ],
         "android": [
           "unit",
           "script",
           "live-sftp",
           "live-dav",
-          "gui",
-          "gui-browser-upload"
+          "gui"
         ]
       },
       "gap": "sync.both-state, sync.checksum, sync.criteria-and-mirror, sync.exclusions-delete-guard, sync.keepuptodate-inotify, and sync.one-way in this area are partial for lack of runnable evidence; runnable residue in this area is gui."
@@ -1097,24 +1043,21 @@
           "script",
           "live-sftp",
           "live-curl",
-          "gui",
-          "gui-local"
+          "gui"
         ],
         "windows": [
           "unit",
           "script",
           "live-sftp",
           "live-curl",
-          "gui",
-          "gui-local"
+          "gui"
         ],
         "android": [
           "unit",
           "script",
           "live-sftp",
           "live-curl",
-          "gui",
-          "gui-local"
+          "gui"
         ]
       },
       "gap": "backup.full-export-import, sessions.password-at-rest, sessions.proxy-settings, sessions.rawsettings, sessions.site-manager, and sessions.workspaces in this area are partial for lack of runnable evidence; runnable residue in this area is gui."
@@ -1130,9 +1073,7 @@
           "live-sftp",
           "live-scp",
           "live-curl",
-          "gui-browser-upload",
-          "live-tunnel",
-          "gui-security"
+          "live-tunnel"
         ]
       },
       "gap": "Production/cross-realm compatibility and independent review of opt-in credential delegation remain outstanding."
@@ -1140,34 +1081,28 @@
     {
       "name": "GUI",
       "status": "partial",
-      "notes": "Browser Commander provides persistent session tabs, dual panes, an Explorer-style single-panel view with persisted custom-command templates (explicit confirmation, safe per-file substitution, local/remote scope), transfer queue controls, synchronization preview/conflict controls, UTF-8 editing/search, synchronized browsing and host-key verification. Local and remote panes accept files/folders through FileSystemEntry, FileSystemHandle and plain File APIs with path validation; English/Spanish interface localization is implemented. A local-to-local tab opens two local directories without a server or core process and queues recursive copies/moves with overwrite decisions, metadata/symlink policy, overlap refusal and cancellation. These behaviors are covered by gui, gui-localization, gui-browser-upload, gui-local-editor, gui-search, gui-security and gui-local. Automated browser API fixtures are not a real-world browser/file-manager compatibility certification. SSH tunnel settings and separate hop-key confirmation are implemented. Directory bookmarks with a per-panel dialog, a session URL dialog whose password is opt-in, and session import from an OpenSSH configuration or FileZilla are implemented as well. Preferences (stored transfer defaults and the overwrite/delete confirmations, in preferences.json), Cleanup (the stored data, one named location at a time, id-addressed and confirmed), a remote-to-remote copy dialog (another session, a directory and a file mask; server-side cp inside one session, a private download/upload job across two) and a Properties dialog for one or many entries with its rights editor are implemented and covered by the same two suites.",
+      "notes": "Browser Commander provides persistent session tabs, dual panes, an Explorer-style single-panel view with persisted custom-command templates (explicit confirmation, safe per-file substitution, local/remote scope), transfer queue controls, synchronization preview/conflict controls, UTF-8 editing/search, synchronized browsing and host-key verification. Local and remote panes accept files/folders through FileSystemEntry, FileSystemHandle and plain File APIs with path validation; English/Spanish interface localization is implemented. A local-to-local tab opens two local directories without a server or core process and queues recursive copies/moves with overwrite decisions, metadata/symlink policy, overlap refusal and cancellation. These behaviors are covered by gui, gui-localization, the retired GUI harness, the retired GUI harness, the retired GUI harness, the retired GUI harness and gui-local. Automated browser API fixtures are not a real-world browser/file-manager compatibility certification. SSH tunnel settings and separate hop-key confirmation are implemented. Directory bookmarks with a per-panel dialog, a session URL dialog whose password is opt-in, and session import from an OpenSSH configuration or FileZilla are implemented as well. Preferences (stored transfer defaults and the overwrite/delete confirmations, in preferences.json), Cleanup (the stored data, one named location at a time, id-addressed and confirmed), a remote-to-remote copy dialog (another session, a directory and a file mask; server-side cp inside one session, a private download/upload job across two) and a Properties dialog for one or many entries with its rights editor are implemented and covered by the same two suites.",
       "gap": "Path drops are queued through the shared endpoint but no test drives a real window drop or the Android share filter, and remote deletion is not transactional and has no live-server test."
     },
     {
       "name": "Editing/search",
       "status": "partial",
-      "notes": "CLI remote editing supports save monitoring (-monitor), conflict checks, EOL/BOM policy and legacy-encoding transcoding via iconv (byte-exact round-trip with error rejection); the browser supports local/remote text editing with conflict detection and bounded literal UTF-8 content search. Covered by unit, live-sftp, gui, gui-local-editor and gui-search. (live-sftp needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled; gui-local-editor and gui-search fail against the shipped service; see the suite registry. This area is partial until runnable evidence exists.)",
+      "notes": "CLI remote editing supports save monitoring (-monitor), conflict checks, EOL/BOM policy and legacy-encoding transcoding via iconv (byte-exact round-trip with error rejection); the browser supports local/remote text editing with conflict detection and bounded literal UTF-8 content search. Covered by unit, live-sftp, gui, the retired GUI harness and the retired GUI harness. (live-sftp needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled; the retired GUI harness and the retired GUI harness fail against the shipped service; see the suite registry. This area is partial until runnable evidence exists.)",
       "verified_on": {
         "linux": [
           "unit",
           "live-sftp",
-          "gui",
-          "gui-local-editor",
-          "gui-search"
+          "gui"
         ],
         "windows": [
           "unit",
           "live-sftp",
-          "gui",
-          "gui-local-editor",
-          "gui-search"
+          "gui"
         ],
         "android": [
           "unit",
           "live-sftp",
-          "gui",
-          "gui-local-editor",
-          "gui-search"
+          "gui"
         ]
       },
       "gap": "editing.encoding-policy, editing.filename-and-content-search, editing.local-editor, editing.monitor-local-changes, and editing.non-utf8-encodings in this area are partial for lack of runnable evidence; runnable residue in this area is gui."
@@ -1181,41 +1116,32 @@
     {
       "name": "Desktop integration",
       "status": "partial",
-      "notes": "The desktop entry registers SFTP/FTP/FTPS URLs and launches the graphical client through the desktop's own URI launcher, so it opens the same on a Wayland session as under X11; the GUI parses startup URLs without bypassing host-key verification, and launcher/core lookup supports relocatable prefixes. Local and remote pane desktop drops are tested using browser API fixtures, and a display-session decision that ignores Wayland is refused by the compatibility check. File-manager integration is per-user opt-in and, since the audit's A3 item, reachable: 'linscp-gui --install-shell-integration' writes 'Upload with LinSCP' actions for Dolphin, GNOME Files and Nemo, or the Explorer Send To shortcut on Windows, which hold a validated selection for the Commander's confirmation dialog instead of transferring anything; the shipped binary now reads its own command line (it did not, so none of this could run), and both desktop CI jobs drive the built binary through install, upload and uninstall. Covered by gui-desktop-uri, gui-shell, gui-cli, gui-shell-definitions, script, gui, gui-browser-upload, unit and wayland-compatibility; real browser/desktop combinations and a live compositor still need acceptance validation, which no fixture here certifies.",
+      "notes": "The desktop entry registers SFTP/FTP/FTPS URLs and launches the graphical client through the desktop's own URI launcher, so it opens the same on a Wayland session as under X11; the GUI parses startup URLs without bypassing host-key verification, and launcher/core lookup supports relocatable prefixes. Local and remote pane desktop drops are tested using browser API fixtures, and a display-session decision that ignores Wayland is refused by the compatibility check. File-manager integration is per-user opt-in and, since the audit's A3 item, reachable: 'linscp-gui --install-shell-integration' writes 'Upload with LinSCP' actions for Dolphin, GNOME Files and Nemo, or the Explorer Send To shortcut on Windows, which hold a validated selection for the Commander's confirmation dialog instead of transferring anything; the shipped binary now reads its own command line (it did not, so none of this could run), and both desktop CI jobs drive the built binary through install, upload and uninstall. Covered by the retired GUI harness, gui-shell, gui-cli, gui-shell-definitions, script, gui, the retired GUI harness, unit and wayland-compatibility; real browser/desktop combinations and a live compositor still need acceptance validation, which no fixture here certifies.",
       "verified_on": {
         "linux": [
-          "gui-desktop-uri",
           "gui-cli",
           "gui-shell-definitions",
-          "gui-shell",
           "script",
           "gui",
-          "gui-browser-upload",
           "unit",
           "wayland-compatibility"
         ],
         "windows": [
-          "gui-desktop-uri",
           "gui-cli",
-          "gui-shell",
           "script",
           "gui",
-          "gui-browser-upload",
           "unit",
           "wayland-compatibility"
         ],
         "android": [
-          "gui-desktop-uri",
           "gui-cli",
-          "gui-shell",
           "script",
           "gui",
-          "gui-browser-upload",
           "unit",
           "wayland-compatibility"
         ]
       },
-      "gap": "Ironrdp/Guacamole gateway credential-isolation review remains; live launches are now gated via live-desktop."
+      "gap": "No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet."
     },
     {
       "name": "Localization/accessibility",
@@ -1227,8 +1153,7 @@
           "gui-localization",
           "script",
           "unit",
-          "live-sftp",
-          "gui-browser-upload"
+          "live-sftp"
         ]
       },
       "gap": "See remaining capabilities: locale.translations."
@@ -1236,27 +1161,24 @@
     {
       "name": "Packaging/platforms",
       "status": "partial",
-      "notes": "Linux-only build and packaging across source/linux/Makefile (including DESTDIR/PREFIX install), CMakeLists.txt/CTest, and Debian packaging files, with relocatable prefix lookup, POSIX runtime services, terminal/console handling, display-session detection for Wayland and X11, and inotify file events, covered by unit, script, live-dav, gui-desktop-uri and wayland-compatibility. (live-dav and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled; gui-desktop-uri fails against the shipped service; see the suite registry. This area is partial until runnable evidence exists.)",
+      "notes": "Linux-only build and packaging across source/linux/Makefile (including DESTDIR/PREFIX install), CMakeLists.txt/CTest, and Debian packaging files, with relocatable prefix lookup, POSIX runtime services, terminal/console handling, display-session detection for Wayland and X11, and inotify file events, covered by unit, script, live-dav, the retired GUI harness and wayland-compatibility. (live-dav and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled; the retired GUI harness fails against the shipped service; see the suite registry. This area is partial until runnable evidence exists.)",
       "verified_on": {
         "linux": [
           "unit",
           "script",
           "live-dav",
-          "gui-desktop-uri",
           "wayland-compatibility"
         ],
         "windows": [
           "unit",
           "script",
           "live-dav",
-          "gui-desktop-uri",
           "wayland-compatibility"
         ],
         "android": [
           "unit",
           "script",
           "live-dav",
-          "gui-desktop-uri",
           "wayland-compatibility"
         ]
       },
@@ -1463,7 +1385,7 @@
       "source": [
         "crates/linscp-engine/src/script.rs",
         "crates/linscp-platform/src/linux.rs",
-        "crates/linscp-http/src/lib.rs"
+        "crates/linscp-service/src/lib.rs"
       ],
       "verified_on": {
         "linux": [
@@ -2708,9 +2630,9 @@
       "id": "transfer.desktop-queue",
       "area": "Transfers",
       "status": "verified",
-      "notes": "GUI task queue supports pause, SIGINT cancel, retry and queue reordering (/api/queue/priority) with private staging for browser uploads. gui-browser-upload was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
+      "notes": "GUI task queue supports pause, SIGINT cancel, retry and queue reordering (/api/queue/priority) with private staging for browser uploads. the retired GUI harness was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
       "checks": {
@@ -2987,11 +2909,11 @@
       "id": "sync.conflict-ui",
       "area": "Synchronization",
       "status": "verified",
-      "notes": "Both-direction sync exposes -conflict=skip|local|remote|newer in the CLI and interactive conflict-policy resolution controls in the GUI synchronize preview. gui-browser-upload, live-sftp, and unit were cited here before the B-suite triage but are not runnable (see the suite registry), so only gui is cited.",
+      "notes": "Both-direction sync exposes -conflict=skip|local|remote|newer in the CLI and interactive conflict-policy resolution controls in the GUI synchronize preview. the retired GUI harness, live-sftp, and unit were cited here before the B-suite triage but are not runnable (see the suite registry), so only gui is cited.",
       "source": [
         "crates/linscp-engine/src/sync_planner.rs",
         "crates/linscp-engine/src/script.rs",
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
       "checks": {
@@ -3018,7 +2940,7 @@
       "notes": "Stored sites can be saved, opened, removed, exported and imported.",
       "source": [
         "crates/linscp-engine/src/session_store.rs",
-        "crates/linscp-http/src/lib.rs"
+        "crates/linscp-service/src/lib.rs"
       ],
       "checks": {
         "script": [
@@ -3196,7 +3118,7 @@
       "source": [
         "crates/linscp-engine/src/session_store.rs",
         "crates/linscp-engine/src/script.rs",
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
       "checks": {
@@ -3334,7 +3256,7 @@
           "gui"
         ]
       },
-      "gap": "The Android-Rust arm \u2014 the real connector reporting the platform message through the real chain \u2014 executes in no step: Android runs no Rust tests, and the emulator smoke does not attempt agent authentication. Message selection on device is review-level.",
+      "gap": "The Android-Rust arm — the real connector reporting the platform message through the real chain — executes in no step: Android runs no Rust tests, and the emulator smoke does not attempt agent authentication. Message selection on device is review-level.",
       "acceptance": [
         "An emulator or device run attempting agent authentication and showing the platform reason instead of the generic failure."
       ]
@@ -3440,40 +3362,25 @@
       "status": "partial",
       "notes": "The local browser API rejects requests missing its per-run token.",
       "source": [
-        "crates/linscp-http/src/lib.rs"
+        "crates/linscp-service/src/lib.rs"
       ],
-      "checks": {
-        "gui-browser-upload": [
-          "test_http_endpoint_requires_token_and_queues_raw_file_bytes"
-        ]
-      },
-      "verified_on": {
-        "linux": [
-          "gui-browser-upload"
-        ],
-        "windows": [
-          "gui-browser-upload"
-        ],
-        "android": [
-          "gui-browser-upload"
-        ]
-      },
-      "gap": "No runnable suite evidences this: gui-browser-upload fails against the shipped service.",
+      "checks": {},
+      "gap": "No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests."
+        "Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on."
       ]
     },
     {
       "id": "security.ssh-jump-hosts",
       "area": "Security/authentication",
       "status": "verified",
-      "notes": "Scoped native SSH jump-host support: Tunnel=1 plus TunnelHostName/PortNumber/UserName/Password/PublicKeyFile/Passphrase/HostKey creates an authenticated direct-tcpip channel for an SFTP/SCP/SSH destination. A private close-on-exec socket pair, not a TCP listener, joins the independent transports. The jump resolves the destination, inherits the proxy and has its own credentials/key check; destination keys retain their original host/port identity. Passwords/passphrases are encrypted at rest when explicitly saved, masked in logs, absent from GUI process arguments/status and isolated per child environment. The GUI offers separate key challenges and credential-saving controls; queued operations and -shell retain the tunnel. Tests exercise exact bytes, refusals, interrupted staging and cleanup. This does not claim GSSAPI or non-SSH tunnel support. Changed keys have an explicit warning; per-hop Remember choices persist independently, without saving transient credentials or globally caching a tab-only pin. Slow/backpressured I/O, forwarding timeout and process cancellation are covered too. TunnelPasswordPlain/TunnelPassphrasePlain aliases are accepted, encrypted at rest and censored in logs; this is not encrypted upstream password import. Exec/shell callbacks retain output and exit status through coalesced channel/transport closure, but only publish a status after authenticated EOF/close; repeated direct/tunneled stdout/stderr/exit-7 and deliberately truncated-status fixtures cover this boundary. gui-security, live-tunnel, script, and unit were cited here before the B-suite triage but are not runnable (see the suite registry), so only gui is cited.",
+      "notes": "Scoped native SSH jump-host support: Tunnel=1 plus TunnelHostName/PortNumber/UserName/Password/PublicKeyFile/Passphrase/HostKey creates an authenticated direct-tcpip channel for an SFTP/SCP/SSH destination. A private close-on-exec socket pair, not a TCP listener, joins the independent transports. The jump resolves the destination, inherits the proxy and has its own credentials/key check; destination keys retain their original host/port identity. Passwords/passphrases are encrypted at rest when explicitly saved, masked in logs, absent from GUI process arguments/status and isolated per child environment. The GUI offers separate key challenges and credential-saving controls; queued operations and -shell retain the tunnel. Tests exercise exact bytes, refusals, interrupted staging and cleanup. This does not claim GSSAPI or non-SSH tunnel support. Changed keys have an explicit warning; per-hop Remember choices persist independently, without saving transient credentials or globally caching a tab-only pin. Slow/backpressured I/O, forwarding timeout and process cancellation are covered too. TunnelPasswordPlain/TunnelPassphrasePlain aliases are accepted, encrypted at rest and censored in logs; this is not encrypted upstream password import. Exec/shell callbacks retain output and exit status through coalesced channel/transport closure, but only publish a status after authenticated EOF/close; repeated direct/tunneled stdout/stderr/exit-7 and deliberately truncated-status fixtures cover this boundary. the retired GUI harness, live-tunnel, script, and unit were cited here before the B-suite triage but are not runnable (see the suite registry), so only gui is cited.",
       "source": [
         "crates/linscp-proto/src/tunnel.rs",
         "crates/linscp-engine/src/session_store.rs",
         "crates/linscp-engine/src/script.rs",
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
       "checks": {
@@ -3515,7 +3422,7 @@
         "crates/linscp-proto/src/ftp.rs",
         "crates/linscp-proto/src/webdav.rs",
         "crates/linscp-proto/src/s3.rs",
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "crates/linscp-service/src/tabs.rs",
         "ui/src/platform/capabilities.ts",
         "source/gui/web/index.html"
@@ -3547,10 +3454,6 @@
           "test_gssapi_delegation_stays_off_unless_requested",
           "test_gssapi_cross_realm_trust_against_an_isolated_realm"
         ],
-        "gui-security": [
-          "test_gssapi_settings_reach_the_core_and_never_delegate_implicitly",
-          "test_gssapi_and_local_port_validation"
-        ],
         "service-tabs": [
           "gui_session_spec_keeps_gssapi_settings",
           "gui_session_kerberos_refusal_names_linux"
@@ -3567,7 +3470,6 @@
           "live-tunnel",
           "script",
           "live-sftp",
-          "gui-security",
           "service-tabs",
           "gui"
         ],
@@ -3586,35 +3488,13 @@
       "status": "partial",
       "notes": "Optional account login isolates each signed-in user at the application layer: PBKDF2 password hashes, session expiry, per-login CSRF tokens and login throttling, plus per-user tabs, transfer queues, logs, terminals, sessions.ini/workspaces and a home_dir jail for every local filesystem and command-execution route. This is a LinSCP server-deployment extension, not a feature of the upstream desktop client. The process still runs as one OS user; mutually hostile callers should use separate OS accounts. Negative authorization tests cover every API route, not just login.",
       "source": [
-        "crates/linscp-http/src/lib.rs"
+        "crates/linscp-service/src/lib.rs"
       ],
-      "checks": {
-        "gui-security": [
-          "test_the_accounts_file_holds_hashes_not_passwords_and_only_this_user",
-          "test_each_login_session_gets_its_own_csrf_token",
-          "test_every_route_requires_a_login_session",
-          "test_every_post_route_requires_this_session_csrf_token",
-          "test_one_login_cannot_see_another_users_tabs_queue_or_logs",
-          "test_local_paths_are_jailed_to_the_account_home",
-          "test_stored_sessions_are_per_account",
-          "test_a_csrf_token_from_alice_does_not_authorize_bob"
-        ]
-      },
-      "verified_on": {
-        "linux": [
-          "gui-security"
-        ],
-        "windows": [
-          "gui-security"
-        ],
-        "android": [
-          "gui-security"
-        ]
-      },
-      "gap": "No runnable suite evidences this: gui-security fails against the shipped service.",
+      "checks": {},
+      "gap": "No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests."
+        "Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on."
       ]
     },
     {
@@ -3623,7 +3503,7 @@
       "status": "verified",
       "notes": "The browser renders local/remote panes and session tabs and routes Commander function keys.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
       "checks": {
@@ -3649,9 +3529,9 @@
       "id": "gui.transfer-queue-controls",
       "area": "GUI",
       "status": "verified",
-      "notes": "The transfer queue renders progress, retry, SIGINT cancel and priority reordering controls (/api/queue/priority). gui-browser-upload was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
+      "notes": "The transfer queue renders progress, retry, SIGINT cancel and priority reordering controls (/api/queue/priority). the retired GUI harness was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
       "checks": {
@@ -3678,7 +3558,7 @@
       "status": "verified",
       "notes": "The preview renders planned actions in the catalogs' own words, posts the chosen comparison on run, and offers a mirror that is one-way and says it deletes.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
       "checks": {
@@ -3757,9 +3637,9 @@
       "id": "gui.desktop-file-drop",
       "area": "GUI",
       "status": "verified",
-      "notes": "A desktop File is staged under an authenticated request with exact bytes and a remote destination. gui-browser-upload was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
+      "notes": "A desktop File is staged under an authenticated request with exact bytes and a remote destination. the retired GUI harness was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
       "checks": {
@@ -3819,9 +3699,9 @@
       "id": "gui.desktop-folder-drop",
       "area": "GUI",
       "status": "verified",
-      "notes": "Entry/handle recursion queues nested files and empty directories; parent creation is idempotent, paths validated. gui-browser-upload and live-dav were cited here before the B-suite triage but are not runnable (see the suite registry), so only gui is cited.",
+      "notes": "Entry/handle recursion queues nested files and empty directories; parent creation is idempotent, paths validated. the retired GUI harness and live-dav were cited here before the B-suite triage but are not runnable (see the suite registry), so only gui is cited.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts",
         "crates/linscp-engine/src/script.rs"
       ],
@@ -3847,9 +3727,9 @@
       "id": "gui.desktop-drop-compatibility",
       "area": "GUI",
       "status": "verified",
-      "notes": "FileSystemEntry, FileSystemHandle and plain File drops preserve nested paths and empty folders across both remote and local panes with path-traversal rejection. gui-browser-upload was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
+      "notes": "FileSystemEntry, FileSystemHandle and plain File drops preserve nested paths and empty folders across both remote and local panes with path-traversal rejection. the retired GUI harness was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
       "checks": {
@@ -3875,9 +3755,9 @@
       "id": "gui.desktop-local-drop",
       "area": "GUI",
       "status": "verified",
-      "notes": "Dropping files or folders from the desktop onto the local pane saves them into the active local directory via /api/local/drop and /api/local/drop-dir with path confinement. gui-browser-upload was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
+      "notes": "Dropping files or folders from the desktop onto the local pane saves them into the active local directory via /api/local/drop and /api/local/drop-dir with path confinement. the retired GUI harness was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
       "checks": {
@@ -3905,8 +3785,7 @@
       "source": [
         "crates/linscp-service/src/ops.rs",
         "crates/linscp-service/src/lib.rs",
-        "ui/src/index.ts",
-        "crates/linscp-http/src/lib.rs"
+        "ui/src/index.ts"
       ],
       "checks": {
         "gui": [
@@ -3955,7 +3834,7 @@
       "source": [
         "crates/linscp-engine/src/editor.rs",
         "crates/linscp-engine/src/script.rs",
-        "crates/linscp-http/src/lib.rs"
+        "crates/linscp-service/src/lib.rs"
       ],
       "checks": {
         "gui": [
@@ -3980,30 +3859,13 @@
       "status": "partial",
       "notes": "GUI reads text and saves locally with a conflict check and atomic replace; symlinks are refused.",
       "source": [
-        "crates/linscp-http/src/lib.rs"
+        "crates/linscp-service/src/lib.rs"
       ],
-      "checks": {
-        "gui-local-editor": [
-          "test_read_and_atomic_save_round_trip",
-          "test_save_refuses_a_stale_editor_version",
-          "test_symbolic_link_cannot_be_overwritten_by_editor"
-        ]
-      },
-      "verified_on": {
-        "linux": [
-          "gui-local-editor"
-        ],
-        "windows": [
-          "gui-local-editor"
-        ],
-        "android": [
-          "gui-local-editor"
-        ]
-      },
-      "gap": "No runnable suite evidences this: gui-local-editor fails against the shipped service.",
+      "checks": {},
+      "gap": "No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests."
+        "Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on."
       ]
     },
     {
@@ -4012,29 +3874,13 @@
       "status": "partial",
       "notes": "Filename search and bounded literal UTF-8 content search skip binary/oversized files and cap the scan.",
       "source": [
-        "crates/linscp-http/src/lib.rs"
+        "crates/linscp-service/src/lib.rs"
       ],
-      "checks": {
-        "gui-search": [
-          "test_content_search_filters_by_mask_and_reports_skips",
-          "test_content_search_stops_at_the_scan_budget"
-        ]
-      },
-      "verified_on": {
-        "linux": [
-          "gui-search"
-        ],
-        "windows": [
-          "gui-search"
-        ],
-        "android": [
-          "gui-search"
-        ]
-      },
-      "gap": "No runnable suite evidences this: gui-search fails against the shipped service.",
+      "checks": {},
+      "gap": "No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests."
+        "Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on."
       ]
     },
     {
@@ -4082,7 +3928,7 @@
       "notes": "The browser editor and search enforce UTF-8 text and reject binary files, while CLI 'edit -eol=lf|crlf' normalizes line endings before upload.",
       "source": [
         "crates/linscp-engine/src/editor.rs",
-        "crates/linscp-http/src/lib.rs"
+        "crates/linscp-service/src/lib.rs"
       ],
       "checks": {
         "unit": [
@@ -4090,34 +3936,28 @@
         ],
         "live-sftp": [
           "test_remote_edit_and_xml_action_log"
-        ],
-        "gui-local-editor": [
-          "test_view_rejects_binary_and_oversized_files"
         ]
       },
       "verified_on": {
         "linux": [
-          "gui-local-editor",
           "live-sftp",
           "unit"
         ],
         "windows": [
-          "gui-local-editor",
           "live-sftp",
           "unit"
         ],
         "android": [
-          "gui-local-editor",
           "live-sftp",
           "unit"
         ]
       },
-      "gap": "No runnable suite evidences this: live-sftp needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled; gui-local-editor fails against the shipped service.",
+      "gap": "No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
         "Give UnitTest.cpp a build target, or port its cases to Rust tests.",
-        "Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests."
+        "Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on."
       ]
     },
     {
@@ -4251,29 +4091,13 @@
       "notes": "The desktop entry and GUI parse sftp://, ftp://, ftps:// and ftpes:// startup URLs with escaped paths.",
       "source": [
         "debian/linscp.desktop",
-        "crates/linscp-http/src/lib.rs"
+        "crates/linscp-service/src/lib.rs"
       ],
-      "checks": {
-        "gui-desktop-uri": [
-          "test_sftp_url_parses_credentials_ipv6_port_and_remote_path",
-          "test_ftp_and_ftps_default_ports"
-        ]
-      },
-      "verified_on": {
-        "linux": [
-          "gui-desktop-uri"
-        ],
-        "windows": [
-          "gui-desktop-uri"
-        ],
-        "android": [
-          "gui-desktop-uri"
-        ]
-      },
-      "gap": "No runnable suite evidences this: gui-desktop-uri fails against the shipped service.",
+      "checks": {},
+      "gap": "No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests."
+        "Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on."
       ]
     },
     {
@@ -4283,45 +4107,39 @@
       "notes": "Installed, Makefile and CMake binaries select their own GUI launcher; the GUI finds the matching core under a relocatable prefix.",
       "source": [
         "crates/linscp-platform/src/linux.rs",
-        "crates/linscp-http/src/lib.rs"
+        "crates/linscp-service/src/lib.rs"
       ],
       "checks": {
         "script": [
           "test_gui_launcher_is_selected_beside_the_running_binary",
           "test_gui_launcher_finds_source_tree_from_make_and_cmake_builds"
-        ],
-        "gui-desktop-uri": [
-          "test_nonstandard_linux_prefix_finds_its_own_core_binary"
         ]
       },
       "verified_on": {
         "linux": [
-          "script",
-          "gui-desktop-uri"
+          "script"
         ],
         "windows": [
-          "script",
-          "gui-desktop-uri"
+          "script"
         ],
         "android": [
-          "script",
-          "gui-desktop-uri"
+          "script"
         ]
       },
-      "gap": "No runnable suite evidences this: script needs a `linscp` binary this repo does not build; gui-desktop-uri fails against the shipped service.",
+      "gap": "No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
-        "Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests."
+        "Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on."
       ]
     },
     {
       "id": "desktop.file-manager-drops",
       "area": "Desktop integration",
       "status": "verified",
-      "notes": "Desktop file and folder drops work on both the remote pane (queued upload) and the local pane (atomic local save) with traversal rejection. gui-browser-upload was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
+      "notes": "Desktop file and folder drops work on both the remote pane (queued upload) and the local pane (atomic local save) with traversal rejection. the retired GUI harness was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
       "checks": {
@@ -4345,25 +4163,17 @@
       "id": "desktop.wayland-session",
       "area": "Desktop integration",
       "status": "partial",
-      "notes": "A desktop session is recognised as Wayland or as X11 before anything is asked of it, and only a program that can draw on it is started. The console client finds the compositor by its socket in XDG_RUNTIME_DIR - the default 'wayland-0' when WAYLAND_DISPLAY is not exported, so a session started by a launcher or a user service is still found - and refuses a Wayland-only terminal under X11, where it exits before mapping a window, while an X11-only one under Wayland is a reported XWayland fallback rather than a silent choice. The graphical client draws no window itself and asks the desktop's own URI launcher ($BROWSER, xdg-open, gio) for a browser, which needs no X11 and no window manager of the X11 kind; linscp.desktop starts it with that option and does not claim a startup notification it could never complete. Covered by unit, gui-desktop-uri and wayland-compatibility; no case runs against a live compositor, so the interaction with one is not certified here.",
+      "notes": "A desktop session is recognised as Wayland or as X11 before anything is asked of it, and only a program that can draw on it is started. The console client finds the compositor by its socket in XDG_RUNTIME_DIR - the default 'wayland-0' when WAYLAND_DISPLAY is not exported, so a session started by a launcher or a user service is still found - and refuses a Wayland-only terminal under X11, where it exits before mapping a window, while an X11-only one under Wayland is a reported XWayland fallback rather than a silent choice. The graphical client draws no window itself and asks the desktop's own URI launcher ($BROWSER, xdg-open, gio) for a browser, which needs no X11 and no window manager of the X11 kind; linscp.desktop starts it with that option and does not claim a startup notification it could never complete. Covered by unit, the retired GUI harness and wayland-compatibility; no case runs against a live compositor, so the interaction with one is not certified here.",
       "source": [
         "crates/linscp-platform/src/linux.rs",
         "crates/linscp-platform/src/lib.rs",
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "debian/linscp.desktop",
         "tools/check_wayland_compatibility.py"
       ],
       "checks": {
         "unit": [
           "TestDesktopSessionDetection"
-        ],
-        "gui-desktop-uri": [
-          "test_a_wayland_session_is_found_by_its_socket",
-          "test_a_variable_without_its_directory_names_no_session",
-          "test_the_desktop_uri_launcher_is_the_way_that_needs_no_x11",
-          "test_a_found_compositor_is_handed_to_the_child",
-          "test_no_window_is_requested_without_a_session",
-          "test_the_address_opened_carries_the_bound_name"
         ],
         "wayland-compatibility": [
           "test_the_real_tree_needs_no_x11",
@@ -4378,30 +4188,27 @@
       },
       "verified_on": {
         "linux": [
-          "gui-desktop-uri",
           "script",
           "unit",
           "wayland-compatibility"
         ],
         "windows": [
-          "gui-desktop-uri",
           "script",
           "unit",
           "wayland-compatibility"
         ],
         "android": [
-          "gui-desktop-uri",
           "script",
           "unit",
           "wayland-compatibility"
         ]
       },
-      "gap": "No runnable suite evidences this on Windows and Android: script needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled; gui-desktop-uri fails against the shipped service. Runnable residue: wayland-compatibility on Linux.",
+      "gap": "No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
         "Give UnitTest.cpp a build target, or port its cases to Rust tests.",
-        "Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests.",
+        "Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "wayland-compatibility cannot run on Windows or Android (it is a Linux display-server guard); record platform-scoped evidence for the Linux-only behavior, or cite additional runnable suites there."
       ]
     },
@@ -4481,7 +4288,7 @@
         "locales/de.json",
         "locales/fr.json",
         "ui/src/index.ts",
-        "crates/linscp-http/src/lib.rs"
+        "crates/linscp-service/src/lib.rs"
       ],
       "checks": {
         "unit": [
@@ -4507,10 +4314,6 @@
           "API selections unchanged",
           "unsaved editor prevents language reload"
         ],
-        "gui-browser-upload": [
-          "test_ui_locale_selection_and_core_protocol_isolation",
-          "test_served_page_has_safe_locale_and_token_data"
-        ],
         "translation-tests": [
           "test_checked_in_table_is_current",
           "test_gui_is_current_and_all_source_messages_have_catalogs",
@@ -4526,7 +4329,6 @@
           "script",
           "live-sftp",
           "gui-localization",
-          "gui-browser-upload",
           "translation-tests"
         ]
       },
@@ -4657,28 +4459,13 @@
       "status": "partial",
       "notes": "An arbitrary PREFIX/share/linscp/gui resolves PREFIX/bin/linscp before /usr/bin.",
       "source": [
-        "crates/linscp-http/src/lib.rs"
+        "crates/linscp-service/src/lib.rs"
       ],
-      "checks": {
-        "gui-desktop-uri": [
-          "test_nonstandard_linux_prefix_finds_its_own_core_binary"
-        ]
-      },
-      "verified_on": {
-        "linux": [
-          "gui-desktop-uri"
-        ],
-        "windows": [
-          "gui-desktop-uri"
-        ],
-        "android": [
-          "gui-desktop-uri"
-        ]
-      },
-      "gap": "No runnable suite evidences this: gui-desktop-uri fails against the shipped service.",
+      "checks": {},
+      "gap": "No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests."
+        "Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on."
       ]
     },
     {
@@ -4785,7 +4572,7 @@
       "id": "platform.conversion-completeness",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "LinSCP is a Linux-only client and the check that says so is part of the build: tools/check_platform_conversion.py reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose operation phrase contradicts the template it is filled into. It runs in 'make -C source/linux check', as the CTest case 'platform-conversion-check', and in CI. The vendored xterm.js files under source/gui/web/vendor are upstream code and are not scanned; everything else in the tree is this project's own.",
+      "notes": "LinSCP is a Linux-only client and the check that says so is part of the build: tools/check_platform_conversion.py reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose operation phrase contradicts the template it is filled into. It runs in 'make -C source/linux check', as the CTest case 'platform-conversion-check', and in CI. Third-party code is not scanned; everything else in the tree is this project's own.",
       "source": [
         "tools/check_platform_conversion.py",
         "tools/tests/test_platform_conversion.py"
@@ -4827,7 +4614,7 @@
       "id": "platform.android-saf-refusals",
       "area": "Packaging/platforms",
       "status": "verified",
-      "notes": "Every local action the granted-folder bridge does not implement fails closed with a message that names the limitation, and the page stops offering those actions for granted folders. chmod is routed through LocalFs.set_permissions_mode, so the bridge owns its POSIX-permissions message instead of the user getting a raw I/O error, and symlink creation is refused before it touches the bridge. The page asks the shared bundle (safLimitationReason, next to hostCapabilities) before prompting for permissions or drawing the properties rights editor, and shows the reason instead. (The other pane of a local tab keeps its older behaviour for joined paths, which never resolved there as a leaf, on plain and granted panes alike.) Editing, saving, reading properties, local copies and moves, session transfers, synchronization and keep-up-to-date route through LocalFs or staged temporary files instead \u2014 see platform.android-saf-editing, platform.android-saf-local-copy-move, platform.android-saf-session-transfers and platform.android-saf-synchronization.",
+      "notes": "Every local action the granted-folder bridge does not implement fails closed with a message that names the limitation, and the page stops offering those actions for granted folders. chmod is routed through LocalFs.set_permissions_mode, so the bridge owns its POSIX-permissions message instead of the user getting a raw I/O error, and symlink creation is refused before it touches the bridge. The page asks the shared bundle (safLimitationReason, next to hostCapabilities) before prompting for permissions or drawing the properties rights editor, and shows the reason instead. (The other pane of a local tab keeps its older behaviour for joined paths, which never resolved there as a leaf, on plain and granted panes alike.) Editing, saving, reading properties, local copies and moves, session transfers, synchronization and keep-up-to-date route through LocalFs or staged temporary files instead — see platform.android-saf-editing, platform.android-saf-local-copy-move, platform.android-saf-session-transfers and platform.android-saf-synchronization.",
       "source": [
         "crates/linscp-service/src/lib.rs",
         "ui/src/platform/capabilities.ts",
@@ -5113,7 +4900,7 @@
       "notes": "CLI editing supports explicit legacy-encoding selection via iconv (ISO-8859-1, Windows-1252, EUC-JP, Shift-JIS, UTF-16 etc.): 'edit -encoding=ENC' converts between the file's encoding and UTF-8, round-tripping byte-exact fixtures with BOM/EOL preservation, and rejects invalid sequences or unrepresentable output without silent replacement. Browser editor/search remain UTF-8-only and reject binary/non-UTF-8 files with an explicit message; the encoding contract is documented and tested.",
       "source": [
         "crates/linscp-engine/src/editor.rs",
-        "crates/linscp-http/src/lib.rs"
+        "crates/linscp-service/src/lib.rs"
       ],
       "checks": {
         "unit": [
@@ -5192,37 +4979,14 @@
       "status": "partial",
       "notes": "A local-to-local session is a tab whose protocol is 'local' and which names two absolute local directories (the upstream IsLocalBrowser/OtherLocalDirectory shape). CoreSession.start, connect and alive never spawn the core and never open a socket; the right pane lists its directory through the same API the remote pane uses. Copies and moves are planned and run in-process on the queue with byte progress and cancellation: recursive trees, merge into an existing directory, atomic per-file replacement through a temporary file, timestamps and modes preserved, symbolic links copied as links, and ask/skip/overwrite/rename decisions (the browser answers 'ask' once and retries). Source equal to or inside the destination is refused before queueing. The second pane also supports mkdir, rename, delete, chmod, properties, checksums, editor save and find. The server-only terminal, synchronization and remote transfer dialogs are not offered in this mode.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
-      "checks": {
-        "gui-local": [
-          "test_a_local_tab_opens_two_independent_panes_without_a_core",
-          "test_recursive_copy_preserves_tree_metadata_and_symlinks",
-          "test_overwrite_ask_reports_conflicts_then_overwrite_replaces",
-          "test_skip_and_rename_are_distinct_overwrite_decisions",
-          "test_move_removes_the_source_only_after_a_complete_copy",
-          "test_source_and_destination_overlap_is_refused_before_queueing",
-          "test_the_queue_reports_bytes_and_a_cancel_leaves_no_partial_file",
-          "test_second_local_pane_supports_crud_properties_and_checksums",
-          "test_browser_drops_land_in_the_second_local_pane"
-        ]
-      },
-      "verified_on": {
-        "linux": [
-          "gui-local"
-        ],
-        "windows": [
-          "gui-local"
-        ],
-        "android": [
-          "gui-local"
-        ]
-      },
-      "gap": "No runnable suite evidences this: gui-local fails against the shipped service.",
+      "checks": {},
+      "gap": "No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests."
+        "Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on."
       ]
     },
     {
@@ -5276,35 +5040,14 @@
       "status": "partial",
       "notes": "Named workspaces are stored in workspaces.json beside sessions.ini (0600, fsynced and atomically replaced) and restore the tabs in order with the saved active tab and both pane paths. An entry is either a local tab with its two directories or a remote tab; a tab that came from a stored site records only the site name and is resolved from sessions.ini on every open, so the site's password encryption, pinned host key and tunnel policy stay authoritative. An ad-hoc tab is saved as a snapshot with password, tunnel password, tunnel passphrase and site name removed. Each tab opens independently: a deleted or renamed site, a missing local directory or a host-key challenge is reported in 'failed' without stopping the others, and a challenge is parked in the normal host-key table for the user to verify. A local site can be saved directly, since the console client has no local transport.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
-      "checks": {
-        "gui-local": [
-          "test_workspace_round_trip_preserves_order_active_tab_and_panes",
-          "test_a_duplicate_workspace_needs_explicit_overwrite",
-          "test_a_failed_tab_does_not_stop_the_rest_of_the_workspace",
-          "test_the_workspace_file_is_private_and_contains_no_credentials",
-          "test_a_deleted_site_is_resolved_from_sessions_ini_every_time",
-          "test_a_workspace_survives_a_restart_and_key_policies_are_kept",
-          "test_a_local_site_is_saved_without_the_console_client"
-        ]
-      },
-      "verified_on": {
-        "linux": [
-          "gui-local"
-        ],
-        "windows": [
-          "gui-local"
-        ],
-        "android": [
-          "gui-local"
-        ]
-      },
-      "gap": "No runnable suite evidences this: gui-local fails against the shipped service.",
+      "checks": {},
+      "gap": "No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests."
+        "Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on."
       ]
     },
     {
@@ -5313,7 +5056,7 @@
       "status": "verified",
       "notes": "A bookmark names a directory of one panel and nothing else: no session, password, host key or command. Both panels have a bookmark menu and dialog in the Commander; the lists are stored per user in bookmarks.json beside sessions.ini (0600, fsynced, atomically replaced), with duplicate names updating the directory instead of adding a row. A local bookmark is resolved through the same home-directory jail as every other local path, and a bookmark record with a control character, an empty field or a duplicate name is ignored when the file is read rather than hiding the good entries. Adding, jumping to and deleting a bookmark are exercised through the HTTP API and the browser dialog. gui-local was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
       "checks": {
@@ -5343,7 +5086,7 @@
       "status": "verified",
       "notes": "Upstream's Generate URL dialog, as a Session URL dialog in the Commander: it shows the active tab's URL and the equivalent 'open' command, and offers the stored password only as an explicit tick. The password is absent from the default URL and from the command line; when it is included the dialog says the URL is a secret, and only the host reaches the command log. A local tab, which has no server or session, is refused by name instead of producing a meaningless URL. gui-local was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
       "checks": {
@@ -5371,7 +5114,7 @@
       "status": "verified",
       "notes": "Upstream imports sites from other clients; the Linux build reads the two clients that exist here: an OpenSSH client configuration (~/.ssh/config or a named file) and FileZilla's sitemanager.xml. The scan lists names, hosts, ports and users without any password; a Host line with a wildcard, a Match block or an Include is reported as skipped instead of importing a site nobody configured. A FileZilla password is decoded from its base64 and encrypted with sessions.key exactly as savesession stores one, the key file is created 0600 when absent, and DOCTYPE/entity declarations, malformed XML, control characters and an unknown FileZilla protocol are refused with the reason, and its explicit-TLS (3) and implicit-TLS (4) protocols become the ftpes:// and ftps:// sites the site form now represents. Imported sections merge into sessions.ini without rewriting unrelated comments or sites; an existing name is kept unless the caller asks to overwrite. The HTTP API, the dialog and the parser are covered by named cases. gui-local was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
       "checks": {
@@ -5401,7 +5144,7 @@
       "status": "verified",
       "notes": "The Commander keeps upstream's two TLS spellings apart: 'ftpes://' is FTP with explicit TLS (stored as protocol=ftp plus ftps=3, port 21) and 'ftps://' is implicit TLS (ftps=1, port 990). A stored site is shown and connected with the scheme its mode means, the site form offers both and moves the port to the scheme's default while the port is still a default, a save writes the console client's own shape back through 'savesession -protocol/-rawsettings' (a TLS site gains no tunnel setting it never had), and a FileZilla import maps its TLS protocols 3 and 4 to explicit and implicit TLS. A mode the client does not recognise leaves the site on plain FTP rather than inventing a scheme, and the generated session URL uses the same scheme. gui-local was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts",
         "crates/linscp-engine/src/session_store.rs"
       ],
@@ -5429,7 +5172,7 @@
       "status": "verified",
       "notes": "Upstream's Preferences dialog, as far as this client has settings to hold: the defaults a transfer starts from (mode, file mask, speed limit, resume, timestamps, newer-only, append, no-permissions, queue priority) and the two confirmations (overwrite, delete). The backend stores them in preferences.json under the configuration directory, 0600 and atomically written, so every browser on the account starts from the same values instead of its own localStorage; the transfer dialog and the F5/F6/queue paths read the same document. A save is a whole document with unknown keys and wrong types refused (a boolean is not a number, a speed is bounded, text has no control characters), while a hand-edited file that no longer validates falls back to the default per key rather than stopping the client. Restoring the defaults is an explicit action. gui-local was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
       "checks": {
@@ -5458,7 +5201,7 @@
       "status": "verified",
       "notes": "Upstream's Cleanup dialog: the data this client stores, listed one named location at a time - stored sessions, the encrypted-password key, the cached SSH host keys, workspaces, bookmarks, custom commands, preferences, pending file-manager uploads and the temporary copies of edited files - with the path each one has and whether it exists. The page names ids, never paths: the backend turns an id into a path from its own table, so a request cannot ask for a file of its choosing, the configuration directory itself is not a location, and an unknown id is refused. Only the ticked locations are removed, after an explicit confirmation that the endpoint also requires; a location that is already gone is not an error, and everything not ticked is left alone. gui-local was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"
       ],
       "checks": {
@@ -5488,7 +5231,7 @@
       "status": "verified",
       "notes": "Upstream's transfer between two servers: the remote selection is copied to another session, chosen from the other open remote tabs and the stored sites, into a directory and through an optional file mask (patterns separated by '|'). Copying inside the current session is the one case one server can do alone, so it is queued as 'cp' commands and the bytes never travel; any other target is a second connection, so the job downloads each file into a private temporary directory and uploads it from there, deleting the directory whatever happens and leaving no partial destination file. The target is resolved by id, the destination directory has to be absolute and free of control characters, the mask has to select at least one entry, and an entry name is validated before anything is queued. Progress, cancellation and retry are the queue's. gui-local was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts",
         "crates/linscp-engine/src/script.rs"
       ],
@@ -5519,7 +5262,7 @@
       "status": "verified",
       "notes": "Upstream's Properties dialog, for one entry or the whole selection: name, path, type, size, permissions, octal mode, owner, group and modification time, read from one 'stat'/'attr' round trip per entry rather than one dialog at a time (a local pane entry is read with the same shape). The dialog ends with the rights editor: a mode in octal or chmod's symbolic grammar applied to every selected entry, refused unless the mode validates, with the per-entry result reported. A recursive change is applied to a local directory tree by walking it; on the server it is refused rather than sent as an operand the client would read as a file name. Paths stay inside the pane they belong to. gui-local was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
       "source": [
-        "crates/linscp-http/src/lib.rs",
+        "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts",
         "crates/linscp-engine/src/script.rs"
       ],
@@ -5575,7 +5318,7 @@
       "id": "backup.full-export-import",
       "area": "Sessions/configuration",
       "status": "partial",
-      "notes": "Full application backup as a distribution-compatible JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute config_dir, unwrapped base64 sessions.key via SecretVault for cross-platform portability, LF-normalized INI/JSON/text). Covers sessions.ini + sessions.key, workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Exported on Debian (LF) restores identically on Fedora, Arch, Windows (CRLF) and Android and vice versa; backup_is_distribution_compatible_between_linux_windows_and_android proves Debian\u2192Windows\u2192Android round-trip, raw base64 key, LF-only decryptable INI and JSON stores, plus fail-closed without key and CRLF file tolerance. Implemented via crates/linscp-engine/src/backup.rs and `backup export|import <file>` in script.rs.",
+      "notes": "Full application backup as a distribution-compatible JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute config_dir, unwrapped base64 sessions.key via SecretVault for cross-platform portability, LF-normalized INI/JSON/text). Covers sessions.ini + sessions.key, workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Exported on Debian (LF) restores identically on Fedora, Arch, Windows (CRLF) and Android and vice versa; backup_is_distribution_compatible_between_linux_windows_and_android proves Debian→Windows→Android round-trip, raw base64 key, LF-only decryptable INI and JSON stores, plus fail-closed without key and CRLF file tolerance. Implemented via crates/linscp-engine/src/backup.rs and `backup export|import <file>` in script.rs.",
       "source": [
         "crates/linscp-engine/src/backup.rs",
         "crates/linscp-engine/src/script.rs",
@@ -5617,41 +5360,29 @@
       "id": "desktop.remote",
       "area": "Desktop integration",
       "status": "partial",
-      "notes": "RDP/VNC/SPICE are direct-TCP (3389/5900) with optional SSH jump SOCKS5h relay; X2Go/X11 are SSH-transported via direct-tcpip. Native viewers are resolved via PATH (xfreerdp3\u2192xfreerdp\u2192wlfreerdp/sdl-freerdp, mstsc, open, vncviewer, remote-viewer/spicy, x2goclient/pyhoca-cli, waypipe/ssh -X) with Windows/macOS/Android specifics, and dial the same proxy/tunnel/TLS/SPKI stack as file protocols. A ticket carries the viewer plan of the build it was made on (mstsc + .rdp body on Windows, `open rdp://` on macOS, FreeRDP argv on Linux), and only the ticket that matches the launcher is ever spawned; a host that cannot show a window (browser server, server-mode script) is handed the .rdp/.vv body or a BrowserGateway hint instead of a spawn, never a spawn it cannot display; XDMCP (UDP 177, unencrypted) is explicitly refused/recommended against. Wayland vs X11 detection drives waypipe vs ssh -X. Verified by unit ticket/argv tests; live viewer integration and ironrdp gateway tests are outstanding.",
+      "notes": "RDP/VNC/SPICE are direct-TCP (3389/5900) with optional SSH jump SOCKS5h relay; X2Go/X11 are SSH-transported via direct-tcpip. Native viewers are resolved via PATH (xfreerdp3→xfreerdp→wlfreerdp/sdl-freerdp, mstsc, open, vncviewer, remote-viewer/spicy, x2goclient/pyhoca-cli, waypipe/ssh -X) with Windows/macOS/Android specifics, and dial the same proxy/tunnel/TLS/SPKI stack as file protocols. A ticket carries the viewer plan of the build it was made on (mstsc + .rdp body on Windows, `open rdp://` on macOS, FreeRDP argv on Linux), and only the ticket that matches the launcher is ever spawned; a host that cannot show a window is handed the .rdp/.vv body or a BrowserGateway hint instead of a spawn, never a spawn it cannot display; XDMCP (UDP 177, unencrypted) is explicitly refused/recommended against. Wayland vs X11 detection drives waypipe vs ssh -X. Verified by unit ticket/argv tests; live viewer integration and ironrdp gateway tests are outstanding.",
       "source": [
         "crates/linscp-platform/src/desktop.rs",
         "crates/linscp-proto/src/remote_desktop.rs",
-        "crates/linscp-engine/src/url_and_raw.rs",
-        "source/linux/tests/LiveDesktopTest.py"
+        "crates/linscp-engine/src/url_and_raw.rs"
       ],
       "checks": {
         "unit": [
           "TestDesktopSessionDetection"
-        ],
-        "live-desktop": [
-          "test_rdp_ticket_generates_correct_argv_and_port",
-          "test_vnc_and_spice_headless_and_viewer",
-          "test_x2go_and_x11_ssh_transport_and_wayland_detection",
-          "test_headless_file_ticket_and_gateway",
-          "test_ssh_prompt_and_install_script_via_sftp_server",
-          "test_http_check_and_install_script"
         ]
       },
       "verified_on": {
         "linux": [
-          "unit",
-          "live-desktop"
+          "unit"
         ],
         "windows": [
-          "unit",
-          "live-desktop"
+          "unit"
         ],
         "android": [
-          "unit",
-          "live-desktop"
+          "unit"
         ]
       },
-      "gap": "Ironrdp WASM / Guacamole gateway HTML5 fallback credential isolation review remains; live viewer launches (xfreerdp/vncviewer/remote-viewer/x2goclient/waypipe, headless .rdp/.vv, jump tunnel inheritance, XDMCP refusal, SSH prompt + installer) are now gated via live-desktop.",
+      "gap": "No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.",
       "acceptance": [
         "Live RDP launch with xfreerdp/mstsc against a throwaway RDP stub verifies argv, port 3389, TLS/NLA option, and jump-host SOCKS5h relay without exposing credentials (live-desktop).",
         "Live VNC (5900) and SPICE (5900/.vv) launches verify viewer resolution (tigervnc/remote-viewer), TLS port, and headless .vv/.rdp ticket generation (live-desktop).",

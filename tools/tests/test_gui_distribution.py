@@ -31,52 +31,53 @@ class GuiDistributionTests(unittest.TestCase):
         for icon in config['bundle']['icon']:
             self.assertTrue((ROOT / 'crates/linscp-tauri' / icon).is_file(), icon)
 
-    def test_both_hosts_of_the_page_are_built_and_installed(self):
-        # The native window and the browser server are the same application in
-        # two hosts. Building and installing only one of them is the parity gap
-        # this guards: a shipped package that cannot serve the page at all.
-        server = tomllib.loads((ROOT / 'crates/linscp-http/Cargo.toml').read_text())
-        binary = next(b for b in server.get('bin', []) if b['name'] == 'linscp-web')
-        self.assertTrue((ROOT / 'crates/linscp-http' / binary['path']).is_file())
-        main = (ROOT / 'crates/linscp-http/src/main.rs').read_text()
-        self.assertIn('BrowserServer::bind', main)
-        for name in ['CMakeLists.txt', 'source/linux/Makefile', 'debian/rules']:
+    def test_the_product_is_one_native_application_with_no_web_host(self):
+        # The Windows build used to produce two apps from this workspace: the
+        # native window and `linscp-web`, a browser server that served the same
+        # page over HTTP. There is no web app in this product, so the crate, its
+        # binary and its launcher are gone and nothing may build them again.
+        workspace = tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']
+        self.assertNotIn('crates/linscp-http', workspace['members'])
+        self.assertNotIn('linscp-http', workspace['dependencies'])
+        self.assertFalse((ROOT / 'crates/linscp-http').exists())
+        self.assertFalse((ROOT / 'debian/linscp-web.desktop').exists())
+        for name in ['CMakeLists.txt', 'source/linux/Makefile', 'debian/rules',
+                     '.github/workflows/windows-build.yml',
+                     '.github/workflows/debian-build.yml']:
             text = (ROOT / name).read_text()
-            self.assertIn('linscp-http', text, name)
-            self.assertIn('linscp-web', text, name)
+            for token in ['linscp-http', 'linscp-web']:
+                self.assertNotIn(token, text, name + ' still names ' + token)
 
-    def test_ci_builds_and_smoke_tests_both_hosts(self):
-        # A host that is built but never started is a host nobody has run. Each
-        # desktop workflow therefore builds `linscp-web` and asks the running
-        # server for the page and for one API answer.
-        for name in ['.github/workflows/debian-build.yml',
-                     '.github/workflows/windows-build.yml']:
-            text = (ROOT / name).read_text()
-            # The Debian workflow builds through `debian/rules`, which names the
-            # crate; the Windows one builds it directly. Both start it.
-            self.assertIn('linscp-web', text, name)
-            self.assertIn('Smoke test the browser host', text, name)
-            self.assertIn('X-LSCP-Token', text, name)
-            self.assertIn('879', text, name)  # the port the smoke test uses
-        self.assertIn('cargo build --release -p linscp-http',
-                      (ROOT / '.github/workflows/windows-build.yml').read_text())
-        self.assertIn('linscp-http', (ROOT / 'debian/rules').read_text())
-        # The browser host is installed next to the native window, not instead
-        # of it, and the package check names both.
-        rules = (ROOT / 'debian/rules').read_text()
-        self.assertIn('usr/bin/linscp-gui', rules)
-        self.assertIn('usr/bin/linscp-web', rules)
-        # Two launchers, two files: the desktop-entry spec allows only one
-        # [Desktop Entry] group per file, so the browser host gets its own.
-        desktop = (ROOT / 'debian/linscp.desktop').read_text()
-        self.assertIn('\nExec=linscp-gui\n', desktop)
-        self.assertNotIn('linscp-web', desktop)
-        browser = (ROOT / 'debian/linscp-web.desktop').read_text()
-        self.assertEqual(browser.count('[Desktop Entry]'), 1)
-        self.assertIn('\nExec=linscp-web\n', browser)
-        self.assertIn('\nTerminal=true\n', browser)
+    def test_the_native_application_is_the_only_thing_built_and_installed(self):
         for name in ['CMakeLists.txt', 'source/linux/Makefile', 'debian/rules']:
-            self.assertIn('linscp-web.desktop', (ROOT / name).read_text(), name)
+            text = (ROOT / name).read_text()
+            self.assertIn('linscp-tauri', text, name)
+            self.assertIn('target/release/linscp-gui', text, name)
+        desktop = (ROOT / 'debian/linscp.desktop').read_text()
+        self.assertEqual(desktop.count('[Desktop Entry]'), 1)
+        self.assertIn('\nExec=linscp-gui\n', desktop)
+        windows = (ROOT / '.github/workflows/windows-build.yml').read_text()
+        self.assertIn('target/release/linscp-gui.exe', windows)
+        # One artifact, one executable: the upload names no second binary.
+        upload = windows[windows.index('Upload the portable application'):]
+        self.assertEqual(upload.count('.exe'), 1, 'the artifacts must be one app')
+
+    def test_the_shared_page_reaches_the_native_bridge_only(self):
+        # The page used to fall back to `fetch()` with a bearer token when no
+        # `__TAURI_INTERNALS__` was present, because a browser server could
+        # serve it. The browser host is gone, so HTTP transport, the token and
+        # the server-account sign-in went with it.
+        page = (ROOT / 'source/gui/web/index.html').read_text()
+        for token in ['LSCP_TOKEN', 'X-LSCP-Token', 'X-LSCP-CSRF', 'csrfToken',
+                      'loginModal', 'accountsEnabled', '/api/login']:
+            self.assertNotIn(token, page, 'the page still carries ' + token)
+        self.assertIn('window.LinSCPTransport.request', page)
+        self.assertFalse((ROOT / 'ui/src/transport/http.ts').exists())
+        transport = (ROOT / 'ui/src/transport/index.ts').read_text()
+        self.assertNotIn('HttpTransport', transport)
+        build = (ROOT / 'ui/scripts/build.mjs').read_text()
+        self.assertNotIn('bearerToken', build)
+        self.assertNotIn('fetch(', build)
 
     def test_the_shipped_binary_reads_the_command_line_it_documents(self):
         # A3: `--install-shell-integration` and `--shell-upload` were documented,

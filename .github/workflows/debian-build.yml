@@ -78,14 +78,6 @@ jobs:
           python3 -m unittest discover -s tools/tests -p test_rust_cross_lang_parity.py
           python3 -m unittest discover -s tools/tests -p test_repo_hygiene.py
 
-      # A crate that nothing in the packaging path builds can be broken for
-      # weeks while every targeted test passes. Compiling and testing the
-      # browser host crate in one go is what keeps that from happening: the
-      # axum handler signatures the browser mode depends on are checked here,
-      # not only when a smoke test happens to reach them.
-      - name: Compile and test the browser host crate
-        run: python3 tools/run_cargo_ci.py cargo test -p linscp-http
-
       # Targeted `cargo test -p <crate> <filter>` runs compile that crate's
       # whole test harness, but a crate with no step at all never compiles
       # its tests anywhere on Linux — and `#[cfg(unix)]` test bodies do not
@@ -95,7 +87,7 @@ jobs:
       # (`linscp-tauri` is left out: the Windows and Android jobs build it,
       # and its test harness wants a desktop toolkit this runner lacks.)
       - name: Compile every unit-test target on Linux
-        run: python3 tools/run_cargo_ci.py cargo test --no-run -p linscp-types -p linscp-i18n -p linscp-crypto -p linscp-platform -p linscp-proto -p linscp-engine -p linscp-service -p linscp-http
+        run: python3 tools/run_cargo_ci.py cargo test --no-run -p linscp-types -p linscp-i18n -p linscp-crypto -p linscp-platform -p linscp-proto -p linscp-engine -p linscp-service
 
       # The platform crate's own tests (shell-integration installers, the CLI
       # parser, the desktop launcher, the vault, the agent message) run on no
@@ -165,9 +157,7 @@ jobs:
           dpkg-deb --contents "$deb"
           contents=$(dpkg-deb --contents "$deb" | awk '{print $NF}' | sed 's|^\./||' | sort)
           for path in usr/bin/linscp-gui \
-                      usr/bin/linscp-web \
                       usr/share/applications/linscp.desktop \
-                      usr/share/applications/linscp-web.desktop \
                       usr/share/pixmaps/linscp.png \
                       usr/share/icons/hicolor/scalable/apps/linscp.svg; do
             echo "$contents" | grep -qx "$path" ||
@@ -180,52 +170,6 @@ jobs:
         run: |
           sudo dpkg -i ../linscp_*_*.deb
           test -x /usr/bin/linscp-gui
-          test -x /usr/bin/linscp-web
-
-      # The browser host is the same page without a native window: start it on
-      # a loopback port, read the token it prints, and ask it for the page and
-      # for one API answer. A host that serves the page but not the API would
-      # otherwise only be noticed by a user.
-      - name: Smoke test the browser host
-        run: |
-          set -euo pipefail
-          log=$(mktemp)
-          linscp-web --port=8791 --print-token >"$log" 2>&1 &
-          app=$!
-          trap 'kill "$app" 2>/dev/null || true' EXIT
-          for _ in $(seq 1 60); do
-            grep -q '^Token: ' "$log" && break
-            kill -0 "$app" 2>/dev/null || { cat "$log"; echo "::error::linscp-web exited before printing its token"; exit 1; }
-            sleep 1
-          done
-          token=$(sed -n 's/^Token: //p' "$log" | head -n 1)
-          test -n "$token" || { cat "$log"; echo "::error::linscp-web printed no token"; exit 1; }
-          for _ in $(seq 1 60); do
-            curl -fsS -o /dev/null "http://127.0.0.1:8791/" && break
-            sleep 1
-          done
-          # The page is read whole before it is searched: `curl | grep -q` lets
-          # grep close the pipe early, which turns curl into a SIGPIPE failure
-          # under `pipefail` and makes a page that does carry the token look
-          # like one that does not.
-          page=$(curl -fsS "http://127.0.0.1:8791/")
-          case "$page" in
-            *LSCP_TOKEN*) ;;
-            *) echo "::error::the served page carries no token"; exit 1 ;;
-          esac
-          # A request without the bearer token is refused, and one with it is
-          # answered: the token is the whole access control of this mode.
-          status=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8791/api/status")
-          test "$status" = 401 || { echo "::error::/api/status answered $status without a token"; exit 1; }
-          status_answer=$(curl -fsS -H "X-LSCP-Token: $token" "http://127.0.0.1:8791/api/status")
-          case "$status_answer" in
-            *'"tabs"'*) ;;
-            *) echo "::error::/api/status did not answer the session list"; exit 1 ;;
-          esac
-          # A Host header that is not allowed must not be treated as loopback.
-          status=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: attacker.example' "http://127.0.0.1:8791/api/status")
-          test "$status" = 403 || { echo "::error::a foreign Host header answered $status"; exit 1; }
-          echo "linscp-web served the page and answered the API"
 
       - name: Smoke test the native window
         run: |

@@ -55,20 +55,12 @@ CASE_SOURCES = {
     "live-scp": "source/linux/tests/LiveScpTest.py",
     "gui": "source/gui/tests/ClientTest.js",
     "gui-localization": "source/gui/tests/LocalizationTest.js",
-    "gui-search": "source/gui/tests/RemoteSearchTest.py",
-    "gui-local-editor": "source/gui/tests/LocalEditorTest.py",
-    "gui-browser-upload": "source/gui/tests/BrowserUploadTest.py",
-    "gui-security": "source/gui/tests/SecurityTest.py",
-    "gui-local": "source/gui/tests/LocalWorkspaceTest.py",
     "powershell": "automation/test_psmodule.py",
     "dotnet": "automation/test_dotnet.py",
     "translation-tests": "tools/tests/test_translations.py",
-    "gui-desktop-uri": "source/gui/tests/DesktopUriTest.py",
-    "gui-shell": "source/gui/tests/ShellIntegrationTest.py",
     "platform-conversion": "tools/tests/test_platform_conversion.py",
     "wayland-compatibility": "tools/tests/test_wayland_compatibility.py",
     "backup": "crates/linscp-engine/src/backup.rs",
-    "live-desktop": "source/linux/tests/LiveDesktopTest.py",
     # The shared TypeScript bundle every host embeds: the touch shell, the dual
     # transport, the path-drop request and the capability matrix live here, so
     # their behaviour is asserted by node against the built bundle instead of

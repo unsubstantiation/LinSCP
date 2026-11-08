@@ -27,10 +27,6 @@ export class TauriTransport implements TransportClient {
     this.internals = internals;
   }
 
-  public setCsrfToken(_token: string): void {
-    // Tauri IPC runs in-process over the WebView bridge without browser cookies.
-  }
-
   public async request<T = unknown>(
     method: string,
     path: string,

@@ -40,8 +40,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-# The files this check reads. The vendored xterm.js files under
-# source/gui/web/vendor are upstream code and are not this project's to fix.
+# The files this check reads.
 SCAN_ROOTS = [
     'source/linux',
     'source/gui',
@@ -66,7 +65,7 @@ FIXTURE_DIRECTORIES = ('tests', 'fixtures')
 TEXT_SUFFIXES = {'.c', '.h', '.cpp', '.rs', '.py', '.psm1', '.md', '.txt', '.json',
                  '.yml', '.yaml', '.mk', '.in', '.desktop', '.rules', '.1'}
 EXTRA_TEXT_FILES = {'Makefile', 'CMakeLists.txt', 'rules', 'linscp-gui',
-                    'linscp.desktop', 'linscp-web.desktop'}
+                    'linscp.desktop'}
 
 # The environment variables that say which display server a session runs. A
 # client that reads one of them has to have looked at the other, and the two

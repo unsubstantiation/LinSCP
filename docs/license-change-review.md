@@ -24,7 +24,7 @@ redistribution terms, described in `NOTICE` and `debian/copyright`.
 | libssh | SSH transport, authentication, host-key handling, SFTP and SCP channels | LGPL-2.1-or-later; linked dynamically from the system; not vendored |
 | OpenSSL libcrypto | Hashing, cryptographic helpers and PPK key conversion | Apache-2.0; linked from the system; not vendored |
 | libargon2 | Key derivation for encrypted PPK v3 files | CC0 1.0 or Apache-2.0 at the user's option; linked from the system; not vendored |
-| xterm.js and FitAddon | Browser-based embedded terminal | MIT; vendored under `source/gui/web/vendor/`, with the notice in `source/gui/web/vendor/LICENSE-xterm.txt` |
+| alacritty_terminal 0.26 | VT parser and grid for the embedded terminal (`crates/linscp-terminal`) | Apache-2.0; no renderer, window or GPU code, and its notice is reproduced in `NOTICE` |
 
 The current tree contains no bundled SSH protocol engine. `NOTICE` and
 `debian/copyright` identify the current third-party components and their

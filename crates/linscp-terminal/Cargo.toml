@@ -1,0 +1,22 @@
+[package]
+name = "linscp-terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[dependencies]
+# `alacritty_terminal` is the VT parser and grid from Alacritty with no
+# renderer, no window and no GPU: it is the half of a terminal that decides
+# what the screen *is*, which is what this crate needs to own. It builds on
+# every target the workspace builds for (it gates its own PTY helpers behind
+# `cfg(unix)`/`cfg(windows)`; this crate never touches them).
+alacritty_terminal = { version = "=0.26.0", default-features = false }
+serde.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

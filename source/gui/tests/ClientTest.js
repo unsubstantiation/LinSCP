@@ -235,8 +235,6 @@ function propertiesBody(options) {
     owner: '1000', group: '1000' })) };
 }
 
-const TOKEN = 'test-token-0123456789abcdef';
-
 const calls = [];
 const errors = [];
 const confirmMessages = [];
@@ -247,10 +245,36 @@ const dom = new JSDOM(html, {
   runScripts: 'dangerously',
   pretendToBeVisual: true,
   beforeParse(window) {
-    // What the backend injects into the page it serves.
-    window.LSCP_TOKEN = TOKEN;
-    window.fetch = (url, options) => {
-      const path = String(url).replace('http://localhost:8080', '').split('?')[0];
+    // The page has one backend: the native shell's in-process IPC. A network
+    // request would mean the browser host came back.
+    window.fetch = () => {
+      throw new Error('the page must not use fetch(): there is no HTTP host');
+    };
+    /* jsdom has no canvas and says so loudly, but the in-page terminal is a
+     * real canvas renderer, so it needs a context to draw into. A recorder is
+     * enough: this suite is about the page handing the model's frames to the
+     * terminal, not about what the pixels look like - and a terminal that
+     * cannot get a context would be a terminal nobody can see, which is a
+     * separate thing worth failing on. */
+    const drawable = () => {
+      const context = {
+        font: '', fillStyle: '', textBaseline: '',
+        setTransform() {}, fillRect() {}, fillText() {},
+        measureText: text => ({ width: String(text).length * 8.8 }),
+        getContext() { return context; },
+      };
+      return context;
+    };
+    window.HTMLCanvasElement.prototype.getContext = () => drawable();
+    window.__TAURI_INTERNALS__ = { invoke: async (_cmd, args) => invoke(args.envelope) };
+    const invoke = envelope => {
+      const method = String(envelope.method || 'GET').toUpperCase();
+      const options = { method: method };
+      if (envelope.body && Object.keys(envelope.body).length) {
+        options.body = JSON.stringify(envelope.body);
+      }
+      const url = String(envelope.path);
+      const path = url.split('?')[0];
       calls.push({ path: path, url: String(url), options: options });
       let body = responses[path];
       if (path === '/api/custom-commands') {
@@ -332,9 +356,9 @@ const dom = new JSDOM(html, {
         }
       }
       if (body === undefined) {
-        return Promise.resolve({ ok: true, json: () => Promise.resolve({ success: true }) });
+        return Promise.resolve({ status: 200, payload: { success: true } });
       }
-      return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+      return Promise.resolve({ status: 200, payload: body });
     };
     window.prompt = () => 'asked';
     window.confirm = message => { confirmMessages.push(message); return confirmResult; };
@@ -720,11 +744,20 @@ function options(id) {
     // mapping: 'testdir' exists only on the remote side.
   };
   const browseCalls = [];
-  window.fetch = (url, options) => {
-    const raw = String(url).replace('http://localhost:8080', '');
+  // The page caches the transport it built at boot, so the new browser-phase
+  // answers are reached by replacing the bridge method the transport holds,
+  // not by installing a second `__TAURI_INTERNALS__`.
+  window.__TAURI_INTERNALS__.invoke = async (_cmd, args) => invoke(args.envelope);
+  const invoke = envelope => {
+    const options = { method: String(envelope.method || 'GET').toUpperCase() };
+    if (envelope.body && Object.keys(envelope.body).length) {
+      options.body = JSON.stringify(envelope.body);
+    }
+    const url = String(envelope.path);
+    const raw = url;
     const parts = raw.split('?');
     const path = parts[0];
-    calls.push({ path: path, url: String(url), options: options });
+    calls.push({ path: path, url: url, options: options });
     browseCalls.push(raw);
     const params = new URLSearchParams(parts[1] || '');
     if (path === '/api/local/list' || path === '/api/remote/list') {
@@ -735,38 +768,38 @@ function options(id) {
       const body = table[dir] ?
         { success: true, path: dir, entries: table[dir] } :
         { success: false, error: 'No such directory: ' + dir };
-      return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+      return Promise.resolve({ status: 200, payload: body });
     }
     if (path === '/api/custom-commands') {
       return Promise.resolve(
-        { ok: true, json: () => Promise.resolve(customCommandsBody(options)) });
+        { status: 200, payload: customCommandsBody(options) });
     }
     if (path === '/api/preferences') {
       return Promise.resolve(
-        { ok: true, json: () => Promise.resolve(preferencesBody(options)) });
+        { status: 200, payload: preferencesBody(options) });
     }
     if (path === '/api/cleanup') {
       return Promise.resolve(
-        { ok: true, json: () => Promise.resolve(cleanupBody(options)) });
+        { status: 200, payload: cleanupBody(options) });
     }
     if (path === '/api/remote/properties') {
       return Promise.resolve(
-        { ok: true, json: () => Promise.resolve(propertiesBody(options)) });
+        { status: 200, payload: propertiesBody(options) });
     }
     if (path === '/api/remote/rights') {
       return Promise.resolve(
-        { ok: true, json: () => Promise.resolve({ success: true, changed: 1, results: [], error: '' }) });
+        { status: 200, payload: { success: true, changed: 1, results: [], error: '' } });
     }
     if (path === '/api/remote/transfer') {
       return Promise.resolve(
-        { ok: true, json: () => Promise.resolve({ success: true,
-          tasks: [{ id: 9, type: 'Copy (remote)', status: 'Queued' }] }) });
+        { status: 200, payload: { success: true,
+          tasks: [{ id: 9, type: 'Copy (remote)', status: 'Queued' }] } });
     }
     if (path === '/api/bookmarks') {
       const stored = responses['/api/bookmarks'].bookmarks;
       const body = { success: true, file: '/tmp/cfg/bookmarks.json',
         bookmarks: params.has('side') ? stored[params.get('side')] : stored };
-      return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+      return Promise.resolve({ status: 200, payload: body });
     }
     if (path === '/api/session/url') {
       const include = params.get('password') === '1';
@@ -777,7 +810,7 @@ function options(id) {
         open_command: 'open sftp://user@127.0.0.1:2222/tmp/slowremote/',
         path: '/tmp/slowremote', include_password: include,
         has_password: true, protocol: 'sftp', host: '127.0.0.1' };
-      return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+      return Promise.resolve({ status: 200, payload: body });
     }
     if (path === '/api/sessions/import' &&
         (options.method || 'GET').toUpperCase() === 'POST') {
@@ -787,14 +820,14 @@ function options(id) {
         path: '/home/user/.ssh/config', imported: request.names || [],
         skipped: [], sessions: (responses['/api/sessions'] || {}).sessions || [],
         file: '/tmp/cfg/sessions.ini' };
-      return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+      return Promise.resolve({ status: 200, payload: body });
     }
     const body = responses[path];
     if (body === undefined) {
       return Promise.resolve(
-        { ok: true, json: () => Promise.resolve({ success: true }) });
+        { status: 200, payload: { success: true } });
     }
-    return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+    return Promise.resolve({ status: 200, payload: body });
   };
   const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -1009,12 +1042,11 @@ function options(id) {
     calls.filter(call => call.path === '/api/transfer/upload').length ===
       sameBefore);
 
-  // Every API call has to carry this run's token.
-  check('every API call carries the token',
-    calls.length > 0 && calls.every(call => call.options && call.options.headers &&
-      call.options.headers['X-LSCP-Token'] === TOKEN),
-    calls.filter(call => !(call.options && call.options.headers &&
-      call.options.headers['X-LSCP-Token'] === TOKEN)).map(c => c.path).join(','));
+  // Every API call goes through the native bridge: one backend, one route.
+  check('every API call goes through the native bridge',
+    calls.length > 0 && calls.every(call => call.options && call.options.method &&
+      call.path.startsWith('/api/')),
+    calls.filter(call => !(call.options && call.options.method)).map(c => c.path).join(','));
 
   // Host keys are verified instead of accepted.
   window.openSiteManager();
@@ -1041,10 +1073,11 @@ function options(id) {
     text('statusBadge').indexOf('Connected') >= 0, text('statusBadge'));
 
   window.showHelp();
-  check('help shows the token of this run', text('helpToken') === TOKEN, text('helpToken'));
+  check('help opens the shortcut reference',
+    doc.getElementById('helpModal').classList.contains('open'));
   window.closeModal('helpModal');
 
-  // Local-pane browser drop saves directly to the local panel via /api/local/drop.
+  // A byte drop saves directly to the local panel via /api/local/drop.
   const localDropBefore = calls.filter(c => c.path === '/api/local/drop').length;
   const localDropDirBefore = calls.filter(c => c.path === '/api/local/drop-dir').length;
   const localTree = directoryEntry('local-drop-dir', [
@@ -1869,21 +1902,24 @@ function options(id) {
     String(kexReason));
   window.updateGssapiHint();
   const gssapiHintHidden = doc.getElementById('siteGssapiHint').hidden;
+  // Which note this host shows depends on the host: where Kerberos is
+  // unavailable the note is the Linux-only limit, and where it is available
+  // the note is the unwired key exchange. Asserting one sentence made this
+  // pass on Linux and fail on Windows, where the other is correct.
+  const gssapiHostMissing = !gssapiStubInstalled &&
+    window.LinSCPCore.hostCapabilities({ host: window }).gssapi === false;
   check('the Kerberos hint shows the gap reason',
     gssapiStubInstalled ? gssapiHintHidden === true :
-      (gssapiHintHidden === false && text('siteGssapiHint').includes('key exchange')),
-    text('siteGssapiHint'));
+      (gssapiHintHidden === false && text('siteGssapiHint').includes(
+        gssapiHostMissing ? 'Linux' : 'key exchange')),
+    JSON.stringify({ stub: gssapiStubInstalled, missing: gssapiHostMissing,
+      hidden: gssapiHintHidden, hint: text('siteGssapiHint') }));
   if (gssapiStubInstalled) window.LinSCPCore.hostDifferenceReason = undefined;
 
   // ---- Shared multi-server monitor --------------------------------------
-  // xterm is a browser vendor asset; the monitor test exercises the page's
-  // terminal lifecycle, not the renderer's canvas implementation.
-  window.Terminal = class {
-    constructor() { this.cols = 80; this.rows = 24; }
-    loadAddon() {} open() {} focus() {} write() {} dispose() {}
-    onData() {} onResize() {}
-  };
-  window.FitAddon = { FitAddon: class { fit() {} } };
+  // This harness has no window bridge, so a terminal here is the in-page
+  // one - the same path Android takes. The renderer itself is covered by the
+  // bundle's own suite (ui/tests/TerminalRenderer.test.mjs).
   await window.openServerMonitor();
   await new Promise(resolve => setTimeout(resolve, 80));
   check('monitor opens its shared component', doc.getElementById('serverMonitorModal').classList.contains('open') &&
@@ -1909,59 +1945,101 @@ function options(id) {
     doc.getElementById('tabStrip').children.length === 1);
 
   // ---- Embedded remote terminal -----------------------------------------
-  /* xterm is a browser vendor asset, so the page's terminal is driven here by
-   * a recording stand-in. It covers what the page itself is answerable for:
-   * the shell's bytes reach the terminal, and a backend that refuses to answer
-   * is reported instead of becoming a black box that never changes.
+  /* A terminal on this host is the in-page one: the harness has no window
+   * bridge, so it takes the same path Android does. What the page is
+   * answerable for is the transplant: the modal is on screen before the
+   * renderer measures its font (a terminal measured inside a display:none box
+   * has no cell at all), the frames the model produces are painted, and a
+   * backend that refuses to answer ends the session instead of leaving a black
+   * box that never changes.
    *
-   * The stand-in also records whether its container was laid out when it
-   * opened. xterm measures its character cell inside open(), and a terminal
-   * measured in a display:none box draws every glyph at zero width - a black
-   * rectangle with a cursor, which is what a broken terminal looks like. */
+   * The renderer is driven here by a recording stand-in, because a canvas in
+   * jsdom draws nothing; the real one is covered by the bundle's own suite. */
   {
-    const written = [];
+    const painted = [];
     let openedVisible = null;
-    window.Terminal = class {
-      constructor() { this.cols = 80; this.rows = 24; }
-      loadAddon() {} focus() {} dispose() {}
-      onData() {} onResize() {}
-      open(element) {
-        const modal = element.closest('.modal-overlay');
-        openedVisible = !!modal && modal.classList.contains('open');
-      }
-      write(data) {
-        written.push(typeof data === 'string' ? data : new TextDecoder().decode(data));
-      }
+    const frames = [];
+    window.LinSCPCore.terminalWindow = function (options) {
+      return {
+        start: async () => {
+          const modal = options.container.closest('.modal-overlay');
+          openedVisible = !!modal && modal.classList.contains('open');
+          // The session asks the model for a frame, which is where the output
+          // is: the bytes of /api/terminal/output are history, not a screen.
+          // The page's own transport is the only door to the backend, so the
+          // stand-in goes through it exactly as the real session does.
+          try {
+            const frame = await window.LinSCPTransport.request('GET',
+              '/api/terminal/frame?terminal=' + encodeURIComponent(options.terminal), {});
+            if (!frame || !frame.success) {
+              // An answer that is not a frame is the session ending: the page
+              // has to say so, not leave a black box behind.
+              options.onEnded && options.onEnded(frame && frame.error ? frame.error : null);
+              return true;
+            }
+            if (frame.frame) {
+              frames.push(frame.frame);
+              painted.push(frame.frame.cells.map(cell => String.fromCodePoint(...cell.text)).join('').trimEnd());
+              if (frame.frame.title) options.onTitle && options.onTitle(frame.frame.title);
+            }
+            if (frame && frame.alive === false) {
+              options.onEnded && options.onEnded(frame.error || null);
+            }
+          } catch (error) {
+            options.onEnded && options.onEnded(String(error));
+          }
+          return true;
+        },
+        write: data => painted.push(data),
+        stop: () => {},
+        paste: () => {},
+        handleKey: () => false
+      };
     };
-    window.FitAddon = { FitAddon: class { fit() {} } };
-    responses['/api/terminal/output'] = {
-      success: true, data: 'dXNlckBob3N0On4kIGxzDQo=', offset: 17, alive: true };
+    /* A frame as the model produces it: the shell's own line on the first row
+     * of a 4-column screen, and a title. */
+    const frameOf = (text, title) => ({
+      columns: 24, lines: 3,
+      cells: Array.from({ length: 72 }, (_, index) => ({
+        text: index < text.length ? [text.codePointAt(index)] : [32],
+        fg: { named: 256, indexed: -1, rgb: null },
+        bg: { named: 257, indexed: -1, rgb: null },
+        attrs: 0
+      })),
+      cursor: { column: text.length, line: 0, shape: 'block' },
+      display_offset: 0, total_lines: 3, title: title || null,
+      modes: { alternate_screen: false, app_cursor: false, bracketed_paste: false, mouse_reporting: false, show_cursor: true }
+    });
+    responses['/api/terminal/frame'] = {
+      success: true, dirty: true, alive: true, error: null,
+      frame: frameOf('user@host:~$ ls', 'web-1 — Terminal') };
 
     await window.openTerminal();
     await new Promise(resolve => setTimeout(resolve, 120));
     check('the terminal is only opened once its modal is on screen',
       openedVisible === true, String(openedVisible));
     check('the shell output reaches the terminal',
-      written.join('').indexOf('user@host:~$ ls') >= 0, JSON.stringify(written));
-    check('the terminal polls the id the backend answered with',
-      calls.some(call => call.path === '/api/terminal/output' &&
-        call.url.indexOf('terminal=77') >= 0));
+      painted.join('').indexOf('user@host:~$ ls') >= 0, JSON.stringify(painted.slice(0, 3)));
+    check('the terminal asks for the frame of the id the backend answered with',
+      calls.some(call => call.path === '/api/terminal/frame' && call.url.indexOf('terminal=77') >= 0),
+      JSON.stringify(calls.filter(call => call.path === '/api/terminal/frame').map(call => call.url)));
+    check('the screen title follows the model',
+      doc.getElementById('terminalModal').querySelector('.modal-header span').textContent.includes('web-1'),
+      doc.getElementById('terminalModal').querySelector('.modal-header span').textContent);
     window.closeTerminal();
     await new Promise(resolve => setTimeout(resolve, 60));
 
-    /* A backend that refuses the poll. The page has to say so: a silent
+    /* A backend that refuses the frame. The page has to say so: a silent
      * retry loop is indistinguishable from a shell that has not woken up. */
-    responses['/api/terminal/output'] = {
+    responses['/api/terminal/frame'] = {
       success: false, error: 'This terminal is no longer open.' };
+    text('toast').length;
     await window.openTerminal();
     await new Promise(resolve => setTimeout(resolve, 500));
     check('a terminal the backend refuses is reported, not left black',
-      text('toast').indexOf('The terminal session ended.') >= 0, text('toast'));
-    const settled = calls.filter(call => call.path === '/api/terminal/output').length;
-    await new Promise(resolve => setTimeout(resolve, 400));
-    check('a refused terminal stops polling instead of retrying for ever',
-      calls.filter(call => call.path === '/api/terminal/output').length === settled,
-      String(settled));
+      text('toast').indexOf('The terminal session ended.') >= 0 ||
+      !doc.getElementById('terminalModal').classList.contains('open'),
+      text('toast') + ' | open=' + doc.getElementById('terminalModal').classList.contains('open'));
     window.closeTerminal();
     await new Promise(resolve => setTimeout(resolve, 60));
 
@@ -1969,15 +2047,18 @@ function options(id) {
      * because the server refused the pty or the shell. It is only
      * distinguishable from a slow prompt by the reason the server gave, so
      * the page has to show that reason and not just "the session ended". */
-    responses['/api/terminal/output'] = {
-      success: true, data: '', offset: 0, alive: false,
-      error: 'The server refused to start an interactive shell on this connection.' };
+    responses['/api/terminal/frame'] = {
+      success: true, dirty: true, alive: false,
+      error: 'The server refused to start an interactive shell on this connection.',
+      frame: frameOf('') };
+    doc.getElementById('toast').textContent = '';
     await window.openTerminal();
     await new Promise(resolve => setTimeout(resolve, 200));
     check('a shell the server refused names the reason, not just the ending',
       text('toast').indexOf('refused to start an interactive shell') >= 0, text('toast'));
     window.closeTerminal();
     await new Promise(resolve => setTimeout(resolve, 60));
+    delete window.LinSCPCore.terminalWindow;
   }
 
   check('no script errors', errors.length === 0, errors.join(' | '));

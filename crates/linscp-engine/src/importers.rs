@@ -1,5 +1,4 @@
-//! OpenSSH `~/.ssh/config` and FileZilla `sitemanager.xml` session importers,
-//! matching the validation and security rules in `source/gui/linscp_gui.py`.
+//! OpenSSH `~/.ssh/config` and FileZilla `sitemanager.xml` session importers.
 
 use std::path::Path;
 
@@ -105,7 +104,7 @@ pub fn parse_openssh_config(text: &str, home_dir: Option<&Path>) -> ImportReport
         let mut private_key = None;
         if let Some(raw_key) = block.identity_file.filter(|s| !s.is_empty()) {
             if raw_key.contains('%') {
-                // Match linscp_gui.py: ignore OpenSSH %-tokens without aborting the host
+                // Ignore OpenSSH %-tokens without aborting the host
             } else {
                 let expanded = expand_tilde(&raw_key, home_dir);
                 if !has_control_char(&expanded) {

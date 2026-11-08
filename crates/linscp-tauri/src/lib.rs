@@ -123,6 +123,92 @@ pub mod commands {
         Ok(state.invoke_async(envelope).await)
     }
 
+    /// Opens one terminal in its own OS window.
+    ///
+    /// A terminal used to be a modal inside the main window, so a person
+    /// watching a build had it either in front of the file panes or behind
+    /// them. A window can be alt-tabbed to on its own, moved to a second
+    /// screen, and kept beside the editor while the file panes stay where they
+    /// were; that is the whole reason it is a window and not a modal.
+    ///
+    /// The new window is labelled `terminal-<id>`, which is what tells the page
+    /// inside it which terminal it is showing. Reopening the same terminal
+    /// focuses the window that already exists rather than stacking a second one
+    /// on the same shell - two windows on one terminal is not a bug, but two
+    /// windows nobody asked for is.
+    #[cfg(not(target_os = "android"))]
+    #[tauri::command]
+    pub async fn linscp_open_terminal_window(
+        app: tauri::AppHandle,
+        state: tauri::State<'_, TauriBridge>,
+        terminal: String,
+        title: String,
+        cols: u32,
+        rows: u32,
+    ) -> Result<serde_json::Value, String> {
+        use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+
+        // The label is built from an id the backend chose (`term-N`), but it is
+        // still an identifier handed in from the page, so it is reduced to the
+        // characters a window label may contain instead of trusted.
+        let safe: String = terminal
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if safe.is_empty() {
+            return Err("A terminal window needs a terminal.".into());
+        }
+        let label = format!("terminal-{safe}");
+        if let Some(existing) = app.get_webview_window(&label) {
+            let _ = existing.unminimize();
+            existing.set_focus().map_err(|e| e.to_string())?;
+            return Ok(json!({ "label": label, "existing": true }));
+        }
+
+        let title = if title.trim().is_empty() { "Terminal".to_string() } else { title };
+        // Each terminal gets its own document, which is what makes the window a
+        // terminal instead of a second copy of the commander. The page reads
+        // the terminal from the window's own label, so a window cannot end up
+        // showing a shell another window is already drawing.
+        let builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
+            .title(title)
+            // Sized for the grid the shell already has, so opening a window does
+            // not immediately resize the remote PTY and reflow the program the
+            // person is watching. The page measures its real font and corrects
+            // this on the first frame.
+            .inner_size((cols.max(20) as f64 * 9.0 + 32.0).clamp(420.0, 1920.0),
+                        (rows.max(5) as f64 * 18.0 + 64.0).clamp(200.0, 1200.0))
+            .min_inner_size(280.0, 120.0)
+            // A terminal is a text surface, and a dropped file has nowhere to
+            // go in it. Left enabled, the webview would swallow the drop before
+            // the page could see it, so a person dragging a file onto a
+            // terminal would watch nothing happen.
+            .disable_drag_drop_handler()
+            .build()
+            .map_err(|e| e.to_string())?;
+        if let Some(icon) = app.default_window_icon() {
+            let _ = builder.set_icon(icon.clone());
+        }
+        // A closed window is a shell nobody is looking at, so closing it closes
+        // the shell. The page cannot be relied on here: a window being
+        // destroyed does not run its unload handlers, so a remote PTY would
+        // outlive the window for as long as the app ran, holding its SSH
+        // channel open on the server.
+        let closed_id = terminal.clone();
+        let service = state.service.clone();
+        builder.on_window_event(move |event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                let _ = service.dispatch(ApiEnvelope {
+                    method: "POST".to_string(),
+                    path: "/api/terminal/close".to_string(),
+                    body: json!({ "terminal": closed_id }),
+                });
+            }
+        });
+
+        Ok(json!({ "label": label, "existing": false }))
+    }
+
     #[tauri::command]
     pub async fn linscp_request_saf_tree(
         state: tauri::State<'_, TauriBridge>,
@@ -272,6 +358,8 @@ pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
     });
     builder.invoke_handler(tauri::generate_handler![
             commands::linscp_invoke,
+            #[cfg(not(target_os = "android"))]
+            commands::linscp_open_terminal_window,
             commands::linscp_request_saf_tree,
             commands::linscp_pick_saf_tree,
             commands::linscp_handle_share_intent,

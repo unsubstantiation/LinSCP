@@ -11,7 +11,7 @@ This document specifies the architecture, crate selection, platform abstractions
 1. **Pure-Rust backend and protocol core:** All transport protocols (SSH, SFTP, SCP, jump tunnels, FTP/FTPS, WebDAV, Amazon S3), session/key cryptography, synchronization planning, CLI scripting, and GUI task orchestration live in one Cargo workspace with zero C/C++ cross-compilation dependencies in the default build.
 2. **Dual-mode graphical client:** A single modular **TypeScript + CSS** Commander frontend (`ui/`) runs both:
    - **Natively inside Tauri v2** on Linux, Windows (WebView2), and Android (Android WebView) via in-process IPC (`invoke` + event streams), and
-   - **In any standard web browser** against a built-in Rust HTTP/WebSocket server (`linscp-http`, invoked via `linscp-gui` or `linscp --serve-http`) for headless, remote, and multi-user deployments.
+   - **In the native Tauri window** (`linscp-gui`) on Linux and Windows, and in the Android app. There is no browser/HTTP host: the page talks to the service only through Tauri IPC.
 3. **Maximum resource sharing:** One in-process session and thread pool replaces the current multi-process chain (`Python HTTP server` -> per-tab `linscp -server` -> per-task `linscp` -> external `curl`), and shared crates eliminate duplicate logic across CLI and GUI for session encryption, configuration files, permission/mask parsing, and localization catalogs.
 4. **Strangler-fig verification:** The Rust workspace builds alongside `source/linux/` and `source/gui/` until every capability tracked in [`docs/upstream-parity.json`](upstream-parity.json) passes the existing Python/Node live and offline regression suites against the Rust binaries.
 
@@ -43,7 +43,6 @@ LinSCP/
 │   ├── linscp-proto/           # Pure-Rust SFTP, SCP, SSH tunnel/PTY, FTP/FTPS, WebDAV, S3
 │   ├── linscp-engine/          # Transfers (.filepart, presets, ASCII), SyncPlanner, Script
 │   ├── linscp-service/         # Transport-agnostic Commander state, session pool & queue
-│   ├── linscp-http/            # Axum HTTP + WebSocket server for standalone browser mode
 │   ├── linscp-cli/             # `linscp` CLI / `-server` / `-shell` / `linscp-gui` binary
 │   └── linscp-tauri/           # Tauri v2 desktop (Linux/Windows) & mobile (Android) host
 │       ├── src/
@@ -57,9 +56,9 @@ LinSCP/
 │   └── src/
 │       ├── transport/          # Tauri invoke/event adapter + HTTP fetch/WS adapter
 │       ├── state/              # Reactive Commander state (tabs, panes, queue, modals)
-│       ├── components/         # Dual/single panes, dialogs, mobile extra-keys bar, terminal
-│       ├── styles/             # Desktop + touch/mobile responsive CSS
-│       └── vendor/             # Vendored xterm.js 6.0.0 + FitAddon
+│       ├── components/         # Dual/single panes, dialogs, mobile extra-keys bar
+│       ├── platform/terminal*  # Terminal renderer, session and window
+│       └── styles/             # Desktop + touch/mobile responsive CSS
 ├── automation/                 # PowerShell 7 module & .NET assembly (cross-platform)
 ├── source/                     # Existing C++ & Python implementation (kept until Phase 6)
 └── tools/                      # Parity, translation, hygiene, and Wayland checks
@@ -83,7 +82,7 @@ Replacing `libssh`, `OpenSSL`, `libargon2`, `iconv`, and subprocess `curl` with 
 | **Checksums** | `HashUtil.c` (`OpenSSL`) | `sha2`, `sha1`, `md-5`, `crc32fast` | Streaming `sha-256`, `sha-1`, `md5`, and `crc32`. |
 | **Legacy Text Encodings (`edit -encoding=`)** | `Editor.cpp` (`<iconv.h>`) | `encoding_rs` | Pure-Rust ISO-8859-*, Windows-1252, Shift-JIS, EUC-JP, and UTF-16 conversions with strict unmappable/invalid-sequence rejection (no silent replacement characters). |
 | **Filesystem Watching (`keepuptodate`)** | `Script.cpp` (`<sys/inotify.h>`) | `notify` | Uses `inotify` on Linux/Android and `ReadDirectoryChangesW` on Windows behind one event stream, retaining `-interval=` full-rescan fallback. |
-| **Local Console & PTY** | `termios`, `pty.openpty()` | `crossterm`, `portable-pty` | Cross-platform password `EchoOff`, raw console `-shell`, and optional local PTY where needed (note: remote SSH terminals connect `xterm.js` directly to a `russh` PTY channel without requiring an OS PTY). |
+| **Local Console & PTY** | `termios`, `pty.openpty()` | `crossterm`, `portable-pty` | Cross-platform password `EchoOff`, raw console `-shell`, and optional local PTY where needed (note: a remote SSH terminal is a `russh` PTY channel, and its VT stream is parsed by `alacritty_terminal` in `crates/linscp-terminal` without requiring an OS PTY). |
 | **HTTP / Browser Mode** | `linscp_gui.py` (`ThreadingHTTPServer`) | `axum`, `tokio-tungstenite`, `tower`, `rust-embed` | Serves embedded `ui/dist/` assets, REST `/api/*` endpoints, streaming browser uploads, and WebSocket terminal/progress feeds. |
 | **Native App Shell** | Browser-only via `xdg-open` | `tauri` v2 + plugins (`dialog`, `fs`, `notification`, `shell`) | Native desktop windows on Linux (WebKitGTK) and Windows (WebView2), plus Android APK/AAB (`gen/android`). |
 | **Type Safety Across Rust ↔ TS** | Untyped JSON dicts | `ts-rs` or `specta` | Generates `ui/src/transport/types.generated.ts` directly from `linscp-types` Rust structs in CI. |
@@ -105,17 +104,16 @@ Both deployment modes execute the exact same application logic in `crates/linscp
 ```text
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                    TypeScript Commander UI (ui/src/)                    │
-│   Dual/Single Panes · Queue · Sync Preview · Editor · xterm.js · i18n   │
+│   Dual/Single Panes · Queue · Sync Preview · Editor · Terminal · i18n   │
 ├───────────────────────────────────┬─────────────────────────────────────┤
-│         TauriTransport            │            HttpTransport            │
-│  invoke("api_call") + Tauri Event │  fetch("/api/*") + WebSocket/SSE    │
-└─────────────────┬─────────────────┴──────────────────┬──────────────────┘
-                  │ In-process IPC                     │ Loopback / LAN HTTP
-┌─────────────────▼─────────────────┐ ┌────────────────▼──────────────────┐
-│        crates/linscp-tauri        │ │        crates/linscp-http         │
-│  Linux / Windows / Android App    │ │  Token + Host + Account/CSRF Auth │
-└─────────────────┬─────────────────┘ └────────────────┬──────────────────┘
-                  └─────────────────┬──────────────────┘
+│         TauriTransport                                                  │
+│  invoke("api_call") + Tauri Event                                       │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    │ In-process IPC
+                  ┌─────────────────▼─────────────────┐
+                  │        crates/linscp-tauri        │
+                  │  Linux / Windows / Android App    │
+                  └─────────────────┬─────────────────┘
                                     ▼
                   ┌────────────────────────────────────┐
                   │       crates/linscp-service        │
@@ -131,9 +129,9 @@ Both deployment modes execute the exact same application logic in `crates/linscp
 
 ### Transport Adapter Rules (`ui/src/transport/`)
 
-1. **Runtime detection:** At startup, `createTransport()` checks `window.__TAURI_INTERNALS__`. If present, it instantiates `TauriTransport`; otherwise it instantiates `HttpTransport` using the server-injected bootstrap configuration (API token, locale, login state).
+1. **Transport:** At startup, `createTransport()` instantiates `TauriTransport` from `window.__TAURI_INTERNALS__`, which is the only transport; a page outside the shell has no backend to reach. (This document predates the removal of the browser host, whose `HttpTransport` took an injected API token.)
 2. **Real-time events instead of polling:**
-   - Queue byte progress, host-key challenges, `keepuptodate` events, and `xterm.js` terminal streams flow over **Tauri events / `tauri::ipc::Channel`** in native mode and **WebSocket (`/api/events`, `/api/terminal/ws`)** in browser mode (retaining HTTP polling fallback routes so existing `SecurityTest.py` and `ClientTest.js` suites continue to work).
+   - Queue byte progress and host-key challenges flow over **Tauri events / `tauri::ipc::Channel`**; the parsed terminal screen is read with `GET /api/terminal/frame`, and the bytes a terminal sends go back through `POST /api/terminal/input`.
 3. **Zero-copy local transfers in native desktop mode:**
    - In browser HTTP mode, desktop drag-and-drop uploads stream raw bytes to a private staging directory (bounded by `MAX_BROWSER_UPLOAD_BYTES`) because browsers hide full local paths.
    - In Tauri desktop mode (Linux/Windows), Tauri's native file-drop event provides validated local filesystem paths directly to `linscp-service`, allowing multi-gigabyte uploads and local-to-local copies without staging duplicates on disk.
@@ -155,7 +153,7 @@ Moving from `C++ + Python + JS + curl` to `Rust + TypeScript` eliminates major r
 3. **Single Configuration & Crypto Implementation (`linscp-crypto` + `linscp-engine`):**
    - `sessions.ini`, `sessions.key` (`lscp1$`), transfer presets, OpenSSH/FileZilla session importers, symbolic permission parser (`u+x,go-w`), and LinSCP file masks exist once in Rust and are called by CLI, HTTP server, and Tauri alike.
 4. **Embedded Web Assets (`rust-embed`):**
-   - Compiled `ui/dist/` assets are embedded into `linscp-http` and `linscp-tauri`, eliminating runtime asset-path mismatches across `/usr/share`, custom CMake prefixes, Windows portable `.exe` builds, and Android APKs.
+   - Compiled `ui/dist/` assets are embedded into `linscp-tauri`, eliminating runtime asset-path mismatches across `/usr/share`, custom CMake prefixes, Windows portable `.exe` builds, and Android APKs.
 
 ---
 
@@ -204,7 +202,7 @@ All OS-dependent behavior sits behind traits in `crates/linscp-platform` (`Local
 - **Mobile & touch UX in `ui/`:**
   - **Responsive single-pane default:** On `pointer: coarse` or viewports `< 720px`, the Commander defaults to single-pane mode with a persistent bottom navigation bar (`Local`, `Remote`, `Queue`, `Terminal`) and horizontal swipe switching, while keeping dual-pane side-by-side mode on tablets/foldables and desktop.
   - **Touch interaction model:** Single-tap enters directories or opens file actions; long-press (or leading selection checkboxes) enters multi-select mode with a floating Transfer/Delete/More action bar; row height scales to `>= 44px` touch targets; `env(safe-area-inset-*)` pads status bars and gesture handles.
-  - **Touch terminal toolbar:** When `xterm.js` is focused on touch devices, an accessory key strip renders above the soft keyboard with `Esc`, `Tab`, `Ctrl` (sticky), `Alt` (sticky), `↑`, `↓`, `←`, `→`, `/`, `-`, `|`, and `~`.
+  - **Touch terminal toolbar:** While the terminal has the keyboard focus on a touch device, an accessory key strip renders above the soft keyboard with `Esc`, `Tab`, `Ctrl` (sticky), `Alt` (sticky), `↑`, `↓`, `←`, `→`, `/`, `-`, `|`, and `~`.
 
 #### Track B: Termux CLI & Headless HTTP Build
 
@@ -231,7 +229,7 @@ Currently, `tools/check_platform_conversion.py` enforces that LinSCP is Linux-on
 
 - LinSCP remains under the **PolyForm Noncommercial License 1.0.0**.
 - Replacing dynamically linked `libssh` (LGPL-2.1-or-later) with permissive MIT/Apache-2.0 pure-Rust crates (`russh`, `rustls`, `reqwest`, `argon2`, `tauri`, `tokio`) removes LGPL dynamic-relinking constraints, allowing single-file static `linscp.exe` CLI binaries on Windows and single-`liblinscp.so` packaging on Android.
-- Update `NOTICE` during cutover with exact third-party Rust crate and `xterm.js` attributions (generated and checked in CI via `cargo-about` or `cargo-deny`).
+- Update `NOTICE` during cutover with exact third-party Rust crate attributions (generated and checked in CI via `cargo-about` or `cargo-deny`). The embedded terminal's emulator, `alacritty_terminal`, is Apache-2.0 and carries its notice in `NOTICE`.
 - *Distribution note:* PolyForm Noncommercial 1.0.0 is compatible with GitHub Releases, Debian/apt self-hosted repos, `winget` / Microsoft Store (noncommercial terms noted), Obtainium, and free noncommercial Google Play listings; main-repo F-Droid requires an OSI/FSF Free Software license, so Android F-Droid distribution would use either a custom F-Droid repo or a separate licensing decision.
 
 ### 7.3 Reusing the Existing Automated Test Suites
@@ -239,8 +237,8 @@ Currently, `tools/check_platform_conversion.py` enforces that LinSCP is Linux-on
 The existing Python and Node test suites are black-box harnesses that drive `linscp` by executable path (`sys.argv[1]`) or HTTP endpoints—meaning they serve directly as the **parity oracle** for the Rust rewrite:
 
 - **CLI & Live Protocol Suites (`ScriptTest.py`, `LiveSftpTest.py`, `LiveTunnelTest.py`, `LiveScpTest.py`, `LiveDavTest.py`, `LiveS3Test.py`, `LiveCurlTest.py`, `test_psmodule.py`, `test_dotnet.py`):** Run directly against `target/release/linscp` (`crates/linscp-cli`).
-- **GUI Backend & Security Suites (`SecurityTest.py`, `BrowserUploadTest.py`, `LocalWorkspaceTest.py`, `LocalEditorTest.py`, `RemoteSearchTest.py`, `DesktopUriTest.py`, `ShellIntegrationTest.py`, `TerminalTest.py`):** Run against `linscp --serve-http` (`crates/linscp-http`).
-- **Frontend Suites (`ClientTest.js`, `LocalizationTest.js`):** Run in Node + `jsdom` against the built `ui/` bundle across both mock `TauriTransport` and `HttpTransport`.
+- **GUI Backend & Security Suites:** the Python suites in this list that drove an HTTP handler (`SecurityTest.py`, `BrowserUploadTest.py`, `LocalWorkspaceTest.py`, `LocalEditorTest.py`, `RemoteSearchTest.py`, `DesktopUriTest.py`, `TerminalTest.py`) went with the browser host and are no longer part of the tree.
+- **Frontend Suites (`ClientTest.js`, `LocalizationTest.js`):** Run in Node + `jsdom` against the built `ui/` bundle with a mock `TauriTransport`; it is the only transport there is.
 
 ---
 
@@ -251,7 +249,7 @@ Each phase is self-contained, keeps CI green, and has explicit acceptance criter
 ### Phase 0: Workspace, UI Build Pipeline & Guardrails
 - **Scope:**
   - Create root `Cargo.toml` workspace and empty crate skeletons (`linscp-types` .. `linscp-tauri`).
-  - Set up `ui/` TypeScript + Vite build modularizing `source/gui/web/index.html` and `theme.css` with `TransportClient` (`HttpTransport` + `TauriTransport` stub) while keeping the existing Python GUI tests passing.
+  - Set up `ui/` TypeScript + Vite build modularizing `source/gui/web/index.html` and `theme.css` with `TransportClient` (`TauriTransport`) while keeping the existing page tests passing.
   - Evolve `tools/check_platform_conversion.py` (preserving brand checks, enforcing `linscp-platform` crate boundaries) and add GitHub Actions CI jobs for `ubuntu-24.04`, `windows-latest`, and Android NDK `cargo check --target aarch64-linux-android`.
 - **Acceptance gate:** `cargo test --workspace` compiles cleanly on Linux, Windows, and Android target triples; `ClientTest.js` and `LocalizationTest.js` pass against the TypeScript `ui/` build; repo hygiene and brand checks pass.
 
@@ -276,16 +274,16 @@ Each phase is self-contained, keeps CI green, and has explicit acceptance criter
   - Implement `.filepart` resumable transfers, ASCII/automatic EOL conversion, file masks, speed throttling, transfer presets, one-way/two-way `SyncPlanner` with persistent state & conflict policies, `keepuptodate`, `edit` (`encoding_rs` + `-monitor`), `-xmllog=`, `-server`, and `-shell`.
 - **Acceptance gate:** `ScriptTest.py`, `LiveSftpTest.py`, `LiveTunnelTest.py`, `LiveScpTest.py`, `LiveDavTest.py`, `LiveS3Test.py`, `LiveCurlTest.py`, `test_psmodule.py`, and `test_dotnet.py` pass against `target/release/linscp` on Linux (and applicable server-free/loopback suites on `windows-latest`).
 
-### Phase 4: Unified Service, Browser HTTP Mode & Desktop Tauri v2 App (`linscp-service`, `linscp-http`, `linscp-tauri`)
+### Phase 4: Unified Service & Desktop Tauri v2 App (`linscp-service`, `linscp-tauri`)
 - **Scope:**
-  - Implement `CommanderService` (connection-pooled tabs, priority transfer queue with pause/cancel/retry, local-to-local transfers, remote-to-remote copy, bounded UTF-8 search, custom commands, embedded `xterm.js` SSH channel bridge).
-  - Ship `linscp-http` (`axum`) for standalone browser mode and `linscp-tauri` for native Linux and Windows desktop windows, adding the Windows local drive/volume selector in `ui/`.
+  - Implement `CommanderService` (connection-pooled tabs, priority transfer queue with pause/cancel/retry, local-to-local transfers, remote-to-remote copy, bounded UTF-8 search, custom commands, and the embedded SSH shell whose VT stream `crates/linscp-terminal` parses into one screen for every window).
+  - Ship `linscp-tauri` for native Linux and Windows desktop windows, adding the Windows local drive/volume selector in `ui/`. The browser mode listed in this phase was later removed.
 - **Acceptance gate:** All 8 Python GUI suites (`SecurityTest.py`, `BrowserUploadTest.py`, `LocalWorkspaceTest.py`, `LocalEditorTest.py`, `RemoteSearchTest.py`, `DesktopUriTest.py`, `ShellIntegrationTest.py`, `TerminalTest.py`) and both JS suites pass; CI builds Linux `.deb`/`.AppImage` and Windows `.msi`/`.exe` artifacts.
 
 ### Phase 5: Android Native App & Touch UX
 - **Scope:**
   - Generate and wire `crates/linscp-tauri/gen/android` with the Kotlin plugin for SAF (`ContentResolver` / `ACTION_OPEN_DOCUMENT_TREE`), Share Sheet upload staging (`ACTION_SEND`), `ForegroundService` background transfer lock + notification. (Android Keystore wrapping for `sessions.key` was descoped: the vault is password-only.)
-  - Deliver mobile single-pane swipe navigation, touch selection/long-press gestures, safe-area insets, and the `xterm.js` extra-keys bar in `ui/`.
+  - Deliver mobile single-pane swipe navigation, touch selection/long-press gestures, safe-area insets, and the extra-keys bar in `ui/`.
   - Add Termux build recipe/job (`aarch64-linux-android` `linscp-cli`).
 - **Acceptance gate:** Android `.apk`/`.aab` builds cleanly in CI; headless Android Emulator (or JVM/instrumented test) verifies session open, SAF local transfer, host-key prompt, and background service lifecycle; mobile viewport/touch tests pass in `ClientTest.js`.
 

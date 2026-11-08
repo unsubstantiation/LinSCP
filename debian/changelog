@@ -1,3 +1,23 @@
+linscp (1.0-7) unstable; urgency=medium
+
+  * One application, no web build. The Windows and Debian builds no longer
+    produce a second app: `crates/linscp-http` (`linscp-web`), the browser
+    server that served the same page over HTTP, is removed along with its
+    binary, its desktop entry, its CI steps and its packaging rules.
+  * The page has a single transport again. `ui/src/transport/http.ts`, the
+    `X-LSCP-Token`/`X-LSCP-CSRF` headers, the `LSCP_TOKEN` bootstrap and the
+    `HttpTransport` fallback are gone; `createTransport()` returns the native
+    Tauri bridge or nothing. A page outside the shell says so instead of
+    issuing a network request.
+  * Server-side accounts went with the host that served them: the `/api/login`,
+    `/api/logout` and `/api/accounts` routes, the page's sign-in dialog and the
+    `accounts` capability are removed. Sessions are the app's own vault.
+  * The Python GUI harnesses that drove that HTTP handler (and the retired
+    `linscp_gui` shim they imported) are removed; the parity ledger records the
+    gap they leave instead of citing suites that cannot run.
+
+ -- LinSCP maintainers <linscp@example.invalid>  Sun, 08 Nov 2026 12:00:00 +0000
+
 linscp (1.0-6) unstable; urgency=medium
 
   * Pure-Rust + Tauri v2 + TypeScript migration (crates/* + ui/): the
