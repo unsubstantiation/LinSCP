@@ -250,6 +250,22 @@ const dom = new JSDOM(html, {
     window.fetch = () => {
       throw new Error('the page must not use fetch(): there is no HTTP host');
     };
+    /* jsdom has no canvas and says so loudly, but the in-page terminal is a
+     * real canvas renderer, so it needs a context to draw into. A recorder is
+     * enough: this suite is about the page handing the model's frames to the
+     * terminal, not about what the pixels look like - and a terminal that
+     * cannot get a context would be a terminal nobody can see, which is a
+     * separate thing worth failing on. */
+    const drawable = () => {
+      const context = {
+        font: '', fillStyle: '', textBaseline: '',
+        setTransform() {}, fillRect() {}, fillText() {},
+        measureText: text => ({ width: String(text).length * 8.8 }),
+        getContext() { return context; },
+      };
+      return context;
+    };
+    window.HTMLCanvasElement.prototype.getContext = () => drawable();
     window.__TAURI_INTERNALS__ = { invoke: async (_cmd, args) => invoke(args.envelope) };
     const invoke = envelope => {
       const method = String(envelope.method || 'GET').toUpperCase();

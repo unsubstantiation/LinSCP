@@ -33,9 +33,6 @@ use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{
     Color, CursorShape, NamedColor, Processor, Rgb as VteRgb, StdSyncHandler,
 };
-// `history_size`, `total_lines` and `screen_lines` live on this trait, so it
-// has to be in scope to call them on a `Grid`.
-use alacritty_terminal::grid::Dimensions as _;
 use serde::Serialize;
 
 /// The scrollback depth a new screen starts with.

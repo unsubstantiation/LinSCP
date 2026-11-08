@@ -177,6 +177,7 @@ impl EmbeddedTerminal {
             buffer_limit,
             handle,
             ring,
+            screen,
         })
     }
 
