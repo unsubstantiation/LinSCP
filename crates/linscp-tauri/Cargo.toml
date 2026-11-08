@@ -28,7 +28,7 @@ linscp-service.workspace = true
 linscp-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tauri = { version = "2.1", optional = true , features = [] }
+tauri = { version = "2.1", optional = true, features = ["image-png"] }
 zeroize.workspace = true
 
 [lints]

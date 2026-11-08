@@ -40,8 +40,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-# The files this check reads. The vendored xterm.js files under
-# source/gui/web/vendor are upstream code and are not this project's to fix.
+# The files this check reads.
 SCAN_ROOTS = [
     'source/linux',
     'source/gui',

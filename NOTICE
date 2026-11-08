@@ -39,17 +39,18 @@ The pure-Rust workspace replaces the former C++ dependencies:
   `serde`/`serde_json` (MIT/Apache-2.0).
 - Tauri v2 desktop/mobile shell (`crates/linscp-tauri`) and plugins: `tauri`
   (MIT/Apache-2.0), `tauri-plugin-dialog`/`fs`/`shell` (MIT/Apache-2.0).
-- UI: TypeScript + `esbuild` (MIT), and the browser terminal embeds xterm.js 6.0.0
-  and its FitAddon (source/gui/web/vendor/, MIT licence; full notice in
-  vendor/LICENSE-xterm.txt) now vendored under `ui/src/vendor/` and `ui/vendor/`
-  where applicable, bundled via `ui/scripts/build.mjs`.
+- UI: TypeScript + `esbuild` (MIT), bundled via `ui/scripts/build.mjs`.
+- Terminal emulation: `alacritty_terminal` 0.26 (Apache-2.0), the VT parser and
+  grid published separately from the Alacritty binary. It carries no renderer,
+  window or GPU code; the cells it produces are painted by this project's own
+  canvas renderer in `ui/src/platform/terminal.ts`.
 
 All Rust crates are listed with exact versions and licenses in `Cargo.lock`;
 a `cargo-about`/`cargo-deny` report can be generated with `cargo about generate`.
 
-The browser terminal in the graphical client embeds xterm.js 6.0.0 and
-its FitAddon (MIT licence; the full notice is in
-ui/vendor/LICENSE-xterm.txt or source/gui/web/vendor/LICENSE-xterm.txt).
+The embedded terminal parses the VT stream with `alacritty_terminal` 0.26
+(crates/linscp-terminal). That crate is Apache-2.0, and its notice follows;
+the renderer, the key encoding and the window are this project's own work.
 
 Artwork
 
@@ -76,3 +77,27 @@ This program does not collect or transmit usage statistics, and it does not
 contact any vendor server for update checks or installation reports. Beyond
 that, the only network traffic it generates is the file transfer traffic you
 start yourself.
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+  
+     http://www.apache.org/licenses/LICENSE-2.0
+  
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+ 
+     http://www.apache.org/licenses/LICENSE-2.0
+ 
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.

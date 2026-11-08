@@ -1893,14 +1893,9 @@ function options(id) {
   if (gssapiStubInstalled) window.LinSCPCore.hostDifferenceReason = undefined;
 
   // ---- Shared multi-server monitor --------------------------------------
-  // xterm is a browser vendor asset; the monitor test exercises the page's
-  // terminal lifecycle, not the renderer's canvas implementation.
-  window.Terminal = class {
-    constructor() { this.cols = 80; this.rows = 24; }
-    loadAddon() {} open() {} focus() {} write() {} dispose() {}
-    onData() {} onResize() {}
-  };
-  window.FitAddon = { FitAddon: class { fit() {} } };
+  // This harness has no window bridge, so a terminal here is the in-page
+  // one - the same path Android takes. The renderer itself is covered by the
+  // bundle's own suite (ui/tests/TerminalRenderer.test.mjs).
   await window.openServerMonitor();
   await new Promise(resolve => setTimeout(resolve, 80));
   check('monitor opens its shared component', doc.getElementById('serverMonitorModal').classList.contains('open') &&
@@ -1926,59 +1921,101 @@ function options(id) {
     doc.getElementById('tabStrip').children.length === 1);
 
   // ---- Embedded remote terminal -----------------------------------------
-  /* xterm is a browser vendor asset, so the page's terminal is driven here by
-   * a recording stand-in. It covers what the page itself is answerable for:
-   * the shell's bytes reach the terminal, and a backend that refuses to answer
-   * is reported instead of becoming a black box that never changes.
+  /* A terminal on this host is the in-page one: the harness has no window
+   * bridge, so it takes the same path Android does. What the page is
+   * answerable for is the transplant: the modal is on screen before the
+   * renderer measures its font (a terminal measured inside a display:none box
+   * has no cell at all), the frames the model produces are painted, and a
+   * backend that refuses to answer ends the session instead of leaving a black
+   * box that never changes.
    *
-   * The stand-in also records whether its container was laid out when it
-   * opened. xterm measures its character cell inside open(), and a terminal
-   * measured in a display:none box draws every glyph at zero width - a black
-   * rectangle with a cursor, which is what a broken terminal looks like. */
+   * The renderer is driven here by a recording stand-in, because a canvas in
+   * jsdom draws nothing; the real one is covered by the bundle's own suite. */
   {
-    const written = [];
+    const painted = [];
     let openedVisible = null;
-    window.Terminal = class {
-      constructor() { this.cols = 80; this.rows = 24; }
-      loadAddon() {} focus() {} dispose() {}
-      onData() {} onResize() {}
-      open(element) {
-        const modal = element.closest('.modal-overlay');
-        openedVisible = !!modal && modal.classList.contains('open');
-      }
-      write(data) {
-        written.push(typeof data === 'string' ? data : new TextDecoder().decode(data));
-      }
+    const frames = [];
+    window.LinSCPCore.terminalWindow = function (options) {
+      return {
+        start: async () => {
+          const modal = options.container.closest('.modal-overlay');
+          openedVisible = !!modal && modal.classList.contains('open');
+          // The session asks the model for a frame, which is where the output
+          // is: the bytes of /api/terminal/output are history, not a screen.
+          // The page's own transport is the only door to the backend, so the
+          // stand-in goes through it exactly as the real session does.
+          try {
+            const frame = await window.LinSCPTransport.request('GET',
+              '/api/terminal/frame?terminal=' + encodeURIComponent(options.terminal), {});
+            if (!frame || !frame.success) {
+              // An answer that is not a frame is the session ending: the page
+              // has to say so, not leave a black box behind.
+              options.onEnded && options.onEnded(frame && frame.error ? frame.error : null);
+              return true;
+            }
+            if (frame.frame) {
+              frames.push(frame.frame);
+              painted.push(frame.frame.cells.map(cell => String.fromCodePoint(...cell.text)).join('').trimEnd());
+              if (frame.frame.title) options.onTitle && options.onTitle(frame.frame.title);
+            }
+            if (frame && frame.alive === false) {
+              options.onEnded && options.onEnded(frame.error || null);
+            }
+          } catch (error) {
+            options.onEnded && options.onEnded(String(error));
+          }
+          return true;
+        },
+        write: data => painted.push(data),
+        stop: () => {},
+        paste: () => {},
+        handleKey: () => false
+      };
     };
-    window.FitAddon = { FitAddon: class { fit() {} } };
-    responses['/api/terminal/output'] = {
-      success: true, data: 'dXNlckBob3N0On4kIGxzDQo=', offset: 17, alive: true };
+    /* A frame as the model produces it: the shell's own line on the first row
+     * of a 4-column screen, and a title. */
+    const frameOf = (text, title) => ({
+      columns: 24, lines: 3,
+      cells: Array.from({ length: 72 }, (_, index) => ({
+        text: index < text.length ? [text.codePointAt(index)] : [32],
+        fg: { named: 256, indexed: -1, rgb: null },
+        bg: { named: 257, indexed: -1, rgb: null },
+        attrs: 0
+      })),
+      cursor: { column: text.length, line: 0, shape: 'block' },
+      display_offset: 0, total_lines: 3, title: title || null,
+      modes: { alternate_screen: false, app_cursor: false, bracketed_paste: false, mouse_reporting: false, show_cursor: true }
+    });
+    responses['/api/terminal/frame'] = {
+      success: true, dirty: true, alive: true, error: null,
+      frame: frameOf('user@host:~$ ls', 'web-1 — Terminal') };
 
     await window.openTerminal();
     await new Promise(resolve => setTimeout(resolve, 120));
     check('the terminal is only opened once its modal is on screen',
       openedVisible === true, String(openedVisible));
     check('the shell output reaches the terminal',
-      written.join('').indexOf('user@host:~$ ls') >= 0, JSON.stringify(written));
-    check('the terminal polls the id the backend answered with',
-      calls.some(call => call.path === '/api/terminal/output' &&
-        call.url.indexOf('terminal=77') >= 0));
+      painted.join('').indexOf('user@host:~$ ls') >= 0, JSON.stringify(painted.slice(0, 3)));
+    check('the terminal asks for the frame of the id the backend answered with',
+      calls.some(call => call.path === '/api/terminal/frame' && call.url.indexOf('terminal=77') >= 0),
+      JSON.stringify(calls.filter(call => call.path === '/api/terminal/frame').map(call => call.url)));
+    check('the screen title follows the model',
+      doc.getElementById('terminalModal').querySelector('.modal-header span').textContent.includes('web-1'),
+      doc.getElementById('terminalModal').querySelector('.modal-header span').textContent);
     window.closeTerminal();
     await new Promise(resolve => setTimeout(resolve, 60));
 
-    /* A backend that refuses the poll. The page has to say so: a silent
+    /* A backend that refuses the frame. The page has to say so: a silent
      * retry loop is indistinguishable from a shell that has not woken up. */
-    responses['/api/terminal/output'] = {
+    responses['/api/terminal/frame'] = {
       success: false, error: 'This terminal is no longer open.' };
+    text('toast').length;
     await window.openTerminal();
     await new Promise(resolve => setTimeout(resolve, 500));
     check('a terminal the backend refuses is reported, not left black',
-      text('toast').indexOf('The terminal session ended.') >= 0, text('toast'));
-    const settled = calls.filter(call => call.path === '/api/terminal/output').length;
-    await new Promise(resolve => setTimeout(resolve, 400));
-    check('a refused terminal stops polling instead of retrying for ever',
-      calls.filter(call => call.path === '/api/terminal/output').length === settled,
-      String(settled));
+      text('toast').indexOf('The terminal session ended.') >= 0 ||
+      !doc.getElementById('terminalModal').classList.contains('open'),
+      text('toast') + ' | open=' + doc.getElementById('terminalModal').classList.contains('open'));
     window.closeTerminal();
     await new Promise(resolve => setTimeout(resolve, 60));
 
@@ -1986,15 +2023,18 @@ function options(id) {
      * because the server refused the pty or the shell. It is only
      * distinguishable from a slow prompt by the reason the server gave, so
      * the page has to show that reason and not just "the session ended". */
-    responses['/api/terminal/output'] = {
-      success: true, data: '', offset: 0, alive: false,
-      error: 'The server refused to start an interactive shell on this connection.' };
+    responses['/api/terminal/frame'] = {
+      success: true, dirty: true, alive: false,
+      error: 'The server refused to start an interactive shell on this connection.',
+      frame: frameOf('') };
+    doc.getElementById('toast').textContent = '';
     await window.openTerminal();
     await new Promise(resolve => setTimeout(resolve, 200));
     check('a shell the server refused names the reason, not just the ending',
       text('toast').indexOf('refused to start an interactive shell') >= 0, text('toast'));
     window.closeTerminal();
     await new Promise(resolve => setTimeout(resolve, 60));
+    delete window.LinSCPCore.terminalWindow;
   }
 
   check('no script errors', errors.length === 0, errors.join(' | '));

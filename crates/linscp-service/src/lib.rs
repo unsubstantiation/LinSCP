@@ -285,7 +285,10 @@ impl CommanderService {
             ("POST", "/api/session/terminal") => self.open_terminal_async(req.body).await,
             ("POST", "/api/terminal/input") => self.terminal_write(req.body),
             ("POST", "/api/terminal/close") => self.terminal_close(req.body),
+            ("POST", "/api/terminal/scroll") => self.terminal_scroll(req.body),
             ("GET", "/api/terminal/output") => self.terminal_read(&parse_query(req.path.split_once('?').map(|(_, q)| q).unwrap_or(""))),
+            ("GET", "/api/terminal/frame") => self.terminal_frame(&parse_query(req.path.split_once('?').map(|(_, q)| q).unwrap_or(""))),
+            ("GET", "/api/terminal/list") => self.terminal_list(),
             ("POST", "/api/shell/consume") => self.consume_shell_offer_async(req.body).await,
             ("GET", "/api/remote/edit") => self.remote_edit_read_async(&parse_query(req.path.split_once('?').map(|(_, q)| q).unwrap_or(""))).await,
             ("POST", "/api/remote/save") => self.remote_save_async(req.body).await,
@@ -1323,8 +1326,14 @@ impl CommanderService {
             terminal_id.clone(), id, &ssh, cols, rows, Some(tab.remote_dir.as_str()), event_tx,
         ).await {
             Ok(terminal) => {
+                let (cols, rows) = terminal.dimensions();
                 self.state.lock().expect("state mutex").terminals.insert(terminal);
-                ApiReply { status: 200, payload: json!({"success": true, "terminal": terminal_id}) }
+                ApiReply { status: 200, payload: json!({
+                    "success": true,
+                    "terminal": terminal_id,
+                    "cols": cols,
+                    "rows": rows,
+                }) }
             }
             Err(error) => api_error(400, error),
         }
@@ -1347,6 +1356,16 @@ impl CommanderService {
         };
         let cols = body.get("cols").and_then(Value::as_u64).unwrap_or(0) as u32;
         let rows = body.get("rows").and_then(Value::as_u64).unwrap_or(0) as u32;
+        // A window that has measured its font reports the cell size on the
+        // same call, because a program that asks how large the text area is in
+        // pixels (CSI 14 t) can only be answered by whoever knows the font.
+        let cell_width = body.get("cell_width").and_then(Value::as_u64).unwrap_or(0);
+        let cell_height = body.get("cell_height").and_then(Value::as_u64).unwrap_or(0);
+        if (1..=1000).contains(&cell_width) && (1..=1000).contains(&cell_height) {
+            terminal.with_screen(|screen| {
+                screen.set_cell_size(cell_width as u16, cell_height as u16)
+            });
+        }
         if cols > 0 && rows > 0 && !terminal.resize(cols, rows) {
             return api_error(400, "Invalid terminal size.");
         }
@@ -1354,6 +1373,23 @@ impl CommanderService {
             return api_error(400, "The terminal session ended.");
         }
         ApiReply { status: 200, payload: json!({"success": true}) }
+    }
+
+    /// Scrolls a terminal's viewport through its own scrollback.
+    ///
+    /// This is a view operation, not shell input. Without it a window can only
+    /// see the last screenful, and a program that does not implement its own
+    /// paging has no way to show a line that has already gone by.
+    fn terminal_scroll(&self, body: Value) -> ApiReply {
+        let terminal_id = body.get("terminal").and_then(Value::as_str).unwrap_or("");
+        let lines = body.get("lines").and_then(Value::as_i64).unwrap_or(0);
+        let lines = lines.clamp(-10_000, 10_000) as i32;
+        let terminal = match self.state.lock().expect("state mutex").terminals.get(terminal_id) {
+            Some(terminal) => terminal,
+            None => return api_error(400, "This terminal is no longer open."),
+        };
+        terminal.with_screen(|screen| screen.scroll(lines));
+        ApiReply { status: 200, payload: json!({ "success": true }) }
     }
 
     fn terminal_read(&self, query: &BTreeMap<String,String>) -> ApiReply {
@@ -1375,6 +1411,49 @@ impl CommanderService {
             "exit_code": exit_code,
             "error": terminal.failure(),
         })}
+    }
+
+    /// The parsed screen of an open terminal: cells, colours, cursor, modes
+    /// and title, already resolved.
+    ///
+    /// This is what a window paints. It is not the byte history
+    /// (`/api/terminal/output`) because a window that had to emulate the bytes
+    /// again would be a second terminal emulator, and two emulators can
+    /// disagree about the same shell. The desktop window and the page both read
+    /// this, so they cannot disagree either.
+    fn terminal_frame(&self, query: &BTreeMap<String, String>) -> ApiReply {
+        let terminal_id = query.get("terminal").map(String::as_str).unwrap_or("");
+        let terminal = match self.state.lock().expect("state mutex").terminals.get(terminal_id) {
+            Some(terminal) => terminal,
+            None => return api_error(400, "This terminal is no longer open."),
+        };
+        // A frame is where a window learns whether the screen is worth
+        // repainting, so it answers with the frame whether or not it changed
+        // and lets the window compare. The dirty flag is reported separately
+        // because a window that polls at a fixed rate still wants to know that
+        // nothing moved since the last frame it painted.
+        match terminal.with_screen(|screen| (screen.is_dirty(), serde_json::to_value(screen.snapshot()))) {
+            Some((dirty, Ok(frame))) => ApiReply { status: 200, payload: json!({
+                "success": true,
+                "dirty": dirty,
+                "alive": terminal.is_alive(),
+                "error": terminal.failure(),
+                "frame": frame,
+            }) },
+            Some((_, Err(error))) => api_error(500, error.to_string()),
+            None => api_error(500, "This terminal has no screen."),
+        }
+    }
+
+    /// The open terminals, so a window opened later can attach to one instead
+    /// of opening a second shell.
+    ///
+    /// Each entry carries what a title bar needs and nothing that would let a
+    /// caller act on a shell it does not own: the id is the handle, and it is
+    /// only useful with the same authenticated caller that opened it.
+    fn terminal_list(&self) -> ApiReply {
+        let terminals = self.state.lock().expect("state mutex").terminals.summaries();
+        ApiReply { status: 200, payload: json!({ "success": true, "terminals": terminals }) }
     }
 
     fn terminal_close(&self, body: Value) -> ApiReply {
@@ -5394,6 +5473,40 @@ mod tests {
             body: json!({"password": "correct horse battery staple"}),
         });
         assert_eq!(reply.status, 200, "{}", reply.payload);
+    }
+
+    /// A terminal nobody opened is refused by every route that needs one, and
+    /// the refusal names the reason instead of reporting a screen of blanks: a
+    /// window that shows an empty terminal for a shell that never existed is
+    /// indistinguishable from one that is simply slow.
+    #[test]
+    fn routes_for_a_terminal_nobody_opened_say_so() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = CommanderService::new(temp.path().to_path_buf(), std::sync::Arc::new(NativeLocalFs::new()));
+        for (method, path) in [
+            ("GET", "/api/terminal/frame?terminal=term-404"),
+            ("POST", "/api/terminal/scroll"),
+            ("POST", "/api/terminal/input"),
+            ("POST", "/api/terminal/close"),
+        ] {
+            let reply = service.dispatch(ApiEnvelope {
+                method: method.into(),
+                path: path.into(),
+                body: json!({"terminal": "term-404", "lines": 3}),
+            });
+            // Closing is the one route that is allowed to answer success: a
+            // window may close a terminal the backend already dropped.
+            if path == "/api/terminal/close" {
+                assert_eq!(reply.status, 200, "{path}");
+            } else {
+                assert_eq!(reply.status, 400, "{path}: {}", reply.payload);
+                assert!(
+                    reply.payload.to_string().contains("no longer open"),
+                    "{path}: {}",
+                    reply.payload,
+                );
+            }
+        }
     }
 
     #[test]

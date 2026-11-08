@@ -1,6 +1,16 @@
-//! Embedded `xterm.js` SSH channel bridge (`TerminalBridge`) multiplexed over
-//! a tab's pooled `SshConnection`, with a bounded 256 KiB ring buffer and
-//! monotonic byte offsets compatible with HTTP polling and WebSocket/Tauri events.
+//! Embedded SSH shell bridge multiplexed over a tab's pooled `SshConnection`.
+//!
+//! Two consumers read the same shell. The ring buffer keeps the raw bytes for
+//! window to ask for them after an offset, which is how the page and the
+//! desktop window both used to get their output. The [`TerminalScreen`] is the
+//! parsed state of the same bytes: the VT stream is fed to it as it arrives,
+//! so a window can be handed cells and a cursor instead of a byte history and
+//! a second emulator. Emulating once, here, is what lets two windows show the
+//! same terminal and what stops the page from needing `xterm.js` at all.
+//!
+//! The ring stays because it is the only thing that can answer "what did I miss
+//! while no window was open", and because a screen that has scrolled away its
+//! history cannot be replayed from the grid.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -8,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine as _;
 use linscp_proto::ssh::{PtyShellEvent, PtyShellHandle, SshConnection};
+use linscp_terminal::{Size, TerminalScreen};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
@@ -33,6 +44,10 @@ pub struct EmbeddedTerminal {
     buffer_limit: usize,
     handle: PtyShellHandle,
     ring: Arc<Mutex<TerminalRingState>>,
+    /// The parsed screen, shared so a window can paint without owning the
+    /// shell. `None` only if the terminal was built with a size no screen can
+    /// have, which `open_over_ssh` refuses up front.
+    screen: Arc<Mutex<Option<TerminalScreen>>>,
 }
 
 impl EmbeddedTerminal {
@@ -58,6 +73,11 @@ impl EmbeddedTerminal {
             let _ = handle.write_bytes(cd_cmd.into_bytes());
         }
 
+        let screen = Arc::new(Mutex::new(TerminalScreen::new(Size::new(
+            init_cols as usize,
+            init_rows as usize,
+        )).ok()));
+
         let ring = Arc::new(Mutex::new(TerminalRingState {
             buffer: Vec::new(),
             dropped: 0,
@@ -69,6 +89,7 @@ impl EmbeddedTerminal {
         }));
 
         let ring_bg = Arc::clone(&ring);
+        let screen_bg = Arc::clone(&screen);
         let id_bg = id.clone();
         let buffer_limit = DEFAULT_TERMINAL_BUFFER_LIMIT;
         tokio::spawn(async move {
@@ -77,6 +98,20 @@ impl EmbeddedTerminal {
                     PtyShellEvent::Data(bytes) => {
                         if bytes.is_empty() {
                             continue;
+                        }
+                        // Parse before storing: the screen is the authority on
+                        // what the terminal shows, and a program waiting for a
+                        // reply to a cursor-position query is waiting on this
+                        // call. Its answer goes back down the same channel the
+                        // output came up.
+                        if let Ok(mut slot) = screen_bg.lock() {
+                            if let Some(screen) = slot.as_mut() {
+                                screen.advance(&bytes);
+                                let replies = screen.take_replies();
+                                if !replies.is_empty() {
+                                    let _ = handle.write_bytes(replies);
+                                }
+                            }
                         }
                         let offset = {
                             let mut g = ring_bg.lock().expect("terminal ring mutex");
@@ -167,6 +202,16 @@ impl EmbeddedTerminal {
             g.cols = cols;
             g.rows = rows;
         }
+        // The parsed grid has to follow the PTY, or a program that redraws for
+        // the new width is parsed into the old one and the screen and the
+        // shell disagree about where the cursor is. The guard is a named
+        // binding: a temporary dropped at the end of the `if let` would end the
+        // borrow while the screen is still in use.
+        if let Ok(mut slot) = self.screen.lock() {
+            if let Some(screen) = slot.as_mut() {
+                screen.resize(Size::new(cols as usize, rows as usize));
+            }
+        }
         self.handle.resize(cols, rows).is_ok()
     }
 
@@ -204,6 +249,17 @@ impl EmbeddedTerminal {
         self.buffer_limit
     }
 
+    /// The parsed screen, locked for the caller.
+    ///
+    /// A window paints from this rather than from the byte ring: the bytes are
+    /// the history, the screen is what is on it. The guard is short-lived on
+    /// both sides - the reader task holds it only for the length of one parse -
+    /// so a paint never waits behind a transfer.
+    pub fn with_screen<T>(&self, read: impl FnOnce(&mut TerminalScreen) -> T) -> Option<T> {
+        let mut slot = self.screen.lock().ok()?;
+        slot.as_mut().map(read)
+    }
+
     pub fn close(&self) {
         self.handle.close();
         if let Ok(mut g) = self.ring.lock() {
@@ -239,6 +295,28 @@ impl TerminalRegistry {
         } else {
             false
         }
+    }
+
+    /// One summary per open terminal, in the order they were opened.
+    pub fn summaries(&self) -> Vec<Value> {
+        self.terminals
+            .values()
+            .map(|term| {
+                let (cols, rows) = term.dimensions();
+                let title = term
+                    .with_screen(|screen| screen.title())
+                    .flatten()
+                    .filter(|title| !title.is_empty());
+                json!({
+                    "terminal": term.id,
+                    "tab": term.tab_id,
+                    "cols": cols,
+                    "rows": rows,
+                    "alive": term.is_alive(),
+                    "title": title,
+                })
+            })
+            .collect()
     }
 
     pub fn close_for_tab(&mut self, tab_id: u64) {

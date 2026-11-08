@@ -8,9 +8,6 @@
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="icon" type="image/png" sizes="64x64" href="/favicon.png">
   <link rel="stylesheet" href="/theme.css">
-  <link rel="stylesheet" href="/vendor/xterm.css">
-  <script src="/vendor/xterm.js"></script>
-  <script src="/vendor/addon-fit.js"></script>
   <style>
     #vaultGate { position:fixed; inset:0; z-index:100000; display:none; align-items:center; justify-content:center; padding:24px; background:rgba(7,11,16,.96); }
     #vaultGate .vault-card { width:min(440px,100%); padding:28px; border:1px solid var(--border,#334155); border-radius:14px; background:var(--panel,#151c25); box-shadow:0 24px 80px #0009; }
@@ -845,8 +842,10 @@
     </div>
   </div>
 
-  <!-- Embedded remote terminal: xterm.js in the page, 'linscp -shell'
-       behind a pseudo-terminal on the backend. -->
+  <!-- The embedded remote terminal: an SSH shell on the backend, drawn here
+       only on a host that cannot open a window for it. A desktop terminal
+       opens in its own OS window, which is the same page with
+       `terminal=<id>`; Android draws it in this modal instead. -->
   <div class="modal-overlay" id="terminalModal" role="dialog" aria-modal="true" aria-label="Terminal">
     <div class="modal-box" style="width:900px; max-width:96vw;">
       <div class="modal-header">
@@ -854,7 +853,7 @@
         <span style="cursor:pointer;" onclick="closeTerminal()">✕</span>
       </div>
       <div class="modal-body" style="flex-direction:column;">
-        <div id="terminalScreen" style="height:480px; max-height:70vh; background:#000;"></div>
+        <div id="terminalScreen" class="terminal-screen"></div>
         <!-- Esc/Tab/Ctrl and the cursor keys, for a soft keyboard that has
              none of them. The shared bundle fills it; the stylesheet shows it
              only while the terminal is focused. -->
@@ -4035,146 +4034,137 @@
     else await refreshPanes(null);
   }
 
+  /* One terminal, and where it is shown.
+   *
+   * A desktop terminal opens in its own OS window, so it can be alt-tabbed to,
+   * moved to another screen, and kept beside the file panes while those stay
+   * where they were. That window is the same page with `terminal=<id>` in it,
+   * which is why the page has to open it rather than draw it: a modal inside
+   * this window cannot be a separate window.
+   *
+   * Android has no OS windows to open, so the same terminal is drawn into the
+   * modal instead, through the shared renderer. Neither path emulates
+   * anything: the VT stream is parsed once, in Rust, and both windows paint
+   * the frames it produces. */
   let embeddedTerminal = null;
+  let terminalWindowLabel = null;
+
+  function terminalTitleOf(tab) {
+    return tab && tab.name ? `${tab.name} — Terminal` : 'Terminal';
+  }
 
   async function openTerminal(targetTab = null, returnToMonitor = false) {
     const tab = targetTab === null ? activeTab() : state.tabs.find(candidate => candidate.id === targetTab);
     if (!tab || !tab.connected) { toast(t("Not connected."), true); return false; }
-    const result = await apiPost('/api/session/terminal', { tab: tab.id });
+    const result = await apiPost('/api/session/terminal', { tab: tab.id, cols: 100, rows: 30 });
     if (!result.success) { toast(errorMessage(result.error, t("Cannot open a terminal.")), true); return false; }
     closeTerminal();
-    const screen = $('terminalScreen');
-    screen.innerHTML = '';
-    // The modal has to be on screen before xterm opens. xterm measures its
-    // character cell in open(), and a terminal measured inside a display:none
-    // box has no cell at all: every glyph it draws afterwards lands at zero
-    // width, which is a black rectangle with a cursor and nothing else. The
-    // fit below then has a real container to measure.
-    openModal('terminalModal');
-    const term = new Terminal({ cursorBlink: true, scrollback: 5000 });
-    const fit = new FitAddon.FitAddon();
-    term.loadAddon(fit);
-    term.open(screen);
-    const terminalState = { id: result.terminal, term, fit, offset: 0, timer: null,
-      closed: false, backendClosed: false, inputQueue: Promise.resolve(),
-      resizeObserver: null, resizeFrame: 0, returnToMonitor };
-    embeddedTerminal = terminalState;
-    const sendTerminalInput = data => {
-      if (terminalState.closed) return;
-      const bytes = new TextEncoder().encode(data);
-      let binary = '';
-      bytes.forEach(b => { binary += String.fromCharCode(b); });
-      // HTTP requests are handled concurrently by the backend. Serialize
-      // input so rapid keypresses and pasted text arrive at the PTY in order.
-      terminalState.inputQueue = terminalState.inputQueue.then(() => {
-        if (!terminalState.closed) return apiPost('/api/terminal/input', {
-          terminal: terminalState.id, data: btoa(binary), cols: term.cols, rows: term.rows
-        });
-      }).catch(() => {});
-    };
-    const fitTerminal = () => {
-      if (terminalState.closed || terminalState.resizeFrame) return;
-      terminalState.resizeFrame = requestAnimationFrame(() => {
-        terminalState.resizeFrame = 0;
-        if (!terminalState.closed) fit.fit();
-      });
-    };
-    // The shell's extra-key row and the keyboard share one entry point, so a
-    // latched Ctrl sends the same bytes whichever one produced them.
-    terminalState.send = sendTerminalInput;
-    term.onData(sendTerminalInput);
-    term.onResize(() => sendTerminalInput(''));
-    // Fit now that the modal is visible; measuring a display:none terminal
-    // gives the remote PTY a tiny or stale size on its first paint.
-    fit.fit();
-    if (typeof ResizeObserver !== 'undefined') {
-      terminalState.resizeObserver = new ResizeObserver(fitTerminal);
-      terminalState.resizeObserver.observe(screen);
-    }
-    term.focus();
-    if (appShell) appShell.setTerminalFocused(true);
-    /* A poll the backend refuses - a terminal it no longer knows about, a
-     * request it will not answer - was dropped and retried every 120 ms for
-     * ever. On screen that is indistinguishable from a shell that has not
-     * woken up yet: a black box whose cursor blinks and nothing more. Saying
-     * so after a few empty answers is the difference between a slow shell and
-     * a dead one, and it stops a page that can never work from polling a
-     * backend that has already said no. */
-    let pollFailures = 0;
-    const endTerminal = message => {
-      if (terminalState.closed) return;
-      terminalState.closed = true;
-      terminalState.backendClosed = true;
-      apiPost('/api/terminal/close', { terminal: terminalState.id });
-      toast(message, true);
-    };
-    const poll = async () => {
-      if (terminalState.closed) return;
-      let out = null;
+    const invoke = window.LinSCPCore && window.LinSCPCore.nativeInvoker
+      ? window.LinSCPCore.nativeInvoker()
+      : null;
+    // A desktop window gets a real OS window; a host without windows (Android)
+    // gets the terminal in the page, which is the only place it can be.
+    if (invoke && $('terminalModal')) {
       try {
-        out = await apiGet('/api/terminal/output?terminal=' +
-          encodeURIComponent(terminalState.id) + '&after=' + terminalState.offset);
+        const opened = await invoke('linscp_open_terminal_window', {
+          terminal: result.terminal,
+          title: terminalTitleOf(tab),
+          cols: result.cols || 100,
+          rows: result.rows || 30
+        });
+        // Only a shell that came back with a window label opened a window.
+        // A host that cannot open one - Android, whose command does not
+        // exist - answers with an error, and a host that answers with nothing
+        // at all has opened nothing either; both fall through to the in-page
+        // renderer instead of leaving the person with a shell they cannot see.
+        if (opened && opened.label) {
+          terminalWindowLabel = opened.label;
+          if (appShell) appShell.setTerminalFocused(false);
+          return true;
+        }
+        terminalWindowLabel = null;
       } catch (error) {
-        out = null;
+        // A host that cannot open a window is not a host without a terminal:
+        // the in-page renderer below is the honest fallback.
+        terminalWindowLabel = null;
       }
-      if (terminalState.closed) return;
-      if (out && out.success) {
-        pollFailures = 0;
-        try {
-          if (out.data) {
-            const binary = atob(out.data);
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-            term.write(bytes);
-          }
-        } catch (error) {
-          /* A payload this page cannot decode ends the session here, rather
-           * than in an unhandled rejection: that would stop the loop and
-           * leave the same black box behind with no explanation at all. */
-          endTerminal(t("The terminal session ended."));
-          return;
-        }
-        terminalState.offset = out.offset;
-        if (!out.alive) {
-          terminalState.closed = true;
-          terminalState.backendClosed = true;
-          apiPost('/api/terminal/close', { terminal: terminalState.id });
-          term.write('\r\n');
-          // A server that refused the shell said why. Showing it is the
-          // whole point: otherwise a shell that will never start looks
-          // exactly like one that has not answered yet.
-          toast(out.error
-            ? errorMessage(out.error, t("The terminal session ended."))
-            : t("The terminal session ended."));
-          return;
-        }
-      } else if (++pollFailures >= 5) {
-        endTerminal(errorMessage(out && out.error, t("The terminal session ended.")));
-        return;
+    }
+    return openTerminalInPage(result.terminal, tab, returnToMonitor);
+  }
+
+  /* The Android path, and the desktop fallback: one renderer, one session,
+   * both from the shared bundle. */
+  function openTerminalInPage(terminal, tab, returnToMonitor) {
+    const screen = $('terminalScreen');
+    if (!screen || !window.LinSCPCore || !window.LinSCPCore.TerminalWindow) return false;
+    screen.innerHTML = '';
+    // The modal has to be on screen before the renderer measures its font: a
+    // terminal measured inside a display:none box has no cell at all, and
+    // every glyph afterwards lands at zero width.
+    openModal('terminalModal');
+    const view = window.LinSCPCore.terminalWindow({
+      container: screen,
+      terminal,
+      transport: window.LinSCPTransport || transportShim(),
+      extraKeysElement: $('terminalExtraKeys'),
+      onTitle: title => {
+        const header = $('terminalModal').querySelector('.modal-header span');
+        if (header) header.textContent = (title && title.trim()) || t('Terminal');
+      },
+      onEnded: reason => {
+        embeddedTerminal = null;
+        if (appShell) appShell.setTerminalFocused(false);
+        toast(reason ? errorMessage(reason, t("The terminal session ended.")) : t("The terminal session ended."), true);
+        closeModal('terminalModal');
+        if (returnToMonitor && serverMonitor && serverMonitor.isOpen) serverMonitor.resume();
       }
-      terminalState.timer = setTimeout(poll, 120);
-    };
-    poll();
+    });
+    embeddedTerminal = { view, returnToMonitor };
+    view.start().then(started => {
+      if (!started && embeddedTerminal && embeddedTerminal.view === view) {
+        embeddedTerminal = null;
+        closeModal('terminalModal');
+      }
+    });
+    if (appShell) appShell.setTerminalFocused(true);
     return true;
+  }
+
+  /* The Android extra-key row: the soft keyboard has no Esc, Ctrl or arrows,
+   * and the shared controller already encodes them. */
+  function sendTerminalBytes(data) {
+    if (embeddedTerminal && embeddedTerminal.view) embeddedTerminal.view.write(data);
   }
 
   function closeTerminal() {
     const state = embeddedTerminal;
     embeddedTerminal = null;
     if (appShell) appShell.setTerminalFocused(false);
-    closeModal('terminalModal');
     if (!state) return;
-    state.closed = true;
-    if (state.timer) clearTimeout(state.timer);
-    if (state.resizeFrame) cancelAnimationFrame(state.resizeFrame);
-    if (state.resizeObserver) state.resizeObserver.disconnect();
-    if (!state.backendClosed) {
-      apiPost('/api/terminal/close', { terminal: state.id });
-      state.backendClosed = true;
-    }
-    state.term.dispose();
+    closeModal('terminalModal');
+    state.view.stop();
+    // The monitor pauses while its shell is open, because a shell and a
+    // sampling loop on one connection make each other slow. Closing the shell
+    // is what resumes it - whether the person closed it or the shell ended.
     if (state.returnToMonitor && serverMonitor && serverMonitor.isOpen) serverMonitor.resume();
   }
+
+  /* Typing in the in-page terminal. A desktop terminal window has its own
+   * document and its own listener; this one only exists for the modal. */
+  document.addEventListener('keydown', event => {
+    if (!embeddedTerminal || !embeddedTerminal.view) return;
+    if (!$('terminalModal') || !$('terminalModal').classList.contains('open')) return;
+    if (event.ctrlKey && event.key.toLowerCase() === 'c' && window.getSelection && String(window.getSelection())) return;
+    if (embeddedTerminal.view.handleKey(event)) return;
+  });
+  document.addEventListener('paste', event => {
+    if (!embeddedTerminal || !embeddedTerminal.view) return;
+    if (!$('terminalModal') || !$('terminalModal').classList.contains('open')) return;
+    const text = event.clipboardData ? event.clipboardData.getData('text') : '';
+    if (!text) return;
+    event.preventDefault();
+    embeddedTerminal.view.paste(text);
+  });
 
   let serverMonitor = null;
   let hostKeyCompletion = null;
@@ -4302,10 +4292,10 @@
       return;
     }
     /* Everything below is a page shortcut, so it is skipped while a field
-     * holds the keyboard. That includes xterm's own hidden textarea, the
-     * element the embedded terminal focuses: Ctrl+N, Ctrl+L and Ctrl+R are
-     * readline keys (next history, clear screen, reverse search), and acting
-     * on them here took the caret out of a shell that was waiting for them. */
+     * holds the keyboard: Ctrl+N, Ctrl+L and Ctrl+R are readline keys (next
+     * history, clear screen, reverse search), and acting on them here while
+     * the terminal modal is open took them from a shell that was waiting for
+     * them. */
     if (inField) return;
     if (event.ctrlKey && event.key.toLowerCase() === 'n') {
       event.preventDefault();
@@ -5699,7 +5689,65 @@
     });
   }
 
+  /* A window opened for one terminal must not boot the whole commander: this
+   * document has no file panes, no queue and no vault gate to answer, and
+   * starting them would run a second copy of every timer against the same
+   * service. The window's own label names the terminal it is for. */
+  function terminalWindowId() {
+    const label = window.LinSCPCore && window.LinSCPCore.terminalWindowLabel
+      ? window.LinSCPCore.terminalWindowLabel() : null;
+    if (typeof label === 'string' && label.startsWith('terminal-')) {
+      return label.slice('terminal-'.length);
+    }
+    // A host with neither window metadata nor a label (a test harness, or an
+    // embedder that mounts one terminal per document) can name it in the URL.
+    const parameter = new URLSearchParams(window.location.search).get('terminal');
+    return parameter && /^[A-Za-z0-9_-]+$/.test(parameter) ? parameter : null;
+  }
+
+  function bootTerminalWindow(terminal) {
+    // The terminal window is the terminal: no commander behind it.
+    document.body.classList.add('terminal-only');
+    const host = $('terminalScreen');
+    if (!host) return;
+    const screen = document.createElement('div');
+    screen.id = 'terminalWindowScreen';
+    screen.className = 'terminal-window-screen';
+    host.parentNode.insertBefore(screen, host);
+    document.querySelectorAll('.modal-overlay').forEach(node => node.classList.add('modal-closed'));
+    const view = window.LinSCPCore.terminalWindow({
+      container: screen,
+      terminal,
+      transport: window.LinSCPTransport || transportShim(),
+      onTitle: title => {
+        if (title && title.trim()) document.title = title;
+      },
+      onEnded: reason => {
+        const banner = document.createElement('div');
+        banner.className = 'terminal-window-ended';
+        banner.textContent = reason
+          ? errorMessage(reason, t('The terminal session ended.'))
+          : t('The terminal session ended.');
+        screen.parentNode.insertBefore(banner, screen);
+      }
+    });
+    document.addEventListener('keydown', event => {
+      if (event.ctrlKey && event.key.toLowerCase() === 'c' && String(window.getSelection())) return;
+      view.handleKey(event);
+    });
+    document.addEventListener('paste', event => {
+      const text = event.clipboardData ? event.clipboardData.getData('text') : '';
+      if (!text) return;
+      event.preventDefault();
+      view.paste(text);
+    });
+    window.addEventListener('beforeunload', () => { view.stop(); });
+    view.start();
+  }
+
   async function boot() {
+    const terminalOnly = terminalWindowId();
+    if (terminalOnly) { bootTerminalWindow(terminalOnly); return; }
     applyExplorerMode();
     mountShell();
     mountServerMonitor();

@@ -41,12 +41,6 @@ fs.copyFileSync(
   path.join(legacyWebDir, 'icon.svg'),
   path.join(distDir, 'icon.svg'),
 );
-fs.cpSync(
-  path.join(legacyWebDir, 'vendor'),
-  path.join(distDir, 'vendor'),
-  { recursive: true },
-);
-
 const rawHtml = fs.readFileSync(path.join(legacyWebDir, 'index.html'), 'utf8').replace(/\r\n/g, '\n');
 
 const anchor = '  async function api(url, options) {\n    options = options || {};';
@@ -80,6 +74,29 @@ const nativeShim = `  window.LinSCPTransport = window.LinSCPCore
     return new window.LinSCPCore.AppShell(options);
   };
 
+  // A terminal window ("terminal-term-1") and the Android app show one
+  // terminal and nothing else. Which one is inside the window's own label,
+  // because the window was opened for exactly one terminal and a window that
+  // guessed would be able to attach to a shell nobody asked it to show.
+  //
+  // The label comes from the shell's own window metadata rather than from a
+  // guess about the URL: the page is the same document in every window, so the
+  // window is the only thing that says which terminal this one is for.
+  window.LinSCPCore.terminalWindowLabel = function () {
+    try {
+      const internals = window.__TAURI_INTERNALS__;
+      const label = internals && internals.metadata && internals.metadata.currentWindow
+        ? internals.metadata.currentWindow.label
+        : null;
+      return typeof label === 'string' && label ? label : null;
+    } catch (error) {
+      return null;
+    }
+  };
+  window.LinSCPCore.terminalWindow = function (options) {
+    return new window.LinSCPCore.TerminalWindow(options);
+  };
+
   async function api(url, options) {
     options = options || {};`;
 
@@ -88,4 +105,4 @@ const distHtml = rawHtml
   .replace(anchor, nativeShim);
 
 fs.writeFileSync(path.join(distDir, 'index.html'), distHtml, 'utf8');
-console.log('Built ui/dist (linscp-core.mjs, linscp-core.iife.js, index.html, theme.css, vendor/).');
+console.log('Built ui/dist (linscp-core.mjs, linscp-core.iife.js, index.html, theme.css).');

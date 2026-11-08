@@ -27,8 +27,7 @@ and a test has to be able to hold a name that a POSIX file system allows
 and a Windows one does not. The product-name rule searches them, subject
 to the external-identifier allowlist below.
 
-The vendored xterm.js files (source/gui/web/vendor) are upstream code
-that is not scanned; everything else in the tree is this project's own.
+Everything in the tree is this project's own code.
 
 Usage:
     python3 tools/check_platform_conversion.py
@@ -41,8 +40,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-# The files this check reads. The vendored xterm.js files under
-# source/gui/web/vendor are upstream code and are excluded on purpose.
+# The files this check reads.
 SCAN_ROOTS = [
     'source/linux',
     'source/gui',

@@ -13,6 +13,7 @@ linscp-engine.workspace = true
 linscp-i18n.workspace = true
 linscp-platform.workspace = true
 linscp-proto.workspace = true
+linscp-terminal.workspace = true
 linscp-types.workspace = true
 rand.workspace = true
 regex.workspace = true
