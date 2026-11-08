@@ -179,9 +179,10 @@ pub mod commands {
                         (rows.max(5) as f64 * 18.0 + 64.0).clamp(200.0, 1200.0))
             .min_inner_size(280.0, 120.0)
             // A terminal is a text surface, and a dropped file has nowhere to
-            // go in it: the main window handles drops, and a drop target here
-            // would capture them for nothing.
-            .drag_drop_enabled(false)
+            // go in it. Left enabled, the webview would swallow the drop before
+            // the page could see it, so a person dragging a file onto a
+            // terminal would watch nothing happen.
+            .disable_drag_drop_handler()
             .build()
             .map_err(|e| e.to_string())?;
         if let Some(icon) = app.default_window_icon() {
