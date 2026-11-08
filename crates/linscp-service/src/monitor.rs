@@ -730,6 +730,7 @@ fn parse_rocm(text: &str) -> Vec<MonitorGpu> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     const STAT: &str = "cpu 100 0 100 800 0 0 0 0\n\ncpu0 50 0 50 400 0 0 0 0\n\ncpu1 50 0 50 400 0 0 0 0\nintr 1\n";
     const STAT2: &str = "cpu 200 0 200 1600 0 0 0 0\n\ncpu0 150 0 50 800 0 0 0 0\n\ncpu1 50 0 150 800 0 0 0 0\n";
@@ -863,9 +864,9 @@ mod tests {
             error: String::new(), snapshot: None, consecutive_failures: 0, outage_since_ms: None,
             outage: false, outage_started: false, recovered: false,
         };
-        for i in 1..=3 {
+        for i in 1..=3u32 {
             sample.outage_started = false;
-            record_failure(&mut state, &mut sample, 3, 100 + i);
+            record_failure(&mut state, &mut sample, 3, 100 + u64::from(i));
             assert_eq!(sample.consecutive_failures, i);
             assert_eq!(sample.outage_started, i == 3);
             assert_eq!(sample.outage, i == 3);
