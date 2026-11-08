@@ -1905,7 +1905,8 @@ function options(id) {
   check('the Kerberos hint shows the gap reason',
     gssapiStubInstalled ? gssapiHintHidden === true :
       (gssapiHintHidden === false && text('siteGssapiHint').includes('key exchange')),
-    text('siteGssapiHint'));
+    JSON.stringify({ stub: gssapiStubInstalled, hidden: gssapiHintHidden,
+      hint: text('siteGssapiHint') }));
   if (gssapiStubInstalled) window.LinSCPCore.hostDifferenceReason = undefined;
 
   // ---- Shared multi-server monitor --------------------------------------

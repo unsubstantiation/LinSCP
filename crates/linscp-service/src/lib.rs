@@ -300,8 +300,12 @@ impl CommanderService {
             ("POST", "/api/terminal/input") => self.terminal_write(req.body),
             ("POST", "/api/terminal/close") => self.terminal_close(req.body),
             ("POST", "/api/terminal/scroll") => self.terminal_scroll(req.body),
-            ("GET", "/api/terminal/output") => self.terminal_read(&query),
-            ("GET", "/api/terminal/frame") => self.terminal_frame(&query),
+            ("GET", "/api/terminal/output") => self.terminal_read(
+                &parse_query(req.path.split_once('?').map(|(_, q)| q).unwrap_or("")),
+            ),
+            ("GET", "/api/terminal/frame") => self.terminal_frame(
+                &parse_query(req.path.split_once('?').map(|(_, q)| q).unwrap_or("")),
+            ),
             ("GET", "/api/terminal/list") => self.terminal_list(),
             // Opening a shell needs the tab's live connection, so it stays in
             // the asynchronous entry point.
