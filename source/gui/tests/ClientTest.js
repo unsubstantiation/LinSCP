@@ -1855,6 +1855,64 @@ function options(id) {
   check('closing the monitor keeps the session tab', !doc.getElementById('serverMonitorModal').classList.contains('open') &&
     doc.getElementById('tabStrip').children.length === 1);
 
+  // ---- Embedded remote terminal -----------------------------------------
+  /* xterm is a browser vendor asset, so the page's terminal is driven here by
+   * a recording stand-in. It covers what the page itself is answerable for:
+   * the shell's bytes reach the terminal, and a backend that refuses to answer
+   * is reported instead of becoming a black box that never changes.
+   *
+   * The stand-in also records whether its container was laid out when it
+   * opened. xterm measures its character cell inside open(), and a terminal
+   * measured in a display:none box draws every glyph at zero width - a black
+   * rectangle with a cursor, which is what a broken terminal looks like. */
+  {
+    const written = [];
+    let openedVisible = null;
+    window.Terminal = class {
+      constructor() { this.cols = 80; this.rows = 24; }
+      loadAddon() {} focus() {} dispose() {}
+      onData() {} onResize() {}
+      open(element) {
+        const modal = element.closest('.modal-overlay');
+        openedVisible = !!modal && modal.classList.contains('open');
+      }
+      write(data) {
+        written.push(typeof data === 'string' ? data : new TextDecoder().decode(data));
+      }
+    };
+    window.FitAddon = { FitAddon: class { fit() {} } };
+    responses['/api/terminal/output'] = {
+      success: true, data: 'dXNlckBob3N0On4kIGxzDQo=', offset: 17, alive: true };
+
+    await window.openTerminal();
+    await new Promise(resolve => setTimeout(resolve, 120));
+    check('the terminal is only opened once its modal is on screen',
+      openedVisible === true, String(openedVisible));
+    check('the shell output reaches the terminal',
+      written.join('').indexOf('user@host:~$ ls') >= 0, JSON.stringify(written));
+    check('the terminal polls the id the backend answered with',
+      calls.some(call => call.path === '/api/terminal/output' &&
+        call.url.indexOf('terminal=77') >= 0));
+    window.closeTerminal();
+    await new Promise(resolve => setTimeout(resolve, 60));
+
+    /* A backend that refuses the poll. The page has to say so: a silent
+     * retry loop is indistinguishable from a shell that has not woken up. */
+    responses['/api/terminal/output'] = {
+      success: false, error: 'This terminal is no longer open.' };
+    await window.openTerminal();
+    await new Promise(resolve => setTimeout(resolve, 500));
+    check('a terminal the backend refuses is reported, not left black',
+      text('toast').indexOf('The terminal session ended.') >= 0, text('toast'));
+    const settled = calls.filter(call => call.path === '/api/terminal/output').length;
+    await new Promise(resolve => setTimeout(resolve, 400));
+    check('a refused terminal stops polling instead of retrying for ever',
+      calls.filter(call => call.path === '/api/terminal/output').length === settled,
+      String(settled));
+    window.closeTerminal();
+    await new Promise(resolve => setTimeout(resolve, 60));
+  }
+
   check('no script errors', errors.length === 0, errors.join(' | '));
   window.close();
 })();

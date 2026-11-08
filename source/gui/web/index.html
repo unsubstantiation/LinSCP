@@ -3968,6 +3968,12 @@
     closeTerminal();
     const screen = $('terminalScreen');
     screen.innerHTML = '';
+    // The modal has to be on screen before xterm opens. xterm measures its
+    // character cell in open(), and a terminal measured inside a display:none
+    // box has no cell at all: every glyph it draws afterwards lands at zero
+    // width, which is a black rectangle with a cursor and nothing else. The
+    // fit below then has a real container to measure.
+    openModal('terminalModal');
     const term = new Terminal({ cursorBlink: true, scrollback: 5000 });
     const fit = new FitAddon.FitAddon();
     term.loadAddon(fit);
@@ -4001,8 +4007,7 @@
     terminalState.send = sendTerminalInput;
     term.onData(sendTerminalInput);
     term.onResize(() => sendTerminalInput(''));
-    openModal('terminalModal');
-    // Fit only once the modal is visible; measuring a display:none terminal
+    // Fit now that the modal is visible; measuring a display:none terminal
     // gives the remote PTY a tiny or stale size on its first paint.
     fit.fit();
     if (typeof ResizeObserver !== 'undefined') {
@@ -4011,17 +4016,46 @@
     }
     term.focus();
     if (appShell) appShell.setTerminalFocused(true);
+    /* A poll the backend refuses - a terminal it no longer knows about, a
+     * request it will not answer - was dropped and retried every 120 ms for
+     * ever. On screen that is indistinguishable from a shell that has not
+     * woken up yet: a black box whose cursor blinks and nothing more. Saying
+     * so after a few empty answers is the difference between a slow shell and
+     * a dead one, and it stops a page that can never work from polling a
+     * backend that has already said no. */
+    let pollFailures = 0;
+    const endTerminal = message => {
+      if (terminalState.closed) return;
+      terminalState.closed = true;
+      terminalState.backendClosed = true;
+      apiPost('/api/terminal/close', { terminal: terminalState.id });
+      toast(message, true);
+    };
     const poll = async () => {
       if (terminalState.closed) return;
-      const out = await apiGet('/api/terminal/output?terminal=' +
-        encodeURIComponent(terminalState.id) + '&after=' + terminalState.offset);
+      let out = null;
+      try {
+        out = await apiGet('/api/terminal/output?terminal=' +
+          encodeURIComponent(terminalState.id) + '&after=' + terminalState.offset);
+      } catch (error) {
+        out = null;
+      }
       if (terminalState.closed) return;
-      if (out.success) {
-        if (out.data) {
-          const binary = atob(out.data);
-          const bytes = new Uint8Array(binary.length);
-          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-          term.write(bytes);
+      if (out && out.success) {
+        pollFailures = 0;
+        try {
+          if (out.data) {
+            const binary = atob(out.data);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            term.write(bytes);
+          }
+        } catch (error) {
+          /* A payload this page cannot decode ends the session here, rather
+           * than in an unhandled rejection: that would stop the loop and
+           * leave the same black box behind with no explanation at all. */
+          endTerminal(t("The terminal session ended."));
+          return;
         }
         terminalState.offset = out.offset;
         if (!out.alive) {
@@ -4032,6 +4066,9 @@
           toast(t("The terminal session ended."));
           return;
         }
+      } else if (++pollFailures >= 5) {
+        endTerminal(errorMessage(out && out.error, t("The terminal session ended.")));
+        return;
       }
       terminalState.timer = setTimeout(poll, 120);
     };
@@ -4185,6 +4222,12 @@
       await saveEditorFile();
       return;
     }
+    /* Everything below is a page shortcut, so it is skipped while a field
+     * holds the keyboard. That includes xterm's own hidden textarea, the
+     * element the embedded terminal focuses: Ctrl+N, Ctrl+L and Ctrl+R are
+     * readline keys (next history, clear screen, reverse search), and acting
+     * on them here took the caret out of a shell that was waiting for them. */
+    if (inField) return;
     if (event.ctrlKey && event.key.toLowerCase() === 'n') {
       event.preventDefault();
       openSiteManager();
@@ -4207,7 +4250,6 @@
     if (serverMonitor && serverMonitor.isOpen && !$('terminalModal').classList.contains('open') &&
         !$('hostKeyModal').classList.contains('open') && !$('editorModal').classList.contains('open') &&
         serverMonitor.handleKey(event)) return;
-    if (inField) return;
     if (event.ctrlKey && event.key.toLowerCase() === 'a') {
       event.preventDefault();
       selectAllInFocusedPane();
