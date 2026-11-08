@@ -21,6 +21,11 @@ class GuiDistributionTests(unittest.TestCase):
         main = (ROOT / 'crates/linscp-tauri/src/main.rs').read_text()
         self.assertIn('run_native_app(tauri::generate_context!())', main)
         config = json.loads((ROOT / 'crates/linscp-tauri/tauri.conf.json').read_text())
+        csp = config['app']['security']['csp']
+        # Commander controls currently use HTML click handlers. Keep their
+        # policy explicit: WebViews can distinguish script elements from
+        # event-handler attributes, so `script-src` alone is not enough.
+        self.assertIn("script-src-attr 'unsafe-inline'", csp)
         frontend = ROOT / 'crates/linscp-tauri' / config['build']['frontendDist']
         self.assertEqual(frontend.resolve(), (ROOT / 'ui/dist').resolve())
         for icon in config['bundle']['icon']:
