@@ -997,7 +997,7 @@ The Linux synchronization watcher uses filesystem events and retains interval po
 
 **Area:** Packaging/platforms · **Status:** partial
 
-LinSCP is a Linux-only client and the check that says so is part of the build: tools/check_platform_conversion.py reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose operation phrase contradicts the template it is filled into. It runs in 'make -C source/linux check', as the CTest case 'platform-conversion-check', and in CI. The vendored xterm.js files under source/gui/web/vendor are upstream code and are not scanned; everything else in the tree is this project's own.
+LinSCP is a Linux-only client and the check that says so is part of the build: tools/check_platform_conversion.py reads the client's own sources and refuses a Windows API call, a Windows header, a Windows-only compilation branch, a Windows environment variable, a Windows executable, a Windows path, a file of another platform, an installer that does not ship what the other installers ship, and an error message whose operation phrase contradicts the template it is filled into. It runs in 'make -C source/linux check', as the CTest case 'platform-conversion-check', and in CI. Third-party code is not scanned; everything else in the tree is this project's own.
 
 **Next:** Runnable evidence exists on Linux only (platform-conversion); Windows and Android have none (see the suite registry).
 

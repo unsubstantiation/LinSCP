@@ -273,7 +273,7 @@ export class TerminalSession {
     const columns = next.columns ?? this.grid.columns;
     const lines = next.lines ?? this.grid.lines;
     this.grid = { columns, lines };
-    // An empty payload carries the size, exactly as the page's xterm handler
+    // An empty payload carries the size, exactly as the page's old handler
     // did: the endpoint already interprets "no data" as "resize only".
     try {
       await this.transport.post('/api/terminal/input', {

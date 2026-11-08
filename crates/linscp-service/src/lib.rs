@@ -57,7 +57,7 @@ struct InnerState {
     logs: Vec<Value>,
     preferences: UserPreferences,
     queue_transfers: Vec<Value>,
-    /// Embedded terminals, one per open `xterm.js` window.
+    /// Embedded terminals, one per open terminal window.
     terminals: terminal_bridge::TerminalRegistry,
     monitors: monitor::Monitors,
 }
