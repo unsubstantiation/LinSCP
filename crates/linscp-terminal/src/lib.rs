@@ -1079,9 +1079,14 @@ mod tests {
         // The normal and bright halves are sixteen distinct palette entries; a
         // bright colour that landed on the entry before it would make
         // `ls --color` unreadable in the most literal way.
-        let mut seen = std::collections::HashSet::new();
-        for named in 0..16 {
-            assert!(seen.insert(named_color_rgb(named)), "named colour {named} shares a palette entry");
+        for first in 0..16 {
+            for second in (first + 1)..16 {
+                assert_ne!(
+                    named_color_rgb(first),
+                    named_color_rgb(second),
+                    "named colours {first} and {second} share a palette entry",
+                );
+            }
         }
         // The dim variants count on after the cursor, and the bright
         // foreground answers with the bright white entry.
