@@ -624,6 +624,13 @@ fn json_memory(value: Option<&Value>) -> Option<u64> {
 }
 fn json_text(value: Option<&Value>) -> String { value.and_then(Value::as_str).unwrap_or("").chars().take(256).collect() }
 
+/// Two-level lookup (`root[a][b]`). A free function, not a closure: a closure's
+/// return type is tied to one inferred lifetime, so it cannot hand back a
+/// reference borrowed from `root` while `a` and `b` are borrowed separately.
+fn json_field<'a>(root: Option<&'a Value>, a: &str, b: &str) -> Option<&'a Value> {
+    root?.get(a)?.get(b)
+}
+
 fn parse_nvidia(text: &str) -> Vec<MonitorGpu> {
     let mut gpus = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -678,25 +685,24 @@ fn parse_amd(static_text: &str, metric_text: &str) -> Vec<MonitorGpu> {
     if !statics.is_empty() || !metrics.is_empty() {
         let ids = statics.keys().chain(metrics.keys()).copied().collect::<BTreeSet<_>>();
         return ids.into_iter().map(|id| {
-            let stat = statics.get(id);
-            let metric = metrics.get(id);
-            let field = |root: Option<&Value>, a: &str, b: &str| root.and_then(|v| v.get(a)).and_then(|v| v.get(b));
+            let stat = statics.get(&id);
+            let metric = metrics.get(&id);
             let temp = metric.and_then(|v| v.get("temperature"));
             let hotspot = json_number(temp.and_then(|v| v.get("hotspot")));
             let limit = stat.and_then(|v| v.get("limit"));
             MonitorGpu {
-                index: id, vendor: "AMD".into(), name: json_text(field(stat, "asic", "market_name")),
-                percent: json_percent(field(metric, "usage", "gfx_activity")),
-                memory_used_bytes: json_memory(field(metric, "mem_usage", "used_vram")),
-                memory_total_bytes: json_memory(field(metric, "mem_usage", "total_vram")).or_else(|| json_memory(field(stat, "vram", "size"))),
-                power_watts: json_number(field(metric, "power", "socket_power")),
+                index: id, vendor: "AMD".into(), name: json_text(json_field(stat, "asic", "market_name")),
+                percent: json_percent(json_field(metric, "usage", "gfx_activity")),
+                memory_used_bytes: json_memory(json_field(metric, "mem_usage", "used_vram")),
+                memory_total_bytes: json_memory(json_field(metric, "mem_usage", "total_vram")).or_else(|| json_memory(json_field(stat, "vram", "size"))),
+                power_watts: json_number(json_field(metric, "power", "socket_power")),
                 power_limit_watts: json_number(limit.and_then(|v| v.get("ppt0")).and_then(|v| v.get("socket_power_limit"))),
                 temperature_c: hotspot.or_else(|| json_number(temp.and_then(|v| v.get("edge")))),
                 temperature_limit_c: json_number(limit.and_then(|v| v.get(if hotspot.is_some() { "slowdown_hotspot_temperature" } else { "slowdown_edge_temperature" }))),
                 temperature_sensor: if hotspot.is_some() { "Hotspot" } else { "Edge" }.into(),
-                driver: json_text(field(stat, "driver", "version")),
-                pcie_generation: pcie_generation(json_number(field(metric, "pcie", "speed"))),
-                pcie_width: uint(&json_number(field(metric, "pcie", "width")).map(|n| n.to_string()).unwrap_or_default()),
+                driver: json_text(json_field(stat, "driver", "version")),
+                pcie_generation: pcie_generation(json_number(json_field(metric, "pcie", "speed"))),
+                pcie_width: uint(&json_number(json_field(metric, "pcie", "width")).map(|n| n.to_string()).unwrap_or_default()),
             }
         }).collect();
     }
@@ -730,6 +736,7 @@ fn parse_rocm(text: &str) -> Vec<MonitorGpu> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     const STAT: &str = "cpu 100 0 100 800 0 0 0 0\n\ncpu0 50 0 50 400 0 0 0 0\n\ncpu1 50 0 50 400 0 0 0 0\nintr 1\n";
     const STAT2: &str = "cpu 200 0 200 1600 0 0 0 0\n\ncpu0 150 0 50 800 0 0 0 0\n\ncpu1 50 0 150 800 0 0 0 0\n";
@@ -863,9 +870,9 @@ mod tests {
             error: String::new(), snapshot: None, consecutive_failures: 0, outage_since_ms: None,
             outage: false, outage_started: false, recovered: false,
         };
-        for i in 1..=3 {
+        for i in 1..=3u32 {
             sample.outage_started = false;
-            record_failure(&mut state, &mut sample, 3, 100 + i);
+            record_failure(&mut state, &mut sample, 3, 100 + u64::from(i));
             assert_eq!(sample.consecutive_failures, i);
             assert_eq!(sample.outage_started, i == 3);
             assert_eq!(sample.outage, i == 3);

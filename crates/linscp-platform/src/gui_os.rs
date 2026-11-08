@@ -617,11 +617,55 @@ pub(crate) fn data_home_lock() -> std::sync::MutexGuard<'static, ()> {
 mod shell_integration_tests {
     use super::*;
 
+    /// A scratch `%APPDATA%`, so a test never touches the runner's own Send To menu.
+    #[cfg(target_os = "windows")]
+    fn scratch_appdata(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("linscp-gui-os-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch appdata");
+        dir
+    }
+
+    #[cfg(target_os = "linux")]
     fn scratch_data_home(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("linscp-gui-os-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch data home");
         dir
+    }
+
+    /// The Windows installer writes a `.cmd` wrapper rather than a `.lnk`, because
+    /// that is the form this crate can create without COM. The file has to be where
+    /// Explorer looks for *Send To*, and its one action line has to name the launcher
+    /// and the flag the parser knows.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn the_send_to_wrapper_names_the_launcher_and_the_upload_flag() {
+        let appdata = scratch_appdata("sendto");
+        let previous = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", &appdata);
+        let installed = install_shell_integration(Path::new(
+            r"C:\Program Files\LinSCP\linscp-gui.exe",
+        ));
+        // Read the wrapper while it is still installed: the uninstall below deletes it.
+        let installed = installed.expect("a space in the path is not an error");
+        let (manager, path, outcome) = &installed[0];
+        assert!(manager.contains("Send To"), "{manager}");
+        assert_eq!(outcome, "installed");
+        let wrapper = std::fs::read_to_string(path).expect("the wrapper");
+        // The path keeps its space in quotes, and `%*` stays unmangled: `"%*"`
+        // would collapse the whole selection into a single argument.
+        assert!(wrapper.contains(r#""C:\Program Files\LinSCP\linscp-gui.exe" --shell-upload %*"#), "{wrapper}");
+        assert!(!wrapper.contains("\"%*\""), "the selection must not be collapsed: {wrapper}");
+        let removed = uninstall_shell_integration();
+        match previous {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+        let removed = removed.expect("uninstall");
+        assert_eq!(removed[0].2, "removed");
+        assert!(!Path::new(path).exists(), "{path} survived the uninstall");
+        let _ = std::fs::remove_dir_all(&appdata);
     }
 
     /// A launcher path with a space in it is the ordinary case — every install

@@ -9990,6 +9990,14 @@ mod tests {
         site.username = "alice".into();
         site.password = Some("do-not-list".into());
         store.upsert(site);
+        // The site carries a password, so the store encrypts it with the master
+        // key, and that only exists while the vault is unlocked. A save into a
+        // locked vault fails with "Vault is locked" rather than writing the
+        // password in the clear - which is the behaviour asserted below, before
+        // the same store is saved for real.
+        store.save_to_dir(&config, svc.secret_vault.as_ref())
+            .expect_err("a password cannot be saved while the vault is locked");
+        unlock_for_test(&svc);
         store.save_to_dir(&config, svc.secret_vault.as_ref()).unwrap();
         let hosts = svc.dispatch_async(ApiEnvelope { method: "GET".into(), path: "/api/monitor/hosts".into(), body: json!({}) }).await;
         assert_eq!(hosts.status, 200, "{}", hosts.payload);
@@ -10005,7 +10013,10 @@ mod tests {
         let missing = svc.dispatch_async(sample(json!({"tabs": [999]}))).await;
         assert_eq!(missing.status, 200);
         assert_eq!(missing.payload["samples"][0]["status"], "disconnected");
-        let local = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp}}) }).await;
+        // A local tab has two panes, and opening one without its second
+        // directory is refused, so both are named here.
+        let local = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp, "other_local_dir": tmp}}) }).await;
+        assert_eq!(local.status, 200, "{}", local.payload);
         let id = local.payload["tab"]["id"].as_u64().unwrap();
         let unsupported = svc.dispatch_async(sample(json!({"tabs": [id]}))).await;
         assert_eq!(unsupported.payload["samples"][0]["status"], "unsupported");
