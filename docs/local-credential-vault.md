@@ -9,11 +9,15 @@ legacy `sessions.key` files are upgraded in place on first setup without
 changing the key used to decrypt existing saved-session passwords.
 
 Saved session passwords continue to use LinSCP's encrypted `sessions.ini`
-format with the random data key. SSH private-key files that LinSCP imports or
-copies into its saved-session store are encrypted with AES-256-GCM under that
-same in-memory key. Their session values are opaque `vaultkey://` references;
-for an SSH connection LinSCP creates a private, short-lived temporary key file
-and removes it when the connection attempt returns. Explicitly locking the
+format with the random data key. The Site Manager opts in to saving passwords
+by default for new SSH sessions; uncheck the password-storage option to keep a
+password only for the current connection. SSH private-key files selected with
+the browse button are imported into the vault and encrypted with AES-256-GCM
+under that same in-memory key. Their session values are opaque `vaultkey://`
+references; existing vault keys can be selected with the key-picker button.
+LinSCP does not modify the source key file. For an SSH connection it creates a
+private, short-lived temporary key file and removes it when the connection
+attempt returns. Explicitly locking the
 vault disconnects sessions and drops the in-memory key. Process exit also drops
 the key.
 

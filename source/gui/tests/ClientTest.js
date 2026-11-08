@@ -37,6 +37,11 @@ const REMOTE_ENTRIES = [
 
 const responses = {
   '/api/vault/status': { success: true, vault: 'unlocked' },
+  '/api/vault/keys': { success: true, keys: [
+    { reference: 'vaultkey://0123456789abcdef0123456789abcdef', label: 'work-laptop-key' }
+  ] },
+  '/api/vault/keys/import': { success: true,
+    reference: 'vaultkey://fedcba9876543210fedcba9876543210', label: 'id_ed25519' },
   '/api/monitor/hosts': { success: true, max_hosts: 32, default_interval: 5, default_timeout: 10,
     tabs: [{ tab: 1, name: 'local test', host: '127.0.0.1', port: 2222, protocol: 'sftp', site: null, key: 'ssh:127.0.0.1:2222' }], sites: [] },
   '/api/monitor/settings': { success: true, document: { version: 1, settings: { interval_secs: 5,
@@ -367,12 +372,15 @@ function options(id) {
   await new Promise(resolve => setTimeout(resolve, 400));
 
   // Boot fetched what it needs.
+  const doc = window.document;
   const paths = calls.map(call => call.path);
   check('boot queried the status', paths.includes('/api/status'));
+  check('vault password fields require six characters',
+    doc.getElementById('vaultPassword').minLength === 6 &&
+      doc.getElementById('vaultPasswordConfirm').minLength === 6);
   check('boot listed the local pane', paths.includes('/api/local/list'));
   check('boot listed the remote pane', paths.includes('/api/remote/list'));
 
-  const doc = window.document;
   check('Commander opens with the dark theme',
     doc.documentElement.dataset.theme === 'dark' && themeCss.includes('--bg: #0e131a'));
   check('app icon uses a dark badge', iconSvg.includes('fill="#101821"'));
@@ -550,8 +558,53 @@ function options(id) {
   await new Promise(resolve => setTimeout(resolve, 100));
   const saved = calls.filter(call => call.path === '/api/sessions/save').pop();
   check('saving posts the name', saved && JSON.parse(saved.options.body).name === 'GUI/test');
-  check('saving does not post the password',
+  check('saving an existing site without a stored password posts no password',
     saved && !JSON.parse(saved.options.body).session.password);
+
+  window.newSite();
+  check('new SSH sessions default to storing their password',
+    doc.getElementById('siteRemember').checked);
+  doc.getElementById('siteName').value = 'new-ssh-site';
+  doc.getElementById('siteHost').value = 'new.example.test';
+  doc.getElementById('siteUser').value = 'deploy';
+  doc.getElementById('sitePass').value = 'ssh-password';
+  await window.saveSite();
+  const newSiteSave = calls.filter(call => call.path === '/api/sessions/save').pop();
+  check('new SSH session saves its password when the default is kept',
+    newSiteSave && JSON.parse(newSiteSave.options.body).session.password === 'ssh-password');
+
+  check('private-key controls offer both browse and vault pickers for destination and tunnel keys',
+    !!doc.getElementById('siteKeyBrowseBtn') && !!doc.getElementById('siteKeyVaultBtn') &&
+      doc.getElementById('siteKeyFileInput').type === 'file' &&
+      !!doc.getElementById('siteTunnelKeyBrowseBtn') && !!doc.getElementById('siteTunnelKeyVaultBtn') &&
+      doc.getElementById('siteTunnelKeyFileInput').type === 'file');
+  await window.openSshKeyVaultPicker();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const vaultKeyChoice = doc.querySelector('#sshKeyVaultList button');
+  check('vault picker lists saved encrypted keys',
+    doc.getElementById('sshKeyVaultModal').classList.contains('open') &&
+      vaultKeyChoice && vaultKeyChoice.textContent === 'work-laptop-key');
+  if (vaultKeyChoice) vaultKeyChoice.click();
+  check('choosing a vault key fills its opaque encrypted reference',
+    doc.getElementById('siteKey').value === 'vaultkey://0123456789abcdef0123456789abcdef' &&
+      window.currentSiteForm().keyfile === 'vaultkey://0123456789abcdef0123456789abcdef');
+  await window.openSshKeyVaultPicker('siteTunnelKey');
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const tunnelKeyChoice = doc.querySelector('#sshKeyVaultList button');
+  if (tunnelKeyChoice) tunnelKeyChoice.click();
+  check('vault picker can target the SSH tunnel key field',
+    doc.getElementById('siteTunnelKey').value === 'vaultkey://0123456789abcdef0123456789abcdef');
+  const keyFileInput = doc.getElementById('siteKeyFileInput');
+  Object.defineProperty(keyFileInput, 'files', { configurable: true, value: [{
+    name: 'id_ed25519', size: 32, text: async () => '-----BEGIN OPENSSH PRIVATE KEY-----\\nfixture\\n',
+  }] });
+  await window.importSshKeyFile(keyFileInput);
+  const keyImport = calls.filter(call => call.path === '/api/vault/keys/import').pop();
+  check('browsed key content is sent to the vault import endpoint',
+    keyImport && JSON.parse(keyImport.options.body).name === 'id_ed25519' &&
+      JSON.parse(keyImport.options.body).private_key.includes('OPENSSH PRIVATE KEY'));
+  check('imported key is used as an encrypted vault reference',
+    doc.getElementById('siteKey').value === 'vaultkey://fedcba9876543210fedcba9876543210');
 
   // CLI terminal.
   window.switchTab('cli');
