@@ -647,19 +647,21 @@ mod shell_integration_tests {
         let installed = install_shell_integration(Path::new(
             r"C:\Program Files\LinSCP\linscp-gui.exe",
         ));
-        let removed = uninstall_shell_integration();
-        match previous {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
+        // Read the wrapper while it is still installed: the uninstall below deletes it.
         let installed = installed.expect("a space in the path is not an error");
         let (manager, path, outcome) = &installed[0];
         assert!(manager.contains("Send To"), "{manager}");
         assert_eq!(outcome, "installed");
         let wrapper = std::fs::read_to_string(path).expect("the wrapper");
-        // CRLF and `%*` are what cmd needs; `"%*"` would collapse the selection.
+        // The path keeps its space in quotes, and `%*` stays unmangled: `"%*"`
+        // would collapse the whole selection into a single argument.
         assert!(wrapper.contains(r#""C:\Program Files\LinSCP\linscp-gui.exe" --shell-upload %*"#), "{wrapper}");
         assert!(!wrapper.contains("\"%*\""), "the selection must not be collapsed: {wrapper}");
+        let removed = uninstall_shell_integration();
+        match previous {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
         let removed = removed.expect("uninstall");
         assert_eq!(removed[0].2, "removed");
         assert!(!Path::new(path).exists(), "{path} survived the uninstall");
