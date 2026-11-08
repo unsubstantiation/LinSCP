@@ -1911,6 +1911,20 @@ function options(id) {
       String(settled));
     window.closeTerminal();
     await new Promise(resolve => setTimeout(resolve, 60));
+
+    /* The other silence: the channel is open and the shell never starts,
+     * because the server refused the pty or the shell. It is only
+     * distinguishable from a slow prompt by the reason the server gave, so
+     * the page has to show that reason and not just "the session ended". */
+    responses['/api/terminal/output'] = {
+      success: true, data: '', offset: 0, alive: false,
+      error: 'The server refused to start an interactive shell on this connection.' };
+    await window.openTerminal();
+    await new Promise(resolve => setTimeout(resolve, 200));
+    check('a shell the server refused names the reason, not just the ending',
+      text('toast').indexOf('refused to start an interactive shell') >= 0, text('toast'));
+    window.closeTerminal();
+    await new Promise(resolve => setTimeout(resolve, 60));
   }
 
   check('no script errors', errors.length === 0, errors.join(' | '));

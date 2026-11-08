@@ -4063,7 +4063,12 @@
           terminalState.backendClosed = true;
           apiPost('/api/terminal/close', { terminal: terminalState.id });
           term.write('\r\n');
-          toast(t("The terminal session ended."));
+          // A server that refused the shell said why. Showing it is the
+          // whole point: otherwise a shell that will never start looks
+          // exactly like one that has not answered yet.
+          toast(out.error
+            ? errorMessage(out.error, t("The terminal session ended."))
+            : t("The terminal session ended."));
           return;
         }
       } else if (++pollFailures >= 5) {

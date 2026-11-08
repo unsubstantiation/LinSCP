@@ -42,6 +42,16 @@ enum PtyShellCommand {
 pub enum PtyShellEvent {
     Data(Vec<u8>),
     ExitStatus(u32),
+    /// The server refused the pseudo-terminal or the shell it was asked for.
+    ///
+    /// russh's `request_pty` and `request_shell` only *set* `want_reply`; they
+    /// send the request and return without waiting for the answer, which is
+    /// what `Channel::send_msg` does with the flag. A server that answers
+    /// SSH_MSG_CHANNEL_FAILURE therefore leaves the channel open and entirely
+    /// silent - and silence is indistinguishable from a shell that has not
+    /// printed its prompt yet. Reading the refusal is the only thing that
+    /// separates "no shell will ever run here" from "wait a moment".
+    Failed(String),
     Closed,
 }
 
@@ -922,6 +932,22 @@ impl SshConnection {
                             }
                             Some(ChannelMsg::ExitStatus { exit_status }) => {
                                 let _ = evt_tx.send(PtyShellEvent::ExitStatus(exit_status));
+                            }
+                            // A pty and a shell are the only requests this
+                            // channel ever makes, so a refusal is a refusal to
+                            // run an interactive shell at all - most often
+                            // `PermitTTY no`, a shell of /sbin/nologin, or a
+                            // ForceCommand that will not allocate one.
+                            Some(ChannelMsg::Failure) => {
+                                let _ = evt_tx.send(PtyShellEvent::Failed(
+                                    "The server refused to start an interactive shell on this \
+                                     connection (a pseudo-terminal may be disabled for this \
+                                     account)."
+                                        .to_string(),
+                                ));
+                                // No Close follows a refusal - the server leaves
+                                // the channel open - so the actor ends itself.
+                                break;
                             }
                             Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
                                 let _ = evt_tx.send(PtyShellEvent::Closed);
