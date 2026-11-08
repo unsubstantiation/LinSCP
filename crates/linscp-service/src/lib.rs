@@ -166,6 +166,18 @@ impl CommanderService {
         let query = parse_query(query_str);
         match (method.as_str(), raw_path) {
             ("GET", "/api/status") => self.handle_status(),
+            // The optional account layer is a server deployment feature; the
+            // native app has no account server, so it answers as signed out
+            // and signing out succeeds. The page offers the entry on every
+            // host, and an unrouted answer there was a 404 the person saw as a
+            // broken menu item.
+            ("GET", "/api/login") => ApiReply { status: 200, payload: json!({
+                "success": true, "logged_in": false, "username": "", "csrf_token": "",
+            }) },
+            ("POST", "/api/login") => ApiReply { status: 400, payload: json!({
+                "success": false, "error": "Accounts not enabled",
+            }) },
+            ("POST", "/api/logout") => ApiReply { status: 200, payload: json!({ "success": true }) },
             ("GET", "/api/vault/status") => self.handle_vault_status(),
             ("POST", "/api/vault/unlock") => self.handle_vault_unlock(req.body),
             ("POST", "/api/vault/lock") => self.handle_vault_lock(),
@@ -282,13 +294,18 @@ impl CommanderService {
             ("POST", "/api/remote/rename") => self.rename_remote_any_async(req.body).await,
             ("POST", "/api/remote/delete") => self.delete_remote_any_async(req.body).await,
             ("POST", "/api/monitor/sample") => self.monitor_sample_async(req.body).await,
-            ("POST", "/api/session/terminal") => self.open_terminal_async(req.body).await,
+            // Terminal routes are served from the synchronous table because
+            // none of them needs the interpreter or the network: the shell
+            // was opened here, and reading or painting it is a lock away.
             ("POST", "/api/terminal/input") => self.terminal_write(req.body),
             ("POST", "/api/terminal/close") => self.terminal_close(req.body),
             ("POST", "/api/terminal/scroll") => self.terminal_scroll(req.body),
-            ("GET", "/api/terminal/output") => self.terminal_read(&parse_query(req.path.split_once('?').map(|(_, q)| q).unwrap_or(""))),
-            ("GET", "/api/terminal/frame") => self.terminal_frame(&parse_query(req.path.split_once('?').map(|(_, q)| q).unwrap_or(""))),
+            ("GET", "/api/terminal/output") => self.terminal_read(&query),
+            ("GET", "/api/terminal/frame") => self.terminal_frame(&query),
             ("GET", "/api/terminal/list") => self.terminal_list(),
+            // Opening a shell needs the tab's live connection, so it stays in
+            // the asynchronous entry point.
+            ("POST", "/api/session/terminal") => self.open_terminal_async(req.body).await,
             ("POST", "/api/shell/consume") => self.consume_shell_offer_async(req.body).await,
             ("GET", "/api/remote/edit") => self.remote_edit_read_async(&parse_query(req.path.split_once('?').map(|(_, q)| q).unwrap_or(""))).await,
             ("POST", "/api/remote/save") => self.remote_save_async(req.body).await,
