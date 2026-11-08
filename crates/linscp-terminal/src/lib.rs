@@ -912,8 +912,17 @@ mod tests {
 
     #[test]
     fn an_empty_screen_is_refused_instead_of_rounded_up() {
-        assert_eq!(TerminalScreen::new(Size::new(0, 10)).unwrap_err(), ScreenError::EmptyDimensions);
-        assert_eq!(TerminalScreen::new(Size::new(80, 0)).unwrap_err(), ScreenError::EmptyDimensions);
+        // A screen has no `Debug` (a grid is megabytes of cells and its
+        // debug print is not something a failure message should carry), so the
+        // error is matched rather than compared inside `assert_eq!`.
+        assert_eq!(
+            TerminalScreen::new(Size::new(0, 10)).err(),
+            Some(ScreenError::EmptyDimensions),
+        );
+        assert_eq!(
+            TerminalScreen::new(Size::new(80, 0)).err(),
+            Some(ScreenError::EmptyDimensions),
+        );
     }
 
     #[test]
