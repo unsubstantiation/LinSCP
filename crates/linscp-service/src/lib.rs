@@ -9990,6 +9990,14 @@ mod tests {
         site.username = "alice".into();
         site.password = Some("do-not-list".into());
         store.upsert(site);
+        // The site carries a password, so the store encrypts it with the master
+        // key, and that only exists while the vault is unlocked. A save into a
+        // locked vault fails with "Vault is locked" rather than writing the
+        // password in the clear - which is the behaviour asserted below, before
+        // the same store is saved for real.
+        store.save_to_dir(&config, svc.secret_vault.as_ref())
+            .expect_err("a password cannot be saved while the vault is locked");
+        unlock_for_test(&svc);
         store.save_to_dir(&config, svc.secret_vault.as_ref()).unwrap();
         let hosts = svc.dispatch_async(ApiEnvelope { method: "GET".into(), path: "/api/monitor/hosts".into(), body: json!({}) }).await;
         assert_eq!(hosts.status, 200, "{}", hosts.payload);
