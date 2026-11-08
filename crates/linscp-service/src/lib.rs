@@ -263,6 +263,16 @@ impl CommanderService {
             ("POST", "/api/desktop/launch") => self.handle_desktop_launch(req.body),
             ("POST", "/api/desktop/check") => self.handle_desktop_check(req.body),
             ("POST", "/api/desktop/install") => self.handle_desktop_install_sync(req.body),
+            // A terminal window reads the model and paints it from here: none
+            // of these needs the interpreter or the network, because the shell
+            // behind them was opened with the tab's own connection. Opening one
+            // does need it, so that stays in the asynchronous entry point.
+            ("POST", "/api/terminal/input") => self.terminal_write(req.body),
+            ("POST", "/api/terminal/close") => self.terminal_close(req.body),
+            ("POST", "/api/terminal/scroll") => self.terminal_scroll(req.body),
+            ("GET", "/api/terminal/output") => self.terminal_read(&query),
+            ("GET", "/api/terminal/frame") => self.terminal_frame(&query),
+            ("GET", "/api/terminal/list") => self.terminal_list(),
             _ => ApiReply { status: 404, payload: json!({"error": format!("Unknown endpoint: {} {}", method, raw_path)})},
         }
     }
@@ -294,21 +304,6 @@ impl CommanderService {
             ("POST", "/api/remote/rename") => self.rename_remote_any_async(req.body).await,
             ("POST", "/api/remote/delete") => self.delete_remote_any_async(req.body).await,
             ("POST", "/api/monitor/sample") => self.monitor_sample_async(req.body).await,
-            // Terminal routes are served from the synchronous table because
-            // none of them needs the interpreter or the network: the shell
-            // was opened here, and reading or painting it is a lock away.
-            ("POST", "/api/terminal/input") => self.terminal_write(req.body),
-            ("POST", "/api/terminal/close") => self.terminal_close(req.body),
-            ("POST", "/api/terminal/scroll") => self.terminal_scroll(req.body),
-            ("GET", "/api/terminal/output") => self.terminal_read(
-                &parse_query(req.path.split_once('?').map(|(_, q)| q).unwrap_or("")),
-            ),
-            ("GET", "/api/terminal/frame") => self.terminal_frame(
-                &parse_query(req.path.split_once('?').map(|(_, q)| q).unwrap_or("")),
-            ),
-            ("GET", "/api/terminal/list") => self.terminal_list(),
-            // Opening a shell needs the tab's live connection, so it stays in
-            // the asynchronous entry point.
             ("POST", "/api/session/terminal") => self.open_terminal_async(req.body).await,
             ("POST", "/api/shell/consume") => self.consume_shell_offer_async(req.body).await,
             ("GET", "/api/remote/edit") => self.remote_edit_read_async(&parse_query(req.path.split_once('?').map(|(_, q)| q).unwrap_or(""))).await,
