@@ -1902,11 +1902,18 @@ function options(id) {
     String(kexReason));
   window.updateGssapiHint();
   const gssapiHintHidden = doc.getElementById('siteGssapiHint').hidden;
+  // Which note this host shows depends on the host: where Kerberos is
+  // unavailable the note is the Linux-only limit, and where it is available
+  // the note is the unwired key exchange. Asserting one sentence made this
+  // pass on Linux and fail on Windows, where the other is correct.
+  const gssapiHostMissing = !gssapiStubInstalled &&
+    window.LinSCPCore.hostCapabilities({ host: window }).gssapi === false;
   check('the Kerberos hint shows the gap reason',
     gssapiStubInstalled ? gssapiHintHidden === true :
-      (gssapiHintHidden === false && text('siteGssapiHint').includes('key exchange')),
-    JSON.stringify({ stub: gssapiStubInstalled, hidden: gssapiHintHidden,
-      hint: text('siteGssapiHint') }));
+      (gssapiHintHidden === false && text('siteGssapiHint').includes(
+        gssapiHostMissing ? 'Linux' : 'key exchange')),
+    JSON.stringify({ stub: gssapiStubInstalled, missing: gssapiHostMissing,
+      hidden: gssapiHintHidden, hint: text('siteGssapiHint') }));
   if (gssapiStubInstalled) window.LinSCPCore.hostDifferenceReason = undefined;
 
   // ---- Shared multi-server monitor --------------------------------------
