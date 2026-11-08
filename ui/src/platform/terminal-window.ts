@@ -26,8 +26,19 @@ export interface TerminalWindowOptions {
   onTitle?: (title: string | null) => void;
   /** The element for the Esc/Tab/Ctrl row on a narrow window, if there is one. */
   extraKeysElement?: HTMLElement | null;
-  /** How the row's keys reach the terminal. */
-  onExtraKey?: (handler: (bytes: string) => void) => void;
+  /**
+   * Attach a keyboard to the canvas.
+   *
+   * A desktop window has a physical keyboard and a document-level listener
+   * hears it, so a soft keyboard is only needed where there is one: the Android
+   * app's terminal pane. The page sets this there and leaves it off in a
+   * desktop window.
+   */
+  keyboard?: boolean;
+  /** Called when the grid the window can show changes. */
+  onResize?: (grid: { columns: number; lines: number }) => void;
+  /** Called with the cursor mode each time it changes (the extra-keys row). */
+  onModes?: (modes: { app_cursor: boolean }) => void;
 }
 
 interface OpenReply {
@@ -107,13 +118,40 @@ export class TerminalWindow {
       onTitle: (title) => {
         this.options.onTitle?.(title);
       },
+      onResize: (grid) => {
+        this.options.onResize?.(grid);
+      },
+      onModes: (modes) => {
+        this.options.onModes?.(modes);
+      },
+      keyboard: this.options.keyboard === true,
     });
     this.session = session;
     session.start();
-    // The extra-key row is a touch affordance: on a phone the keyboard is the
-    // only input, and Esc, Ctrl and the arrows have no other way to be sent.
-    this.options.onExtraKey?.((bytes) => this.session?.write(bytes));
     return true;
+  }
+
+  /**
+   * Sends one press from the extra-keys row.
+   *
+   * The row speaks key names (`up`, `esc`, `/`), not bytes, so the named ones
+   * are encoded here against the screen's own modes - the arrows have to become
+   * the application-cursor variant inside `vi`. The rest are text and are sent
+   * as typed.
+   */
+  public pressExtraKey(keyId: string): void {
+    const session = this.session;
+    if (!session) {
+      return;
+    }
+    const encoded = session.encodeNamedKey(keyId);
+    if (encoded !== null) {
+      session.write(encoded);
+      return;
+    }
+    if (keyId.length === 1) {
+      session.write(keyId);
+    }
   }
 
   /** Sends typed text; `Enter` and the other named keys go through `key`. */
@@ -124,6 +162,16 @@ export class TerminalWindow {
   /** Handles one key press, encoded against the modes the screen is in. */
   public handleKey(event: Parameters<TerminalSession['handleKey']>[0]): boolean {
     return this.session?.handleKey(event) ?? false;
+  }
+
+  /** Scrolls the viewport through history; positive is back into it. */
+  public async scroll(lines: number): Promise<void> {
+    await this.session?.scroll(lines);
+  }
+
+  /** The keyboard attachment, so the page can raise or dismiss it. */
+  public get input(): TerminalSession['input'] {
+    return this.session?.input ?? null;
   }
 
   /** Handles a paste, wrapped when the program asked for bracketed paste. */

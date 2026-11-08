@@ -148,6 +148,35 @@ class GuiDistributionTests(unittest.TestCase):
         self.assertIn('\nExec=linscp-gui\n', desktop)
         self.assertNotIn('--open-browser', desktop)
 
+    def test_the_shared_page_declares_no_name_twice(self):
+        """A second `function f() {}` silently replaces the first.
+
+        The page is one long script, so a helper added a second time does not
+        collide loudly - the later definition simply wins, and the earlier one
+        becomes dead code that still looks live. That happened to the terminal's
+        own byte sender: two `sendTerminalBytes` existed, and whether the
+        extra-keys row worked came down to which was parsed last.
+        """
+        import re
+        page = (ROOT / 'source/gui/web/index.html').read_text()
+        declared = {}
+        for match in re.finditer(
+            r'^  (?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(', page, re.MULTILINE
+        ):
+            declared.setdefault(match.group(1), []).append(match.start())
+        duplicates = {name: at for name, at in declared.items() if len(at) > 1}
+        if duplicates:
+            detail = {
+                name: [page.count('\n', 0, offset) + 1 for offset in offsets]
+                for name, offsets in duplicates.items()
+            }
+            self.fail(f'these page functions are declared more than once: {detail}')
+
+        # The helpers the terminal path depends on are declared, so a rename
+        # cannot leave a call behind that only fails when it is reached.
+        for name in ('sendTerminalBytes', 'openTerminalInPage', 'bootTerminalWindow'):
+            self.assertIn(name, declared)
+
 
 if __name__ == '__main__':
     unittest.main()

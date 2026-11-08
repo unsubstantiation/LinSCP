@@ -203,6 +203,33 @@ test('MobileShellController handles touch pane switching and terminal extra-key 
   assert.equal(applyCtrlModifier('d'), '\x04');
 });
 
+test('the extra-key arrows follow application-cursor mode', () => {
+  // `vi`, `less` and every other full-screen program switch the arrows to the
+  // ESC O A form. A row that always sent ESC [ A moved the cursor nowhere in
+  // them, which on a phone is the only way to move it.
+  const dom = new JSDOM('<!doctype html><div id="app"></div>');
+  const root = dom.window.document.getElementById('app');
+  const emitted = [];
+  const mobile = new MobileShellController({
+    rootElement: root,
+    onTerminalInput: (seq) => emitted.push(seq),
+  });
+
+  mobile.pressExtraKey('up');
+  assert.deepEqual(emitted, ['\x1b[A'], 'normal mode uses the cursor-key form');
+
+  mobile.setApplicationCursor(true);
+  emitted.length = 0;
+  mobile.pressExtraKey('up');
+  mobile.pressExtraKey('left');
+  assert.deepEqual(emitted, ['\x1bOA', '\x1bOD'], 'application mode uses the SS3 form');
+
+  mobile.setApplicationCursor(false);
+  emitted.length = 0;
+  mobile.pressExtraKey('down');
+  assert.deepEqual(emitted, ['\x1b[B'], 'leaving the program restores normal mode');
+});
+
 test('Built ui/dist/index.html mounts the local root switcher in the native app', async () => {
   const distHtml = fs.readFileSync(path.join(repoRoot, 'ui', 'dist', 'index.html'), 'utf8');
   const requested = [];

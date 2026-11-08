@@ -4,6 +4,8 @@ export interface ExtraKeySpec {
   id: string;
   label: string;
   sequence?: string;
+  /** The sequence in application-cursor mode, where it differs (the arrows). */
+  applicationSequence?: string;
   modifier?: 'ctrl' | 'alt';
 }
 
@@ -18,10 +20,13 @@ export const EXTRA_KEYS: readonly ExtraKeySpec[] = [
   { id: 'tab', label: 'Tab', sequence: '\t' },
   { id: 'ctrl', label: 'Ctrl', modifier: 'ctrl' },
   { id: 'alt', label: 'Alt', modifier: 'alt' },
-  { id: 'up', label: '↑', sequence: '\x1b[A' },
-  { id: 'down', label: '↓', sequence: '\x1b[B' },
-  { id: 'left', label: '←', sequence: '\x1b[D' },
-  { id: 'right', label: '→', sequence: '\x1b[C' },
+  // The arrows are the one pair of sequences a full-screen program changes:
+  // `vi` and `less` ask for application-cursor mode and expect `ESC O A`. A row
+  // that always sent `ESC [ A` moved the cursor nowhere in either of them.
+  { id: 'up', label: '↑', sequence: '\x1b[A', applicationSequence: '\x1bOA' },
+  { id: 'down', label: '↓', sequence: '\x1b[B', applicationSequence: '\x1bOB' },
+  { id: 'left', label: '←', sequence: '\x1b[D', applicationSequence: '\x1bOD' },
+  { id: 'right', label: '→', sequence: '\x1b[C', applicationSequence: '\x1bOC' },
   { id: 'slash', label: '/', sequence: '/' },
   { id: 'dash', label: '-', sequence: '-' },
   { id: 'pipe', label: '|', sequence: '|' },
@@ -109,6 +114,8 @@ export class MobileShellController {
   private readonly onPaneChange?: (pane: MobilePaneId) => void;
   private activePane: MobilePaneId = 'local';
   private ctrlLatched = false;
+  /** Whether the screen asked for application-cursor arrows. */
+  private applicationCursor = false;
   private altLatched = false;
   private bottomNav: HTMLElement | null = null;
   private swipeContainer: HTMLElement | null = null;
@@ -475,6 +482,16 @@ export class MobileShellController {
 
   // Extra keys ---------------------------------------------------------------
 
+  /**
+   * Tells the row which cursor mode the screen is in.
+   *
+   * The terminal reports it with every frame; the row cannot know it on its
+   * own, and guessing normal mode is what made the arrows dead in `vi`.
+   */
+  public setApplicationCursor(applicationCursor: boolean): void {
+    this.applicationCursor = applicationCursor;
+  }
+
   public pressExtraKey(keyId: string): string | null {
     const spec = EXTRA_KEYS.find((key) => key.id === keyId);
     if (!spec) {
@@ -490,7 +507,10 @@ export class MobileShellController {
       this.syncLatchedKeys();
       return null;
     }
-    const seq = this.transformTextInput(spec.sequence ?? '');
+    const base = this.applicationCursor && spec.applicationSequence
+      ? spec.applicationSequence
+      : spec.sequence ?? '';
+    const seq = this.transformTextInput(base);
     this.syncLatchedKeys();
     this.onTerminalInput?.(seq);
     return seq;

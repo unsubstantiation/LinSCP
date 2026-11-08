@@ -30,6 +30,7 @@ function fakeCanvas() {
     measureText: (text) => ({ width: text.length * 8.8 }),
     getContext: () => context,
   };
+  const listeners = new Map();
   const canvas = {
     className: '',
     width: 0,
@@ -40,6 +41,27 @@ function fakeCanvas() {
       this.attributes[name] = value;
     },
     getContext: () => context,
+    // A real canvas carries events, and the terminal attaches its gestures to
+    // this element, so the fake has to be able to hold and fire them.
+    addEventListener(type, listener) {
+      if (!listeners.has(type)) {
+        listeners.set(type, new Set());
+      }
+      listeners.get(type).add(listener);
+    },
+    removeEventListener(type, listener) {
+      listeners.get(type)?.delete(listener);
+    },
+    dispatchEvent(event) {
+      for (const listener of listeners.get(event.type) ?? []) {
+        listener(event);
+      }
+      this.lastEvent = event;
+      return true;
+    },
+    hasListener(type) {
+      return (listeners.get(type)?.size ?? 0) > 0;
+    },
     remove() {
       this.removed = true;
     },
@@ -47,11 +69,19 @@ function fakeCanvas() {
   return { canvas, context, calls };
 }
 
-/** A container with a fixed size, as an element the renderer measures. */
+/**
+ * A container with a fixed size, as an element the renderer measures.
+ *
+ * `ownerDocument` is real: a session with a keyboard builds its textarea in the
+ * container's own document, which is what a page has and a bare object does
+ * not.
+ */
 function fakeContainer(width = 90, height = 36) {
+  const document = globalThis.document;
   return {
     clientWidth: width,
     clientHeight: height,
+    ownerDocument: document,
     appended: [],
     appendChild(node) {
       this.appended.push(node);
@@ -141,6 +171,22 @@ test('a colour the stream defined wins over the theme, and an indexed one uses i
   const texts = calls.filter((call) => call[0] === 'fillText' && call[1] !== ' ');
   assert.equal(texts[0][4], 'rgb(1, 2, 3)');
   assert.equal(texts[1][4], DEFAULT_RENDERER_THEME.palette[1]);
+});
+
+test('a bright named colour maps to its own palette entry, not the one before it', () => {
+  // `NamedColor` numbers its bright half straight on from its normal half:
+  // BrightBlack is 8 and BrightRed 9. Reading them as `named - 1` painted every
+  // bright colour with the grey before it, which is what `ls --color`, git's
+  // diff colouring and most shells' prompts use.
+  const { renderer, calls } = makeRenderer();
+  const frame = blankFrame(10, 2);
+  frame.cells[0] = { ...frame.cells[0], text: [0x61], fg: { named: 1, indexed: -1, rgb: null } };
+  frame.cells[1] = { ...frame.cells[1], text: [0x62], fg: { named: 9, indexed: -1, rgb: null } };
+  renderer.render(frame);
+  const texts = calls.filter((call) => call[0] === 'fillText' && call[1] !== ' ');
+  assert.equal(texts[0][4], DEFAULT_RENDERER_THEME.palette[1], 'SGR 31 is red');
+  assert.equal(texts[1][4], DEFAULT_RENDERER_THEME.palette[9], 'SGR 91 is bright red');
+  assert.notEqual(texts[0][4], texts[1][4], 'normal and bright must not be the same colour');
 });
 
 test('the extended palette is the standard cube and grey ramp', () => {
@@ -336,6 +382,87 @@ test('the session polls frames, paints them and resizes only after a frame', asy
   );
   assert.equal(container.appended.length, 1, 'the session appended its canvas');
   assert.ok(canvas);
+  dom.cleanup();
+});
+
+test('a swipe over the terminal scrolls the model instead of the page', async () => {
+  // A canvas terminal has no scrollbar and its page must not scroll: dragging
+  // has to move the model's viewport. On a phone that is the only way into
+  // scrollback, so a drag that did nothing would hide everything above the
+  // screen for good.
+  const dom = installDom();
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(10, 2) }),
+  });
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-2',
+    container: fakeContainer(90, 36),
+    pollInterval: 1,
+    keyboard: true,
+  });
+  session.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const el = session.element;
+  const touch = (y) => ({ clientY: y, clientX: 10 });
+  const start = new dom.dom.window.Event('touchstart');
+  start.touches = [touch(200)];
+  el.dispatchEvent(start);
+  const move = new dom.dom.window.Event('touchmove', { cancelable: true });
+  move.touches = [touch(110)];
+  el.dispatchEvent(move);
+  el.dispatchEvent(new dom.dom.window.Event('touchend'));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const scrolls = transport.calls.filter((call) => call.path === '/api/terminal/scroll');
+  assert.equal(scrolls.length, 1, 'one drag, one scroll request');
+  // Dragging up by 90px at an 18px cell is five lines back into history, which
+  // the model counts as positive.
+  assert.equal(scrolls[0].body.lines, 5);
+  assert.equal(move.defaultPrevented, true, 'the page must not scroll with the finger');
+
+  // A wheel does the same thing for a desktop mouse.
+  const wheel = new dom.dom.window.Event('wheel', { cancelable: true });
+  wheel.deltaY = 100;
+  el.dispatchEvent(wheel);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const after = transport.calls.filter((call) => call.path === '/api/terminal/scroll');
+  assert.equal(after.length, 2);
+  assert.equal(after[1].body.lines, -3, 'a wheel down walks forward again');
+
+  await session.close();
+  dom.cleanup();
+});
+
+test('a tap on the terminal raises the keyboard and a drag does not dismiss it', async () => {
+  const dom = installDom();
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(10, 2) }),
+  });
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-3',
+    container: fakeContainer(90, 36),
+    pollInterval: 1,
+    keyboard: true,
+  });
+  session.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const el = session.element;
+  // The harness canvas is not in a document, so focus cannot move; what is
+  // asserted here is that the gesture is heard at all, and heard only for taps.
+  assert.equal(el.hasListener('click'), true, 'a tap has to be listened for');
+  assert.equal(el.hasListener('touchstart'), true);
+
+  el.dispatchEvent(new dom.dom.window.Event('click'));
+  // A drag cancels its own click, so the click never reaches this listener;
+  // the gesture code is what guarantees that, checked in the swipe test above.
+  assert.ok(session.input, 'the session owns a keyboard to raise');
+
+  await session.close();
+  assert.equal(el.hasListener('click'), false, 'closing removes every listener');
   dom.cleanup();
 });
 

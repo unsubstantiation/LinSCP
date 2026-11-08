@@ -1960,6 +1960,32 @@ function options(id) {
     let openedVisible = null;
     const frames = [];
     window.LinSCPCore.terminalWindow = function (options) {
+      /* The real window attaches a keyboard to the canvas when the host asks
+       * for one; a stand-in without it would let the page ship a terminal
+       * nobody can type into and still pass. */
+      let keyboard = null;
+      /* Typed text goes to the shell the way the real terminal sends it: a
+       * base64 body on `/api/terminal/input`. */
+      const send = data => {
+        painted.push(data);
+        void window.LinSCPTransport.request('POST', '/api/terminal/input', {
+          terminal: options.terminal,
+          data: window.btoa(unescape(encodeURIComponent(data))),
+          cols: 80,
+          rows: 24
+        });
+      };
+      if (options.keyboard) {
+        const field = doc.createElement('textarea');
+        field.setAttribute('aria-label', 'Terminal input');
+        field.addEventListener('input', () => {
+          const text = field.value;
+          field.value = '';
+          if (text) send(text);
+        });
+        options.container.appendChild(field);
+        keyboard = { element: field };
+      }
       return {
         start: async () => {
           const modal = options.container.closest('.modal-overlay');
@@ -1990,10 +2016,11 @@ function options(id) {
           }
           return true;
         },
-        write: data => painted.push(data),
-        stop: () => {},
+        write: data => send(data),
+        stop: () => { keyboard = null; },
         paste: () => {},
-        handleKey: () => false
+        handleKey: () => false,
+        input: () => keyboard
       };
     };
     /* A frame as the model produces it: the shell's own line on the first row
@@ -2023,6 +2050,26 @@ function options(id) {
     check('the terminal asks for the frame of the id the backend answered with',
       calls.some(call => call.path === '/api/terminal/frame' && call.url.indexOf('terminal=77') >= 0),
       JSON.stringify(calls.filter(call => call.path === '/api/terminal/frame').map(call => call.url)));
+    /* The Android path has no OS window, so the terminal is the in-page one -
+     * and a canvas cannot raise a soft keyboard. Without the attachment the
+     * pane is a picture of a shell nobody can type into, which is exactly what
+     * it was. */
+    const terminalInput = doc.querySelector('#terminalScreen textarea');
+    check('the in-page terminal carries an element that can raise a keyboard',
+      !!terminalInput, String(!!terminalInput));
+    if (terminalInput) {
+      terminalInput.value = 'l';
+      terminalInput.dispatchEvent(new window.Event('input'));
+      await new Promise(resolve => setTimeout(resolve, 60));
+      const typed = calls.filter(call => call.path === '/api/terminal/input')
+        .map(call => JSON.parse(call.options.body));
+      check('a character typed on a phone reaches the shell',
+        typed.some(body => window.atob(body.data) === 'l'),
+        JSON.stringify(typed.map(body => window.atob(body.data))));
+      check('the typed character does not stay in the field',
+        terminalInput.value === '', JSON.stringify(terminalInput.value));
+    }
+
     check('the screen title follows the model',
       doc.getElementById('terminalModal').querySelector('.modal-header span').textContent.includes('web-1'),
       doc.getElementById('terminalModal').querySelector('.modal-header span').textContent);

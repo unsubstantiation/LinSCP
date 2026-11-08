@@ -1989,14 +1989,6 @@
   /* Terminal bytes for the shell's key row. The row is usable before a
    * terminal exists (the Android keyboard can open on the terminal panel), so
    * this reports the missing session instead of throwing into the key handler. */
-  function sendTerminalBytes(data) {
-    const terminal = embeddedTerminal;
-    if (!terminal || terminal.closed) {
-      toast(t('Open a terminal first.'), true);
-      return;
-    }
-    terminal.send(data);
-  }
 
   async function loadRemote(path) {
     const tab = activeTab();
@@ -4107,6 +4099,16 @@
       terminal,
       transport: window.LinSCPTransport || transportShim(),
       extraKeysElement: $('terminalExtraKeys'),
+      /* This path is the one without OS windows: Android, and a desktop whose
+       * shell refused a window. The terminal is a canvas, and a canvas cannot
+       * raise a soft keyboard, so it needs the attachment - without it the
+       * pane shows a shell nobody can type into. */
+      keyboard: true,
+      onModes: modes => {
+        // The extra-keys row's arrows follow the screen: `vi` and `less` ask
+        // for application-cursor mode and expect ESC O A, not ESC [ A.
+        if (appShell) appShell.setApplicationCursor(modes.app_cursor);
+      },
       onTitle: title => {
         const header = $('terminalModal').querySelector('.modal-header span');
         if (header) header.textContent = (title && title.trim()) || t('Terminal');
@@ -4132,9 +4134,17 @@
 
   /* The Android extra-key row: the soft keyboard has no Esc, Ctrl or arrows,
    * and the shared controller already encodes them. */
+  /* The extra-keys row and the soft keyboard both end up here. Declared once:
+   * a duplicate would be silently replaced by whichever came last, and the row
+   * would send to a terminal that does not exist. */
   function sendTerminalBytes(data) {
-    if (embeddedTerminal && embeddedTerminal.view) embeddedTerminal.view.write(data);
+    if (embeddedTerminal && embeddedTerminal.view) {
+      embeddedTerminal.view.write(data);
+      return;
+    }
+    toast(t('Open a terminal first.'), true);
   }
+
 
   function closeTerminal() {
     const state = embeddedTerminal;

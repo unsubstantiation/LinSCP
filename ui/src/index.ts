@@ -9,5 +9,6 @@ export * from './platform/shell.js';
 export * from './platform/terminal.js';
 export * from './platform/terminal-session.js';
 export * from './platform/terminal-window.js';
+export * from './platform/terminal-input.js';
 export * from './platform/drops.js';
 export * from './components/monitor.js';

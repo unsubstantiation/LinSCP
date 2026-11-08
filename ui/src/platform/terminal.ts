@@ -369,7 +369,12 @@ export class TerminalRenderer {
         return this.theme.palette[color.named] ?? this.theme.foreground;
       }
       if (color.named < 16) {
-        return this.theme.palette[color.named - 1] ?? this.theme.foreground;
+        // `NamedColor` numbers its bright half straight on from its normal
+        // half - BrightBlack is 8, BrightRed 9 - so the value is the palette
+        // index. Subtracting one here painted every bright colour with the
+        // grey before it, which is exactly what `ls --color` and every prompt
+        // use.
+        return this.theme.palette[color.named] ?? this.theme.foreground;
       }
       // 256 is the foreground, 257 the background, 258 the cursor.
       if (color.named === 257) {
@@ -393,6 +398,39 @@ export class TerminalRenderer {
       g: Math.round(a.g + (b.g - a.g) * ratio),
       b: Math.round(a.b + (b.b - a.b) * ratio),
     });
+  }
+
+  /**
+   * The canvas element, for the owner that has to attach listeners to it.
+   *
+   * The renderer paints; it does not decide what a tap means. Handing the
+   * element out keeps that decision with the terminal, where the session and
+   * its input live.
+   */
+  public get element(): HTMLCanvasElement {
+    return this.canvas;
+  }
+
+  /**
+   * The cursor cell's rectangle in CSS pixels, or `null` before a frame.
+   *
+   * A soft keyboard's candidate window is anchored to the element being typed
+   * into, and this is what tells the terminal where that is: the cursor, which
+   * moves with every byte the shell writes. A terminal whose keyboard popped up
+   * in the screen corner instead of at the prompt would be technically usable
+   * and practically not.
+   */
+  public cursorRect(): { left: number; top: number; width: number; height: number } | null {
+    const frame = this.frame;
+    if (!frame) {
+      return null;
+    }
+    return {
+      left: frame.cursor.column * this.cellWidth,
+      top: frame.cursor.line * this.cellHeight,
+      width: this.cellWidth,
+      height: this.cellHeight,
+    };
   }
 
   /** Removes the canvas and every listener this renderer installed. */
