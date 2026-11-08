@@ -577,7 +577,6 @@ async fn handle_mock_exec(channel: Channel<Msg>, cmd: String, fs: Arc<Mutex<MemF
     if !stderr.is_empty() {
         let _ = channel.extended_data(1, stderr.as_bytes()).await;
     }
-    }
     let _ = channel.exit_status(code).await;
     let _ = channel.eof().await;
     let _ = channel.close().await;
