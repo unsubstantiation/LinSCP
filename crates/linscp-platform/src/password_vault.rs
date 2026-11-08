@@ -122,7 +122,7 @@ impl SecretVault for PasswordSecretVault {
 
 fn validate_password(password: &str) -> Result<(), PlatformError> {
     let length = password.encode_utf16().count();
-    if !(12..=1024).contains(&length) { return Err(vault_error("Vault password must be 12 to 1024 UTF-16 units")); }
+    if !(6..=1024).contains(&length) { return Err(vault_error("Vault password must be 6 to 1024 UTF-16 units")); }
     Ok(())
 }
 

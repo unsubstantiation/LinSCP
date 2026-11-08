@@ -169,6 +169,8 @@ impl CommanderService {
             ("GET", "/api/vault/status") => self.handle_vault_status(),
             ("POST", "/api/vault/unlock") => self.handle_vault_unlock(req.body),
             ("POST", "/api/vault/lock") => self.handle_vault_lock(),
+            ("GET", "/api/vault/keys") => self.handle_vault_ssh_keys(),
+            ("POST", "/api/vault/keys/import") => self.handle_vault_ssh_key_import(req.body),
             ("GET", "/api/local/roots") => self.handle_local_roots(),
             ("GET", "/api/local/list") => self.handle_local_list(&query),
             ("GET", "/api/local/edit") => self.handle_local_edit_get(&query),
@@ -2059,6 +2061,112 @@ impl CommanderService {
         state.pending_connections.clear();
         state.active_tab_id = None;
         ApiReply { status: 200, payload: json!({"success": true, "vault": "locked"}) }
+    }
+
+    fn handle_vault_ssh_keys(&self) -> ApiReply {
+        let config_root = self.config_root();
+        match self.secret_vault.status(&config_root) {
+            Ok("unlocked") => {}
+            Ok(_) => return api_error(423, "Unlock the local vault before choosing an SSH key."),
+            Err(error) => return api_error(500, error.to_string()),
+        }
+        let key_dir = config_root.join("keys");
+        let entries = match std::fs::read_dir(&key_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ApiReply { status: 200, payload: json!({"success": true, "keys": []}) };
+            }
+            Err(error) => return api_error(500, format!("Cannot list vault keys: {error}")),
+        };
+        let mut keys = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !entry.file_type().map(|kind| kind.is_file()).unwrap_or(false) { continue; }
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else { continue; };
+            let Some(id) = file_name.strip_suffix(".key.vault") else { continue; };
+            if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) { continue; }
+            let label_path = key_dir.join(format!("{id}.label"));
+            let label = std::fs::read_to_string(&label_path).ok()
+                .filter(|label| label.len() <= 512)
+                .map(|label| label.trim().to_string())
+                .filter(|label| !label.is_empty())
+                .or_else(|| {
+                    let public_path = key_dir.join(format!("{id}.pub"));
+                    let public = read_bounded_key_optional(&public_path, 32 * 1024).ok()?;
+                    let mut fields = public.split_whitespace();
+                    let algorithm = fields.next()?;
+                    let _key = fields.next();
+                    let comment = fields.collect::<Vec<_>>().join(" ");
+                    Some(if comment.is_empty() { algorithm.to_string() } else { comment })
+                })
+                .unwrap_or_else(|| format!("SSH key {}", &id[..8]));
+            keys.push(json!({
+                "reference": format!("{LOCAL_VAULT_KEY_PREFIX}{id}"),
+                "label": label,
+            }));
+        }
+        keys.sort_by(|left, right| left["label"].as_str().cmp(&right["label"].as_str()));
+        ApiReply { status: 200, payload: json!({"success": true, "keys": keys}) }
+    }
+
+    fn handle_vault_ssh_key_import(&self, mut body: Value) -> ApiReply {
+        let config_root = self.config_root();
+        let name = body.get("name").and_then(Value::as_str).unwrap_or("")
+            .rsplit(['/', '\\']).next().unwrap_or("")
+            .chars().filter(|character| !character.is_control()).take(128).collect::<String>();
+        let private_key = body.get("private_key").and_then(Value::as_str).unwrap_or("");
+        if private_key.is_empty() || private_key.as_bytes().len() > 1024 * 1024 || private_key.contains('\0') {
+            if let Some(Value::String(private_key)) = body.get_mut("private_key") {
+                zeroize::Zeroize::zeroize(private_key);
+            }
+            return api_error(400, "Choose a non-empty SSH key file no larger than 1 MiB.");
+        }
+        let plaintext = zeroize::Zeroizing::new(private_key.as_bytes().to_vec());
+        let encryption_result = self.secret_vault.seal_local_blob(&plaintext);
+        if let Some(Value::String(private_key)) = body.get_mut("private_key") {
+            zeroize::Zeroize::zeroize(private_key);
+        }
+        let encrypted = match encryption_result {
+            Ok(encrypted) => encrypted,
+            Err(error) => return api_error(400, error.to_string()),
+        };
+        let key_dir = config_root.join("keys");
+        if let Err(error) = linscp_platform::create_private_dir(&key_dir) {
+            return api_error(500, error.to_string());
+        }
+        for _ in 0..8 {
+            let mut random = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut random);
+            let id = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+            let encrypted_path = key_dir.join(format!("{id}.key.vault"));
+            match write_exclusive_private_file(&encrypted_path, &encrypted) {
+                Ok(()) => {}
+                Err(linscp_platform::PlatformError::AlreadyExists(_)) => continue,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&encrypted_path);
+                    return api_error(500, error.to_string());
+                }
+            }
+            let label = if name.is_empty() { format!("SSH key {}", &id[..8]) } else { name.clone() };
+            let label_path = key_dir.join(format!("{id}.label"));
+            match write_exclusive_private_file(&label_path, label.as_bytes()) {
+                Ok(()) => {}
+                Err(linscp_platform::PlatformError::AlreadyExists(_)) => {
+                    let _ = std::fs::remove_file(&encrypted_path);
+                    continue;
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(&encrypted_path);
+                    return api_error(500, error.to_string());
+                }
+            }
+            return ApiReply { status: 200, payload: json!({
+                "success": true,
+                "reference": format!("{LOCAL_VAULT_KEY_PREFIX}{id}"),
+                "label": label,
+            }) };
+        }
+        api_error(500, "Cannot allocate a unique encrypted SSH key file.")
     }
 
     fn handle_status(&self) -> ApiReply {
@@ -8715,11 +8823,14 @@ mod tests {
             method: "GET".into(), path: "/api/vault/status".into(), body: json!({}),
         });
         assert_eq!(status(&service).payload["vault"], "setup_required");
-        let short = service.dispatch(ApiEnvelope {
-            method: "POST".into(), path: "/api/vault/unlock".into(), body: json!({"password": "short"}),
+        let too_short = service.dispatch(ApiEnvelope {
+            method: "POST".into(), path: "/api/vault/unlock".into(), body: json!({"password": "12345"}),
         });
-        assert_eq!(short.status, 400);
-        unlock_for_test(&service);
+        assert_eq!(too_short.status, 400);
+        let minimum_length = service.dispatch(ApiEnvelope {
+            method: "POST".into(), path: "/api/vault/unlock".into(), body: json!({"password": "123456"}),
+        });
+        assert_eq!(minimum_length.status, 200, "{}", minimum_length.payload);
         assert_eq!(status(&service).payload["vault"], "unlocked");
         let wrapped_key = std::fs::read(root.join("sessions.key")).unwrap();
         assert!(wrapped_key.starts_with(b"LSCPVLT1"));
@@ -8728,6 +8839,33 @@ mod tests {
         });
         assert_eq!(locked.status, 200);
         assert_eq!(status(&service).payload["vault"], "locked");
+        let locked_key_list = service.dispatch(ApiEnvelope {
+            method: "GET".into(), path: "/api/vault/keys".into(), body: json!({}),
+        });
+        assert_eq!(locked_key_list.status, 423);
+        let unlocked_again = service.dispatch(ApiEnvelope {
+            method: "POST".into(), path: "/api/vault/unlock".into(), body: json!({"password": "123456"}),
+        });
+        assert_eq!(unlocked_again.status, 200, "{}", unlocked_again.payload);
+        assert_eq!(status(&service).payload["vault"], "unlocked");
+        let private_key = "fixture private key contents";
+        let imported = service.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/vault/keys/import".into(),
+            body: json!({"name": "id_ed25519", "private_key": private_key}),
+        });
+        assert_eq!(imported.status, 200, "{}", imported.payload);
+        let reference = imported.payload["reference"].as_str().unwrap();
+        assert!(reference.starts_with("vaultkey://"));
+        let key_id = reference.strip_prefix("vaultkey://").unwrap();
+        let encrypted = std::fs::read(root.join("keys").join(format!("{key_id}.key.vault"))).unwrap();
+        assert!(!encrypted.windows(private_key.len()).any(|window| window == private_key.as_bytes()));
+        let listed = service.dispatch(ApiEnvelope {
+            method: "GET".into(), path: "/api/vault/keys".into(), body: json!({}),
+        });
+        assert_eq!(listed.status, 200);
+        assert_eq!(listed.payload["keys"][0]["reference"], reference);
+        assert_eq!(listed.payload["keys"][0]["label"], "id_ed25519");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -8743,6 +8881,8 @@ mod tests {
         let save_reply = svc.dispatch(ApiEnvelope { method: "POST".to_string(), path: "/api/sessions/save".to_string(), body: serde_json::to_value(SessionConfig { name: "prod/web".to_string(), protocol: ProtocolScheme::Sftp, host: "10.0.0.8".to_string(), port: 22, username: "deploy".to_string(), password: Some("vault-secret".to_string()), keyfile: None, hostkey: "SHA256:xyz".to_string(), initial_dir: "/srv/www".to_string(), local_dir: String::new(), tunnel: None }).unwrap() });
         assert_eq!(save_reply.status, 200);
         assert!(tmp.join("sessions.key").exists());
+        let stored_sessions = std::fs::read_to_string(tmp.join("sessions.ini")).unwrap();
+        assert!(!stored_sessions.contains("vault-secret"), "saved passwords must be encrypted at rest");
         let list_reply = svc.dispatch(ApiEnvelope { method: "GET".to_string(), path: "/api/sessions".to_string(), body: json!({}) });
         assert_eq!(list_reply.status, 200);
         assert_eq!(list_reply.payload["sessions"][0]["name"], "prod/web");

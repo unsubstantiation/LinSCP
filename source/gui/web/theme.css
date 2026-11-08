@@ -615,6 +615,10 @@ table.file-table tr.selected td { color: var(--selection-text); }
   background: var(--surface-raised);
 }
 .form-row { display: flex; align-items: center; gap: 9px; min-height: 29px; }
+.keyfile-input-row { display: flex; flex: 1; min-width: 0; align-items: center; gap: 4px; }
+.keyfile-input-row .input-field { min-width: 0; }
+.keyfile-input-row .btn-icon { flex: none; }
+.keyfile-input-row svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .form-row > label:first-child, .form-row > label:not(:has(input)) { flex: none; width: 100px; color: var(--muted); font-size: 11px; }
 .form-row input:not([type="checkbox"]), .form-row select { flex: 1; }
 .form-row label:has(input[type="checkbox"]) { display: flex; align-items: center; gap: 7px; width: auto; color: var(--text); }
@@ -640,6 +644,7 @@ table.file-table tr.selected td { color: var(--selection-text); }
 .site-list-items { flex: 1; overflow: auto; }
 .site-item { padding: 7px 9px; color: var(--text); font-size: 11px; cursor: pointer; }
 .site-item:hover { background: var(--surface-hover); }
+button.site-item { display: block; width: 100%; border: 0; background: transparent; text-align: left; font: inherit; }
 .site-item.selected { background: var(--selection); color: var(--selection-text); }
 .site-empty { padding: 10px; color: var(--subtle); font-size: 11px; }
 .site-list-footer { display: flex; gap: 4px; padding: 6px; border-top: 1px solid var(--border); }
