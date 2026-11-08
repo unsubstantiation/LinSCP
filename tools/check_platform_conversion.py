@@ -226,12 +226,11 @@ REMOVED_ARTEFACTS = [
 # has to install every one of them.
 # Phase 6 pure-Rust: the Python GUI (linscp_gui.py/linscp_crypto.py) and the
 # explorer-commands.json template are now embedded in the Rust workspace
-# (crates/linscp-http, crates/linscp-service, ui/dist) and no longer installed
+# (crates/linscp-tauri, crates/linscp-service, ui/dist) and no longer installed
 # as loose files under /usr/share/linscp/gui/. The Debian/CMake/Make installers
-# were updated to ship the Rust binaries instead.
+# were updated to ship the Rust binary instead.
 INSTALLED_FILES = [
     'debian/linscp.desktop',
-    'debian/linscp-web.desktop',
     'debian/linscp.png',
     'debian/linscp.svg',
 ]

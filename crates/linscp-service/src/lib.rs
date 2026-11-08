@@ -2,9 +2,9 @@
 #![allow(unused_variables, unused_imports, dead_code, unused_mut, clippy::all)]
 //! Transport-neutral Commander backend service (`CommanderService`).
 //!
-//! Both `linscp-http` (axum browser server) and `linscp-tauri` (native Linux,
-//! Windows, and Android shell) route every UI command through
-//! `CommanderService::dispatch` (sync) and `dispatch_async` (async for remote).
+//! `linscp-tauri` (native Linux, Windows, and Android shell) routes every UI
+//! command through `CommanderService::dispatch` (sync) and `dispatch_async`
+//! (async for remote).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -240,13 +240,6 @@ impl CommanderService {
             ("POST", "/api/queue/clear") => self.handle_queue_clear(),
             ("POST", "/api/queue/retry") => self.handle_queue_retry(req.body),
             ("POST", "/api/queue/priority") => self.handle_queue_priority(req.body),
-            ("GET", "/api/accounts") => self.handle_accounts(),
-            ("GET", "/api/login") => ApiReply{ status: 200, payload: json!({"success": true, "logged_in": false, "username": "", "csrf_token": ""})},
-            ("POST", "/api/login") => ApiReply{ status: 400, payload: json!({"success": false, "error": "Accounts not enabled"})},
-            // Signing out has to answer on every app: the browser page, the
-            // native window and the Android app all offer the menu entry, and
-            // an unauthenticated run has nothing to end, so it succeeds.
-            ("POST", "/api/logout") => ApiReply{ status: 200, payload: json!({"success": true})},
             // `list`/`save`/`delete` only. `run` needs the console interpreter,
             // which is async, so it is answered by the asynchronous entry point.
             ("POST", "/api/custom-commands") => self.handle_custom_commands(req.body),
@@ -3698,7 +3691,6 @@ impl CommanderService {
         let id = body.get("task_id").and_then(Value::as_u64).unwrap_or(0);
         if self.queue.prioritize(id, body.get("position").and_then(Value::as_str).unwrap_or("top")) { ApiReply{ status:200, payload: json!({"success": true})} } else { api_error(400, "Task cannot be prioritized") }
     }
-    fn handle_accounts(&self) -> ApiReply { ApiReply{ status:200, payload: json!({"accounts_enabled": false})}}
     fn handle_custom_commands(&self, body: Value) -> ApiReply {
         let cfg = self.state.lock().expect("m").config_root.clone();
         let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("list");
@@ -5509,8 +5501,8 @@ mod tests {
 
     /// A1, from the service's side of the contract: when the service says "I cannot
     /// show a viewer", the `.rdp` body handed to the client must be writeable — and
-    /// must not contain the login it describes. That is the answer the browser host
-    /// and a server-mode script depend on, and it is the branch Windows used to take
+    /// must not contain the login it describes. That is the answer a host that
+    /// cannot show a viewer depends on, and it is the branch Windows used to take
     /// *by accident*.
     #[test]
     fn a_host_that_cannot_show_a_viewer_gets_a_safe_ticket_body() {

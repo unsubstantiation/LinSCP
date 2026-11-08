@@ -11,7 +11,7 @@ This document specifies the architecture, crate selection, platform abstractions
 1. **Pure-Rust backend and protocol core:** All transport protocols (SSH, SFTP, SCP, jump tunnels, FTP/FTPS, WebDAV, Amazon S3), session/key cryptography, synchronization planning, CLI scripting, and GUI task orchestration live in one Cargo workspace with zero C/C++ cross-compilation dependencies in the default build.
 2. **Dual-mode graphical client:** A single modular **TypeScript + CSS** Commander frontend (`ui/`) runs both:
    - **Natively inside Tauri v2** on Linux, Windows (WebView2), and Android (Android WebView) via in-process IPC (`invoke` + event streams), and
-   - **In any standard web browser** against a built-in Rust HTTP/WebSocket server (`linscp-http`, invoked via `linscp-gui` or `linscp --serve-http`) for headless, remote, and multi-user deployments.
+   - **In the native Tauri window** (`linscp-gui`) on Linux and Windows, and in the Android app. There is no browser/HTTP host: the page talks to the service only through Tauri IPC.
 3. **Maximum resource sharing:** One in-process session and thread pool replaces the current multi-process chain (`Python HTTP server` -> per-tab `linscp -server` -> per-task `linscp` -> external `curl`), and shared crates eliminate duplicate logic across CLI and GUI for session encryption, configuration files, permission/mask parsing, and localization catalogs.
 4. **Strangler-fig verification:** The Rust workspace builds alongside `source/linux/` and `source/gui/` until every capability tracked in [`docs/upstream-parity.json`](upstream-parity.json) passes the existing Python/Node live and offline regression suites against the Rust binaries.
 
@@ -43,7 +43,6 @@ LinSCP/
 │   ├── linscp-proto/           # Pure-Rust SFTP, SCP, SSH tunnel/PTY, FTP/FTPS, WebDAV, S3
 │   ├── linscp-engine/          # Transfers (.filepart, presets, ASCII), SyncPlanner, Script
 │   ├── linscp-service/         # Transport-agnostic Commander state, session pool & queue
-│   ├── linscp-http/            # Axum HTTP + WebSocket server for standalone browser mode
 │   ├── linscp-cli/             # `linscp` CLI / `-server` / `-shell` / `linscp-gui` binary
 │   └── linscp-tauri/           # Tauri v2 desktop (Linux/Windows) & mobile (Android) host
 │       ├── src/
@@ -107,15 +106,14 @@ Both deployment modes execute the exact same application logic in `crates/linscp
 │                    TypeScript Commander UI (ui/src/)                    │
 │   Dual/Single Panes · Queue · Sync Preview · Editor · xterm.js · i18n   │
 ├───────────────────────────────────┬─────────────────────────────────────┤
-│         TauriTransport            │            HttpTransport            │
-│  invoke("api_call") + Tauri Event │  fetch("/api/*") + WebSocket/SSE    │
-└─────────────────┬─────────────────┴──────────────────┬──────────────────┘
-                  │ In-process IPC                     │ Loopback / LAN HTTP
-┌─────────────────▼─────────────────┐ ┌────────────────▼──────────────────┐
-│        crates/linscp-tauri        │ │        crates/linscp-http         │
-│  Linux / Windows / Android App    │ │  Token + Host + Account/CSRF Auth │
-└─────────────────┬─────────────────┘ └────────────────┬──────────────────┘
-                  └─────────────────┬──────────────────┘
+│         TauriTransport                                                  │
+│  invoke("api_call") + Tauri Event                                       │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    │ In-process IPC
+                  ┌─────────────────▼─────────────────┐
+                  │        crates/linscp-tauri        │
+                  │  Linux / Windows / Android App    │
+                  └─────────────────┬─────────────────┘
                                     ▼
                   ┌────────────────────────────────────┐
                   │       crates/linscp-service        │
@@ -131,7 +129,7 @@ Both deployment modes execute the exact same application logic in `crates/linscp
 
 ### Transport Adapter Rules (`ui/src/transport/`)
 
-1. **Runtime detection:** At startup, `createTransport()` checks `window.__TAURI_INTERNALS__`. If present, it instantiates `TauriTransport`; otherwise it instantiates `HttpTransport` using the server-injected bootstrap configuration (API token, locale, login state).
+1. **Transport:** At startup, `createTransport()` instantiates `TauriTransport` from `window.__TAURI_INTERNALS__`, which is the only transport; a page outside the shell has no backend to reach. (This document predates the removal of the browser host, whose `HttpTransport` took an injected API token.)
 2. **Real-time events instead of polling:**
    - Queue byte progress, host-key challenges, `keepuptodate` events, and `xterm.js` terminal streams flow over **Tauri events / `tauri::ipc::Channel`** in native mode and **WebSocket (`/api/events`, `/api/terminal/ws`)** in browser mode (retaining HTTP polling fallback routes so existing `SecurityTest.py` and `ClientTest.js` suites continue to work).
 3. **Zero-copy local transfers in native desktop mode:**
@@ -155,7 +153,7 @@ Moving from `C++ + Python + JS + curl` to `Rust + TypeScript` eliminates major r
 3. **Single Configuration & Crypto Implementation (`linscp-crypto` + `linscp-engine`):**
    - `sessions.ini`, `sessions.key` (`lscp1$`), transfer presets, OpenSSH/FileZilla session importers, symbolic permission parser (`u+x,go-w`), and LinSCP file masks exist once in Rust and are called by CLI, HTTP server, and Tauri alike.
 4. **Embedded Web Assets (`rust-embed`):**
-   - Compiled `ui/dist/` assets are embedded into `linscp-http` and `linscp-tauri`, eliminating runtime asset-path mismatches across `/usr/share`, custom CMake prefixes, Windows portable `.exe` builds, and Android APKs.
+   - Compiled `ui/dist/` assets are embedded into `linscp-tauri`, eliminating runtime asset-path mismatches across `/usr/share`, custom CMake prefixes, Windows portable `.exe` builds, and Android APKs.
 
 ---
 
@@ -239,8 +237,8 @@ Currently, `tools/check_platform_conversion.py` enforces that LinSCP is Linux-on
 The existing Python and Node test suites are black-box harnesses that drive `linscp` by executable path (`sys.argv[1]`) or HTTP endpoints—meaning they serve directly as the **parity oracle** for the Rust rewrite:
 
 - **CLI & Live Protocol Suites (`ScriptTest.py`, `LiveSftpTest.py`, `LiveTunnelTest.py`, `LiveScpTest.py`, `LiveDavTest.py`, `LiveS3Test.py`, `LiveCurlTest.py`, `test_psmodule.py`, `test_dotnet.py`):** Run directly against `target/release/linscp` (`crates/linscp-cli`).
-- **GUI Backend & Security Suites (`SecurityTest.py`, `BrowserUploadTest.py`, `LocalWorkspaceTest.py`, `LocalEditorTest.py`, `RemoteSearchTest.py`, `DesktopUriTest.py`, `ShellIntegrationTest.py`, `TerminalTest.py`):** Run against `linscp --serve-http` (`crates/linscp-http`).
-- **Frontend Suites (`ClientTest.js`, `LocalizationTest.js`):** Run in Node + `jsdom` against the built `ui/` bundle across both mock `TauriTransport` and `HttpTransport`.
+- **GUI Backend & Security Suites:** the Python suites in this list that drove an HTTP handler (`SecurityTest.py`, `BrowserUploadTest.py`, `LocalWorkspaceTest.py`, `LocalEditorTest.py`, `RemoteSearchTest.py`, `DesktopUriTest.py`, `TerminalTest.py`) went with the browser host and are no longer part of the tree.
+- **Frontend Suites (`ClientTest.js`, `LocalizationTest.js`):** Run in Node + `jsdom` against the built `ui/` bundle with a mock `TauriTransport`; it is the only transport there is.
 
 ---
 
@@ -251,7 +249,7 @@ Each phase is self-contained, keeps CI green, and has explicit acceptance criter
 ### Phase 0: Workspace, UI Build Pipeline & Guardrails
 - **Scope:**
   - Create root `Cargo.toml` workspace and empty crate skeletons (`linscp-types` .. `linscp-tauri`).
-  - Set up `ui/` TypeScript + Vite build modularizing `source/gui/web/index.html` and `theme.css` with `TransportClient` (`HttpTransport` + `TauriTransport` stub) while keeping the existing Python GUI tests passing.
+  - Set up `ui/` TypeScript + Vite build modularizing `source/gui/web/index.html` and `theme.css` with `TransportClient` (`TauriTransport`) while keeping the existing page tests passing.
   - Evolve `tools/check_platform_conversion.py` (preserving brand checks, enforcing `linscp-platform` crate boundaries) and add GitHub Actions CI jobs for `ubuntu-24.04`, `windows-latest`, and Android NDK `cargo check --target aarch64-linux-android`.
 - **Acceptance gate:** `cargo test --workspace` compiles cleanly on Linux, Windows, and Android target triples; `ClientTest.js` and `LocalizationTest.js` pass against the TypeScript `ui/` build; repo hygiene and brand checks pass.
 
@@ -276,10 +274,10 @@ Each phase is self-contained, keeps CI green, and has explicit acceptance criter
   - Implement `.filepart` resumable transfers, ASCII/automatic EOL conversion, file masks, speed throttling, transfer presets, one-way/two-way `SyncPlanner` with persistent state & conflict policies, `keepuptodate`, `edit` (`encoding_rs` + `-monitor`), `-xmllog=`, `-server`, and `-shell`.
 - **Acceptance gate:** `ScriptTest.py`, `LiveSftpTest.py`, `LiveTunnelTest.py`, `LiveScpTest.py`, `LiveDavTest.py`, `LiveS3Test.py`, `LiveCurlTest.py`, `test_psmodule.py`, and `test_dotnet.py` pass against `target/release/linscp` on Linux (and applicable server-free/loopback suites on `windows-latest`).
 
-### Phase 4: Unified Service, Browser HTTP Mode & Desktop Tauri v2 App (`linscp-service`, `linscp-http`, `linscp-tauri`)
+### Phase 4: Unified Service & Desktop Tauri v2 App (`linscp-service`, `linscp-tauri`)
 - **Scope:**
   - Implement `CommanderService` (connection-pooled tabs, priority transfer queue with pause/cancel/retry, local-to-local transfers, remote-to-remote copy, bounded UTF-8 search, custom commands, embedded `xterm.js` SSH channel bridge).
-  - Ship `linscp-http` (`axum`) for standalone browser mode and `linscp-tauri` for native Linux and Windows desktop windows, adding the Windows local drive/volume selector in `ui/`.
+  - Ship `linscp-tauri` for native Linux and Windows desktop windows, adding the Windows local drive/volume selector in `ui/`. The browser mode listed in this phase was later removed.
 - **Acceptance gate:** All 8 Python GUI suites (`SecurityTest.py`, `BrowserUploadTest.py`, `LocalWorkspaceTest.py`, `LocalEditorTest.py`, `RemoteSearchTest.py`, `DesktopUriTest.py`, `ShellIntegrationTest.py`, `TerminalTest.py`) and both JS suites pass; CI builds Linux `.deb`/`.AppImage` and Windows `.msi`/`.exe` artifacts.
 
 ### Phase 5: Android Native App & Touch UX

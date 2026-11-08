@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Shared dual-mode TypeScript frontend for LinSCP (Tauri v2 + standalone HTTP browser server)",
+  "description": "Shared TypeScript frontend for the LinSCP Tauri v2 application (desktop and Android)",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "node scripts/build.mjs",

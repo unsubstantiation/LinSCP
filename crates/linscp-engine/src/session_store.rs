@@ -1,5 +1,5 @@
 //! Full `sessions.ini` codec and persistent `SessionStore`, byte-compatible
-//! with `source/linux/SessionStore.cpp` and `source/gui/linscp_gui.py`.
+//! with `source/linux/SessionStore.cpp`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

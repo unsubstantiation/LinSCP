@@ -1,13 +1,13 @@
 /**
  * One description of what the shared frontend can do, whichever host embeds it.
  *
- * The same `ui/dist` bundle backs the Tauri desktop window, the standalone
- * browser server and the experimental Android app. Those hosts differ in what
- * the *backend* can reach (native IPC, Android Storage Access Framework, a
- * foreground service, server-side accounts), while the page has to look and
- * behave the same. Keeping the list here - instead of scattering `if
- * (window.__TAURI_INTERNALS__)` through the page - is what lets the parity test
- * assert that every app exposes the same feature surface.
+ * The same `ui/dist` bundle backs the Tauri desktop window and the experimental
+ * Android app. Those hosts differ in what the *backend* can reach (native IPC,
+ * Android Storage Access Framework, a foreground service, OS desktop
+ * launchers), while the page has to look and behave the same. Keeping the list
+ * here - instead of scattering `if (window.__TAURI_INTERNALS__)` through the
+ * page - is what lets the parity test assert that every app exposes the same
+ * feature surface.
  */
 
 import type { TransportMode } from '../transport/client.js';
@@ -19,11 +19,10 @@ export type HostPlatform =
   | 'macos'
   | 'android'
   | 'ios'
-  | 'browser'
   | 'unknown';
 
 export interface HostCapabilities {
-  /** `tauri` when the page talks to the native shell, `http` in a browser. */
+  /** Always `tauri`: the page only ever talks to the native shell. */
   transport: TransportMode;
   /** Operating system the *backend* runs on, as far as the page can tell. */
   platform: HostPlatform;
@@ -41,8 +40,6 @@ export interface HostCapabilities {
   fileDrop: boolean;
   /** The shell reports OS file drops as events instead of HTML5 drops. */
   nativeFileDrop: boolean;
-  /** The backend can require a sign-in before answering. */
-  accounts: boolean;
   /** Remote desktop viewers (RDP/VNC/SPICE/X2Go/X11) can be launched. */
   desktopLaunchers: boolean;
   /** An interactive terminal can be opened on a session. */
@@ -63,7 +60,7 @@ export interface HostGlobals {
 }
 
 /**
- * `tauri` when the page is embedded in the native shell, otherwise `http`.
+ * The transport the page uses, which is always the native shell's IPC.
  *
  * The probe itself lives in the transport layer: host capability detection
  * must not open a second, private path to the native bridge.
@@ -74,8 +71,6 @@ export function detectHostKind(host: unknown = globalThis): TransportMode {
 
 /**
  * Maps a `navigator.userAgent` / `navigator.platform` pair to a host platform.
- * A browser page served by the standalone HTTP server reports `browser`
- * because the page cannot see the server's operating system from there.
  */
 export function detectHostPlatform(host: unknown = globalThis): HostPlatform {
   const candidate = host as HostGlobals | null | undefined;
@@ -99,7 +94,7 @@ export function detectHostPlatform(host: unknown = globalThis): HostPlatform {
   if (text.includes('linux') || text.includes('x11')) {
     return 'linux';
   }
-  return 'browser';
+  return 'unknown';
 }
 
 export interface HostCapabilityOptions {
@@ -116,7 +111,6 @@ export interface HostCapabilityOptions {
   shareIntents?: boolean;
   foregroundTransfers?: boolean;
   nativeFileDrop?: boolean;
-  accounts?: boolean;
   desktopLaunchers?: boolean;
   terminal?: boolean;
   /** Backend can reach an SSH agent (the shell may know better). */
@@ -132,10 +126,9 @@ export interface HostCapabilityOptions {
  *
  * The Android native build registers its SAF, share-intent, and foreground
  * transfer plugin in `build_native_app`; only a native Android WebView may
- * advertise those integrations. A browser running on Android is still an HTTP
- * host and does not receive these capabilities. Native desktop launchers and
- * OS drop events are distinct from Android's intent-based viewer launch and
- * incoming share-sheet handling.
+ * advertise those integrations. Native desktop launchers and OS drop events
+ * are distinct from Android's intent-based viewer launch and incoming
+ * share-sheet handling.
  */
 export function hostCapabilities(options: HostCapabilityOptions = {}): HostCapabilities {
   const host = options.host ?? globalThis;
@@ -156,15 +149,13 @@ export function hostCapabilities(options: HostCapabilityOptions = {}): HostCapab
     shareIntents,
     foregroundTransfers,
     sshAgent: options.sshAgent ?? !android,
-    // Only a native non-Linux build is known to lack Kerberos; anything else
-    // fails open because the page cannot see the server OS, and the backend
+    // Only a native non-Linux build is known to lack Kerberos, and the backend
     // refuses explicit Kerberos settings where it cannot honor them. Key
     // exchange is unwired on every build, so it stays off unless overridden.
-    gssapi: options.gssapi ?? !(native && platform !== 'linux'),
+    gssapi: options.gssapi ?? platform === 'linux',
     gssapiKex: options.gssapiKex ?? false,
     fileDrop: true,
     nativeFileDrop: options.nativeFileDrop ?? (native && !android),
-    accounts: options.accounts ?? !native,
     desktopLaunchers: options.desktopLaunchers ?? (
       native && ['linux', 'windows', 'macos', 'android'].includes(platform)
     ),
@@ -228,9 +219,6 @@ export function hostDifferenceReason(
   }
   if (capability === 'desktopLaunchers' && !caps.desktopLaunchers) {
     return 'Remote desktop viewers require a supported native launcher integration.';
-  }
-  if (capability === 'accounts' && !caps.accounts) {
-    return 'The native application does not require a sign-in.';
   }
   if (capability === 'sshAgent' && !caps.sshAgent) {
     return 'SSH agent authentication is not available on this build; use a private key file instead.';

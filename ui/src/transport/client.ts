@@ -1,10 +1,9 @@
 import type { HostKeyChallenge, TransportEventMap } from '../types/api.js';
 
-export type TransportMode = 'tauri' | 'http';
+export type TransportMode = 'tauri';
 
 export class TransportError extends Error {
   public readonly status: number;
-  public readonly loginRequired: boolean;
   public readonly hostKeyChallenge?: HostKeyChallenge;
   public readonly payload?: Record<string, unknown>;
 
@@ -12,7 +11,6 @@ export class TransportError extends Error {
     message: string,
     status: number,
     options?: {
-      loginRequired?: boolean;
       hostKeyChallenge?: HostKeyChallenge;
       payload?: Record<string, unknown>;
     },
@@ -20,7 +18,6 @@ export class TransportError extends Error {
     super(message);
     this.name = 'TransportError';
     this.status = status;
-    this.loginRequired = Boolean(options?.loginRequired);
     this.hostKeyChallenge = options?.hostKeyChallenge;
     this.payload = options?.payload;
   }
@@ -28,7 +25,6 @@ export class TransportError extends Error {
 
 export interface TransportClient {
   readonly mode: TransportMode;
-  setCsrfToken(token: string): void;
   request<T = unknown>(method: string, path: string, body?: unknown): Promise<T>;
   get<T = unknown>(path: string): Promise<T>;
   post<T = unknown>(path: string, body?: unknown): Promise<T>;

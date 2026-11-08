@@ -8,7 +8,6 @@ members = [
     "crates/linscp-proto",
     "crates/linscp-engine",
     "crates/linscp-service",
-    "crates/linscp-http",
     "crates/linscp-tauri",
 ]
 
@@ -27,7 +26,6 @@ linscp-platform = { path = "crates/linscp-platform" }
 linscp-proto = { path = "crates/linscp-proto" }
 linscp-engine = { path = "crates/linscp-engine" }
 linscp-service = { path = "crates/linscp-service" }
-linscp-http = { path = "crates/linscp-http" }
 
 async-trait = "0.1"
 aes = "0.8"

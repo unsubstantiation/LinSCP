@@ -802,8 +802,6 @@ button.site-item { display: block; width: 100%; border: 0; background: transpare
 }
 
 /* ---- Sign-in ---------------------------------------------------------- */
-.login-modal .modal-box { width: 380px; }
-.login-error { margin-top: 8px; color: var(--danger); font-size: 11px; min-height: 14px; }
 
 /* ---- Transfer settings ------------------------------------------------ */
 .transfer-preset-row { display: flex; align-items: center; gap: 6px; }

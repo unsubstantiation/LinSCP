@@ -24,7 +24,7 @@
 //!   phone and the page opens an intent instead).
 //! * *Can this client show a file?* — a property of the **transport**, and only
 //!   the caller knows it. `launch_remote_desktop`'s `force_file_ticket` carries
-//!   the answer and must be set by a headless/browser host; the scripting engine
+//!   the answer and must be set by a host that has no desktop; the scripting engine
 //!   used to answer the host question itself (from `DISPLAY`) and pass the result
 //!   here, which is how a Windows desktop came to be called headless.
 

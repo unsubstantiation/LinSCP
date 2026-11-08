@@ -394,11 +394,11 @@ class InventoryTests(unittest.TestCase):
         self.assertGreater(flagged, 0)
         self.assertEqual(report.count("Not runnable on"), flagged)
         # The suites the audit found unrunnable are flagged on every platform.
+        # The Python GUI suites and `live-desktop` are absent: they drove the
+        # retired HTTP host and its `linscp_gui` shim, so they no longer exist
+        # to be runnable or not.
         for suite in ("unit", "script", "live-sftp", "live-scp", "live-s3",
-                      "live-dav", "live-curl", "live-tunnel", "live-desktop",
-                      "gui-security", "gui-local", "gui-search",
-                      "gui-browser-upload", "gui-local-editor", "gui-desktop-uri",
-                      "gui-shell"):
+                      "live-dav", "live-curl", "live-tunnel"):
             for platform, record in platforms.items():
                 self.assertIn(suite, record.get("not_runnable", {}),
                               suite + " reads as runnable on " + platform)

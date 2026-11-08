@@ -668,12 +668,12 @@ SFTP SOCKS5 and HTTP CONNECT proxies and curl proxy routing are verified live; w
 
 The local browser API rejects requests missing its per-run token.
 
-**Next:** No runnable suite evidences this: gui-browser-upload fails against the shipped service.
+**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests.
+- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 
 ## security.gssapi-and-tunnels
 
@@ -695,12 +695,12 @@ Authenticated SSH jump-host connections work for SFTP/SCP/SSH and for FTP/FTPS/W
 
 Optional account login isolates each signed-in user at the application layer: PBKDF2 password hashes, session expiry, per-login CSRF tokens and login throttling, plus per-user tabs, transfer queues, logs, terminals, sessions.ini/workspaces and a home_dir jail for every local filesystem and command-execution route. This is a LinSCP server-deployment extension, not a feature of the upstream desktop client. The process still runs as one OS user; mutually hostile callers should use separate OS accounts. Negative authorization tests cover every API route, not just login.
 
-**Next:** No runnable suite evidences this: gui-security fails against the shipped service.
+**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests.
+- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 
 ## gui.native-path-drop
 
@@ -722,12 +722,12 @@ An operating-system drop in a native window arrives as paths, not as a File: `dr
 
 GUI reads text and saves locally with a conflict check and atomic replace; symlinks are refused.
 
-**Next:** No runnable suite evidences this: gui-local-editor fails against the shipped service.
+**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests.
+- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 
 ## editing.filename-and-content-search
 
@@ -735,12 +735,12 @@ GUI reads text and saves locally with a conflict check and atomic replace; symli
 
 Filename search and bounded literal UTF-8 content search skip binary/oversized files and cap the scan.
 
-**Next:** No runnable suite evidences this: gui-search fails against the shipped service.
+**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests.
+- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 
 ## editing.monitor-local-changes
 
@@ -762,14 +762,14 @@ Filename search and bounded literal UTF-8 content search skip binary/oversized f
 
 The browser editor and search enforce UTF-8 text and reject binary files, while CLI 'edit -eol=lf|crlf' normalizes line endings before upload.
 
-**Next:** No runnable suite evidences this: live-sftp needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled; gui-local-editor fails against the shipped service.
+**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
 - [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-- [ ] Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests.
+- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 
 ## automation.command-interpreter
 
@@ -852,12 +852,12 @@ The CLI and its external automation interfaces were removed in the GUI-only conv
 
 The desktop entry and GUI parse sftp://, ftp://, ftps:// and ftpes:// startup URLs with escaped paths.
 
-**Next:** No runnable suite evidences this: gui-desktop-uri fails against the shipped service.
+**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests.
+- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 
 ## desktop.launcher-prefix
 
@@ -865,28 +865,28 @@ The desktop entry and GUI parse sftp://, ftp://, ftps:// and ftpes:// startup UR
 
 Installed, Makefile and CMake binaries select their own GUI launcher; the GUI finds the matching core under a relocatable prefix.
 
-**Next:** No runnable suite evidences this: script needs a `linscp` binary this repo does not build; gui-desktop-uri fails against the shipped service.
+**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests.
+- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 
 ## desktop.wayland-session
 
 **Area:** Desktop integration · **Status:** partial
 
-A desktop session is recognised as Wayland or as X11 before anything is asked of it, and only a program that can draw on it is started. The console client finds the compositor by its socket in XDG_RUNTIME_DIR - the default 'wayland-0' when WAYLAND_DISPLAY is not exported, so a session started by a launcher or a user service is still found - and refuses a Wayland-only terminal under X11, where it exits before mapping a window, while an X11-only one under Wayland is a reported XWayland fallback rather than a silent choice. The graphical client draws no window itself and asks the desktop's own URI launcher ($BROWSER, xdg-open, gio) for a browser, which needs no X11 and no window manager of the X11 kind; linscp.desktop starts it with that option and does not claim a startup notification it could never complete. Covered by unit, gui-desktop-uri and wayland-compatibility; no case runs against a live compositor, so the interaction with one is not certified here.
+A desktop session is recognised as Wayland or as X11 before anything is asked of it, and only a program that can draw on it is started. The console client finds the compositor by its socket in XDG_RUNTIME_DIR - the default 'wayland-0' when WAYLAND_DISPLAY is not exported, so a session started by a launcher or a user service is still found - and refuses a Wayland-only terminal under X11, where it exits before mapping a window, while an X11-only one under Wayland is a reported XWayland fallback rather than a silent choice. The graphical client draws no window itself and asks the desktop's own URI launcher ($BROWSER, xdg-open, gio) for a browser, which needs no X11 and no window manager of the X11 kind; linscp.desktop starts it with that option and does not claim a startup notification it could never complete. Covered by unit, the retired GUI harness and wayland-compatibility; no case runs against a live compositor, so the interaction with one is not certified here.
 
-**Next:** No runnable suite evidences this on Windows and Android: script needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled; gui-desktop-uri fails against the shipped service. Runnable residue: wayland-compatibility on Linux.
+**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
 - [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-- [ ] Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests.
+- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] wayland-compatibility cannot run on Windows or Android (it is a Linux display-server guard); record platform-scoped evidence for the Linux-only behavior, or cite additional runnable suites there.
 
 ## locale.translations
@@ -946,12 +946,12 @@ debian/rules and debian/control package the CLI, GUI, desktop entry, icons and m
 
 An arbitrary PREFIX/share/linscp/gui resolves PREFIX/bin/linscp before /usr/bin.
 
-**Next:** No runnable suite evidences this: gui-desktop-uri fails against the shipped service.
+**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests.
+- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 
 ## platform.posix-runtime-services
 
@@ -1116,12 +1116,12 @@ The XML action log (-xmllog=) now writes the upstream session format instead of 
 
 A local-to-local session is a tab whose protocol is 'local' and which names two absolute local directories (the upstream IsLocalBrowser/OtherLocalDirectory shape). CoreSession.start, connect and alive never spawn the core and never open a socket; the right pane lists its directory through the same API the remote pane uses. Copies and moves are planned and run in-process on the queue with byte progress and cancellation: recursive trees, merge into an existing directory, atomic per-file replacement through a temporary file, timestamps and modes preserved, symbolic links copied as links, and ask/skip/overwrite/rename decisions (the browser answers 'ask' once and retries). Source equal to or inside the destination is refused before queueing. The second pane also supports mkdir, rename, delete, chmod, properties, checksums, editor save and find. The server-only terminal, synchronization and remote transfer dialogs are not offered in this mode.
 
-**Next:** No runnable suite evidences this: gui-local fails against the shipped service.
+**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests.
+- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 
 ## gui.local-symlink
 
@@ -1142,12 +1142,12 @@ Symbolic links can be created in a local pane, not just over SFTP: the other pan
 
 Named workspaces are stored in workspaces.json beside sessions.ini (0600, fsynced and atomically replaced) and restore the tabs in order with the saved active tab and both pane paths. An entry is either a local tab with its two directories or a remote tab; a tab that came from a stored site records only the site name and is resolved from sessions.ini on every open, so the site's password encryption, pinned host key and tunnel policy stay authoritative. An ad-hoc tab is saved as a snapshot with password, tunnel password, tunnel passphrase and site name removed. Each tab opens independently: a deleted or renamed site, a missing local directory or a host-key challenge is reported in 'failed' without stopping the others, and a challenge is parked in the normal host-key table for the user to verify. A local site can be saved directly, since the console client has no local transport.
 
-**Next:** No runnable suite evidences this: gui-local fails against the shipped service.
+**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Repair the Python GUI suite against the shipped service, or port its cases to ClientTest.js / service tests.
+- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 
 ## gui.remote-delete
 
@@ -1179,9 +1179,9 @@ Full application backup as a distribution-compatible JSON bundle (version 1, LF 
 
 **Area:** Desktop integration · **Status:** partial
 
-RDP/VNC/SPICE are direct-TCP (3389/5900) with optional SSH jump SOCKS5h relay; X2Go/X11 are SSH-transported via direct-tcpip. Native viewers are resolved via PATH (xfreerdp3→xfreerdp→wlfreerdp/sdl-freerdp, mstsc, open, vncviewer, remote-viewer/spicy, x2goclient/pyhoca-cli, waypipe/ssh -X) with Windows/macOS/Android specifics, and dial the same proxy/tunnel/TLS/SPKI stack as file protocols. A ticket carries the viewer plan of the build it was made on (mstsc + .rdp body on Windows, `open rdp://` on macOS, FreeRDP argv on Linux), and only the ticket that matches the launcher is ever spawned; a host that cannot show a window (browser server, server-mode script) is handed the .rdp/.vv body or a BrowserGateway hint instead of a spawn, never a spawn it cannot display; XDMCP (UDP 177, unencrypted) is explicitly refused/recommended against. Wayland vs X11 detection drives waypipe vs ssh -X. Verified by unit ticket/argv tests; live viewer integration and ironrdp gateway tests are outstanding.
+RDP/VNC/SPICE are direct-TCP (3389/5900) with optional SSH jump SOCKS5h relay; X2Go/X11 are SSH-transported via direct-tcpip. Native viewers are resolved via PATH (xfreerdp3→xfreerdp→wlfreerdp/sdl-freerdp, mstsc, open, vncviewer, remote-viewer/spicy, x2goclient/pyhoca-cli, waypipe/ssh -X) with Windows/macOS/Android specifics, and dial the same proxy/tunnel/TLS/SPKI stack as file protocols. A ticket carries the viewer plan of the build it was made on (mstsc + .rdp body on Windows, `open rdp://` on macOS, FreeRDP argv on Linux), and only the ticket that matches the launcher is ever spawned; a host that cannot show a window is handed the .rdp/.vv body or a BrowserGateway hint instead of a spawn, never a spawn it cannot display; XDMCP (UDP 177, unencrypted) is explicitly refused/recommended against. Wayland vs X11 detection drives waypipe vs ssh -X. Verified by unit ticket/argv tests; live viewer integration and ironrdp gateway tests are outstanding.
 
-**Next:** Ironrdp WASM / Guacamole gateway HTML5 fallback credential isolation review remains; live viewer launches (xfreerdp/vncviewer/remote-viewer/x2goclient/waypipe, headless .rdp/.vv, jump tunnel inheritance, XDMCP refusal, SSH prompt + installer) are now gated via live-desktop.
+**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
 
 **Acceptance criteria:**
 

@@ -54,8 +54,11 @@ if (!rawHtml.includes(anchor)) {
   throw new Error('Expected api(url, options) entrypoint in source/gui/web/index.html');
 }
 
-const dualModeShim = `  window.LinSCPTransport = window.LinSCPCore
-    ? window.LinSCPCore.createTransport({ host: window, bearerToken: window.LSCP_TOKEN || '' })
+// The page's own `api()` is the native implementation; the bundle only has to
+// hand it the transport, the shared components and the shell mount. The shim
+// ends by re-emitting the anchor so the page's function body stays intact.
+const nativeShim = `  window.LinSCPTransport = window.LinSCPCore
+    ? window.LinSCPCore.createTransport({ host: window })
     : null;
 
   // The local root switcher is a real component with behaviour (SAF picker,
@@ -71,41 +74,18 @@ const dualModeShim = `  window.LinSCPTransport = window.LinSCPCore
   // The touch shell (bottom navigation, swipe, long-press selection and the
   // terminal extra-key row) is one component with real behaviour, so it lives
   // in the shared bundle as well. The page owns the elements and the actions;
-  // every host - the desktop window, the browser page and the Android app -
-  // mounts this same object, which is why the narrow layout behaves the same
-  // in all three.
+  // every host - the desktop window and the Android app - mounts this same
+  // object, which is why the narrow layout behaves the same in both.
   window.LinSCPCore.mountAppShell = function (options) {
     return new window.LinSCPCore.AppShell(options);
   };
 
   async function api(url, options) {
-    options = options || {};
-    if (window.LinSCPTransport && window.LinSCPTransport.mode === 'tauri') {
-      const method = (options.method || 'GET').toUpperCase();
-      let parsedBody = {};
-      if (typeof options.body === 'string' && options.body.length > 0) {
-        try { parsedBody = JSON.parse(options.body); } catch (_) { parsedBody = {}; }
-      }
-      try {
-        return await window.LinSCPTransport.request(method, url, parsedBody);
-      } catch (error) {
-        // API errors can carry actionable data such as a host-key challenge
-        // or overwrite conflicts. Do not discard it as a transport failure.
-        if (error && error.payload && typeof error.payload === 'object') {
-          return Object.assign({}, error.payload, { success: false });
-        }
-        if (error && (error.status === 401 || error.status === 403)) {
-          toast(errorMessage(error.message, t("The backend refused this request.")), true);
-          return { success: false, error: error.message || 'refused' };
-        }
-        toast(t("Cannot reach the LinSCP backend: {error}", {error: String(error)}), true);
-        return { success: false, error: String(error) };
-      }
-    }`;
+    options = options || {};`;
 
 const distHtml = rawHtml
   .replace('<script>', `<script>\n${iifeCode}\n</script>\n<script>`)
-  .replace(anchor, dualModeShim);
+  .replace(anchor, nativeShim);
 
 fs.writeFileSync(path.join(distDir, 'index.html'), distHtml, 'utf8');
 console.log('Built ui/dist (linscp-core.mjs, linscp-core.iife.js, index.html, theme.css, vendor/).');

@@ -15,7 +15,6 @@ async function page({ saved, server, browsers = ['en-US'], blocked = false } = {
   const dom = new JSDOM(html, {
     url: 'http://localhost:8080/', runScripts: 'dangerously', virtualConsole,
     beforeParse(window) {
-      window.LSCP_TOKEN = 'private-token';
       window.LSCP_LANGUAGE = server;
       Object.defineProperty(window.navigator, 'languages', {value: browsers});
       if (saved) window.localStorage.setItem('lscp-language', saved);
@@ -23,7 +22,20 @@ async function page({ saved, server, browsers = ['en-US'], blocked = false } = {
       window.setInterval = () => 1;
       window.prompt = question => { prompts.push(question); return 'new name {path} %n.txt'; };
       window.confirm = question => { prompts.push(question); return false; };
-      window.fetch = async (url, options = {}) => {
+      // One backend: the native shell's IPC. `fetch` must never be used.
+      window.fetch = async () => {
+        throw new Error('the page must not use fetch(): there is no HTTP host');
+      };
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (_cmd, args) => bridge(args.envelope),
+      };
+      const bridge = async (envelope = {}) => {
+        const url = envelope.path;
+        const method = String(envelope.method || 'GET').toUpperCase();
+        const options = { method };
+        if (envelope.body && Object.keys(envelope.body).length) {
+          options.body = JSON.stringify(envelope.body);
+        }
         calls.push({ url, options });
         let data = {success: true};
         if (url === '/api/vault/status') data = {success: true, vault: 'unlocked'};
@@ -41,7 +53,7 @@ async function page({ saved, server, browsers = ['en-US'], blocked = false } = {
         if (url === '/api/remote/save') data = {success: true, info: {mtime: 43}};
         if (url === '/api/sync/preview') data = {success: true, plan: {summary: {upload: 1}, items: [
           {action: 'upload', path: '/Remote/Delete', reason: 'the sizes differ'}]}};
-        return {status: 200, json: async () => data};
+        return {status: 200, payload: data};
       };
     }
   });
@@ -92,7 +104,7 @@ async function run() {
       await w.transfer('upload');
       const transfer = p.calls.find(call => call.url === '/api/transfer/upload');
       check('API selections unchanged', JSON.parse(transfer.options.body).names[0] === 'Delete');
-      check('API token preserved', transfer.options.headers['X-LSCP-Token'] === 'private-token');
+      check('API call went through the native bridge', transfer.options.method === 'POST');
       check(String(p.errors), p.errors.length === 0);
     } finally { await pause(); p.dom.window.close(); }
   }

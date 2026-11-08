@@ -8,13 +8,12 @@
  * tests, while the Android app and a narrow desktop window still showed the
  * two-pane desktop layout with no bottom navigation, no touch selection and no
  * Esc/Ctrl row above the soft keyboard. That is a parity bug, not a platform
- * difference, because the same `ui/dist` bundle is served to every host.
+ * difference, because the same `ui/dist` bundle is embedded in every host.
  *
  * `AppShell` therefore connects the controller to the DOM the page owns, in the
  * same way `LocalRootSwitcher` connects the root selector: the page supplies
  * the elements and the callbacks, the bundle supplies the behaviour. The
- * desktop window, a browser page served by `linscp-http` and the Android app
- * mount the identical object.
+ * desktop window and the Android app mount the identical object.
  *
  * Everything here is defensive about its host. A missing element, a WebView
  * without `matchMedia`, a page that never resizes: none of them may throw,

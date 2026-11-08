@@ -3,16 +3,16 @@
 
 During and after the Rust + Tauri v2 + TypeScript migration, LinSCP targets
 Linux, Windows, and Android from one shared codebase while preserving strict
-isolation of OS-specific code and dual-mode UI transport calls:
+isolation of OS-specific code and a single UI transport boundary:
 
   1. Upstream product-name allowlist across the entire repository.
   2. Obsolete historical artefacts stay absent.
   3. OS-specific Rust cfg gates and platform crates (windows-sys, jni, nix,
      libc, #[cfg(windows)], #[cfg(target_os = ...)], etc.) are allowed ONLY
      in crates/linscp-platform/ and crates/linscp-tauri/.
-  4. Direct network/IPC primitives (fetch(...) and __TAURI_INTERNALS__) in
-     ui/src/ are allowed ONLY inside ui/src/transport/, keeping every UI
-     component compatible with both Tauri native apps and browser HTTP mode.
+  4. Direct IPC primitives (__TAURI_INTERNALS__) in ui/src/ are allowed ONLY
+     inside ui/src/transport/, so every UI component reaches the backend
+     through the one native bridge.
 
 Usage:
     python3 tools/check_repo_hygiene.py

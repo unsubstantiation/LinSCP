@@ -7,7 +7,6 @@ import { JSDOM } from 'jsdom';
 
 import {
   EXTRA_KEYS,
-  HttpTransport,
   SHARED_FEATURES,
   ForegroundTransferBridge,
   hostCapabilities,
@@ -44,12 +43,11 @@ function loadUnifiedGuiBundles() {
   return bundles;
 }
 
-test('detectTransportMode and createTransport select Tauri vs HTTP automatically', async () => {
-  assert.equal(detectTransportMode({}), 'http');
-  assert.equal(
-    detectTransportMode({ __TAURI_INTERNALS__: { invoke: async () => ({}) } }),
-    'tauri',
-  );
+test('createTransport builds the native bridge and nothing else', async () => {
+  // There is one transport: the shell's in-process IPC. The page used to fall
+  // back to HTTP with a bearer token, which is what a second, browser host
+  // required; that host is gone.
+  assert.equal(detectTransportMode({}), 'tauri');
 
   const calls = [];
   const tauriClient = createTransport({
@@ -77,6 +75,10 @@ test('detectTransportMode and createTransport select Tauri vs HTTP automatically
     body: {},
   });
   assert.equal(status.local_roots[0].path, 'C:\\');
+
+  // Outside the shell there is no backend to reach, and the page says so
+  // rather than pretending a network request could answer.
+  assert.equal(createTransport({ host: {} }), null);
 });
 
 test('TauriTransport retains structured failures for connection and overwrite dialogs', async () => {
@@ -94,51 +96,7 @@ test('TauriTransport retains structured failures for connection and overwrite di
     assert.deepEqual(error.payload.conflicts, ['file.txt']);
     return true;
   });
-});
-
-test('HttpTransport attaches X-LSCP-Token and X-LSCP-CSRF and surfaces login_required', async () => {
-  const seen = [];
-  let authPrompted = 0;
-
-  const client = new HttpTransport({
-    baseUrl: 'http://127.0.0.1:8765',
-    bearerToken: 'tok-secret-123',
-    onAuthRequired: () => {
-      authPrompted += 1;
-    },
-    fetchImpl: async (url, init) => {
-      seen.push({ url, init });
-      if (String(url).endsWith('/api/protected')) {
-        return {
-          ok: false,
-          status: 401,
-          json: async () => ({ login_required: true, error: 'Session expired' }),
-        };
-      }
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ saved: true }),
-      };
-    },
-  });
-
-  client.setCsrfToken('csrf-abc');
-  const res = await client.post('/api/preferences', { resume: true });
-  assert.deepEqual(res, { saved: true });
-  assert.equal(seen[0].init.headers['X-LSCP-Token'], 'tok-secret-123');
-  assert.equal(seen[0].init.headers['X-LSCP-CSRF'], 'csrf-abc');
-
-  await assert.rejects(
-    () => client.get('/api/protected'),
-    (err) => {
-      assert.ok(err instanceof TransportError);
-      assert.equal(err.status, 401);
-      assert.equal(err.loginRequired, true);
-      return true;
-    },
-  );
-  assert.equal(authPrompted, 1);
+  assert.ok(new TransportError('refused', 403) instanceof Error);
 });
 
 test('I18nCatalog consumes unified locales/*.json with CLDR plurals and single-pass safety', () => {
@@ -245,42 +203,42 @@ test('MobileShellController handles touch pane switching and terminal extra-key 
   assert.equal(applyCtrlModifier('d'), '\x04');
 });
 
-test('Built ui/dist/index.html mounts the local root switcher in the browser app too', async () => {
+test('Built ui/dist/index.html mounts the local root switcher in the native app', async () => {
   const distHtml = fs.readFileSync(path.join(repoRoot, 'ui', 'dist', 'index.html'), 'utf8');
   const requested = [];
 
   const dom = new JSDOM(distHtml, {
-    url: 'http://127.0.0.1:8080/',
+    url: 'http://ipc.localhost/',
     runScripts: 'dangerously',
     pretendToBeVisual: true,
     beforeParse(window) {
-      window.fetch = async (url) => {
-        const target = String(url);
-        requested.push(target);
-        let payload = { success: true };
-        if (target.includes('/api/vault/status')) {
-          payload = { success: true, vault: 'unlocked' };
-        } else if (target.includes('/api/status')) {
-          payload = { connected: false, active_tab: null, tabs: [], local_dir: '/home/alice' };
-        } else if (target.includes('/api/local/roots')) {
-          payload = {
-            success: true,
-            roots: [
-              { path: '/', label: '/', kind: 'posix', read_only: false },
-              { path: '/home/alice', label: 'Home', kind: 'posix', read_only: false },
-            ],
-          };
-        } else if (target.includes('/api/local/list')) {
-          payload = { success: true, path: '/home/alice', entries: [] };
-        } else if (target.includes('/api/accounts')) {
-          payload = { enabled: false };
-        }
-        return {
-          ok: true,
-          status: 200,
-          json: async () => payload,
-          text: async () => JSON.stringify(payload),
-        };
+      // The page has one backend: the native bridge. A network request would
+      // mean a browser host came back.
+      window.fetch = async () => {
+        throw new Error('fetch() must never be called: the page has no HTTP host');
+      };
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd, args) => {
+          const target = args.envelope.path;
+          requested.push(target);
+          let payload = { success: true };
+          if (target.includes('/api/vault/status')) {
+            payload = { success: true, vault: 'unlocked' };
+          } else if (target.includes('/api/status')) {
+            payload = { connected: false, active_tab: null, tabs: [], local_dir: '/home/alice' };
+          } else if (target.includes('/api/local/roots')) {
+            payload = {
+              success: true,
+              roots: [
+                { path: '/', label: '/', kind: 'posix', read_only: false },
+                { path: '/home/alice', label: 'Home', kind: 'posix', read_only: false },
+              ],
+            };
+          } else if (target.includes('/api/local/list')) {
+            payload = { success: true, path: '/home/alice', entries: [] };
+          }
+          return { status: 200, payload };
+        },
       };
     },
   });
@@ -302,7 +260,6 @@ test('all native targets expose the shared feature contract and report only inst
   const debian = hostCapabilities({ transport: 'tauri', platform: 'linux' });
   const windows = hostCapabilities({ transport: 'tauri', platform: 'windows' });
   const android = hostCapabilities({ transport: 'tauri', platform: 'android' });
-  const browser = hostCapabilities({ transport: 'http', platform: 'browser' });
 
   // The shared service/frontend contract is identical across Debian, Windows,
   // and Android. Host integrations are checked separately and never inferred
@@ -310,24 +267,25 @@ test('all native targets expose the shared feature contract and report only inst
   assert.deepEqual(sharedFeatureSet(), [...SHARED_FEATURES]);
   assert.equal(sharedFeatureSet().length, 15);
 
-  for (const caps of [debian, windows, android, browser]) {
+  for (const caps of [debian, windows, android]) {
     for (const feature of ['localRoots', 'fileDrop', 'terminal']) {
       assert.equal(caps[feature], true, `${feature} must exist on ${caps.platform}`);
     }
+    // The one transport is the shell's IPC, on every app.
+    assert.equal(caps.transport, 'tauri');
+    assert.equal(caps.nativeIpc, true);
   }
 
   assert.equal(debian.desktopLaunchers, true);
   assert.equal(windows.desktopLaunchers, true);
   assert.equal(android.desktopLaunchers, true);
-  assert.equal(browser.desktopLaunchers, false);
   assert.equal(debian.nativeFileDrop, true);
   assert.equal(windows.nativeFileDrop, true);
   assert.equal(android.nativeFileDrop, false);
-  assert.equal(browser.nativeFileDrop, false);
-  assert.equal(browser.nativeIpc, false);
+  assert.equal(android.nativeFileDrop, false);
 
-  // The native Android shell registers these implementations. OS detection
-  // alone is insufficient: an Android browser remains an HTTP host below.
+  // The native Android shell registers these implementations; OS detection
+  // alone does not grant them.
   for (const bridge of ['safTrees', 'shareIntents', 'foregroundTransfers', 'desktopLaunchers']) {
     assert.equal(android[bridge], true, `${bridge} is registered by the Android host`);
   }
@@ -340,21 +298,18 @@ test('all native targets expose the shared feature contract and report only inst
   // Android backend, which has none, and the gap always has a stated reason.
   assert.equal(debian.sshAgent, true);
   assert.equal(windows.sshAgent, true);
-  assert.equal(browser.sshAgent, true);
   assert.equal(android.sshAgent, false);
   assert.equal(hostDifferenceReason('sshAgent', debian), null);
   assert.match(hostDifferenceReason('sshAgent', android) ?? '', /private key file/);
 
-  // Kerberos is a Linux-backend ability: native non-Linux builds lack it, a
-  // browser fails open because the page cannot see the server OS, and key
-  // exchange is unwired everywhere so it is off on all four hosts.
+  // Kerberos is a Linux-backend ability: the other native builds lack it, and
+  // key exchange is unwired everywhere so it is off on all three apps.
   assert.equal(debian.gssapi, true);
   assert.equal(windows.gssapi, false);
   assert.equal(android.gssapi, false);
-  assert.equal(browser.gssapi, true);
   assert.equal(hostDifferenceReason('gssapi', debian), null);
   assert.match(hostDifferenceReason('gssapi', windows) ?? '', /only available on Linux/);
-  for (const caps of [debian, windows, android, browser]) {
+  for (const caps of [debian, windows, android]) {
     assert.equal(caps.gssapiKex, false, `key exchange is unwired on ${caps.platform}`);
   }
   assert.match(hostDifferenceReason('gssapiKex', debian) ?? '', /not supported/);
@@ -362,17 +317,18 @@ test('all native targets expose the shared feature contract and report only inst
   // A missing control always has a stated reason; silent capability gaps are
   // the parity bug this inventory exists to catch.
   assert.equal(hostDifferenceReason('desktopLaunchers', android), null);
-  assert.match(hostDifferenceReason('desktopLaunchers', browser) ?? '', /launcher integration/);
-  assert.match(hostDifferenceReason('accounts', debian) ?? '', /sign-in/);
   assert.equal(hostDifferenceReason('terminal', android), null);
 
   // The description is derived from the window the page runs in, so the page
   // can ask it instead of probing the native bridge at each call site.
-  const fakeBrowser = { navigator: { userAgent: 'Mozilla/5.0 (X11; Linux x86_64)' } };
+  const fakeDesktop = { navigator: { userAgent: 'Mozilla/5.0 (X11; Linux x86_64)' } };
   assert.deepEqual(
-    [hostCapabilities({ host: fakeBrowser }).transport, hostCapabilities({ host: fakeBrowser }).platform],
-    ['http', 'linux'],
+    [hostCapabilities({ host: fakeDesktop }).transport, hostCapabilities({ host: fakeDesktop }).platform],
+    ['tauri', 'linux'],
   );
+  // A window that cannot name its operating system claims no OS-specific
+  // integration rather than guessing one.
+  assert.equal(hostCapabilities({ host: {} }).platform, 'unknown');
   const fakeAndroid = {
     navigator: { userAgent: 'Mozilla/5.0 (Linux; Android 14)' },
     __TAURI_INTERNALS__: { invoke: async () => ({}) },
@@ -385,8 +341,8 @@ test('all native targets expose the shared feature contract and report only inst
   assert.equal(detected.shareIntents, true);
   assert.equal(detected.foregroundTransfers, true);
   assert.equal(detected.desktopLaunchers, true);
-  assert.equal(hostCapabilities({ host: fakeBrowser }).shareIntents, false);
-  assert.equal(hostCapabilities({ host: fakeBrowser }).foregroundTransfers, false);
+  assert.equal(hostCapabilities({ host: fakeDesktop }).shareIntents, false);
+  assert.equal(hostCapabilities({ host: fakeDesktop }).foregroundTransfers, false);
 });
 
 test('Android desktop viewer URIs allow direct RDP/VNC/SPICE targets and reject unsupported or unsafe targets', () => {
@@ -427,8 +383,7 @@ test('Android external URI dispatch allows supported viewers and rejects unsafe 
 });
 
 test('the SAF picker degrades to null where no shell can open one', async () => {
-  // No `__TAURI_INTERNALS__`: the browser build must not throw or claim a
-  // folder. This is what lets the same bundle serve the HTTP app.
+  // No `__TAURI_INTERNALS__`: the bundle must not throw or claim a folder.
   assert.equal(await requestSafTree({ invoker: null }), null);
 
   const invoked = [];

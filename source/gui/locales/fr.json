@@ -801,6 +801,7 @@
   "These files could not be queued: {reasons}": "Ces fichiers n’ont pas pu être mis en file d’attente : {reasons}",
   "These files were selected in your file manager. Upload them to this tab's remote directory?": "Ces fichiers ont été sélectionnés dans votre gestionnaire de fichiers. Les envoyer dans le répertoire distant de cet onglet ?",
   "This browser did not expose the dropped files or folder contents.": "Ce navigateur n’a pas donné accès aux fichiers déposés ni au contenu des dossiers.",
+  "This page only runs inside the LinSCP application.": "Cette page ne s’exécute que dans l’application LinSCP.",
   "This plan deletes files. In \"both\" mode only files that the record of the previous synchronization proves were removed on the other side are deleted, and nothing is deleted while a conflict is unresolved.": "Ce plan supprime des fichiers. En mode « Les deux », seuls sont supprimés les fichiers dont l’enregistrement de la synchronisation précédente prouve qu’ils ont été supprimés de l’autre côté, et rien n’est supprimé tant qu’un conflit n’est pas résolu.",
   "This remote desktop type is not available on Android.": "Ce type de bureau à distance n’est pas disponible sur Android.",
   "This run's API token:": "Jeton d’API de cette exécution :",

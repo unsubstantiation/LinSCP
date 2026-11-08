@@ -1874,12 +1874,10 @@ class ScriptTests(unittest.TestCase):
             self.assertTrue((destdir / "usr/bin/linscp-gui").is_file())
             self.assertTrue(
                 (destdir / "usr/share/applications/linscp.desktop").is_file())
-            # The browser host is installed as a program and a launcher of its
-            # own: a package that ships only the native window is one release
-            # behind the page it contains.
-            self.assertTrue((destdir / "usr/bin/linscp-web").is_file())
-            self.assertTrue(
-                (destdir / "usr/share/applications/linscp-web.desktop").is_file())
+            # One app: there is no browser host binary and no second launcher.
+            self.assertFalse((destdir / "usr/bin/linscp-web").exists())
+            self.assertFalse(
+                (destdir / "usr/share/applications/linscp-web.desktop").exists())
 
             # Verify CMakeLists.txt and Debian packaging metadata remain aligned.
             cmake_text = (repo_root / "CMakeLists.txt").read_text(encoding="utf-8")

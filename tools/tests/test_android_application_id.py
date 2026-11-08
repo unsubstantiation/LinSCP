@@ -156,7 +156,7 @@ class AndroidApplicationIdTests(unittest.TestCase):
     def test_a_launcher_does_not_claim_the_old_identifier(self):
         # The desktop entries name executables, not the bundle identifier, so a
         # rename must not have left a launcher pointing at the old name.
-        for name in ['debian/linscp.desktop', 'debian/linscp-web.desktop']:
+        for name in ['debian/linscp.desktop']:
             desktop = (ROOT / name).read_text(encoding='utf-8')
             self.assertNotIn('io.', desktop, name)
         self.assertIn('Exec=linscp-gui',

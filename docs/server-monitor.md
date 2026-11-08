@@ -1,7 +1,7 @@
 # Multi-server monitor
 
 LinSCP's **Monitor** toolbar button and Commands menu open the same shared
-TypeScript display in the native Tauri window and the browser server. Both
+TypeScript display in the native Tauri window and the Android app. Both
 hosts call the same Rust service routes:
 
 - `GET /api/monitor/hosts` lists connected SSH/SFTP/SCP tabs and saved SSH
