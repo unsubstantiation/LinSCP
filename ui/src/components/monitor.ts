@@ -1,6 +1,7 @@
 import type { TransportClient } from '../transport/client.js';
 import type {
-  MonitorGpu, MonitorHostsResponse, MonitorSample, MonitorSampleResponse,
+  MonitorBuiltinMetric, MonitorCustomMetric, MonitorCustomReading, MonitorGpu, MonitorHostConfig, MonitorHostsResponse,
+  MonitorSample, MonitorSampleResponse, MonitorSettingsDocument, MonitorSettingsResponse,
   MonitorSiteCandidate, MonitorSnapshot, MonitorTabCandidate,
 } from '../types/api.js';
 
@@ -14,6 +15,10 @@ export interface ServerMonitorOptions {
   openTerminal: (tab: number) => void | Promise<void>;
   onClose: () => void;
   onError?: (message: string) => void;
+  /** Outage/recovery notices. The backend logs them even when this is silent. */
+  onNotice?: (message: string, tone: 'warn' | 'success') => void;
+  /** Host-provided audible alert; the component applies the configured cooldown. */
+  playAlert?: () => void;
 }
 
 /** The reference dashboard's non-linear thermal scale, not a temperature guess. */
@@ -35,11 +40,53 @@ export function memoryPercent(used: number | null, total: number | null): number
     ? Math.min(100, used / total * 100) : null;
 }
 
+/** Network rates are shown in bits/s, the unit link speeds are rated in. */
+export function formatBitsPerSec(bytesPerSec: number | null): string {
+  if (bytesPerSec === null || !Number.isFinite(bytesPerSec) || bytesPerSec < 0) return 'N/A';
+  const bits = bytesPerSec * 8;
+  if (bits >= 1e9) return `${(bits / 1e9).toFixed(2)} Gbps`;
+  if (bits >= 1e6) return `${(bits / 1e6).toFixed(2)} Mbps`;
+  if (bits >= 1e3) return `${(bits / 1e3).toFixed(1)} Kbps`;
+  return `${Math.round(bits)} bps`;
+}
+
+export function formatDuration(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
+
+const HISTORY_POINTS = 60;
+const BUILTIN_METRICS: MonitorBuiltinMetric[] = ['cpu', 'mem', 'swap', 'disk', 'load', 'net', 'gpu'];
+const METRIC_LABELS: Record<MonitorBuiltinMetric, string> = {
+  cpu: 'CPU', mem: 'RAM', swap: 'Swap', disk: 'Disk', load: 'Load 1m', net: 'Network', gpu: 'GPU',
+};
+
+function defaultHostConfig(): MonitorHostConfig {
+  return { enabled_metrics: [...BUILTIN_METRICS], custom_metrics: [], paused: false };
+}
+
+function defaultDocument(): MonitorSettingsDocument {
+  return {
+    version: 1,
+    settings: {
+      interval_secs: 5, connect_timeout_secs: 10, poll_timeout_secs: 10,
+      outage_threshold: 3, notify_on_outage: true, beep_on_outage: false, beep_cooldown_secs: 10,
+    },
+    hosts: {},
+  };
+}
+
+function finite(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
 interface HostState {
   sample: MonitorSample | null;
   snapshot: MonitorSnapshot | null;
   receivedAt: number;
-  history: number[];
+  history: Record<string, number[]>;
 }
 
 /**
@@ -55,6 +102,7 @@ export class ServerMonitor {
   private readonly t: MonitorTranslate;
   private readonly selected = new Set<number>();
   private readonly hosts = new Map<number, HostState>();
+  private readonly keys = new Map<number, string>();
   private sites: MonitorSiteCandidate[] = [];
   private tabs: MonitorTabCandidate[] = [];
   private maxHosts = 32;
@@ -72,14 +120,23 @@ export class ServerMonitor {
   private pollRequested = false;
   private generation = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private document: MonitorSettingsDocument = defaultDocument();
+  private settingsOpen = false;
+  private configKey: string | null = null;
+  private configDraft: MonitorHostConfig | null = null;
+  private configApproved = false;
+  private customCounter = 0;
+  private lastBeepAt = 0;
   private statusElement!: HTMLElement;
   private content!: HTMLElement;
+  private settingsPanel!: HTMLElement;
   private pauseButton!: HTMLButtonElement;
   private viewButton!: HTMLButtonElement;
   private compactButton!: HTMLButtonElement;
   private previousButton!: HTMLButtonElement;
   private nextButton!: HTMLButtonElement;
   private shellButton!: HTMLButtonElement;
+  private settingsButton!: HTMLButtonElement;
 
   public constructor(options: ServerMonitorOptions) {
     this.options = options;
@@ -102,7 +159,7 @@ export class ServerMonitor {
     if (!this.selected.size) this.picking = true;
     this.render();
     this.root.focus();
-    await this.loadHosts();
+    await Promise.all([this.loadHosts(), this.loadSettings()]);
     if (this.opened && !this.paused && !this.picking) this.requestPoll();
   }
 
@@ -162,7 +219,7 @@ export class ServerMonitor {
     this.pollRequested = false;
     this.inFlight = true;
     const generation = this.generation;
-    const ids = this.selectedHosts;
+    const ids = this.activeHosts();
     this.renderStatus();
     try {
       if (!ids.length) return;
@@ -172,11 +229,16 @@ export class ServerMonitor {
       if (!reply.success || !Array.isArray(reply.samples)) throw new Error(this.t('The monitoring request failed.'));
       for (const sample of reply.samples) {
         if (!this.selected.has(sample.tab)) continue;
+        if (sample.key) this.keys.set(sample.tab, sample.key);
         const previous = this.hosts.get(sample.tab);
         const snapshot = sample.status === 'ok' && sample.snapshot ? sample.snapshot : null;
-        const history = snapshot?.cpu.percent == null ? [] : [...(previous?.history ?? []), snapshot.cpu.percent].slice(-40);
-        this.hosts.set(sample.tab, { sample, snapshot: snapshot ?? previous?.snapshot ?? null,
-          receivedAt: Date.now(), history });
+        const history = { ...(previous?.history ?? {}) };
+        if (snapshot) this.recordHistory(history, snapshot);
+        this.hosts.set(sample.tab, {
+          sample, snapshot: snapshot ?? previous?.snapshot ?? null,
+          receivedAt: snapshot ? Date.now() : previous?.receivedAt ?? 0, history,
+        });
+        this.notifyOutage(sample);
       }
       this.renderContent();
     } catch (error) {
@@ -186,7 +248,7 @@ export class ServerMonitor {
       }
     } finally {
       this.inFlight = false;
-      if (this.opened && !this.paused && !this.picking) {
+      if (this.opened && !this.paused && !this.picking && this.activeHosts().length) {
         this.stopTimer();
         const immediate = this.pollRequested || generation !== this.generation;
         this.pollRequested = false;
@@ -217,6 +279,21 @@ export class ServerMonitor {
 
   private requestPoll(): void { this.pollRequested = true; void this.refresh(); }
   private stopTimer(): void { if (this.timer !== null) clearTimeout(this.timer); this.timer = null; }
+  private activeHosts(): number[] { return this.selectedHosts.filter(id => !this.isHostPaused(id)); }
+
+  private hostKey(id: number): string {
+    return this.hosts.get(id)?.sample?.key || this.keys.get(id)
+      || this.tabs.find(tab => tab.tab === id)?.key || `tab:${id}`;
+  }
+
+  private hostConfig(key: string): MonitorHostConfig {
+    return this.document.hosts[key] ?? defaultHostConfig();
+  }
+
+  private isHostPaused(id: number): boolean { return this.hostConfig(this.hostKey(id)).paused; }
+  private enabled(id: number, metric: MonitorBuiltinMetric): boolean {
+    return this.hostConfig(this.hostKey(id)).enabled_metrics.includes(metric);
+  }
 
   private element<K extends keyof HTMLElementTagNameMap>(tag: K, className = '', text?: string): HTMLElementTagNameMap[K] {
     const node = this.doc.createElement(tag);
@@ -245,36 +322,103 @@ export class ServerMonitor {
     this.shellButton = this.button('SSH shell', () => void this.openShell());
     this.shellButton.title = this.t('Open a shell on the current server; return here when it closes (s)');
     this.pauseButton = this.button('Pause', () => this.paused ? this.resume() : this.pause());
+    this.settingsButton = this.button('Monitor settings', () => { this.settingsOpen = !this.settingsOpen; this.renderSettingsPanel(); });
     controls.append(this.viewButton, this.previousButton, this.nextButton, this.compactButton,
-      this.shellButton, this.pauseButton, this.button('Refresh now', () => this.requestPoll()));
-    const settings = this.element('div', 'monitor-settings');
-    settings.append(this.numericSetting('Refresh every', 5, 0.1, 60, 0.1, value => {
-      this.interval = value; this.stopTimer(); if (!this.paused && !this.picking) this.requestPoll();
-    }), this.numericSetting('Sample timeout', 10, 0.1, 30, 0.1, value => { this.timeout = value; }),
-      this.numericSetting('Connection timeout', 10, 1, 60, 1, value => { this.connectTimeout = value; }));
-    settings.append(this.element('span', 'hint', this.t('Seconds')));
+      this.shellButton, this.pauseButton, this.settingsButton, this.button('Refresh now', () => this.requestPoll()));
+    this.settingsPanel = this.element('div', 'monitor-settings-panel');
+    this.settingsPanel.hidden = true;
     this.statusElement = this.element('div', 'monitor-status');
     this.statusElement.setAttribute('role', 'status');
     this.statusElement.setAttribute('aria-live', 'polite');
     this.content = this.element('div', 'monitor-content');
-    this.root.append(controls, settings, this.statusElement, this.content);
+    this.root.append(controls, this.settingsPanel, this.statusElement, this.content);
   }
 
-  private numericSetting(label: string, initial: number, min: number, max: number, step: number, change: (value: number) => void): HTMLElement {
+  private numericInput(label: string, value: number, min: number, max: number, step: number): { wrapper: HTMLElement; input: HTMLInputElement } {
     const wrapper = this.element('label', 'monitor-number');
     const input = this.element('input', 'input-field');
-    input.type = 'number'; input.min = String(min); input.max = String(max); input.step = String(step); input.value = String(initial);
-    input.addEventListener('change', () => {
-      const value = input.valueAsNumber;
-      if (!Number.isFinite(value) || value < min || value > max) {
-        input.value = String(initial); change(initial);
-        this.options.onError?.(this.t('Enter a value from {min} to {max}.', { min, max }));
-        return;
-      }
-      change(value);
-    });
+    input.type = 'number'; input.min = String(min); input.max = String(max); input.step = String(step); input.value = String(value);
     wrapper.append(this.element('span', '', this.t(label)), input);
-    return wrapper;
+    return { wrapper, input };
+  }
+
+  private checkbox(label: string, checked: boolean): { wrapper: HTMLElement; input: HTMLInputElement } {
+    const wrapper = this.element('label', 'monitor-check');
+    const input = this.element('input'); input.type = 'checkbox'; input.checked = checked;
+    wrapper.append(input, this.element('span', '', this.t(label)));
+    return { wrapper, input };
+  }
+
+  private async loadSettings(): Promise<void> {
+    try {
+      const reply = await this.options.transport.get<MonitorSettingsResponse>('/api/monitor/settings');
+      if (!reply?.success || !reply.document) return;
+      this.document = { ...defaultDocument(), ...reply.document,
+        settings: { ...defaultDocument().settings, ...reply.document.settings },
+        hosts: reply.document.hosts ?? {} };
+      this.interval = this.document.settings.interval_secs;
+      this.timeout = this.document.settings.poll_timeout_secs;
+      this.connectTimeout = this.document.settings.connect_timeout_secs;
+      if (this.settingsOpen) this.renderSettingsPanel();
+      if (this.opened && !this.picking) this.renderContent();
+      if (this.opened) this.renderStatus();
+    } catch (error) {
+      this.options.onError?.(String((error as Error)?.message ?? error));
+    }
+  }
+
+  private async saveDocument(next: MonitorSettingsDocument): Promise<boolean> {
+    try {
+      const reply = await this.options.transport.post<MonitorSettingsResponse>('/api/monitor/settings', next);
+      if (!reply?.success || !reply.document) throw new Error(this.t('The monitoring request failed.'));
+      this.document = reply.document;
+      this.interval = this.document.settings.interval_secs;
+      this.timeout = this.document.settings.poll_timeout_secs;
+      this.connectTimeout = this.document.settings.connect_timeout_secs;
+      return true;
+    } catch (error) {
+      this.options.onError?.(String((error as Error)?.message ?? error));
+      return false;
+    }
+  }
+
+  private renderSettingsPanel(): void {
+    this.settingsPanel.hidden = !this.settingsOpen;
+    this.settingsButton.setAttribute('aria-pressed', String(this.settingsOpen));
+    this.settingsPanel.replaceChildren();
+    if (!this.settingsOpen) return;
+    const settings = this.document.settings;
+    const interval = this.numericInput('Refresh every', settings.interval_secs, 0.1, 60, 0.1);
+    const poll = this.numericInput('Sample timeout', settings.poll_timeout_secs, 0.1, 30, 0.1);
+    const connect = this.numericInput('Connection timeout', settings.connect_timeout_secs, 1, 60, 1);
+    const threshold = this.numericInput('Outage threshold', settings.outage_threshold, 1, 100, 1);
+    const cooldown = this.numericInput('Beep cooldown', settings.beep_cooldown_secs, 0, 600, 1);
+    const notify = this.checkbox('Notify on outage and recovery', settings.notify_on_outage);
+    const beep = this.checkbox('Beep on outage', settings.beep_on_outage);
+    const grid = this.element('div', 'monitor-settings-grid');
+    grid.append(interval.wrapper, poll.wrapper, connect.wrapper, threshold.wrapper, cooldown.wrapper);
+    const actions = this.element('div', 'monitor-picker-actions');
+    const save = this.button('Save monitor settings', () => {
+      const read = (input: HTMLInputElement, fallback: number): number => Number.isFinite(input.valueAsNumber) ? input.valueAsNumber : fallback;
+      void this.saveDocument({ ...this.document, settings: {
+        interval_secs: read(interval.input, settings.interval_secs),
+        poll_timeout_secs: read(poll.input, settings.poll_timeout_secs),
+        connect_timeout_secs: read(connect.input, settings.connect_timeout_secs),
+        outage_threshold: Math.round(read(threshold.input, settings.outage_threshold)),
+        notify_on_outage: notify.input.checked,
+        beep_on_outage: beep.input.checked,
+        beep_cooldown_secs: Math.round(read(cooldown.input, settings.beep_cooldown_secs)),
+      } }).then(ok => {
+        if (!ok) return;
+        this.settingsOpen = false; this.renderSettingsPanel(); this.renderStatus();
+        this.stopTimer(); if (!this.paused && !this.picking) this.requestPoll();
+      });
+    }, 'btn btn-primary');
+    const test = this.button('Test beep', () => this.options.playAlert?.());
+    actions.append(test, save);
+    this.settingsPanel.append(this.element('h3', '', this.t('Monitor settings')), grid,
+      notify.wrapper, beep.wrapper,
+      this.element('p', 'hint', this.t('Seconds; outage threshold is consecutive failed polls. Settings are saved on this device.')), actions);
   }
 
   private async loadHosts(): Promise<void> {
@@ -287,7 +431,7 @@ export class ServerMonitor {
       this.sites = Array.isArray(reply.sites) ? reply.sites : [];
       this.maxHosts = Math.max(1, Math.min(32, reply.max_hosts || 32));
       const live = new Set(this.tabs.map(tab => tab.tab));
-      for (const id of this.selected) if (!live.has(id)) { this.selected.delete(id); this.hosts.delete(id); }
+      for (const id of this.selected) if (!live.has(id)) { this.selected.delete(id); this.hosts.delete(id); this.keys.delete(id); }
       if (this.picking) this.renderPicker(); else this.renderContent();
       this.renderStatus();
     } catch (error) {
@@ -307,10 +451,12 @@ export class ServerMonitor {
     this.shellButton.disabled = !this.selected.size || this.picking;
     const samples = [...this.hosts.values()].filter(state => this.selected.has(state.sample?.tab ?? -1));
     const failed = samples.filter(state => state.sample?.status !== 'ok').length;
+    const outages = samples.filter(state => state.sample?.outage).length;
     this.statusElement.textContent = this.picking ? this.t('Choose up to {count} Linux servers.', { count: this.maxHosts })
       : this.paused ? this.t('Monitoring paused. SSH sessions stay connected.')
+      : !this.activeHosts().length && this.selected.size ? this.t('All selected servers are paused.')
       : this.inFlight ? this.t('Sampling selected servers…')
-      : this.t('{count} servers selected · {failed} need attention', { count: this.selected.size, failed });
+      : this.t('{count} servers selected · {failed} need attention · {outages} offline', { count: this.selected.size, failed, outages });
   }
 
   private renderPicker(): void {
@@ -318,7 +464,7 @@ export class ServerMonitor {
     const intro = this.element('p', 'hint', this.t('Select open sessions or saved SSH sites. New connections use the normal host-key verification. Removing a server here does not close its session.'));
     const list = this.element('div', 'monitor-picker-list');
     const pendingSites = new Set<string>();
-    let pendingTabs = new Set(this.selected);
+    const pendingTabs = new Set(this.selected);
     const count = () => pendingTabs.size + pendingSites.size;
     const updateCount = () => { apply.disabled = !count() || count() > this.maxHosts || this.connecting; };
     for (const tab of this.tabs) {
@@ -381,16 +527,14 @@ export class ServerMonitor {
 
   private renderContent(): void {
     this.content.replaceChildren();
+    if (this.configKey && this.configDraft) this.content.append(this.renderConfigPanel());
     if (!this.selected.size) {
       this.content.append(this.element('p', 'monitor-empty', this.t('Choose servers to start monitoring.')));
       return;
     }
     const ids = this.overview ? this.selectedHosts : [this.current];
     const grid = this.element('div', this.overview ? 'monitor-grid' : 'monitor-detail');
-    for (const id of ids) {
-      const state = this.hosts.get(id);
-      grid.append(this.renderCard(id, state));
-    }
+    for (const id of ids) grid.append(this.renderCard(id, this.hosts.get(id)));
     this.content.append(grid);
     this.renderStatus();
   }
@@ -398,22 +542,30 @@ export class ServerMonitor {
   private renderCard(id: number, state?: HostState): HTMLElement {
     const sample = state?.sample;
     const snapshot = state?.snapshot;
+    const paused = this.isHostPaused(id);
     const stale = !sample || sample.status !== 'ok';
-    const card = this.element('article', `monitor-card${stale ? ' monitor-stale' : ''}`);
+    const outage = Boolean(sample?.outage) && !paused;
+    const card = this.element('article', `monitor-card${stale ? ' monitor-stale' : ''}${outage ? ' monitor-outage' : ''}${paused ? ' monitor-paused' : ''}`);
     const header = this.element('header', 'monitor-card-header');
     const identity = this.element('div', 'monitor-identity');
     const title = this.element('h3', '', sample?.name || this.tabs.find(tab => tab.tab === id)?.name || `#${id}`);
     identity.append(title, this.element('p', 'hint', snapshot?.primary_ip || sample?.host || ''));
     if (snapshot?.hostname) identity.append(this.element('small', 'hint', snapshot.hostname));
-    const badge = this.element('span', `monitor-badge ${stale ? 'monitor-badge-warn' : 'monitor-badge-ok'}`,
-      this.t(!sample ? 'Waiting for sample' : stale ? 'Stale / unavailable' : 'Live'));
+    const badge = this.element('span', `monitor-badge ${outage ? 'monitor-badge-warn' : stale ? 'monitor-badge-warn' : 'monitor-badge-ok'}`,
+      this.t(paused ? 'Paused' : outage ? 'Offline' : !sample ? 'Waiting for sample' : stale ? 'Stale / unavailable' : 'Live'));
+    const actions = this.element('div', 'monitor-card-actions');
+    const pause = this.button(paused ? 'Resume' : 'Pause', () => void this.toggleHostPaused(id), 'btn tiny');
+    pause.setAttribute('aria-label', this.t(paused ? 'Resume monitoring this server' : 'Pause monitoring this server'));
+    const configure = this.button('Configure', () => this.openConfig(id), 'btn tiny');
     const remove = this.button('Remove', () => {
       this.selected.delete(id); this.hosts.delete(id);
       if (this.current === id) this.current = this.selectedHosts[0] ?? 0;
+      if (this.configKey === this.hostKey(id)) { this.configKey = null; this.configDraft = null; }
       this.render();
     }, 'btn tiny');
     remove.setAttribute('aria-label', this.t('Stop monitoring this server'));
-    header.append(identity, badge, remove);
+    actions.append(pause, configure, remove);
+    header.append(identity, badge, actions);
     if (this.overview) {
       title.tabIndex = 0; title.setAttribute('role', 'button');
       const detail = () => { this.current = id; this.overview = false; this.render(); };
@@ -421,33 +573,63 @@ export class ServerMonitor {
       title.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); detail(); } });
     }
     card.append(header);
-    if (sample?.error) card.append(this.element('p', 'monitor-error', sample.error));
+    if (outage && sample?.outage_since_ms) {
+      card.append(this.element('p', 'monitor-outage-strip', this.t('Offline for {duration}: {error}', {
+        duration: formatDuration(Date.now() - sample.outage_since_ms), error: sample.error || this.t('No error reported'),
+      })));
+    } else if (sample?.error) card.append(this.element('p', 'monitor-error', sample.error));
+    if (paused) card.append(this.element('p', 'hint', this.t('Monitoring paused for this server.')));
     if (!snapshot) {
       card.append(this.element('p', 'hint', this.t(sample?.status === 'disconnected'
         ? 'Reconnect this server in its session tab, then refresh the monitor.'
         : 'CPU usage needs two samples. Waiting for telemetry…')));
       return card;
     }
-    if (stale && state) card.append(this.element('p', 'monitor-stale-time', this.t('Last successful sample: {time}', { time: new Date(state.receivedAt).toLocaleTimeString() })));
-    card.append(this.metric('CPU', snapshot.cpu.percent, snapshot.cpu.model || this.t('{count} logical CPUs', { count: snapshot.cpu.logical_count })));
-    if (!this.overview && state?.history.length) card.append(this.sparkline(state.history));
-    card.append(this.metric('RAM', snapshot.memory?.percent ?? null, snapshot.memory
-      ? `${formatBytes(snapshot.memory.used_bytes)} / ${formatBytes(snapshot.memory.total_bytes)}` : this.t('Unavailable')));
-    const diskPercent = snapshot.disks.length ? Math.max(...snapshot.disks.map(disk => disk.percent)) : null;
-    card.append(this.metric('Disk', diskPercent, snapshot.disks.length ? this.t('Fullest of {count} mounts', { count: snapshot.disks.length }) : this.t('Unavailable')));
+    if (stale && state?.receivedAt) card.append(this.element('p', 'monitor-stale-time', this.t('Last successful sample: {time}', { time: new Date(state.receivedAt).toLocaleTimeString() })));
+    const history = state?.history ?? {};
+    if (this.enabled(id, 'cpu')) {
+      card.append(this.metric('CPU', snapshot.cpu.percent, snapshot.cpu.model || this.t('{count} logical CPUs', { count: snapshot.cpu.logical_count }), undefined, history.cpu));
+    }
+    if (this.enabled(id, 'mem')) {
+      card.append(this.metric('RAM', snapshot.memory?.percent ?? null, snapshot.memory
+        ? `${formatBytes(snapshot.memory.used_bytes)} / ${formatBytes(snapshot.memory.total_bytes)}` : this.t('Unavailable'), undefined, history.mem));
+    }
+    if (this.enabled(id, 'swap')) {
+      card.append(this.metric('Swap', snapshot.swap?.percent ?? null, snapshot.swap
+        ? `${formatBytes(snapshot.swap.used_bytes)} / ${formatBytes(snapshot.swap.total_bytes)}` : this.t('Unavailable'), undefined, history.swap));
+    }
+    if (this.enabled(id, 'disk')) {
+      const diskPercent = snapshot.disks.length ? Math.max(...snapshot.disks.map(disk => disk.percent)) : null;
+      card.append(this.metric('Disk', diskPercent, snapshot.disks.length ? this.t('Fullest of {count} mounts', { count: snapshot.disks.length }) : this.t('Unavailable'), undefined, history.disk));
+    }
+    if (this.enabled(id, 'load')) {
+      const load = snapshot.load_average[0] ?? null;
+      card.append(this.scalarMetric('Load 1m', load === null ? this.t('N/A') : load.toFixed(2), history.load,
+        snapshot.load_average.map(n => n.toFixed(2)).join(', ') || this.t('Unavailable')));
+    }
+    if (this.enabled(id, 'net')) {
+      const network = snapshot.network;
+      card.append(this.scalarMetric('Net in', formatBitsPerSec(network?.rx_bytes_per_sec ?? null), history.net_in,
+        network ? this.t('Total received: {bytes}', { bytes: formatBytes(network.rx_bytes_total) }) : this.t('Unavailable')));
+      card.append(this.scalarMetric('Net out', formatBitsPerSec(network?.tx_bytes_per_sec ?? null), history.net_out,
+        network ? this.t('Total sent: {bytes}', { bytes: formatBytes(network.tx_bytes_total) }) : this.t('Unavailable')));
+    }
     const gpus = snapshot.gpus;
-    const usages = gpus.map(gpu => gpu.percent).filter((n): n is number => n !== null);
-    const gpuPercent = usages.length ? usages.reduce((sum, n) => sum + n, 0) / usages.length : null;
-    card.append(this.metric('GPU', gpuPercent, gpus.length ? this.t('{count} GPUs · mean reported usage', { count: gpus.length }) : this.t('No GPU telemetry')));
-    const power = gpus.map(gpu => gpu.power_watts).filter((n): n is number => n !== null);
-    if (power.length) card.append(this.element('p', 'monitor-power', this.t('GPU power: {watts} W reported', { watts: power.reduce((sum, n) => sum + n, 0).toFixed(1) })));
-    if (!this.overview) this.renderDetail(card, snapshot);
+    if (this.enabled(id, 'gpu')) {
+      const usages = gpus.map(gpu => gpu.percent).filter((n): n is number => n !== null);
+      const gpuPercent = usages.length ? usages.reduce((sum, n) => sum + n, 0) / usages.length : null;
+      card.append(this.metric('GPU', gpuPercent, gpus.length ? this.t('{count} GPUs · mean reported usage', { count: gpus.length }) : this.t('No GPU telemetry'), undefined, history.gpu));
+      const power = gpus.map(gpu => gpu.power_watts).filter((n): n is number => n !== null);
+      if (power.length) card.append(this.element('p', 'monitor-power', this.t('GPU power: {watts} W reported', { watts: power.reduce((sum, n) => sum + n, 0).toFixed(1) })));
+    }
+    for (const reading of snapshot.custom ?? []) card.append(this.customReading(reading, history));
+    if (!this.overview) this.renderDetail(card, snapshot, id);
     else if (snapshot.warnings.length) card.append(this.element('p', 'hint monitor-warning', snapshot.warnings.map(warning => this.t(warning)).join(' ')));
     if (sample) card.append(this.element('footer', 'monitor-card-footer hint', `${sample.latency_ms} ms · ${new Date(sample.sampled_at).toLocaleTimeString()}`));
     return card;
   }
 
-  private metric(label: string, value: number | null, description: string, fill = value): HTMLElement {
+  private metric(label: string, value: number | null, description: string, fill = value, history?: number[]): HTMLElement {
     const wrapper = this.element('div', 'monitor-metric');
     const heading = this.element('div', 'monitor-metric-label');
     heading.append(this.element('strong', '', this.t(label)), this.element('span', '', value === null ? this.t('N/A') : `${value.toFixed(1)}%`));
@@ -459,55 +641,94 @@ export class ServerMonitor {
     const bar = this.element('span', fill !== null && fill >= 90 ? 'monitor-meter-fill monitor-meter-hot' : 'monitor-meter-fill');
     bar.style.width = `${fill === null ? 0 : Math.max(0, Math.min(100, fill))}%`;
     track.append(bar);
-    wrapper.append(heading, track, this.element('small', 'hint', description));
+    wrapper.append(heading, track);
+    if (history && history.length > 1) wrapper.append(this.sparkline(history, label, 0, 100));
+    wrapper.append(this.element('small', 'hint', description));
     return wrapper;
   }
 
-  private sparkline(history: number[]): SVGSVGElement {
+  private scalarMetric(label: string, valueText: string, history: number[] | undefined, description: string): HTMLElement {
+    const wrapper = this.element('div', 'monitor-metric monitor-scalar');
+    const heading = this.element('div', 'monitor-metric-label');
+    heading.append(this.element('strong', '', this.t(label)), this.element('span', '', valueText));
+    wrapper.append(heading);
+    if (history && history.length > 1) wrapper.append(this.sparkline(history, label));
+    wrapper.append(this.element('small', 'hint', description));
+    return wrapper;
+  }
+
+  private customReading(reading: MonitorCustomReading, history: Record<string, number[]>): HTMLElement {
+    const wrapper = this.element('div', `monitor-metric monitor-custom${reading.error ? ' monitor-custom-error' : ''}`);
+    const heading = this.element('div', 'monitor-metric-label');
+    const value = reading.parse === 'text' ? reading.text || this.t('N/A')
+      : reading.value === null ? this.t('N/A') : `${formatCustomNumber(reading.value)}${reading.unit ? ` ${reading.unit}` : ''}`;
+    heading.append(this.element('strong', '', reading.name), this.element('span', reading.display === 'big_number' ? 'monitor-big-number' : '', value));
+    wrapper.append(heading);
+    if (reading.error) wrapper.append(this.element('small', 'monitor-error', reading.error));
+    const series = history[`custom:${reading.id}`];
+    if (reading.display === 'sparkline' && series && series.length > 1) wrapper.append(this.sparkline(series, reading.name));
+    return wrapper;
+  }
+
+  private sparkline(history: number[], label: string, min?: number, max?: number): SVGSVGElement {
+    const values = history.filter(finite);
     const svg = this.doc.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.setAttribute('viewBox', '0 0 400 48'); svg.setAttribute('class', 'monitor-sparkline');
-    svg.setAttribute('role', 'img'); svg.setAttribute('aria-label', this.t('Recent CPU usage'));
-    const points = history.map((value, index) => `${index / Math.max(1, history.length - 1) * 400},${47 - value / 100 * 46}`).join(' ');
+    svg.setAttribute('role', 'img'); svg.setAttribute('aria-label', `${this.t('Recent trend')}: ${this.t(label)}`);
+    const low = min ?? Math.min(...values);
+    const high = max ?? Math.max(...values);
+    const span = high > low ? high - low : 1;
+    const points = values.map((value, index) => {
+      const x = values.length === 1 ? 200 : index / (values.length - 1) * 400;
+      const y = 47 - Math.max(0, Math.min(1, (value - low) / span)) * 46;
+      return `${x},${y}`;
+    }).join(' ');
     const line = this.doc.createElementNS('http://www.w3.org/2000/svg', 'polyline');
     line.setAttribute('points', points); line.setAttribute('fill', 'none'); line.setAttribute('stroke', 'currentColor'); line.setAttribute('stroke-width', '2');
     svg.append(line); return svg;
   }
 
-  private renderDetail(card: HTMLElement, snapshot: MonitorSnapshot): void {
+  private renderDetail(card: HTMLElement, snapshot: MonitorSnapshot, id: number): void {
     if (snapshot.uptime_seconds !== null) card.append(this.element('p', 'hint', this.t('Uptime: {seconds} s · Load: {load}', {
       seconds: Math.floor(snapshot.uptime_seconds), load: snapshot.load_average.map(n => n.toFixed(2)).join(', ') || this.t('N/A'),
     })));
-    const cores = this.element('section', 'monitor-section');
-    cores.append(this.element('h4', '', this.t('CPU cores')));
-    const coreGrid = this.element('div', 'monitor-core-grid');
-    for (const core of snapshot.cpu.cores) {
-      const node = this.element('div', 'monitor-core');
-      const label = `${core.socket === null ? '' : `S${core.socket} / `}C${core.core}`;
-      node.title = core.threads.map(thread => `CPU ${thread.id}: ${thread.percent === null ? this.t('N/A') : `${thread.percent.toFixed(1)}%`}`).join('\n');
-      node.append(this.element('small', '', label));
-      for (const thread of core.threads) {
-        const track = this.element('div', 'monitor-core-thread');
-        const fill = this.element('span'); fill.style.height = `${thread.percent ?? 0}%`; track.append(fill); node.append(track);
+    if (this.enabled(id, 'cpu')) {
+      const cores = this.element('section', 'monitor-section');
+      cores.append(this.element('h4', '', this.t('CPU cores')));
+      const coreGrid = this.element('div', 'monitor-core-grid');
+      for (const core of snapshot.cpu.cores) {
+        const node = this.element('div', 'monitor-core');
+        const label = `${core.socket === null ? '' : `S${core.socket} / `}C${core.core}`;
+        node.title = core.threads.map(thread => `CPU ${thread.id}: ${thread.percent === null ? this.t('N/A') : `${thread.percent.toFixed(1)}%`}`).join('\n');
+        node.append(this.element('small', '', label));
+        for (const thread of core.threads) {
+          const track = this.element('div', 'monitor-core-thread');
+          const fill = this.element('span'); fill.style.height = `${thread.percent ?? 0}%`; track.append(fill); node.append(track);
+        }
+        coreGrid.append(node);
       }
-      coreGrid.append(node);
+      if (!snapshot.cpu.cores.length) coreGrid.append(this.element('p', 'hint', this.t('Per-core telemetry is unavailable.')));
+      cores.append(coreGrid); card.append(cores);
     }
-    if (!snapshot.cpu.cores.length) coreGrid.append(this.element('p', 'hint', this.t('Per-core telemetry is unavailable.')));
-    cores.append(coreGrid); card.append(cores);
-    const disks = this.element('section', 'monitor-section');
-    disks.append(this.element('h4', '', this.t('Mounted filesystems')));
-    for (const disk of snapshot.disks) disks.append(this.metric(disk.mount, disk.percent,
-      `${disk.device} · ${formatBytes(disk.used_bytes)} / ${formatBytes(disk.total_bytes)} · ${formatBytes(disk.available_bytes)} ${this.t('available')}`));
-    if (!snapshot.disks.length) disks.append(this.element('p', 'hint', this.t('Disk telemetry is unavailable.')));
-    card.append(disks);
-    const gpuSection = this.element('section', 'monitor-section');
-    gpuSection.append(this.element('h4', '', this.t('GPU usage')));
-    if (snapshot.cuda_version) gpuSection.append(this.element('p', 'hint', `CUDA ${snapshot.cuda_version}`));
-    const gpuGrid = this.element('div', this.compact ? 'monitor-gpu-grid monitor-gpu-compact' : 'monitor-gpu-grid');
-    for (const gpu of snapshot.gpus) gpuGrid.append(this.renderGpu(gpu));
-    if (!snapshot.gpus.length) gpuSection.append(this.element('p', 'hint', this.t('No GPU telemetry: install/vendor-enable nvidia-smi, amd-smi or rocm-smi, or this server has no supported GPU.')));
-    gpuSection.append(gpuGrid);
-    for (const warning of snapshot.warnings) gpuSection.append(this.element('p', 'hint monitor-warning', this.t(warning)));
-    card.append(gpuSection);
+    if (this.enabled(id, 'disk')) {
+      const disks = this.element('section', 'monitor-section');
+      disks.append(this.element('h4', '', this.t('Mounted filesystems')));
+      for (const disk of snapshot.disks) disks.append(this.metric(disk.mount, disk.percent,
+        `${disk.device} · ${formatBytes(disk.used_bytes)} / ${formatBytes(disk.total_bytes)} · ${formatBytes(disk.available_bytes)} ${this.t('available')}`));
+      if (!snapshot.disks.length) disks.append(this.element('p', 'hint', this.t('Disk telemetry is unavailable.')));
+      card.append(disks);
+    }
+    if (this.enabled(id, 'gpu')) {
+      const gpuSection = this.element('section', 'monitor-section');
+      gpuSection.append(this.element('h4', '', this.t('GPU usage')));
+      if (snapshot.cuda_version) gpuSection.append(this.element('p', 'hint', `CUDA ${snapshot.cuda_version}`));
+      const gpuGrid = this.element('div', this.compact ? 'monitor-gpu-grid monitor-gpu-compact' : 'monitor-gpu-grid');
+      for (const gpu of snapshot.gpus) gpuGrid.append(this.renderGpu(gpu));
+      if (!snapshot.gpus.length) gpuSection.append(this.element('p', 'hint', this.t('No GPU telemetry: install/vendor-enable nvidia-smi, amd-smi or rocm-smi, or this server has no supported GPU.')));
+      gpuSection.append(gpuGrid);
+      for (const warning of snapshot.warnings) gpuSection.append(this.element('p', 'hint monitor-warning', this.t(warning)));
+      card.append(gpuSection);
+    }
   }
 
   private renderGpu(gpu: MonitorGpu): HTMLElement {
@@ -539,6 +760,148 @@ export class ServerMonitor {
     return card;
   }
 
+  private openConfig(id: number): void {
+    this.configKey = this.hostKey(id);
+    this.configDraft = structuredClone(this.hostConfig(this.configKey));
+    this.configApproved = false;
+    this.renderContent();
+  }
+
+  private renderConfigPanel(): HTMLElement {
+    const panel = this.element('section', 'monitor-config-panel');
+    const draft = this.configDraft!;
+    panel.append(this.element('h3', '', this.t('Server metrics')), this.element('p', 'hint', this.configKey ?? ''));
+    const metrics = this.element('div', 'monitor-config-metrics');
+    for (const metric of BUILTIN_METRICS) {
+      const check = this.checkbox(METRIC_LABELS[metric], draft.enabled_metrics.includes(metric));
+      check.input.addEventListener('change', () => {
+        draft.enabled_metrics = check.input.checked
+          ? [...draft.enabled_metrics, metric]
+          : draft.enabled_metrics.filter(item => item !== metric);
+      });
+      metrics.append(check.wrapper);
+    }
+    panel.append(metrics);
+    panel.append(this.element('h4', '', this.t('Custom metrics')));
+    panel.append(this.element('p', 'hint', this.t('Custom commands run on the remote server every poll. Add only commands you trust; output is capped and parsed as a number, regex capture, or text.')));
+    const list = this.element('div', 'monitor-custom-list');
+    draft.custom_metrics.forEach((metric, index) => list.append(this.renderCustomEditor(metric, index)));
+    if (!draft.custom_metrics.length) list.append(this.element('p', 'hint', this.t('No custom metrics.')));
+    panel.append(list);
+    const add = this.button('Add custom metric', () => {
+      if (draft.custom_metrics.length >= 8) { this.options.onError?.(this.t('At most {count} custom metrics are allowed per server.', { count: 8 })); return; }
+      draft.custom_metrics.push({ id: `m-${Date.now().toString(36)}-${this.customCounter++}`, name: '', command: '', parse: 'number', display: 'sparkline', unit: '' });
+      this.renderContent();
+    });
+    const approval = this.checkbox('I approve running these custom commands on this server every poll.', this.configApproved);
+    approval.input.addEventListener('change', () => { this.configApproved = approval.input.checked; });
+    const actions = this.element('div', 'monitor-picker-actions');
+    const cancel = this.button('Cancel', () => { this.configKey = null; this.configDraft = null; this.renderContent(); });
+    const save = this.button('Apply server metrics', () => void this.saveConfig(), 'btn btn-primary');
+    actions.append(add, cancel, save);
+    panel.append(approval.wrapper, actions);
+    return panel;
+  }
+
+  private renderCustomEditor(metric: MonitorCustomMetric, index: number): HTMLElement {
+    const row = this.element('div', 'monitor-custom-editor');
+    const name = this.element('input', 'input-field'); name.type = 'text'; name.value = metric.name; name.placeholder = this.t('Name');
+    name.setAttribute('aria-label', this.t('Custom metric name'));
+    name.addEventListener('input', () => { metric.name = name.value; });
+    const command = this.element('textarea', 'input-field'); command.value = metric.command; command.rows = 2;
+    command.placeholder = this.t('Remote command'); command.setAttribute('aria-label', this.t('Custom metric command'));
+    command.addEventListener('input', () => { metric.command = command.value; });
+    const parse = this.element('select', 'input-field'); parse.setAttribute('aria-label', this.t('Parse output'));
+    for (const [value, label] of [['number', 'Number'], ['regex', 'Regex capture'], ['text', 'Raw text']] as const) {
+      const option = this.element('option', '', this.t(label)); option.value = value; parse.append(option);
+    }
+    parse.value = metric.parse;
+    const display = this.element('select', 'input-field'); display.setAttribute('aria-label', this.t('Display'));
+    for (const [value, label] of [['sparkline', 'Sparkline'], ['big_number', 'Big number'], ['text', 'Text']] as const) {
+      const option = this.element('option', '', this.t(label)); option.value = value; display.append(option);
+    }
+    display.value = metric.display;
+    const unit = this.element('input', 'input-field'); unit.type = 'text'; unit.value = metric.unit; unit.placeholder = this.t('Unit');
+    unit.setAttribute('aria-label', this.t('Custom metric unit'));
+    unit.addEventListener('input', () => { metric.unit = unit.value; });
+    const regex = this.element('input', 'input-field'); regex.type = 'text'; regex.value = metric.regex ?? '';
+    regex.placeholder = this.t('Regex with one capture group'); regex.setAttribute('aria-label', this.t('Custom metric regex'));
+    regex.hidden = metric.parse !== 'regex';
+    regex.addEventListener('input', () => { metric.regex = regex.value; });
+    parse.addEventListener('change', () => {
+      metric.parse = parse.value as MonitorCustomMetric['parse'];
+      regex.hidden = metric.parse !== 'regex';
+      if (metric.parse === 'text') { metric.display = 'text'; display.value = 'text'; }
+      display.disabled = metric.parse === 'text';
+    });
+    display.disabled = metric.parse === 'text';
+    display.addEventListener('change', () => { metric.display = display.value as MonitorCustomMetric['display']; });
+    const remove = this.button('Remove', () => { this.configDraft?.custom_metrics.splice(index, 1); this.renderContent(); }, 'btn tiny');
+    row.append(name, command, parse, display, unit, regex, remove);
+    return row;
+  }
+
+  private async saveConfig(): Promise<void> {
+    if (!this.configKey || !this.configDraft) return;
+    const draft = this.configDraft;
+    if (draft.custom_metrics.length && !this.configApproved) {
+      this.options.onError?.(this.t('Approve the custom commands before applying them.'));
+      return;
+    }
+    for (const metric of draft.custom_metrics) {
+      if (!metric.name.trim() || !metric.command.trim()) { this.options.onError?.(this.t('A custom metric name and command are required.')); return; }
+      if (metric.parse === 'regex' && !(metric.regex ?? '').trim()) { this.options.onError?.(this.t('A regex custom metric needs a pattern.')); return; }
+    }
+    const next = { ...this.document, hosts: { ...this.document.hosts, [this.configKey]: draft } };
+    if (await this.saveDocument(next)) {
+      this.configKey = null; this.configDraft = null; this.configApproved = false;
+      this.render(); this.requestPoll();
+    }
+  }
+
+  private async toggleHostPaused(id: number): Promise<void> {
+    const key = this.hostKey(id);
+    const config = this.hostConfig(key);
+    const next = { ...this.document, hosts: { ...this.document.hosts, [key]: { ...config, paused: !config.paused } } };
+    if (await this.saveDocument(next)) {
+      this.render();
+      if (!config.paused) this.stopTimer(); else this.requestPoll();
+    }
+  }
+
+  private recordHistory(history: Record<string, number[]>, snapshot: MonitorSnapshot): void {
+    const push = (key: string, value: number | null | undefined): void => {
+      if (!finite(value)) return;
+      history[key] = [...(history[key] ?? []), value].slice(-HISTORY_POINTS);
+    };
+    push('cpu', snapshot.cpu.percent);
+    push('mem', snapshot.memory?.percent);
+    push('swap', snapshot.swap?.percent);
+    push('disk', snapshot.disks.length ? Math.max(...snapshot.disks.map(disk => disk.percent)) : null);
+    push('load', snapshot.load_average[0]);
+    push('net_in', snapshot.network?.rx_bytes_per_sec);
+    push('net_out', snapshot.network?.tx_bytes_per_sec);
+    const usages = snapshot.gpus.map(gpu => gpu.percent).filter((n): n is number => n !== null);
+    push('gpu', usages.length ? usages.reduce((sum, n) => sum + n, 0) / usages.length : null);
+    for (const reading of snapshot.custom ?? []) push(`custom:${reading.id}`, reading.value);
+  }
+
+  private notifyOutage(sample: MonitorSample): void {
+    const settings = this.document.settings;
+    if (sample.outage_started) {
+      if (settings.notify_on_outage) this.options.onNotice?.(this.t('{name} is offline: {error}', { name: sample.name, error: sample.error || this.t('No error reported') }), 'warn');
+      const cooldown = Math.max(0, settings.beep_cooldown_secs) * 1000;
+      const now = Date.now();
+      if (settings.beep_on_outage && (cooldown === 0 || now - this.lastBeepAt >= cooldown)) {
+        this.lastBeepAt = now;
+        this.options.playAlert?.();
+      }
+    }
+    if (sample.recovered && settings.notify_on_outage) {
+      this.options.onNotice?.(this.t('{name} recovered.', { name: sample.name }), 'success');
+    }
+  }
+
   private async openShell(): Promise<void> {
     if (!this.selected.size || this.picking) return;
     if (!this.selected.has(this.current)) this.current = this.selectedHosts[0]!;
@@ -547,6 +910,11 @@ export class ServerMonitor {
     try { await this.options.openTerminal(id); }
     catch (error) { this.options.onError?.(String((error as Error)?.message ?? error)); this.resume(); }
   }
+}
+
+function formatCustomNumber(value: number): string {
+  const abs = Math.abs(value);
+  return abs >= 100 ? value.toFixed(0) : abs >= 1 ? value.toFixed(2) : value.toFixed(3);
 }
 
 function formatBytes(bytes: number): string {

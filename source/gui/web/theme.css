@@ -1171,6 +1171,28 @@ body {
 .monitor-gpu-compact .monitor-metric { margin: 7px 0; }
 .monitor-gpu-compact .monitor-gpu-stat { font-size: 10px; margin: 5px 0; }
 .monitor-warning { font-size: 10px; }
+.monitor-card-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
+.monitor-card-actions .btn.tiny { padding: 3px 6px; font-size: 10px; }
+.monitor-outage { border-color: var(--danger); box-shadow: 0 0 0 1px color-mix(in srgb, var(--danger) 25%, transparent) inset; }
+.monitor-outage-strip { padding: 6px 8px; border: 1px solid var(--danger); border-radius: 5px; background: var(--danger-soft); color: var(--danger); font-size: 11px; overflow-wrap: anywhere; }
+.monitor-paused { opacity: .78; }
+.monitor-settings-panel { padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--surface-raised); }
+.monitor-settings-panel h3 { margin: 0 0 10px; font-size: 13px; }
+.monitor-settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; margin-bottom: 8px; }
+.monitor-check { display: flex; align-items: center; gap: 8px; margin: 6px 0; color: var(--muted); font-size: 11px; cursor: pointer; }
+.monitor-config-panel { margin: 12px 0; padding: 14px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface-raised); }
+.monitor-config-panel h3 { margin: 0 0 6px; font-size: 14px; }
+.monitor-config-panel h4 { margin: 14px 0 8px; font-size: 12px; }
+.monitor-config-metrics { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.monitor-custom-list { display: grid; gap: 8px; margin: 8px 0; }
+.monitor-custom-editor { display: grid; grid-template-columns: minmax(110px, 1fr) minmax(180px, 2fr) repeat(2, minmax(90px, .8fr)) minmax(60px, .5fr) auto; gap: 6px; align-items: start; padding: 8px; border: 1px solid var(--border); border-radius: 6px; }
+.monitor-custom-editor textarea { grid-column: 1 / -1; min-height: 48px; font-family: monospace; }
+.monitor-custom-editor input[hidden] { display: none; }
+.monitor-custom-editor .input-field { min-width: 0; }
+.monitor-scalar .monitor-sparkline, .monitor-metric .monitor-sparkline { height: 32px; margin: 4px 0; }
+.monitor-big-number { font-size: 15px; font-weight: 700; }
+.monitor-custom { padding: 8px; border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent); border-radius: 6px; background: color-mix(in srgb, var(--warning) 6%, transparent); }
+.monitor-custom-error { border-color: var(--danger); }
 @media (max-width: 600px) {
   .monitor-overlay { padding: 5px; }
   .monitor-box { width: 100%; max-height: 98vh; height: 98vh; }
@@ -1180,6 +1202,9 @@ body {
   .monitor-grid { grid-template-columns: minmax(0, 1fr); }
   .monitor-card { padding: 11px; }
   .monitor-number { flex-wrap: wrap; }
+  .monitor-custom-editor { grid-template-columns: 1fr 1fr; }
+  .monitor-custom-editor textarea { grid-column: 1 / -1; }
+  .monitor-card-actions { justify-content: flex-start; }
   .monitor-help { font-size: 9px; }
 }
 @media (prefers-reduced-motion: reduce) { .monitor-meter-fill { transition: none; } }

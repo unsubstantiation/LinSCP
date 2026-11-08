@@ -38,11 +38,18 @@ const REMOTE_ENTRIES = [
 const responses = {
   '/api/vault/status': { success: true, vault: 'unlocked' },
   '/api/monitor/hosts': { success: true, max_hosts: 32, default_interval: 5, default_timeout: 10,
-    tabs: [{ tab: 1, name: 'local test', host: '127.0.0.1', port: 2222, protocol: 'sftp', site: null }], sites: [] },
-  '/api/monitor/sample': { success: true, samples: [{ tab: 1, name: 'local test', host: '127.0.0.1', port: 2222,
-    protocol: 'sftp', status: 'ok', sampled_at: Date.now(), latency_ms: 5, error: '', snapshot: {
+    tabs: [{ tab: 1, name: 'local test', host: '127.0.0.1', port: 2222, protocol: 'sftp', site: null, key: 'ssh:127.0.0.1:2222' }], sites: [] },
+  '/api/monitor/settings': { success: true, document: { version: 1, settings: { interval_secs: 5,
+    connect_timeout_secs: 10, poll_timeout_secs: 10, outage_threshold: 3, notify_on_outage: true,
+    beep_on_outage: false, beep_cooldown_secs: 10 }, hosts: {} } },
+  '/api/monitor/sample': { success: true, samples: [{ tab: 1, key: 'ssh:127.0.0.1:2222', name: 'local test', host: '127.0.0.1', port: 2222,
+    protocol: 'sftp', status: 'ok', sampled_at: Date.now(), latency_ms: 5, error: '', consecutive_failures: 0,
+    outage_since_ms: null, outage: false, outage_started: false, recovered: false, snapshot: {
       hostname: 'worker', primary_ip: '127.0.0.1', uptime_seconds: 10, load_average: [0.1],
-      cpu: { model: 'Test CPU', logical_count: 1, percent: 25, cores: [] }, memory: null, disks: [], gpus: [], cuda_version: '', warnings: [] } }] },
+      cpu: { model: 'Test CPU', logical_count: 1, percent: 25, cores: [] }, memory: null,
+      swap: { total_bytes: 1000, used_bytes: 250, free_bytes: 750, percent: 25 },
+      network: { rx_bytes_total: 1000, tx_bytes_total: 2000, rx_bytes_per_sec: 125000, tx_bytes_per_sec: 250000 },
+      disks: [], gpus: [], cuda_version: '', custom: [], warnings: [] } }] },
   '/api/session/terminal': { success: true, terminal: 77, cols: 80, rows: 24 },
   '/api/terminal/output': { success: true, data: '', offset: 0, alive: true },
   '/api/terminal/close': { success: true },
@@ -1834,6 +1841,8 @@ function options(id) {
   check('monitor samples the selected session', calls.some(call => call.path === '/api/monitor/sample' &&
     JSON.parse(call.options.body).tabs.join() === '1'));
   check('monitor renders telemetry', text('serverMonitorScreen').includes('25.0%'));
+  check('monitor loads persisted settings and network rates', calls.some(call => call.path === '/api/monitor/settings') &&
+    text('serverMonitorScreen').includes('1.00 Mbps') && text('serverMonitorScreen').includes('2.00 Mbps'));
   [...doc.querySelectorAll('#serverMonitorScreen button')].find(b => b.textContent === 'SSH shell').click();
   await new Promise(resolve => setTimeout(resolve, 80));
   check('monitor shell reuses the terminal endpoint', calls.some(call => call.path === '/api/session/terminal' &&

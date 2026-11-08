@@ -460,6 +460,70 @@ pub struct MonitorGpu {
     pub pcie_width: Option<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorSwap {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    /// Zero when the host has no swap; absent swap telemetry stays null.
+    pub percent: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorNetwork {
+    pub rx_bytes_total: u64,
+    pub tx_bytes_total: u64,
+    /// Null until two samples exist, or when counters reset/wrap.
+    pub rx_bytes_per_sec: Option<f64>,
+    pub tx_bytes_per_sec: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorMetricParse {
+    #[default]
+    Number,
+    Regex,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorMetricDisplay {
+    #[default]
+    Sparkline,
+    BigNumber,
+    Text,
+}
+
+/// A user-approved remote command sampled alongside the fixed built-in probe.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorCustomMetric {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub parse: MonitorMetricParse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+    #[serde(default)]
+    pub display: MonitorMetricDisplay,
+    #[serde(default)]
+    pub unit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorCustomReading {
+    pub id: String,
+    pub name: String,
+    pub parse: MonitorMetricParse,
+    pub display: MonitorMetricDisplay,
+    pub unit: String,
+    pub value: Option<f64>,
+    pub text: String,
+    pub error: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MonitorSnapshot {
     pub hostname: String,
@@ -468,9 +532,15 @@ pub struct MonitorSnapshot {
     pub load_average: Vec<f64>,
     pub cpu: MonitorCpu,
     pub memory: Option<MonitorMemory>,
+    #[serde(default)]
+    pub swap: Option<MonitorSwap>,
+    #[serde(default)]
+    pub network: Option<MonitorNetwork>,
     pub disks: Vec<MonitorDisk>,
     pub gpus: Vec<MonitorGpu>,
     pub cuda_version: String,
+    #[serde(default)]
+    pub custom: Vec<MonitorCustomReading>,
     /// Missing optional tools/sensors, distinct from a failed SSH sample.
     pub warnings: Vec<String>,
 }
@@ -478,6 +548,9 @@ pub struct MonitorSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonitorSample {
     pub tab: u64,
+    /// Stable settings key for the saved site or unsaved SSH identity.
+    #[serde(default)]
+    pub key: String,
     pub name: String,
     pub host: String,
     pub port: u16,
@@ -488,4 +561,75 @@ pub struct MonitorSample {
     pub latency_ms: u64,
     pub error: String,
     pub snapshot: Option<MonitorSnapshot>,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub outage_since_ms: Option<u64>,
+    #[serde(default)]
+    pub outage: bool,
+    #[serde(default)]
+    pub outage_started: bool,
+    #[serde(default)]
+    pub recovered: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorSettings {
+    pub interval_secs: f64,
+    pub connect_timeout_secs: f64,
+    pub poll_timeout_secs: f64,
+    pub outage_threshold: u32,
+    pub notify_on_outage: bool,
+    pub beep_on_outage: bool,
+    pub beep_cooldown_secs: u32,
+}
+
+impl Default for MonitorSettings {
+    fn default() -> Self {
+        Self {
+            interval_secs: 5.0,
+            connect_timeout_secs: 10.0,
+            poll_timeout_secs: 10.0,
+            outage_threshold: 3,
+            notify_on_outage: true,
+            beep_on_outage: false,
+            beep_cooldown_secs: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorHostConfig {
+    pub enabled_metrics: Vec<String>,
+    pub custom_metrics: Vec<MonitorCustomMetric>,
+    #[serde(default)]
+    pub paused: bool,
+}
+
+impl Default for MonitorHostConfig {
+    fn default() -> Self {
+        Self {
+            enabled_metrics: default_monitor_metrics(),
+            custom_metrics: Vec::new(),
+            paused: false,
+        }
+    }
+}
+
+pub fn default_monitor_metrics() -> Vec<String> {
+    ["cpu", "mem", "swap", "disk", "load", "net", "gpu"]
+        .iter().map(|s| s.to_string()).collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorSettingsDocument {
+    pub version: u32,
+    pub settings: MonitorSettings,
+    pub hosts: std::collections::BTreeMap<String, MonitorHostConfig>,
+}
+
+impl Default for MonitorSettingsDocument {
+    fn default() -> Self {
+        Self { version: 1, settings: MonitorSettings::default(), hosts: std::collections::BTreeMap::new() }
+    }
 }

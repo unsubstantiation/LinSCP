@@ -15,6 +15,7 @@ linscp-platform.workspace = true
 linscp-proto.workspace = true
 linscp-types.workspace = true
 rand.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile = "3"
