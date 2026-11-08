@@ -140,6 +140,7 @@ pub mod commands {
     #[tauri::command]
     pub async fn linscp_open_terminal_window(
         app: tauri::AppHandle,
+        state: tauri::State<'_, TauriBridge>,
         terminal: String,
         title: String,
         cols: u32,
@@ -188,6 +189,22 @@ pub mod commands {
         if let Some(icon) = app.default_window_icon() {
             let _ = builder.set_icon(icon.clone());
         }
+        // A closed window is a shell nobody is looking at, so closing it closes
+        // the shell. The page cannot be relied on here: a window being
+        // destroyed does not run its unload handlers, so a remote PTY would
+        // outlive the window for as long as the app ran, holding its SSH
+        // channel open on the server.
+        let closed_id = terminal.clone();
+        let service = state.service.clone();
+        builder.on_window_event(move |event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                let _ = service.dispatch(ApiEnvelope {
+                    method: "POST".to_string(),
+                    path: "/api/terminal/close".to_string(),
+                    body: json!({ "terminal": closed_id }),
+                });
+            }
+        });
 
         Ok(json!({ "label": label, "existing": false }))
     }

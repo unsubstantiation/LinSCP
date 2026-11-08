@@ -436,6 +436,44 @@ test('a window given a tab opens a shell on it', async () => {
   dom.cleanup();
 });
 
+test('closing a terminal window closes the remote shell behind it', async () => {
+  // The window is the only thing drawing the shell, so it is also the thing
+  // that ends it. A window that merely stopped painting would leave a remote
+  // PTY - and its SSH channel - open on the server for the life of the app.
+  const dom = installDom();
+  const transport = fakeTransport({
+    '/api/session/terminal': { success: true, terminal: 'term-7' },
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(10, 2) }),
+  });
+  const window = new TerminalWindow({
+    transport,
+    tab: 2,
+    container: fakeContainer(),
+  });
+  assert.equal(await window.start(), true);
+  await window.close();
+  const closed = transport.calls.find((call) => call.path === '/api/terminal/close');
+  assert.ok(closed, 'the shell is closed by id, not just abandoned');
+  assert.equal(closed.body.terminal, 'term-7');
+  dom.cleanup();
+});
+
+test('stopping a window paints nothing more and leaves the shell to its owner', async () => {
+  // `stop` is the teardown for a window that is not the shell's owner - the
+  // page shutting down - so it must not close a shell somebody else may still
+  // be using.
+  const dom = installDom();
+  const transport = fakeTransport({
+    '/api/session/terminal': { success: true, terminal: 'term-8' },
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(10, 2) }),
+  });
+  const window = new TerminalWindow({ transport, tab: 3, container: fakeContainer() });
+  assert.equal(await window.start(), true);
+  window.stop();
+  assert.equal(transport.calls.filter((call) => call.path === '/api/terminal/close').length, 0);
+  dom.cleanup();
+});
+
 test('a window with neither a terminal nor a tab says so instead of hanging', async () => {
   const reasons = [];
   const window = new TerminalWindow({

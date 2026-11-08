@@ -5741,7 +5741,13 @@
       event.preventDefault();
       view.paste(text);
     });
-    window.addEventListener('beforeunload', () => { view.stop(); });
+    /* Closing the window closes its shell. \`close\` tells the backend, which
+     * is what actually ends the remote PTY; the native side also closes it
+     * when the window is destroyed, because a window being torn down does not
+     * reliably run this. Doing both is harmless - closing twice is answered
+     * the same - and it means a shell cannot outlive the window that showed
+     * it either way. */
+    window.addEventListener('beforeunload', () => { void view.close(); });
     view.start();
   }
 
