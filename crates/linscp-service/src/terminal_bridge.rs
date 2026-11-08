@@ -18,6 +18,10 @@ struct TerminalRingState {
     dropped: u64,
     alive: bool,
     exit_code: Option<i32>,
+    /// Why the session is no longer alive, when the server said why. A
+    /// refused shell and a shell that exited are both "not alive"; only one
+    /// of them is something the person at the keyboard can act on.
+    failure: Option<String>,
     cols: u32,
     rows: u32,
 }
@@ -59,6 +63,7 @@ impl EmbeddedTerminal {
             dropped: 0,
             alive: true,
             exit_code: None,
+            failure: None,
             cols: init_cols,
             rows: init_rows,
         }));
@@ -93,6 +98,23 @@ impl EmbeddedTerminal {
                     PtyShellEvent::ExitStatus(code) => {
                         let mut g = ring_bg.lock().expect("terminal ring mutex");
                         g.exit_code = Some(code as i32);
+                    }
+                    PtyShellEvent::Failed(reason) => {
+                        let exit_code = {
+                            let mut g = ring_bg.lock().expect("terminal ring mutex");
+                            g.alive = false;
+                            g.failure = Some(reason);
+                            if g.exit_code.is_none() {
+                                g.exit_code = Some(1);
+                            }
+                            g.exit_code
+                        };
+                        let _ = event_tx.send(json!({
+                            "type": "terminal_closed",
+                            "terminal": id_bg,
+                            "exit_code": exit_code,
+                        }));
+                        break;
                     }
                     PtyShellEvent::Closed => {
                         let exit_code = {
@@ -167,6 +189,15 @@ impl EmbeddedTerminal {
             .lock()
             .map(|g| (g.cols, g.rows))
             .unwrap_or((100, 30))
+    }
+
+    /// Why the session ended, when the server refused it. `None` for a shell
+    /// that ran and finished, which needs no explanation.
+    pub fn failure(&self) -> Option<String> {
+        self.ring
+            .lock()
+            .map(|g| g.failure.clone())
+            .unwrap_or(None)
     }
 
     pub fn buffer_limit(&self) -> usize {

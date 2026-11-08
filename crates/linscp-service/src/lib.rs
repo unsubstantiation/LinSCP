@@ -1368,12 +1368,17 @@ impl CommanderService {
         };
         let after = query.get("after").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
         let (data, offset, alive, exit_code) = terminal.poll(after);
+        // `error` is why the session stopped, not a failure of this request:
+        // a server that refuses a pty or a shell keeps the channel open and
+        // silent, so the reason is the only thing that distinguishes that
+        // from a shell which has simply not written anything yet.
         ApiReply { status: 200, payload: json!({
             "success": true,
             "data": BASE64_STD.encode(&data),
             "offset": offset,
             "alive": alive,
             "exit_code": exit_code,
+            "error": terminal.failure(),
         })}
     }
 
