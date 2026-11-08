@@ -90,6 +90,10 @@ impl EmbeddedTerminal {
 
         let ring_bg = Arc::clone(&ring);
         let screen_bg = Arc::clone(&screen);
+        // The replies a screen owes its program go back down the same channel
+        // the output came up, so the reader task needs the handle too - and
+        // the terminal keeps its own for input from a window.
+        let handle_bg = handle.clone();
         let id_bg = id.clone();
         let buffer_limit = DEFAULT_TERMINAL_BUFFER_LIMIT;
         tokio::spawn(async move {
@@ -109,7 +113,7 @@ impl EmbeddedTerminal {
                                 screen.advance(&bytes);
                                 let replies = screen.take_replies();
                                 if !replies.is_empty() {
-                                    let _ = handle.write_bytes(replies);
+                                    let _ = handle_bg.write_bytes(replies);
                                 }
                             }
                         }
