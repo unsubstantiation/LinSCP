@@ -17,6 +17,7 @@
 import type { TransportClient } from '../transport/client.js';
 import type { TerminalFrame, TerminalModes } from './terminal.js';
 import { TerminalRenderer } from './terminal.js';
+import { TerminalInput } from './terminal-input.js';
 
 /** The keyboard state a key press needs to become bytes. */
 export interface KeyEventLike {
@@ -156,6 +157,19 @@ export interface TerminalSessionOptions {
   onTitle?: (title: string | null) => void;
   /** Called when a repaint actually happened, so a test can count frames. */
   onFrame?: (frame: TerminalFrame) => void;
+  /**
+   * Attach a keyboard to the canvas.
+   *
+   * A canvas cannot raise a soft keyboard, so on a touch host this is the
+   * difference between a terminal that can be typed into and a picture of one.
+   * It is off by default only so a host that already has a keyboard - a test, a
+   * window that only mirrors a shell - does not get a stray hidden textarea.
+   */
+  keyboard?: boolean;
+  /** Called whenever the grid the window can show changes. */
+  onResize?: (grid: { columns: number; lines: number }) => void;
+  /** Called when the cursor mode changes, for the extra-keys row's arrows. */
+  onModes?: (modes: TerminalModes) => void;
 }
 
 interface FrameReply {
@@ -181,6 +195,8 @@ export class TerminalSession {
   private readonly onEnded?: TerminalSessionOptions['onEnded'];
   private readonly onTitle?: TerminalSessionOptions['onTitle'];
   private readonly onFrame?: TerminalSessionOptions['onFrame'];
+  private readonly onResize?: TerminalSessionOptions['onResize'];
+  private readonly onModes?: TerminalSessionOptions['onModes'];
   public readonly terminal: string;
   private readonly renderer: TerminalRenderer;
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -191,6 +207,12 @@ export class TerminalSession {
   private lastTitle: string | null = null;
   private pollFailures = 0;
   private grid: { columns: number; lines: number };
+  /** The keyboard attachment, when the host asked for one. */
+  private keyboard: TerminalInput | null = null;
+  /** The canvas, kept only so the tap listener can be removed again. */
+  private canvas: HTMLCanvasElement | null = null;
+  /** Where a one-finger drag started, and how far it has travelled. */
+  private drag: { y: number; lines: number } | null = null;
   /**
    * The modes of the last painted frame.
    *
@@ -214,6 +236,8 @@ export class TerminalSession {
     this.onEnded = options.onEnded;
     this.onTitle = options.onTitle;
     this.onFrame = options.onFrame;
+    this.onResize = options.onResize;
+    this.onModes = options.onModes;
     this.renderer = new TerminalRenderer({
       container: options.container,
       onCellSize: (size) => {
@@ -225,6 +249,47 @@ export class TerminalSession {
       },
     });
     this.grid = this.renderer.size();
+    if (options.keyboard) {
+      this.keyboard = new TerminalInput({
+        container: options.container,
+        // Typed text goes to the shell exactly as typed: the input method has
+        // already applied the person's language, so nothing is transformed
+        // here. Latched Ctrl/Alt from the extra-keys row come through `write`.
+        onData: (data) => this.write(data),
+        onKey: (event) => this.handleTypedKey(event),
+        onPaste: (text) => this.paste(text),
+      });
+      // A tap on the terminal is a tap into it: the canvas is not focusable, so
+      // without this the soft keyboard never appears and there is nothing to
+      // type into. Tapping again dismisses it, which is what every phone
+      // terminal does.
+      const canvas = this.renderer.element;
+      // `click`, not `pointerdown`: a scroll drag cancels its own click when it
+      // calls `preventDefault` on the move, so dragging through history cannot
+      // also dismiss the keyboard the person is using.
+      canvas.addEventListener('click', this.handleTap);
+      canvas.addEventListener('touchstart', this.handleTouchStart, { passive: true });
+      canvas.addEventListener('touchmove', this.handleTouchMove, { passive: false });
+      canvas.addEventListener('touchend', this.handleTouchEnd);
+      canvas.addEventListener('wheel', this.handleWheel, { passive: false });
+      this.canvas = canvas;
+    }
+  }
+
+  /** The keyboard attachment, when this session has one. */
+  public get input(): TerminalInput | null {
+    return this.keyboard;
+  }
+
+  /**
+   * The painted surface.
+   *
+   * Exposed so a host can attach its own gestures to it - the touch shell does,
+   * and a test that could not reach it could not check that a swipe scrolls
+   * anything.
+   */
+  public get element(): HTMLCanvasElement {
+    return this.renderer.element;
   }
 
   /** The grid the window can show, in cells. */
@@ -234,8 +299,50 @@ export class TerminalSession {
 
   /** Starts painting and polling. */
   public start(): void {
+    this.watchViewport();
     this.poll();
   }
+
+  /**
+   * Re-measures the canvas when the part of the screen it occupies changes.
+   *
+   * On a phone the soft keyboard does not resize the layout viewport, it
+   * shrinks the *visual* one, so a grid sized from `clientHeight` either hides
+   * its bottom rows behind the keyboard or, worse, keeps claiming a size the
+   * shell cannot show and the prompt ends up underneath the keys. Watching the
+   * visual viewport is what makes the prompt stay above the keyboard.
+   */
+  private watchViewport(): void {
+    if (this.stopped) {
+      return;
+    }
+    const doc = this.renderer.element.ownerDocument;
+    const view = doc?.defaultView as (Window & typeof globalThis) | null | undefined;
+    this.viewport = view?.visualViewport ?? null;
+    if (this.viewport) {
+      this.viewport.addEventListener('resize', this.handleViewportChange);
+    }
+    view?.addEventListener('resize', this.handleViewportChange);
+  }
+
+  private readonly handleViewportChange = (): void => {
+    if (this.stopped) {
+      return;
+    }
+    this.renderer.resizeBackingStore();
+    const next = this.renderer.size();
+    if (next.columns !== this.grid.columns || next.lines !== this.grid.lines) {
+      this.grid = next;
+      this.onResize?.(next);
+      // The frame's own `takeResize` would also notice this, but only on the
+      // next poll; sending it here is what makes the prompt stay visible while
+      // the keyboard is still animating open.
+      void this.resize({ columns: next.columns, lines: next.lines });
+    }
+    this.renderer.repaint();
+  };
+
+  private viewport: VisualViewport | null = null;
 
   /** Stops polling and removes the canvas. The shell is told only by `close`. */
   public stop(): void {
@@ -244,16 +351,39 @@ export class TerminalSession {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    this.viewport?.removeEventListener('resize', this.handleViewportChange);
+    this.viewport = null;
+    this.detachKeyboard();
     this.renderer.destroy();
+  }
+
+  /**
+   * Tears down the keyboard attachment.
+   *
+   * Removing the textarea while it has focus is what tells the phone to put the
+   * soft keyboard away; leaving it behind would leave a focused invisible
+   * element holding the keyboard open over whatever the person opened next.
+   */
+  private detachKeyboard(): void {
+    if (this.canvas) {
+      this.canvas.removeEventListener('click', this.handleTap);
+      this.canvas.removeEventListener('touchstart', this.handleTouchStart);
+      this.canvas.removeEventListener('touchmove', this.handleTouchMove);
+      this.canvas.removeEventListener('touchend', this.handleTouchEnd);
+      this.canvas.removeEventListener('wheel', this.handleWheel);
+      this.canvas = null;
+    }
+    this.keyboard?.destroy();
+    this.keyboard = null;
   }
 
   /** Tells the backend to close the shell and stops painting. */
   public async close(): Promise<void> {
-    this.stopped = true;
-    if (this.timer !== null) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
+    // `stop` is the whole teardown - timers, the keyboard, the canvas, the
+    // viewport listener - and it used to be copied here. Two copies meant the
+    // listeners added since the copy was made were left attached: a closed
+    // terminal went on hearing taps.
+    this.stop();
     if (!this.backendClosed) {
       this.backendClosed = true;
       try {
@@ -262,7 +392,6 @@ export class TerminalSession {
         // A shell that is already gone is the same outcome as closing it.
       }
     }
-    this.renderer.destroy();
   }
 
   /** Reports a new grid size to the model and the remote PTY. */
@@ -318,6 +447,22 @@ export class TerminalSession {
     return this.modes;
   }
 
+  /**
+   * Handles one key press and reports whether it was sent.
+   *
+   * `handleTypedKey` is the soft keyboard's path: an ordinary character must
+   * come through the textarea's `input` event, not from here, or every letter
+   * typed on a phone would be sent twice - once for the key press and once for
+   * the text it produced.
+   */
+  public handleTypedKey(event: KeyEventLike): boolean {
+    // A single printable character (and no modifier) is the input event's job.
+    if ([...event.key].length === 1 && !event.ctrlKey && !event.altKey && !event.metaKey) {
+      return false;
+    }
+    return this.handleKey(event);
+  }
+
   /** Handles one key press and reports whether it was sent. */
   public handleKey(event: KeyEventLike, modes?: { app_cursor: boolean; bracketed_paste: boolean }): boolean {
     const active = modes ?? this.modes;
@@ -328,6 +473,27 @@ export class TerminalSession {
     event.preventDefault?.();
     this.write(encoded);
     return true;
+  }
+
+  /**
+   * Encodes a key the extra-keys row pressed.
+   *
+   * The row has key names, not key events, and its arrows have to become the
+   * same bytes a physical arrow does - including the application-cursor
+   * variant, or the arrows in `vi` and `less` would move nothing. Returns null
+   * for the row's text keys (`/`, `-`, `|`, `~`), which go through `write`.
+   */
+  public encodeNamedKey(name: string): string | null {
+    const arrow = this.modes.app_cursor;
+    switch (name) {
+      case 'esc': return '\x1b';
+      case 'tab': return '\t';
+      case 'up': return arrow ? '\x1bOA' : '\x1b[A';
+      case 'down': return arrow ? '\x1bOB' : '\x1b[B';
+      case 'left': return arrow ? '\x1bOD' : '\x1b[D';
+      case 'right': return arrow ? '\x1bOC' : '\x1b[C';
+      default: return null;
+    }
   }
 
   /** Handles a paste, honouring the model's bracketed-paste mode. */
@@ -348,6 +514,79 @@ export class TerminalSession {
       // A screen that cannot scroll stays where it is; nothing is lost.
     }
   }
+
+  /**
+   * A tap on the terminal is a tap into it.
+   *
+   * The canvas cannot take focus, so this is what raises the soft keyboard on a
+   * phone; tapping an already-focused terminal dismisses it, so the person can
+   * see the bottom of the screen without hunting for a back button.
+   */
+  private readonly handleTap = (): void => {
+    if (this.stopped || !this.keyboard) {
+      return;
+    }
+    this.keyboard.toggle();
+  };
+
+  /**
+   * Drags through scrollback.
+   *
+   * The model's viewport moves, not the page: scrolling a canvas terminal by
+   * scrolling the document would move the keyboard and the extra-keys row with
+   * it and leave the prompt behind. A drag is accumulated in whole cells so a
+   * slow drag is not a request per pixel.
+   */
+  private readonly handleTouchStart = (event: TouchEvent): void => {
+    if (this.stopped) {
+      return;
+    }
+    const touch = event.touches[0];
+    if (!touch) {
+      return;
+    }
+    this.drag = { y: touch.clientY, lines: 0 };
+  };
+
+  private readonly handleTouchMove = (event: TouchEvent): void => {
+    if (this.stopped || !this.drag) {
+      return;
+    }
+    const touch = event.touches[0];
+    if (!touch) {
+      return;
+    }
+    const cell = this.renderer.cellSize().height || 18;
+    // Dragging down reveals what is above, which is the history; the model
+    // counts positive lines as going up, so the sign is inverted from the
+    // finger's.
+    const delta = this.drag.y - touch.clientY;
+    const lines = Math.trunc(delta / cell);
+    if (lines === this.drag.lines) {
+      return;
+    }
+    // Cancelling the move is what stops the browser turning this drag into a
+    // click at the end of it, and a click would toggle the keyboard shut over
+    // the scrollback the person just opened.
+    event.preventDefault?.();
+    const step = lines - this.drag.lines;
+    this.drag.lines = lines;
+    void this.scroll(step);
+  };
+
+  private readonly handleTouchEnd = (): void => {
+    this.drag = null;
+  };
+
+  /** A wheel spin is a short drag: the same three-line step every terminal uses. */
+  private readonly handleWheel = (event: WheelEvent): void => {
+    if (this.stopped || event.deltaY === 0) {
+      return;
+    }
+    event.preventDefault?.();
+    const lines = Math.sign(event.deltaY) * 3;
+    void this.scroll(-lines);
+  };
 
   private poll(): void {
     if (this.stopped) {
@@ -383,6 +622,10 @@ export class TerminalSession {
     if (reply && reply.success && reply.frame) {
       this.pollFailures = 0;
       const frame = reply.frame;
+      if (frame.modes.app_cursor !== this.modes.app_cursor) {
+        // The on-screen row holds its own copy of this; nothing else changes it.
+        this.onModes?.(frame.modes);
+      }
       this.modes = frame.modes;
       this.renderer.render(frame);
       if (frame.title !== this.lastTitle) {
@@ -395,6 +638,13 @@ export class TerminalSession {
       const resized = this.renderer.takeResize(this.grid);
       if (resized) {
         this.grid = resized;
+      }
+      // The keyboard follows the cursor, not the element's last position: on a
+      // phone this is what keeps the input method's candidate window at the
+      // prompt instead of in the corner it was first put in.
+      const rect = this.renderer.cursorRect();
+      if (rect) {
+        this.keyboard?.moveTo(rect);
       }
       if (!reply.alive) {
         this.finish(reply.error ?? null);

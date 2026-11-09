@@ -1196,6 +1196,34 @@ body {
 .monitor-big-number { font-size: 15px; font-weight: 700; }
 .monitor-custom { padding: 8px; border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent); border-radius: 6px; background: color-mix(in srgb, var(--warning) 6%, transparent); }
 .monitor-custom-error { border-color: var(--danger); }
+/* The terminal modal on a phone is the screen: a 560px box on a 360px display
+ * wastes most of the width on margins nobody asked for, and the columns are
+ * what a shell needs. The extra-keys row stays at the bottom, so it is laid out
+ * inside that height rather than after it. */
+@media (max-width: 600px) {
+  #terminalModal .modal-box,
+  #terminalModal .modal-overlay > .modal-box {
+    width: 100%;
+    max-width: none;
+    height: 100%;
+    max-height: none;
+    border-radius: 0;
+    border: 0;
+  }
+  #terminalModal .modal-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    padding: 0;
+  }
+  #terminalModal .modal-footer { padding: 4px 8px; }
+  #terminalModal .terminal-screen {
+    flex: 1 1 auto;
+    height: auto;
+    max-height: none;
+    min-height: 0;
+  }
+}
+
 @media (max-width: 600px) {
   .monitor-overlay { padding: 5px; }
   .monitor-box { width: 100%; max-height: 98vh; height: 98vh; }
@@ -1217,10 +1245,15 @@ body {
  * it: a terminal window is the terminal, and a stray scrollbar would resize
  * the grid the remote PTY is told about. */
 .terminal-screen {
+  position: relative;
   height: 480px;
   max-height: 70vh;
+  min-height: 0;
   background: #000;
   overflow: hidden;
+  /* A canvas terminal scrolls its own viewport, so the browser must not try to
+   * scroll the page when a finger drags across it. */
+  touch-action: none;
 }
 
 /* A terminal in its own window: no page around it, no scrollbars, and the
@@ -1230,7 +1263,11 @@ body {
 body.terminal-only {
   margin: 0;
   padding: 0;
+  /* The *visual* viewport, not the layout one: with a soft keyboard open the
+   * layout viewport is still the full screen, so `100vh` would size the
+   * terminal to the part of the screen the keyboard is covering. */
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
   background: #000;
 }

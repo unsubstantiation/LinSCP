@@ -274,6 +274,11 @@ export class AppShell {
     this.controller.setTerminalFocused(focused);
   }
 
+  /** Tells the key row which cursor mode the screen is in, so its arrows work. */
+  public setApplicationCursor(applicationCursor: boolean): void {
+    this.controller.setApplicationCursor(applicationCursor);
+  }
+
   /** Sends a hardware key press through the same encoding as the key row. */
   public pressExtraKey(keyId: string): string | null {
     return this.controller.pressExtraKey(keyId);
