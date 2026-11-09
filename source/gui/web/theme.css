@@ -87,9 +87,13 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .app-shell { flex: none; position: relative; z-index: 5; }
 .menu-bar {
   display: flex;
+  /* Wrapping rather than scrolling: nine groups do not fit a narrow window,
+   * and a horizontal scroll container clips the absolutely-positioned
+   * dropdowns it holds, which made every menu open into a one-pixel box. */
+  flex-wrap: wrap;
   align-items: center;
   gap: 2px;
-  height: 36px;
+  min-height: 36px;
   padding: 0 12px;
   background: #0a0f15;
   border-bottom: 1px solid #202a36;
@@ -138,6 +142,10 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   box-shadow: var(--shadow);
 }
 .menu-group.open .menu-dropdown { display: block; }
+/* The last groups sit at the right edge of a narrow window, where a
+ * left-anchored panel would hang off it. */
+.menu-group:last-child .menu-dropdown,
+.menu-group:nth-last-child(2) .menu-dropdown { left: auto; right: 0; }
 .menu-dropdown button {
   width: 100%;
   display: flex;
@@ -729,7 +737,7 @@ button.site-item { display: block; width: 100%; border: 0; background: transpare
 }
 @media (max-width: 720px) {
   body { min-width: 360px; min-height: 0; height: auto; overflow: auto; }
-  .menu-bar { padding-inline: 6px; overflow-x: auto; }
+  .menu-bar { padding-inline: 6px; }
   .menu-brand { margin-right: 4px; }
   .menu-item { padding-inline: 7px; }
   .app-toolbar { flex-wrap: wrap; padding: 7px; }
@@ -1081,10 +1089,14 @@ body {
   .toolbar-divider { display: none; }
 }
 
-/* Menu bar: ensure all 7 groups are reachable via horizontal scroll with affordance */
-.menu-bar { overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
-.menu-bar::-webkit-scrollbar { height: 6px; }
-.menu-bar::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; }
+/* The menu bar must never become a scroll container.
+ *
+ * It used to carry `overflow-x: auto` here to fit nine groups into one row. A
+ * scroll container clips its own overflow, and an absolutely-positioned
+ * dropdown lives in exactly that overflow, so every menu opened into a box one
+ * pixel tall - unreachable on the desktop window and on the phone alike. The
+ * bar wraps (see `.menu-bar`) instead, and this note is here because the scroll
+ * was added deliberately once and would look reasonable to add again. */
 
 /* Remote desktop prompt: Not available card — Cancel / Install are both visible */
 #remoteDesktopPrompt { animation: fadeIn .18s ease; }
