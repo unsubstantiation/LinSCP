@@ -785,6 +785,7 @@ test('the touch shell is mounted from the shared bundle in every host', async ()
   const selections = [];
   const actions = [];
   const panes = [];
+  const activated = [];
 
   const shell = new AppShell({
     rootElement: doc.getElementById('app'),
@@ -798,6 +799,7 @@ test('the touch shell is mounted from the shared bundle in every host', async ()
     onSelectionChange: (selection) => selections.push(selection),
     onAction: (action) => actions.push(action),
     onPaneChange: (pane) => panes.push(pane),
+    onPaneSelect: (pane) => activated.push(pane),
   });
 
   assert.equal(shell.touchLayout, true);
@@ -816,9 +818,28 @@ test('the touch shell is mounted from the shared bundle in every host', async ()
   );
   assert.equal(shell.pane, 'remote');
   assert.deepEqual(panes, ['remote']);
+  // The tap is also reported as an act, once, so a panel that is opened by
+  // its tab rather than shown by it can act on every tap.
+  assert.deepEqual(activated, ['remote']);
   // A pane change the page made itself is not echoed back to it.
   shell.syncPane('local');
   assert.deepEqual(panes, ['remote']);
+  assert.deepEqual(activated, ['remote']);
+
+  /* A tab tapped while it is already the selected pane is still an act.
+   *
+   * The Terminal tab is the case this exists for: it opens a window, closing
+   * that window does not deselect the tab, and a controller that only reported
+   * *changes* of pane left the tab working exactly once. A tap therefore
+   * reports through onPaneSelect even when nothing moved. */
+  doc.querySelector('#nav [data-pane="terminal"]').dispatchEvent(
+    new dom.window.MouseEvent('click', { bubbles: true }),
+  );
+  doc.querySelector('#nav [data-pane="terminal"]').dispatchEvent(
+    new dom.window.MouseEvent('click', { bubbles: true }),
+  );
+  assert.deepEqual(panes, ['remote', 'terminal'], 'only the move is a change');
+  assert.deepEqual(activated, ['remote', 'terminal', 'terminal'], 'every tap is an act');
 
   // A latched Ctrl turns the next key into a control byte, and the key row
   // and the keyboard share the encoding.

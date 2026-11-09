@@ -61,6 +61,14 @@ export interface AppShellOptions {
   actionLabel?: (action: ShellAction) => string;
   /** The user chose another pane by tapping, swiping or a keyboard shortcut. */
   onPaneChange?: (pane: MobilePaneId) => void;
+  /**
+   * The user tapped a pane's tab, including the tab already showing.
+   *
+   * A panel with a window of its own (the terminal) has to hear the tap even
+   * when its tab is already selected - closing the window does not deselect
+   * the tab, so a host that only listened for moves could never reopen it.
+   */
+  onPaneSelect?: (pane: MobilePaneId) => void;
   /** Bytes for the open terminal, already encoded by the latched modifiers. */
   onTerminalInput?: (data: string) => void;
   /** The touch selection of one pane changed. */
@@ -140,6 +148,11 @@ export class AppShell {
       onPaneChange: (pane) => {
         if (!this.quiet) {
           this.options.onPaneChange?.(pane);
+        }
+      },
+      onPaneSelect: (pane) => {
+        if (!this.quiet) {
+          this.options.onPaneSelect?.(pane);
         }
       },
     });

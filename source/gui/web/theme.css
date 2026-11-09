@@ -914,20 +914,19 @@ body {
   .menu-bar .shortcut { display: none; }
 }
 
-/* Also handle very narrow viewports as single-pane even on fine pointer */
+/* Also handle very narrow viewports as single-pane even on fine pointer.
+ *
+ * Only hide a panel that exists. The navigation offers four panes, but the
+ * page has two of them as sibling panels: the transfer queue and the terminal
+ * are a tab strip and a dialog, not `#queuePanel`/`#terminalPanel` elements.
+ * Hiding the two file panes for "queue" or "terminal" therefore left a blank
+ * screen - the pane the person asked for was never in this container, and the
+ * ones that were had just been hidden. The file panes are the only things this
+ * container can show, so they stay; the queue is reached by its own tab strip
+ * and the terminal by its own dialog. */
 @media (max-width: 720px) {
-  [data-mobile-pane="local"] #remotePane,
-  [data-mobile-pane="local"] #queuePanel,
-  [data-mobile-pane="local"] #terminalPanel { display: none !important; }
-  [data-mobile-pane="remote"] #localPane,
-  [data-mobile-pane="remote"] #queuePanel,
-  [data-mobile-pane="remote"] #terminalPanel { display: none !important; }
-  [data-mobile-pane="queue"] #localPane,
-  [data-mobile-pane="queue"] #remotePane,
-  [data-mobile-pane="queue"] #terminalPanel { display: none !important; }
-  [data-mobile-pane="terminal"] #localPane,
-  [data-mobile-pane="terminal"] #remotePane,
-  [data-mobile-pane="terminal"] #queuePanel { display: none !important; }
+  [data-mobile-pane="local"] #remotePane { display: none !important; }
+  [data-mobile-pane="remote"] #localPane { display: none !important; }
 }
 
 /* 44px minimum touch targets for file rows + selection checkboxes */
