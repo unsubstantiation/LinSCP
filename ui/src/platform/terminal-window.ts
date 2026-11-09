@@ -39,6 +39,8 @@ export interface TerminalWindowOptions {
   onResize?: (grid: { columns: number; lines: number }) => void;
   /** Called with the cursor mode each time it changes (the extra-keys row). */
   onModes?: (modes: { app_cursor: boolean }) => void;
+  /** Called when a long-press selection opens or closes, for the copy bar. */
+  onSelection?: (open: boolean) => void;
 }
 
 interface OpenReply {
@@ -124,6 +126,9 @@ export class TerminalWindow {
       onModes: (modes) => {
         this.options.onModes?.(modes);
       },
+      onSelection: (open) => {
+        this.options.onSelection?.(open);
+      },
       keyboard: this.options.keyboard === true,
     });
     this.session = session;
@@ -162,6 +167,21 @@ export class TerminalWindow {
   /** Handles one key press, encoded against the modes the screen is in. */
   public handleKey(event: Parameters<TerminalSession['handleKey']>[0]): boolean {
     return this.session?.handleKey(event) ?? false;
+  }
+
+  /** The open selection, if one is being dragged. */
+  public get selection(): TerminalSession['selection'] {
+    return this.session?.selection ?? null;
+  }
+
+  /** Copies the selection, which also closes it; null when nothing was selected. */
+  public async copySelection(): Promise<string | null> {
+    return (await this.session?.copySelection()) ?? null;
+  }
+
+  /** Clears a selection without copying it. */
+  public async clearSelection(): Promise<void> {
+    await this.session?.endSelection();
   }
 
   /** Scrolls the viewport through history; positive is back into it. */

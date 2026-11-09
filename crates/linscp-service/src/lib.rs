@@ -273,6 +273,8 @@ impl CommanderService {
             ("GET", "/api/terminal/output") => self.terminal_read(&query),
             ("GET", "/api/terminal/frame") => self.terminal_frame(&query),
             ("GET", "/api/terminal/list") => self.terminal_list(),
+            ("POST", "/api/terminal/select") => self.terminal_select(req.body),
+            ("GET", "/api/terminal/selection") => self.terminal_selected_text(&query),
             _ => ApiReply { status: 404, payload: json!({"error": format!("Unknown endpoint: {} {}", method, raw_path)})},
         }
     }
@@ -1406,6 +1408,54 @@ impl CommanderService {
         };
         terminal.with_screen(|screen| screen.scroll(lines));
         ApiReply { status: 200, payload: json!({ "success": true }) }
+    }
+
+    /// Starts, extends or clears the terminal's selection.
+    ///
+    /// Dragging on the screen is a view gesture, so it takes the same shape as
+    /// scrolling: the window says which cells, the model owns what that means.
+    /// A selection that is not on screen is still a selection - the person may
+    /// scroll away from it - so nothing here bounds the coordinates.
+    fn terminal_select(&self, body: Value) -> ApiReply {
+        let terminal_id = body.get("terminal").and_then(Value::as_str).unwrap_or("");
+        let terminal = match self.state.lock().expect("state mutex").terminals.get(terminal_id) {
+            Some(terminal) => terminal,
+            None => return api_error(400, "This terminal is no longer open."),
+        };
+        let cell = |name: &str| body.get(name).and_then(Value::as_u64).map(|value| value as usize);
+        match body.get("action").and_then(Value::as_str).unwrap_or("") {
+            "start" => match (cell("row"), cell("column")) {
+                (Some(row), Some(column)) => {
+                    terminal.with_screen(|screen| screen.select_start(row, column));
+                }
+                _ => return api_error(400, "A selection needs the cell it starts at."),
+            },
+            "extend" => match (cell("row"), cell("column")) {
+                (Some(row), Some(column)) => {
+                    terminal.with_screen(|screen| screen.select_extend(row, column));
+                }
+                _ => return api_error(400, "A selection needs the cell it extends to."),
+            },
+            "clear" => {
+                terminal.with_screen(|screen| screen.clear_selection());
+            }
+            _ => return api_error(400, "A selection action is start, extend or clear."),
+        }
+        ApiReply { status: 200, payload: json!({ "success": true }) }
+    }
+
+    /// The text the selection covers.
+    ///
+    /// Read on demand rather than shipped with every frame: a frame is polled
+    /// several times a second and a selection is read once, when it is copied.
+    fn terminal_selected_text(&self, query: &BTreeMap<String, String>) -> ApiReply {
+        let terminal_id = query.get("terminal").map(String::as_str).unwrap_or("");
+        let terminal = match self.state.lock().expect("state mutex").terminals.get(terminal_id) {
+            Some(terminal) => terminal,
+            None => return api_error(400, "This terminal is no longer open."),
+        };
+        let text = terminal.with_screen(|screen| screen.selection()).flatten();
+        ApiReply { status: 200, payload: json!({ "success": true, "text": text }) }
     }
 
     fn terminal_read(&self, query: &BTreeMap<String,String>) -> ApiReply {

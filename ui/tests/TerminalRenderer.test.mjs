@@ -612,3 +612,132 @@ test('a window with neither a terminal nor a tab says so instead of hanging', as
   assert.equal(reasons.length, 1);
   assert.match(reasons[0], /terminal/i);
 });
+
+test('a selected block is painted over the cells it covers', () => {
+  const { renderer, calls } = makeRenderer();
+  const frame = blankFrame(10, 3);
+  frame.selection = [0, 2, 1, 5];
+  renderer.render(frame);
+  const bands = calls.filter((call) => call[0] === 'fillRect' && call[5] === 'rgba(80, 140, 255, 0.35)');
+  // The first row runs from the start column to the edge, the last from the
+  // edge to the end column, so a selection that wraps covers both fully.
+  const { width: cw, height: ch } = renderer.cellSize();
+  assert.equal(bands.length, 2);
+  assert.deepEqual(bands[0].slice(1, 5), [2 * cw, 0, 8 * cw, ch]);
+  assert.deepEqual(bands[1].slice(1, 5), [0, ch, 6 * cw, ch]);
+  // Rows given the other way round still cover the same rectangle: the model
+  // orders its ends, but a renderer that trusted that would draw nothing the
+  // day it stopped being true.
+  const reversed = blankFrame(10, 3);
+  reversed.selection = [1, 2, 1, 5];
+  renderer.render(reversed);
+  const oneRow = calls.filter((call) => call[0] === 'fillRect' && call[5] === 'rgba(80, 140, 255, 0.35)');
+  assert.deepEqual(oneRow.at(-1).slice(1, 5), [2 * cw, ch, 4 * cw, ch]);
+});
+
+test('scrolling back shows where the viewport is, and being live shows nothing', () => {
+  const { renderer, calls } = makeRenderer();
+  const live = blankFrame(10, 2);
+  renderer.render(live);
+  const liveBands = calls.filter((call) => call[0] === 'fillRect' && call[5] === 'rgba(255, 255, 255, 0.25)');
+  assert.equal(liveBands.length, 0, 'a live screen has no scroll mark');
+
+  const scrolled = blankFrame(10, 2, { display_offset: 10, total_lines: 50 });
+  renderer.render(scrolled);
+  const marks = calls.filter((call) => call[0] === 'fillRect' && call[5] === 'rgba(255, 255, 255, 0.25)');
+  assert.equal(marks.length, 1, 'a scrolled screen shows one');
+  // Sits in the right margin, and higher up as more history is scrolled past.
+  assert.ok(marks[0][1] > 80, 'in the margin, not over the text');
+  const further = blankFrame(10, 2, { display_offset: 30, total_lines: 50 });
+  renderer.render(further);
+  const deeper = calls.filter((call) => call[0] === 'fillRect' && call[5] === 'rgba(255, 255, 255, 0.25)').at(-1);
+  assert.ok(deeper[2] < marks[0][2], 'the mark travels up as the viewport goes back');
+});
+
+test('a long press selects, a drag extends it, and copy reads the model', async () => {
+  const dom = installDom();
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(10, 2) }),
+    '/api/terminal/selection': { success: true, text: 'bravo' },
+  });
+  const opens = [];
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-4',
+    container: fakeContainer(90, 36),
+    pollInterval: 1,
+    keyboard: true,
+    onSelection: (open) => opens.push(open),
+  });
+  session.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const el = session.element;
+  const touch = (x, y) => ({ clientX: x, clientY: y });
+  const start = new dom.dom.window.Event('touchstart');
+  start.touches = [touch(0, 0)];
+  el.dispatchEvent(start);
+  await new Promise((resolve) => setTimeout(resolve, TerminalSession.LONG_PRESS_MS + 60));
+
+  assert.deepEqual(opens, [true], 'holding still opens a selection');
+  assert.ok(session.selection, 'the session reports the open selection');
+  const started = transport.calls.filter((call) => call.path === '/api/terminal/select');
+  assert.equal(started[0].body.action, 'start');
+
+  const move = new dom.dom.window.Event('touchmove', { cancelable: true });
+  move.touches = [touch(27, 18)];
+  el.dispatchEvent(move);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const extended = transport.calls.filter((call) => call.path === '/api/terminal/select').at(-1);
+  assert.equal(extended.body.action, 'extend');
+  assert.equal(extended.body.column, 3, 'the column the finger is over');
+  assert.equal(extended.body.row, 1);
+
+  // Nothing scrolled: choosing text is not scrolling away from it.
+  assert.equal(transport.calls.filter((call) => call.path === '/api/terminal/scroll').length, 0);
+
+  el.dispatchEvent(new dom.dom.window.Event('touchend'));
+  assert.equal(await session.copySelection(), 'bravo');
+  assert.deepEqual(opens, [true, false], 'copying closes the selection');
+  const cleared = transport.calls.filter((call) => call.path === '/api/terminal/select').at(-1);
+  assert.equal(cleared.body.action, 'clear');
+
+  await session.close();
+  dom.cleanup();
+});
+
+test('a quick swipe scrolls instead of selecting', async () => {
+  const dom = installDom();
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(10, 2) }),
+  });
+  const opens = [];
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-5',
+    container: fakeContainer(90, 36),
+    pollInterval: 1,
+    keyboard: true,
+    onSelection: (open) => opens.push(open),
+  });
+  session.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const el = session.element;
+  const start = new dom.dom.window.Event('touchstart');
+  start.touches = [{ clientX: 0, clientY: 200 }];
+  el.dispatchEvent(start);
+  const move = new dom.dom.window.Event('touchmove', { cancelable: true });
+  move.touches = [{ clientX: 0, clientY: 110 }];
+  el.dispatchEvent(move);
+  el.dispatchEvent(new dom.dom.window.Event('touchend'));
+  // The press ended before the long-press threshold, so no selection was ever
+  // armed - and a pending timer would have opened one after the swipe.
+  await new Promise((resolve) => setTimeout(resolve, TerminalSession.LONG_PRESS_MS + 60));
+  assert.deepEqual(opens, [], 'scrolling never opens a selection');
+  assert.equal(transport.calls.filter((call) => call.path === '/api/terminal/select').length, 0);
+  assert.ok(transport.calls.some((call) => call.path === '/api/terminal/scroll'));
+
+  await session.close();
+  dom.cleanup();
+});

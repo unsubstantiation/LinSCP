@@ -27,8 +27,9 @@ use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::Line;
+use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{
     Color, CursorShape, NamedColor, Processor, Rgb as VteRgb, StdSyncHandler,
@@ -165,6 +166,10 @@ pub struct Frame {
     /// The stream's window title, when it set one.
     pub title: Option<String>,
     pub modes: Modes,
+    /// The selected block, as `(row, column, row, column)`, when a selection is
+    /// on screen. A window draws it; the text is a separate call, because a
+    /// frame is polled and copying is not.
+    pub selection: Option<(usize, usize, usize, usize)>,
 }
 
 /// Why a screen cannot be built.
@@ -473,6 +478,65 @@ impl TerminalScreen {
         self.dirty = true;
     }
 
+    /// Starts a selection at a cell of the viewport.
+    ///
+    /// The window addresses cells the way it draws them - row 0 is the top of
+    /// the visible screen - while the grid addresses them through its history,
+    /// where the top of the screen is a negative line. The translation is the
+    /// inverse of the one a snapshot makes, and getting it wrong would select
+    /// text the person did not touch.
+    pub fn select_start(&mut self, row: usize, column: usize) {
+        let point = self.point_at(row, column);
+        self.term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+        self.dirty = true;
+    }
+
+    /// Extends the selection to a cell of the viewport.
+    pub fn select_extend(&mut self, row: usize, column: usize) {
+        let point = self.point_at(row, column);
+        if let Some(selection) = self.term.selection.as_mut() {
+            selection.update(point, Side::Right);
+            self.dirty = true;
+        }
+    }
+
+    /// Drops the selection, so the screen paints plain again.
+    pub fn clear_selection(&mut self) {
+        if self.term.selection.take().is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// The cells the selection covers, or `None` when nothing is selected.
+    pub fn selection(&self) -> Option<String> {
+        self.term.selection_to_string()
+    }
+
+    /// The viewport row and column of each end of the selection, for a window
+    /// that draws it. Ordering is start-then-end, which is what a rectangle
+    /// needs, and it is only reported when it lies on screen.
+    pub fn selection_bounds(&self) -> Option<(usize, usize, usize, usize)> {
+        // One borrow at a time: the selection lives inside the term that
+        // `to_range` also needs, so it is read and released before the term is
+        // touched again. Holding both would be two borrows of one field.
+        let range = {
+            let selection = self.term.selection.as_ref()?;
+            selection.to_range(&self.term)?
+        };
+        let offset = self.term.grid().display_offset();
+        let lines = self.size.lines;
+        let start = viewport_cell(range.start, offset, lines)?;
+        let end = viewport_cell(range.end, offset, lines)?;
+        Some((start.0, start.1, end.0, end.1))
+    }
+
+    /// A viewport cell as a grid point: the inverse of `viewport_line`.
+    fn point_at(&self, row: usize, column: usize) -> Point {
+        let offset = self.term.grid().display_offset() as i32;
+        let line = Line(row as i32 - offset);
+        Point::new(line, Column(column))
+    }
+
     /// Jumps the viewport back to live output without changing the history.
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
@@ -512,6 +576,7 @@ impl TerminalScreen {
             total_lines: self.term.grid().total_lines(),
             title: self.title(),
             modes,
+            selection: self.selection_bounds(),
         };
         self.dirty = false;
         self.shared.wakeup.store(false, Ordering::Release);
@@ -625,6 +690,20 @@ fn plain_char(cell: &alacritty_terminal::term::cell::Cell) -> Option<char> {
 fn viewport_line(line: Line, display_offset: usize, lines: usize) -> usize {
     let row = line.0 + display_offset as i32;
     row.clamp(0, lines.saturating_sub(1) as i32) as usize
+}
+
+/// A grid point as a viewport cell, or `None` when it is off screen.
+///
+/// The inverse of [`viewport_line`], but refusing rather than clamping: a
+/// cursor pushed out of view is still useful to report, while a selection end
+/// that is off screen would draw a rectangle across rows the person never
+/// dragged over.
+fn viewport_cell(point: Point, display_offset: usize, lines: usize) -> Option<(usize, usize)> {
+    let row = point.line.0 + display_offset as i32;
+    if row < 0 || row >= lines as i32 {
+        return None;
+    }
+    Some((row as usize, point.column.0))
 }
 
 fn cell_snapshot(
@@ -880,6 +959,60 @@ mod tests {
 
         screen.scroll_to_bottom();
         assert_eq!(screen.snapshot().display_offset, 0);
+    }
+
+    /// Dragging across a line copies that line. The window addresses cells as
+    /// it draws them, from the top of the screen; the grid addresses them
+    /// through its history, where the topmost row is a negative line. Reading
+    /// one as the other selects the wrong text by exactly the scroll offset,
+    /// which is invisible until you scroll.
+    #[test]
+    fn a_selection_copies_the_cells_the_window_named() {
+        let mut screen = screen(10, 3);
+        screen.advance(b"alpha\r\nbravo\r\ncharlie");
+        screen.select_start(1, 0);
+        screen.select_extend(1, 4);
+        assert_eq!(screen.selection().as_deref(), Some("bravo"));
+        // And the frame tells a window where to draw it.
+        assert_eq!(screen.snapshot().selection, Some((1, 0, 1, 4)));
+
+        screen.clear_selection();
+        assert_eq!(screen.selection(), None);
+        assert_eq!(screen.snapshot().selection, None);
+    }
+
+    /// The same drag after scrolling back must copy the row under the finger,
+    /// not the row that shares its number at the bottom of the history.
+    #[test]
+    fn a_selection_after_scrolling_names_the_row_it_is_drawn_on() {
+        let mut screen = screen(10, 2);
+        screen.advance(b"1\r\n2\r\n3\r\n4\r\n5");
+        screen.scroll(2);
+        let frame = screen.snapshot();
+        assert_eq!(lines_of(&frame), vec!["2".to_string(), "3".to_string()]);
+
+        // Row 0 of what is on screen is "2", two lines above the live viewport.
+        // A selection of one cell still selects it: the two anchors share a
+        // point but carry opposite sides, which is how a click-drag over a
+        // single character copies it rather than copying nothing.
+        screen.select_start(0, 0);
+        screen.select_extend(0, 0);
+        assert_eq!(screen.selection().as_deref(), Some("2"));
+        assert_eq!(screen.snapshot().selection, Some((0, 0, 0, 0)));
+    }
+
+    /// A selection scrolled out of view is still a selection - the person may
+    /// scroll back to it - but there is nothing on screen to draw.
+    #[test]
+    fn a_selection_off_screen_is_not_drawn_but_is_still_held() {
+        let mut screen = screen(10, 2);
+        screen.advance(b"1\r\n2\r\n3\r\n4\r\n5");
+        screen.select_start(0, 0);
+        screen.select_extend(0, 0);
+        assert_eq!(screen.selection().as_deref(), Some("4"));
+        screen.scroll(3);
+        assert_eq!(screen.snapshot().selection, None, "nothing to draw while scrolled away");
+        assert_eq!(screen.selection().as_deref(), Some("4"), "the text is still selected");
     }
 
     #[test]
