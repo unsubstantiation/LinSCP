@@ -77,6 +77,17 @@ export interface MobileShellOptions {
    * itself (`syncPane`) does not call it.
    */
   onPaneChange?: (pane: MobilePaneId) => void;
+  /**
+   * The user chose a pane, including the pane that is already showing.
+   *
+   * `onPaneChange` reports a move; this reports the *act*. A panel that owns a
+   * window of its own has to hear a tap on its own tab as well: after the
+   * window is closed the tab is still selected, so a callback that only
+   * reported moves left the tab dead until the person switched to another pane
+   * and back. The host makes changes itself through `syncPane`, which does not
+   * call this.
+   */
+  onPaneSelect?: (pane: MobilePaneId) => void;
 }
 
 export const MOBILE_PANE_ORDER: readonly MobilePaneId[] = ['local', 'remote', 'queue', 'terminal'] as const;
@@ -112,6 +123,7 @@ export class MobileShellController {
   private readonly onTerminalInput?: (data: string) => void;
   private readonly paneLabel?: (pane: MobilePaneId) => string;
   private readonly onPaneChange?: (pane: MobilePaneId) => void;
+  private readonly onPaneSelect?: (pane: MobilePaneId) => void;
   private activePane: MobilePaneId = 'local';
   private ctrlLatched = false;
   /** Whether the screen asked for application-cursor arrows. */
@@ -134,6 +146,7 @@ export class MobileShellController {
     this.onTerminalInput = options.onTerminalInput;
     this.paneLabel = options.paneLabel;
     this.onPaneChange = options.onPaneChange;
+    this.onPaneSelect = options.onPaneSelect;
     this.root.dataset['mobilePane'] = this.activePane;
     if (options.bottomNavElement) {
       this.attachBottomNav(options.bottomNavElement);
@@ -176,6 +189,20 @@ export class MobileShellController {
   }
 
   /**
+   * A pane the user activated by a tap or a swipe, whether or not it changed.
+   *
+   * This is the one gesture signal a host can act on: `setActivePane` reports a
+   * move only, so a panel that is opened by its tab (the terminal) could not
+   * hear a tap on the tab it is already on. Every user gesture goes through
+   * here, so a pane is activated exactly once per gesture and a host never has
+   * to guess whether `onPaneChange` or `onPaneSelect` will carry the news.
+   */
+  private activatePane(pane: MobilePaneId): void {
+    this.setActivePane(pane);
+    this.onPaneSelect?.(pane);
+  }
+
+  /**
    * Removes every listener this controller installed. Called when the window
    * leaves the touch layout so a later resize does not stack handlers.
    */
@@ -202,7 +229,10 @@ export class MobileShellController {
       if (!target) return;
       const pane = target.getAttribute('data-pane') as MobilePaneId | null;
       if (pane && (MOBILE_PANE_ORDER as readonly string[]).includes(pane)) {
-        this.setActivePane(pane);
+        // A tab the person tapped is a request for that panel, even when it is
+        // the panel already showing: a closed window would otherwise leave its
+        // own tab with nothing left to open.
+        this.activatePane(pane);
       }
     };
     navEl.addEventListener('click', listener);
@@ -302,9 +332,9 @@ export class MobileShellController {
     // Require horizontal dominance and minimum distance (40px)
     if (Math.abs(dx) < 40 || Math.abs(dx) < Math.abs(dy) * 1.2) return;
     if (dx < 0) {
-      this.setActivePane(nextPane(this.activePane));
+      this.activatePane(nextPane(this.activePane));
     } else {
-      this.setActivePane(prevPane(this.activePane));
+      this.activatePane(prevPane(this.activePane));
     }
   };
 
@@ -319,24 +349,57 @@ export class MobileShellController {
       const dx = up.clientX - startX;
       const dy = up.clientY - startY;
       if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.2) return;
-      if (dx < 0) this.setActivePane(nextPane(this.activePane));
-      else this.setActivePane(prevPane(this.activePane));
+      if (dx < 0) this.activatePane(nextPane(this.activePane));
+      else this.activatePane(prevPane(this.activePane));
     };
     view.addEventListener('mouseup', onUp, { once: true });
   };
 
   private syncSwipeScroll(): void {
     if (!this.swipeContainer) return;
-    // When in single-pane swipe mode (flex row with scroll-snap), scroll to active pane.
-    // Fallback: rely on CSS [data-mobile-pane] selector; scroll is progressive enhancement.
-    const idx = MOBILE_PANE_ORDER.indexOf(this.activePane);
+    // The container is only a carousel for the panels it actually holds: the
+    // two file panes. The navigation offers four panes, but the queue is a tab
+    // strip and the terminal is a dialog - neither is a sibling here - so
+    // scrolling to their index panned the file panes off screen and left the
+    // person looking at empty space, which is where the blank window came
+    // from. Only the panes this container can show move it, and a container
+    // with nothing to scroll is left alone.
+    const panes = this.swipePanes();
+    const idx = panes.indexOf(this.activePane);
     if (idx < 0) return;
     try {
       const paneWidth = this.swipeContainer.clientWidth || 1;
-      this.swipeContainer.scrollTo({ left: idx * paneWidth, behavior: 'smooth' });
+      const overflow = this.swipeContainer.scrollWidth - this.swipeContainer.clientWidth;
+      if (overflow <= 0) {
+        return;
+      }
+      this.swipeContainer.scrollTo({ left: Math.min(idx * paneWidth, overflow), behavior: 'smooth' });
     } catch {
       // JSDOM or older browsers may not support scrollTo – ignore.
     }
+  }
+
+  /**
+   * The panes the swipe container holds, in navigation order.
+   *
+   * Found from the DOM rather than assumed: a host may mount the shell over
+   * two panels or over four, and the container is the authority on which. An
+   * empty answer means the container is not a carousel and is left alone.
+   */
+  private swipePanes(): MobilePaneId[] {
+    const container = this.swipeContainer;
+    if (!container) return [];
+    const present = new Set<string>();
+    for (const child of Array.from(container.children)) {
+      const pane = (child as HTMLElement).getAttribute?.('data-shell-pane');
+      if (pane) present.add(pane);
+    }
+    if (present.size === 0) {
+      // A host that marks no panes still gets the file-manager order, which
+      // is the order they are laid out in.
+      return ['local', 'remote'];
+    }
+    return MOBILE_PANE_ORDER.filter((pane) => present.has(pane));
   }
 
   // Touch selection / long-press -------------------------------------------

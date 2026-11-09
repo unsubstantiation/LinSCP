@@ -1954,7 +1954,20 @@
       onPaneChange: pane => {
         if (pane === 'local' || pane === 'remote') focusPane(pane);
         if (pane === 'queue') switchTab('queue');
-        if (pane === 'terminal') openTerminal();
+      },
+      /* The Terminal tab is not a pane that can be shown and hidden: it is a
+       * button that opens a window, and closing that window leaves the tab
+       * selected. Acting only on a *change* of pane therefore made the tab work
+       * once and be dead afterwards - which is what "I can't open the terminal"
+       * looked like on Android. Every gesture that lands on the terminal (a tap
+       * on the tab, a swipe onto it) reports here, including a tap on the tab
+       * that is already selected, so the tab opens it as often as it is asked
+       * to. A window that is already open is left alone rather than replaced
+       * under the person using it. */
+      onPaneSelect: pane => {
+        if (pane !== 'terminal') return;
+        if ($('terminalModal') && $('terminalModal').classList.contains('open')) return;
+        openTerminal();
       },
       onTerminalInput: data => sendTerminalBytes(data),
       onSelectionChange: (selection) => {
@@ -4191,7 +4204,22 @@
     if (appShell) appShell.setTerminalFocused(false);
     if (!state) return;
     closeModal('terminalModal');
-    state.view.stop();
+    /* Closes the shell, not just the picture of it.
+     *
+     * `stop` detaches this window; the remote PTY lives on the server until
+     * something closes it. Every close therefore left a shell running on the
+     * far side for as long as the app was open - holding its SSH channel and
+     * a process - until the tab was disconnected. `close` sends the close and
+     * then stops, so closing a terminal actually ends it. It is also safe when
+     * the session already ended by itself: a second close is answered the
+     * same and the session knows it is gone. */
+    void (typeof state.view.close === 'function'
+      ? state.view.close().catch(() => {
+          // A shell that is already gone is the same outcome, and `stop` still
+          // has to run so the modal is not left painting it.
+          state.view.stop();
+        })
+      : Promise.resolve(state.view.stop()));
     // The monitor pauses while its shell is open, because a shell and a
     // sampling loop on one connection make each other slow. Closing the shell
     // is what resumes it - whether the person closed it or the shell ended.

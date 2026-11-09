@@ -2102,6 +2102,15 @@ function options(id) {
           options.onSelection && options.onSelection(true);
         },
         stop: () => { keyboard = null; },
+        /* Closing a terminal closes its shell: the real window sends
+         * `/api/terminal/close` and then stops. A stand-in without `close`
+         * would let the page leak a remote PTY on every close and still pass,
+         * which is exactly what it did. */
+        close: async () => {
+          keyboard = null;
+          await window.LinSCPTransport.request('POST', '/api/terminal/close',
+            { terminal: options.terminal });
+        },
         paste: () => {},
         handleKey: () => false,
         input: () => keyboard
@@ -2203,6 +2212,66 @@ function options(id) {
       text('toast').indexOf('refused to start an interactive shell') >= 0, text('toast'));
     window.closeTerminal();
     await new Promise(resolve => setTimeout(resolve, 60));
+
+    /* Closing a terminal closes the shell, not just the picture of it.
+     *
+     * The window is the only thing that knows the session exists, and the
+     * remote PTY lives on the server until something tells it to stop. Every
+     * close used to leave that shell running on the far side, holding its
+     * channel and a process, for as long as the app was open. */
+    {
+      // The checks above deliberately left a refusing frame in place; a
+      // terminal that cannot paint would fail for the wrong reason here.
+      responses['/api/terminal/frame'] = {
+        success: true, dirty: true, alive: true, error: null,
+        frame: frameOf('user@host:~$ ', 'web-1 — Terminal') };
+      const closings = calls.filter(call => call.path === '/api/terminal/close');
+      const before = closings.length;
+      await window.openTerminal();
+      await new Promise(resolve => setTimeout(resolve, 120));
+      window.closeTerminal();
+      await new Promise(resolve => setTimeout(resolve, 120));
+      const after = calls.filter(call => call.path === '/api/terminal/close').length;
+      check('closing a terminal ends the shell it was showing',
+        after > before, 'close calls before=' + before + ' after=' + after);
+    }
+
+    /* The Terminal tab on a phone is a button, not a panel.
+     *
+     * There is no Terminal *pane* in the page - the modal is the terminal - so
+     * tapping the tab has to open it. Acting only on a change of pane made the
+     * tab work once: closing the modal leaves the tab selected, so the next tap
+     * changed nothing and opened nothing. That is the "I can't open the
+     * terminal" report, and it is what this check is for. */
+    {
+      const navTerminal = doc.querySelector('#mobileBottomNav [data-pane="terminal"]');
+      check('the touch shell offers a Terminal tab', !!navTerminal,
+        String(!!navTerminal));
+      if (navTerminal) {
+        // Leave the shell on another pane, open the terminal, close it, and tap
+        // the very same tab again while it is still the selected pane.
+        doc.querySelector('#mobileBottomNav [data-pane="local"]').click();
+        await new Promise(resolve => setTimeout(resolve, 40));
+        navTerminal.click();
+        await new Promise(resolve => setTimeout(resolve, 200));
+        const openedByTab = doc.getElementById('terminalModal').classList.contains('open');
+        window.closeTerminal();
+        await new Promise(resolve => setTimeout(resolve, 120));
+        const closedByButton = !doc.getElementById('terminalModal').classList.contains('open');
+        navTerminal.click();
+        await new Promise(resolve => setTimeout(resolve, 200));
+        check('the Terminal tab opens the terminal', openedByTab, 'open=' + openedByTab);
+        check('closing it leaves the tab selected so it can be tapped again', closedByButton,
+          'modal open=' + doc.getElementById('terminalModal').classList.contains('open'));
+        check('a second tap on the already-selected Terminal tab opens it again',
+          doc.getElementById('terminalModal').classList.contains('open'),
+          'pane=' + (doc.getElementById('appShell') || doc.body).dataset.mobilePane +
+          ' open=' + doc.getElementById('terminalModal').classList.contains('open'));
+        window.closeTerminal();
+        await new Promise(resolve => setTimeout(resolve, 120));
+      }
+    }
+
     delete window.LinSCPCore.terminalWindow;
   }
 
