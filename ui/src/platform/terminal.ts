@@ -62,6 +62,8 @@ export interface TerminalFrame {
   total_lines: number;
   title: string | null;
   modes: TerminalModes;
+  /** The selected block as `[row, column, row, column]`, when one is drawn. */
+  selection?: [number, number, number, number] | null;
 }
 
 /** The little of the platform a renderer needs, so a test can supply its own. */
@@ -297,7 +299,69 @@ export class TerminalRenderer {
       }
     }
 
+    this.paintSelection(frame, cw, ch);
+    this.paintScrollPosition(frame);
     this.paintCursor(frame.cursor, cw, ch);
+  }
+
+  /**
+   * A mark in the margin while the viewport is scrolled back.
+   *
+   * Without it, a screen scrolled into history looks exactly like a live one
+   * that has stopped producing output - and the person keeps typing commands
+   * into a prompt they cannot see. The mark is drawn over the canvas rather
+   * than in an element so it moves and disappears with the frame that brought
+   * it, and nothing has to be kept in step.
+   */
+  private paintScrollPosition(frame: TerminalFrame): void {
+    const ctx = this.ctx;
+    const scrollable = frame.total_lines - frame.lines;
+    if (!ctx || frame.display_offset <= 0 || scrollable <= 0) {
+      return;
+    }
+    const width = frame.columns * this.cellWidth;
+    const height = frame.lines * this.cellHeight;
+    const track = 4;
+    const visible = Math.max(8, Math.round((frame.lines / frame.total_lines) * height));
+    // Offset counts back from the bottom, so the thumb travels up the margin as
+    // the viewport does.
+    const travelled = Math.round((frame.display_offset / scrollable) * (height - visible));
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.25)';
+    ctx.fillRect(width - track - 2, height - visible - travelled, track, visible);
+  }
+
+  /**
+   * Tints the cells the selection covers.
+   *
+   * Assertions about which cells are selected belong to the model; this only
+   * has to cover the rectangle it was given, whichever way round its corners
+   * arrive.
+   */
+  private paintSelection(frame: TerminalFrame, cw: number, ch: number): void {
+    const ctx = this.ctx;
+    const selection = frame.selection;
+    if (!ctx || !selection) {
+      return;
+    }
+    const [startRow, startColumn, endRow, endColumn] = selection;
+    // The model reports its ends in grid order, but a rectangle that is drawn
+    // from a backwards pair would silently cover nothing, which reads as a
+    // selection that failed rather than one that was mis-described.
+    const top = Math.min(startRow, endRow);
+    const bottom = Math.max(startRow, endRow);
+    const firstColumn = startRow === top ? startColumn : endColumn;
+    const lastColumn = startRow === top ? endColumn : startColumn;
+    ctx.fillStyle = this.theme.selection ?? 'rgba(80, 140, 255, 0.35)';
+    for (let row = top; row <= bottom; row += 1) {
+      // The first and last rows of a selection usually stop mid-line; the rows
+      // between them are covered from edge to edge.
+      const from = row === top ? firstColumn : 0;
+      const to = row === bottom ? lastColumn : frame.columns - 1;
+      if (to < from) {
+        continue;
+      }
+      ctx.fillRect(from * cw, row * ch, (to - from + 1) * cw, ch);
+    }
   }
 
   /** Draws the cursor in whichever shape the stream last selected. */

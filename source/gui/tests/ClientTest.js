@@ -1959,6 +1959,7 @@ function options(id) {
     const painted = [];
     let openedVisible = null;
     const frames = [];
+    let lastWindow = null;
     window.LinSCPCore.terminalWindow = function (options) {
       /* The real window attaches a keyboard to the canvas when the host asks
        * for one; a stand-in without it would let the page ship a terminal
@@ -1986,7 +1987,21 @@ function options(id) {
         options.container.appendChild(field);
         keyboard = { element: field };
       }
-      return {
+      /* The real window exposes the open selection and can copy it from the
+       * model; the page's copy bar is driven by both. */
+      let selection = null;
+      lastWindow = {
+        get selection() { return selection; },
+        copySelection: async () => {
+          if (!selection) return null;
+          selection = null;
+          options.onSelection && options.onSelection(false);
+          return 'copied text';
+        },
+        clearSelection: async () => {
+          selection = null;
+          options.onSelection && options.onSelection(false);
+        },
         start: async () => {
           const modal = options.container.closest('.modal-overlay');
           openedVisible = !!modal && modal.classList.contains('open');
@@ -2017,11 +2032,18 @@ function options(id) {
           return true;
         },
         write: data => send(data),
+        // A long press in the real terminal opens a selection; the harness opens
+        // one on demand so the page's copy bar can be checked.
+        selectAll: () => {
+          selection = { start: { row: 0, column: 0 }, end: { row: 0, column: 10 } };
+          options.onSelection && options.onSelection(true);
+        },
         stop: () => { keyboard = null; },
         paste: () => {},
         handleKey: () => false,
         input: () => keyboard
       };
+      return lastWindow;
     };
     /* A frame as the model produces it: the shell's own line on the first row
      * of a 4-column screen, and a title. */
@@ -2069,6 +2091,19 @@ function options(id) {
       check('the typed character does not stay in the field',
         terminalInput.value === '', JSON.stringify(terminalInput.value));
     }
+
+    /* A long press selects text, and a phone has no Ctrl+Shift+C: the bar is
+     * the only way that selection becomes usable in another app. */
+    const selectionBar = doc.getElementById('terminalSelectionBar');
+    check('the copy bar is out of the way until something is selected',
+      !!selectionBar && selectionBar.hidden === true, String(selectionBar && selectionBar.hidden));
+    lastWindow.selectAll();
+    check('selecting text offers to copy it',
+      selectionBar.hidden === false, String(selectionBar.hidden));
+    await window.copyTerminalSelection();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    check('copying closes the selection and puts the bar away',
+      selectionBar.hidden === true, String(selectionBar.hidden));
 
     check('the screen title follows the model',
       doc.getElementById('terminalModal').querySelector('.modal-header span').textContent.includes('web-1'),

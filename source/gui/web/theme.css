@@ -996,6 +996,20 @@ body {
   background: var(--surface-raised);
 }
 .terminal-extra-keys.visible { display: flex; }
+/* The copy bar takes the extra-keys row's place while a selection is open:
+ * the row's keys would type into a shell the person is trying to copy from. */
+.terminal-selection-bar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 6px 8px calc(6px + env(safe-area-inset-bottom, 0));
+  border-top: 1px solid var(--border);
+  background: var(--surface-raised);
+}
+.terminal-selection-bar[hidden] { display: none; }
+.terminal-selection-bar .btn { flex: none; min-height: 36px; }
 .terminal-extra-keys .extra-key {
   flex: none;
   min-width: 44px;

@@ -19,6 +19,12 @@ import type { TerminalFrame, TerminalModes } from './terminal.js';
 import { TerminalRenderer } from './terminal.js';
 import { TerminalInput } from './terminal-input.js';
 
+/** One cell of the visible screen, counted from the top-left of the viewport. */
+export interface Cell {
+  row: number;
+  column: number;
+}
+
 /** The keyboard state a key press needs to become bytes. */
 export interface KeyEventLike {
   key: string;
@@ -170,6 +176,8 @@ export interface TerminalSessionOptions {
   onResize?: (grid: { columns: number; lines: number }) => void;
   /** Called when the cursor mode changes, for the extra-keys row's arrows. */
   onModes?: (modes: TerminalModes) => void;
+  /** Called when a long-press selection opens, moves or closes. */
+  onSelection?: (open: boolean) => void;
 }
 
 interface FrameReply {
@@ -197,6 +205,7 @@ export class TerminalSession {
   private readonly onFrame?: TerminalSessionOptions['onFrame'];
   private readonly onResize?: TerminalSessionOptions['onResize'];
   private readonly onModes?: TerminalSessionOptions['onModes'];
+  private readonly onSelection?: TerminalSessionOptions['onSelection'];
   public readonly terminal: string;
   private readonly renderer: TerminalRenderer;
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -212,7 +221,22 @@ export class TerminalSession {
   /** The canvas, kept only so the tap listener can be removed again. */
   private canvas: HTMLCanvasElement | null = null;
   /** Where a one-finger drag started, and how far it has travelled. */
-  private drag: { y: number; lines: number } | null = null;
+  private drag: { y: number; lines: number; selecting: boolean; start: Cell } | null = null;
+  /** The long-press timer; a press that lasts becomes a selection. */
+  private longPress: ReturnType<typeof setTimeout> | null = null;
+  /** True while the current gesture is selecting rather than scrolling. */
+  private selecting = false;
+  /** The cell the selection currently ends at, while one is being dragged. */
+  private selectionEnd: Cell | null = null;
+
+  /**
+   * How long a still finger becomes a selection.
+   *
+   * Long enough that a scroll which starts slowly does not become one, short
+   * enough not to feel like the screen is ignoring the press. This is the
+   * threshold the platform's own text views use.
+   */
+  public static readonly LONG_PRESS_MS = 450;
   /**
    * The modes of the last painted frame.
    *
@@ -238,6 +262,7 @@ export class TerminalSession {
     this.onFrame = options.onFrame;
     this.onResize = options.onResize;
     this.onModes = options.onModes;
+    this.onSelection = options.onSelection;
     this.renderer = new TerminalRenderer({
       container: options.container,
       onCellSize: (size) => {
@@ -353,6 +378,11 @@ export class TerminalSession {
     }
     this.viewport?.removeEventListener('resize', this.handleViewportChange);
     this.viewport = null;
+    // A long-press timer that outlived the session would open a selection on a
+    // terminal that has already closed.
+    this.cancelLongPress();
+    this.selecting = false;
+    this.selectionEnd = null;
     this.detachKeyboard();
     this.renderer.destroy();
   }
@@ -501,6 +531,82 @@ export class TerminalSession {
     this.write(encodePaste(text, bracketedPaste ?? this.modes.bracketed_paste));
   }
 
+  /**
+   * Selects the text between two cells of the viewport.
+   *
+   * Copying on a phone is a long press followed by a drag, which is the same
+   * gesture every other app teaches; there is no keyboard shortcut and no
+   * mouse. The cells are the ones the window names, so the model and the
+   * pixels cannot disagree about which text that is.
+   */
+  public async select(start: Cell, end: Cell = start): Promise<void> {
+    try {
+      await this.transport.post('/api/terminal/select', {
+        terminal: this.terminal,
+        action: 'start',
+        row: start.row,
+        column: start.column,
+      });
+      if (end.row !== start.row || end.column !== start.column) {
+        await this.transport.post('/api/terminal/select', {
+          terminal: this.terminal,
+          action: 'extend',
+          row: end.row,
+          column: end.column,
+        });
+      }
+    } catch {
+      // A selection that could not be made leaves the screen as it was.
+    }
+  }
+
+  /** Drops the selection, so the screen paints plain again. */
+  public async clearSelection(): Promise<void> {
+    try {
+      await this.transport.post('/api/terminal/select', { terminal: this.terminal, action: 'clear' });
+    } catch {
+      // Already gone is the same outcome.
+    }
+  }
+
+  /** The selected text, or null when nothing is selected. */
+  public async selectedText(): Promise<string | null> {
+    try {
+      const reply = await this.transport.get<{ success?: boolean; text?: string | null }>(
+        `/api/terminal/selection?terminal=${encodeURIComponent(this.terminal)}`,
+      );
+      return reply && reply.success ? reply.text ?? null : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Copies the selection to the clipboard.
+   *
+   * The text comes from the model, not from the painted canvas: a canvas has no
+   * text to read, and rebuilding it from cells would get wrapped lines and wide
+   * glyphs wrong in exactly the cases people copy text for.
+   */
+  public async copySelection(): Promise<string | null> {
+    const text = await this.selectedText();
+    // Copying finishes the selection: a highlighted block left on screen after
+    // the text is already in the clipboard is a block nobody can act on.
+    await this.endSelection();
+    if (!text) {
+      return null;
+    }
+    try {
+      const clipboard = (this.renderer.element.ownerDocument.defaultView as Window | null)
+        ?.navigator?.clipboard;
+      await clipboard?.writeText(text);
+    } catch {
+      // A refused clipboard leaves the selection in place; the caller may still
+      // show it.
+    }
+    return text;
+  }
+
   /** Scrolls the model's viewport; positive is up into history. */
   public async scroll(lines: number): Promise<void> {
     if (lines === 0) {
@@ -545,7 +651,17 @@ export class TerminalSession {
     if (!touch) {
       return;
     }
-    this.drag = { y: touch.clientY, lines: 0 };
+    const start = this.cellAt(touch);
+    this.drag = { y: touch.clientY, lines: 0, selecting: this.selecting, start };
+    if (!this.selecting) {
+      // A press that stays still becomes a selection; a press that moves
+      // scrolls. This is the gesture every phone app teaches, and it is the
+      // only way to copy text into another app from here.
+      this.longPress = setTimeout(() => {
+        this.longPress = null;
+        this.beginSelection(start);
+      }, TerminalSession.LONG_PRESS_MS);
+    }
   };
 
   private readonly handleTouchMove = (event: TouchEvent): void => {
@@ -556,6 +672,17 @@ export class TerminalSession {
     if (!touch) {
       return;
     }
+    if (this.selecting) {
+      // Dragging with a selection open extends it: the person is choosing how
+      // much text to copy, not scrolling away from it.
+      event.preventDefault?.();
+      const cell = this.cellAt(touch);
+      this.selectionEnd = cell;
+      void this.select(this.drag.start, cell);
+      return;
+    }
+    // A finger that moved is not a long press.
+    this.cancelLongPress();
     const cell = this.renderer.cellSize().height || 18;
     // Dragging down reveals what is above, which is the history; the model
     // counts positive lines as going up, so the sign is inverted from the
@@ -575,8 +702,60 @@ export class TerminalSession {
   };
 
   private readonly handleTouchEnd = (): void => {
+    this.cancelLongPress();
     this.drag = null;
+    // A gesture that ended on a selection leaves it in place to be copied; the
+    // person taps again to clear it, which is what a selection is for.
   };
+
+  private cancelLongPress(): void {
+    if (this.longPress !== null) {
+      clearTimeout(this.longPress);
+      this.longPress = null;
+    }
+  }
+
+  /** Where a touch landed, in cells of the visible screen. */
+  private cellAt(touch: { clientX: number; clientY: number }): Cell {
+    const box = this.renderer.element.getBoundingClientRect?.() ?? { left: 0, top: 0 };
+    const size = this.renderer.cellSize();
+    const width = size.width || 9;
+    const height = size.height || 18;
+    return {
+      row: Math.max(0, Math.floor((touch.clientY - box.top) / height)),
+      column: Math.max(0, Math.floor((touch.clientX - box.left) / width)),
+    };
+  }
+
+  private beginSelection(start: Cell): void {
+    this.selecting = true;
+    this.onSelection?.(true);
+    this.selectionEnd = start;
+    if (this.drag) {
+      this.drag.selecting = true;
+      this.drag.start = start;
+    }
+    void this.select(start, start);
+  }
+
+  /** Ends a selection and tells the model to stop drawing one. */
+  public async endSelection(): Promise<void> {
+    if (!this.selecting) {
+      return;
+    }
+    this.selecting = false;
+    this.selectionEnd = null;
+    this.onSelection?.(false);
+    await this.clearSelection();
+  }
+
+  /** Where the selection currently ends, for a copy button. */
+  public get selection(): { start: Cell; end: Cell } | null {
+    if (!this.selecting || !this.drag) {
+      return null;
+    }
+    return { start: this.drag.start, end: this.selectionEnd ?? this.drag.start };
+  }
 
   /** A wheel spin is a short drag: the same three-line step every terminal uses. */
   private readonly handleWheel = (event: WheelEvent): void => {
