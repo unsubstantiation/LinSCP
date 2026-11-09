@@ -716,6 +716,69 @@ function options(id) {
       .length === declinedBefore);
   doc.getElementById('localPane').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
 
+  /* ---- The menu bar --------------------------------------------------- */
+  /* A dropdown is an absolutely-positioned panel inside the bar, so it lives
+   * in the bar's overflow. Any ancestor that clips its overflow - a scroll
+   * container is the usual accident - hides the whole panel, and the menu
+   * simply does not exist for the person clicking it. This happened twice: a
+   * `overflow-x: auto` on the bar at desktop width and again in the narrow
+   * rule, which is why no menu worked anywhere. */
+  {
+    // `themeCss` is the stylesheet the run was pointed at: the built one when
+    // the harness is given `dist/index.html`, which is what CI and the release
+    // run pass.
+    const stylesheet = themeCss;
+    // Every declaration of a selector, so a later rule cannot quietly reinstate
+    // what an earlier one stopped doing.
+    // The declarations of a selector, found without a regex so the CSS in the
+    // test file cannot confuse the test: every `{...}` that follows the name.
+    const declarationsOf = (selector, from = stylesheet) => {
+      const found = [];
+      let at = from.indexOf(selector);
+      while (at !== -1) {
+        const open = from.indexOf('{', at + selector.length);
+        const close = from.indexOf('}', open);
+        // Only a rule, not a mention in a comment or a longer selector.
+        const before = from.slice(Math.max(0, at - 1), at);
+        const after = from.slice(at + selector.length, open).trim();
+        if (open !== -1 && close !== -1 && (before === '' || /[\s,}]/.test(before)) && after === '') {
+          found.push(from.slice(open + 1, close));
+        }
+        at = from.indexOf(selector, at + selector.length);
+      }
+      return found;
+    };
+    // Which of the given rules make a scroll container, and so clip whatever
+    // overflows them - which is where an absolutely-positioned dropdown lives.
+    const clippingIn = (blocks) => blocks.flatMap((block) => {
+      const entries = block.split(';').map((entry) => entry.trim());
+      return ['overflow', 'overflow-x', 'overflow-y']
+        .filter((prop) => entries.some((entry) =>
+          entry.startsWith(`${prop}:`) && !entry.includes('visible')));
+    });
+    const wide = declarationsOf('.menu-bar');
+    check('the menu bar is styled at all', wide.length > 0, JSON.stringify(wide));
+    check('no rule for the menu bar clips the dropdowns it holds',
+      clippingIn(wide).length === 0, JSON.stringify(clippingIn(wide)));
+    const narrow = declarationsOf(
+      '.menu-bar', stylesheet.slice(stylesheet.indexOf('@media (max-width: 720px)')),
+    );
+    check('the narrow menu bar does not clip them either',
+      clippingIn(narrow).length === 0, JSON.stringify(clippingIn(narrow)));
+    check('the bar wraps so every group stays reachable',
+      wide.some((block) => block.includes('flex-wrap: wrap')), JSON.stringify(wide));
+
+    // And the behaviour the stylesheet exists for: a click opens the panel.
+    const button = doc.querySelector('[onclick*="localMenu"]');
+    const menu = doc.getElementById('localMenu');
+    button.click();
+    check('clicking a menu opens its panel',
+      menu.parentElement.classList.contains('open'), menu.parentElement.className);
+    button.click();
+    check('clicking again closes it',
+      !menu.parentElement.classList.contains('open'), menu.parentElement.className);
+  }
+
   // ---- Synchronized browsing ------------------------------------------
   // The boot stub answers every list call with one fixed response, which
   // cannot show navigation; switch to a path-aware stub for this section.
