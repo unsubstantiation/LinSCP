@@ -1003,6 +1003,16 @@ body {
   background: var(--surface-raised);
 }
 .terminal-extra-keys.visible { display: flex; }
+/* `hidden` has to win over the rule above.
+ *
+ * The page sets `hidden` on this row while a selection is open, so the keys
+ * cannot type into a shell the person is trying to copy from. But `.visible`
+ * is one class more specific than the browser's own `[hidden] { display:none }`
+ * and it sets `display: flex`, so the attribute had no effect at all: the row
+ * stayed on screen underneath the copy bar. This rule names both the class and
+ * the attribute, so it outranks the rule above and the attribute means what it
+ * says. */
+.terminal-extra-keys.visible[hidden] { display: none; }
 /* The copy bar takes the extra-keys row's place while a selection is open:
  * the row's keys would type into a shell the person is trying to copy from. */
 .terminal-selection-bar {
