@@ -4142,6 +4142,10 @@
       }
     });
     embeddedTerminal = { view, returnToMonitor };
+    // A new terminal has no selection, and the row it needs is the one a
+    // previous terminal may have hidden. Syncing here is what makes the row
+    // follow the terminal it belongs to rather than the last one.
+    syncTerminalSelectionBar();
     view.start().then(started => {
       if (!started && embeddedTerminal && embeddedTerminal.view === view) {
         embeddedTerminal = null;
@@ -4161,10 +4165,17 @@
     if (!bar) return;
     const open = !!(embeddedTerminal && embeddedTerminal.view && embeddedTerminal.view.selection);
     bar.hidden = !open;
-    if (embeddedTerminal && embeddedTerminal.view) {
-      const keys = $('terminalExtraKeys');
-      if (keys) keys.hidden = open;
-    }
+    /* The key row is hidden whenever no terminal is asking for it, not only
+     * while a selection is open.
+     *
+     * It used to be hidden inside `if (embeddedTerminal ...)`, so closing a
+     * terminal *while* a selection was open skipped the update and left the
+     * attribute set. The row is the Esc/Ctrl/arrow row a phone has no other
+     * source for, so the next terminal opened had no keys at all. It is also
+     * shown only while a terminal exists: the row types into a shell, and
+     * there is no shell once the terminal is closed. */
+    const keys = $('terminalExtraKeys');
+    if (keys) keys.hidden = open || !(embeddedTerminal && embeddedTerminal.view);
   }
 
   async function copyTerminalSelection() {

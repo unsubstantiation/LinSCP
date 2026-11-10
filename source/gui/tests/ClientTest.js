@@ -768,6 +768,17 @@ function options(id) {
     check('the bar wraps so every group stays reachable',
       wide.some((block) => block.includes('flex-wrap: wrap')), JSON.stringify(wide));
 
+    /* The extra-keys row has two sources of visibility - a `visible` class the
+     * shell toggles and a `hidden` attribute the page sets while a selection is
+     * open - and the class was the more specific of the two. `hidden` then did
+     * nothing at all: the row of Esc/Ctrl/arrow keys stayed on screen under the
+     * copy bar. jsdom lays nothing out, so the rule that settles it is asserted
+     * here rather than the geometry. */
+    const extraKeysHidden = declarationsOf('.terminal-extra-keys.visible[hidden]');
+    check('hiding the extra-keys row actually hides it',
+      extraKeysHidden.some((block) => block.includes('display: none')),
+      JSON.stringify(extraKeysHidden));
+
     // And the behaviour the stylesheet exists for: a click opens the panel.
     const button = doc.querySelector('[onclick*="localMenu"]');
     const menu = doc.getElementById('localMenu');
@@ -2270,6 +2281,42 @@ function options(id) {
         window.closeTerminal();
         await new Promise(resolve => setTimeout(resolve, 120));
       }
+    }
+
+    /* Closing a terminal while a selection is open must not leave the next one
+     * without its keys.
+     *
+     * The Esc/Ctrl/arrow row is hidden while a selection is open, and the code
+     * that hid it only ran when a terminal existed. Closing mid-selection
+     * therefore skipped the update and left the attribute set, so the row was
+     * still hidden the next time a terminal opened - and a phone has no other
+     * source for Esc, Ctrl or the cursor keys.
+     */
+    {
+      const keysRow = doc.getElementById('terminalExtraKeys');
+      const navLocal = doc.querySelector('#mobileBottomNav [data-pane="local"]');
+      const navTerminal2 = doc.querySelector('#mobileBottomNav [data-pane="terminal"]');
+      if (navLocal) navLocal.click();
+      await new Promise(resolve => setTimeout(resolve, 40));
+      navTerminal2.click();
+      await new Promise(resolve => setTimeout(resolve, 200));
+      check('the extra-keys row is on screen for an open terminal',
+        keysRow.hidden === false, String(keysRow.hidden));
+      // Open a selection the way the page sees one, then close under it.
+      lastWindow.selectAll();
+      await new Promise(resolve => setTimeout(resolve, 40));
+      check('a selection hides the key row it would type through',
+        keysRow.hidden === true, String(keysRow.hidden));
+      window.closeTerminal();
+      await new Promise(resolve => setTimeout(resolve, 120));
+      navTerminal2.click();
+      await new Promise(resolve => setTimeout(resolve, 250));
+      check('the next terminal still has its keys after a close mid-selection',
+        keysRow.hidden === false && doc.getElementById('terminalModal').classList.contains('open'),
+        'hidden=' + keysRow.hidden +
+        ' open=' + doc.getElementById('terminalModal').classList.contains('open'));
+      window.closeTerminal();
+      await new Promise(resolve => setTimeout(resolve, 120));
     }
 
     delete window.LinSCPCore.terminalWindow;
