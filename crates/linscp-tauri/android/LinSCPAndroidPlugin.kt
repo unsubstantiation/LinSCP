@@ -124,14 +124,15 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun statUri(invoke: Invoke) {
     val uri = Uri.parse(invoke.parseArgs(SingleUriArgs::class.java).uri)
-    runIo(invoke, "Cannot read SAF document") { readEntry(uri) }
+    runIo(invoke, "Cannot read SAF document") { readEntry(resolveDocument(uri)) }
   }
 
   @Command
   fun readUri(invoke: Invoke) {
     val uri = Uri.parse(invoke.parseArgs(SingleUriArgs::class.java).uri)
+    val resolved = resolveDocument(uri)
     runIo(invoke, "Cannot read SAF document") {
-      val bytes = activity.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+      val bytes = activity.contentResolver.openInputStream(resolved)?.use { it.readBytes() }
         ?: throw IllegalStateException("provider returned no stream")
       mapOf("base64" to android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))
     }
@@ -141,7 +142,7 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   fun writeUri(invoke: Invoke) {
     val args = invoke.parseArgs(WriteArgs::class.java)
     runIo(invoke, "Cannot write SAF document") {
-      val parent = documentUri(Uri.parse(args.parent_uri))
+      val parent = resolveDocument(Uri.parse(args.parent_uri))
       val existing = findChild(parent, args.name)
       if (existing != null && readEntry(existing)["is_dir"] == true) {
         throw IllegalStateException("a folder already has that name")
@@ -159,7 +160,7 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   fun mkdirUri(invoke: Invoke) {
     val args = invoke.parseArgs(NameArgs::class.java)
     runIo(invoke, "Cannot create SAF folder") {
-      val parent = documentUri(Uri.parse(args.parent_uri))
+      val parent = resolveDocument(Uri.parse(args.parent_uri))
       val existing = findChild(parent, args.name)
       val result = if (existing != null) {
         if (readEntry(existing)["is_dir"] != true) throw IllegalStateException("an item already has that name")
@@ -176,7 +177,7 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   fun deleteUri(invoke: Invoke) {
     val uri = Uri.parse(invoke.parseArgs(SingleUriArgs::class.java).uri)
     runIo(invoke, "Cannot delete SAF document") {
-      if (!DocumentsContract.deleteDocument(activity.contentResolver, documentUri(uri))) {
+      if (!DocumentsContract.deleteDocument(activity.contentResolver, resolveDocument(uri))) {
         throw IllegalStateException("provider refused deletion")
       }
       mapOf("success" to true)
@@ -187,7 +188,7 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   fun renameUri(invoke: Invoke) {
     val args = invoke.parseArgs(RenameArgs::class.java)
     runIo(invoke, "Cannot rename SAF document") {
-      val result = DocumentsContract.renameDocument(activity.contentResolver, documentUri(Uri.parse(args.uri)), args.new_name)
+      val result = DocumentsContract.renameDocument(activity.contentResolver, resolveDocument(Uri.parse(args.uri)), args.new_name)
         ?: throw IllegalStateException("provider refused rename")
       mapOf("uri" to result.toString())
     }
@@ -353,9 +354,62 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     if (!DocumentsContract.isTreeUri(uri)) return uri
     return DocumentsContract.buildDocumentUriUsingTree(uri, DocumentsContract.getTreeDocumentId(uri))
   }
+
+  /**
+   * Resolves the segments below a tree to a document URI the provider accepts.
+   *
+   * The rest of the application builds child URIs as `.../document/<name>`,
+   * because on shared storage the document id *is* the name (`primary:Download`
+   * and `primary:Download/report.pdf`). Google Drive, and any provider that
+   * keeps an opaque id, hands out something like `1a2B3c...` instead, so a URI
+   * carrying the display name names a document that does not exist and the
+   * provider refuses it. Every command below therefore resolves a name against
+   * the provider's own child listing before it builds a URI.
+   *
+   * A segment that already matches a document id is used as it stands, which
+   * keeps the shared-storage form - and every path the page builds after
+   * listing a folder through this plugin - working unchanged.
+   */
+  private fun resolveDocument(uri: Uri): Uri {
+    if (!DocumentsContract.isTreeUri(uri)) return uri
+    val segments = uri.pathSegments
+    val treeIndex = segments.indexOf("tree")
+    val childIndex = segments.indexOf("document")
+    // The tree itself, or a URI that already names one document by id.
+    if (treeIndex < 0 || treeIndex + 1 >= segments.size || childIndex < 0) return documentUri(uri)
+    val grantId = segments[treeIndex + 1]
+    var current = DocumentsContract.buildDocumentUriUsingTree(uri, grantId)
+    var i = childIndex + 1
+    while (i < segments.size) {
+      // `document/id/document/id/...` - the pairs repeat, so skip the keyword.
+      if (segments[i] == "document") { i += 1; continue }
+      val wanted = segments[i]
+      val children = DocumentsContract.buildChildDocumentsUriUsingTree(
+        uri, DocumentsContract.getDocumentId(current))
+      var found: String? = null
+      activity.contentResolver.query(
+        children,
+        arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+        null, null, null)?.use { cursor ->
+        val idColumn = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+        val nameColumn = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+        while (cursor.moveToNext()) {
+          val id = cursor.getString(idColumn) ?: continue
+          // An id that matches exactly is the shared-storage shape and wins;
+          // otherwise the display name is what the caller meant.
+          if (id == wanted) { found = id; break }
+          if (cursor.getString(nameColumn) == wanted && found == null) found = id
+        }
+      } ?: throw IllegalStateException("provider returned no directory listing")
+      val id = found ?: throw IllegalStateException("no document named $wanted in this folder")
+      current = DocumentsContract.buildDocumentUriUsingTree(uri, id)
+      i += 1
+    }
+    return current
+  }
   private fun listChildren(uri: Uri): List<Map<String, Any>> {
     val tree = treeUri(uri)
-    val parent = documentUri(uri)
+    val parent = resolveDocument(uri)
     val parentId = DocumentsContract.getDocumentId(parent)
     val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentId)
     val out = mutableListOf<Map<String, Any>>()

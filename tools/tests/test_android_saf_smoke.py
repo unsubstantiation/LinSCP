@@ -55,22 +55,109 @@ class AndroidSafSmokeTests(unittest.TestCase):
         self.assertIn("granted", driver.lower(),
                       "the driver explains how to grant a folder")
 
-    def test_the_suite_never_writes_outside_its_own_run_folder(self):
-        """It runs against a real phone with the user's files on it."""
+    def test_every_write_it_makes_is_namespaced_by_the_run_id(self):
+        """It runs against a real phone with the user's files on it.
+
+        The local routes take a single leaf name and refuse a path, so a run
+        folder cannot be entered by writing `run/name` - each write is a leaf in
+        the granted tree, and the only thing keeping it from colliding with the
+        user's own files is the timestamped run id inside the name.
+        """
         text = HARNESS.read_text(encoding="utf-8")
-        self.assertIn("linscp-saf-", text,
-                      "every write must be scoped to a run-named folder")
-        # A save or mkdir whose path is a bare name would land in the tree root.
-        for match in re.finditer(r"['\"]path['\"]\s*:\s*([^,}]+)", text):
-            target = match.group(1).strip()
-            self.assertIn("run", target,
-                          f"a write targets {target!r}, which is not scoped to the run folder")
+        self.assertIn("linscp-saf-", text, "every name must carry the run prefix")
+
+        # Every identifier built from the run id, e.g.
+        #   const fileName = run + '.txt'
+        derived = {name for name, expression
+                   in re.findall(r"const (\w+) = ([^;]*);", text)
+                   if "run" in expression and name != "run"}
+        self.assertTrue(derived,
+                        "no name in the harness is derived from the run id, so a "
+                        "write could collide with the user's own file")
+
+        # Every value handed to a write route must be one of those identifiers,
+        # or the run id itself. A literal name would be a bug even if it looked
+        # harmless, because the next person would copy it.
+        # Only the bodies of calls that actually write, so a `name:` that is
+        # part of some other object does not stand in for a write here.
+        bodies = [m.group(1) for m in
+                  re.finditer(r"attempt\('[A-Z]+',\s*'[^']+',\s*\{([^}]*)\}", text, re.S)]
+        writes = []
+        for body in bodies:
+            for value in re.findall(r"\b(?:path|names?)\s*:\s*(\[[^\]]*\]|[A-Za-z_$][\w$]*)", body):
+                writes.extend(part.strip() for part in value.strip("[]").split(",") if part.strip())
+        self.assertTrue(writes, "the harness performs no write to a granted folder")
+        for value in writes:
+            self.assertIn(value, derived | {"run"},
+                          f"a write uses {value!r}, which is not derived from the run id")
+        self.assertIn("names: [run]", text, "the run folder is cleaned up")
 
     def test_the_suite_addresses_a_content_uri_root(self):
         """The whole point is a provider-backed root, not app-private storage."""
         text = HARNESS.read_text(encoding="utf-8")
         self.assertIn("saf_tree", text, "the harness must require a saf_tree root")
         self.assertIn("content://", text, "the harness must check the URI scheme")
+
+    def test_the_name_to_id_resolution_matches_what_each_provider_returns(self):
+        """The plugin resolves a name to the provider's own document id.
+
+        This mirrors `resolveDocument` in LinSCPAndroidPlugin.kt. It cannot run
+        the Kotlin, but it pins the rule the Kotlin implements, because the bug
+        it fixes is invisible on shared storage and fatal on Google Drive:
+        there the id is an opaque token, so `.../document/<name>` names a
+        document that does not exist.
+        """
+        def resolve(segments, listing):
+            if "tree" not in segments or "document" not in segments:
+                return "tree-root"
+            current = segments[segments.index("tree") + 1]
+            i = segments.index("document") + 1
+            while i < len(segments):
+                if segments[i] == "document":
+                    i += 1
+                    continue
+                wanted, found = segments[i], None
+                for child_id, name in listing.get(current, []):
+                    if child_id == wanted:
+                        found = child_id
+                        break
+                    if name == wanted and found is None:
+                        found = child_id
+                self.assertIsNotNone(
+                    found, f"expected {wanted!r} to resolve through its parent listing")
+                current = found
+                i += 1
+            return current
+
+        # Shared storage: the id is the name, so the old form keeps working.
+        shared = {"primary:Download": [("primary:Download/report.pdf", "report.pdf")]}
+        self.assertEqual(
+            resolve(["tree", "primary:Download", "document", "report.pdf"], shared),
+            "primary:Download/report.pdf")
+
+        # Google Drive: the id is opaque, so a name has to be looked up.
+        drive = {"treeId": [("1a2B3c", "report.pdf"), ("9zY8x", "Photos")],
+                 "9zY8x": [("4kL5m", "beach.jpg")]}
+        self.assertEqual(
+            resolve(["tree", "treeId", "document", "report.pdf"], drive), "1a2B3c")
+        self.assertEqual(
+            resolve(["tree", "treeId", "document", "Photos", "document", "beach.jpg"], drive),
+            "4kL5m")
+        # A URI that already carries a real id resolves to itself, which is the
+        # shape the page builds after listing through this plugin.
+        self.assertEqual(resolve(["tree", "treeId", "document", "9zY8x"], drive), "9zY8x")
+
+    def test_the_plugin_resolves_before_it_builds_a_document_uri(self):
+        """The five commands must not append a name to a parent URI unlooked-up."""
+        plugin = (ROOT / "crates" / "linscp-tauri" / "android"
+                  / "LinSCPAndroidPlugin.kt").read_text(encoding="utf-8")
+        self.assertIn("private fun resolveDocument", plugin)
+        for command in ("writeUri", "mkdirUri", "deleteUri", "renameUri", "statUri"):
+            start = plugin.index(f"fun {command}(")
+            end = plugin.index("@Command", start) if "@Command" in plugin[start:] else len(plugin)
+            body = plugin[start:end]
+            self.assertIn("resolveDocument(", body,
+                          f"{command} builds a document URI without resolving the name")
 
     def test_the_rows_it_evidences_are_still_the_ones_missing_device_proof(self):
         ledger = json.loads(LEDGER.read_text(encoding="utf-8"))

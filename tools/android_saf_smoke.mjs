@@ -46,20 +46,19 @@ const expression = `
 
   const invoke = (method, path, body = {}) => window.LinSCPTransport.request(method, path, body);
   const steps = [];
+  const notes = [];
   const step = name => steps.push(name);
 
-  // A 400 is an answer, not a crash: the transport rejects with a status and
-  // the payload, so a refusal can be asserted on instead of aborting the run.
+  // A refusal is an answer, not a crash: the transport rejects with a status
+  // and payload, so a 400 can be asserted on instead of aborting the run.
   const attempt = async (method, path, body) => {
     try { return { ok: true, reply: await invoke(method, path, body) }; }
     catch (error) { return { ok: false, status: error?.status, payload: error?.payload, message: String(error?.message ?? error) }; }
   };
 
   // --- the grant -----------------------------------------------------------
-  // The service enumerates granted trees itself (platform::android::list_roots
-  // extends the filesystem roots with the bridge's persisted grants), so this
-  // one call proves the grant reached the Rust side - which is the part that
-  // the mock cannot tell us anything about.
+  // The service enumerates granted trees itself, so this one call proves the
+  // grant reached the Rust side - the part a mock cannot speak to.
   const listed = await invoke('GET', '/api/local/roots');
   const trees = (listed.roots ?? []).filter(r => r && r.kind === 'saf_tree');
   if (!trees.length) {
@@ -82,61 +81,109 @@ const expression = `
   if (typeof tabId !== 'number') fail('no tab id: ' + JSON.stringify(tab.reply));
   step('a local tab opens on a granted folder');
 
-  // The provider is a real filesystem: list it to prove the tab is looking at
-  // documents rather than at a pathname that happens to share a name.
   const before = await attempt('GET', '/api/local/list?tab=' + tabId);
   if (!before.ok || !Array.isArray(before.reply.entries)) {
     fail('listing the granted tree failed: ' + JSON.stringify(before));
   }
   step('the granted folder lists through the provider (' + before.reply.entries.length + ' entries)');
 
-  // --- a run-scoped folder, so the user's own files are never touched ------
+  // --- run-scoped names ----------------------------------------------------
+  // One folder and one file, each a single leaf directly in the granted tree.
+  // Local routes take a leaf name and refuse anything with a separator, so the
+  // suite names leaves rather than paths - which is exactly how the page drives
+  // these routes too.
   const run = 'linscp-saf-' + Date.now();
+  const fileName = run + '.txt';
+  const text = 'granted text ' + run + '\n';
+
   const made = await attempt('POST', '/api/local/mkdir', { tab: tabId, name: run });
   if (!made.ok) fail('mkdir in the granted tree failed: ' + JSON.stringify(made));
   step('a folder can be created in a granted tree');
 
   // --- editing -------------------------------------------------------------
-  // platform.android-saf-editing: a document is written, read back byte for
-  // byte, and its stat carries the provider's own mtime.
-  const text = 'granted text ' + run + '\\n';
-  const written = await attempt('POST', '/api/local/save', { tab: tabId, path: run + '/note.txt', content: text });
+  const written = await attempt('POST', '/api/local/save', { tab: tabId, path: fileName, content: text });
   if (!written.ok) fail('creating a document failed: ' + JSON.stringify(written));
+  step('a document can be created in a granted folder');
 
-  const saved = await attempt('GET', '/api/local/edit?tab=' + tabId + '&path=' + encodeURIComponent(run + '/note.txt'));
+  const saved = await attempt('GET', '/api/local/edit?tab=' + tabId + '&path=' + encodeURIComponent(fileName));
   if (!saved.ok) fail('reading the document back failed: ' + JSON.stringify(saved));
-  if (saved.reply.content !== text) fail('the provider returned different bytes: ' + JSON.stringify(saved.reply.content));
+  if (saved.reply.content !== text) {
+    fail('the provider returned different bytes: ' + JSON.stringify(saved.reply.content));
+  }
   step('a document round-trips through the provider byte for byte');
 
-  const mtime = saved.reply.info?.mtime;
-  if (typeof mtime !== 'number' || !mtime) fail('the provider stat carries no mtime: ' + JSON.stringify(saved.reply.info));
-  step('the provider reports an mtime (' + mtime + ')');
+  const info = saved.reply.info ?? {};
+  if (typeof info.mtime !== 'number' || !info.mtime) {
+    fail('the provider stat carries no mtime: ' + JSON.stringify(info));
+  }
+  step('the provider reports an mtime (' + info.mtime + ')');
 
-  // A save whose base mtime is stale must be refused: this is the conflict
-  // guard, and on a provider it depends on the mtime surviving a write.
+  // The conflict guard depends on that mtime surviving a write.
   const stale = await attempt('POST', '/api/local/save', {
-    tab: tabId, path: run + '/note.txt', content: 'lost\\n', base_mtime_ns: mtime - 1000000000,
+    tab: tabId, path: fileName, content: 'lost\n', base_mtime_ns: info.mtime - 1000000000,
   });
   if (stale.ok) fail('a stale save was accepted; the conflict guard did not fire');
   if (stale.status !== 400) fail('a stale save failed with status ' + stale.status);
   step('a save against a stale mtime is refused');
 
-  // --- listing sees what the provider now holds ----------------------------
-  const after = await attempt('GET', '/api/local/list?tab=' + tabId + '&path=' + encodeURIComponent(run));
-  const names = (after.reply?.entries ?? []).map(e => e.name);
-  if (!names.includes('note.txt')) fail('the created document is not listed: ' + JSON.stringify(names));
+  const reSave = await attempt('POST', '/api/local/save', {
+    tab: tabId, path: fileName, content: text + 'second\n', base_mtime_ns: info.mtime,
+  });
+  if (!reSave.ok) {
+    // Worth reporting rather than failing the whole run: a provider that
+    // rewrites its own mtime after a write cannot honour a conflict guard, and
+    // that is a property of the provider, not of this suite.
+    notes.push('re-save with the reported mtime was refused: ' + JSON.stringify(reSave.payload ?? reSave.message));
+  } else {
+    step('a save against the current mtime is accepted');
+  }
+
+  const listedFile = await attempt('GET', '/api/local/list?tab=' + tabId);
+  const names = (listedFile.reply?.entries ?? []).map(e => e.name);
+  if (!names.includes(fileName)) fail('the created document is not listed: ' + JSON.stringify(names));
   step('the created document is listed back');
 
+  // --- the nested case -----------------------------------------------------
+  // This is the one that distinguishes a provider whose document id is the
+  // display name (shared storage: primary:Download/report.pdf) from one that
+  // keeps an opaque id (Google Drive: 1a2B3c...). Opening a folder and reading
+  // a document inside it builds .../document/<name> two levels down, and an
+  // opaque provider refuses that unless the shell resolves names to ids.
+  //
+  // It is a probe, not a gate: a provider that refuses nested paths is a real
+  // finding to report, so it is recorded instead of aborting the run.
+  const nestedTab = await attempt('POST', '/api/tabs/local', {
+    local_dir: treeUri + '/document/' + encodeURIComponent(run),
+    remote_dir: treeUri,
+  });
+  if (!nestedTab.ok) {
+    notes.push('a local tab will not open on a subfolder: ' + JSON.stringify(nestedTab.payload ?? nestedTab.message));
+  } else {
+    const nestedId = nestedTab.reply.tab.id;
+    const inside = await attempt('GET', '/api/local/edit?tab=' + nestedId + '&path=' + encodeURIComponent(fileName));
+    if (!inside.ok) {
+      notes.push('a document inside a subfolder cannot be read: ' + JSON.stringify(inside.payload ?? inside.message));
+    } else if (inside.reply.content !== text) {
+      notes.push('a document inside a subfolder reads back different bytes');
+    } else {
+      step('a document inside a subfolder is readable (provider ids resolve)');
+    }
+    await attempt('POST', '/api/tabs/close', { tab: nestedId });
+  }
+
   // --- deleting ------------------------------------------------------------
-  const gone = await attempt('POST', '/api/local/delete', { tab: tabId, names: ['note.txt'] });
+  const gone = await attempt('POST', '/api/local/delete', { tab: tabId, names: [fileName] });
   if (!gone.ok) fail('deleting a document failed: ' + JSON.stringify(gone));
-  const remaining = await attempt('GET', '/api/local/list?tab=' + tabId + '&path=' + encodeURIComponent(run));
-  if ((remaining.reply?.entries ?? []).some(e => e.name === 'note.txt')) {
+  const remaining = await attempt('GET', '/api/local/list?tab=' + tabId);
+  if ((remaining.reply?.entries ?? []).some(e => e.name === fileName)) {
     fail('the deleted document is still listed');
   }
   step('a document can be deleted through the provider');
 
-  return { treeUri, run, tab: tabId, mtime, steps };
+  // Leave the granted tree as it was found.
+  await attempt('POST', '/api/local/delete', { tab: tabId, names: [run] });
+
+  return { treeUri, run, tab: tabId, mtime: info.mtime, steps, notes };
 })()`;
 
 let nextId = 0;
@@ -183,5 +230,15 @@ if (value?.skip) {
 }
 
 if (reportPath) writeFileSync(reportPath, JSON.stringify(value, null, 2));
-for (const name of value.steps ?? []) console.log('  ok  ' + name);
-console.log('Android SAF smoke passed on ' + value.treeUri);
+for (const name of value.steps ?? []) console.log('  ok    ' + name);
+// A note is a real finding about the provider that did not stop the run. It is
+// printed, written into the report, and never turned into a pass.
+for (const note of value.notes ?? []) console.log('  note  ' + note);
+if ((value.notes ?? []).length) {
+  console.log('');
+  console.log('Android SAF smoke finished with ' + value.notes.length +
+              ' provider finding(s); the runs above still passed.');
+} else {
+  console.log('Android SAF smoke passed on ' + value.treeUri);
+}
+console.log(JSON.stringify({ treeUri: value.treeUri, steps: (value.steps ?? []).length, notes: value.notes ?? [] }));
