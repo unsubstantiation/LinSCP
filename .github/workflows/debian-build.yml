@@ -77,6 +77,8 @@ jobs:
           python3 -m unittest discover -s tools/tests -p test_shared_frontend.py
           python3 -m unittest discover -s tools/tests -p test_rust_cross_lang_parity.py
           python3 -m unittest discover -s tools/tests -p test_repo_hygiene.py
+          python3 tools/check_ci_test_execution.py
+          python3 -m unittest discover -s tools/tests -p test_ci_test_execution.py
 
       # Targeted `cargo test -p <crate> <filter>` runs compile that crate's
       # whole test harness, but a crate with no step at all never compiles
@@ -94,6 +96,43 @@ jobs:
       # other job; without this step they are checked by reading alone.
       - name: Exercise the platform unit tests
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-platform -- --nocapture
+
+      # The Windows job runs `cargo test --workspace`, so every crate's tests
+      # do run somewhere - but the Debian job is the Linux gate, and it only
+      # compiled seven crates and executed five of them. So a Linux-only
+      # regression in the rest would have shipped green: the type crate, the
+      # catalogs, the vault crypto, the protocol unit tests, the engine, the
+      # terminal emulator and the host bridge.
+      #
+      # `linscp-terminal` matters most: its 28 tests cover the escape-sequence
+      # parser, wide and combining glyphs, scrolling, selections and the palette
+      # queries - the code the Android terminal draws with - and the Debian job
+      # did not even compile them.
+      #
+      # These are offline and hermetic; the live-server cases keep their own
+      # opt-in steps below.
+      - name: Exercise the type, i18n and crypto unit tests
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-types -p linscp-i18n -p linscp-crypto -- --nocapture
+
+      - name: Exercise the protocol unit tests
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-proto -- --nocapture
+
+      - name: Exercise the engine unit tests
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-engine -- --nocapture
+
+      - name: Exercise the terminal emulator unit tests
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-terminal -- --nocapture
+
+      # `tauri` is an optional dependency behind `native-shell`, which this
+      # builds without, so the bridge's own tests need no desktop toolkit.
+      - name: Exercise the host bridge unit tests
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-tauri -- --nocapture
+
+      # The rest of the service suite: the local-to-local transfer, the vault,
+      # the SAF bridge, the console and the drop endpoints. The `live_*` cases
+      # are skipped here because each has its own opt-in step below.
+      - name: Exercise the remaining service unit tests
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service -- --nocapture --test-threads=1 --skip live_
 
       # Local symlink creation needs a privilege Windows CI cannot grant, so
       # its test is Unix-only and this job is the one that runs it.
