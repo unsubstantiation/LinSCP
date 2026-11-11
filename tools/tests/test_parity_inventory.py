@@ -385,6 +385,31 @@ class InventoryTests(unittest.TestCase):
                         label + ": " + platform +
                         " cites suites with no named cases")
 
+    def test_a_cited_case_must_be_a_test_and_not_merely_a_function(self):
+        """A helper whose name reads like a case is not a case.
+
+        gui.remote-delete cited `exercise_remote_delete` for a while. It takes
+        arguments and returns a future - it is a helper called from
+        live_webdav_gui_upload_download - but it matches a bare `fn` lookup, so
+        the gate accepted it. The lookup now requires a test attribute.
+        """
+        import re
+        source = ("#[cfg(target_os = \"linux\")]\n"
+                  "#[tokio::test]\n"
+                  "async fn real_case() { }\n"
+                  "\n"
+                  "async fn helper_taking_arguments(svc: &u8, id: u64) { }\n")
+
+        def cited(name):
+            return re.search(
+                r"#\[(?:tokio::)?test[^\]]*\]"
+                r"(?:\s*(?://[^\n]*|#\[[^\]]*\]))*"
+                r"\s*(?:async\s+)?fn\s+" + re.escape(name) + r"\s*\(", source)
+
+        self.assertIsNotNone(cited("real_case"), "a #[tokio::test] fn is a case")
+        self.assertIsNone(cited("helper_taking_arguments"),
+                          "a plain fn is not a case, however much it reads like one")
+
     def test_the_suite_registry_marks_what_does_not_run(self):
         inventory = json.loads((ROOT / "docs/upstream-parity.json").read_text())
         report = matrix_report(inventory)

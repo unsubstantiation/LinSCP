@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
-"""Check that every crate's tests run on Linux, not only on Windows.
+"""Check that every crate with tests has a Debian step that names it.
 
-The Windows job runs `cargo test --workspace`, so every crate's tests do run
-somewhere. The Debian job is different: it compiles seven crates' test targets
-with `--no-run` and executes only the handful it names. A compact, portable
-crate can therefore go years here with its tests compiled and never executed
-on the platform the product actually ships on first.
+Every crate in this workspace already has its tests executed on Linux, and by
+one line: `debian/rules` runs `cargo test --workspace --all-targets` while
+`dpkg-buildpackage` builds the package, and that package build is a step in the
+Debian workflow. So this check is not what makes the suites run, and it would
+be wrong to describe it as closing a coverage hole - it does not.
 
-Two crates were in exactly that position. `linscp-terminal` - 28 tests over
-the escape-sequence parser, wide and combining glyphs, scrolling, selections
-and palette queries, the code the Android terminal draws with - was not even
-compiled by the Debian job. `linscp-tauri` - the SAF tree validation and the
-grant-as-root listing - was not either. Both were covered only by a Windows
-runner, so a Linux-only regression in either would have shipped green.
+What it protects is attribution. That one line is a single opaque step: when a
+crate's test fails inside it, the job goes red with a Cargo transcript and no
+step of its own to blame, and a crate that a reader believes is covered can sit
+there without any step that would visibly break if it stopped executing. A
+named `cargo test -p <crate>` step per crate makes the failure name the crate
+and makes its absence visible in review.
 
-This check reads the workflow files and fails when a workspace crate whose
-source contains tests has no Debian step that runs them.
+So the rule this enforces is narrower than "does it run somewhere": a crate
+whose source contains tests must have a Debian workflow step that runs them by
+name. That is a legibility guarantee, and it is worth stating plainly which
+guarantee this is.
+
+Two mistakes shaped the checks below, both of which once made this pass while
+proving nothing. A step that only compiles (`--no-run`) is not execution, and
+crossing a crate list with a regex that excludes digits silently truncates it.
+The Windows job's `cargo test --workspace` is not evidence either: coverage on
+another platform says nothing about this one, and reading it as coverage is how
+a crate goes untested on the platform that ships first.
 
 Usage:
     python3 tools/check_ci_test_execution.py
@@ -98,6 +107,33 @@ def executed_crates(root=ROOT):
     return executed
 
 
+RULES = 'debian/rules'
+
+
+def package_build_runs_workspace_tests(root=ROOT):
+    """Whether `debian/rules` still runs the whole workspace suite.
+
+    This is the premise the rest of the check rests on. `debian/rules` runs
+    `cargo test --workspace --all-targets` while `dpkg-buildpackage` builds the
+    package, and the Debian workflow has a step that builds the package - so
+    that line, not the named steps, is what makes every crate's tests execute
+    on Linux. If somebody removes or narrows it, coverage really would be lost,
+    and the named steps alone do not replace it.
+    """
+    rules = root / RULES
+    if not rules.is_file():
+        return False
+    for line in rules.read_text(encoding='utf-8').splitlines():
+        stripped = line.strip()
+        if stripped.startswith('#'):
+            continue
+        if not re.search(r'cargo\s+test\b', stripped):
+            continue
+        if '--workspace' in stripped or '-p ' not in stripped:
+            return True
+    return False
+
+
 def collect(root=ROOT):
     """Every crate whose tests are compiled but never executed."""
     executed = executed_crates(root)
@@ -111,15 +147,24 @@ def collect(root=ROOT):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.parse_args()
+    if not package_build_runs_workspace_tests():
+        print(f'{RULES} no longer runs `cargo test --workspace --all-targets`, so the '
+              f'package build is not executing the workspace suite any more. The named '
+              f'steps below cover only the crates they list; restore the workspace run '
+              f'or add a step for every crate.',
+              file=sys.stderr)
+        return 1
     missing = collect()
     for crate, count in missing:
-        print(f'crates/{crate} has {count} tests that no workflow executes: '
-              f'add a step that runs `cargo test -p {crate}`', file=sys.stderr)
+        print(f'crates/{crate} has {count} tests and no Debian step names it, so a '
+              f'failure in it would report no crate: add a step that runs '
+              f'`cargo test -p {crate}`', file=sys.stderr)
     if missing:
         return 1
     total = sum(crates_with_tests().values())
-    print(f'Every one of the {len(crates_with_tests())} crates with tests is executed by CI '
-          f'({total} test attributes).')
+    print(f'All {len(crates_with_tests())} crates with tests have a Debian step of their own '
+          f'({total} test attributes). The workspace-wide `--all-targets` run in '
+          f'debian/rules still executes them all; these steps are what names them.')
     return 0
 
 
