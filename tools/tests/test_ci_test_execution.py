@@ -1,9 +1,16 @@
 """Regressions for tools/check_ci_test_execution.py.
 
-The check exists because a crate's tests can be compiled on every push and
-executed on none of them: five crates were in that state, and the terminal
-emulator's 28 tests had never run anywhere. These cases prove the check
-notices each way that can happen, so the guard cannot quietly stop noticing.
+The check asserts that every crate with tests has a Debian step naming it, so a
+failure reports a crate instead of a transcript from one workspace-wide run.
+That is a legibility guarantee, not a coverage one: `debian/rules` already runs
+`cargo test --workspace --all-targets` during the package build.
+
+An earlier version of this file said the terminal emulator's tests had never
+run anywhere, and that five crates were compiled but executed on none of them.
+Both were wrong, and wrong in a way worth keeping on the record here: the
+workflow's visible steps were read, and the build system those steps invoke was
+not. These cases prove the check still notices each of the ways a crate can go
+unnamed, including the two that once made it pass while proving nothing.
 """
 import pathlib
 import sys
@@ -43,6 +50,30 @@ class CiTestExecutionTests(unittest.TestCase):
     def missing(self):
         """Crates compiled but not executed, reading this temp tree."""
         return check.collect(self.root)
+
+    def test_the_real_package_build_still_runs_the_workspace_suite(self):
+        # The named steps only add attribution. What actually executes every
+        # crate's tests on Linux is the workspace-wide run inside the package
+        # build, so the guard has to notice if that line ever goes away.
+        self.assertTrue(check.package_build_runs_workspace_tests())
+
+    def test_a_package_build_that_drops_the_workspace_run_is_refused(self):
+        self.workspace('alpha')
+        self.crate('alpha')
+        self.workflow('cargo test -p alpha')
+        self.write('debian/rules',
+                   'build-stamp:\n\tcargo build --release -p linscp-tauri\n')
+        self.assertFalse(check.package_build_runs_workspace_tests(self.root))
+
+    def test_a_commented_workspace_run_is_not_a_workspace_run(self):
+        # Commenting the line out is the realistic way it disappears, and a
+        # commented-out command runs nothing.
+        self.workspace('alpha')
+        self.crate('alpha')
+        self.write('debian/rules',
+                   'build-stamp:\n\t# cargo test --workspace --all-targets\n'
+                   '\tcargo build --release -p linscp-tauri\n')
+        self.assertFalse(check.package_build_runs_workspace_tests(self.root))
 
     def test_the_real_repository_executes_every_crate_with_tests(self):
         # The repository itself must satisfy the rule, or the guard has already

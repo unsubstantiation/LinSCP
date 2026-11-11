@@ -80,14 +80,16 @@ jobs:
           python3 tools/check_ci_test_execution.py
           python3 -m unittest discover -s tools/tests -p test_ci_test_execution.py
 
-      # Targeted `cargo test -p <crate> <filter>` runs compile that crate's
-      # whole test harness, but a crate with no step at all never compiles
-      # its tests anywhere on Linux — and `#[cfg(unix)]` test bodies do not
-      # even exist to the Windows job. Building every test target without
-      # running it is what keeps a Unix-only test from rotting: it fails here
-      # on a type error instead of surprising the next full-workspace run.
-      # (`linscp-tauri` is left out: the Windows and Android jobs build it,
-      # and its test harness wants a desktop toolkit this runner lacks.)
+      # A filtered `cargo test -p <crate> <filter>` still compiles that crate's
+      # whole harness, so between them the named steps below compile most of
+      # the workspace early. This step makes that explicit for the crates whose
+      # tests are targeted by name and builds them before anything runs, so a
+      # type error in a `#[cfg(unix)]` test body - which does not even exist to
+      # the Windows job - surfaces here rather than in the package build.
+      #
+      # `linscp-terminal` and `linscp-tauri` are left out because the steps
+      # below compile them by running their tests outright, which is strictly
+      # more than `--no-run` would do.
       - name: Compile every unit-test target on Linux
         run: python3 tools/run_cargo_ci.py cargo test --no-run -p linscp-types -p linscp-i18n -p linscp-crypto -p linscp-platform -p linscp-proto -p linscp-engine -p linscp-service
 
@@ -97,20 +99,23 @@ jobs:
       - name: Exercise the platform unit tests
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-platform -- --nocapture
 
-      # The Windows job runs `cargo test --workspace`, so every crate's tests
-      # do run somewhere - but the Debian job is the Linux gate, and it only
-      # compiled seven crates and executed five of them. So a Linux-only
-      # regression in the rest would have shipped green: the type crate, the
-      # catalogs, the vault crypto, the protocol unit tests, the engine, the
-      # terminal emulator and the host bridge.
+      # Every crate's tests already run on Linux, and in one place: the
+      # package build below runs `cargo test --workspace --all-targets` from
+      # debian/rules. That line covers the whole workspace, so these steps do
+      # not add coverage - they add a name.
       #
-      # `linscp-terminal` matters most: its 28 tests cover the escape-sequence
-      # parser, wide and combining glyphs, scrolling, selections and the palette
-      # queries - the code the Android terminal draws with - and the Debian job
-      # did not even compile them.
+      # The difference matters when something fails. A red `--all-targets` run
+      # is one opaque step with a Cargo transcript and no crate to point at, and
+      # a crate nobody steps over deliberately can sit there without any step
+      # that would visibly break if it stopped running. `linscp-terminal` is the
+      # one to care about: its 28 tests cover the escape-sequence parser, wide
+      # and combining glyphs, scrolling, selections and the palette queries - the
+      # code the Android terminal draws with - and it is worth a step of its own
+      # rather than a mention in a transcript.
       #
       # These are offline and hermetic; the live-server cases keep their own
-      # opt-in steps below.
+      # opt-in steps below. tools/check_ci_test_execution.py enforces that every
+      # crate with tests keeps one.
       - name: Exercise the type, i18n and crypto unit tests
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-types -p linscp-i18n -p linscp-crypto -- --nocapture
 

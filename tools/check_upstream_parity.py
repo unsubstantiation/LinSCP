@@ -356,9 +356,14 @@ def check_capabilities(inventory, errors, root=ROOT):
                                "gui-shell-definitions", "gui-shell-actions",
                                "platform-windows-acl", "proto-ssh",
                                "vault-password", "service-tabs"):
-                    # A Rust test is a #[test]/#[tokio::test] function, not a
-                    # `test_*` ffi symbol; the drop helpers are `async fn`.
-                    expression = r"\b(?:async\s+)?fn\s+" + re.escape(case) + r"\s*\("
+                    # A cited case must be a #[test]/#[tokio::test] function,
+                    # not merely a function of that name. A helper taking
+                    # arguments is not a case: `exercise_remote_delete` was
+                    # cited here for a while purely because its name reads like
+                    # one, and a bare `fn` match cannot tell the difference.
+                    expression = (r"#\[(?:tokio::)?test[^\]]*\]"
+                                  r"(?:\s*(?://[^\n]*|#\[[^\]]*\]))*"
+                                  r"\s*(?:async\s+)?fn\s+" + re.escape(case) + r"\s*\(")
                 else:
                     # Python's test_* / C++ Test* / Rust fn test_*.
                     expression = r"\b(?:def|void|fn)\s+" + re.escape(case) + r"\s*\("
