@@ -779,6 +779,91 @@ function options(id) {
       extraKeysHidden.some((block) => block.includes('display: none')),
       JSON.stringify(extraKeysHidden));
 
+    /* ---- The design system ------------------------------------------- */
+    /* The stylesheet is now built out of tokens, so the ways it can rot are
+     * different from the ways a hand-written stylesheet rots. These four
+     * checks each cover a failure this migration actually hit. */
+    {
+      // 1. A block that closes early leaves the declarations after it outside
+      //    any rule. They are parsed, ignored, and every colour they define
+      //    silently disappears - while the page still renders and every
+      //    geometry test still passes. This is how the base palette died once.
+      let depth = 0;
+      let orphaned = 0;
+      for (const line of stylesheet.split('\n')) {
+        const code = line.split('/*')[0];
+        const before = depth;
+        depth += (code.match(/{/g) || []).length - (code.match(/}/g) || []).length;
+        if (before === 0 && /^\s*--[a-z0-9-]+\s*:/.test(code)) orphaned += 1;
+      }
+      check('every declaration in the stylesheet is inside a rule', orphaned === 0,
+        `${orphaned} token declarations sit outside any block`);
+      check('the stylesheet braces balance', depth === 0, `unbalanced by ${depth}`);
+
+      // 2. A var() with no definition is not an error in CSS: the property
+      //    just does not apply, so a typo in a token name looks like styling
+      //    that was never written.
+      const defined = new Set();
+      for (const m of stylesheet.matchAll(/(--[a-z0-9-]+)\s*:/g)) defined.add(m[1]);
+      const undefinedTokens = [...new Set([...stylesheet.matchAll(/var\((--[a-z0-9-]+)/g)]
+        .map((m) => m[1]))].filter((name) => !defined.has(name));
+      check('every token a rule uses is defined', undefinedTokens.length === 0,
+        undefinedTokens.join(', '));
+
+      // 3. The palette is the only source of colour. One-off hex inside a
+      //    rule is how the light theme ended up with a dark blue glow.
+      //    Comments are stripped first: this file documents the values it
+      //    replaced, and quoting one is not painting with it.
+      const body = stylesheet
+        .slice(stylesheet.indexOf('* { box-sizing'))
+        .replace(/\/\*[\s\S]*?\*\//g, '');
+      const literals = [...new Set([
+        ...(body.match(/#[0-9a-fA-F]{3,8}\b/g) || []),
+        ...(body.match(/rgba?\([^)]*\)/g) || []),
+      ])].filter((value) => !value.includes('transparent'));
+      check('no rule paints a colour the palette does not name',
+        literals.length === 0, literals.join(', '));
+
+      // 4. Text has to be readable, and a placeholder is still text. Both
+      //    themes are checked against every surface an input can sit on.
+      const luminance = (hex) => {
+        const value = hex.replace('#', '');
+        const channels = [0, 2, 4].map((i) => parseInt(value.slice(i, i + 2), 16) / 255);
+        return channels
+          .map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4))
+          .reduce((sum, c, i) => sum + c * [0.2126, 0.7152, 0.0722][i], 0);
+      };
+      const contrast = (a, b) => {
+        const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+        return (hi + 0.05) / (lo + 0.05);
+      };
+      const valueOf = (name, from) => {
+        const m = from.match(new RegExp(`${name}:\\s*(#[0-9a-fA-F]{6})`));
+        return m ? m[1] : null;
+      };
+      const themes = {
+        dark: stylesheet.slice(0, stylesheet.indexOf(':root[data-theme="light"]')),
+        light: stylesheet.slice(stylesheet.indexOf(':root[data-theme="light"]'),
+          stylesheet.indexOf('* { box-sizing')),
+      };
+      // The terminal is painted by a canvas that brings its own colours, so
+      // only the surfaces that actually carry HTML text are checked.
+      const textSurfaces = ['--surface', '--surface-raised', '--code-bg', '--surface-input'];
+      const unreadable = [];
+      for (const [theme, block] of Object.entries(themes)) {
+        for (const surface of textSurfaces) {
+          for (const ink of ['--text', '--muted', '--subtle']) {
+            const fg = valueOf(ink, block);
+            const bg = valueOf(surface, block);
+            if (!fg || !bg) continue;
+            if (contrast(fg, bg) < 4.5) unreadable.push(`${theme}: ${ink} on ${surface}`);
+          }
+        }
+      }
+      check('body and placeholder text clear 4.5:1 on every surface',
+        unreadable.length === 0, unreadable.join(', '));
+    }
+
     // And the behaviour the stylesheet exists for: a click opens the panel.
     const button = doc.querySelector('[onclick*="localMenu"]');
     const menu = doc.getElementById('localMenu');

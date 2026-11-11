@@ -106,7 +106,7 @@
   --border-strong: #3a4a5c;
   --text: #edf2f7;
   --muted: #9aaabd;
-  --subtle: #728297;
+  --subtle: #7f8fa4;
   --accent: #55a8ed;
   --accent-strong: #2383ce;
   --accent-hover: #72bdff;
@@ -135,7 +135,7 @@
   --border-strong: #aebdcd;
   --text: #1d2938;
   --muted: #607186;
-  --subtle: #7c8a9a;
+  --subtle: #626e7a;
   --accent: #176eae;
   --accent-strong: #075c9d;
   --accent-hover: #0b79c6;
@@ -873,7 +873,7 @@ button.site-item { display: block; width: 100%; border: 0; background: transpare
 }
 
 /* Language names remain readable at longer translated label lengths. */
-.language-control { display:flex; align-items:center; gap:6px; font-size: var(--fs-base); }
+.language-control { display: flex; align-items: center; gap: var(--space-3); font-size: var(--fs-base); }
 .language-control select { max-width:150px; font:inherit; }
 
 /* ---- Custom command templates ---------------------------------------- */
@@ -1227,7 +1227,10 @@ body {
 /* Toolbar: remote desktop button is a first-class action — visible even on narrow */
 #remoteDesktopToolbarBtn { border-color: var(--accent); color: var(--accent-hover); }
 #remoteDesktopToolbarBtn:hover { background: var(--accent-soft); }
-#remoteDesktopToolbarBtn .tool-icon { filter: drop-shadow(0 1px 4px rgba(85,168,237,.35)); }
+/* Same story as the pulse below: the glow was --accent written as rgba. */
+#remoteDesktopToolbarBtn .tool-icon {
+  filter: drop-shadow(0 1px 4px color-mix(in srgb, var(--accent) 35%, transparent));
+}
 
 /* Make all toolbar buttons wrap gracefully instead of vanishing on 960px */
 @media (max-width: 960px) {
@@ -1250,7 +1253,7 @@ body {
  * was added deliberately once and would look reasonable to add again. */
 
 /* Remote desktop prompt: Not available card — Cancel / Install are both visible */
-#remoteDesktopPrompt { animation: fadeIn .18s ease; }
+#remoteDesktopPrompt { animation: fadeIn var(--duration-base) var(--ease); }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 #remoteDesktopScript { font-family: var(--font-mono); }
 #remoteDesktopStatus { font-weight: var(--fw-semibold); }
@@ -1284,8 +1287,14 @@ var(--border-strong)kupModal .hint code { user-select: all; background: var(--su
 }
 
 /* Feature tour hint: subtle “what's new” pulse for Remote Desktop after first load */
-@keyframes pulseGlow { 0%,100% { box-shadow: 0 0 0 0 rgba(85,168,237,0); } 50% { box-shadow: 0 0 0 6px rgba(85,168,237,.18); } }
-#remoteDesktopToolbarBtn.is-new { animation: pulseGlow 1.8s ease 1.2s 3; }
+/* The ring was written as rgba(85,168,237,...), which is --accent spelled out
+ * by hand - so it pulsed the dark theme's blue even when the light theme had
+ * swapped the accent for a darker one. color-mix keeps it the accent. */
+@keyframes pulseGlow {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
+  50% { box-shadow: 0 0 0 var(--space-3) color-mix(in srgb, var(--accent) 18%, transparent); }
+}
+#remoteDesktopToolbarBtn.is-new { animation: pulseGlow 1.8s var(--ease) 1.2s 3; }
 
 /* Shared multi-server monitor: one component, native/browser/touch hosts. */
 .monitor-overlay { z-index: 1050; }
