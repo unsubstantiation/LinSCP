@@ -1173,15 +1173,20 @@ body {
   [data-mobile-pane="remote"] #localPane { display: none !important; }
 }
 
-/* Touch devices read at arm's length and the small end of the ramp was
- * still 10px there. Re-stating the two smallest steps once, here, lifts every
- * label that uses them — bottom nav, hints, badges, key caps — instead of
- * leaving the same 10px sprinkled across a dozen rules. The 30px row height
- * grows to the 44px thumb target in the same block. */
+/* Touch devices read at arm's length and the small end of the ramp was still
+ * 10px there. Re-stating the ramp once, here, lifts every label that uses it -
+ * bottom nav, hints, badges, key caps - instead of leaving the same 10px
+ * sprinkled across a dozen rules.
+ *
+ * The whole ramp moves, not just the two smallest steps: lifting those alone
+ * to 11/12 against a 13px body gives four sizes one pixel apart, which is a
+ * list of numbers rather than a hierarchy. */
 @media (pointer: coarse) {
   :root {
     --fs-xs: 11px;
     --fs-sm: 12px;
+    --fs-base: 14px;
+    --fs-lg: 16px;
   }
 }
 
