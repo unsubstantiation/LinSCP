@@ -36,7 +36,8 @@
   /* The scale is complete on purpose: the ends are unused today and exist so a
    * new rule reaches for 0 or 28px instead of writing it as a literal. */
 
-  /* Type: four sizes, no others. 13px is body, 14px is a heading. */
+  /* Type: four sizes, no others. 13px is body; 14px is a heading, 11px a
+   * secondary label, 10px a badge or key cap. Touch devices raise all four. */
   --fs-xs: 10px;
   --fs-sm: 11px;
   --fs-base: 13px;
@@ -56,7 +57,9 @@
   --r-lg: 8px;
   --r-pill: 999px;
 
-  /* Elevation: one raised surface and one overlay. */
+  /* Elevation: four steps, from a hairline lift to something above a dialog.
+   * They are re-stated for the light theme - an rgba-black shadow that reads as
+   * depth on a dark page reads as a grey smudge on a white one. */
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, .28);
   --shadow-md: 0 8px 20px rgba(0, 0, 0, .34);
   --shadow-lg: 0 16px 42px rgba(0, 0, 0, .42);
@@ -82,7 +85,8 @@
   /* Monospace, stated once instead of four different font stacks. */
   --font-mono: "Cascadia Code", Consolas, "DejaVu Sans Mono", monospace;
 
-  /* Semantic overlays, so "hover" and "selected" stop being hand-mixed. */
+  /* The dim behind a modal. Hover and selection are --surface-hover and
+   * --selection, which already existed; this is the one that did not. */
   --backdrop: rgba(2, 7, 12, .72);
 
   /* Roles the rules had been spelling as one-off hex values. A band is a
