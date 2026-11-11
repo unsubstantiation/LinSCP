@@ -933,6 +933,76 @@ button.site-item { display: block; width: 100%; border: 0; background: transpare
   border-radius: var(--r-lg);
   background: var(--surface-raised);
 }
+/* The vault gate. This is the first screen the app shows and it used to be
+ * styled by a <style> block in the page head - the one screen that never
+ * learned about the palette, with its own 14px radius, four hardcoded colours
+ * (one of them a near-invisible 96% black) and a var(--panel) that no
+ * stylesheet defines, so the card fell back to a fixed dark grey in the light
+ * theme too. It is a full-screen dialog like any other, so it is built from
+ * the same tokens as the rest. */
+#vaultGate {
+  position: fixed;
+  inset: 0;
+  z-index: 100000;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-10);
+  background: var(--backdrop);
+  backdrop-filter: blur(3px);
+}
+#vaultGate .vault-card {
+  width: min(440px, 100%);
+  padding: var(--space-12);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow-xl);
+}
+#vaultGate h1 {
+  margin: 0 0 var(--space-4);
+  font-size: var(--fs-lg);
+  line-height: var(--lh-tight);
+}
+#vaultGate p {
+  margin: 0 0 var(--space-6);
+  color: var(--muted);
+  font-size: var(--fs-base);
+  line-height: 1.5;
+}
+#vaultGate label {
+  display: block;
+  margin: var(--space-6) 0 var(--space-2);
+  color: var(--muted);
+  font-size: var(--fs-sm);
+}
+#vaultGate input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--space-5) var(--space-6);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--surface-input);
+  color: var(--text);
+  font-size: var(--fs-base);
+}
+#vaultGate input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+#vaultGate .vault-error {
+  min-height: 1.5em;
+  margin: 0;
+  color: var(--danger);
+  font-size: var(--fs-sm);
+}
+#vaultGate #vaultUnlockButton {
+  width: 100%;
+  min-height: 36px;
+  margin-top: var(--space-4);
+}
+
 /* A copyable command or script shown in a dialog. It was spelled inline on
  * one <pre>; a second one would have been spelled slightly differently. */
 .script-block {

@@ -803,9 +803,12 @@ function options(id) {
       // 2. A var() with no definition is not an error in CSS: the property
       //    just does not apply, so a typo in a token name looks like styling
       //    that was never written.
+      // Comments are stripped first: prose that names a token - including a
+      // note explaining that one was undefined - is not a use of it.
+      const code = stylesheet.replace(/\/\*[\s\S]*?\*\//g, '');
       const defined = new Set();
-      for (const m of stylesheet.matchAll(/(--[a-z0-9-]+)\s*:/g)) defined.add(m[1]);
-      const undefinedTokens = [...new Set([...stylesheet.matchAll(/var\((--[a-z0-9-]+)/g)]
+      for (const m of code.matchAll(/(--[a-z0-9-]+)\s*:/g)) defined.add(m[1]);
+      const undefinedTokens = [...new Set([...code.matchAll(/var\((--[a-z0-9-]+)/g)]
         .map((m) => m[1]))].filter((name) => !defined.has(name));
       check('every token a rule uses is defined', undefinedTokens.length === 0,
         undefinedTokens.join(', '));
