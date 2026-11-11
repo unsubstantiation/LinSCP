@@ -393,7 +393,7 @@
     <div class="modal-box" style="width:560px;">
       <div class="modal-header">
         <span>Workspaces</span>
-        <span style="cursor:pointer;" onclick="closeModal('workspacesModal')">✕</span>
+        <button type="button" class="modal-close" onclick="closeModal('workspacesModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body">
         <div class="hint">A workspace reopens the current tabs, their two pane directories and the active tab. Passwords are not stored in it.</div>
@@ -414,7 +414,7 @@
     <div class="modal-box" style="width:560px;">
       <div class="modal-header">
         <span>Bookmarks</span>
-        <span style="cursor:pointer;" onclick="closeModal('bookmarksModal')">✕</span>
+        <button type="button" class="modal-close" onclick="closeModal('bookmarksModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body">
         <div class="hint">A bookmark stores a directory of one panel. It stores no session, password or host key.</div>
@@ -434,11 +434,11 @@
     <div class="modal-box" style="width:560px;">
       <div class="modal-header">
         <span>Session URL</span>
-        <span style="cursor:pointer;" onclick="closeModal('sessionUrlModal')">✕</span>
+        <button type="button" class="modal-close" onclick="closeModal('sessionUrlModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body">
         <div class="hint">The URL opens this site in this client. The password is left out unless you ask for it.</div>
-        <textarea id="sessionUrlText" class="input-field" readonly rows="4" style="width:100%; font-family:monospace; resize:vertical;"></textarea>
+        <textarea id="sessionUrlText" class="input-field textarea-field" readonly rows="4"></textarea>
         <label class="form-row"><input type="checkbox" id="urlIncludePassword" onchange="loadSessionUrl()"><span>Include the password</span></label>
         <div class="hint">A URL with a password is a secret. It is shown and copied here, never written to the command log.</div>
         <div class="hint" id="sessionUrlStatus"></div>
@@ -455,7 +455,7 @@
     <div class="modal-box" style="width:640px;">
       <div class="modal-header">
         <span>Import sessions</span>
-        <span style="cursor:pointer;" onclick="closeModal('importSessionsModal')">✕</span>
+        <button type="button" class="modal-close" onclick="closeModal('importSessionsModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body">
         <div class="hint">Sites are read from an OpenSSH client configuration or a FileZilla sitemanager.xml file. Passwords are encrypted with sessions.key when they are stored.</div>
@@ -485,7 +485,7 @@
     <div class="modal-box" style="width:620px;">
       <div class="modal-header">
         <span>Preferences</span>
-        <span style="cursor:pointer;" onclick="closeModal('preferencesModal')">✕</span>
+        <button type="button" class="modal-close" onclick="closeModal('preferencesModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body">
         <div class="hint">These are the defaults a transfer and a confirmation start from. A transfer dialog still lets you change them for one run.</div>
@@ -523,7 +523,7 @@
     <div class="modal-box" style="width:620px;">
       <div class="modal-header">
         <span>Cleanup stored data</span>
-        <span style="cursor:pointer;" onclick="closeModal('cleanupModal')">✕</span>
+        <button type="button" class="modal-close" onclick="closeModal('cleanupModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body">
         <div class="hint">Each item is one file or directory this client writes. Removing it cannot be undone, and the parts you leave unticked are not touched.</div>
@@ -543,7 +543,7 @@
     <div class="modal-box" style="width:680px; max-width:96vw;">
       <div class="modal-header">
         <span>🖥️ Remote desktop</span>
-        <span style="cursor:pointer;" onclick="closeModal('remoteDesktopModal')">✕</span>
+        <button type="button" class="modal-close" onclick="closeModal('remoteDesktopModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body">
         <div class="hint">Open a desktop session on the remote host. RDP (3389, xrdp), VNC (5900, TigerVNC) and SPICE (spice-vdagent) ride the SSH tunnel when a jump is configured; X2Go/NX and X11 are transported over SSH direct-tcpip.</div>
@@ -563,19 +563,19 @@
         <div class="form-row"><label>Host:</label><input type="text" id="remoteDesktopHost" class="input-field" placeholder="127.0.0.1 (empty = session host)"></div>
         <div class="form-row"><label>Display / port:</label><input type="number" id="remoteDesktopPort" class="input-field" placeholder="3389 for RDP, 5900 for VNC/SPICE"></div>
         <div id="remoteDesktopStatus" class="hint" style="min-height:1.2em;"></div>
-        <details id="remoteDesktopScriptDetails" style="margin-top:8px;"><summary>Installer script (auto-detects Debian/Ubuntu, Fedora/RHEL, Arch, openSUSE via /etc/os-release)</summary>
+        <details id="remoteDesktopScriptDetails" class="stack-top"><summary>Installer script (auto-detects Debian/Ubuntu, Fedora/RHEL, Arch, openSUSE via /etc/os-release)</summary>
           <pre id="remoteDesktopScript" class="script-block"></pre>
           <div class="hint">Runs on the server via the SSH session (sudo when not root, DEBIAN_FRONTEND=noninteractive for apt) and shows the apt/dnf/yum/pacman/zypper variant for xrdp, tigervnc-server, spice-vdagent and x2goserver.</div>
         </details>
         <div id="remoteDesktopPrompt" class="callout" style="display:none;">
-          <div style="font-weight:700; color:var(--warning);" id="remoteDesktopPromptTitle">Not available</div>
+          <div class="callout-title" id="remoteDesktopPromptTitle">Not available</div>
           <div style="margin:6px 0 10px; white-space:pre-wrap;" id="remoteDesktopPromptBody"></div>
           <div style="display:flex; gap:8px; flex-wrap:wrap;">
             <button class="btn" onclick="closeModal('remoteDesktopModal')">Cancel</button>
             <button class="btn btn-primary" id="remoteDesktopInstallBtn" onclick="installRemoteDesktop()">Install on server</button>
             <button class="btn" onclick="copyRemoteDesktopScript()">Copy script</button>
           </div>
-          <div class="hint" id="remoteDesktopInstallStatus" style="margin-top:8px;"></div>
+          <div class="hint stack-top" id="remoteDesktopInstallStatus"></div>
         </div>
       </div>
       <div class="modal-footer">
@@ -591,7 +591,7 @@
     <div class="modal-box" style="width:640px; max-width:96vw;">
       <div class="modal-header">
         <span>Credential vault import / export</span>
-        <span style="cursor:pointer;" onclick="closeModal('backupModal')">✕</span>
+        <button type="button" class="modal-close" onclick="closeModal('backupModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body">
         <div class="hint">Export saved sessions, login information, SSH keys and jump-host credentials as a timestamped Argon2id-encrypted backup. Use a strong, unique password and keep the file somewhere safe. The encrypted container is LinSCP v2; OfflineOTP-side import support will be added separately. Import merges by default; matching saved session names are left unchanged.</div>
@@ -616,7 +616,7 @@
     <div class="modal-box" style="width:600px;">
       <div class="modal-header">
         <span>Copy or move to another server</span>
-        <span style="cursor:pointer;" onclick="closeModal('remoteTransferModal')">✕</span>
+        <button type="button" class="modal-close" onclick="closeModal('remoteTransferModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body">
         <div class="hint" id="remoteTransferSource"></div>
@@ -643,7 +643,7 @@
     <div class="modal-box" style="width:560px;">
       <div class="modal-header">
         <span>Files from your file manager</span>
-        <span style="cursor:pointer;" onclick="closeModal('shellUploadModal')">✕</span>
+        <button type="button" class="modal-close" onclick="closeModal('shellUploadModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body">
         <div class="hint" id="shellUploadTarget">These files were selected in your file manager. Upload them to this tab's remote directory?</div>
@@ -662,7 +662,7 @@
     <div class="modal-box" style="width:640px;">
       <div class="modal-header">
         <span>Site Manager</span>
-        <span style="cursor:pointer;" onclick="closeModal('siteModal')">✕</span>
+        <button type="button" class="modal-close" onclick="closeModal('siteModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body" style="flex-direction:row; gap:12px; align-items:stretch;">
         <div class="site-list">
@@ -841,7 +841,7 @@
     <div class="modal-box" style="width:900px; max-width:96vw;">
       <div class="modal-header">
         <span>Terminal</span>
-        <span style="cursor:pointer;" onclick="closeTerminal()">✕</span>
+        <button type="button" class="modal-close" onclick="closeTerminal()" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body" style="flex-direction:column;">
         <div id="terminalScreen" class="terminal-screen"></div>
@@ -867,7 +867,7 @@
     <div class="modal-box" style="width:600px;">
       <div class="modal-header">
         <span>Synchronize directories</span>
-        <span style="cursor:pointer;" onclick="closeModal('syncModal')">✕</span>
+        <button type="button" class="modal-close" onclick="closeModal('syncModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body">
         <div class="form-row"><label>Direction:</label>
@@ -926,9 +926,9 @@
     <div class="modal-box" style="width:760px; height:80vh;">
       <div class="modal-header">
         <span id="editorTitle">Remote editor</span>
-        <span style="cursor:pointer;" onclick="closeEditor()">✕</span>
+        <button type="button" class="modal-close" onclick="closeEditor()" aria-label="Close">&#10005;</button>
       </div>
-      <div class="modal-body" style="flex:1; padding:0; gap:0;">
+      <div class="modal-body modal-body-flush">
         <textarea id="editorText" class="editor-area" spellcheck="false"
                   oninput="markDirty()"></textarea>
       </div>
@@ -947,7 +947,7 @@
     <div class="modal-box" style="width:620px;">
       <div class="modal-header">
         <span>Search the remote directory</span>
-        <span style="cursor:pointer;" onclick="closeModal('searchModal')">✕</span>
+        <button type="button" class="modal-close" onclick="closeModal('searchModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body">
         <div class="form-row"><label>Start in:</label><input type="text" id="searchPath" class="input-field"></div>
@@ -981,7 +981,7 @@
     <div class="modal-box" style="width:540px;">
       <div class="modal-header">
         <span id="hostKeyTitle">Unknown host key</span>
-        <span style="cursor:pointer;" onclick="cancelHostKey()">✕</span>
+        <button type="button" class="modal-close" onclick="cancelHostKey()" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body">
         <div id="hostKeyQuestion" class="body-copy"></div>
@@ -1009,7 +1009,7 @@
     <div class="modal-box" style="width:600px;">
       <div class="modal-header">
         <span>Custom commands</span>
-        <span style="cursor:pointer;" onclick="closeModal('customCommandsModal')">&#10005;</span>
+        <button type="button" class="modal-close" onclick="closeModal('customCommandsModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body">
         <p class="hint">Saved command templates. Write {file} where the
@@ -1044,7 +1044,7 @@
     <div class="modal-box" style="width:560px;">
       <div class="modal-header">
         <span>Transfer settings</span>
-        <span style="cursor:pointer;" onclick="closeModal('transferModal')">&#10005;</span>
+        <button type="button" class="modal-close" onclick="closeModal('transferModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body" onchange="if (event.target.id === 'transferResumeSupport') resumeSupportChanged()">
         <p class="hint">These apply to the transfers you start next: F5, F6,
@@ -1125,7 +1125,7 @@
     <div class="modal-box" style="width:560px;">
       <div class="modal-header">
         <span id="propertiesTitle">Properties</span>
-        <span style="cursor:pointer;" onclick="closeModal('propertiesModal')">&#10005;</span>
+        <button type="button" class="modal-close" onclick="closeModal('propertiesModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body">
         <div id="propertiesBody" style="max-height:340px; overflow-y:auto;"></div>
@@ -1141,7 +1141,7 @@
     <div class="modal-box" style="width:520px;">
       <div class="modal-header">
         <span>Keep remote directory up to date</span>
-        <span style="cursor:pointer;" onclick="closeModal('keepUpToDateModal')">&#10005;</span>
+        <button type="button" class="modal-close" onclick="closeModal('keepUpToDateModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body">
         <p class="hint">Watches the local directory and copies what changes in
@@ -1177,7 +1177,7 @@
     <div class="modal-box" style="width:560px;">
       <div class="modal-header">
         <span>LinSCP Commander</span>
-        <span style="cursor:pointer;" onclick="closeModal('helpModal')">✕</span>
+        <button type="button" class="modal-close" onclick="closeModal('helpModal')" aria-label="Close">&#10005;</button>
       </div>
       <div class="modal-body body-copy">
         <p><b>Sessions</b> opens the site manager: stored sessions are shared with the

@@ -709,8 +709,34 @@ table.file-table tr.selected td { color: var(--selection-text); }
   font-size: var(--fs-base);
   font-weight: var(--fw-bold);
 }
-.modal-header > span:last-child[onclick] { color: var(--muted); cursor: pointer; }
-.modal-header > span:last-child[onclick]:hover { color: var(--danger); }
+/* One close control for every dialog. It used to be a <span> whose styling
+ * was found by `span:last-child[onclick]` - a selector that depends on the
+ * element being the last child and carrying an inline handler - and each of
+ * the 21 dialogs also wrote `cursor:pointer` by hand. */
+.modal-close {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-md);
+  height: var(--control-md);
+  margin-right: calc(var(--space-1) * -1);
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--fs-lg);
+  line-height: 1;
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease),
+    color var(--duration-fast) var(--ease);
+}
+.modal-close:hover {
+  background: var(--surface-hover);
+  color: var(--danger);
+}
+.modal-close:active { background: var(--surface-active); }
 .modal-body {
   display: flex;
   flex: 1 1 auto;
@@ -932,6 +958,13 @@ button.site-item { display: block; width: 100%; border: 0; background: transpare
 /* Explanatory prose inside a dialog. It was 11px inline in two places and
  * unreadable on a phone; the ramp's body step is the floor for running text. */
 .body-copy { font-size: var(--fs-base); line-height: 1.6; }
+/* A multi-line text field: same field as .input-field, but it grows. */
+.textarea-field { width: 100%; font-family: var(--font-mono); resize: vertical; }
+/* A block that follows the one above it at the small step, rather than four
+ * different inline margin-tops. */
+.stack-top { margin-top: var(--space-4); }
+/* The heading of a callout, in the warning colour. */
+.callout-title { color: var(--warning); font-weight: var(--fw-bold); }
 /* An inset note that sets a warning apart from the fields around it. */
 .callout {
   margin-top: var(--space-6);
@@ -940,6 +973,10 @@ button.site-item { display: block; width: 100%; border: 0; background: transpare
   border-radius: var(--r-lg);
   background: var(--surface-raised);
 }
+/* A dialog body whose content supplies its own padding and spacing - the file
+ * editor is a textarea that fills the body edge to edge. */
+.modal-body-flush { flex: 1; padding: 0; gap: 0; }
+
 /* The vault gate. This is the first screen the app shows and it used to be
  * styled by a <style> block in the page head - the one screen that never
  * learned about the palette, with its own 14px radius, four hardcoded colours
