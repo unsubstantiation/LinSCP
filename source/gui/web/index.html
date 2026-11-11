@@ -2933,8 +2933,7 @@
         if (!seenFolders.has(folder)) {
           seenFolders.add(folder);
           const delBtn = document.createElement('button');
-          delBtn.className = 'btn tiny site-folder';
-          delBtn.style.cssText = 'padding:0 5px; font-size:10px; float:right;';
+          delBtn.className = 'btn tiny site-folder site-folder-delete';
           delBtn.textContent = '×';
           delBtn.title = t("Delete folder \"{folder}\"", {folder});
           delBtn.onclick = (event) => { event.stopPropagation(); deleteSiteFolder(folder); };
@@ -3639,7 +3638,6 @@
     if ((summary.conflict || 0) > 0) {
       const bar = document.createElement('span');
       bar.className = 'plan-conflict-bar';
-      bar.style.cssText = 'display:inline-flex; gap:4px; align-items:center; margin-left:8px; font-size:11px;';
       bar.innerHTML = ("<span>" + escapeHtml(t("Resolve:")) + "</span>") +
         ("<button class=\"btn tiny\" onclick=\"resolveSyncConflictPolicy('local')\">" + escapeHtml(t("Local wins")) + "</button>") +
         ("<button class=\"btn tiny\" onclick=\"resolveSyncConflictPolicy('remote')\">" + escapeHtml(t("Remote wins")) + "</button>") +

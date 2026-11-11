@@ -341,6 +341,20 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .btn { min-height: var(--control-md); padding: var(--space-2) var(--space-4); }
 .btn.tiny { min-height: var(--control-sm); padding: var(--space-1) var(--space-3); font-size: var(--fs-xs); }
 .btn-icon { min-width: var(--control-md); min-height: var(--control-md); padding: var(--space-2) var(--space-4); }
+/* The delete control on a folder heading in the site list: a tiny button that
+ * sits at the right end of the row. It was an inline cssText of 10px text and
+ * 5px padding - the one place in the app with a font size of its own.
+ * `.site-folder` stays on it: that class is how the page and its tests find a
+ * folder row, so it is a marker, not a style. */
+.site-folder-delete { float: right; padding: 0 var(--space-2); }
+/* "Resolve: Local wins / Remote wins / Newer wins" under a sync plan. */
+.plan-conflict-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-left: var(--space-4);
+  font-size: var(--fs-sm);
+}
 
 .badge-connected, .badge-disconnected {
   max-width: 235px;
