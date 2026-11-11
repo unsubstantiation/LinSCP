@@ -573,10 +573,10 @@
         <div class="form-row"><label>Display / port:</label><input type="number" id="remoteDesktopPort" class="input-field" placeholder="3389 for RDP, 5900 for VNC/SPICE"></div>
         <div id="remoteDesktopStatus" class="hint" style="min-height:1.2em;"></div>
         <details id="remoteDesktopScriptDetails" style="margin-top:8px;"><summary>Installer script (auto-detects Debian/Ubuntu, Fedora/RHEL, Arch, openSUSE via /etc/os-release)</summary>
-          <pre id="remoteDesktopScript" style="max-height:220px; overflow:auto; background:var(--surface-raised); border:1px solid var(--border); border-radius:6px; padding:8px; font-size:11px; white-space:pre-wrap; margin-top:6px;"></pre>
+          <pre id="remoteDesktopScript" class="script-block"></pre>
           <div class="hint">Runs on the server via the SSH session (sudo when not root, DEBIAN_FRONTEND=noninteractive for apt) and shows the apt/dnf/yum/pacman/zypper variant for xrdp, tigervnc-server, spice-vdagent and x2goserver.</div>
         </details>
-        <div id="remoteDesktopPrompt" style="display:none; margin-top:12px; border:1px solid var(--border); border-radius:8px; padding:12px; background:var(--surface-raised);">
+        <div id="remoteDesktopPrompt" class="callout" style="display:none;">
           <div style="font-weight:700; color:var(--warning);" id="remoteDesktopPromptTitle">Not available</div>
           <div style="margin:6px 0 10px; white-space:pre-wrap;" id="remoteDesktopPromptBody"></div>
           <div style="display:flex; gap:8px; flex-wrap:wrap;">
@@ -796,7 +796,7 @@
           <div class="form-row local-only-row" style="display:none;"><label>Other local dir:</label><input type="text" id="siteOtherLocalDir" class="input-field"></div>
           <div class="hint local-only-row" style="display:none;">Both panes are directories on this machine; no server is contacted.</div>
           <div class="form-row remote-only-row"><label></label>
-            <label style="flex:1; font-weight:normal; width:auto;">
+            <label class="checkbox-row" style="flex:1;">
               <input type="checkbox" id="siteRemember" checked> Store the password in the encrypted session store
             </label>
           </div>
@@ -908,13 +908,13 @@
         </div>
         <div class="form-row"><label>File mask:</label><input type="text" id="syncMask" class="input-field" placeholder="e.g. *.txt|*.bak (empty = every file)"></div>
         <div class="form-row"><label></label>
-          <label style="flex:1; font-weight:normal; width:auto;"><input type="checkbox" id="syncRecursive" checked> Include subdirectories</label>
+          <label class="checkbox-row" style="flex:1;"><input type="checkbox" id="syncRecursive" checked> Include subdirectories</label>
         </div>
         <div class="form-row"><label></label>
-          <label style="flex:1; font-weight:normal; width:auto;"><input type="checkbox" id="syncDelete"> Delete obsolete files on the target side</label>
+          <label class="checkbox-row" style="flex:1;"><input type="checkbox" id="syncDelete"> Delete obsolete files on the target side</label>
         </div>
         <div class="form-row"><label></label>
-          <label style="flex:1; font-weight:normal; width:auto;"><input type="checkbox" id="syncMirror" onchange="syncMirrorChanged()"> Mirror the source: delete everything the target has and the source does not</label>
+          <label class="checkbox-row" style="flex:1;"><input type="checkbox" id="syncMirror" onchange="syncMirrorChanged()"> Mirror the source: delete everything the target has and the source does not</label>
         </div>
         <div class="preview-box" id="syncPreviewBox" style="display:none;">
           <div class="preview-header" id="syncSummary"></div>
@@ -962,10 +962,10 @@
         <div class="form-row"><label>Start in:</label><input type="text" id="searchPath" class="input-field"></div>
         <div class="form-row"><label>Filename mask:</label><input type="text" id="searchPattern" class="input-field" value="*"></div>
         <div class="form-row"><label></label>
-          <label style="flex:1; font-weight:normal; width:auto;"><input type="checkbox" id="searchCase"> Case sensitive</label>
+          <label class="checkbox-row" style="flex:1;"><input type="checkbox" id="searchCase"> Case sensitive</label>
         </div>
         <div class="form-row"><label></label>
-          <label style="flex:1; font-weight:normal; width:auto;"><input type="checkbox" id="searchContents" onchange="toggleSearchContents()"> Search inside files</label>
+          <label class="checkbox-row" style="flex:1;"><input type="checkbox" id="searchContents" onchange="toggleSearchContents()"> Search inside files</label>
         </div>
         <div class="form-row" id="searchTextRow" style="display:none;">
           <label>Contains text:</label><input type="text" id="searchText" class="input-field" maxlength="1024" placeholder="Literal UTF-8 text">
@@ -993,7 +993,7 @@
         <span style="cursor:pointer;" onclick="cancelHostKey()">✕</span>
       </div>
       <div class="modal-body">
-        <div id="hostKeyQuestion" style="font-size:11px;"></div>
+        <div id="hostKeyQuestion" class="body-copy"></div>
         <div class="fingerprint" id="hostKeyFingerprint"></div>
         <div class="hint">
           Compare this fingerprint with the one the server's own console shows, or
@@ -1001,7 +1001,7 @@
           checking it lets anybody who can redirect your connection read and change
           your files.
         </div>
-        <label class="form-row" style="font-weight:normal;">
+        <label class="checkbox-row">
           <input type="checkbox" id="hostKeyRemember" checked>
           <span style="flex:1;">Remember this key, so the next connection is silent</span>
         </label>
@@ -1188,7 +1188,7 @@
         <span>LinSCP Commander</span>
         <span style="cursor:pointer;" onclick="closeModal('helpModal')">✕</span>
       </div>
-      <div class="modal-body" style="font-size:11px; line-height:1.6;">
+      <div class="modal-body body-copy">
         <p><b>Sessions</b> opens the site manager: stored sessions are shared with the
         console client, and each tab keeps its own connection open.</p>
         <p><b>Transfers</b> run in the queue at the bottom. They can be paused,
