@@ -4,7 +4,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-90 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+87 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -666,9 +666,9 @@ SFTP SOCKS5 and HTTP CONNECT proxies and curl proxy routing are verified live; w
 
 **Area:** Security/authentication · **Status:** partial
 
-The local browser API rejects requests missing its per-run token.
+There is no local HTTP API and therefore no bearer token to steal or leak. Upstream serves the page from a loopback socket guarded by a per-run token; LinSCP does not open that socket at all. In the packaged app the page calls CommanderService::dispatch in-process over Tauri IPC (invoke("linscp_invoke")), so requests never cross a TCP boundary and cannot be reached from another process on the machine. The trade-off is that the IPC surface is not itself authenticated: whatever can invoke into the webview can drive the service. That is the same boundary the desktop client always had - the local user - and the browser build, which is what the `gui` suite drives, talks to the service through the same dispatch entry point.
 
-**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
+**Next:** The absence of a listening socket is a property of the shipped binary, not something a case asserts: no suite binds a port and proves none appears, and the IPC surface is not shown to be unreachable from another local process. The tauri crate's tests run on Linux and Windows but need the native-shell feature for the IPC command itself, which CI does not build.
 
 **Acceptance criteria:**
 
@@ -715,32 +715,6 @@ An operating-system drop in a native window arrives as paths, not as a File: `dr
 - [ ] Drive a real WebKit/GTK drop onto the native window and show the queued task names the dropped paths (the shell's `dragDropEnabled` handler cannot be exercised by jsdom).
 - [ ] Register the Android share intent filter in the generated Kotlin project and prove a shared file reaches the same drop path, including the conflict question and the queue entry.
 - [ ] Prove a dropped folder larger than memory is staged without holding it in the page, and that a partial staging tree is removed when the queue refuses the drop.
-
-## editing.local-editor
-
-**Area:** Editing/search · **Status:** partial
-
-GUI reads text and saves locally with a conflict check and atomic replace; symlinks are refused.
-
-**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-
-## editing.filename-and-content-search
-
-**Area:** Editing/search · **Status:** partial
-
-Filename search and bounded literal UTF-8 content search skip binary/oversized files and cap the scan.
-
-**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 
 ## editing.monitor-local-changes
 
@@ -879,7 +853,7 @@ Installed, Makefile and CMake binaries select their own GUI launcher; the GUI fi
 
 A desktop session is recognised as Wayland or as X11 before anything is asked of it, and only a program that can draw on it is started. The console client finds the compositor by its socket in XDG_RUNTIME_DIR - the default 'wayland-0' when WAYLAND_DISPLAY is not exported, so a session started by a launcher or a user service is still found - and refuses a Wayland-only terminal under X11, where it exits before mapping a window, while an X11-only one under Wayland is a reported XWayland fallback rather than a silent choice. The graphical client draws no window itself and asks the desktop's own URI launcher ($BROWSER, xdg-open, gio) for a browser, which needs no X11 and no window manager of the X11 kind; linscp.desktop starts it with that option and does not claim a startup notification it could never complete. Covered by unit, the retired GUI harness and wayland-compatibility; no case runs against a live compositor, so the interaction with one is not certified here.
 
-**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
+**Next:** The source-shape checks in wayland-compatibility run on every platform, but the C++ session detector and the console launcher it describes are exercised by UnitTest.cpp and ScriptTest.py, which have no build target and need a `linscp` binary this repo does not build - so they are not evidence. No case runs against a live compositor either, so what a real Wayland session does with this build is not certified here.
 
 **Acceptance criteria:**
 
@@ -1135,19 +1109,6 @@ Symbolic links can be created in a local pane, not just over SFTP: the other pan
 
 - [ ] A Windows CI run proving link creation in a plain directory, or a documented privilege requirement the backend reports.
 - [ ] A device or emulator run proving link creation in Android app storage.
-
-## sessions.workspaces
-
-**Area:** Sessions/configuration · **Status:** partial
-
-Named workspaces are stored in workspaces.json beside sessions.ini (0600, fsynced and atomically replaced) and restore the tabs in order with the saved active tab and both pane paths. An entry is either a local tab with its two directories or a remote tab; a tab that came from a stored site records only the site name and is resolved from sessions.ini on every open, so the site's password encryption, pinned host key and tunnel policy stay authoritative. An ad-hoc tab is saved as a snapshot with password, tunnel password, tunnel passphrase and site name removed. Each tab opens independently: a deleted or renamed site, a missing local directory or a host-key challenge is reported in 'failed' without stopping the others, and a challenge is parked in the normal host-key table for the user to verify. A local site can be saved directly, since the console client has no local transport.
-
-**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 
 ## gui.remote-delete
 
