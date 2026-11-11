@@ -33,6 +33,8 @@
   --space-10: 24px;
   --space-11: 28px;
   --space-12: 32px;
+  /* The scale is complete on purpose: the ends are unused today and exist so a
+   * new rule reaches for 0 or 28px instead of writing it as a literal. */
 
   /* Type: four sizes, no others. 13px is body, 14px is a heading. */
   --fs-xs: 10px;
@@ -66,6 +68,11 @@
    * first step that holds it. Touch devices grow this to 44px below. */
   --row-height: 32px;
   --cell-padding-x: 10px;
+  /* Control heights. A button, a menu row and a field are the same idea at
+   * three sizes, and they were 22/26/27/28/29/30/31/34/36/40px apart. */
+  --control-sm: 24px;
+  --control-md: 30px;
+  --control-lg: 36px;
 
   /* Motion, so a transition cannot invent its own duration either. */
   --ease: cubic-bezier(.4, 0, .2, 1);
@@ -205,7 +212,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-1);
-  min-height: 36px;
+  min-height: var(--control-lg);
   padding: 0 var(--space-6);
   background: var(--band);
   border-bottom: 1px solid var(--band-border);
@@ -224,7 +231,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .menu-brand img { width: 22px; height: 22px; border-radius: 50%; }
 .menu-group { position: relative; height: 100%; display: flex; align-items: center; }
 .menu-item {
-  min-height: 29px;
+  min-height: var(--control-md);
   padding: var(--space-2) var(--space-5);
   border: 1px solid transparent;
   border-radius: var(--r-md);
@@ -263,7 +270,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   align-items: center;
   justify-content: space-between;
   gap: var(--space-9);
-  min-height: 31px;
+  min-height: var(--control-md);
   padding: var(--space-2) var(--space-4);
   border: 0;
   border-radius: var(--r-md);
@@ -304,7 +311,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   justify-content: center;
   align-items: center;
   gap: var(--space-3);
-  min-height: 30px;
+  min-height: var(--control-md);
   padding: var(--space-2) var(--space-5);
   border: 1px solid var(--border-strong);
   border-radius: var(--r-md);
@@ -331,9 +338,9 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 }
 .toolbar-button.primary:hover, .btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--accent-ink); }
 .toolbar-button.tertiary { border-color: transparent; background: transparent; }
-.btn { min-height: 26px; padding: var(--space-2) var(--space-4); }
-.btn.tiny { min-height: 22px; padding: var(--space-1) var(--space-3); font-size: var(--fs-xs); }
-.btn-icon { min-width: 28px; min-height: 28px; padding: var(--space-2) var(--space-4); }
+.btn { min-height: var(--control-md); padding: var(--space-2) var(--space-4); }
+.btn.tiny { min-height: var(--control-sm); padding: var(--space-1) var(--space-3); font-size: var(--fs-xs); }
+.btn-icon { min-width: var(--control-md); min-height: var(--control-md); padding: var(--space-2) var(--space-4); }
 
 .badge-connected, .badge-disconnected {
   max-width: 235px;
@@ -354,7 +361,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .badge-disconnected { color: var(--muted); background: var(--surface-raised); border-color: var(--border); }
 
 .tabs-bar {
-  min-height: 36px;
+  min-height: var(--control-lg);
   display: flex;
   align-items: stretch;
   background: var(--surface-raised);
@@ -432,7 +439,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   justify-content: center;
   flex: none;
   gap: var(--space-4);
-  min-height: 31px;
+  min-height: var(--control-md);
   padding: var(--space-2) var(--space-5);
   border: 1px solid var(--border);
   border-radius: var(--r-md);
@@ -487,7 +494,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
  * border and text colour cannot drift between the path box and a modal. */
 .path-input, .input-field, .select-field, .root-select {
   min-width: 0;
-  min-height: 29px;
+  min-height: var(--control-md);
   padding: var(--space-2) var(--space-4);
   border: 1px solid var(--border-strong);
   border-radius: var(--r-md);
@@ -567,13 +574,13 @@ table.file-table tr.selected td { color: var(--selection-text); }
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  min-height: 36px;
+  min-height: var(--control-lg);
   padding: var(--space-2) var(--space-4) 0;
   border-bottom: 1px solid var(--border);
   background: var(--surface-raised);
 }
 .tab {
-  min-height: 31px;
+  min-height: var(--control-md);
   padding: var(--space-3) var(--space-5);
   border: 1px solid transparent;
   border-bottom: 0;
@@ -726,7 +733,7 @@ table.file-table tr.selected td { color: var(--selection-text); }
   border-top: 1px solid var(--border);
   background: var(--surface-raised);
 }
-.form-row { display: flex; align-items: center; gap: var(--space-4); min-height: 29px; }
+.form-row { display: flex; align-items: center; gap: var(--space-4); min-height: var(--control-md); }
 .keyfile-input-row { display: flex; flex: 1; min-width: 0; align-items: center; gap: var(--space-2); }
 .keyfile-input-row .input-field { min-width: 0; }
 .keyfile-input-row .btn-icon { flex: none; }
@@ -999,7 +1006,7 @@ button.site-item { display: block; width: 100%; border: 0; background: transpare
 }
 #vaultGate #vaultUnlockButton {
   width: 100%;
-  min-height: 36px;
+  min-height: var(--control-lg);
   margin-top: var(--space-4);
 }
 
@@ -1185,7 +1192,7 @@ body {
 }
 .floating-action-bar.visible { display: flex; }
 .floating-action-bar .fab-btn {
-  min-height: 36px;
+  min-height: var(--control-lg);
   padding: var(--space-3) var(--space-6);
   border-radius: var(--r-pill);
   font-size: var(--fs-base);
@@ -1238,7 +1245,7 @@ body {
   background: var(--surface-raised);
 }
 .terminal-selection-bar[hidden] { display: none; }
-.terminal-selection-bar .btn { flex: none; min-height: 36px; }
+.terminal-selection-bar .btn { flex: none; min-height: var(--control-lg); }
 .terminal-extra-keys .extra-key {
   flex: none;
   min-width: 44px;
@@ -1351,9 +1358,9 @@ var(--border-strong)kupModal .hint code { user-select: all; background: var(--su
 
 /* Accessibility: ensure every menu item has at least 44px hit area on coarse pointer (already for file rows) */
 @media (pointer: coarse) {
-  .menu-item { min-height: 36px; }
-  .menu-dropdown button { min-height: 40px; }
-  .modal-footer .btn { min-height: 40px; }
+  .menu-item { min-height: var(--control-lg); }
+  .menu-dropdown button { min-height: var(--control-lg); }
+  .modal-footer .btn { min-height: var(--control-lg); }
 }
 
 /* Feature tour hint: subtle “what's new” pulse for Remote Desktop after first load */
@@ -1377,7 +1384,7 @@ var(--border-strong)kupModal .hint code { user-select: all; background: var(--su
 .monitor-controls .btn[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
 .monitor-settings { padding-top: var(--space-2); padding-bottom: var(--space-5); border-bottom: 1px solid var(--border); }
 .monitor-number { display: inline-flex; align-items: center; gap: var(--space-3); color: var(--muted); font-size: var(--fs-sm); }
-.monitor-number input { width: 66px; min-height: 27px; padding: var(--space-2) var(--space-3); }
+.monitor-number input { width: 66px; min-height: var(--control-md); padding: var(--space-2) var(--space-3); }
 .monitor-status { padding: var(--space-4) var(--space-8); color: var(--accent); font-size: var(--fs-sm); }
 .monitor-content { flex: 1; min-height: 0; overflow: auto; padding: 0 var(--space-8) var(--space-8); }
 .monitor-help { flex: none; margin: 0 !important; padding: var(--space-4) var(--space-8); border-top: 1px solid var(--border); font-size: var(--fs-xs); }
@@ -1484,7 +1491,7 @@ var(--border-strong)kupModal .hint code { user-select: all; background: var(--su
   .monitor-overlay { padding: var(--space-2); }
   .monitor-box { width: 100%; max-height: 98vh; height: 98vh; }
   .monitor-controls, .monitor-settings { padding-left: var(--space-5); padding-right: var(--space-5); }
-  .monitor-controls .btn { min-height: 34px; }
+  .monitor-controls .btn { min-height: var(--control-lg); }
   .monitor-content { padding: 0 var(--space-4) var(--space-6); }
   .monitor-grid { grid-template-columns: minmax(0, 1fr); }
   .monitor-card { padding: var(--space-5); }
