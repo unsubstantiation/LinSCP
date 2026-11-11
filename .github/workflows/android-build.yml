@@ -48,6 +48,7 @@ jobs:
         run: |
           python3 -m unittest discover -s tools/tests -p test_android_application_id.py
           python3 -m unittest discover -s tools/tests -p test_android_release_signing.py
+          python3 -m unittest discover -s tools/tests -p test_android_saf_smoke.py
           echo "applicationId: $(python3 tools/android_application_id.py)"
       - name: Prepare Android SDK
         run: python3 tools/run_cargo_ci.py bash tools/prepare_android_sdk.sh
@@ -95,6 +96,7 @@ jobs:
         run: |
           python3 -m unittest discover -s tools/tests -p test_android_application_id.py
           python3 -m unittest discover -s tools/tests -p test_android_release_signing.py
+          python3 -m unittest discover -s tools/tests -p test_android_saf_smoke.py
           echo "applicationId: $(python3 tools/android_application_id.py)"
       - name: Prepare Android SDK
         run: python3 tools/run_cargo_ci.py bash tools/prepare_android_sdk.sh

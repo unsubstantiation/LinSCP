@@ -191,3 +191,43 @@ build's DevTools endpoint, and finally installs the release APK itself with
 `tools/android_release_launch_check.sh`, which proves it starts, keeps running,
 is not debuggable and installs under the configured application ID. It does not
 create an AAB.
+
+### A granted folder, on a real device
+
+The emulator run above proves the app reaches its own private storage through
+Rust. It says nothing about a folder the user granted, because a Storage Access
+Framework tree is handed over by a system picker that no harness can click - so
+every `platform.android-saf-*` capability is evidenced only against an
+in-memory mock in `crates/linscp-service`.
+
+`tools/android_saf_smoke.sh` closes that gap by starting from a grant that
+already exists. It runs on any device or emulator with the app installed and a
+folder already granted, which makes the provider real and the run reproducible:
+the same device and the same permission produce the same result every time.
+
+```sh
+adb devices                                    # one device, unlocked, trusted
+adb shell mkdir -p /sdcard/Documents/linscp-saf
+adb push some-file.txt /sdcard/Documents/linscp-saf/
+# launch the app, add that folder with the local-root switcher's system picker
+python3 tools/run_cargo_ci.py bash tools/android_saf_smoke.sh
+```
+
+The suite reads the granted tree back from the service rather than being told a
+URI, so a misspelt or stale URI cannot pass, and it asserts that the root the
+service enumerates is the one the picker granted. It then opens a local tab on
+that folder and drives the same routes the page uses - list, mkdir, save, read
+back, the stale-mtime refusal, delete - which is what the four
+`platform.android-saf-*` rows describe.
+
+Three properties make it safe to run against a phone with your own files on it:
+it creates one folder named `linscp-saf-<timestamp>` and keeps every write
+inside it; a device with no grant is a skip rather than a failure, because
+nobody granting a folder is a fact about the device and not a defect in the
+build; and it never clicks the picker, so it cannot wander into a folder you did
+not choose.
+
+`tools/tests/test_android_saf_smoke.py` keeps it honest without a device. It
+checks that every route the harness calls is a real service route, that no write
+escapes the run folder, and that the ledger rows it claims to evidence still
+carry the provider gap - so upgrading a row without updating the suite fails.
