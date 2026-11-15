@@ -94,6 +94,11 @@ CASE_SOURCES = {
     # The SSH/SFTP/SCP/tunnel protocol behaviour against the mock server.
     # Android runs no Rust tests, so Android rows cite other suites instead.
     "proto-ssh": "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs",
+    # The script interpreter end to end against the mock server: the
+    # live-sftp cases ported to Rust, plus the change-guards that pin the
+    # guarded-upload refusal until guarded SFTP uploads exist. Android runs
+    # no Rust tests, so Android rows cite other suites instead.
+    "engine-sftp": "crates/linscp-engine/tests/sftp_live_cases.rs",
     # The password-only vault: setup/unlock/lock and the retired prefixes.
     # Android runs no Rust tests, so Android rows cite other suites instead.
     "vault-password": "crates/linscp-platform/src/password_vault.rs",
@@ -354,7 +359,7 @@ def check_capabilities(inventory, errors, root=ROOT):
                     expression = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
                 elif suite in ("service", "service-commands", "gui-cli",
                                "gui-shell-definitions", "gui-shell-actions",
-                               "platform-windows-acl", "proto-ssh",
+                               "platform-windows-acl", "proto-ssh", "engine-sftp",
                                "vault-password", "service-tabs"):
                     # A cited case must be a #[test]/#[tokio::test] function,
                     # not merely a function of that name. A helper taking

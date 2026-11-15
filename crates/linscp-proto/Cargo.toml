@@ -40,6 +40,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+linscp-test-support.workspace = true
 axum.workspace = true
 ed25519-dalek.workspace = true
 p256 = { workspace = true, features = ["ecdsa", "pkcs8"] }

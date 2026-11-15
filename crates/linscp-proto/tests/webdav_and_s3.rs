@@ -9,8 +9,8 @@
 //!   `CopyObject`, `rename`, resumable Multipart Upload (skipping uploaded parts
 //!   on retry!), and `ListObjectVersions` / `?versionId=` operations
 
-mod common;
 
+use linscp_test_support as common;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;

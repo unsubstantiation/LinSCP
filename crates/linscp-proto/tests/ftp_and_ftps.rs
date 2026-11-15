@@ -10,8 +10,8 @@
 //! - `RETR` + `REST` resume, `STOR`, `APPE`, `MKD`, `RMD`, `DELE`, `RNFR`/`RNTO`,
 //!   and `SITE CHMOD`
 
-mod common;
 
+use linscp_test_support as common;
 use std::collections::HashMap;
 use std::sync::Arc;
 
