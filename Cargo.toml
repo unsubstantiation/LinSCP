@@ -10,6 +10,7 @@ members = [
     "crates/linscp-engine",
     "crates/linscp-service",
     "crates/linscp-tauri",
+    "crates/linscp-test-support",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ linscp-proto = { path = "crates/linscp-proto" }
 linscp-terminal = { path = "crates/linscp-terminal" }
 linscp-engine = { path = "crates/linscp-engine" }
 linscp-service = { path = "crates/linscp-service" }
+linscp-test-support = { path = "crates/linscp-test-support" }
 
 async-trait = "0.1"
 aes = "0.8"

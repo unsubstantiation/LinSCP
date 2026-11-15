@@ -1,0 +1,22 @@
+[package]
+name = "linscp-test-support"
+description = "Shared in-memory mock SSH/SFTP server and test PKI for LinSCP integration tests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+
+[dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
+linscp-crypto.workspace = true
+linscp-proto.workspace = true
+p256 = { workspace = true, features = ["ecdsa", "pkcs8"] }
+russh.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

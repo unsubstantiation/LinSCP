@@ -27,5 +27,9 @@ tempfile = "3"
 tokio.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+filetime.workspace = true
+linscp-test-support.workspace = true
+
 [lints]
 workspace = true
