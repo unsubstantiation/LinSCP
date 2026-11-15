@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::Duration;
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -586,8 +587,9 @@ impl russh::server::Handler for MockSshSession {
             if let Some(channel) = self.channels.lock().await.remove(&channel_id) {
                 session.channel_success(channel_id)?;
                 let fs = Arc::clone(&self.server.fs);
+                let check_file_name = self.server.check_file_name;
                 tokio::spawn(async move {
-                    let _ = serve_mock_sftp(channel.into_stream(), fs, self.server.check_file_name).await;
+                    let _ = serve_mock_sftp(channel.into_stream(), fs, check_file_name).await;
                 });
                 return Ok(());
             }
