@@ -533,9 +533,12 @@ async fn test_open_with_a_wrong_password_is_refused() {
     };
     match SftpClientSession::connect(ProtocolScheme::Sftp, &cfg, None, 0).await {
         Err(ProtoError::Transport(message)) => {
+            // The password is refused, then keyboard-interactive (tried with
+            // the same password) is refused too; the last refusal wins in the
+            // reported error. Either way the refusal comes from the server.
             assert!(
-                message.contains("Authentication failed"),
-                "expected an authentication failure, got: {message}"
+                message.contains("Server rejected"),
+                "expected a server-side authentication refusal, got: {message}"
             );
         }
         Err(other) => panic!("expected a transport authentication error, got {other:?}"),
