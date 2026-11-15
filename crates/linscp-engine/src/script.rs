@@ -423,6 +423,7 @@ pub struct ScriptInterpreter {
     option_mask_used: bool,
     fail_on_nomatch: bool,
     synch_delete: bool,
+    sftp_risky_publish: bool,
     reconnect_time_secs: u64,
     editor_cmd: String,
     edit_max_size: u64,
@@ -451,6 +452,7 @@ impl ScriptInterpreter {
             option_mask_used: false,
             fail_on_nomatch: false,
             synch_delete: false,
+            sftp_risky_publish: false,
             reconnect_time_secs: 120,
             editor_cmd: String::new(),
             edit_max_size: 16 * 1024 * 1024,
@@ -1604,6 +1606,7 @@ impl ScriptInterpreter {
             }
             "failonnomatch" => (if self.fail_on_nomatch { "on" } else { "off" }).to_string(),
             "synchdelete" => (if self.synch_delete { "on" } else { "off" }).to_string(),
+            "sftpriskypublish" => (if self.sftp_risky_publish { "on" } else { "off" }).to_string(),
             "reconnecttime" => {
                 if self.reconnect_time_secs > 0 {
                     self.reconnect_time_secs.to_string()
@@ -1636,6 +1639,7 @@ impl ScriptInterpreter {
             "exclude",
             "failonnomatch",
             "synchdelete",
+            "sftpriskypublish",
             "reconnecttime",
             "editor",
             "editmaxsize",
@@ -1649,7 +1653,7 @@ impl ScriptInterpreter {
         }
 
         if args[0].starts_with('-') {
-            let supported = self.tr("supported: echo, batch, confirm, resume, transfer, include, exclude, failonnomatch, synchdelete, reconnecttime, editor, editmaxsize, preset");
+            let supported = self.tr("supported: echo, batch, confirm, resume, transfer, include, exclude, failonnomatch, synchdelete, sftpriskypublish, reconnecttime, editor, editmaxsize, preset");
             let hint = self.trp(
                 "Syntax: option [<name> [<value>]] ({options})",
                 &[("options", supported)],
@@ -1676,7 +1680,7 @@ impl ScriptInterpreter {
             return Ok(());
         }
         if args.len() > 2 && opt_name != "editor" {
-            let supported = self.tr("supported: echo, batch, confirm, resume, transfer, include, exclude, failonnomatch, synchdelete, reconnecttime, editor, editmaxsize, preset");
+            let supported = self.tr("supported: echo, batch, confirm, resume, transfer, include, exclude, failonnomatch, synchdelete, sftpriskypublish, reconnecttime, editor, editmaxsize, preset");
             let hint = self.trp(
                 "Syntax: option [<name> [<value>]] ({options})",
                 &[("options", supported)],
@@ -1781,6 +1785,10 @@ impl ScriptInterpreter {
             }
             "synchdelete" => {
                 self.synch_delete = parse_option_on_off(val, "synchdelete")
+                    .map_err(|h| self.wrong_args("option", &h))?;
+            }
+            "sftpriskypublish" => {
+                self.sftp_risky_publish = parse_option_on_off(val, "sftpriskypublish")
                     .map_err(|h| self.wrong_args("option", &h))?;
             }
             "reconnecttime" => {
@@ -3966,6 +3974,7 @@ impl ScriptInterpreter {
             },
             resume: resume_forced,
             resume_support: self.resume_support,
+            sftp_risky_publish: self.sftp_risky_publish,
             ..TransferFlags::default()
         };
 
@@ -4634,6 +4643,7 @@ impl ScriptInterpreter {
             permissions: base_tflags.permissions,
             speed_kbytes_per_sec: base_tflags.speed_kbytes_per_sec,
             file_mask: base_tflags.file_mask,
+            sftp_risky_publish: self.sftp_risky_publish,
             ..SyncOptions::default()
         };
 
@@ -4876,6 +4886,7 @@ impl ScriptInterpreter {
             permissions: base_tflags.permissions,
             speed_kbytes_per_sec: base_tflags.speed_kbytes_per_sec,
             file_mask: base_tflags.file_mask,
+            sftp_risky_publish: self.sftp_risky_publish,
             ..KeepUpToDateOptions::default()
         };
         let mut positional = Vec::new();

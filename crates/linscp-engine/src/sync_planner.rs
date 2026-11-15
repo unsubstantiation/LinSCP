@@ -231,6 +231,8 @@ pub struct SyncOptions {
     pub permissions: crate::presets::PresetPermissions,
     pub speed_kbytes_per_sec: Option<u64>,
     pub file_mask: FileMask,
+    /// The user acknowledged the staged SFTP publish (see `TransferFlags::sftp_risky_publish`).
+    pub sftp_risky_publish: bool,
 }
 
 impl Default for SyncOptions {
@@ -248,6 +250,7 @@ impl Default for SyncOptions {
             permissions: crate::presets::PresetPermissions::Off,
             speed_kbytes_per_sec: None,
             file_mask: FileMask::default(),
+            sftp_risky_publish: false,
         }
     }
 }
@@ -1042,6 +1045,7 @@ pub async fn apply_sync_plan(
         preserve_time: opts.preserve_time,
         permissions: opts.permissions,
         speed_kbytes_per_sec: opts.speed_kbytes_per_sec,
+        sftp_risky_publish: opts.sftp_risky_publish,
         ..TransferFlags::default()
     };
 
