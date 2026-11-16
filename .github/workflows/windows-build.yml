@@ -108,12 +108,6 @@ jobs:
           if ($uninstall.ExitCode -ne 0) { throw "--uninstall-shell-integration exited $($uninstall.ExitCode)" }
           if (Test-Path $sendto) { throw "uninstall left the Send To shortcut behind" }
 
-      # One application, one artifact: the native window is the product. The
-      # browser server that used to be built and smoked here was a second host
-      # for the same page, and this project does not ship it.
-      - name: Upload the portable application
-        uses: actions/upload-artifact@v7
-        with:
-          name: linscp-windows
-          path: target/release/linscp-gui.exe
-          if-no-files-found: error
+# Nothing is uploaded from this job: it builds the native application and
+# smoke-tests it, and releases are managed by hand, so there is no
+# downloadable artifact.

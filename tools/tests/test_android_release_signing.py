@@ -299,23 +299,20 @@ class RepositoryConfigurationTests(unittest.TestCase):
         self.assertIn('secrets.ANDROID_KEYSTORE_PASSWORD', workflow)
         self.assertIn('tools/android_release_signing.py', workflow)
 
-    def test_the_published_apk_is_the_release_build(self):
+    def test_the_release_build_is_the_only_full_build(self):
         workflow = self.workflow()
-        self.assertIn('name: linscp-android-release', workflow)
-        self.assertIn('path: android-artifacts/linscp-android-release.apk', workflow)
         self.assertNotIn('linscp-android-debug', workflow)
         # The release build is the one without --debug; the debug flag may only
         # appear on builds that feed a test (the DevTools smoke test, or the
-        # pull-request check job's unsigned verification) — never on the build
-        # whose APK is published. Exactly one build is published, and it is
-        # the release one.
+        # pull-request check job's unsigned verification). Releases are managed
+        # by hand, so the workflow uploads nothing for download.
         commands = [line for line in workflow.splitlines() if 'android build --ci' in line]
         release = [line for line in commands if '--debug' not in line]
         self.assertEqual(len(release), 1, commands)
         for line in commands:
             if line != release[0]:
                 self.assertIn('--debug', line)
-        self.assertEqual(workflow.count('actions/upload-artifact'), 1, workflow)
+        self.assertNotIn('actions/upload-artifact', workflow)
 
     def test_the_apk_checks_distinguish_debug_from_release(self):
         workflow = self.workflow()
