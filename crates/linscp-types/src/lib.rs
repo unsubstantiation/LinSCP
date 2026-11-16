@@ -162,6 +162,7 @@ pub struct StoredSessionSummary {
     pub port: u16,
     pub username: String,
     pub has_password: bool,
+    pub has_key_passphrase: bool,
     pub has_unreadable_secret: bool,
     pub initial_dir: String,
     pub local_dir: String,

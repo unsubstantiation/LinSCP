@@ -84,7 +84,7 @@ impl TabRuntime {
     pub fn describe(&self) -> Value {
         let mut redacted = self.session_json.clone();
         if let Some(obj) = redacted.as_object_mut() {
-            for key in ["s3_secret_key", "s3_session_token", "proxy_password", "passphrase", "key_passphrase"] { obj.remove(key); }
+            for key in ["s3_secret_key", "s3_session_token", "proxy_password", "passphrase", "key_passphrase", "clear_key_passphrase", "keep_password", "keep_key_passphrase", "keep_tunnel_password", "keep_tunnel_passphrase"] { obj.remove(key); }
             obj.remove("password");
             obj.remove("tunnel_password");
             obj.remove("tunnel_passphrase");
@@ -169,6 +169,8 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
     let proto = site.protocol.as_str();
     let has_password = site.password.as_ref().is_some_and(|p| !p.is_empty())
         || site.password_raw.as_ref().is_some_and(|p| !p.is_empty());
+    let has_key_passphrase = site.key_passphrase.as_ref().is_some_and(|p| !p.is_empty())
+        || site.key_passphrase_raw.as_ref().is_some_and(|p| !p.is_empty());
     let mut obj = serde_json::Map::new();
     obj.insert("name".into(), json!(site.name));
     if let Some((folder, _)) = site.name.rsplit_once('/') {
@@ -183,6 +185,7 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
     obj.insert("username".into(), json!(site.username));
     obj.insert("user".into(), json!(site.username));
     obj.insert("has_password".into(), json!(has_password));
+    obj.insert("has_key_passphrase".into(), json!(has_key_passphrase));
     obj.insert(
         "keyfile".into(),
         json!(site.private_key.clone().unwrap_or_default()),
@@ -204,17 +207,35 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
     obj.insert("proxy_port".into(), json!(site.proxy_port));
     obj.insert("proxy_username".into(), json!(site.proxy_username));
     obj.insert("proxy_command".into(), json!(site.proxy_command));
+    obj.insert("proxy_dns".into(), json!(site.proxy_dns));
+    obj.insert("proxy_localhost".into(), json!(site.proxy_localhost));
+    obj.insert("proxy_exclude".into(), json!(site.proxy_exclude));
+    obj.insert("tunnel".into(), json!(site.tunnel.enabled));
     obj.insert("tunnel_enabled".into(), json!(site.tunnel.enabled));
     obj.insert("tunnel_host".into(), json!(site.tunnel.host));
     obj.insert("tunnel_port".into(), json!(site.tunnel.port));
     obj.insert("tunnel_user".into(), json!(site.tunnel.username));
+    obj.insert("tunnel_username".into(), json!(site.tunnel.username));
     obj.insert("tunnel_keyfile".into(), json!(site.tunnel.keyfile));
+    obj.insert("tunnel_private_key".into(), json!(site.tunnel.keyfile));
+    obj.insert("tunnel_local_port".into(), json!(site.tunnel.local_port));
+    obj.insert("tunnel_error".into(), json!(site.tunnel_error.clone().unwrap_or_default()));
+    obj.insert(
+        "has_tunnel_password".into(),
+        json!(site.tunnel.password.as_ref().is_some_and(|p| !p.is_empty())
+            || site.tunnel_password_raw.as_ref().is_some_and(|p| !p.is_empty())),
+    );
+    obj.insert(
+        "has_tunnel_passphrase".into(),
+        json!(site.tunnel_passphrase.as_ref().is_some_and(|p| !p.is_empty())
+            || site.tunnel_passphrase_raw.as_ref().is_some_and(|p| !p.is_empty())),
+    );
     obj.insert(
         "tunnel_hostkey".into(),
         json!(site.tunnel.hostkey.clone()),
     );
     for (k, v) in &site.extra_fields {
-        if matches!(k.as_str(), "s3_secret_key" | "s3_session_token" | "proxy_password" | "passphrase" | "tunnel_passphrase") { continue; }
+        if matches!(k.as_str(), "s3_secret_key" | "s3_session_token" | "proxy_password" | "passphrase" | "key_passphrase" | "tunnel_passphrase") { continue; }
         obj.entry(k.clone()).or_insert_with(|| json!(v));
     }
     Value::Object(obj)
@@ -476,7 +497,7 @@ pub fn parse_gui_session_spec(
                 .and_then(|b| b.tunnel.password.clone())
         });
     let tunnel_keyfile = {
-        let tk = str_field(session, &["tunnel_keyfile"]);
+        let tk = str_field(session, &["tunnel_keyfile", "tunnel_private_key"]);
         if !tk.is_empty() {
             Some(tk)
         } else if let Some(nt) = nested_tun {
@@ -488,6 +509,14 @@ pub fn parse_gui_session_spec(
                 .and_then(|b| b.tunnel.keyfile.clone())
         }
     };
+    let tunnel_local_port = u16_field(
+        session,
+        &["tunnel_local_port"],
+        nested_tun
+            .and_then(|nt| u16_field(nt, &["local_port"], 0).ok())
+            .or_else(|| stored_base.as_ref().map(|b| b.tunnel.local_port))
+            .unwrap_or(0),
+    )?;
     let tunnel_hostkey = {
         let thk = str_field(session, &["tunnel_hostkey"]);
         if !thk.is_empty() {
@@ -510,7 +539,7 @@ pub fn parse_gui_session_spec(
         password: tunnel_password,
         keyfile: tunnel_keyfile,
         hostkey: tunnel_hostkey.unwrap_or_default(),
-        local_port: 0,
+        local_port: tunnel_local_port,
     };
 
     let mut spec = if let Some(ref b) = stored_base {
@@ -518,6 +547,19 @@ pub fn parse_gui_session_spec(
     } else {
         ParsedSiteSpec::default()
     };
+    // A typed tunnel key passphrase wins over the stored one; an empty field
+    // falls back to it (same rule as the passwords). It only applies to an
+    // enabled tunnel - a typed passphrase for a disabled tunnel is dropped,
+    // exactly like the tunnel password.
+    if tunnel_enabled {
+        if let Some(tp) = session
+            .get("tunnel_passphrase")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            spec.raw_fields.insert("tunnel_passphrase".to_string(), tp.to_string());
+        }
+    }
 
     spec.session = SessionConfig {
         name: str_field(session, &["name"]),
@@ -533,14 +575,25 @@ pub fn parse_gui_session_spec(
         tunnel: tunnel.enabled.then(|| tunnel.clone()),
     };
     spec.session.keyfile = keyfile.clone();
-    if let Some(pp) = session
-        .get("passphrase")
-        .or_else(|| session.get("key_passphrase"))
+    spec.passphrase = match session
+        .get("key_passphrase")
+        .or_else(|| session.get("passphrase"))
         .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
     {
-        spec.passphrase = Some(pp.to_string());
-    }
+        Some(pp) if !pp.is_empty() => Some(pp.to_string()),
+        Some(_) => {
+            if session
+                .get("clear_key_passphrase")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                None
+            } else {
+                stored_base.as_ref().and_then(|b| b.key_passphrase.clone())
+            }
+        }
+        None => stored_base.as_ref().and_then(|b| b.key_passphrase.clone()),
+    };
 
     // Extra protocol fields (`s3_*`, `ftp_*`, `tls_*`, `proxy_*`, Kerberos)
     let extra_keys = [
@@ -646,7 +699,7 @@ pub fn parse_gui_session_spec(
         );
         obj.insert("remote_dir".into(), json!(initial_dir));
         obj.insert("local_dir".into(), json!(local_dir));
-        for key in ["s3_secret_key", "s3_session_token", "proxy_password", "passphrase", "key_passphrase"] { obj.remove(key); }
+        for key in ["s3_secret_key", "s3_session_token", "proxy_password", "passphrase", "key_passphrase", "clear_key_passphrase", "keep_password", "keep_key_passphrase", "keep_tunnel_password", "keep_tunnel_passphrase"] { obj.remove(key); }
         obj.remove("password");
         obj.remove("tunnel_password");
         obj.remove("tunnel_passphrase");

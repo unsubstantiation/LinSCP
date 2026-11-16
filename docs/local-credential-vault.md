@@ -9,9 +9,15 @@ legacy `sessions.key` files are upgraded in place on first setup without
 changing the key used to decrypt existing saved-session passwords.
 
 Saved session passwords continue to use LinSCP's encrypted `sessions.ini`
-format with the random data key. The Site Manager opts in to saving passwords
-by default for new SSH sessions; uncheck the password-storage option to keep a
-password only for the current connection. SSH private-key files selected with
+format with the random data key. The Site Manager has two separate entries,
+both stored encrypted under that key when the "store the passwords" option is
+ticked: `User Password`, the login password for the server (terminal and
+permissions access), and `Key Password`, the passphrase that decrypts an
+encrypted OpenSSH private key. The option is ticked by default for new SSH
+sessions; uncheck it to keep the passwords only for the current connection.
+An empty field with the option ticked keeps the secret already stored for the
+site, so re-saving a session does not wipe its saved passwords; unchecking
+the box on save removes them. SSH private-key files selected with
 the browse button are imported into the vault and encrypted with AES-256-GCM
 under that same in-memory key. Their session values are opaque `vaultkey://`
 references; existing vault keys can be selected with the key-picker button.

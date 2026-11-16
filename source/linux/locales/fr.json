@@ -247,6 +247,7 @@
   "The interval must be between 1 and 86400 seconds.": "L’intervalle doit être compris entre 1 et 86400 secondes.",
   "The key is already installed in '{path}'.": "La clé est déjà installée dans '{path}'.",
   "The key is already installed.": "La clé est déjà installée.",
+  "The key password of this connection is not known (it was taken from an agent or an unencrypted key), so it cannot be stored.": "Le mot de passe de la clé de cette connexion est inconnu (il provient d’un agent ou d’une clé non chiffrée) ; il ne peut donc pas être enregistré.",
   "The only value of '-preservetime' is 'all' (directories are timed too); use '-nopreservetime' to keep no timestamps.": "La seule valeur de '-preservetime' est 'all' (les répertoires sont aussi horodatés) ; utilisez '-nopreservetime' pour ne conserver aucun horodatage.",
   "The option '{name}' is not supported by this build.": "L’option '{name}' n’est pas prise en charge par cette version.",
   "The password of this connection is not known (it was typed or taken from a key or an agent), so it cannot be stored.": "Le mot de passe de cette connexion est inconnu (il a été saisi ou provient d’une clé ou d’un agent) ; il ne peut donc pas être enregistré.",

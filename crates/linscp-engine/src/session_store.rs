@@ -60,6 +60,13 @@ pub struct StoredSite {
     /// mismatched, preventing unrelated edits from wiping another site's secret.
     pub password_raw: Option<String>,
     pub password_error: Option<String>,
+    /// Passphrase for the encrypted OpenSSH private key, stored encrypted
+    /// under the same `sessions.key` data key as the password.
+    pub key_passphrase: Option<String>,
+    /// Preserved raw `lscp1$` ciphertext when `sessions.key` was unavailable or
+    /// mismatched, preventing unrelated edits from wiping the key password.
+    pub key_passphrase_raw: Option<String>,
+    pub key_passphrase_error: Option<String>,
     pub private_key: Option<String>,
     pub hostkey: Option<String>,
     pub remote_directory: String,
@@ -105,6 +112,9 @@ impl StoredSite {
             password: None,
             password_raw: None,
             password_error: None,
+            key_passphrase: None,
+            key_passphrase_raw: None,
+            key_passphrase_error: None,
             private_key: None,
             hostkey: None,
             remote_directory: String::new(),
@@ -202,7 +212,10 @@ impl StoredSite {
             username: self.username.clone(),
             has_password: self.password.as_deref().is_some_and(|p| !p.is_empty())
                 || self.password_raw.is_some(),
+            has_key_passphrase: self.key_passphrase.as_deref().is_some_and(|p| !p.is_empty())
+                || self.key_passphrase_raw.is_some(),
             has_unreadable_secret: self.password_raw.is_some()
+                || self.key_passphrase_raw.is_some()
                 || self.proxy_password_raw.is_some()
                 || self.tunnel_password_raw.is_some()
                 || self.tunnel_passphrase_raw.is_some(),
@@ -212,11 +225,13 @@ impl StoredSite {
     }
 
     pub fn needs_encryption_key(&self) -> bool {
+        // Any secret written into sessions.ini - including a tunnel passphrase
+        // left in the form after the tunnel box was unticked - needs the data key.
         self.password.as_deref().is_some_and(|s| !s.is_empty())
+            || self.key_passphrase.as_deref().is_some_and(|s| !s.is_empty())
             || self.proxy_password.as_deref().is_some_and(|s| !s.is_empty())
-            || (self.tunnel.enabled
-                && (self.tunnel.password.as_deref().is_some_and(|s| !s.is_empty())
-                    || self.tunnel_passphrase.as_deref().is_some_and(|s| !s.is_empty())))
+            || self.tunnel.password.as_deref().is_some_and(|s| !s.is_empty())
+            || self.tunnel_passphrase.as_deref().is_some_and(|s| !s.is_empty())
     }
 }
 
@@ -320,6 +335,12 @@ impl SessionStore {
                 site.password = plain;
                 site.password_raw = raw;
                 site.password_error = err;
+            }
+            if let Some(kp) = map.remove("key_passphrase") {
+                let (plain, raw, err) = decode_secret_field(&kp, master_key);
+                site.key_passphrase = plain;
+                site.key_passphrase_raw = raw;
+                site.key_passphrase_error = err;
             }
             site.private_key = map.remove("private_key").filter(|s| !s.is_empty());
             site.hostkey = map.remove("hostkey").filter(|s| !s.is_empty());
@@ -532,6 +553,13 @@ impl SessionStore {
             )? {
                 out.push_str(&format!("password={}\n", escape_ini_value(&enc_pw)));
             }
+            if let Some(enc_kp) = encode_secret_field(
+                site.key_passphrase.as_deref(),
+                site.key_passphrase_raw.as_deref(),
+                master_key,
+            )? {
+                out.push_str(&format!("key_passphrase={}\n", escape_ini_value(&enc_kp)));
+            }
             if let Some(pk) = site.private_key.as_deref().filter(|s| !s.is_empty()) {
                 out.push_str(&format!("private_key={}\n", escape_ini_value(pk)));
             }
@@ -716,6 +744,10 @@ impl SessionStore {
                 site.password_raw = existing.password_raw.take();
                 site.password_error = existing.password_error.take();
             }
+            if site.key_passphrase.is_none() && site.key_passphrase_raw.is_none() {
+                site.key_passphrase_raw = existing.key_passphrase_raw.take();
+                site.key_passphrase_error = existing.key_passphrase_error.take();
+            }
             let proxy_disabled = site.proxy_method.trim().is_empty()
                 || site.proxy_method.trim().eq_ignore_ascii_case("none")
                 || site.proxy_method.trim() == "0";
@@ -840,5 +872,67 @@ mod tests {
             Some("s3cr3t\twith\ttabs")
         );
         assert_eq!(recovered.folders(), vec!["prod", "staging"]);
+    }
+
+    #[test]
+    fn key_passphrase_round_trip_and_unreadable_secret_preservation() {
+        let key_a = SessionMasterKey::from_array([0x33; 32]);
+        let key_b = SessionMasterKey::from_array([0x44; 32]);
+
+        let mut store = SessionStore::new();
+        let mut prod = StoredSite::new("prod/app", ProtocolScheme::Sftp, "10.0.0.5");
+        prod.username = "deploy".to_string();
+        prod.password = Some("user-secret".to_string());
+        prod.key_passphrase = Some("key-secret".to_string());
+        store.upsert(prod);
+
+        let ini_text = store.serialize_ini(Some(&key_a)).unwrap();
+        assert!(ini_text.contains("key_passphrase="), "{ini_text}");
+        assert!(!ini_text.contains("key-secret"), "key password must be encrypted at rest");
+        assert!(!ini_text.contains("user-secret"), "password must be encrypted at rest");
+
+        // Round trip under the right key: both secrets come back.
+        let loaded = SessionStore::parse_ini(&ini_text, Some(&key_a)).unwrap();
+        let site = loaded.find("prod/app").unwrap();
+        assert_eq!(site.password.as_deref(), Some("user-secret"));
+        assert_eq!(site.key_passphrase.as_deref(), Some("key-secret"));
+        assert!(site.key_passphrase_raw.is_none());
+        assert!(site.needs_encryption_key());
+        assert!(site.summary().has_key_passphrase);
+        assert!(site.summary().has_password);
+        assert!(!site.summary().has_unreadable_secret);
+
+        // Under a different key the ciphertext is preserved verbatim through
+        // unrelated edits and still decrypts under the right key afterwards.
+        let mut loaded_wrong_key = SessionStore::parse_ini(&ini_text, Some(&key_b)).unwrap();
+        let site_wrong = loaded_wrong_key.find("prod/app").unwrap();
+        assert!(site_wrong.key_passphrase.is_none());
+        assert!(site_wrong.key_passphrase_raw.is_some());
+        assert!(site_wrong.password_raw.is_some());
+        assert!(site_wrong.summary().has_unreadable_secret);
+
+        let staging = StoredSite::new("staging/web", ProtocolScheme::Sftp, "example.org");
+        loaded_wrong_key.upsert(staging);
+        let resaved_ini = loaded_wrong_key.serialize_ini(Some(&key_b)).unwrap();
+        assert!(resaved_ini.contains("key_passphrase=lscp1$"));
+
+        let recovered = SessionStore::parse_ini(&resaved_ini, Some(&key_a)).unwrap();
+        let site = recovered.find("prod/app").unwrap();
+        assert_eq!(site.key_passphrase.as_deref(), Some("key-secret"));
+        assert_eq!(site.password.as_deref(), Some("user-secret"));
+
+        // An unrelated re-save that leaves the key password unset keeps the
+        // unreadable ciphertext instead of wiping it.
+        let recovered_wrong = SessionStore::parse_ini(&resaved_ini, Some(&key_b)).unwrap();
+        let mut rebuilt = StoredSite::new("prod/app", ProtocolScheme::Sftp, "10.0.0.5");
+        rebuilt.username = "deploy".to_string();
+        let mut combined = recovered_wrong;
+        combined.upsert(rebuilt);
+        let combined_ini = combined.serialize_ini(Some(&key_b)).unwrap();
+        let final_load = SessionStore::parse_ini(&combined_ini, Some(&key_a)).unwrap();
+        assert_eq!(
+            final_load.find("prod/app").unwrap().key_passphrase.as_deref(),
+            Some("key-secret")
+        );
     }
 }

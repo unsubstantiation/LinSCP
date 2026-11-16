@@ -355,7 +355,7 @@ impl CommanderService {
             return api_error(400, "Wildcard SSH host keys are not supported");
         }
         if let Some(object) = clean.as_object_mut() {
-            for key in ["proxy_password", "passphrase", "password", "tunnel_password", "tunnel_passphrase"] { object.remove(key); }
+            for key in ["proxy_password", "passphrase", "key_passphrase", "password", "tunnel_password", "tunnel_passphrase", "clear_key_passphrase", "keep_password", "keep_key_passphrase", "keep_tunnel_password", "keep_tunnel_passphrase"] { object.remove(key); }
             if let Some(tunnel) = object.get_mut("tunnel").and_then(Value::as_object_mut) {
                 for key in ["password", "passphrase"] { tunnel.remove(key); }
             }
@@ -2537,7 +2537,38 @@ impl CommanderService {
         let cfg_root = self.state.lock().expect("m").config_root.clone();
         let spec_res = tabs::parse_gui_session_spec(&session_val, None, &cfg_root, self.secret_vault.as_ref());
         if let Err(e) = spec_res { return ApiReply{ status: 400, payload: json!({"success": false, "error": e})}; }
-        let (spec, _) = spec_res.unwrap();
+        let (mut spec, _) = spec_res.unwrap();
+        // The dialog sends explicit keep flags when the "Store ..." box is ticked
+        // but the field was left empty on an existing session: keep the secret
+        // already in the store instead of wiping it on an unrelated re-save.
+        let keep_password = session_val.get("keep_password").and_then(Value::as_bool).unwrap_or(false);
+        let keep_key_passphrase = session_val.get("keep_key_passphrase").and_then(Value::as_bool).unwrap_or(false);
+        let keep_tunnel_password = session_val.get("keep_tunnel_password").and_then(Value::as_bool).unwrap_or(false);
+        let keep_tunnel_passphrase = session_val.get("keep_tunnel_passphrase").and_then(Value::as_bool).unwrap_or(false);
+        if keep_password || keep_key_passphrase || keep_tunnel_password || keep_tunnel_passphrase {
+            if let Some(existing) = SessionStore::load_from_dir(&cfg_root, self.secret_vault.as_ref())
+                .unwrap_or_default()
+                .find(&final_name)
+                .cloned()
+            {
+                if keep_password && spec.session.password.is_none() {
+                    spec.session.password = existing.password.clone();
+                }
+                if keep_key_passphrase && spec.passphrase.is_none() {
+                    spec.passphrase = existing.key_passphrase.clone();
+                }
+                if keep_tunnel_password && spec.session.tunnel.as_ref().is_some_and(|t| t.password.is_none()) {
+                    if let (Some(tun), Some(pw)) = (spec.session.tunnel.as_mut(), existing.tunnel.password.clone()) {
+                        tun.password = Some(pw);
+                    }
+                }
+                if keep_tunnel_passphrase && spec.session.tunnel.is_some() && !spec.raw_fields.contains_key("tunnel_passphrase") {
+                    if let Some(tp) = existing.tunnel_passphrase.clone() {
+                        spec.raw_fields.insert("tunnel_passphrase".to_string(), tp);
+                    }
+                }
+            }
+        }
         if spec.raw_fields.get("s3_session_token").is_some_and(|token| !token.is_empty()) {
             return api_error(400, "Saving S3 session tokens is not supported; supply the token when connecting instead.");
         }
@@ -4568,10 +4599,12 @@ fn offlineotp_entries_from_sessions(
             return Err(format!("Saved session '{}' has a name that cannot be represented safely in an OfflineOTP import.", site.name));
         }
         if site.password_raw.is_some()
+            || site.key_passphrase_raw.is_some()
             || site.proxy_password_raw.is_some()
             || site.tunnel_password_raw.is_some()
             || site.tunnel_passphrase_raw.is_some()
             || site.password_error.is_some()
+            || site.key_passphrase_error.is_some()
             || site.proxy_error.is_some()
             || site.tunnel_error.is_some()
             || site.setting_error.is_some()
@@ -4931,6 +4964,8 @@ fn clear_imported_key_paths(site: &mut StoredSite) {
     site.tunnel.keyfile = None;
     site.password_raw = None;
     site.password_error = None;
+    site.key_passphrase_raw = None;
+    site.key_passphrase_error = None;
     site.proxy_password_raw = None;
     site.tunnel_password_raw = None;
     site.tunnel_passphrase_raw = None;
@@ -4952,6 +4987,7 @@ fn validate_imported_site(site: &StoredSite) -> Result<(), String> {
         ("host", site.host.as_str()),
         ("username", site.username.as_str()),
         ("password", site.password.as_deref().unwrap_or("")),
+        ("key password", site.key_passphrase.as_deref().unwrap_or("")),
         ("host key", site.hostkey.as_deref().unwrap_or("")),
         ("remote directory", site.remote_directory.as_str()),
         ("local directory", site.local_directory.as_str()),
@@ -9059,6 +9095,57 @@ mod tests {
         assert_eq!(list_reply.payload["sessions"][0]["name"], "prod/web");
         assert_eq!(list_reply.payload["sessions"][0]["has_password"], true);
         assert_eq!(list_reply.payload["folders"][0], "prod");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    #[test]
+    fn sessions_save_round_trip_stores_and_reports_the_key_password() {
+        let tmp = std::env::temp_dir().join(format!("linscp-svc-keypass-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let svc = CommanderService::new(tmp.clone(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
+        let request = |method: &str, path: &str, body: Value| ApiEnvelope { method: method.into(), path: path.into(), body };
+        let key_file = tmp.join("id_ed25519");
+        std::fs::write(&key_file, b"-----BEGIN OPENSSH PRIVATE KEY-----\nnot-a-real-key\n-----END OPENSSH PRIVATE KEY-----\n").unwrap();
+        let key_path = key_file.to_string_lossy().to_string();
+
+        // Saving a site with both passwords: both land in sessions.ini encrypted,
+        // never in the list payload, and both are reported as stored.
+        let save = svc.dispatch(request("POST", "/api/sessions/save", json!({"name": "keypass/test", "session": {"protocol": "sftp", "host": "10.0.0.9", "username": "deploy", "password": "user-secret-pw", "keyfile": key_path, "key_passphrase": "key-secret-pass"}})));
+        assert_eq!(save.status, 200, "{}", save.payload);
+        let ini = std::fs::read_to_string(tmp.join("sessions.ini")).unwrap();
+        assert!(ini.contains("password=lscp1$"), "{ini}");
+        assert!(ini.contains("key_passphrase=lscp1$"), "{ini}");
+        assert!(!ini.contains("user-secret-pw"));
+        assert!(!ini.contains("key-secret-pass"));
+        let list = svc.dispatch(request("GET", "/api/sessions", json!({})));
+        let listed = list.payload["sessions"].as_array().unwrap().iter().find(|s| s["name"] == "keypass/test").unwrap().clone();
+        assert_eq!(listed["has_password"], true);
+        assert_eq!(listed["has_key_passphrase"], true);
+        assert!(!list.payload.to_string().contains("key-secret-pass"));
+        assert!(!list.payload.to_string().contains("user-secret-pw"));
+
+        // The dialog re-saves the form with the fields empty and the Store box
+        // ticked: the stored secrets must survive (keep flags), the other
+        // settings must update, and the payload must still not contain secrets.
+        let resave = svc.dispatch(request("POST", "/api/sessions/save", json!({"name": "keypass/test", "session": {"protocol": "sftp", "host": "10.0.0.10", "username": "deploy", "password": "", "key_passphrase": "", "keyfile": key_path, "keep_password": true, "keep_key_passphrase": true}})));
+        assert_eq!(resave.status, 200, "{}", resave.payload);
+        let store = SessionStore::load_from_dir(&tmp, svc.secret_vault.as_ref()).unwrap();
+        let site = store.find("keypass/test").unwrap();
+        assert_eq!(site.host, "10.0.0.10");
+        assert_eq!(site.password.as_deref(), Some("user-secret-pw"));
+        assert_eq!(site.key_passphrase.as_deref(), Some("key-secret-pass"));
+
+        // Unticking Store (fields empty, no keep flags) drops both secrets.
+        let cleared = svc.dispatch(request("POST", "/api/sessions/save", json!({"name": "keypass/test", "session": {"protocol": "sftp", "host": "10.0.0.10", "username": "deploy", "password": "", "key_passphrase": "", "keyfile": key_path}})));
+        assert_eq!(cleared.status, 200, "{}", cleared.payload);
+        let store = SessionStore::load_from_dir(&tmp, svc.secret_vault.as_ref()).unwrap();
+        let site = store.find("keypass/test").unwrap();
+        assert!(site.password.is_none() && site.password_raw.is_none());
+        assert!(site.key_passphrase.is_none() && site.key_passphrase_raw.is_none());
+        let list = svc.dispatch(request("GET", "/api/sessions", json!({})));
+        let listed = list.payload["sessions"].as_array().unwrap().iter().find(|s| s["name"] == "keypass/test").unwrap().clone();
+        assert_eq!(listed["has_password"], false);
+        assert_eq!(listed["has_key_passphrase"], false);
         let _ = std::fs::remove_dir_all(&tmp);
     }
     #[test]

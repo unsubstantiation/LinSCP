@@ -76,7 +76,8 @@ use the `linscp_` prefix so OfflineOTP's existing password-entry model can
 preserve them as ordinary additional columns:
 
 - `linscp_session_json` is the portable saved-session record (including
-  protocol, remote directories, proxy/jump-host configuration and their credentials).
+  protocol, remote directories, proxy/jump-host configuration, their credentials
+  and the saved key password).
   Local directory paths, key/certificate file paths and unreadable ciphertext are omitted; key
   material is carried separately when it is an SSH key. The sensitive session
   data is protected by the enclosing encrypted backup. Export refuses settings

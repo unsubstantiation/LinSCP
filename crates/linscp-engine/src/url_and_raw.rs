@@ -448,6 +448,12 @@ pub fn site_spec_from_stored(site: &StoredSite) -> Result<ParsedSiteSpec, String
             site.name
         ));
     }
+    if let Some(ref err) = site.key_passphrase_error {
+        return Err(format!(
+            "The stored key password for '{}' cannot be used: {err}",
+            site.name
+        ));
+    }
     if let Some(ref err) = site.proxy_error {
         return Err(err.clone());
     }
@@ -464,7 +470,7 @@ pub fn site_spec_from_stored(site: &StoredSite) -> Result<ParsedSiteSpec, String
         preset_name: site.preset.clone(),
         session_label: site.name.clone(),
         explicit_session_name: None,
-        passphrase: None,
+        passphrase: site.key_passphrase.clone(),
         timeout_secs: 30,
     };
 
@@ -1516,6 +1522,7 @@ pub fn stored_site_from_spec(name: &str, spec: &ParsedSiteSpec) -> StoredSite {
     site.port = spec.session.port;
     site.username = spec.session.username.clone();
     site.password = spec.session.password.clone();
+    site.key_passphrase = spec.passphrase.clone();
     site.private_key = spec.session.keyfile.clone();
     site.hostkey = if spec.session.hostkey.is_empty() {
         None
