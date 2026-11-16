@@ -40,7 +40,7 @@ Transfers, directories, renames, symbolic links (ln/symlink) and chmod use nativ
 
 Native copy-data replies are used when offered; a multi-source/recursive streamed fallback works when absent.
 
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. test_cp_multiple_sources_and_recursive_tree is not ported; live-sftp needs a `linscp` binary this repo does not build.
+**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. test_cp_multiple_sources_and_recursive_tree is ported against a mock that refuses the copy-data extension, proving the streamed fallback; the native copy-data path is covered by test_cp_uses_native_copy_data_when_the_server_advertises_it. live-sftp needs a `linscp` binary this repo does not build.
 
 **Acceptance criteria:**
 
@@ -66,7 +66,7 @@ Server check-file-name is used for sha-256 and all documented hashes fall back t
 
 Octal and recursive symbolic chmod plus file and directory timestamp preservation (-preservetime=all) work against the live SFTP server.
 
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. test_timestamps_survive_in_both_directions and test_transfer_speed_append_and_preservetime_all are not ported; live-sftp needs a `linscp` binary this repo does not build.
+**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The upload half of test_timestamps_survive_in_both_directions runs through the acknowledged staged SFTP publish; the 'put -append' half of test_transfer_speed_append_and_preservetime_all stays refused by design (the acknowledged staged publish replaces atomically, it does not append) and the refusal is pinned in the ported case. live-sftp needs a `linscp` binary this repo does not build.
 
 **Acceptance criteria:**
 
@@ -402,7 +402,7 @@ Automatic/on/off and -resumesupport thresholds are parsed; resume-off transfers 
 
 SFTP preserves file and directory timestamps (-preservetime=all) and applies -permissions modes on uploads and downloads.
 
-**Next:** No runnable suite evidences this: live-sftp needs a `linscp` binary this repo does not build.
+**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The upload half of test_timestamps_survive_in_both_directions runs through the acknowledged staged SFTP publish; the 'put -append' half of test_transfer_speed_append_and_preservetime_all stays refused by design and its refusal is pinned in the ported case. live-sftp needs a `linscp` binary this repo does not build.
 
 **Acceptance criteria:**
 
@@ -415,7 +415,7 @@ SFTP preserves file and directory timestamps (-preservetime=all) and applies -pe
 
 Native SFTP supports -append without overwriting existing bytes and -speed= bandwidth throttling; curl uses --limit-rate and refuses append.
 
-**Next:** No runnable suite evidences this: live-sftp needs a `linscp` binary this repo does not build.
+**Next:** The ported case now executes in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. -append is covered on download; 'put -append' is refused by design, even with the acknowledged staged SFTP publish, and the refusal is pinned in the ported case. live-sftp needs a `linscp` binary this repo does not build.
 
 **Acceptance criteria:**
 
@@ -468,7 +468,7 @@ Local-to-remote keepuptodate and recursive one-way planning/upload run against t
 
 A persistent state file distinguishes one-sided changes and deletions from two-sided conflicts and applies -conflict=skip|local|remote|newer against a live SFTP server.
 
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The upstream case's keepuptodate half is not ported: local-to-remote uploads are refused by the guarded-upload rules in this build; the refusal is pinned by test_keepuptodate_reports_the_unguarded_sftp_upload_by_name (a change-guard, not case coverage). unit has no build target and cannot be compiled; live-sftp needs a `linscp` binary this repo does not build.
+**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The full upstream case is ported, conflict policy and the keepuptodate mirror alike; uploads go through the acknowledged staged SFTP publish. The keepuptodate refusal without the acknowledgment is pinned by test_keepuptodate_reports_the_unguarded_sftp_upload_by_name (a change-guard, not case coverage). unit has no build target and cannot be compiled; live-sftp needs a `linscp` binary this repo does not build.
 
 **Acceptance criteria:**
 
@@ -496,7 +496,7 @@ Checksum criteria find same-size/same-time changes and stop if contents cannot b
 
 An excluded subtree is pruned from the plan and cannot be deleted at the destination.
 
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The full upstream case cannot run as written in this build: the local→remote upload half is refused by the guarded-upload rules (the preview evidence and the refusal are what the ported case asserts). live-sftp needs a `linscp` binary this repo does not build.
+**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The full upstream case runs: without the acknowledgment the run aborts naming the refusal (pinned in the same test); with 'option sftpriskypublish on' the upload half completes and the excluded subtree stays untouched. live-sftp needs a `linscp` binary this repo does not build.
 
 **Acceptance criteria:**
 
@@ -522,7 +522,7 @@ Nested local arrivals wake the recursive inotify watcher before the rescan inter
 
 Time/size/checksum criteria, -mirror and two-way conflict policies are validated in script and unit suites and exercised against a live SFTP server. The Commander's synchronize dialogue offers the same mirror as a one-way copy that deletes what the source no longer has, and its settings are held to the planner's own rules by a service unit test.
 
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The keepuptodate half of the conflict case is not ported (guarded-upload refusal). unit has no build target and cannot be compiled; live-sftp and script need a `linscp` binary this repo does not build.
+**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The conflict case is ported in full, keepuptodate included, with uploads through the acknowledged staged SFTP publish. unit has no build target and cannot be compiled; live-sftp and script need a `linscp` binary this repo does not build.
 
 **Acceptance criteria:**
 
@@ -1036,7 +1036,7 @@ Shared LIST parser handles Unix long listings, DOS/IIS listings (MM-DD-YY[YY] HH
 
 'etag <file> -match=ETAG' records an If-Match precondition and '-nomatch=ETAG' an If-None-Match one, per path and per session; '-get' reads the current tag with a Depth-0 PROPFIND and tells a missing path apart from a server that reported no tag; '-clear' forgets a recorded one. A WebDAV upload, delete or move of that path carries the tag in the If header, in one no-tag condition list together with a lock token when the path is also locked - '(<opaquelocktoken:...> ["tag"])' - because RFC 4918 reads an If header as either no-tag lists or tagged lists and never as both, and the token has to be the Coded-URL of angle brackets a standard server looks for. '-nomatch=' is sent as '(Not ["tag"])': a list without the Not would have been If-Match, the opposite of the documented 'write only if the version differs'. The value travels quoted as the entity tag the server gave - 'etag -get' prints "abc", the command splitter strips those quotes, and DavEntityTag puts them back with a W/ weakness prefix left outside them - and '*' is refused by name instead of sent, since an If header has no way to say 'only if absent' and a quoted asterisk is a tag no resource carries, which would guard nothing while looking like a guard. DAV response text is XML-unescaped on the way in, so an escaped getetag arrives as the tag it is rather than as '&quot;...&quot;', which no precondition could ever match. Against a live server a matching tag writes, a stale one is refused with 412 and leaves the destination's bytes and its collection listing exactly as they were, If-None-Match writes where the version differs and is refused where it does not, an absent resource answers it, and a 412 on MOVE says which of its two causes it was rather than always blaming an existing destination. Collection semantics are defined rather than inherited: a precondition guards the path it was recorded for and nothing below it, because a collection's tag names its listing - the first member written under an inherited one would stale it and fail every later write in that directory. A session whose protocol has no entity tags (the SSH engines, FTP, S3) is refused by name, '-get' included, rather than left believing a later write is conditional. Upstream's WebDAV backend sends no ETag precondition at all, so this is a LinSCP extension.
 
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The trailing upload half of the etag case is not ported (guarded-upload refusal); the refusal path is what the ported case ends on. live-dav and live-sftp need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
+**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The etag case is ported in full, including the trailing put (through the acknowledged staged SFTP publish). live-dav and live-sftp need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
 
 **Acceptance criteria:**
 

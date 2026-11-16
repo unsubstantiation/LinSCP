@@ -49,6 +49,8 @@ pub struct KeepUpToDateOptions {
     pub permissions: PresetPermissions,
     pub speed_kbytes_per_sec: Option<u64>,
     pub file_mask: FileMask,
+    /// The user acknowledged the staged SFTP publish (see `TransferFlags::sftp_risky_publish`).
+    pub sftp_risky_publish: bool,
 }
 
 impl Default for KeepUpToDateOptions {
@@ -63,6 +65,7 @@ impl Default for KeepUpToDateOptions {
             permissions: PresetPermissions::Off,
             speed_kbytes_per_sec: None,
             file_mask: FileMask::default(),
+            sftp_risky_publish: false,
         }
     }
 }
@@ -114,6 +117,7 @@ where
         permissions: opts.permissions,
         speed_kbytes_per_sec: opts.speed_kbytes_per_sec,
         file_mask: opts.file_mask.clone(),
+        sftp_risky_publish: opts.sftp_risky_publish,
         ..SyncOptions::default()
     };
 

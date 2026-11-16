@@ -497,6 +497,7 @@ pub struct MockSshServer {
     pub allowed_pubkey: PublicKey,
     pub allow_forwarding: bool,
     pub check_file_name: bool,
+    pub copy_data: bool,
 }
 
 impl russh::server::Server for MockSshServer {
@@ -588,8 +589,9 @@ impl russh::server::Handler for MockSshSession {
                 session.channel_success(channel_id)?;
                 let fs = Arc::clone(&self.server.fs);
                 let check_file_name = self.server.check_file_name;
+                let copy_data = self.server.copy_data;
                 tokio::spawn(async move {
-                    let _ = serve_mock_sftp(channel.into_stream(), fs, check_file_name).await;
+                    let _ = serve_mock_sftp(channel.into_stream(), fs, check_file_name, copy_data).await;
                 });
                 return Ok(());
             }
@@ -992,6 +994,7 @@ async fn serve_mock_sftp(
     mut stream: ChannelStream<Msg>,
     fs: Arc<Mutex<MemFs>>,
     check_file_name: bool,
+    copy_data: bool,
 ) -> Result<(), std::io::Error> {
     let mut handles: HashMap<String, OpenSftpHandle> = HashMap::new();
     let mut next_h = 1u64;
@@ -1012,8 +1015,10 @@ async fn serve_mock_sftp(
             w.push_u32(3);
             w.push_str("posix-rename@openssh.com");
             w.push_str("1");
-            w.push_str("copy-data");
-            w.push_str("1");
+            if copy_data {
+                w.push_str("copy-data");
+                w.push_str("1");
+            }
             let reply = w.into_framed_packet(SSH_FXP_VERSION, None);
             stream.write_all(&reply).await?;
             stream.flush().await?;
@@ -1282,6 +1287,11 @@ async fn serve_mock_sftp(
                         }
                     }
                     "copy-data" => {
+                        if !copy_data {
+                            // A server without the extension reports it as unsupported
+                            // so the client falls back to streaming through it.
+                            sftp_status_packet(req_id, SSH_FX_OP_UNSUPPORTED, "copy-data is unsupported by this server")
+                        } else {
                         let rh = r.read_string_lossy().unwrap_or_default();
                         let read_off = r.read_u64().unwrap_or(0) as usize;
                         let read_len = r.read_u64().unwrap_or(0) as usize;
@@ -1323,6 +1333,7 @@ async fn serve_mock_sftp(
                             }
                             _ => sftp_status_packet(req_id, SSH_FX_NO_SUCH_FILE, "Bad handle"),
                         }
+                        }
                     }
                     "check-file-name" => {
                         if !check_file_name {
@@ -1359,22 +1370,24 @@ async fn serve_mock_sftp(
     }
 }
 
-/// Starts the mock with `check_file_name = true`, matching the historical default.
+/// Starts the mock with `check_file_name = true` and `copy_data = true`,
+/// matching the historical default.
 pub async fn start_mock_ssh_server(
     host_seed: u8,
     user_pubkey: PublicKey,
     allow_forwarding: bool,
 ) -> (u16, String, String, Arc<Mutex<MemFs>>) {
-    start_mock_ssh_server_with(host_seed, user_pubkey, allow_forwarding, true).await
+    start_mock_ssh_server_with(host_seed, user_pubkey, allow_forwarding, true, true).await
 }
 
-/// Starts the mock, optionally refusing the `check-file-name` extension so
-/// callers can exercise the download-and-hash fallback path.
+/// Starts the mock, optionally refusing the `check-file-name` and
+/// `copy-data` extensions so callers can exercise the fallback paths.
 pub async fn start_mock_ssh_server_with(
     host_seed: u8,
     user_pubkey: PublicKey,
     allow_forwarding: bool,
     check_file_name: bool,
+    copy_data: bool,
 ) -> (u16, String, String, Arc<Mutex<MemFs>>) {
     let host_key = generate_ed25519_ssh_key(host_seed, "server-host-key");
     let fs = Arc::new(Mutex::new(MemFs::new()));
@@ -1385,6 +1398,7 @@ pub async fn start_mock_ssh_server_with(
         allowed_pubkey: user_pubkey,
         allow_forwarding,
         check_file_name,
+        copy_data,
     };
     let cfg = Arc::new(russh::server::Config {
         auth_rejection_time: Duration::from_millis(10),

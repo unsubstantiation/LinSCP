@@ -7,14 +7,17 @@
 //! mock SSH/SFTP server — the same one the `proto-ssh` suite uses — driving
 //! the script interpreter end to end.
 //!
-//! Not ported (evidenced here only as change-guards, never as upstream
-//! coverage): guarded/overwrite SFTP uploads themselves. The build refuses
-//! unguarded SFTP uploads by design ("Unguarded SFTP/FTP uploads are
-//! disabled; use exclusive creation ..."), so `synchronize remote`,
-//! `keepuptodate` and the upload half of `synchronize both` cannot complete
-//! against the mock until that gap closes. The conflict-resolution phase of
-//! `synchronize both` needs no upload (a conflicted pair is left alone) and
-//! is ported in full.
+//! Unguarded SFTP uploads stay refused by design ("Unguarded SFTP/FTP
+//! uploads are disabled; ..."). Scripts that must overwrite on the server
+//! opt into the explicitly acknowledged staged publish
+//! (`option sftpriskypublish on`): a fresh binary copy is staged under a
+//! name this client created exclusively and published onto the destination
+//! by rename (atomic where the server has `posix-rename`). The destination
+//! is never unlinked first. The acknowledged mode covers `put`,
+//! `synchronize` and `keepuptodate`; it does not cover `-append` or
+//! `-resume`, which remain refused, and it is never the default. The
+//! change-guard tests pinning the refusal stay: they prove the default
+//! posture.
 
 use std::fs;
 use std::path::Path;
@@ -28,7 +31,7 @@ use linscp_engine::xml_log::SessionLogger;
 use linscp_proto::sftp::SftpClientSession;
 use linscp_proto::ssh::SshConnectConfig;
 use linscp_proto::{download_bytes, upload_bytes, RemoteSession, TransferRequest};
-use linscp_test_support::{generate_ed25519_ssh_key, start_mock_ssh_server};
+use linscp_test_support::{generate_ed25519_ssh_key, start_mock_ssh_server_with};
 use linscp_types::ProtocolScheme;
 use zeroize::Zeroizing;
 
@@ -51,9 +54,25 @@ fn in_memory_logger() -> SessionLogger {
 /// Connects to a fresh mock SSH/SFTP server (seeded with caller-chosen host
 /// and key seeds) and returns the session plus the pinned host fingerprint.
 async fn connect_mock(host_seed: u8, key_seed: u8) -> (Arc<SftpClientSession>, String) {
+    connect_mock_with(host_seed, key_seed, true).await
+}
+
+/// Like `connect_mock`, with the `copy_data` extension optionally refused
+/// so the streamed-fallback copy path can be exercised.
+async fn connect_mock_with(
+    host_seed: u8,
+    key_seed: u8,
+    copy_data: bool,
+) -> (Arc<SftpClientSession>, String) {
     let user_key = generate_ed25519_ssh_key(key_seed, "tester@linscp");
-    let (port, host_sha256, _md5, _fs) =
-        start_mock_ssh_server(host_seed, user_key.private_key.public_key().clone(), false).await;
+    let (port, host_sha256, _md5, _fs) = start_mock_ssh_server_with(
+        host_seed,
+        user_key.private_key.public_key().clone(),
+        false,
+        /* check_file_name */ true,
+        copy_data,
+    )
+    .await;
     let cfg = SshConnectConfig {
         tab_id: 1,
         role: "destination".to_string(),
@@ -262,11 +281,171 @@ async fn test_ln_symlink_and_recursive_chmod() {
     sftp.close().await.unwrap();
 }
 
+/// The `copy-data` extension is optional: multi-source copies and a whole
+/// tree copy must still work through the streamed fallback when the server
+/// does not offer it. The mock here refuses `copy-data`, so the fallback is
+/// what runs, and the console says so by name.
+#[tokio::test]
+async fn test_cp_multiple_sources_and_recursive_tree() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let first: Vec<u8> = (0..8193u32).map(|i| (i * 31 % 251) as u8).collect();
+    let second: Vec<u8> = (0..12291u32).map(|i| (i * 17 % 241) as u8).collect();
+    let nested: Vec<u8> = (0..4097u32).map(|i| (i * 13 % 253) as u8).collect();
+
+    let (sftp, _fp) = connect_mock_with(0x61, 0x62, /* copy_data */ false).await;
+    sftp.mkdir("/copy-input").await.expect("input root");
+    sftp.mkdir("/copy-input/sub").await.expect("input subdir");
+    seed_remote(&sftp, "/copy-input/first.bin", &first, None).await;
+    seed_remote(&sftp, "/copy-input/second.bin", &second, None).await;
+    seed_remote(&sftp, "/copy-input/sub/nested.bin", &nested, None).await;
+
+    let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
+    adopt(&mut interp, Arc::clone(&sftp), tmp.path());
+
+    let cp = format!(
+        "option confirm off ; mkdir /many ; \
+         cp /copy-input/first.bin /copy-input/second.bin /many ; \
+         cp /copy-input /whole-copy ; \
+         get /many/first.bin {0}/first-copy.bin ; \
+         get /many/second.bin {0}/second-copy.bin ; \
+         get /whole-copy/sub/nested.bin {0}/nested-copy.bin",
+        tmp.path().display()
+    );
+    let (ok, out) = run_line_captured(&mut interp, &cp).await;
+    assert!(ok, "the multi-source and tree copy runs: {out}");
+    assert!(
+        out.contains("copying through this client"),
+        "the streamed fallback announces itself: {out}"
+    );
+    assert_eq!(fs::read(tmp.path().join("first-copy.bin")).unwrap(), first);
+    assert_eq!(fs::read(tmp.path().join("second-copy.bin")).unwrap(), second);
+    assert_eq!(fs::read(tmp.path().join("nested-copy.bin")).unwrap(), nested);
+
+    sftp.close().await.unwrap();
+}
+
+/// `-preservetime` means the server time and the local time agree after a
+/// transfer, whichever way the bytes went. The download half runs in the
+/// default posture; the upload half goes through the acknowledged staged
+/// publish, which the script turns on first.
+#[tokio::test]
+async fn test_timestamps_survive_in_both_directions() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let when = 1_234_567_890i64;
+    let remote_payload = b"stamp payload\n".to_vec();
+    let local_payload = b"payload\n".to_vec();
+
+    let (sftp, _fp) = connect_mock(0x63, 0x64).await;
+    seed_remote(&sftp, "/stamp.txt", &remote_payload, Some(when)).await;
+
+    let local_up = tmp.path().join("up.txt");
+    fs::write(&local_up, &local_payload).unwrap();
+    filetime::set_file_mtime(&local_up, FileTime::from_unix_time(when, 0)).unwrap();
+
+    let local_stamp = tmp.path().join("stamp.txt");
+    let script = format!(
+        "get -preservetime /stamp.txt {} ; option sftpriskypublish on ; put -preservetime {} /up.txt",
+        local_stamp.display(),
+        local_up.display()
+    );
+    let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
+    adopt(&mut interp, Arc::clone(&sftp), tmp.path());
+
+    let (ok, out) = run_line_captured(&mut interp, &script).await;
+    assert!(ok, "both halves run: {out}");
+    let downloaded = fs::metadata(&local_stamp).unwrap();
+    assert_eq!(
+        FileTime::from_last_modification_time(&downloaded).unix_seconds(),
+        when,
+        "the download keeps the remote stamp"
+    );
+    let remote = sftp.stat("/up.txt").await.unwrap().expect("the upload landed");
+    assert_eq!(remote.mtime, when, "the upload keeps the local stamp");
+    let landed = download_bytes(&*sftp, "/up.txt", TransferRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(landed, local_payload);
+
+    sftp.close().await.unwrap();
+}
+
+/// `-speed=` throttles, `-append` appends on download, and
+/// `-preservetime=all` preserves directory modification times as well as
+/// file times, in both directions. The `put -append` half of the upstream
+/// case stays refused even with the acknowledgment — the staged publish
+/// replaces atomically, it does not extend end-of-file — and the refusal
+/// is pinned here.
+#[tokio::test]
+async fn test_transfer_speed_append_and_preservetime_all() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let fixed_mtime = 1_650_000_000i64;
+
+    let (sftp, _fp) = connect_mock(0x65, 0x66).await;
+    // Download-append fixture: a local head to extend with the remote tail.
+    seed_remote(&sftp, "/remote-tail.txt", b"remote-tail\n", None).await;
+    let local_log = tmp.path().join("local-log.txt");
+    fs::write(&local_log, b"local-head\n").unwrap();
+    // put -append fixture: refused by design, pinned below.
+    seed_remote(&sftp, "/remote-log.txt", b"head\n", None).await;
+    let tail = tmp.path().join("tail.txt");
+    fs::write(&tail, b"tail\n").unwrap();
+    // -preservetime=all tree fixture.
+    let src_dir = tmp.path().join("dated-dir");
+    fs::create_dir_all(&src_dir).unwrap();
+    let src_file = src_dir.join("item.txt");
+    fs::write(&src_file, b"dated\n").unwrap();
+    filetime::set_file_mtime(&src_file, FileTime::from_unix_time(fixed_mtime, 0)).unwrap();
+    filetime::set_file_mtime(&src_dir, FileTime::from_unix_time(fixed_mtime, 0)).unwrap();
+    let dated_out = tmp.path().join("dated-out");
+
+    let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
+    adopt(&mut interp, Arc::clone(&sftp), tmp.path());
+
+    let script = format!(
+        "option sftpriskypublish on\n\
+         get -append -speed=1024 /remote-tail.txt {}\n\
+         put -r -preservetime=all {} /dated-dir\n\
+         get -r -preservetime=all /dated-dir {}",
+        local_log.display(),
+        src_dir.display(),
+        dated_out.display()
+    );
+    let (ok, out) = run_script(&mut interp, &script).await;
+    assert!(ok, "the download halves and the tree round-trip run: {out}");
+    assert_eq!(fs::read(&local_log).unwrap(), b"local-head\nremote-tail\n");
+    let remote_dir = sftp.stat("/dated-dir").await.unwrap().expect("the tree landed");
+    assert_eq!(remote_dir.mtime, fixed_mtime, "the remote directory keeps its stamp");
+    assert_eq!(fs::read(dated_out.join("item.txt")).unwrap(), b"dated\n");
+    let out_dir_meta = fs::metadata(&dated_out).unwrap();
+    assert_eq!(
+        FileTime::from_last_modification_time(&out_dir_meta).unix_seconds(),
+        fixed_mtime,
+        "the downloaded tree keeps its directory stamp"
+    );
+
+    // The upstream `put -append` is not offered: the acknowledged staged
+    // publish replaces atomically, it does not extend end-of-file.
+    let (ok, out) = run_line_captured(
+        &mut interp,
+        &format!("put -append -speed=1024 {} /remote-log.txt", tail.display()),
+    )
+    .await;
+    assert!(!ok, "put -append is refused even with the acknowledgment: {out}");
+    assert!(out.contains("fresh binary copy"), "the refusal says why: {out}");
+    let remote_log = download_bytes(&*sftp, "/remote-log.txt", TransferRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(remote_log, b"head\n", "the refused append left the remote alone");
+
+    sftp.close().await.unwrap();
+}
+
 /// `-filemask=|skip/` prunes the excluded subtree in both the transfer and
 /// the delete phases: the preview lists the surviving file and neither of
-/// the excluded ones. The full upstream case cannot run as written in this
-/// build: every unguarded SFTP upload is refused, so the real run aborts
-/// naming the refusal (a change-guard, pending guarded overwrite uploads).
+/// the excluded ones. Without the acknowledgment the run aborts naming the
+/// refusal and uploads nothing; with `option sftpriskypublish on` the full
+/// upstream flow runs: `keep.txt` lands on the server and the excluded
+/// remote file survives `-delete`.
 #[tokio::test]
 async fn test_synchronize_filemask_prunes_excluded_subtrees() {
     let tmp = tempfile::tempdir().expect("temp dir");
@@ -297,8 +476,8 @@ async fn test_synchronize_filemask_prunes_excluded_subtrees() {
     assert!(!preview.contains("new.txt"), "the preview prunes the excluded source: {preview}");
     assert!(!preview.contains("old.txt"), "the excluded remote delete is not planned: {preview}");
 
-    // The run aborts at the unguarded SFTP upload naming the refusal; the
-    // excluded subtree is untouched either way.
+    // Without the acknowledgment the run aborts at the upload naming the
+    // refusal; the excluded subtree is untouched either way.
     let (ok, out) = run_script(
         &mut interp,
         "option confirm off ; synchronize remote -filemask=|skip/ -delete ./sync-exclusion /home/tester/sync-exclusion ; exit",
@@ -315,6 +494,30 @@ async fn test_synchronize_filemask_prunes_excluded_subtrees() {
     assert!(new_remote.is_none(), "the excluded source was never uploaded");
     let keep_remote = sftp.stat("/home/tester/sync-exclusion/keep.txt").await.unwrap();
     assert!(keep_remote.is_none(), "the refused upload never landed");
+
+    // With the acknowledgment the full upstream flow runs: keep.txt lands,
+    // the excluded source stays local and the excluded remote file survives
+    // the delete phase.
+    let (ok, out) = run_script(
+        &mut interp,
+        "option sftpriskypublish on ; option confirm off ; synchronize remote -filemask=|skip/ -delete ./sync-exclusion /home/tester/sync-exclusion ; exit",
+    )
+    .await;
+    assert!(ok, "the acknowledged run completes: {out}");
+    let keep_remote = sftp
+        .stat("/home/tester/sync-exclusion/keep.txt")
+        .await
+        .unwrap()
+        .expect("keep.txt landed");
+    assert!(!keep_remote.is_dir, "keep.txt is a file");
+    let keep_bytes = download_bytes(&*sftp, "/home/tester/sync-exclusion/keep.txt", TransferRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(keep_bytes, keep, "keep.txt landed with its bytes");
+    let old = sftp.stat("/home/tester/sync-exclusion/skip/old.txt").await.unwrap();
+    assert!(old.is_some(), "the excluded remote file survives -delete");
+    let new_remote = sftp.stat("/home/tester/sync-exclusion/skip/new.txt").await.unwrap();
+    assert!(new_remote.is_none(), "the excluded source was never uploaded");
 
     sftp.close().await.unwrap();
 }
@@ -394,12 +597,13 @@ async fn test_synchronize_by_checksum_sees_what_the_timestamp_hides() {
 
 /// `synchronize both` records its state under `<config_dir>/sync/`, refuses a
 /// conflicted pair in the default policy (skip) and applies `-conflict=newer`
-/// resolving in favour of the newer side. The `keepuptodate` half of the
-/// upstream case is deliberately not ported: local-to-remote uploads are
-/// refused by the guarded-upload rules in this build, so the case cannot run
-/// as written here. See `test_keepuptodate_reports_the_unguarded_sftp_upload_by_name`.
+/// resolving in favour of the newer side — in both directions, the upload
+/// side going through the acknowledged staged publish. `keepuptodate
+/// -count=1 -delete` then mirrors the local watch directory: `fresh.txt` is
+/// uploaded through the same acknowledged mode and the stale remote file is
+/// deleted.
 #[tokio::test]
-async fn test_synchronize_conflict_policy() {
+async fn test_synchronize_conflict_policy_and_keepuptodate() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let local = tmp.path().join("local");
     fs::create_dir_all(&local).unwrap();
@@ -418,10 +622,11 @@ async fn test_synchronize_conflict_policy() {
     let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
     adopt(&mut interp, Arc::clone(&sftp), tmp.path());
 
-    // Baseline bidirectional sync records the state file.
+    // Baseline bidirectional sync records the state file. The acknowledgment
+    // is on for the whole run: it is what the upload halves below go through.
     let (baseline_ok, baseline) = run_script(
         &mut interp,
-        "synchronize both ./local /home/tester/sync-both",
+        "option sftpriskypublish on ; synchronize both ./local /home/tester/sync-both",
     )
     .await;
     assert!(baseline_ok, "the baseline runs: {baseline}");
@@ -455,14 +660,52 @@ async fn test_synchronize_conflict_policy() {
     assert!(resolved_ok, "the newer-side resolution applies: {resolved}");
     assert_eq!(fs::read(&local_doc).unwrap(), b"remote-v2-longer\n", "the newer remote side won");
 
+    // And the other direction: both sides change again, this time local is
+    // newer, so the newer-side resolution publishes the local file through
+    // the acknowledged staged publish.
+    fs::write(&local_doc, b"local-v3-longer-than-remote\n").unwrap();
+    stamp(&local_doc, 1_800_000_300);
+    seed_remote(&sftp, "/home/tester/sync-both/doc.txt", b"remote-v3\n", Some(1_800_000_250)).await;
+    let (upload_ok, upload_out) = run_script(
+        &mut interp,
+        "synchronize both -conflict=newer ./local /home/tester/sync-both",
+    )
+    .await;
+    assert!(upload_ok, "the newer local side is published: {upload_out}");
+    let remote_now = download_bytes(&*sftp, "/home/tester/sync-both/doc.txt", TransferRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(remote_now, b"local-v3-longer-than-remote\n", "the local side won the upload resolution");
+
+    // keepuptodate -count=1 -delete mirrors the local watch directory:
+    // fresh.txt is uploaded through the same acknowledged mode and the
+    // stale remote file is deleted.
+    let watch = tmp.path().join("watch");
+    fs::create_dir_all(&watch).unwrap();
+    fs::write(watch.join("fresh.txt"), b"watched\n").unwrap();
+    sftp.mkdir("/home/tester/watch").await.expect("watch root");
+    seed_remote(&sftp, "/home/tester/watch/stale.txt", b"remove-me\n", None).await;
+    let (kept_ok, kept) = run_script(
+        &mut interp,
+        "option confirm off ; keepuptodate -count=1 -delete ./watch /home/tester/watch ; exit",
+    )
+    .await;
+    assert!(kept_ok, "keepuptodate completes with the acknowledgment: {kept}");
+    let fresh = download_bytes(&*sftp, "/home/tester/watch/fresh.txt", TransferRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(fresh, b"watched\n");
+    let stale = sftp.stat("/home/tester/watch/stale.txt").await.unwrap();
+    assert!(stale.is_none(), "the stale remote file is deleted");
+
     sftp.close().await.unwrap();
 }
 
-/// keepuptodate cannot currently run as the upstream case requires: the build
-/// refuses every unguarded SFTP upload, so the command fails closed naming
-/// the refusal instead of mirroring the watch directory. This pins the
-/// refusal by name as a change-guard; the port of the full upstream case
-/// lands when guarded overwrite uploads over native SFTP exist.
+/// The default posture stays refused: without the acknowledgment
+/// `keepuptodate` fails closed naming the refusal instead of mirroring the
+/// watch directory. This pins the refusal by name as a change-guard; with
+/// `option sftpriskypublish on` the full upstream case runs (see
+/// `test_synchronize_conflict_policy_and_keepuptodate`).
 #[tokio::test]
 async fn test_keepuptodate_reports_the_unguarded_sftp_upload_by_name() {
     let tmp = tempfile::tempdir().expect("temp dir");
@@ -526,15 +769,32 @@ async fn test_etag_names_a_protocol_that_has_no_etags() {
 
     // Nothing was recorded on the way, so a plain remote copy of the path
     // succeeds exactly as it would have before the refusals: no precondition
-    // is waiting for a version that will never come. (The upstream case's
-    // trailing 'put' is not ported: unguarded SFTP uploads are refused in
-    // this build, by design.)
+    // is waiting for a version that will never come.
     let (cp_ok, cp_out) = run_line_captured(&mut interp, "cp /home/tester/config.ini /home/tester/config-copy.ini").await;
     assert!(cp_ok, "the copy after the refusals runs: {cp_out}");
     let copied = download_bytes(&*sftp, "/home/tester/config-copy.ini", TransferRequest::default())
         .await
         .unwrap();
     assert_eq!(copied, b"[global]\n");
+
+    // And the upstream case's trailing 'put' runs too: the bytes land
+    // unchanged, through the acknowledged staged publish.
+    let source = tmp.path().join("etag-refused.txt");
+    fs::write(&source, b"written with no precondition\n").unwrap();
+    let (put_ok, put_out) = run_script(
+        &mut interp,
+        &format!(
+            "option sftpriskypublish on ; option confirm off ; put {} /etag-refused.txt ; echo WROTE",
+            source.display()
+        ),
+    )
+    .await;
+    assert!(put_ok, "the put after the refusals runs: {put_out}");
+    assert!(put_out.contains("WROTE"), "the script kept running: {put_out}");
+    let landed = download_bytes(&*sftp, "/etag-refused.txt", TransferRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(landed, b"written with no precondition\n");
 
     sftp.close().await.unwrap();
 }

@@ -706,6 +706,7 @@ async fn test_checksum_fallback_supports_all_documented_algorithms() {
         user_key.private_key.public_key().clone(),
         false,
         /* check_file_name */ false,
+        /* copy_data */ true,
     )
     .await;
 

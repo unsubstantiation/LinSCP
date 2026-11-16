@@ -36,6 +36,11 @@ pub struct TransferFlags {
     pub no_clobber: bool,
     /// User acknowledged FTP's non-atomic rename and overwrite race.
     pub ftp_risky_publish: bool,
+    /// User acknowledged SFTP's non-atomic publish and overwrite race.
+    /// Publishes through an exclusively-created stage renamed onto the
+    /// destination on the server (atomic where the server has
+    /// posix-rename); the destination is never unlinked first.
+    pub sftp_risky_publish: bool,
     /// Server-side compare-and-replace using a previously approved strong ETag.
     pub overwrite_etag: Option<String>,
     /// Read only the remote representation matching this strong ETag.
@@ -69,6 +74,7 @@ impl Default for TransferFlags {
             recursive: false,
             no_clobber: false,
             ftp_risky_publish: false,
+            sftp_risky_publish: false,
             overwrite_etag: None,
             source_etag: None,
             cancel_flag: None,
@@ -766,10 +772,10 @@ pub async fn upload_single_file(
     // another client has substituted. It is not an ownership proof and must
     // not be used for SFTP/FTP cleanup or publication.
     if matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Scp | ProtocolScheme::Ssh | ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes)
-        && !flags.no_clobber && !flags.ftp_risky_publish {
-        return Err("Unguarded SFTP/FTP uploads are disabled; use exclusive creation or the explicitly acknowledged FTP staging mode.".to_string());
+        && !flags.no_clobber && !flags.ftp_risky_publish && !flags.sftp_risky_publish {
+        return Err("Unguarded SFTP/FTP uploads are disabled; use exclusive creation or an explicitly acknowledged staged publish (SFTP: 'option sftpriskypublish on'; FTP: accept the FTP rename risk).".to_string());
     }
-    if local_src == Path::new("-") && (flags.no_clobber || flags.ftp_risky_publish || flags.overwrite_etag.is_some()) {
+    if local_src == Path::new("-") && (flags.no_clobber || flags.ftp_risky_publish || flags.sftp_risky_publish || flags.overwrite_etag.is_some()) {
         return Err("Guarded uploads require a local file with a known length.".to_string());
     }
     if local_src == Path::new("-") {
@@ -851,7 +857,7 @@ pub async fn upload_single_file(
         .unwrap_or_default();
     let effective_ascii = wants_ascii_conversion(flags.transfer_mode, &leaf);
 
-    if (flags.no_clobber || flags.overwrite_etag.is_some() || flags.ftp_risky_publish) && effective_ascii {
+    if (flags.no_clobber || flags.overwrite_etag.is_some() || flags.ftp_risky_publish || flags.sftp_risky_publish) && effective_ascii {
         return Err("Guarded or staged uploads require binary transfer mode.".to_string());
     }
     if effective_ascii {
@@ -915,6 +921,78 @@ pub async fn upload_single_file(
         return Ok(true);
     }
 
+    if flags.sftp_risky_publish {
+        if !matches!(session.scheme(), ProtocolScheme::Sftp) {
+            return Err("The acknowledged staged publish is for SFTP sessions; FTP(S) uploads have their own staged mode, and WebDAV and S3 have their own approved overwrite preconditions.".to_string());
+        }
+        if flags.resume || flags.append || effective_ascii || flags.delete_source {
+            return Err("SFTP staged upload requires a fresh binary copy.".to_string());
+        }
+        if flags.no_clobber {
+            return Err("Exclusive creation and the acknowledged staged SFTP publish are separate modes; give only one of them.".to_string());
+        }
+        let directory = remote_dest
+            .rsplit_once('/')
+            .map(|(dir, _)| if dir.is_empty() { "/" } else { dir })
+            .unwrap_or(".");
+        let leaf = remote_dest.rsplit('/').next().unwrap_or("upload");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let stage = format!("{directory}/.{leaf}.linscp-sftp-stage-{nanos}");
+        let input = tokio::fs::File::open(local_src)
+            .await
+            .map_err(|e| format!("Cannot open local file '{src_label}': {e}"))?;
+        let mut reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
+        let req = TransferRequest {
+            resume_offset: 0,
+            append: false,
+            preserve_time: desired_mtime.is_some(),
+            mtime: desired_mtime,
+            permissions: desired_perms,
+            speed_kbytes_per_sec: speed_u32(flags.speed_kbytes_per_sec),
+            version_id: None,
+        };
+        // The stage is ours: exclusive creation proves we created it, so it
+        // is ours to rename onto the destination. The destination itself is
+        // never unlinked; the server replaces it atomically on publish.
+        let bytes = session
+            .upload_exclusive(&stage, req, &mut reader, Some(local_info.size), progress)
+            .await
+            .map_err(|e| format!("Cannot stage the upload as '{stage}': {e}"))?;
+        if flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) {
+            return Err(format!("Cancelled before publication; temporary SFTP file '{stage}' remains."));
+        }
+        if bytes != local_info.size {
+            return Err(format!("Source size changed; temporary SFTP file '{stage}' remains."));
+        }
+        let current = session
+            .stat(remote_dest)
+            .await
+            .map_err(|e| format!("Cannot check the SFTP destination; temporary file '{stage}' remains: {e}"))?;
+        if current.as_ref().is_some_and(|e| e.is_dir || e.is_symlink) {
+            return Err(format!("The SFTP destination is a directory or a symbolic link; temporary file '{stage}' remains."));
+        }
+        if flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) {
+            return Err(format!("Cancelled before publication; temporary SFTP file '{stage}' remains."));
+        }
+        session.rename(&stage, remote_dest).await.map_err(|e| {
+            format!("SFTP publish of '{stage}' to '{remote_dest}' failed; '{stage}' may remain and the destination may have changed: {e}")
+        })?;
+        if let Some(m) = desired_perms {
+            let _ = session.chmod(remote_dest, m).await;
+        }
+        if let Some(mt) = desired_mtime {
+            let _ = session.set_mtime(remote_dest, mt).await;
+        }
+        logger.record_transfer(true, &src_label, remote_dest, Some(bytes), Ok(()));
+        if let Some(mt) = desired_mtime.filter(|_| session.scheme() != ProtocolScheme::S3) {
+            logger.record_touch(remote_dest, mt, Ok(()));
+        }
+        return Ok(true);
+    }
+
     if flags.no_clobber || flags.overwrite_etag.is_some() {
         if flags.resume || flags.append || effective_ascii || (flags.no_clobber && flags.overwrite_etag.is_some()) {
             return Err("Exclusive uploads require a fresh binary transfer.".to_string());
@@ -941,7 +1019,11 @@ pub async fn upload_single_file(
         return Ok(true);
     }
 
-    let use_stage = should_use_filepart(flags, session.scheme(), true, false, local_info.size);
+    // The acknowledged staged SFTP publish returns before this point; the
+    // exclusion here keeps the invariant local if the early refusal above is
+    // ever relaxed.
+    let use_stage = !flags.sftp_risky_publish
+        && should_use_filepart(flags, session.scheme(), true, false, local_info.size);
     let stage_opt = if use_stage {
         remote_stage_path(remote_dest, None)
     } else {
@@ -1027,6 +1109,7 @@ pub async fn upload_single_file(
             if session.scheme() != ProtocolScheme::S3
                 && !is_webdav_scheme(session.scheme())
                 && session.stat(remote_dest).await.ok().flatten().is_some()
+                && !flags.sftp_risky_publish
             {
                 let _ = session.remove_file(remote_dest).await;
             }
