@@ -250,6 +250,11 @@ const dom = new JSDOM(html, {
     window.fetch = () => {
       throw new Error('the page must not use fetch(): there is no HTTP host');
     };
+    /* The build stamps the Alaska Standard Time version (VYYYY-MM-DD-HH-MM)
+     * into the page; a page built by ui/scripts/build.mjs overrides this
+     * seed with the real stamp. Seeding it keeps this suite runnable against
+     * the bare source page as well. */
+    window.LinSCPBuildVersion = 'V2000-01-02-03-04';
     /* jsdom has no canvas and says so loudly, but the in-page terminal is a
      * real canvas renderer, so it needs a context to draw into. A recorder is
      * enough: this suite is about the page handing the model's frames to the
@@ -670,6 +675,8 @@ function options(id) {
     calls.filter(call => call.path === '/api/local/chmod').length > localChmodBefore);
   doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'F1', bubbles: true }));
   check('F1 opens Help', doc.getElementById('helpModal').className.indexOf('open') >= 0);
+  check('Help shows the build stamp as the version',
+    /^LinSCP V\d{4}-\d{2}-\d{2}-\d{2}-\d{2}$/.test(doc.getElementById('buildVersion').textContent));
   doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
   check('Escape closes the modal', doc.getElementById('helpModal').className.indexOf('open') < 0);
 

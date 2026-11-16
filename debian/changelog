@@ -1,3 +1,16 @@
+linscp (2026.11.15.1950) unstable; urgency=medium
+
+  * Replace the version numbering with the date of the build. The version
+    shown in the app is now VYYYY-MM-DD-HH-MM in Alaska Standard Time
+    (UTC-9, fixed; AKST does not observe daylight saving), generated when
+    the build runs - SOURCE_DATE_EPOCH pins the instant for reproducible
+    builds. The previous 0.1.0 (crate, frontend, CMake) and 1.0-7 (this
+    package) schemes are gone. The crate, frontend and CMake project
+    versions are the build-date semver (2026.11.15); this package's version
+    is the same stamp with the dots kept and the hyphens skipped.
+
+ -- LinSCP maintainers <linscp@example.invalid>  Mon, 16 Nov 2026 04:50:10 +0000
+
 linscp (1.0-7) unstable; urgency=medium
 
   * One application, no web build. The Windows and Debian builds no longer

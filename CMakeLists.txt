@@ -1,6 +1,6 @@
 # Convenience wrapper for the native Tauri desktop application.
 cmake_minimum_required(VERSION 3.25)
-project(LinSCP VERSION 1.0 LANGUAGES NONE)
+project(LinSCP VERSION 2026.11.15 LANGUAGES NONE)
 find_program(CARGO cargo REQUIRED)
 find_program(NPM npm REQUIRED)
 add_custom_target(linscp ALL
