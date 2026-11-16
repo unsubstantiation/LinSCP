@@ -108,6 +108,14 @@ jobs:
           if ($uninstall.ExitCode -ne 0) { throw "--uninstall-shell-integration exited $($uninstall.ExitCode)" }
           if (Test-Path $sendto) { throw "uninstall left the Send To shortcut behind" }
 
-# Nothing is uploaded from this job: it builds the native application and
-# smoke-tests it, and releases are managed by hand, so there is no
-# downloadable artifact.
+      # Releases are managed by hand; this artifact is only how the built
+      # binary leaves the run for that manual process. GitHub always delivers
+      # artifacts as a .zip envelope, so compression-level: 0 stores the exe
+      # uncompressed inside it; the file that comes out extracts byte-identical.
+      - name: Upload the portable application
+        uses: actions/upload-artifact@v7
+        with:
+          name: linscp-windows
+          path: target/release/linscp-gui.exe
+          if-no-files-found: error
+          compression-level: 0
