@@ -227,7 +227,7 @@ const SCRIPT_COMMAND_HELPS: &[(&str, &str)] = &[
     ),
     (
         "option",
-        "option [ <name> [ <value> ] ]\n  Shows or changes a setting: echo, batch, confirm, resume,\n  transfer, include, exclude, failonnomatch, synchdelete,\n  reconnecttime, editor, editmaxsize, preset. Without a name it\n  prints every setting; a name or a value may be abbreviated\n  as long as the abbreviation is unambiguous.",
+        "option [ <name> [ <value> ] ]\n  Shows or changes a setting: echo, batch, confirm, resume,\n  transfer, include, exclude, failonnomatch, synchdelete,\n  sftpriskypublish, reconnecttime, editor, editmaxsize, preset. Without a name it\n  prints every setting; a name or a value may be abbreviated\n  as long as the abbreviation is unambiguous.",
     ),
     (
         "presets",
