@@ -151,7 +151,9 @@ no background transfers.
 ## Continuous integration
 
 The workflows in `.github/workflows/` build the Debian package, the Windows
-application and the signed Android APK. Each runs on a push to `master` and can
+application and the signed Android APK, and upload each as an uncompressed
+artifact for the manual release process (GitHub delivers artifacts as a zip
+envelope; no GitHub Release is created). Each runs on a push to `master` and can
 also be started by hand, from the Actions tab ("Run workflow", where the branch
 to build can be chosen) or with `gh workflow run "Android build" --ref <branch>`.
 GitHub only offers that button for workflows whose default-branch copy declares

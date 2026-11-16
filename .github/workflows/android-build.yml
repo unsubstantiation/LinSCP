@@ -120,11 +120,21 @@ jobs:
         run: python3 ../../tools/run_cargo_ci.py npm run tauri -- android build --ci --apk true --aab false --target aarch64 x86_64 --features native-shell
       - name: Verify release APK contents, package and signature
         run: python3 tools/run_cargo_ci.py python3 tools/verify_android_apk.py --build-type release
+      # Releases are managed by hand; this artifact is only how the signed APK
+      # leaves the run for that manual process. GitHub always delivers
+      # artifacts as a .zip envelope, so compression-level: 0 stores the APK
+      # uncompressed inside it; the file that comes out extracts byte-identical.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linscp-android-release
+          path: android-artifacts/linscp-android-release.apk
+          if-no-files-found: error
+          compression-level: 0
       - name: Build debug APK for the WebView smoke test
         working-directory: crates/linscp-tauri
         # The smoke test drives the page through the WebView DevTools endpoint,
         # which a release build does not expose. Only the emulator's ABI is
-        # built: the release APK above is what gets verified, this one never
+        # built: the release APK above is the one uploaded, this one never
         # leaves the runner.
         run: python3 ../../tools/run_cargo_ci.py npm run tauri -- android build --ci --debug --apk true --aab false --target x86_64 --features native-shell
       - name: Verify debug APK contents and package
@@ -148,6 +158,3 @@ jobs:
             python3 tools/run_cargo_ci.py bash tools/android_emulator_smoke.sh
             python3 tools/run_cargo_ci.py bash tools/android_release_launch_check.sh
 
-# Nothing is uploaded from this job: it builds and verifies the signed APK,
-# smoke-tests it on an emulator, and releases are managed by hand, so there
-# is no downloadable artifact.

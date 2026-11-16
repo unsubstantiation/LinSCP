@@ -184,9 +184,10 @@ npm run tauri -- android build --ci --debug --apk true --aab false --target aarc
 The Android GitHub Actions workflow runs on every push to `master` - and by
 hand, from the Actions tab or `gh workflow run "Android build" --ref <branch>`,
 which is how a branch is built before it is merged - and builds, verifies and
-builds the signed APK at `android-artifacts/linscp-android-release.apk` - and
-uploads nothing: the workflow builds, verifies and smoke-tests only, and
-releases are managed by hand. It then builds an x86-64 debug APK, exercises
+uploads `android-artifacts/linscp-android-release.apk` as the
+`linscp-android-release` artifact, stored uncompressed (`compression-level:
+0`) - GitHub delivers artifacts as a .zip envelope either way - and creates no
+release; releases are managed by hand. It then builds an x86-64 debug APK, exercises
 the WebView, Rust IPC and WebDAV transfers on an emulator through the debug
 build's DevTools endpoint, and finally installs the release APK itself with
 `tools/android_release_launch_check.sh`, which proves it starts, keeps running,

@@ -58,9 +58,12 @@ class GuiDistributionTests(unittest.TestCase):
         self.assertIn('\nExec=linscp-gui\n', desktop)
         windows = (ROOT / '.github/workflows/windows-build.yml').read_text()
         self.assertIn('target/release/linscp-gui.exe', windows)
-        # Releases are managed by hand, so the workflow uploads nothing for
-        # download.
-        self.assertNotIn('actions/upload-artifact', windows)
+        # Releases are managed by hand, so the artifact is only how the built
+        # exe leaves the run - stored uncompressed in the envelope GitHub
+        # always zips (compression-level: 0).
+        upload = windows[windows.index('Upload the portable application'):]
+        self.assertEqual(upload.count('.exe'), 1, 'the artifact must be one app')
+        self.assertIn('compression-level: 0', upload)
 
     def test_the_shared_page_reaches_the_native_bridge_only(self):
         # The page used to fall back to `fetch()` with a bearer token when no

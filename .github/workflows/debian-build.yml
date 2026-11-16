@@ -208,6 +208,8 @@ jobs:
             echo "$contents" | grep -qx "$path" ||
               { echo "::error::$path is missing from the package"; exit 1; }
           done
+          # upload-artifact forbids '..' paths, so stage the .deb in the workspace.
+          cp ../linscp_*_*.deb "$GITHUB_WORKSPACE/"
 
       - name: Install and smoke test the package
         run: |
@@ -302,6 +304,14 @@ jobs:
             *) echo "::error::--help did not document --shell-upload"; exit 1 ;;
           esac
 
-# Nothing is uploaded from this job: it builds, installs and smoke-tests the
-# package, and releases are managed by hand, so there is no downloadable
-# artifact.
+      # Releases are managed by hand; this artifact is only how the package
+      # leaves the run for that manual process. GitHub always delivers
+      # artifacts as a .zip envelope, so compression-level: 0 stores the .deb
+      # uncompressed inside it; the file that comes out extracts byte-identical.
+      - name: Upload the Debian package
+        uses: actions/upload-artifact@v7
+        with:
+          name: linscp-debian
+          path: linscp_*_*.deb
+          if-no-files-found: error
+          compression-level: 0
