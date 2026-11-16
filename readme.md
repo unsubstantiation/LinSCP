@@ -132,6 +132,9 @@ Run `cargo test --workspace --all-targets` and `npm --prefix ui test` for the
 Rust and frontend tests. CMake and `source/linux/Makefile` are convenience
 wrappers around the same build and install the one application.
 
+The version shown in the app is the date of the build, not a release
+counter; see [docs/versioning.md](docs/versioning.md).
+
 ## Debian package
 
 Install the build dependencies listed in `debian/control`, then run

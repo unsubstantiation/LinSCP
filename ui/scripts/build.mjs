@@ -8,6 +8,22 @@ const repoRoot = path.resolve(uiRoot, '..');
 const distDir = path.join(uiRoot, 'dist');
 const legacyWebDir = path.join(repoRoot, 'source', 'gui', 'web');
 
+// The in-app version is the build's Alaska Standard Time (UTC-9, fixed: AKST
+// does not observe daylight saving) stamp: VYYYY-MM-DD-HH-MM, minutes
+// precision, the minute the build ran. SOURCE_DATE_EPOCH, when set, pins the
+// instant so reproducible builds stamp the same string.
+function buildStamp() {
+  const configured = process.env.SOURCE_DATE_EPOCH;
+  const seconds = configured === undefined ? Math.floor(Date.now() / 1000) : Number(configured);
+  if (!Number.isInteger(seconds) || seconds <= 0) {
+    throw new Error(`SOURCE_DATE_EPOCH must be a positive whole number of seconds, got: ${configured}`);
+  }
+  // Shift, then read the UTC fields: those are the AKST wall-clock fields.
+  const akst = new Date((seconds - 9 * 3600) * 1000).toISOString();
+  return `V${akst.slice(0, 10)}-${akst.slice(11, 13)}-${akst.slice(14, 16)}`;
+}
+const BUILD_STAMP = buildStamp();
+
 fs.rmSync(distDir, { recursive: true, force: true });
 fs.mkdirSync(distDir, { recursive: true });
 
@@ -100,9 +116,15 @@ const nativeShim = `  window.LinSCPTransport = window.LinSCPCore
   async function api(url, options) {
     options = options || {};`;
 
+// The same stamp every host that bundles this page shows: the desktop
+// window, the Android app. Inserted before the bundle, so the page's own
+// script sees it; a page served without the build (the bare source tree)
+// reads the absence and prints no version line.
+const buildVersionLine = `window.LinSCPBuildVersion = ${JSON.stringify(BUILD_STAMP)};`;
+
 const distHtml = rawHtml
-  .replace('<script>', `<script>\n${iifeCode}\n</script>\n<script>`)
+  .replace('<script>', `<script>\n${buildVersionLine}\n${iifeCode}\n</script>\n<script>`)
   .replace(anchor, nativeShim);
 
 fs.writeFileSync(path.join(distDir, 'index.html'), distHtml, 'utf8');
-console.log('Built ui/dist (linscp-core.mjs, linscp-core.iife.js, index.html, theme.css).');
+console.log(`Built ui/dist (linscp-core.mjs, linscp-core.iife.js, index.html, theme.css). Version: ${BUILD_STAMP}`);

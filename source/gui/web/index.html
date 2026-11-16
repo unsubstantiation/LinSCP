@@ -1199,6 +1199,7 @@
         <p>The LinSCP command console runs commands in the live session of the current tab.</p>
       </div>
       <div class="modal-footer">
+        <span class="hint" id="buildVersion" style="margin-right: auto;"></span>
         <button class="btn" onclick="closeModal('helpModal')">Close</button>
       </div>
     </div>
@@ -4325,6 +4326,14 @@
   function openModal(id) { $(id).classList.add('open'); }
   function closeModal(id) { $(id).classList.remove('open'); }
   function showHelp() {
+    // The build stamps its Alaska Standard Time version (VYYYY-MM-DD-HH-MM)
+    // into the page; a page served without that stamp shows no version line
+    // rather than inventing one.
+    const stampLine = $('buildVersion');
+    if (stampLine) {
+      const stamp = window.LinSCPBuildVersion || '';
+      stampLine.textContent = stamp ? `LinSCP ${stamp}` : '';
+    }
     openModal('helpModal');
   }
 

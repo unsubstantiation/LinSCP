@@ -69,6 +69,7 @@ jobs:
       - name: Check the parity ledger and its repo-state suites
         run: |
           python3 tools/check_upstream_parity.py
+          python3 -m unittest discover -s tools/tests -p test_build_version.py
           python3 -m unittest discover -s tools/tests -p test_parity_inventory.py
           python3 -m unittest discover -s tools/tests -p test_platform_conversion.py
           python3 -m unittest discover -s tools/tests -p test_wayland_compatibility.py
