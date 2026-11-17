@@ -100,7 +100,13 @@ from an unknown key. Never solve a mismatch by automatically trusting `*`.
 
 Enable **Use SSH tunnel** in the site manager and supply the jump settings.
 The password/passphrase storage checkbox is separate from the destination's
-password storage choice. Background operations, queued transfers and the
+password storage choice. The site manager keeps two separate destination
+entries, both encrypted under the per-user `sessions.key` when the storage
+checkbox is ticked: **User Password** (the server login password) and
+**Key Password** (the passphrase decrypting an encrypted private key). The
+tunnel section likewise stores its jump password and the **Tunnel key
+passphrase**, which is honoured for encrypted jump keys at connect time.
+Background operations, queued transfers and the
 embedded SSH terminal use the same tunnel policy.
 
 An untrusted jump key is presented first, followed by an independent challenge

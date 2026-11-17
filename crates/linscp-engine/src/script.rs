@@ -2313,6 +2313,8 @@ impl ScriptInterpreter {
 
         let mut save_password = url_had_password;
         let mut explicit_password: Option<String> = None;
+        let mut save_passphrase = false;
+        let mut explicit_passphrase: Option<String> = None;
         let mut port_given = false;
         let mut protocol_given = false;
         let mut switch_tokens: Vec<String> = Vec::new();
@@ -2410,6 +2412,13 @@ impl ScriptInterpreter {
             } else if low.starts_with("-password=") {
                 save_password = true;
                 explicit_password = Some(norm["-password=".len()..].to_string());
+            } else if low == "-passphrase" {
+                // Like -password: persist the passphrase only when the caller
+                // asks, never because a connection merely used it.
+                save_passphrase = true;
+            } else if low.starts_with("-passphrase=") {
+                save_passphrase = true;
+                explicit_passphrase = Some(norm["-passphrase=".len()..].to_string());
             } else {
                 switch_tokens.push(a.clone());
             }
@@ -2463,6 +2472,21 @@ impl ScriptInterpreter {
             spec.session.password = Some(secret);
         } else if !url_had_password {
             spec.session.password = None;
+        }
+        // Mirror the password rule for the key password: a passphrase used
+        // by the connection is only persisted when asked for with -passphrase;
+        // the ciphertext of an unreadable stored one is preserved by the store.
+        if save_passphrase {
+            let pp = explicit_passphrase.or_else(|| spec.passphrase.clone());
+            let Some(secret) = pp.filter(|s| !s.is_empty()) else {
+                return Err(self.wrong_args(
+                    "savesession",
+                    self.tr("The key password of this connection is not known (it was taken from an agent or an unencrypted key), so it cannot be stored."),
+                ));
+            };
+            spec.passphrase = Some(secret);
+        } else {
+            spec.passphrase = None;
         }
 
         validate_session_settings(&spec).map_err(|e| self.wrong_args("savesession", &e))?;
