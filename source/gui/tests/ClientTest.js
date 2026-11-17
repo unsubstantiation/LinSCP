@@ -235,6 +235,37 @@ function propertiesBody(options) {
     owner: '1000', group: '1000' })) };
 }
 
+/* Key/Session backups: one answer shape for every phase of the page, so both
+ * invoke stubs below can speak it. */
+function vaultBackupBody(path, options) {
+  let request = {};
+  try { request = JSON.parse((options && options.body) || '{}'); } catch (error) {}
+  if (path === '/api/vault/export') {
+    return { success: true,
+      filename: request.plain_text
+        ? 'key_session_2026-11-15_00-00-00.json'
+        : 'key_session_2026-11-15_00-00-00.json.aes',
+      data_base64: 'W10=', entry_count: (request.sessions || []).length,
+      plain_text: !!request.plain_text };
+  }
+  if (path === '/api/vault/scan') {
+    return { success: true, encrypted: false, ignored_entries: 1, entry_count: 2,
+      entries: [
+        { name: 'GUI/test', protocol: 'sftp', host: '127.0.0.1', port: 2222,
+          username: 'user', has_password: true, has_key_passphrase: true,
+          has_ssh_key: false, exists_in_store: true },
+        { name: 'backup/restored', protocol: 'webdavs', host: 'dav.example.test', port: 443,
+          username: 'build', has_password: false, has_key_passphrase: false,
+          has_ssh_key: true, exists_in_store: false }
+      ] };
+  }
+  if (path === '/api/vault/import') {
+    return { success: true, imported: (request.sessions || []).length,
+      skipped_existing: 0, ignored_entries: 1 };
+  }
+  return undefined;
+}
+
 const calls = [];
 const errors = [];
 const confirmMessages = [];
@@ -271,6 +302,10 @@ const dom = new JSDOM(html, {
       return context;
     };
     window.HTMLCanvasElement.prototype.getContext = () => drawable();
+    /* The export downloads the backup through a temporary object URL; jsdom
+     * cannot create one, so a stub keeps the download path testable. */
+    window.URL.createObjectURL = () => 'blob:key-session-export';
+    window.URL.revokeObjectURL = () => {};
     window.__TAURI_INTERNALS__ = { invoke: async (_cmd, args) => invoke(args.envelope) };
     const invoke = envelope => {
       const method = String(envelope.method || 'GET').toUpperCase();
@@ -336,6 +371,8 @@ const dom = new JSDOM(html, {
           sessions: (responses['/api/sessions'] || {}).sessions || [],
           file: '/tmp/cfg/sessions.ini' };
       }
+      const vaultBody = vaultBackupBody(path, options);
+      if (vaultBody !== undefined) { body = vaultBody; }
       if (path === '/api/remote/search') {
         let request = {};
         try { request = JSON.parse(options.body || '{}'); } catch (error) {}
@@ -990,6 +1027,10 @@ function options(id) {
         skipped: [], sessions: (responses['/api/sessions'] || {}).sessions || [],
         file: '/tmp/cfg/sessions.ini' };
       return Promise.resolve({ status: 200, payload: body });
+    }
+    const vaultBody = vaultBackupBody(path, options);
+    if (vaultBody !== undefined) {
+      return Promise.resolve({ status: 200, payload: vaultBody });
     }
     const body = responses[path];
     if (body === undefined) {
@@ -1663,6 +1704,133 @@ function options(id) {
   check('a finished import reloads the stored site list',
     calls.filter(call => call.path === '/api/sessions').length > sessionsBefore);
   window.closeModal('importSessionsModal');
+
+  /* Key/Session Export: the list comes from the saved sessions; the password
+   * must match; the plain-text option is off by default and warns; only the
+   * ticked sessions are exported. */
+  await window.openKeySessionExport();
+  check('the export dialog opens and lists the saved sessions',
+    doc.getElementById('keySessionExportModal').classList.contains('open') &&
+      doc.getElementById('keyExportList').children.length === 1 &&
+      text('keyExportList').includes('GUI/test'),
+    text('keyExportList'));
+  check('the plain-text option is off by default and its warning is hidden',
+    !doc.getElementById('keyExportPlainText').checked &&
+      doc.getElementById('keyExportWarning').style.display === 'none' &&
+      !doc.getElementById('keyExportPassword').disabled);
+  doc.getElementById('keyExportPassword').value = 'backup-password';
+  doc.getElementById('keyExportPasswordConfirm').value = 'backup-password';
+  const exportCalls = () => calls.filter(call => call.path === '/api/vault/export');
+  const exportBaseline = exportCalls().length;
+  doc.querySelector('#keyExportList input[type="checkbox"]').checked = false;
+  await window.exportKeySession();
+  check('an empty selection exports nothing',
+    exportCalls().length === exportBaseline &&
+      text('keyExportStatus').includes('Select at least one session to export'),
+    text('keyExportStatus'));
+  doc.querySelector('#keyExportList input[type="checkbox"]').checked = true;
+  doc.getElementById('keyExportPasswordConfirm').value = 'different-password';
+  await window.exportKeySession();
+  check('mismatched passwords refuse to export',
+    exportCalls().length === exportBaseline &&
+      text('keyExportStatus').includes('The backup passwords do not match.'),
+    text('keyExportStatus'));
+  doc.getElementById('keyExportPasswordConfirm').value = 'backup-password';
+  await window.exportKeySession();
+  const exportCall = exportCalls().pop();
+  const exportPayload = exportCall ? JSON.parse(exportCall.options.body) : {};
+  check('a matching export posts the ticked sessions',
+    exportPayload.plain_text === false &&
+      exportPayload.password === 'backup-password' &&
+      JSON.stringify(exportPayload.sessions) === JSON.stringify(['GUI/test']),
+    JSON.stringify(exportPayload));
+  check('a finished export names the file and clears the password fields',
+    text('keyExportStatus').includes('key_session_2026-11-15_00-00-00.json.aes') &&
+      value('keyExportPassword') === '' && value('keyExportPasswordConfirm') === '',
+    text('keyExportStatus'));
+  doc.getElementById('keyExportPlainText').checked = true;
+  doc.getElementById('keyExportPlainText').dispatchEvent(new window.Event('change'));
+  check('the plain-text option warns and disables the password fields',
+    doc.getElementById('keyExportWarning').style.display !== 'none' &&
+      doc.getElementById('keyExportPassword').disabled &&
+      doc.getElementById('keyExportPasswordConfirm').disabled);
+  await window.exportKeySession();
+  const plainCall = exportCalls().pop();
+  const plainPayload = plainCall ? JSON.parse(plainCall.options.body) : {};
+  check('the plain-text export posts plain_text and no password',
+    plainPayload.plain_text === true && plainPayload.password === '' &&
+      JSON.stringify(plainPayload.sessions) === JSON.stringify(['GUI/test']),
+    JSON.stringify(plainPayload));
+  check('the plain-text export says the secrets are readable on this device',
+    text('keyExportStatus').includes('Plain-text export written') &&
+      text('keyExportStatus').includes('.json'),
+    text('keyExportStatus'));
+  doc.getElementById('keyExportPlainText').checked = false;
+  doc.getElementById('keyExportPlainText').dispatchEvent(new window.Event('change'));
+  window.closeModal('keySessionExportModal');
+
+  /* Key/Session Import: the file is read before anything is listed, the
+   * magic bytes tell encrypted from plain without trusting the extension,
+   * and only the ticked sessions are imported. */
+  await window.openKeySessionImport();
+  check('the import dialog opens with everything reset',
+    doc.getElementById('keySessionImportModal').classList.contains('open') &&
+      value('keyImportPassword') === '' && value('keyImportFile') === '' &&
+      doc.getElementById('keyImportList').children.length === 0);
+  const scanCalls = () => calls.filter(call => call.path === '/api/vault/scan');
+  const sealedFile = new window.File([new Uint8Array([76, 83, 67, 80, 86, 76, 84, 50, 1, 2])], 'backup.json.aes');
+  Object.defineProperty(doc.getElementById('keyImportFile'), 'files',
+    { value: [sealedFile], configurable: true });
+  await window.scanKeySessionBackup();
+  check('an encrypted backup without a password explains itself and scans nothing',
+    scanCalls().length === 0 &&
+      text('keyImportStatus').includes('encrypted backup'),
+    text('keyImportStatus'));
+  const plainFile = new window.File(['[{"type":"PASSWORD"}]'], 'backup.json',
+    { type: 'application/json' });
+  Object.defineProperty(doc.getElementById('keyImportFile'), 'files',
+    { value: [plainFile], configurable: true });
+  await window.scanKeySessionBackup();
+  check('the scan lists what the backup holds',
+    doc.getElementById('keyImportList').children.length === 2 &&
+      text('keyImportList').includes('GUI/test') &&
+      text('keyImportList').includes('backup/restored'),
+    text('keyImportList'));
+  check('the scan flags sessions that already exist',
+    text('keyImportList').includes('Already saved'));
+  check('the scan reports ignored entries',
+    text('keyImportStatus').includes('1'), text('keyImportStatus'));
+  const scanCall = scanCalls().pop();
+  const scanPayload = scanCall ? JSON.parse(scanCall.options.body) : {};
+  check('the scan posts the file and the password it was given',
+    typeof scanPayload.data_base64 === 'string' && scanPayload.data_base64.length > 0 &&
+      scanPayload.password === '',
+    JSON.stringify(scanPayload));
+  const importCalls = () => calls.filter(call => call.path === '/api/vault/import');
+  const importBaseline = importCalls().length;
+  const boxes = doc.querySelectorAll('#keyImportList input[type="checkbox"]');
+  boxes[0].checked = false; // skip the one that is already saved
+  confirmResult = false;
+  doc.getElementById('keyImportReplace').checked = true;
+  await window.importKeySession();
+  check('a declined overwrite warning imports nothing',
+    importCalls().length === importBaseline &&
+      confirmMessages[confirmMessages.length - 1].includes('overwritten'),
+    confirmMessages[confirmMessages.length - 1]);
+  confirmResult = true;
+  doc.getElementById('keyImportReplace').checked = false;
+  await window.importKeySession();
+  const keyImportCall = importCalls().pop();
+  const keyImportPayload = keyImportCall ? JSON.parse(keyImportCall.options.body) : {};
+  check('importing posts only the ticked sessions',
+    JSON.stringify(keyImportPayload.sessions) === JSON.stringify(['backup/restored']) &&
+      keyImportPayload.replace === false,
+    JSON.stringify(keyImportPayload));
+  check('a finished import reports what happened and reloads the saved sessions',
+    text('keyImportStatus').includes('Imported 1 session(s)') &&
+      calls.filter(call => call.path === '/api/sessions').length > 0,
+    text('keyImportStatus'));
+  window.closeModal('keySessionImportModal');
 
   /* Preferences: the defaults come from the backend, a save posts the whole
    * document, and the confirmation switches reach the copy and delete paths. */
