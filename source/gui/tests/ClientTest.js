@@ -1252,6 +1252,75 @@ function options(id) {
     calls.filter(call => call.path === '/api/transfer/upload').length ===
       sameBefore);
 
+  // The packaged window swallows HTML5 drag-and-drop, so dragging a row to
+  // the other panel is driven by pointer events everywhere. A press, a small
+  // move and a release on the remote pane queues the same upload as F5.
+  const pointerRow = doc.getElementById('localFileList').children[0];
+  pointerRow.click();
+  const pointerBefore = calls.filter(
+    call => call.path === '/api/transfer/upload').length;
+  pointerRow.dispatchEvent(new window.MouseEvent('pointerdown', {
+    bubbles: true, button: 0, clientX: 10, clientY: 10 }));
+  doc.dispatchEvent(new window.MouseEvent('pointermove', {
+    bubbles: true, clientX: 10, clientY: 11 }));
+  check('a sub-threshold move does not start a drag',
+    !doc.querySelector('.pane-drag-ghost'));
+  doc.dispatchEvent(new window.MouseEvent('pointermove', {
+    bubbles: true, clientX: 80, clientY: 120 }));
+  check('a pointer move past the threshold shows a drag ghost',
+    !!doc.querySelector('.pane-drag-ghost'),
+    'no ghost rendered');
+  check('the dragged entry is selected for the transfer',
+    window.selectedNames('local').join(',') === 'a.txt',
+    window.selectedNames('local').join(','));
+  doc.getElementById('remotePane').dispatchEvent(new window.MouseEvent('pointerup', {
+    bubbles: true, clientX: 700, clientY: 300 }));
+  await wait(150);
+  const pointerCalls = calls.filter(
+    call => call.path === '/api/transfer/upload');
+  const pointerBody = pointerCalls.length ?
+    JSON.parse(pointerCalls[pointerCalls.length - 1].options.body) : {};
+  check('a pointer drag from local to remote queues an upload',
+    pointerCalls.length === pointerBefore + 1,
+    pointerBefore + ' -> ' + pointerCalls.length);
+  check('the pointer drag carries the dragged name and both panes',
+    (pointerBody.names || []).join(',') === 'a.txt' &&
+      pointerBody.local_dir === '/tmp/slowlocal' &&
+      pointerBody.remote_dir === '/tmp/slowremote',
+    JSON.stringify(pointerBody));
+  check('the drop clears the ghost and the highlight',
+    !doc.querySelector('.pane-drag-ghost') &&
+      !doc.body.classList.contains('pane-drag-active') &&
+      doc.getElementById('remotePane').className.indexOf('drop-target') < 0);
+
+  // Escape aborts the gesture without queueing a transfer or leaving a ghost.
+  const escapeBefore = calls.filter(
+    call => call.path === '/api/transfer/upload').length;
+  pointerRow.dispatchEvent(new window.MouseEvent('pointerdown', {
+    bubbles: true, button: 0, clientX: 10, clientY: 10 }));
+  doc.dispatchEvent(new window.MouseEvent('pointermove', {
+    bubbles: true, clientX: 60, clientY: 80 }));
+  doc.dispatchEvent(new window.KeyboardEvent('keydown', {
+    key: 'Escape', bubbles: true, cancelable: true }));
+  doc.getElementById('remotePane').dispatchEvent(new window.MouseEvent('pointerup', {
+    bubbles: true, clientX: 700, clientY: 300 }));
+  await wait(80);
+  check('Escape cancels the drag and queues nothing',
+    calls.filter(call => call.path === '/api/transfer/upload').length === escapeBefore);
+  check('the cancelled drag leaves no ghost behind',
+    !doc.querySelector('.pane-drag-ghost') &&
+      !doc.body.classList.contains('pane-drag-active'));
+
+  // A finger on a row keeps the shell's gestures; only a mouse or pen drags.
+  const touchDown = new window.MouseEvent('pointerdown', {
+    bubbles: true, button: 0, clientX: 10, clientY: 10 });
+  Object.defineProperty(touchDown, 'pointerType', { value: 'touch' });
+  pointerRow.dispatchEvent(touchDown);
+  doc.dispatchEvent(new window.MouseEvent('pointermove', {
+    bubbles: true, clientX: 60, clientY: 80 }));
+  check('a touch pointerdown does not start a file drag',
+    !doc.querySelector('.pane-drag-ghost'));
+
   // Every API call goes through the native bridge: one backend, one route.
   check('every API call goes through the native bridge',
     calls.length > 0 && calls.every(call => call.options && call.options.method &&
@@ -2255,7 +2324,9 @@ function options(id) {
 
   // ---- Shared multi-server monitor --------------------------------------
   // This harness has no window bridge, so a terminal here is the in-page
-  // one - the same path Android takes. The renderer itself is covered by the
+  // one. The desktop half of that path is checked first (no touch row, no
+  // soft keyboard), then the capability answer is stubbed to Android for the
+  // touch half. The renderer itself is covered by the
   // bundle's own suite (ui/tests/TerminalRenderer.test.mjs).
   await window.openServerMonitor();
   await new Promise(resolve => setTimeout(resolve, 80));
@@ -2408,6 +2479,47 @@ function options(id) {
     responses['/api/terminal/frame'] = {
       success: true, dirty: true, alive: true, error: null,
       frame: frameOf('user@host:~$ ls', 'web-1 — Terminal') };
+
+    /* A desktop host draws neither the soft keyboard nor the Esc/~ row, even
+     * when the terminal has to be drawn in the page. This harness cannot open
+     * an OS window, so the in-page path is all there is here - and it must
+     * still look like a desktop terminal: physical keyboard through the
+     * document listener, no touch accessories. The Android checks below stub
+     * the capability answer to 'android'; this section runs against the
+     * harness's default host. */
+    /* The bundle's exports are getter-only, so the platform cannot be
+     * stubbed by assignment; wrapping the whole namespace in a Proxy is the
+     * only door from the outside, and it is scoped to this block. */
+    const realCore = window.LinSCPCore;
+    const asPlatform = platform => new Proxy(realCore, {
+      get(target, key) {
+        if (key === 'hostCapabilities') {
+          return () => Object.assign(
+            target.hostCapabilities({ host: window }), { platform });
+        }
+        const value = Reflect.get(target, key);
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    });
+    await window.openTerminal();
+    await new Promise(resolve => setTimeout(resolve, 120));
+    /* The touch shell fills its key row at boot on every host, so the count
+     * of buttons is not the contract - `hidden` is: the row stays hidden on
+     * a desktop, where the keyboard has Esc and the arrows of its own. */
+    check('the extra-keys row stays hidden on desktop',
+      doc.getElementById('terminalExtraKeys').hidden === true,
+      String(doc.getElementById('terminalExtraKeys').hidden));
+    check('a desktop terminal attaches no soft keyboard',
+      !doc.querySelector('#terminalScreen textarea'),
+      String(!!doc.querySelector('#terminalScreen textarea')));
+    lastWindow.selectAll();
+    check('the copy bar is not for a selection on a desktop',
+      doc.getElementById('terminalSelectionBar').hidden === true,
+      String(doc.getElementById('terminalSelectionBar').hidden));
+    window.closeTerminal();
+    await new Promise(resolve => setTimeout(resolve, 120));
+    /* The Android path starts here: a touch host, no OS windows. */
+    window.LinSCPCore = asPlatform('android');
 
     await window.openTerminal();
     await new Promise(resolve => setTimeout(resolve, 120));
@@ -2582,6 +2694,7 @@ function options(id) {
       await new Promise(resolve => setTimeout(resolve, 120));
     }
 
+    window.LinSCPCore = realCore;
     delete window.LinSCPCore.terminalWindow;
   }
 

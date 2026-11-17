@@ -879,6 +879,30 @@ button.site-item { display: block; width: 100%; border: 0; background: transpare
 .toast.error { border-color: var(--danger); color: var(--danger); background: var(--danger-soft); }
 .pane.drop-target { outline: 2px dashed var(--accent); outline-offset: -4px; }
 .pane.drop-target .file-table-container { background: color-mix(in srgb, var(--accent) 12%, var(--surface)); }
+/* The floating chip that follows the pointer during a pane-to-pane drag.
+   Fixed above everything, never intercepts the pointer, and trimmed to one
+   line so a long file name cannot widen it. */
+.pane-drag-ghost {
+  position: fixed;
+  z-index: 1000;
+  pointer-events: none;
+  max-width: 280px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--accent);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-md);
+  font-size: var(--fs-sm);
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+body.pane-drag-active,
+body.pane-drag-active * {
+  user-select: none !important;
+  cursor: grabbing !important;
+}
 
 @media (max-width: 960px) {
   body { min-width: 560px; }

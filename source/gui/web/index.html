@@ -1825,15 +1825,15 @@
    * says is absent is absent here too: the Android-only bridges never run in
    * the desktop window, and the control that would need them is not offered. */
   function hostCaps() {
+    /* Asked fresh every time: the answer is an object literal, and caching it
+     * broke nothing until a host legitimately answered differently for the
+     * same document. The touch-terminal checks below depend on the answer
+     * following the host, not the first caller. */
     if (!window.LinSCPCore || typeof window.LinSCPCore.hostCapabilities !== 'function') {
       return null;
     }
-    if (!hostCapabilitiesCache) {
-      hostCapabilitiesCache = window.LinSCPCore.hostCapabilities({ host: window });
-    }
-    return hostCapabilitiesCache;
+    return window.LinSCPCore.hostCapabilities({ host: window });
   }
-  let hostCapabilitiesCache = null;
 
   /* The reason a control is missing, or null when this host has it. The page
    * shows the reason instead of a control that could only fail. */
@@ -2095,9 +2095,13 @@
         '<td>' + escapeHtml(entry.permissions || '') + '</td>';
       row.onclick = (event) => selectEntry(side, entry, event);
       row.ondblclick = () => openEntry(side, entry);
-      row.draggable = true;
-      row.ondragstart = (event) => beginDrag(side, entry, event);
-      row.ondragend = () => endDrag();
+      // The packaged desktop window swallows HTML5 drags (its native
+      // handler reports OS drops to the page instead), which left a row
+      // with only `draggable` draggable in a browser but dead in the app.
+      // Pointer events reach the page on every host, so the pane-to-pane
+      // drag is driven by them; the HTML5 handlers stay for the browser
+      // only through beginDrag/dropOnPane below.
+      row.addEventListener('pointerdown', (event) => rowPointerDragStart(side, entry, event));
       tbody.appendChild(row);
     }
     if (appShell) appShell.refreshRows(side, tbody);
@@ -2249,6 +2253,145 @@
     state.dragSide = null;
     document.querySelectorAll('.pane.drop-target').forEach(
       (pane) => pane.classList.remove('drop-target'));
+  }
+
+  /* ---- Pointer-driven drag between the panes ------------------------
+   * The desktop window consumes HTML5 drag-and-drop, so a draggable row
+   * never started one there. Pointer events are delivered on every host,
+   * so the local-to-remote drag is built on them: hold the mouse on a
+   * row, move past a small threshold, and drop it on the other panel.
+   * A drop reuses the same transfer call as the HTML5 drop and the F5
+   * button, so files and folders behave exactly alike and the backend
+   * walks directory trees as it does for the other routes. Touch keeps
+   * the shell's long-press selection and the floating copy bar, and an
+   * operating-system drop onto the window keeps the native path. */
+  const POINTER_DRAG_THRESHOLD = 6;
+  let pointerDrag = null;
+  let pointerDragGhost = null;
+
+  function rowPointerDragStart(side, entry, event) {
+    if (event.button !== undefined && event.button !== 0) return;
+    // A finger dragging a row would fight the panel's scrolling and the
+    // shell's long-press selection, so the drag is a mouse or pen gesture.
+    if (event.pointerType && event.pointerType !== 'mouse' && event.pointerType !== 'pen') return;
+    pointerDrag = {
+      side: side, entry: entry,
+      startX: event.clientX || 0, startY: event.clientY || 0,
+      active: false, names: []
+    };
+    document.addEventListener('pointermove', rowPointerDragMove, { passive: false });
+    document.addEventListener('pointerup', rowPointerDragEnd);
+    document.addEventListener('pointercancel', rowPointerDragCancel);
+    document.addEventListener('keydown', rowPointerDragKey, true);
+  }
+
+  /* Where the pointer is, as a pane name. The event target answers in a
+   * real window and in the jsdom tests; elementFromPoint answers when the
+   * pointer is over a gap in the page. */
+  function pointerPaneAt(event) {
+    let target = event.target;
+    if (target && target.nodeType === 3) target = target.parentElement;
+    if (target && target.closest) {
+      const pane = target.closest('.pane[data-shell-pane]');
+      if (pane) return pane.getAttribute('data-shell-pane');
+    }
+    if (typeof document.elementFromPoint === 'function') {
+      try {
+        const found = document.elementFromPoint(event.clientX, event.clientY);
+        if (found && found.closest) {
+          const pane = found.closest('.pane[data-shell-pane]');
+          if (pane) return pane.getAttribute('data-shell-pane');
+        }
+      } catch (error) { /* no element under the pointer */ }
+    }
+    return null;
+  }
+
+  function highlightPointerPane(side) {
+    document.querySelectorAll('.pane.drop-target').forEach(
+      (pane) => pane.classList.remove('drop-target'));
+    if (!side) return;
+    const pane = $(side + 'Pane');
+    if (pane) pane.classList.add('drop-target');
+  }
+
+  function movePointerDragGhost(event) {
+    if (!pointerDragGhost) return;
+    pointerDragGhost.style.left = ((event.clientX || 0) + 14) + 'px';
+    pointerDragGhost.style.top = ((event.clientY || 0) + 12) + 'px';
+  }
+
+  function rowPointerDragMove(event) {
+    if (!pointerDrag) return;
+    const dx = (event.clientX || 0) - pointerDrag.startX;
+    const dy = (event.clientY || 0) - pointerDrag.startY;
+    if (!pointerDrag.active) {
+      if (dx * dx + dy * dy < POINTER_DRAG_THRESHOLD * POINTER_DRAG_THRESHOLD) return;
+      const pane = state[pointerDrag.side];
+      if (!pane.selection.has(pointerDrag.entry.name)) {
+        pane.selection.clear();
+        pane.selection.add(pointerDrag.entry.name);
+        renderPane(pointerDrag.side);
+      }
+      pointerDrag.active = true;
+      pointerDrag.names = selectedNames(pointerDrag.side);
+      state.dragSide = pointerDrag.side;
+      const chosen = new Set(pointerDrag.names);
+      const hasFolder = pane.entries.some(e => chosen.has(e.name) && e.is_dir);
+      pointerDragGhost = document.createElement('div');
+      pointerDragGhost.className = 'pane-drag-ghost';
+      pointerDragGhost.textContent = (hasFolder ? '\u{1F4C1}' : '\u{1F4C4}') +
+        (pointerDrag.names.length > 1 ? ' \u00D7' + pointerDrag.names.length + '  ' : '  ') +
+        pointerDrag.names[0];
+      document.body.appendChild(pointerDragGhost);
+      document.body.classList.add('pane-drag-active');
+    }
+    // Hold the page still under the drag: no text selection, no scroll.
+    event.preventDefault();
+    movePointerDragGhost(event);
+    const target = pointerPaneAt(event);
+    highlightPointerPane(target && target !== pointerDrag.side ? target : null);
+  }
+
+  function endPointerDragListeners() {
+    document.removeEventListener('pointermove', rowPointerDragMove);
+    document.removeEventListener('pointerup', rowPointerDragEnd);
+    document.removeEventListener('pointercancel', rowPointerDragCancel);
+    document.removeEventListener('keydown', rowPointerDragKey, true);
+    if (pointerDragGhost) { pointerDragGhost.remove(); pointerDragGhost = null; }
+    document.body.classList.remove('pane-drag-active');
+    highlightPointerPane(null);
+    state.dragSide = null;
+  }
+
+  async function rowPointerDragEnd(event) {
+    if (!pointerDrag) return;
+    const side = pointerDrag.side;
+    const names = pointerDrag.names.slice();
+    const active = pointerDrag.active;
+    const target = active ? pointerPaneAt(event) : null;
+    endPointerDragListeners();
+    pointerDrag = null;
+    if (!active) return;
+    if (target === side) {
+      toast(t("Dropping onto the same pane does nothing - drop it on the {side} side to transfer.", {side: sideLabel(side === 'local' ? 'remote' : 'local')}), true);
+      return;
+    }
+    if (!target) return;
+    state[side].selection = new Set(names);
+    await transfer(side === 'local' ? 'upload' : 'download', names);
+  }
+
+  function rowPointerDragCancel() {
+    if (!pointerDrag) return;
+    endPointerDragListeners();
+    pointerDrag = null;
+  }
+
+  function rowPointerDragKey(event) {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    rowPointerDragCancel();
   }
 
   function dragOverPane(side, event) {
@@ -4160,9 +4303,21 @@
 
   /* The Android path, and the desktop fallback: one renderer, one session,
    * both from the shared bundle. */
+  /* The extra-keys row (Esc/Tab/Ctrl/Alt/arrows/~) and the soft keyboard are
+   * for a host with no physical keyboard: Android draws this terminal in the
+   * page because it cannot open an OS window, and a phone keyboard has no
+   * Esc and no arrows. A desktop keyboard has them all, and a desktop that
+   * cannot open the window gets the modal with ordinary typing through the
+   * document listener - never the touch row. */
+  function terminalTouchExtras() {
+    const caps = hostCaps();
+    return !!caps && caps.platform === 'android';
+  }
+
   function openTerminalInPage(terminal, tab, returnToMonitor) {
     const screen = $('terminalScreen');
     if (!screen || !window.LinSCPCore || !window.LinSCPCore.TerminalWindow) return false;
+    const touchExtras = terminalTouchExtras();
     screen.innerHTML = '';
     // The modal has to be on screen before the renderer measures its font: a
     // terminal measured inside a display:none box has no cell at all, and
@@ -4172,12 +4327,14 @@
       container: screen,
       terminal,
       transport: window.LinSCPTransport || transportShim(),
-      extraKeysElement: $('terminalExtraKeys'),
+      extraKeysElement: touchExtras ? $('terminalExtraKeys') : null,
       /* This path is the one without OS windows: Android, and a desktop whose
        * shell refused a window. The terminal is a canvas, and a canvas cannot
-       * raise a soft keyboard, so it needs the attachment - without it the
-       * pane shows a shell nobody can type into. */
-      keyboard: true,
+       * raise a soft keyboard, so Android needs the attachment - without it
+       * the pane shows a shell nobody can type into. A desktop does not:
+       * its physical keyboard reaches the terminal through the document-level
+       * listener below, and it has Esc and the arrows of its own. */
+      keyboard: touchExtras,
       onModes: modes => {
         // The extra-keys row's arrows follow the screen: `vi` and `less` ask
         // for application-cursor mode and expect ESC O A, not ESC [ A.
@@ -4196,7 +4353,7 @@
         if (returnToMonitor && serverMonitor && serverMonitor.isOpen) serverMonitor.resume();
       }
     });
-    embeddedTerminal = { view, returnToMonitor };
+    embeddedTerminal = { view, returnToMonitor, extras: touchExtras };
     // A new terminal has no selection, and the row it needs is the one a
     // previous terminal may have hidden. Syncing here is what makes the row
     // follow the terminal it belongs to rather than the last one.
@@ -4218,19 +4375,15 @@
   function syncTerminalSelectionBar() {
     const bar = $('terminalSelectionBar');
     if (!bar) return;
+    const extras = !!(embeddedTerminal && embeddedTerminal.extras);
     const open = !!(embeddedTerminal && embeddedTerminal.view && embeddedTerminal.view.selection);
-    bar.hidden = !open;
-    /* The key row is hidden whenever no terminal is asking for it, not only
-     * while a selection is open.
-     *
-     * It used to be hidden inside `if (embeddedTerminal ...)`, so closing a
-     * terminal *while* a selection was open skipped the update and left the
-     * attribute set. The row is the Esc/Ctrl/arrow row a phone has no other
-     * source for, so the next terminal opened had no keys at all. It is also
-     * shown only while a terminal exists: the row types into a shell, and
-     * there is no shell once the terminal is closed. */
+    bar.hidden = !open || !extras;
+    /* The key row belongs to a touch host only, and to an open terminal
+     * there. Hiding it when no terminal asks is not only about a selection:
+     * the row types into a shell, and there is no shell once the terminal is
+     * closed, and a desktop never asked for the row at all. */
     const keys = $('terminalExtraKeys');
-    if (keys) keys.hidden = open || !(embeddedTerminal && embeddedTerminal.view);
+    if (keys) keys.hidden = open || !extras;
   }
 
   async function copyTerminalSelection() {
@@ -5986,9 +6139,11 @@
    * starting them would run a second copy of every timer against the same
    * service. The window's own label names the terminal it is for. */
   function terminalWindowId() {
-    const label = window.LinSCPCore && window.LinSCPCore.terminalWindowLabel
+    const fromCore = window.LinSCPCore && window.LinSCPCore.terminalWindowLabel
       ? window.LinSCPCore.terminalWindowLabel() : null;
-    if (typeof label === 'string' && label.startsWith('terminal-')) {
+    const injected = window.__LINSCP_TERMINAL_LABEL__;
+    const label = typeof fromCore === 'string' && fromCore ? fromCore : injected;
+    if (typeof label === 'string' && /^terminal-[A-Za-z0-9_-]+$/.test(label)) {
       return label.slice('terminal-'.length);
     }
     // A host with neither window metadata nor a label (a test harness, or an

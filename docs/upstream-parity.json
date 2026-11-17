@@ -3623,13 +3623,17 @@
       "id": "gui.pane-drag",
       "area": "GUI",
       "status": "verified",
-      "notes": "Dragging a selected item between panes queues exactly those names; same-pane drops do nothing.",
+      "notes": "Dragging a selected item (a file or a folder) between panes queues exactly those names; same-pane drops do nothing. The gesture is pointer-driven because the packaged window consumes HTML5 drag-and-drop; an operating-system drop onto the window keeps the native path entry below.",
       "source": [
-        "ui/src/index.ts"
+        "ui/src/index.ts",
+        "source/gui/web/index.html"
       ],
       "checks": {
         "gui": [
           "the upload carries exactly the dragged names",
+          "a pointer drag from local to remote queues an upload",
+          "the pointer drag carries the dragged name and both panes",
+          "Escape cancels the drag and queues nothing",
           "a same-pane drop does not queue anything"
         ]
       },
