@@ -2095,9 +2095,13 @@
         '<td>' + escapeHtml(entry.permissions || '') + '</td>';
       row.onclick = (event) => selectEntry(side, entry, event);
       row.ondblclick = () => openEntry(side, entry);
-      row.draggable = true;
-      row.ondragstart = (event) => beginDrag(side, entry, event);
-      row.ondragend = () => endDrag();
+      // The packaged desktop window swallows HTML5 drags (its native
+      // handler reports OS drops to the page instead), which left a row
+      // with only `draggable` draggable in a browser but dead in the app.
+      // Pointer events reach the page on every host, so the pane-to-pane
+      // drag is driven by them; the HTML5 handlers stay for the browser
+      // only through beginDrag/dropOnPane below.
+      row.addEventListener('pointerdown', (event) => rowPointerDragStart(side, entry, event));
       tbody.appendChild(row);
     }
     if (appShell) appShell.refreshRows(side, tbody);
@@ -2249,6 +2253,145 @@
     state.dragSide = null;
     document.querySelectorAll('.pane.drop-target').forEach(
       (pane) => pane.classList.remove('drop-target'));
+  }
+
+  /* ---- Pointer-driven drag between the panes ------------------------
+   * The desktop window consumes HTML5 drag-and-drop, so a draggable row
+   * never started one there. Pointer events are delivered on every host,
+   * so the local-to-remote drag is built on them: hold the mouse on a
+   * row, move past a small threshold, and drop it on the other panel.
+   * A drop reuses the same transfer call as the HTML5 drop and the F5
+   * button, so files and folders behave exactly alike and the backend
+   * walks directory trees as it does for the other routes. Touch keeps
+   * the shell's long-press selection and the floating copy bar, and an
+   * operating-system drop onto the window keeps the native path. */
+  const POINTER_DRAG_THRESHOLD = 6;
+  let pointerDrag = null;
+  let pointerDragGhost = null;
+
+  function rowPointerDragStart(side, entry, event) {
+    if (event.button !== undefined && event.button !== 0) return;
+    // A finger dragging a row would fight the panel's scrolling and the
+    // shell's long-press selection, so the drag is a mouse or pen gesture.
+    if (event.pointerType && event.pointerType !== 'mouse' && event.pointerType !== 'pen') return;
+    pointerDrag = {
+      side: side, entry: entry,
+      startX: event.clientX || 0, startY: event.clientY || 0,
+      active: false, names: []
+    };
+    document.addEventListener('pointermove', rowPointerDragMove, { passive: false });
+    document.addEventListener('pointerup', rowPointerDragEnd);
+    document.addEventListener('pointercancel', rowPointerDragCancel);
+    document.addEventListener('keydown', rowPointerDragKey, true);
+  }
+
+  /* Where the pointer is, as a pane name. The event target answers in a
+   * real window and in the jsdom tests; elementFromPoint answers when the
+   * pointer is over a gap in the page. */
+  function pointerPaneAt(event) {
+    let target = event.target;
+    if (target && target.nodeType === 3) target = target.parentElement;
+    if (target && target.closest) {
+      const pane = target.closest('.pane[data-shell-pane]');
+      if (pane) return pane.getAttribute('data-shell-pane');
+    }
+    if (typeof document.elementFromPoint === 'function') {
+      try {
+        const found = document.elementFromPoint(event.clientX, event.clientY);
+        if (found && found.closest) {
+          const pane = found.closest('.pane[data-shell-pane]');
+          if (pane) return pane.getAttribute('data-shell-pane');
+        }
+      } catch (error) { /* no element under the pointer */ }
+    }
+    return null;
+  }
+
+  function highlightPointerPane(side) {
+    document.querySelectorAll('.pane.drop-target').forEach(
+      (pane) => pane.classList.remove('drop-target'));
+    if (!side) return;
+    const pane = $(side + 'Pane');
+    if (pane) pane.classList.add('drop-target');
+  }
+
+  function movePointerDragGhost(event) {
+    if (!pointerDragGhost) return;
+    pointerDragGhost.style.left = ((event.clientX || 0) + 14) + 'px';
+    pointerDragGhost.style.top = ((event.clientY || 0) + 12) + 'px';
+  }
+
+  function rowPointerDragMove(event) {
+    if (!pointerDrag) return;
+    const dx = (event.clientX || 0) - pointerDrag.startX;
+    const dy = (event.clientY || 0) - pointerDrag.startY;
+    if (!pointerDrag.active) {
+      if (dx * dx + dy * dy < POINTER_DRAG_THRESHOLD * POINTER_DRAG_THRESHOLD) return;
+      const pane = state[pointerDrag.side];
+      if (!pane.selection.has(pointerDrag.entry.name)) {
+        pane.selection.clear();
+        pane.selection.add(pointerDrag.entry.name);
+        renderPane(pointerDrag.side);
+      }
+      pointerDrag.active = true;
+      pointerDrag.names = selectedNames(pointerDrag.side);
+      state.dragSide = pointerDrag.side;
+      const chosen = new Set(pointerDrag.names);
+      const hasFolder = pane.entries.some(e => chosen.has(e.name) && e.is_dir);
+      pointerDragGhost = document.createElement('div');
+      pointerDragGhost.className = 'pane-drag-ghost';
+      pointerDragGhost.textContent = (hasFolder ? '\u{1F4C1}' : '\u{1F4C4}') +
+        (pointerDrag.names.length > 1 ? ' \u00D7' + pointerDrag.names.length + '  ' : '  ') +
+        pointerDrag.names[0];
+      document.body.appendChild(pointerDragGhost);
+      document.body.classList.add('pane-drag-active');
+    }
+    // Hold the page still under the drag: no text selection, no scroll.
+    event.preventDefault();
+    movePointerDragGhost(event);
+    const target = pointerPaneAt(event);
+    highlightPointerPane(target && target !== pointerDrag.side ? target : null);
+  }
+
+  function endPointerDragListeners() {
+    document.removeEventListener('pointermove', rowPointerDragMove);
+    document.removeEventListener('pointerup', rowPointerDragEnd);
+    document.removeEventListener('pointercancel', rowPointerDragCancel);
+    document.removeEventListener('keydown', rowPointerDragKey, true);
+    if (pointerDragGhost) { pointerDragGhost.remove(); pointerDragGhost = null; }
+    document.body.classList.remove('pane-drag-active');
+    highlightPointerPane(null);
+    state.dragSide = null;
+  }
+
+  async function rowPointerDragEnd(event) {
+    if (!pointerDrag) return;
+    const side = pointerDrag.side;
+    const names = pointerDrag.names.slice();
+    const active = pointerDrag.active;
+    const target = active ? pointerPaneAt(event) : null;
+    endPointerDragListeners();
+    pointerDrag = null;
+    if (!active) return;
+    if (target === side) {
+      toast(t("Dropping onto the same pane does nothing - drop it on the {side} side to transfer.", {side: sideLabel(side === 'local' ? 'remote' : 'local')}), true);
+      return;
+    }
+    if (!target) return;
+    state[side].selection = new Set(names);
+    await transfer(side === 'local' ? 'upload' : 'download', names);
+  }
+
+  function rowPointerDragCancel() {
+    if (!pointerDrag) return;
+    endPointerDragListeners();
+    pointerDrag = null;
+  }
+
+  function rowPointerDragKey(event) {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    rowPointerDragCancel();
   }
 
   function dragOverPane(side, event) {
