@@ -2539,6 +2539,7 @@ impl CommanderService {
             Err(error) => return api_error(400, &error),
         };
         let entries: Vec<Value> = planned
+            .sites
             .iter()
             .map(|candidate| {
                 json!({

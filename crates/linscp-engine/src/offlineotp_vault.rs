@@ -758,7 +758,7 @@ mod tests {
         // A plain backup is the JSON document itself - readable, and never
         // valid in the encrypted envelope.
         assert!(!plain.starts_with(FILE_MAGIC));
-        assert_eq!(&plain[..1], b"[");
+        assert_eq!(plain[0], b'[');
         assert!(open(&plain, "secret").is_err());
         let restored = open_plain(&plain).unwrap();
         assert_eq!(restored.entries, entries);
