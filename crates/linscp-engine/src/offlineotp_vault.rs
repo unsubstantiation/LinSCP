@@ -5,6 +5,11 @@
 //! OfflineOTP key and `PWD1` login conventions; OfflineOTP will add support for
 //! this stronger envelope on its side. LinSCP-specific fields are ordinary
 //! additional login columns.
+//!
+//! The GUI's "Key/Session Export" writes this envelope by default, or the same
+//! JSON document without the envelope when the user explicitly asks for a
+//! plain-text backup (secrets readable by anything on the device). "Key/Session
+//! Import" auto-detects the two by the envelope's magic marker.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -144,22 +149,31 @@ impl BackupEntry {
     }
 }
 
-/// Encrypts credential entries in LinSCP's versioned Argon2id vault format.
-pub fn seal(entries: &[CredentialEntry], password: &str) -> Result<Vec<u8>, String> {
-    if password.is_empty() || password.encode_utf16().count() > 1_024 {
-        return Err("Backup password must contain 1 to 1024 characters.".to_string());
-    }
+fn validate_entries(entries: &[CredentialEntry]) -> Result<(), String> {
     if entries.is_empty() {
         return Err("There are no credentials to export.".to_string());
     }
     if entries.len() > ENTRY_LIMIT {
         return Err(format!("The vault exceeds OfflineOTP's {ENTRY_LIMIT}-entry limit."));
     }
+    Ok(())
+}
 
+fn encode_all_entries(entries: &[CredentialEntry]) -> Result<Vec<BackupEntry>, String> {
     let mut encoded_entries = Vec::with_capacity(entries.len());
     for entry in entries {
         encoded_entries.push(encode_entry(entry)?);
     }
+    Ok(encoded_entries)
+}
+
+/// Encrypts credential entries in LinSCP's versioned Argon2id vault format.
+pub fn seal(entries: &[CredentialEntry], password: &str) -> Result<Vec<u8>, String> {
+    if password.is_empty() || password.encode_utf16().count() > 1_024 {
+        return Err("Backup password must contain 1 to 1024 characters.".to_string());
+    }
+    validate_entries(entries)?;
+    let encoded_entries = encode_all_entries(entries)?;
     let mut plaintext = Zeroizing::new(
         serde_json::to_vec(&encoded_entries).map_err(|e| format!("Cannot encode vault: {e}"))?,
     );
@@ -228,15 +242,35 @@ pub fn open(bytes: &[u8], password: &str) -> Result<ImportedCredentialVault, Str
             )
             .map_err(|_| "Incorrect backup password or damaged LinSCP credential vault.".to_string())?,
     );
-    validate_json_depth(&plaintext)?;
-    let value: serde_json::Value = serde_json::from_slice(&plaintext)
-        .map_err(|e| format!("Invalid credential-vault JSON: {e}"))?;
+    let parsed = parse_entries_document(&plaintext)?;
     plaintext.zeroize();
+    Ok(parsed)
+}
+
+/// Whether the backup is an encrypted `LSCPVLT2` envelope. Anything else that
+/// parses as the backup JSON is treated as plain text by the importer.
+pub fn is_encrypted_backup(bytes: &[u8]) -> bool {
+    bytes.starts_with(FILE_MAGIC)
+}
+
+/// Opens a plain-text backup (the exact document `seal` would encrypt).
+/// Callers detect the format by the absence of `FILE_MAGIC`.
+pub fn open_plain(bytes: &[u8]) -> Result<ImportedCredentialVault, String> {
+    if bytes.len() > FILE_LIMIT {
+        return Err("The key/session backup exceeds 16 MiB.".to_string());
+    }
+    parse_entries_document(bytes)
+}
+
+fn parse_entries_document(plaintext: &[u8]) -> Result<ImportedCredentialVault, String> {
+    validate_json_depth(plaintext)?;
+    let value: serde_json::Value = serde_json::from_slice(plaintext)
+        .map_err(|e| format!("Invalid key/session backup JSON: {e}"))?;
     let rows = value
         .as_array()
-        .ok_or_else(|| "Credential vault must contain a JSON array.".to_string())?;
+        .ok_or_else(|| "The key/session backup must contain a JSON array.".to_string())?;
     if rows.is_empty() || rows.len() > ENTRY_LIMIT {
-        return Err(format!("Credential vault must contain 1 to {ENTRY_LIMIT} entries."));
+        return Err(format!("The key/session backup must contain 1 to {ENTRY_LIMIT} entries."));
     }
 
     let mut entries = Vec::new();
@@ -258,9 +292,23 @@ pub fn open(bytes: &[u8], password: &str) -> Result<ImportedCredentialVault, Str
         }
     }
     if entries.is_empty() {
-        return Err("The credential vault contains no SSH keys or login entries.".to_string());
+        return Err("The key/session backup contains no SSH keys or login entries.".to_string());
     }
     Ok(ImportedCredentialVault { entries, ignored_entries })
+}
+
+/// Encodes credential entries as a plain-text backup (no encryption). The
+/// secrets are readable by anything on the device; the GUI only produces
+/// this when the user explicitly opts in.
+pub fn seal_plain(entries: &[CredentialEntry]) -> Result<Vec<u8>, String> {
+    validate_entries(entries)?;
+    let encoded_entries = encode_all_entries(entries)?;
+    let plaintext = serde_json::to_vec(&encoded_entries)
+        .map_err(|e| format!("Cannot encode the key/session backup: {e}"))?;
+    if plaintext.len() > FILE_LIMIT {
+        return Err("The key/session backup exceeds OfflineOTP's 16 MiB limit.".to_string());
+    }
+    Ok(plaintext)
 }
 
 fn derive_backup_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
@@ -617,7 +665,18 @@ fn validate_ssh_text(value: &str, max: usize, label: &str, token: bool) -> Resul
     Ok(())
 }
 
-/// Timestamped filename used by OfflineOTP, in UTC and with ASCII digits.
+/// Timestamped filename used for a plain-text backup, in UTC and with ASCII digits.
+pub fn timestamped_plain_filename(unix_seconds: u64) -> String {
+    let days = (unix_seconds / 86_400) as i64;
+    let seconds = unix_seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds / 3_600;
+    let minute = (seconds % 3_600) / 60;
+    let second = seconds % 60;
+    format!("key_session_{year:04}-{month:02}-{day:02}_{hour:02}-{minute:02}-{second:02}.json")
+}
+
+/// Timestamped filename used for an encrypted backup, in UTC and with ASCII digits.
 pub fn timestamped_filename(unix_seconds: u64) -> String {
     let days = (unix_seconds / 86_400) as i64;
     let seconds = unix_seconds % 86_400;
@@ -625,7 +684,7 @@ pub fn timestamped_filename(unix_seconds: u64) -> String {
     let hour = seconds / 3_600;
     let minute = (seconds % 3_600) / 60;
     let second = seconds % 60;
-    format!("otp_accounts_{year:04}-{month:02}-{day:02}_{hour:02}-{minute:02}-{second:02}.json.aes")
+    format!("key_session_{year:04}-{month:02}-{day:02}_{hour:02}-{minute:02}-{second:02}.json.aes")
 }
 
 // Gregorian civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
@@ -687,8 +746,27 @@ mod tests {
         let restored = open(&sealed, "correct horse battery staple").unwrap();
         assert_eq!(restored.entries, entries);
         assert_eq!(restored.ignored_entries, 0);
-        assert_eq!(timestamped_filename(0), "otp_accounts_1970-01-01_00-00-00.json.aes");
-        assert_eq!(timestamped_filename(1_796_150_400), "otp_accounts_2026-12-01_18-40-00.json.aes");
+        assert_eq!(timestamped_filename(0), "key_session_1970-01-01_00-00-00.json.aes");
+        assert_eq!(timestamped_filename(1_796_150_400), "key_session_2026-12-01_18-40-00.json.aes");
+        assert_eq!(timestamped_plain_filename(0), "key_session_1970-01-01_00-00-00.json");
+    }
+
+    #[test]
+    fn plain_text_backup_round_trips_and_is_not_mistaken_for_the_encrypted_format() {
+        let entries = fixture();
+        let plain = seal_plain(&entries).unwrap();
+        // A plain backup is the JSON document itself - readable, and never
+        // valid in the encrypted envelope.
+        assert!(!plain.starts_with(FILE_MAGIC));
+        assert_eq!(&plain[..1], b"[");
+        assert!(open(&plain, "secret").is_err());
+        let restored = open_plain(&plain).unwrap();
+        assert_eq!(restored.entries, entries);
+        assert_eq!(restored.ignored_entries, 0);
+        let text = String::from_utf8(plain).unwrap();
+        assert!(text.contains("webdavs://dav.example.test:8443"));
+        assert!(open_plain(b"not json").is_err());
+        assert!(open_plain(b"").is_err());
     }
 
     #[test]

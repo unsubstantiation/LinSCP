@@ -194,6 +194,7 @@ impl CommanderService {
             ("GET", "/api/monitor/hosts") => self.monitor_hosts(),
             ("GET", "/api/monitor/settings") => self.monitor_settings_get(),
             ("POST", "/api/monitor/settings") => self.monitor_settings_post(req.body),
+            ("POST", "/api/vault/scan") => self.handle_scan_key_session_backup(req.body),
             ("POST", "/api/vault/export") => self.handle_export_offlineotp_vault(req.body),
             ("POST", "/api/vault/import") => self.handle_import_offlineotp_vault(req.body),
             ("POST", "/api/sessions/save") => self.handle_save_session(req.body),
@@ -2446,34 +2447,121 @@ impl CommanderService {
     }
 
     fn handle_export_offlineotp_vault(&self, body: Value) -> ApiReply {
+        let plain_text = body.get("plain_text").and_then(Value::as_bool).unwrap_or(false);
         let password = body.get("password").and_then(Value::as_str).unwrap_or("");
-        if password.is_empty() {
-            return api_error(400, "Choose a non-empty backup password.");
+        if !plain_text && password.is_empty() {
+            return api_error(400, "Choose a non-empty backup password, or export without one as plain text.");
         }
+        // Optional selection: an explicit array of saved-session names. When
+        // present, only those sites (and the SSH keys they reference) are
+        // exported; an empty array exports nothing and says so.
+        let selection = match parse_name_selection(body.get("sessions")) {
+            Ok(selection) => selection,
+            Err(error) => return api_error(400, &error),
+        };
         let cfg = self.state.lock().expect("m").config_root.clone();
         let store = match SessionStore::load_from_dir(&cfg, self.secret_vault.as_ref()) {
             Ok(store) => store,
             Err(error) => return api_error(500, &error),
         };
-        let entries = match offlineotp_entries_from_sessions(&store, &cfg, self.secret_vault.as_ref()) {
+        if let Some(set) = selection.as_ref() {
+            if set.is_empty() {
+                return api_error(400, "Select at least one session to export.");
+            }
+            for name in body
+                .get("sessions")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+                .unwrap_or_default()
+            {
+                if store.find(name).is_none() {
+                    return api_error(400, &format!("Saved session '{name}' was not found."));
+                }
+            }
+        }
+        let entries = match offlineotp_entries_from_sessions(&store, &cfg, self.secret_vault.as_ref(), selection.as_ref()) {
             Ok(entries) => entries,
             Err(error) => return api_error(400, &error),
         };
-        let data = match offlineotp_vault::seal(&entries, password) {
-            Ok(data) => data,
-            Err(error) => return api_error(400, &error),
+        let unix_seconds = unix_now_seconds();
+        let (data, filename) = if plain_text {
+            match offlineotp_vault::seal_plain(&entries) {
+                Ok(data) => (data, offlineotp_vault::timestamped_plain_filename(unix_seconds)),
+                Err(error) => return api_error(400, &error),
+            }
+        } else {
+            match offlineotp_vault::seal(&entries, password) {
+                Ok(data) => (data, offlineotp_vault::timestamped_filename(unix_seconds)),
+                Err(error) => return api_error(400, &error),
+            }
         };
-        let unix_seconds = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0);
         ApiReply {
             status: 200,
             payload: json!({
                 "success": true,
-                "filename": offlineotp_vault::timestamped_filename(unix_seconds),
+                "filename": filename,
                 "data_base64": BASE64_STD.encode(data),
                 "entry_count": entries.len(),
+                "plain_text": plain_text,
+            }),
+        }
+    }
+
+    /// Reads the backup the user picked and lists the sessions it contains,
+    /// so the page can show a tick-list without importing anything. Never
+    /// returns secret material.
+    fn handle_scan_key_session_backup(&self, body: Value) -> ApiReply {
+        let password = body.get("password").and_then(Value::as_str).unwrap_or("");
+        let encoded = body.get("data_base64").and_then(Value::as_str).unwrap_or("");
+        if encoded.len() > 22 * 1024 * 1024 {
+            return api_error(413, "The key/session backup exceeds the 16 MiB limit.");
+        }
+        let bytes = match BASE64_STD.decode(encoded.as_bytes()) {
+            Ok(bytes) => bytes,
+            Err(_) => return api_error(400, "The selected file is not valid base64 data."),
+        };
+        let encrypted = offlineotp_vault::is_encrypted_backup(&bytes);
+        if encrypted && password.is_empty() {
+            return api_error(400, "Enter the password used to encrypt this backup.");
+        }
+        let imported = match open_key_session_backup(&bytes, password, encrypted) {
+            Ok(imported) => imported,
+            Err(error) => return api_error(400, &error),
+        };
+        let ignored_entries = imported.ignored_entries;
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let existing_names: std::collections::HashSet<String> =
+            SessionStore::load_from_dir(&cfg, self.secret_vault.as_ref())
+                .map(|store| store.sites().iter().map(|site| site.name.clone()).collect())
+                .unwrap_or_default();
+        let planned = match plan_offlineotp_import(imported, None) {
+            Ok(planned) => planned,
+            Err(error) => return api_error(400, &error),
+        };
+        let entries: Vec<Value> = planned
+            .iter()
+            .map(|candidate| {
+                json!({
+                    "name": candidate.site.name,
+                    "exists_in_store": existing_names.contains(&candidate.site.name),
+                    "protocol": candidate.site.protocol.as_str(),
+                    "host": candidate.site.host,
+                    "port": candidate.site.port,
+                    "username": candidate.site.username,
+                    "has_password": candidate.site.password.as_ref().is_some_and(|p| !p.is_empty()),
+                    "has_key_passphrase": candidate.site.key_passphrase.as_ref().is_some_and(|p| !p.is_empty()),
+                    "has_ssh_key": candidate.ssh_key.is_some() || candidate.tunnel_key.is_some(),
+                })
+            })
+            .collect();
+        ApiReply {
+            status: 200,
+            payload: json!({
+                "success": true,
+                "encrypted": encrypted,
+                "entries": entries,
+                "entry_count": entries.len(),
+                "ignored_entries": ignored_entries,
             }),
         }
     }
@@ -2482,27 +2570,40 @@ impl CommanderService {
         let password = body.get("password").and_then(Value::as_str).unwrap_or("");
         let encoded = body.get("data_base64").and_then(Value::as_str).unwrap_or("");
         if encoded.len() > 22 * 1024 * 1024 {
-            return api_error(413, "The encrypted vault exceeds the 16 MiB OfflineOTP file limit.");
+            return api_error(413, "The key/session backup exceeds the 16 MiB limit.");
         }
         let bytes = match BASE64_STD.decode(encoded.as_bytes()) {
             Ok(bytes) => bytes,
             Err(_) => return api_error(400, "The selected file is not valid base64 data."),
         };
-        let imported = match offlineotp_vault::open(&bytes, password) {
+        // Encrypted backups require their password; plain-text backups carry
+        // no envelope and need none. The two are told apart by the magic
+        // marker, never by the file extension.
+        let encrypted = offlineotp_vault::is_encrypted_backup(&bytes);
+        if encrypted && password.is_empty() {
+            return api_error(400, "Enter the password used to encrypt this backup.");
+        }
+        let imported = match open_key_session_backup(&bytes, password, encrypted) {
             Ok(imported) => imported,
             Err(error) => return api_error(400, &error),
         };
+        let selection = match parse_name_selection(body.get("sessions")) {
+            Ok(selection) => selection,
+            Err(error) => return api_error(400, &error),
+        };
+        if matches!(selection.as_ref(), Some(set) if set.is_empty()) {
+            return api_error(400, "Select at least one session to import.");
+        }
         let replace = body.get("replace").and_then(Value::as_bool).unwrap_or(false);
         let cfg = self.state.lock().expect("m").config_root.clone();
-        let existing = if replace {
-            SessionStore::new()
-        } else {
-            match SessionStore::load_from_dir(&cfg, self.secret_vault.as_ref()) {
-                Ok(store) => store,
-                Err(error) => return api_error(500, &error),
-            }
+        // `replace` never discards saved sessions: the store is always merged,
+        // and same-named sessions are overwritten only for names present in
+        // the backup and selected for import.
+        let existing = match SessionStore::load_from_dir(&cfg, self.secret_vault.as_ref()) {
+            Ok(store) => store,
+            Err(error) => return api_error(500, &error),
         };
-        match import_offlineotp_entries(&cfg, existing, imported, self.secret_vault.as_ref()) {
+        match import_offlineotp_entries(&cfg, existing, imported, self.secret_vault.as_ref(), selection.as_ref(), replace) {
             Ok((count, skipped, ignored)) => ApiReply {
                 status: 200,
                 payload: json!({ "success": true, "imported": count, "skipped_existing": skipped, "ignored_entries": ignored }),
@@ -4579,6 +4680,48 @@ impl CommanderService {
     }
 }
 
+fn unix_now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// Parses an optional `sessions` array from a request body. Names are
+/// returned as a set; `None` means the caller did not restrict the
+/// operation. An explicitly empty selection is allowed here and rejected by
+/// the handlers with a clear message.
+fn parse_name_selection(value: Option<&Value>) -> Result<Option<std::collections::HashSet<String>>, String> {
+    let Some(value) = value else { return Ok(None) };
+    let items = value
+        .as_array()
+        .ok_or_else(|| "The session selection must be a list of session names.".to_string())?;
+    let mut names = std::collections::HashSet::with_capacity(items.len());
+    for item in items {
+        let name = item
+            .as_str()
+            .filter(|name| !name.is_empty() && name.len() <= 1024)
+            .ok_or_else(|| "The session selection contains an invalid session name.".to_string())?;
+        names.insert(name.to_string());
+    }
+    Ok(Some(names))
+}
+
+/// Opens an encrypted or plain-text key/session backup. Callers detect the
+/// format by `offlineotp_vault::is_encrypted_backup` (the magic marker),
+/// never by the file extension.
+fn open_key_session_backup(
+    bytes: &[u8],
+    password: &str,
+    encrypted: bool,
+) -> Result<offlineotp_vault::ImportedCredentialVault, String> {
+    if encrypted {
+        offlineotp_vault::open(bytes, password)
+    } else {
+        offlineotp_vault::open_plain(bytes)
+    }
+}
+
 const OFFLINEOTP_SESSION_JSON: &str = "linscp_session_json";
 const LOCAL_VAULT_KEY_PREFIX: &str = "vaultkey://";
 const OFFLINEOTP_SSH_KEY_LABEL: &str = "linscp_ssh_key_label";
@@ -4590,9 +4733,15 @@ fn offlineotp_entries_from_sessions(
     store: &SessionStore,
     config_root: &Path,
     secret_vault: &linscp_platform::password_vault::PasswordSecretVault,
+    selection: Option<&std::collections::HashSet<String>>,
 ) -> Result<Vec<CredentialEntry>, String> {
     let mut entries = Vec::new();
     for site in store.sites() {
+        if let Some(selection) = selection {
+            if !selection.contains(&site.name) {
+                continue;
+            }
+        }
         if site.name.trim().is_empty() || site.name.len() > 1024
             || site.name.contains(']') || site.name.chars().any(char::is_control)
         {
@@ -4695,7 +4844,11 @@ fn offlineotp_entries_from_sessions(
         }));
     }
     if entries.is_empty() {
-        return Err("There are no saved sessions or SSH keys to export.".to_string());
+        return Err(if selection.is_some() {
+            "Select at least one session to export.".to_string()
+        } else {
+            "There are no saved sessions or SSH keys to export.".to_string()
+        });
     }
     Ok(entries)
 }
@@ -4787,12 +4940,18 @@ struct OfflineOtpImportSite {
     tunnel_key: Option<SshKeyRecord>,
 }
 
-fn import_offlineotp_entries(
-    config_root: &Path,
-    mut store: SessionStore,
+struct OfflineOtpImportPlan {
+    sites: Vec<OfflineOtpImportSite>,
+    ignored: usize,
+}
+
+/// Pairs SSH keys with their login entries and resolves which sites a
+/// backup contains, without touching disk. `selection`, when given, keeps
+/// only the named sites (and the keys they reference).
+fn plan_offlineotp_import(
     imported: offlineotp_vault::ImportedCredentialVault,
-    secret_vault: &linscp_platform::password_vault::PasswordSecretVault,
-) -> Result<(usize, usize, usize), String> {
+    selection: Option<&std::collections::HashSet<String>>,
+) -> Result<OfflineOtpImportPlan, String> {
     let mut ignored = imported.ignored_entries;
     let mut sites = Vec::<OfflineOtpImportSite>::new();
     let mut keys = Vec::<SshKeyRecord>::new();
@@ -4833,10 +4992,8 @@ fn import_offlineotp_entries(
         }
     }
 
-    let mut created_files = Vec::<PathBuf>::new();
-    let result = (|| {
-        {
-            let mut key_labels = std::collections::HashSet::new();
+    {
+        let mut key_labels = std::collections::HashSet::new();
             for key in &keys {
                 if !key_labels.insert(key.label.clone()) {
                     return Err(format!("The OfflineOTP backup contains duplicate SSH key label '{}'.", key.label));
@@ -4896,16 +5053,35 @@ fn import_offlineotp_entries(
             });
         }
 
+        // Filter by the user's selection before the duplicate-name check so
+        // selecting one of two same-named sites is possible.
+        if let Some(selection) = selection {
+            sites.retain(|candidate| selection.contains(&candidate.site.name));
+        }
         let mut seen = std::collections::HashSet::new();
         for candidate in &sites {
             if !seen.insert(candidate.site.name.to_ascii_lowercase()) {
                 return Err("The OfflineOTP backup contains duplicate LinSCP session names.".to_string());
             }
         }
+        Ok(OfflineOtpImportPlan { sites, ignored })
+}
+
+fn import_offlineotp_entries(
+    config_root: &Path,
+    mut store: SessionStore,
+    imported: offlineotp_vault::ImportedCredentialVault,
+    secret_vault: &linscp_platform::password_vault::PasswordSecretVault,
+    selection: Option<&std::collections::HashSet<String>>,
+    replace_same_names: bool,
+) -> Result<(usize, usize, usize), String> {
+    let mut created_files = Vec::<PathBuf>::new();
+    let result = (|| {
+        let OfflineOtpImportPlan { sites, ignored } = plan_offlineotp_import(imported, selection)?;
         let mut skipped = 0usize;
         let mut staged_site_names = Vec::new();
         for mut candidate in sites {
-            if store.find(&candidate.site.name).is_some() {
+            if store.find(&candidate.site.name).is_some() && !replace_same_names {
                 skipped += 1;
                 continue;
             }
@@ -5633,7 +5809,7 @@ mod tests {
         std::fs::create_dir_all(&config_root).unwrap();
         let secret_vault = linscp_platform::password_vault::PasswordSecretVault::new();
         secret_vault.unlock_or_setup(&config_root, "correct horse battery staple", &NativeSecretVault::new()).unwrap();
-        let entries = offlineotp_entries_from_sessions(&source, &config_root, &secret_vault).unwrap();
+        let entries = offlineotp_entries_from_sessions(&source, &config_root, &secret_vault, None).unwrap();
         assert!(entries.iter().any(|entry| match entry {
             CredentialEntry::Login(login) => {
                 !login.metadata[OFFLINEOTP_SESSION_JSON].contains(source_path.as_str())
@@ -5648,6 +5824,8 @@ mod tests {
             SessionStore::new(),
             opened,
             &secret_vault,
+            None,
+            false,
         ).unwrap();
         assert_eq!((imported, skipped, ignored), (1, 0, 0));
 
@@ -5673,6 +5851,96 @@ mod tests {
         let sessions_ini = std::fs::read_to_string(config_root.join("sessions.ini")).unwrap();
         assert!(!sessions_ini.contains("login-secret"));
         assert!(!sessions_ini.contains(source_key.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn key_session_backup_selection_and_plain_text_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_root = temp.path().join("config");
+        std::fs::create_dir_all(&config_root).unwrap();
+        let secret_vault = linscp_platform::password_vault::PasswordSecretVault::new();
+        secret_vault.unlock_or_setup(&config_root, "correct horse battery staple", &NativeSecretVault::new()).unwrap();
+
+        let mut source = SessionStore::new();
+        let mut primary = StoredSite::new("primary", ProtocolScheme::Sftp, "sftp.example.test");
+        primary.username = "deploy".into();
+        primary.password = Some("login-secret".into());
+        primary.key_passphrase = Some("key-secret".into());
+        source.upsert(primary);
+        let mut secondary = StoredSite::new("secondary", ProtocolScheme::Sftp, "other.example.test");
+        secondary.username = "ops".into();
+        secondary.password = Some("second-secret".into());
+        source.upsert(secondary);
+
+        // Export everything, then re-import only one of the two sites.
+        let entries = offlineotp_entries_from_sessions(&source, &config_root, &secret_vault, None).unwrap();
+        assert_eq!(entries.iter().filter(|entry| matches!(entry, CredentialEntry::Login(_))).count(), 2);
+        let sealed = offlineotp_vault::seal(&entries, "correct horse battery staple").unwrap();
+        let opened = offlineotp_vault::open(&sealed, "correct horse battery staple").unwrap();
+        let only_primary = std::collections::HashSet::from(["primary".to_string()]);
+        let (imported, skipped, ignored) = import_offlineotp_entries(
+            &config_root,
+            SessionStore::new(),
+            opened,
+            &secret_vault,
+            Some(&only_primary),
+            false,
+        ).unwrap();
+        assert_eq!((imported, skipped, ignored), (1, 0, 0));
+        let restored = SessionStore::load_from_dir(&config_root, &secret_vault).unwrap();
+        assert!(restored.find("primary").is_some());
+        assert!(restored.find("secondary").is_none());
+        assert_eq!(restored.find("primary").unwrap().key_passphrase.as_deref(), Some("key-secret"));
+
+        // replace=true overwrites a selected same-named session but still
+        // never touches sessions outside the selection.
+        let mut replacement = StoredSite::new("primary", ProtocolScheme::Sftp, "moved.example.test");
+        replacement.username = "deploy".into();
+        replacement.password = Some("rotated-secret".into());
+        let mut rotated = SessionStore::new();
+        rotated.upsert(replacement);
+        let entries = offlineotp_entries_from_sessions(&rotated, &config_root, &secret_vault, None).unwrap();
+        let sealed = offlineotp_vault::seal(&entries, "correct horse battery staple").unwrap();
+        let opened = offlineotp_vault::open(&sealed, "correct horse battery staple").unwrap();
+        let only_primary = std::collections::HashSet::from(["primary".to_string()]);
+        let existing = SessionStore::load_from_dir(&config_root, &secret_vault).unwrap();
+        let (imported, skipped, ignored) = import_offlineotp_entries(
+            &config_root,
+            existing,
+            opened,
+            &secret_vault,
+            Some(&only_primary),
+            true,
+        ).unwrap();
+        assert_eq!((imported, skipped, ignored), (1, 0, 0));
+        let restored = SessionStore::load_from_dir(&config_root, &secret_vault).unwrap();
+        assert_eq!(restored.find("primary").unwrap().host, "moved.example.test");
+        assert_eq!(restored.find("primary").unwrap().password.as_deref(), Some("rotated-secret"));
+
+        // Plain-text export: the document is readable JSON and round-trips
+        // through the plain-text open path, never the encrypted one.
+        let temp_plain = tempfile::tempdir().unwrap();
+        let config_plain = temp_plain.path().join("config");
+        std::fs::create_dir_all(&config_plain).unwrap();
+        let vault_plain = linscp_platform::password_vault::PasswordSecretVault::new();
+        vault_plain.unlock_or_setup(&config_plain, "correct horse battery staple", &NativeSecretVault::new()).unwrap();
+        let entries = offlineotp_entries_from_sessions(&source, &config_root, &secret_vault, None).unwrap();
+        let plain = offlineotp_vault::seal_plain(&entries).unwrap();
+        assert_eq!(&plain[..1], b"[");
+        assert!(!offlineotp_vault::is_encrypted_backup(&plain));
+        assert!(offlineotp_vault::open(&plain, "x").is_err());
+        let opened = offlineotp_vault::open_plain(&plain).unwrap();
+        let (imported, skipped, ignored) = import_offlineotp_entries(
+            &config_plain,
+            SessionStore::new(),
+            opened,
+            &vault_plain,
+            None,
+            false,
+        ).unwrap();
+        assert_eq!((imported, skipped, ignored), (2, 0, 0));
+        let restored = SessionStore::load_from_dir(&config_plain, &vault_plain).unwrap();
+        assert_eq!(restored.find("secondary").unwrap().password.as_deref(), Some("second-secret"));
     }
 
     #[test]
