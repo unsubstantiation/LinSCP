@@ -764,7 +764,10 @@ mod tests {
         assert_eq!(restored.entries, entries);
         assert_eq!(restored.ignored_entries, 0);
         let text = String::from_utf8(plain).unwrap();
-        assert!(text.contains("webdavs://dav.example.test:8443"));
+        assert!(text.contains("\"label\":\"WebDAV staging\""));
+        assert!(text.contains("\"type\":\"PASSWORD\""));
+        // The secrets travel as base32 blobs; they are readable by anything
+        // that opens the file, never as a password field in the clear.
         assert!(open_plain(b"not json").is_err());
         assert!(open_plain(b"").is_err());
     }
