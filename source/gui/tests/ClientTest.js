@@ -2255,7 +2255,9 @@ function options(id) {
 
   // ---- Shared multi-server monitor --------------------------------------
   // This harness has no window bridge, so a terminal here is the in-page
-  // one - the same path Android takes. The renderer itself is covered by the
+  // one. The desktop half of that path is checked first (no touch row, no
+  // soft keyboard), then the capability answer is stubbed to Android for the
+  // touch half. The renderer itself is covered by the
   // bundle's own suite (ui/tests/TerminalRenderer.test.mjs).
   await window.openServerMonitor();
   await new Promise(resolve => setTimeout(resolve, 80));
@@ -2408,6 +2410,47 @@ function options(id) {
     responses['/api/terminal/frame'] = {
       success: true, dirty: true, alive: true, error: null,
       frame: frameOf('user@host:~$ ls', 'web-1 — Terminal') };
+
+    /* A desktop host draws neither the soft keyboard nor the Esc/~ row, even
+     * when the terminal has to be drawn in the page. This harness cannot open
+     * an OS window, so the in-page path is all there is here - and it must
+     * still look like a desktop terminal: physical keyboard through the
+     * document listener, no touch accessories. The Android checks below stub
+     * the capability answer to 'android'; this section runs against the
+     * harness's default host. */
+    /* The bundle's exports are getter-only, so the platform cannot be
+     * stubbed by assignment; wrapping the whole namespace in a Proxy is the
+     * only door from the outside, and it is scoped to this block. */
+    const realCore = window.LinSCPCore;
+    const asPlatform = platform => new Proxy(realCore, {
+      get(target, key) {
+        if (key === 'hostCapabilities') {
+          return () => Object.assign(
+            target.hostCapabilities({ host: window }), { platform });
+        }
+        const value = Reflect.get(target, key);
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    });
+    await window.openTerminal();
+    await new Promise(resolve => setTimeout(resolve, 120));
+    /* The touch shell fills its key row at boot on every host, so the count
+     * of buttons is not the contract - `hidden` is: the row stays hidden on
+     * a desktop, where the keyboard has Esc and the arrows of its own. */
+    check('the extra-keys row stays hidden on desktop',
+      doc.getElementById('terminalExtraKeys').hidden === true,
+      String(doc.getElementById('terminalExtraKeys').hidden));
+    check('a desktop terminal attaches no soft keyboard',
+      !doc.querySelector('#terminalScreen textarea'),
+      String(!!doc.querySelector('#terminalScreen textarea')));
+    lastWindow.selectAll();
+    check('the copy bar is not for a selection on a desktop',
+      doc.getElementById('terminalSelectionBar').hidden === true,
+      String(doc.getElementById('terminalSelectionBar').hidden));
+    window.closeTerminal();
+    await new Promise(resolve => setTimeout(resolve, 120));
+    /* The Android path starts here: a touch host, no OS windows. */
+    window.LinSCPCore = asPlatform('android');
 
     await window.openTerminal();
     await new Promise(resolve => setTimeout(resolve, 120));
@@ -2582,6 +2625,7 @@ function options(id) {
       await new Promise(resolve => setTimeout(resolve, 120));
     }
 
+    window.LinSCPCore = realCore;
     delete window.LinSCPCore.terminalWindow;
   }
 

@@ -170,6 +170,13 @@ pub mod commands {
         // terminal instead of a second copy of the commander. The page reads
         // the terminal from the window's own label, so a window cannot end up
         // showing a shell another window is already drawing.
+        // The page usually reads its window's own label from the Tauri JS
+        // internals (see the terminalWindowLabel shim in ui/scripts/build.mjs).
+        // That path depends on the internals' shape, so the label is also
+        // injected before any page script runs; terminalWindowId() in the page
+        // prefers the shim and falls back to this. The label is reduced to
+        // [A-Za-z0-9_-] above, so inlining it into a script is safe.
+        let init_script = format!("window.__LINSCP_TERMINAL_LABEL__ = \"{label}\";");
         let builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
             .title(title)
             // Sized for the grid the shell already has, so opening a window does
@@ -179,6 +186,12 @@ pub mod commands {
             .inner_size((cols.max(20) as f64 * 9.0 + 32.0).clamp(420.0, 1920.0),
                         (rows.max(5) as f64 * 18.0 + 64.0).clamp(200.0, 1200.0))
             .min_inner_size(280.0, 120.0)
+            // A terminal is a window you keep beside the file panes, not a fixed
+            // box: it is meant to be resized to fit half a screen or a second
+            // monitor, and the page tells the remote PTY about every resize.
+            .resizable(true)
+            // `&str` on the 2.1 API, `Into<String>` later: both are satisfied.
+            .initialization_script(init_script.as_str())
             // A terminal is a text surface, and a dropped file has nowhere to
             // go in it. Left enabled, the webview would swallow the drop before
             // the page could see it, so a person dragging a file onto a
