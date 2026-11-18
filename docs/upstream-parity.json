@@ -3846,15 +3846,18 @@
       "id": "editing.remote-editor",
       "area": "Editing/search",
       "status": "verified",
-      "notes": "Remote editing downloads, checks modification times and full file contents, supports -eol=lf|crlf and -monitor in the CLI, and saves with conflict detection in the GUI. live-sftp and unit were cited here before the B-suite triage but are not runnable (see the suite registry), so only gui is cited.",
+      "notes": "The in-page editor is a CodeMirror 6 view (line-number gutter, syntax highlighting, search and replace, bracket matching), bundled into the page by ui/scripts/build.mjs; the dialog, the dirty flag and the conflict rules it drives are unchanged. Remote editing downloads, checks modification times and full file contents, supports -eol=lf|crlf and -monitor in the CLI, and saves with conflict detection in the GUI. live-sftp and unit were cited here before the B-suite triage but are not runnable (see the suite registry), so only gui is cited.",
       "source": [
         "crates/linscp-engine/src/editor.rs",
         "crates/linscp-engine/src/script.rs",
-        "crates/linscp-service/src/lib.rs"
+        "crates/linscp-service/src/lib.rs",
+        "ui/src/editor.ts"
       ],
       "checks": {
         "gui": [
-          "save sent the base modification time"
+          "save sent the base modification time",
+          "the editor mounts with line numbers and a code surface",
+          "Ctrl+S in the editor saves the file"
         ]
       },
       "verified_on": {
@@ -3873,14 +3876,17 @@
       "id": "editing.local-editor",
       "area": "Editing/search",
       "status": "verified",
-      "notes": "GUI reads text and saves locally with a conflict check and atomic replace; symlinks are refused. Opening and saving through the browser editor are exercised by gui on all three platforms. Line-ending normalisation on upload belongs to the CLI edit path, not to the browser editor this row describes.",
+      "notes": "The in-page editor is a CodeMirror 6 view bundled into the page the same way; the dialog and the save rules are unchanged. GUI reads text and saves locally with a conflict check and atomic replace; symlinks are refused. Opening and saving through the browser editor are exercised by gui on all three platforms. Line-ending normalisation on upload belongs to the CLI edit path, not to the browser editor this row describes.",
       "source": [
-        "crates/linscp-service/src/lib.rs"
+        "crates/linscp-service/src/lib.rs",
+        "ui/src/editor.ts"
       ],
       "checks": {
         "gui": [
           "opening a local file entry loads it in the editor",
-          "local save posts the content and conflict timestamp"
+          "local save posts the content and conflict timestamp",
+          "the editor mounts with line numbers and a code surface",
+          "Ctrl+S in the editor saves the file"
         ]
       },
       "verified_on": {

@@ -286,6 +286,24 @@ const dom = new JSDOM(html, {
      * seed with the real stamp. Seeding it keeps this suite runnable against
      * the bare source page as well. */
     window.LinSCPBuildVersion = 'V2000-01-02-03-04';
+
+      // CodeMirror measures text with Range rects and schedules with rAF;
+      // jsdom has neither (pretendToBeVisual below only adds rAF). Zero
+      // rects are fine headless: nothing depends on the measurements.
+      if (typeof window.requestAnimationFrame !== 'function') {
+        window.requestAnimationFrame = callback => window.setTimeout(callback, 0);
+        window.cancelAnimationFrame = id => window.clearTimeout(id);
+      }
+      if (window.Range && typeof window.Range.prototype.getClientRects !== 'function') {
+        const emptyRect = { x: 0, y: 0, left: 0, top: 0, right: 0, bottom: 0,
+          width: 0, height: 0, toJSON: () => ({}) };
+        window.Range.prototype.getBoundingClientRect = () => emptyRect;
+        window.Range.prototype.getClientRects = () => ({
+          length: 0,
+          item: () => null,
+          [Symbol.iterator]: [][Symbol.iterator],
+        });
+      }
     /* jsdom has no canvas and says so loudly, but the in-page terminal is a
      * real canvas renderer, so it needs a context to draw into. A recorder is
      * enough: this suite is about the page handing the model's frames to the
@@ -486,19 +504,17 @@ function options(id) {
   await new Promise(resolve => setTimeout(resolve, 80));
   check('F3 opens the selected remote text file read-only',
     doc.getElementById('editorModal').className.indexOf('open') >= 0 &&
-      doc.getElementById('editorText').readOnly &&
+      window.isEditorReadOnly() &&
       doc.getElementById('editorSaveBtn').style.display === 'none');
   window.closeEditor();
   await window.editSelected('remote');
   await new Promise(resolve => setTimeout(resolve, 100));
   check('F4 opens the selected remote file in the editor', doc.getElementById('editorModal').className.indexOf('open') >= 0);
-  check('editor loaded the content', doc.getElementById('editorText').value === 'keep\n',
-    JSON.stringify(doc.getElementById('editorText').value));
+  check('editor loaded the content', window.getEditorValue() === 'keep\n',
+    JSON.stringify(window.getEditorValue()));
 
   // Editing marks it dirty, saving posts the new content.
-  const area = doc.getElementById('editorText');
-  area.value = 'keep\nmore\n';
-  area.dispatchEvent(new window.Event('input', { bubbles: true }));
+  window.setEditorValue('keep\nmore\n');
   check('editing marks the file dirty', text('editorStatus').indexOf('Modified') >= 0,
     text('editorStatus'));
   await window.saveEditorFile();
@@ -515,16 +531,66 @@ function options(id) {
   await window.editSelected('local');
   await new Promise(resolve => setTimeout(resolve, 80));
   check('F4 edits a local text file too',
-    doc.getElementById('editorText').value === 'local text\n' &&
-      !doc.getElementById('editorText').readOnly);
-  doc.getElementById('editorText').value = 'edited locally\n';
-  doc.getElementById('editorText').dispatchEvent(new window.Event('input', { bubbles: true }));
+    window.getEditorValue() === 'local text\n' &&
+      !window.isEditorReadOnly());
+  window.setEditorValue('edited locally\n');
   await window.saveEditorFile();
   await new Promise(resolve => setTimeout(resolve, 80));
   const localSave = calls.filter(call => call.path === '/api/local/save').pop();
   check('local save posts the content and conflict timestamp',
     localSave && JSON.parse(localSave.options.body).content === 'edited locally\n' &&
       JSON.parse(localSave.options.body).base_mtime_ns === 1791875271000000000);
+  window.closeEditor();
+
+  // The built-in editor is a real CodeMirror view, not a textarea: it renders
+  // gutters and highlighting, rebuilds cleanly per file, and its view mode
+  // makes the document non-editable at the view level, not just in state.
+  doc.getElementById('remoteFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  await window.editSelected('remote');
+  await new Promise(resolve => setTimeout(resolve, 80));
+  check('the editor mounts with line numbers and a code surface',
+    !!doc.querySelector('#editorHost .cm-gutters .cm-lineNumbers') &&
+      !!doc.querySelector('#editorHost .cm-content'),
+    doc.getElementById('editorHost').innerHTML.slice(0, 120));
+  check('the editor reports the loaded text',
+    window.getEditorValue() === 'keep\n');
+  check('edit mode keeps the document editable at the view level',
+    doc.querySelector('#editorHost .cm-content').getAttribute('contenteditable') ===
+      'true');
+  window.closeEditor();
+  await window.viewSelected('remote');
+  await new Promise(resolve => setTimeout(resolve, 80));
+  check('view mode makes the document non-editable at the view level',
+    doc.querySelector('#editorHost .cm-content').getAttribute('contenteditable') ===
+      'false');
+  window.closeEditor();
+
+  // While the editor holds the keyboard, the pane shortcuts stay out of the
+  // way: CodeMirror's content is a contenteditable div, not a textarea.
+  doc.getElementById('remoteFileList').children[0]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  await window.editSelected('remote');
+  await new Promise(resolve => setTimeout(resolve, 80));
+  const editorContent = doc.querySelector('#editorHost .cm-content');
+  const listCallsBefore = calls.filter(call => call.path === '/api/remote/list').length;
+  editorContent.dispatchEvent(new window.KeyboardEvent('keydown', {
+    key: 'Backspace', bubbles: true, cancelable: true }));
+  await new Promise(resolve => setTimeout(resolve, 80));
+  check('Backspace in the editor does not navigate the pane up',
+    calls.filter(call => call.path === '/api/remote/list').length === listCallsBefore);
+  const remoteSelection = window.selectedNames('remote').join(',');
+  editorContent.dispatchEvent(new window.KeyboardEvent('keydown', {
+    key: 'a', ctrlKey: true, bubbles: true, cancelable: true }));
+  check('Ctrl+A in the editor does not select the whole remote pane',
+    window.selectedNames('remote').join(',') === remoteSelection);
+  const savesBeforeEditorKeys = calls.filter(call => call.path === '/api/remote/save').length;
+  editorContent.dispatchEvent(new window.KeyboardEvent('keydown', {
+    key: 's', ctrlKey: true, bubbles: true, cancelable: true }));
+  await new Promise(resolve => setTimeout(resolve, 120));
+  check('Ctrl+S in the editor saves the file',
+    calls.filter(call => call.path === '/api/remote/save').length ===
+      savesBeforeEditorKeys + 1);
   window.closeEditor();
 
   // Synchronize: preview renders the plan.

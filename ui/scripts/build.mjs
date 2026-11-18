@@ -49,6 +49,25 @@ const iifeResult = await build({
 const iifeCode = iifeResult.outputFiles[0].text;
 fs.writeFileSync(path.join(distDir, 'linscp-core.iife.js'), iifeCode, 'utf8');
 
+// The editor is its own bundle with its own global: the page only needs it
+// when the editor modal opens, and keeping it out of linscp-core keeps each
+// piece focused. It is inlined into the built page below, exactly like the
+// core bundle, so there is one file to serve and CSP stays unchanged.
+const editorResult = await build({
+  entryPoints: [path.join(uiRoot, 'src', 'editor.ts')],
+  bundle: true,
+  write: false,
+  format: 'iife',
+  globalName: 'LinSCPEditor',
+  platform: 'browser',
+  target: ['es2022'],
+  // Only this bundle is minified: it ships the whole CodeMirror toolchain,
+  // which unminified is ten times the core's size.
+  minify: true,
+});
+const editorIifeCode = editorResult.outputFiles[0].text;
+fs.writeFileSync(path.join(distDir, 'linscp-editor.iife.js'), editorIifeCode, 'utf8');
+
 fs.copyFileSync(
   path.join(legacyWebDir, 'theme.css'),
   path.join(distDir, 'theme.css'),
@@ -123,8 +142,8 @@ const nativeShim = `  window.LinSCPTransport = window.LinSCPCore
 const buildVersionLine = `window.LinSCPBuildVersion = ${JSON.stringify(BUILD_STAMP)};`;
 
 const distHtml = rawHtml
-  .replace('<script>', `<script>\n${buildVersionLine}\n${iifeCode}\n</script>\n<script>`)
+  .replace('<script>', () => `<script>\n${buildVersionLine}\n${iifeCode}\n${editorIifeCode}</script>\n<script>`)
   .replace(anchor, nativeShim);
 
 fs.writeFileSync(path.join(distDir, 'index.html'), distHtml, 'utf8');
-console.log(`Built ui/dist (linscp-core.mjs, linscp-core.iife.js, index.html, theme.css). Version: ${BUILD_STAMP}`);
+console.log(`Built ui/dist (linscp-core.mjs, linscp-core.iife.js, linscp-editor.iife.js, index.html, theme.css). Version: ${BUILD_STAMP}`);
