@@ -1711,7 +1711,8 @@ fn build_proxy_config(spec: &ParsedSiteSpec) -> Result<Option<ProxyConfig>, Stri
 
 fn build_tls_settings(spec: &ParsedSiteSpec) -> Result<TlsSettings, String> {
     let mut tls = TlsSettings::default();
-    if is_ssh_scheme(spec.session.protocol) {
+    if is_ssh_scheme(spec.session.protocol)
+        || matches!(spec.session.protocol, ProtocolScheme::X2Go | ProtocolScheme::X11) {
         return Ok(tls);
     }
     let hk = spec.session.hostkey.trim();
@@ -1805,7 +1806,8 @@ fn build_tls_settings(spec: &ParsedSiteSpec) -> Result<TlsSettings, String> {
 /// connect paths call this at session build; the GUI parser calls it too, so
 /// the site dialog refuses a Kerberos site it could never open.
 pub fn validate_ssh_gssapi_policy(spec: &ParsedSiteSpec) -> Result<(), String> {
-    if !is_ssh_scheme(spec.session.protocol) {
+    if !is_ssh_scheme(spec.session.protocol)
+        && !matches!(spec.session.protocol, ProtocolScheme::X2Go | ProtocolScheme::X11) {
         return Ok(());
     }
     let auth_kex = spec
@@ -2281,8 +2283,9 @@ async fn connect_site_spec_inner(
                 proxy: proxy.clone(),
                 timeout,
             };
-            let sess = RemoteDesktopSession::connect(
+            let sess = RemoteDesktopSession::connect_with_ssh_config(
                 rd_cfg,
+                Some(&dest_ssh_cfg),
                 tunnel_ssh_cfg.as_ref(),
                 tunnel_local_port,
             )
@@ -2823,6 +2826,16 @@ impl SecretVault for DefaultOsVault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_desktop_host_keys_are_not_treated_as_tls_pins() {
+        for protocol in [ProtocolScheme::X2Go, ProtocolScheme::X11] {
+            let mut spec = ParsedSiteSpec::default();
+            spec.session.protocol = protocol;
+            spec.session.hostkey = "ssh-ed25519 SHA256:example".into();
+            assert!(build_tls_settings(&spec).is_ok());
+        }
+    }
 
     #[test]
     fn url_parser_enforces_schemes_ipv6_brackets_and_percent_encoding() {
