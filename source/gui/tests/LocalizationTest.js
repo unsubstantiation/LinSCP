@@ -15,6 +15,24 @@ async function page({ saved, server, browsers = ['en-US'], blocked = false } = {
   const dom = new JSDOM(html, {
     url: 'http://localhost:8080/', runScripts: 'dangerously', virtualConsole,
     beforeParse(window) {
+
+      // CodeMirror measures text with Range rects and schedules with rAF;
+      // jsdom has neither (pretendToBeVisual below only adds rAF). Zero
+      // rects are fine headless: nothing depends on the measurements.
+      if (typeof window.requestAnimationFrame !== 'function') {
+        window.requestAnimationFrame = callback => window.setTimeout(callback, 0);
+        window.cancelAnimationFrame = id => window.clearTimeout(id);
+      }
+      if (window.Range && typeof window.Range.prototype.getClientRects !== 'function') {
+        const emptyRect = { x: 0, y: 0, left: 0, top: 0, right: 0, bottom: 0,
+          width: 0, height: 0, toJSON: () => ({}) };
+        window.Range.prototype.getBoundingClientRect = () => emptyRect;
+        window.Range.prototype.getClientRects = () => ({
+          length: 0,
+          item: () => null,
+          [Symbol.iterator]: [][Symbol.iterator],
+        });
+      }
       window.LSCP_LANGUAGE = server;
       Object.defineProperty(window.navigator, 'languages', {value: browsers});
       if (saved) window.localStorage.setItem('lscp-language', saved);
@@ -89,8 +107,8 @@ async function run() {
       check('fingerprint never becomes markup', !doc.querySelector('#hostKeyFingerprint img'));
       await w.openEditor('/Remote/Save', 'remote', false);
       check('translated editor', doc.querySelector('#editorTitle').textContent === 'Editando /Remote/Save');
-      check('file content unchanged', doc.querySelector('#editorText').value === 'Delete <script> %n {path}');
-      doc.querySelector('#editorText').value = 'New {path}';
+      check('file content unchanged', w.getEditorValue() === 'Delete <script> %n {path}');
+      w.setEditorValue('New {path}');
       w.markDirty();
       check('dirty editor translated', doc.querySelector('#editorStatus').textContent === 'Modificado - sin guardar');
       await w.saveEditorFile();
