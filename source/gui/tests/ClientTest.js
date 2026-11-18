@@ -696,6 +696,9 @@ function options(id) {
   window.newSite();
   check('new SSH sessions default to storing their password',
     doc.getElementById('siteRemember').checked);
+  check('automatic sudo password use is off by default',
+    !doc.getElementById('siteSudoPassword').checked);
+  doc.getElementById('siteSudoPassword').checked = true;
   doc.getElementById('siteName').value = 'new-ssh-site';
   doc.getElementById('siteHost').value = 'new.example.test';
   doc.getElementById('siteUser').value = 'deploy';
@@ -704,6 +707,8 @@ function options(id) {
   const newSiteSave = calls.filter(call => call.path === '/api/sessions/save').pop();
   check('new SSH session saves its password when the default is kept',
     newSiteSave && JSON.parse(newSiteSave.options.body).session.password === 'ssh-password');
+  check('automatic sudo password use is saved only when selected',
+    newSiteSave && JSON.parse(newSiteSave.options.body).session.sudo_password_auto === true);
 
   check('private-key controls offer both browse and vault pickers for destination and tunnel keys',
     !!doc.getElementById('siteKeyBrowseBtn') && !!doc.getElementById('siteKeyVaultBtn') &&
@@ -2567,6 +2572,121 @@ function options(id) {
         return typeof value === 'function' ? value.bind(target) : value;
       }
     });
+    // A missing X2Go server is offered for installation on the selected
+    // authenticated host, never run until the user presses Install.
+    responses['/api/desktop/check'] = { success: true, available: false, checked: true,
+      via_ssh: true, can_install: true, desktop_checked: true, desktop: 'MATE',
+      reason: 'x2goserver not found on 127.0.0.1',
+      install_script: '#!/bin/bash\necho install-x2go\n',
+      xfce_install_script: '#!/bin/bash\necho install-xfce\n' };
+    responses['/api/terminal/input'] = { success: true };
+    const desktopTestStatus = responses['/api/status'];
+    responses['/api/status'] = { ...desktopTestStatus, tabs: [{
+      id: 1, name: 'X2Go server', connected: true,
+      session: { protocol: 'x2go', host: '127.0.0.1', port: 2222, username: 'user' },
+      local_dir: '/tmp/slowlocal', remote_dir: '/'
+    }], active_tab: 1 };
+    await window.refreshStatus();
+    window.openRemoteDesktop(1);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const directCheck = calls.filter(call => call.path === '/api/desktop/check').pop();
+    const directBody = directCheck && JSON.parse(directCheck.options.body);
+    check('an X2Go tab automatically checks its actual SSH port',
+      directBody && directBody.kind === 'x2go' && directBody.tab === 1 && directBody.port === 2222 &&
+      !doc.getElementById('remoteDesktopInstallBtn').disabled);
+    window.closeModal('remoteDesktopModal');
+    responses['/api/status'] = desktopTestStatus;
+    await window.refreshStatus();
+    window.openRemoteDesktop();
+    doc.getElementById('remoteDesktopKind').value = 'x2go';
+    window.remoteDesktopKindChanged();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    check('missing X2Go offers an explicit installation on the selected server',
+      doc.getElementById('remoteDesktopPrompt').style.display === 'block' &&
+      !doc.getElementById('remoteDesktopInstallBtn').disabled &&
+      doc.getElementById('remoteDesktopXfceChoice').hidden);
+    const inputBeforeInstall = calls.filter(call => call.path === '/api/terminal/input').length;
+    await window.installRemoteDesktop();
+    const installInput = calls.filter(call => call.path === '/api/terminal/input').pop();
+    const installBody = installInput && JSON.parse(installInput.options.body);
+    const installCommand = installBody && Buffer.from(installBody.data, 'base64').toString();
+    check('X2Go install opens a terminal and sends the reviewed script after approval',
+      calls.filter(call => call.path === '/api/terminal/input').length === inputBeforeInstall + 1 &&
+      installCommand && installCommand.includes('base64 -d | bash') &&
+      Buffer.from(installCommand.match(/'([^']+)'/)[1], 'base64').toString().includes('install-x2go'));
+    check('an existing MATE desktop does not install XFCE',
+      installCommand && !installCommand.includes(' && ') &&
+      doc.getElementById('remoteDesktopXfceChoice').hidden);
+    window.closeTerminal();
+    // Neither X2Go nor a known desktop: the extra XFCE install is opt-in.
+    responses['/api/desktop/check'].desktop = null;
+    window.openRemoteDesktop();
+    doc.getElementById('remoteDesktopKind').value = 'x2go';
+    window.remoteDesktopKindChanged();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    check('no detected desktop offers XFCE unchecked',
+      !doc.getElementById('remoteDesktopXfceChoice').hidden &&
+      !doc.getElementById('remoteDesktopXfce').checked &&
+      !text('remoteDesktopScript').includes('install-xfce'));
+    await window.installRemoteDesktop();
+    let lastInput = calls.filter(call => call.path === '/api/terminal/input').pop();
+    let command = Buffer.from(JSON.parse(lastInput.options.body).data, 'base64').toString();
+    check('leaving XFCE unchecked installs only X2Go', !command.includes(' && '));
+    window.closeTerminal();
+    window.openRemoteDesktop();
+    doc.getElementById('remoteDesktopKind').value = 'x2go';
+    window.remoteDesktopKindChanged();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    doc.getElementById('remoteDesktopXfce').checked = true;
+    window.updateRemoteDesktopScript();
+    check('opting in includes the XFCE installer in the preview', text('remoteDesktopScript').includes('install-xfce'));
+    await window.installRemoteDesktop();
+    lastInput = calls.filter(call => call.path === '/api/terminal/input').pop();
+    command = Buffer.from(JSON.parse(lastInput.options.body).data, 'base64').toString();
+    let scripts = Array.from(command.matchAll(/'([^']+)'/g), match => Buffer.from(match[1], 'base64').toString());
+    check('XFCE is installed only after explicit opt-in',
+      scripts.length === 2 && scripts[0].includes('install-x2go') && scripts[1].includes('install-xfce'));
+    window.closeTerminal();
+    // If the server is already installed, offer XFCE by itself.
+    responses['/api/desktop/check'].available = true;
+    window.openRemoteDesktop();
+    doc.getElementById('remoteDesktopKind').value = 'x2go';
+    window.remoteDesktopKindChanged();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    check('an installed server without a known desktop offers only XFCE',
+      doc.getElementById('remoteDesktopInstallBtn').textContent === 'Install XFCE' &&
+      text('remoteDesktopScript').includes('install-xfce') && !text('remoteDesktopScript').includes('install-x2go'));
+    await window.installRemoteDesktop();
+    lastInput = calls.filter(call => call.path === '/api/terminal/input').pop();
+    command = Buffer.from(JSON.parse(lastInput.options.body).data, 'base64').toString();
+    scripts = Array.from(command.matchAll(/'([^']+)'/g), match => Buffer.from(match[1], 'base64').toString());
+    check('the desktop-only action does not reinstall X2Go',
+      scripts.length === 1 && scripts[0].includes('install-xfce'));
+    window.closeTerminal();
+    // A failed environment probe is unknown, not an invitation to install.
+    responses['/api/desktop/check'].desktop_checked = false;
+    window.openRemoteDesktop();
+    doc.getElementById('remoteDesktopKind').value = 'x2go';
+    window.remoteDesktopKindChanged();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    check('an inconclusive desktop check does not offer XFCE installation',
+      doc.getElementById('remoteDesktopInstallBtn').disabled && doc.getElementById('remoteDesktopXfceChoice').hidden);
+    responses['/api/desktop/check'].available = false;
+    responses['/api/desktop/check'].desktop_checked = true;
+    window.openRemoteDesktop();
+    doc.getElementById('remoteDesktopKind').value = 'x2go';
+    window.remoteDesktopKindChanged();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    doc.getElementById('remoteDesktopHost').value = 'other.example';
+    window.remoteDesktopSelectionChanged();
+    check('changing the target invalidates the previous install approval',
+      doc.getElementById('remoteDesktopInstallBtn').disabled);
+    const beforeStaleInstall = calls.filter(call => call.path === '/api/terminal/input').length;
+    await window.installRemoteDesktop();
+    check('a stale X2Go check cannot run an installer',
+      calls.filter(call => call.path === '/api/terminal/input').length === beforeStaleInstall);
+    window.closeModal('remoteDesktopModal');
+
     await window.openTerminal();
     await new Promise(resolve => setTimeout(resolve, 120));
     /* The touch shell fills its key row at boot on every host, so the count

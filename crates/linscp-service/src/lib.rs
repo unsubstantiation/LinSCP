@@ -36,6 +36,28 @@ pub mod terminal_bridge;
 use tabs::{TabRuntime, parse_tab_id_str, session_is_local, collect_session_folders, stored_site_to_gui_json};
 use linscp_engine::url_and_raw::GuiConnectError;
 
+/// Only use the encrypted stored site's password for the same connected
+/// identity. A form override or a later site edit must not redirect a secret.
+fn saved_sudo_credentials(
+    tab: &TabRuntime,
+    store: &SessionStore,
+) -> Option<(String, String)> {
+    let spec = tab.spec.as_ref()?;
+    let site = store.find(tab.site_name.as_deref()?)?;
+    if site.extra_fields.get("sudo_password_auto").map(String::as_str) != Some("1")
+        || spec.raw_fields.get("sudo_password_auto").map(String::as_str) != Some("1")
+        || site.host != spec.session.host
+        || site.port != spec.session.port
+        || site.username != spec.session.username
+        || site.protocol != spec.session.protocol
+        || site.password_error.is_some() {
+        return None;
+    }
+    let password = site.password.as_ref().filter(|p| !p.is_empty())?;
+    if spec.session.password.as_ref() != Some(password) { return None; }
+    Some((site.username.clone(), password.clone()))
+}
+
 /// What a dropped path turned out to be, once the filesystem was asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DroppedKind {
@@ -1326,7 +1348,7 @@ impl CommanderService {
         let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
             Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected"),
         };
-        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        let session = match tab.remote.as_ref() { Some(session) => session, None => return api_error(400, "Not connected") };
         let ssh = match session.ssh_connection() {
             Some(ssh) => ssh.clone(),
             // A terminal is an SSH shell; FTP, WebDAV and S3 have none, and
@@ -1341,8 +1363,10 @@ impl CommanderService {
             let event_tx = self.event_sender();
             (terminal_id, event_tx)
         };
+        let sudo_credentials = SessionStore::load_from_dir(&self.config_root(), self.secret_vault.as_ref())
+            .ok().and_then(|store| saved_sudo_credentials(&tab, &store));
         match terminal_bridge::EmbeddedTerminal::open_over_ssh(
-            terminal_id.clone(), id, &ssh, cols, rows, Some(tab.remote_dir.as_str()), event_tx,
+            terminal_id.clone(), id, &ssh, cols, rows, Some(tab.remote_dir.as_str()), sudo_credentials, event_tx,
         ).await {
             Ok(terminal) => {
                 let (cols, rows) = terminal.dimensions();
@@ -4274,25 +4298,24 @@ impl CommanderService {
                     }
                 }
                 // If this tab itself is an SSH session, use it as via
-                if tab.remote.is_some() && tab.spec.as_ref().map(|s| matches!(s.session.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)).unwrap_or(false) {
+                if tab.connected && tab.remote.as_ref().and_then(|s| s.ssh_connection()).is_some() {
+                    if let Some(spec) = tab.spec.as_ref() {
+                        if kind == RemoteDesktopKind::X2Go && !target_host.is_empty() && !target_host.eq_ignore_ascii_case(&spec.session.host) {
+                            return api_error(400, "The selected SSH session is connected to a different host.");
+                        }
+                        if target_host.is_empty() { target_host = spec.session.host.clone(); }
+                        let ssh_port = if spec.session.port == 0 { 22 } else { spec.session.port };
+                        if kind == RemoteDesktopKind::X2Go && target_port != 0 && target_port != ssh_port {
+                            return api_error(400, "The selected SSH session uses a different port.");
+                        }
+                    }
                     via_session = tab.remote.clone();
                     via_tab_id = Some(tid);
                 }
             }
         }
-        // Also check explicit via_tab field separate from tab
-        if via_session.is_none() {
-            if let Some(vid) = body.get("via_tab").and_then(|v| v.as_u64()).or_else(|| body.get("viaTab").and_then(|v| v.as_u64())) {
-                let state = self.state.lock().expect("state mutex");
-                if let Some(tab) = state.tabs.get(&vid) {
-                    via_session = tab.remote.clone();
-                    via_tab_id = Some(vid);
-                    if target_host.is_empty() { if let Some(spec) = tab.spec.as_ref() { target_host = spec.session.host.clone(); } }
-                }
-            }
-        }
         // Fallback: find any connected SSH tab with matching host
-        if via_session.is_none() && !target_host.is_empty() {
+        if via_session.is_none() && tab_id.is_none() && !target_host.is_empty() {
             let state = self.state.lock().expect("state mutex");
             for (id, tab) in state.tabs.iter() {
                 let is_ssh = tab.spec.as_ref().map(|s| matches!(s.session.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)).unwrap_or(false);
@@ -4306,19 +4329,6 @@ impl CommanderService {
                 }
             }
         }
-        // Last fallback: any SSH tab
-        if via_session.is_none() {
-            let state = self.state.lock().expect("state mutex");
-            for (id, tab) in state.tabs.iter() {
-                let is_ssh = tab.spec.as_ref().map(|s| matches!(s.session.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)).unwrap_or(false);
-                if is_ssh && tab.remote.is_some() {
-                    via_session = tab.remote.clone();
-                    via_tab_id = Some(*id);
-                    if target_host.is_empty() { if let Some(spec) = tab.spec.as_ref() { target_host = spec.session.host.clone(); } }
-                    break;
-                }
-            }
-        }
         if target_host.is_empty() { target_host = "server".to_string(); }
         if target_port == 0 { target_port = match kind { RemoteDesktopKind::Rdp => 3389, RemoteDesktopKind::Vnc => 5900, RemoteDesktopKind::Spice => 5900, _ => 22 }; }
         let pkg = server_package_name(kind);
@@ -4328,6 +4338,9 @@ impl CommanderService {
 
         // If we have an SSH session, probe via exec
         if let Some(sess) = via_session {
+            let desktop = if kind == RemoteDesktopKind::X2Go {
+                Some(linscp_proto::remote_desktop::detect_x2go_desktop(sess.as_ref()).await)
+            } else { None };
             match linscp_proto::remote_desktop::check_via_ssh(sess.as_ref(), kind).await {
                 Ok(true) => {
                     return ApiReply{ status:200, payload: json!({
@@ -4336,6 +4349,9 @@ impl CommanderService {
                         "checked": true,
                         "via_ssh": true,
                         "via_tab": via_tab_id,
+                        "desktop_checked": desktop.as_ref().is_some_and(Result::is_ok),
+                        "desktop": desktop.as_ref().and_then(|result| result.as_ref().ok()).and_then(|name| *name),
+                        "xfce_install_script": if kind == RemoteDesktopKind::X2Go { Some(linscp_proto::remote_desktop::x2go_xfce_install_script()) } else { None },
                         "kind": kind.as_str(),
                         "host": target_host,
                         "port": target_port,
@@ -4355,6 +4371,9 @@ impl CommanderService {
                         "checked": true,
                         "via_ssh": true,
                         "via_tab": via_tab_id,
+                        "desktop_checked": desktop.as_ref().is_some_and(Result::is_ok),
+                        "desktop": desktop.as_ref().and_then(|result| result.as_ref().ok()).and_then(|name| *name),
+                        "xfce_install_script": if kind == RemoteDesktopKind::X2Go { Some(linscp_proto::remote_desktop::x2go_xfce_install_script()) } else { None },
                         "kind": kind.as_str(),
                         "host": target_host,
                         "port": target_port,
@@ -4380,6 +4399,9 @@ impl CommanderService {
                         "checked": true,
                         "via_ssh": true,
                         "via_tab": via_tab_id,
+                        "desktop_checked": desktop.as_ref().is_some_and(Result::is_ok),
+                        "desktop": desktop.as_ref().and_then(|result| result.as_ref().ok()).and_then(|name| *name),
+                        "xfce_install_script": if kind == RemoteDesktopKind::X2Go { Some(linscp_proto::remote_desktop::x2go_xfce_install_script()) } else { None },
                         "kind": kind.as_str(),
                         "host": target_host,
                         "port": target_port,
@@ -4388,13 +4410,17 @@ impl CommanderService {
                         "probe_command": probe,
                         "install_script": script,
                         "reason": format!("Probe failed: {e}"),
-                        "can_install": true,
+                        "can_install": false,
                         "message": format!("Could not verify {} on {}: {e}. Installer available.", descr, target_host)
                     })};
                 }
             }
         }
 
+        // An open SSH port does not establish that X2Go is installed.
+        if kind == RemoteDesktopKind::X2Go {
+            return api_error(400, "Connect an SSH session to this server to check X2Go before installing.");
+        }
         // No SSH session: try TCP probe if direct desktop port
         let tcp_ok = linscp_proto::remote_desktop::check_tcp_availability(&target_host, target_port).await;
         if tcp_ok {
@@ -4442,33 +4468,27 @@ impl CommanderService {
         use linscp_proto::remote_desktop::{server_package_name, install_script_for_kind, RemoteDesktopKind};
         let kind_str = body.get("kind").and_then(|v| v.as_str()).or_else(|| body.get("protocol").and_then(|v| v.as_str()));
         let kind = Self::parse_desktop_kind_str(kind_str);
+        if kind == RemoteDesktopKind::X2Go {
+            return api_error(400, "Run the X2Go installer in an interactive terminal so sudo can request authorization.");
+        }
         let via_tab = body.get("via_tab").and_then(|v| v.as_u64()).or_else(|| body.get("viaTab").and_then(|v| v.as_u64())).or_else(|| tabs::parse_tab_id_value(body.get("tab"))).or_else(|| body.get("tabId").and_then(|v| v.as_u64()));
         let mut target_host = body.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let mut via_session: Option<std::sync::Arc<dyn linscp_proto::RemoteSession>> = None;
-        let mut via_tab_id: Option<u64> = None;
-        if let Some(vid) = via_tab {
-            let state = self.state.lock().expect("state mutex");
-            if let Some(tab) = state.tabs.get(&vid) {
-                via_session = tab.remote.clone();
-                via_tab_id = Some(vid);
-                if target_host.is_empty() { if let Some(spec) = tab.spec.as_ref() { target_host = spec.session.host.clone(); } }
-            }
-        }
-        if via_session.is_none() {
-            let state = self.state.lock().expect("state mutex");
-            for (id, tab) in state.tabs.iter() {
-                let is_ssh = tab.spec.as_ref().map(|s| matches!(s.session.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)).unwrap_or(false);
-                if is_ssh && tab.remote.is_some() {
-                    via_session = tab.remote.clone();
-                    via_tab_id = Some(*id);
-                    if target_host.is_empty() { if let Some(spec) = tab.spec.as_ref() { target_host = spec.session.host.clone(); } }
-                    break;
-                }
-            }
-        }
-        let Some(sess) = via_session else {
-            return ApiReply{ status:400, payload: json!({"success": false, "error": "No SSH session found to install on. Connect via SSH to the server first (sftp:// or scp://), then retry."})};
+        let Some(vid) = via_tab else {
+            return api_error(400, "Select the SSH session for the server before installing.");
         };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&vid).cloned() {
+            Some(tab) if tab.connected => tab,
+            _ => return api_error(400, "The selected SSH session is not connected."),
+        };
+        let Some(spec) = tab.spec.as_ref() else { return api_error(400, "Missing session settings"); };
+        if !target_host.is_empty() && !target_host.eq_ignore_ascii_case(&spec.session.host) {
+            return api_error(400, "The selected SSH session is connected to a different host.");
+        }
+        target_host = spec.session.host.clone();
+        let Some(sess) = tab.remote.as_ref().filter(|s| s.ssh_connection().is_some()) else {
+            return api_error(400, "The selected session has no SSH connection.");
+        };
+        let via_tab_id = Some(vid);
         let pkg = server_package_name(kind);
         let script = install_script_for_kind(kind);
         // For X11/SPICE etc the script is short; for RDP/VNC/X2Go it may take minutes
@@ -4486,7 +4506,8 @@ impl CommanderService {
                     }
                 }
                 ApiReply{ status: if success {200} else {500}, payload: json!({
-                    "success": success,
+                    "success": success && (kind != RemoteDesktopKind::X2Go || now_available),
+                    "error": if success && (kind != RemoteDesktopKind::X2Go || now_available) { String::new() } else if !stderr.trim().is_empty() { stderr.clone() } else { format!("Installer failed or {pkg} could not be verified (exit {exit}).") },
                     "via_tab": via_tab_id,
                     "host": target_host,
                     "kind": kind.as_str(),
@@ -4509,7 +4530,7 @@ impl CommanderService {
         // return the same prompt as /api/desktop/check so the UI can show cancel/install.
         let kind_str = body.get("kind").and_then(|v| v.as_str()).or_else(|| body.get("protocol").and_then(|v| v.as_str()));
         let mut target_host = body.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let tab_id = tabs::parse_tab_id_value(body.get("tab")).or_else(|| body.get("tabId").and_then(|v| v.as_u64()));
+        let tab_id = tabs::parse_tab_id_value(body.get("tab")).or_else(|| tabs::parse_tab_id_value(body.get("via_tab"))).or_else(|| body.get("tabId").and_then(|v| v.as_u64()));
         let mut kind = Self::parse_desktop_kind_str(kind_str);
         let mut target_port: u16 = body.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
         let mut desktop_tab_spec: Option<tabs::TabRuntime> = None;
@@ -4530,25 +4551,24 @@ impl CommanderService {
                     }
                 }
                 // If this tab is SSH, remember as via
-                if tab.remote.is_some() && tab.spec.as_ref().map(|s| matches!(s.session.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)).unwrap_or(false) {
+                if tab.connected && tab.remote.as_ref().and_then(|s| s.ssh_connection()).is_some() {
+                    if let Some(spec) = tab.spec.as_ref() {
+                        if kind == RemoteDesktopKind::X2Go && !target_host.is_empty() && !target_host.eq_ignore_ascii_case(&spec.session.host) {
+                            return api_error(400, "The selected SSH session is connected to a different host.");
+                        }
+                        if target_host.is_empty() { target_host = spec.session.host.clone(); }
+                        let ssh_port = if spec.session.port == 0 { 22 } else { spec.session.port };
+                        if kind == RemoteDesktopKind::X2Go && target_port != 0 && target_port != ssh_port {
+                            return api_error(400, "The selected SSH session uses a different port.");
+                        }
+                    }
                     via_session = tab.remote.clone();
                     via_tab_id = Some(tid);
                 }
             }
         }
-        // Also check explicit via_tab separate from tab
-        if via_session.is_none() {
-            if let Some(vid) = body.get("via_tab").and_then(|v| v.as_u64()).or_else(|| body.get("viaTab").and_then(|v| v.as_u64())) {
-                let state = self.state.lock().expect("state mutex");
-                if let Some(tab) = state.tabs.get(&vid) {
-                    via_session = tab.remote.clone();
-                    via_tab_id = Some(vid);
-                    if target_host.is_empty() { if let Some(spec) = tab.spec.as_ref() { target_host = spec.session.host.clone(); } }
-                }
-            }
-        }
         // Fallback: any SSH tab with matching host
-        if via_session.is_none() && !target_host.is_empty() {
+        if via_session.is_none() && tab_id.is_none() && !target_host.is_empty() {
             let state = self.state.lock().expect("state mutex");
             for (id, tab) in state.tabs.iter() {
                 let is_ssh = tab.spec.as_ref().map(|s| matches!(s.session.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)).unwrap_or(false);
@@ -4556,13 +4576,6 @@ impl CommanderService {
                     let h = tab.spec.as_ref().map(|s| s.session.host.clone()).unwrap_or_default();
                     if h.eq_ignore_ascii_case(&target_host) { via_session = tab.remote.clone(); via_tab_id = Some(*id); break; }
                 }
-            }
-        }
-        if via_session.is_none() {
-            let state = self.state.lock().expect("state mutex");
-            for (id, tab) in state.tabs.iter() {
-                let is_ssh = tab.spec.as_ref().map(|s| matches!(s.session.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)).unwrap_or(false);
-                if is_ssh && tab.remote.is_some() { via_session = tab.remote.clone(); via_tab_id = Some(*id); if target_host.is_empty() { if let Some(spec) = tab.spec.as_ref() { target_host = spec.session.host.clone(); } } break; }
             }
         }
         if target_host.is_empty() {
@@ -4573,7 +4586,11 @@ impl CommanderService {
         let descr = server_description(kind);
         let script = install_script_for_kind(kind);
         let probe = probe_command_for_kind(kind);
+        if kind == RemoteDesktopKind::X2Go && via_session.is_none() {
+            return api_error(400, "Connect an SSH session to this server to check X2Go before opening it.");
+        }
         // If we have SSH, probe via exec; if not available, return prompt instead of launching
+        let mut detected_desktop = None;
         if let Some(sess) = via_session.as_ref() {
             match linscp_proto::remote_desktop::check_via_ssh(sess.as_ref(), kind).await {
                 Ok(false) => {
@@ -4602,11 +4619,12 @@ impl CommanderService {
                         "error": format!("Remote desktop not available: {descr} not found on {target_host}")
                     })};
                 },
-                Ok(true) => { /* continue to launch */ },
-                Err(e) => {
-                    // Probe error: log but still allow launch to be attempted (maybe transient)
-                    let _ = e;
-                }
+                Ok(true) => {
+                    if kind == RemoteDesktopKind::X2Go {
+                        detected_desktop = linscp_proto::remote_desktop::detect_x2go_desktop(sess.as_ref()).await.ok().flatten();
+                    }
+                },
+                Err(e) => return api_error(400, format!("Could not verify the remote desktop server: {e}")),
             }
         } else if !target_host.is_empty() && matches!(kind, RemoteDesktopKind::Rdp | RemoteDesktopKind::Vnc | RemoteDesktopKind::Spice) {
             // No SSH, try TCP probe for direct desktop ports
@@ -4653,14 +4671,16 @@ impl CommanderService {
                 let k = RemoteDesktopKind::from_scheme(spec.session.protocol).unwrap_or(kind);
                 let p = if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port };
                 let t = format!("{}:{}", spec.session.host, p);
-                let opts = DesktopOptions::from_raw_fields(&spec.raw_fields);
+                let mut opts = DesktopOptions::from_raw_fields(&spec.raw_fields);
+                if kind == RemoteDesktopKind::X2Go { opts.use_detected_x2go_desktop(detected_desktop); }
                 let tun = spec.session.tunnel.as_ref().map(|t| t.enabled && !t.host.trim().is_empty()).unwrap_or(false);
                 let c = RemoteDesktopConnectConfig{ scheme: spec.session.protocol, kind: k, host: spec.session.host.clone(), port: p, username: if spec.session.username.is_empty() { None } else { Some(spec.session.username.clone()) }, password: spec.session.password.clone().map(zeroize::Zeroizing::new), domain: opts.domain.clone(), desktop_opts: opts, tls: linscp_proto::tls::TlsSettings::default(), proxy: None, timeout: std::time::Duration::from_secs(15) };
                 (c, t, tun)
             } else { return ApiReply{ status:400, payload: json!({"success": false, "error": "Tab has no session spec"})}; }
         } else {
             if target_host.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Desktop target host is required. Provide tab with desktop session or host/kind."})}; }
-            let opts = DesktopOptions::default();
+            let mut opts = DesktopOptions::default();
+            if kind == RemoteDesktopKind::X2Go { opts.use_detected_x2go_desktop(detected_desktop); }
             let c = RemoteDesktopConnectConfig{ scheme: spec_protocol, kind, host: spec_host.clone(), port: spec_port, username: None, password: None, domain: None, desktop_opts: opts, tls: linscp_proto::tls::TlsSettings::default(), proxy: None, timeout: std::time::Duration::from_secs(15) };
             let t = format!("{}:{}", spec_host, spec_port);
             (c, t, false)
@@ -5744,6 +5764,53 @@ mod tests {
     use super::*;
     use linscp_platform::PlatformError;
     use linscp_types::{FileEntry, LocalRootEntry, ProtocolScheme};
+
+    #[test]
+    fn sudo_credentials_require_saved_opt_in_and_matching_identity() {
+        let mut site = StoredSite::new("example", ProtocolScheme::Sftp, "host.example");
+        site.username = "alice".into();
+        site.password = Some("secret".into());
+        site.extra_fields.insert("sudo_password_auto".into(), "1".into());
+        let spec = linscp_engine::url_and_raw::site_spec_from_stored(&site).unwrap();
+        let mut store = SessionStore::new();
+        store.upsert(site.clone());
+        let mut tab = TabRuntime {
+            id: 1, name: "example".into(), site_name: Some("example".into()),
+            is_local: false, connected: true, local_dir: String::new(), remote_dir: "/".into(),
+            other_local_dir: String::new(), observed_hostkey: String::new(),
+            hostkey_role: String::new(), hostkey_changed: false, error: String::new(),
+            spec: Some(spec), session_json: json!({}), remote: None,
+        };
+        assert_eq!(saved_sudo_credentials(&tab, &store), Some(("alice".into(), "secret".into())));
+        tab.spec.as_mut().unwrap().session.host = "other.example".into();
+        assert!(saved_sudo_credentials(&tab, &store).is_none());
+        tab.spec.as_mut().unwrap().session.host = "host.example".into();
+        tab.spec.as_mut().unwrap().session.password = Some("other".into());
+        assert!(saved_sudo_credentials(&tab, &store).is_none());
+        tab.spec.as_mut().unwrap().session.password = Some("secret".into());
+        tab.spec.as_mut().unwrap().raw_fields.insert("sudo_password_auto".into(), "0".into());
+        assert!(saved_sudo_credentials(&tab, &store).is_none());
+        tab.spec.as_mut().unwrap().raw_fields.insert("sudo_password_auto".into(), "1".into());
+        site.extra_fields.remove("sudo_password_auto");
+        store.upsert(site);
+        assert!(saved_sudo_credentials(&tab, &store).is_none());
+    }
+
+    #[tokio::test]
+    async fn x2go_does_not_assume_ssh_port_means_server_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        for path in ["/api/desktop/check", "/api/desktop/launch"] {
+            let result = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: path.into(),
+                body: json!({"kind": "x2go", "host": "server.example", "port": 22}) }).await;
+            assert_eq!(result.status, 400, "{}", result.payload);
+            assert_eq!(result.payload["success"], false);
+        }
+        let install = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/desktop/install".into(),
+            body: json!({"kind": "x2go"}) }).await;
+        assert_eq!(install.status, 400);
+        assert!(install.payload["error"].as_str().unwrap_or("").contains("interactive terminal"));
+    }
 
     fn unlock_for_test(service: &CommanderService) {
         let reply = service.dispatch(ApiEnvelope {

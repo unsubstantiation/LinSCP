@@ -21,8 +21,62 @@ use linscp_proto::ssh::{PtyShellEvent, PtyShellHandle, SshConnection};
 use linscp_terminal::{Size, TerminalScreen};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
+use zeroize::Zeroizing;
 
 pub const DEFAULT_TERMINAL_BUFFER_LIMIT: usize = 256 * 1024;
+
+// Terminal output is untrusted. This is deliberately opt-in: even this exact
+// sudo prompt can be forged by any program running on the remote host.
+struct SudoPasswordResponder {
+    password: Zeroizing<String>,
+    prompt: Vec<u8>,
+    output_tail: Vec<u8>,
+    armed: bool,
+}
+
+impl SudoPasswordResponder {
+    fn new(username: &str, password: String) -> Option<Self> {
+        let password = Zeroizing::new(password);
+        if username.is_empty() || username.chars().any(char::is_control)
+            || password.is_empty() || password.chars().any(char::is_control) {
+            return None;
+        }
+        Some(Self {
+            password,
+            prompt: format!("[sudo] password for {username}:").into_bytes(),
+            output_tail: Vec::new(),
+            armed: false,
+        })
+    }
+
+    // Arm only on a user-submitted line. Never retry on a rejected password
+    // until the user submits another line; startup output is never answered.
+    fn input(&mut self, data: &[u8]) {
+        if data.iter().any(|b| *b == b'\r' || *b == b'\n') {
+            self.armed = true;
+            self.output_tail.clear();
+        }
+        if data.contains(&3) { self.armed = false; self.output_tail.clear(); }
+    }
+
+    fn output(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+        if !self.armed { return None; }
+        self.output_tail.extend_from_slice(data);
+        if self.output_tail.len() > self.prompt.len() + 8 {
+            let excess = self.output_tail.len() - (self.prompt.len() + 8);
+            self.output_tail.drain(..excess);
+        }
+        let tail = self.output_tail.strip_suffix(b" ").unwrap_or(&self.output_tail);
+        if tail.ends_with(&self.prompt) {
+            self.armed = false;
+            self.output_tail.clear();
+            let mut response = self.password.as_bytes().to_vec();
+            response.push(b'\n');
+            return Some(response);
+        }
+        None
+    }
+}
 
 struct TerminalRingState {
     buffer: Vec<u8>,
@@ -43,6 +97,7 @@ pub struct EmbeddedTerminal {
     pub tab_id: u64,
     buffer_limit: usize,
     handle: PtyShellHandle,
+    sudo: Option<Arc<Mutex<SudoPasswordResponder>>>,
     ring: Arc<Mutex<TerminalRingState>>,
     /// The parsed screen, shared so a window can paint without owning the
     /// shell. `None` only if the terminal was built with a size no screen can
@@ -58,6 +113,7 @@ impl EmbeddedTerminal {
         cols: u32,
         rows: u32,
         initial_dir: Option<&str>,
+        sudo_credentials: Option<(String, String)>,
         event_tx: broadcast::Sender<Value>,
     ) -> Result<Self, String> {
         let init_cols = if (1..=1000).contains(&cols) { cols } else { 100 };
@@ -88,6 +144,9 @@ impl EmbeddedTerminal {
             rows: init_rows,
         }));
 
+        let sudo = sudo_credentials.and_then(|(user, password)| SudoPasswordResponder::new(&user, password))
+            .map(|responder| Arc::new(Mutex::new(responder)));
+        let sudo_bg = sudo.clone();
         let ring_bg = Arc::clone(&ring);
         let screen_bg = Arc::clone(&screen);
         // The replies a screen owes its program go back down the same channel
@@ -102,6 +161,13 @@ impl EmbeddedTerminal {
                     PtyShellEvent::Data(bytes) => {
                         if bytes.is_empty() {
                             continue;
+                        }
+                        if let Some(responder) = &sudo_bg {
+                            if let Ok(mut responder) = responder.lock() {
+                                if let Some(response) = responder.output(&bytes) {
+                                    let _ = handle_bg.write_bytes(response);
+                                }
+                            }
                         }
                         // Parse before storing: the screen is the authority on
                         // what the terminal shows, and a program waiting for a
@@ -180,6 +246,7 @@ impl EmbeddedTerminal {
             tab_id,
             buffer_limit,
             handle,
+            sudo,
             ring,
             screen,
         })
@@ -223,6 +290,9 @@ impl EmbeddedTerminal {
     pub fn write(&self, data: &[u8]) -> bool {
         if data.is_empty() {
             return self.is_alive();
+        }
+        if let Some(responder) = &self.sudo {
+            if let Ok(mut responder) = responder.lock() { responder.input(data); }
         }
         self.handle.write_bytes(data.to_vec()).is_ok()
     }
@@ -333,5 +403,45 @@ impl TerminalRegistry {
         for id in ids {
             self.close(&id);
         }
+    }
+}
+
+#[cfg(test)]
+mod sudo_password_tests {
+    use super::SudoPasswordResponder;
+
+    #[test]
+    fn recognizes_split_prompt_only_after_input_and_once_per_submission() {
+        let mut r = SudoPasswordResponder::new("alice", "secret".into()).unwrap();
+        assert!(r.output(b"[sudo] password for alice: ").is_none());
+        r.input(b"sudo apt update\r");
+        assert!(r.output(b"[sudo] pass").is_none());
+        assert_eq!(r.output(b"word for alice: "), Some(b"secret\n".to_vec()));
+        assert!(r.output(b"[sudo] password for alice: ").is_none());
+        r.input(b"sudo whoami\r");
+        assert!(r.output(b"[sudo] password for bob: ").is_none());
+        assert_eq!(r.output(b"[sudo] password for alice:"), Some(b"secret\n".to_vec()));
+    }
+
+    #[test]
+    fn recognizes_prompt_split_at_every_byte_boundary() {
+        let prompt = b"[sudo] password for alice: ";
+        for split in 0..prompt.len() {
+            let mut r = SudoPasswordResponder::new("alice", "secret".into()).unwrap();
+            r.input(b"sudo true\r");
+            let first = r.output(&prompt[..split]);
+            let second = r.output(&prompt[split..]);
+            assert_eq!(first.or(second), Some(b"secret\n".to_vec()), "split {split}");
+        }
+    }
+
+    #[test]
+    fn refuses_control_characters_and_cancels_on_control_c() {
+        assert!(SudoPasswordResponder::new("alice", "bad\npassword".into()).is_none());
+        assert!(SudoPasswordResponder::new("a\rb", "password".into()).is_none());
+        let mut r = SudoPasswordResponder::new("alice", "password".into()).unwrap();
+        r.input(b"sudo cmd\r");
+        r.input(&[3]);
+        assert!(r.output(b"[sudo] password for alice: ").is_none());
     }
 }

@@ -185,6 +185,7 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
     obj.insert("username".into(), json!(site.username));
     obj.insert("user".into(), json!(site.username));
     obj.insert("has_password".into(), json!(has_password));
+    obj.insert("sudo_password_auto".into(), json!(site.extra_fields.get("sudo_password_auto").is_some_and(|v| v == "1")));
     obj.insert("has_key_passphrase".into(), json!(has_key_passphrase));
     obj.insert(
         "keyfile".into(),
@@ -597,6 +598,7 @@ pub fn parse_gui_session_spec(
 
     // Extra protocol fields (`s3_*`, `ftp_*`, `tls_*`, `proxy_*`, Kerberos)
     let extra_keys = [
+        "sudo_password_auto",
         "s3_access_key",
         "s3_secret_key",
         "s3_session_token",
@@ -865,6 +867,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn gui_sudo_opt_in_round_trips_without_exposing_password() {
+        let dir = test_config_dir("sudo-option");
+        let vault = linscp_platform::NativeSecretVault::new();
+        let session = json!({"protocol": "sftp", "host": "host.example", "username": "alice",
+            "password": "secret", "sudo_password_auto": true});
+        let (spec, clean) = parse_gui_session_spec(&session, None, &dir, &vault).unwrap();
+        assert_eq!(spec.raw_fields.get("sudo_password_auto").map(String::as_str), Some("1"));
+        assert!(clean.get("password").is_none());
+        let mut site = build_stored_site_for_save("example", &spec);
+        // Exercise the INI codec without writing an unencrypted password.
+        site.password = None;
+        let mut store = SessionStore::new();
+        store.upsert(site);
+        let ini = store.serialize_ini(None).unwrap();
+        let restored = SessionStore::parse_ini(&ini, None).unwrap();
+        let view = stored_site_to_gui_json(restored.find("example").unwrap());
+        assert_eq!(view["sudo_password_auto"], json!(true));
+        assert!(view.get("password").is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

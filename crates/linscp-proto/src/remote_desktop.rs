@@ -101,6 +101,15 @@ pub struct DesktopOptions {
 }
 
 impl DesktopOptions {
+    /// Prefer an explicitly configured session; otherwise use a recognized
+    /// remote desktop, never an arbitrary command supplied by the server.
+    pub fn use_detected_x2go_desktop(&mut self, detected: Option<&str>) {
+        if self.x2go_session_type.is_none() && self.x2go_command.is_none() {
+            self.x2go_session_type = detected.filter(|name| matches!(*name, "XFCE" | "MATE" | "LXDE"))
+                .map(str::to_string);
+        }
+    }
+
     pub fn from_raw_fields(raw: &BTreeMap<String, String>) -> Self {
         let mut opts = Self::default();
         for (k, v) in raw {
@@ -228,21 +237,28 @@ impl RemoteDesktopSession {
         tunnel_ssh_cfg: Option<&SshConnectConfig>,
         tunnel_local_port: u16,
     ) -> Result<Self, ProtoError> {
+        Self::connect_with_ssh_config(cfg, None, tunnel_ssh_cfg, tunnel_local_port).await
+    }
+
+    /// Use the caller's SSH policy, credentials and host-key verification for
+    /// SSH-transported desktops, just as for file-transfer sessions.
+    pub async fn connect_with_ssh_config(
+        cfg: RemoteDesktopConnectConfig,
+        destination_ssh_cfg: Option<&SshConnectConfig>,
+        tunnel_ssh_cfg: Option<&SshConnectConfig>,
+        tunnel_local_port: u16,
+    ) -> Result<Self, ProtoError> {
         // X2Go / X11: SSH-transported, so establish an SSH connection first.
         if cfg.kind == RemoteDesktopKind::X2Go || cfg.kind == RemoteDesktopKind::X11 {
-            let ssh_cfg = SshConnectConfig {
+            let ssh_cfg = destination_ssh_cfg.cloned().unwrap_or_else(|| SshConnectConfig {
                 tab_id: 1,
                 role: "destination".to_string(),
                 host: cfg.host.clone(),
-                port: if cfg.scheme == ProtocolScheme::X2Go || cfg.scheme == ProtocolScheme::X11 {
-                    22
-                } else {
-                    cfg.port
-                },
+                port: cfg.port,
                 username: cfg.username.clone().unwrap_or_else(|| "user".to_string()),
                 password: cfg.password.clone(),
                 ..Default::default()
-            };
+            });
             // When a jump is configured, open the downstream SSH over the jump's direct-tcpip.
             let (conn, jump) = if let Some(tun_cfg) = tunnel_ssh_cfg {
                 let jump = SshJumpTunnel::connect(tun_cfg.clone())
@@ -648,7 +664,7 @@ pub fn probe_command_for_kind(kind: RemoteDesktopKind) -> &'static str {
         RemoteDesktopKind::Rdp => "command -v xrdp >/dev/null 2>&1",
         RemoteDesktopKind::Vnc => "command -v x11vnc >/dev/null 2>&1 || command -v Xtigervnc >/dev/null 2>&1 || command -v vncserver >/dev/null 2>&1 || command -v tigervncserver >/dev/null 2>&1 || command -v x0vncserver >/dev/null 2>&1",
         RemoteDesktopKind::Spice => "command -v spice-vdagentd >/dev/null 2>&1 || command -v spice-vdagent >/dev/null 2>&1 || test -x /usr/libexec/spice-vdagentd 2>/dev/null || test -x /usr/sbin/spice-vdagentd 2>/dev/null",
-        RemoteDesktopKind::X2Go => "command -v x2godbadmin >/dev/null 2>&1 || command -v x2goserver >/dev/null 2>&1 || dpkg -l 2>/dev/null | grep -q x2goserver || rpm -q x2goserver >/dev/null 2>&1",
+        RemoteDesktopKind::X2Go => "command -v x2gostartagent >/dev/null 2>&1 || test -x /usr/bin/x2gostartagent",
         RemoteDesktopKind::X11 => "command -v xauth >/dev/null 2>&1",
     }
 }
@@ -725,24 +741,23 @@ echo "[linscp] spice-vdagent installed."
 "#.to_string(),
         RemoteDesktopKind::X2Go => r#"#!/bin/bash
 set -e
+# Run in an interactive terminal so sudo can ask the user when needed.
 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo" || true
-echo "[linscp] Checking X2Go server..."
-if command -v x2godbadmin >/dev/null 2>&1 || dpkg -l 2>/dev/null | grep -q x2goserver || rpm -q x2goserver >/dev/null 2>&1; then echo "[linscp] x2goserver already installed"; exit 0; fi
 if [ -f /etc/os-release ]; then . /etc/os-release; OS=$ID; else OS=unknown; fi
 case "$OS" in
-  ubuntu|debian|linuxmint|pop)
+  debian|ubuntu|linuxmint|pop)
     $SUDO apt-get update -qq
-    $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common 2>/dev/null || true
-    $SUDO add-apt-repository -y ppa:x2go/stable 2>/dev/null || true
-    $SUDO apt-get update -qq
-    $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y x2goserver x2goserver-xsession ;;
+    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y x2goserver x2goserver-xsession ;;
   fedora) $SUDO dnf install -y x2goserver x2goserver-xsession ;;
-  rhel|centos|almalinux|rocky) $SUDO dnf install -y epel-release 2>/dev/null || true; $SUDO dnf install -y x2goserver x2goserver-xsession 2>/dev/null || $SUDO yum install -y x2goserver x2goserver-xsession ;;
+  rhel|centos|almalinux|rocky) $SUDO dnf install -y x2goserver x2goserver-xsession || $SUDO yum install -y x2goserver x2goserver-xsession ;;
   arch|manjaro) $SUDO pacman -Sy --noconfirm x2goserver ;;
   opensuse*|sles) $SUDO zypper --non-interactive install x2goserver x2goserver-xsession ;;
-  *) if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update -qq && $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y x2goserver; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y x2goserver; elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y x2goserver; elif command -v pacman >/dev/null 2>&1; then $SUDO pacman -Sy --noconfirm x2goserver; elif command -v zypper >/dev/null 2>&1; then $SUDO zypper --non-interactive install x2goserver; else echo "no package manager"; exit 1; fi ;;
+  *) echo "[linscp] Unsupported distribution; install x2goserver, x2goserver-xsession and an X2Go-compatible desktop manually." >&2; exit 1 ;;
 esac
-echo "[linscp] x2goserver installed. Ensure SSH is running and a desktop environment is present (e.g. apt install xfce4)."
+if ! command -v x2gostartagent >/dev/null 2>&1 && ! test -x /usr/bin/x2gostartagent; then
+  echo "[linscp] X2Go was installed but x2gostartagent is not available." >&2; exit 1
+fi
+echo "[linscp] X2Go server installation completed."
 "#.to_string(),
         RemoteDesktopKind::X11 => r#"#!/bin/bash
 set -e
@@ -778,6 +793,42 @@ pub async fn check_tcp_availability(host: &str, port: u16) -> bool {
     }
 }
 
+/// A conservative check for desktop sessions known to work with X2Go. This
+/// only detects common executables; an unrecognized desktop may still exist.
+pub const X2GO_DESKTOP_PROBE: &str = "if command -v startxfce4 >/dev/null 2>&1; then echo XFCE; elif command -v mate-session >/dev/null 2>&1; then echo MATE; elif command -v startlxde >/dev/null 2>&1; then echo LXDE; else echo NONE; fi";
+
+pub async fn detect_x2go_desktop(session: &dyn crate::RemoteSession) -> Result<Option<&'static str>, ProtoError> {
+    let output = session.exec_command(X2GO_DESKTOP_PROBE).await?;
+    if output.exit_code != Some(0) {
+        return Err(ProtoError::Transport("Could not check the remote desktop environment.".to_string()));
+    }
+    match std::str::from_utf8(&output.stdout).ok().map(str::trim) {
+        Some("XFCE") => Ok(Some("XFCE")),
+        Some("MATE") => Ok(Some("MATE")),
+        Some("LXDE") => Ok(Some("LXDE")),
+        Some("NONE") => Ok(None),
+        _ => Err(ProtoError::Transport("The remote desktop check returned an unexpected result.".to_string())),
+    }
+}
+
+/// Separate, explicitly approved XFCE setup; never included in the server installer.
+pub fn x2go_xfce_install_script() -> &'static str {
+    r#"#!/bin/bash
+set -e
+SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo" || true
+if [ -f /etc/os-release ]; then . /etc/os-release; OS=$ID; else OS=unknown; fi
+case "$OS" in
+  debian|ubuntu|linuxmint|pop) $SUDO apt-get update -qq; $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 ;;
+  fedora|rhel|centos|almalinux|rocky) $SUDO dnf group install -y xfce-desktop-environment ;;
+  arch|manjaro) $SUDO pacman -Sy --noconfirm xfce4 ;;
+  opensuse*|sles) $SUDO zypper --non-interactive install -t pattern xfce ;;
+  *) echo "[linscp] Unsupported distribution; install XFCE manually." >&2; exit 1 ;;
+esac
+if ! command -v startxfce4 >/dev/null 2>&1; then echo "[linscp] XFCE could not be verified." >&2; exit 1; fi
+echo "[linscp] XFCE installation completed."
+"#
+}
+
 /// Check availability via an existing SSH session (preferred when the user
 /// is already SSH-connected to the same host). Returns true if the server package
 /// for `kind` appears to be installed.
@@ -787,7 +838,11 @@ pub async fn check_via_ssh(
 ) -> Result<bool, crate::ProtoError> {
     let cmd = probe_command_for_kind(kind);
     match session.exec_command(cmd).await {
-        Ok(out) => Ok(out.exit_code == Some(0)),
+        Ok(out) => match out.exit_code {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            code => Err(crate::ProtoError::Transport(format!("Desktop probe failed (exit status {code:?}): {}", String::from_utf8_lossy(&out.stderr)))),
+        },
         Err(e) => Err(e),
     }
 }
@@ -826,6 +881,13 @@ impl RemoteSession for RemoteDesktopSession {
         Ok(())
     }
     fn observed_host_key(&self) -> Option<&str> { self.observed_host_key.as_deref() }
+    fn ssh_connection(&self) -> Option<&Arc<SshConnection>> { self.ssh_for_x2go.as_ref() }
+    async fn exec_command(&self, command: &str) -> Result<crate::ssh::ExecOutput, ProtoError> {
+        match self.ssh_for_x2go.as_ref() {
+            Some(ssh) => ssh.exec_command(command).await,
+            None => Err(ProtoError::UnsupportedCapability("exec_command", self.scheme)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -873,6 +935,39 @@ mod tests {
         let ticket = sess.launch_ticket();
         assert!(ticket.argv.iter().any(|a| a.contains("3389")));
         assert_eq!(ticket.kind, "rdp");
+    }
+
+    #[test]
+    fn detected_x2go_desktop_does_not_override_explicit_selection() {
+        let mut opts = DesktopOptions::default();
+        opts.use_detected_x2go_desktop(Some("MATE"));
+        assert_eq!(opts.x2go_session_type.as_deref(), Some("MATE"));
+        let mut configured = DesktopOptions::default();
+        configured.x2go_session_type = Some("LXDE".into());
+        configured.use_detected_x2go_desktop(Some("MATE"));
+        assert_eq!(configured.x2go_session_type.as_deref(), Some("LXDE"));
+        let mut custom = DesktopOptions::default();
+        custom.x2go_command = Some("my-session".into());
+        custom.use_detected_x2go_desktop(Some("MATE"));
+        assert!(custom.x2go_session_type.is_none());
+        let mut invalid = DesktopOptions::default();
+        invalid.use_detected_x2go_desktop(Some("unrecognized"));
+        assert!(invalid.x2go_session_type.is_none());
+    }
+
+    #[test]
+    fn x2go_probe_and_debian_setup_are_explicit_and_do_not_add_repositories() {
+        let probe = probe_command_for_kind(RemoteDesktopKind::X2Go);
+        assert!(probe.contains("x2gostartagent"));
+        assert!(!probe.contains("dpkg -l"));
+        let script = install_script_for_kind(RemoteDesktopKind::X2Go);
+        assert!(script.contains("x2goserver x2goserver-xsession"));
+        assert!(!script.contains("install -y x2goserver x2goserver-xsession xfce4"));
+        assert!(x2go_xfce_install_script().contains("install -y xfce4"));
+        assert!(script.contains("DEBIAN_FRONTEND=noninteractive"));
+        assert!(!script.contains("add-apt-repository"));
+        assert!(!script.contains("ppa:"));
+        assert!(script.contains("sudo"));
     }
 
     /// A1's neighbour: the viewer named in the ticket and the argument vector built
