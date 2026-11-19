@@ -12,7 +12,7 @@ on:
 
 defaults:
   run:
-    shell: bash -euo pipefail {0}
+    shell: bash
 
 jobs:
   build:
@@ -29,6 +29,7 @@ jobs:
 
       - name: Install the Rust toolchain and packaging dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update -qq
           # The workspace needs Rust 1.89+, newer than the rustc the runner
           # image ships, so the real toolchain comes from rustup. The apt
@@ -40,7 +41,7 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
             xvfb xdotool xauth openbox x11-utils \
             python3-paramiko python3-pyftpdlib python3-openssl
-          curl --proto '=https' --tlsv1.2 -sSf https://rustup.rs | sh -s -- -y --profile minimal
+          curl --proto '=https' --tlsv1.2 -sSf https://rustup.rs | bash -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - uses: Swatinem/rust-cache@v2
@@ -79,6 +80,7 @@ jobs:
       # of repo state, so one job running them is enough.
       - name: Check the parity ledger and its repo-state suites
         run: |
+          set -euo pipefail
           python3 tools/check_upstream_parity.py
           python3 -m unittest discover -s tools/tests -p test_build_version.py
           python3 -m unittest discover -s tools/tests -p test_parity_inventory.py
