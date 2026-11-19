@@ -3,9 +3,6 @@ name: Debian build
 on:
   push:
     branches: [master]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
   pull_request:
   workflow_dispatch:
 
