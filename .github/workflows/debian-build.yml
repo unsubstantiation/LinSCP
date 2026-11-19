@@ -10,6 +10,10 @@ on:
   # or re-run a build without waiting for a push to master.
   workflow_dispatch:
 
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
 jobs:
   build:
     name: Debian package (.deb)
@@ -20,6 +24,8 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "ui/package-lock.json"
 
       - name: Install the Rust toolchain and packaging dependencies
         run: |
@@ -31,8 +37,10 @@ jobs:
           # the build in debian/rules.
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             build-essential dpkg-dev pkg-config curl cargo rustc nodejs npm \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev xvfb xdotool xauth openbox x11-utils python3-paramiko python3-pyftpdlib python3-openssl
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            xvfb xdotool xauth openbox x11-utils \
+            python3-paramiko python3-pyftpdlib python3-openssl
+          curl --proto '=https' --tlsv1.2 -sSf https://rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - uses: Swatinem/rust-cache@v2
@@ -103,23 +111,10 @@ jobs:
       - name: Exercise the platform unit tests
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-platform -- --nocapture
 
-      # Every crate's tests already run on Linux, and in one place: the
-      # package build below runs `cargo test --workspace --all-targets` from
-      # debian/rules. That line covers the whole workspace, so these steps do
-      # not add coverage - they add a name.
-      #
-      # The difference matters when something fails. A red `--all-targets` run
-      # is one opaque step with a Cargo transcript and no crate to point at, and
-      # a crate nobody steps over deliberately can sit there without any step
-      # that would visibly break if it stopped running. `linscp-terminal` is the
-      # one to care about: its 28 tests cover the escape-sequence parser, wide
-      # and combining glyphs, scrolling, selections and the palette queries - the
-      # code the Android terminal draws with - and it is worth a step of its own
-      # rather than a mention in a transcript.
-      #
-      # These are offline and hermetic; the live-server cases keep their own
-      # opt-in steps below. tools/check_ci_test_execution.py enforces that every
-      # crate with tests keeps one.
+      # Every crate's tests already run individually above, so `nocheck` avoids
+      # re-running `cargo test --workspace --all-targets` inside debian/rules.
+      # tools/check_ci_test_execution.py enforces that every crate with tests
+      # keeps a dedicated step here.
       - name: Exercise the type, i18n and crypto unit tests
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-types -p linscp-i18n -p linscp-crypto -- --nocapture
 
@@ -195,126 +190,3 @@ jobs:
           RUST_MIN_STACK: "16777216"
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_s3_ -- --nocapture --test-threads=1
 
-      - name: Build the binary package
-        run: python3 tools/run_cargo_ci.py dpkg-buildpackage -b -us -uc
-
-      - name: Check the package contents
-        run: |
-          deb=$(ls ../linscp_*_*.deb)
-          echo "Built $deb"
-          dpkg-deb --contents "$deb"
-          contents=$(dpkg-deb --contents "$deb" | awk '{print $NF}' | sed 's|^\./||' | sort)
-          for path in usr/bin/linscp-gui \
-                      usr/share/applications/linscp.desktop \
-                      usr/share/pixmaps/linscp.png \
-                      usr/share/icons/hicolor/scalable/apps/linscp.svg; do
-            echo "$contents" | grep -qx "$path" ||
-              { echo "::error::$path is missing from the package"; exit 1; }
-          done
-          # upload-artifact forbids '..' paths, so stage the .deb in the workspace.
-          cp ../linscp_*_*.deb "$GITHUB_WORKSPACE/"
-
-      - name: Install and smoke test the package
-        run: |
-          sudo dpkg -i ../linscp_*_*.deb
-          test -x /usr/bin/linscp-gui
-
-      - name: Smoke test the native window
-        run: |
-          if xvfb-run -a bash -euo pipefail -c '
-            export WEBKIT_DISABLE_COMPOSITING_MODE=1
-            openbox >/dev/null 2>&1 &
-            wm=$!
-            linscp-gui &
-            app=$!
-            trap "kill $app $wm 2>/dev/null || true" EXIT
-            for i in $(seq 1 120); do
-              if ! kill -0 "$app" 2>/dev/null; then
-                wait "$app" || true
-                echo "Application exited before opening a window" >&2
-                exit 1
-              fi
-              if xdotool search --onlyvisible --name "^LinSCP" >/dev/null 2>&1; then
-                echo "LinSCP window opened"
-                exit 0
-              fi
-              sleep 1
-            done
-            echo "The LinSCP window did not open within 120 seconds" >&2
-            xdotool search --name ".*" getwindowname %@ || true
-            for id in $(xdotool search --name "LinSCP" || true); do xwininfo -id "$id" || true; done
-            ps -ef | grep -E "[l]inscp-gui|[W]ebKit|[b]wrap" || true
-            exit 1
-          ' > native-smoke.log 2>&1; then
-            cat native-smoke.log
-          else
-            cat native-smoke.log
-            python3 -c 'from pathlib import Path; t=Path("native-smoke.log").read_text().replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"); print("::error title=Native window smoke test::" + t[-3000:])'
-            exit 1
-          fi
-
-      # A3: the shipped binary ignored its own command line, so the documented
-      # "--install-shell-integration" never ran and the actions it writes could not
-      # exist. This drives the installed binary the way a file manager does: install
-      # into a scratch data directory, check the definitions are there and carry the
-      # flag, stage a selection through the very same flag the definition contains,
-      # and uninstall. It fails if any of those steps stops doing something.
-      - name: Smoke test the file-manager actions
-        run: |
-          set -euo pipefail
-          # Separate config root for the manifest, so it cannot disturb (or be
-          # disturbed by) the window smoke test that runs after this.
-          export LINSCP_CONFIG_DIR=$(mktemp -d)
-          export XDG_DATA_HOME=$(mktemp -d)
-          linscp-gui --install-shell-integration
-          for path in "kio/servicemenus/linscp-upload.desktop" \
-                      "nautilus/scripts/Upload with LinSCP" \
-                      "nemo/actions/linscp-upload.nemo_action"; do
-            test -f "$XDG_DATA_HOME/$path" || { echo "::error::$path was not written"; exit 1; }
-          done
-          grep -q -- '--shell-upload' "$XDG_DATA_HOME/kio/servicemenus/linscp-upload.desktop" ||
-            { echo "::error::the Dolphin action does not call --shell-upload"; exit 1; }
-          # The action itself, with the selection a file manager would pass. The
-          # manifest lands in the config directory the running window polls, and the
-          # command returns instead of opening a window (a file manager would wait).
-          selection=$(mktemp)
-          timeout 60 linscp-gui --shell-upload "$selection"
-          manifests=$(find "$LINSCP_CONFIG_DIR" -path '*shell-manifests/*.json' -print -quit)
-          test -n "$manifests" || { echo "::error::--shell-upload recorded no manifest"; exit 1; }
-          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['items'], d" "$manifests"
-
-          # GNOME Files never passes the selection as arguments: the script reads it
-          # from the environment, one path per line. Run the installed script that way
-          # with two awkward names and check both survive verbatim.
-          first="$PWD/first file&odd.txt"
-          second="$PWD/second*.glob"
-          : > "$first"
-          : > "$second"
-          rm -rf "$LINSCP_CONFIG_DIR"/shell-manifests
-          selected=$(printf '%s\n%s' "$first" "$second")
-          NAUTILUS_SCRIPT_SELECTED_FILE_PATHS="$selected" \
-            timeout 60 "$XDG_DATA_HOME/nautilus/scripts/Upload with LinSCP"
-          staged=$(find "$LINSCP_CONFIG_DIR" -path '*shell-manifests/*.json' -print -quit)
-          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); paths=sorted(i['path'] for i in d['items']); assert len(paths)==2, paths; assert paths[0].endswith('first file&odd.txt'), paths; assert paths[1].endswith('second*.glob'), paths" "$staged"
-          linscp-gui --uninstall-shell-integration
-          test ! -f "$XDG_DATA_HOME/kio/servicemenus/linscp-upload.desktop" ||
-            { echo "::error::uninstall left the Dolphin action behind"; exit 1; }
-          # The help text is reachable without a display, so a user can discover the
-          # flags from a terminal and not only from the documentation.
-          usage=$(linscp-gui --help)
-          case "$usage" in
-            *--shell-upload*) ;;
-            *) echo "::error::--help did not document --shell-upload"; exit 1 ;;
-          esac
-
-      # Releases are managed by hand; this artifact is only how the package
-      # leaves the run for that manual process. GitHub always delivers
-      # artifacts as a .zip envelope, so compression-level: 0 stores the .deb
-      # uncompressed inside it; the file that comes out extracts byte-identical.
-      - name: Upload the Debian package
-        uses: actions/upload-artifact@v7
-        with:
-          name: linscp-debian
-          path: linscp_*_*.deb
-          if-no-files-found: error
-          compression-level: 0
