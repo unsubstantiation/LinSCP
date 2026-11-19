@@ -38,6 +38,30 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      - name: Configure Maven Central mirror to avoid HTTP 429 rate limits
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat << 'EOF' > ~/.gradle/init.d/maven-mirror.gradle
+          allprojects {
+            buildscript {
+              repositories {
+                all { ArtifactRepository repo ->
+                  if (repo instanceof MavenArtifactRepository && repo.url.toString().startsWith("https://apache.org")) {
+                    repo.url = uri("https://googleapis.com")
+                  }
+                }
+              }
+            }
+            repositories {
+              all { ArtifactRepository repo ->
+                if (repo instanceof MavenArtifactRepository && repo.url.toString().startsWith("https://apache.org")) {
+                  repo.url = uri("https://googleapis.com")
+                }
+              }
+            }
+          }
+          EOF
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,x86_64-linux-android
@@ -102,6 +126,30 @@ jobs:
           java-version: "17"
 
       - uses: gradle/actions/setup-gradle@v4
+
+      - name: Configure Maven Central mirror to avoid HTTP 429 rate limits
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat << 'EOF' > ~/.gradle/init.d/maven-mirror.gradle
+          allprojects {
+            buildscript {
+              repositories {
+                all { ArtifactRepository repo ->
+                  if (repo instanceof MavenArtifactRepository && repo.url.toString().startsWith("https://apache.org")) {
+                    repo.url = uri("https://googleapis.com")
+                  }
+                }
+              }
+            }
+            repositories {
+              all { ArtifactRepository repo ->
+                if (repo instanceof MavenArtifactRepository && repo.url.toString().startsWith("https://apache.org")) {
+                  repo.url = uri("https://googleapis.com")
+                }
+              }
+            }
+          }
+          EOF
 
       - uses: dtolnay/rust-toolchain@stable
         with:
