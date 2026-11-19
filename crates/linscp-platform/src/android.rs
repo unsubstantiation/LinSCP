@@ -42,6 +42,11 @@ pub trait SafBridge: Send + Sync {
 pub trait ShareBridge: Send + Sync {
     fn staged_share_paths(&self) -> Result<Vec<PathBuf>, PlatformError>;
     fn stage_uris(&self, uris: &[String]) -> Result<Vec<PathBuf>, PlatformError>;
+    /// Allocate, populate and hand out one private outgoing-share batch.
+    fn prepare_export(&self) -> Result<PathBuf, PlatformError>;
+    fn stage_local_export(&self, batch: &std::path::Path, directory: &str, names: &[String]) -> Result<(), PlatformError>;
+    fn open_export(&self, batch: &std::path::Path, names: &[String]) -> Result<(), PlatformError>;
+    fn discard_export(&self, batch: &std::path::Path) -> Result<(), PlatformError>;
 }
 
 /// Opens a safe external URI through Android's package resolver. This is used

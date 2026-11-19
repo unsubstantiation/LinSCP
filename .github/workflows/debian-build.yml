@@ -47,6 +47,9 @@ jobs:
       - name: Check that every workflow can be started by hand
         run: python3 -m unittest discover -s tools/tests -p test_workflow_triggers.py
 
+      - name: Test X2Go installer and desktop detection
+        run: python3 -m unittest discover -s tools/tests -p test_x2go_installer.py
+
       # The same page is served by two hosts. The frontend suite builds
       # `ui/dist` and drives it in jsdom, the translation compiler rejects an
       # uncatalogued message, and the shared-frontend check keeps a page

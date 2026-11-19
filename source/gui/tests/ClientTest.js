@@ -458,6 +458,37 @@ function options(id) {
   // Boot fetched what it needs.
   const doc = window.document;
   const paths = calls.map(call => call.path);
+  // Boot the real bundled page as a second native terminal window. Metadata
+  // can transiently report the main window; the injected terminal label must
+  // still win, and the canvas cannot live under the hidden terminal modal.
+  {
+    const terminalCalls = [];
+    const terminalPage = new JSDOM(html, {
+      url: 'http://localhost:8080/', runScripts: 'dangerously', pretendToBeVisual: true,
+      beforeParse(host) {
+        host.__LINSCP_TERMINAL_LABEL__ = 'terminal-term-separate';
+        host.__TAURI_INTERNALS__ = {
+          metadata: { currentWindow: { label: 'main' } },
+          invoke: async (_command, args) => {
+            terminalCalls.push(args.envelope);
+            return { status: 200, payload: { success: true, alive: true } };
+          }
+        };
+        host.HTMLCanvasElement.prototype.getContext = () => ({
+          font: '', fillStyle: '', textBaseline: '', setTransform() {}, fillRect() {}, fillText() {},
+          measureText: value => ({ width: String(value).length * 9 })
+        });
+      }
+    });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    const child = terminalPage.window.document.getElementById('terminalWindowScreen');
+    check('separate terminal canvas is outside all hidden modals',
+      !!child && child.parentElement === terminalPage.window.document.body && !child.closest('.modal-overlay'));
+    check('the injected terminal label survives unrelated window metadata',
+      terminalCalls.some(call => call && call.path === '/api/terminal/input' && call.body.terminal === 'term-separate'),
+      JSON.stringify(terminalCalls));
+    terminalPage.window.close();
+  }
   check('boot queried the status', paths.includes('/api/status'));
   check('vault password fields require six characters',
     doc.getElementById('vaultPassword').minLength === 6 &&
@@ -490,6 +521,124 @@ function options(id) {
   check('failed task offers Retry',
     doc.getElementById('queueList').innerHTML.indexOf('Retry') >= 0);
   check('sizes are formatted', text('localFileList').indexOf('1.0 MB') >= 0, text('localFileList'));
+
+  // Android share captures the selected pane and tab before awaiting native
+  // staging. No chooser is opened without confirmation or for directories.
+  {
+    const core = window.LinSCPCore;
+    const shares = [];
+    let failShare = false;
+    window.LinSCPCore = new Proxy(core, { get(target, key) {
+      if (key === 'hostCapabilities') return () => ({ ...target.hostCapabilities({ host: window }), platform: 'android', nativeIpc: true });
+      if (key === 'shareFiles') return async source => { shares.push(source); if (failShare) throw new Error('provider refused'); };
+      return Reflect.get(target, key);
+    }});
+    window.focusPane('local');
+    window.clearFocusedSelection();
+    doc.getElementById('localFileList').children[0].click();
+    await window.shareSelectedFiles();
+    check('Android share sends the selected local file and directory', shares.length === 1 && shares[0].side === 'local' && shares[0].directory === '/tmp/slowlocal' && shares[0].names[0] === 'a.txt');
+    confirmResult = false;
+    await window.shareSelectedFiles();
+    confirmResult = true;
+    check('Android share asks for consent before staging', shares.length === 1);
+    window.focusPane('remote');
+    window.clearFocusedSelection();
+    doc.getElementById('remoteFileList').children[0].click();
+    await window.shareSelectedFiles();
+    check('Android share keeps the selected remote tab and directory', shares.length === 2 && shares[1].side === 'remote' && shares[1].tab === 1 && shares[1].directory === '/tmp/slowremote' && shares[1].names[0] === 'keep.txt');
+    failShare = true;
+    await window.shareSelectedFiles();
+    check('Android share reports provider errors', shares.length === 3 && text('toast').includes('provider refused'));
+    failShare = false;
+    window.clearFocusedSelection();
+    doc.getElementById('remoteFileList').children[1].click();
+    await window.shareSelectedFiles();
+    check('Android share rejects directories before invoking the host', shares.length === 3);
+    window.clearFocusedSelection();
+    window.LinSCPCore = core;
+  }
+
+  // A desktop terminal must use the native invoker object's method, not call
+  // the object as a function and silently fall back to the modal.
+  {
+    const internals = window.__TAURI_INTERNALS__;
+    const originalInvoke = internals.invoke;
+    const priorTerminal = responses['/api/session/terminal'];
+    const windows = [];
+    responses['/api/session/terminal'] = { success: true, terminal: 'term-77', cols: 100, rows: 30 };
+    internals.invoke = async (command, args) => {
+      if (command === 'linscp_open_terminal_window') {
+        windows.push(args);
+        return { label: 'terminal-term-77' };
+      }
+      return originalInvoke(command, args);
+    };
+    const opened = await window.openTerminal();
+    check('desktop terminal opens a separate native window', opened && windows.length === 1 &&
+      windows[0].terminal === 'term-77' && windows[0].cols === 100 && windows[0].rows === 30 &&
+      !doc.getElementById('terminalModal').classList.contains('open'));
+    internals.invoke = async (command, args) => {
+      if (command === 'linscp_open_terminal_window') throw new Error('window manager refused');
+      return originalInvoke(command, args);
+    };
+    let closedBefore = calls.filter(call => call.path === '/api/terminal/close').length;
+    const inputBefore = calls.filter(call => call.path === '/api/terminal/input').length;
+    const refused = await window.openTerminal(null, false, 'must-not-run');
+    let closes = calls.filter(call => call.path === '/api/terminal/close');
+    check('a refused desktop window reports an error, closes its shell and never opens the modal',
+      refused === false && text('toast').includes('window manager refused') &&
+      text('toast').includes('Cannot open a separate terminal window.') &&
+      !doc.getElementById('terminalModal').classList.contains('open') &&
+      closes.length === closedBefore + 1 && JSON.parse(closes.at(-1).options.body).terminal === 'term-77' &&
+      calls.filter(call => call.path === '/api/terminal/input').length === inputBefore);
+    internals.invoke = async (command, args) => command === 'linscp_open_terminal_window'
+      ? {} : originalInvoke(command, args);
+    closedBefore = closes.length;
+    const missingLabel = await window.openTerminal();
+    closes = calls.filter(call => call.path === '/api/terminal/close');
+    check('a desktop window with no label closes the shell without opening the modal',
+      missingLabel === false && text('toast').includes('no window label') &&
+      !doc.getElementById('terminalModal').classList.contains('open') && closes.length === closedBefore + 1);
+    const priorClose = responses['/api/terminal/close'];
+    responses['/api/terminal/close'] = { success: false, error: 'close refused' };
+    const failedClose = await window.openTerminal();
+    check('a failed terminal cleanup is reported alongside the window failure',
+      failedClose === false && text('toast').includes('Cannot close the terminal session.') &&
+      text('toast').includes('close refused') && !doc.getElementById('terminalModal').classList.contains('open'));
+    responses['/api/terminal/close'] = priorClose;
+    closes = calls.filter(call => call.path === '/api/terminal/close');
+    const core = window.LinSCPCore;
+    for (const platform of ['linux', 'windows', 'macos', 'unknown']) {
+      window.LinSCPCore = new Proxy(core, { get(target, key) {
+        if (key === 'nativeInvoker') return () => null;
+        if (key === 'hostCapabilities') return () => ({ ...target.hostCapabilities({ host: window }), platform });
+        return Reflect.get(target, key);
+      }});
+      closedBefore = closes.length;
+      const noBridge = await window.openTerminal();
+      closes = calls.filter(call => call.path === '/api/terminal/close');
+      check(`a missing ${platform} window bridge closes the shell without opening the modal`,
+        noBridge === false && text('toast').includes('bridge is unavailable') &&
+        !doc.getElementById('terminalModal').classList.contains('open') && closes.length === closedBefore + 1);
+    }
+    window.LinSCPCore = core;
+    window.LinSCPCore = new Proxy(core, { get(target, key) {
+      if (key === 'hostCapabilities') return () => ({ ...target.hostCapabilities({ host: window }), platform: 'android' });
+      return Reflect.get(target, key);
+    }});
+    internals.invoke = async (command, args) => {
+      if (command === 'linscp_open_terminal_window') { windows.push(args); throw new Error('not available on Android'); }
+      return originalInvoke(command, args);
+    };
+    await window.openTerminal();
+    check('Android opens the in-app terminal without requesting a desktop window',
+      windows.length === 1 && doc.getElementById('terminalModal').classList.contains('open'));
+    window.closeTerminal();
+    window.LinSCPCore = core;
+    internals.invoke = originalInvoke;
+    responses['/api/session/terminal'] = priorTerminal;
+  }
 
   // Selecting a file, then opening the editor on the remote side.
   doc.getElementById('remoteFileList').children[0]
@@ -2394,11 +2543,8 @@ function options(id) {
   if (gssapiStubInstalled) window.LinSCPCore.hostDifferenceReason = undefined;
 
   // ---- Shared multi-server monitor --------------------------------------
-  // This harness has no window bridge, so a terminal here is the in-page
-  // one. The desktop half of that path is checked first (no touch row, no
-  // soft keyboard), then the capability answer is stubbed to Android for the
-  // touch half. The renderer itself is covered by the
-  // bundle's own suite (ui/tests/TerminalRenderer.test.mjs).
+  // Exercise both the Android in-page shell and the independent desktop
+  // window. The renderer itself is covered by TerminalRenderer.test.mjs.
   await window.openServerMonitor();
   await new Promise(resolve => setTimeout(resolve, 80));
   check('monitor opens its shared component', doc.getElementById('serverMonitorModal').classList.contains('open') &&
@@ -2411,6 +2557,11 @@ function options(id) {
   check('monitor renders telemetry', text('serverMonitorScreen').includes('25.0%'));
   check('monitor loads persisted settings and network rates', calls.some(call => call.path === '/api/monitor/settings') &&
     text('serverMonitorScreen').includes('1.00 Mbps') && text('serverMonitorScreen').includes('2.00 Mbps'));
+  const monitorCore = window.LinSCPCore;
+  window.LinSCPCore = new Proxy(monitorCore, { get(target, key) {
+    if (key === 'hostCapabilities') return () => ({ ...target.hostCapabilities({ host: window }), platform: 'android' });
+    return Reflect.get(target, key);
+  }});
   [...doc.querySelectorAll('#serverMonitorScreen button')].find(b => b.textContent === 'SSH shell').click();
   await new Promise(resolve => setTimeout(resolve, 80));
   check('monitor shell reuses the terminal endpoint', calls.some(call => call.path === '/api/session/terminal' &&
@@ -2419,14 +2570,39 @@ function options(id) {
   await new Promise(resolve => setTimeout(resolve, 80));
   check('closing the monitor shell resumes monitoring', text('serverMonitorScreen').includes('Sampling selected servers') ||
     text('serverMonitorScreen').includes('servers selected'));
+  window.LinSCPCore = monitorCore;
+  {
+    const internals = window.__TAURI_INTERNALS__;
+    const originalInvoke = internals.invoke;
+    internals.invoke = async (command, args) => command === 'linscp_open_terminal_window'
+      ? { label: 'terminal-monitor' } : originalInvoke(command, args);
+    [...doc.querySelectorAll('#serverMonitorScreen button')].find(b => b.textContent === 'SSH shell').click();
+    await new Promise(resolve => setTimeout(resolve, 80));
+    check('opening a separate monitor shell resumes monitoring without closing the monitor',
+      doc.getElementById('serverMonitorModal').classList.contains('open') &&
+      [...doc.querySelectorAll('#serverMonitorScreen button')].some(b => b.textContent === 'Pause') &&
+      !doc.getElementById('terminalModal').classList.contains('open'));
+    const closedBefore = calls.filter(call => call.path === '/api/terminal/close').length;
+    internals.invoke = async (command, args) => {
+      if (command === 'linscp_open_terminal_window') throw new Error('cannot create monitor window');
+      return originalInvoke(command, args);
+    };
+    [...doc.querySelectorAll('#serverMonitorScreen button')].find(b => b.textContent === 'SSH shell').click();
+    await new Promise(resolve => setTimeout(resolve, 80));
+    check('a failed monitor shell resumes monitoring, closes its PTY and shows no in-app terminal',
+      [...doc.querySelectorAll('#serverMonitorScreen button')].some(b => b.textContent === 'Pause') &&
+      !doc.getElementById('terminalModal').classList.contains('open') &&
+      calls.filter(call => call.path === '/api/terminal/close').length === closedBefore + 1 &&
+      text('toast').includes('cannot create monitor window'));
+    internals.invoke = originalInvoke;
+  }
   window.closeServerMonitor();
   check('closing the monitor keeps the session tab', !doc.getElementById('serverMonitorModal').classList.contains('open') &&
     doc.getElementById('tabStrip').children.length === 1);
 
   // ---- Embedded remote terminal -----------------------------------------
-  /* A terminal on this host is the in-page one: the harness has no window
-   * bridge, so it takes the same path Android does. What the page is
-   * answerable for is the transplant: the modal is on screen before the
+  /* Android uses an in-page terminal. What the page is answerable for is
+   * the transplant: the modal is on screen before the
    * renderer measures its font (a terminal measured inside a display:none box
    * has no cell at all), the frames the model produces are painted, and a
    * backend that refuses to answer ends the session instead of leaving a black
@@ -2551,13 +2727,6 @@ function options(id) {
       success: true, dirty: true, alive: true, error: null,
       frame: frameOf('user@host:~$ ls', 'web-1 — Terminal') };
 
-    /* A desktop host draws neither the soft keyboard nor the Esc/~ row, even
-     * when the terminal has to be drawn in the page. This harness cannot open
-     * an OS window, so the in-page path is all there is here - and it must
-     * still look like a desktop terminal: physical keyboard through the
-     * document listener, no touch accessories. The Android checks below stub
-     * the capability answer to 'android'; this section runs against the
-     * harness's default host. */
     /* The bundle's exports are getter-only, so the platform cannot be
      * stubbed by assignment; wrapping the whole namespace in a Proxy is the
      * only door from the outside, and it is scoped to this block. */
@@ -2572,6 +2741,12 @@ function options(id) {
         return typeof value === 'function' ? value.bind(target) : value;
       }
     });
+    // X2Go uses a desktop terminal window; fake the OS window bridge while
+    // testing that installation scripts reach the selected remote shell.
+    const internals = window.__TAURI_INTERNALS__;
+    const originalInvoke = internals.invoke;
+    internals.invoke = async (command, args) => command === 'linscp_open_terminal_window'
+      ? { label: 'terminal-installer' } : originalInvoke(command, args);
     // A missing X2Go server is offered for installation on the selected
     // authenticated host, never run until the user presses Install.
     responses['/api/desktop/check'] = { success: true, available: false, checked: true,
@@ -2687,23 +2862,7 @@ function options(id) {
       calls.filter(call => call.path === '/api/terminal/input').length === beforeStaleInstall);
     window.closeModal('remoteDesktopModal');
 
-    await window.openTerminal();
-    await new Promise(resolve => setTimeout(resolve, 120));
-    /* The touch shell fills its key row at boot on every host, so the count
-     * of buttons is not the contract - `hidden` is: the row stays hidden on
-     * a desktop, where the keyboard has Esc and the arrows of its own. */
-    check('the extra-keys row stays hidden on desktop',
-      doc.getElementById('terminalExtraKeys').hidden === true,
-      String(doc.getElementById('terminalExtraKeys').hidden));
-    check('a desktop terminal attaches no soft keyboard',
-      !doc.querySelector('#terminalScreen textarea'),
-      String(!!doc.querySelector('#terminalScreen textarea')));
-    lastWindow.selectAll();
-    check('the copy bar is not for a selection on a desktop',
-      doc.getElementById('terminalSelectionBar').hidden === true,
-      String(doc.getElementById('terminalSelectionBar').hidden));
-    window.closeTerminal();
-    await new Promise(resolve => setTimeout(resolve, 120));
+    internals.invoke = originalInvoke;
     /* The Android path starts here: a touch host, no OS windows. */
     window.LinSCPCore = asPlatform('android');
 

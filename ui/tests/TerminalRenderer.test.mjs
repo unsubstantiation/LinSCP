@@ -315,7 +315,7 @@ function installDom() {
   globalThis.document = dom.window.document;
   globalThis.devicePixelRatio = 1;
   const originalCreate = dom.window.document.createElement.bind(dom.window.document);
-  dom.window.document.createElement = (tag) => (tag === 'canvas' ? Object.assign(canvas, { style: {}, remove() {} }) : originalCreate(tag));
+  dom.window.document.createElement = (tag) => (tag === 'canvas' ? Object.assign(canvas, { style: {}, ownerDocument: dom.window.document, remove() {} }) : originalCreate(tag));
   return { dom, calls, cleanup: () => {
     delete globalThis.document;
     delete globalThis.devicePixelRatio;
@@ -347,7 +347,77 @@ function fakeTransport(answers = {}) {
   };
 }
 
-test('the session polls frames, paints them and resizes only after a frame', async () => {
+test('the session reports its initial window grid and later window resizes in order', async () => {
+  const dom = installDom();
+  const container = fakeContainer(90, 36);
+  const calls = [];
+  let releaseFirst;
+  const first = new Promise(resolve => { releaseFirst = resolve; });
+  const transport = {
+    mode: 'tauri',
+    async get() { return { success: true, alive: true, frame: blankFrame(10, 2) }; },
+    async post(path, body) {
+      if (path === '/api/terminal/input') {
+        calls.push({ ...body });
+        if (calls.length === 1) await first;
+      }
+      return { success: true };
+    },
+    request: async () => ({}), subscribe: () => () => {},
+  };
+  const removedListeners = [];
+  const originalRemove = dom.dom.window.removeEventListener.bind(dom.dom.window);
+  dom.dom.window.removeEventListener = (type, listener, options) => {
+    removedListeners.push(type);
+    return originalRemove(type, listener, options);
+  };
+  const session = new TerminalSession({ transport, terminal: 'term-1', container, pollInterval: 1000 });
+  session.start();
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.deepEqual([calls[0].cols, calls[0].rows, calls[0].cell_width, calls[0].cell_height], [10, 2, 9, 18]);
+  container.clientWidth = 180; container.clientHeight = 72;
+  dom.dom.window.dispatchEvent(new dom.dom.window.Event('resize'));
+  session.write('x');
+  container.clientWidth = 270; container.clientHeight = 90;
+  dom.dom.window.dispatchEvent(new dom.dom.window.Event('resize'));
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(calls.length, 1, 'later resizes wait for the first resize');
+  releaseFirst();
+  await new Promise(resolve => setTimeout(resolve, 15));
+  assert.deepEqual(calls.map(c => [c.cols, c.rows]), [[10, 2], [20, 4], [20, 4], [30, 5]]);
+  assert.equal(Buffer.from(calls[2].data, 'base64').toString(), 'x');
+  session.stop();
+  assert.ok(removedListeners.includes('resize'), 'the window listener is detached on teardown');
+  container.clientWidth = 360;
+  dom.dom.window.dispatchEvent(new dom.dom.window.Event('resize'));
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(calls.length, 4, 'stopped sessions no longer react to window changes');
+  dom.cleanup();
+});
+
+test('a container-only layout change updates the PTY on the next frame', async () => {
+  const dom = installDom();
+  const container = fakeContainer(90, 36);
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(10, 2) }),
+  });
+  const resized = [];
+  const session = new TerminalSession({ transport, terminal: 'term-1', container, pollInterval: 10,
+    onResize: grid => resized.push(grid) });
+  session.start();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  container.clientWidth = 180; container.clientHeight = 72;
+  await new Promise(resolve => setTimeout(resolve, 35));
+  const inputs = transport.calls.filter(call => call.path === '/api/terminal/input');
+  assert.deepEqual(inputs.map(call => [call.body.cols, call.body.rows]), [[10, 2], [20, 4]]);
+  assert.deepEqual(resized, [{ columns: 20, lines: 4 }]);
+  assert.equal(session.element.width, 180);
+  assert.equal(session.element.height, 72);
+  session.stop();
+  dom.cleanup();
+});
+
+test('the session polls frames and paints them', async () => {
   const dom = installDom();
   const { canvas } = fakeCanvas();
   const container = fakeContainer(180, 72);

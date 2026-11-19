@@ -299,6 +299,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   font-size: var(--fs-base);
   cursor: pointer;
 }
+.menu-dropdown button[hidden] { display: none; }
 .menu-dropdown button:hover { background: var(--surface-hover); }
 .menu-dropdown button .shortcut { color: var(--subtle); font-size: var(--fs-sm); }
 .menu-separator { height: 1px; margin: var(--space-2) var(--space-2); background: var(--border); }

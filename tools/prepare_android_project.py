@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Apply the small, security-critical customizations to Tauri's pinned template."""
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 from android_application_id import application_id
 
@@ -48,7 +49,37 @@ if 'LinSCPTransferService' not in text:
         '        <service android:name=".LinSCPTransferService" '
         'android:exported="false" android:foregroundServiceType="dataSync" />\n'
         '    </application>', 1)
+# Only this app-private cache subtree can be handed to another app. The
+# provider itself is not exported; chooser recipients get explicit read grants.
+if '@xml/linscp_outgoing_files' not in text:
+    if text.count('    </application>') != 1:
+        raise SystemExit('Unexpected Android application closing tag; register outgoing share provider')
+    text = text.replace('    </application>',
+        '        <provider android:name=".LinSCPExportProvider"\n'
+        '            android:authorities="${applicationId}.outgoing" android:exported="false"\n'
+        '            android:grantUriPermissions="true">\n'
+        '            <meta-data android:name="android.support.FILE_PROVIDER_PATHS"\n'
+        '                android:resource="@xml/linscp_outgoing_files" />\n'
+        '        </provider>\n'
+        '    </application>', 1)
+android = '{http://schemas.android.com/apk/res/android}'
+application_node = ET.fromstring(text).find('application')
+providers = [] if application_node is None else [p for p in application_node.findall('provider')
+    if p.get(android + 'name') == '.LinSCPExportProvider']
+if len(providers) != 1 or providers[0].get(android + 'exported') != 'false' or \
+        providers[0].get(android + 'grantUriPermissions') != 'true' or \
+        providers[0].get(android + 'authorities') != '${applicationId}.outgoing' or \
+        not any(m.get(android + 'name') == 'android.support.FILE_PROVIDER_PATHS' and
+                m.get(android + 'resource') == '@xml/linscp_outgoing_files'
+                for m in providers[0].findall('meta-data')):
+    raise SystemExit('Invalid outgoing share provider configuration')
 manifest.write_text(text)
+share_paths = root / 'crates/linscp-tauri/gen/android/app/src/main/res/xml/linscp_outgoing_files.xml'
+share_paths.parent.mkdir(parents=True, exist_ok=True)
+share_paths.write_text('<?xml version="1.0" encoding="utf-8"?>\n'
+    '<paths xmlns:android="http://schemas.android.com/apk/res/android">\n'
+    '    <cache-path name="exports" path="outgoing-shares/" />\n'
+    '</paths>\n')
 
 # The generated project carries the identifier Tauri read when it was created.
 # A project generated before a rename would ship under the old name - and its

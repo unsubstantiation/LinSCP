@@ -91,8 +91,10 @@ is wired end to end. The incomplete paths above apply to all native hosts unless
 called out otherwise. Android additionally provides registered SAF,
 incoming-share, foreground-service, and external-viewer intent integrations.
 The viewer hand-off currently covers direct RDP/VNC/SPICE only. Android
-Keystore, Android outgoing share, X2Go/X11 viewer intents, real-device SAF/share
-coverage, and Windows/Linux-versus-Android integration parity remain outstanding.
+Keystore, X2Go/X11 viewer intents, real-device SAF/share coverage, and
+Windows/Linux-versus-Android integration parity remain outstanding. Android
+outgoing file sharing is implemented with private staged copies and read-only
+URI grants, but still needs device and receiver validation; see `docs/android.md`.
 
 Parity should only be called complete after each shared feature has equivalent
 behavioral acceptance coverage on Windows, Debian, and Android, and each

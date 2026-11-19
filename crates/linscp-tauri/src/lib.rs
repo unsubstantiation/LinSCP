@@ -270,6 +270,44 @@ pub mod commands {
         Ok(json!({ "success": true, "staged": staged_buf, "manifest": manifest }))
     }
 
+    /// Prepare a private export before granting the chosen Android app read
+    /// access. The batch is never supplied by the webview and is discarded on
+    /// every failure; chooser success retains it for the receiver to read.
+    #[cfg(target_os = "android")]
+    #[tauri::command]
+    pub async fn linscp_share_files(
+        state: tauri::State<'_, TauriBridge>,
+        side: String,
+        tab: Option<u64>,
+        directory: String,
+        names: Vec<String>,
+    ) -> Result<serde_json::Value, String> {
+        if names.is_empty() || names.len() > linscp_service::share_export::MAX_EXPORT_FILES {
+            return Err("Select between 1 and 32 files to share.".to_string());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for name in &names {
+            linscp_service::ops::validate_leaf_name(name)?;
+            if !seen.insert(name) { return Err("Duplicate file name.".to_string()); }
+        }
+        if side != "local" && side != "remote" { return Err("Invalid share source.".to_string()); }
+        if side == "remote" && tab.is_none() { return Err("No active remote session.".to_string()); }
+        let bridge = state.android_state().export_bridge().map_err(|e| e.to_string())?;
+        let batch = bridge.prepare_export().map_err(|e| e.to_string())?;
+        let result = if side == "remote" {
+            state.service.stage_remote_share(tab.unwrap(), &directory, &names, &batch).await
+        } else {
+            bridge.stage_local_export(&batch, &directory, &names).map_err(|e| e.to_string())
+        };
+        let result = match result {
+            Ok(()) => bridge.open_export(&batch, &names).map_err(|e| e.to_string()),
+            Err(error) => Err(error),
+        };
+        if result.is_err() { let _ = bridge.discard_export(&batch); }
+        result?;
+        Ok(json!({ "success": true }))
+    }
+
     /// Opens an external URI through Android's activity resolver. The Kotlin
     /// plugin allowlists HTTP(S) and supported remote-desktop viewer schemes.
     #[tauri::command]
@@ -376,6 +414,8 @@ pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
             commands::linscp_request_saf_tree,
             commands::linscp_pick_saf_tree,
             commands::linscp_handle_share_intent,
+            #[cfg(target_os = "android")]
+            commands::linscp_share_files,
             commands::linscp_open_external_uri,
             commands::linscp_foreground_start,
             commands::linscp_foreground_update,
