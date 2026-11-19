@@ -18,7 +18,7 @@ jobs:
     name: ${{ github.event_name == 'pull_request' && 'Android pull-request check' || 'Signed Android release APK' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 50
-    environment: ${{ github.event_name != 'pull_request' && 'android-release' || '' }}
+    environment: android-release
     steps:
       - uses: actions/checkout@v7
 
@@ -41,7 +41,7 @@ jobs:
           H1="repo.maven"
           H2="apache.org/maven2"
           M1="maven-central.storage-download"
-          M2="://googleapis.com"
+          M2="googleapis.com/maven2/"
           cat << EOF > ~/.gradle/init.d/maven-mirror.gradle
           allprojects {
             buildscript {
