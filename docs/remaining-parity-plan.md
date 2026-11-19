@@ -1140,7 +1140,7 @@ Full application backup as a distribution-compatible JSON bundle (version 1, LF 
 
 **Area:** Desktop integration · **Status:** partial
 
-RDP/VNC/SPICE are direct-TCP (3389/5900) with optional SSH jump SOCKS5h relay; X2Go/X11 are SSH-transported via direct-tcpip. Native viewers are resolved via PATH (xfreerdp3→xfreerdp→wlfreerdp/sdl-freerdp, mstsc, open, vncviewer, remote-viewer/spicy, x2goclient/pyhoca-cli, waypipe/ssh -X) with Windows/macOS/Android specifics, and dial the same proxy/tunnel/TLS/SPKI stack as file protocols. A ticket carries the viewer plan of the build it was made on (mstsc + .rdp body on Windows, `open rdp://` on macOS, FreeRDP argv on Linux), and only the ticket that matches the launcher is ever spawned; a host that cannot show a window is handed the .rdp/.vv body or a BrowserGateway hint instead of a spawn, never a spawn it cannot display; XDMCP (UDP 177, unencrypted) is explicitly refused/recommended against. Wayland vs X11 detection drives waypipe vs ssh -X. Verified by unit ticket/argv tests; live viewer integration and ironrdp gateway tests are outstanding.
+RDP/VNC/SPICE are direct-TCP (3389/5900) with optional SSH jump SOCKS5h relay; X11 uses SSH. X2Go KDrive viewer is not yet implemented, and NX is removed. Native viewers are resolved via PATH (xfreerdp3→xfreerdp→wlfreerdp/sdl-freerdp, mstsc, open, vncviewer, remote-viewer/spicy, waypipe/ssh -X) with Windows/macOS/Android specifics, and dial the same proxy/tunnel/TLS/SPKI stack as file protocols. A ticket carries the viewer plan of the build it was made on (mstsc + .rdp body on Windows, `open rdp://` on macOS, FreeRDP argv on Linux), and only the ticket that matches the launcher is ever spawned; a host that cannot show a window is handed the .rdp/.vv body or a BrowserGateway hint instead of a spawn, never a spawn it cannot display; XDMCP (UDP 177, unencrypted) is explicitly refused/recommended against. Wayland vs X11 detection drives waypipe vs ssh -X. Verified by unit ticket/argv tests; live viewer integration and ironrdp gateway tests are outstanding.
 
 **Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
 
@@ -1148,7 +1148,7 @@ RDP/VNC/SPICE are direct-TCP (3389/5900) with optional SSH jump SOCKS5h relay; X
 
 - [ ] Live RDP launch with xfreerdp/mstsc against a throwaway RDP stub verifies argv, port 3389, TLS/NLA option, and jump-host SOCKS5h relay without exposing credentials (live-desktop).
 - [ ] Live VNC (5900) and SPICE (5900/.vv) launches verify viewer resolution (tigervnc/remote-viewer), TLS port, and headless .vv/.rdp ticket generation (live-desktop).
-- [ ] Live X2Go/NX and X11/Waypipe launches verify SSH-transported NX compression over direct-tcpip, WAYLAND_DISPLAY detection, and that jump-host proxy/TLS/SPKI settings are inherited without fallback (live-desktop).
+- [ ] Implement and test a built-in X2Go KDrive viewer on Linux, Windows and macOS, including graphics, input, SSH forwarding, and safe session lifecycle. Separately test X11/Waypipe launches and jump-host policy (live-desktop).
 - [ ] Obtain independent review that ironrdp WASM / Guacamole gateway fallback correctly isolates credentials and that XDMCP (UDP 177) remains refusing/not recommended.
 
 ## platform.android-saf-synchronization

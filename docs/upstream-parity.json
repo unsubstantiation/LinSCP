@@ -637,7 +637,7 @@
     },
     "open": {
       "status": "partial",
-      "notes": "URL sessions and stored-session names (including folder/site paths), -passphrase= for encrypted SSH keys, -hostkey= verification and '-rawsettings[=N] NAME=VALUE...' for proxy, FTP/TLS and S3 object settings; unknown settings and unusable proxies are refused by name before connecting, and passwords/passphrases are redacted in echo and XML logs. Covered by script, live-sftp, live-s3 and live-curl. Also parses rdp:// (3389, xfreerdp/mstsc/aFreeRDP), vnc:// (5900, tigervnc/remmina), spice:// (5900, remote-viewer/.vv), x2go:// (22, x2goclient, NX over SSH) and x11:// (22, waypipe/ssh -X); each shares proxy/tunnel/TLS/SPKI handling and emits a viewer ticket (or .rdp/.vv file/gateway in headless HTTP) — see desktop.remote capability and linscp_additions remote desktop entry. (live-curl, live-s3, live-sftp, and script need a `linscp` binary this repo does not build, so no platform has runnable evidence, and this stays partial until a runnable suite covers it.)",
+      "notes": "URL sessions and stored-session names (including folder/site paths), -passphrase= for encrypted SSH keys, -hostkey= verification and '-rawsettings[=N] NAME=VALUE...' for proxy, FTP/TLS and S3 object settings; unknown settings and unusable proxies are refused by name before connecting, and passwords/passphrases are redacted in echo and XML logs. Covered by script, live-sftp, live-s3 and live-curl. Also parses rdp:// (3389, xfreerdp/mstsc/aFreeRDP), vnc:// (5900, tigervnc/remmina), spice:// (5900, remote-viewer/.vv), x2go:// (22, built-in KDrive viewer not yet implemented; NX removed) and x11:// (22, waypipe/ssh -X); supported external-viewer protocols emit a viewer ticket (or .rdp/.vv file/gateway in headless HTTP) — see desktop.remote capability and linscp_additions remote desktop entry. (live-curl, live-s3, live-sftp, and script need a `linscp` binary this repo does not build, so no platform has runnable evidence, and this stays partial until a runnable suite covers it.)",
       "verified_on": {
         "linux": [
           "script",
@@ -5418,7 +5418,7 @@
       "id": "desktop.remote",
       "area": "Desktop integration",
       "status": "partial",
-      "notes": "RDP/VNC/SPICE are direct-TCP (3389/5900) with optional SSH jump SOCKS5h relay; X2Go/X11 are SSH-transported via direct-tcpip. Native viewers are resolved via PATH (xfreerdp3→xfreerdp→wlfreerdp/sdl-freerdp, mstsc, open, vncviewer, remote-viewer/spicy, x2goclient/pyhoca-cli, waypipe/ssh -X) with Windows/macOS/Android specifics, and dial the same proxy/tunnel/TLS/SPKI stack as file protocols. A ticket carries the viewer plan of the build it was made on (mstsc + .rdp body on Windows, `open rdp://` on macOS, FreeRDP argv on Linux), and only the ticket that matches the launcher is ever spawned; a host that cannot show a window is handed the .rdp/.vv body or a BrowserGateway hint instead of a spawn, never a spawn it cannot display; XDMCP (UDP 177, unencrypted) is explicitly refused/recommended against. Wayland vs X11 detection drives waypipe vs ssh -X. Verified by unit ticket/argv tests; live viewer integration and ironrdp gateway tests are outstanding.",
+      "notes": "RDP/VNC/SPICE are direct-TCP (3389/5900) with optional SSH jump SOCKS5h relay; X11 uses SSH. X2Go KDrive viewer is not yet implemented, and NX is removed. Native viewers are resolved via PATH (xfreerdp3→xfreerdp→wlfreerdp/sdl-freerdp, mstsc, open, vncviewer, remote-viewer/spicy, waypipe/ssh -X) with Windows/macOS/Android specifics, and dial the same proxy/tunnel/TLS/SPKI stack as file protocols. A ticket carries the viewer plan of the build it was made on (mstsc + .rdp body on Windows, `open rdp://` on macOS, FreeRDP argv on Linux), and only the ticket that matches the launcher is ever spawned; a host that cannot show a window is handed the .rdp/.vv body or a BrowserGateway hint instead of a spawn, never a spawn it cannot display; XDMCP (UDP 177, unencrypted) is explicitly refused/recommended against. Wayland vs X11 detection drives waypipe vs ssh -X. Verified by unit ticket/argv tests; live viewer integration and ironrdp gateway tests are outstanding.",
       "source": [
         "crates/linscp-platform/src/desktop.rs",
         "crates/linscp-proto/src/remote_desktop.rs",
@@ -5444,7 +5444,7 @@
       "acceptance": [
         "Live RDP launch with xfreerdp/mstsc against a throwaway RDP stub verifies argv, port 3389, TLS/NLA option, and jump-host SOCKS5h relay without exposing credentials (live-desktop).",
         "Live VNC (5900) and SPICE (5900/.vv) launches verify viewer resolution (tigervnc/remote-viewer), TLS port, and headless .vv/.rdp ticket generation (live-desktop).",
-        "Live X2Go/NX and X11/Waypipe launches verify SSH-transported NX compression over direct-tcpip, WAYLAND_DISPLAY detection, and that jump-host proxy/TLS/SPKI settings are inherited without fallback (live-desktop).",
+        "Implement and test a built-in X2Go KDrive viewer on Linux, Windows and macOS, including graphics, input, SSH forwarding, and safe session lifecycle. Separately test X11/Waypipe launches and jump-host policy (live-desktop).",
         "Obtain independent review that ironrdp WASM / Guacamole gateway fallback correctly isolates credentials and that XDMCP (UDP 177) remains refusing/not recommended."
       ]
     },

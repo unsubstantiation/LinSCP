@@ -309,7 +309,7 @@ pub fn parse_site_url(url: &str) -> Result<ParsedSiteSpec, String> {
         "rdp" | "rdps" | "msrdp" => (ProtocolScheme::Rdp, 3389u16),
         "vnc" | "rfb" => (ProtocolScheme::Vnc, 5900u16),
         "spice" => (ProtocolScheme::Spice, 5900u16),
-        "x2go" | "nx" => (ProtocolScheme::X2Go, 22u16),
+        "x2go" => (ProtocolScheme::X2Go, 22u16),
         "x11" | "x" | "waypipe" => (ProtocolScheme::X11, 22u16),
         other => {
             return Err(format!(
@@ -2851,5 +2851,8 @@ mod tests {
         assert!(parse_site_url("sftp://::1/").is_err());
         assert!(parse_site_url("sftp://[::1]:2222/dir").is_ok());
         assert!(parse_site_url("https://example.com/path?x=1").is_err());
+        assert_eq!(parse_site_url("x2go://alice@example.com/").unwrap().session.protocol, ProtocolScheme::X2Go);
+        assert!(parse_site_url("nx://alice@example.com/").is_err());
+        assert!(parse_site_url("nx3://alice@example.com/").is_err());
     }
 }

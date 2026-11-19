@@ -776,7 +776,7 @@ impl ScriptInterpreter {
         }
 
         // Remote desktop schemes do not open a file tree — they produce a viewer
-        // ticket (xfreerdp / vncviewer / remote-viewer / x2goclient / waypipe)
+        // ticket (xfreerdp / vncviewer / remote-viewer / waypipe)
         // or a .rdp/.vv file when no viewer is installed / in headless mode.
         if is_desktop_scheme(spec.session.protocol) {
             return self.open_desktop_slot_from_spec(spec).await;

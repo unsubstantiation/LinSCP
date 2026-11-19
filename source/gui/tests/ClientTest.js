@@ -2861,6 +2861,22 @@ function options(id) {
     check('a stale X2Go check cannot run an installer',
       calls.filter(call => call.path === '/api/terminal/input').length === beforeStaleInstall);
     window.closeModal('remoteDesktopModal');
+    // A reachable server is not evidence that the built-in viewer exists.
+    responses['/api/desktop/check'].available = true;
+    responses['/api/desktop/check'].desktop = 'MATE';
+    responses['/api/desktop/launch'] = { success: false, error: 'The built-in X2Go KDrive viewer is not implemented yet; NX support has been removed.' };
+    window.openRemoteDesktop();
+    doc.getElementById('remoteDesktopKind').value = 'x2go';
+    window.remoteDesktopKindChanged();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    check('KDrive server detection does not claim the viewer is ready',
+      text('remoteDesktopStatus').includes('viewer is not available yet'));
+    await window.launchRemoteDesktop();
+    check('an unfinished X2Go viewer reports the error without closing the dialog',
+      text('toast').includes('KDrive viewer is not implemented yet') &&
+      doc.getElementById('remoteDesktopModal').classList.contains('open'));
+    window.closeModal('remoteDesktopModal');
+    delete responses['/api/desktop/launch'];
 
     internals.invoke = originalInvoke;
     /* The Android path starts here: a touch host, no OS windows. */

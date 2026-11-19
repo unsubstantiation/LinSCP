@@ -17,8 +17,10 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use zeroize::Zeroizing;
 
+pub mod desktop_frame_cache;
 pub mod ftp;
 pub mod gssapi;
+pub mod kdrive_wire;
 pub mod listing;
 pub mod proxy;
 pub mod remote_desktop;
@@ -29,6 +31,8 @@ pub mod ssh;
 pub mod tls;
 pub mod tunnel;
 pub mod webdav;
+pub mod x2go_control;
+pub mod x2go_transport;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ProtoError {

@@ -1,4 +1,4 @@
-//! Remote desktop engines — RDP, VNC, SPICE, X2Go (NX) and X11/Waypipe.
+//! Remote desktop engines — RDP, VNC, SPICE, X2Go and X11/Waypipe.
 //!
 //! All engines reuse the same jump-host (`direct-tcpip` via `SshJumpTunnel`) and
 //! SOCKS5h proxy dialer as the file-transfer protocols, and the same fail-closed
@@ -13,8 +13,8 @@
 //!   Android: `androidVNC`. Options: `-SharedViewOnly -PreferredEncoding -via`.
 //! * **SPICE** – QEMU/KVM. Linux: `remote-viewer`/`spicy`/`virt-viewer`, Windows: `remote-viewer.exe`.
 //!   Options: `spice://host:port?tls-port=...`.
-//! * **X2Go / NX** – SSH-tunneled NX. Uses the existing `SshConnection` + `direct-tcpip` channel.
-//!   Clients: `x2goclient`, `pyhoca-cli`, `nxproxy -S nx/nx,…`. Server spawns `x2gostartagent`.
+//! * **X2Go / KDrive** – built-in viewer planned; session, graphics and lifecycle
+//!   integration are incomplete. There is no external NX viewer fallback.
 //! * **X11** – `ssh -X` / `waypipe ssh`. Headless mode falls back to `xwayland` detection the
 //!   same way `detect_desktop_session()` does.
 
@@ -37,7 +37,7 @@ pub struct DesktopLaunchTicket {
     pub kind: String,
     /// Human-readable target (`host:port`).
     pub target: String,
-    /// Suggested external binary (`xfreerdp`, `vncviewer`, `remote-viewer`, `x2goclient` …).
+    /// Suggested external binary for supported external-viewer protocols.
     pub viewer: String,
     /// Full argv including viewer as `argv[0]`.
     pub argv: Vec<String>,
@@ -183,13 +183,12 @@ impl RemoteDesktopKind {
             Self::X11 => "x11",
         }
     }
-    pub fn default_viewer(self, tunnel_over_ssh: bool) -> &'static str {
+    pub fn default_viewer(self, _tunnel_over_ssh: bool) -> &'static str {
         match self {
             Self::Rdp => "xfreerdp",
             Self::Vnc => "vncviewer",
             Self::Spice => "remote-viewer",
-            Self::X2Go if tunnel_over_ssh => "x2goclient",
-            Self::X2Go => "x2goclient",
+            Self::X2Go => "",
             Self::X11 => "waypipe",
         }
     }
@@ -408,7 +407,7 @@ pub fn ticket_from_config(
         },
         RemoteDesktopKind::Vnc => "vncviewer",
         RemoteDesktopKind::Spice => "remote-viewer",
-        RemoteDesktopKind::X2Go => "x2goclient",
+        RemoteDesktopKind::X2Go => "",
         RemoteDesktopKind::X11 => "waypipe",
     }
     .to_string();
@@ -434,7 +433,9 @@ pub fn ticket_from_config(
         }
         RemoteDesktopKind::Vnc => (build_vnc_argv(&viewer, &tmp, tunneled, &local_endpoint), None, None),
         RemoteDesktopKind::Spice => (build_spice_argv(&viewer, &tmp, tunneled, &local_endpoint), None, Some(".vv".to_string())),
-        RemoteDesktopKind::X2Go => (build_x2go_argv(&viewer, &tmp), None, None),
+        // No external viewer or command is offered for X2Go. The built-in
+        // KDrive implementation is not yet connected to this ticket API.
+        RemoteDesktopKind::X2Go => (Vec::new(), None, None),
         RemoteDesktopKind::X11 => (build_x11_argv(&viewer, &tmp), None, None),
     };
 
@@ -573,46 +574,6 @@ fn build_spice_argv(_viewer: &str, sess: &RemoteDesktopSession, tunneled: bool, 
     vec!["remote-viewer".to_string(), uri]
 }
 
-fn build_x2go_argv(viewer: &str, sess: &RemoteDesktopSession) -> Vec<String> {
-    let opts = &sess.config.desktop_opts;
-    let session_type = opts.x2go_session_type.as_deref().unwrap_or("XFCE");
-    let cmd = opts.x2go_command.as_deref().unwrap_or("");
-    let link = opts.x2go_link.as_deref().unwrap_or("adsl");
-    let pack = opts.x2go_pack.as_deref().unwrap_or("16m-jpeg");
-    // x2goclient --session=X2GO --command=...
-    // pyhoca-cli variant: pyhoca-cli -u USER -H HOST -o session=TYPE
-    if viewer.contains("pyhoca") {
-        vec![
-            viewer.to_string(),
-            "-u".to_string(),
-            sess.config.username.clone().unwrap_or_default(),
-            "-H".to_string(),
-            sess.config.host.clone(),
-            "-p".to_string(),
-            sess.config.port.to_string(),
-            "--session-type".to_string(),
-            session_type.to_string(),
-        ]
-    } else {
-        let mut argv = vec![
-            viewer.to_string(),
-            "--session".to_string(),
-            format!("{}@{}", sess.config.username.as_deref().unwrap_or(""), sess.config.host),
-            "--command".to_string(),
-            if cmd.is_empty() { session_type.to_string() } else { cmd.to_string() },
-            "--link".to_string(),
-            link.to_string(),
-            "--pack".to_string(),
-            pack.to_string(),
-        ];
-        if let Some(ref display) = opts.x11_display {
-            argv.push("--display".to_string());
-            argv.push(display.clone());
-        }
-        argv
-    }
-}
-
 fn build_x11_argv(viewer: &str, sess: &RemoteDesktopSession) -> Vec<String> {
     let opts = &sess.config.desktop_opts;
     if viewer == "waypipe" && (opts.waypipe || std::env::var_os("WAYLAND_DISPLAY").is_some()) {
@@ -642,7 +603,7 @@ pub fn server_package_name(kind: RemoteDesktopKind) -> &'static str {
         RemoteDesktopKind::Rdp => "xrdp",
         RemoteDesktopKind::Vnc => "tigervnc-standalone-server / x11vnc",
         RemoteDesktopKind::Spice => "spice-vdagent",
-        RemoteDesktopKind::X2Go => "x2goserver",
+        RemoteDesktopKind::X2Go => "x2goserver + x2goserver-x2gokdrive",
         RemoteDesktopKind::X11 => "xauth / xorg-xauth",
     }
 }
@@ -652,7 +613,7 @@ pub fn server_description(kind: RemoteDesktopKind) -> &'static str {
         RemoteDesktopKind::Rdp => "RDP server (xrdp) on port 3389",
         RemoteDesktopKind::Vnc => "VNC server (TigerVNC / x11vnc) on port 5900-5999",
         RemoteDesktopKind::Spice => "SPICE agent (spice-vdagent) for QEMU/KVM",
-        RemoteDesktopKind::X2Go => "X2Go server (x2goserver) over SSH",
+        RemoteDesktopKind::X2Go => "X2Go server with KDrive backend over SSH",
         RemoteDesktopKind::X11 => "X11 forwarding (xauth + Xorg/Waypipe) over SSH",
     }
 }
@@ -664,7 +625,9 @@ pub fn probe_command_for_kind(kind: RemoteDesktopKind) -> &'static str {
         RemoteDesktopKind::Rdp => "command -v xrdp >/dev/null 2>&1",
         RemoteDesktopKind::Vnc => "command -v x11vnc >/dev/null 2>&1 || command -v Xtigervnc >/dev/null 2>&1 || command -v vncserver >/dev/null 2>&1 || command -v tigervncserver >/dev/null 2>&1 || command -v x0vncserver >/dev/null 2>&1",
         RemoteDesktopKind::Spice => "command -v spice-vdagentd >/dev/null 2>&1 || command -v spice-vdagent >/dev/null 2>&1 || test -x /usr/libexec/spice-vdagentd 2>/dev/null || test -x /usr/sbin/spice-vdagentd 2>/dev/null",
-        RemoteDesktopKind::X2Go => "command -v x2gostartagent >/dev/null 2>&1 || test -x /usr/bin/x2gostartagent",
+        // The agent alone also exists on NX-only servers. These checks establish
+        // component presence, not version, TCP forwarding, or interoperability.
+        RemoteDesktopKind::X2Go => "(command -v x2gostartagent >/dev/null 2>&1 || test -x /usr/bin/x2gostartagent) && (command -v x2gokdrive >/dev/null 2>&1 || test -x /usr/bin/x2gokdrive) && test -r /usr/share/x2go/versions/VERSION.x2goserver-x2gokdrive",
         RemoteDesktopKind::X11 => "command -v xauth >/dev/null 2>&1",
     }
 }
@@ -747,17 +710,17 @@ if [ -f /etc/os-release ]; then . /etc/os-release; OS=$ID; else OS=unknown; fi
 case "$OS" in
   debian|ubuntu|linuxmint|pop)
     $SUDO apt-get update -qq
-    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y x2goserver x2goserver-xsession ;;
-  fedora) $SUDO dnf install -y x2goserver x2goserver-xsession ;;
-  rhel|centos|almalinux|rocky) $SUDO dnf install -y x2goserver x2goserver-xsession || $SUDO yum install -y x2goserver x2goserver-xsession ;;
-  arch|manjaro) $SUDO pacman -Sy --noconfirm x2goserver ;;
-  opensuse*|sles) $SUDO zypper --non-interactive install x2goserver x2goserver-xsession ;;
-  *) echo "[linscp] Unsupported distribution; install x2goserver, x2goserver-xsession and an X2Go-compatible desktop manually." >&2; exit 1 ;;
+    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y x2goserver x2goserver-xsession x2goserver-x2gokdrive xserver-x2gokdrive ;;
+  fedora) $SUDO dnf install -y x2goserver x2goserver-xsession x2goserver-x2gokdrive ;;
+  rhel|centos|almalinux|rocky) $SUDO dnf install -y x2goserver x2goserver-xsession x2goserver-x2gokdrive || $SUDO yum install -y x2goserver x2goserver-xsession x2goserver-x2gokdrive ;;
+  *) echo "[linscp] Automatic KDrive package selection is unavailable for this distribution; install X2Go and its KDrive backend manually from trusted repositories." >&2; exit 1 ;;
 esac
-if ! command -v x2gostartagent >/dev/null 2>&1 && ! test -x /usr/bin/x2gostartagent; then
-  echo "[linscp] X2Go was installed but x2gostartagent is not available." >&2; exit 1
+if ! (command -v x2gostartagent >/dev/null 2>&1 || test -x /usr/bin/x2gostartagent) ||
+   ! (command -v x2gokdrive >/dev/null 2>&1 || test -x /usr/bin/x2gokdrive) ||
+   ! test -r /usr/share/x2go/versions/VERSION.x2goserver-x2gokdrive; then
+  echo "[linscp] X2Go KDrive components could not be verified; check the server packages and installation paths." >&2; exit 1
 fi
-echo "[linscp] X2Go server installation completed."
+echo "[linscp] X2Go server installation completed; KDrive components detected. The LinSCP viewer is not yet implemented."
 "#.to_string(),
         RemoteDesktopKind::X11 => r#"#!/bin/bash
 set -e
@@ -904,7 +867,7 @@ mod tests {
         assert_eq!(opts.color_depth, Some(24));
         assert!(opts.vnc_view_only);
         assert_eq!(RemoteDesktopKind::Rdp.default_viewer(false), "xfreerdp");
-        assert_eq!(RemoteDesktopKind::X2Go.default_viewer(true), "x2goclient");
+        assert_eq!(RemoteDesktopKind::X2Go.default_viewer(true), "");
     }
     #[test]
     fn rdp_and_vnc_argv() {
@@ -938,6 +901,27 @@ mod tests {
     }
 
     #[test]
+    fn x2go_ticket_never_offers_an_external_nx_command() {
+        let cfg = RemoteDesktopConnectConfig {
+            scheme: ProtocolScheme::X2Go,
+            kind: RemoteDesktopKind::X2Go,
+            host: "example.test".to_string(),
+            port: 22,
+            username: Some("alice".to_string()),
+            password: None,
+            domain: None,
+            desktop_opts: DesktopOptions::default(),
+            tls: crate::tls::TlsSettings::default(),
+            proxy: None,
+            timeout: std::time::Duration::from_secs(15),
+        };
+        let ticket = ticket_from_config(&cfg, RemoteDesktopKind::X2Go, "example.test:22", false, None);
+        assert!(ticket.viewer.is_empty());
+        assert!(ticket.argv.is_empty());
+        assert!(ticket.file_content.is_none());
+    }
+
+    #[test]
     fn detected_x2go_desktop_does_not_override_explicit_selection() {
         let mut opts = DesktopOptions::default();
         opts.use_detected_x2go_desktop(Some("MATE"));
@@ -959,10 +943,12 @@ mod tests {
     fn x2go_probe_and_debian_setup_are_explicit_and_do_not_add_repositories() {
         let probe = probe_command_for_kind(RemoteDesktopKind::X2Go);
         assert!(probe.contains("x2gostartagent"));
+        assert!(probe.contains("x2gokdrive"));
+        assert!(probe.contains("VERSION.x2goserver-x2gokdrive"));
         assert!(!probe.contains("dpkg -l"));
         let script = install_script_for_kind(RemoteDesktopKind::X2Go);
-        assert!(script.contains("x2goserver x2goserver-xsession"));
-        assert!(!script.contains("install -y x2goserver x2goserver-xsession xfce4"));
+        assert!(script.contains("x2goserver x2goserver-xsession x2goserver-x2gokdrive xserver-x2gokdrive"));
+        assert!(!script.contains("xfce4"));
         assert!(x2go_xfce_install_script().contains("install -y xfce4"));
         assert!(script.contains("DEBIAN_FRONTEND=noninteractive"));
         assert!(!script.contains("add-apt-repository"));

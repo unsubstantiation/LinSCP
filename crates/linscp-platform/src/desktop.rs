@@ -1,4 +1,5 @@
-//! Remote-desktop viewer launcher — RDP, VNC, SPICE, X2Go/NX and X11/Waypipe.
+//! Remote-desktop viewer launcher — RDP, VNC, SPICE and X11/Waypipe.
+//! X2Go is reserved for the future built-in KDrive viewer.
 //!
 //! The proto layer (`linscp-proto::remote_desktop`) builds a `DesktopLaunchTicket`
 //! with `viewer + argv + file_content`. This module turns that ticket into an
@@ -8,7 +9,7 @@
 //!   On Linux that follows `linux::detect_desktop_session`; Windows and macOS can
 //!   always start one even though neither defines `DISPLAY`; Android never can.
 //! * Viewer binary resolution via `$PATH` (`xfreerdp`, `xfreerdp3`, `wlfreerdp`,
-//!   `vncviewer`/`tigervnc`, `remote-viewer`/`spicy`, `x2goclient`, `waypipe`, `ssh`)
+//!   `vncviewer`/`tigervnc`, `remote-viewer`/`spicy`, `waypipe`, `ssh`)
 //! * `mstsc.exe` on Windows (`SystemRoot\System32\mstsc.exe`)
 //! * Ticket-file fallback for a host that cannot show a viewer: write `.rdp`/`.vv`
 //!   next to `config_dir` and return it so the caller can download or print it.
@@ -55,7 +56,7 @@ impl DesktopViewerKind {
             "rdp" | "rdps" | "msrdp" | "ms-rdp" => Some(Self::Rdp),
             "vnc" | "rfb" => Some(Self::Vnc),
             "spice" => Some(Self::Spice),
-            "x2go" | "nx" => Some(Self::X2Go),
+            "x2go" => Some(Self::X2Go),
             "x11" | "x" | "waypipe" => Some(Self::X11),
             _ => None,
         }
@@ -154,7 +155,7 @@ pub fn host_can_spawn_gui_viewer() -> bool {
 /// * RDP on Linux: `xfreerdp3`, `xfreerdp`, `wlfreerdp`, `sdl-freerdp`; Windows: `mstsc` (`System32\\mstsc.exe`); macOS: `open`
 /// * VNC: `vncviewer` (includes tigervnc), `xtigervncviewer`, `remmina`
 /// * SPICE: `remote-viewer`, `virt-viewer`, `spicy`
-/// * X2Go: `x2goclient`, `pyhoca-cli`, `x2goclient-gtk`
+/// * X2Go: no external viewer; the built-in KDrive viewer is not yet available
 /// * X11: `waypipe` (Wayland) or `ssh -X` fallback
 pub fn resolve_viewer_binary(ticket: &DesktopTicket) -> Option<PathBuf> {
     let kind = ticket.viewer_kind()?;
@@ -225,14 +226,7 @@ pub fn resolve_viewer_binary(ticket: &DesktopTicket) -> Option<PathBuf> {
             }
             None
         }
-        DesktopViewerKind::X2Go => {
-            for cand in ["x2goclient", "pyhoca-cli", "pyhoca-gui", "x2goclient-gtk"] {
-                if let Some(p) = find_executable_on_path(cand) {
-                    return Some(p);
-                }
-            }
-            find_executable_on_path(&ticket.viewer)
-        }
+        DesktopViewerKind::X2Go => None,
         DesktopViewerKind::X11 => {
             // Wayland needs `waypipe`; on Windows/macOS/Android the session is not a
             // Linux one, so the `ssh -X` fallback below is the only answer.
@@ -305,6 +299,11 @@ pub fn launch_remote_desktop(
     config_dir: &Path,
     force_file_ticket: bool,
 ) -> Result<DesktopLaunchResult, String> {
+    // Never start an external X2Go/NX client or report a gateway as a working
+    // built-in viewer, even for old or manually constructed tickets.
+    if matches!(ticket.kind.trim().to_ascii_lowercase().as_str(), "x2go" | "nx" | "nx3") {
+        return Err("The built-in X2Go KDrive viewer is not implemented yet; NX support has been removed.".to_string());
+    }
     let viewer_bin = resolve_viewer_binary(ticket);
     let spawn_allowed = !force_file_ticket && host_can_spawn_gui_viewer();
     let plan = plan_launch(ticket, spawn_allowed, viewer_bin.is_some());
@@ -428,7 +427,7 @@ pub fn desktop_recommendations() -> &'static str {
      \x20 RDP  — Linux: xfreerdp3 / xfreerdp / wlfreerdp (FreeRDP 3.x, recommended), sdl-freerdp (Wayland). Windows: mstsc.exe (built-in). macOS: open rdp:// / Microsoft Remote Desktop. Android: aFreeRDP / aRDP (intent rdp://). Embedded fallback: Devolutions/ironrdp WASM (HTML5/WebSocket) when no native viewer is installed.\n\
      \x20 VNC  — Linux: tigervnc-viewer / remmina / gvncviewer (TigerVNC, recommended for 5900-5999). Windows: TightVNC / RealVNC viewer. Android: androidVNC / VNC Viewer (443).\n\
      \x20 SPICE — Linux/Windows: remote-viewer / virt-viewer (virt-viewer, recommended for QEMU/KVM). Fallback: spicy (spice-gtk). Uses spice://host:port?tls-port=... and .vv virt-viewer files.\n\
-     \x20 X2Go/NX — Linux: x2goclient / pyhoca-cli (recommended; SSH on 22 with NX compression, reuses jump-host tunnel). Windows: X2Go Client for Windows. Falls back to nxproxy -S.\n\
+     \x20 X2Go KDrive — built-in viewer planned but not yet implemented; NX is not supported.\n\
      \x20 X11 forwarding — Linux: waypipe ssh (Wayland, recommended) or ssh -X / ssh -Y (X11). Detects WAYLAND_DISPLAY / XDG_SESSION_TYPE / DISPLAY.\n\
      \x20 XDMCP — Not recommended; plain UDP port 177 with no encryption. Use X2Go or waypipe-over-SSH instead.\n"
 }
@@ -442,8 +441,25 @@ mod tests {
         assert_eq!(DesktopViewerKind::from_str("vnc"), Some(DesktopViewerKind::Vnc));
         assert_eq!(DesktopViewerKind::from_str("spice"), Some(DesktopViewerKind::Spice));
         assert_eq!(DesktopViewerKind::from_str("x2go"), Some(DesktopViewerKind::X2Go));
+        assert_eq!(DesktopViewerKind::from_str("nx"), None);
+        assert_eq!(DesktopViewerKind::from_str("nx3"), None);
         assert_eq!(DesktopViewerKind::from_str("x11"), Some(DesktopViewerKind::X11));
         assert_eq!(DesktopViewerKind::Rdp.as_str(), "rdp");
+    }
+
+    #[test]
+    fn x2go_and_legacy_nx_tickets_never_spawn_or_produce_gateway_or_file() {
+        for kind in ["x2go", "X2GO", "nx", "nx3"] {
+            let mut ticket = rdp_ticket(Some("must not be written"));
+            ticket.kind = kind.to_string();
+            ticket.viewer = "x2goclient".to_string();
+            ticket.argv = vec!["x2goclient".into()];
+            assert!(resolve_viewer_binary(&ticket).is_none());
+            for force_file in [false, true] {
+                let error = launch_remote_desktop(&ticket, Path::new("."), force_file).unwrap_err();
+                assert!(error.contains("not implemented"), "{error}");
+            }
+        }
     }
 
     fn rdp_ticket(file_content: Option<&str>) -> DesktopTicket {

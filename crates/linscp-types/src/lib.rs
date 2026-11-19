@@ -28,7 +28,7 @@ pub enum ProtocolScheme {
     Vnc,
     /// SPICE (Simple Protocol for Independent Computing Environments) — QEMU/KVM `remote-viewer`/`spicy`.
     Spice,
-    /// X2Go / NX — SSH-tunneled X11 with NX compression (`x2goclient`, `nxproxy`, `pyhoca`).
+    /// X2Go over SSH; the built-in KDrive viewer is not implemented yet.
     X2Go,
     /// Generic X11 forwarding (`ssh -X`) — Wayland-aware via `waypipe`/`xwayland`.
     X11,
@@ -70,7 +70,7 @@ impl ProtocolScheme {
             "rdp" | "rdps" | "msrdp" | "ms-rdp" => Some(Self::Rdp),
             "vnc" | "rfb" => Some(Self::Vnc),
             "spice" => Some(Self::Spice),
-            "x2go" | "nx" | "nx3" => Some(Self::X2Go),
+            "x2go" => Some(Self::X2Go),
             "x11" | "x" | "waypipe" => Some(Self::X11),
             _ => None,
         }
@@ -384,6 +384,13 @@ mod tests {
         assert_eq!(ProtocolScheme::Ftpes.default_port(), 21);
         assert_eq!(ProtocolScheme::Ftps.default_port(), 990);
         assert_eq!(ProtocolScheme::Local.default_port(), 0);
+    }
+
+    #[test]
+    fn x2go_does_not_alias_removed_nx_protocols() {
+        assert_eq!(ProtocolScheme::parse("x2go"), Some(ProtocolScheme::X2Go));
+        assert_eq!(ProtocolScheme::parse("nx"), None);
+        assert_eq!(ProtocolScheme::parse("nx3"), None);
     }
 
     #[test]

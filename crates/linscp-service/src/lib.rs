@@ -4120,6 +4120,9 @@ impl CommanderService {
         // Build ticket from stored spec via proto helper.
         let kind = linscp_proto::remote_desktop::RemoteDesktopKind::from_scheme(spec.session.protocol)
             .unwrap_or(linscp_proto::remote_desktop::RemoteDesktopKind::Rdp);
+        if kind == linscp_proto::remote_desktop::RemoteDesktopKind::X2Go {
+            return api_error(501, "The built-in X2Go KDrive viewer is not implemented yet; NX support has been removed.");
+        }
         let port = if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port };
         let target = format!("{}:{}", spec.session.host, port);
         let desktop_opts = linscp_proto::remote_desktop::DesktopOptions::from_raw_fields(&spec.raw_fields);
@@ -4177,6 +4180,9 @@ impl CommanderService {
         }
         let kind = linscp_proto::remote_desktop::RemoteDesktopKind::from_scheme(spec.session.protocol)
             .unwrap_or(linscp_proto::remote_desktop::RemoteDesktopKind::Rdp);
+        if kind == linscp_proto::remote_desktop::RemoteDesktopKind::X2Go {
+            return api_error(501, "The built-in X2Go KDrive viewer is not implemented yet; NX support has been removed.");
+        }
         let port = if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port };
         let target = format!("{}:{}", spec.session.host, port);
         let desktop_opts = linscp_proto::remote_desktop::DesktopOptions::from_raw_fields(&spec.raw_fields);
@@ -4224,21 +4230,22 @@ impl CommanderService {
         }
     }
 
-    fn parse_desktop_kind_str(raw: Option<&str>) -> linscp_proto::remote_desktop::RemoteDesktopKind {
+    fn parse_desktop_kind_str(raw: Option<&str>) -> Result<linscp_proto::remote_desktop::RemoteDesktopKind, &'static str> {
         use linscp_proto::remote_desktop::RemoteDesktopKind;
-        match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        Ok(match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
             "vnc" | "rfb" => RemoteDesktopKind::Vnc,
             "spice" => RemoteDesktopKind::Spice,
-            "x2go" | "nx" => RemoteDesktopKind::X2Go,
+            "x2go" => RemoteDesktopKind::X2Go,
+            "nx" | "nx3" => return Err("NX is no longer supported; the X2Go KDrive viewer is not implemented yet."),
             "x11" | "x" | "waypipe" => RemoteDesktopKind::X11,
             _ => RemoteDesktopKind::Rdp,
-        }
+        })
     }
 
     fn handle_desktop_install_script(&self, query: &BTreeMap<String, String>, body: Value) -> ApiReply {
         use linscp_proto::remote_desktop::{server_description, server_package_name, probe_command_for_kind, install_script_for_kind};
         let kind_str = query.get("kind").map(|s| s.as_str()).or_else(|| body.get("kind").and_then(|v| v.as_str()));
-        let kind = Self::parse_desktop_kind_str(kind_str);
+        let kind = match Self::parse_desktop_kind_str(kind_str) { Ok(kind) => kind, Err(error) => return api_error(400, error) };
         let pkg = server_package_name(kind);
         let descr = server_description(kind);
         let script = install_script_for_kind(kind);
@@ -4260,7 +4267,7 @@ impl CommanderService {
         let kind_str = body.get("kind").and_then(|v| v.as_str()).or_else(|| body.get("protocol").and_then(|v| v.as_str()));
         let host = body.get("host").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         let tab_id = tabs::parse_tab_id_value(body.get("tab")).or_else(|| body.get("tabId").and_then(|v| v.as_u64())).or_else(|| body.get("via_tab").and_then(|v| v.as_u64()));
-        let mut kind = Self::parse_desktop_kind_str(kind_str);
+        let mut kind = match Self::parse_desktop_kind_str(kind_str) { Ok(kind) => kind, Err(error) => return api_error(400, error) };
         let mut target_host = host.clone();
         let mut target_port: u16 = body.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
         // If a desktop tab is referenced, prefer its spec for host/port/kind
@@ -4335,7 +4342,7 @@ impl CommanderService {
         let host = body.get("host").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         let via_tab_raw = body.get("via_tab").cloned().or_else(|| body.get("tab").cloned());
         let tab_id = tabs::parse_tab_id_value(via_tab_raw.as_ref()).or_else(|| body.get("tabId").and_then(|v| v.as_u64()));
-        let mut kind = Self::parse_desktop_kind_str(kind_str);
+        let mut kind = match Self::parse_desktop_kind_str(kind_str) { Ok(kind) => kind, Err(error) => return api_error(400, error) };
         let mut target_host = host.clone();
         let mut target_port: u16 = body.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
         // Prefer desktop tab spec if provided
@@ -4521,7 +4528,7 @@ impl CommanderService {
     async fn handle_desktop_install_async(&self, body: Value) -> ApiReply {
         use linscp_proto::remote_desktop::{server_package_name, install_script_for_kind, RemoteDesktopKind};
         let kind_str = body.get("kind").and_then(|v| v.as_str()).or_else(|| body.get("protocol").and_then(|v| v.as_str()));
-        let kind = Self::parse_desktop_kind_str(kind_str);
+        let kind = match Self::parse_desktop_kind_str(kind_str) { Ok(kind) => kind, Err(error) => return api_error(400, error) };
         if kind == RemoteDesktopKind::X2Go {
             return api_error(400, "Run the X2Go installer in an interactive terminal so sudo can request authorization.");
         }
@@ -4585,7 +4592,7 @@ impl CommanderService {
         let kind_str = body.get("kind").and_then(|v| v.as_str()).or_else(|| body.get("protocol").and_then(|v| v.as_str()));
         let mut target_host = body.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let tab_id = tabs::parse_tab_id_value(body.get("tab")).or_else(|| tabs::parse_tab_id_value(body.get("via_tab"))).or_else(|| body.get("tabId").and_then(|v| v.as_u64()));
-        let mut kind = Self::parse_desktop_kind_str(kind_str);
+        let mut kind = match Self::parse_desktop_kind_str(kind_str) { Ok(kind) => kind, Err(error) => return api_error(400, error) };
         let mut target_port: u16 = body.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
         let mut desktop_tab_spec: Option<tabs::TabRuntime> = None;
         let mut via_session: Option<std::sync::Arc<dyn linscp_proto::RemoteSession>> = None;
@@ -4620,6 +4627,11 @@ impl CommanderService {
                     via_tab_id = Some(tid);
                 }
             }
+        }
+        // Do not probe, start an agent, launch an external NX client, or return
+        // a misleading gateway while the built-in KDrive viewer is incomplete.
+        if kind == RemoteDesktopKind::X2Go {
+            return api_error(501, "The built-in X2Go KDrive viewer is not implemented yet; NX support has been removed.");
         }
         // Fallback: any SSH tab with matching host
         if via_session.is_none() && tab_id.is_none() && !target_host.is_empty() {
@@ -5854,11 +5866,21 @@ mod tests {
     async fn x2go_does_not_assume_ssh_port_means_server_installed() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
-        for path in ["/api/desktop/check", "/api/desktop/launch"] {
-            let result = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: path.into(),
-                body: json!({"kind": "x2go", "host": "server.example", "port": 22}) }).await;
-            assert_eq!(result.status, 400, "{}", result.payload);
-            assert_eq!(result.payload["success"], false);
+        let check = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/desktop/check".into(),
+            body: json!({"kind": "x2go", "host": "server.example", "port": 22}) }).await;
+        assert_eq!(check.status, 400, "{}", check.payload);
+        assert_eq!(check.payload["success"], false);
+        let launch = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/desktop/launch".into(),
+            body: json!({"kind": "x2go", "host": "server.example", "port": 22}) }).await;
+        assert_eq!(launch.status, 501, "{}", launch.payload);
+        assert!(launch.payload["error"].as_str().unwrap_or("").contains("not implemented"));
+        for kind in ["nx", "nx3"] {
+            for path in ["/api/desktop/check", "/api/desktop/launch", "/api/desktop/install"] {
+                let result = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: path.into(),
+                    body: json!({"kind": kind, "host": "server.example"}) }).await;
+                assert_eq!(result.status, 400, "{}", result.payload);
+                assert!(result.payload["error"].as_str().unwrap_or("").contains("NX"));
+            }
         }
         let install = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/desktop/install".into(),
             body: json!({"kind": "x2go"}) }).await;
