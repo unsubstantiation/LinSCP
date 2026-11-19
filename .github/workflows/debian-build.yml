@@ -125,7 +125,7 @@ jobs:
       - name: Build the binary package
         env:
           DEB_BUILD_OPTIONS: "nocheck"
-       run: python3 tools/run_cargo_ci.py dpkg-buildpackage -b -us -uc -d -j$(nproc)
+        run: python3 tools/run_cargo_ci.py dpkg-buildpackage -b -us -uc -d -j$(nproc)
 
       - name: Check the package contents
         run: |
