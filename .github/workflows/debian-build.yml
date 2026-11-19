@@ -183,7 +183,7 @@ jobs:
             exit 1
           fi
 
-     - name: Smoke test the file-manager actions
+      - name: Smoke test the file-manager actions
         run: |
           set -euo pipefail
           export LINSCP_CONFIG_DIR=$(mktemp -d)
