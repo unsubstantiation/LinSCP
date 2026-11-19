@@ -14,6 +14,9 @@ defaults:
   run:
     shell: bash
 
+permissions:
+  contents: write
+
 jobs:
   test:
     name: Linux checks & unit tests
@@ -48,12 +51,22 @@ jobs:
           python3 -m unittest discover -s tools/tests -p test_gui_distribution.py
           python3 -m unittest discover -s tools/tests -p test_workflow_triggers.py
           python3 -m unittest discover -s tools/tests -p test_x2go_installer.py
-
+          
       - name: Install and test the shared frontend
         run: |
           set -euo pipefail
           npm --prefix ui ci --no-audit --no-fund
           npm --prefix ui test
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            python3 tools/compile_translations.py
+            if ! git diff --quiet locales/; then
+              git config user.name "github-actions[bot]"
+              git config user.email "actions@localhost"
+              git add locales/de.json locales/en.json locales/es.json locales/fr.json
+              git commit -m "Regenerate unified locale files"
+              git push
+            fi
+          fi
           python3 tools/compile_translations.py --check && python3 tools/check_shared_frontend.py
 
       - name: Check the parity ledger and its repo-state suites
