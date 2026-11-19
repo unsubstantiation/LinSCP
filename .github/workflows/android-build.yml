@@ -41,21 +41,23 @@ jobs:
       - name: Configure Maven Central mirror to avoid HTTP 429 rate limits
         run: |
           mkdir -p ~/.gradle/init.d
-          cat << 'EOF' > ~/.gradle/init.d/maven-mirror.gradle
+          SRC_HOST="repo.maven.apache.org/maven2"
+          DST_HOST="://googleapis.com"
+          cat << EOF > ~/.gradle/init.d/maven-mirror.gradle
           allprojects {
             buildscript {
               repositories {
                 all { ArtifactRepository repo ->
-                  if (repo instanceof MavenArtifactRepository && repo.url.toString().startsWith("https://apache.org")) {
-                    repo.url = uri("https://googleapis.com")
+                  if (repo instanceof MavenArtifactRepository && repo.url.toString().startsWith("https://${SRC_HOST}")) {
+                    repo.url = uri("https://${DST_HOST}")
                   }
                 }
               }
             }
             repositories {
               all { ArtifactRepository repo ->
-                if (repo instanceof MavenArtifactRepository && repo.url.toString().startsWith("https://apache.org")) {
-                  repo.url = uri("https://googleapis.com")
+                if (repo instanceof MavenArtifactRepository && repo.url.toString().startsWith("https://${SRC_HOST}")) {
+                  repo.url = uri("https://${DST_HOST}")
                 }
               }
             }
@@ -130,21 +132,23 @@ jobs:
       - name: Configure Maven Central mirror to avoid HTTP 429 rate limits
         run: |
           mkdir -p ~/.gradle/init.d
-          cat << 'EOF' > ~/.gradle/init.d/maven-mirror.gradle
+          SRC_HOST="repo.maven.apache.org/maven2"
+          DST_HOST="://googleapis.com"
+          cat << EOF > ~/.gradle/init.d/maven-mirror.gradle
           allprojects {
             buildscript {
               repositories {
                 all { ArtifactRepository repo ->
-                  if (repo instanceof MavenArtifactRepository && repo.url.toString().startsWith("https://apache.org")) {
-                    repo.url = uri("https://googleapis.com")
+                  if (repo instanceof MavenArtifactRepository && repo.url.toString().startsWith("https://${SRC_HOST}")) {
+                    repo.url = uri("https://${DST_HOST}")
                   }
                 }
               }
             }
             repositories {
               all { ArtifactRepository repo ->
-                if (repo instanceof MavenArtifactRepository && repo.url.toString().startsWith("https://apache.org")) {
-                  repo.url = uri("https://googleapis.com")
+                if (repo instanceof MavenArtifactRepository && repo.url.toString().startsWith("https://${SRC_HOST}")) {
+                  repo.url = uri("https://${DST_HOST}")
                 }
               }
             }
