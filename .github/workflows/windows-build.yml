@@ -3,17 +3,24 @@ name: Windows build
 on:
   push:
     branches: [master]
-  # A pull request has to prove itself before it merges: without this trigger
-  # a PR lands with every build unrun, and master is where the red is found.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   pull_request:
-  # Run by hand from the Actions tab (or `gh workflow run`) to build a branch
-  # or re-run a build without waiting for a push to master.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     name: Windows (MSVC)
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -24,11 +31,13 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "ui/package-lock.json"
 
       - name: Install the UI dependencies
         working-directory: ui
         shell: bash
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Build the TypeScript UI
         working-directory: ui
@@ -65,11 +74,6 @@ jobs:
             if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
           }
 
-      # A3: the shipped binary ignored its own command line, so the *Send To*
-      # shortcut could never be installed by any artifact Microsoft ships. Drive the
-      # built binary the way Explorer does. The GUI is a windows-subsystem program, so
-      # it writes nothing to this console; what is checked is the files it produces.
-      # APPDATA is redirected so the runner's own Send To menu is left alone.
       - name: Smoke test the Explorer action
         shell: pwsh
         run: |
@@ -81,8 +85,6 @@ jobs:
           $exe = "$PWD/target/release/linscp-gui.exe"
           $sendto = Join-Path $env:APPDATA "Microsoft\Windows\SendTo\Upload with LinSCP.cmd"
 
-          # Wait for it: the GUI is a windows-subsystem binary, so PowerShell would
-          # otherwise not block on it and every check below would race the install.
           $install = Start-Process -FilePath $exe -ArgumentList "--install-shell-integration" -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "--install-shell-integration exited $($install.ExitCode)" }
           if (-not (Test-Path $sendto)) { throw "the Send To shortcut was not written" }
@@ -90,7 +92,6 @@ jobs:
             throw "the Send To shortcut does not call --shell-upload"
           }
 
-          # What Explorer does with a right-click: run it with the selection.
           $selection = Join-Path $root "report.pdf"
           Set-Content -Path $selection -Value "payload"
           $process = Start-Process -FilePath $sendto -ArgumentList "`"$selection`"" -PassThru
@@ -108,10 +109,6 @@ jobs:
           if ($uninstall.ExitCode -ne 0) { throw "--uninstall-shell-integration exited $($uninstall.ExitCode)" }
           if (Test-Path $sendto) { throw "uninstall left the Send To shortcut behind" }
 
-      # Releases are managed by hand; this artifact is only how the built
-      # binary leaves the run for that manual process. GitHub always delivers
-      # artifacts as a .zip envelope, so compression-level: 0 stores the exe
-      # uncompressed inside it; the file that comes out extracts byte-identical.
       - name: Upload the portable application
         uses: actions/upload-artifact@v7
         with:
@@ -119,3 +116,4 @@ jobs:
           path: target/release/linscp-gui.exe
           if-no-files-found: error
           compression-level: 0
+          retention-days: 14
