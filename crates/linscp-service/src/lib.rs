@@ -30,6 +30,7 @@ pub mod cli_actions;
 pub mod monitor;
 pub mod ops;
 pub mod queue;
+pub mod share_export;
 pub mod tabs;
 pub mod terminal_bridge;
 
@@ -1949,6 +1950,59 @@ impl CommanderService {
             let error = if stderr.trim().is_empty() { stdout.trim().to_string() } else { stderr.trim().to_string() };
             ApiReply { status: 400, payload: json!({"success": false, "error": error, "output": stdout}) }
         }
+    }
+
+    /// Download regular files for an Android share into a private directory
+    /// created by the native shell. This is not exposed as a generic API route.
+    /// The caller owns cleanup on every error and after the chooser expires.
+    pub async fn stage_remote_share(
+        &self, tab_id: u64, remote_dir: &str, names: &[String], destination: &Path,
+    ) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        use share_export::{LimitedWriter, MAX_EXPORT_BYTES, MAX_EXPORT_FILES};
+        if names.is_empty() || names.len() > MAX_EXPORT_FILES {
+            return Err("Select between 1 and 32 files to share.".to_string());
+        }
+        let dir = validate_remote_absolute_path(remote_dir)?;
+        if dir != remote_dir { return Err("The remote directory must not have leading or trailing whitespace.".to_string()); }
+        let session = {
+            let state = self.state.lock().map_err(|e| e.to_string())?;
+            let tab = state.tabs.get(&tab_id).filter(|tab| tab.connected && !tab.is_local)
+                .ok_or_else(|| "The selected remote session is not connected.".to_string())?;
+            tab.remote.clone().ok_or_else(|| "The selected remote session is not connected.".to_string())?
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut items = Vec::new();
+        let mut expected_total = 0u64;
+        for name in names {
+            ops::validate_leaf_name(name)?;
+            let base = destination.to_str().ok_or("Invalid private share directory.")?;
+            resolve_contained(base, name)?;
+            if !seen.insert(name) { return Err("Duplicate file name.".to_string()); }
+            let remote = format!("{}/{}", dir.trim_end_matches('/'), name);
+            let entry = session.stat(&remote).await.map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("File not found: {name}"))?;
+            if entry.is_dir || entry.is_symlink { return Err("Only regular files can be shared.".to_string()); }
+            expected_total = expected_total.checked_add(entry.size).ok_or("Shared files exceed the 512 MiB limit.")?;
+            if expected_total > MAX_EXPORT_BYTES { return Err("Shared files exceed the 512 MiB limit.".to_string()); }
+            items.push((remote, name, entry.size));
+        }
+        let mut used = 0u64;
+        for (remote, name, expected) in items {
+            let target = destination.join(name);
+            let file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&target).await
+                .map_err(|e| format!("Cannot create private share copy: {e}"))?;
+            let mut sink = LimitedWriter::new(file, MAX_EXPORT_BYTES - used);
+            let received = session.download(&remote, Default::default(), &mut sink, None).await.map_err(|e| e.to_string())?;
+            sink.flush().await.map_err(|e| e.to_string())?;
+            drop(sink);
+            let actual = tokio::fs::metadata(&target).await.map_err(|e| e.to_string())?.len();
+            if received != actual || actual != expected {
+                return Err(format!("The source changed or the download was incomplete: {name}"));
+            }
+            used = used.checked_add(actual).ok_or("Shared files exceed the 512 MiB limit.")?;
+        }
+        Ok(())
     }
 
     async fn queue_transfer_async(&self, body: Value, upload: bool, move_item: bool) -> ApiReply {
@@ -10399,6 +10453,34 @@ mod tests {
         let tab = TabRuntime { id: 7, name: "mock".to_string(), site_name: None, is_local: false, connected: true, local_dir: local_dir.to_string(), remote_dir: "/".to_string(), other_local_dir: String::new(), observed_hostkey: String::new(), hostkey_role: "destination".to_string(), hostkey_changed: false, error: String::new(), spec: None, session_json: json!({"protocol": "dav"}), remote: Some(session) };
         service.state.lock().expect("state mutex").tabs.insert(tab.id, tab);
         7
+    }
+
+    #[tokio::test]
+    async fn remote_share_stages_the_selected_tab_and_rejects_unsafe_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSession::new());
+        session.add_file("/one.txt", b"one");
+        session.add_file("/two.txt", b"two");
+        session.add_dir("/folder");
+        let id = insert_remote_tab(&svc, session.clone(), "/");
+        let batch = tmp.path().join("batch");
+        std::fs::create_dir(&batch).unwrap();
+        let names = vec!["one.txt".to_string(), "two.txt".to_string()];
+        svc.stage_remote_share(id, "/", &names, &batch).await.unwrap();
+        assert_eq!(std::fs::read(batch.join("one.txt")).unwrap(), b"one");
+        assert_eq!(std::fs::read(batch.join("two.txt")).unwrap(), b"two");
+        assert_eq!(session.bytes_of("/one.txt").unwrap(), b"one");
+        // Never replace a pre-existing copy or use a different tab.
+        assert!(svc.stage_remote_share(id, "/", &names, &batch).await.is_err());
+        assert!(svc.stage_remote_share(id + 1, "/", &names, &batch).await.is_err());
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        for bad in [vec!["folder"], vec!["one.txt", "folder"], vec!["../one.txt"], vec!["one.txt", "one.txt"]] {
+            let names: Vec<String> = bad.into_iter().map(str::to_string).collect();
+            assert!(svc.stage_remote_share(id, "/", &names, &empty).await.is_err());
+            assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
+        }
     }
 
     /// A session-download request body with the WebDAV tree options set.

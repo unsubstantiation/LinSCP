@@ -210,7 +210,7 @@ export class TerminalSession {
   private readonly renderer: TerminalRenderer;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
-  /** Serialises input so rapid key presses reach the PTY in order. */
+  /** Serialises input and resize requests so an old grid cannot overtake a new one. */
   private inputQueue: Promise<unknown> = Promise.resolve();
   private backendClosed = false;
   private lastTitle: string | null = null;
@@ -325,6 +325,10 @@ export class TerminalSession {
   /** Starts painting and polling. */
   public start(): void {
     this.watchViewport();
+    // The PTY was opened at a requested size, which need not match this
+    // window's actual measured grid. Send it before the first keystroke.
+    const cell = this.renderer.cellSize();
+    void this.resize({ columns: this.grid.columns, lines: this.grid.lines, width: cell.width, height: cell.height });
     this.poll();
   }
 
@@ -347,7 +351,8 @@ export class TerminalSession {
     if (this.viewport) {
       this.viewport.addEventListener('resize', this.handleViewportChange);
     }
-    view?.addEventListener('resize', this.handleViewportChange);
+    this.windowView = view ?? null;
+    this.windowView?.addEventListener('resize', this.handleViewportChange);
   }
 
   private readonly handleViewportChange = (): void => {
@@ -368,6 +373,7 @@ export class TerminalSession {
   };
 
   private viewport: VisualViewport | null = null;
+  private windowView: Window | null = null;
 
   /** Stops polling and removes the canvas. The shell is told only by `close`. */
   public stop(): void {
@@ -378,6 +384,8 @@ export class TerminalSession {
     }
     this.viewport?.removeEventListener('resize', this.handleViewportChange);
     this.viewport = null;
+    this.windowView?.removeEventListener('resize', this.handleViewportChange);
+    this.windowView = null;
     // A long-press timer that outlived the session would open a selection on a
     // terminal that has already closed.
     this.cancelLongPress();
@@ -434,18 +442,20 @@ export class TerminalSession {
     this.grid = { columns, lines };
     // An empty payload carries the size, exactly as the page's old handler
     // did: the endpoint already interprets "no data" as "resize only".
-    try {
-      await this.transport.post('/api/terminal/input', {
-        terminal: this.terminal,
-        data: '',
-        cols: columns,
-        rows: lines,
-        ...(next.width !== undefined ? { cell_width: next.width, cell_height: next.height } : {}),
-      });
-    } catch {
-      // A size the backend refused is not fatal; the next frame is unchanged
-      // and the next resize will try again.
-    }
+    const payload = {
+      terminal: this.terminal,
+      data: '',
+      cols: columns,
+      rows: lines,
+      ...(next.width !== undefined ? { cell_width: next.width, cell_height: next.height } : {}),
+    };
+    this.inputQueue = this.inputQueue.then(() => {
+      if (this.stopped) return;
+      return this.transport.post('/api/terminal/input', payload);
+    }).catch(() => {
+      // A refused size is not fatal; a later resize can try again.
+    });
+    await this.inputQueue;
   }
 
   /** Sends bytes to the shell, in order, after any input already queued. */
@@ -454,6 +464,9 @@ export class TerminalSession {
       return;
     }
     const data = encodeInput(text);
+    // Capture the grid at enqueue time: a later resize must not make this
+    // earlier write jump ahead to a size that is followed by an older resize.
+    const { columns, lines } = this.grid;
     this.inputQueue = this.inputQueue
       .then(() => {
         if (this.stopped) {
@@ -462,8 +475,8 @@ export class TerminalSession {
         return this.transport.post('/api/terminal/input', {
           terminal: this.terminal,
           data,
-          cols: this.grid.columns,
-          rows: this.grid.lines,
+          cols: columns,
+          rows: lines,
         });
       })
       .catch(() => {
@@ -812,11 +825,14 @@ export class TerminalSession {
         this.onTitle?.(frame.title);
       }
       this.onFrame?.(frame);
-      // A resize the window noticed is sent only after a frame has painted:
-      // the model's answer is what the new grid's programs redraw against.
+      // Layout changes can resize a container without a window resize event.
+      // In that case update the remote PTY as well as the local grid.
       const resized = this.renderer.takeResize(this.grid);
       if (resized) {
-        this.grid = resized;
+        this.renderer.resizeBackingStore();
+        this.renderer.repaint();
+        this.onResize?.(resized);
+        void this.resize(resized);
       }
       // The keyboard follows the cursor, not the element's last position: on a
       // phone this is what keeps the input method's candidate window at the

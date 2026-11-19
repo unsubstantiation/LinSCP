@@ -164,6 +164,16 @@ export async function handleShareIntent(
   return { staged: reply.staged ?? [], manifest: reply.manifest };
 }
 
+/** Opens Android's chooser after the native host stages the selected files. */
+export async function shareFiles(
+  source: { side: 'local' | 'remote'; tab: number | null; directory: string; names: string[] },
+  options: { invoker?: NativeInvoker | null } = {},
+): Promise<void> {
+  const invoker = options.invoker ?? nativeInvoker();
+  if (!invoker) throw new Error('Android sharing is not available.');
+  await invoker.invoke('linscp_share_files', source);
+}
+
 /** Starts or stops the Android foreground service that keeps transfers alive. */
 export class ForegroundTransferBridge {
   private readonly invoker: NativeInvoker | null;

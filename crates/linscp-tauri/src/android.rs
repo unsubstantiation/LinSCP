@@ -95,6 +95,9 @@ mod imp {
                 None => Ok(Vec::new()),
             }
         }
+        pub fn export_bridge(&self) -> Result<Arc<dyn ShareBridge>, PlatformError> {
+            self.share.lock().unwrap().clone().ok_or_else(|| PlatformError::Unsupported("Android share integration is not available".to_string()))
+        }
         pub fn foreground_start(&self, title: &str, ongoing: usize) -> Result<(), PlatformError> {
             if let Some(bridge) = self.fg.lock().unwrap().as_deref() {
                 bridge.start(title, ongoing)
@@ -266,6 +269,25 @@ mod mobile_plugin {
         fn stage_uris(&self, uris: &[String]) -> Result<Vec<PathBuf>, PlatformError> {
             #[derive(Serialize)] struct Args<'a> { uris: &'a [String] }
             Ok(self.call::<PathList, _>("stageUris", Args { uris })?.paths)
+        }
+        fn prepare_export(&self) -> Result<PathBuf, PlatformError> {
+            #[derive(Deserialize)] struct Batch { path: PathBuf }
+            Ok(self.call::<Batch, _>("prepareExport", ())?.path)
+        }
+        fn stage_local_export(&self, batch: &std::path::Path, directory: &str, names: &[String]) -> Result<(), PlatformError> {
+            #[derive(Serialize)] struct Args<'a> { batch: &'a std::path::Path, directory: &'a str, names: &'a [String] }
+            let _: serde_json::Value = self.call("stageLocalExport", Args { batch, directory, names })?;
+            Ok(())
+        }
+        fn open_export(&self, batch: &std::path::Path, names: &[String]) -> Result<(), PlatformError> {
+            #[derive(Serialize)] struct Args<'a> { batch: &'a std::path::Path, names: &'a [String] }
+            let _: serde_json::Value = self.call("openExport", Args { batch, names })?;
+            Ok(())
+        }
+        fn discard_export(&self, batch: &std::path::Path) -> Result<(), PlatformError> {
+            #[derive(Serialize)] struct Args<'a> { batch: &'a std::path::Path }
+            let _: serde_json::Value = self.call("discardExport", Args { batch })?;
+            Ok(())
         }
     }
     impl ExternalUriBridge for MobileBridge {

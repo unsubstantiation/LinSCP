@@ -14,7 +14,11 @@ import json
 import pathlib
 import re
 import sys
+import shutil
+import subprocess
+import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -142,6 +146,69 @@ class AndroidApplicationIdTests(unittest.TestCase):
         self.assertIn('LinSCPTransferService', prepare)
         host = (ROOT / 'crates/linscp-tauri/src/lib.rs').read_text(encoding='utf-8')
         self.assertIn('android::mobile_plugin()', host)
+
+    def test_outgoing_share_provider_is_private_and_prepare_is_idempotent(self):
+        # Exercise the real preparation script against a disposable generated
+        # project, not just a string assertion about what it might produce.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for name in ['tools/prepare_android_project.py', 'tools/android_application_id.py',
+                         'crates/linscp-tauri/tauri.conf.json', 'crates/linscp-tauri/android/LinSCPAndroidPlugin.kt']:
+                target = root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / name, target)
+            app = root / 'crates/linscp-tauri/gen/android/app'
+            manifest = app / 'src/main/AndroidManifest.xml'
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text('''<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application>
+        <activity android:name=".MainActivity"></activity>
+    </application>
+</manifest>''')
+            (app / 'build.gradle.kts').write_text(f'applicationId = "{EXPECTED}"\n')
+            activity = app / 'src/main/java' / pathlib.Path(*EXPECTED.split('.')) / 'MainActivity.kt'
+            activity.parent.mkdir(parents=True, exist_ok=True)
+            activity.write_text('super.onCreate(savedInstanceState)\n')
+            command = [sys.executable, str(root / 'tools/prepare_android_project.py')]
+            for _ in range(2):
+                subprocess.run(command, check=True, capture_output=True, text=True)
+            android = '{http://schemas.android.com/apk/res/android}'
+            providers = ET.parse(manifest).getroot().find('application').findall('provider')
+            self.assertEqual(len(providers), 1)
+            provider = providers[0]
+            self.assertEqual(provider.get(android + 'name'), '.LinSCPExportProvider')
+            self.assertEqual(provider.get(android + 'exported'), 'false')
+            self.assertEqual(provider.get(android + 'grantUriPermissions'), 'true')
+            self.assertEqual(provider.get(android + 'authorities'), '${applicationId}.outgoing')
+            paths = ET.parse(app / 'src/main/res/xml/linscp_outgoing_files.xml').getroot()
+            self.assertEqual([(item.tag, item.get('path')) for item in paths], [('cache-path', 'outgoing-shares/')])
+            # A pre-existing provider that weakens the policy must fail closed.
+            manifest.write_text(manifest.read_text().replace('android:exported="false"\n            android:grantUriPermissions', 'android:exported="true"\n            android:grantUriPermissions'))
+            rejected = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
+            self.assertIn('Invalid outgoing share provider', rejected.stderr)
+
+    def test_outgoing_share_uses_read_grants_and_an_isolated_cache(self):
+        kotlin = (ROOT / 'crates/linscp-tauri/android/LinSCPAndroidPlugin.kt').read_text(encoding='utf-8')
+        for command in ['prepareExport', 'stageLocalExport', 'openExport', 'discardExport']:
+            self.assertIn('fun ' + command + '(invoke: Invoke)', kotlin)
+        self.assertIn('class LinSCPExportProvider : FileProvider()', kotlin)
+        self.assertIn('FileProvider.getUriForFile', kotlin)
+        self.assertIn('Intent.ACTION_SEND_MULTIPLE', kotlin)
+        self.assertIn('ClipData.Item(it)', kotlin)
+        self.assertIn('Intent.FLAG_GRANT_READ_URI_PERMISSION', kotlin)
+        export_section = kotlin[kotlin.index('private fun cleanupOldExports'):kotlin.index('fun foregroundStart')]
+        self.assertNotIn('FLAG_GRANT_WRITE_URI_PERMISSION', export_section)
+        self.assertIn('batch.absolutePath !in activeExports', export_section)
+        self.assertIn('batch.setLastModified', export_section)
+        self.assertIn('resolveDocument(uri)', export_section)
+        host = (ROOT / 'crates/linscp-tauri/src/lib.rs').read_text(encoding='utf-8')
+        self.assertIn('if result.is_err() { let _ = bridge.discard_export(&batch); }', host)
+        self.assertIn('state.service.stage_remote_share', host)
+        service = (ROOT / 'crates/linscp-service/src/share_export.rs').read_text(encoding='utf-8')
+        self.assertIn('pub const MAX_EXPORT_BYTES', service)
+        self.assertIn('struct LimitedWriter', service)
 
     def test_the_android_workflow_installs_the_cli_and_builds_the_frontend(self):
         # `tauri android init` runs the locally installed Tauri CLI, and the APK

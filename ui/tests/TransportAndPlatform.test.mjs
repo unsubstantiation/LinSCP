@@ -27,6 +27,7 @@ import {
   normalizeLocale,
   openExternalUri,
   requestSafTree,
+  shareFiles,
   safLimitationReason,
   sharedFeatureSet,
 } from '../dist/linscp-core.mjs';
@@ -79,6 +80,15 @@ test('createTransport builds the native bridge and nothing else', async () => {
   // Outside the shell there is no backend to reach, and the page says so
   // rather than pretending a network request could answer.
   assert.equal(createTransport({ host: {} }), null);
+});
+
+test('Android outgoing share passes the selected source and preserves native errors', async () => {
+  const calls = [];
+  const source = { side: 'remote', tab: 7, directory: '/files', names: ['one.txt', 'two.png'] };
+  const invoker = { invoke: async (command, args) => { calls.push({ command, args }); } };
+  await shareFiles(source, { invoker });
+  assert.deepEqual(calls, [{ command: 'linscp_share_files', args: source }]);
+  await assert.rejects(() => shareFiles(source, { invoker: { invoke: async () => { throw new Error('provider refused'); } } }), /provider refused/);
 });
 
 test('TauriTransport retains structured failures for connection and overwrite dialogs', async () => {

@@ -34,6 +34,17 @@ upload). Android support is incomplete:
   The receiving half is shared: a Share Sheet selection and a desktop
   `--shell-upload` end up in the same pending manifest, offered by the same
   confirmation dialog.
+- **Files → Share files…** offers selected app-storage, granted-folder or
+  remote files to Android's chooser. Up to 32 regular files and 512 MiB in total
+  are copied to private cache; remote files must finish downloading before the
+  chooser opens. The recipient gets read-only content-URI grants, not raw paths.
+  Copies remain after the chooser closes and are removed best-effort at a later
+  app launch or share after 24 hours; Android may evict them earlier, and the
+  receiving app may retain its own copy. Failed preparation is cleaned up
+  best-effort. There is currently no progress or cancellation control, and the
+  operation is not part of the transfer queue. A remote file can change during
+  download; checking its size does not establish a snapshot. This integration
+  has not yet been verified on a device or with a real receiving app.
 - Remote transfer restrictions and cleanup caveats in the main README still
   apply. The shared GUI actions listed in the native feature audit are routed
   through the service, but some remain protocol-limited or lack Android

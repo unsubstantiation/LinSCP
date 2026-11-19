@@ -2,6 +2,7 @@ package com.fairuniversal.linscp
 
 import android.app.Activity
 import android.content.Intent
+import android.content.ClipData
 import android.net.Uri
 import android.os.Build
 import android.provider.DocumentsContract
@@ -30,6 +31,8 @@ import android.content.Context
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import android.webkit.MimeTypeMap
 
 @InvokeArg
 internal class TreeArgs { lateinit var uri: String }
@@ -47,6 +50,15 @@ internal class RenameArgs { lateinit var uri: String; lateinit var new_name: Str
 internal class ForegroundStartArgs { lateinit var title: String; var ongoing: Int = 0 }
 @InvokeArg
 internal class ProgressArgs { var done: Long = 0; var total: Long = 0 }
+@InvokeArg
+internal class ExportArgs { lateinit var batch: String; lateinit var names: ArrayList<String> }
+@InvokeArg
+internal class LocalExportArgs { lateinit var batch: String; lateinit var directory: String; lateinit var names: ArrayList<String> }
+@InvokeArg
+internal class ExportBatchArgs { lateinit var batch: String }
+
+/** A distinct provider avoids merging another plugin's FileProvider settings. */
+class LinSCPExportProvider : FileProvider()
 
 /** Android implementation behind the Rust `linscp-platform::android` bridges. */
 @TauriPlugin
@@ -57,6 +69,11 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   private val shareDir: File get() = File(activity.cacheDir, "incoming-shares")
   private val maxSharedBytes = 512L * 1024L * 1024L
   private val stageLock = Any()
+  private val exportLock = Any()
+  private val activeExports = mutableSetOf<String>()
+  private val exportRoot: File get() = File(activity.cacheDir, "outgoing-shares")
+  private val exportLimit = 512L * 1024L * 1024L
+  private val exportLifetime = 24L * 60 * 60 * 1000
 
   private fun <T : Any> runIo(invoke: Invoke, failurePrefix: String, action: () -> T) {
     Thread({
@@ -72,6 +89,7 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   override fun load(webView: WebView) {
+    Thread({ cleanupOldExports() }, "linscp-export-cleanup").start()
     activity.intent?.let { stageShareIntent(it) }
   }
 
@@ -225,6 +243,142 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   fun takePendingShares(invoke: Invoke) {
     val paths = synchronized(shareLock) { pendingShares.toList().also { pendingShares.clear() } }
     invoke.resolveObject(mapOf("paths" to paths))
+  }
+
+  // Export batches are private until FileProvider grants an exact URI to the
+  // receiving app. They are kept after the chooser returns because a receiver
+  // may read asynchronously; old inactive batches are removed opportunistically.
+  private fun cleanupOldExports() = synchronized(exportLock) {
+    val cutoff = System.currentTimeMillis() - exportLifetime
+    exportRoot.listFiles()?.forEach { batch ->
+      if (batch.absolutePath !in activeExports && batch.lastModified() < cutoff) batch.deleteRecursively()
+    }
+  }
+
+  private fun activeExport(path: String): File = synchronized(exportLock) {
+    val root = exportRoot.canonicalFile
+    val batch = File(path)
+    if (batch.absolutePath !in activeExports || batch.canonicalFile.parentFile != root || !batch.isDirectory)
+      throw IllegalStateException("invalid or expired share batch")
+    batch
+  }
+
+  private fun checkedExportNames(names: List<String>) {
+    if (names.isEmpty() || names.size > 32 || names.toSet().size != names.size)
+      throw IllegalStateException("select between 1 and 32 distinct files")
+    for (name in names) {
+      if (name.isEmpty() || name == "." || name == ".." || name.any { it == '/' || it == '\\' || it == ':' || it.isISOControl() })
+        throw IllegalStateException("invalid file name")
+    }
+  }
+
+  @Command
+  fun prepareExport(invoke: Invoke) {
+    runIo(invoke, "Cannot prepare sharing") {
+      synchronized(exportLock) {
+        cleanupOldExports()
+        if (!exportRoot.exists() && !exportRoot.mkdirs()) throw IllegalStateException("cannot create private cache")
+        val batch = File(exportRoot, UUID.randomUUID().toString())
+        if (!batch.mkdir()) throw IllegalStateException("cannot create private share batch")
+        activeExports.add(batch.absolutePath)
+        mapOf("path" to batch.absolutePath)
+      }
+    }
+  }
+
+  @Command
+  fun stageLocalExport(invoke: Invoke) {
+    val args = invoke.parseArgs(LocalExportArgs::class.java)
+    runIo(invoke, "Cannot prepare local files for sharing") {
+      checkedExportNames(args.names)
+      val batch = activeExport(args.batch)
+      var total = 0L
+      for (name in args.names) {
+        val input = if (args.directory.startsWith("content://")) {
+          val uri = Uri.parse(args.directory).buildUpon().appendPath("document").appendPath(name).build()
+          val resolved = resolveDocument(uri)
+          if (readEntry(resolved)["is_dir"] == true) throw IllegalStateException("only files can be shared")
+          activity.contentResolver.openInputStream(resolved) ?: throw IllegalStateException("cannot read selected document")
+        } else {
+          val source = File(args.directory, name)
+          val appRoot = File(activity.applicationInfo.dataDir).canonicalFile
+          val canonical = source.canonicalFile
+          if (!canonical.toPath().startsWith(appRoot.toPath()) || !source.isFile || java.nio.file.Files.isSymbolicLink(source.toPath()))
+            throw IllegalStateException("only regular files in app storage can be shared")
+          source.inputStream()
+        }
+        input.use { src ->
+          val dest = File(batch, name)
+          if (!dest.createNewFile()) throw IllegalStateException("share destination already exists")
+          FileOutputStream(dest).use { out ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+              val count = src.read(buffer)
+              if (count < 0) break
+              total += count
+              if (total > exportLimit) throw IllegalStateException("shared files exceed the 512 MiB limit")
+              out.write(buffer, 0, count)
+            }
+            out.fd.sync()
+          }
+        }
+      }
+      mapOf("success" to true)
+    }
+  }
+
+  @Command
+  fun discardExport(invoke: Invoke) {
+    val args = invoke.parseArgs(ExportBatchArgs::class.java)
+    runIo(invoke, "Cannot clean up share") {
+      synchronized(exportLock) {
+        val batch = activeExport(args.batch)
+        batch.deleteRecursively()
+        activeExports.remove(batch.absolutePath)
+      }
+      mapOf("success" to true)
+    }
+  }
+
+  @Command
+  fun openExport(invoke: Invoke) {
+    val args = invoke.parseArgs(ExportArgs::class.java)
+    try {
+      checkedExportNames(args.names)
+      val batch = activeExport(args.batch)
+      val files = args.names.map { name ->
+        val file = File(batch, name)
+        if (!file.isFile || java.nio.file.Files.isSymbolicLink(file.toPath()) || file.canonicalFile.parentFile != batch.canonicalFile)
+          throw IllegalStateException("a staged file is missing or invalid")
+        file
+      }
+      if (files.sumOf { it.length() } > exportLimit) throw IllegalStateException("shared files exceed the 512 MiB limit")
+      val uris = files.map { FileProvider.getUriForFile(activity, activity.packageName + ".outgoing", it) }
+      val types = files.map { file ->
+        MimeTypeMap.getSingleton().getMimeTypeFromExtension(file.extension.lowercase(Locale.ROOT)) ?: "application/octet-stream"
+      }
+      val mime = if (types.distinct().size == 1) types.first() else "*/*"
+      val clip = ClipData.newRawUri("LinSCP", uris.first())
+      uris.drop(1).forEach { clip.addItem(ClipData.Item(it)) }
+      val send = Intent(if (uris.size == 1) Intent.ACTION_SEND else Intent.ACTION_SEND_MULTIPLE).apply {
+        type = mime
+        if (uris.size == 1) putExtra(Intent.EXTRA_STREAM, uris.first())
+        else putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+        clipData = clip
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+      }
+      activity.runOnUiThread {
+        try {
+          val chooser = Intent.createChooser(send, null).apply {
+            clipData = clip
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+          }
+          activity.startActivity(chooser)
+          synchronized(exportLock) { batch.setLastModified(System.currentTimeMillis()); activeExports.remove(batch.absolutePath) }
+          invoke.resolveObject(mapOf("success" to true))
+        } catch (e: Exception) { invoke.reject("Cannot open share chooser: ${e.message}") }
+      }
+    } catch (e: Exception) { invoke.reject("Cannot prepare share: ${e.message}") }
   }
 
   @Command
