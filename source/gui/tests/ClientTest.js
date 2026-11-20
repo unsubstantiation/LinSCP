@@ -442,6 +442,25 @@ function text(id) {
   return node ? node.textContent.trim() : '<missing #' + id + '>';
 }
 
+/* An error is an entry in the Logs panel, not a popup: a refusal is read back
+ * from the panel, and the toast only carries the notices that confirm an
+ * action. The panel keeps everything the page logged, so these assertions ask
+ * how often a message is in it, not whether it is the only thing there. */
+function errorLog() {
+  return text('logOutput');
+}
+
+/* The entry an action just added, which is what the popup used to show: the
+ * panel keeps everything, so a check about one failure reads the last line. */
+function lastLogLine() {
+  const box = window.document.getElementById('logOutput');
+  return box && box.lastElementChild ? box.lastElementChild.textContent : '<no log entry>';
+}
+
+function countIn(haystack, needle) {
+  return haystack.split(needle).length - 1;
+}
+
 function value(id) {
   const node = window.document.getElementById(id);
   return node ? node.value : '<missing #' + id + '>';
@@ -478,6 +497,10 @@ function options(id) {
           font: '', fillStyle: '', textBaseline: '', setTransform() {}, fillRect() {}, fillText() {},
           measureText: value => ({ width: String(value).length * 9 })
         });
+        /* Every WebView has TextEncoder and the terminal encodes its shell
+         * input with it; jsdom does not, so the window would be one no real
+         * host is. */
+        host.TextEncoder = require('util').TextEncoder;
       }
     });
     await new Promise(resolve => setTimeout(resolve, 30));
@@ -487,6 +510,32 @@ function options(id) {
     check('the injected terminal label survives unrelated window metadata',
       terminalCalls.some(call => call && call.path === '/api/terminal/input' && call.body.terminal === 'term-separate'),
       JSON.stringify(terminalCalls));
+
+    /* The canvas selection is the model's, so the window's own shortcuts have
+     * to reach it: Ctrl+Shift+C reads the selection, Ctrl+Shift+V pastes the
+     * clipboard, and a plain Ctrl+C with nothing selected stays the shell's
+     * interrupt instead of becoming a copy nobody asked for. */
+    const terminalWindow = terminalPage.window;
+    Object.defineProperty(terminalWindow.navigator, 'clipboard', {
+      configurable: true,
+      value: { readText: async () => 'pasted text' }
+    });
+    const press = (key, shift) => terminalWindow.document.dispatchEvent(
+      new terminalWindow.KeyboardEvent('keydown', { key, ctrlKey: true, shiftKey: !!shift, cancelable: true }));
+    press('c', true);
+    press('v', true);
+    press('c', false);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    const inputs = terminalCalls.filter(call => call && call.path === '/api/terminal/input' && call.body && call.body.data);
+    check('Ctrl+Shift+C reads the terminal selection in a desktop window',
+      terminalCalls.some(call => call && String(call.path).indexOf('/api/terminal/selection') === 0),
+      JSON.stringify(terminalCalls.map(call => call && call.path)));
+    check('Ctrl+Shift+V pastes the clipboard into the shell',
+      inputs.some(call => Buffer.from(call.body.data, 'base64').toString() === 'pasted text'),
+      JSON.stringify(inputs.map(call => call.body.data)));
+    check('a plain Ctrl+C still reaches the shell as its interrupt',
+      inputs.some(call => call.body.data === Buffer.from('\x03').toString('base64')),
+      JSON.stringify(inputs.map(call => call.body.data)));
     terminalPage.window.close();
   }
   check('boot queried the status', paths.includes('/api/status'));
@@ -549,7 +598,7 @@ function options(id) {
     check('Android share keeps the selected remote tab and directory', shares.length === 2 && shares[1].side === 'remote' && shares[1].tab === 1 && shares[1].directory === '/tmp/slowremote' && shares[1].names[0] === 'keep.txt');
     failShare = true;
     await window.shareSelectedFiles();
-    check('Android share reports provider errors', shares.length === 3 && text('toast').includes('provider refused'));
+    check('Android share reports provider errors', shares.length === 3 && lastLogLine().includes('provider refused'));
     failShare = false;
     window.clearFocusedSelection();
     doc.getElementById('remoteFileList').children[1].click();
@@ -587,8 +636,8 @@ function options(id) {
     const refused = await window.openTerminal(null, false, 'must-not-run');
     let closes = calls.filter(call => call.path === '/api/terminal/close');
     check('a refused desktop window reports an error, closes its shell and never opens the modal',
-      refused === false && text('toast').includes('window manager refused') &&
-      text('toast').includes('Cannot open a separate terminal window.') &&
+      refused === false && lastLogLine().includes('window manager refused') &&
+      lastLogLine().includes('Cannot open a separate terminal window.') &&
       !doc.getElementById('terminalModal').classList.contains('open') &&
       closes.length === closedBefore + 1 && JSON.parse(closes.at(-1).options.body).terminal === 'term-77' &&
       calls.filter(call => call.path === '/api/terminal/input').length === inputBefore);
@@ -598,14 +647,14 @@ function options(id) {
     const missingLabel = await window.openTerminal();
     closes = calls.filter(call => call.path === '/api/terminal/close');
     check('a desktop window with no label closes the shell without opening the modal',
-      missingLabel === false && text('toast').includes('no window label') &&
+      missingLabel === false && lastLogLine().includes('no window label') &&
       !doc.getElementById('terminalModal').classList.contains('open') && closes.length === closedBefore + 1);
     const priorClose = responses['/api/terminal/close'];
     responses['/api/terminal/close'] = { success: false, error: 'close refused' };
     const failedClose = await window.openTerminal();
     check('a failed terminal cleanup is reported alongside the window failure',
-      failedClose === false && text('toast').includes('Cannot close the terminal session.') &&
-      text('toast').includes('close refused') && !doc.getElementById('terminalModal').classList.contains('open'));
+      failedClose === false && lastLogLine().includes('Cannot close the terminal session.') &&
+      lastLogLine().includes('close refused') && !doc.getElementById('terminalModal').classList.contains('open'));
     responses['/api/terminal/close'] = priorClose;
     closes = calls.filter(call => call.path === '/api/terminal/close');
     const core = window.LinSCPCore;
@@ -619,7 +668,7 @@ function options(id) {
       const noBridge = await window.openTerminal();
       closes = calls.filter(call => call.path === '/api/terminal/close');
       check(`a missing ${platform} window bridge closes the shell without opening the modal`,
-        noBridge === false && text('toast').includes('bridge is unavailable') &&
+        noBridge === false && lastLogLine().includes('bridge is unavailable') &&
         !doc.getElementById('terminalModal').classList.contains('open') && closes.length === closedBefore + 1);
     }
     window.LinSCPCore = core;
@@ -901,8 +950,9 @@ function options(id) {
     text('cliOutput').indexOf('/tmp/slowremote') >= 0, text('cliOutput').slice(-80));
   window.switchTab('log');
   await new Promise(resolve => setTimeout(resolve, 150));
-  check('log tab renders entries', doc.getElementById('logOutput').children.length === 1,
-    doc.getElementById('logOutput').children.length);
+  // The panel also holds what the page logged itself, so the backend's entry
+  // is asked for by name rather than by a count of the whole panel.
+  check('log tab renders entries', text('logOutput').includes('Connected'), text('logOutput'));
   window.switchTab('queue');
 
   // Keyboard shortcuts: Ctrl+A in the focused pane.
@@ -1839,7 +1889,7 @@ function options(id) {
   doc.getElementById('localFileList').children[0]
     .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
   await window.runCustomCommand();
-  const refusals = text('toast');
+  const refusals = lastLogLine();
   const afterMismatch = calls.filter(call => call.path === '/api/custom-commands' &&
     JSON.parse(call.options.body || '{}').action === 'run').length;
   check('a template saved for one side is refused on the other side by name',
@@ -1905,8 +1955,8 @@ function options(id) {
     refused: [{ name: 'locked.txt', error: 'The destination already exists.' }] };
   await window.shellUploadConfirm();
   check('a refused file is reported with its reason',
-    text('toast').includes('locked.txt: The destination already exists.'),
-    text('toast'));
+    lastLogLine().includes('locked.txt: The destination already exists.'),
+    lastLogLine());
   responses['/api/shell/consume'] = { success: true, queued: ['a.txt', 'folder'],
     missing: [], refused: [], remote_dir: '/tmp/slowremote' };
   responses['/api/shell/pending'] = { success: true, pending: [] };
@@ -2304,6 +2354,33 @@ function options(id) {
     doc.getElementById('tabStrip').children.length === savedStatus.tabs.length,
     String(doc.getElementById('tabStrip').children.length));
 
+  /* A request that got no answer is not a status. The transport hands back
+   * `{success:false, error}` for one, and drawing that emptied the tab strip
+   * and put "Disconnected" on the badge - a backend that could not be reached
+   * is not a server that went away, and this is asked on a timer and whenever
+   * the window is looked at again. */
+  responses['/api/status'] = { success: false, error: 'Cannot reach the LinSCP backend.' };
+  await window.refreshStatus();
+  check('a status answer that failed the request leaves the tabs it last drew',
+    doc.getElementById('tabStrip').children.length === savedStatus.tabs.length,
+    String(doc.getElementById('tabStrip').children.length));
+  responses['/api/status'] = savedStatus;
+  await window.refreshStatus();
+
+  /* A session can end while this window is not the one being looked at: on a
+   * desktop the shell that says so runs in a window of its own. The status is
+   * asked again when this window is looked at again instead of only by the
+   * fifteen-second poll, so the badge has caught up by the time the panes are
+   * being used. */
+  {
+    const statuses = () => calls.filter(call => call.path === '/api/status').length;
+    const before = statuses();
+    window.dispatchEvent(new window.Event('focus'));
+    await new Promise(resolve => setTimeout(resolve, 40));
+    check('looking at the window again asks what became of its tabs',
+      statuses() > before, 'status calls before=' + before + ' after=' + statuses());
+  }
+
   await window.loadLocal('/tmp/slowlocal/partial');
   check('a listing with unusable entries still shows the usable ones',
     text('localFileList').includes('keep.txt') &&
@@ -2324,13 +2401,70 @@ function options(id) {
   await window.refreshQueue();
 
   const savedLogs = responses['/api/logs'];
+  // The panel holds the page's own entries too, so the backend's answer is
+  // counted against a fetch that returned nothing usable at all.
+  responses['/api/logs'] = { logs: [] };
+  await window.refreshLogs();
+  const ownEntries = doc.getElementById('logOutput').children.length;
   responses['/api/logs'] = { logs: [null, { level: 'error', text: 'kept line' }] };
   await window.refreshLogs();
   check('a log answer with an unusable entry keeps the usable one',
-    doc.getElementById('logOutput').children.length === 1 &&
+    doc.getElementById('logOutput').children.length === ownEntries + 1 &&
       text('logOutput').includes('kept line'),
     text('logOutput'));
   responses['/api/logs'] = savedLogs;
+  await window.refreshLogs();
+
+  // ---- Errors are log entries, not popups -------------------------------
+  /* A failure used to be a toast: gone after four seconds, and nothing to read
+   * back for anyone who was not looking at that moment. Every failure the page
+   * reports goes through toast(message, true), so the backend is made
+   * unreachable here - the one failure that reaches every caller - and the
+   * message has to end up in the Logs panel with the popup left alone. */
+  const logTab = doc.getElementById('tabLogBtn');
+  const popup = doc.getElementById('toast');
+  const realRequest = window.LinSCPTransport.request;
+  const unreachable = 'Cannot reach the LinSCP backend';
+  popup.textContent = '';
+  popup.className = 'toast';
+  // The checks before this one logged refusals of their own. Opening the
+  // panel clears that count, so the one this block causes can be counted.
+  window.switchTab('log');
+  await window.refreshLogs();
+  window.switchTab('queue');
+  window.LinSCPTransport.request = async () => { throw new Error('the stub backend is not there'); };
+  await window.refreshQueue();
+  check('an error is written into the Logs panel instead of a popup',
+    countIn(errorLog(), unreachable) === 1 &&
+      lastLogLine().includes('the stub backend is not there') &&
+      !text('toast').includes(unreachable),
+    errorLog() + ' | popup=' + text('toast'));
+  check('the Logs tab counts an error that arrived behind another panel',
+    logTab.getAttribute('data-count') === '1', String(logTab.getAttribute('data-count')));
+  /* The queue is polled every two seconds and the log every four, so an
+   * unreachable backend fails again on a timer. The repeat replaces its own
+   * entry: a panel full of one sentence is not a log. */
+  await window.refreshQueue();
+  await window.refreshLogs();
+  check('a repeating error replaces its own entry instead of stacking up',
+    countIn(errorLog(), unreachable) === 1 && logTab.getAttribute('data-count') === '1',
+    countIn(errorLog(), unreachable) + ' | ' + logTab.getAttribute('data-count'));
+  window.LinSCPTransport.request = realRequest;
+  await window.refreshQueue();
+  window.switchTab('log');
+  await window.refreshLogs();
+  check('opening the Logs panel clears the error count',
+    logTab.getAttribute('data-count') === null && errorLog().includes(unreachable),
+    String(logTab.getAttribute('data-count')));
+  // A notice is still a popup: it confirms an action just taken, and there is
+  // nothing about it to read back later.
+  window.toast('The stub backend renamed the file.');
+  check('a notice is still a popup and not a log entry',
+    text('toast').includes('The stub backend renamed the file.') &&
+      !errorLog().includes('The stub backend renamed the file.'),
+    text('toast'));
+  popup.textContent = '';
+  popup.className = 'toast';
 
   // ---- Granted Android folders ------------------------------------------
   // A granted folder browses, edits, copies and moves, but cannot sync,
@@ -2361,19 +2495,19 @@ function options(id) {
   check('a granted folder offers the editor',
     doc.getElementById('editorModal').className.indexOf('open') >= 0 &&
       posted('/api/local/edit') === editsBefore + 1,
-    text('toast'));
+    lastLogLine());
   window.closeModal('editorModal');
 
   window.openSynchronize();
   check('a granted folder is offered synchronization',
     doc.getElementById('syncModal').className.indexOf('open') >= 0,
-    text('toast'));
+    lastLogLine());
   window.closeModal('syncModal');
 
   window.openKeepUpToDate();
   check('a granted folder is offered keep-up-to-date',
     doc.getElementById('keepUpToDateModal').className.indexOf('open') >= 0,
-    text('toast'));
+    lastLogLine());
   window.closeModal('keepUpToDateModal');
 
   window.focusPane('local');
@@ -2383,7 +2517,7 @@ function options(id) {
   await window.transfer('upload');
   check('a granted folder is offered transfers',
     posted('/api/transfer/upload') === safUploadsBefore + 1,
-    text('toast'));
+    lastLogLine());
 
   const confirmsBefore = confirmMessages.length;
   const movesBefore = posted('/api/transfer/move');
@@ -2391,14 +2525,14 @@ function options(id) {
   check('a granted folder is offered moves',
     confirmMessages.length === confirmsBefore + 1 &&
       posted('/api/transfer/move') === movesBefore + 1,
-    text('toast'));
+    lastLogLine());
 
   const chmodsBefore = posted('/api/local/chmod');
   await window.permissionsPrompt('local');
   check('a granted folder is not offered chmod',
-    text('toast').includes(safReason('permissions')) &&
+    lastLogLine().includes(safReason('permissions')) &&
       posted('/api/local/chmod') === chmodsBefore,
-    text('toast'));
+    lastLogLine());
 
   await window.openProperties();
   check('properties on a granted folder explain the missing rights editor',
@@ -2434,14 +2568,14 @@ function options(id) {
   await window.transfer('upload');
   check('a local tab offers transfers out of a granted folder',
     posted('/api/transfer/upload') === localUploadsBefore + 1,
-    text('toast'));
+    lastLogLine());
   const localConfirmsBefore = confirmMessages.length;
   const localMovesBefore = posted('/api/transfer/move');
   await window.moveToOtherPane();
   check('a local tab offers moves out of a granted folder',
     confirmMessages.length === localConfirmsBefore + 1 &&
       posted('/api/transfer/move') === localMovesBefore + 1,
-    text('toast'));
+    lastLogLine());
   responses['/api/status'] = savedStatusForLocalTab;
   await window.refreshStatus();
   await window.loadLocal('/tmp/slowlocal');
@@ -2475,9 +2609,9 @@ function options(id) {
   const linksBefore = posted('/api/local/link');
   await window.promptLink('local');
   check('a granted folder is not offered symbolic links',
-    text('toast').includes(safReason('symlink')) &&
+    lastLogLine().includes(safReason('symlink')) &&
       posted('/api/local/link') === linksBefore,
-    text('toast'));
+    lastLogLine());
   await window.loadLocal('/tmp/slowlocal');
   if (safStubInstalled) window.LinSCPCore.safLimitationReason = undefined;
 
@@ -2593,7 +2727,7 @@ function options(id) {
       [...doc.querySelectorAll('#serverMonitorScreen button')].some(b => b.textContent === 'Pause') &&
       !doc.getElementById('terminalModal').classList.contains('open') &&
       calls.filter(call => call.path === '/api/terminal/close').length === closedBefore + 1 &&
-      text('toast').includes('cannot create monitor window'));
+      lastLogLine().includes('cannot create monitor window'));
     internals.invoke = originalInvoke;
   }
   window.closeServerMonitor();
@@ -2780,7 +2914,15 @@ function options(id) {
       doc.getElementById('remoteDesktopPrompt').style.display === 'block' &&
       !doc.getElementById('remoteDesktopInstallBtn').disabled &&
       doc.getElementById('remoteDesktopXfceChoice').hidden);
+    check('the X2Go installer is expanded and shown before installation',
+      doc.getElementById('remoteDesktopScriptDetails').open &&
+      doc.getElementById('remoteDesktopScript').textContent === responses['/api/desktop/check'].install_script);
     const inputBeforeInstall = calls.filter(call => call.path === '/api/terminal/input').length;
+    doc.getElementById('remoteDesktopScriptDetails').open = false;
+    await window.installRemoteDesktop();
+    check('a collapsed installer preview is reopened without starting the installer',
+      doc.getElementById('remoteDesktopScriptDetails').open &&
+      calls.filter(call => call.path === '/api/terminal/input').length === inputBeforeInstall);
     await window.installRemoteDesktop();
     const installInput = calls.filter(call => call.path === '/api/terminal/input').pop();
     const installBody = installInput && JSON.parse(installInput.options.body);
@@ -2814,7 +2956,9 @@ function options(id) {
     await new Promise(resolve => setTimeout(resolve, 50));
     doc.getElementById('remoteDesktopXfce').checked = true;
     window.updateRemoteDesktopScript();
-    check('opting in includes the XFCE installer in the preview', text('remoteDesktopScript').includes('install-xfce'));
+    check('opting in includes the XFCE installer in the expanded preview',
+      doc.getElementById('remoteDesktopScriptDetails').open &&
+      doc.getElementById('remoteDesktopScript').textContent === responses['/api/desktop/check'].install_script + '\n\n' + responses['/api/desktop/check'].xfce_install_script);
     await window.installRemoteDesktop();
     lastInput = calls.filter(call => call.path === '/api/terminal/input').pop();
     command = Buffer.from(JSON.parse(lastInput.options.body).data, 'base64').toString();
@@ -2861,22 +3005,110 @@ function options(id) {
     check('a stale X2Go check cannot run an installer',
       calls.filter(call => call.path === '/api/terminal/input').length === beforeStaleInstall);
     window.closeModal('remoteDesktopModal');
-    // A reachable server is not evidence that the built-in viewer exists.
+    // Other remote desktop installers also show their script before use.
+    const savedCheck = responses['/api/desktop/check'];
+    responses['/api/desktop/check'] = { success: true, available: false, checked: true,
+      via_ssh: true, can_install: true, reason: 'xrdp missing', install_script: '#!/bin/bash\necho install-xrdp\n' };
+    window.openRemoteDesktop();
+    doc.getElementById('remoteDesktopKind').value = 'rdp';
+    window.remoteDesktopKindChanged();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    check('other desktop installers are expanded and visible before installation',
+      doc.getElementById('remoteDesktopScriptDetails').open &&
+      doc.getElementById('remoteDesktopScript').textContent === responses['/api/desktop/check'].install_script &&
+      !doc.getElementById('remoteDesktopInstallBtn').disabled);
+    responses['/api/desktop/check'].install_script = '';
+    await window.checkRemoteDesktop();
+    check('installation is unavailable when the script cannot be shown',
+      doc.getElementById('remoteDesktopInstallBtn').disabled && !text('remoteDesktopScript'));
+    window.closeModal('remoteDesktopModal');
+    responses['/api/desktop/check'] = savedCheck;
+    // A detected desktop can now open the experimental built-in viewer.
     responses['/api/desktop/check'].available = true;
     responses['/api/desktop/check'].desktop = 'MATE';
-    responses['/api/desktop/launch'] = { success: false, error: 'The built-in X2Go KDrive viewer is not implemented yet; NX support has been removed.' };
+    responses['/api/x2go/open'] = { success: true, generation: '1' };
+    responses['/api/x2go/input'] = { success: true };
+    responses['/api/x2go/close'] = { success: true };
+    const pngHeader = Buffer.from([137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,2,0,0,0,1]).toString('base64');
+    responses['/api/x2go/poll'] = { success: true, message: { type: 'frame', frame: {
+      width: 2, height: 1, x: -1, y: -1, cacheId: 0, windowId: 0,
+      regions: [{ sourceId: 0, sourceX: 0, sourceY: 0, x: 0, y: 0, width: 2, height: 1, data: pngHeader }] } } };
+    const savedContext = window.HTMLCanvasElement.prototype.getContext;
+    const savedBitmap = window.createImageBitmap;
+    window.HTMLCanvasElement.prototype.getContext = () => ({
+      createImageData: (w, h) => ({ data: new Uint8ClampedArray(w * h * 4) }),
+      putImageData() {}, drawImage() {},
+      getImageData: (_x, _y, w, h) => ({ data: new Uint8ClampedArray(w * h * 4).fill(42) })
+    });
+    window.createImageBitmap = async () => ({ width: 2, height: 1, close() {} });
     window.openRemoteDesktop();
     doc.getElementById('remoteDesktopKind').value = 'x2go';
     window.remoteDesktopKindChanged();
     await new Promise(resolve => setTimeout(resolve, 50));
-    check('KDrive server detection does not claim the viewer is ready',
-      text('remoteDesktopStatus').includes('viewer is not available yet'));
+    check('KDrive detection describes the viewer as experimental',
+      text('remoteDesktopStatus').includes('experimental'));
     await window.launchRemoteDesktop();
-    check('an unfinished X2Go viewer reports the error without closing the dialog',
-      text('toast').includes('KDrive viewer is not implemented yet') &&
-      doc.getElementById('remoteDesktopModal').classList.contains('open'));
+    await new Promise(resolve => setTimeout(resolve, 60));
+    const openedX2Go = calls.filter(call => call.path === '/api/x2go/open').pop();
+    const openedX2GoBody = openedX2Go && JSON.parse(openedX2Go.options.body);
+    check('X2Go launch opens the tab-bound experimental viewer',
+      openedX2GoBody && openedX2GoBody.desktop === 'MATE' && openedX2GoBody.tab === 1 &&
+      doc.getElementById('x2goViewerModal').classList.contains('open') &&
+      !!doc.querySelector('#x2goSurface canvas'));
+    check('the viewer polls and paints the backend main frame',
+      calls.some(call => call.path === '/api/x2go/poll') && text('x2goViewerStatus') === 'X2Go desktop');
+    responses['/api/x2go/poll'] = { success: true, message: null };
+    const xcanvas = doc.querySelector('#x2goSurface canvas');
+    if (xcanvas) {
+      xcanvas.focus();
+      xcanvas.dispatchEvent(new window.KeyboardEvent('keydown', { bubbles: true, cancelable: true, code: 'KeyA', key: 'a' }));
+      xcanvas.dispatchEvent(new window.KeyboardEvent('keyup', { bubbles: true, cancelable: true, code: 'KeyA', key: 'a' }));
+    }
+    await new Promise(resolve => setTimeout(resolve, 40));
+    check('viewer keyboard input reaches the tab-bound bridge',
+      calls.filter(call => call.path === '/api/x2go/input').length >= 2 &&
+      JSON.parse(calls.filter(call => call.path === '/api/x2go/input').pop().options.body).generation === '1');
+    if (xcanvas) xcanvas.dispatchEvent(new window.KeyboardEvent('keydown', { bubbles: true, cancelable: true, code: 'Escape', key: 'Escape' }));
+    check('Escape in the focused desktop is sent to the server instead of closing it',
+      doc.getElementById('x2goViewerModal').classList.contains('open'));
+    window.closeX2GoViewer();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    check('closing the viewer requests agent cleanup', calls.some(call => call.path === '/api/x2go/close' && JSON.parse(call.options.body).generation === '1'));
+    // If the user closes while startup is still in flight, a later successful
+    // answer must not leak the newly started remote agent.
+    window.openRemoteDesktop();
+    doc.getElementById('remoteDesktopKind').value = 'x2go';
+    window.remoteDesktopKindChanged();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const realX2GoRequest = window.LinSCPTransport.request;
+    let finishX2GoOpen;
+    window.LinSCPTransport.request = (method, path, body) => path === '/api/x2go/open'
+      ? new Promise(resolve => { finishX2GoOpen = resolve; }) : realX2GoRequest.call(window.LinSCPTransport, method, path, body);
+    const closesBeforeCancel = calls.filter(call => call.path === '/api/x2go/close').length;
+    const pendingX2Go = window.launchRemoteDesktop();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    window.closeX2GoViewer();
+    window.openRemoteDesktop();
+    doc.getElementById('remoteDesktopKind').value = 'x2go';
+    window.remoteDesktopKindChanged();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const firstFinishX2GoOpen = finishX2GoOpen;
+    await window.launchRemoteDesktop();
+    check('a new viewer cannot replace one whose startup is being cancelled',
+      finishX2GoOpen === firstFinishX2GoOpen && !doc.getElementById('x2goViewerModal').classList.contains('open'));
     window.closeModal('remoteDesktopModal');
-    delete responses['/api/desktop/launch'];
+    if (finishX2GoOpen) finishX2GoOpen({success: true, generation: '2'});
+    await pendingX2Go;
+    await new Promise(resolve => setTimeout(resolve, 20));
+    check('cancelling startup closes a session that opens afterwards',
+      !!finishX2GoOpen && calls.filter(call => call.path === '/api/x2go/close').length === closesBeforeCancel + 1 &&
+      JSON.parse(calls.filter(call => call.path === '/api/x2go/close').pop().options.body).generation === '2' &&
+      !doc.getElementById('x2goViewerModal').classList.contains('open'));
+    window.LinSCPTransport.request = realX2GoRequest;
+    window.HTMLCanvasElement.prototype.getContext = savedContext;
+    window.createImageBitmap = savedBitmap;
+    delete responses['/api/x2go/open']; delete responses['/api/x2go/input'];
+    delete responses['/api/x2go/poll']; delete responses['/api/x2go/close'];
 
     internals.invoke = originalInvoke;
     /* The Android path starts here: a touch host, no OS windows. */
@@ -2934,13 +3166,12 @@ function options(id) {
      * retry loop is indistinguishable from a shell that has not woken up. */
     responses['/api/terminal/frame'] = {
       success: false, error: 'This terminal is no longer open.' };
-    text('toast').length;
     await window.openTerminal();
     await new Promise(resolve => setTimeout(resolve, 500));
     check('a terminal the backend refuses is reported, not left black',
-      text('toast').indexOf('The terminal session ended.') >= 0 ||
+      lastLogLine().indexOf('The terminal session ended.') >= 0 ||
       !doc.getElementById('terminalModal').classList.contains('open'),
-      text('toast') + ' | open=' + doc.getElementById('terminalModal').classList.contains('open'));
+      lastLogLine() + ' | open=' + doc.getElementById('terminalModal').classList.contains('open'));
     window.closeTerminal();
     await new Promise(resolve => setTimeout(resolve, 60));
 
@@ -2952,13 +3183,36 @@ function options(id) {
       success: true, dirty: true, alive: false,
       error: 'The server refused to start an interactive shell on this connection.',
       frame: frameOf('') };
-    doc.getElementById('toast').textContent = '';
     await window.openTerminal();
     await new Promise(resolve => setTimeout(resolve, 200));
     check('a shell the server refused names the reason, not just the ending',
-      text('toast').indexOf('refused to start an interactive shell') >= 0, text('toast'));
+      lastLogLine().indexOf('refused to start an interactive shell') >= 0, lastLogLine());
     window.closeTerminal();
     await new Promise(resolve => setTimeout(resolve, 60));
+
+    /* The shell and the tab's session run over one connection, so a server
+     * that was told to shut down ends both. The backend says so while
+     * answering the frame that reported the ending, and the page has to ask
+     * for the status again at that moment: the badge is otherwise drawn from a
+     * poll that runs every fifteen seconds, and a tab still saying
+     * "connected" beside a terminal that says the session ended is the thing
+     * the person looking at both windows sees first. */
+    {
+      responses['/api/terminal/frame'] = {
+        success: true, dirty: true, alive: false,
+        error: 'The connection to the server ended.', frame: frameOf('') };
+      const statuses = () => calls.filter(call => call.path === '/api/status').length;
+      const before = statuses();
+      await window.openTerminal();
+      await new Promise(resolve => setTimeout(resolve, 200));
+      check('an ended shell asks what became of its tab',
+        statuses() > before, 'status calls before=' + before + ' after=' + statuses());
+      window.closeTerminal();
+      await new Promise(resolve => setTimeout(resolve, 60));
+      responses['/api/terminal/frame'] = {
+        success: true, dirty: true, alive: true, error: null,
+        frame: frameOf('user@host:~$ ', 'web-1 — Terminal') };
+    }
 
     /* Closing a terminal closes the shell, not just the picture of it.
      *

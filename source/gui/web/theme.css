@@ -889,7 +889,6 @@ button.site-item { display: block; width: 100%; border: 0; background: transpare
   transition: opacity var(--duration-base) var(--ease), transform var(--duration-base) var(--ease);
 }
 .toast.show { opacity: 1; transform: translateY(0); }
-.toast.error { border-color: var(--danger); color: var(--danger); background: var(--danger-soft); }
 .pane.drop-target { outline: 2px dashed var(--accent); outline-offset: -4px; }
 .pane.drop-target .file-table-container { background: color-mix(in srgb, var(--accent) 12%, var(--surface)); }
 /* The floating chip that follows the pointer during a pane-to-pane drag.
@@ -1448,10 +1447,13 @@ var(--border-strong)kupModal .hint code { user-select: all; background: var(--su
 
 /* Lower panel tabs: all of Queue / Log / CLI visible with count badges */
 .tabs .tab[data-count]:after { content: " (" attr(data-count) ")"; color: var(--muted); font-weight: var(--fw-medium); }
+/* The badge on the Logs tab counts the errors that arrived while another
+   panel was up. It replaced the error popup, so it has to be seen. */
+#tabLogBtn[data-count]:after { color: var(--danger); font-weight: var(--fw-semibold); }
 
-/* Toast: ensure success vs error are visually distinct and not hidden behind FAB */
+/* Toast: a notice is not hidden behind the FAB. Errors are not notices: they
+   are entries in the Logs panel, so the toast has no error variant. */
 .toast { border-left-width: 4px; }
-.toast.error { border-left-color: var(--danger); }
 
 /* Accessibility: ensure every menu item has at least 44px hit area on coarse pointer (already for file rows) */
 @media (pointer: coarse) {
@@ -1651,4 +1653,7 @@ body.terminal-only > *:not(.terminal-window-screen):not(.terminal-window-ended) 
   color: var(--banner-text);
   background: var(--banner-bg);
 }
-.terminal-canvas { display: block; }
+/* The canvas paints text a mouse can select, so it wears the cursor a text
+ * view wears. The WebView's own context menu on it - which is where the
+ * painted screen can be copied as an image - is deliberately left alone. */
+.terminal-canvas { display: block; cursor: text; }

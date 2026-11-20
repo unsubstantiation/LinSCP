@@ -452,6 +452,12 @@ impl RemoteSession for ScpSession {
         Some(&self.ssh)
     }
 
+    // The shell a command runs in and this session share the connection, so a
+    // host that shuts down ends both and the session cannot answer again.
+    fn connection_lost(&self) -> bool {
+        self.ssh.is_closed()
+    }
+
     fn observed_host_key(&self) -> Option<&str> {
         Some(self.ssh.observed_fingerprint())
     }

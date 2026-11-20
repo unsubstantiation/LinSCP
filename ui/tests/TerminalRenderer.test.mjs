@@ -811,3 +811,224 @@ test('a quick swipe scrolls instead of selecting', async () => {
   await session.close();
   dom.cleanup();
 });
+
+// --- the mouse -------------------------------------------------------------
+
+/**
+ * A frame whose first row carries text, for the gestures that read words.
+ *
+ * The renderer paints cells; a word selection reads the same cells back, so a
+ * test of one has to give the session a frame with something in it.
+ */
+function textFrame(text, columns = 10, lines = 2) {
+  const frame = blankFrame(columns, lines);
+  for (let i = 0; i < text.length && i < columns; i++) {
+    frame.cells[i].text = [...text[i]].map((ch) => ch.codePointAt(0));
+  }
+  return frame;
+}
+
+/** Installs a clipboard the session's `navigator.clipboard` look-up will find. */
+function installClipboard(dom) {
+  const written = [];
+  Object.defineProperty(dom.window.navigator, 'clipboard', {
+    configurable: true,
+    value: { writeText: async (text) => { written.push(text); } },
+  });
+  return written;
+}
+
+test('a mouse drag selects, and releasing it copies without losing the highlight', async () => {
+  const dom = installDom();
+  const written = installClipboard(dom.dom);
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(10, 2) }),
+    '/api/terminal/selection': { success: true, text: 'bravo' },
+  });
+  const opens = [];
+  // No keyboard: this is the desktop window's configuration, where a mouse is
+  // the only pointer there is.
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-m1',
+    container: fakeContainer(90, 36),
+    pollInterval: 1,
+    onSelection: (open) => opens.push(open),
+  });
+  session.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const el = session.element;
+  assert.equal(el.hasListener('mousedown'), true, 'a desktop terminal hears the mouse');
+  const down = new dom.dom.window.MouseEvent('mousedown', { button: 0, detail: 1, clientX: 0, clientY: 0, cancelable: true });
+  el.dispatchEvent(down);
+  assert.equal(down.defaultPrevented, true, 'the press must not become a native drag of the canvas');
+  assert.equal(session.selection, null, 'a press that has not moved is not a selection yet');
+
+  // The drag listeners live on the document, so a drag that leaves the canvas
+  // is still a drag; the move lands one cell right and one row down.
+  const doc = dom.dom.window.document;
+  doc.dispatchEvent(new dom.dom.window.MouseEvent('mousemove', { button: 0, clientX: 27, clientY: 18, cancelable: true }));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const selects = transport.calls.filter((call) => call.path === '/api/terminal/select');
+  assert.equal(selects[0].body.action, 'start');
+  const extended = selects.at(-1);
+  assert.equal(extended.body.action, 'extend');
+  assert.deepEqual([extended.body.row, extended.body.column], [1, 3], 'the cell the pointer is over');
+  assert.deepEqual(opens, [true], 'the first move opened the selection');
+
+  doc.dispatchEvent(new dom.dom.window.MouseEvent('mouseup', { button: 0, clientX: 27, clientY: 18 }));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(written, ['bravo'], 'releasing copies what the model read');
+  assert.ok(session.selection, 'the highlight stays, showing what was copied');
+  assert.equal(
+    transport.calls.filter((call) => call.path === '/api/terminal/select' && call.body.action === 'clear').length,
+    0,
+    'copying with the mouse does not drop the selection',
+  );
+
+  await session.close();
+  assert.equal(el.hasListener('mousedown'), false, 'closing removes the mouse too');
+  dom.cleanup();
+});
+
+test('a plain click clears the selection a drag left open', async () => {
+  const dom = installDom();
+  installClipboard(dom.dom);
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(10, 2) }),
+    '/api/terminal/selection': { success: true, text: 'bravo' },
+  });
+  const opens = [];
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-m2',
+    container: fakeContainer(90, 36),
+    pollInterval: 1,
+    onSelection: (open) => opens.push(open),
+  });
+  session.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const el = session.element;
+  const doc = dom.dom.window.document;
+  const mouse = (type, x, y) => new dom.dom.window.MouseEvent(type, { button: 0, detail: 1, clientX: x, clientY: y, cancelable: true });
+
+  el.dispatchEvent(mouse('mousedown', 0, 0));
+  doc.dispatchEvent(mouse('mousemove', 18, 0));
+  doc.dispatchEvent(mouse('mouseup', 18, 0));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(session.selection, 'the drag selected');
+
+  // A click that never moves is a click into the terminal, not a selection:
+  // the highlight it lands on goes away.
+  el.dispatchEvent(mouse('mousedown', 45, 9));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  doc.dispatchEvent(mouse('mouseup', 45, 9));
+  assert.equal(session.selection, null, 'the click cleared it');
+  assert.deepEqual(opens, [true, false]);
+  const cleared = transport.calls.filter((call) => call.path === '/api/terminal/select').at(-1);
+  assert.equal(cleared.body.action, 'clear');
+
+  await session.close();
+  dom.cleanup();
+});
+
+test('a double click selects the word under the pointer', async () => {
+  const dom = installDom();
+  const written = installClipboard(dom.dom);
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: textFrame('echo hello') }),
+    '/api/terminal/selection': { success: true, text: 'hello' },
+  });
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-m3',
+    container: fakeContainer(90, 36),
+    pollInterval: 1,
+  });
+  session.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const el = session.element;
+  const doc = dom.dom.window.document;
+
+  // Column 7 is the second `l` of `hello`; a cell is 9px wide.
+  el.dispatchEvent(new dom.dom.window.MouseEvent('mousedown', { button: 0, detail: 2, clientX: 67, clientY: 4, cancelable: true }));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const selects = transport.calls.filter((call) => call.path === '/api/terminal/select');
+  assert.deepEqual(
+    selects.map((call) => [call.body.action, call.body.row, call.body.column]),
+    [['start', 0, 5], ['extend', 0, 9]],
+    'the word, from the space before it to the line width that follows',
+  );
+
+  doc.dispatchEvent(new dom.dom.window.MouseEvent('mouseup', { button: 0, detail: 2, clientX: 67, clientY: 4 }));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(written, ['hello'], 'the word is copied on release');
+
+  await session.close();
+  dom.cleanup();
+});
+
+test('the wheel scrolls a desktop window, which has no keyboard and no scrollbar', async () => {
+  const dom = installDom();
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(10, 2) }),
+  });
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-m4',
+    container: fakeContainer(90, 36),
+    pollInterval: 1,
+  });
+  session.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const wheel = new dom.dom.window.Event('wheel', { cancelable: true });
+  wheel.deltaY = -100;
+  session.element.dispatchEvent(wheel);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const scrolls = transport.calls.filter((call) => call.path === '/api/terminal/scroll');
+  assert.equal(scrolls.length, 1);
+  assert.equal(scrolls[0].body.lines, 3, 'a wheel up walks back into history');
+  await session.close();
+  dom.cleanup();
+});
+
+test('the mouse events a touch fires on its way out are ignored', async () => {
+  const dom = installDom();
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(10, 2) }),
+  });
+  const opens = [];
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-m5',
+    container: fakeContainer(90, 36),
+    pollInterval: 1,
+    keyboard: true,
+    onSelection: (open) => opens.push(open),
+  });
+  session.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const el = session.element;
+  const doc = dom.dom.window.document;
+
+  // A finger that scrolls leaves the selection alone; the browser replays the
+  // gesture as mouse events afterwards, and those must not select either.
+  const start = new dom.dom.window.Event('touchstart');
+  start.touches = [{ clientX: 10, clientY: 200 }];
+  el.dispatchEvent(start);
+  const move = new dom.dom.window.Event('touchmove', { cancelable: true });
+  move.touches = [{ clientX: 10, clientY: 110 }];
+  el.dispatchEvent(move);
+  el.dispatchEvent(new dom.dom.window.Event('touchend'));
+  el.dispatchEvent(new dom.dom.window.MouseEvent('mousedown', { button: 0, detail: 1, clientX: 10, clientY: 110, cancelable: true }));
+  doc.dispatchEvent(new dom.dom.window.MouseEvent('mousemove', { button: 0, clientX: 40, clientY: 110, cancelable: true }));
+  doc.dispatchEvent(new dom.dom.window.MouseEvent('mouseup', { button: 0, clientX: 40, clientY: 110 }));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(opens, [], 'the echo of a touch opens no selection');
+  assert.equal(transport.calls.filter((call) => call.path === '/api/terminal/select').length, 0);
+  assert.ok(transport.calls.some((call) => call.path === '/api/terminal/scroll'), 'the touch itself scrolled');
+
+  await session.close();
+  dom.cleanup();
+});

@@ -785,6 +785,12 @@ impl RemoteSession for SftpClientSession {
         Some(&self.ssh)
     }
 
+    // Every channel of this session - the SFTP one and an embedded shell -
+    // runs over this connection, so a host that shuts down ends them together.
+    fn connection_lost(&self) -> bool {
+        self.ssh.is_closed()
+    }
+
     fn observed_host_key(&self) -> Option<&str> {
         Some(self.ssh.observed_fingerprint())
     }

@@ -150,6 +150,24 @@ export function encodeInput(text: string): string {
   return btoa(binary);
 }
 
+/**
+ * The punctuation that ends a word for a double-click selection.
+ *
+ * Whitespace plus the brackets, quotes and shell metacharacters that group or
+ * end an argument. Dots, slashes, dashes, colons and `@` are deliberately not
+ * here, so a double-click takes a whole path, URL or address - which is what a
+ * double-click in a terminal is usually for.
+ */
+const WORD_SEPARATORS = new Set([
+  '"', "'", '(', ')', '[', ']', '{', '}', '<', '>', '|', '`', ',', ';',
+  '*', '?', '^', '$', '&', '=', '+', '~', '!', '%', '\\',
+]);
+
+/** True for a character a double-click selection stops at. */
+function isWordSeparator(character: string): boolean {
+  return /\s/.test(character) || WORD_SEPARATORS.has(character);
+}
+
 export interface TerminalSessionOptions {
   transport: TransportClient;
   terminal: string;
@@ -170,13 +188,19 @@ export interface TerminalSessionOptions {
    * difference between a terminal that can be typed into and a picture of one.
    * It is off by default only so a host that already has a keyboard - a test, a
    * window that only mirrors a shell - does not get a stray hidden textarea.
+   *
+   * It also brings the touch gestures with it, because the hosts that need a
+   * soft keyboard are the hosts fingers are used on. The mouse is heard
+   * everywhere: a desktop drags to select, and on a touch host the emulated
+   * mouse events a finger also fires are recognised and ignored, so one
+   * gesture never runs twice.
    */
   keyboard?: boolean;
   /** Called whenever the grid the window can show changes. */
   onResize?: (grid: { columns: number; lines: number }) => void;
   /** Called when the cursor mode changes, for the extra-keys row's arrows. */
   onModes?: (modes: TerminalModes) => void;
-  /** Called when a long-press selection opens, moves or closes. */
+  /** Called when a selection - a long press or a mouse drag - opens or closes. */
   onSelection?: (open: boolean) => void;
 }
 
@@ -218,16 +242,26 @@ export class TerminalSession {
   private grid: { columns: number; lines: number };
   /** The keyboard attachment, when the host asked for one. */
   private keyboard: TerminalInput | null = null;
-  /** The canvas, kept only so the tap listener can be removed again. */
+  /** The canvas, kept so every gesture listener can be removed again. */
   private canvas: HTMLCanvasElement | null = null;
+  /** The document the mouse drag listeners are on, for the same removal. */
+  private eventDoc: Document | null = null;
   /** Where a one-finger drag started, and how far it has travelled. */
   private drag: { y: number; lines: number; selecting: boolean; start: Cell } | null = null;
+  /** Where a mouse drag anchored, and whether it has moved off that cell. */
+  private mouseDrag: { anchor: Cell; moved: boolean } | null = null;
   /** The long-press timer; a press that lasts becomes a selection. */
   private longPress: ReturnType<typeof setTimeout> | null = null;
   /** True while the current gesture is selecting rather than scrolling. */
   private selecting = false;
+  /** The cell the open selection started at, for whichever gesture opened it. */
+  private selectionStart: Cell | null = null;
   /** The cell the selection currently ends at, while one is being dragged. */
   private selectionEnd: Cell | null = null;
+  /** The last painted frame; word and line selections read their text from it. */
+  private lastFrame: TerminalFrame | null = null;
+  /** When a touch was last seen, so its emulated mouse events are ignored. */
+  private lastTouch = 0;
 
   /**
    * How long a still finger becomes a selection.
@@ -237,6 +271,18 @@ export class TerminalSession {
    * threshold the platform's own text views use.
    */
   public static readonly LONG_PRESS_MS = 450;
+
+  /**
+   * How long after a touch its emulated mouse events are ignored.
+   *
+   * A browser replays a tap as `mousedown`/`mouseup`/`click` for pages that
+   * only speak mouse, and this page speaks both: without the gap, a finger
+   * that long-pressed a selection open would have its own echo clear it again.
+   * The window is longer than any tap and shorter than a person switching from
+   * a finger to a real mouse.
+   */
+  public static readonly TOUCH_MOUSE_GAP_MS = 800;
+
   /**
    * The modes of the last painted frame.
    *
@@ -274,6 +320,19 @@ export class TerminalSession {
       },
     });
     this.grid = this.renderer.size();
+    const canvas = this.renderer.element;
+    this.canvas = canvas;
+    const doc = canvas.ownerDocument ?? null;
+    this.eventDoc = doc;
+    // The wheel belongs to every host, not only a touch one: a canvas has no
+    // scrollbar, so without this a desktop window could never see its history.
+    canvas.addEventListener('wheel', this.handleWheel, { passive: false });
+    // A mouse selects text the way it does in every other terminal: press
+    // anchors, drag extends, release copies. The move and release live on the
+    // document so a drag that leaves the canvas still finishes where it began.
+    canvas.addEventListener('mousedown', this.handleMouseDown);
+    doc?.addEventListener('mousemove', this.handleMouseMove);
+    doc?.addEventListener('mouseup', this.handleMouseUp);
     if (options.keyboard) {
       this.keyboard = new TerminalInput({
         container: options.container,
@@ -288,7 +347,6 @@ export class TerminalSession {
       // without this the soft keyboard never appears and there is nothing to
       // type into. Tapping again dismisses it, which is what every phone
       // terminal does.
-      const canvas = this.renderer.element;
       // `click`, not `pointerdown`: a scroll drag cancels its own click when it
       // calls `preventDefault` on the move, so dragging through history cannot
       // also dismiss the keyboard the person is using.
@@ -296,8 +354,6 @@ export class TerminalSession {
       canvas.addEventListener('touchstart', this.handleTouchStart, { passive: true });
       canvas.addEventListener('touchmove', this.handleTouchMove, { passive: false });
       canvas.addEventListener('touchend', this.handleTouchEnd);
-      canvas.addEventListener('wheel', this.handleWheel, { passive: false });
-      this.canvas = canvas;
     }
   }
 
@@ -390,17 +446,22 @@ export class TerminalSession {
     // terminal that has already closed.
     this.cancelLongPress();
     this.selecting = false;
+    this.selectionStart = null;
     this.selectionEnd = null;
+    this.mouseDrag = null;
+    this.lastFrame = null;
     this.detachKeyboard();
     this.renderer.destroy();
   }
 
   /**
-   * Tears down the keyboard attachment.
+   * Tears down the keyboard attachment and every gesture listener.
    *
    * Removing the textarea while it has focus is what tells the phone to put the
    * soft keyboard away; leaving it behind would leave a focused invisible
    * element holding the keyboard open over whatever the person opened next.
+   * The mouse drag listeners live on the document, which outlives the canvas,
+   * so a session that stopped mid-drag has to take them with it.
    */
   private detachKeyboard(): void {
     if (this.canvas) {
@@ -409,7 +470,13 @@ export class TerminalSession {
       this.canvas.removeEventListener('touchmove', this.handleTouchMove);
       this.canvas.removeEventListener('touchend', this.handleTouchEnd);
       this.canvas.removeEventListener('wheel', this.handleWheel);
+      this.canvas.removeEventListener('mousedown', this.handleMouseDown);
       this.canvas = null;
+    }
+    if (this.eventDoc) {
+      this.eventDoc.removeEventListener('mousemove', this.handleMouseMove);
+      this.eventDoc.removeEventListener('mouseup', this.handleMouseUp);
+      this.eventDoc = null;
     }
     this.keyboard?.destroy();
     this.keyboard = null;
@@ -547,10 +614,10 @@ export class TerminalSession {
   /**
    * Selects the text between two cells of the viewport.
    *
-   * Copying on a phone is a long press followed by a drag, which is the same
-   * gesture every other app teaches; there is no keyboard shortcut and no
-   * mouse. The cells are the ones the window names, so the model and the
-   * pixels cannot disagree about which text that is.
+   * Copying on a phone is a long press followed by a drag; on a desktop it is
+   * a press followed by the same drag with a mouse. Both end here: the cells
+   * are the ones the window names, so the model and the pixels cannot disagree
+   * about which text that is.
    */
   public async select(start: Cell, end: Cell = start): Promise<void> {
     try {
@@ -609,6 +676,30 @@ export class TerminalSession {
     if (!text) {
       return null;
     }
+    await this.writeClipboard(text);
+    return text;
+  }
+
+  /**
+   * Copies the selection but leaves it highlighted.
+   *
+   * This is the mouse's copy: a drag that just finished is showing the person
+   * what landed on the clipboard, and clearing it would take that away before
+   * they could check it. The next click clears it.
+   */
+  private async copySelectionKeepHighlight(): Promise<void> {
+    if (this.stopped) {
+      return;
+    }
+    const text = await this.selectedText();
+    if (!text || this.stopped) {
+      return;
+    }
+    await this.writeClipboard(text);
+  }
+
+  /** Hands text to the system clipboard, when the host has one to give. */
+  private async writeClipboard(text: string): Promise<void> {
     try {
       const clipboard = (this.renderer.element.ownerDocument.defaultView as Window | null)
         ?.navigator?.clipboard;
@@ -617,7 +708,6 @@ export class TerminalSession {
       // A refused clipboard leaves the selection in place; the caller may still
       // show it.
     }
-    return text;
   }
 
   /** Scrolls the model's viewport; positive is up into history. */
@@ -660,6 +750,9 @@ export class TerminalSession {
     if (this.stopped) {
       return;
     }
+    // A touch also fires emulated mouse events; the mouse handlers use this
+    // stamp to stay out of a finger's way.
+    this.lastTouch = Date.now();
     const touch = event.touches[0];
     if (!touch) {
       return;
@@ -691,7 +784,7 @@ export class TerminalSession {
       event.preventDefault?.();
       const cell = this.cellAt(touch);
       this.selectionEnd = cell;
-      void this.select(this.drag.start, cell);
+      void this.select(this.selectionStart ?? this.drag.start, cell);
       return;
     }
     // A finger that moved is not a long press.
@@ -717,6 +810,10 @@ export class TerminalSession {
   private readonly handleTouchEnd = (): void => {
     this.cancelLongPress();
     this.drag = null;
+    // The emulated mouse events of this touch arrive right after it; the stamp
+    // has to be the release, not the press, or a long drag's mouse events
+    // would fall outside the window that ignores them.
+    this.lastTouch = Date.now();
     // A gesture that ended on a selection leaves it in place to be copied; the
     // person taps again to clear it, which is what a selection is for.
   };
@@ -728,27 +825,178 @@ export class TerminalSession {
     }
   }
 
-  /** Where a touch landed, in cells of the visible screen. */
+  /** Where a touch or a mouse landed, in cells of the visible screen. */
   private cellAt(touch: { clientX: number; clientY: number }): Cell {
     const box = this.renderer.element.getBoundingClientRect?.() ?? { left: 0, top: 0 };
     const size = this.renderer.cellSize();
     const width = size.width || 9;
     const height = size.height || 18;
+    // A mouse drag is allowed to leave the canvas, and the selection it is
+    // making should reach the edge of the screen rather than a row or column
+    // the grid does not have.
     return {
-      row: Math.max(0, Math.floor((touch.clientY - box.top) / height)),
-      column: Math.max(0, Math.floor((touch.clientX - box.left) / width)),
+      row: Math.min(Math.max(0, Math.floor((touch.clientY - box.top) / height)),
+        Math.max(0, this.grid.lines - 1)),
+      column: Math.min(Math.max(0, Math.floor((touch.clientX - box.left) / width)),
+        Math.max(0, this.grid.columns - 1)),
     };
   }
 
+  /** True while a touch is close enough that these mouse events are its echoes. */
+  private isEmulatedMouse(): boolean {
+    return Date.now() - this.lastTouch < TerminalSession.TOUCH_MOUSE_GAP_MS;
+  }
+
+  /**
+   * Pressing the left button anchors a selection.
+   *
+   * One press anchors a drag, two select the word under the pointer and three
+   * the whole line - the gesture every desktop terminal teaches. Any other
+   * button is left alone on purpose: the right one belongs to the WebView's own
+   * menu, which is where the canvas can still be copied as an image.
+   */
+  private readonly handleMouseDown = (event: MouseEvent): void => {
+    if (this.stopped || event.button !== 0 || this.isEmulatedMouse()) {
+      return;
+    }
+    // Cancelling the press is what stops the WebView turning the drag into a
+    // native drag of the canvas picture or a selection of the page around it.
+    event.preventDefault?.();
+    const cell = this.cellAt(event);
+    if (event.detail >= 3) {
+      const line = this.lineRange(cell);
+      this.openSelection(line.start, line.end);
+      this.mouseDrag = { anchor: line.start, moved: true };
+      return;
+    }
+    if (event.detail === 2) {
+      const word = this.wordRange(cell);
+      this.openSelection(word.start, word.end);
+      this.mouseDrag = { anchor: word.start, moved: true };
+      return;
+    }
+    // A shift-press adds to the selection that is open instead of starting a
+    // new one, which is how a selection too large to drag in one go is made.
+    if (event.shiftKey && this.selecting && this.selectionStart) {
+      this.mouseDrag = { anchor: this.selectionStart, moved: true };
+      this.selectionEnd = cell;
+      void this.select(this.selectionStart, cell);
+      return;
+    }
+    // A plain press clears whatever was highlighted: a click on a terminal is
+    // a click *into* it, and an old selection surviving it is one nobody can
+    // tell apart from the new one about to be made.
+    if (this.selecting) {
+      void this.endSelection();
+    }
+    this.mouseDrag = { anchor: cell, moved: false };
+  };
+
+  private readonly handleMouseMove = (event: MouseEvent): void => {
+    const drag = this.mouseDrag;
+    if (this.stopped || !drag) {
+      return;
+    }
+    const cell = this.cellAt(event);
+    if (!drag.moved) {
+      if (cell.row === drag.anchor.row && cell.column === drag.anchor.column) {
+        return;
+      }
+      // The selection opens on the first cell of real movement, not on the
+      // press: a click that never moves must stay a click.
+      drag.moved = true;
+      this.beginSelection(drag.anchor);
+    }
+    event.preventDefault?.();
+    this.selectionEnd = cell;
+    void this.select(drag.anchor, cell);
+  };
+
+  private readonly handleMouseUp = (event: MouseEvent): void => {
+    const drag = this.mouseDrag;
+    if (!drag) {
+      return;
+    }
+    this.mouseDrag = null;
+    if (this.stopped || event.button !== 0 || this.isEmulatedMouse()) {
+      return;
+    }
+    if (!drag.moved) {
+      return;
+    }
+    // A finished drag has said what it wants: the text goes to the clipboard
+    // without another keystroke, and the highlight stays so the person can see
+    // what was copied. The next plain click clears it.
+    void this.copySelectionKeepHighlight();
+  };
+
+  /**
+   * The word around a cell, read from the last painted frame.
+   *
+   * The frame's cells are the text - the same reason copying reads the model -
+   * and the boundaries are the separators every terminal agrees on: whitespace
+   * and the brackets and quotes that group arguments. Dots, slashes, dashes and
+   * colons are word characters, so a double-click takes a whole path or URL,
+   * which is what a double-click in a terminal is usually for.
+   */
+  private wordRange(cell: Cell): { start: Cell; end: Cell } {
+    const frame = this.lastFrame;
+    const row = cell.row;
+    if (!frame || row < 0 || row >= frame.lines || cell.column < 0 || cell.column >= frame.columns) {
+      return { start: cell, end: cell };
+    }
+    const charAt = (column: number): string => {
+      const snapshot = frame.cells[row * frame.columns + column];
+      // A cell with no text of its own is the spacer of the wide glyph before
+      // it (or hidden text): it belongs to its neighbour and ends no word. A
+      // blank cell is reported as the space it paints as.
+      if (!snapshot) {
+        return ' ';
+      }
+      if (snapshot.text.length === 0) {
+        return '';
+      }
+      return String.fromCodePoint(snapshot.text[0]!);
+    };
+    const isSeparator = (column: number): boolean => {
+      const character = charAt(column);
+      return character !== '' && isWordSeparator(character);
+    };
+    if (isSeparator(cell.column)) {
+      return { start: cell, end: cell };
+    }
+    let start = cell.column;
+    while (start > 0 && !isSeparator(start - 1)) {
+      start -= 1;
+    }
+    let end = cell.column;
+    while (end < frame.columns - 1 && !isSeparator(end + 1)) {
+      end += 1;
+    }
+    return { start: { row, column: start }, end: { row, column: end } };
+  }
+
+  /** The whole line a cell is on; the model trims the blanks when it is read. */
+  private lineRange(cell: Cell): { start: Cell; end: Cell } {
+    const columns = Math.max(1, this.lastFrame?.columns ?? this.grid.columns);
+    return { start: { row: cell.row, column: 0 }, end: { row: cell.row, column: columns - 1 } };
+  }
+
   private beginSelection(start: Cell): void {
+    this.openSelection(start, start);
+  }
+
+  /** Opens a selection over a range and tells the model to draw it. */
+  private openSelection(start: Cell, end: Cell): void {
     this.selecting = true;
     this.onSelection?.(true);
-    this.selectionEnd = start;
+    this.selectionStart = start;
+    this.selectionEnd = end;
     if (this.drag) {
       this.drag.selecting = true;
       this.drag.start = start;
     }
-    void this.select(start, start);
+    void this.select(start, end);
   }
 
   /** Ends a selection and tells the model to stop drawing one. */
@@ -757,17 +1005,18 @@ export class TerminalSession {
       return;
     }
     this.selecting = false;
+    this.selectionStart = null;
     this.selectionEnd = null;
     this.onSelection?.(false);
     await this.clearSelection();
   }
 
-  /** Where the selection currently ends, for a copy button. */
+  /** Where the open selection reaches, for a copy button or a shortcut. */
   public get selection(): { start: Cell; end: Cell } | null {
-    if (!this.selecting || !this.drag) {
+    if (!this.selecting || !this.selectionStart) {
       return null;
     }
-    return { start: this.drag.start, end: this.selectionEnd ?? this.drag.start };
+    return { start: this.selectionStart, end: this.selectionEnd ?? this.selectionStart };
   }
 
   /** A wheel spin is a short drag: the same three-line step every terminal uses. */
@@ -819,6 +1068,9 @@ export class TerminalSession {
         this.onModes?.(frame.modes);
       }
       this.modes = frame.modes;
+      // A double-click reads word borders from the cells the model last sent;
+      // the canvas itself has no text to read them from.
+      this.lastFrame = frame;
       this.renderer.render(frame);
       if (frame.title !== this.lastTitle) {
         this.lastTitle = frame.title;

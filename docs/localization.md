@@ -3,7 +3,7 @@
 ## Supported languages and coverage
 
 English (`en`), Spanish (`es`), German (`de`) and French (`fr`) catalogs ship
-with the application. There are 456 CLI catalog entries and 656 browser entries,
+with the application. There are 457 CLI catalog entries and 1020 browser entries,
 including whole help messages and plural variants. They are embedded at build time; there are no
 runtime downloads, gettext dependencies or installed OS locale requirements.
 A catalog walker reports interface strings still answered in English so a new
@@ -31,7 +31,8 @@ the missing languages alone: every message the client prints in this build
 goes through a catalog, and the compiler refuses a new one that does not.
 Server-provided SSH challenges, protocol data, core/OS diagnostic details,
 command-console output and logs are deliberately retained verbatim. A browser
-operation failure shows a translated explanation with the diagnostic detail;
+operation failure is written into the Logs panel as a translated explanation
+with the diagnostic detail, rather than popped up and lost;
 file contents, filenames, session names, paths, host-key fingerprints, command
 names and API enum values must never be translated.
 
