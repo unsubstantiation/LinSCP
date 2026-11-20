@@ -89,17 +89,8 @@ impl PasswordSecretVault {
     }
 
     pub fn open_local_blob(&self, encrypted: &[u8]) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
-        if encrypted.len() < BLOB_MAGIC.len() + NONCE_LEN + 16 || !encrypted.starts_with(BLOB_MAGIC) {
-            return Err(vault_error("Invalid encrypted local vault data"));
-        }
         let master = self.master_key_copy()?;
-        let nonce_start = BLOB_MAGIC.len();
-        let ciphertext_start = nonce_start + NONCE_LEN;
-        let cipher = Aes256Gcm::new_from_slice(&master[..]).map_err(|_| vault_error("Invalid local vault key"))?;
-        let plaintext = cipher.decrypt(Nonce::from_slice(&encrypted[nonce_start..ciphertext_start]),
-            Payload { msg: &encrypted[ciphertext_start..], aad: BLOB_MAGIC })
-            .map_err(|_| vault_error("Could not decrypt local vault data"))?;
-        Ok(Zeroizing::new(plaintext))
+        open_blob_with_master_key(encrypted, &master)
     }
 
     fn master_key_copy(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, PlatformError> {
@@ -128,6 +119,21 @@ impl SecretVault for PasswordSecretVault {
     fn load_or_create_master_key(&self, _config_dir: &Path) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
         self.master_key_copy()
     }
+}
+
+/// Open a local-vault blob using the source key contained inside an already
+/// authenticated portable backup. The plaintext must never be written to disk.
+pub fn open_blob_with_master_key(encrypted: &[u8], master: &[u8; 32]) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
+    if encrypted.len() < BLOB_MAGIC.len() + NONCE_LEN + 16 || !encrypted.starts_with(BLOB_MAGIC) {
+        return Err(vault_error("Invalid encrypted local vault data"));
+    }
+    let nonce_start = BLOB_MAGIC.len();
+    let ciphertext_start = nonce_start + NONCE_LEN;
+    let cipher = Aes256Gcm::new_from_slice(master).map_err(|_| vault_error("Invalid local vault key"))?;
+    let plaintext = cipher.decrypt(Nonce::from_slice(&encrypted[nonce_start..ciphertext_start]),
+        Payload { msg: &encrypted[ciphertext_start..], aad: BLOB_MAGIC })
+        .map_err(|_| vault_error("Could not decrypt local vault data"))?;
+    Ok(Zeroizing::new(plaintext))
 }
 
 fn validate_password(password: &str) -> Result<(), PlatformError> {

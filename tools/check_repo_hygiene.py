@@ -63,29 +63,90 @@ def strip_code_comments(text):
     return LINE_COMMENT.sub('', text)
 
 
-def _test_module_line_ranges(text):
-    """Line ranges of a crate's own `#[cfg(test)] mod ...` blocks.
+def mask_rust_non_code(text):
+    """Blank Rust comments and literals without changing offsets or line numbers.
 
-    A crate's unit tests may build OS-specific fixtures (`#[cfg(unix)] mkfifo`)
-    to prove a fail-closed path; that is a test of the platform, not production
-    OS code leaking out of `linscp-platform`. The ranges are computed on the
-    comment-stripped text so line numbers stay comparable with the findings.
+    Counting braces in test modules must ignore format strings, URLs, raw
+    strings, character literals, and nested block comments. A regex that strips
+    `//` first can consume a closing brace inside a quoted URL.
     """
-    stripped = strip_code_comments(text)
+    out = list(text)
+    length = len(text)
+    i = 0
+    raw_pattern = re.compile(r'(?:br|cr|r)(#{0,255})"')
+    char_pattern = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\n])'")
+
+    def blank(start, end):
+        for k in range(start, end):
+            if text[k] != '\n':
+                out[k] = ' '
+
+    while i < length:
+        start = i
+        if text.startswith('//', i):
+            end = text.find('\n', i)
+            i = length if end < 0 else end
+        elif text.startswith('/*', i):
+            i += 2
+            depth = 1
+            while i < length and depth:
+                if text.startswith('/*', i):
+                    depth += 1
+                    i += 2
+                elif text.startswith('*/', i):
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+        else:
+            raw = raw_pattern.match(text, i) if text[i] in 'bcr' else None
+            if raw and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == '_')):
+                terminator = '"' + raw.group(1)
+                end = text.find(terminator, raw.end())
+                i = length if end < 0 else end + len(terminator)
+            elif text[i] == '"':
+                i += 1
+                while i < length:
+                    if text[i] == '\\':
+                        i = min(length, i + 2)
+                    elif text[i] == '"':
+                        i += 1
+                        break
+                    else:
+                        i += 1
+            elif text[i] == "'":
+                # A lifetime such as 'a is not a character literal.
+                char = char_pattern.match(text, i)
+                if not char:
+                    i += 1
+                    continue
+                i = char.end()
+            else:
+                i += 1
+                continue
+        blank(start, i)
+    return ''.join(out)
+
+
+def _test_module_line_ranges(text):
+    """Return line ranges of `#[cfg(test)] mod ...` blocks, excluding literals."""
+    stripped = mask_rust_non_code(text)
     ranges = []
     for match in re.finditer(r'#\s*\[\s*cfg\(\s*test\s*\)\s*\]', stripped):
         start = stripped.count('\n', 0, match.start()) + 1
-        mod = re.compile(r'\bmod\s+\w+\s*\{').search(stripped, match.end())
+        # Attributes may intervene, but never cross a different Rust item:
+        # a cfg(test) function must not exempt the next production module.
+        mod = re.compile(r'\s*(?:#\s*\[[^]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{').match(stripped, match.end())
         if not mod:
             continue
         depth = 0
-        for _, char in enumerate(stripped[mod.end() - 1:], start=mod.end() - 1):
+        for index, char in enumerate(stripped[mod.end() - 1:], start=mod.end() - 1):
             if char == '{':
                 depth += 1
             elif char == '}':
                 depth -= 1
                 if depth == 0:
-                    end = stripped.count('\n', 0, _) + 1
+                    end = stripped.count('\n', 0, index) + 1
                     ranges.append((start, end))
                     break
     return ranges
@@ -125,8 +186,9 @@ def check_crate_boundaries(root=ROOT):
         for rs_path in sorted(src_dir.rglob('*.rs')):
             if any(part in legacy_check.SKIP_DIRECTORIES for part in rs_path.parts):
                 continue
-            cleaned = strip_code_comments(rs_path.read_text(encoding='utf-8'))
-            test_ranges = _test_module_line_ranges(cleaned)
+            original = rs_path.read_text(encoding='utf-8')
+            cleaned = mask_rust_non_code(original)
+            test_ranges = _test_module_line_ranges(original)
             for rule_name, regex, desc in (
                 ('crate-os-cfg', RUST_OS_CFG,
                  f'OS-specific #[cfg] in {crate_name}; isolate OS branches in linscp-platform'),

@@ -79,6 +79,30 @@ class RepoHygieneTests(unittest.TestCase):
         )
         self.assertIn('crate-os-cfg', self.names(hygiene.check_crate_boundaries(self.root)))
 
+    def test_rust_literals_and_nested_comments_do_not_break_test_ranges(self):
+        self.write(
+            'crates/linscp-proto/src/test.rs',
+            '#[cfg(test)]\nmod tests {\n'
+            '    const URL: &str = "https://example.test/{item}";\n'
+            '    const RAW: &str = r##"raw \" } // still a string"##;\n'
+            "    const BRACE: char = '}';\n"
+            '    /* { /* nested } */ { */\n'
+            '    #[cfg(unix)] fn fixture() {}\n'
+            '}\n'
+            '#[cfg(windows)] fn production() {}\n',
+        )
+        findings = hygiene.check_crate_boundaries(self.root)
+        self.assertEqual(self.names(findings), ['crate-os-cfg'])
+        self.assertIn('windows', findings[0][4])
+
+    def test_test_function_does_not_exempt_following_production_module(self):
+        self.write(
+            'crates/linscp-proto/src/test.rs',
+            '#[cfg(test)] fn helper() {}\n'
+            'mod production { #[cfg(unix)] fn shipped() {} }\n',
+        )
+        self.assertIn('crate-os-cfg', self.names(hygiene.check_crate_boundaries(self.root)))
+
     def test_raw_fetch_or_tauri_outside_ui_transport_is_rejected(self):
         self.write(
             'ui/src/components/pane.ts',

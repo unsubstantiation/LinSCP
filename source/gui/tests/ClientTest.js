@@ -2265,10 +2265,8 @@ function options(id) {
       doc.getElementById('keyExportList').children.length === 1 &&
       text('keyExportList').includes('GUI/test'),
     text('keyExportList'));
-  check('the plain-text option is off by default and its warning is hidden',
-    !doc.getElementById('keyExportPlainText').checked &&
-      doc.getElementById('keyExportWarning').style.display === 'none' &&
-      !doc.getElementById('keyExportPassword').disabled);
+  check('the export dialog does not offer plaintext backups',
+    !doc.getElementById('keyExportPlainText') && !doc.getElementById('keyExportPassword').disabled);
   doc.getElementById('keyExportPassword').value = 'backup-password';
   doc.getElementById('keyExportPasswordConfirm').value = 'backup-password';
   const exportCalls = () => calls.filter(call => call.path === '/api/vault/export');
@@ -2299,25 +2297,6 @@ function options(id) {
     text('keyExportStatus').includes('key_session_2026-11-15_00-00-00.json.aes') &&
       value('keyExportPassword') === '' && value('keyExportPasswordConfirm') === '',
     text('keyExportStatus'));
-  doc.getElementById('keyExportPlainText').checked = true;
-  doc.getElementById('keyExportPlainText').dispatchEvent(new window.Event('change'));
-  check('the plain-text option warns and disables the password fields',
-    doc.getElementById('keyExportWarning').style.display !== 'none' &&
-      doc.getElementById('keyExportPassword').disabled &&
-      doc.getElementById('keyExportPasswordConfirm').disabled);
-  await window.exportKeySession();
-  const plainCall = exportCalls().pop();
-  const plainPayload = plainCall ? JSON.parse(plainCall.options.body) : {};
-  check('the plain-text export posts plain_text and no password',
-    plainPayload.plain_text === true && plainPayload.password === '' &&
-      JSON.stringify(plainPayload.sessions) === JSON.stringify(['GUI/test']),
-    JSON.stringify(plainPayload));
-  check('the plain-text export says the secrets are readable on this device',
-    text('keyExportStatus').includes('Plain-text export written') &&
-      text('keyExportStatus').includes('.json'),
-    text('keyExportStatus'));
-  doc.getElementById('keyExportPlainText').checked = false;
-  doc.getElementById('keyExportPlainText').dispatchEvent(new window.Event('change'));
   window.closeModal('keySessionExportModal');
 
   /* Key/Session Import: the file is read before anything is listed, the

@@ -185,6 +185,7 @@
   "Choose a key/session backup and read it. Encrypted LinSCP backups and plain-text backups are detected automatically. Tick the sessions you want, then import them. Names already saved are skipped unless you tick Replace saved sessions with the same name below.": "Choose a key/session backup and read it. Encrypted LinSCP backups and plain-text backups are detected automatically. Tick the sessions you want, then import them. Names already saved are skipped unless you tick Replace saved sessions with the same name below.",
   "Choose a key/session backup file first.": "Choose a key/session backup file first.",
   "Choose a non-empty SSH key file no larger than 1 MiB.": "Choose a non-empty SSH key file no larger than 1 MiB.",
+  "Choose a non-empty backup password.": "Choose a non-empty backup password.",
   "Choose a non-empty backup password, or untick the password and use a plain-text export.": "Choose a non-empty backup password, or untick the password and use a plain-text export.",
   "Choose a private key from the vault": "Choose a private key from the vault",
   "Choose a separate vault password. It will be required each time LinSCP starts.": "Choose a separate vault password. It will be required each time LinSCP starts.",

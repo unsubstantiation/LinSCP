@@ -686,7 +686,7 @@ pub fn parse_gui_session_spec(
         }
     }
     // The site form uses descriptive values, whereas the engine stores the
-    // WinSCP-compatible numeric mode. Never let an unknown value silently
+    // legacy-compatible numeric mode. Never let an unknown value silently
     // downgrade an FTP connection to plaintext.
     if let Some(mode) = session.get("ftps").and_then(Value::as_str) {
         match mode.trim().to_ascii_lowercase().as_str() {
@@ -889,8 +889,9 @@ pub async fn dial_gui_tab_session(
     cache_pinned_hostkeys: bool,
     locale: &str,
     log_sink: Option<linscp_proto::ssh::SshEventLogger>,
+    vault: Arc<dyn SecretVault>,
 ) -> Result<(Arc<dyn RemoteSession>, String, String), GuiConnectError> {
-    let session = connect_gui_site_spec(spec, config_root, cache_pinned_hostkeys, locale, log_sink.clone()).await?;
+    let session = connect_gui_site_spec(spec, config_root, cache_pinned_hostkeys, locale, log_sink.clone(), vault).await?;
     if let Some(log) = &log_sink { log("Connected; determining the initial remote directory."); }
     let resolved_dir = if spec.session.initial_dir.trim().is_empty()
         || spec.session.initial_dir.trim() == "~"

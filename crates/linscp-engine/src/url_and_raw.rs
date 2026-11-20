@@ -2334,12 +2334,13 @@ fn make_gui_ssh_host_key_callback(
     config_dir: std::path::PathBuf,
     cache_pinned: bool,
     locale: String,
+    vault: Arc<dyn linscp_platform::SecretVault>,
     capture: Arc<std::sync::Mutex<Option<GuiHostKeyChallenge>>>,
 ) -> HostKeyDecisionCallback {
     Arc::new(move |obs: &ObservedServerHostKey| -> Result<(), ProtoError> {
         let role = if is_tunnel { "tunnel" } else { "destination" };
         let cache_path = config_dir.join("sshhostkeys");
-        let mut cache = HostKeyCache::load_from_path(&cache_path).unwrap_or_default();
+        let mut cache = HostKeyCache::load_protected(&cache_path, vault.as_ref()).map_err(ProtoError::Transport)?;
         let cached_fp = cache
             .lookup(&obs.host, obs.port, &obs.key_type)
             .map(str::to_string);
@@ -2359,7 +2360,7 @@ fn make_gui_ssh_host_key_callback(
                         &obs.key_type,
                         &obs.sha256_fingerprint,
                     );
-                    let _ = cache.save_to_path(&cache_path);
+                    cache.save_protected(&cache_path, vault.as_ref()).map_err(ProtoError::Transport)?;
                 }
                 return Ok(());
             }
@@ -2458,6 +2459,7 @@ pub async fn connect_gui_site_spec(
     cache_pinned_hostkeys: bool,
     locale: &str,
     ssh_log_sink: Option<SshEventLogger>,
+    vault: Arc<dyn linscp_platform::SecretVault>,
 ) -> Result<Box<dyn RemoteSession>, GuiConnectError> {
     validate_ssh_gssapi_policy(spec).map_err(GuiConnectError::Failed)?;
     let proxy = build_proxy_config(spec).map_err(GuiConnectError::Failed)?;
@@ -2481,6 +2483,7 @@ pub async fn connect_gui_site_spec(
         config_dir.to_path_buf(),
         cache_pinned_hostkeys,
         locale.to_string(),
+        Arc::clone(&vault),
         Arc::clone(&capture),
     ));
     if let Some(ref mut tun_cfg) = tunnel_ssh_cfg {
@@ -2494,6 +2497,7 @@ pub async fn connect_gui_site_spec(
             config_dir.to_path_buf(),
             cache_pinned_hostkeys,
             locale.to_string(),
+            Arc::clone(&vault),
             Arc::clone(&capture),
         ));
     }
@@ -2637,7 +2641,7 @@ fn make_ssh_host_key_callback(
         let prefix = if is_tunnel { "TUNNELHOSTKEY" } else { "HOSTKEY" };
         let role = if is_tunnel { "tunnel" } else { "destination" };
         let cache_path = config_dir.join("sshhostkeys");
-        let mut cache = HostKeyCache::load_from_path(&cache_path).unwrap_or_default();
+        let mut cache = HostKeyCache::load_from_path(&cache_path).map_err(ProtoError::Transport)?;
         let cached_fp = cache
             .lookup(&obs.host, obs.port, &obs.key_type)
             .map(str::to_string);
