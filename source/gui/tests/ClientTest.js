@@ -891,6 +891,20 @@ function options(id) {
   check('saving an existing site without a stored password posts no password',
     saved && !JSON.parse(saved.options.body).session.password);
 
+  const oldPrompt = window.prompt;
+  const copyCallsBefore = calls.filter(call => call.path === '/api/sessions/copy').length;
+  window.prompt = () => null;
+  await window.copySite();
+  check('cancelling a site copy does not make a request', calls.filter(call => call.path === '/api/sessions/copy').length === copyCallsBefore);
+  window.prompt = () => 'GUI/test copy';
+  responses['/api/sessions/copy'] = {success: true};
+  await window.copySite();
+  const copyCall = calls.filter(call => call.path === '/api/sessions/copy').pop();
+  check('copy site copies the selected stored session under the requested name',
+    copyCall && JSON.parse(copyCall.options.body).source === 'GUI/test' && JSON.parse(copyCall.options.body).name === 'GUI/test copy');
+  delete responses['/api/sessions/copy'];
+  window.prompt = oldPrompt;
+
   window.newSite();
   check('new SSH sessions default to storing their password',
     doc.getElementById('siteRemember').checked);
@@ -929,6 +943,44 @@ function options(id) {
   if (tunnelKeyChoice) tunnelKeyChoice.click();
   check('vault picker can target the SSH tunnel key field',
     doc.getElementById('siteTunnelKey').value === 'vaultkey://0123456789abcdef0123456789abcdef');
+  const originalVaultKeys = responses['/api/vault/keys'];
+  responses['/api/vault/keys/delete'] = { success: true, deleted: true };
+  await window.openSshKeyVaultPicker();
+  const deleteKey = doc.querySelector('#sshKeyVaultList .vault-key-delete');
+  const keyDeletesBefore = calls.filter(call => call.path === '/api/vault/keys/delete').length;
+  confirmResult = false;
+  if (deleteKey) deleteKey.click();
+  confirmResult = true;
+  const deleteWarning = confirmMessages[confirmMessages.length - 1] || '';
+  check('deleting a vault key requires confirmation and explains saved sites and backups',
+    !!deleteKey && deleteWarning.includes('work-laptop-key') && deleteWarning.includes('stored sessions') &&
+    deleteWarning.includes('backups') && calls.filter(call => call.path === '/api/vault/keys/delete').length === keyDeletesBefore);
+  responses['/api/vault/keys'] = { success: true, keys: [] };
+  if (deleteKey) deleteKey.click();
+  await new Promise(resolve => setTimeout(resolve, 30));
+  const deletedKeyCall = calls.filter(call => call.path === '/api/vault/keys/delete').pop();
+  check('confirmed deletion sends only the reference and confirmation, clears current fields and refreshes the list',
+    deletedKeyCall && JSON.parse(deletedKeyCall.options.body).reference === 'vaultkey://0123456789abcdef0123456789abcdef' &&
+      JSON.parse(deletedKeyCall.options.body).confirm === true && !doc.getElementById('siteKey').value &&
+      !doc.getElementById('siteTunnelKey').value && text('sshKeyVaultList').includes('No SSH keys'));
+  responses['/api/vault/keys'] = originalVaultKeys;
+  responses['/api/vault/keys/delete'] = { success: false, error: 'vault delete refused' };
+  doc.getElementById('siteKey').value = 'vaultkey://0123456789abcdef0123456789abcdef';
+  await window.openSshKeyVaultPicker();
+  doc.querySelector('#sshKeyVaultList .vault-key-delete').click();
+  await new Promise(resolve => setTimeout(resolve, 30));
+  check('failed key deletion leaves the current selection and reports the error',
+    doc.getElementById('siteKey').value === 'vaultkey://0123456789abcdef0123456789abcdef' && lastLogLine().includes('vault delete refused'));
+  responses['/api/vault/keys/delete'] = { success: false, deleted: true, error: 'metadata cleanup failed' };
+  responses['/api/vault/keys'] = { success: true, keys: [] };
+  doc.querySelector('#sshKeyVaultList .vault-key-delete').click();
+  await new Promise(resolve => setTimeout(resolve, 30));
+  check('partial key deletion clears the deleted selection and reports metadata cleanup failure',
+    !doc.getElementById('siteKey').value && lastLogLine().includes('metadata cleanup failed') &&
+      text('sshKeyVaultList').includes('No SSH keys'));
+  responses['/api/vault/keys'] = originalVaultKeys;
+  window.closeModal('sshKeyVaultModal');
+  delete responses['/api/vault/keys/delete'];
   const keyFileInput = doc.getElementById('siteKeyFileInput');
   Object.defineProperty(keyFileInput, 'files', { configurable: true, value: [{
     name: 'id_ed25519', size: 32, text: async () => '-----BEGIN OPENSSH PRIVATE KEY-----\\nfixture\\n',
@@ -1620,6 +1672,25 @@ function options(id) {
     verify && JSON.parse(verify.options.body).remember === true);
   check('the pinned connection becomes the active tab',
     text('statusBadge').indexOf('Connected') >= 0, text('statusBadge'));
+  const savedVerify = responses['/api/tabs/verify'];
+  const failedKey = 'Failed to load PPK private key: PPK integrity check failed';
+  responses['/api/tabs/verify'] = { success: false, error: failedKey };
+  window.showHostKeyChallenge({ tab: 7, host: '127.0.0.1', port: 2222, role: 'destination', fingerprint: 'ssh-ed25519 SHA256:example' });
+  await window.acceptHostKey();
+  check('a private-key failure after verification does not blame the host key',
+    lastLogLine().includes('Connection failed after host-key verification.') && lastLogLine().includes(failedKey) &&
+      !lastLogLine().includes('Cannot connect with that host key.'));
+  responses['/api/tabs/verify'] = { success: false, error: 'unknown destination key', challenge: {
+    tab: 7, host: 'destination', port: 22, role: 'destination', fingerprint: 'ssh-ed25519 SHA256:destination' } };
+  const beforeNextChallenge = doc.getElementById('logOutput').children.length;
+  window.showHostKeyChallenge({ tab: 7, host: 'jump', port: 22, role: 'tunnel', fingerprint: 'ssh-ed25519 SHA256:jump' });
+  await window.acceptHostKey();
+  check('a second host-key challenge opens without logging a connection failure',
+    doc.getElementById('hostKeyModal').classList.contains('open') &&
+    text('hostKeyFingerprint') === 'ssh-ed25519 SHA256:destination' &&
+    doc.getElementById('logOutput').children.length === beforeNextChallenge);
+  window.closeModal('hostKeyModal');
+  responses['/api/tabs/verify'] = savedVerify;
 
   window.showHelp();
   check('help opens the shortcut reference',
@@ -2412,6 +2483,87 @@ function options(id) {
     doc.getElementById('logOutput').children.length === ownEntries + 1 &&
       text('logOutput').includes('kept line'),
     text('logOutput'));
+  // Logs are selectable across refreshes, and right-click copies either the
+  // selected text or the clicked entry without exposing HTML as markup.
+  window.switchTab('log');
+  responses['/api/logs'] = { logs: [
+    { time: '12:34:56', level: 'info', text: 'first <entry> here' },
+    { time: '12:34:57', level: 'error', text: 'second entry' }
+  ] };
+  await window.refreshLogs();
+  const logOutput = doc.getElementById('logOutput');
+  const logScroller = doc.getElementById('tabLog');
+  const contextMenu = doc.getElementById('logContextMenu');
+  const firstLog = logOutput.querySelector('.log-line');
+  const firstText = firstLog.lastElementChild.firstChild;
+  const selection = window.getSelection();
+  const range = doc.createRange();
+  range.setStart(firstText, 0); range.setEnd(firstText, 5);
+  firstLog.dispatchEvent(new window.MouseEvent('mousedown', { bubbles: true, button: 0 }));
+  responses['/api/logs'].logs.push({ time: '12:34:58', level: 'info', text: 'new entry' });
+  await window.refreshLogs();
+  check('a refresh does not replace logs while a text drag is starting', logOutput.firstElementChild === firstLog);
+  selection.removeAllRanges(); selection.addRange(range);
+  doc.dispatchEvent(new window.MouseEvent('mouseup', { bubbles: true, button: 0 }));
+  await window.refreshLogs();
+  check('a selected log survives a refresh until selection is cleared',
+    logOutput.firstElementChild === firstLog && selection.toString() === 'first' && !text('logOutput').includes('new entry'));
+  check('logs explicitly enable mouse text selection', /#logOutput\s*\{[^}]*user-select:\s*text/.test(themeCss));
+
+  const clipboardDescriptor = Object.getOwnPropertyDescriptor(window.navigator, 'clipboard');
+  const copiedLogs = [];
+  Object.defineProperty(window.navigator, 'clipboard', { configurable: true, value: { writeText: async value => copiedLogs.push(value) } });
+  firstLog.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 20, clientY: 30 }));
+  check('right-click offers Copy for log text', !contextMenu.hidden && contextMenu.textContent.includes('Copy'));
+  await window.copyLogContext();
+  check('right-click on selected log text copies the selection', copiedLogs.pop() === 'first');
+  const across = doc.createRange();
+  across.setStart(firstText, 0);
+  across.setEnd(logOutput.children[1].lastElementChild.firstChild, 6);
+  selection.removeAllRanges(); selection.addRange(across);
+  const acrossText = selection.toString();
+  logOutput.children[1].dispatchEvent(new window.MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+  await window.copyLogContext();
+  check('a selection spanning log entries is copied intact', acrossText.includes('first') && acrossText.includes('second') && copiedLogs.pop() === acrossText);
+  selection.removeAllRanges(); selection.addRange(range);
+  // Some native WebViews do not expose navigator.clipboard: the fallback must
+  // check execCommand's return value and leave the user's selection intact.
+  Object.defineProperty(window.navigator, 'clipboard', { configurable: true, value: { writeText: async () => { throw new Error('denied'); } } });
+  const savedExecCommand = doc.execCommand;
+  let fallbackText = '';
+  doc.execCommand = command => {
+    if (command !== 'copy') return false;
+    fallbackText = doc.activeElement.value;
+    return true;
+  };
+  firstLog.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+  await window.copyLogContext();
+  check('clipboard fallback copies and preserves the log selection', fallbackText === 'first' && selection.toString() === 'first', JSON.stringify({ fallbackText, selected: selection.toString(), rangeCount: selection.rangeCount }));
+  doc.execCommand = savedExecCommand;
+  Object.defineProperty(window.navigator, 'clipboard', { configurable: true, value: { writeText: async value => copiedLogs.push(value) } });
+  logOutput.children[1].dispatchEvent(new window.MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+  await window.copyLogContext();
+  check('right-click on a different log copies its timestamp and complete message', copiedLogs.pop() === '12:34:57 second entry');
+  firstLog.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+  contextMenu.querySelector('button').dispatchEvent(new window.KeyboardEvent('keydown', { bubbles: true, key: 'Escape' }));
+  check('Escape dismisses the log context menu', contextMenu.hidden);
+  Object.defineProperty(window.navigator, 'clipboard', { configurable: true, value: { writeText: async () => { throw new Error('denied'); } } });
+  doc.execCommand = () => false;
+  firstLog.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+  await window.copyLogContext();
+  doc.execCommand = savedExecCommand;
+  selection.removeAllRanges();
+  doc.dispatchEvent(new window.Event('selectionchange'));
+  check('the latest logs appear after the selection is cleared', text('logOutput').includes('new entry'));
+  check('clipboard failure is reported instead of claiming success', text('logOutput').includes('Copy failed — select the log text and copy it manually.'));
+  Object.defineProperty(logScroller, 'scrollHeight', { configurable: true, value: 1000 });
+  Object.defineProperty(logScroller, 'clientHeight', { configurable: true, value: 100 });
+  logScroller.scrollTop = 20;
+  await window.refreshLogs();
+  check('refresh keeps the scroll position when reading older logs', logScroller.scrollTop === 20);
+  delete logScroller.scrollHeight; delete logScroller.clientHeight;
+  if (clipboardDescriptor) Object.defineProperty(window.navigator, 'clipboard', clipboardDescriptor);
+  else delete window.navigator.clipboard;
   responses['/api/logs'] = savedLogs;
   await window.refreshLogs();
 

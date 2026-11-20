@@ -183,7 +183,7 @@ pub fn parse_ppk_str(text: &str) -> Result<ParsedPpk, PpkError> {
     let mut parallelism = 0u32;
     let mut salt = Vec::new();
 
-    if version == 3 {
+    if version == 3 && encryption == "aes256-cbc" {
         let (kdf_name, kdf_val) = parse_header_line(lines.next().ok_or_else(|| {
             PpkError::InvalidFormat("Missing PPK v3 Key-Derivation header".to_string())
         })?)?;
@@ -193,65 +193,59 @@ pub fn parse_ppk_str(text: &str) -> Result<ParsedPpk, PpkError> {
             ));
         }
         argon_type = kdf_val.to_string();
-        if encryption == "aes256-cbc" {
-            if !matches!(argon_type.as_str(), "Argon2d" | "Argon2i" | "Argon2id") {
-                return Err(PpkError::InvalidFormat(
-                    "Unsupported PPK v3 key derivation algorithm".to_string(),
-                ));
-            }
-            let (m_name, m_val) = parse_header_line(lines.next().ok_or_else(|| {
-                PpkError::InvalidFormat("Missing Argon2-Memory header".to_string())
-            })?)?;
-            if m_name != "Argon2-Memory" {
-                return Err(PpkError::InvalidFormat("Missing Argon2-Memory header".to_string()));
-            }
-            memory_kib = m_val
-                .parse()
-                .map_err(|_| PpkError::InvalidFormat("Invalid Argon2-Memory value".to_string()))?;
-
-            let (p_name, p_val) = parse_header_line(lines.next().ok_or_else(|| {
-                PpkError::InvalidFormat("Missing Argon2-Passes header".to_string())
-            })?)?;
-            if p_name != "Argon2-Passes" {
-                return Err(PpkError::InvalidFormat("Missing Argon2-Passes header".to_string()));
-            }
-            passes = p_val
-                .parse()
-                .map_err(|_| PpkError::InvalidFormat("Invalid Argon2-Passes value".to_string()))?;
-
-            let (par_name, par_val) = parse_header_line(lines.next().ok_or_else(|| {
-                PpkError::InvalidFormat("Missing Argon2-Parallelism header".to_string())
-            })?)?;
-            if par_name != "Argon2-Parallelism" {
-                return Err(PpkError::InvalidFormat(
-                    "Missing Argon2-Parallelism header".to_string(),
-                ));
-            }
-            parallelism = par_val.parse().map_err(|_| {
-                PpkError::InvalidFormat("Invalid Argon2-Parallelism value".to_string())
-            })?;
-
-            let (s_name, s_val) = parse_header_line(lines.next().ok_or_else(|| {
-                PpkError::InvalidFormat("Missing Argon2-Salt header".to_string())
-            })?)?;
-            if s_name != "Argon2-Salt" {
-                return Err(PpkError::InvalidFormat("Missing Argon2-Salt header".to_string()));
-            }
-            salt = hex_decode(s_val)
-                .filter(|s| !s.is_empty() && s.len() <= 1024)
-                .ok_or_else(|| PpkError::InvalidFormat("Invalid PPK Argon2 salt".to_string()))?;
-
-            // Bound Argon2 work factors BEFORE allocating memory.
-            if !(8..=256 * 1024).contains(&memory_kib)
-                || !(1..=100).contains(&passes)
-                || !(1..=64).contains(&parallelism)
-            {
-                return Err(PpkError::UnsafeArgon2Parameters);
-            }
-        } else if argon_type != "none" {
+        if !matches!(argon_type.as_str(), "Argon2d" | "Argon2i" | "Argon2id") {
             return Err(PpkError::InvalidFormat(
-                "Unencrypted PPK v3 key has unexpected derivation parameters".to_string(),
+                "Unsupported PPK v3 key derivation algorithm".to_string(),
             ));
+        }
+        let (m_name, m_val) = parse_header_line(lines.next().ok_or_else(|| {
+            PpkError::InvalidFormat("Missing Argon2-Memory header".to_string())
+        })?)?;
+        if m_name != "Argon2-Memory" {
+            return Err(PpkError::InvalidFormat("Missing Argon2-Memory header".to_string()));
+        }
+        memory_kib = m_val
+            .parse()
+            .map_err(|_| PpkError::InvalidFormat("Invalid Argon2-Memory value".to_string()))?;
+
+        let (p_name, p_val) = parse_header_line(lines.next().ok_or_else(|| {
+            PpkError::InvalidFormat("Missing Argon2-Passes header".to_string())
+        })?)?;
+        if p_name != "Argon2-Passes" {
+            return Err(PpkError::InvalidFormat("Missing Argon2-Passes header".to_string()));
+        }
+        passes = p_val
+            .parse()
+            .map_err(|_| PpkError::InvalidFormat("Invalid Argon2-Passes value".to_string()))?;
+
+        let (par_name, par_val) = parse_header_line(lines.next().ok_or_else(|| {
+            PpkError::InvalidFormat("Missing Argon2-Parallelism header".to_string())
+        })?)?;
+        if par_name != "Argon2-Parallelism" {
+            return Err(PpkError::InvalidFormat(
+                "Missing Argon2-Parallelism header".to_string(),
+            ));
+        }
+        parallelism = par_val.parse().map_err(|_| {
+            PpkError::InvalidFormat("Invalid Argon2-Parallelism value".to_string())
+        })?;
+
+        let (s_name, s_val) = parse_header_line(lines.next().ok_or_else(|| {
+            PpkError::InvalidFormat("Missing Argon2-Salt header".to_string())
+        })?)?;
+        if s_name != "Argon2-Salt" {
+            return Err(PpkError::InvalidFormat("Missing Argon2-Salt header".to_string()));
+        }
+        salt = hex_decode(s_val)
+            .filter(|s| !s.is_empty() && s.len() <= 1024)
+            .ok_or_else(|| PpkError::InvalidFormat("Invalid PPK Argon2 salt".to_string()))?;
+
+        // Bound Argon2 work factors BEFORE allocating memory.
+        if !(8..=256 * 1024).contains(&memory_kib)
+            || !(1..=100).contains(&passes)
+            || !(1..=64).contains(&parallelism)
+        {
+            return Err(PpkError::UnsafeArgon2Parameters);
         }
     }
 
@@ -449,16 +443,14 @@ pub fn decrypt_and_verify_ppk(
     put_ssh_bytes(&mut mac_data, &plain);
 
     let mac_ok = if ppk.version == 2 {
-        let mac_key: Zeroizing<Vec<u8>> = if ppk.encryption == "aes256-cbc" {
-            let mut h = Sha1::new();
-            h.update(PPK_MAC_LABEL);
-            h.update(passphrase.as_bytes());
-            let d: [u8; 20] = h.finalize().into();
-            Zeroizing::new(d.to_vec())
-        } else {
-            Zeroizing::new(PPK_MAC_LABEL.to_vec())
-        };
-        let mut mac = <HmacSha1 as Mac>::new_from_slice(&mac_key).expect("HMAC key");
+        // PuTTY v2 hashes the label even when there is no encryption. An
+        // unencrypted key always uses an empty passphrase for its MAC.
+        let mut h = Sha1::new();
+        h.update(PPK_MAC_LABEL);
+        if ppk.encryption == "aes256-cbc" { h.update(passphrase.as_bytes()); }
+        let digest: [u8; 20] = h.finalize().into();
+        let mac_key = Zeroizing::new(digest);
+        let mut mac = <HmacSha1 as Mac>::new_from_slice(&mac_key[..]).expect("HMAC key");
         mac.update(&mac_data);
         let actual: [u8; 20] = mac.finalize().into_bytes().into();
         bool::from(actual.ct_eq(ppk.mac.as_slice()))
@@ -466,7 +458,8 @@ pub fn decrypt_and_verify_ppk(
         let mac_key: &[u8] = if ppk.encryption == "aes256-cbc" {
             &key_material[48..80]
         } else {
-            PPK_MAC_LABEL
+            // PPK v3 uses a zero-length MAC key when unencrypted.
+            &[]
         };
         let mut mac = <HmacSha256 as Mac>::new_from_slice(mac_key).expect("HMAC key");
         mac.update(&mac_data);
@@ -1254,10 +1247,9 @@ Encryption: none
 Comment: ed25519-v3
 Public-Lines: 1
 AAAAC3NzaC1lZDI1NTE5AAAAIHm1Vi6P5lT5QHixEuipi6eQH4U65pW+1+DjkQutBJZk
-Key-Derivation: none
 Private-Lines: 1
 AAAAIAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g
-Private-MAC: 811d91c584905245d2ff3387fce282ae4b35c5af0e43257969d458b07031b4ff
+Private-MAC: a53a40b2ed67e0d61735289002ebfa0ecc474397afeeb75403c28b9601a60bd8
 ";
 
     const ED25519_V2_ENCRYPTED: &str = "\
@@ -1270,6 +1262,31 @@ Private-Lines: 1
 Y9f+qSB5FZfq2THk/c3+YDp7WUUEInGl7poCWM0H3hZSKKSrhvXEZOFcav7qc/bk
 Private-MAC: 1459a716b2ebdea871aa101e3a6fe0801798df2f
 ";
+
+    #[test]
+    fn puttygen_v2_and_v3_keys_verify_with_or_without_encryption() {
+        // Generated by PuTTYgen, not by this implementation. The key and
+        // passphrase are public test material and must never be used for auth.
+        let files = [
+            (include_str!("../tests/fixtures/ppk/v2-none.ppk"), "", false),
+            (include_str!("../tests/fixtures/ppk/v3-none.ppk"), "", false),
+            (include_str!("../tests/fixtures/ppk/v2-encrypted.ppk"), "test-only-passphrase", true),
+            (include_str!("../tests/fixtures/ppk/v3-encrypted.ppk"), "test-only-passphrase", true),
+        ];
+        let expected = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAcbjjhbdxtrXkvVyx9FyLgN93v7GDGjobBYzeZ7EH+B LinSCP disposable test key";
+        for (text, password, encrypted) in files {
+            assert_eq!(ppk_authorized_keys_line(text, password).unwrap(), expected);
+            assert!(ppk_to_openssh_pem(text, password, None).unwrap().starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
+            if encrypted {
+                assert_eq!(ppk_authorized_keys_line(text, "wrong"), Err(PpkError::IntegrityCheckFailed));
+            } else {
+                // A stale saved password must not change an unencrypted MAC.
+                assert_eq!(ppk_authorized_keys_line(text, "unused").unwrap(), expected);
+            }
+            let tampered = text.replace("Comment: LinSCP disposable test key", "Comment: modified");
+            assert_eq!(ppk_authorized_keys_line(&tampered, password), Err(PpkError::IntegrityCheckFailed));
+        }
+    }
 
     #[test]
     fn ppk_v3_unencrypted_and_v2_encrypted_vectors_verify_and_export() {
