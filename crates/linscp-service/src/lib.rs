@@ -563,8 +563,8 @@ impl CommanderService {
             }
         }
         let session = body.get("session").cloned().unwrap_or(json!({}));
-        if session_is_local(&session) { return self.handle_tabs_open(body); }
         let site_name = body.get("site_name").and_then(Value::as_str).filter(|s| !s.is_empty());
+        if site_name.is_none() && session_is_local(&session) { return self.handle_tabs_open(body); }
         let root = self.config_root();
         let (mut spec, mut clean) = match tabs::parse_gui_session_spec(&session, site_name, &root, self.secret_vault.as_ref()) {
             Ok(value) => value,
@@ -8889,7 +8889,7 @@ mod tests {
         assert_eq!(r_local.extra_fields.get("other_local_dir").map(String::as_str), Some(right_local.to_string_lossy().as_ref()));
         let open_local = dst_svc.dispatch_async(ApiEnvelope {
             method: "POST".into(),
-            path: "/api/tabs".into(),
+            path: "/api/tabs/open".into(),
             body: json!({"site_name": "Workspaces/Dual Local Workspace", "session": {"protocol": "local"}}),
         }).await;
         assert_eq!(open_local.status, 200, "{}", open_local.payload);
