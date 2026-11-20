@@ -12,14 +12,39 @@ pub struct Identity {
     pub protocol: String,
     pub host: String,
     pub port: u16,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub alt_host: String,
+    #[serde(default, skip_serializing_if = "is_zero_port")]
+    pub alt_port: u16,
     pub username: String,
+}
+
+fn is_zero_port(port: &u16) -> bool {
+    *port == 0
 }
 
 impl Identity {
     pub fn of(site: &StoredSite) -> Self {
-        Self { protocol: site.protocol.as_str().to_string(), host: site.host.clone(),
-            port: if site.port == 0 { site.protocol.default_port() } else { site.port },
-            username: site.username.clone() }
+        let port = if site.port == 0 { site.protocol.default_port() } else { site.port };
+        let alt_host = site
+            .extra_fields
+            .get("alt_hostname")
+            .filter(|host| !host.is_empty())
+            .cloned()
+            .unwrap_or_default();
+        let alt_port = if alt_host.is_empty() {
+            0
+        } else {
+            crate::tabs::effective_site_alt_port(site)
+        };
+        Self {
+            protocol: site.protocol.as_str().to_string(),
+            host: site.host.clone(),
+            port,
+            alt_host,
+            alt_port,
+            username: site.username.clone(),
+        }
     }
 }
 

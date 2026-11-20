@@ -1359,6 +1359,18 @@ pub fn record_shell_upload_manifest(
     Ok(doc)
 }
 
+fn read_shell_manifest_file(path: &Path) -> Result<Value, String> {
+    use std::io::Read;
+    const LIMIT: usize = 1024 * 1024;
+    let file = linscp_platform::open_private_file_no_follow(path).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(LIMIT as u64 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() > LIMIT {
+        return Err("Shell upload manifest exceeds size limit.".into());
+    }
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
 pub fn list_shell_manifests(config_root: &Path) -> Vec<Value> {
     let dir = config_root.join("shell-manifests");
     let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -1370,10 +1382,8 @@ pub fn list_shell_manifests(config_root: &Path) -> Vec<Value> {
         if p.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        if let Ok(raw) = std::fs::read_to_string(&p) {
-            if let Ok(val) = serde_json::from_str::<Value>(&raw) {
-                out.push(val);
-            }
+        if let Ok(val) = read_shell_manifest_file(&p) {
+            out.push(val);
         }
     }
     out.sort_by_key(|v| v.get("created").and_then(Value::as_u64).unwrap_or(0));
@@ -1385,9 +1395,8 @@ pub fn take_shell_manifest(config_root: &Path, id: &str) -> Result<Value, String
     let path = config_root
         .join("shell-manifests")
         .join(format!("{safe_id}.json"));
-    let raw = std::fs::read_to_string(&path)
+    let val = read_shell_manifest_file(&path)
         .map_err(|_| format!("Pending shell upload '{safe_id}' is no longer available."))?;
-    let val: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&path);
     Ok(val)
 }

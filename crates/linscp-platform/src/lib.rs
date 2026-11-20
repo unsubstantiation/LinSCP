@@ -107,6 +107,10 @@ mod fallback_unix {
         Ok(())
     }
 
+    pub fn sync_directory(_path: &Path) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("Directory durability is not implemented on this platform".to_string()))
+    }
+
     pub fn atomic_replace(temp_path: &Path, target_path: &Path) -> Result<(), PlatformError> {
         std::fs::rename(temp_path, target_path)?;
         Ok(())
@@ -719,6 +723,12 @@ pub fn create_private_dir(path: &Path) -> Result<(), PlatformError> {
     sys::ensure_private_dir(path)
 }
 
+/// Flush directory metadata for durable rename/create/delete ordering.
+/// Fails closed on filesystems or platforms that cannot provide this barrier.
+pub fn sync_directory(path: &Path) -> Result<(), PlatformError> {
+    sys::sync_directory(path)
+}
+
 /// Creates a brand-new owner-only file (`O_CREAT | O_EXCL`, `0600` on Unix),
 /// refusing to overwrite an existing file (used by `ConvertPpkToOpenSsh`).
 pub fn write_exclusive_private_file(target: &Path, content: &[u8]) -> Result<(), PlatformError> {
@@ -739,6 +749,46 @@ pub fn open_private_file_no_follow(target: &Path) -> Result<std::fs::File, Platf
 /// stays open, so the caller keeps an exclusive `flock` for its lifetime.
 pub fn create_private_file(target: &Path) -> Result<std::fs::File, PlatformError> {
     sys::create_private_file(target)
+}
+
+/// An advisory, interprocess exclusive lock for one configuration directory.
+/// The persistent lock file must never be renamed or unlinked: all cooperating
+/// processes must lock the same file for the full duration of their access.
+/// This does not protect against older clients or arbitrary external writers.
+pub struct ConfigDirectoryLock {
+    _file: std::fs::File,
+    root: PathBuf,
+}
+
+impl ConfigDirectoryLock {
+    /// Try to acquire the lock without waiting. Dropping the returned guard,
+    /// including on normal process termination, releases the OS lock. The OS
+    /// also releases it if the process is killed.
+    pub fn try_acquire(config_dir: &Path) -> Result<Self, PlatformError> {
+        create_private_dir(config_dir)?;
+        let path = config_dir.join(".configuration.lock");
+        let file = match std::fs::symlink_metadata(&path) {
+            Ok(_) => open_private_file_no_follow(&path)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match create_private_file(&path) {
+                    Ok(file) => file,
+                    // Another cooperating process may create it first.
+                    Err(PlatformError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => open_private_file_no_follow(&path)?,
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => return Err(PlatformError::Io(e)),
+        };
+        file.try_lock().map_err(|error| PlatformError::Io(std::io::Error::other(
+            format!("Cannot acquire configuration directory lock: {error}"))))?;
+        let root = std::fs::canonicalize(config_dir).map_err(PlatformError::Io)?;
+        Ok(Self { _file: file, root })
+    }
+
+    /// Check that this guard was acquired for this configuration directory.
+    pub fn covers_directory(&self, config_dir: &Path) -> bool {
+        std::fs::canonicalize(config_dir).is_ok_and(|path| path == self.root)
+    }
 }
 
 /// Creates a FIFO at `target` for tests that must prove a special file is
@@ -828,6 +878,25 @@ impl SecretVault for NativeSecretVault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_lock_excludes_other_handles_until_released() {
+        let root = std::env::temp_dir().join(format!("linscp-config-lock-{}-{}", std::process::id(), rand::random::<u64>()));
+        let first = ConfigDirectoryLock::try_acquire(&root).unwrap();
+        assert!(ConfigDirectoryLock::try_acquire(&root).is_err());
+        drop(first);
+        let next = ConfigDirectoryLock::try_acquire(&root).unwrap();
+        drop(next);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn configuration_lock_rejects_non_regular_lock_file() {
+        let root = std::env::temp_dir().join(format!("linscp-config-lock-bad-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(root.join(".configuration.lock")).unwrap();
+        assert!(ConfigDirectoryLock::try_acquire(&root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// In-memory SAF tree. It is deliberately strict: a name containing a
     /// separator is refused, so a caller that passes a path instead of a single

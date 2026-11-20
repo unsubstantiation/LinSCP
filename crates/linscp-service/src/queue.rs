@@ -335,6 +335,8 @@ struct QueueState {
     next_id: u64,
     paused: bool,
     worker_started: bool,
+    // True through post-task staging cleanup, even after status changes.
+    worker_active: bool,
     tasks: Vec<QueuedTransferTask>,
 }
 
@@ -353,6 +355,7 @@ impl QueueManager {
                 next_id: 1,
                 paused: false,
                 worker_started: false,
+                worker_active: false,
                 tasks: Vec::new(),
             })),
             notify: Arc::new(Notify::new()),
@@ -386,6 +389,13 @@ impl QueueManager {
         let g = self.inner.lock().expect("queue mutex");
         let list = g.tasks.iter().map(QueuedTransferTask::as_json).collect();
         (list, g.paused)
+    }
+
+    /// Fail closed if anything is queued, executing, or still cleaning up.
+    /// A caller excluding enqueue/retry concurrently may use this to refuse
+    /// configuration restore while background transfers can touch files.
+    pub fn has_unfinished_work(&self) -> bool {
+        self.inner.lock().map(|g| g.worker_active || g.tasks.iter().any(|task| matches!(task.status.as_str(), "queued" | "running"))).unwrap_or(true)
     }
 
     pub fn is_paused(&self) -> bool {
@@ -623,7 +633,7 @@ impl QueueManager {
         loop {
             let next_task = {
                 let mut g = self.inner.lock().expect("queue mutex");
-                if g.paused {
+                let task = if g.paused {
                     None
                 } else if let Some(t) = g.tasks.iter_mut().find(|t| t.status == "queued") {
                     t.status = "running".to_string();
@@ -631,7 +641,9 @@ impl QueueManager {
                     Some(t.clone())
                 } else {
                     None
-                }
+                };
+                if task.is_some() { g.worker_active = true; }
+                task
             };
 
             let Some(task) = next_task else {
@@ -676,6 +688,7 @@ impl QueueManager {
             if should_cleanup {
                 task.cleanup_staging();
             }
+            if let Ok(mut state) = self.inner.lock() { state.worker_active = false; }
             self.broadcast_snapshot();
         }
     }
@@ -1801,6 +1814,22 @@ pub async fn delete_remote_recursive_quiet(
 #[cfg(test)]
 mod transfer_safety_tests {
     use super::*;
+
+    #[test]
+    fn unfinished_work_includes_queued_tasks_and_worker_cleanup() {
+        let queue = QueueManager::new(tokio::sync::broadcast::channel(4).0, Arc::new(linscp_platform::NativeLocalFs::new()));
+        assert!(!queue.has_unfinished_work());
+        // This synchronous test has no Tokio runtime, so the task stays queued.
+        let id = queue.enqueue(None, "local", "fixture".into(), "source".into(), "target".into(), 0, false,
+            QueueJob::LocalCopyOrMove { source: PathBuf::from("source"), target: PathBuf::from("target"), move_item: false, policy: ConflictPolicy::Ask });
+        assert!(queue.has_unfinished_work());
+        assert!(queue.cancel(id));
+        assert!(!queue.has_unfinished_work());
+        queue.inner.lock().unwrap().worker_active = true;
+        assert!(queue.has_unfinished_work());
+        queue.inner.lock().unwrap().worker_active = false;
+        assert!(!queue.has_unfinished_work());
+    }
 
     #[test]
     fn tree_names_cannot_escape_destination() {

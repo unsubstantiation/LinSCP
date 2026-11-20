@@ -582,7 +582,7 @@ pub fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<(
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
         let source = crate::windows::to_extended_length_path(source);
         let destination = crate::windows::to_extended_length_path(destination);
         let source: Vec<u16> = source.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
@@ -590,8 +590,9 @@ pub fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<(
         if source[..source.len() - 1].contains(&0) || destination[..destination.len() - 1].contains(&0) {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"));
         }
-        // SAFETY: pointers address NUL-terminated UTF-16 strings; flags=0 forbids replacement and cross-volume copying.
-        let result = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) };
+        // SAFETY: pointers address NUL-terminated UTF-16 strings; without
+        // REPLACE_EXISTING or COPY_ALLOWED this never replaces or copies.
+        let result = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), MOVEFILE_WRITE_THROUGH) };
         if result != 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]

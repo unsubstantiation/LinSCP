@@ -246,6 +246,11 @@ pub fn create_private_file(path: &Path) -> Result<File, PlatformError> {
         .open(path)?)
 }
 
+pub fn sync_directory(path: &Path) -> Result<(), PlatformError> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
 pub fn atomic_replace(temp_path: &Path, target_path: &Path) -> Result<(), PlatformError> {
     std::fs::rename(temp_path, target_path)?;
     Ok(())

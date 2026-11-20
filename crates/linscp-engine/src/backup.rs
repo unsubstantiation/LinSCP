@@ -13,7 +13,7 @@ use linscp_platform::SecretVault;
 use linscp_types::{BookmarkEntry, UserPreferences, WorkspaceSnapshot};
 use serde::{Deserialize, Serialize};
 
-use crate::config_stores::{BookmarksStore, PreferencesStore};
+use crate::config_stores::PreferencesStore;
 use crate::session_store::SessionStore;
 
 /// Original encrypted key blob and optional metadata. The blob remains
@@ -121,7 +121,7 @@ fn validate_key_references(ini: &str, keys: &[BackupVaultKey]) -> Result<(), Str
 /// keys are ignored on import for forward compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackupBundle {
-    /// Schema version (`1` for legacy bundles, `2` for backups with vault keys).
+    /// Schema version of the encrypted backup payload.
     pub version: u32,
     /// ISO-8601 creation timestamp (UTC) for display only, not validated.
     #[serde(default)]
@@ -165,6 +165,13 @@ pub struct BackupBundle {
     /// `explorer-commands.json` text (custom Commander commands) if present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explorer_commands_json: Option<String>,
+    /// Additional persistent settings; absent files are restored as absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_commands_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_presets_ini: Option<String>,
 }
 
 impl Default for BackupBundle {
@@ -184,6 +191,9 @@ impl Default for BackupBundle {
             accounts_ini: None,
             sshhostkeys: None,
             explorer_commands_json: None,
+            custom_commands_json: None,
+            monitor_json: None,
+            transfer_presets_ini: None,
         }
     }
 }
@@ -208,6 +218,22 @@ fn read_optional_text(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
+fn validate_additional_settings(bundle: &BackupBundle) -> Result<(), String> {
+    if let Some(text) = &bundle.custom_commands_json {
+        let value: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("Invalid custom commands: {e}"))?;
+        if !value.is_array() && !value.get("commands").is_some_and(serde_json::Value::is_array) {
+            return Err("Invalid custom commands structure.".into());
+        }
+    }
+    if let Some(text) = &bundle.monitor_json {
+        serde_json::from_str::<linscp_types::MonitorSettingsDocument>(text).map_err(|e| format!("Invalid monitor settings: {e}"))?;
+    }
+    if let Some(text) = &bundle.transfer_presets_ini {
+        crate::presets::TransferPresetStore::parse_ini(text, "backup transfer presets")?;
+    }
+    Ok(())
+}
+
 /// Collects all per-user configuration from `config_dir` into a
 /// distribution-compatible `BackupBundle`.
 ///
@@ -217,6 +243,9 @@ pub fn export_backup(
     config_dir: &Path,
     vault: &dyn SecretVault,
 ) -> Result<BackupBundle, String> {
+    if restore_recovery_required(config_dir)? {
+        return Err("Unlock the local vault and recover the interrupted restore before exporting a backup.".into());
+    }
     if vault.protects_session_store() && vault.load_master_key(config_dir).map_err(|e| e.to_string())?.is_none() {
         return Err("Unlock the local vault before exporting a backup.".into());
     }
@@ -249,15 +278,14 @@ pub fn export_backup(
             } else { return Err("Invalid workspace data".into()); }
         }
     };
-    let (bookmarks, commander_bookmarks) = match std::fs::read(config_dir.join("bookmarks.json")) {
-        Ok(bytes) => {
-            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("Invalid bookmarks: {e}"))?;
+    let (bookmarks, commander_bookmarks) = match read_optional_text(&config_dir.join("bookmarks.json"))? {
+        Some(raw) => {
+            let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| format!("Invalid bookmarks: {e}"))?;
             if value.is_array() { (serde_json::from_value(value).map_err(|e| format!("Invalid bookmarks: {e}"))?, None) }
             else if ["local", "remote"].iter().all(|key| value.get(*key).is_some_and(serde_json::Value::is_array)) { (Vec::new(), Some(value)) }
             else { return Err("Invalid bookmarks structure".into()); }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
-        Err(e) => return Err(format!("Cannot read bookmarks: {e}")),
+        None => (Vec::new(), None),
     };
     let preferences = PreferencesStore::load(config_dir)?;
 
@@ -271,8 +299,8 @@ pub fn export_backup(
     let now = chrono_lite_now_utc();
     let created_on = detect_distribution_id();
 
-    Ok(BackupBundle {
-        version: 2,
+    let bundle = BackupBundle {
+        version: 1,
         created_at: now,
         created_on,
         sessions_ini,
@@ -286,7 +314,12 @@ pub fn export_backup(
         accounts_ini,
         sshhostkeys,
         explorer_commands_json,
-    })
+        custom_commands_json: read_optional_text(&config_dir.join("custom-commands.json"))?,
+        monitor_json: read_optional_text(&config_dir.join("monitor.json"))?,
+        transfer_presets_ini: read_optional_text(&config_dir.join("transfer-presets.ini"))?,
+    };
+    validate_additional_settings(&bundle)?;
+    Ok(bundle)
 }
 
 /// Serializes `bundle` to distribution-compatible pretty JSON with LF.
@@ -408,158 +441,247 @@ fn publish_restored_keys(files: Vec<(PathBuf, Vec<u8>)>, config_dir: &Path) -> R
         if result.is_err() { let _ = std::fs::remove_file(&temp); }
         result?;
     }
+    linscp_platform::sync_directory(&dir).map_err(|e| e.to_string())?;
+    linscp_platform::sync_directory(config_dir).map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// Restores `bundle` into `config_dir`, overwriting existing files
-/// atomically with owner-only permissions where applicable.
-///
-/// When the destination has an unlocked password vault, session secrets are
-/// re-encrypted with its key instead of replacing its wrapped master key.
-pub fn import_backup(
+/// Whether startup must recover an interrupted transactional restore before
+/// exposing any configuration. Failure to inspect the journal is an error, not
+/// evidence that recovery is unnecessary.
+pub fn restore_recovery_required(config_dir: &Path) -> Result<bool, String> {
+    crate::restore_journal::pending(config_dir)
+}
+
+/// Recover a pending restore while holding the configuration-directory lock.
+/// The caller must also exclude every in-process reader and writer. Recovery
+/// is idempotent and may be retried after an interruption.
+pub fn recover_interrupted_restore(
+    config_dir: &Path,
+    vault: &dyn SecretVault,
+    lock: &linscp_platform::ConfigDirectoryLock,
+) -> Result<bool, String> {
+    if !lock.covers_directory(config_dir) { return Err("Configuration lock does not match the restore directory.".into()); }
+    crate::restore_journal::recover(config_dir, vault)
+}
+
+struct PreparedRestore {
+    restored_keys: Vec<(PathBuf, Vec<u8>)>,
+    key_names: Vec<String>,
+    restored_ini: zeroize::Zeroizing<String>,
+    workspace_bytes: zeroize::Zeroizing<Vec<u8>>,
+    bookmark_bytes: zeroize::Zeroizing<Vec<u8>>,
+}
+
+fn prepare_restore_plan(
     config_dir: &Path,
     bundle: &BackupBundle,
     vault: &dyn SecretVault,
-) -> Result<(), String> {
-    if bundle.version != 1 && bundle.version != 2 {
+) -> Result<PreparedRestore, String> {
+    if !vault.protects_session_store() {
+        return Err("An unlocked password vault is required to restore a full backup.".into());
+    }
+    let current_master = vault.load_master_key(config_dir).map_err(|e| e.to_string())?
+        .ok_or_else(|| "Unlock the local vault before restoring a backup.".to_string())?;
+    if crate::restore_journal::pending(config_dir)? {
+        return Err("A previous restore requires recovery first.".into());
+    }
+    if bundle.version != 1 {
         return Err(format!("Unsupported backup version: {}", bundle.version));
     }
     validate_key_references(&bundle.sessions_ini, &bundle.vault_keys)?;
 
-    std::fs::create_dir_all(config_dir).map_err(|e| e.to_string())?;
-    // Check access before replacing any key: a legacy client must not damage
-    // a password-vault store that it cannot open.
+    linscp_platform::create_private_dir(config_dir).map_err(|e| e.to_string())?;
     let _existing_sessions = SessionStore::read_ini_text(config_dir, vault)?;
-    if vault.protects_session_store() && vault.load_master_key(config_dir).map_err(|e| e.to_string())?.is_none() {
-        return Err("Unlock the local vault before restoring a backup.".into());
-    }
-
     let _existing_workspaces = crate::protected_file::read(&config_dir.join("workspaces.json"), "workspaces", vault)?;
     let _existing_hostkeys = crate::protected_file::read(&config_dir.join("sshhostkeys"), "ssh-host-keys", vault)?;
+
     if let Some(value) = &bundle.commander_workspaces {
-        if !value.get("workspaces").is_some_and(serde_json::Value::is_object) { return Err("Invalid Commander workspace data in backup".into()); }
+        if !value.get("workspaces").is_some_and(serde_json::Value::is_object) {
+            return Err("Invalid Commander workspace data in backup".into());
+        }
     }
     if let Some(value) = &bundle.commander_bookmarks {
-        if !["local", "remote"].iter().all(|key| value.get(*key).is_some_and(serde_json::Value::is_array)) { return Err("Invalid Commander bookmarks in backup".into()); }
+        if !["local", "remote"].iter().all(|key| value.get(*key).is_some_and(serde_json::Value::is_array)) {
+            return Err("Invalid Commander bookmarks in backup".into());
+        }
     }
-    if let Some(text) = &bundle.sshhostkeys { crate::hostkeys::HostKeyCache::validate(text)?; }
-    let restored_keys = prepare_vault_key_restore(config_dir, bundle, vault)?;
-    let mut restored_ini = zeroize::Zeroizing::new(bundle.sessions_ini.clone());
+    if let Some(text) = &bundle.sshhostkeys {
+        crate::hostkeys::HostKeyCache::validate(text)?;
+    }
+    if let Some(text) = &bundle.explorer_commands_json {
+        serde_json::from_str::<serde_json::Value>(text)
+            .map_err(|e| format!("Invalid explorer-commands.json in backup: {e}"))?;
+    }
+    validate_additional_settings(bundle)?;
 
-    // 1) sessions.key — must be written first so subsequent sessions.ini
-    //    passwords remain decryptable.
+    let mut restored_ini = zeroize::Zeroizing::new(normalize_to_lf(&bundle.sessions_ini));
     if let Some(b64) = &bundle.sessions_key_b64 {
-        let raw = zeroize::Zeroizing::new(BASE64
-            .decode(b64.as_bytes())
-            .map_err(|e| format!("Invalid sessions.key in backup: {e}"))?);
+        let raw = zeroize::Zeroizing::new(
+            BASE64
+                .decode(b64.as_bytes())
+                .map_err(|e| format!("Invalid sessions.key in backup: {e}"))?,
+        );
         if raw.len() != 32 {
             return Err("Invalid sessions.key length in backup".to_string());
         }
         let source_key = linscp_crypto::SessionMasterKey::from_array(raw.as_slice().try_into().unwrap());
         let store = SessionStore::parse_ini(&bundle.sessions_ini, Some(&source_key))
             .map_err(|e| format!("Backup sessions.ini invalid with bundled key: {e}"))?;
-        if store.sites().iter().any(|site| site.password_error.is_some() || site.key_passphrase_error.is_some() || site.proxy_error.is_some() || site.tunnel_error.is_some()) {
+        if store.sites().iter().any(|site| {
+            site.password_error.is_some()
+                || site.key_passphrase_error.is_some()
+                || site.proxy_error.is_some()
+                || site.tunnel_error.is_some()
+        }) {
             return Err("Backup contains secrets that cannot be decrypted with its key.".into());
         }
-        let already_active = vault.load_master_key(config_dir).map_err(|e| e.to_string())?
-            .is_some_and(|current| &current[..] == raw.as_slice());
-        if !already_active && vault.protects_session_store() {
-            let current = vault.load_master_key(config_dir).map_err(|e| e.to_string())?.ok_or_else(|| "The local vault is locked.".to_string())?;
-            let destination = linscp_crypto::SessionMasterKey::from_array(*current);
-            *restored_ini = store.serialize_ini(Some(&destination))?;
-        }
-        if !already_active && !vault.protects_session_store() {
-            let encoded = format!("{b64}\n");
-            linscp_platform::write_private_file_atomic(
-                &config_dir.join("sessions.key"),
-                encoded.as_bytes(),
-            )
-            .map_err(|e| e.to_string())?;
-            // Touch the vault so the freshly written key is exercised once
-            let _ = vault.load_master_key(config_dir);
+        if &current_master[..] != raw.as_slice() {
+            let destination = linscp_crypto::SessionMasterKey::from_array(*current_master);
+            *restored_ini = normalize_to_lf(&store.serialize_ini(Some(&destination))?);
         }
     } else if bundle.sessions_ini.contains("lscp1$") {
-        // Backup contains encrypted passwords but no key — import would
-        // make them unreadable. Fail closed with guidance.
         return Err(
-            "Backup contains encrypted passwords (lscp1$) but no sessions.key; \
-             refusal to import would lose secrets. Export again with the key, \
-             or import the key separately."
+            "Backup contains encrypted passwords (lscp1$) but no sessions.key;              refusal to import would lose secrets. Export again with the key,              or import the key separately."
                 .to_string(),
         );
+    } else {
+        SessionStore::parse_ini(&bundle.sessions_ini, None)
+            .map_err(|e| format!("Backup sessions.ini invalid: {e}"))?;
     }
 
-    // Publish keys first: a failed or interrupted restore cannot introduce
-    // saved-session references to keys that have not yet been written.
-    publish_restored_keys(restored_keys, config_dir)?;
-
-    // 2) sessions.ini — always LF, validated above if key present.
-    if !bundle.sessions_ini.is_empty() || config_dir.join("sessions.ini").exists() {
-        let ini_text = zeroize::Zeroizing::new(normalize_to_lf(&restored_ini));
-        // Write even if empty to truncate a previous file (explicit backup of “no sessions”).
-        SessionStore::write_ini_text(config_dir, vault, &ini_text)?;
+    let restored_keys = prepare_vault_key_restore(config_dir, bundle, vault)?;
+    let mut key_names = Vec::with_capacity(restored_keys.len());
+    for (path, _) in &restored_keys {
+        if path.parent() != Some(config_dir.join("keys").as_path()) {
+            return Err("Invalid restore key path.".into());
+        }
+        let leaf = path.file_name().and_then(|s| s.to_str()).ok_or("Invalid restore key path.")?;
+        key_names.push(format!("keys/{leaf}"));
     }
 
-    // 3) JSON stores — already distribution-agnostic, same helpers as live code.
     let workspace_value = match &bundle.commander_workspaces {
-        Some(value) if value.get("workspaces").is_some_and(serde_json::Value::is_object) => value.clone(),
-        Some(_) => return Err("Invalid Commander workspace data in backup".into()),
+        Some(value) => value.clone(),
         None => serde_json::to_value(&bundle.workspaces).map_err(|e| e.to_string())?,
     };
     let workspace_bytes = zeroize::Zeroizing::new(serde_json::to_vec(&workspace_value).map_err(|e| e.to_string())?);
-    if vault.protects_session_store() {
-        crate::protected_file::write(&config_dir.join("workspaces.json"), "workspaces", vault, &workspace_bytes)?;
-    } else {
-        // Do not let a legacy client overwrite an encrypted workspace.
-        if config_dir.join("workspaces.json").exists() {
-            crate::protected_file::read(&config_dir.join("workspaces.json"), "workspaces", vault)?;
+
+    let bookmark_value = match &bundle.commander_bookmarks {
+        Some(bookmarks) => bookmarks.clone(),
+        None => {
+            let local: Vec<_> = bundle.bookmarks.iter().filter(|entry| !entry.local_dir.is_empty()).map(|entry| serde_json::json!({"name": entry.name, "path": entry.local_dir, "session_name": entry.session_name})).collect();
+            let remote: Vec<_> = bundle.bookmarks.iter().filter(|entry| !entry.remote_dir.is_empty()).map(|entry| serde_json::json!({"name": entry.name, "path": entry.remote_dir, "session_name": entry.session_name})).collect();
+            serde_json::json!({"local": local, "remote": remote})
         }
-        linscp_platform::write_private_file_atomic(&config_dir.join("workspaces.json"), &workspace_bytes).map_err(|e| e.to_string())?;
+    };
+    let bookmark_bytes = zeroize::Zeroizing::new(serde_json::to_vec(&bookmark_value).map_err(|e| e.to_string())?);
+
+    Ok(PreparedRestore {
+        restored_keys,
+        key_names,
+        restored_ini,
+        workspace_bytes,
+        bookmark_bytes,
+    })
+}
+
+fn remove_optional_restore_file(config_dir: &Path, name: &str) -> Result<(), String> {
+    match std::fs::remove_file(config_dir.join(name)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Cannot remove {name}: {error}")),
     }
-    if let Some(bookmarks) = &bundle.commander_bookmarks {
-        let bytes = zeroize::Zeroizing::new(serde_json::to_vec(bookmarks).map_err(|e| e.to_string())?);
-        linscp_platform::write_private_file_atomic(&config_dir.join("bookmarks.json"), &bytes).map_err(|e| e.to_string())?;
-    } else if vault.protects_session_store() {
-        let local: Vec<_> = bundle.bookmarks.iter().filter(|entry| !entry.local_dir.is_empty()).map(|entry| serde_json::json!({"name": entry.name, "path": entry.local_dir, "session_name": entry.session_name})).collect();
-        let remote: Vec<_> = bundle.bookmarks.iter().filter(|entry| !entry.remote_dir.is_empty()).map(|entry| serde_json::json!({"name": entry.name, "path": entry.remote_dir, "session_name": entry.session_name})).collect();
-        let bytes = zeroize::Zeroizing::new(serde_json::to_vec(&serde_json::json!({"local": local, "remote": remote})).map_err(|e| e.to_string())?);
-        linscp_platform::write_private_file_atomic(&config_dir.join("bookmarks.json"), &bytes).map_err(|e| e.to_string())?;
-    } else {
-        BookmarksStore::save(config_dir, &bundle.bookmarks).map_err(|e| e.to_string())?;
+}
+
+fn apply_prepared_restore(
+    config_dir: &Path,
+    bundle: &BackupBundle,
+    vault: &dyn SecretVault,
+    plan: PreparedRestore,
+) -> Result<(), String> {
+    // Publish keys and flush directory entries before saved sessions can reference them.
+    publish_restored_keys(plan.restored_keys, config_dir)?;
+
+    if !plan.restored_ini.is_empty() || config_dir.join("sessions.ini").exists() {
+        SessionStore::write_ini_text(config_dir, vault, &plan.restored_ini)?;
     }
+
+    crate::protected_file::write(&config_dir.join("workspaces.json"), "workspaces", vault, &plan.workspace_bytes)?;
+    linscp_platform::write_private_file_atomic(&config_dir.join("bookmarks.json"), &plan.bookmark_bytes).map_err(|e| e.to_string())?;
     PreferencesStore::save(config_dir, &bundle.preferences).map_err(|e| e.to_string())?;
 
-    // 4) Optional text stores — LF-normalized.
     if let Some(text) = &bundle.accounts_ini {
         linscp_platform::write_private_file_atomic(
             &config_dir.join("accounts.ini"),
             normalize_to_lf(text).as_bytes(),
         )
         .map_err(|e| e.to_string())?;
-    }
-    if let Some(text) = &bundle.sshhostkeys {
-        crate::hostkeys::HostKeyCache::validate(text)?;
-        let path = config_dir.join("sshhostkeys");
-        if vault.protects_session_store() {
-            crate::protected_file::write(&path, "ssh-host-keys", vault, normalize_to_lf(text).as_bytes())?;
-        } else {
-            if path.exists() { crate::protected_file::read(&path, "ssh-host-keys", vault)?; }
-            linscp_platform::write_private_file_atomic(&path, normalize_to_lf(text).as_bytes()).map_err(|e| e.to_string())?;
-        }
-    }
-    if let Some(text) = &bundle.explorer_commands_json {
-        // explorer-commands.json is not secret, but keep atomic write for consistency.
-        let normalized = normalize_to_lf(text);
-        // Validate JSON before writing
-        serde_json::from_str::<serde_json::Value>(&normalized)
-            .map_err(|e| format!("Invalid explorer-commands.json in backup: {e}"))?;
-        linscp_platform::write_private_file_atomic(
-            &config_dir.join("explorer-commands.json"),
-            normalized.as_bytes(),
-        )
-        .map_err(|e| e.to_string())?;
+    } else {
+        remove_optional_restore_file(config_dir, "accounts.ini")?;
     }
 
+    if let Some(text) = &bundle.sshhostkeys {
+        crate::protected_file::write(
+            &config_dir.join("sshhostkeys"),
+            "ssh-host-keys",
+            vault,
+            normalize_to_lf(text).as_bytes(),
+        )?;
+    } else {
+        remove_optional_restore_file(config_dir, "sshhostkeys")?;
+    }
+
+    for (name, contents) in [
+        ("explorer-commands.json", &bundle.explorer_commands_json),
+        ("custom-commands.json", &bundle.custom_commands_json),
+        ("monitor.json", &bundle.monitor_json),
+        ("transfer-presets.ini", &bundle.transfer_presets_ini),
+    ] {
+        let path = config_dir.join(name);
+        match contents {
+            Some(text) => linscp_platform::write_private_file_atomic(&path, normalize_to_lf(text).as_bytes()).map_err(|e| e.to_string())?,
+            None => remove_optional_restore_file(config_dir, name)?,
+        }
+    }
+
+    // Device-local reconnect intentions are cleared rather than carried over.
+    remove_optional_restore_file(config_dir, "auto-reconnect.json")?;
+    Ok(())
+}
+
+/// Journal-backed full restore, for a caller that holds the matching exclusive
+/// configuration lock and has stopped all in-process readers and writers.
+/// Recovery must also run before configuration is read at the next startup.
+/// Unsupported directory durability fails closed; the local vault key is never
+/// replaced.
+pub fn import_backup_transactional(
+    config_dir: &Path,
+    bundle: &BackupBundle,
+    vault: &dyn SecretVault,
+    lock: &linscp_platform::ConfigDirectoryLock,
+) -> Result<(), String> {
+    if !lock.covers_directory(config_dir) {
+        return Err("Configuration lock does not match the restore directory.".into());
+    }
+    let plan = prepare_restore_plan(config_dir, bundle, vault)?;
+    crate::restore_journal::prepare(config_dir, vault, &plan.key_names)?;
+    if let Err(error) = apply_prepared_restore(config_dir, bundle, vault, plan) {
+        return match crate::restore_journal::recover(config_dir, vault) {
+            Ok(true) => Err(format!("Restore failed and was rolled back: {error}")),
+            Ok(false) => Err(format!("Restore failed; its recovery journal disappeared: {error}")),
+            Err(recovery) => Err(format!("Restore failed: {error}. Recovery is required: {recovery}")),
+        };
+    }
+    if let Err(error) = crate::restore_journal::commit(config_dir, vault) {
+        // Once the journal has been removed, the new stores have already been
+        // flushed; an error on the final directory sync makes the reported
+        // outcome uncertain. Never claim rollback if there is no journal.
+        return match crate::restore_journal::recover(config_dir, vault) {
+            Ok(true) => Err(format!("Restore commit failed and was rolled back: {error}")),
+            Ok(false) => Err(format!("Restore commit outcome is uncertain: {error}")),
+            Err(recovery) => Err(format!("Restore commit failed: {error}. Recovery is required: {recovery}")),
+        };
+    }
     Ok(())
 }
 
@@ -600,7 +722,7 @@ pub fn open_encrypted_backup(bytes: &[u8], password: &str) -> Result<BackupBundl
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     const HEADER_LEN: usize = 8 + 16 + 12;
     if bytes.len() < HEADER_LEN + 16 || bytes.len() > BACKUP_MAX_BYTES + HEADER_LEN + 16 || !bytes.starts_with(BACKUP_MAGIC) {
-        return Err("Not a valid encrypted LinSCP backup; legacy plaintext backups require manual migration.".into());
+        return Err("Not a valid encrypted LinSCP backup.".into());
     }
     let key = backup_key(password, &bytes[8..24])?;
     let cipher = aes_gcm::Aes256Gcm::new_from_slice(&*key).map_err(|_| "Invalid backup key")?;
@@ -616,12 +738,20 @@ pub fn export_backup_to_file(config_dir: &Path, dest_path: &Path, vault: &dyn Se
     linscp_platform::write_private_file_atomic(dest_path, &bytes).map_err(|e| e.to_string())
 }
 
-pub fn import_backup_from_file(config_dir: &Path, src_path: &Path, vault: &dyn SecretVault, password: &str) -> Result<BackupBundle, String> {
-    let metadata = std::fs::metadata(src_path).map_err(|e| e.to_string())?;
-    if metadata.len() > (BACKUP_MAX_BYTES + 64) as u64 { return Err("Backup exceeds size limit".into()); }
-    let bytes = std::fs::read(src_path).map_err(|e| e.to_string())?;
+pub fn import_backup_from_file_transactional(
+    config_dir: &Path,
+    src_path: &Path,
+    vault: &dyn SecretVault,
+    password: &str,
+    lock: &linscp_platform::ConfigDirectoryLock,
+) -> Result<BackupBundle, String> {
+    let max_encrypted = BACKUP_MAX_BYTES + 64;
+    let file = std::fs::File::open(src_path).map_err(|e| e.to_string())?;
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    file.take(max_encrypted as u64 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() > max_encrypted { return Err("Backup exceeds size limit".into()); }
     let bundle = open_encrypted_backup(&bytes, password)?;
-    import_backup(config_dir, &bundle, vault)?;
+    import_backup_transactional(config_dir, &bundle, vault, lock)?;
     Ok(bundle)
 }
 
@@ -668,7 +798,6 @@ mod tests {
     use super::*;
     use linscp_crypto::SessionMasterKey;
     use linscp_platform::password_vault::PasswordSecretVault;
-    use crate::config_stores::WorkspacesStore;
     use linscp_platform::NativeSecretVault;
     use linscp_types::ProtocolScheme;
 
@@ -712,21 +841,21 @@ mod tests {
             accounts_ini: Some("[alice]\nhash=abc\n".to_string()),
             sshhostkeys: Some("example.com ssh-rsa AAAAB3...\n".to_string()),
             explorer_commands_json: Some("[{\"name\":\"Open\"}]\n".to_string()),
+            custom_commands_json: None,
+            monitor_json: None,
+            transfer_presets_ini: None,
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
     #[test]
     fn backup_is_distribution_compatible_between_linux_windows_and_android() {
-        // Simulate a backup created on Debian (Linux) and restored on
-        // Windows (CRLF filesystem) and Android (app-private dir).
         let key = SessionMasterKey::from_array([42u8; 32]);
         let bundle = sample_bundle_with_secrets(&key);
         let bytes = serialize_backup(&bundle).unwrap();
-        // Outer document must be LF-only (not CRLF) regardless of host.
         assert!(!bytes.windows(2).any(|w| w == b"\r\n"));
         assert!(bytes.ends_with(b"\n"));
 
-        // Simulate editing on Windows: convert outer LF → CRLF (user opens in Notepad, saves).
         let crlf_bytes = bytes
             .iter()
             .flat_map(|&b| if b == b'\n' { vec![b'\r', b'\n'] } else { vec![b] })
@@ -735,7 +864,6 @@ mod tests {
         assert_eq!(parsed_crlf.sessions_ini, bundle.sessions_ini);
         assert_eq!(parsed_crlf.sessions_key_b64, bundle.sessions_key_b64);
 
-        // Restore on three simulated distribution config dirs
         for dir_suffix in ["debian", "windows", "android"] {
             let base = std::env::temp_dir().join(format!(
                 "linscp-backup-test-{}-{}-{}",
@@ -749,33 +877,30 @@ mod tests {
             let _ = std::fs::remove_dir_all(&base);
             let cfg = base.join(dir_suffix);
             std::fs::create_dir_all(&cfg).unwrap();
-            let vault = NativeSecretVault::new();
-            import_backup(&cfg, &bundle, &vault).unwrap();
+            let vault = PasswordSecretVault::new();
+            vault.unlock_or_setup(&cfg, "destination vault password", &NativeSecretVault::new()).unwrap();
+            let lock = linscp_platform::ConfigDirectoryLock::try_acquire(&cfg).unwrap();
+            import_backup_transactional(&cfg, &bundle, &vault, &lock).unwrap();
 
-            // Key must be portable raw base64, not dpapi1$/aks1$
-            let key_text = std::fs::read_to_string(cfg.join("sessions.key")).unwrap();
-            assert!(key_text.trim().chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
-            assert!(!key_text.contains("dpapi1$"));
-            assert!(!key_text.contains("aks1$"));
-
-            // sessions.ini must be LF-only and decryptable with the same key
-            let ini = std::fs::read_to_string(cfg.join("sessions.ini")).unwrap();
-            assert!(!ini.contains("\r\n"));
-            let store = SessionStore::parse_ini(&ini, Some(&key)).unwrap();
+            let store = SessionStore::load_from_dir(&cfg, &vault).unwrap();
             assert_eq!(store.find("prod/app").unwrap().password.as_deref(), Some("s3cr3t!\twith\ttabs"));
 
-            // JSON stores must round-trip identically
-            assert_eq!(WorkspacesStore::load(&cfg).unwrap(), bundle.workspaces);
-            assert_eq!(BookmarksStore::load(&cfg).unwrap(), bundle.bookmarks);
+            let workspace_plain = crate::protected_file::read(&cfg.join("workspaces.json"), "workspaces", &vault).unwrap().unwrap();
+            let restored_ws: Vec<WorkspaceSnapshot> = serde_json::from_slice(&workspace_plain).unwrap();
+            assert_eq!(restored_ws, bundle.workspaces);
+            let restored_bm: serde_json::Value = serde_json::from_slice(&std::fs::read(cfg.join("bookmarks.json")).unwrap()).unwrap();
+            assert_eq!(restored_bm["local"][0]["path"], "/tmp/logs");
+            assert_eq!(restored_bm["remote"][0]["path"], "/var/log");
             assert_eq!(PreferencesStore::load(&cfg).unwrap(), bundle.preferences);
 
-            // Text stores must be LF-normalized
             let acct = std::fs::read_to_string(cfg.join("accounts.ini")).unwrap();
             assert!(!acct.contains("\r\n"));
+            drop(lock);
             let _ = std::fs::remove_dir_all(&base);
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
     #[test]
     fn application_backup_restore_keeps_the_password_wrapped_master_key_when_it_matches() {
         let base = std::env::temp_dir().join(format!(
@@ -789,13 +914,181 @@ mod tests {
         vault.unlock_or_setup(&base, "correct horse battery staple", &NativeSecretVault::new()).unwrap();
         let wrapped_before = std::fs::read(base.join("sessions.key")).unwrap();
         let bundle = export_backup(&base, &vault).unwrap();
-        import_backup(&base, &bundle, &vault).unwrap();
+        let lock = linscp_platform::ConfigDirectoryLock::try_acquire(&base).unwrap();
+        import_backup_transactional(&base, &bundle, &vault, &lock).unwrap();
         let wrapped_after = std::fs::read(base.join("sessions.key")).unwrap();
         assert_eq!(wrapped_after, wrapped_before);
         assert!(wrapped_after.starts_with(b"LSCPVLT1"));
+        drop(lock);
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[test]
+    fn invalid_settings_fail_without_replacing_existing_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let vault = PasswordSecretVault::new();
+        vault.unlock_or_setup(root, "destination vault password", &NativeSecretVault::new()).unwrap();
+        std::fs::write(root.join("custom-commands.json"), b"[]").unwrap();
+        let mut invalid = BackupBundle::default();
+        invalid.version = 1;
+        invalid.custom_commands_json = Some("{\"commands\": 123}".into());
+        let lock = linscp_platform::ConfigDirectoryLock::try_acquire(root).unwrap();
+        assert!(import_backup_transactional(root, &invalid, &vault, &lock).is_err());
+        assert_eq!(std::fs::read(root.join("custom-commands.json")).unwrap(), b"[]");
+        assert!(!restore_recovery_required(root).unwrap());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
+    #[test]
+    fn transactional_restore_rewraps_sessions_and_vault_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let src_vault = PasswordSecretVault::new();
+        let dst_vault = PasswordSecretVault::new();
+        src_vault.unlock_or_setup(&source, "source vault password", &NativeSecretVault::new()).unwrap();
+        dst_vault.unlock_or_setup(&destination, "destination vault password", &NativeSecretVault::new()).unwrap();
+        let id = "0123456789abcdef0123456789abcdef";
+        std::fs::create_dir(source.join("keys")).unwrap();
+        std::fs::write(source.join("keys").join(format!("{id}.key.vault")), src_vault.seal_local_blob(b"private key").unwrap()).unwrap();
+        let mut source_sites = SessionStore::new();
+        let mut site = crate::session_store::StoredSite::new("source", ProtocolScheme::Sftp, "source.example");
+        site.private_key = Some(format!("vaultkey://{id}"));
+        site.password = Some("password secret".into());
+        source_sites.upsert(site);
+        source_sites.save_to_dir(&source, &src_vault).unwrap();
+        let mut destination_sites = SessionStore::new();
+        destination_sites.upsert(crate::session_store::StoredSite::new("previous", ProtocolScheme::Sftp, "old.example"));
+        destination_sites.save_to_dir(&destination, &dst_vault).unwrap();
+        std::fs::write(source.join("custom-commands.json"), r#"{"commands":[{"name":"example","command":"echo hello"}]}"#).unwrap();
+        std::fs::write(source.join("transfer-presets.ini"), "[example]\nspeed=5\n").unwrap();
+        for name in ["monitor.json", "auto-reconnect.json", "accounts.ini", "explorer-commands.json"] {
+            std::fs::write(destination.join(name), b"old settings").unwrap();
+        }
+        crate::protected_file::write(&destination.join("sshhostkeys"), "ssh-host-keys", &dst_vault, b"old host keys").unwrap();
+        let bundle = export_backup(&source, &src_vault).unwrap();
+        assert_eq!(bundle.version, 1);
+        let sealed = seal_backup(&bundle, "independent backup password").unwrap();
+        assert!(!sealed.windows(b"echo hello".len()).any(|part| part == b"echo hello"));
+        let bundle = open_encrypted_backup(&sealed, "independent backup password").unwrap();
+        let before_key = std::fs::read(destination.join("sessions.key")).unwrap();
+        let lock = linscp_platform::ConfigDirectoryLock::try_acquire(&destination).unwrap();
+        import_backup_transactional(&destination, &bundle, &dst_vault, &lock).unwrap();
+        assert!(!restore_recovery_required(&destination).unwrap());
+        assert_eq!(std::fs::read(destination.join("sessions.key")).unwrap(), before_key);
+        let restored = SessionStore::load_from_dir(&destination, &dst_vault).unwrap();
+        assert_eq!(restored.find("source").unwrap().password.as_deref(), Some("password secret"));
+        assert!(restored.find("previous").is_none());
+        let encrypted = std::fs::read(destination.join("keys").join(format!("{id}.key.vault"))).unwrap();
+        assert_eq!(dst_vault.open_local_blob(&encrypted).unwrap().as_slice(), b"private key");
+        assert!(src_vault.open_local_blob(&encrypted).is_err());
+        assert!(std::fs::read_to_string(destination.join("custom-commands.json")).unwrap().contains("echo hello"));
+        assert!(std::fs::read_to_string(destination.join("transfer-presets.ini")).unwrap().contains("speed=5"));
+        for name in ["monitor.json", "auto-reconnect.json", "accounts.ini", "explorer-commands.json", "sshhostkeys"] {
+            assert!(!destination.join(name).exists(), "{name} should be absent after restore");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
+    #[test]
+    fn interrupted_transaction_requires_matching_lock_and_restores_original() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("destination");
+        let other = temp.path().join("other");
+        let vault = PasswordSecretVault::new();
+        vault.unlock_or_setup(&destination, "destination vault password", &NativeSecretVault::new()).unwrap();
+        std::fs::write(destination.join("sessions.ini"), b"old bytes").unwrap();
+        let lock = linscp_platform::ConfigDirectoryLock::try_acquire(&destination).unwrap();
+        crate::restore_journal::prepare(&destination, &vault, &[]).unwrap();
+        assert!(export_backup(&destination, &vault).is_err());
+        std::fs::write(destination.join("sessions.ini"), b"new bytes").unwrap();
+        let wrong_lock = linscp_platform::ConfigDirectoryLock::try_acquire(&other).unwrap();
+        assert!(recover_interrupted_restore(&destination, &vault, &wrong_lock).is_err());
+        assert_eq!(std::fs::read(destination.join("sessions.ini")).unwrap(), b"new bytes");
+        assert!(restore_recovery_required(&destination).unwrap());
+        assert!(recover_interrupted_restore(&destination, &vault, &lock).unwrap());
+        assert_eq!(std::fs::read(destination.join("sessions.ini")).unwrap(), b"old bytes");
+        assert!(!restore_recovery_required(&destination).unwrap());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
+    #[test]
+    fn vault_failure_after_session_write_restores_original_session_ciphertext() {
+        struct FailingWorkspaceVault<'a>(&'a PasswordSecretVault);
+        impl SecretVault for FailingWorkspaceVault<'_> {
+            fn load_master_key(&self, dir: &Path) -> Result<Option<zeroize::Zeroizing<[u8; 32]>>, linscp_platform::PlatformError> {
+                self.0.load_master_key(dir)
+            }
+            fn load_or_create_master_key(&self, dir: &Path) -> Result<zeroize::Zeroizing<[u8; 32]>, linscp_platform::PlatformError> {
+                self.0.load_or_create_master_key(dir)
+            }
+            fn protects_session_store(&self) -> bool { true }
+            fn seal_session_store(&self, bytes: &[u8]) -> Result<Vec<u8>, linscp_platform::PlatformError> {
+                if bytes.starts_with(b"LinSCP protected file: workspaces\n") {
+                    return Err(linscp_platform::PlatformError::SecretVault("injected workspace failure".into()));
+                }
+                self.0.seal_session_store(bytes)
+            }
+            fn open_session_store(&self, bytes: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>, linscp_platform::PlatformError> {
+                self.0.open_session_store(bytes)
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        let src_vault = PasswordSecretVault::new();
+        let dst_vault = PasswordSecretVault::new();
+        src_vault.unlock_or_setup(&source, "source vault password", &NativeSecretVault::new()).unwrap();
+        dst_vault.unlock_or_setup(&target, "destination vault password", &NativeSecretVault::new()).unwrap();
+        let mut src = SessionStore::new();
+        src.upsert(crate::session_store::StoredSite::new("new", ProtocolScheme::Sftp, "source.example"));
+        src.save_to_dir(&source, &src_vault).unwrap();
+        let mut dst = SessionStore::new();
+        dst.upsert(crate::session_store::StoredSite::new("old", ProtocolScheme::Sftp, "target.example"));
+        dst.save_to_dir(&target, &dst_vault).unwrap();
+        let before = std::fs::read(target.join("sessions.ini")).unwrap();
+        let bundle = export_backup(&source, &src_vault).unwrap();
+        let lock = linscp_platform::ConfigDirectoryLock::try_acquire(&target).unwrap();
+        let error = import_backup_transactional(&target, &bundle, &FailingWorkspaceVault(&dst_vault), &lock).unwrap_err();
+        assert!(error.contains("rolled back"));
+        assert!(!restore_recovery_required(&target).unwrap());
+        assert_eq!(std::fs::read(target.join("sessions.ini")).unwrap(), before);
+        assert!(SessionStore::load_from_dir(&target, &dst_vault).unwrap().find("old").is_some());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
+    #[test]
+    fn restore_rejects_non_regular_destination_before_writing_any_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = temp.path();
+        let vault = PasswordSecretVault::new();
+        vault.unlock_or_setup(cfg, "local vault password", &NativeSecretVault::new()).unwrap();
+        let bundle = export_backup(cfg, &vault).unwrap();
+        std::fs::create_dir(cfg.join("preferences.json")).unwrap();
+        let lock = linscp_platform::ConfigDirectoryLock::try_acquire(cfg).unwrap();
+        assert!(import_backup_transactional(cfg, &bundle, &vault, &lock).is_err());
+        assert!(!restore_recovery_required(cfg).unwrap());
+    }
+
+    #[test]
+    fn malformed_commands_are_rejected_before_restore_changes_any_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = temp.path();
+        let vault = PasswordSecretVault::new();
+        vault.unlock_or_setup(cfg, "local vault password", &NativeSecretVault::new()).unwrap();
+        let mut bundle = export_backup(cfg, &vault).unwrap();
+        let before = std::fs::read(cfg.join("sessions.key")).unwrap();
+        bundle.explorer_commands_json = Some("{broken".into());
+        let lock = linscp_platform::ConfigDirectoryLock::try_acquire(cfg).unwrap();
+        assert!(import_backup_transactional(cfg, &bundle, &vault, &lock).is_err());
+        assert!(!restore_recovery_required(cfg).unwrap());
+        assert_eq!(std::fs::read(cfg.join("sessions.key")).unwrap(), before);
+        assert!(!cfg.join("workspaces.json").exists());
+        assert!(!cfg.join("preferences.json").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
     #[test]
     fn encrypted_backup_restores_session_to_a_different_unlocked_vault() {
         let temp = tempfile::tempdir().unwrap();
@@ -836,8 +1129,9 @@ mod tests {
             assert!(!bytes.windows(secret.len()).any(|part| part == secret.as_bytes()));
         }
         let original_key = std::fs::read(destination.join("sessions.key")).unwrap();
-        assert!(import_backup_from_file(&destination, &backup, &target_vault, "wrong password here").is_err());
-        import_backup_from_file(&destination, &backup, &target_vault, "independent backup password").unwrap();
+        let lock = linscp_platform::ConfigDirectoryLock::try_acquire(&destination).unwrap();
+        assert!(import_backup_from_file_transactional(&destination, &backup, &target_vault, "wrong password here", &lock).is_err());
+        import_backup_from_file_transactional(&destination, &backup, &target_vault, "independent backup password", &lock).unwrap();
         assert_eq!(std::fs::read(destination.join("sessions.key")).unwrap(), original_key);
         let restored = SessionStore::load_from_dir(&destination, &target_vault).unwrap();
         assert_eq!(restored.find("private-name").unwrap().password.as_deref(), Some("private-password"));
@@ -853,8 +1147,7 @@ mod tests {
             assert_eq!(std::fs::read_to_string(destination.join("keys").join(format!("{id}.label"))).unwrap(), format!("label-{id}"));
             assert_eq!(std::fs::read_to_string(destination.join("keys").join(format!("{id}.pub"))).unwrap(), format!("ssh-ed25519 public-{id}"));
         }
-        // Restoring a second time keeps identical existing keys and metadata.
-        import_backup_from_file(&destination, &backup, &target_vault, "independent backup password").unwrap();
+        import_backup_from_file_transactional(&destination, &backup, &target_vault, "independent backup password", &lock).unwrap();
         assert_eq!(crate::hostkeys::HostKeyCache::load_protected(&destination.join("sshhostkeys"), &target_vault).unwrap().lookup("private-host", 22, "ssh-ed25519"), Some("SHA256:fingerprint"));
         let restored_workspace = crate::protected_file::read(&destination.join("workspaces.json"), "workspaces", &target_vault).unwrap().unwrap();
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&restored_workspace).unwrap(), workspaces);
@@ -879,26 +1172,29 @@ mod tests {
         std::fs::create_dir_all(source.join("keys")).unwrap();
         std::fs::write(source.join("keys").join(format!("{id}.key.vault")), source_vault.seal_local_blob(b"source key").unwrap()).unwrap();
         let bundle = export_backup(&source, &source_vault).unwrap();
+        let lock = linscp_platform::ConfigDirectoryLock::try_acquire(&destination).unwrap();
         let mut missing = bundle.clone();
         missing.vault_keys.clear();
-        assert!(import_backup(&destination, &missing, &target_vault).is_err());
+        assert!(import_backup_transactional(&destination, &missing, &target_vault, &lock).is_err());
         let mut corrupted = bundle.clone();
         corrupted.vault_keys[0].encrypted_b64 = BASE64.encode(b"invalid blob");
-        assert!(import_backup(&destination, &corrupted, &target_vault).is_err());
+        assert!(import_backup_transactional(&destination, &corrupted, &target_vault, &lock).is_err());
         let mut duplicate = bundle.clone();
         duplicate.vault_keys.push(duplicate.vault_keys[0].clone());
-        assert!(import_backup(&destination, &duplicate, &target_vault).is_err());
+        assert!(import_backup_transactional(&destination, &duplicate, &target_vault, &lock).is_err());
         let mut bad_id = bundle.clone();
         bad_id.vault_keys[0].id = "../../unsafe".into();
-        assert!(import_backup(&destination, &bad_id, &target_vault).is_err());
+        assert!(import_backup_transactional(&destination, &bad_id, &target_vault, &lock).is_err());
         assert!(!destination.join("sessions.ini").exists());
+        assert!(!restore_recovery_required(&destination).unwrap());
         std::fs::create_dir_all(destination.join("keys")).unwrap();
         let existing = target_vault.seal_local_blob(b"different key").unwrap();
         let path = destination.join("keys").join(format!("{id}.key.vault"));
         std::fs::write(&path, &existing).unwrap();
-        assert!(import_backup(&destination, &bundle, &target_vault).unwrap_err().contains("different key"));
+        assert!(import_backup_transactional(&destination, &bundle, &target_vault, &lock).unwrap_err().contains("different key"));
         assert_eq!(std::fs::read(&path).unwrap(), existing);
         assert!(!destination.join("sessions.ini").exists());
+        assert!(!restore_recovery_required(&destination).unwrap());
     }
 
     #[test]
@@ -921,12 +1217,17 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        let vault = NativeSecretVault::new();
-        let err = import_backup(&base, &bundle, &vault).unwrap_err();
+        let vault = PasswordSecretVault::new();
+        vault.unlock_or_setup(&base, "destination vault password", &NativeSecretVault::new()).unwrap();
+        let lock = linscp_platform::ConfigDirectoryLock::try_acquire(&base).unwrap();
+        let err = import_backup_transactional(&base, &bundle, &vault, &lock).unwrap_err();
         assert!(err.contains("no sessions.key"));
+        assert!(!restore_recovery_required(&base).unwrap());
+        drop(lock);
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
     #[test]
     fn backup_round_trips_via_file_with_crlf_tolerance() {
         let key = SessionMasterKey::from_array([7u8; 32]);
@@ -941,9 +1242,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        let vault = NativeSecretVault::new();
         let file = base.join("backup.linscp-backup.json");
-        // export_backup_to_file would try to read empty config, but bundle is valid via direct serialize
         let password = "a strong backup password";
         let bytes = seal_backup(&bundle, password).unwrap();
         assert!(!bytes.windows(8).any(|w| w == b"prod/app"));
@@ -954,8 +1253,12 @@ mod tests {
         std::fs::write(&file, bytes).unwrap();
         let cfg2 = base.join("restore");
         std::fs::create_dir_all(&cfg2).unwrap();
-        let restored = import_backup_from_file(&cfg2, &file, &vault, password).unwrap();
+        let vault = PasswordSecretVault::new();
+        vault.unlock_or_setup(&cfg2, "destination vault password", &NativeSecretVault::new()).unwrap();
+        let lock = linscp_platform::ConfigDirectoryLock::try_acquire(&cfg2).unwrap();
+        let restored = import_backup_from_file_transactional(&cfg2, &file, &vault, password, &lock).unwrap();
         assert_eq!(restored.sessions_key_b64, bundle.sessions_key_b64);
+        drop(lock);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

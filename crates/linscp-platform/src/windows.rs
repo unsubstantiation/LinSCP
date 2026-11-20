@@ -250,9 +250,12 @@ pub fn create_exclusive_private_file(path: &Path, content: &[u8]) -> Result<(), 
     if let Some(parent) = ext.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(&ext)
         .map_err(|err| {
             if err.kind() == std::io::ErrorKind::AlreadyExists {
@@ -262,6 +265,7 @@ pub fn create_exclusive_private_file(path: &Path, content: &[u8]) -> Result<(), 
             }
         })?;
     if let Err(err) = file.write_all(content).and_then(|()| file.sync_all()) {
+        drop(file);
         let _ = std::fs::remove_file(&ext);
         return Err(PlatformError::Io(err));
     }
@@ -282,10 +286,13 @@ fn to_wide_null(path: &Path) -> Vec<u16> {
 pub fn open_regular_file_no_follow(path: &Path) -> Option<File> {
     use std::fs::OpenOptions as StdOpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
     let file = StdOpenOptions::new()
         .read(true)
         .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(to_extended_length_path(path))
         .ok()?;
@@ -321,13 +328,41 @@ pub fn create_fifo(_path: &Path) -> Result<(), PlatformError> {
 pub fn create_private_file(path: &Path) -> Result<File, PlatformError> {
     use std::fs::OpenOptions as StdOpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
     Ok(StdOpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(to_extended_length_path(path))?)
+}
+
+/// Flush a directory handle opened with write access. A read-only handle
+/// cannot be flushed by FlushFileBuffers. Reject reparse points and propagate
+/// every open/flush error; do not silently downgrade the durability barrier.
+pub fn sync_directory(path: &Path) -> Result<(), PlatformError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let directory = OpenOptions::new()
+        .write(true)
+        // Hold the opened directory against rename or deletion until the flush.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(to_extended_length_path(path))?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(PlatformError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput, "Directory sync requires a non-reparse-point directory",
+        )));
+    }
+    directory.sync_all()?;
+    Ok(())
 }
 
 pub fn atomic_replace(temp_path: &Path, target_path: &Path) -> Result<(), PlatformError> {
@@ -423,6 +458,36 @@ mod tests {
             LocalFree(sd as HLOCAL);
             Ok(summary)
         }
+    }
+
+    #[test]
+    fn directory_sync_flushes_real_directory_and_rejects_invalid_paths() {
+        let root = std::env::temp_dir().join(format!("linscp-win-dir-sync-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        sync_directory(&root).expect("a writable test directory must be flushed");
+        let file = root.join("file");
+        std::fs::write(&file, b"test").unwrap();
+        assert!(sync_directory(&file).is_err());
+        assert!(sync_directory(&root.join("missing")).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_sync_refuses_directory_symlinks_when_supported() {
+        let root = std::env::temp_dir().join(format!("linscp-win-dir-link-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = root.join("link");
+        match std::os::windows::fs::symlink_dir(&target, &link) {
+            Ok(()) => {
+                assert!(sync_directory(&link).is_err());
+                std::fs::remove_dir(&link).unwrap();
+            }
+            Err(error) if error.raw_os_error() == Some(1314) => {} // symlink privilege unavailable
+            Err(error) => panic!("could not create test symlink: {error}"),
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

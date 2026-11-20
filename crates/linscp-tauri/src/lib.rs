@@ -88,10 +88,11 @@ impl TauriBridge {
         if envelope.method.eq_ignore_ascii_case("GET")
             && envelope.path.split('?').next() == Some("/api/shell/pending")
         {
+            let Ok(_activity) = self.service.begin_config_activity() else { return; };
             if let Ok(paths) = self.android_state().staged_share_paths() {
                 if !paths.is_empty() {
                     let _ = linscp_service::ops::record_shell_upload_manifest(
-                        &linscp_platform::config_dir(), &paths,
+                        &self.service.config_root(), &paths,
                     );
                 }
             }
@@ -258,12 +259,13 @@ pub mod commands {
         state: tauri::State<'_, TauriBridge>,
         uris: Vec<String>,
     ) -> Result<serde_json::Value, String> {
+        let _activity = state.service.begin_config_activity()?;
         let staged = state
             .android_state()
             .stage_share_uris(&uris)
             .map_err(|e| e.to_string())?;
         // Record pending manifest identical to desktop --shell-upload flow.
-        let cfg_dir = linscp_platform::config_dir();
+        let cfg_dir = state.service.config_root();
         let staged_buf: Vec<std::path::PathBuf> = staged;
         let manifest = linscp_service::ops::record_shell_upload_manifest(&cfg_dir, &staged_buf)
             .map_err(|e| e.to_string())?;
@@ -282,6 +284,7 @@ pub mod commands {
         directory: String,
         names: Vec<String>,
     ) -> Result<serde_json::Value, String> {
+        let _activity = state.service.begin_config_activity()?;
         if names.is_empty() || names.len() > linscp_service::share_export::MAX_EXPORT_FILES {
             return Err("Select between 1 and 32 files to share.".to_string());
         }
@@ -549,7 +552,9 @@ mod tests {
 
     #[test]
     fn tauri_bridge_routes_status_without_network_socket() {
-        let bridge = TauriBridge::default();
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("linscp-tauri-status-{}-{nonce}", std::process::id()));
+        let bridge = TauriBridge::new(CommanderService::new(root.clone(), std::sync::Arc::new(linscp_platform::NativeLocalFs::new())));
         let reply = bridge.invoke(ApiEnvelope {
             method: "GET".to_string(),
             path: "/api/status".to_string(),
@@ -557,6 +562,8 @@ mod tests {
         });
         assert_eq!(reply.status, 200);
         assert!(reply.payload.get("local_roots").is_some());
+        drop(bridge);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

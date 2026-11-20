@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine as _;
 use linscp_i18n::{CatalogDomain, translate, translate_with};
 use linscp_platform::SecretVault;
 use linscp_platform::terminal::{
@@ -32,7 +30,7 @@ use crate::presets::{PresetPermissions, ResumeSupportMode, TransferPreset, Trans
 use crate::script_params::{
     PrefixMatch, expand_script_parameters, resolve_prefixed_name, tokenize_script_line,
 };
-use crate::backup::{export_backup_to_file, import_backup_from_file};
+use crate::backup::{export_backup_to_file, import_backup_from_file_transactional};
 use crate::session_store::SessionStore;
 use crate::sync_planner::{
     SyncAction, SyncConflictPolicy, SyncCriteria, SyncMode, SyncOptions, SyncState,
@@ -2234,6 +2232,9 @@ impl ScriptInterpreter {
             return Err(self.tr("Syntax: backup export <file> | import <file>.").to_string());
         }
         let sub = args[0].to_ascii_lowercase();
+        if !matches!(sub.as_str(), "export" | "import") {
+            return Err(self.tr("Syntax: backup export <file> | import <file>.").to_string());
+        }
         let path = std::path::PathBuf::from(expand_tilde(&args[1]));
         // Keep passphrases out of command text, history, and status messages.
         let password = zeroize::Zeroizing::new(std::env::var("LINSCP_BACKUP_PASSWORD")
@@ -2249,12 +2250,18 @@ impl ScriptInterpreter {
                 Ok(())
             }
             "import" => {
-                import_backup_from_file(&self.cfg.config_dir, &path, vault, &password)
-                    .map_err(|e| self.trp("Cannot import backup from '{file}': {error}", &[("file", &args[1]), ("error", &e)]))?;
-                self.out(&format!("{}", self.trp("Full backup imported from '{file}'.", &[("file", &args[1])])));
+                if !self.slots.is_empty() {
+                    return Err("Close open sessions before restoring a full backup.".to_string());
+                }
+                let lock = linscp_platform::ConfigDirectoryLock::try_acquire(&self.cfg.config_dir)
+                    .map_err(|_| "Close any open LinSCP window or other configuration process before restoring a full backup.".to_string())?;
+                import_backup_from_file_transactional(&self.cfg.config_dir, &path, vault, &password, &lock)
+                    .map_err(|e| format!("Cannot restore backup from '{}': {e}", args[1]))?;
+                self.active_preset_name = None;
+                self.out(&format!("Full backup restored from '{}'.", args[1]));
                 Ok(())
             }
-            _ => Err(self.tr("Syntax: backup export <file> | import <file>.").to_string())
+            _ => unreachable!(),
         }
     }
 

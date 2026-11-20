@@ -189,6 +189,7 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
     obj.insert("auto_reconnect".into(), json!(crate::auto_reconnect::enabled(site)));
     obj.insert("auto_reconnect_seconds".into(), json!(crate::auto_reconnect::interval(site)));
     obj.insert("alt_hostname".into(), json!(site.extra_fields.get("alt_hostname").cloned().unwrap_or_default()));
+    obj.insert("alt_port".into(), json!(effective_site_alt_port(site)));
     obj.insert("alt_fallback".into(), json!(site.extra_fields.get("alt_fallback").is_some_and(|v| v == "1")));
     obj.insert("has_key_passphrase".into(), json!(has_key_passphrase));
     obj.insert(
@@ -352,6 +353,18 @@ pub fn parse_gui_session_spec(
         } else {
             p
         }
+    };
+
+    let stored_alt_port = stored_base.as_ref().and_then(site_alt_port);
+    let default_alt_port = stored_alt_port.unwrap_or(port);
+    let explicit_zero_alt_port = matches!(session.get("alt_port"), Some(Value::Number(n)) if n.as_u64() == Some(0))
+        || matches!(session.get("alt_port"), Some(Value::String(text)) if text.trim() == "0");
+    if protocol != ProtocolScheme::Local && explicit_zero_alt_port {
+        return Err("Alt Port 0 is out of range (1..65535).".to_string());
+    }
+    let alt_port = {
+        let p = u16_field(session, &["alt_port"], default_alt_port)?;
+        if p == 0 { port } else { p }
     };
 
     let username = {
@@ -669,6 +682,9 @@ pub fn parse_gui_session_spec(
         session.get("alt_fallback").is_some_and(|v| !v.is_boolean()) {
         return Err("Invalid alternate hostname settings.".to_string());
     }
+    if protocol != ProtocolScheme::Local && (session.get("alt_port").is_some() || stored_alt_port.is_some()) {
+        spec.raw_fields.insert("alt_port".to_string(), alt_port.to_string());
+    }
     if let Some(host) = spec.raw_fields.get("alt_hostname") {
         if !host.is_empty() && !valid_alternate_hostname(host) {
             return Err("Enter a valid alternate hostname without a port or URL.".to_string());
@@ -746,6 +762,7 @@ pub fn parse_gui_session_spec(
         obj.insert("protocol".into(), json!(protocol.as_str()));
         obj.insert("host".into(), json!(host));
         obj.insert("port".into(), json!(port));
+        obj.insert("alt_port".into(), json!(alt_port));
         obj.insert("username".into(), json!(spec.session.username));
         obj.insert("user".into(), json!(spec.session.username));
         obj.insert(
@@ -771,18 +788,78 @@ pub fn valid_alternate_hostname(host: &str) -> bool {
             || (host.starts_with('[') && host.ends_with(']') && host[1..host.len()-1].parse::<std::net::Ipv6Addr>().is_ok()))
 }
 
+pub fn site_alt_port(site: &StoredSite) -> Option<u16> {
+    site.extra_fields
+        .get("alt_port")
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+}
+
+pub fn effective_site_alt_port(site: &StoredSite) -> u16 {
+    site_alt_port(site).unwrap_or_else(|| {
+        if site.port == 0 {
+            site.protocol.default_port()
+        } else {
+            site.port
+        }
+    })
+}
+
 pub fn site_matches_host(site: &StoredSite, host: &str) -> bool {
     site.host == host || site.extra_fields.get("alt_hostname").is_some_and(|alt| alt == host && valid_alternate_hostname(alt))
 }
 
-/// The alternate gets its own SSH host-key cache entry and TLS hostname.
+pub fn site_matches_endpoint(site: &StoredSite, host: &str, port: u16) -> bool {
+    let primary_port = if site.port == 0 {
+        site.protocol.default_port()
+    } else {
+        site.port
+    };
+    let primary_match = site.host == host && primary_port == port;
+    let alt_match = site
+        .extra_fields
+        .get("alt_hostname")
+        .is_some_and(|alt| alt == host && valid_alternate_hostname(alt))
+        && effective_site_alt_port(site) == port;
+    primary_match || alt_match
+}
+
+pub fn alternate_endpoint(spec: &ParsedSiteSpec) -> Result<(String, u16), String> {
+    let alt_host = spec.raw_fields.get("alt_hostname").cloned().unwrap_or_default();
+    if !valid_alternate_hostname(&alt_host) {
+        return Err("A valid alternate hostname is required.".to_string());
+    }
+    let fallback_port = if spec.session.port == 0 {
+        spec.session.protocol.default_port()
+    } else {
+        spec.session.port
+    };
+    let alt_port = match spec.raw_fields.get("alt_port").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(raw) => raw
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0)
+            .ok_or_else(|| "Enter a valid alternate port from 1 to 65535.".to_string())?,
+        None => fallback_port,
+    };
+    Ok((alt_host, alt_port))
+}
+
+/// The alternate gets its own port, SSH host-key cache entry and TLS hostname.
 pub fn select_alternate(spec: &mut ParsedSiteSpec) -> Result<(), String> {
-    let alt = spec.raw_fields.get("alt_hostname").cloned().unwrap_or_default();
-    if !valid_alternate_hostname(&alt) { return Err("A valid alternate hostname is required.".to_string()); }
-    if alt != spec.session.host {
-        spec.raw_fields.insert("linscp_primary_host".into(), spec.session.host.clone());
-        spec.raw_fields.insert("linscp_primary_hostkey".into(), spec.session.hostkey.clone());
-        spec.session.host = alt;
+    let (alt_host, alt_port) = alternate_endpoint(spec)?;
+    if alt_host != spec.session.host || alt_port != spec.session.port {
+        spec.raw_fields
+            .entry("linscp_primary_host".into())
+            .or_insert_with(|| spec.session.host.clone());
+        spec.raw_fields
+            .entry("linscp_primary_port".into())
+            .or_insert_with(|| spec.session.port.to_string());
+        spec.raw_fields
+            .entry("linscp_primary_hostkey".into())
+            .or_insert_with(|| spec.session.hostkey.clone());
+        spec.session.host = alt_host;
+        spec.session.port = alt_port;
         spec.session.hostkey.clear();
     }
     Ok(())
@@ -946,24 +1023,32 @@ mod tests {
         let vault = linscp_platform::NativeSecretVault::new();
         let (mut spec, _) = parse_gui_session_spec(&json!({
             "protocol": "sftp", "host": "primary.example", "port": 22, "username": "user",
-            "hostkey": "ssh-ed25519 SHA256:primary", "alt_hostname": "backup.example", "alt_fallback": true,
+            "hostkey": "ssh-ed25519 SHA256:primary", "alt_hostname": "backup.example", "alt_port": 2222, "alt_fallback": true,
             "auth_gssapi": false
         }), None, dir.path(), &vault).unwrap();
         let saved = build_stored_site_for_save("site", &spec);
         let view = stored_site_to_gui_json(&saved);
         assert_eq!(view["alt_hostname"], "backup.example");
+        assert_eq!(view["alt_port"], 2222);
         assert_eq!(view["alt_fallback"], true);
         select_alternate(&mut spec).unwrap();
         assert_eq!(spec.session.host, "backup.example");
+        assert_eq!(spec.session.port, 2222);
         assert!(spec.session.hostkey.is_empty());
+        assert_eq!(spec.raw_fields["linscp_primary_port"], "22");
         assert_eq!(spec.raw_fields["linscp_primary_hostkey"], "ssh-ed25519 SHA256:primary");
         assert!(site_matches_host(&saved, &spec.session.host));
+        assert!(site_matches_endpoint(&saved, "backup.example", 2222));
+        assert!(!site_matches_endpoint(&saved, "backup.example", 22));
+        assert!(site_matches_endpoint(&saved, "primary.example", 22));
         assert!(!site_matches_host(&saved, "other.example"));
         assert!(!valid_alternate_hostname("https://host/"));
         assert!(!valid_alternate_hostname("host:22"));
         assert!(!valid_alternate_hostname("user@host"));
         assert!(valid_alternate_hostname("[::1]"));
         assert!(parse_gui_session_spec(&json!({"host": "primary", "alt_fallback": true}), None, dir.path(), &vault).is_err());
+        assert!(parse_gui_session_spec(&json!({"host": "primary", "alt_port": 0}), None, dir.path(), &vault).is_err());
+        assert!(parse_gui_session_spec(&json!({"host": "primary", "alt_port": 70000}), None, dir.path(), &vault).is_err());
     }
 
     fn test_config_dir(tag: &str) -> std::path::PathBuf {
