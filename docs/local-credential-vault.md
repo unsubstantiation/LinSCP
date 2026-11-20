@@ -56,3 +56,22 @@ multiple instances against the same configuration directory while changing
 sessions or deleting keys: those writers are not protected by a shared
 transaction or interprocess lock. Original key files and backups are not
 deleted by the vault picker.
+
+### Saved-session metadata and migration
+
+When the local password vault is unlocked, the application encrypts the entire
+saved session store (including names, primary and alternate hosts, reconnect
+settings, and other fields) with the vault key using authenticated encryption.
+Reconnect restore intentions are encrypted as well. Existing plaintext stores
+are validated and atomically replaced on unlock; an unreadable store causes
+unlock to fail rather than being overwritten. Locking prevents reading or
+writing these encrypted files. Older clients and the native CLI that do not
+unlock the local password vault cannot read them and must not be used to edit
+those files. Migration cannot erase plaintext from old backups, filesystem
+snapshots, deleted blocks, or copies made before migration.
+
+The portable backup format is **not encrypted**: exports contain session
+metadata and the unwrapped master key. Store exports securely and remove old
+copies as appropriate. Other data such as workspaces, bookmarks, host-key
+records, transfer history, and connection logs are not covered by this session
+store encryption and can contain hostnames or other identifying information.

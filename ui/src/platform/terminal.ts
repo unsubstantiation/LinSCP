@@ -129,7 +129,7 @@ export class TerminalRenderer {
   private readonly container: HTMLElement;
   private readonly theme: RendererTheme;
   private readonly fontFamily: string;
-  private readonly fontSize: number;
+  private fontSize: number;
   private readonly onCellSize?: RendererOptions['onCellSize'];
   private readonly canvas: HTMLCanvasElement;
   private readonly ctx: CanvasRenderingContext2D | null;
@@ -147,7 +147,7 @@ export class TerminalRenderer {
     this.theme = options.theme ?? DEFAULT_RENDERER_THEME;
     this.fontFamily = options.fontFamily
       ?? 'ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace';
-    this.fontSize = options.fontSize ?? 14;
+    this.fontSize = Math.max(8, Math.min(32, options.fontSize ?? 14));
     this.onCellSize = options.onCellSize;
     const createElement = options.context?.createElement
       ?? ((tag: 'canvas') => document.createElement(tag));
@@ -182,6 +182,19 @@ export class TerminalRenderer {
   /** What one cell measures, in CSS pixels, for the model's size report. */
   public cellSize(): { width: number; height: number } {
     return { width: Math.round(this.cellWidth), height: Math.round(this.cellHeight) };
+  }
+
+  /** Font size in CSS pixels, bounded to a readable and usable range. */
+  public get textSize(): number { return this.fontSize; }
+
+  public setTextSize(size: number): number {
+    if (this.destroyed || !Number.isFinite(size)) return this.fontSize;
+    const next = Math.max(8, Math.min(32, Math.round(size)));
+    if (next !== this.fontSize) {
+      this.fontSize = next;
+      this.measureCell();
+    }
+    return this.fontSize;
   }
 
   /** Measures one character of the configured font and sizes the backing store. */

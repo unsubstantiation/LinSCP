@@ -157,6 +157,7 @@ export class ServerMonitor {
     this.generation++;
     this.root.classList.add('monitor-open');
     if (!this.selected.size) this.picking = true;
+    this.tabs = []; this.sites = [];
     this.render();
     this.root.focus();
     await Promise.all([this.loadHosts(), this.loadSettings()]);
@@ -210,6 +211,7 @@ export class ServerMonitor {
     this.picking = true;
     this.generation++;
     this.stopTimer();
+    this.tabs = []; this.sites = [];
     this.render();
     await this.loadHosts();
   }

@@ -26,6 +26,7 @@ use linscp_types::{
 };
 use serde_json::{json, Value};
 
+pub mod auto_reconnect;
 pub mod cli_actions;
 pub mod monitor;
 pub mod ops;
@@ -48,7 +49,7 @@ fn saved_sudo_credentials(
     let site = store.find(tab.site_name.as_deref()?)?;
     if site.extra_fields.get("sudo_password_auto").map(String::as_str) != Some("1")
         || spec.raw_fields.get("sudo_password_auto").map(String::as_str) != Some("1")
-        || site.host != spec.session.host
+        || !tabs::site_matches_host(site, &spec.session.host)
         || site.port != spec.session.port
         || site.username != spec.session.username
         || site.protocol != spec.session.protocol
@@ -79,6 +80,11 @@ struct InnerState {
     challenges: HashMap<u64, TabRuntime>,
     pending_connections: std::collections::HashSet<u64>,
     logs: Vec<Value>,
+    auto_retry_at: HashMap<String, std::time::Instant>,
+    auto_inflight: std::collections::HashSet<String>,
+    auto_suspended: std::collections::HashSet<String>,
+    pending_sites: HashMap<u64, String>,
+    auto_pending: std::collections::HashSet<u64>,
     preferences: UserPreferences,
     queue_transfers: Vec<Value>,
     /// Embedded terminals, one per open terminal window.
@@ -87,6 +93,20 @@ struct InnerState {
     x2go_next_generation: u64,
     x2go_pending: std::collections::HashSet<u64>,
     monitors: monitor::Monitors,
+}
+
+// Releases a site reservation even if the requesting window disappears mid-dial.
+struct AutoReconnectReservation { state: Arc<Mutex<InnerState>>, name: String, completed: bool }
+impl Drop for AutoReconnectReservation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.auto_inflight.remove(&self.name);
+            if !self.completed {
+                let ids: Vec<u64> = state.pending_sites.iter().filter_map(|(id, name)| (name == &self.name && state.auto_pending.contains(id)).then_some(*id)).collect();
+                for id in ids { state.pending_sites.remove(&id); state.pending_connections.remove(&id); state.auto_pending.remove(&id); }
+            }
+        }
+    }
 }
 
 // A generation correlates delayed browser requests with the bridge that issued
@@ -158,6 +178,11 @@ impl CommanderService {
                 challenges: HashMap::new(),
                 pending_connections: std::collections::HashSet::new(),
                 logs: Vec::new(),
+                auto_retry_at: HashMap::new(),
+                auto_inflight: std::collections::HashSet::new(),
+                auto_suspended: std::collections::HashSet::new(),
+                pending_sites: HashMap::new(),
+                auto_pending: std::collections::HashSet::new(),
                 preferences,
                 queue_transfers: Vec::new(),
                 terminals: terminal_bridge::TerminalRegistry::default(),
@@ -196,7 +221,9 @@ impl CommanderService {
 
     pub fn add_log(&self, text: &str, level: &str) {
         let mut g = self.state.lock().expect("state mutex");
-        g.logs.push(json!({"text": text, "level": level}));
+        let timestamp_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_millis() as u64;
+        g.logs.push(json!({"text": text, "level": level, "timestamp_ms": timestamp_ms}));
         if g.logs.len() > 500 { g.logs.remove(0); }
     }
 
@@ -325,6 +352,7 @@ impl CommanderService {
             ("GET", "/api/terminal/list") => self.terminal_list(),
             ("POST", "/api/terminal/select") => self.terminal_select(req.body),
             ("GET", "/api/terminal/selection") => self.terminal_selected_text(&query),
+            ("GET", "/api/terminal/text") => self.terminal_all_text(&query),
             _ => ApiReply { status: 404, payload: json!({"error": format!("Unknown endpoint: {} {}", method, raw_path)})},
         }
     }
@@ -343,6 +371,7 @@ impl CommanderService {
             ("POST", "/api/tabs/open") => self.open_tab_async(req.body).await,
             ("POST", "/api/tabs/verify") => self.verify_tab_async(req.body).await,
             ("POST", "/api/tabs/reconnect") => self.reconnect_tab_async(req.body).await,
+            ("POST", "/api/auto-reconnect/tick") => self.auto_reconnect_tick().await,
             ("POST", "/api/remote/mkdir") => self.mkdir_remote_async(req.body).await,
             ("POST", "/api/remote/properties") => Box::pin(self.remote_properties_async(req.body)).await,
             ("POST", "/api/workspaces/open") => Box::pin(self.open_workspace_async(req.body)).await,
@@ -404,8 +433,30 @@ impl CommanderService {
             Ok(value) => value,
             Err(error) => return api_error(400, error),
         };
+        if let Some(expected) = body.get("expected_site") {
+            if expected.get("host").and_then(Value::as_str) != Some(spec.session.host.as_str())
+                || expected.get("port").and_then(Value::as_u64) != Some(u64::from(spec.session.port))
+                || expected.get("protocol").and_then(Value::as_str) != Some(spec.session.protocol.as_str()) {
+                return api_error(409, "The saved site changed. Refresh the server list and select it again.");
+            }
+        }
         if let Some(seconds) = body.get("connect_timeout").and_then(Value::as_u64) {
             spec.timeout_secs = seconds;
+        }
+        // Monitor connections must represent the exact endpoint they check.
+        if body.get("expected_site").is_some() {
+            if body.get("use_alt_host").and_then(Value::as_bool) == Some(true) {
+                return api_error(400, "A monitored endpoint cannot be replaced with an alternate host.");
+            }
+            spec.raw_fields.insert("linscp_disable_fallback".into(), "1".into());
+        }
+        if body.get("use_alt_host").and_then(Value::as_bool) == Some(true) {
+            if let Err(error) = tabs::select_alternate(&mut spec) { return api_error(400, error); }
+            spec.raw_fields.insert("linscp_prefer_alt".into(), "1".into());
+            if let Some(object) = clean.as_object_mut() {
+                object.insert("host".into(), json!(spec.session.host));
+                object.insert("hostkey".into(), json!(""));
+            }
         }
         if spec.session.hostkey.trim() == "*" || spec.session.tunnel.as_ref().is_some_and(|t| t.hostkey.trim() == "*") {
             return api_error(400, "Wildcard SSH host keys are not supported");
@@ -422,10 +473,34 @@ impl CommanderService {
             }
         };
         let mut tab = {
+            let _guard = self.session_key_lock.lock().expect("session key lock");
+            if body.get("automatic").and_then(Value::as_bool) == Some(true) {
+                let eligible = site_name.and_then(|name| {
+                    let store = SessionStore::load_from_dir(&root, self.secret_vault.as_ref()).ok()?;
+                    let site = store.find(name)?;
+                    let intentions = auto_reconnect::load(&root, self.secret_vault.as_ref()).ok()?;
+                    let identity = auto_reconnect::Identity::of(site);
+                    Some(auto_reconnect::enabled(site) && intentions.get(name) == Some(&identity)
+                        && spec.session.protocol == site.protocol && tabs::site_matches_host(site, &spec.session.host)
+                        && spec.session.port == identity.port
+                        && (site.username.is_empty() || spec.session.username == site.username))
+                }).unwrap_or(false);
+                if !eligible { return api_error(409, "Automatic reconnection is no longer enabled for this saved session."); }
+            }
             let mut state = self.state.lock().expect("state mutex");
+            if let Some(name) = site_name {
+                let automatic = body.get("automatic").and_then(Value::as_bool) == Some(true);
+                let pending_same = state.pending_sites.values().any(|site| site == name);
+                let open_same = state.tabs.values().any(|tab| tab.site_name.as_deref() == Some(name));
+                if (automatic && (pending_same || open_same)) || (!automatic && state.auto_inflight.contains(name)) {
+                    return api_error(409, "A connection to this saved session is already in progress.");
+                }
+            }
             let id = state.next_tab_id;
             state.next_tab_id += 1;
             state.pending_connections.insert(id);
+            if let Some(name) = site_name { state.pending_sites.insert(id, name.to_string()); }
+            if body.get("automatic").and_then(Value::as_bool) == Some(true) { state.auto_pending.insert(id); }
             TabRuntime {
                 id, name: body.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or(&spec.session.host).to_string(),
                 site_name: site_name.map(str::to_string), is_local: false, connected: false,
@@ -440,25 +515,98 @@ impl CommanderService {
     async fn connect_tab(&self, tab: &mut TabRuntime) -> ApiReply {
         let mut dial_spec = match tab.spec.as_ref() { Some(s) => s.clone(), None => return api_error(400, "Missing session settings") };
         let config_root = self.config_root();
+        let service = self.clone();
+        let tab_id = tab.id;
+        let log_sink: linscp_proto::ssh::SshEventLogger = Arc::new(move |message| {
+            service.add_log(&format!("[Connection {tab_id}] {message}"), "info");
+        });
+        log_sink("Preparing connection and authentication settings.");
         let _temporary_keys = match materialize_vault_key_paths(&mut dial_spec, &config_root, self.secret_vault.as_ref()) {
             Ok(files) => files,
-            Err(error) => return api_error(400, error),
+            Err(error) => {
+                log_sink("Could not prepare authentication credentials.");
+                let mut state = self.state.lock().expect("state mutex");
+                state.pending_connections.remove(&tab.id);
+                state.pending_sites.remove(&tab.id);
+                state.auto_pending.remove(&tab.id);
+                if let Some(current) = state.tabs.get_mut(&tab.id) {
+                    current.connected = false;
+                    current.remote = None;
+                    current.error = error.clone();
+                }
+                return api_error(400, error);
+            },
         };
-        let result = match tokio::time::timeout(
-            std::time::Duration::from_secs(dial_spec.timeout_secs.max(1)),
-            tabs::dial_gui_tab_session(&dial_spec, &config_root, false, "en"),
+        log_sink(&format!("Starting connection (timeout: {} seconds).", dial_spec.timeout_secs.max(1)));
+        let mut result = match tokio::time::timeout(
+            std::time::Duration::from_secs(dial_spec.timeout_secs.max(1)) + std::time::Duration::from_millis(250),
+            tabs::dial_gui_tab_session(&dial_spec, &config_root, false, "en", Some(log_sink.clone())),
         ).await {
             Ok(result) => result,
             Err(_) => Err(GuiConnectError::Failed(format!(
                 "Connection timed out after {} seconds.", dial_spec.timeout_secs.max(1)
             ))),
         };
+        // Only a definite direct TCP-connect failure can trigger a fallback.
+        // Host-key, TLS, authentication, proxy and generic timeout errors are
+        // deliberately not treated as proof that the first host is offline.
+        let should_fallback = !dial_spec.raw_fields.contains_key("linscp_disable_fallback")
+            && matches!(&result, Err(GuiConnectError::Failed(error)) if direct_connect_failure(&dial_spec, error))
+            && dial_spec.raw_fields.get("alt_fallback").is_some_and(|v| v == "1")
+            && dial_spec.raw_fields.get("alt_hostname").is_some_and(|alt| tabs::valid_alternate_hostname(alt) && alt != &dial_spec.session.host);
+        if should_fallback {
+            if let Err(GuiConnectError::Failed(error)) = &result {
+                log_sink(&format!("Primary connection failed: {error}"));
+            }
+            if !self.state.lock().expect("state mutex").pending_connections.contains(&tab.id) {
+                return api_error(400, "Connection was cancelled.");
+            }
+            // Update both the private runtime spec (which holds original key
+            // references) and the materialized copy used only for this dial.
+            if let (Some(spec), Ok(())) = (tab.spec.as_mut(), tabs::select_alternate(&mut dial_spec)) {
+                if let Err(error) = tabs::select_alternate(spec) { return api_error(400, error); }
+                if let Some(object) = tab.session_json.as_object_mut() {
+                    object.insert("host".into(), json!(dial_spec.session.host));
+                    object.insert("hostkey".into(), json!(""));
+                }
+                log_sink(&format!("Primary host could not be reached; trying alternate host {}:{}.", dial_spec.session.host, dial_spec.session.port));
+                result = match tokio::time::timeout(
+                    std::time::Duration::from_secs(dial_spec.timeout_secs.max(1)),
+                    tabs::dial_gui_tab_session(&dial_spec, &config_root, false, "en", Some(log_sink.clone())),
+                ).await {
+                    Ok(result) => result,
+                    Err(_) => Err(GuiConnectError::Failed(format!("Alternate connection timed out after {} seconds.", dial_spec.timeout_secs.max(1)))),
+                };
+            }
+        }
+        // Serialize intent updates with session edits and intentional tab closes.
+        let _session_guard = self.session_key_lock.lock().expect("session key lock");
+        let restore_identity: Result<Option<(String, auto_reconnect::Identity)>, String> = if result.is_ok() {
+            if let Some(name) = tab.site_name.as_deref() {
+                SessionStore::load_from_dir(&config_root, self.secret_vault.as_ref()).map(|store| {
+                    store.find(name).filter(|site| tab.spec.as_ref().is_some_and(|spec| {
+                        site.protocol == spec.session.protocol && tabs::site_matches_host(site, &spec.session.host)
+                            && (if site.port == 0 { site.protocol.default_port() } else { site.port }) == spec.session.port
+                            && (site.username.is_empty() || site.username == spec.session.username)
+                    })).map(|site| (name.to_string(), auto_reconnect::Identity::of(site)))
+                })
+            } else { Ok(None) }
+        } else { Ok(None) };
         let mut state = self.state.lock().expect("state mutex");
         // Closing a tab or cancelling a challenge while dialing must not bring
         // it back to life after the asynchronous connection completes.
         if !state.pending_connections.contains(&tab.id) {
             return api_error(400, "Connection was cancelled.");
         }
+        let message = match &result {
+            Ok(_) => "Connection completed successfully.",
+            Err(GuiConnectError::HostKeyChallenge(_)) => "Host-key verification is required; waiting for the user's decision.",
+            Err(GuiConnectError::Failed(_)) => "Connection failed; see the error in the log.",
+        };
+        let timestamp_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_millis() as u64;
+        state.logs.push(json!({"text": format!("[Connection {tab_id}] {message}"), "level": "info", "timestamp_ms": timestamp_ms}));
+        if state.logs.len() > 500 { state.logs.remove(0); }
         match result {
             Ok((session, remote_dir, observed)) => {
                 tab.remote = Some(session);
@@ -467,10 +615,24 @@ impl CommanderService {
                 tab.connected = true;
                 tab.error.clear();
                 state.pending_connections.remove(&tab.id);
+                state.pending_sites.remove(&tab.id);
+                state.auto_pending.remove(&tab.id);
                 state.challenges.remove(&tab.id);
                 state.active_tab_id = Some(tab.id);
                 state.tabs.insert(tab.id, tab.clone());
-                ApiReply { status: 200, payload: json!({"success": true, "tab": tab.describe()}) }
+                if let Some(name) = &tab.site_name { state.auto_suspended.remove(name); }
+                let warning = restore_identity.and_then(|identity| {
+                    if let Some((name, identity)) = identity {
+                        let mut intentions = auto_reconnect::load(&config_root, self.secret_vault.as_ref())?;
+                        intentions.insert(name, identity);
+                        auto_reconnect::save(&config_root, self.secret_vault.as_ref(), &intentions)?;
+                    }
+                    Ok(())
+                }).err();
+                if let Some(ref error) = warning {
+                    state.logs.push(json!({"text": format!("Auto reconnect: {error}"), "level": "error"}));
+                }
+                ApiReply { status: 200, payload: json!({"success": true, "tab": tab.describe(), "warning": warning}) }
             }
             Err(GuiConnectError::HostKeyChallenge(challenge)) => {
                 tabs::apply_challenge_to_tab(tab, &challenge);
@@ -480,6 +642,8 @@ impl CommanderService {
             }
             Err(GuiConnectError::Failed(error)) => {
                 state.pending_connections.remove(&tab.id);
+                state.pending_sites.remove(&tab.id);
+                state.auto_pending.remove(&tab.id);
                 if let Some(current) = state.tabs.get_mut(&tab.id) {
                     current.connected = false;
                     current.remote = None;
@@ -493,12 +657,32 @@ impl CommanderService {
     async fn reconnect_tab_async(&self, body: Value) -> ApiReply {
         let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No such tab") };
         let (mut tab, ended_viewer) = {
+            let _guard = self.session_key_lock.lock().expect("session key lock");
+            let root = self.config_root();
             let mut state = self.state.lock().expect("state mutex");
             state.monitors.forget(id);
             let tab = match state.tabs.get(&id).cloned() { Some(tab) => tab, None => return api_error(400, "No such tab") };
-            if tab.is_local { return ApiReply { status: 200, payload: json!({"success": true, "tab": tab.describe()}) }; }
+            if tab.is_local || (body.get("automatic").and_then(Value::as_bool) == Some(true) && tab.connected) {
+                return ApiReply { status: 200, payload: json!({"success": true, "tab": tab.describe()}) };
+            }
             if tab.spec.is_none() { return api_error(400, "Missing session settings"); }
+            if body.get("automatic").and_then(Value::as_bool) == Some(true) {
+                let eligible = tab.site_name.as_deref().and_then(|name| {
+                    let store = SessionStore::load_from_dir(&root, self.secret_vault.as_ref()).ok()?;
+                    let site = store.find(name)?;
+                    let intentions = auto_reconnect::load(&root, self.secret_vault.as_ref()).ok()?;
+                    let identity = auto_reconnect::Identity::of(site);
+                    let spec = tab.spec.as_ref()?;
+                    Some(auto_reconnect::enabled(site) && intentions.get(name) == Some(&identity)
+                        && spec.session.protocol == site.protocol && tabs::site_matches_host(site, &spec.session.host)
+                        && spec.session.port == identity.port
+                        && (site.username.is_empty() || spec.session.username == site.username))
+                }).unwrap_or(false);
+                if !eligible { return api_error(409, "Automatic reconnection is no longer enabled for this saved session."); }
+            }
             if !state.pending_connections.insert(id) { return api_error(409, "Connection already in progress"); }
+            if let Some(name) = tab.site_name.as_ref() { state.pending_sites.insert(id, name.clone()); }
+            if body.get("automatic").and_then(Value::as_bool) == Some(true) { state.auto_pending.insert(id); }
             if let Some(current) = state.tabs.get_mut(&id) { current.connected = false; current.remote = None; current.error.clear(); }
             let ended_viewer = state.x2go.remove(&id);
             (tab, ended_viewer)
@@ -506,10 +690,117 @@ impl CommanderService {
         drop(ended_viewer);
         // Reconnect to the directory being viewed, not the original startup
         // directory; credentials and approved host keys stay in the private spec.
-        if let Some(spec) = tab.spec.as_mut() { spec.session.initial_dir = tab.remote_dir.clone(); }
+        if let Some(spec) = tab.spec.as_mut() {
+            spec.session.initial_dir = tab.remote_dir.clone();
+            if spec.raw_fields.get("linscp_prefer_alt").is_none_or(|v| v != "1") {
+                if let Some(primary) = spec.raw_fields.remove("linscp_primary_host") {
+                    spec.session.host = primary;
+                    spec.session.hostkey = spec.raw_fields.remove("linscp_primary_hostkey").unwrap_or_default();
+                    if let Some(object) = tab.session_json.as_object_mut() {
+                        object.insert("host".into(), json!(spec.session.host));
+                        object.insert("hostkey".into(), json!(spec.session.hostkey));
+                    }
+                }
+            }
+        }
         tab.connected = false;
         tab.remote = None;
         self.connect_tab(&mut tab).await
+    }
+
+    /// Called once a second by the unlocked main window. All selection and
+    /// reservations are made in the service, so multiple windows cannot start
+    /// the same automatic attempt. Network operations never hold the locks.
+    async fn auto_reconnect_tick(&self) -> ApiReply {
+        let job = {
+            let _guard = self.session_key_lock.lock().expect("session key lock");
+            let root = self.config_root();
+            if !matches!(self.secret_vault.status(&root), Ok("unlocked")) {
+                return ApiReply { status: 200, payload: json!({"success": true}) };
+            }
+            let store = match SessionStore::load_from_dir(&root, self.secret_vault.as_ref()) {
+                Ok(store) => store, Err(error) => return api_error(500, error),
+            };
+            let intentions = match auto_reconnect::load(&root, self.secret_vault.as_ref()) {
+                Ok(intentions) => intentions, Err(error) => return api_error(500, error),
+            };
+            let mut state = self.state.lock().expect("state mutex");
+            let now = std::time::Instant::now();
+            let mut selected: Option<(String, String, Option<u64>, Option<Arc<dyn linscp_proto::RemoteSession>>)> = None;
+            for site in store.sites() {
+                if !auto_reconnect::enabled(site) || site.protocol == linscp_types::ProtocolScheme::Local
+                    || state.auto_inflight.contains(&site.name) || state.auto_suspended.contains(&site.name) { continue; }
+                let identity = auto_reconnect::Identity::of(site);
+                if intentions.get(&site.name) != Some(&identity) { continue; }
+                if state.challenges.values().any(|tab| tab.site_name.as_deref() == Some(site.name.as_str()))
+                    || state.pending_sites.values().any(|name| name == &site.name) { continue; }
+                let matching_tab = state.tabs.values().filter(|tab| {
+                    tab.site_name.as_deref() == Some(site.name.as_str()) && tab.spec.as_ref().is_some_and(|spec| {
+                        spec.session.protocol == site.protocol && tabs::site_matches_host(site, &spec.session.host)
+                            && spec.session.port == identity.port
+                            && (site.username.is_empty() || site.username == spec.session.username)
+                    })
+                }).min_by_key(|tab| tab.connected);
+                let (id, probe) = match matching_tab {
+                    Some(tab) if tab.connected => {
+                        if !matches!(site.protocol, linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes) { continue; }
+                        (Some(tab.id), tab.remote.clone())
+                    }
+                    Some(tab) => (Some(tab.id), None),
+                    None if state.tabs.values().any(|tab| tab.site_name.as_deref() == Some(site.name.as_str())) => continue,
+                    None => (None, None),
+                };
+                let key = if probe.is_some() { format!("probe:{}", id.unwrap()) }
+                    else { id.map(|id| format!("tab:{id}")).unwrap_or_else(|| format!("site:{}", site.name)) };
+                let interval = auto_reconnect::interval(site);
+                if let Some(last) = state.auto_retry_at.get(&key) {
+                    if now.duration_since(*last).as_secs() < interval { continue; }
+                } else if id.is_some() {
+                    state.auto_retry_at.insert(key, now);
+                    continue;
+                }
+                selected = Some((site.name.clone(), key, id, probe));
+                break;
+            }
+            if let Some((name, key, _, _)) = &selected {
+                state.auto_retry_at.insert(key.clone(), now);
+                state.auto_inflight.insert(name.clone());
+            }
+            selected
+        };
+        let Some((name, _key, id, probe)) = job else {
+            return ApiReply { status: 200, payload: json!({"success": true}) };
+        };
+        let mut reservation = AutoReconnectReservation { state: Arc::clone(&self.state), name: name.clone(), completed: false };
+        if let Some(session) = probe {
+            if session.probe_connection().await == Some(false) {
+                self.mark_connection_lost_if(id.unwrap(), &name, Some(&session));
+            }
+            reservation.completed = true;
+            return ApiReply { status: 200, payload: json!({"success": true}) };
+        }
+        self.add_log(&format!("[Auto reconnect] Attempting saved session {name}."), "info");
+        let result = if let Some(id) = id {
+            self.reconnect_tab_async(json!({"tab": id, "automatic": true})).await
+        } else {
+            self.open_tab_async(json!({"name": name, "site_name": name, "session": {}, "automatic": true})).await
+        };
+        reservation.completed = true;
+        if result.payload.get("challenge").is_some() {
+            self.add_log(&format!("[Auto reconnect] {name}: host-key verification is required."), "error");
+        } else if result.status != 200 {
+            let error = result.payload["error"].as_str().unwrap_or("Connection failed.");
+            let lower = error.to_ascii_lowercase();
+            if lower.contains("authenticat") || lower.contains("private key") || lower.contains("passphrase")
+                || lower.contains("ftp user rejected") || lower.contains("ftp acct rejected") {
+                self.state.lock().expect("state mutex").auto_suspended.insert(name.clone());
+                self.add_log(&format!("[Auto reconnect] {name}: authentication needs attention; automatic retries are paused until the session is saved or connected manually."), "error");
+            }
+            self.add_log(&format!("[Auto reconnect] {name}: {error}"), "error");
+        } else {
+            self.add_log(&format!("[Auto reconnect] {name}: connected."), "success");
+        }
+        ApiReply { status: 200, payload: json!({"success": true, "attempted": name, "result": result.payload}) }
     }
 
     async fn mkdir_remote_async(&self, body: Value) -> ApiReply {
@@ -1208,7 +1499,7 @@ impl CommanderService {
     }
 
     /// The session and the state key a synchronization of this tab uses.
-    fn sync_target(&self, body: &Value) -> Result<(Arc<dyn linscp_proto::RemoteSession>, u64, String, String), ApiReply> {
+    fn sync_target(&self, body: &Value) -> Result<(Arc<dyn linscp_proto::RemoteSession>, u64, String, String, String), ApiReply> {
         let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return Err(api_error(400, "No active tab")) };
         let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
             Some(tab) if tab.connected && !tab.is_local => tab, _ => return Err(api_error(400, "Not connected")),
@@ -1216,18 +1507,32 @@ impl CommanderService {
         let session = match tab.remote { Some(session) => session, None => return Err(api_error(400, "Not connected")) };
         // The previous record is kept per endpoint and directory pair, so a
         // second run with the same tab finds the first run's state.
-        let host_key = tab.spec.as_ref().map(|spec| format!("{}:{}", spec.session.host, spec.session.port))
+        let host_key = tab.spec.as_ref().map(|spec| json!(["sync-v2", spec.session.protocol.as_str(), spec.session.username, spec.session.host, spec.session.port]).to_string())
             .unwrap_or_else(|| format!("tab:{id}"));
-        Ok((session, id, host_key, tab.remote_dir.clone()))
+        let legacy_host_key = tab.spec.as_ref().map(|spec| format!("{}:{}", spec.session.host, spec.session.port))
+            .unwrap_or_else(|| format!("tab:{id}"));
+        Ok((session, id, host_key, legacy_host_key, tab.remote_dir.clone()))
+    }
+
+    fn sync_state_path(config_root: &Path, host_key: &str, legacy_host: &str, local: &Path, remote: &str) -> Result<PathBuf, String> {
+        use linscp_engine::sync_planner::SyncState;
+        let local = local.to_string_lossy();
+        let path = SyncState::state_path(config_root, &SyncState::make_key(host_key, &local, remote));
+        let legacy = SyncState::state_path(config_root, &SyncState::make_key(legacy_host, &local, remote));
+        if !path.try_exists().map_err(|e| format!("Cannot inspect synchronization state: {e}"))?
+            && legacy.try_exists().map_err(|e| format!("Cannot inspect synchronization state: {e}"))? {
+            return Err(format!("An older synchronization baseline at '{}' does not identify the remote account. Back it up and remove it only after reviewing the previous history; then preview synchronization again.", legacy.display()));
+        }
+        Ok(path)
     }
 
     async fn sync_preview_async(&self, body: Value) -> ApiReply {
         use linscp_engine::sync_planner::{plan_synchronization, SyncState};
-        let (session, _id, host_key, _dir) = match self.sync_target(&body) { Ok(t) => t, Err(reply) => return reply };
+        let (session, _id, host_key, legacy_host, _dir) = match self.sync_target(&body) { Ok(t) => t, Err(reply) => return reply };
         let (local_root, remote_root, opts) = match Self::sync_options_from(&body) { Ok(t) => t, Err(error) => return api_error(400, error) };
         let config_root = self.state.lock().expect("state mutex").config_root.clone();
-        let state_file = SyncState::state_path(&config_root, &SyncState::make_key(&host_key, &local_root.to_string_lossy(), &remote_root));
-        let state = SyncState::load(&state_file).unwrap_or_default();
+        let state_file = match Self::sync_state_path(&config_root, &host_key, &legacy_host, &local_root, &remote_root) { Ok(path) => path, Err(error) => return api_error(409, error) };
+        let state = match SyncState::load(&state_file) { Ok(state) => state, Err(error) => return api_error(500, error) };
         let saf_fs = if is_saf_path(&local_root.to_string_lossy()) { Some(self.local_fs.as_ref()) } else { None };
         match plan_synchronization(session.as_ref(), &local_root, &remote_root, &opts, &state, saf_fs).await {
             Ok(items) => ApiReply { status: 200, payload: json!({"success": true, "plan": sync_plan_json(&items)}) },
@@ -1238,7 +1543,7 @@ impl CommanderService {
     /// Queues a synchronization as one task, so the queue's pause, cancel and
     /// progress apply to it exactly as they do to a transfer.
     async fn sync_run_async(&self, body: Value) -> ApiReply {
-        let (session, id, host_key, _dir) = match self.sync_target(&body) { Ok(t) => t, Err(reply) => return reply };
+        let (session, id, host_key, legacy_host, _dir) = match self.sync_target(&body) { Ok(t) => t, Err(reply) => return reply };
         let (local_root, remote_root, mut opts) = match Self::sync_options_from(&body) { Ok(t) => t, Err(error) => return api_error(400, error) };
         // The shared reader above defaults to preview-only so a preview can
         // never write; a run applies the plan, so it opts back out. Without
@@ -1246,6 +1551,7 @@ impl CommanderService {
         opts.preview_only = false;
         // The same options a preview used, so what the user saw is what runs.
         let config_root = self.state.lock().expect("state mutex").config_root.clone();
+        if let Err(error) = Self::sync_state_path(&config_root, &host_key, &legacy_host, &local_root, &remote_root) { return api_error(409, error); }
         let local_is_dir = if is_saf_path(&local_root.to_string_lossy()) {
             self.local_fs.stat(&local_root.to_string_lossy()).is_ok_and(|info| info.is_dir && !info.is_symlink)
         } else {
@@ -1278,8 +1584,10 @@ impl CommanderService {
                 "protocol": session.protocol.as_str(), "site": tab.site_name, "key": key})
         }).collect::<Vec<_>>();
         tabs.sort_by_key(|tab| tab["tab"].as_u64().unwrap_or(0));
-        let mut sites = SessionStore::load_from_dir(&state.config_root, self.secret_vault.as_ref())
-            .unwrap_or_default().sites().iter().filter(|site| {
+        let store = match SessionStore::load_from_dir(&state.config_root, self.secret_vault.as_ref()) {
+            Ok(store) => store, Err(error) => return api_error(500, format!("Cannot load stored sessions: {error}")),
+        };
+        let mut sites = store.sites().iter().filter(|site| {
                 matches!(site.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)
             }).map(|site| json!({"name": site.name, "host": site.host, "port": site.port,
                 "protocol": site.protocol.as_str(), "key": format!("site:{}", site.name)})).collect::<Vec<_>>();
@@ -1639,6 +1947,19 @@ impl CommanderService {
         };
         let text = terminal.with_screen(|screen| screen.selection()).flatten();
         ApiReply { status: 200, payload: json!({ "success": true, "text": text }) }
+    }
+
+    /// Read the retained buffer, including scrollback, without changing selection.
+    fn terminal_all_text(&self, query: &BTreeMap<String, String>) -> ApiReply {
+        let terminal_id = query.get("terminal").map(String::as_str).unwrap_or("");
+        let terminal = match self.state.lock().expect("state mutex").terminals.get(terminal_id) {
+            Some(terminal) => terminal,
+            None => return api_error(400, "This terminal is no longer open."),
+        };
+        match terminal.with_screen(|screen| screen.all_text()) {
+            Some(text) => ApiReply { status: 200, payload: json!({"success": true, "text": text}) },
+            None => api_error(400, "This terminal is no longer open."),
+        }
     }
 
     fn terminal_read(&self, query: &BTreeMap<String,String>) -> ApiReply {
@@ -2414,12 +2735,30 @@ impl CommanderService {
         if let Err(error) = unlock_result {
             return api_error(400, error.to_string());
         }
+        let _guard = self.session_key_lock.lock().expect("session key lock");
+        if let Err(error) = SessionStore::protect_existing(&config_root, self.secret_vault.as_ref())
+            .and_then(|_| auto_reconnect::protect_existing(&config_root, self.secret_vault.as_ref())) {
+            let _ = self.secret_vault.lock();
+            return api_error(500, format!("Could not protect existing session data: {error}"));
+        }
         let stale_temp_dir = config_root.join("tmp").join("unlocked-keys").join(std::process::id().to_string());
         let _ = std::fs::remove_dir_all(stale_temp_dir);
         ApiReply { status: 200, payload: json!({"success": true, "vault": "unlocked"}) }
     }
 
     fn handle_vault_lock(&self) -> ApiReply {
+        let _guard = self.session_key_lock.lock().expect("session key lock");
+        // Locking explicitly disconnects every tab; do not restore them later.
+        {
+            let state = self.state.lock().expect("state mutex");
+            let result = auto_reconnect::load(&state.config_root, self.secret_vault.as_ref()).and_then(|mut intentions| {
+                let before = intentions.len();
+                intentions.clear();
+                if intentions.len() != before { auto_reconnect::save(&state.config_root, self.secret_vault.as_ref(), &intentions)?; }
+                Ok(())
+            });
+            if let Err(error) = result { return api_error(500, error); }
+        }
         if let Err(error) = self.secret_vault.lock() {
             return api_error(500, error.to_string());
         }
@@ -2433,6 +2772,10 @@ impl CommanderService {
         state.tabs.clear();
         state.challenges.clear();
         state.pending_connections.clear();
+        state.pending_sites.clear();
+        state.auto_pending.clear();
+        state.auto_retry_at.clear();
+        state.auto_suspended.clear();
         state.active_tab_id = None;
         ApiReply { status: 200, payload: json!({"success": true, "vault": "locked"}) }
     }
@@ -2641,6 +2984,10 @@ impl CommanderService {
 
     /// Reports a session that will not answer again, once.
     fn mark_connection_lost(&self, tab_id: u64, name: &str) {
+        self.mark_connection_lost_if(tab_id, name, None);
+    }
+
+    fn mark_connection_lost_if(&self, tab_id: u64, name: &str, expected: Option<&Arc<dyn linscp_proto::RemoteSession>>) {
         const REASON: &str = "The connection to the server ended.";
         let (note, ended, ended_viewer) = {
             let mut state = self.state.lock().expect("state mutex");
@@ -2648,7 +2995,7 @@ impl CommanderService {
             // The status is asked every fifteen seconds and the frame of an
             // ended shell is asked for far more often than that: one ending is
             // one entry, or the log fills with the same sentence.
-            if !tab.connected {
+            if !tab.connected || expected.is_some_and(|session| tab.remote.as_ref().is_none_or(|current| !Arc::ptr_eq(current, session))) {
                 return;
             }
             tab.connected = false;
@@ -2657,6 +3004,7 @@ impl CommanderService {
             // joins the thread that watched a jump tunnel, and every other
             // request waits on this mutex.
             let ended = tab.remote.take();
+            state.auto_retry_at.insert(format!("tab:{tab_id}"), std::time::Instant::now());
             let ended_viewer = state.x2go.remove(&tab_id);
             (format!("[Session] {name}: {}", REASON.to_lowercase()), ended, ended_viewer)
         };
@@ -3010,15 +3358,21 @@ impl CommanderService {
         // already in the store instead of wiping it on an unrelated re-save.
         let keep_password = session_val.get("keep_password").and_then(Value::as_bool).unwrap_or(false);
         let keep_key_passphrase = session_val.get("keep_key_passphrase").and_then(Value::as_bool).unwrap_or(false);
+        let keep_proxy_password = session_val.get("keep_proxy_password").and_then(Value::as_bool).unwrap_or(false);
         let keep_tunnel_password = session_val.get("keep_tunnel_password").and_then(Value::as_bool).unwrap_or(false);
         let keep_tunnel_passphrase = session_val.get("keep_tunnel_passphrase").and_then(Value::as_bool).unwrap_or(false);
-        if keep_password || keep_key_passphrase || keep_tunnel_password || keep_tunnel_passphrase {
+        if keep_password || keep_key_passphrase || keep_proxy_password || keep_tunnel_password || keep_tunnel_passphrase {
             if let Some(existing) = store.find(&final_name) {
                 if keep_password && spec.session.password.is_none() {
                     spec.session.password = existing.password.clone();
                 }
                 if keep_key_passphrase && spec.passphrase.is_none() {
                     spec.passphrase = existing.key_passphrase.clone();
+                }
+                if keep_proxy_password && spec.raw_fields.get("proxy_password").is_none_or(String::is_empty) {
+                    if let Some(password) = &existing.proxy_password {
+                        spec.raw_fields.insert("proxy_password".into(), password.clone());
+                    }
                 }
                 if keep_tunnel_password && spec.session.tunnel.as_ref().is_some_and(|t| t.password.is_none()) {
                     if let (Some(tun), Some(pw)) = (spec.session.tunnel.as_mut(), existing.tunnel.password.clone()) {
@@ -3036,6 +3390,30 @@ impl CommanderService {
             return api_error(400, "Saving S3 session tokens is not supported; supply the token when connecting instead.");
         }
         let mut stored = tabs::build_stored_site_for_save(&final_name, &spec);
+        for key in ["alt_hostname", "alt_fallback"] {
+            if session_val.get(key).is_none() {
+                if let Some(value) = store.find(&final_name).and_then(|old| old.extra_fields.get(key)) {
+                    stored.extra_fields.insert(key.into(), value.clone());
+                }
+            }
+        }
+        if stored.protocol != linscp_types::ProtocolScheme::Local
+            && stored.extra_fields.get("alt_fallback").is_some_and(|v| v == "1")
+            && stored.extra_fields.get("alt_hostname").is_none_or(|v| !tabs::valid_alternate_hostname(v)) {
+            return api_error(400, "An alternate hostname is required when fallback is enabled.");
+        }
+        for key in ["auto_reconnect", "auto_reconnect_seconds"] {
+            if let Some(value) = session_val.get(key) {
+                let encoded = match (key, value) {
+                    ("auto_reconnect", Value::Bool(value)) => if *value { "1".to_string() } else { "0".to_string() },
+                    ("auto_reconnect_seconds", value) if value.as_u64().is_some_and(|v| (1..=3600).contains(&v)) => value.as_u64().unwrap().to_string(),
+                    _ => return api_error(400, "Auto reconnect time must be an integer from 1 to 3600 seconds and its switch must be a boolean."),
+                };
+                stored.extra_fields.insert(key.into(), encoded);
+            } else if let Some(value) = store.find(&final_name).and_then(|old| old.extra_fields.get(key)) {
+                stored.extra_fields.insert(key.into(), value.clone());
+            }
+        }
         let mut protected_key_files = Vec::new();
         if let Err(error) = protect_stored_ssh_keys(&mut stored, &cfg_root, self.secret_vault.as_ref(), &mut protected_key_files) {
             for path in protected_key_files { let _ = std::fs::remove_file(path); }
@@ -3045,6 +3423,14 @@ impl CommanderService {
         if let Err(e) = store.save_to_dir(&cfg_root, self.secret_vault.as_ref()) {
             for path in protected_key_files { let _ = std::fs::remove_file(path); }
             return ApiReply{ status: 500, payload: json!({"success": false, "error": e})};
+        }
+        {
+            let mut state = self.state.lock().expect("state mutex");
+            state.auto_suspended.remove(&final_name);
+            if state.auto_inflight.contains(&final_name) {
+                let ids: Vec<u64> = state.pending_sites.iter().filter_map(|(id, name)| (name == &final_name).then_some(*id)).collect();
+                for id in ids { state.pending_connections.remove(&id); state.pending_sites.remove(&id); state.auto_pending.remove(&id); }
+            }
         }
         self.add_log(&format!("Saved session {final_name}"), "success");
         ApiReply{ status: 200, payload: json!({"success": true})}
@@ -3086,8 +3472,20 @@ impl CommanderService {
             let kind = if folder { "folder" } else { "session" };
             return ApiReply{ status: 400, payload: json!({"success": false, "error": format!("No {kind} named '{name}'")})};
         }
+        let intent_result = auto_reconnect::load(&cfg, self.secret_vault.as_ref()).and_then(|mut intentions| {
+            intentions.retain(|site, _| !(site == &name || (folder && site.starts_with(&format!("{name}/")))));
+            auto_reconnect::save(&cfg, self.secret_vault.as_ref(), &intentions)
+        });
+        if let Err(error) = intent_result { return api_error(500, error); }
         if let Err(e) = store.save_to_dir(&cfg, self.secret_vault.as_ref()) {
             return ApiReply{ status: 500, payload: json!({"success": false, "error": e})};
+        }
+        {
+            let mut state = self.state.lock().expect("state mutex");
+            let ids: Vec<u64> = state.pending_sites.iter().filter_map(|(id, site)| {
+                (state.auto_inflight.contains(site) && (site == &name || (folder && site.starts_with(&format!("{name}/"))))).then_some(*id)
+            }).collect();
+            for id in ids { state.pending_connections.remove(&id); state.pending_sites.remove(&id); state.auto_pending.remove(&id); }
         }
         ApiReply{ status: 200, payload: json!({"success": true})}
     }
@@ -3183,10 +3581,28 @@ impl CommanderService {
         }
     }
 
+    // Missing files are new stores; unreadable or malformed files are not.
+    fn read_json_store(path: &Path, default: Value, kind: &str) -> Result<Value, String> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(default),
+            Err(e) => return Err(format!("Cannot read {}: {e}", path.display())),
+        };
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|e| format!("Invalid {}: {e}", path.display()))?;
+        let valid = match kind {
+            "bookmarks" => value.is_object() && ["local", "remote"].iter().all(|key| value.get(*key).is_some_and(Value::is_array)),
+            "workspaces" => value.is_object() && value.get("workspaces").is_some_and(Value::is_object),
+            _ => false,
+        };
+        if !valid { return Err(format!("Invalid {} structure", path.display())); }
+        Ok(value)
+    }
+
     fn handle_get_bookmarks(&self, query: &BTreeMap<String,String>) -> ApiReply {
         let cfg = self.state.lock().expect("m").config_root.clone();
         let path = cfg.join("bookmarks.json");
-        let data: Value = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({"local": [], "remote": []}));
+        let data = match Self::read_json_store(&path, json!({"local": [], "remote": []}), "bookmarks") { Ok(data) => data, Err(e) => return api_error(500, e) };
         if let Some(side) = query.get("side") {
             if side != "local" && side != "remote" { return ApiReply{ status: 400, payload: json!({"success": false, "error": "side must be local or remote"})}; }
             let arr = data.get(side).cloned().unwrap_or(json!([]));
@@ -3200,6 +3616,8 @@ impl CommanderService {
         let cfg = self.state.lock().expect("m").config_root.clone();
         let next = body.get("bookmarks").cloned().unwrap_or(body.clone());
         let path = cfg.join("bookmarks.json");
+        if let Err(e) = Self::read_json_store(&path, json!({"local": [], "remote": []}), "bookmarks") { return api_error(500, e); }
+        if !next.is_object() || !["local", "remote"].iter().all(|key| next.get(*key).is_some_and(Value::is_array)) { return api_error(400, "Invalid bookmarks structure."); }
         let bytes = serde_json::to_vec_pretty(&next).unwrap_or_default();
         if let Err(e) = write_private_file_atomic(&path, &bytes) {
             return ApiReply{ status: 500, payload: json!({"success": false, "error": e.to_string()})};
@@ -3214,7 +3632,7 @@ impl CommanderService {
         if name.is_empty() || bm_path.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "name and path required"})}; }
         let cfg = self.state.lock().expect("m").config_root.clone();
         let file = cfg.join("bookmarks.json");
-        let mut data: Value = std::fs::read_to_string(&file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({"local": [], "remote": []}));
+        let mut data = match Self::read_json_store(&file, json!({"local": [], "remote": []}), "bookmarks") { Ok(data) => data, Err(e) => return api_error(500, e) };
         if !data.is_object() { data = json!({"local": [], "remote": []}); }
         let arr = data.get_mut(&side).and_then(|v| v.as_array_mut());
         if let Some(a) = arr {
@@ -3232,19 +3650,19 @@ impl CommanderService {
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let cfg = self.state.lock().expect("m").config_root.clone();
         let file = cfg.join("bookmarks.json");
-        let mut data: Value = std::fs::read_to_string(&file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({"local": [], "remote": []}));
+        let mut data = match Self::read_json_store(&file, json!({"local": [], "remote": []}), "bookmarks") { Ok(data) => data, Err(e) => return api_error(500, e) };
         if let Some(a) = data.get_mut(&side).and_then(|v| v.as_array_mut()) {
             a.retain(|e| e.get("name").and_then(|v| v.as_str()).unwrap_or("") != name);
         }
         let bytes = serde_json::to_vec_pretty(&data).unwrap_or_default();
-        let _ = write_private_file_atomic(&file, &bytes);
+        if let Err(e) = write_private_file_atomic(&file, &bytes) { return api_error(500, e.to_string()); }
         ApiReply{ status: 200, payload: json!({"success": true, "file": file.to_string_lossy()})}
     }
 
     fn handle_get_workspaces(&self) -> ApiReply {
         let cfg = self.state.lock().expect("m").config_root.clone();
         let path = cfg.join("workspaces.json");
-        let data: Value = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({"workspaces": {}}));
+        let data = match Self::read_json_store(&path, json!({"workspaces": {}}), "workspaces") { Ok(data) => data, Err(e) => return api_error(500, e) };
         let mut workspaces: Vec<Value> = data.get("workspaces").and_then(Value::as_object).map(|entries| entries.iter().map(|(name, entry)| json!({"name": name, "tab_count": entry.get("tabs").and_then(Value::as_array).map_or(0, Vec::len)})).collect()).unwrap_or_default();
         workspaces.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         ApiReply{ status: 200, payload: json!({"success": true, "workspaces": workspaces, "file": path.to_string_lossy()})}
@@ -3253,6 +3671,8 @@ impl CommanderService {
         let cfg = self.state.lock().expect("m").config_root.clone();
         let next = body.get("workspaces").cloned().unwrap_or(body);
         let path = cfg.join("workspaces.json");
+        if let Err(e) = Self::read_json_store(&path, json!({"workspaces": {}}), "workspaces") { return api_error(500, e); }
+        if !next.is_object() || !next.get("workspaces").is_some_and(Value::is_object) { return api_error(400, "Invalid workspace structure."); }
         let bytes = serde_json::to_vec_pretty(&next).unwrap_or_default();
         if let Err(e) = write_private_file_atomic(&path, &bytes) {
             return ApiReply{ status: 500, payload: json!({"success": false, "error": e.to_string()})};
@@ -3277,7 +3697,7 @@ impl CommanderService {
         if tabs.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "There are no open tabs to save."})}; }
         if tabs.len() > 100 { return api_error(400, "A workspace can contain at most 100 tabs."); }
         let path = cfg.join("workspaces.json");
-        let mut data: Value = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({}));
+        let mut data = match Self::read_json_store(&path, json!({"workspaces": {}}), "workspaces") { Ok(data) => data, Err(e) => return api_error(500, e) };
         if !data.is_object() { data = json!({}); }
         if data.get("workspaces").is_none() { data["workspaces"] = json!({}); }
         if !data["workspaces"].is_object() { return api_error(400, "Invalid workspace file."); }
@@ -3296,13 +3716,13 @@ impl CommanderService {
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let cfg = self.state.lock().expect("m").config_root.clone();
         let path = cfg.join("workspaces.json");
-        let mut data: Value = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({}));
+        let mut data = match Self::read_json_store(&path, json!({"workspaces": {}}), "workspaces") { Ok(data) => data, Err(e) => return api_error(500, e) };
         if data.get("workspaces").and_then(|w| w.get(&name)).is_none() {
             return ApiReply{ status: 400, payload: json!({"success": false, "error": format!("No workspace named \"{name}\" exists.")})};
         }
         if let Some(obj) = data.get_mut("workspaces").and_then(|v| v.as_object_mut()) { obj.remove(&name); }
         let bytes = serde_json::to_vec_pretty(&data).unwrap_or_default();
-        let _ = write_private_file_atomic(&path, &bytes);
+        if let Err(e) = write_private_file_atomic(&path, &bytes) { return api_error(500, e.to_string()); }
         ApiReply{ status: 200, payload: json!({"success": true})}
     }
 
@@ -3349,10 +3769,27 @@ impl CommanderService {
 
     fn handle_tabs_close(&self, body: Value) -> ApiReply {
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) }).unwrap_or(0);
+        let _guard = self.session_key_lock.lock().expect("session key lock");
         let mut g = self.state.lock().expect("m");
+        let site = g.tabs.get(&tab_id).or_else(|| g.challenges.get(&tab_id))
+            .and_then(|tab| tab.site_name.clone());
+        if let Some(name) = site {
+            let another = g.tabs.values().any(|tab| tab.id != tab_id && tab.site_name.as_deref() == Some(name.as_str()));
+            if !another {
+                let result = auto_reconnect::load(&g.config_root, self.secret_vault.as_ref()).and_then(|mut intentions| {
+                    if intentions.remove(&name).is_some() { auto_reconnect::save(&g.config_root, self.secret_vault.as_ref(), &intentions)?; }
+                    Ok(())
+                });
+                if let Err(error) = result { return api_error(500, error); }
+            }
+        }
         g.tabs.remove(&tab_id);
         g.challenges.remove(&tab_id);
         g.pending_connections.remove(&tab_id);
+        g.pending_sites.remove(&tab_id);
+        g.auto_pending.remove(&tab_id);
+        g.auto_retry_at.remove(&format!("tab:{tab_id}"));
+        g.auto_retry_at.remove(&format!("probe:{tab_id}"));
         // A terminal lives in a tab's connection; closing the tab must not
         // leave the shell running with no window to show it.
         g.terminals.close_for_tab(tab_id);
@@ -5956,6 +6393,19 @@ fn stage_offlineotp_key(
     Err("Cannot allocate a unique imported SSH key filename.".to_string())
 }
 
+/// Fail closed: do not infer network failure from authentication, host-key,
+/// TLS, proxy, server replies, or a generic whole-operation timeout.
+fn direct_connect_failure(spec: &linscp_engine::url_and_raw::ParsedSiteSpec, error: &str) -> bool {
+    if spec.session.tunnel.is_some() || spec.raw_fields.get("proxy_method")
+        .is_some_and(|p| !p.is_empty() && p != "0" && !p.eq_ignore_ascii_case("none")) { return false; }
+    if !matches!(spec.session.protocol, linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Scp
+        | linscp_types::ProtocolScheme::Ssh | linscp_types::ProtocolScheme::Ftp
+        | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes) { return false; }
+    let endpoint = format!("{}:{}", spec.session.host, spec.session.port);
+    error.starts_with(&format!("Could not connect to {endpoint}: "))
+        || error == format!("Timed out connecting to {endpoint}.")
+}
+
 fn api_error(status: u16, error: impl Into<String>) -> ApiReply {
     ApiReply { status, payload: json!({"success": false, "error": error.into()}) }
 }
@@ -6252,6 +6702,58 @@ mod tests {
     use linscp_types::{FileEntry, LocalRootEntry, ProtocolScheme};
 
     #[test]
+    fn corrupt_bookmarks_and_workspaces_are_not_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        let bookmark = tmp.path().join("bookmarks.json");
+        std::fs::write(&bookmark, "{broken").unwrap();
+        let reply = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/bookmarks/save".into(), body: json!({"side":"local", "name":"x", "path":"/tmp"}) });
+        assert_eq!(reply.status, 500);
+        assert_eq!(std::fs::read_to_string(&bookmark).unwrap(), "{broken");
+        let workspace = tmp.path().join("workspaces.json");
+        std::fs::write(&workspace, "{broken").unwrap();
+        let reply = svc.dispatch(ApiEnvelope { method: "GET".into(), path: "/api/workspaces".into(), body: json!({}) });
+        assert_eq!(reply.status, 500);
+        assert_eq!(std::fs::read_to_string(&workspace).unwrap(), "{broken");
+    }
+
+    #[test]
+    fn saved_proxy_password_is_kept_without_exposing_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
+        let request = |method: &str, path: &str, body: Value| ApiEnvelope { method: method.into(), path: path.into(), body };
+        let mut session = json!({"protocol":"sftp", "host":"example.test", "proxy_method":"HTTP", "proxy_host":"proxy.test", "proxy_password":"secret"});
+        assert_eq!(svc.dispatch(request("POST", "/api/sessions/save", json!({"name":"site", "session":session}))).status, 200);
+        let list = svc.dispatch(request("GET", "/api/sessions", json!({})));
+        assert_eq!(list.payload["sessions"][0]["has_proxy_password"], true);
+        assert!(!list.payload.to_string().contains("secret"));
+        session["proxy_password"] = json!("");
+        let (spec, _) = tabs::parse_gui_session_spec(&session, Some("site"), tmp.path(), svc.secret_vault.as_ref()).unwrap();
+        assert_eq!(spec.raw_fields.get("proxy_password").map(String::as_str), Some("secret"));
+        session["keep_proxy_password"] = json!(true);
+        assert_eq!(svc.dispatch(request("POST", "/api/sessions/save", json!({"name":"site", "session":session}))).status, 200);
+        let store = SessionStore::load_from_dir(tmp.path(), svc.secret_vault.as_ref()).unwrap();
+        assert_eq!(store.find("site").unwrap().proxy_password.as_deref(), Some("secret"));
+        session["keep_proxy_password"] = json!(false);
+        assert_eq!(svc.dispatch(request("POST", "/api/sessions/save", json!({"name":"site", "session":session}))).status, 200);
+        let store = SessionStore::load_from_dir(tmp.path(), svc.secret_vault.as_ref()).unwrap();
+        assert!(store.find("site").unwrap().proxy_password.is_none());
+    }
+
+    #[test]
+    fn legacy_sync_baseline_requires_review() {
+        use linscp_engine::sync_planner::SyncState;
+        let tmp = tempfile::tempdir().unwrap();
+        let local = Path::new("/local");
+        let legacy = SyncState::state_path(tmp.path(), &SyncState::make_key("host:22", "/local", "/remote"));
+        SyncState::default().save(&legacy).unwrap();
+        assert!(CommanderService::sync_state_path(tmp.path(), "new-key", "host:22", local, "/remote").is_err());
+        std::fs::remove_file(&legacy).unwrap();
+        assert!(CommanderService::sync_state_path(tmp.path(), "new-key", "host:22", local, "/remote").is_ok());
+    }
+
+    #[test]
     fn sudo_credentials_require_saved_opt_in_and_matching_identity() {
         let mut site = StoredSite::new("example", ProtocolScheme::Sftp, "host.example");
         site.username = "alice".into();
@@ -6269,6 +6771,12 @@ mod tests {
         };
         assert_eq!(saved_sudo_credentials(&tab, &store), Some(("alice".into(), "secret".into())));
         tab.spec.as_mut().unwrap().session.host = "other.example".into();
+        assert!(saved_sudo_credentials(&tab, &store).is_none());
+        site.extra_fields.insert("alt_hostname".into(), "other.example".into());
+        store.upsert(site.clone());
+        assert_eq!(saved_sudo_credentials(&tab, &store), Some(("alice".into(), "secret".into())));
+        site.extra_fields.insert("alt_hostname".into(), "new.example".into());
+        store.upsert(site.clone());
         assert!(saved_sudo_credentials(&tab, &store).is_none());
         tab.spec.as_mut().unwrap().session.host = "host.example".into();
         tab.spec.as_mut().unwrap().session.password = Some("other".into());
@@ -6392,6 +6900,124 @@ mod tests {
             body: json!({"password": "correct horse battery staple"}),
         });
         assert_eq!(reply.status, 200, "{}", reply.payload);
+    }
+
+    #[tokio::test]
+    async fn saved_ftp_session_tries_alternate_after_primary_refuses_connection() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            stream.get_mut().write_all(b"220 test ready\r\n").await.unwrap();
+            loop {
+                let mut line = String::new();
+                if stream.read_line(&mut line).await.unwrap() == 0 { break; }
+                let reply = if line.starts_with("USER ") { "230 logged in\r\n" }
+                    else if line.starts_with("FEAT") { "500 unsupported\r\n" }
+                    else if line.starts_with("PWD") { "257 \"/\" is current directory\r\n" }
+                    else { "200 OK\r\n" };
+                stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        let saved = svc.dispatch(request("/api/sessions/save", json!({"name": "fallback", "session": {
+            "protocol": "ftp", "host": "127.0.0.2", "port": port, "username": "user",
+            "alt_hostname": "127.0.0.1", "alt_fallback": true, "initial_dir": "/"
+        }})));
+        assert_eq!(saved.status, 200, "{}", saved.payload);
+        let opened = svc.dispatch_async(request("/api/tabs/open", json!({"name": "fallback", "site_name": "fallback", "session": {}}))).await;
+        assert_eq!(opened.status, 200, "{}", opened.payload);
+        assert_eq!(opened.payload["tab"]["session"]["host"], "127.0.0.1");
+        let store = SessionStore::load_from_dir(tmp.path(), svc.secret_vault.as_ref()).unwrap();
+        assert_eq!(store.find("fallback").unwrap().host, "127.0.0.2");
+        assert!(auto_reconnect::load(tmp.path(), svc.secret_vault.as_ref()).unwrap().contains_key("fallback"));
+        assert!(svc.state.lock().unwrap().logs.iter().any(|entry| entry["text"].as_str().unwrap_or("").contains("trying alternate host")));
+        server.abort();
+    }
+
+    #[test]
+    fn alternate_fallback_only_accepts_direct_transport_failures() {
+        let mut spec = linscp_engine::url_and_raw::ParsedSiteSpec::default();
+        spec.session.protocol = linscp_types::ProtocolScheme::Sftp;
+        spec.session.host = "primary.example".into();
+        spec.session.port = 22;
+        assert!(direct_connect_failure(&spec, "Could not connect to primary.example:22: Connection refused"));
+        assert!(direct_connect_failure(&spec, "Timed out connecting to primary.example:22."));
+        assert!(!direct_connect_failure(&spec, "Connection timed out after 30 seconds."));
+        assert!(!direct_connect_failure(&spec, "Host key verification required"));
+        assert!(!direct_connect_failure(&spec, "Server rejected password authentication."));
+        assert!(!direct_connect_failure(&spec, "Could not connect to proxy proxy.example:22: Connection refused"));
+        spec.raw_fields.insert("proxy_method".into(), "socks5".into());
+        assert!(!direct_connect_failure(&spec, "Could not connect to primary.example:22: Connection refused"));
+    }
+
+    #[tokio::test]
+    async fn auto_reconnect_restores_only_enabled_previously_connected_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(temp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        let save = svc.dispatch(request("/api/sessions/save", json!({"name": "saved", "session": {
+            "protocol": "sftp", "host": "127.0.0.1", "port": 1, "username": "user",
+            "auth_gssapi": false, "auto_reconnect": true, "auto_reconnect_seconds": 2
+        }})));
+        assert_eq!(save.status, 200, "{}", save.payload);
+        let store = SessionStore::load_from_dir(temp.path(), svc.secret_vault.as_ref()).unwrap();
+        let site = store.find("saved").unwrap();
+        assert!(auto_reconnect::enabled(site));
+        assert_eq!(auto_reconnect::interval(site), 2);
+        let empty = svc.dispatch_async(request("/api/auto-reconnect/tick", json!({}))).await;
+        assert!(empty.payload.get("attempted").is_none());
+        let mut intentions = auto_reconnect::Intentions::new();
+        intentions.insert("saved".into(), auto_reconnect::Identity::of(site));
+        auto_reconnect::save(temp.path(), svc.secret_vault.as_ref(), &intentions).unwrap();
+        let first = svc.dispatch_async(request("/api/auto-reconnect/tick", json!({}))).await;
+        assert_eq!(first.payload["attempted"], "saved");
+        let not_due = svc.dispatch_async(request("/api/auto-reconnect/tick", json!({}))).await;
+        assert!(not_due.payload.get("attempted").is_none());
+        let mut changed = intentions.clone();
+        changed.get_mut("saved").unwrap().host = "different.example".into();
+        auto_reconnect::save(temp.path(), svc.secret_vault.as_ref(), &changed).unwrap();
+        let mismatch = svc.dispatch_async(request("/api/auto-reconnect/tick", json!({}))).await;
+        assert!(mismatch.payload.get("attempted").is_none());
+        auto_reconnect::save(temp.path(), svc.secret_vault.as_ref(), &intentions).unwrap();
+        let deleted = svc.dispatch(request("/api/sessions/delete", json!({"name": "saved"})));
+        assert_eq!(deleted.status, 200, "{}", deleted.payload);
+        assert!(auto_reconnect::load(temp.path(), svc.secret_vault.as_ref()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn auto_reconnect_intent_survives_one_duplicate_but_not_last_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(temp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        let mut site = linscp_engine::session_store::StoredSite::new("saved", linscp_types::ProtocolScheme::Sftp, "host");
+        site.username = "user".into();
+        site.password = Some("secret-never-persisted-in-intent".into());
+        let mut intentions = auto_reconnect::Intentions::new();
+        intentions.insert(site.name.clone(), auto_reconnect::Identity::of(&site));
+        auto_reconnect::save(temp.path(), svc.secret_vault.as_ref(), &intentions).unwrap();
+        assert!(!std::fs::read_to_string(temp.path().join("auto-reconnect.json")).unwrap().contains("secret-never-persisted-in-intent"));
+        for id in [1, 2] {
+            svc.state.lock().unwrap().tabs.insert(id, TabRuntime {
+                id, name: "saved".into(), site_name: Some("saved".into()), is_local: false, connected: false,
+                local_dir: "/".into(), remote_dir: "/".into(), other_local_dir: String::new(),
+                observed_hostkey: String::new(), hostkey_role: String::new(), hostkey_changed: false,
+                error: String::new(), spec: None, session_json: json!({}), remote: None,
+            });
+        }
+        assert_eq!(svc.handle_tabs_close(json!({"tab": 1})).status, 200);
+        assert!(auto_reconnect::load(temp.path(), svc.secret_vault.as_ref()).unwrap().contains_key("saved"));
+        std::fs::write(temp.path().join("auto-reconnect.json"), b"broken").unwrap();
+        assert_eq!(svc.handle_tabs_close(json!({"tab": 2})).status, 500);
+        assert!(svc.state.lock().unwrap().tabs.contains_key(&2));
+        auto_reconnect::save(temp.path(), svc.secret_vault.as_ref(), &intentions).unwrap();
+        assert_eq!(svc.handle_tabs_close(json!({"tab": 2})).status, 200);
+        assert!(auto_reconnect::load(temp.path(), svc.secret_vault.as_ref()).unwrap().is_empty());
     }
 
     /// A terminal nobody opened is refused by every route that needs one, and
@@ -9986,6 +10612,40 @@ mod tests {
     }
 
     #[test]
+    fn vault_migrates_and_encrypts_full_session_and_reconnect_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = NativeSecretVault::new();
+        let mut original = SessionStore::new();
+        let mut site = StoredSite::new("private-site", linscp_types::ProtocolScheme::Sftp, "primary.example");
+        site.extra_fields.insert("alt_hostname".into(), "alternate.example".into());
+        site.extra_fields.insert("auto_reconnect_seconds".into(), "77".into());
+        site.password = Some("secret-password".into());
+        original.upsert(site.clone());
+        original.save_to_dir(tmp.path(), &legacy).unwrap();
+        let mut intentions = auto_reconnect::Intentions::new();
+        intentions.insert(site.name.clone(), auto_reconnect::Identity::of(&site));
+        std::fs::write(tmp.path().join("auto-reconnect.json"), serde_json::to_vec(&intentions).unwrap()).unwrap();
+        let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
+        for path in ["sessions.ini", "auto-reconnect.json"] {
+            let data = std::fs::read(tmp.path().join(path)).unwrap();
+            for secret in ["private-site", "primary.example", "alternate.example", "secret-password", "auto_reconnect_seconds"] {
+                assert!(!data.windows(secret.len()).any(|part| part == secret.as_bytes()));
+            }
+        }
+        let restored = SessionStore::load_from_dir(tmp.path(), svc.secret_vault.as_ref()).unwrap();
+        let restored = restored.find("private-site").unwrap();
+        assert_eq!(restored.extra_fields.get("alt_hostname").unwrap(), "alternate.example");
+        assert_eq!(restored.extra_fields.get("auto_reconnect_seconds").unwrap(), "77");
+        assert_eq!(restored.password.as_deref(), Some("secret-password"));
+        assert_eq!(auto_reconnect::load(tmp.path(), svc.secret_vault.as_ref()).unwrap(), intentions);
+        svc.secret_vault.lock().unwrap();
+        assert!(SessionStore::load_from_dir(tmp.path(), svc.secret_vault.as_ref()).is_err());
+        assert!(auto_reconnect::load(tmp.path(), svc.secret_vault.as_ref()).is_err());
+        assert!(original.save_to_dir(tmp.path(), &legacy).is_err());
+    }
+
+    #[test]
     fn session_save_refuses_an_unreadable_store_before_importing_keys() {
         let tmp = tempfile::tempdir().unwrap();
         let service = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
@@ -10006,6 +10666,7 @@ mod tests {
     fn session_folder_deletion_keeps_same_named_site_and_other_folders() {
         let tmp = tempfile::tempdir().unwrap();
         let service = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&service);
         let mut store = SessionStore::new();
         for name in ["team", "team/one", "team/nested/two", "teamwork/other"] {
             store.upsert(StoredSite::new(name, linscp_types::ProtocolScheme::Sftp, "example.test"));
@@ -10222,8 +10883,10 @@ mod tests {
         let save = svc.dispatch(request("POST", "/api/sessions/save", json!({"name": "keypass/test", "session": {"protocol": "sftp", "host": "10.0.0.9", "username": "deploy", "password": "user-secret-pw", "keyfile": key_path, "key_passphrase": "key-secret-pass"}})));
         assert_eq!(save.status, 200, "{}", save.payload);
         let ini = std::fs::read_to_string(tmp.join("sessions.ini")).unwrap();
-        assert!(ini.contains("password=lscp1$"), "{ini}");
-        assert!(ini.contains("key_passphrase=lscp1$"), "{ini}");
+        assert!(ini.starts_with("LSCP-SESSION-VAULT-1$"));
+        let decrypted = SessionStore::read_ini_text(&tmp, svc.secret_vault.as_ref()).unwrap().unwrap();
+        assert!(decrypted.contains("password=lscp1$"));
+        assert!(decrypted.contains("key_passphrase=lscp1$"));
         assert!(!ini.contains("user-secret-pw"));
         assert!(!ini.contains("key-secret-pass"));
         let list = svc.dispatch(request("GET", "/api/sessions", json!({})));

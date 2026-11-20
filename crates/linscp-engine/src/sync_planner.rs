@@ -319,13 +319,14 @@ impl SyncState {
                 continue;
             }
             let fields: Vec<&str> = line.split('\t').collect();
-            if fields.len() < 4 {
-                continue;
+            if fields.len() != 4 || fields[0].is_empty() {
+                return Err(format!("Invalid synchronization state '{}': malformed record", path.display()));
             }
             let rel = unescape_state_value(fields[0]);
-            let local_time = fields[1].parse::<u64>().unwrap_or(0);
-            let remote_time = fields[2].parse::<u64>().unwrap_or(0);
-            let size = fields[3].parse::<u64>().unwrap_or(0);
+            let invalid = || format!("Invalid synchronization state '{}': malformed number", path.display());
+            let local_time = fields[1].parse::<u64>().map_err(|_| invalid())?;
+            let remote_time = fields[2].parse::<u64>().map_err(|_| invalid())?;
+            let size = fields[3].parse::<u64>().map_err(|_| invalid())?;
             state.entries.insert(
                 rel,
                 SyncStateEntry {
@@ -1227,6 +1228,17 @@ pub async fn apply_sync_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrupt_sync_state_is_not_an_empty_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("history");
+        assert!(SyncState::load(&file).is_ok());
+        std::fs::write(&file, "file\tbad\t10\t20\n").unwrap();
+        assert!(SyncState::load(&file).is_err());
+        std::fs::write(&file, "truncated\n").unwrap();
+        assert!(SyncState::load(&file).is_err());
+    }
 
     #[test]
     fn sync_state_hash_and_tsv_match_cpp_planner() {

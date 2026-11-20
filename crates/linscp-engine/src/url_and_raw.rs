@@ -2102,7 +2102,8 @@ async fn connect_site_spec_inner(
                 Some("1") => ProtocolScheme::Ftps,
                 Some("2" | "3") => ProtocolScheme::Ftpes,
                 Some("0") => ProtocolScheme::Ftp,
-                _ => spec.session.protocol,
+                None => spec.session.protocol,
+                Some(mode) => return Err(format!("Invalid FTPS mode '{mode}'.")),
             };
             let ftp_cfg = FtpConnectConfig {
                 scheme: ftp_scheme,

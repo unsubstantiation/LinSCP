@@ -41,6 +41,8 @@ export interface TerminalWindowOptions {
   onModes?: (modes: { app_cursor: boolean }) => void;
   /** Called when a selection - a long press or a mouse drag - opens or closes. */
   onSelection?: (open: boolean) => void;
+  /** Report denied clipboard access to the user. */
+  onClipboardError?: () => void;
 }
 
 interface OpenReply {
@@ -129,6 +131,7 @@ export class TerminalWindow {
       onSelection: (open) => {
         this.options.onSelection?.(open);
       },
+      onClipboardError: () => this.options.onClipboardError?.(),
       keyboard: this.options.keyboard === true,
     });
     this.session = session;
@@ -177,6 +180,16 @@ export class TerminalWindow {
   /** Copies the selection, which also closes it; null when nothing was selected. */
   public async copySelection(): Promise<string | null> {
     return (await this.session?.copySelection()) ?? null;
+  }
+
+  /** Adjust the font of this terminal without affecting other windows. */
+  public changeTextSize(delta: number): number | null {
+    return this.session?.changeTextSize(delta) ?? null;
+  }
+
+  /** Copies all retained text, including scrollback. */
+  public async copyAllText(): Promise<string | null> {
+    return (await this.session?.copyAllText()) ?? null;
   }
 
   /** Clears a selection without copying it. */

@@ -413,6 +413,7 @@ impl SshConnection {
         if cfg.request_gssapi || cfg.request_gssapi_kex {
             ensure_gssapi_available(cfg.request_gssapi_kex)?;
         }
+        if let Some(log) = &cfg.event_logger { log("Opening SSH transport (including any configured proxy)."); }
         let stream = connect_stream_maybe_proxied(
             &cfg.host,
             cfg.port,
@@ -420,6 +421,7 @@ impl SshConnection {
             cfg.connect_timeout,
         )
         .await?;
+        if let Some(log) = &cfg.event_logger { log("SSH transport established; starting handshake and host-key verification."); }
         Self::connect_over_stream(cfg, stream).await
     }
 
@@ -488,7 +490,9 @@ impl SshConnection {
             }
         };
 
+        if let Some(log) = &cfg.event_logger { log("SSH handshake and host-key verification completed; starting authentication."); }
         Self::authenticate(&mut handle, cfg).await?;
+        if let Some(log) = &cfg.event_logger { log("SSH authentication completed."); }
 
         let (observed_key_type, observed_fingerprint) = observed
             .lock()
@@ -511,8 +515,12 @@ impl SshConnection {
         let mut last_error: Option<String> = None;
 
         // 0. Probe `none` userauth to discover advertised server methods (and allow `none` auth).
+        if let Some(log) = &cfg.event_logger { log("Checking server authentication methods."); }
         let server_offers_gssapi = match handle.authenticate_none(&cfg.username).await {
-            Ok(AuthResult::Success) => return Ok(()),
+            Ok(AuthResult::Success) => {
+                if let Some(log) = &cfg.event_logger { log("Server accepted authentication without credentials."); }
+                return Ok(());
+            },
             Ok(AuthResult::Failure {
                 remaining_methods, ..
             }) => remaining_methods.contains(&MethodKind::GssapiWithMic),
@@ -581,6 +589,7 @@ impl SshConnection {
         };
 
         if let Some(raw_key) = key_material {
+            if let Some(log) = &cfg.event_logger { log("Trying configured SSH private key."); }
             let key_pair = load_private_key_text(
                 &raw_key,
                 cfg.key_passphrase.as_deref().map(String::as_str),
@@ -598,13 +607,16 @@ impl SshConnection {
                 .await
                 .map_err(|e| ProtoError::Transport(format!("Public-key auth error: {e}")))?;
             if auth_res.success() {
+                if let Some(log) = &cfg.event_logger { log("Server accepted SSH private-key authentication."); }
                 return Ok(());
             }
+            if let Some(log) = &cfg.event_logger { log("Server rejected the SSH private key."); }
             last_error = Some("Server rejected private key authentication.".to_string());
         }
 
         // 3. SSH Agent (`AgentClient` over platform or custom stream)
         if cfg.try_agent || cfg.agent_connector.is_some() {
+            if let Some(log) = &cfg.event_logger { log("Checking SSH agent identities."); }
             let connector: Arc<dyn SshAgentConnector> = cfg
                 .agent_connector
                 .clone()
@@ -642,6 +654,7 @@ impl SshConnection {
                                 .unwrap_or(false),
                         };
                         if accepted {
+                            if let Some(log) = &cfg.event_logger { log("Server accepted an SSH agent identity."); }
                             return Ok(());
                         }
                     }
@@ -654,25 +667,32 @@ impl SshConnection {
 
         // 4. Password authentication
         if let Some(password) = cfg.password.as_deref() {
+            if let Some(log) = &cfg.event_logger { log("Trying password authentication."); }
             let auth_res = handle
                 .authenticate_password(&cfg.username, password.as_str())
                 .await
                 .map_err(|e| ProtoError::Transport(format!("Password auth error: {e}")))?;
             if auth_res.success() {
+                if let Some(log) = &cfg.event_logger { log("Server accepted password authentication."); }
                 return Ok(());
             }
+            if let Some(log) = &cfg.event_logger { log("Server rejected password authentication."); }
             last_error = Some("Server rejected password authentication.".to_string());
         }
 
         // 5. Keyboard-interactive authentication (responder or password fallback)
         if cfg.keyboard_interactive.is_some() || cfg.password.is_some() {
+            if let Some(log) = &cfg.event_logger { log("Trying keyboard-interactive authentication."); }
             if let Ok(mut step) = handle
                 .authenticate_keyboard_interactive_start(&cfg.username, None::<String>)
                 .await
             {
                 for _round in 0..8 {
                     match step {
-                        KeyboardInteractiveAuthResponse::Success => return Ok(()),
+                        KeyboardInteractiveAuthResponse::Success => {
+                            if let Some(log) = &cfg.event_logger { log("Server accepted keyboard-interactive authentication."); }
+                            return Ok(());
+                        },
                         KeyboardInteractiveAuthResponse::Failure { .. } => {
                             last_error = Some(
                                 "Server rejected keyboard-interactive authentication.".to_string(),

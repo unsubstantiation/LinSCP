@@ -239,3 +239,22 @@ test('per-server pause and metric/custom configuration are persisted and applied
   assert.ok(configured.custom_metrics.some(metric => metric.name === 'Load file' && metric.command === 'cat /proc/loadavg'));
   s.monitor.dispose();
 });
+
+test('picker clears old saved sites while reloading and after a failed refresh', async () => {
+  let calls = 0; let release;
+  const s = setup({ transport: { async get(path) {
+    if (path === '/api/monitor/settings') return { success: false };
+    calls++;
+    if (calls === 1) return { success: true, tabs: [], sites: [{name:'old',host:'old.example',port:22,protocol:'ssh'}] };
+    await new Promise(resolve => { release = resolve; });
+    throw new Error('offline');
+  } } });
+  await s.monitor.open();
+  assert.ok(s.root.textContent.includes('old.example'));
+  const pending = s.monitor.showPicker();
+  assert.ok(!s.root.textContent.includes('old.example'));
+  release(); await pending;
+  assert.ok(!s.root.textContent.includes('old.example'));
+  assert.ok(s.errors.length);
+  s.monitor.dispose();
+});

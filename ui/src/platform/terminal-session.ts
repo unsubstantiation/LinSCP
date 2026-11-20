@@ -202,6 +202,8 @@ export interface TerminalSessionOptions {
   onModes?: (modes: TerminalModes) => void;
   /** Called when a selection - a long press or a mouse drag - opens or closes. */
   onSelection?: (open: boolean) => void;
+  /** Clipboard access can be denied by the host. */
+  onClipboardError?: () => void;
 }
 
 interface FrameReply {
@@ -230,6 +232,8 @@ export class TerminalSession {
   private readonly onResize?: TerminalSessionOptions['onResize'];
   private readonly onModes?: TerminalSessionOptions['onModes'];
   private readonly onSelection?: TerminalSessionOptions['onSelection'];
+  private readonly onClipboardError?: TerminalSessionOptions['onClipboardError'];
+  private selectionQueue: Promise<void> = Promise.resolve();
   public readonly terminal: string;
   private readonly renderer: TerminalRenderer;
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -309,13 +313,18 @@ export class TerminalSession {
     this.onResize = options.onResize;
     this.onModes = options.onModes;
     this.onSelection = options.onSelection;
+    this.onClipboardError = options.onClipboardError;
     this.renderer = new TerminalRenderer({
       container: options.container,
       onCellSize: (size) => {
         // The model answers a program that asks how large the text area is in
         // pixels, and only the renderer knows what a cell measures.
         if (this.grid) {
-          void this.resize({ width: size.width, height: size.height });
+          const next = this.renderer.size();
+          if (next.columns !== this.grid.columns || next.lines !== this.grid.lines) {
+            this.onResize?.(next);
+          }
+          void this.resize({ ...next, width: size.width, height: size.height });
         }
       },
     });
@@ -331,6 +340,7 @@ export class TerminalSession {
     // anchors, drag extends, release copies. The move and release live on the
     // document so a drag that leaves the canvas still finishes where it began.
     canvas.addEventListener('mousedown', this.handleMouseDown);
+    canvas.addEventListener('contextmenu', this.handleContextMenu);
     doc?.addEventListener('mousemove', this.handleMouseMove);
     doc?.addEventListener('mouseup', this.handleMouseUp);
     if (options.keyboard) {
@@ -376,6 +386,11 @@ export class TerminalSession {
   /** The grid the window can show, in cells. */
   public size(): { columns: number; lines: number } {
     return this.renderer.size();
+  }
+
+  /** Change text size, remeasure cells and report the new grid to the PTY. */
+  public changeTextSize(delta: number): number {
+    return this.renderer.setTextSize(this.renderer.textSize + delta);
   }
 
   /** Starts painting and polling. */
@@ -471,6 +486,7 @@ export class TerminalSession {
       this.canvas.removeEventListener('touchend', this.handleTouchEnd);
       this.canvas.removeEventListener('wheel', this.handleWheel);
       this.canvas.removeEventListener('mousedown', this.handleMouseDown);
+      this.canvas.removeEventListener('contextmenu', this.handleContextMenu);
       this.canvas = null;
     }
     if (this.eventDoc) {
@@ -575,6 +591,11 @@ export class TerminalSession {
 
   /** Handles one key press and reports whether it was sent. */
   public handleKey(event: KeyEventLike, modes?: { app_cursor: boolean; bracketed_paste: boolean }): boolean {
+    if (event.ctrlKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 'v') {
+      event.preventDefault?.();
+      void this.pasteClipboard();
+      return true;
+    }
     const active = modes ?? this.modes;
     const encoded = encodeKey(event, active.app_cursor);
     if (encoded === null) {
@@ -620,45 +641,36 @@ export class TerminalSession {
    * about which text that is.
    */
   public async select(start: Cell, end: Cell = start): Promise<void> {
-    try {
+    const run = async (): Promise<void> => {
       await this.transport.post('/api/terminal/select', {
-        terminal: this.terminal,
-        action: 'start',
-        row: start.row,
-        column: start.column,
+        terminal: this.terminal, action: 'start', row: start.row, column: start.column,
       });
       if (end.row !== start.row || end.column !== start.column) {
         await this.transport.post('/api/terminal/select', {
-          terminal: this.terminal,
-          action: 'extend',
-          row: end.row,
-          column: end.column,
+          terminal: this.terminal, action: 'extend', row: end.row, column: end.column,
         });
       }
-    } catch {
-      // A selection that could not be made leaves the screen as it was.
-    }
+    };
+    this.selectionQueue = this.selectionQueue.then(run).catch(() => {});
+    await this.selectionQueue;
   }
 
   /** Drops the selection, so the screen paints plain again. */
   public async clearSelection(): Promise<void> {
-    try {
+    this.selectionQueue = this.selectionQueue.then(async () => {
       await this.transport.post('/api/terminal/select', { terminal: this.terminal, action: 'clear' });
-    } catch {
-      // Already gone is the same outcome.
-    }
+    }).catch(() => {});
+    await this.selectionQueue;
   }
 
   /** The selected text, or null when nothing is selected. */
   public async selectedText(): Promise<string | null> {
-    try {
-      const reply = await this.transport.get<{ success?: boolean; text?: string | null }>(
-        `/api/terminal/selection?terminal=${encodeURIComponent(this.terminal)}`,
-      );
-      return reply && reply.success ? reply.text ?? null : null;
-    } catch {
-      return null;
-    }
+    await this.selectionQueue;
+    const reply = await this.transport.get<{ success?: boolean; text?: string | null; error?: string }>(
+      `/api/terminal/selection?terminal=${encodeURIComponent(this.terminal)}`,
+    );
+    if (!reply?.success) throw new Error(reply?.error || 'Cannot read terminal selection.');
+    return reply.text ?? null;
   }
 
   /**
@@ -670,45 +682,67 @@ export class TerminalSession {
    */
   public async copySelection(): Promise<string | null> {
     const text = await this.selectedText();
-    // Copying finishes the selection: a highlighted block left on screen after
-    // the text is already in the clipboard is a block nobody can act on.
-    await this.endSelection();
-    if (!text) {
-      return null;
-    }
+    if (!text) return null;
     await this.writeClipboard(text);
+    await this.endSelection();
     return text;
   }
 
-  /**
-   * Copies the selection but leaves it highlighted.
-   *
-   * This is the mouse's copy: a drag that just finished is showing the person
-   * what landed on the clipboard, and clearing it would take that away before
-   * they could check it. The next click clears it.
-   */
-  private async copySelectionKeepHighlight(): Promise<void> {
-    if (this.stopped) {
-      return;
-    }
-    const text = await this.selectedText();
-    if (!text || this.stopped) {
-      return;
-    }
-    await this.writeClipboard(text);
+  /** Copies the retained model buffer, not the canvas or raw escape sequences. */
+  public async copyAllText(): Promise<string | null> {
+    const reply = await this.transport.get<{ success?: boolean; text?: string; error?: string }>(
+      `/api/terminal/text?terminal=${encodeURIComponent(this.terminal)}`,
+    );
+    if (!reply?.success) throw new Error(reply?.error || 'Cannot read terminal text.');
+    if (!reply.text) return null;
+    await this.writeClipboard(reply.text);
+    return reply.text;
   }
 
-  /** Hands text to the system clipboard, when the host has one to give. */
-  private async writeClipboard(text: string): Promise<void> {
+  /** A mouse drag copies without removing its highlight. */
+  private async copySelectionKeepHighlight(): Promise<void> {
+    if (this.stopped) return;
     try {
-      const clipboard = (this.renderer.element.ownerDocument.defaultView as Window | null)
-        ?.navigator?.clipboard;
-      await clipboard?.writeText(text);
-    } catch {
-      // A refused clipboard leaves the selection in place; the caller may still
-      // show it.
-    }
+      const text = await this.selectedText();
+      if (!text || this.stopped) return;
+      await this.writeClipboard(text);
+    } catch { this.onClipboardError?.(); }
   }
+
+  /** Write via the clipboard API, with a native WebView fallback. */
+  private async writeClipboard(text: string): Promise<void> {
+    const doc = this.renderer.element.ownerDocument;
+    try {
+      const clipboard = doc.defaultView?.navigator?.clipboard;
+      if (clipboard?.writeText) { await clipboard.writeText(text); return; }
+    } catch { /* Fall back to the document copy command. */ }
+    const field = doc.createElement('textarea');
+    field.value = text;
+    field.setAttribute('readonly', '');
+    field.style.position = 'fixed';
+    field.style.left = '-10000px';
+    doc.body.appendChild(field);
+    field.select();
+    let copied = false;
+    try { copied = doc.execCommand('copy'); } catch { /* Report failure below. */ }
+    field.remove();
+    if (!copied) throw new Error('Cannot copy terminal text to the clipboard.');
+  }
+
+  /** Paste only after an explicit gesture; never forward a refused read. */
+  private async pasteClipboard(): Promise<void> {
+    try {
+      const clipboard = this.renderer.element.ownerDocument.defaultView?.navigator?.clipboard;
+      if (!clipboard?.readText) throw new Error('Clipboard unavailable');
+      const text = await clipboard.readText();
+      if (text && !this.stopped) this.paste(text);
+    } catch { this.onClipboardError?.(); }
+  }
+
+  private readonly handleContextMenu = (event: MouseEvent): void => {
+    event.preventDefault();
+    if (!this.stopped) void this.pasteClipboard();
+  };
 
   /** Scrolls the model's viewport; positive is up into history. */
   public async scroll(lines: number): Promise<void> {
@@ -814,8 +848,8 @@ export class TerminalSession {
     // has to be the release, not the press, or a long drag's mouse events
     // would fall outside the window that ignores them.
     this.lastTouch = Date.now();
-    // A gesture that ended on a selection leaves it in place to be copied; the
-    // person taps again to clear it, which is what a selection is for.
+    // Like a mouse drag, a completed touch selection copies on release.
+    if (this.selecting) void this.copySelectionKeepHighlight();
   };
 
   private cancelLongPress(): void {

@@ -1033,7 +1033,7 @@ impl QueueManager {
                     remote_root,
                 );
                 let state_file = SyncState::state_path(config_dir, &state_key);
-                let mut state = SyncState::load(&state_file).unwrap_or_default();
+                let mut state = SyncState::load(&state_file)?;
                 // A granted root plans and applies through `LocalFs`; a
                 // plain root keeps the direct path, byte for byte as before.
                 let saf_fs = if crate::is_saf_path(&local_root.to_string_lossy()) {
@@ -1061,7 +1061,7 @@ impl QueueManager {
                     saf_fs,
                 )
                 .await?;
-                let _ = state.save(&state_file);
+                state.save(&state_file).map_err(|error| format!("Synchronization file operations completed, but the baseline could not be saved: {error}"))?;
                 Ok(())
             }
             QueueJob::KeepUpToDate {
