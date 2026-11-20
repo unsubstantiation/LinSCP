@@ -105,23 +105,41 @@ The first fields are `url`, `username`, and `password`. LinSCP-specific fields
 use the `linscp_` prefix so OfflineOTP's existing password-entry model can
 preserve them as ordinary additional columns:
 
-- `linscp_session_json` is the portable saved-session record (including
-  protocol, remote directories, proxy/jump-host configuration, their credentials
-  and the saved key password).
-  Local directory paths, key/certificate file paths and unreadable ciphertext are omitted; key
-  material is carried separately when it is an SSH key. The sensitive session
-  data is protected by the enclosing encrypted backup (or, for a plain-text
-  backup, nothing — see the previous section). Export refuses settings
-  containing credentials LinSCP cannot safely restore.
+- `linscp_session_json` is the complete portable saved-session record (including
+  folder, protocol, remote and local directories, `other_local_dir` for
+  dual-local sessions, proxy/jump-host configuration and credentials, the saved
+  key password, `sudo_password_auto`, alternate host/port/fallback,
+  auto-reconnect, S3/FTP/TLS/GSSAPI options, color, note, preset name, and
+  `last_used`). Key/certificate file paths and unreadable ciphertext are
+  omitted; SSH key material is carried in sibling `SSH_KEY` entries, TLS
+  certificate/key material is carried in Base64 metadata columns below, and any
+  file-based `pinned_public_key` is normalized to inline `sha256//<base64>`
+  SPKI pins. The sensitive session data is protected by the enclosing encrypted
+  backup (or, for a plain-text backup, nothing — see the previous section).
+  Export refuses settings containing credentials LinSCP cannot safely restore.
 - `linscp_ssh_key_label` and `linscp_tunnel_key_label`, when present, identify
-  the separate SSH_KEY entries carrying the main and jump-host key material.
+  the separate `SSH_KEY` entries carrying the main and jump-host key material
+  (including public-only `vaultpub://` or `.pub` keys).
+- `linscp_ca_cert_b64`, `linscp_tls_cert_b64`, and `linscp_tls_key_b64`, when
+  present, carry Base64-encoded CA bundle (`ca_certificate_file` +
+  `ca_certificate_dir`), TLS client certificate (`tls_certificate_file` /
+  `certificate`), and TLS client private key (`tls_certificate_key_file`) bytes
+  (up to 384 KiB raw bytes each).
+- `linscp_cached_hostkeys_b64`, when present, carries Base64-encoded
+  `sshhostkeys` entries scoped strictly to the session's own SSH primary,
+  alternate, and jump-host endpoints.
+- `linscp_transfer_preset_b64`, when present, carries the Base64-encoded
+  `transfer-presets.ini` section for a custom transfer preset named by the
+  session.
 
 This lets OfflineOTP retain connection context and a later importer
 reconstruct LinSCP sessions without requiring OfflineOTP to interpret LinSCP's
-settings today. On import, LinSCP writes private key material to fresh
-owner-only files inside its config directory and never trusts a path from the
-backup. Field names are unique case-insensitively; at most 64 columns and 64
-KiB per field are accepted, with a 4 MiB encoded payload limit per entry.
+settings today. On import, LinSCP writes private SSH key material (`keys/<id>.key.vault`,
+`vaultkey://<id>`), public-only SSH keys (`keys/<id>.pub`, `vaultpub://<id>`),
+and TLS CA/certificate/key blobs (`keys/<id>.tls.vault`, `vaulttls://<id>`) to
+fresh owner-only files inside its config directory and never trusts a file path
+from the backup. Field names are unique case-insensitively; at most 64 columns
+and 512 KiB per field are accepted, with a 4 MiB encoded payload limit per entry.
 
 The generic OfflineOTP `SSH_KEY` and `PASSWORD` entries remain useful on their
 own: users can inspect/copy stored keys and credentials in OfflineOTP even

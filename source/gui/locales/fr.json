@@ -882,7 +882,7 @@
   "The backend refused this request.": "Le backend a refusé cette requête.",
   "The backup contains no LinSCP sessions.": "La sauvegarde ne contient aucune session LinSCP.",
   "The backup could not be read.": "La sauvegarde n’a pas pu être lue.",
-  "The backup password is not saved. The export is a timestamped LinSCP backup; import it with Key/Session Import. Local directory and certificate-file paths are omitted; SSH key contents are included.": "Le mot de passe de sauvegarde n’est pas enregistré. L’export est une sauvegarde LinSCP horodatée ; importez-la avec Key/Session Import. Les chemins de répertoire local et de fichiers de certificat sont omis ; le contenu des clés SSH est inclus.",
+  "The backup password is not saved. The export is a timestamped LinSCP backup; import it with Key/Session Import. All saved session settings, directories, SSH keys, TLS certificates, remembered host keys and transfer presets are included.": "Le mot de passe de sauvegarde n’est pas enregistré. L’export est une sauvegarde LinSCP horodatée ; importez-la avec Key/Session Import. Tous les paramètres enregistrés de la session, répertoires, clés SSH, certificats TLS, clés d’hôte mémorisées et préréglages de transfert sont inclus.",
   "The backup passwords do not match.": "Les mots de passe de sauvegarde ne correspondent pas.",
   "The command finished.": "La commande est terminée.",
   "The copy is queued.": "La copie est en file d’attente.",

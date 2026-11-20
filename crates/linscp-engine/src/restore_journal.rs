@@ -29,7 +29,7 @@ type Record = (String, Option<Zeroizing<Vec<u8>>>);
 
 fn valid_key_name(name: &str) -> bool {
     let Some(leaf) = name.strip_prefix("keys/") else { return false; };
-    let id = [".key.vault", ".label", ".pub"].iter().find_map(|suffix| leaf.strip_suffix(suffix));
+    let id = [".key.vault", ".tls.vault", ".label", ".pub"].iter().find_map(|suffix| leaf.strip_suffix(suffix));
     id.is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 

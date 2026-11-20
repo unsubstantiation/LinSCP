@@ -33,6 +33,10 @@ impl HostKeyCache {
         Self::default()
     }
 
+    pub fn entries(&self) -> &[CachedHostKeyEntry] {
+        &self.entries
+    }
+
     pub fn parse(text: &str) -> Self {
         let mut entries = Vec::new();
         for raw in text.lines() {

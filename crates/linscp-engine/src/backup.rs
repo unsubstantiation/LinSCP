@@ -28,8 +28,17 @@ pub struct BackupVaultKey {
     pub public_b64: Option<String>,
 }
 
+/// Encrypted TLS certificate/CA/key blob stored under `keys/<id>.tls.vault`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupVaultTlsBlob {
+    pub id: String,
+    pub encrypted_b64: String,
+}
+
 const KEY_LIMIT: usize = 1024 * 1024;
 const KEY_BLOB_LIMIT: usize = KEY_LIMIT + 64;
+const TLS_LIMIT: usize = 384 * 1024;
+const TLS_BLOB_LIMIT: usize = TLS_LIMIT + 64;
 const KEY_COUNT_LIMIT: usize = 2000;
 const LABEL_LIMIT: usize = 512;
 const PUBLIC_LIMIT: usize = 32 * 1024;
@@ -113,6 +122,63 @@ fn validate_key_references(ini: &str, keys: &[BackupVaultKey]) -> Result<(), Str
     Ok(())
 }
 
+fn session_tls_references(ini: &str) -> Result<BTreeSet<String>, String> {
+    let store = SessionStore::parse_ini(ini, None)?;
+    let mut ids = BTreeSet::new();
+    for site in store.sites() {
+        for field in ["ca_certificate_file", "tls_certificate_file", "tls_certificate_key_file"] {
+            if let Some(id) = site.extra_fields.get(field).and_then(|v| v.strip_prefix("vaulttls://")) {
+                if !valid_key_id(id) { return Err("Invalid vault TLS certificate reference in saved sessions.".into()); }
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn collect_vault_tls_blobs(config_dir: &Path, vault: &dyn SecretVault) -> Result<Vec<BackupVaultTlsBlob>, String> {
+    let key_dir = config_dir.join("keys");
+    match std::fs::symlink_metadata(&key_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {},
+        Ok(_) => return Err("The vault keys path is not a directory.".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("Cannot inspect vault TLS blobs: {e}")),
+    }
+    let entries = match std::fs::read_dir(&key_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("Cannot inspect vault TLS blobs: {e}")),
+    };
+    let mut blobs = Vec::new();
+    let mut names = BTreeSet::new();
+    let mut total_bytes = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| "Invalid vault TLS filename".to_string())?;
+        let Some(id) = name.strip_suffix(".tls.vault") else { continue; };
+        if !valid_key_id(id) || !names.insert(id.to_ascii_lowercase()) || blobs.len() >= KEY_COUNT_LIMIT {
+            return Err("Invalid or duplicate vault TLS identifier.".into());
+        }
+        let encrypted = read_key_file(&entry.path(), TLS_BLOB_LIMIT)?.ok_or_else(|| "Vault TLS blob disappeared during backup.".to_string())?;
+        total_bytes = total_bytes.checked_add(encrypted.len()).ok_or_else(|| "Vault TLS blobs exceed backup size limit.".to_string())?;
+        if total_bytes > 32 * 1024 * 1024 { return Err("Vault TLS blobs exceed backup size limit.".into()); }
+        let plaintext = vault.open_session_store(&encrypted).map_err(|e| format!("Cannot open vault TLS blob {id}: {e}"))?;
+        if plaintext.is_empty() || plaintext.len() > TLS_LIMIT { return Err("Invalid vault TLS blob size.".into()); }
+        blobs.push(BackupVaultTlsBlob { id: id.to_string(), encrypted_b64: BASE64.encode(encrypted) });
+    }
+    blobs.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(blobs)
+}
+
+fn validate_tls_references(ini: &str, blobs: &[BackupVaultTlsBlob]) -> Result<(), String> {
+    let ids: BTreeSet<&str> = blobs.iter().map(|blob| blob.id.as_str()).collect();
+    for id in session_tls_references(ini)? {
+        if !ids.contains(id.as_str()) { return Err(format!("Backup is missing vault TLS material {id} referenced by a saved session.")); }
+    }
+    Ok(())
+}
+
 /// In-memory portable backup bundle. Its serialized JSON contains secrets and
 /// must only be persisted inside an encrypted backup envelope.
 ///
@@ -142,6 +208,9 @@ pub struct BackupBundle {
     /// All local vault SSH keys, including unreferenced keys.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vault_keys: Vec<BackupVaultKey>,
+    /// All local vault TLS certificate/CA/key blobs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vault_tls_blobs: Vec<BackupVaultTlsBlob>,
     /// `workspaces.json` content.
     #[serde(default)]
     pub workspaces: Vec<WorkspaceSnapshot>,
@@ -183,6 +252,7 @@ impl Default for BackupBundle {
             sessions_ini: String::new(),
             sessions_key_b64: None,
             vault_keys: Vec::new(),
+            vault_tls_blobs: Vec::new(),
             workspaces: Vec::new(),
             commander_workspaces: None,
             bookmarks: Vec::new(),
@@ -250,10 +320,12 @@ pub fn export_backup(
         return Err("Unlock the local vault before exporting a backup.".into());
     }
     let vault_keys = collect_vault_keys(config_dir, vault)?;
+    let vault_tls_blobs = collect_vault_tls_blobs(config_dir, vault)?;
     let sessions_ini = SessionStore::read_ini_text(config_dir, vault)?
         .map(|s| normalize_to_lf(&s))
         .unwrap_or_default();
     validate_key_references(&sessions_ini, &vault_keys)?;
+    validate_tls_references(&sessions_ini, &vault_tls_blobs)?;
 
     // Export the *unwrapped* master key as portable base64. This is what
     // makes the backup cross-distribution: every platform reads the same
@@ -306,6 +378,7 @@ pub fn export_backup(
         sessions_ini,
         sessions_key_b64,
         vault_keys,
+        vault_tls_blobs,
         workspaces,
         commander_workspaces,
         bookmarks,
@@ -427,6 +500,60 @@ fn prepare_vault_key_restore(config_dir: &Path, bundle: &BackupBundle, vault: &d
     Ok(prepared)
 }
 
+fn prepare_vault_tls_restore(config_dir: &Path, bundle: &BackupBundle, vault: &dyn SecretVault) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
+    if bundle.vault_tls_blobs.is_empty() { return Ok(Vec::new()); }
+    if !vault.protects_session_store() { return Err("Restoring vault TLS certificates requires an unlocked local password vault.".into()); }
+    if bundle.vault_tls_blobs.len() > KEY_COUNT_LIMIT { return Err("Too many vault TLS blobs in backup.".into()); }
+    let encoded_master = bundle.sessions_key_b64.as_ref().ok_or_else(|| "Backup has vault TLS blobs but no source master key.".to_string())?;
+    let source = zeroize::Zeroizing::new(BASE64.decode(encoded_master).map_err(|_| "Invalid source master key".to_string())?);
+    let source_key: &[u8; 32] = source.as_slice().try_into().map_err(|_| "Invalid source master key length".to_string())?;
+    let dir = config_dir.join("keys");
+    let mut existing_names = BTreeSet::new();
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.file_type().is_dir() => {
+            for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+                let name = entry.map_err(|e| e.to_string())?.file_name().to_string_lossy().to_string();
+                existing_names.insert(name.to_ascii_lowercase());
+            }
+        }
+        Ok(_) => return Err("The vault keys path is not a directory.".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("Cannot inspect vault keys: {e}")),
+    }
+    let mut names = BTreeSet::new();
+    let mut prepared = Vec::new();
+    let mut total_bytes = 0usize;
+    for blob in &bundle.vault_tls_blobs {
+        if !valid_key_id(&blob.id) || !names.insert(blob.id.to_ascii_lowercase()) {
+            return Err("Invalid or duplicate vault TLS identifier in backup.".into());
+        }
+        if blob.encrypted_b64.len() > ((TLS_BLOB_LIMIT + 2) / 3) * 4 { return Err("Vault TLS blob is too large.".into()); }
+        let encrypted = BASE64.decode(&blob.encrypted_b64).map_err(|_| "Invalid vault TLS encoding".to_string())?;
+        if encrypted.len() > TLS_BLOB_LIMIT { return Err("Vault TLS blob is too large.".into()); }
+        total_bytes = total_bytes.checked_add(encrypted.len()).ok_or_else(|| "Vault TLS blobs exceed backup size limit.".to_string())?;
+        if total_bytes > 32 * 1024 * 1024 { return Err("Vault TLS blobs exceed backup size limit.".into()); }
+        let plaintext = linscp_platform::password_vault::open_blob_with_master_key(&encrypted, source_key)
+            .map_err(|e| format!("Cannot decrypt backup vault TLS blob {}: {e}", blob.id))?;
+        if plaintext.is_empty() || plaintext.len() > TLS_LIMIT { return Err("Invalid backup vault TLS blob size.".into()); }
+        let filename = format!("{}.tls.vault", blob.id);
+        let path = dir.join(&filename);
+        let existing = read_key_file(&path, TLS_BLOB_LIMIT)?;
+        if existing.is_none() && existing_names.contains(&filename.to_ascii_lowercase()) {
+            return Err(format!("Vault TLS ID {} conflicts with an existing filename.", blob.id));
+        }
+        if let Some(existing) = existing {
+            let existing_plain = vault.open_session_store(&existing).map_err(|e| format!("Cannot read existing vault TLS blob {}: {e}", blob.id))?;
+            if existing_plain.as_slice() != plaintext.as_slice() {
+                return Err(format!("Vault TLS ID {} already belongs to different TLS material; restore into a separate vault.", blob.id));
+            }
+        } else {
+            let sealed = vault.seal_session_store(&plaintext).map_err(|e| e.to_string())?;
+            prepared.push((path, sealed));
+        }
+    }
+    Ok(prepared)
+}
+
 fn publish_restored_keys(files: Vec<(PathBuf, Vec<u8>)>, config_dir: &Path) -> Result<(), String> {
     if files.is_empty() { return Ok(()); }
     let dir = config_dir.join("keys");
@@ -490,6 +617,7 @@ fn prepare_restore_plan(
         return Err(format!("Unsupported backup version: {}", bundle.version));
     }
     validate_key_references(&bundle.sessions_ini, &bundle.vault_keys)?;
+    validate_tls_references(&bundle.sessions_ini, &bundle.vault_tls_blobs)?;
 
     linscp_platform::create_private_dir(config_dir).map_err(|e| e.to_string())?;
     let _existing_sessions = SessionStore::read_ini_text(config_dir, vault)?;
@@ -550,7 +678,8 @@ fn prepare_restore_plan(
             .map_err(|e| format!("Backup sessions.ini invalid: {e}"))?;
     }
 
-    let restored_keys = prepare_vault_key_restore(config_dir, bundle, vault)?;
+    let mut restored_keys = prepare_vault_key_restore(config_dir, bundle, vault)?;
+    restored_keys.extend(prepare_vault_tls_restore(config_dir, bundle, vault)?);
     let mut key_names = Vec::with_capacity(restored_keys.len());
     for (path, _) in &restored_keys {
         if path.parent() != Some(config_dir.join("keys").as_path()) {
@@ -817,6 +946,7 @@ mod tests {
             sessions_ini: ini,
             sessions_key_b64: Some(raw_b64),
             vault_keys: Vec::new(),
+            vault_tls_blobs: Vec::new(),
             workspaces: vec![WorkspaceSnapshot {
                 name: "Deploy".to_string(),
                 tabs: vec![linscp_types::WorkspaceTabSnapshot {
