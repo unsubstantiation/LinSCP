@@ -248,6 +248,7 @@ impl CommanderService {
             ("POST", "/api/sessions/copy") => self.handle_copy_session(req.body),
             ("POST", "/api/sessions/delete") => self.handle_delete_session(req.body),
             ("GET", "/api/sessions/import") => self.handle_sessions_import_get(&query),
+            ("POST", "/api/sessions/import") => self.handle_sessions_import_post(req.body),
             ("POST", "/api/import/openssh") => self.handle_import_openssh(req.body),
             ("POST", "/api/import/filezilla") => self.handle_import_filezilla(req.body),
             ("GET", "/api/bookmarks") => self.handle_get_bookmarks(&query),
@@ -2993,8 +2994,14 @@ impl CommanderService {
         }
         let final_name = if name.is_empty() { session_val.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string() } else { name };
         if final_name.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "A session name is required"})}; }
-        // Validate session data via tabs parser
+        // Read before protecting any new keys or changing the store. Never
+        // interpret an unreadable sessions file as an empty one.
         let cfg_root = self.state.lock().expect("m").config_root.clone();
+        let mut store = match SessionStore::load_from_dir(&cfg_root, self.secret_vault.as_ref()) {
+            Ok(store) => store,
+            Err(error) => return api_error(500, format!("Cannot load stored sessions: {error}")),
+        };
+        // Validate session data via tabs parser
         let spec_res = tabs::parse_gui_session_spec(&session_val, None, &cfg_root, self.secret_vault.as_ref());
         if let Err(e) = spec_res { return ApiReply{ status: 400, payload: json!({"success": false, "error": e})}; }
         let (mut spec, _) = spec_res.unwrap();
@@ -3006,11 +3013,7 @@ impl CommanderService {
         let keep_tunnel_password = session_val.get("keep_tunnel_password").and_then(Value::as_bool).unwrap_or(false);
         let keep_tunnel_passphrase = session_val.get("keep_tunnel_passphrase").and_then(Value::as_bool).unwrap_or(false);
         if keep_password || keep_key_passphrase || keep_tunnel_password || keep_tunnel_passphrase {
-            if let Some(existing) = SessionStore::load_from_dir(&cfg_root, self.secret_vault.as_ref())
-                .unwrap_or_default()
-                .find(&final_name)
-                .cloned()
-            {
+            if let Some(existing) = store.find(&final_name) {
                 if keep_password && spec.session.password.is_none() {
                     spec.session.password = existing.password.clone();
                 }
@@ -3038,7 +3041,6 @@ impl CommanderService {
             for path in protected_key_files { let _ = std::fs::remove_file(path); }
             return api_error(400, error);
         }
-        let mut store = SessionStore::load_from_dir(&cfg_root, self.secret_vault.as_ref()).unwrap_or_default();
         store.upsert(stored);
         if let Err(e) = store.save_to_dir(&cfg_root, self.secret_vault.as_ref()) {
             for path in protected_key_files { let _ = std::fs::remove_file(path); }
@@ -3074,8 +3076,15 @@ impl CommanderService {
         let mut store = match SessionStore::load_from_dir(&cfg, self.secret_vault.as_ref()) {
             Ok(s) => s, Err(e) => return ApiReply{ status: 500, payload: json!({"success": false, "error": e})},
         };
-        if !store.remove(&name) {
-            return ApiReply{ status: 400, payload: json!({"success": false, "error": format!("No session named '{name}'")})};
+        let folder = match body.get("folder") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return api_error(400, "The folder flag must be a boolean."),
+        };
+        let removed = if folder { store.remove_folder(&name) } else { usize::from(store.remove(&name)) };
+        if removed == 0 {
+            let kind = if folder { "folder" } else { "session" };
+            return ApiReply{ status: 400, payload: json!({"success": false, "error": format!("No {kind} named '{name}'")})};
         }
         if let Err(e) = store.save_to_dir(&cfg, self.secret_vault.as_ref()) {
             return ApiReply{ status: 500, payload: json!({"success": false, "error": e})};
@@ -3084,10 +3093,81 @@ impl CommanderService {
     }
 
     fn handle_sessions_import_get(&self, query: &BTreeMap<String,String>) -> ApiReply {
-        let source = query.get("source").cloned().unwrap_or_default();
-        let path = query.get("path").cloned().unwrap_or_default();
-        // Simplified: just report no sources
-        ApiReply{ status: 200, payload: json!({"success": true, "sources": []})}
+        let source = query.get("source").map(String::as_str).unwrap_or("");
+        let path = query.get("path").map(String::as_str).unwrap_or("");
+        let (path, report, fingerprint) = match read_session_import(source, path) {
+            Ok(result) => result,
+            Err(error) => return api_error(400, error),
+        };
+        let entries: Vec<Value> = report.imported.iter().map(|site| json!({
+            "name": site.name, "protocol": site.protocol.as_str(), "host": site.host,
+            "port": site.port, "username": site.username, "has_password": site.password.is_some(),
+        })).collect();
+        let skipped: Vec<Value> = report.skipped.iter().map(|item| json!({"name":item.label, "reason":item.reason})).collect();
+        ApiReply { status: 200, payload: json!({"success":true, "sources":[{
+            "source":source, "path":path.to_string_lossy(), "exists":true,
+            "entries":entries, "skipped":skipped, "fingerprint":fingerprint
+        }]}) }
+    }
+
+    fn handle_sessions_import_post(&self, body: Value) -> ApiReply {
+        let _guard = self.session_key_lock.lock().expect("session key lock");
+        let source = body.get("source").and_then(Value::as_str).unwrap_or("");
+        let path = body.get("path").and_then(Value::as_str).unwrap_or("");
+        let (path, report, fingerprint) = match read_session_import(source, path) {
+            Ok(result) => result,
+            Err(error) => return api_error(400, error),
+        };
+        if body.get("fingerprint").and_then(Value::as_str) != Some(fingerprint.as_str()) {
+            return api_error(409, "The import source changed or has not been scanned. Refresh it before importing.");
+        }
+        let selection = match parse_name_selection(body.get("names")) {
+            Ok(Some(names)) if !names.is_empty() => names,
+            _ => return api_error(400, "Select at least one session to import."),
+        };
+        let overwrite = body.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
+        let cfg = self.config_root();
+        let mut store = match SessionStore::load_from_dir(&cfg, self.secret_vault.as_ref()) {
+            Ok(store) => store, Err(error) => return api_error(500, error),
+        };
+        let mut unique = std::collections::HashSet::new();
+        let mut found = std::collections::HashSet::new();
+        let mut imported = Vec::new();
+        let mut skipped = Vec::new();
+        let mut created = Vec::new();
+        let result: Result<(), String> = (|| {
+            for candidate in report.imported.into_iter().filter(|site| selection.contains(&site.name)) {
+                if !unique.insert(candidate.name.to_ascii_lowercase()) {
+                    return Err("The import contains duplicate selected session names.".to_string());
+                }
+                found.insert(candidate.name.clone());
+                let existing = store.find(&candidate.name).map(|site| site.name.clone());
+                if existing.is_some() && !overwrite {
+                    skipped.push(json!({"name":candidate.name,"reason":"A stored session with that name already exists."}));
+                    continue;
+                }
+                let mut site = StoredSite::new(&candidate.name, candidate.protocol, &candidate.host);
+                site.port = candidate.port;
+                site.username = candidate.username;
+                site.password = candidate.password;
+                site.private_key = candidate.private_key;
+                site.remote_directory = candidate.remote_directory;
+                site.local_directory = candidate.local_directory;
+                validate_imported_site(&site)?;
+                protect_stored_ssh_keys(&mut site, &cfg, self.secret_vault.as_ref(), &mut created)?;
+                if let Some(existing) = existing { store.remove(&existing); }
+                imported.push(site.name.clone());
+                store.upsert(site);
+            }
+            if found != selection { return Err("Some selected sessions are no longer in the import source.".to_string()); }
+            if !imported.is_empty() { store.save_to_dir(&cfg, self.secret_vault.as_ref())?; }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for file in created { let _ = std::fs::remove_file(file); }
+            return api_error(400, error);
+        }
+        ApiReply { status: 200, payload: json!({"success":true, "path":path.to_string_lossy(), "imported":imported, "skipped":skipped}) }
     }
 
     fn handle_import_openssh(&self, body: Value) -> ApiReply {
@@ -5080,6 +5160,40 @@ fn unix_now_seconds() -> u64 {
 /// returned as a set; `None` means the caller did not restrict the
 /// operation. An explicitly empty selection is allowed here and rejected by
 /// the handlers with a clear message.
+/// Read and parse a local import file with a strict cap. Fingerprint the bytes
+/// so a changed source cannot silently replace a different selection after scan.
+fn read_session_import(source: &str, raw_path: &str) -> Result<(PathBuf, linscp_types::ImportReport, String), String> {
+    use std::io::Read as _;
+    let home = std::env::var_os("HOME").filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty())).map(PathBuf::from);
+    let path = if raw_path.trim().is_empty() {
+        match source {
+            "openssh" => home.as_ref().ok_or("Cannot determine the home directory.")?.join(".ssh").join("config"),
+            "filezilla" => {
+                let base = std::env::var_os(if cfg!(windows) { "APPDATA" } else { "XDG_CONFIG_HOME" })
+                    .filter(|value| !value.is_empty()).map(PathBuf::from)
+                    .or_else(|| home.as_ref().map(|home| home.join(".config")))
+                    .ok_or("Cannot determine the configuration directory.")?;
+                base.join("filezilla").join("sitemanager.xml")
+            },
+            _ => return Err("Unknown session import source.".to_string()),
+        }
+    } else {
+        if source != "openssh" && source != "filezilla" { return Err("Unknown session import source.".to_string()); }
+        PathBuf::from(linscp_platform::terminal::expand_tilde(raw_path.trim()))
+    };
+    let file = std::fs::File::open(&path).map_err(|error| format!("Cannot open import source: {error}"))?;
+    if !file.metadata().map_err(|error| error.to_string())?.is_file() { return Err("The import source must be a regular file.".to_string()); }
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    file.take(2 * 1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|error| format!("Cannot read import source: {error}"))?;
+    if bytes.len() > 2 * 1024 * 1024 { return Err("The import source exceeds the 2 MiB limit.".to_string()); }
+    let text = std::str::from_utf8(&bytes).map_err(|_| "The import source is not UTF-8.".to_string())?;
+    let fingerprint = linscp_crypto::digests::sha256_hex(&bytes);
+    let report = if source == "openssh" { parse_openssh_config(text, home.as_deref()) }
+        else { parse_filezilla_xml(text)? };
+    Ok((path, report, fingerprint))
+}
+
 fn parse_name_selection(value: Option<&Value>) -> Result<Option<std::collections::HashSet<String>>, String> {
     let Some(value) = value else { return Ok(None) };
     let items = value
@@ -9869,6 +9983,102 @@ mod tests {
         assert_eq!(listed.payload["keys"][0]["reference"], reference);
         assert_eq!(listed.payload["keys"][0]["label"], "id_ed25519");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_save_refuses_an_unreadable_store_before_importing_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&service);
+        let ini = tmp.path().join("sessions.ini");
+        let invalid = [0xff, 0xfe, 0x00];
+        std::fs::write(&ini, invalid).unwrap();
+        let source_key = tmp.path().join("private-key");
+        std::fs::write(&source_key, "fixture").unwrap();
+        let save = service.dispatch(ApiEnvelope { method:"POST".into(), path:"/api/sessions/save".into(),
+            body:json!({"name":"new", "session":{"protocol":"sftp", "host":"example.test", "keyfile":source_key.to_string_lossy(), "keep_password":true}}) });
+        assert_eq!(save.status, 500, "{}", save.payload);
+        assert_eq!(std::fs::read(&ini).unwrap(), invalid);
+        assert!(!tmp.path().join("keys").exists());
+    }
+
+    #[test]
+    fn session_folder_deletion_keeps_same_named_site_and_other_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        let mut store = SessionStore::new();
+        for name in ["team", "team/one", "team/nested/two", "teamwork/other"] {
+            store.upsert(StoredSite::new(name, linscp_types::ProtocolScheme::Sftp, "example.test"));
+        }
+        store.save_to_dir(tmp.path(), service.secret_vault.as_ref()).unwrap();
+        let request = |body| ApiEnvelope { method:"POST".into(), path:"/api/sessions/delete".into(), body };
+        let malformed = service.dispatch(request(json!({"name":"team", "folder":"true"})));
+        assert_eq!(malformed.status, 400);
+        let missing = service.dispatch(request(json!({"name":"missing", "folder":true})));
+        assert_eq!(missing.status, 400);
+        let result = service.dispatch(request(json!({"name":"team", "folder":true})));
+        assert_eq!(result.status, 200, "{}", result.payload);
+        let store = SessionStore::load_from_dir(tmp.path(), service.secret_vault.as_ref()).unwrap();
+        assert!(store.find("team").is_some());
+        assert!(store.find("teamwork/other").is_some());
+        assert!(store.find("team/one").is_none());
+        assert!(store.find("team/nested/two").is_none());
+    }
+
+    #[test]
+    fn session_import_scans_without_secrets_checks_source_and_saves_selected_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&service);
+        let path = tmp.path().join("sites.xml");
+        let xml = r#"<FileZilla3><Servers><Server><Name>prod</Name><Host>example.test</Host><Protocol>1</Protocol><User>alice</User><Pass encoding="base64">c2VjcmV0</Pass></Server><Server><Name>other</Name><Host>other.test</Host><Protocol>1</Protocol></Server></Servers></FileZilla3>"#;
+        std::fs::write(&path, xml).unwrap();
+        let path_text = path.to_string_lossy().into_owned();
+        let scan = service.dispatch(ApiEnvelope { method:"GET".into(), path:format!("/api/sessions/import?source=filezilla&path={path_text}"), body:json!({}) });
+        assert_eq!(scan.status, 200, "{}", scan.payload);
+        assert_eq!(scan.payload["sources"][0]["entries"].as_array().unwrap().len(), 2);
+        assert!(!scan.payload.to_string().contains("secret"));
+        let fingerprint = scan.payload["sources"][0]["fingerprint"].as_str().unwrap().to_string();
+        let post = |fingerprint: &str, names: Value, overwrite: bool| ApiEnvelope { method:"POST".into(), path:"/api/sessions/import".into(), body:json!({"source":"filezilla", "path":path_text, "names":names, "overwrite":overwrite, "fingerprint":fingerprint}) };
+        assert_eq!(service.dispatch(post("wrong", json!(["prod"]), false)).status, 409);
+        assert_eq!(service.dispatch(post(&fingerprint, json!(["prod", "missing"]), false)).status, 400);
+        assert!(!tmp.path().join("sessions.ini").exists());
+        let imported = service.dispatch(post(&fingerprint, json!(["prod"]), false));
+        assert_eq!(imported.status, 200, "{}", imported.payload);
+        let store = SessionStore::load_from_dir(tmp.path(), service.secret_vault.as_ref()).unwrap();
+        assert_eq!(store.find("prod").unwrap().password.as_deref(), Some("secret"));
+        assert!(store.find("other").is_none());
+        let ini = std::fs::read_to_string(tmp.path().join("sessions.ini")).unwrap();
+        assert!(!ini.contains("secret"));
+        let skipped = service.dispatch(post(&fingerprint, json!(["prod"]), false));
+        assert_eq!(skipped.payload["imported"].as_array().unwrap().len(), 0);
+        assert_eq!(skipped.payload["skipped"].as_array().unwrap().len(), 1);
+        std::fs::write(&path, xml.replace("example.test", "changed.test")).unwrap();
+        assert_eq!(service.dispatch(post(&fingerprint, json!(["prod"]), true)).status, 409);
+        let store = SessionStore::load_from_dir(tmp.path(), service.secret_vault.as_ref()).unwrap();
+        assert_eq!(store.find("prod").unwrap().host, "example.test");
+    }
+
+    #[test]
+    fn openssh_import_skips_unsupported_patterns_and_protects_selected_private_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&service);
+        let key = tmp.path().join("identity");
+        std::fs::write(&key, "private fixture").unwrap();
+        let config = tmp.path().join("sshconfig");
+        std::fs::write(&config, format!("Host *\n User ignored\nHost prod\n HostName example.test\n User deploy\n IdentityFile {}\n", key.display())).unwrap();
+        let path = config.to_string_lossy().into_owned();
+        let scan = service.dispatch(ApiEnvelope { method:"GET".into(), path:format!("/api/sessions/import?source=openssh&path={path}"), body:json!({}) });
+        assert_eq!(scan.status, 200, "{}", scan.payload);
+        assert_eq!(scan.payload["sources"][0]["skipped"].as_array().unwrap().len(), 1);
+        let fingerprint = scan.payload["sources"][0]["fingerprint"].as_str().unwrap();
+        let imported = service.dispatch(ApiEnvelope { method:"POST".into(), path:"/api/sessions/import".into(), body:json!({"source":"openssh", "path":path, "names":["prod"], "fingerprint":fingerprint}) });
+        assert_eq!(imported.status, 200, "{}", imported.payload);
+        let store = SessionStore::load_from_dir(tmp.path(), service.secret_vault.as_ref()).unwrap();
+        let reference = store.find("prod").unwrap().private_key.as_deref().unwrap();
+        assert!(reference.starts_with(LOCAL_VAULT_KEY_PREFIX));
+        assert_eq!(std::fs::read_to_string(key).unwrap(), "private fixture");
     }
 
     #[test]

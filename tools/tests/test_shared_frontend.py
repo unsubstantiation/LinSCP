@@ -21,6 +21,12 @@ class SharedFrontendTests(unittest.TestCase):
         service = '("GET", "/api/terminal/output") => self.read(),'
         self.assertEqual(check.unrouted(page, service), [])
 
+    def test_method_mismatch_is_reported_even_when_path_exists(self):
+        page = "apiGet('/api/import?source=x'); apiPost('/api/import', {});"
+        service = '("GET", "/api/import") => self.scan(),'
+        self.assertEqual(check.unrouted(page, service), [])
+        self.assertEqual(check.unrouted_methods(page, service), [('POST', '/api/import')])
+
     def test_an_endpoint_built_from_a_prefix_is_not_reported(self):
         page = "const p = '/api/local/' + action;"
         service = '("POST", "/api/local/list") => self.list(),'

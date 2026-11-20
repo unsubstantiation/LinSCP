@@ -28,7 +28,7 @@ pub enum ProtocolScheme {
     Vnc,
     /// SPICE (Simple Protocol for Independent Computing Environments) — QEMU/KVM `remote-viewer`/`spicy`.
     Spice,
-    /// X2Go over SSH; the built-in KDrive viewer is not implemented yet.
+    /// X2Go over SSH; the built-in KDrive viewer is experimental and requires a KDrive server.
     X2Go,
     /// Generic X11 forwarding (`ssh -X`) — Wayland-aware via `waypipe`/`xwayland`.
     X11,

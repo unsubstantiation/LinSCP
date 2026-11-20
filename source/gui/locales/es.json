@@ -627,6 +627,7 @@
   "Refresh both file panels": "Actualizar ambos paneles de archivos",
   "Refresh every": "Actualizar cada",
   "Refresh now": "Actualizar ahora",
+  "Refresh the import source before importing.": "Actualice la fuente antes de importar.",
   "Regex capture": "Captura de regex",
   "Regex with one capture group": "Regex con un grupo de captura",
   "Reload": "Recargar",

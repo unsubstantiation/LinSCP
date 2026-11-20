@@ -309,7 +309,7 @@ class RepositoryConfigurationTests(unittest.TestCase):
         self.assertNotIn('linscp-android-debug', workflow)
         # The release build is the one without --debug; the debug flag may only
         # appear on builds that feed a test (the DevTools smoke test, or the
-        # pull-request check job's unsigned verification) — never on the build
+        # unsigned check job's verification) — never on the build
         # whose APK is published. Exactly one build is published, and it is
         # the release one.
         commands = [line for line in workflow.splitlines() if 'android build --ci' in line]
