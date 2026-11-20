@@ -109,6 +109,26 @@ impl Drop for AutoReconnectReservation {
     }
 }
 
+// Logs are kept only in process memory. Wipe the owned text on eviction,
+// explicit lock, and normal service destruction; copies in a browser or OS
+// crash dump cannot be guaranteed to be erased.
+fn wipe_log_entry(entry: &mut Value) {
+    use zeroize::Zeroize;
+    match entry {
+        Value::String(text) => text.zeroize(),
+        Value::Array(items) => for item in items { wipe_log_entry(item); },
+        Value::Object(fields) => for value in fields.values_mut() { wipe_log_entry(value); },
+        _ => {},
+    }
+}
+fn wipe_logs(logs: &mut Vec<Value>) {
+    for entry in logs.iter_mut() { wipe_log_entry(entry); }
+    logs.clear();
+}
+impl Drop for InnerState {
+    fn drop(&mut self) { wipe_logs(&mut self.logs); }
+}
+
 // A generation correlates delayed browser requests with the bridge that issued
 // them. It is not an authentication credential; normal API access controls apply.
 struct X2GoRegistered { generation: String, bridge: x2go_bridge::X2GoBridge }
@@ -224,7 +244,7 @@ impl CommanderService {
         let timestamp_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default().as_millis() as u64;
         g.logs.push(json!({"text": text, "level": level, "timestamp_ms": timestamp_ms}));
-        if g.logs.len() > 500 { g.logs.remove(0); }
+        if g.logs.len() > 500 { let mut old = g.logs.remove(0); wipe_log_entry(&mut old); }
     }
 
     // Synchronous dispatch for HTTP and Tauri – handles all local and file-backed endpoints.
@@ -540,7 +560,7 @@ impl CommanderService {
         log_sink(&format!("Starting connection (timeout: {} seconds).", dial_spec.timeout_secs.max(1)));
         let mut result = match tokio::time::timeout(
             std::time::Duration::from_secs(dial_spec.timeout_secs.max(1)) + std::time::Duration::from_millis(250),
-            tabs::dial_gui_tab_session(&dial_spec, &config_root, false, "en", Some(log_sink.clone())),
+            tabs::dial_gui_tab_session(&dial_spec, &config_root, false, "en", Some(log_sink.clone()), self.secret_vault.clone()),
         ).await {
             Ok(result) => result,
             Err(_) => Err(GuiConnectError::Failed(format!(
@@ -572,7 +592,7 @@ impl CommanderService {
                 log_sink(&format!("Primary host could not be reached; trying alternate host {}:{}.", dial_spec.session.host, dial_spec.session.port));
                 result = match tokio::time::timeout(
                     std::time::Duration::from_secs(dial_spec.timeout_secs.max(1)),
-                    tabs::dial_gui_tab_session(&dial_spec, &config_root, false, "en", Some(log_sink.clone())),
+                    tabs::dial_gui_tab_session(&dial_spec, &config_root, false, "en", Some(log_sink.clone()), self.secret_vault.clone()),
                 ).await {
                     Ok(result) => result,
                     Err(_) => Err(GuiConnectError::Failed(format!("Alternate connection timed out after {} seconds.", dial_spec.timeout_secs.max(1)))),
@@ -606,7 +626,7 @@ impl CommanderService {
         let timestamp_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default().as_millis() as u64;
         state.logs.push(json!({"text": format!("[Connection {tab_id}] {message}"), "level": "info", "timestamp_ms": timestamp_ms}));
-        if state.logs.len() > 500 { state.logs.remove(0); }
+        if state.logs.len() > 500 { let mut old = state.logs.remove(0); wipe_log_entry(&mut old); }
         match result {
             Ok((session, remote_dir, observed)) => {
                 tab.remote = Some(session);
@@ -631,6 +651,7 @@ impl CommanderService {
                 }).err();
                 if let Some(ref error) = warning {
                     state.logs.push(json!({"text": format!("Auto reconnect: {error}"), "level": "error"}));
+                    if state.logs.len() > 500 { let mut old = state.logs.remove(0); wipe_log_entry(&mut old); }
                 }
                 ApiReply { status: 200, payload: json!({"success": true, "tab": tab.describe(), "warning": warning}) }
             }
@@ -768,7 +789,7 @@ impl CommanderService {
             }
             selected
         };
-        let Some((name, _key, id, probe)) = job else {
+        let Some((name, key, id, probe)) = job else {
             return ApiReply { status: 200, payload: json!({"success": true}) };
         };
         let mut reservation = AutoReconnectReservation { state: Arc::clone(&self.state), name: name.clone(), completed: false };
@@ -776,6 +797,7 @@ impl CommanderService {
             if session.probe_connection().await == Some(false) {
                 self.mark_connection_lost_if(id.unwrap(), &name, Some(&session));
             }
+            self.state.lock().expect("state mutex").auto_retry_at.insert(key, std::time::Instant::now());
             reservation.completed = true;
             return ApiReply { status: 200, payload: json!({"success": true}) };
         }
@@ -785,6 +807,10 @@ impl CommanderService {
         } else {
             self.open_tab_async(json!({"name": name, "site_name": name, "session": {}, "automatic": true})).await
         };
+        // Schedule the next retry from completion, not from the start of a
+        // potentially slow connection attempt. Otherwise a timeout longer
+        // than the configured interval can immediately trigger another dial.
+        self.state.lock().expect("state mutex").auto_retry_at.insert(key, std::time::Instant::now());
         reservation.completed = true;
         if result.payload.get("challenge").is_some() {
             self.add_log(&format!("[Auto reconnect] {name}: host-key verification is required."), "error");
@@ -866,8 +892,8 @@ impl CommanderService {
     async fn open_workspace_async(&self, body: Value) -> ApiReply {
         let name = body.get("name").and_then(Value::as_str).unwrap_or("");
         let path = self.config_root().join("workspaces.json");
-        let data: Value = match std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()) {
-            Some(data) => data, None => return api_error(400, "Workspace file cannot be read."),
+        let data = match self.read_workspace_store(&path) {
+            Ok(data) => data, Err(error) => return api_error(500, error),
         };
         let workspace = match data.get("workspaces").and_then(|w| w.get(name)) { Some(entry) => entry, None => return api_error(400, format!("No workspace named \"{name}\" exists.")) };
         let entries = match workspace.get("tabs").and_then(Value::as_array) { Some(tabs) if !tabs.is_empty() && tabs.len() <= 100 => tabs, _ => return api_error(400, "Workspace has no valid tabs.") };
@@ -927,9 +953,9 @@ impl CommanderService {
                 }
             };
             let path = self.config_root().join("sshhostkeys");
-            let result = linscp_engine::hostkeys::HostKeyCache::load_from_path(&path).and_then(|mut cache| {
+            let result = linscp_engine::hostkeys::HostKeyCache::load_protected(&path, self.secret_vault.as_ref()).and_then(|mut cache| {
                 cache.upsert(challenge["host"].as_str().unwrap_or(""), challenge["port"].as_u64().unwrap_or(22) as u16, kind, key)?;
-                cache.save_to_path(&path)
+                cache.save_protected(&path, self.secret_vault.as_ref())
             });
             if let Err(error) = result {
                 self.state.lock().expect("state mutex").challenges.insert(id, tab);
@@ -2737,7 +2763,16 @@ impl CommanderService {
         }
         let _guard = self.session_key_lock.lock().expect("session key lock");
         if let Err(error) = SessionStore::protect_existing(&config_root, self.secret_vault.as_ref())
-            .and_then(|_| auto_reconnect::protect_existing(&config_root, self.secret_vault.as_ref())) {
+            .and_then(|_| auto_reconnect::protect_existing(&config_root, self.secret_vault.as_ref()))
+            .and_then(|_| linscp_engine::protected_file::migrate(&config_root.join("sshhostkeys"), "ssh-host-keys", self.secret_vault.as_ref(), |bytes| {
+                let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+                linscp_engine::hostkeys::HostKeyCache::validate(text)
+            }))
+            .and_then(|_| linscp_engine::protected_file::migrate(&config_root.join("workspaces.json"), "workspaces", self.secret_vault.as_ref(), |bytes| {
+                let value: Value = serde_json::from_slice(bytes).map_err(|e| format!("Invalid workspace file: {e}"))?;
+                // Older engine versions used an array; preserve it for compatibility.
+                if value.is_array() || value.get("workspaces").is_some_and(Value::is_object) { Ok(()) } else { Err("Invalid workspace structure".into()) }
+            })) {
             let _ = self.secret_vault.lock();
             return api_error(500, format!("Could not protect existing session data: {error}"));
         }
@@ -2777,6 +2812,7 @@ impl CommanderService {
         state.auto_retry_at.clear();
         state.auto_suspended.clear();
         state.active_tab_id = None;
+        wipe_logs(&mut state.logs);
         ApiReply { status: 200, payload: json!({"success": true, "vault": "locked"}) }
     }
 
@@ -3154,9 +3190,8 @@ impl CommanderService {
     fn handle_export_offlineotp_vault(&self, body: Value) -> ApiReply {
         let plain_text = body.get("plain_text").and_then(Value::as_bool).unwrap_or(false);
         let password = body.get("password").and_then(Value::as_str).unwrap_or("");
-        if !plain_text && password.is_empty() {
-            return api_error(400, "Choose a non-empty backup password, or export without one as plain text.");
-        }
+        if plain_text { return api_error(400, "Plain-text backup exports are disabled."); }
+        if password.is_empty() { return api_error(400, "Choose a non-empty backup password."); }
         // Optional selection: an explicit array of saved-session names. When
         // present, only those sites (and the SSH keys they reference) are
         // exported; an empty array exports nothing and says so.
@@ -3189,16 +3224,9 @@ impl CommanderService {
             Err(error) => return api_error(400, &error),
         };
         let unix_seconds = unix_now_seconds();
-        let (data, filename) = if plain_text {
-            match offlineotp_vault::seal_plain(&entries) {
-                Ok(data) => (data, offlineotp_vault::timestamped_plain_filename(unix_seconds)),
-                Err(error) => return api_error(400, &error),
-            }
-        } else {
-            match offlineotp_vault::seal(&entries, password) {
-                Ok(data) => (data, offlineotp_vault::timestamped_filename(unix_seconds)),
-                Err(error) => return api_error(400, &error),
-            }
+        let (data, filename) = match offlineotp_vault::seal(&entries, password) {
+            Ok(data) => (data, offlineotp_vault::timestamped_filename(unix_seconds)),
+            Err(error) => return api_error(400, &error),
         };
         ApiReply {
             status: 200,
@@ -3659,22 +3687,49 @@ impl CommanderService {
         ApiReply{ status: 200, payload: json!({"success": true, "file": file.to_string_lossy()})}
     }
 
+    fn read_workspace_store(&self, path: &Path) -> Result<Value, String> {
+        let Some(bytes) = linscp_engine::protected_file::read(path, "workspaces", self.secret_vault.as_ref())? else {
+            return Ok(json!({"workspaces": {}}));
+        };
+        let value: Value = serde_json::from_slice(&bytes).map_err(|e| format!("Invalid workspace file: {e}"))?;
+        if value.is_array() {
+            let old: Vec<linscp_types::WorkspaceSnapshot> = serde_json::from_value(value).map_err(|e| format!("Invalid legacy workspace file: {e}"))?;
+            let mut workspaces = serde_json::Map::new();
+            for item in old {
+                if workspaces.contains_key(&item.name) { return Err("Duplicate legacy workspace name".into()); }
+                let tabs: Vec<Value> = item.tabs.into_iter().map(|tab| json!({"name": tab.session_name, "kind": "remote", "site": tab.session_name, "local_dir": tab.local_dir, "remote_dir": tab.remote_dir})).collect();
+                workspaces.insert(item.name, json!({"tabs": tabs, "active": item.active_index, "updated": 0}));
+            }
+            return Ok(json!({"workspaces": workspaces}));
+        }
+        if !value.is_object() || !value.get("workspaces").is_some_and(Value::is_object) {
+            return Err("Invalid workspace structure".into());
+        }
+        Ok(value)
+    }
+
+    fn write_workspace_store(&self, path: &Path, value: &Value) -> Result<(), String> {
+        let bytes = zeroize::Zeroizing::new(serde_json::to_vec(value).map_err(|e| e.to_string())?);
+        linscp_engine::protected_file::write(path, "workspaces", self.secret_vault.as_ref(), &bytes)
+    }
+
     fn handle_get_workspaces(&self) -> ApiReply {
         let cfg = self.state.lock().expect("m").config_root.clone();
         let path = cfg.join("workspaces.json");
-        let data = match Self::read_json_store(&path, json!({"workspaces": {}}), "workspaces") { Ok(data) => data, Err(e) => return api_error(500, e) };
+        let data = match self.read_workspace_store(&path) { Ok(data) => data, Err(e) => return api_error(500, e) };
         let mut workspaces: Vec<Value> = data.get("workspaces").and_then(Value::as_object).map(|entries| entries.iter().map(|(name, entry)| json!({"name": name, "tab_count": entry.get("tabs").and_then(Value::as_array).map_or(0, Vec::len)})).collect()).unwrap_or_default();
         workspaces.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         ApiReply{ status: 200, payload: json!({"success": true, "workspaces": workspaces, "file": path.to_string_lossy()})}
     }
     fn handle_save_workspaces(&self, body: Value) -> ApiReply {
         let cfg = self.state.lock().expect("m").config_root.clone();
-        let next = body.get("workspaces").cloned().unwrap_or(body);
+        let next = if body.get("workspaces").is_some_and(|value| value.get("workspaces").is_some_and(Value::is_object)) {
+            body.get("workspaces").cloned().unwrap_or_default()
+        } else { body };
         let path = cfg.join("workspaces.json");
-        if let Err(e) = Self::read_json_store(&path, json!({"workspaces": {}}), "workspaces") { return api_error(500, e); }
+        if let Err(e) = self.read_workspace_store(&path) { return api_error(500, e); }
         if !next.is_object() || !next.get("workspaces").is_some_and(Value::is_object) { return api_error(400, "Invalid workspace structure."); }
-        let bytes = serde_json::to_vec_pretty(&next).unwrap_or_default();
-        if let Err(e) = write_private_file_atomic(&path, &bytes) {
+        if let Err(e) = self.write_workspace_store(&path, &next) {
             return ApiReply{ status: 500, payload: json!({"success": false, "error": e.to_string()})};
         }
         ApiReply{ status: 200, payload: json!({"success": true})}
@@ -3697,7 +3752,7 @@ impl CommanderService {
         if tabs.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "There are no open tabs to save."})}; }
         if tabs.len() > 100 { return api_error(400, "A workspace can contain at most 100 tabs."); }
         let path = cfg.join("workspaces.json");
-        let mut data = match Self::read_json_store(&path, json!({"workspaces": {}}), "workspaces") { Ok(data) => data, Err(e) => return api_error(500, e) };
+        let mut data = match self.read_workspace_store(&path) { Ok(data) => data, Err(e) => return api_error(500, e) };
         if !data.is_object() { data = json!({}); }
         if data.get("workspaces").is_none() { data["workspaces"] = json!({}); }
         if !data["workspaces"].is_object() { return api_error(400, "Invalid workspace file."); }
@@ -3706,8 +3761,7 @@ impl CommanderService {
             return ApiReply{ status: 409, payload: json!({"success": false, "error": format!("A workspace named \"{name}\" already exists."), "exists": true})};
         }
         data["workspaces"][&name] = json!({"tabs": tabs, "active": active, "updated": 0});
-        let bytes = serde_json::to_vec_pretty(&data).unwrap_or_default();
-        if let Err(e) = write_private_file_atomic(&path, &bytes) {
+        if let Err(e) = self.write_workspace_store(&path, &data) {
             return ApiReply{ status: 500, payload: json!({"success": false, "error": e.to_string()})};
         }
         ApiReply{ status: 200, payload: json!({"success": true, "workspace": json!({"name": name})})}
@@ -3716,13 +3770,12 @@ impl CommanderService {
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let cfg = self.state.lock().expect("m").config_root.clone();
         let path = cfg.join("workspaces.json");
-        let mut data = match Self::read_json_store(&path, json!({"workspaces": {}}), "workspaces") { Ok(data) => data, Err(e) => return api_error(500, e) };
+        let mut data = match self.read_workspace_store(&path) { Ok(data) => data, Err(e) => return api_error(500, e) };
         if data.get("workspaces").and_then(|w| w.get(&name)).is_none() {
             return ApiReply{ status: 400, payload: json!({"success": false, "error": format!("No workspace named \"{name}\" exists.")})};
         }
         if let Some(obj) = data.get_mut("workspaces").and_then(|v| v.as_object_mut()) { obj.remove(&name); }
-        let bytes = serde_json::to_vec_pretty(&data).unwrap_or_default();
-        if let Err(e) = write_private_file_atomic(&path, &bytes) { return api_error(500, e.to_string()); }
+        if let Err(e) = self.write_workspace_store(&path, &data) { return api_error(500, e.to_string()); }
         ApiReply{ status: 200, payload: json!({"success": true})}
     }
 
@@ -6964,13 +7017,13 @@ mod tests {
         let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
         let save = svc.dispatch(request("/api/sessions/save", json!({"name": "saved", "session": {
             "protocol": "sftp", "host": "127.0.0.1", "port": 1, "username": "user",
-            "auth_gssapi": false, "auto_reconnect": true, "auto_reconnect_seconds": 2
+            "auth_gssapi": false, "auto_reconnect": true, "auto_reconnect_seconds": 3600
         }})));
         assert_eq!(save.status, 200, "{}", save.payload);
         let store = SessionStore::load_from_dir(temp.path(), svc.secret_vault.as_ref()).unwrap();
         let site = store.find("saved").unwrap();
         assert!(auto_reconnect::enabled(site));
-        assert_eq!(auto_reconnect::interval(site), 2);
+        assert_eq!(auto_reconnect::interval(site), 3600);
         let empty = svc.dispatch_async(request("/api/auto-reconnect/tick", json!({}))).await;
         assert!(empty.payload.get("attempted").is_none());
         let mut intentions = auto_reconnect::Intentions::new();
@@ -6995,13 +7048,16 @@ mod tests {
     fn auto_reconnect_intent_survives_one_duplicate_but_not_last_close() {
         let temp = tempfile::tempdir().unwrap();
         let svc = CommanderService::new(temp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
         let mut site = linscp_engine::session_store::StoredSite::new("saved", linscp_types::ProtocolScheme::Sftp, "host");
         site.username = "user".into();
         site.password = Some("secret-never-persisted-in-intent".into());
         let mut intentions = auto_reconnect::Intentions::new();
         intentions.insert(site.name.clone(), auto_reconnect::Identity::of(&site));
         auto_reconnect::save(temp.path(), svc.secret_vault.as_ref(), &intentions).unwrap();
-        assert!(!std::fs::read_to_string(temp.path().join("auto-reconnect.json")).unwrap().contains("secret-never-persisted-in-intent"));
+        let stored = std::fs::read(temp.path().join("auto-reconnect.json")).unwrap();
+        let secret = b"secret-never-persisted-in-intent";
+        assert!(!stored.windows(secret.len()).any(|window| window == secret));
         for id in [1, 2] {
             svc.state.lock().unwrap().tabs.insert(id, TabRuntime {
                 id, name: "saved".into(), site_name: Some("saved".into()), is_local: false, connected: false,
@@ -7318,6 +7374,7 @@ mod tests {
         std::fs::create_dir_all(&left).unwrap(); std::fs::create_dir_all(&right).unwrap();
         let root = tmp.join("config");
         let svc = CommanderService::new(root.clone(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
         let request = |method: &str, path: &str, body: Value| ApiEnvelope { method: method.into(), path: path.into(), body };
         let first = svc.dispatch_async(request("POST", "/api/tabs/local", json!({"local_dir": left, "remote_dir": right}))).await;
         let first_id = first.payload["tab"]["id"].as_u64().unwrap();
@@ -8644,8 +8701,10 @@ mod tests {
         let original = open.payload["tab"]["id"].as_u64().unwrap();
         let saved = svc.dispatch_async(request("/api/workspaces/save", json!({"name": "FTP workspace"}))).await;
         assert_eq!(saved.status, 200, "{}", saved.payload);
-        let serialized = std::fs::read_to_string(config.join("workspaces.json")).unwrap();
-        assert!(!serialized.contains("testpass"));
+        let serialized = std::fs::read(config.join("workspaces.json")).unwrap();
+        for secret in ["testpass", "FTP workspace", "Saved FTP"] {
+            assert!(!serialized.windows(secret.len()).any(|part| part == secret.as_bytes()));
+        }
         let reopened = svc.dispatch_async(request("/api/workspaces/open", json!({"name": "FTP workspace"}))).await;
         assert_eq!(reopened.status, 200, "{}", reopened.payload);
         assert!(reopened.payload["failed"].as_array().unwrap().is_empty(), "{}", reopened.payload);
@@ -10643,6 +10702,46 @@ mod tests {
         assert!(SessionStore::load_from_dir(tmp.path(), svc.secret_vault.as_ref()).is_err());
         assert!(auto_reconnect::load(tmp.path(), svc.secret_vault.as_ref()).is_err());
         assert!(original.save_to_dir(tmp.path(), &legacy).is_err());
+    }
+
+    #[test]
+    fn vault_protects_legacy_workspace_and_hostkeys_and_wipes_logs_on_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspaces.json");
+        let hostkeys = tmp.path().join("sshhostkeys");
+        std::fs::write(&workspace, r#"{"workspaces":{"private-workspace":{"tabs":[],"active":0}}}"#).unwrap();
+        std::fs::write(&hostkeys, "private-host@22 ssh-ed25519 SHA256:fingerprint\n").unwrap();
+        let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
+        for (path, secret) in [(&workspace, "private-workspace"), (&hostkeys, "private-host")] {
+            let bytes = std::fs::read(path).unwrap();
+            assert!(!bytes.windows(secret.len()).any(|part| part == secret.as_bytes()));
+        }
+        assert_eq!(svc.handle_get_workspaces().payload["workspaces"][0]["name"], "private-workspace");
+        assert_eq!(linscp_engine::hostkeys::HostKeyCache::load_protected(&hostkeys, svc.secret_vault.as_ref()).unwrap().lookup("private-host", 22, "ssh-ed25519"), Some("SHA256:fingerprint"));
+        let protected_hostkeys = std::fs::read(&hostkeys).unwrap();
+        let mut tampered = protected_hostkeys.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        std::fs::write(&hostkeys, tampered).unwrap();
+        assert!(linscp_engine::hostkeys::HostKeyCache::load_protected(&hostkeys, svc.secret_vault.as_ref()).is_err());
+        std::fs::write(&hostkeys, protected_hostkeys).unwrap();
+        let direct = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/workspaces".into(), body: json!({"workspaces": {"direct-private": {"tabs": [], "active": 0}}}) });
+        assert_eq!(direct.status, 200, "{}", direct.payload);
+        let saved = std::fs::read(&workspace).unwrap();
+        assert!(!saved.windows(14).any(|part| part == b"direct-private"));
+        svc.add_log("private log entry", "info");
+        assert_eq!(svc.handle_vault_lock().status, 200);
+        assert!(svc.handle_logs().payload["logs"].as_array().unwrap().is_empty());
+        assert!(linscp_engine::hostkeys::HostKeyCache::load_protected(&hostkeys, svc.secret_vault.as_ref()).is_err());
+        assert_eq!(svc.handle_get_workspaces().status, 500);
+    }
+
+    #[test]
+    fn plaintext_key_backup_export_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
+        assert_eq!(svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/vault/export".into(), body: json!({"plain_text": true}) }).status, 400);
     }
 
     #[test]

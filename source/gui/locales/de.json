@@ -185,6 +185,7 @@
   "Choose a key/session backup and read it. Encrypted LinSCP backups and plain-text backups are detected automatically. Tick the sessions you want, then import them. Names already saved are skipped unless you tick Replace saved sessions with the same name below.": "Wählen Sie ein Key/Session-Backup und lesen Sie es ein. Verschlüsselte LinSCP-Backups und Klartext-Backups werden automatisch erkannt. Aktivieren Sie die gewünschten Sitzungen und importieren Sie sie. Namen, die bereits gespeichert sind, werden übersprungen, sofern unten „Replace saved sessions with the same name“ nicht aktiviert ist.",
   "Choose a key/session backup file first.": "Wählen Sie zuerst eine Key/Session-Backupdatei.",
   "Choose a non-empty SSH key file no larger than 1 MiB.": "Wählen Sie eine nicht leere SSH-Schlüsseldatei mit höchstens 1 MiB aus.",
+  "Choose a non-empty backup password.": "Wählen Sie ein nicht leeres Backup-Passwort.",
   "Choose a non-empty backup password, or untick the password and use a plain-text export.": "Wählen Sie ein nicht leeres Backup-Passwort, oder deaktivieren Sie das Passwort für einen Klartext-Export.",
   "Choose a private key from the vault": "Privaten Schlüssel aus dem Tresor auswählen",
   "Choose a separate vault password. It will be required each time LinSCP starts.": "Wählen Sie ein separates Tresorpasswort. Es wird bei jedem Start von LinSCP benötigt.",

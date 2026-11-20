@@ -6,10 +6,8 @@
 //! this stronger envelope on its side. LinSCP-specific fields are ordinary
 //! additional login columns.
 //!
-//! The GUI's "Key/Session Export" writes this envelope by default, or the same
-//! JSON document without the envelope when the user explicitly asks for a
-//! plain-text backup (secrets readable by anything on the device). "Key/Session
-//! Import" auto-detects the two by the envelope's magic marker.
+//! The GUI's "Key/Session Export" requires this encrypted envelope.
+//! "Key/Session Import" can still read legacy plaintext documents.
 
 use std::collections::BTreeMap;
 use std::fmt;

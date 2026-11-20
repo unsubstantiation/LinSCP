@@ -55,10 +55,33 @@ impl HostKeyCache {
 
     pub fn load_from_path(path: &Path) -> Result<Self, String> {
         match std::fs::read_to_string(path) {
+            Ok(text) if text.starts_with("LSCP-PROTECTED-FILE-1\n") => Err("Unlock the local vault to read host keys".into()),
             Ok(text) => Ok(Self::parse(&text)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::new()),
             Err(err) => Err(format!("Cannot read {}: {err}", path.display())),
         }
+    }
+
+    pub fn load_protected(path: &Path, vault: &dyn linscp_platform::SecretVault) -> Result<Self, String> {
+        let Some(bytes) = crate::protected_file::read(path, "ssh-host-keys", vault)? else { return Ok(Self::new()); };
+        let text = std::str::from_utf8(&bytes).map_err(|e| format!("Invalid host-key cache: {e}"))?;
+        Self::validate(text)?;
+        Ok(Self::parse(text))
+    }
+
+    pub fn validate(text: &str) -> Result<(), String> {
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() != 3 || fields.iter().any(|s| has_unsafe_token_char(s)) {
+                return Err("Invalid host-key cache entry".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn save_protected(&self, path: &Path, vault: &dyn linscp_platform::SecretVault) -> Result<(), String> {
+        let text = zeroize::Zeroizing::new(self.serialize());
+        crate::protected_file::write(path, "ssh-host-keys", vault, text.as_bytes())
     }
 
     pub fn lookup(&self, host: &str, port: u16, key_type: &str) -> Option<&str> {

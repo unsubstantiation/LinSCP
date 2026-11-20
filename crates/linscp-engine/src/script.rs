@@ -276,7 +276,7 @@ const SCRIPT_COMMAND_HELPS: &[(&str, &str)] = &[
     ),
     (
         "backup",
-        "backup export <file> | import <file>\n  Exports or imports *all* per-user configuration as a single\n  distribution-compatible JSON bundle (sessions.ini + sessions.key,\n  workspaces.json, bookmarks.json, preferences.json, accounts.ini,\n  sshhostkeys, explorer-commands.json). The bundle is LF, UTF-8,\n  base64 for secrets and CRLF-tolerant, so a backup from Debian\n  restores on Fedora, Arch, Windows and Android and vice versa.",
+        "backup export <file> | import <file>\n  Encrypts portable backups with the independent password in\n  LINSCP_BACKUP_PASSWORD (12 or more bytes). Keep the password safe.\n  Existing plaintext backup files are not imported by this command.",
     ),
     (
         "etag",
@@ -2235,31 +2235,21 @@ impl ScriptInterpreter {
         }
         let sub = args[0].to_ascii_lowercase();
         let path = std::path::PathBuf::from(expand_tilde(&args[1]));
+        // Keep passphrases out of command text, history, and status messages.
+        let password = zeroize::Zeroizing::new(std::env::var("LINSCP_BACKUP_PASSWORD")
+            .map_err(|_| "Set LINSCP_BACKUP_PASSWORD to an independent backup password (12 or more bytes).".to_string())?);
         let vault_override = self.secret_vault.clone();
         let default_vault = linscp_platform::NativeSecretVault::new();
         let vault: &dyn SecretVault = vault_override.as_deref().unwrap_or(&default_vault);
         match sub.as_str() {
             "export" => {
-                export_backup_to_file(&self.cfg.config_dir, &path, vault)
+                export_backup_to_file(&self.cfg.config_dir, &path, vault, &password)
                     .map_err(|e| self.trp("Cannot export backup to '{file}': {error}", &[("file", &args[1]), ("error", &e)]))?;
                 self.out(&format!("{}", self.trp("Full backup exported to '{file}'.", &[("file", &args[1])])));
                 Ok(())
             }
             "import" => {
-                if vault_override.is_some() {
-                    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-                    let bundle = crate::backup::deserialize_backup(&bytes)?;
-                    if let Some(encoded_key) = bundle.sessions_key_b64.as_deref() {
-                        let backup_key = zeroize::Zeroizing::new(BASE64.decode(encoded_key.as_bytes()).map_err(|e| e.to_string())?);
-                        let active_key = vault.load_master_key(&self.cfg.config_dir)
-                            .map_err(|e| e.to_string())?
-                            .ok_or_else(|| "The local vault is locked.".to_string())?;
-                        if backup_key.as_slice() != &active_key[..] {
-                            return Err(self.tr("This backup uses a different sessions.key. Restoring it here would replace the active password-wrapped key. Restore it into a separate LinSCP config directory instead.").to_string());
-                        }
-                    }
-                }
-                import_backup_from_file(&self.cfg.config_dir, &path, vault)
+                import_backup_from_file(&self.cfg.config_dir, &path, vault, &password)
                     .map_err(|e| self.trp("Cannot import backup from '{file}': {error}", &[("file", &args[1]), ("error", &e)]))?;
                 self.out(&format!("{}", self.trp("Full backup imported from '{file}'.", &[("file", &args[1])])));
                 Ok(())

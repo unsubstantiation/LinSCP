@@ -32,11 +32,32 @@ computer; LinSCP does not overwrite or delete user-owned source files. It
 protects LinSCP's own saved copy. Public keys are not secret and may remain
 plaintext. The separate OfflineOTP `.json.aes` interchange remains encrypted
 with its own export/import passphrase and is not the LinSCP application backup.
-The pre-existing LinSCP application backup format is a different, portable
-configuration bundle; it includes the unwrapped master key as base64 and must
-itself be kept in a protected location. Restoring an application backup with a
-different master key is refused from the Commander command console so the
-password-wrapped local key is not silently replaced with plaintext.
+The application backup uses an independent password and an authenticated
+Argon2id/AES-256-GCM envelope. It is distinct from the encrypted Key/Session
+Export. The console command requires `LINSCP_BACKUP_PASSWORD` in the application
+process environment (at least 12 bytes); do not put it in command arguments or
+shell history. Environment variables may be visible to privileged processes or
+inherited by child processes. Save the backup password separately: without it
+the backup cannot be opened. Old plaintext application backups are not accepted
+by this command and must be kept secure separately.
+
+Full application backups include all vault SSH keys, including unreferenced
+keys and their label/public-key metadata. Key files are already encrypted by
+the source vault; they and the source master key are enclosed in the encrypted
+backup. On restore, keys are decrypted in memory and re-encrypted with the
+destination's unlocked vault key. Saved-session and tunnel references retain
+their IDs. Existing keys are never overwritten: a conflicting ID or public
+key causes restore to fail; matching keys retain their existing labels.
+Missing or corrupt referenced keys cause export/restore to fail rather than
+produce a broken backup. Legacy backups without vault-key entries are accepted
+only when they do not reference a missing vault key.
+
+A backup with a different master key is re-encrypted under the destination's
+unlocked vault key on import. Restore modifies several files separately and is
+not an all-or-nothing transaction; keys are published before sessions so a
+partial restore cannot leave new session references to keys not yet written.
+Keep an independent recovery copy before restoring, and do not run simultaneous
+writers against the same configuration directory.
 
 Choose a strong, unique vault password and keep a separate encrypted
 OfflineOTP credential export as a recovery copy. There is no password-reset
@@ -70,8 +91,16 @@ unlock the local password vault cannot read them and must not be used to edit
 those files. Migration cannot erase plaintext from old backups, filesystem
 snapshots, deleted blocks, or copies made before migration.
 
-The portable backup format is **not encrypted**: exports contain session
-metadata and the unwrapped master key. Store exports securely and remove old
-copies as appropriate. Other data such as workspaces, bookmarks, host-key
-records, transfer history, and connection logs are not covered by this session
-store encryption and can contain hostnames or other identifying information.
+Workspaces and SSH host-key records are also encrypted under the unlocked
+vault key, with different authenticated contexts. Legacy plaintext files are
+validated and atomically migrated on unlock. Older clients cannot read them;
+plaintext left in old backups, snapshots or deleted disk blocks is not erased.
+Bookmarks and other configuration stores are not covered by this protection and
+may still reveal identifying information.
+
+The Commander log panel is held in process and browser memory rather than
+intentionally persisted; owned backend log strings are wiped on eviction, vault
+lock and normal service destruction. Browser/runtime copies, clipboard copies,
+swap, operating-system crash dumps, forced termination and external process logs
+cannot be guaranteed to be securely erased. Old log files and copies made by other
+software are not automatically removed.
