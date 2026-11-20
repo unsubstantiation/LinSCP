@@ -8602,8 +8602,11 @@ mod tests {
         let entries = offlineotp_entries_from_sessions(&source, &config_root, &secret_vault, None).unwrap();
         assert!(entries.iter().any(|entry| match entry {
             CredentialEntry::Login(login) => {
-                !login.metadata[OFFLINEOTP_SESSION_JSON].contains(source_path.as_str())
-                    && login.metadata[OFFLINEOTP_SESSION_JSON].contains(local_path.as_str())
+                let raw_json = &login.metadata[OFFLINEOTP_SESSION_JSON];
+                let decoded: StoredSite = serde_json::from_str(raw_json).unwrap();
+                !raw_json.contains("original-id_ed25519")
+                    && decoded.private_key.is_none()
+                    && decoded.local_directory == local_path
             }
             _ => false,
         }));
@@ -8894,8 +8897,14 @@ mod tests {
         }).await;
         assert_eq!(open_local.status, 200, "{}", open_local.payload);
         assert_eq!(open_local.payload["tab"]["is_local"], true);
-        assert_eq!(open_local.payload["tab"]["local_dir"], left_local.to_string_lossy().as_ref());
-        assert_eq!(open_local.payload["tab"]["other_local_dir"], right_local.to_string_lossy().as_ref());
+        assert_eq!(
+            std::fs::canonicalize(open_local.payload["tab"]["local_dir"].as_str().unwrap()).unwrap(),
+            std::fs::canonicalize(&left_local).unwrap(),
+        );
+        assert_eq!(
+            std::fs::canonicalize(open_local.payload["tab"]["other_local_dir"].as_str().unwrap()).unwrap(),
+            std::fs::canonicalize(&right_local).unwrap(),
+        );
 
         // Verify 4 & 5: S3 credentials and re-export of public-only SSH key + vaulttls:// blobs
         let r_s3 = restored_store.find("Object Archive S3").unwrap();
