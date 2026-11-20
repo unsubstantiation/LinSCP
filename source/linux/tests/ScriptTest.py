@@ -42,7 +42,7 @@ def _ppk_rsa_fixture(version=2, valid_mac=True):
     mac_data = b"".join(_ssh_string(part) for part in
                         (algorithm, encryption, comment, public, private))
     digest = hashlib.sha1 if version == 2 else hashlib.sha256
-    mac_key = b"putty-private-key-file-mac-key"
+    mac_key = hashlib.sha1(b"putty-private-key-file-mac-key").digest() if version == 2 else b""
     mac = hmac.new(mac_key, mac_data, digest).hexdigest()
     if not valid_mac:
         mac = ("0" if mac[0] != "0" else "1") + mac[1:]
@@ -53,8 +53,6 @@ def _ppk_rsa_fixture(version=2, valid_mac=True):
         "Public-Lines: 1",
         base64.b64encode(public).decode("ascii"),
     ]
-    if version == 3:
-        lines.append("Key-Derivation: none")
     lines.extend(("Private-Lines: 1", base64.b64encode(private).decode("ascii"),
                   "Private-MAC: " + mac, ""))
     return "\n".join(lines)

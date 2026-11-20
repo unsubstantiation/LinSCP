@@ -108,6 +108,7 @@ pub struct CommanderService {
     legacy_secret_vault: Arc<dyn SecretVault>,
     state: Arc<Mutex<InnerState>>,
     event_tx: Arc<Mutex<Option<tokio::sync::broadcast::Sender<Value>>>>,
+    session_key_lock: Arc<Mutex<()>>,
     queue: queue::QueueManager,
     /// Whether the caller that built this service can show a *server-side* window.
     ///
@@ -166,6 +167,7 @@ impl CommanderService {
                 monitors: monitor::Monitors::default(),
             })),
             event_tx: Arc::new(Mutex::new(None)),
+            session_key_lock: Arc::new(Mutex::new(())),
             queue: queue::QueueManager::new(tokio::sync::broadcast::channel(64).0, local_fs),
             desktop_spawn_allowed: false,
         }
@@ -226,6 +228,7 @@ impl CommanderService {
             ("POST", "/api/vault/lock") => self.handle_vault_lock(),
             ("GET", "/api/vault/keys") => self.handle_vault_ssh_keys(),
             ("POST", "/api/vault/keys/import") => self.handle_vault_ssh_key_import(req.body),
+            ("POST", "/api/vault/keys/delete") => self.handle_vault_ssh_key_delete(req.body),
             ("GET", "/api/local/roots") => self.handle_local_roots(),
             ("GET", "/api/local/list") => self.handle_local_list(&query),
             ("GET", "/api/local/edit") => self.handle_local_edit_get(&query),
@@ -242,6 +245,7 @@ impl CommanderService {
             ("POST", "/api/vault/export") => self.handle_export_offlineotp_vault(req.body),
             ("POST", "/api/vault/import") => self.handle_import_offlineotp_vault(req.body),
             ("POST", "/api/sessions/save") => self.handle_save_session(req.body),
+            ("POST", "/api/sessions/copy") => self.handle_copy_session(req.body),
             ("POST", "/api/sessions/delete") => self.handle_delete_session(req.body),
             ("GET", "/api/sessions/import") => self.handle_sessions_import_get(&query),
             ("POST", "/api/import/openssh") => self.handle_import_openssh(req.body),
@@ -2478,6 +2482,69 @@ impl CommanderService {
         ApiReply { status: 200, payload: json!({"success": true, "keys": keys}) }
     }
 
+    /// Remove only one explicitly confirmed vault key and its metadata. Saved
+    /// sites using the key must first be updated or removed.
+    fn handle_vault_ssh_key_delete(&self, body: Value) -> ApiReply {
+        let _guard = self.session_key_lock.lock().expect("session key lock");
+        let config_root = self.config_root();
+        match self.secret_vault.status(&config_root) {
+            Ok("unlocked") => {}
+            Ok(_) => return api_error(423, "Unlock the local vault before deleting an SSH key."),
+            Err(error) => return api_error(500, error.to_string()),
+        }
+        if body.get("confirm").and_then(Value::as_bool) != Some(true) {
+            return api_error(400, "Confirm SSH key deletion first.");
+        }
+        let Some(id) = body.get("reference").and_then(Value::as_str)
+            .and_then(|reference| reference.strip_prefix(LOCAL_VAULT_KEY_PREFIX))
+            .filter(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())) else {
+            return api_error(400, "Invalid encrypted SSH key reference.");
+        };
+        let reference = format!("{LOCAL_VAULT_KEY_PREFIX}{id}");
+        let store = match SessionStore::load_from_dir(&config_root, self.secret_vault.as_ref()) {
+            Ok(store) => store,
+            Err(error) => return api_error(500, format!("Cannot check stored sessions: {error}")),
+        };
+        let users: Vec<&str> = store.sites().iter().filter(|site|
+            site.private_key.as_deref() == Some(reference.as_str()) ||
+            site.tunnel.keyfile.as_deref() == Some(reference.as_str())
+        ).map(|site| site.name.as_str()).collect();
+        if !users.is_empty() {
+            return api_error(409, format!("Cannot delete this key: stored sessions use it: {}. Change or delete those sessions first.", users.join(", ")));
+        }
+        let key_dir = config_root.join("keys");
+        // Never traverse a symlink masquerading as the vault key directory.
+        match std::fs::symlink_metadata(&key_dir) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return api_error(400, "Invalid vault key directory."),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return api_error(404, "SSH key is no longer in the vault."),
+            Err(error) => return api_error(500, format!("Cannot inspect vault keys: {error}")),
+        }
+        let private_path = key_dir.join(format!("{id}.key.vault"));
+        match std::fs::symlink_metadata(&private_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => return api_error(400, "Invalid encrypted SSH key file."),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return api_error(404, "SSH key is no longer in the vault."),
+            Err(error) => return api_error(500, format!("Cannot inspect encrypted SSH key: {error}")),
+        }
+        if let Err(error) = std::fs::remove_file(&private_path) {
+            return api_error(500, format!("Could not delete the encrypted SSH key: {error}"));
+        }
+        // Metadata cleanup is best effort, but report partial failure honestly.
+        // remove_file removes a symlink itself, never the target.
+        let mut metadata_failed = false;
+        for extension in ["label", "pub"] {
+            if let Err(error) = std::fs::remove_file(key_dir.join(format!("{id}.{extension}"))) {
+                if error.kind() != std::io::ErrorKind::NotFound { metadata_failed = true; }
+            }
+        }
+        if metadata_failed {
+            return ApiReply { status: 500, payload: json!({"success": false, "deleted": true,
+                "error": "The encrypted SSH key was deleted, but some metadata could not be removed."}) };
+        }
+        ApiReply { status: 200, payload: json!({"success": true, "deleted": true}) }
+    }
+
     fn handle_vault_ssh_key_import(&self, mut body: Value) -> ApiReply {
         let config_root = self.config_root();
         let name = body.get("name").and_then(Value::as_str).unwrap_or("")
@@ -2857,6 +2924,7 @@ impl CommanderService {
     }
 
     fn handle_import_offlineotp_vault(&self, body: Value) -> ApiReply {
+        let _guard = self.session_key_lock.lock().expect("session key lock");
         let password = body.get("password").and_then(Value::as_str).unwrap_or("");
         let encoded = body.get("data_base64").and_then(Value::as_str).unwrap_or("");
         if encoded.len() > 22 * 1024 * 1024 {
@@ -2917,6 +2985,7 @@ impl CommanderService {
     }
 
     fn handle_save_session(&self, body: Value) -> ApiReply {
+        let _guard = self.session_key_lock.lock().expect("session key lock");
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         let session_val = body.get("session").cloned().unwrap_or(body.clone());
         if name.is_empty() && session_val.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().is_empty() {
@@ -2979,7 +3048,26 @@ impl CommanderService {
         ApiReply{ status: 200, payload: json!({"success": true})}
     }
 
+    fn handle_copy_session(&self, body: Value) -> ApiReply {
+        let _guard = self.session_key_lock.lock().expect("session key lock");
+        let source = body.get("source").and_then(Value::as_str).unwrap_or("").trim();
+        let name = body.get("name").and_then(Value::as_str).unwrap_or("").trim();
+        if source.is_empty() || name.is_empty() { return api_error(400, "A source and a new session name are required."); }
+        let cfg = self.config_root();
+        let mut store = match SessionStore::load_from_dir(&cfg, self.secret_vault.as_ref()) {
+            Ok(store) => store, Err(error) => return api_error(500, error),
+        };
+        if store.find(name).is_some() { return api_error(409, "A session with that name already exists."); }
+        let Some(mut copy) = store.find(source).cloned() else { return api_error(404, "The source session no longer exists."); };
+        copy.name = name.to_string();
+        copy.last_used = None;
+        store.upsert(copy);
+        if let Err(error) = store.save_to_dir(&cfg, self.secret_vault.as_ref()) { return api_error(500, error); }
+        ApiReply { status: 200, payload: json!({"success": true}) }
+    }
+
     fn handle_delete_session(&self, body: Value) -> ApiReply {
+        let _guard = self.session_key_lock.lock().expect("session key lock");
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         if name.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "A session name is required"})}; }
         let cfg = self.state.lock().expect("m").config_root.clone();
@@ -5543,6 +5631,10 @@ fn protect_one_ssh_key(
     if let Some(id) = path.strip_prefix(LOCAL_VAULT_KEY_PREFIX) {
         if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err("Saved encrypted SSH key reference is invalid.".to_string());
+        }
+        let key = config_root.join("keys").join(format!("{id}.key.vault"));
+        if !std::fs::symlink_metadata(&key).is_ok_and(|metadata| metadata.file_type().is_file()) {
+            return Err("Saved encrypted SSH key is no longer in the vault.".to_string());
         }
         return Ok(path.to_string());
     }
@@ -9777,6 +9869,110 @@ mod tests {
         assert_eq!(listed.payload["keys"][0]["reference"], reference);
         assert_eq!(listed.payload["keys"][0]["label"], "id_ed25519");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn vault_key_deletion_requires_unlock_and_confirmation_and_keeps_saved_sites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&service);
+        let request = |method: &str, path: &str, body: Value| ApiEnvelope { method: method.into(), path: path.into(), body };
+        let imported = service.dispatch(request("POST", "/api/vault/keys/import", json!({"name":"old.ppk", "private_key":"test-only key"})));
+        assert_eq!(imported.status, 200);
+        let reference = imported.payload["reference"].as_str().unwrap().to_string();
+        let id = reference.strip_prefix(LOCAL_VAULT_KEY_PREFIX).unwrap();
+        let dir = tmp.path().join("keys");
+        let key = dir.join(format!("{id}.key.vault"));
+        let label = dir.join(format!("{id}.label"));
+        let public = dir.join(format!("{id}.pub"));
+        std::fs::write(&public, "test public metadata").unwrap();
+        let saved = service.dispatch(request("POST", "/api/sessions/save", json!({"name":"uses-key", "session": {
+            "protocol":"sftp", "host":"example.test", "username":"user", "keyfile":reference
+        }})));
+        assert_eq!(saved.status, 200, "{}", saved.payload);
+        let no_confirm = service.dispatch(request("POST", "/api/vault/keys/delete", json!({"reference":reference})));
+        assert_eq!(no_confirm.status, 400);
+        for bad in ["vaultkey://../../sessions.ini", "vaultkey://0123456789abcdef0123456789abcde/", "other://0123456789abcdef0123456789abcdef"] {
+            assert_eq!(service.dispatch(request("POST", "/api/vault/keys/delete", json!({"reference":bad,"confirm":true}))).status, 400);
+        }
+        assert!(key.exists() && label.exists() && public.exists());
+        assert_eq!(service.dispatch(request("POST", "/api/vault/lock", json!({}))).status, 200);
+        assert_eq!(service.dispatch(request("POST", "/api/vault/keys/delete", json!({"reference":reference,"confirm":true}))).status, 423);
+        assert!(key.exists());
+        unlock_for_test(&service);
+        let blocked = service.dispatch(request("POST", "/api/vault/keys/delete", json!({"reference":reference,"confirm":true})));
+        assert_eq!(blocked.status, 409, "{}", blocked.payload);
+        assert!(blocked.payload["error"].as_str().unwrap().contains("uses-key"));
+        assert!(key.exists() && label.exists() && public.exists());
+        let sessions = service.dispatch(request("GET", "/api/sessions", json!({})));
+        assert_eq!(sessions.payload["sessions"][0]["private_key"], reference);
+        assert_eq!(service.dispatch(request("POST", "/api/sessions/delete", json!({"name":"uses-key"}))).status, 200);
+        let deleted = service.dispatch(request("POST", "/api/vault/keys/delete", json!({"reference":reference,"confirm":true})));
+        assert_eq!(deleted.status, 200, "{}", deleted.payload);
+        assert!(!key.exists() && !label.exists() && !public.exists());
+        assert_eq!(service.dispatch(request("POST", "/api/vault/keys/delete", json!({"reference":reference,"confirm":true}))).status, 404);
+        let listed = service.dispatch(request("GET", "/api/vault/keys", json!({})));
+        assert!(listed.payload["keys"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn copied_session_preserves_secrets_and_blocks_tunnel_key_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&service);
+        let imported = service.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/vault/keys/import".into(), body: json!({"private_key":"fixture"}) });
+        let reference = imported.payload["reference"].as_str().unwrap();
+        let mut store = SessionStore::load_from_dir(tmp.path(), service.secret_vault.as_ref()).unwrap();
+        let mut site = linscp_engine::session_store::StoredSite::new("source", linscp_types::ProtocolScheme::Sftp, "example.test");
+        site.password = Some("secret".into());
+        site.tunnel.enabled = true;
+        site.tunnel.keyfile = Some(reference.to_string());
+        store.upsert(site);
+        store.save_to_dir(tmp.path(), service.secret_vault.as_ref()).unwrap();
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        let copied = service.dispatch(request("/api/sessions/copy", json!({"source":"source", "name":"copy"})));
+        assert_eq!(copied.status, 200, "{}", copied.payload);
+        assert_eq!(service.dispatch(request("/api/sessions/copy", json!({"source":"source", "name":"copy"}))).status, 409);
+        let store = SessionStore::load_from_dir(tmp.path(), service.secret_vault.as_ref()).unwrap();
+        let copy = store.find("copy").unwrap();
+        assert_eq!(copy.password.as_deref(), Some("secret"));
+        assert_eq!(copy.tunnel.keyfile.as_deref(), Some(reference));
+        let blocked = service.dispatch(request("/api/vault/keys/delete", json!({"reference":reference,"confirm":true})));
+        assert_eq!(blocked.status, 409, "{}", blocked.payload);
+        assert!(blocked.payload["error"].as_str().unwrap().contains("copy"));
+    }
+
+    #[test]
+    fn vault_key_deletion_reports_partial_metadata_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&service);
+        let imported = service.dispatch(ApiEnvelope { method:"POST".into(), path:"/api/vault/keys/import".into(), body:json!({"private_key":"fixture"}) });
+        let reference = imported.payload["reference"].as_str().unwrap();
+        let id = reference.strip_prefix(LOCAL_VAULT_KEY_PREFIX).unwrap();
+        std::fs::create_dir(tmp.path().join("keys").join(format!("{id}.pub"))).unwrap();
+        let deleted = service.dispatch(ApiEnvelope { method:"POST".into(), path:"/api/vault/keys/delete".into(), body:json!({"reference":reference,"confirm":true}) });
+        assert_eq!(deleted.status, 500);
+        assert_eq!(deleted.payload["deleted"], true);
+        assert!(!tmp.path().join("keys").join(format!("{id}.key.vault")).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_key_deletion_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let service = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&service);
+        let keys = tmp.path().join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        let target = tmp.path().join("untouched");
+        std::fs::write(&target, "untouched").unwrap();
+        let id = "0123456789abcdef0123456789abcdef";
+        symlink(&target, keys.join(format!("{id}.key.vault"))).unwrap();
+        let result = service.dispatch(ApiEnvelope { method:"POST".into(), path:"/api/vault/keys/delete".into(), body:json!({"reference":format!("vaultkey://{id}"),"confirm":true}) });
+        assert_eq!(result.status, 400);
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "untouched");
     }
 
     #[test]

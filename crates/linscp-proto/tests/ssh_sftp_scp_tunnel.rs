@@ -806,6 +806,34 @@ async fn test_cp_uses_native_copy_data_when_the_server_advertises_it() {
     sftp.close().await.unwrap();
 }
 
+/// PuTTYgen-generated keys exercise the real SSH authentication path, not just
+/// the converter. The committed keys are public, disposable test fixtures.
+#[tokio::test]
+async fn test_ssh_authentication_with_puttygen_ppk_v2_and_v3() {
+    const V2_NONE: &str = include_str!("../../linscp-crypto/tests/fixtures/ppk/v2-none.ppk");
+    const V3_NONE: &str = include_str!("../../linscp-crypto/tests/fixtures/ppk/v3-none.ppk");
+    const V2_ENCRYPTED: &str = include_str!("../../linscp-crypto/tests/fixtures/ppk/v2-encrypted.ppk");
+    const V3_ENCRYPTED: &str = include_str!("../../linscp-crypto/tests/fixtures/ppk/v3-encrypted.ppk");
+    let plain = linscp_crypto::ppk::ppk_to_openssh_pem(V3_NONE, "", None).unwrap();
+    let key = russh::keys::decode_secret_key(plain.as_str(), None).unwrap();
+    let (port, host_sha256, _host_md5, _fs) =
+        start_mock_ssh_server(0x43, key.public_key().clone(), false).await;
+    for (text, password) in [(V2_NONE, None), (V3_NONE, None),
+        (V2_ENCRYPTED, Some("test-only-passphrase")), (V3_ENCRYPTED, Some("test-only-passphrase"))] {
+        let cfg = SshConnectConfig {
+            tab_id: 59, role: "destination".to_string(), host: "127.0.0.1".to_string(),
+            port, username: "tester".to_string(), pinned_host_key: Some(host_sha256.clone()),
+            private_key_pem: Some(Zeroizing::new(text.to_string())),
+            key_passphrase: password.map(|value| Zeroizing::new(value.to_string())),
+            ..Default::default()
+        };
+        let session = SftpClientSession::connect(ProtocolScheme::Sftp, &cfg, None, 0)
+            .await.expect("PuTTYgen key should authenticate");
+        assert_eq!(session.pwd().await.unwrap(), "/home/tester");
+        session.close().await.unwrap();
+    }
+}
+
 /// Agent-backed authentication opens the session with no password, and an
 /// encrypted PPK only opens the session when its passphrase is supplied.
 #[tokio::test]
