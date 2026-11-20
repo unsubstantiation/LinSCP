@@ -11,6 +11,7 @@ pub mod offlineotp_vault;
 pub mod keepuptodate;
 pub mod presets;
 pub mod protected_file;
+pub(crate) mod restore_journal;
 pub mod script;
 pub mod script_params;
 pub mod session_store;

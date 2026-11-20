@@ -240,16 +240,20 @@ function propertiesBody(options) {
 function vaultBackupBody(path, options) {
   let request = {};
   try { request = JSON.parse((options && options.body) || '{}'); } catch (error) {}
+  if (path === '/api/backup/export') return { success: true, filename: 'backup.lscpbak', data_base64: 'TFNDUEJBSzE=' };
+  if (path === '/api/backup/import') return { success: true };
   if (path === '/api/vault/export') {
     return { success: true,
       filename: request.plain_text
         ? 'key_session_2026-11-15_00-00-00.json'
         : 'key_session_2026-11-15_00-00-00.json.aes',
-      data_base64: 'W10=', entry_count: (request.sessions || []).length,
+      data_base64: 'W10=',
+      entry_count: (request.sessions || []).length,
       plain_text: !!request.plain_text };
   }
   if (path === '/api/vault/scan') {
-    return { success: true, encrypted: false, ignored_entries: 1, entry_count: 2,
+    return { success: true, encrypted: false, fingerprint: 'b'.repeat(64), ignored_entries: 1,
+      entry_count: 2,
       entries: [
         { name: 'GUI/test', protocol: 'sftp', host: '127.0.0.1', port: 2222,
           username: 'user', has_password: true, has_key_passphrase: true,
@@ -277,6 +281,7 @@ const dom = new JSDOM(html, {
   runScripts: 'dangerously',
   pretendToBeVisual: true,
   beforeParse(window) {
+    window.TextEncoder = require("util").TextEncoder;
     // The page has one backend: the native shell's in-process IPC. A network
     // request would mean the browser host came back.
     window.fetch = () => {
@@ -910,7 +915,11 @@ function options(id) {
     !doc.getElementById('siteAutoReconnect').checked && doc.getElementById('siteAutoReconnectSeconds').value === '30');
   doc.getElementById('siteAutoReconnect').checked = true;
   doc.getElementById('siteAutoReconnectSeconds').value = '12';
+  check('port row sits directly below hostname row and alt port row sits directly below alt hostname row',
+    doc.getElementById('siteHost').closest('.form-row').nextElementSibling === doc.getElementById('sitePort').closest('.form-row') &&
+    doc.getElementById('siteAltHost').closest('.form-row').nextElementSibling === doc.getElementById('siteAltPort').closest('.form-row'));
   doc.getElementById('siteAltHost').value = 'backup.example.test';
+  doc.getElementById('siteAltPort').value = '2222';
   doc.getElementById('siteAltFallback').checked = true;
   await window.saveSite();
   await new Promise(resolve => setTimeout(resolve, 100));
@@ -928,8 +937,9 @@ function options(id) {
   check('stored auto reconnect settings populate the form',
     doc.getElementById('siteAutoReconnect').checked && doc.getElementById('siteAutoReconnectSeconds').value === '17');
   window.fillSiteForm({name: 'GUI/test', protocol: 'sftp', host: '127.0.0.1', port: 2222, username: 'user'});
-  check('saving posts alternate hostname and fallback setting',
+  check('saving posts alternate hostname, alternate port and fallback setting',
     JSON.parse(saved.options.body).session.alt_hostname === 'backup.example.test' &&
+    JSON.parse(saved.options.body).session.alt_port === 2222 &&
     JSON.parse(saved.options.body).session.alt_fallback === true);
   check('saving posts the name', saved && JSON.parse(saved.options.body).name === 'GUI/test');
   check('saving an existing site without a stored password posts no password',
@@ -949,19 +959,30 @@ function options(id) {
   delete responses['/api/sessions/copy'];
   window.prompt = oldPrompt;
 
-  window.fillSiteForm({name: 'alt', protocol: 'sftp', host: 'primary.example',
-    alt_hostname: 'alternate.example', alt_fallback: true});
-  check('stored alternate settings populate the form',
-    doc.getElementById('siteAltHost').value === 'alternate.example' && doc.getElementById('siteAltFallback').checked);
+  window.fillSiteForm({name: 'alt', protocol: 'sftp', host: 'primary.example', port: 22,
+    alt_hostname: 'alternate.example', alt_port: 2202, alt_fallback: true});
+  check('stored alternate settings populate the form including Alt Port',
+    doc.getElementById('siteAltHost').value === 'alternate.example' &&
+    doc.getElementById('siteAltPort').value === '2202' &&
+    doc.getElementById('siteAltFallback').checked);
+  doc.getElementById('siteAltPort').value = '70000';
+  const badAltPortBefore = calls.filter(call => call.path === '/api/sessions/save').length;
+  await window.saveSite();
+  check('invalid Alt Port is rejected before saving',
+    calls.filter(call => call.path === '/api/sessions/save').length === badAltPortBefore &&
+    lastLogLine().includes('1 to 65535'));
+  doc.getElementById('siteAltPort').value = '2202';
   const oldAltOpen = responses['/api/tabs/open'];
   responses['/api/tabs/open'] = {success: false, error: 'Test alternate failure'};
   window.openModal('siteModal');
   await window.connectFromSiteManager(true);
   const altOpen = calls.filter(call => call.path === '/api/tabs/open').pop();
-  check('Alt Connect sends the alternate-selection flag without replacing the primary hostname',
+  check('Alt Connect sends the alternate-selection flag and Alt Port without replacing the primary host/port',
     JSON.parse(altOpen.options.body).use_alt_host === true &&
     JSON.parse(altOpen.options.body).session.host === 'primary.example' &&
-    JSON.parse(altOpen.options.body).session.alt_hostname === 'alternate.example');
+    JSON.parse(altOpen.options.body).session.port === 22 &&
+    JSON.parse(altOpen.options.body).session.alt_hostname === 'alternate.example' &&
+    JSON.parse(altOpen.options.body).session.alt_port === 2202);
   responses['/api/tabs/open'] = oldAltOpen;
   window.newSite();
   const missingAltBefore = calls.filter(call => call.path === '/api/tabs/open').length;
@@ -1922,8 +1943,9 @@ function options(id) {
   window.newSite();
   doc.getElementById('siteProtocol').value = 'ftp';
   window.siteProtocolChanged();
-  check('choosing FTP in the site form moves the port to 21',
-    doc.getElementById('sitePort').value === '21');
+  check('choosing FTP in the site form moves both Port and Alt Port to 21',
+    doc.getElementById('sitePort').value === '21' &&
+    doc.getElementById('siteAltPort').value === '21');
   doc.getElementById('siteProtocol').value = 'webdav';
   window.siteProtocolChanged();
   check('the site form offers WebDAV over HTTPS on port 443',
@@ -2256,15 +2278,71 @@ function options(id) {
     calls.filter(call => call.path === '/api/sessions').length > sessionsBefore);
   window.closeModal('importSessionsModal');
 
-  /* Key/Session Export: the list comes from the saved sessions; the password
-   * must match; the plain-text option is off by default and warns; only the
-   * ticked sessions are exported. */
+  const previousVaultStatus = responses['/api/vault/status'];
+  responses['/api/vault/status'] = { success: false, error: 'Configuration is locked by another instance.' };
+  const gated = await window.requireLocalVaultUnlock();
+  check('configuration startup errors remain visible and block vault setup',
+    gated === false && doc.getElementById('vaultGate').style.display === 'flex' &&
+      doc.getElementById('vaultUnlockButton').disabled && text('vaultGateError').includes('another instance'));
+  responses['/api/vault/status'] = previousVaultStatus;
+  doc.getElementById('vaultGate').style.display = 'none';
+  doc.getElementById('vaultUnlockButton').disabled = false;
+  doc.getElementById('vaultGateError').textContent = '';
+
+  window.openFullBackup();
+  check('full backup dialog opens', doc.getElementById('fullBackupModal').classList.contains('open'));
+  doc.getElementById('fullBackupPassword').value = 'long-backup-password';
+  doc.getElementById('fullBackupConfirm').value = 'mismatch';
+  await window.exportFullBackup();
+  check('full backup rejects mismatched passwords', !calls.some(call => call.path === '/api/backup/export'));
+  doc.getElementById('fullBackupConfirm').value = 'long-backup-password';
+  await window.exportFullBackup();
+  const fullExport = calls.filter(call => call.path === '/api/backup/export').pop();
+  check('full backup exports with an independent password and clears it',
+    fullExport && JSON.parse(fullExport.options.body).password === 'long-backup-password' && value('fullBackupPassword') === '');
+  check('full backup restore requires choosing a backup file first',
+    !doc.getElementById('fullBackupImport').disabled);
+  await window.importFullBackup();
+  check('full backup restore without file sends nothing',
+    !calls.some(call => call.path === '/api/backup/import') &&
+      text('fullBackupStatus').includes('Choose a full backup file first.'));
+  const fullBackupFile = new window.File([new Uint8Array([76, 83, 67, 80, 66, 65, 75, 49, 1])], 'backup.lscpbak');
+  Object.defineProperty(doc.getElementById('fullBackupFile'), 'files',
+    { value: [fullBackupFile], configurable: true });
+  doc.getElementById('fullBackupPassword').value = 'long-backup-password';
+  await window.importFullBackup();
+  check('full backup restore requires explicit replace confirmation',
+    !calls.some(call => call.path === '/api/backup/import') &&
+      text('fullBackupStatus').includes('Confirm replacing current configuration'));
+  doc.getElementById('fullBackupPassword').value = 'long-backup-password';
+  doc.getElementById('fullBackupConfirmReplace').checked = true;
+  await window.importFullBackup();
+  const fullImport = calls.filter(call => call.path === '/api/backup/import').pop();
+  const fullImportBody = fullImport ? JSON.parse(fullImport.options.body) : {};
+  check('full backup restore posts base64 backup with confirmation and clears secrets',
+    fullImportBody.password === 'long-backup-password' &&
+      fullImportBody.confirm_replace === true &&
+      fullImportBody.data_base64 === 'TFNDUEJBSzEB' &&
+      value('fullBackupPassword') === '' &&
+      !doc.getElementById('fullBackupConfirmReplace').checked &&
+      text('fullBackupStatus').includes('Full backup restored.'));
+  window.closeFullBackup();
+
+  /* Key/Session Export: the list comes from saved sessions (reloaded on open),
+   * the password must match, tunnel-only keys show the SSH key badge, and
+   * only the ticked sessions are sent. */
+  const origSessionsList = responses['/api/sessions'].sessions;
+  responses['/api/sessions'].sessions = [
+    Object.assign({}, origSessionsList[0], { tunnel_private_key: 'vaultkey://fedcba9876543210fedcba9876543210' })
+  ];
   await window.openKeySessionExport();
-  check('the export dialog opens and lists the saved sessions',
+  check('the export dialog reloads saved sessions and flags tunnel SSH keys',
     doc.getElementById('keySessionExportModal').classList.contains('open') &&
       doc.getElementById('keyExportList').children.length === 1 &&
-      text('keyExportList').includes('GUI/test'),
+      text('keyExportList').includes('GUI/test') &&
+      text('keyExportList').includes('SSH key'),
     text('keyExportList'));
+  responses['/api/sessions'].sessions = origSessionsList;
   check('the export dialog does not offer plaintext backups',
     !doc.getElementById('keyExportPlainText') && !doc.getElementById('keyExportPassword').disabled);
   doc.getElementById('keyExportPassword').value = 'backup-password';
@@ -2275,13 +2353,15 @@ function options(id) {
   await window.exportKeySession();
   check('an empty selection exports nothing',
     exportCalls().length === exportBaseline &&
-      text('keyExportStatus').includes('Select at least one session to export'),
+      text('keyExportStatus').includes('Select at least one session to export.'),
     text('keyExportStatus'));
   doc.querySelector('#keyExportList input[type="checkbox"]').checked = true;
+  doc.getElementById('keyExportPassword').value = 'backup-password';
   doc.getElementById('keyExportPasswordConfirm').value = 'different-password';
+  const mismatchBaseline = exportCalls().length;
   await window.exportKeySession();
   check('mismatched passwords refuse to export',
-    exportCalls().length === exportBaseline &&
+    exportCalls().length === mismatchBaseline &&
       text('keyExportStatus').includes('The backup passwords do not match.'),
     text('keyExportStatus'));
   doc.getElementById('keyExportPasswordConfirm').value = 'backup-password';
@@ -2301,7 +2381,8 @@ function options(id) {
 
   /* Key/Session Import: the file is read before anything is listed, the
    * magic bytes tell encrypted from plain without trusting the extension,
-   * and only the ticked sessions are imported. */
+   * scan fingerprints prevent stale imports, and ticked sessions (with their
+   * merged SSH keys) are imported. */
   await window.openKeySessionImport();
   check('the import dialog opens with everything reset',
     doc.getElementById('keySessionImportModal').classList.contains('open') &&
@@ -2349,16 +2430,33 @@ function options(id) {
     confirmMessages[confirmMessages.length - 1]);
   confirmResult = true;
   doc.getElementById('keyImportReplace').checked = false;
+  const mutatedFile = new window.File(['[{"type":"PASSWORD","changed":1}]'], 'backup.json',
+    { type: 'application/json' });
+  Object.defineProperty(doc.getElementById('keyImportFile'), 'files',
+    { value: [mutatedFile], configurable: true });
   await window.importKeySession();
+  check('changing the backup file after scan refuses import until re-read',
+    importCalls().length === importBaseline &&
+      text('keyImportStatus').includes('changed since it was read'),
+    text('keyImportStatus'));
+  Object.defineProperty(doc.getElementById('keyImportFile'), 'files',
+    { value: [plainFile], configurable: true });
+  doc.getElementById('sshKeyVaultModal').classList.add('open');
+  const keyPickerCallsBefore = calls.filter(call => call.path === '/api/vault/keys').length;
+  await window.importKeySession();
+  const keyPickerCallsAfter = calls.filter(call => call.path === '/api/vault/keys').length;
+  doc.getElementById('sshKeyVaultModal').classList.remove('open');
   const keyImportCall = importCalls().pop();
   const keyImportPayload = keyImportCall ? JSON.parse(keyImportCall.options.body) : {};
-  check('importing posts only the ticked sessions',
+  check('importing posts only the ticked sessions and the scan fingerprint',
     JSON.stringify(keyImportPayload.sessions) === JSON.stringify(['backup/restored']) &&
+      keyImportPayload.fingerprint === 'b'.repeat(64) &&
       keyImportPayload.replace === false,
     JSON.stringify(keyImportPayload));
-  check('a finished import reports what happened and reloads the saved sessions',
+  check('a finished import reports what happened, reloads saved sessions, and refreshes open key pickers',
     text('keyImportStatus').includes('Imported 1 session(s)') &&
-      calls.filter(call => call.path === '/api/sessions').length > 0,
+      calls.filter(call => call.path === '/api/sessions').length > 0 &&
+      keyPickerCallsAfter > keyPickerCallsBefore,
     text('keyImportStatus'));
   window.closeModal('keySessionImportModal');
 

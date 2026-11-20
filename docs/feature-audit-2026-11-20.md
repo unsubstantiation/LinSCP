@@ -2,14 +2,17 @@
 
 **Baseline:** `4987880ca4adea91a8d3a8e056217620d39859ed` (includes PR #125). This is a focused static audit of the current native GUI, service routes, known limitations and CI, not an exhaustive security review or a claim that unmentioned features are complete. Prior reports and the generated parity ledger include historical CLI and removed-host material; their counts are not a count of broken GUI features.
 
-> **Follow-up in progress on this branch:** workflow triggers and PPK test
-> registration have been updated; site saves now fail on unreadable stores,
-> folder deletion uses the folder boundary, and session import has been wired
-> with bounded scanning and source-change checks. Literal frontend route checks
-> now include HTTP methods. These changes have not yet passed a full Rust build
-> or end-to-end native tests; the findings below describe the audited baseline.
-> X2Go, Android/device verification, transfer restrictions and interprocess
-> vault coordination remain open.
+> **Follow-up status on `arena/7562cb1f-linscp` (after PR #128):** portable
+> encrypted full application backup and crash-safe transactional restore (with
+> vault SSH key rewrapping, encrypted undo journal `.full-restore-journal`,
+> startup recovery gate, advisory `ConfigDirectoryLock`, and Linux/Android/
+> Windows directory durability barriers) are now implemented and enabled in the
+> GUI and console, alongside encrypted `sessions.ini`/`sshhostkeys`/
+> `workspaces.json`/`auto-reconnect.json` and memory-only Commander logs from
+> PR #128. Full CI Rust workspace builds/tests on Linux, Windows, and Android
+> still need to run on GitHub Actions; X2Go live interoperability, Android
+> Keystore/device verification, and transfer/queue parity gaps below remain
+> open.
 
 **Status vocabulary:** *broken* means a concrete mismatch visible in current source; *limited* means intentionally restricted or missing behavior; *unverified* means there is insufficient end-to-end evidence, not proof of failure. Priority is suggested by user impact and risk, not a release commitment.
 
