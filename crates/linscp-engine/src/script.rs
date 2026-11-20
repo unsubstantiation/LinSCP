@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine as _;
 use linscp_i18n::{CatalogDomain, translate, translate_with};
 use linscp_platform::SecretVault;
 use linscp_platform::terminal::{

@@ -8156,10 +8156,15 @@ mod tests {
             path: "/api/sessions/save".into(),
             body: json!({"name": "prod", "protocol": "sftp", "host": "prod.example", "port": 22, "username": "deploy", "password": "secret-password", "private_key": key_ref}),
         }).status, 200);
+        let prefs_to_save = UserPreferences {
+            filemask: "*.tar.gz".into(),
+            confirm_overwrite: false,
+            ..UserPreferences::default()
+        };
         assert_eq!(src.dispatch(ApiEnvelope {
             method: "POST".into(),
             path: "/api/preferences".into(),
-            body: json!({"preferences": {"filemask": "*.tar.gz", "confirm_overwrite": false}}),
+            body: json!({"preferences": prefs_to_save}),
         }).status, 200);
 
         assert_eq!(dst.dispatch(ApiEnvelope {
