@@ -1,11 +1,17 @@
 //! X2Go KDrive session-control primitives.
 //!
-//! These construct and parse session-control messages without executing
-//! commands. They do not implement the KDrive graphics protocol. Callers must
-//! not start an agent until they can attach a graphics transport and reliably
-//! clean up the remote session.
+//! Session-control primitives, guarded startup and best-effort termination for
+//! X2Go KDrive. The experimental service route uses these primitives; callers
+//! must attach graphics and manage the agent lifecycle.
 
 use std::fmt;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::ssh::SshConnection;
+use crate::ProtoError;
+use zeroize::{Zeroize, Zeroizing};
 
 const MAX_REPLY_BYTES: usize = 8192;
 const MAX_DIMENSION: u16 = 8192;
@@ -92,10 +98,143 @@ impl X2GoStartedSession {
     /// Server-side graphics listener port from the validated agent response.
     pub fn graphics_port(&self) -> u16 { self.graphics_port }
 
+    /// Build the desktop startup command from a validated session and one of
+    /// the supported desktop names. It never contains the graphics cookie or
+    /// caller-supplied shell fragments. A successful shell exit only confirms
+    /// the command was launched, not that the desktop is usable.
+    pub fn desktop_command(&self, desktop: X2GoDesktop) -> String {
+        format!("(setsid x2goruncommand {} {} {} {} {} nosnd D </dev/null >/dev/null 2>&1 &)",
+            self.display, self.agent_pid, self.session_id, self.sound_port, desktop.argument())
+    }
+
     /// A safe command for explicit cleanup, based on the validated session ID.
     /// Constructing this string does not terminate the session.
     pub fn terminate_command(&self) -> String {
         format!("x2goterminate-session {}", self.session_id)
+    }
+}
+
+impl Drop for X2GoStartedSession {
+    fn drop(&mut self) { self.cookie.zeroize(); }
+}
+
+/// Owns an already-started, validated agent. Releasing the guard triggers a
+/// single bounded termination attempt over the same authenticated SSH session.
+/// This does not start an agent and must be created immediately after a valid
+/// startup response, before graphics setup. Explicit `close` reports cleanup
+/// failure; dropping schedules best-effort cleanup without blocking.
+///
+/// Runtime shutdown, process termination, broken SSH, and malformed or missing
+/// startup replies can still leave remote agents behind. The caller must expose
+/// cleanup failures and must not claim that Drop guarantees remote termination.
+pub struct X2GoAgentGuard {
+    session: X2GoStartedSession,
+    ssh: Option<Arc<SshConnection>>,
+    release: Option<tokio::sync::oneshot::Sender<()>>,
+    cleanup: Option<tokio::task::JoinHandle<Result<(), ProtoError>>>,
+}
+
+impl X2GoAgentGuard {
+    /// The handle must be the runtime that owns the SSH connection, and it must
+    /// remain running until cleanup finishes. The connection must be the same
+    /// destination on which the agent was started, never a new direct session.
+    pub fn new(runtime: &tokio::runtime::Handle, ssh: Arc<SshConnection>, session: X2GoStartedSession) -> Self {
+        let command = session.terminate_command();
+        let connection = Arc::clone(&ssh);
+        let cleanup = async move {
+            let output = ssh.exec_command_bounded(&command, Duration::from_secs(10), 8192).await?;
+            if output.exit_code != Some(0) {
+                return Err(ProtoError::Transport("Could not terminate the X2Go agent.".into()));
+            }
+            Ok(())
+        };
+        let mut guard = Self::with_cleanup(runtime, session, cleanup);
+        guard.ssh = Some(connection);
+        guard
+    }
+
+    fn with_cleanup<F>(runtime: &tokio::runtime::Handle, session: X2GoStartedSession, cleanup: F) -> Self
+    where F: Future<Output = Result<(), ProtoError>> + Send + 'static {
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let task = runtime.spawn(async move {
+            // Receiving either a signal or sender drop means the owner ended.
+            let _ = wait.await;
+            cleanup.await
+        });
+        Self { session, ssh: None, release: Some(release), cleanup: Some(task) }
+    }
+
+    /// The graphics handshake needs the cookie, but it must never leave the
+    /// authenticated channel or be written to logs, IPC, or process arguments.
+    pub fn session(&self) -> &X2GoStartedSession { &self.session }
+
+    pub(crate) fn connection(&self) -> Option<&Arc<SshConnection>> { self.ssh.as_ref() }
+
+    /// Trigger cleanup and wait for its result. If this future is cancelled the
+    /// detached cleanup task continues while the runtime is still running.
+    pub async fn close(mut self) -> Result<(), ProtoError> {
+        if let Some(release) = self.release.take() { let _ = release.send(()); }
+        let Some(task) = self.cleanup.take() else {
+            return Err(ProtoError::Transport("X2Go cleanup is unavailable.".into()));
+        };
+        match task.await {
+            Ok(result) => result,
+            Err(_) => Err(ProtoError::Transport("X2Go cleanup task failed.".into())),
+        }
+    }
+}
+
+/// Start an agent using the authenticated destination connection, then
+/// immediately put its validated response under a cleanup guard. The detached
+/// startup task continues if the caller cancels; if its result is no longer
+/// wanted, dropping the returned guard schedules termination.
+///
+/// A timeout, disconnect, malformed reply, or process/runtime shutdown can
+/// still leave an unidentifiable remote agent. These errors explicitly warn
+/// that cleanup is unconfirmed; the caller must not assume no session exists.
+/// The service uses this for experimental viewer startup; it does not itself
+/// start a desktop.
+pub async fn start_guarded_agent(
+    ssh: Arc<SshConnection>, width: u16, height: u16, desktop: X2GoDesktop,
+    link: X2GoLink, timeout: Duration,
+) -> Result<X2GoAgentGuard, ProtoError> {
+    let command = start_command(width, height, desktop, link)
+        .map_err(|_| ProtoError::Transport("Invalid X2Go startup parameters.".into()))?;
+    if timeout.is_zero() || timeout > Duration::from_secs(120) {
+        return Err(ProtoError::Transport("Invalid X2Go startup timeout.".into()));
+    }
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|_| ProtoError::Transport("X2Go startup requires an active runtime.".into()))?;
+    let task_runtime = runtime.clone();
+    detach_startup(&runtime, async move {
+        let output = ssh.exec_command_bounded(&command, timeout, MAX_REPLY_BYTES).await
+            .map_err(|_| ProtoError::Transport("X2Go agent startup failed; remote cleanup could not be confirmed.".into()))?;
+        // Neither stdout (which contains the cookie) nor stderr reaches IPC,
+        // logs, error text, or Debug; erase both buffers when finished.
+        let stdout = Zeroizing::new(output.stdout);
+        let _stderr = Zeroizing::new(output.stderr);
+        let session = parse_start_reply(&stdout, output.exit_code)
+            .map_err(|_| ProtoError::Transport("Invalid X2Go agent response; remote cleanup could not be confirmed.".into()))?;
+        Ok(X2GoAgentGuard::new(&task_runtime, ssh, session))
+    }).await
+}
+
+async fn detach_startup<F>(runtime: &tokio::runtime::Handle, startup: F) -> Result<X2GoAgentGuard, ProtoError>
+where F: Future<Output = Result<X2GoAgentGuard, ProtoError>> + Send + 'static {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    runtime.spawn(async move {
+        // If the requester disappeared, the returned guard is dropped here,
+        // triggering the same cleanup as an explicitly abandoned session.
+        let _ = sender.send(startup.await);
+    });
+    receiver.await.map_err(|_| ProtoError::Transport("X2Go startup task ended; remote cleanup could not be confirmed.".into()))?
+}
+
+impl Drop for X2GoAgentGuard {
+    fn drop(&mut self) {
+        // Dropping the sender wakes the detached task; dropping a JoinHandle
+        // does not abort it. Never wait for SSH while holding service locks.
+        self.release.take();
     }
 }
 
@@ -163,6 +302,109 @@ mod tests {
 
     fn reply(id: &str) -> String {
         format!("50\n{COOKIE}\n12345\n{id}\n31001\n31002\n31003\n")
+    }
+
+    #[test]
+    fn desktop_startup_uses_only_validated_fields_and_never_the_cookie() {
+        let session = parse_start_reply(reply("alice-50-test").as_bytes(), Some(0)).unwrap();
+        for desktop in [X2GoDesktop::Xfce, X2GoDesktop::Mate, X2GoDesktop::Lxde] {
+            let command = session.desktop_command(desktop);
+            assert!(command.contains("x2goruncommand 50 12345 alice-50-test 31002"));
+            assert!(command.contains(desktop.argument()));
+            assert!(!command.contains(COOKIE));
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_startup_continues_and_then_cleans_the_guard() {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
+        let runtime = tokio::runtime::Handle::current();
+        let task_runtime = runtime.clone();
+        let caller = tokio::spawn(async move {
+            detach_startup(&runtime, async move {
+                let _ = ready_tx.send(());
+                let _ = resume_rx.await;
+                let session = parse_start_reply(reply("alice-50-test").as_bytes(), Some(0)).unwrap();
+                Ok(X2GoAgentGuard::with_cleanup(&task_runtime, session, async move {
+                    let _ = cleanup_tx.send(());
+                    Ok(())
+                }))
+            }).await
+        });
+        ready_rx.await.unwrap();
+        caller.abort();
+        let _ = caller.await;
+        resume_tx.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), cleanup_rx).await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn closing_a_guard_waits_for_cleanup_once() {
+        let session = parse_start_reply(reply("alice-50-test").as_bytes(), Some(0)).unwrap();
+        let (signal, observed) = tokio::sync::oneshot::channel();
+        let guard = X2GoAgentGuard::with_cleanup(&tokio::runtime::Handle::current(), session, async move {
+            let _ = signal.send(());
+            Ok(())
+        });
+        assert_eq!(guard.session().session_id(), "alice-50-test");
+        assert!(guard.close().await.is_ok());
+        assert!(observed.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_guard_still_starts_cleanup() {
+        let session = parse_start_reply(reply("alice-50-test").as_bytes(), Some(0)).unwrap();
+        let (signal, observed) = tokio::sync::oneshot::channel();
+        let guard = X2GoAgentGuard::with_cleanup(&tokio::runtime::Handle::current(), session, async move {
+            let _ = signal.send(());
+            Ok(())
+        });
+        drop(guard);
+        assert!(tokio::time::timeout(Duration::from_secs(1), observed).await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_does_not_abort_cleanup() {
+        let session = parse_start_reply(reply("alice-50-test").as_bytes(), Some(0)).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let guard = X2GoAgentGuard::with_cleanup(&tokio::runtime::Handle::current(), session, async move {
+            let _ = started_tx.send(());
+            let _ = finish_rx.await;
+            let _ = done_tx.send(());
+            Ok(())
+        });
+        let close = tokio::spawn(guard.close());
+        started_rx.await.unwrap();
+        close.abort();
+        let _ = close.await;
+        finish_tx.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), done_rx).await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_graphics_attachment_waits_for_agent_cleanup() {
+        let session = parse_start_reply(reply("alice-50-test").as_bytes(), Some(0)).unwrap();
+        let (signal, observed) = tokio::sync::oneshot::channel();
+        let guard = X2GoAgentGuard::with_cleanup(&tokio::runtime::Handle::current(), session, async move {
+            let _ = signal.send(());
+            Ok(())
+        });
+        let result = crate::x2go_transport::GuardedKDriveSession::attach(guard, 800, 600, Duration::from_secs(1)).await;
+        assert!(result.is_err());
+        assert!(observed.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_is_reported_to_explicit_close() {
+        let session = parse_start_reply(reply("alice-50-test").as_bytes(), Some(0)).unwrap();
+        let guard = X2GoAgentGuard::with_cleanup(&tokio::runtime::Handle::current(), session, async {
+            Err(ProtoError::Transport("cleanup failed".into()))
+        });
+        assert!(guard.close().await.is_err());
     }
 
     #[test]

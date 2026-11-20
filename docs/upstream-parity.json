@@ -5142,7 +5142,7 @@
       "id": "gui.generate-url",
       "area": "GUI",
       "status": "verified",
-      "notes": "Upstream's Generate URL dialog, as a Session URL dialog in the Commander: it shows the active tab's URL and the equivalent 'open' command, and offers the stored password only as an explicit tick. The password is absent from the default URL and from the command line; when it is included the dialog says the URL is a secret, and only the host reaches the command log. A local tab, which has no server or session, is refused by name instead of producing a meaningless URL. gui-local was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
+      "notes": "Upstream's Generate URL dialog, as a Session URL dialog in the Commander: it shows the active tab's URL and the equivalent 'open' command, and offers the stored password only as an explicit tick. The password is absent from the default URL and from the command line; when it is included the dialog says the URL is a secret, and only the host reaches the logs. A local tab, which has no server or session, is refused by name instead of producing a meaningless URL. gui-local was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
       "source": [
         "crates/linscp-service/src/lib.rs",
         "ui/src/index.ts"

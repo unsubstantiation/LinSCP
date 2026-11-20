@@ -33,6 +33,7 @@ pub mod queue;
 pub mod share_export;
 pub mod tabs;
 pub mod terminal_bridge;
+pub mod x2go_bridge;
 
 use tabs::{TabRuntime, parse_tab_id_str, session_is_local, collect_session_folders, stored_site_to_gui_json};
 use linscp_engine::url_and_raw::GuiConnectError;
@@ -82,7 +83,22 @@ struct InnerState {
     queue_transfers: Vec<Value>,
     /// Embedded terminals, one per open terminal window.
     terminals: terminal_bridge::TerminalRegistry,
+    x2go: HashMap<u64, X2GoRegistered>,
+    x2go_next_generation: u64,
+    x2go_pending: std::collections::HashSet<u64>,
     monitors: monitor::Monitors,
+}
+
+// A generation correlates delayed browser requests with the bridge that issued
+// them. It is not an authentication credential; normal API access controls apply.
+struct X2GoRegistered { generation: String, bridge: x2go_bridge::X2GoBridge }
+
+/// Clears a tab's in-progress reservation even if an open request is cancelled.
+struct X2GoOpenReservation { state: Arc<Mutex<InnerState>>, tab: u64 }
+impl Drop for X2GoOpenReservation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() { state.x2go_pending.remove(&self.tab); }
+    }
 }
 
 #[derive(Clone)]
@@ -144,6 +160,9 @@ impl CommanderService {
                 preferences,
                 queue_transfers: Vec::new(),
                 terminals: terminal_bridge::TerminalRegistry::default(),
+                x2go: HashMap::new(),
+                x2go_pending: std::collections::HashSet::new(),
+                x2go_next_generation: 0,
                 monitors: monitor::Monitors::default(),
             })),
             event_tx: Arc::new(Mutex::new(None)),
@@ -181,6 +200,7 @@ impl CommanderService {
 
     // Synchronous dispatch for HTTP and Tauri – handles all local and file-backed endpoints.
     pub fn dispatch(&self, req: ApiEnvelope) -> ApiReply {
+        self.note_lost_connections();
         let method = req.method.to_ascii_uppercase();
         let (raw_path, query_str) = match req.path.split_once('?') {
             Some((p, q)) => (p, q),
@@ -214,6 +234,7 @@ impl CommanderService {
             ("GET", "/api/preferences") => self.handle_get_preferences(),
             ("POST", "/api/preferences") => self.handle_save_preferences(req.body),
             ("GET", "/api/sessions") => self.handle_list_sessions(),
+            ("GET", "/api/x2go/poll") => self.x2go_poll(&query),
             ("GET", "/api/monitor/hosts") => self.monitor_hosts(),
             ("GET", "/api/monitor/settings") => self.monitor_settings_get(),
             ("POST", "/api/monitor/settings") => self.monitor_settings_post(req.body),
@@ -304,6 +325,9 @@ impl CommanderService {
     }
 
     pub async fn dispatch_async(&self, req: ApiEnvelope) -> ApiReply {
+        // A route that falls through to `dispatch` is asked twice; the second
+        // pass finds a tab that is already disconnected and does nothing.
+        self.note_lost_connections();
         let (method, raw_path) = {
             let m = req.method.to_ascii_uppercase();
             let p = req.path.split('?').next().unwrap_or(&req.path).to_string();
@@ -331,6 +355,9 @@ impl CommanderService {
             ("POST", "/api/remote/delete") => self.delete_remote_any_async(req.body).await,
             ("POST", "/api/monitor/sample") => self.monitor_sample_async(req.body).await,
             ("POST", "/api/session/terminal") => self.open_terminal_async(req.body).await,
+            ("POST", "/api/x2go/open") => self.x2go_open(req.body).await,
+            ("POST", "/api/x2go/input") => self.x2go_input(req.body).await,
+            ("POST", "/api/x2go/close") => self.x2go_close(req.body).await,
             ("POST", "/api/shell/consume") => self.consume_shell_offer_async(req.body).await,
             ("GET", "/api/remote/edit") => self.remote_edit_read_async(&parse_query(req.path.split_once('?').map(|(_, q)| q).unwrap_or(""))).await,
             ("POST", "/api/remote/save") => self.remote_save_async(req.body).await,
@@ -460,7 +487,7 @@ impl CommanderService {
 
     async fn reconnect_tab_async(&self, body: Value) -> ApiReply {
         let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No such tab") };
-        let mut tab = {
+        let (mut tab, ended_viewer) = {
             let mut state = self.state.lock().expect("state mutex");
             state.monitors.forget(id);
             let tab = match state.tabs.get(&id).cloned() { Some(tab) => tab, None => return api_error(400, "No such tab") };
@@ -468,8 +495,10 @@ impl CommanderService {
             if tab.spec.is_none() { return api_error(400, "Missing session settings"); }
             if !state.pending_connections.insert(id) { return api_error(409, "Connection already in progress"); }
             if let Some(current) = state.tabs.get_mut(&id) { current.connected = false; current.remote = None; current.error.clear(); }
-            tab
+            let ended_viewer = state.x2go.remove(&id);
+            (tab, ended_viewer)
         };
+        drop(ended_viewer);
         // Reconnect to the directory being viewed, not the original startup
         // directory; credentials and approved host keys stay in the private spec.
         if let Some(spec) = tab.spec.as_mut() { spec.session.initial_dir = tab.remote_dir.clone(); }
@@ -1341,6 +1370,129 @@ impl CommanderService {
             }
         }
         ApiReply { status: 200, payload: json!({"success": true, "samples": samples}) }
+    }
+
+    /// Starts only on an existing authenticated tab; no host or credentials
+    /// from the request can redirect the graphics connection to another host.
+    async fn x2go_open(&self, body: Value) -> ApiReply {
+        use linscp_proto::x2go_control::{start_command, start_guarded_agent, X2GoDesktop, X2GoLink};
+        use linscp_proto::x2go_transport::GuardedKDriveSession;
+        let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else { return api_error(400, "No active tab"); };
+        let desktop = match body.get("desktop").and_then(Value::as_str) {
+            Some("XFCE") => X2GoDesktop::Xfce,
+            Some("MATE") => X2GoDesktop::Mate,
+            Some("LXDE") => X2GoDesktop::Lxde,
+            _ => return api_error(400, "Select an available X2Go desktop."),
+        };
+        let width = body.get("width").and_then(Value::as_u64).and_then(|n| u16::try_from(n).ok()).unwrap_or(0);
+        let height = body.get("height").and_then(Value::as_u64).and_then(|n| u16::try_from(n).ok()).unwrap_or(0);
+        if start_command(width, height, desktop, X2GoLink::Lan).is_err() { return api_error(400, "Invalid X2Go desktop dimensions."); }
+        let (session, ssh) = {
+            let mut state = self.state.lock().expect("state mutex");
+            if state.x2go.contains_key(&id) || state.x2go_pending.contains(&id) { return api_error(409, "An X2Go viewer is already open or starting for this tab."); }
+            let Some(tab) = state.tabs.get(&id).filter(|tab| tab.connected && !tab.is_local) else { return api_error(400, "Not connected"); };
+            let Some(session) = tab.remote.as_ref().cloned() else { return api_error(400, "Not connected"); };
+            let Some(ssh) = session.ssh_connection().cloned() else { return api_error(400, "This session has no SSH connection."); };
+            state.x2go_pending.insert(id);
+            (session, ssh)
+        };
+        let _reservation = X2GoOpenReservation { state: self.state.clone(), tab: id };
+        match tokio::time::timeout(std::time::Duration::from_secs(15),
+            linscp_proto::remote_desktop::check_via_ssh(session.as_ref(), linscp_proto::remote_desktop::RemoteDesktopKind::X2Go)).await {
+            Ok(Ok(true)) => {},
+            Ok(Ok(false)) => return api_error(400, "X2Go KDrive components were not detected on this server."),
+            _ => return api_error(400, "Could not check the X2Go server."),
+        }
+        let agent = match start_guarded_agent(ssh.clone(), width, height, desktop, X2GoLink::Lan, std::time::Duration::from_secs(75)).await {
+            Ok(agent) => agent,
+            Err(error) => return api_error(400, error.to_string()),
+        };
+        let mut channel = match GuardedKDriveSession::attach(agent, width, height, std::time::Duration::from_secs(15)).await {
+            Ok(channel) => channel,
+            Err(error) => return api_error(400, error.to_string()),
+        };
+        if channel.start_desktop(desktop).await.is_err() {
+            return match channel.close().await {
+                Ok(()) => api_error(400, "Could not start the X2Go desktop."),
+                Err(_) => api_error(400, "Could not start the X2Go desktop; agent cleanup could not be confirmed."),
+            };
+        }
+        let bridge = x2go_bridge::X2GoBridge::start(channel);
+        let generation = match self.register_x2go_bridge(id, &ssh, bridge) {
+            Ok(generation) => generation,
+            Err(bridge) => return match bridge.close().await {
+                Ok(()) => api_error(409, "The selected SSH session changed while X2Go was starting."),
+                Err(_) => api_error(409, "The SSH session changed while X2Go was starting; agent cleanup could not be confirmed."),
+            },
+        };
+        ApiReply { status: 200, payload: json!({"success": true, "tab": id, "generation": generation, "width": width, "height": height}) }
+    }
+
+    /// Install only on the exact connection that started the agent. The caller
+    /// retains ownership on failure so dropping the bridge still cleans up.
+    fn register_x2go_bridge(&self, tab_id: u64, ssh: &Arc<linscp_proto::ssh::SshConnection>,
+                            bridge: x2go_bridge::X2GoBridge) -> Result<String, x2go_bridge::X2GoBridge> {
+        let mut state = self.state.lock().expect("state mutex");
+        let matches = state.tabs.get(&tab_id).filter(|tab| tab.connected && !tab.is_local)
+            .and_then(|tab| tab.remote.as_ref())
+            .and_then(|remote| remote.ssh_connection())
+            .is_some_and(|current| Arc::ptr_eq(current, ssh));
+        if !matches || state.x2go.contains_key(&tab_id) { return Err(bridge); }
+        let Some(next) = state.x2go_next_generation.checked_add(1) else { return Err(bridge); };
+        state.x2go_next_generation = next;
+        let generation = next.to_string();
+        state.x2go.insert(tab_id, X2GoRegistered { generation: generation.clone(), bridge });
+        Ok(generation)
+    }
+
+    fn x2go_poll(&self, query: &BTreeMap<String, String>) -> ApiReply {
+        let Some(id) = query.get("tab").and_then(|value| value.parse::<u64>().ok()) else {
+            return api_error(400, "No active tab");
+        };
+        let mut state = self.state.lock().expect("state mutex");
+        let Some(registered) = state.x2go.get_mut(&id).filter(|entry| query.get("generation") == Some(&entry.generation)) else { return api_error(400, "X2Go viewer is not open."); };
+        match registered.bridge.poll() {
+            Ok(message) => ApiReply { status: 200, payload: json!({"success": true, "message": message}) },
+            Err(error) => api_error(400, error),
+        }
+    }
+
+    async fn x2go_input(&self, body: Value) -> ApiReply {
+        let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else { return api_error(400, "No active tab"); };
+        // 41 bytes encode to exactly 56 base64 characters; cap before decoding.
+        let Some(encoded) = body.get("data").and_then(Value::as_str).filter(|s| s.len() == 56) else {
+            return api_error(400, "Invalid KDrive input event.");
+        };
+        let packet: [u8; linscp_proto::kdrive_wire::CLIENT_EVENT_SIZE] = match BASE64_STD.decode(encoded)
+            .ok().and_then(|bytes| bytes.try_into().ok()) {
+                Some(packet) => packet,
+                None => return api_error(400, "Invalid KDrive input event."),
+            };
+        let input = {
+            let state = self.state.lock().expect("state mutex");
+            match state.x2go.get(&id).filter(|entry| body.get("generation").and_then(Value::as_str) == Some(entry.generation.as_str())) {
+                Some(entry) => entry.bridge.input(), None => return api_error(400, "X2Go viewer is not open.")
+            }
+        };
+        match input.write(packet).await {
+            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
+            Err(error) => api_error(400, error),
+        }
+    }
+
+    async fn x2go_close(&self, body: Value) -> ApiReply {
+        let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else { return api_error(400, "No active tab"); };
+        let bridge = {
+            let mut state = self.state.lock().expect("state mutex");
+            if state.x2go.get(&id).is_some_and(|entry| body.get("generation").and_then(Value::as_str) == Some(entry.generation.as_str())) {
+                state.x2go.remove(&id).map(|entry| entry.bridge)
+            } else { None }
+        };
+        let Some(bridge) = bridge else { return ApiReply { status: 200, payload: json!({"success": true}) }; };
+        match bridge.close().await {
+            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
+            Err(error) => api_error(400, error),
+        }
     }
 
     /// Opens an embedded terminal on a tab's pooled SSH connection.
@@ -2386,6 +2538,65 @@ impl CommanderService {
         api_error(500, "Cannot allocate a unique encrypted SSH key file.")
     }
 
+    /* A tab's `connected` said that its last answer had come back, and nothing
+     * asked again. A host that is told to shut down closes the connection
+     * between two answers, and the tab went on being offered as connected: the
+     * badge said so, the next listing was attempted over a session that could
+     * not answer, and the embedded shell - which runs over the same connection
+     * and so learns first - was the only place that reported the ending. Every
+     * request now asks the connection first, which is a flag read and not a
+     * probe: nothing is sent to a host that may no longer be there. The frame
+     * a terminal window polls is a request like any other, so the window that
+     * is watching the shell die is the one whose next answer says the tab is
+     * disconnected too. */
+
+    /// Reports every tab whose connection is gone as disconnected.
+    fn note_lost_connections(&self) {
+        let lost: Vec<(u64, String)> = {
+            let state = self.state.lock().expect("state mutex");
+            state
+                .tabs
+                .values()
+                .filter(|tab| tab.connected && !tab.is_local)
+                .filter_map(|tab| {
+                    tab.remote
+                        .as_ref()
+                        .filter(|session| session.connection_lost())
+                        .map(|_| (tab.id, tab.name.clone()))
+                })
+                .collect()
+        };
+        for (id, name) in lost {
+            self.mark_connection_lost(id, &name);
+        }
+    }
+
+    /// Reports a session that will not answer again, once.
+    fn mark_connection_lost(&self, tab_id: u64, name: &str) {
+        const REASON: &str = "The connection to the server ended.";
+        let (note, ended, ended_viewer) = {
+            let mut state = self.state.lock().expect("state mutex");
+            let Some(tab) = state.tabs.get_mut(&tab_id) else { return };
+            // The status is asked every fifteen seconds and the frame of an
+            // ended shell is asked for far more often than that: one ending is
+            // one entry, or the log fills with the same sentence.
+            if !tab.connected {
+                return;
+            }
+            tab.connected = false;
+            tab.error = REASON.to_string();
+            // The session is let go outside this lock: dropping the last of it
+            // joins the thread that watched a jump tunnel, and every other
+            // request waits on this mutex.
+            let ended = tab.remote.take();
+            let ended_viewer = state.x2go.remove(&tab_id);
+            (format!("[Session] {name}: {}", REASON.to_lowercase()), ended, ended_viewer)
+        };
+        drop(ended_viewer);
+        drop(ended);
+        self.add_log(&note, "error");
+    }
+
     fn handle_status(&self) -> ApiReply {
         let g = self.state.lock().expect("state mutex");
         let roots = self.local_fs.list_roots().unwrap_or_default();
@@ -2977,8 +3188,11 @@ impl CommanderService {
         // A terminal lives in a tab's connection; closing the tab must not
         // leave the shell running with no window to show it.
         g.terminals.close_for_tab(tab_id);
+        let ended_viewer = g.x2go.remove(&tab_id);
         g.monitors.forget(tab_id);
         if g.active_tab_id == Some(tab_id) { g.active_tab_id = g.tabs.keys().next().cloned(); }
+        drop(g);
+        drop(ended_viewer);
         ApiReply{ status: 200, payload: json!({"success": true})}
     }
     fn handle_tabs_select(&self, body: Value) -> ApiReply {
@@ -4121,7 +4335,7 @@ impl CommanderService {
         let kind = linscp_proto::remote_desktop::RemoteDesktopKind::from_scheme(spec.session.protocol)
             .unwrap_or(linscp_proto::remote_desktop::RemoteDesktopKind::Rdp);
         if kind == linscp_proto::remote_desktop::RemoteDesktopKind::X2Go {
-            return api_error(501, "The built-in X2Go KDrive viewer is not implemented yet; NX support has been removed.");
+            return api_error(501, "Use the experimental X2Go viewer in Remote desktop; NX support has been removed.");
         }
         let port = if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port };
         let target = format!("{}:{}", spec.session.host, port);
@@ -4181,7 +4395,7 @@ impl CommanderService {
         let kind = linscp_proto::remote_desktop::RemoteDesktopKind::from_scheme(spec.session.protocol)
             .unwrap_or(linscp_proto::remote_desktop::RemoteDesktopKind::Rdp);
         if kind == linscp_proto::remote_desktop::RemoteDesktopKind::X2Go {
-            return api_error(501, "The built-in X2Go KDrive viewer is not implemented yet; NX support has been removed.");
+            return api_error(501, "Use the experimental X2Go viewer in Remote desktop; NX support has been removed.");
         }
         let port = if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port };
         let target = format!("{}:{}", spec.session.host, port);
@@ -4236,7 +4450,7 @@ impl CommanderService {
             "vnc" | "rfb" => RemoteDesktopKind::Vnc,
             "spice" => RemoteDesktopKind::Spice,
             "x2go" => RemoteDesktopKind::X2Go,
-            "nx" | "nx3" => return Err("NX is no longer supported; the X2Go KDrive viewer is not implemented yet."),
+            "nx" | "nx3" => return Err("NX is no longer supported; use the experimental X2Go KDrive viewer."),
             "x11" | "x" | "waypipe" => RemoteDesktopKind::X11,
             _ => RemoteDesktopKind::Rdp,
         })
@@ -4631,7 +4845,7 @@ impl CommanderService {
         // Do not probe, start an agent, launch an external NX client, or return
         // a misleading gateway while the built-in KDrive viewer is incomplete.
         if kind == RemoteDesktopKind::X2Go {
-            return api_error(501, "The built-in X2Go KDrive viewer is not implemented yet; NX support has been removed.");
+            return api_error(501, "Use the experimental X2Go viewer in Remote desktop; NX support has been removed.");
         }
         // Fallback: any SSH tab with matching host
         if via_session.is_none() && tab_id.is_none() && !target_host.is_empty() {
@@ -5863,6 +6077,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn x2go_open_rejects_invalid_requests_without_starting_an_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        for body in [
+            json!({"tab": 7, "desktop": "XFCE; echo bad", "width": 800, "height": 600}),
+            json!({"tab": 7, "desktop": "MATE", "width": 0, "height": 600}),
+            json!({"tab": 7, "desktop": "MATE", "width": 8192, "height": 8192}),
+            json!({"tab": 7, "desktop": "MATE", "width": 800, "height": 600}),
+        ] {
+            let result = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/x2go/open".into(), body }).await;
+            assert_eq!(result.status, 400);
+        }
+        let state = svc.state.lock().expect("state mutex");
+        assert!(state.x2go.is_empty());
+        assert!(state.x2go_pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn x2go_bridge_endpoints_poll_write_and_close_the_right_tab() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let (client, mut server) = tokio::io::duplex(1024);
+        let (signal, cleanup) = tokio::sync::oneshot::channel();
+        svc.state.lock().expect("state mutex").x2go.insert(7, X2GoRegistered { generation: "1".into(), bridge: x2go_bridge::test_bridge(client, signal) });
+        let request = |method: &str, path: &str, body: Value| ApiEnvelope { method: method.into(), path: path.into(), body };
+        let missing = svc.dispatch(request("GET", "/api/x2go/poll?tab=8", json!({})));
+        assert_eq!(missing.status, 400);
+        let mut header = [0u8; linscp_proto::kdrive_wire::SERVER_HEADER_SIZE];
+        header[..4].copy_from_slice(&9u32.to_le_bytes());
+        server.write_all(&header).await.unwrap();
+        let found = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let reply = svc.dispatch(request("GET", "/api/x2go/poll?tab=7&generation=1", json!({})));
+                if !reply.payload["message"].is_null() { break reply; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert_eq!(found.payload["message"]["type"], "keepalive");
+        let mut packet = [0u8; linscp_proto::kdrive_wire::CLIENT_EVENT_SIZE];
+        packet[..4].copy_from_slice(&2u32.to_le_bytes());
+        packet[8..12].copy_from_slice(&38u32.to_le_bytes());
+        let reply = svc.dispatch_async(request("POST", "/api/x2go/input", json!({"tab":7,"generation":"1","data":BASE64_STD.encode(packet)}))).await;
+        assert_eq!(reply.status, 200);
+        let mut received = [0u8; linscp_proto::kdrive_wire::CLIENT_EVENT_SIZE];
+        server.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, packet);
+        let invalid = svc.dispatch_async(request("POST", "/api/x2go/input", json!({"tab":7,"generation":"1","data":"bad"}))).await;
+        assert_eq!(invalid.status, 400);
+        // Delayed requests from an older viewer must not read, write, or close
+        // the current bridge even when they refer to the same tab.
+        let stale_poll = svc.dispatch(request("GET", "/api/x2go/poll?tab=7&generation=old", json!({})));
+        assert_eq!(stale_poll.status, 400);
+        let stale_input = svc.dispatch_async(request("POST", "/api/x2go/input", json!({"tab":7,"generation":"old","data":BASE64_STD.encode(packet)}))).await;
+        assert_eq!(stale_input.status, 400);
+        let stale_close = svc.dispatch_async(request("POST", "/api/x2go/close", json!({"tab":7,"generation":"old"}))).await;
+        assert_eq!(stale_close.status, 200);
+        assert!(svc.state.lock().expect("state mutex").x2go.contains_key(&7));
+        let closed = svc.dispatch_async(request("POST", "/api/x2go/close", json!({"tab":7,"generation":"1"}))).await;
+        assert_eq!(closed.status, 200);
+        assert!(cleanup.await.is_ok());
+        assert_eq!(svc.dispatch(request("GET", "/api/x2go/poll?tab=7&generation=1", json!({}))).status, 400);
+    }
+
+    #[tokio::test]
+    async fn closing_a_tab_releases_its_x2go_bridge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let (client, _server) = tokio::io::duplex(1024);
+        let (signal, cleanup) = tokio::sync::oneshot::channel();
+        svc.state.lock().expect("state mutex").x2go.insert(7, X2GoRegistered { generation: "1".into(), bridge: x2go_bridge::test_bridge(client, signal) });
+        let reply = svc.dispatch(ApiEnvelope { method:"POST".into(), path:"/api/tabs/close".into(), body:json!({"tab":7}) });
+        assert_eq!(reply.status, 200);
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(2), cleanup).await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
     async fn x2go_does_not_assume_ssh_port_means_server_installed() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
@@ -5873,7 +6164,7 @@ mod tests {
         let launch = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/desktop/launch".into(),
             body: json!({"kind": "x2go", "host": "server.example", "port": 22}) }).await;
         assert_eq!(launch.status, 501, "{}", launch.payload);
-        assert!(launch.payload["error"].as_str().unwrap_or("").contains("not implemented"));
+        assert!(launch.payload["error"].as_str().unwrap_or("").contains("experimental X2Go viewer"));
         for kind in ["nx", "nx3"] {
             for path in ["/api/desktop/check", "/api/desktop/launch", "/api/desktop/install"] {
                 let result = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: path.into(),
@@ -10287,6 +10578,9 @@ mod tests {
     /// server that refuses them.
     struct MockSession {
         docs: Mutex<HashMap<String, MockRemoteDoc>>,
+        /// Whether the connection this session runs on is gone, which is what
+        /// a host that was told to shut down leaves behind.
+        lost: Mutex<bool>,
     }
 
     impl MockSession {
@@ -10294,9 +10588,15 @@ mod tests {
         const ETAG: &'static str = "\"mock-etag\"";
 
         fn new() -> Self {
-            let session = MockSession { docs: Mutex::new(HashMap::new()) };
+            let session = MockSession { docs: Mutex::new(HashMap::new()), lost: Mutex::new(false) };
             session.add_dir("/");
             session
+        }
+
+        /// Ends the connection the way a host that shut down does: the session
+        /// object is still there, and nothing will answer over it again.
+        fn end_connection(&self) {
+            *self.lost.lock().expect("m") = true;
         }
 
         fn add_file(&self, path: &str, content: &[u8]) {
@@ -10357,6 +10657,8 @@ mod tests {
     #[async_trait]
     impl RemoteSession for MockSession {
         fn scheme(&self) -> ProtocolScheme { ProtocolScheme::Dav }
+
+        fn connection_lost(&self) -> bool { *self.lost.lock().expect("m") }
 
         async fn pwd(&self) -> Result<String, ProtoError> { Ok("/".to_string()) }
 
@@ -10475,6 +10777,98 @@ mod tests {
         let tab = TabRuntime { id: 7, name: "mock".to_string(), site_name: None, is_local: false, connected: true, local_dir: local_dir.to_string(), remote_dir: "/".to_string(), other_local_dir: String::new(), observed_hostkey: String::new(), hostkey_role: "destination".to_string(), hostkey_changed: false, error: String::new(), spec: None, session_json: json!({"protocol": "dav"}), remote: Some(session) };
         service.state.lock().expect("state mutex").tabs.insert(tab.id, tab);
         7
+    }
+
+    /* The embedded shell and a tab's session run over one connection, so a
+     * host that is told to shut down ends both at once. The shell said so and
+     * the tab went on being offered as connected until an operation over it
+     * failed - the badge, the tab strip and every action that asks whether the
+     * tab is connected all kept the old answer. A request now asks the
+     * connection first, which is a flag read and not a probe. */
+    #[test]
+    fn a_tab_is_disconnected_when_its_connection_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSession::new());
+        let id = insert_remote_tab(&svc, session.clone(), "/");
+        let get = |path: &str| {
+            svc.dispatch(ApiEnvelope { method: "GET".into(), path: path.into(), body: json!({}) }).payload
+        };
+        let reported = |payload: &Value| -> Value {
+            payload["tabs"]
+                .as_array()
+                .expect("a status answer lists its tabs")
+                .iter()
+                .find(|tab| tab["id"].as_u64() == Some(id))
+                .expect("the tab that was opened")
+                .clone()
+        };
+        let endings = |payload: &Value| {
+            payload["logs"]
+                .as_array()
+                .expect("a log answer lists its entries")
+                .iter()
+                .filter(|entry| entry["level"].as_str() == Some("error"))
+                .count()
+        };
+
+        // A connection that is still there is still offered as connected.
+        assert!(reported(&get("/api/status"))["connected"].as_bool().unwrap());
+        let before = endings(&get("/api/logs"));
+
+        session.end_connection();
+        let after = reported(&get("/api/status"));
+        assert!(!after["connected"].as_bool().unwrap(),
+            "a session that cannot answer again was still offered as connected");
+        assert!(!after["error"].as_str().unwrap_or_default().is_empty(),
+            "the tab does not say why it is no longer connected");
+
+        // The status is asked every fifteen seconds and the frame of an ended
+        // shell far more often than that: one ending is one entry.
+        let logged = endings(&get("/api/logs"));
+        assert_eq!(logged, before + 1, "the ending was reported {} times", logged - before);
+        let _ = get("/api/status");
+        assert_eq!(endings(&get("/api/logs")), logged, "a second poll reported the same ending again");
+        assert!(!reported(&get("/api/status"))["connected"].as_bool().unwrap());
+    }
+
+    /// The ending is not a status request's specialty: whatever arrives next
+    /// answers from a tab that knows, and a tab that cannot answer is no
+    /// longer offered for work over the session that died.
+    #[tokio::test]
+    async fn any_request_reports_a_connection_that_ended() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSession::new());
+        session.add_file("/one.txt", b"one");
+        let id = insert_remote_tab(&svc, session.clone(), "/");
+        let envelope = |method: &str, path: &str, body: Value| {
+            ApiEnvelope { method: method.into(), path: path.into(), body }
+        };
+        let list = format!("/api/remote/list?tab={id}&path=/");
+
+        let listed = svc.dispatch_async(envelope("GET", &list, json!({}))).await;
+        assert_eq!(listed.status, 200, "{listed:?}");
+        assert_eq!(listed.payload["entries"].as_array().map(Vec::len), Some(1), "{listed:?}");
+
+        session.end_connection();
+        // The log is not a status request, and it is what happens to arrive
+        // first here; it still answers from a tab that has been told.
+        let _ = svc.dispatch(envelope("GET", "/api/logs", json!({})));
+        {
+            let state = svc.state.lock().expect("state mutex");
+            let tab = &state.tabs[&id];
+            assert!(!tab.connected, "the tab was not told that its connection ended");
+            assert!(tab.remote.is_none(), "a session that cannot answer was kept for the next operation");
+            assert!(state.logs.iter().any(|entry| {
+                entry["level"].as_str() == Some("error")
+                    && entry["text"].as_str().unwrap_or_default().contains("mock")
+            }), "the ending was not reported where the page reads its errors");
+        }
+
+        let refused = svc.dispatch_async(envelope("GET", &list, json!({}))).await;
+        assert_eq!(refused.status, 400, "{refused:?}");
+        assert_eq!(refused.payload["error"], "Not connected");
     }
 
     #[tokio::test]

@@ -9,11 +9,20 @@ transfer engine only through the shell's in-process IPC, so there is no local
 HTTP server, no access token and no server-side sign-in. No separate
 command-line client is built or distributed. **The native
 GUI is experimental and is not ready for production transfers.** Remote listing
-and queued file uploads and downloads are implemented. A shared multi-server
+and queued file uploads and downloads are implemented. The lower panel's Logs
+tab keeps the log the backend writes together with every failure the page
+reports: an error is an entry there, counted on the tab until the panel is
+opened, not a popup that disappears after four seconds. A shared multi-server
 monitor displays Linux CPU/per-core, RAM, swap, disk, load, network and NVIDIA/AMD
 GPU telemetry over authenticated SSH sessions, with saved-site selection,
 sparklines, custom metrics, outage alerts, persisted settings, compact GPU cards
-and an embedded SSH shell; see `docs/server-monitor.md`. SFTP and plain HTTP
+and an embedded SSH shell; see `docs/server-monitor.md`. The shell's desktop
+window selects text with the mouse (drag, double-click a word, triple-click a
+line), copies the selection when the drag ends or on Ctrl+Shift+C - a plain
+Ctrl+C copies while a selection is open and interrupts the shell when none is -
+pastes with Ctrl+Shift+V, and scrolls its history with the wheel; the WebView's
+own context menu, including copying the painted screen as an image, is left
+untouched. SFTP and plain HTTP
 WebDAV connections and transfers have live integration tests; FTP, explicit FTPS
 and implicit FTPS staged uploads, plus FTP/explicit FTPS downloads and S3 small-file
 transfers, also have live tests. SFTP and WebDAV directories can be copied between

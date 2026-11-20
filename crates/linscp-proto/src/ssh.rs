@@ -984,6 +984,25 @@ impl SshConnection {
         Ok((PtyShellHandle { tx: cmd_tx }, evt_rx))
     }
 
+    /// Whether the transport behind this connection is gone.
+    ///
+    /// A shell that is exited closes its own channel and leaves the connection
+    /// open; a host that shuts down closes the connection, and every channel
+    /// multiplexed over it - an SFTP session included - is dead with it. This
+    /// reads the flag the SSH session sets when it ends and probes nothing: a
+    /// question sent to a peer that is no longer there is only a timeout
+    /// somebody has to wait for.
+    ///
+    /// The answer is `false` while an operation in flight holds the handle,
+    /// which is the conservative one - a connection that is busy is not gone -
+    /// and the caller asks again at the next poll.
+    pub fn is_closed(&self) -> bool {
+        self.handle
+            .try_lock()
+            .map(|guard| guard.is_closed())
+            .unwrap_or(false)
+    }
+
     pub async fn disconnect(&self) -> Result<(), ProtoError> {
         let guard = self.handle.lock().await;
         if guard.is_closed() {

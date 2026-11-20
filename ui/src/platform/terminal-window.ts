@@ -39,7 +39,7 @@ export interface TerminalWindowOptions {
   onResize?: (grid: { columns: number; lines: number }) => void;
   /** Called with the cursor mode each time it changes (the extra-keys row). */
   onModes?: (modes: { app_cursor: boolean }) => void;
-  /** Called when a long-press selection opens or closes, for the copy bar. */
+  /** Called when a selection - a long press or a mouse drag - opens or closes. */
   onSelection?: (open: boolean) => void;
 }
 

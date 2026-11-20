@@ -1,7 +1,8 @@
-//! Transport for a future built-in X2Go KDrive viewer.
+//! SSH graphics transport for the experimental built-in X2Go KDrive viewer.
 //!
 //! This opens the SSH graphics channel and provides an opt-in KDrive handshake.
-//! It does not start an agent, decode compressed images, or create a window.
+//! Agent lifecycle, browser image decoding, and window creation are handled by
+//! other modules.
 
 use linscp_platform::AsyncStream;
 use std::time::Duration;
@@ -9,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::kdrive_wire::{Decoder, Handshake, Message};
 use crate::ssh::SshConnection;
-use crate::x2go_control::X2GoStartedSession;
+use crate::x2go_control::{X2GoAgentGuard, X2GoDesktop, X2GoStartedSession};
 use crate::ProtoError;
 
 /// Opens the validated agent's graphics port on the SSH server's loopback.
@@ -20,8 +21,8 @@ use crate::ProtoError;
 /// to the caller; there is no direct TCP or external-viewer fallback. Dropping
 /// the returned stream closes its SSH channel, but does not terminate the agent.
 ///
-/// This deliberately does not start an agent: until image decoding, rendering,
-/// and remote lifecycle are integrated, there is no usable built-in viewer.
+/// This primitive does not start an agent; the guarded session owner handles
+/// startup and cleanup.
 pub async fn open_graphics_stream(
     ssh: &SshConnection,
     session: &X2GoStartedSession,
@@ -92,6 +93,193 @@ pub async fn negotiate_kdrive(
         .map_err(|_| ProtoError::Transport("KDrive handshake timed out.".into()))?
 }
 
+/// A graphics channel tied to the guard for the agent that created it.
+/// Dropping this value closes both stream halves and schedules best-effort
+/// termination via the guard. Explicit close reports termination errors.
+pub struct GuardedKDriveSession {
+    pub reader: KDriveReader,
+    pub writer: KDriveWriter,
+    agent: X2GoAgentGuard,
+    desktop_started: bool,
+}
+
+impl GuardedKDriveSession {
+    /// Attach only to the connection held by the agent guard, so a bastion or
+    /// another host cannot be used for the cookie handshake. The caller must
+    /// have obtained and guarded a validated startup response first; this does
+    /// not start the agent or the remote desktop environment. On cancellation,
+    /// guard drop schedules cleanup. On setup failure, cleanup is awaited.
+    pub async fn attach(agent: X2GoAgentGuard, width: u16, height: u16, timeout: Duration) -> Result<Self, ProtoError> {
+        let result = tokio::time::timeout(timeout, async {
+            let ssh = agent.connection().ok_or_else(|| ProtoError::Transport("Missing X2Go SSH connection.".into()))?;
+            let stream = open_graphics_stream(ssh.as_ref(), agent.session()).await?;
+            negotiate_kdrive(stream, agent.session().cookie(), width, height, timeout).await
+        }).await;
+        match result {
+            Ok(Ok(channel)) => {
+                let (reader, writer) = channel.into_halves();
+                Ok(Self { reader, writer, agent, desktop_started: false })
+            }
+            _ => {
+                if agent.close().await.is_err() {
+                    return Err(ProtoError::Transport("X2Go graphics setup failed and agent cleanup could not be confirmed.".into()));
+                }
+                Err(ProtoError::Transport("X2Go graphics setup failed; agent cleanup was requested.".into()))
+            }
+        }
+    }
+
+    /// Launch the selected desktop after the graphics handshake. This runs a
+    /// fixed command over the same authenticated connection. Shell success is
+    /// not proof that the background desktop actually started. If this future
+    /// is cancelled or returns an error the owner must close the entire session.
+    pub async fn start_desktop(&mut self, desktop: X2GoDesktop) -> Result<(), ProtoError> {
+        if self.desktop_started { return Err(ProtoError::Transport("X2Go desktop start was already requested.".into())); }
+        self.desktop_started = true;
+        let ssh = self.agent.connection().ok_or_else(|| ProtoError::Transport("Missing X2Go SSH connection.".into()))?;
+        let command = self.agent.session().desktop_command(desktop);
+        let result = ssh.exec_command_bounded(&command, Duration::from_secs(15), 8192).await
+            .map_err(|_| ProtoError::Transport("Could not start the X2Go desktop.".into()))?;
+        if result.exit_code != Some(0) { return Err(ProtoError::Transport("Could not start the X2Go desktop.".into())); }
+        Ok(())
+    }
+
+    /// Transfer ownership to a service bridge. The owner must keep the guard
+    /// until both halves are dropped and then await its cleanup.
+    pub fn into_parts(self) -> (KDriveReader, KDriveWriter, X2GoAgentGuard) {
+        (self.reader, self.writer, self.agent)
+    }
+
+    pub async fn close(self) -> Result<(), ProtoError> {
+        let Self { reader, writer, agent, .. } = self;
+        drop(reader);
+        drop(writer);
+        agent.close().await
+    }
+}
+
+/// Translate parsed graphics messages into the viewer IPC contract. The caller
+/// must keep this stream ordered and bound the number of queued replies. Screen
+/// contents are sensitive: do not log the JSON or send it to another session.
+/// Clipboard, selection and cursor messages are deliberately not forwarded;
+/// no clipboard sharing is enabled by this adapter. Rootless windows and UDP
+/// cannot be rendered by the current viewer and therefore fail closed.
+pub fn viewer_message(message: Message) -> Result<Option<serde_json::Value>, ProtoError> {
+    use base64::Engine as _;
+    use serde_json::json;
+    let result = match message {
+        Message::Frame(frame) => {
+            let regions: Vec<_> = frame.regions.into_iter().map(|r| json!({
+                "sourceId": r.source_id, "sourceX": r.source_x, "sourceY": r.source_y,
+                "x": r.x, "y": r.y, "width": r.width, "height": r.height,
+                "data": base64::engine::general_purpose::STANDARD.encode(&r.data),
+            })).collect();
+            json!({"type": "frame", "frame": {
+                "width": frame.width, "height": frame.height, "x": frame.x, "y": frame.y,
+                "cacheId": frame.cache_id, "windowId": frame.window_id, "regions": regions,
+            }})
+        }
+        Message::DeletedFrames(ids) => json!({"type": "deleted-frames", "ids": ids}),
+        Message::Reinitialize => json!({"type": "reinitialize"}),
+        Message::Keepalive => json!({"type": "keepalive"}),
+        Message::Disconnect => json!({"type": "disconnect"}),
+        Message::Cursor(_) | Message::DeletedCursors(_) | Message::Selection(_) | Message::DemandSelection(_) => return Ok(None),
+        Message::WindowUpdate(_) | Message::UdpOpen | Message::UdpFailed | Message::ServerVersion(_) => {
+            return Err(ProtoError::Transport("Unsupported KDrive viewer message.".into()));
+        }
+    };
+    Ok(Some(result))
+}
+
+/// Ordered reader and writer halves of a negotiated graphics stream. The owner
+/// must drop both on any failure or cancellation, and must terminate the remote
+/// X2Go agent separately. They do not spawn tasks or start a remote session.
+pub struct KDriveReader {
+    stream: tokio::io::ReadHalf<Box<dyn AsyncStream>>,
+    decoder: Decoder,
+    closed: bool,
+}
+
+pub struct KDriveWriter {
+    stream: tokio::io::WriteHalf<Box<dyn AsyncStream>>,
+    closed: bool,
+}
+
+impl KDriveChannel {
+    /// Preserve bytes read during negotiation while allowing writes to proceed
+    /// independently of a reader waiting for the next server message.
+    pub fn into_halves(self) -> (KDriveReader, KDriveWriter) {
+        let (reader, writer) = tokio::io::split(self.stream);
+        (KDriveReader { stream: reader, decoder: self.decoder, closed: false },
+         KDriveWriter { stream: writer, closed: false })
+    }
+}
+
+impl KDriveReader {
+    /// Read the next message in wire order, including messages coalesced with
+    /// the version response. Unknown or invalid wire data closes the reader;
+    /// callers must not skip a message and continue rendering a stale screen.
+    /// This returns compressed images, not decoded pixels. Clipboard and cursor
+    /// payloads must not be logged or exposed without explicit authorization.
+    pub async fn next_message(&mut self) -> Result<Message, ProtoError> {
+        if self.closed { return Err(ProtoError::Transport("KDrive graphics reader is closed.".into())); }
+        let mut incoming = [0u8; 8192];
+        loop {
+            match self.decoder.next_message() {
+                Ok(Some(Message::ServerVersion(_))) => {
+                    self.closed = true;
+                    return Err(ProtoError::Transport("Unexpected KDrive version message.".into()));
+                }
+                Ok(Some(message)) => {
+                    if matches!(&message, Message::Disconnect) { self.closed = true; }
+                    return Ok(message);
+                }
+                Err(_) => {
+                    self.closed = true;
+                    return Err(ProtoError::Transport("Invalid KDrive graphics message.".into()));
+                }
+                Ok(None) => {}
+            }
+            let count = match self.stream.read(&mut incoming).await {
+                Ok(n) => n,
+                Err(_) => {
+                    self.closed = true;
+                    return Err(ProtoError::Transport("Could not read KDrive graphics channel.".into()));
+                }
+            };
+            if count == 0 {
+                self.closed = true;
+                return Err(ProtoError::Transport("KDrive graphics channel closed.".into()));
+            }
+            if self.decoder.feed(&incoming[..count]).is_err() {
+                self.closed = true;
+                return Err(ProtoError::Transport("KDrive graphics input exceeded limits.".into()));
+            }
+        }
+    }
+}
+
+impl KDriveWriter {
+    /// Write exactly one client event. The owner must serialize calls and only
+    /// provide protocol-validated events. If this future is cancelled midway,
+    /// discard both halves: a partially written packet cannot be resynchronized.
+    /// A bounded timeout covers both the write and flush.
+    pub async fn write_event(&mut self, event: &[u8; crate::kdrive_wire::CLIENT_EVENT_SIZE], timeout: Duration) -> Result<(), ProtoError> {
+        if self.closed { return Err(ProtoError::Transport("KDrive graphics writer is closed.".into())); }
+        let write = async {
+            self.stream.write_all(event).await?;
+            self.stream.flush().await
+        };
+        match tokio::time::timeout(timeout, write).await {
+            Ok(Ok(())) => Ok(()),
+            _ => {
+                self.closed = true;
+                Err(ProtoError::Transport("Could not write KDrive graphics event.".into()))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod handshake_tests {
     use super::*;
@@ -104,6 +292,79 @@ mod handshake_tests {
         h[..4].copy_from_slice(&kind.to_le_bytes());
         h[4..6].copy_from_slice(&version.to_le_bytes());
         h
+    }
+
+    #[test]
+    fn viewer_contract_encodes_graphics_but_never_clipboard_or_cursor_data() {
+        use crate::kdrive_wire::{Frame, Region, Selection};
+        let frame = Frame { width: 2, height: 1, x: -1, y: -1, cache_id: 0, window_id: 0,
+            regions: vec![Region { source_id: 0, source_x: 0, source_y: 0, x: 0, y: 0,
+                width: 2, height: 1, data: vec![1, 2, 3] }] };
+        let value = viewer_message(Message::Frame(frame)).unwrap().unwrap();
+        assert_eq!(value["type"], "frame");
+        assert_eq!(value["frame"]["cacheId"], 0);
+        assert_eq!(value["frame"]["regions"][0]["data"], "AQID");
+        let selection = Selection { selection: 0, format: 0, chunk_size: 1, first: true, last: true,
+            compressed_size: 0, total: 1, data: vec![42] };
+        assert!(viewer_message(Message::Selection(selection)).unwrap().is_none());
+        assert!(viewer_message(Message::DemandSelection(0)).unwrap().is_none());
+        assert!(viewer_message(Message::WindowUpdate(vec![])).is_err());
+    }
+
+    #[tokio::test]
+    async fn split_preserves_buffered_messages_and_orders_subsequent_reads() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let mut decoder = Decoder::new();
+        decoder.feed(&server_header(9, 0)).unwrap(); // keepalive buffered during handshake
+        let channel = KDriveChannel { stream: Box::new(client), decoder, server_version: 8 };
+        let (mut reader, _writer) = channel.into_halves();
+        assert!(matches!(reader.next_message().await.unwrap(), Message::Keepalive));
+        let disconnect = server_header(10, 0);
+        server.write_all(&disconnect[..17]).await.unwrap();
+        server.write_all(&disconnect[17..]).await.unwrap();
+        assert!(matches!(reader.next_message().await.unwrap(), Message::Disconnect));
+        assert!(reader.next_message().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn writing_is_independent_of_a_reader_waiting_for_input() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let channel = KDriveChannel { stream: Box::new(client), decoder: Decoder::new(), server_version: 8 };
+        let (mut reader, mut writer) = channel.into_halves();
+        let expected = [42u8; CLIENT_EVENT_SIZE];
+        let peer = tokio::spawn(async move {
+            let mut sent = [0; CLIENT_EVENT_SIZE];
+            server.read_exact(&mut sent).await.unwrap();
+            assert_eq!(sent, [42u8; CLIENT_EVENT_SIZE]);
+            server.write_all(&server_header(9, 0)).await.unwrap();
+        });
+        let (message, sent) = tokio::join!(reader.next_message(), writer.write_event(&expected, Duration::from_secs(2)));
+        assert!(matches!(message.unwrap(), Message::Keepalive));
+        assert!(sent.is_ok());
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_and_duplicate_version_messages_fail_closed() {
+        for header in [server_header(5, 8), server_header(0xffffffff, 0)] {
+            let (client, mut server) = tokio::io::duplex(1024);
+            let channel = KDriveChannel { stream: Box::new(client), decoder: Decoder::new(), server_version: 8 };
+            let (mut reader, _writer) = channel.into_halves();
+            server.write_all(&header).await.unwrap();
+            assert!(reader.next_message().await.is_err());
+            assert!(reader.next_message().await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_write_permanently_closes_writer() {
+        let (client, server) = tokio::io::duplex(64);
+        drop(server);
+        let channel = KDriveChannel { stream: Box::new(client), decoder: Decoder::new(), server_version: 8 };
+        let (_reader, mut writer) = channel.into_halves();
+        let event = [0u8; CLIENT_EVENT_SIZE];
+        assert!(writer.write_event(&event, Duration::from_secs(1)).await.is_err());
+        assert!(writer.write_event(&event, Duration::from_secs(1)).await.is_err());
     }
 
     #[tokio::test]

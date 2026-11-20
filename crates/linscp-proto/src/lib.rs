@@ -507,6 +507,15 @@ pub trait RemoteSession: Send + Sync {
     fn ssh_connection(&self) -> Option<&std::sync::Arc<ssh::SshConnection>> {
         None
     }
+    /// Whether the connection this session runs on is gone.
+    ///
+    /// A session that keeps one connection open answers from that connection's
+    /// own state, so a caller can tell a server that is finished from a server
+    /// that has not answered yet. A session that is a request per call has no
+    /// connection to lose and answers `false`.
+    fn connection_lost(&self) -> bool {
+        false
+    }
     fn observed_host_key(&self) -> Option<&str> {
         None
     }

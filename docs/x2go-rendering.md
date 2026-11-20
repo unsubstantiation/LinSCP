@@ -1,12 +1,15 @@
 # Built-in X2Go rendering: current status
 
-LinSCP does **not** yet have a built-in X2Go viewer. The intended implementation
-is now **KDrive**, not NX3; the user has accepted dropping NX compatibility.
-The former external NX client launch path has been removed. X2Go launch and
-ticket requests now report that the built-in viewer is not implemented; no
-remote agent is started. The shared `DesktopFrameRenderer` is only a building
-block; it is not connected to `/api/desktop/launch` and must not be advertised
-as a working viewer.
+LinSCP now wires an **experimental** built-in X2Go KDrive viewer through the
+selected authenticated SSH tab. It starts a new agent, opens its graphics
+channel, renders frames and forwards input through a service bridge. It has
+not been tested against a live X2Go server, and the complete Rust application
+has not been compiled in the available sandbox. The parser, control, transport
+and bridge modules were compiled and tested in isolation with stubbed SSH and
+zeroization dependencies; those tests do not validate the full integration. Do not treat the wiring as proof that a
+working desktop opens. NX3 and the former external NX launch path are not
+supported; a KDrive server backend is required. Clipboard, sound, file sharing,
+resizing and session resume are not implemented.
 
 ## Decoded-frame surface
 
@@ -34,10 +37,30 @@ cookie and a client-version event over the provided SSH graphics channel, waits
 for a server-version message with an overall timeout, and sends one-screen
 geometry. It retains any subsequently received bytes in the decoder. Failure
 closes the channel, but does **not** terminate the remote agent; callers must
-provide reliable agent lifecycle cleanup. The function is not wired to launch.
+provide reliable agent lifecycle cleanup. The guarded session uses it during startup.
 It declares feature version 3 and Windows-style clipboard mode; clipboard
 handling is not implemented. Only server feature versions 7 and 8 are accepted;
 other versions are refused conservatively until compatibility is verified.
+A negotiated channel can now be split into an ordered reader and independent
+writer. The reader retains coalesced messages from the handshake and fails
+closed on malformed data; writes are bounded by a timeout. The owner must drop
+both halves after an error or interrupted write and separately terminate the
+agent. `viewer_message` translates parsed frames and cache/control events to
+bounded viewer JSON with base64 image payloads; clipboard and cursor messages
+are not forwarded, and rootless-window and UDP messages are rejected. The
+TypeScript IPC decoder validates and converts this contract before handing it
+to `KDriveViewerSession`. The service now has an `X2GoBridge` for an already
+negotiated, guarded channel: it validates input packets, preserves output order,
+applies bounded backpressure and attempts agent cleanup on closure. The service
+can associate a bridge with the exact connected SSH tab and exposes nonblocking
+poll, input, and close routes. Closing or reconnecting a tab releases its bridge;
+an abandoned viewer lease expires after 60 seconds. The experimental X2Go
+open route registers that bridge and the page polls it, forwards input, and
+requests close. Poll, input and close carry a service-issued generation so
+delayed requests from an earlier viewer cannot operate on a replacement bridge.
+This generation is not an authentication credential. The bridge sends protocol keepalives and closes on prolonged server silence
+while it is able to read. The corresponding modules passed isolated tests with stubbed SSH; the complete
+Rust workspace has not been built or tested here.
 
 Wire-layout facts were researched from the public GPL-3.0
 [Casement KDrive client](https://github.com/Inkbraid/casement-plugin-x2go)
@@ -49,10 +72,17 @@ I/O, and teardown still need live X2Go verification.
 `ui/src/platform/kdrive-image-decoder.ts` decodes JPEG/PNG regions using the
 WebView's `createImageBitmap` and canvas APIs. It checks encoded size and
 header dimensions before invoking the decoder and checks decoded dimensions
-again, serializes calls, and frees temporary image/canvas resources. It is not
-wired to the Rust wire parser or frame cache. WebView support, malicious image
-handling and color behavior must be tested on Linux, Windows and macOS. Native
-image-library behavior cannot be proven safe solely by header checks.
+again, serializes calls, and frees temporary image/canvas resources. The shared
+`KDriveFramePipeline` now connects this decoder to `DesktopFrameRenderer`: it
+composes compressed regions and cached references, applies deletions, clips
+screen updates, and invalidates the cache and screen on errors. It bounds cache,
+image, encoded data and composition work, and rejects overlapping calls; its
+caller must deliver wire messages in order and explicitly reset after an error.
+It rejects rootless-window frames rather than pretending to support them. Tests
+use synthetic frames and a simulated WebView; its IPC path is wired to the Rust
+wire parser but has not been tested against a live session. WebView support, malicious image handling and
+color behavior must be tested on Linux, Windows and macOS. Native image-library
+behavior cannot be proven safe solely by header checks.
 
 ## Decoded-image cache
 
@@ -75,12 +105,42 @@ is not connected to a wire parser or viewer.
 
 ## Input capture
 
+`ui/src/platform/kdrive-events.ts` encodes fixed-size key, button, motion and
+update-request packets with checked fields. A key press is not equivalent to
+blindly forwarding a DOM keydown; the server handles modifier masks and key
+strokes differently. Packet layouts are based on the public KDrive client linked
+above; tests use synthetic data. Live server behavior remains unverified.
+
+`KDriveInputQueue` serializes translator actions, copies packets, bounds queued
+work, and waits at barriers after sending a one-pixel update request. The
+page uses a one-pixel response heuristic to acknowledge it;
+this protocol has no unique request identifier, so correlation with unsolicited
+one-pixel updates must be tested and handled conservatively. A timeout, write
+failure, overflow or close stops the queue and the owning session must close
+its SSH graphics stream. The queue cannot cancel a write already in progress.
+It is tested with fake writers and is not connected to a live session.
+
+`KDriveViewerSession` ties the frame pipeline, renderer, input capture,
+translator and queue together behind an injected transport. It serializes and
+bounds parsed incoming messages, enables input only after a main image, and
+closes on overflow, decode errors or disconnect. A supplied transport must write
+packets, request a new main image on reinitialization, and arrange remote agent
+cleanup; the reader delivers messages and uses a heuristic to identify barrier replies.
+Tests exercise this wiring with a simulated transport and WebView. The page
+uses `/api/x2go/open`, poll, input and close; it has not been tested against an
+actual X2Go server. Generic desktop launch/ticket requests still reject X2Go.
+
 `DesktopInput` captures keyboard, mouse buttons, motion and wheel events on the
 focused canvas, and releases held keys and buttons on focus loss or teardown.
-It starts disabled; a future session must enable it only when ready and deliver
-its callback events to the backend in order. It exposes browser physical and
-logical key identifiers, not X keysyms or KDrive packets. Composition/IME and
-clipboard handling are not implemented. On transport failure the backend must
+It starts disabled. `KDriveInputTranslator` now maps common browser physical
+keys to XKB evdev keycodes and creates KDrive packets, tracks modifiers and
+locks, and emits required ordering barriers. The caller must serialize all
+input actions and perform a real server round trip for each barrier before
+sending later actions; the input queue above provides that ordering once a
+session connects its writer and barrier-response reader. The translator requires explicit initial remote lock
+states and AltGr configuration; unsupported keys, IME, horizontal scrolling and
+Windows' synthetic Ctrl preceding AltGr are not handled. It is connected to
+the SSH bridge but has not been tested with a live viewer. On transport failure the backend must
 reset its remote key/button state; local synthetic releases cannot guarantee
 that a disconnected peer receives them.
 
@@ -141,9 +201,10 @@ is not authorization to install server packages without an explicit action.
   or captured test data has been copied into LinSCP. Its Windows-specific
   implementation and claimed tests are useful evidence, not proof that this
   project supports Linux, Windows, or macOS.
-- A usable viewer still needs to connect the parser, image decoder and cache;
-  translate KDrive cache operations and input; synchronize, manage lifecycle,
-  and run integration tests. Clipboard, cursor and UDP support are not present.
+- The viewer now delivers parsed messages to the frame pipeline, translates
+  browser input and coordinates transport and lifecycle, but these paths still
+  need live integration tests.
+  Clipboard, cursor and UDP support are not present.
 - A [public KDrive client release announcement](https://www.mail-archive.com/x2go-announcements@lists.x2go.org/msg00217.html)
   mentions version negotiation before requesting the main image and geometry
   updates to elicit an initial image. It does not provide a complete message
@@ -153,38 +214,42 @@ is not authorization to install server packages without an explicit action.
 An X2Go session also has to be started or resumed on the server before graphics
 can flow. The [x2gostartagent manual](https://github.com/eugenesan/x2goserver/blob/master/x2goserver/man/man8/x2gostartagent.8)
 describes required session parameters and returned graphics connection details.
-Starting an agent without a functioning decoder and reliable teardown would
-leave a remote session running without a usable viewer, so the current code
-does not invoke it. The independent `x2go_control` module constructs a
-restricted startup command and validates the documented startup reply without
-executing either startup or termination. It treats the session cookie as a
-secret and does not include it in debug output or parse errors. These primitives
-are not yet connected to the SSH session or a graphics backend. The parser's
-accepted response forms still need verification against live X2Go servers.
+Starting an agent without a functioning decoder and reliable teardown can
+leave a remote session running without a usable viewer. The experimental X2Go
+open route uses the guarded startup primitive in `x2go_control`:
+it runs the restricted startup command on the existing SSH connection, validates
+the reply and immediately creates a cleanup guard. A cancelled caller leaves
+startup running so the resulting guard can attempt cleanup. A guarded graphics
+session can also launch a fixed XFCE, MATE or LXDE command after negotiation;
+the background command's exit status does not prove the desktop started.
+The guard attempts bounded termination over the same SSH connection on close,
+setup failure, or drop. Cleanup on drop is best-effort: runtime shutdown,
+process termination, a broken SSH connection, or an invalid/lost startup reply
+can still leave an agent behind. The cookie is redacted in debug output and
+zeroized when the parsed session is dropped. These primitives are wired into
+the service; their tests passed in an isolated harness with stubbed SSH and
+zeroization, but the complete Rust application has not been compiled here.
+Startup replies and command behavior still need verification against live X2Go
+servers.
 
 `x2go_transport::open_graphics_stream` can open the validated agent's graphics
 port on the destination's loopback through an already-authenticated SSH
 connection. The caller must use the same destination connection that created
 the agent; it never falls back to direct TCP. The handshake and wire decoder
-can process that stream as described above, but are not connected to a viewer.
+are connected to the experimental viewer through the service bridge.
 Opening or dropping the stream does not start or terminate an agent. The SSH
 mock integration tests are included but have not been run in this environment;
 they use an echo server, not X2Go.
 
-## Still required for a working viewer
+## Still required for a verified viewer
 
-- Integrate and verify KDrive wire decoding, image decoding, framebuffer cache
-  and rendering on Linux, Windows and macOS without a separately installed
-  viewer. The GPL clients cannot simply be copied into this PolyForm-licensed
-  project.
-- Authenticate and start/resume the X2Go session using the selected server,
-  enforcing the existing host-key, proxy and jump-host policies. Never fall
-  back silently to a different connection path or leak credentials.
-- Convert decoded display updates into the bounded frame contract, handle
-  reconnects and full-frame resynchronization, and apply backpressure without
-  corrupting delta order.
-- Create a separate resizable LinSCP window and connect keyboard, pointer,
-  resize, clipboard and session lifecycle events to the actual KDrive backend.
-- Test real remote sessions, input, resizing, reconnect and teardown on each
-  supported desktop OS. Unit tests with decoded pixels alone cannot validate
-  KDrive compatibility or prove that a remote window opens.
+- Compile and run Rust tests and verify startup, rendering, input, and cleanup
+  against actual KDrive servers on supported client platforms.
+- Verify compatibility of server versions, frame and cursor semantics, keyboard
+  barriers, and WebView image decoding. The one-pixel barrier has no request ID
+  and can be confused with an unsolicited update.
+- Add robust recovery for failed startup replies, lifecycle failures and
+  reconnects; cleanup remains best-effort after timeouts or lost SSH.
+- Support a resizable separate desktop window, resizing, cursor, clipboard,
+  optional sound, and session resume as distinct features. None is promised by
+  this experimental fixed-size in-page viewer.

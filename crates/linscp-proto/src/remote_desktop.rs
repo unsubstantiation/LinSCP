@@ -720,7 +720,7 @@ if ! (command -v x2gostartagent >/dev/null 2>&1 || test -x /usr/bin/x2gostartage
    ! test -r /usr/share/x2go/versions/VERSION.x2goserver-x2gokdrive; then
   echo "[linscp] X2Go KDrive components could not be verified; check the server packages and installation paths." >&2; exit 1
 fi
-echo "[linscp] X2Go server installation completed; KDrive components detected. The LinSCP viewer is not yet implemented."
+echo "[linscp] X2Go server installation completed; KDrive components detected. The LinSCP viewer is experimental."
 "#.to_string(),
         RemoteDesktopKind::X11 => r#"#!/bin/bash
 set -e
@@ -845,6 +845,12 @@ impl RemoteSession for RemoteDesktopSession {
     }
     fn observed_host_key(&self) -> Option<&str> { self.observed_host_key.as_deref() }
     fn ssh_connection(&self) -> Option<&Arc<SshConnection>> { self.ssh_for_x2go.as_ref() }
+    // An X2Go desktop runs over this connection for as long as the session is
+    // open, so a host that shuts down ends the desktop with it. The other
+    // desktop kinds have no connection here and answer the trait's default.
+    fn connection_lost(&self) -> bool {
+        self.ssh_for_x2go.as_ref().is_some_and(|conn| conn.is_closed())
+    }
     async fn exec_command(&self, command: &str) -> Result<crate::ssh::ExecOutput, ProtoError> {
         match self.ssh_for_x2go.as_ref() {
             Some(ssh) => ssh.exec_command(command).await,
