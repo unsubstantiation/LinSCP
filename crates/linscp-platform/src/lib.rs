@@ -233,6 +233,14 @@ pub trait LocalFs: Send + Sync {
 pub trait SecretVault: Send + Sync {
     fn load_master_key(&self, config_dir: &Path) -> Result<Option<Zeroizing<[u8; 32]>>, PlatformError>;
     fn load_or_create_master_key(&self, config_dir: &Path) -> Result<Zeroizing<[u8; 32]>, PlatformError>;
+    /// The local password vault protects the entire session store, not just secrets.
+    fn protects_session_store(&self) -> bool { false }
+    fn seal_session_store(&self, _plaintext: &[u8]) -> Result<Vec<u8>, PlatformError> {
+        Err(PlatformError::SecretVault("This vault cannot encrypt session metadata".into()))
+    }
+    fn open_session_store(&self, _encrypted: &[u8]) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
+        Err(PlatformError::SecretVault("Unlock the local vault to read encrypted sessions".into()))
+    }
 }
 
 #[derive(Default)]

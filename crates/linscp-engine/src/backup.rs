@@ -128,7 +128,7 @@ pub fn export_backup(
     config_dir: &Path,
     vault: &dyn SecretVault,
 ) -> Result<BackupBundle, String> {
-    let sessions_ini = std::fs::read_to_string(config_dir.join("sessions.ini"))
+    let sessions_ini = SessionStore::read_ini_text(config_dir, vault)?
         .map(|s| normalize_to_lf(&s))
         .unwrap_or_default();
 
@@ -139,7 +139,7 @@ pub fn export_backup(
     let sessions_key_b64 = match vault.load_master_key(config_dir) {
         Ok(Some(k)) => Some(BASE64.encode(&*k)),
         Ok(None) => None,
-        Err(_) => None,
+        Err(error) => return Err(error.to_string()),
     };
 
     // JSON stores — missing files are treated as defaults (already compatible).
@@ -211,6 +211,12 @@ pub fn import_backup(
     }
 
     std::fs::create_dir_all(config_dir).map_err(|e| e.to_string())?;
+    // Check access before replacing any key: a legacy client must not damage
+    // a password-vault store that it cannot open.
+    let _existing_sessions = SessionStore::read_ini_text(config_dir, vault)?;
+    if vault.protects_session_store() && vault.load_master_key(config_dir).map_err(|e| e.to_string())?.is_none() {
+        return Err("Unlock the local vault before restoring a backup.".into());
+    }
 
     // 1) sessions.key — must be written first so subsequent sessions.ini
     //    passwords remain decryptable.
@@ -234,6 +240,9 @@ pub fn import_backup(
         }
         let already_active = vault.load_master_key(config_dir).map_err(|e| e.to_string())?
             .is_some_and(|current| &current[..] == raw.as_slice());
+        if !already_active && vault.protects_session_store() {
+            return Err("Backup key differs from the unlocked local vault; restore into a separate configuration directory.".into());
+        }
         if !already_active {
             let encoded = format!("{b64}\n");
             linscp_platform::write_private_file_atomic(
@@ -259,11 +268,7 @@ pub fn import_backup(
     if !bundle.sessions_ini.is_empty() || config_dir.join("sessions.ini").exists() {
         let ini_text = normalize_to_lf(&bundle.sessions_ini);
         // Write even if empty to truncate a previous file (explicit backup of “no sessions”).
-        linscp_platform::write_private_file_atomic(
-            &config_dir.join("sessions.ini"),
-            ini_text.as_bytes(),
-        )
-        .map_err(|e| e.to_string())?;
+        SessionStore::write_ini_text(config_dir, vault, &ini_text)?;
     }
 
     // 3) JSON stores — already distribution-agnostic, same helpers as live code.

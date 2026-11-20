@@ -516,6 +516,8 @@ pub trait RemoteSession: Send + Sync {
     fn connection_lost(&self) -> bool {
         false
     }
+    /// Optional non-invasive liveness probe. None means unsupported or busy.
+    async fn probe_connection(&self) -> Option<bool> { None }
     fn observed_host_key(&self) -> Option<&str> {
         None
     }

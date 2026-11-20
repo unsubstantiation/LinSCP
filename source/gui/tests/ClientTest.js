@@ -270,6 +270,7 @@ const calls = [];
 const errors = [];
 const confirmMessages = [];
 let confirmResult = true;
+let delayedTabOpen = null;
 
 const dom = new JSDOM(html, {
   url: 'http://localhost:8080/',
@@ -334,6 +335,7 @@ const dom = new JSDOM(html, {
       const url = String(envelope.path);
       const path = url.split('?')[0];
       calls.push({ path: path, url: String(url), options: options });
+      if (path === '/api/tabs/open' && delayedTabOpen) return delayedTabOpen;
       let body = responses[path];
       if (path === '/api/custom-commands') {
         body = customCommandsBody(options);
@@ -490,6 +492,8 @@ function options(id) {
           metadata: { currentWindow: { label: 'main' } },
           invoke: async (_command, args) => {
             terminalCalls.push(args.envelope);
+            if (String(args.envelope.path).startsWith('/api/terminal/text'))
+              return { status: 200, payload: { success: true, text: 'history\ncurrent' } };
             return { status: 200, payload: { success: true, alive: true } };
           }
         };
@@ -518,20 +522,38 @@ function options(id) {
     const terminalWindow = terminalPage.window;
     Object.defineProperty(terminalWindow.navigator, 'clipboard', {
       configurable: true,
-      value: { readText: async () => 'pasted text' }
+      value: { readText: async () => 'pasted text', writeText: async text => { terminalWindow.copiedTerminalText = text; } }
     });
+    const toolbar = terminalWindow.document.querySelector('.terminal-window-toolbar');
+    const copyAll = [...toolbar.querySelectorAll('button')].find(button => button.textContent === 'Copy All Text');
+    const help = [...toolbar.querySelectorAll('button')].find(button => button.textContent === 'Help');
+    check('terminal toolbar below screen offers copy all and help, not copy selected', !!copyAll && !!help && toolbar.previousElementSibling === child && !toolbar.textContent.includes('Copy Selected Text'));
+    const smaller = toolbar.querySelector('button[aria-label="Decrease terminal text size"]');
+    const larger = toolbar.querySelector('button[aria-label="Increase terminal text size"]');
+    check('desktop terminal offers text size buttons below the screen', !!smaller && !!larger);
+    larger.click(); smaller.click();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    const sizes = terminalCalls.filter(call => call && call.path === '/api/terminal/input' && call.body && call.body.cell_height).map(call => call.body.cell_height);
+    check('desktop text size buttons update terminal cell metrics', sizes.includes(21) && sizes.at(-1) === 18, JSON.stringify(sizes));
+    let terminalHelp = ''; terminalWindow.alert = text => { terminalHelp = text; };
+    help.click();
+    check('terminal help explains mouse selection and paste', terminalHelp.includes('mouse') && terminalHelp.includes('Right-click') && terminalHelp.includes('Ctrl+V'));
+    copyAll.click();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    check('desktop copy all reads model text including history', terminalWindow.copiedTerminalText === 'history\ncurrent');
     const press = (key, shift) => terminalWindow.document.dispatchEvent(
       new terminalWindow.KeyboardEvent('keydown', { key, ctrlKey: true, shiftKey: !!shift, cancelable: true }));
     press('c', true);
     press('v', true);
+    press('v', false);
     press('c', false);
     await new Promise(resolve => setTimeout(resolve, 30));
     const inputs = terminalCalls.filter(call => call && call.path === '/api/terminal/input' && call.body && call.body.data);
     check('Ctrl+Shift+C reads the terminal selection in a desktop window',
       terminalCalls.some(call => call && String(call.path).indexOf('/api/terminal/selection') === 0),
       JSON.stringify(terminalCalls.map(call => call && call.path)));
-    check('Ctrl+Shift+V pastes the clipboard into the shell',
-      inputs.some(call => Buffer.from(call.body.data, 'base64').toString() === 'pasted text'),
+    check('Ctrl+V and Ctrl+Shift+V each paste once into the shell',
+      inputs.filter(call => Buffer.from(call.body.data, 'base64').toString() === 'pasted text').length === 2,
       JSON.stringify(inputs.map(call => call.body.data)));
     check('a plain Ctrl+C still reaches the shell as its interrupt',
       inputs.some(call => call.body.data === Buffer.from('\x03').toString('base64')),
@@ -884,9 +906,31 @@ function options(id) {
   doc.getElementById('siteList').children[0].dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
   check('clicking a site fills the form', doc.getElementById('siteHost').value === '127.0.0.1',
     doc.getElementById('siteHost').value);
+  check('auto reconnect is off by default with a 30 second interval',
+    !doc.getElementById('siteAutoReconnect').checked && doc.getElementById('siteAutoReconnectSeconds').value === '30');
+  doc.getElementById('siteAutoReconnect').checked = true;
+  doc.getElementById('siteAutoReconnectSeconds').value = '12';
+  doc.getElementById('siteAltHost').value = 'backup.example.test';
+  doc.getElementById('siteAltFallback').checked = true;
   await window.saveSite();
   await new Promise(resolve => setTimeout(resolve, 100));
   const saved = calls.filter(call => call.path === '/api/sessions/save').pop();
+  check('saved site sends the reconnect toggle and interval',
+    JSON.parse(saved.options.body).session.auto_reconnect === true &&
+    JSON.parse(saved.options.body).session.auto_reconnect_seconds === 12);
+  doc.getElementById('siteAutoReconnectSeconds').value = '0';
+  const beforeInvalidReconnect = calls.filter(call => call.path === '/api/sessions/save').length;
+  await window.saveSite();
+  check('invalid reconnect intervals are rejected before saving',
+    calls.filter(call => call.path === '/api/sessions/save').length === beforeInvalidReconnect &&
+    lastLogLine().includes('1 to 3600'));
+  window.fillSiteForm({name: 'settings', protocol: 'sftp', host: 'test', auto_reconnect: true, auto_reconnect_seconds: 17});
+  check('stored auto reconnect settings populate the form',
+    doc.getElementById('siteAutoReconnect').checked && doc.getElementById('siteAutoReconnectSeconds').value === '17');
+  window.fillSiteForm({name: 'GUI/test', protocol: 'sftp', host: '127.0.0.1', port: 2222, username: 'user'});
+  check('saving posts alternate hostname and fallback setting',
+    JSON.parse(saved.options.body).session.alt_hostname === 'backup.example.test' &&
+    JSON.parse(saved.options.body).session.alt_fallback === true);
   check('saving posts the name', saved && JSON.parse(saved.options.body).name === 'GUI/test');
   check('saving an existing site without a stored password posts no password',
     saved && !JSON.parse(saved.options.body).session.password);
@@ -905,6 +949,27 @@ function options(id) {
   delete responses['/api/sessions/copy'];
   window.prompt = oldPrompt;
 
+  window.fillSiteForm({name: 'alt', protocol: 'sftp', host: 'primary.example',
+    alt_hostname: 'alternate.example', alt_fallback: true});
+  check('stored alternate settings populate the form',
+    doc.getElementById('siteAltHost').value === 'alternate.example' && doc.getElementById('siteAltFallback').checked);
+  const oldAltOpen = responses['/api/tabs/open'];
+  responses['/api/tabs/open'] = {success: false, error: 'Test alternate failure'};
+  window.openModal('siteModal');
+  await window.connectFromSiteManager(true);
+  const altOpen = calls.filter(call => call.path === '/api/tabs/open').pop();
+  check('Alt Connect sends the alternate-selection flag without replacing the primary hostname',
+    JSON.parse(altOpen.options.body).use_alt_host === true &&
+    JSON.parse(altOpen.options.body).session.host === 'primary.example' &&
+    JSON.parse(altOpen.options.body).session.alt_hostname === 'alternate.example');
+  responses['/api/tabs/open'] = oldAltOpen;
+  window.newSite();
+  const missingAltBefore = calls.filter(call => call.path === '/api/tabs/open').length;
+  doc.getElementById('siteHost').value = 'primary.example';
+  await window.connectFromSiteManager(true);
+  check('Alt Connect requires an alternate hostname',
+    calls.filter(call => call.path === '/api/tabs/open').length === missingAltBefore &&
+    lastLogLine().includes('An alternate hostname is required.'));
   window.newSite();
   check('new SSH sessions default to storing their password',
     doc.getElementById('siteRemember').checked);
@@ -1287,6 +1352,7 @@ function options(id) {
     const path = parts[0];
     calls.push({ path: path, url: url, options: options });
     browseCalls.push(raw);
+    if (path === '/api/tabs/open' && delayedTabOpen) return delayedTabOpen;
     const params = new URLSearchParams(parts[1] || '');
     if (path === '/api/local/list' || path === '/api/remote/list') {
       const isLocal = path === '/api/local/list';
@@ -1649,11 +1715,77 @@ function options(id) {
       call.path.startsWith('/api/')),
     calls.filter(call => !(call.options && call.options.method)).map(c => c.path).join(','));
 
+  // Failures and successes are recorded in the visible log.
+  window.openSiteManager();
+  await new Promise(resolve => setTimeout(resolve, 100));
+  const originalOpen = responses['/api/tabs/open'];
+  responses['/api/tabs/open'] = { success: false, error: 'Connection refused' };
+  await window.connectFromSiteManager();
+  check('a failed connection is visible in the log and permits another try',
+    doc.getElementById('tabLogBtn').classList.contains('active') &&
+    !doc.getElementById('siteConnectBtn').disabled &&
+    lastLogLine().includes('Connection refused'));
+  window.openSiteManager();
+  responses['/api/tabs/open'] = { success: true, tab: {
+    id: 1, session: { protocol: 'sftp' }
+  } };
+  await window.connectFromSiteManager();
+  check('a successful connection clears progress and closes the site form',
+    !doc.getElementById('siteModal').classList.contains('open') &&
+    !doc.getElementById('siteConnectBtn').disabled && text('logOutput').includes('Connection established.'));
+  responses['/api/tabs/open'] = originalOpen;
+
+  // Automatic attempts must still ask for a host-key decision.
+  responses['/api/auto-reconnect/tick'] = { success: true, attempted: 'restored', result: {
+    success: false, challenge: { tab: 31, host: 'restored.example', port: 22, fingerprint: 'ssh-ed25519 SHA256:restore' }
+  } };
+  await window.pollAutoReconnect();
+  check('automatic reconnect presents the host-key challenge without accepting it',
+    doc.getElementById('hostKeyModal').classList.contains('open') &&
+    text('hostKeyFingerprint') === 'ssh-ed25519 SHA256:restore');
+  await window.cancelHostKey();
+  responses['/api/auto-reconnect/tick'] = { success: true, attempted: 'restored', result: {
+    success: false, error: 'Server rejected password authentication.'
+  } };
+  await window.pollAutoReconnect();
+  check('automatic reconnect failures are visible in the log',
+    lastLogLine().includes('Automatic reconnection failed for restored.') &&
+    lastLogLine().includes('Server rejected password authentication.'));
+  delete responses['/api/auto-reconnect/tick'];
+
   // Host keys are verified instead of accepted.
   window.openSiteManager();
   await new Promise(resolve => setTimeout(resolve, 100));
+  let finishOpen;
+  delayedTabOpen = new Promise(resolve => { finishOpen = resolve; });
+  const beforeOpen = calls.filter(call => call.path === '/api/tabs/open').length;
+  doc.getElementById('sitePass').value = 'secret-connection-test';
+  const connecting = window.connectFromSiteManager();
+  check('connection opens the log with details and disables duplicate attempts',
+    !doc.getElementById('siteModal').classList.contains('open') &&
+    doc.getElementById('tabLogBtn').classList.contains('active') &&
+    doc.getElementById('siteConnectBtn').disabled &&
+    text('logOutput').includes(doc.getElementById('siteHost').value) &&
+    text('logOutput').includes('Waiting for the connection') &&
+    !text('logOutput').includes('secret-connection-test'));
+  const oldLogs = responses['/api/logs'];
+  responses['/api/logs'] = { logs: [{ timestamp_ms: Date.now(), level: 'info',
+    text: '[Connection 7] SSH handshake and host-key verification completed; starting authentication.' }] };
+  await window.refreshLogs();
+  check('backend connection stages appear in the log while the request is pending',
+    text('logOutput').includes('SSH handshake and host-key verification completed'));
+  responses['/api/logs'] = oldLogs;
   await window.connectFromSiteManager();
+  check('repeated connection requests do not start another attempt',
+    calls.filter(call => call.path === '/api/tabs/open').length === beforeOpen + 1);
+  finishOpen({ status: 200, payload: responses['/api/tabs/open'] });
+  await connecting;
+  delayedTabOpen = null;
   await new Promise(resolve => setTimeout(resolve, 100));
+  check('connection progress clears for a host-key challenge',
+    !doc.getElementById('siteConnectBtn').disabled &&
+    text('logOutput').includes('Host-key verification is required') &&
+    !doc.getElementById('siteModal').classList.contains('open'));
   check('an unknown host key opens the verification dialog',
     doc.getElementById('hostKeyModal').className.indexOf('open') >= 0);
   check('the dialog shows the fingerprint',
@@ -1682,13 +1814,14 @@ function options(id) {
       !lastLogLine().includes('Cannot connect with that host key.'));
   responses['/api/tabs/verify'] = { success: false, error: 'unknown destination key', challenge: {
     tab: 7, host: 'destination', port: 22, role: 'destination', fingerprint: 'ssh-ed25519 SHA256:destination' } };
-  const beforeNextChallenge = doc.getElementById('logOutput').children.length;
+  const beforeNextChallenge = doc.querySelectorAll('#logOutput .log-error').length;
   window.showHostKeyChallenge({ tab: 7, host: 'jump', port: 22, role: 'tunnel', fingerprint: 'ssh-ed25519 SHA256:jump' });
   await window.acceptHostKey();
   check('a second host-key challenge opens without logging a connection failure',
     doc.getElementById('hostKeyModal').classList.contains('open') &&
     text('hostKeyFingerprint') === 'ssh-ed25519 SHA256:destination' &&
-    doc.getElementById('logOutput').children.length === beforeNextChallenge);
+    doc.querySelectorAll('#logOutput .log-error').length === beforeNextChallenge &&
+    lastLogLine().includes('Host-key verification is required'));
   window.closeModal('hostKeyModal');
   responses['/api/tabs/verify'] = savedVerify;
 
@@ -2460,6 +2593,30 @@ function options(id) {
       statuses() > before, 'status calls before=' + before + ' after=' + statuses());
   }
 
+  // Late replies must not replace the newest navigation.
+  {
+    const transport = window.LinSCPTransport;
+    const original = transport.request;
+    let release;
+    transport.request = async function(method, url, body) {
+      if (url.includes('path=' + encodeURIComponent('/race/slow'))) {
+        return await new Promise(resolve => { release = () => resolve({ success: true, path: '/race/slow', entries: [{name:'old', is_dir:false}] }); });
+      }
+      if (url.includes('path=' + encodeURIComponent('/race/new'))) {
+        return { success: true, path: '/race/new', entries: [{name:'new', is_dir:false}] };
+      }
+      return original.call(this, method, url, body);
+    };
+    const first = window.loadLocal('/race/slow');
+    await wait(10);
+    const second = window.loadLocal('/race/new');
+    check('pending pane navigation does not leave rows selectable', doc.getElementById('localFileList').children.length === 0);
+    release(); await first; await second;
+    check('a stale listing cannot replace a newer navigation', value('localPathInput') === '/race/new' && text('localFileList').includes('new') && !text('localFileList').includes('old'));
+    transport.request = original;
+    await window.loadLocal('/tmp/slowlocal');
+  }
+
   await window.loadLocal('/tmp/slowlocal/partial');
   check('a listing with unusable entries still shows the usable ones',
     text('localFileList').includes('keep.txt') &&
@@ -2941,6 +3098,8 @@ function options(id) {
       let selection = null;
       lastWindow = {
         get selection() { return selection; },
+        copyAllText: async () => 'all terminal text',
+        changeTextSize: delta => { painted.push('size:' + delta); return 14 + delta; },
         copySelection: async () => {
           if (!selection) return null;
           selection = null;
@@ -3308,12 +3467,19 @@ function options(id) {
     const selectionBar = doc.getElementById('terminalSelectionBar');
     check('the copy bar is out of the way until something is selected',
       !!selectionBar && selectionBar.hidden === true, String(selectionBar && selectionBar.hidden));
+    check('terminal footer exposes copy all and help without a copy selected button', !!doc.querySelector('#terminalModal button[onclick="copyTerminalAllText()"]') && !!doc.querySelector('#terminalModal button[onclick="showTerminalCopyHelp()"]') && !doc.getElementById('terminalCopySelected'));
+    const shrink = doc.querySelector('#terminalModal button[aria-label="Decrease terminal text size"]');
+    const grow = doc.querySelector('#terminalModal button[aria-label="Increase terminal text size"]');
+    check('embedded terminal exposes both text size buttons', !!shrink && !!grow);
+    shrink.click(); grow.click();
+    check('embedded terminal size buttons reach its own view', painted.includes('size:-2') && painted.includes('size:2'));
+    await window.copyTerminalAllText();
     lastWindow.selectAll();
     check('selecting text offers to copy it',
       selectionBar.hidden === false, String(selectionBar.hidden));
-    await window.copyTerminalSelection();
+    await window.clearTerminalSelection();
     await new Promise(resolve => setTimeout(resolve, 20));
-    check('copying closes the selection and puts the bar away',
+    check('clearing the selection puts the bar away',
       selectionBar.hidden === true, String(selectionBar.hidden));
 
     check('the screen title follows the model',

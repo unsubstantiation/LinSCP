@@ -3,6 +3,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use zeroize::Zeroizing;
+
+const VAULT_STORE_PREFIX: &str = "LSCP-SESSION-VAULT-1$";
+const VAULT_STORE_CONTEXT: &str = "LinSCP session store v1\n";
 
 use serde::{Deserialize, Serialize};
 use linscp_crypto::{decrypt_password, encrypt_password, is_encrypted_password, SessionMasterKey};
@@ -500,6 +506,16 @@ impl SessionStore {
                 }
             }
 
+            // Older GUI releases wrote descriptive FTPS choices (and an
+            // empty default) rather than the engine's numeric representation.
+            if let Some(mode) = map.get("ftps").cloned() {
+                match mode.trim().to_ascii_lowercase().as_str() {
+                    "" => { map.remove("ftps"); }
+                    "implicit" => { map.insert("ftps".into(), "1".into()); }
+                    "explicit" => { map.insert("ftps".into(), "3".into()); }
+                    _ => {}
+                }
+            }
             site.extra_fields = map;
             if let Some(existing) = out.iter_mut().find(|s| s.name == site.name) {
                 *existing = site;
@@ -515,12 +531,29 @@ impl SessionStore {
                 continue;
             }
             if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                if trimmed[1..trimmed.len() - 1].trim().is_empty() {
+                    return Err("Empty session section name".to_string());
+                }
                 flush_section(current_name.take(), &mut current_fields, &mut store.sites);
                 current_name = Some(unescape_ini_value(&trimmed[1..trimmed.len() - 1]));
                 continue;
             }
+            if trimmed.starts_with('[') {
+                return Err(format!("Malformed session section header: {trimmed}"));
+            }
+            if current_name.is_none() || !line.contains('=') {
+                return Err(format!("Malformed session store line: {trimmed}"));
+            }
             if let Some((key, value)) = line.split_once('=') {
                 let clean_key = key.trim().to_ascii_lowercase();
+                let value_check = value.trim();
+                if clean_key.is_empty() { return Err("Empty session setting name".to_string()); }
+                if clean_key == "protocol" && ProtocolScheme::parse(value_check).is_none() {
+                    return Err(format!("Invalid stored protocol '{value_check}'"));
+                }
+                if clean_key == "port" && !value_check.parse::<u16>().is_ok_and(|port| port > 0) {
+                    return Err(format!("Invalid stored port '{value_check}'"));
+                }
                 // Value strips leading spaces before unescaping, matching SessionStore.cpp
                 let raw_val = value.trim_start_matches([' ', '\t']);
                 current_fields.push((clean_key, unescape_ini_value(raw_val)));
@@ -697,37 +730,84 @@ impl SessionStore {
         Ok(out)
     }
 
-    pub fn load_from_dir(config_dir: &Path, vault: &dyn SecretVault) -> Result<Self, String> {
-        let ini_path = config_dir.join("sessions.ini");
-        let text = match std::fs::read_to_string(&ini_path) {
-            Ok(s) => s,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::new()),
-            Err(err) => return Err(format!("Cannot read {}: {err}", ini_path.display())),
+    /// Read the on-disk store as INI, decrypting a password-vault envelope.
+    /// Never interpret a locked or corrupt encrypted store as an empty store.
+    pub fn read_ini_text(config_dir: &Path, vault: &dyn SecretVault) -> Result<Option<Zeroizing<String>>, String> {
+        let path = config_dir.join("sessions.ini");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => Zeroizing::new(text),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(format!("Cannot read {}: {err}", path.display())),
         };
-        let master = vault
-            .load_master_key(config_dir)
-            .ok()
-            .flatten()
-            .map(|z| SessionMasterKey::from_array(*z));
+        if let Some(encoded) = text.strip_prefix(VAULT_STORE_PREFIX) {
+            let encrypted = BASE64.decode(encoded.trim()).map_err(|_| "Encrypted session store has invalid encoding.".to_string())?;
+            let plain = vault.open_session_store(&encrypted).map_err(|e| e.to_string())?;
+            let decoded = std::str::from_utf8(&plain).map_err(|_| "Encrypted session store is not UTF-8.".to_string())?;
+            let ini = decoded.strip_prefix(VAULT_STORE_CONTEXT).ok_or_else(|| "Invalid encrypted session store context.".to_string())?;
+            return Ok(Some(Zeroizing::new(ini.to_owned())));
+        }
+        if vault.protects_session_store() && vault.load_master_key(config_dir).map_err(|e| e.to_string())?.is_none() {
+            return Err("Unlock the local vault to read saved sessions.".to_string());
+        }
+        Ok(Some(text))
+    }
+
+    /// Atomically write INI inside the password vault, or use the legacy codec
+    /// for hosts whose vault explicitly does not support encrypted metadata.
+    pub fn write_ini_text(config_dir: &Path, vault: &dyn SecretVault, text: &str) -> Result<(), String> {
+        let path = config_dir.join("sessions.ini");
+        if vault.protects_session_store() {
+            let mut payload = Zeroizing::new(String::from(VAULT_STORE_CONTEXT));
+            payload.push_str(text);
+            let encrypted = vault.seal_session_store(payload.as_bytes()).map_err(|e| e.to_string())?;
+            let envelope = format!("{VAULT_STORE_PREFIX}{}\n", BASE64.encode(encrypted));
+            write_private_file_atomic(&path, envelope.as_bytes()).map_err(|e| e.to_string())
+        } else {
+            match std::fs::read_to_string(&path) {
+                Ok(existing) if existing.starts_with(VAULT_STORE_PREFIX) => return Err("Refusing to overwrite an encrypted session vault without unlocking it.".into()),
+                Ok(_) => {},
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(format!("Cannot read {}: {error}", path.display())),
+            }
+            write_private_file_atomic(&path, text.as_bytes()).map_err(|e| e.to_string())
+        }
+    }
+
+    /// Migrate an existing legacy store only after unlock, preserving its exact
+    /// content. Validate before atomic replacement; leave corrupt input intact.
+    pub fn protect_existing(config_dir: &Path, vault: &dyn SecretVault) -> Result<(), String> {
+        if !vault.protects_session_store() { return Ok(()); }
+        let path = config_dir.join("sessions.ini");
+        let original = match std::fs::read_to_string(&path) {
+            Ok(text) => Zeroizing::new(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("Cannot read {}: {error}", path.display())),
+        };
+        let ini = Self::read_ini_text(config_dir, vault)?.ok_or_else(|| "Session store disappeared during migration.".to_string())?;
+        let master = vault.load_master_key(config_dir).map_err(|e| e.to_string())?
+            .ok_or_else(|| "Unlock the local vault before migrating sessions.".to_string())?;
+        let key = SessionMasterKey::from_array(*master);
+        Self::parse_ini(&ini, Some(&key))?;
+        if !original.starts_with(VAULT_STORE_PREFIX) { Self::write_ini_text(config_dir, vault, &ini)?; }
+        Ok(())
+    }
+
+    pub fn load_from_dir(config_dir: &Path, vault: &dyn SecretVault) -> Result<Self, String> {
+        let text = match Self::read_ini_text(config_dir, vault)? { Some(text) => text, None => return Ok(Self::new()) };
+        let master = vault.load_master_key(config_dir).ok().flatten().map(|z| SessionMasterKey::from_array(*z));
         Self::parse_ini(&text, master.as_ref())
     }
 
     pub fn save_to_dir(&self, config_dir: &Path, vault: &dyn SecretVault) -> Result<(), String> {
         let needs_key = self.sites.iter().any(StoredSite::needs_encryption_key);
         let master = if needs_key {
-            let z = vault
-                .load_or_create_master_key(config_dir)
-                .map_err(|e| e.to_string())?;
+            let z = vault.load_or_create_master_key(config_dir).map_err(|e| e.to_string())?;
             Some(SessionMasterKey::from_array(*z))
         } else {
-            vault
-                .load_master_key(config_dir)
-                .map_err(|e| e.to_string())?
-                .map(|z| SessionMasterKey::from_array(*z))
+            vault.load_master_key(config_dir).map_err(|e| e.to_string())?.map(|z| SessionMasterKey::from_array(*z))
         };
-        let rendered = self.serialize_ini(master.as_ref())?;
-        write_private_file_atomic(&config_dir.join("sessions.ini"), rendered.as_bytes())
-            .map_err(|e| e.to_string())
+        let rendered = Zeroizing::new(self.serialize_ini(master.as_ref())?);
+        Self::write_ini_text(config_dir, vault, &rendered)
     }
 
     pub fn find(&self, name: &str) -> Option<&StoredSite> {
@@ -836,6 +916,15 @@ impl SessionStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn malformed_store_is_not_treated_as_empty_and_old_ftps_modes_migrate() {
+        assert!(super::SessionStore::parse_ini("[broken\nhost=example\n", None).is_err());
+        assert!(super::SessionStore::parse_ini("[site]\nport=abc\n", None).is_err());
+        assert!(super::SessionStore::parse_ini("[site]\nprotocol=unknown\n", None).is_err());
+        let store = super::SessionStore::parse_ini("[site]\nprotocol=ftp\nhost=example\nftps=explicit\n", None).unwrap();
+        assert_eq!(store.find("site").unwrap().extra_fields.get("ftps").map(String::as_str), Some("3"));
+    }
+
     use super::*;
 
     #[test]

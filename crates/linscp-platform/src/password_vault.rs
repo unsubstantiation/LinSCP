@@ -110,6 +110,16 @@ impl PasswordSecretVault {
 }
 
 impl SecretVault for PasswordSecretVault {
+    fn protects_session_store(&self) -> bool { true }
+
+    fn seal_session_store(&self, plaintext: &[u8]) -> Result<Vec<u8>, PlatformError> {
+        self.seal_local_blob(plaintext)
+    }
+
+    fn open_session_store(&self, encrypted: &[u8]) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
+        self.open_local_blob(encrypted)
+    }
+
     fn load_master_key(&self, _config_dir: &Path) -> Result<Option<Zeroizing<[u8; 32]>>, PlatformError> {
         let guard = self.master_key.lock().map_err(lock_error)?;
         Ok(guard.as_ref().map(|key| Zeroizing::new(**key)))

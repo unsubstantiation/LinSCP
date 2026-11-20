@@ -512,6 +512,22 @@ impl TerminalScreen {
         self.term.selection_to_string()
     }
 
+    /// Text in the current terminal buffer, including retained scrollback.
+    /// The temporary model selection preserves wrapping and wide characters,
+    /// and is restored without altering the user's selection or viewport.
+    pub fn all_text(&mut self) -> String {
+        let history = self.term.grid().history_size();
+        let start = Point::new(Line(-(history as i32)), Column(0));
+        let end = Point::new(Line((self.size.lines - 1) as i32), Column(self.size.columns - 1));
+        let old = self.term.selection.take();
+        let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+        selection.update(end, Side::Right);
+        self.term.selection = Some(selection);
+        let text = self.term.selection_to_string().unwrap_or_default();
+        self.term.selection = old;
+        text.trim_end_matches('\n').to_string()
+    }
+
     /// The viewport row and column of each end of the selection, for a window
     /// that draws it. Ordering is start-then-end, which is what a rectangle
     /// needs, and it is only reported when it lies on screen.
@@ -966,6 +982,28 @@ mod tests {
     /// through its history, where the topmost row is a negative line. Reading
     /// one as the other selects the wrong text by exactly the scroll offset,
     /// which is invisible until you scroll.
+    #[test]
+    fn all_text_includes_scrollback_without_changing_selection_or_viewport() {
+        let mut screen = screen(10, 2);
+        screen.advance(b"1\r\n2\r\n3\r\n4\r\n5");
+        screen.select_start(0, 0);
+        screen.select_extend(0, 0);
+        let selected = screen.selection();
+        screen.scroll(2);
+        let offset = screen.snapshot().display_offset;
+        let text = screen.all_text();
+        assert_eq!(text, "1\n2\n3\n4\n5");
+        assert_eq!(screen.selection(), selected);
+        assert_eq!(screen.snapshot().display_offset, offset);
+    }
+
+    #[test]
+    fn all_text_joins_soft_wraps_and_preserves_unicode() {
+        let mut screen = screen(5, 2);
+        screen.advance("ab界cde".as_bytes());
+        assert_eq!(screen.all_text(), "ab界cde");
+    }
+
     #[test]
     fn a_selection_copies_the_cells_the_window_named() {
         let mut screen = screen(10, 3);

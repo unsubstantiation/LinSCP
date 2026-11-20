@@ -1604,7 +1604,7 @@ var(--border-strong)kupModal .hint code { user-select: all; background: var(--su
     min-height: 0;
     padding: 0;
   }
-  #terminalModal .modal-footer { padding: var(--space-2) var(--space-4); }
+  #terminalModal .modal-footer { padding: var(--space-2) var(--space-4); flex-wrap: wrap; }
   #terminalModal .terminal-screen {
     flex: 1 1 auto;
     height: auto;
@@ -1660,12 +1660,28 @@ body.terminal-only {
   overflow: hidden;
   background: var(--terminal-bg);
 }
-body.terminal-only > *:not(.terminal-window-screen):not(.terminal-window-ended) {
+body.terminal-only > *:not(.terminal-window-screen):not(.terminal-window-ended):not(.terminal-window-toolbar) {
   display: none !important;
 }
+.terminal-window-toolbar {
+  overflow-x: auto;
+  white-space: nowrap;
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 42px;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
+  background: var(--terminal-bg);
+}
+.terminal-window-toolbar .btn { flex: none; }
+.terminal-copy-status { color: var(--banner-text); font-size: var(--fs-xs); }
 .terminal-window-screen {
   position: fixed;
-  inset: 0;
+  inset: 0 0 42px;
   background: var(--terminal-bg);
   overflow: hidden;
 }
@@ -1680,7 +1696,13 @@ body.terminal-only > *:not(.terminal-window-screen):not(.terminal-window-ended) 
   color: var(--banner-text);
   background: var(--banner-bg);
 }
-/* The canvas paints text a mouse can select, so it wears the cursor a text
- * view wears. The WebView's own context menu on it - which is where the
- * painted screen can be copied as an image - is deliberately left alone. */
+/* The canvas paints selectable text; right-click pastes into the terminal. */
 .terminal-canvas { display: block; cursor: text; }
+
+.auto-reconnect-row > label:first-child { width: auto; }
+.auto-reconnect-row > input[type="number"] { flex: 0 1 6em; min-width: 4em; }
+.auto-reconnect-row { flex-wrap: wrap; }
+
+.alt-host-row { flex-wrap: wrap; }
+.alt-host-row > input[type="text"] { min-width: 8em; }
+#siteModal .modal-footer { flex-wrap: wrap; }

@@ -840,6 +840,22 @@ impl RemoteSession for FtpSession {
         self.cfg.scheme
     }
 
+    async fn probe_connection(&self) -> Option<bool> {
+        // Do not interfere with an active operation or its control replies.
+        let Ok(mut inner) = self.inner.try_lock() else { return None };
+        if inner.poisoned { return Some(false); }
+        match tokio::time::timeout(std::time::Duration::from_secs(10), inner.command("NOOP")).await {
+            Ok(Ok(reply)) => Some(reply.code != 421),
+            Ok(Err(_)) => { inner.poisoned = true; Some(false) },
+            Err(_) => {
+                // Cancelling a control read can leave an unread reply; never
+                // reuse this control stream after the timeout.
+                inner.poisoned = true;
+                Some(false)
+            }
+        }
+    }
+
     async fn pwd(&self) -> Result<String, ProtoError> {
         let mut inner = self.inner.lock().await;
         let rep = inner.command("PWD").await?;
@@ -1384,6 +1400,35 @@ impl RemoteSession for FtpSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reconnect_probe_skips_busy_ftp_and_detects_closed_control_stream() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let task = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            let mut line = String::new();
+            server.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "NOOP\r\n");
+            server.get_mut().write_all(b"200 OK\r\n").await.unwrap();
+        });
+        let session = FtpSession {
+            cfg: FtpConnectConfig::default(), tls_config: None,
+            inner: Mutex::new(FtpInner { ctrl: ControlStream::Plain(BufReader::new(client)), poisoned: false,
+                prot_private: false, supports_mlst: false, supports_size: false, supports_mdtm: false,
+                supports_mfmt: false, home_dir: "/".into() }),
+            jump_tunnel: None, socks_relay: Mutex::new(None),
+        };
+        let held = session.inner.lock().await;
+        assert_eq!(session.probe_connection().await, None);
+        drop(held);
+        assert_eq!(session.probe_connection().await, Some(true));
+        task.await.unwrap();
+        assert_eq!(session.probe_connection().await, Some(false));
+        assert!(session.inner.lock().await.poisoned);
+    }
 
     #[test]
     fn pasv_and_epsv_parsers_reject_overflow_and_flag_unroutable_addresses() {

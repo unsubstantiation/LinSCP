@@ -726,6 +726,7 @@ test('scrolling back shows where the viewport is, and being live shows nothing',
 
 test('a long press selects, a drag extends it, and copy reads the model', async () => {
   const dom = installDom();
+  installClipboard(dom.dom);
   const transport = fakeTransport({
     '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(10, 2) }),
     '/api/terminal/selection': { success: true, text: 'bravo' },
@@ -1031,4 +1032,133 @@ test('the mouse events a touch fires on its way out are ignored', async () => {
 
   await session.close();
   dom.cleanup();
+});
+
+test('copy all reads retained model text and reports clipboard failures', async () => {
+  const dom = installDom();
+  const written = installClipboard(dom.dom);
+  const transport = fakeTransport({
+    '/api/terminal/text': { success: true, text: 'history\nvisible' },
+    '/api/terminal/frame': { success: true, alive: true, frame: blankFrame(10, 2) },
+  });
+  const session = new TerminalSession({ transport, terminal: 'term/copy', container: fakeContainer(90, 36) });
+  assert.equal(await session.copyAllText(), 'history\nvisible');
+  assert.deepEqual(written, ['history\nvisible']);
+  assert.ok(transport.calls.some(call => call.path === '/api/terminal/text?terminal=term%2Fcopy'));
+  Object.defineProperty(dom.dom.window.navigator, 'clipboard', { configurable: true,
+    value: { writeText: async () => { throw new Error('denied'); } } });
+  dom.dom.window.document.execCommand = () => false;
+  await assert.rejects(session.copyAllText(), /clipboard/);
+  session.stop(); dom.cleanup();
+});
+
+test('selection survives a failed clipboard write', async () => {
+  const dom = installDom();
+  Object.defineProperty(dom.dom.window.navigator, 'clipboard', { configurable: true,
+    value: { writeText: async () => { throw new Error('denied'); } } });
+  dom.dom.window.document.execCommand = () => false;
+  const transport = fakeTransport({
+    '/api/terminal/selection': { success: true, text: 'selected' },
+    '/api/terminal/frame': { success: true, alive: true, frame: blankFrame(10, 2) },
+  });
+  const session = new TerminalSession({ transport, terminal: 'term-1', container: fakeContainer(90, 36) });
+  session.start();
+  const win = dom.dom.window, doc = win.document;
+  session.element.dispatchEvent(new win.MouseEvent('mousedown', { button: 0, detail: 1, clientX: 0, clientY: 0 }));
+  doc.dispatchEvent(new win.MouseEvent('mousemove', { button: 0, clientX: 18, clientY: 0 }));
+  await new Promise(resolve => setTimeout(resolve, 10));
+  await assert.rejects(session.copySelection(), /clipboard/);
+  assert.ok(session.selection);
+  assert.equal(transport.calls.filter(call => call.path === '/api/terminal/select' && call.body.action === 'clear').length, 0);
+  session.stop(); dom.cleanup();
+});
+
+test('right-click and Ctrl+V paste clipboard text once with bracketed-paste mode', async () => {
+  const dom = installDom();
+  Object.defineProperty(dom.dom.window.navigator, 'clipboard', { configurable: true,
+    value: { readText: async () => 'first\r\nsecond' } });
+  const modes = { alternate_screen: false, app_cursor: false, bracketed_paste: true,
+    mouse_reporting: false, show_cursor: true };
+  const transport = fakeTransport({ '/api/terminal/frame': { success: true, alive: true, frame: blankFrame(10, 2, { modes }) } });
+  const session = new TerminalSession({ transport, terminal: 'term-paste', container: fakeContainer(90, 36), pollInterval: 5 });
+  session.start(); await new Promise(resolve => setTimeout(resolve, 15));
+  const right = new dom.dom.window.MouseEvent('contextmenu', { button: 2, cancelable: true });
+  session.element.dispatchEvent(right);
+  assert.equal(right.defaultPrevented, true, 'the image context menu is suppressed');
+  const key = new dom.dom.window.KeyboardEvent('keydown', { key: 'v', ctrlKey: true, cancelable: true });
+  assert.equal(session.handleKey(key), true);
+  assert.equal(key.defaultPrevented, true);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const bytes = transport.calls.filter(call => call.path === '/api/terminal/input' && call.body.data)
+    .map(call => Buffer.from(call.body.data, 'base64').toString());
+  assert.deepEqual(bytes, ['\x1b[200~first\nsecond\x1b[201~', '\x1b[200~first\nsecond\x1b[201~']);
+  await session.close();
+  assert.equal(session.element.hasListener('contextmenu'), false);
+  dom.cleanup();
+});
+
+test('clipboard read failure reports an error and never pastes input', async () => {
+  const dom = installDom(); let errors = 0;
+  Object.defineProperty(dom.dom.window.navigator, 'clipboard', { configurable: true,
+    value: { readText: async () => { throw new Error('denied'); } } });
+  const transport = fakeTransport();
+  const session = new TerminalSession({ transport, terminal: 'term-paste', container: fakeContainer(),
+    onClipboardError: () => { errors++; } });
+  session.handleKey(new dom.dom.window.KeyboardEvent('keydown', { key: 'v', ctrlKey: true, cancelable: true }));
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(errors, 1);
+  assert.equal(transport.calls.filter(call => call.path === '/api/terminal/input').length, 0);
+  session.stop(); dom.cleanup();
+});
+
+test('touch selection copies on release after queued selection updates', async () => {
+  const dom = installDom(); const written = installClipboard(dom.dom); let release;
+  const transport = fakeTransport({
+    '/api/terminal/frame': { success: true, alive: true, frame: blankFrame(10, 2) },
+    '/api/terminal/select': async body => {
+      if (body.action === 'extend') await new Promise(resolve => { release = resolve; });
+      return { success: true };
+    },
+    '/api/terminal/selection': { success: true, text: 'touch selection' },
+  });
+  const session = new TerminalSession({ transport, terminal: 'term-touch', container: fakeContainer(), keyboard: true });
+  session.start();
+  const touch = (x, y) => ({ clientX: x, clientY: y });
+  const start = new dom.dom.window.Event('touchstart'); start.touches = [touch(0, 0)];
+  session.element.dispatchEvent(start);
+  await new Promise(resolve => setTimeout(resolve, TerminalSession.LONG_PRESS_MS + 30));
+  const move = new dom.dom.window.Event('touchmove', { cancelable: true }); move.touches = [touch(18, 0)];
+  session.element.dispatchEvent(move);
+  session.element.dispatchEvent(new dom.dom.window.Event('touchend'));
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(written.length, 0, 'waits for selection extension');
+  release(); await new Promise(resolve => setTimeout(resolve, 15));
+  assert.deepEqual(written, ['touch selection']);
+  assert.ok(session.selection, 'the highlight remains visible');
+  session.stop(); dom.cleanup();
+});
+
+test('terminal text size remeasures, repaints and reports the new grid and cell pixels', async () => {
+  const dom = installDom();
+  const transport = fakeTransport();
+  const grids = [];
+  const session = new TerminalSession({ transport, terminal: 'term-size', container: fakeContainer(180, 90),
+    onResize: grid => grids.push(grid) });
+  const ctx = session.element.getContext('2d');
+  ctx.measureText = text => ({ width: text.length * parseFloat(ctx.font) * 0.625 });
+  session.start();
+  assert.equal(session.changeTextSize(2), 16);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  let last = transport.calls.filter(call => call.path === '/api/terminal/input').at(-1).body;
+  assert.deepEqual([last.cols, last.rows, last.cell_width, last.cell_height], [18, 4, 10, 21]);
+  assert.deepEqual(grids.at(-1), { columns: 18, lines: 4 });
+  assert.equal(session.changeTextSize(-2), 14);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  last = transport.calls.filter(call => call.path === '/api/terminal/input').at(-1).body;
+  assert.deepEqual([last.cols, last.rows, last.cell_width, last.cell_height], [20, 5, 9, 18]);
+  assert.equal(session.changeTextSize(-100), 8);
+  assert.equal(session.changeTextSize(100), 32);
+  assert.equal(session.changeTextSize(2), 32);
+  assert.equal(session.changeTextSize(Number.NaN), 32);
+  session.stop(); dom.cleanup();
 });

@@ -186,6 +186,10 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
     obj.insert("user".into(), json!(site.username));
     obj.insert("has_password".into(), json!(has_password));
     obj.insert("sudo_password_auto".into(), json!(site.extra_fields.get("sudo_password_auto").is_some_and(|v| v == "1")));
+    obj.insert("auto_reconnect".into(), json!(crate::auto_reconnect::enabled(site)));
+    obj.insert("auto_reconnect_seconds".into(), json!(crate::auto_reconnect::interval(site)));
+    obj.insert("alt_hostname".into(), json!(site.extra_fields.get("alt_hostname").cloned().unwrap_or_default()));
+    obj.insert("alt_fallback".into(), json!(site.extra_fields.get("alt_fallback").is_some_and(|v| v == "1")));
     obj.insert("has_key_passphrase".into(), json!(has_key_passphrase));
     obj.insert(
         "keyfile".into(),
@@ -207,6 +211,7 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
     obj.insert("proxy_host".into(), json!(site.proxy_host));
     obj.insert("proxy_port".into(), json!(site.proxy_port));
     obj.insert("proxy_username".into(), json!(site.proxy_username));
+    obj.insert("has_proxy_password".into(), json!(site.proxy_password.as_ref().is_some_and(|p| !p.is_empty()) || site.proxy_password_raw.as_ref().is_some_and(|p| !p.is_empty())));
     obj.insert("proxy_command".into(), json!(site.proxy_command));
     obj.insert("proxy_dns".into(), json!(site.proxy_dns));
     obj.insert("proxy_localhost".into(), json!(site.proxy_localhost));
@@ -298,8 +303,8 @@ pub fn parse_gui_session_spec(
     }
 
     let stored_base = if let Some(sname) = site_name.map(str::trim).filter(|s| !s.is_empty()) {
-        let store = SessionStore::load_from_dir(config_root, vault).unwrap_or_default();
-        store.find(sname).cloned()
+        let store = SessionStore::load_from_dir(config_root, vault)?;
+        Some(store.find(sname).cloned().ok_or_else(|| format!("Saved site {sname:?} no longer exists."))?)
     } else {
         None
     };
@@ -544,7 +549,7 @@ pub fn parse_gui_session_spec(
     };
 
     let mut spec = if let Some(ref b) = stored_base {
-        site_spec_from_stored(b).unwrap_or_default()
+        site_spec_from_stored(b)?
     } else {
         ParsedSiteSpec::default()
     };
@@ -599,6 +604,8 @@ pub fn parse_gui_session_spec(
     // Extra protocol fields (`s3_*`, `ftp_*`, `tls_*`, `proxy_*`, Kerberos)
     let extra_keys = [
         "sudo_password_auto",
+        "alt_hostname",
+        "alt_fallback",
         "s3_access_key",
         "s3_secret_key",
         "s3_session_token",
@@ -620,6 +627,12 @@ pub fn parse_gui_session_spec(
         "tls_cert_file",
         "tls_key_file",
         "tls_verify",
+        "min_tls_version",
+        "max_tls_version",
+        "tls_certificate_file",
+        "ca_certificate_file",
+        "pinned_public_key",
+        "pinned_pubkey",
         "certificate",
         "proxy_method",
         "proxy_host",
@@ -650,6 +663,46 @@ pub fn parse_gui_session_spec(
                 }
                 _ => {}
             }
+        }
+    }
+    if session.get("alt_hostname").is_some_and(|v| !v.is_string()) ||
+        session.get("alt_fallback").is_some_and(|v| !v.is_boolean()) {
+        return Err("Invalid alternate hostname settings.".to_string());
+    }
+    if let Some(host) = spec.raw_fields.get("alt_hostname") {
+        if !host.is_empty() && !valid_alternate_hostname(host) {
+            return Err("Enter a valid alternate hostname without a port or URL.".to_string());
+        }
+    }
+    if protocol != ProtocolScheme::Local && spec.raw_fields.get("alt_fallback").is_some_and(|v| v == "1") &&
+        spec.raw_fields.get("alt_hostname").is_none_or(|v| v.is_empty()) {
+        return Err("An alternate hostname is required when fallback is enabled.".to_string());
+    }
+    // Empty password inputs do not disclose saved secrets to the GUI.
+    if session.get("proxy_password").and_then(Value::as_str) == Some("")
+        && stored_base.is_some() && !session.get("clear_proxy_password").and_then(Value::as_bool).unwrap_or(false) {
+        if let Some(password) = stored_base.as_ref().and_then(|site| site.proxy_password.as_ref()) {
+            spec.raw_fields.insert("proxy_password".into(), password.clone());
+        }
+    }
+    // The site form uses descriptive values, whereas the engine stores the
+    // WinSCP-compatible numeric mode. Never let an unknown value silently
+    // downgrade an FTP connection to plaintext.
+    if let Some(mode) = session.get("ftps").and_then(Value::as_str) {
+        match mode.trim().to_ascii_lowercase().as_str() {
+            "" => { spec.raw_fields.remove("ftps"); }
+            "implicit" | "1" => { spec.raw_fields.insert("ftps".into(), "1".into()); }
+            "explicit" | "3" => { spec.raw_fields.insert("ftps".into(), "3".into()); }
+            "0" | "2" => { spec.raw_fields.insert("ftps".into(), mode.trim().into()); }
+            _ => return Err(format!("Invalid FTPS mode '{mode}'.")),
+        }
+    }
+    if let Some(pin) = spec.raw_fields.remove("pinned_pubkey") {
+        spec.raw_fields.insert("pinned_public_key".into(), pin);
+    }
+    for key in ["min_tls_version", "max_tls_version"] {
+        if spec.raw_fields.get(key).is_some_and(|value| value.trim().is_empty()) {
+            spec.raw_fields.remove(key);
         }
     }
     if protocol == ProtocolScheme::S3 {
@@ -708,6 +761,31 @@ pub fn parse_gui_session_spec(
     }
 
     Ok((spec, clean_view))
+}
+
+/// An alternate is a hostname/IP only, never a URL, credential or port.
+pub fn valid_alternate_hostname(host: &str) -> bool {
+    !host.is_empty() && host == host.trim() && host != "*" && host.len() <= 253
+        && !host.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | '@' | '?' | '#' | '%'))
+        && (!host.contains(':') || host.parse::<std::net::Ipv6Addr>().is_ok()
+            || (host.starts_with('[') && host.ends_with(']') && host[1..host.len()-1].parse::<std::net::Ipv6Addr>().is_ok()))
+}
+
+pub fn site_matches_host(site: &StoredSite, host: &str) -> bool {
+    site.host == host || site.extra_fields.get("alt_hostname").is_some_and(|alt| alt == host && valid_alternate_hostname(alt))
+}
+
+/// The alternate gets its own SSH host-key cache entry and TLS hostname.
+pub fn select_alternate(spec: &mut ParsedSiteSpec) -> Result<(), String> {
+    let alt = spec.raw_fields.get("alt_hostname").cloned().unwrap_or_default();
+    if !valid_alternate_hostname(&alt) { return Err("A valid alternate hostname is required.".to_string()); }
+    if alt != spec.session.host {
+        spec.raw_fields.insert("linscp_primary_host".into(), spec.session.host.clone());
+        spec.raw_fields.insert("linscp_primary_hostkey".into(), spec.session.hostkey.clone());
+        spec.session.host = alt;
+        spec.session.hostkey.clear();
+    }
+    Ok(())
 }
 
 /// Converts a `ParsedSiteSpec` into a `StoredSite` ready to write into `sessions.ini`.
@@ -810,8 +888,10 @@ pub async fn dial_gui_tab_session(
     config_root: &Path,
     cache_pinned_hostkeys: bool,
     locale: &str,
+    log_sink: Option<linscp_proto::ssh::SshEventLogger>,
 ) -> Result<(Arc<dyn RemoteSession>, String, String), GuiConnectError> {
-    let session = connect_gui_site_spec(spec, config_root, cache_pinned_hostkeys, locale, None).await?;
+    let session = connect_gui_site_spec(spec, config_root, cache_pinned_hostkeys, locale, log_sink.clone()).await?;
+    if let Some(log) = &log_sink { log("Connected; determining the initial remote directory."); }
     let resolved_dir = if spec.session.initial_dir.trim().is_empty()
         || spec.session.initial_dir.trim() == "~"
     {
@@ -859,6 +939,32 @@ pub fn collect_session_folders(sessions: &[Value]) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn alternate_host_settings_round_trip_and_never_reuse_primary_host_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = linscp_platform::NativeSecretVault::new();
+        let (mut spec, _) = parse_gui_session_spec(&json!({
+            "protocol": "sftp", "host": "primary.example", "port": 22, "username": "user",
+            "hostkey": "ssh-ed25519 SHA256:primary", "alt_hostname": "backup.example", "alt_fallback": true,
+            "auth_gssapi": false
+        }), None, dir.path(), &vault).unwrap();
+        let saved = build_stored_site_for_save("site", &spec);
+        let view = stored_site_to_gui_json(&saved);
+        assert_eq!(view["alt_hostname"], "backup.example");
+        assert_eq!(view["alt_fallback"], true);
+        select_alternate(&mut spec).unwrap();
+        assert_eq!(spec.session.host, "backup.example");
+        assert!(spec.session.hostkey.is_empty());
+        assert_eq!(spec.raw_fields["linscp_primary_hostkey"], "ssh-ed25519 SHA256:primary");
+        assert!(site_matches_host(&saved, &spec.session.host));
+        assert!(!site_matches_host(&saved, "other.example"));
+        assert!(!valid_alternate_hostname("https://host/"));
+        assert!(!valid_alternate_hostname("host:22"));
+        assert!(!valid_alternate_hostname("user@host"));
+        assert!(valid_alternate_hostname("[::1]"));
+        assert!(parse_gui_session_spec(&json!({"host": "primary", "alt_fallback": true}), None, dir.path(), &vault).is_err());
+    }
+
     fn test_config_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "linscp-tabs-gssapi-{tag}-{}",
@@ -867,6 +973,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn gui_ftps_and_tls_fields_are_translated_and_fail_closed() {
+        let dir = test_config_dir("tls-options");
+        let vault = linscp_platform::NativeSecretVault::new();
+        let session = json!({"protocol":"ftp", "host":"example.test", "ftps":"explicit",
+            "min_tls_version":"1.2", "max_tls_version":"1.3", "tls_certificate_file":"client.pem",
+            "ca_certificate_file":"ca.pem", "pinned_pubkey":"sha256//pin"});
+        let (spec, _) = parse_gui_session_spec(&session, None, &dir, &vault).unwrap();
+        for (key, expected) in [("ftps", "3"), ("min_tls_version", "1.2"), ("max_tls_version", "1.3"),
+            ("tls_certificate_file", "client.pem"), ("ca_certificate_file", "ca.pem"), ("pinned_public_key", "sha256//pin")] {
+            assert_eq!(spec.raw_fields.get(key).map(String::as_str), Some(expected));
+        }
+        let mut invalid = session.clone(); invalid["ftps"] = json!("unexpected");
+        assert!(parse_gui_session_spec(&invalid, None, &dir, &vault).is_err());
+        invalid["ftps"] = json!("implicit");
+        assert_eq!(parse_gui_session_spec(&invalid, None, &dir, &vault).unwrap().0.raw_fields["ftps"], "1");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_saved_site_does_not_connect_with_stale_settings() {
+        let dir = test_config_dir("missing-site");
+        let vault = linscp_platform::NativeSecretVault::new();
+        assert!(parse_gui_session_spec(&json!({"host":"old.example"}), Some("deleted"), &dir, &vault).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
