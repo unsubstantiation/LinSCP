@@ -46,3 +46,13 @@ application backup or an OfflineOTP export). Malware running as the
 same user (or an administrator/root process) can read credentials from process
 memory or intercept them while the vault is unlocked; this design protects data
 at rest, not an actively compromised account.
+
+## Concurrent instances
+
+Vault-key deletion checks stored sessions, including tunnel keys, and refuses
+keys currently referenced by them. Coordination is currently within one
+CommanderService instance only. Do not edit `sessions.ini` externally or run
+multiple instances against the same configuration directory while changing
+sessions or deleting keys: those writers are not protected by a shared
+transaction or interprocess lock. Original key files and backups are not
+deleted by the vault picker.

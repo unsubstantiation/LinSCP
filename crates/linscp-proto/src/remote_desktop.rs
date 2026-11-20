@@ -13,8 +13,8 @@
 //!   Android: `androidVNC`. Options: `-SharedViewOnly -PreferredEncoding -via`.
 //! * **SPICE** – QEMU/KVM. Linux: `remote-viewer`/`spicy`/`virt-viewer`, Windows: `remote-viewer.exe`.
 //!   Options: `spice://host:port?tls-port=...`.
-//! * **X2Go / KDrive** – built-in viewer planned; session, graphics and lifecycle
-//!   integration are incomplete. There is no external NX viewer fallback.
+//! * **X2Go / KDrive** – experimental built-in viewer in the service; live-server
+//!   compatibility and lifecycle need validation. There is no external NX fallback.
 //! * **X11** – `ssh -X` / `waypipe ssh`. Headless mode falls back to `xwayland` detection the
 //!   same way `detect_desktop_session()` does.
 

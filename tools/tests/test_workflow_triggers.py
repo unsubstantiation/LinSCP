@@ -1,26 +1,8 @@
-"""Every workflow builds master, builds pull requests, and can be started by hand.
+"""Build workflows run on pull requests and manually, not on pushes.
 
-A build that only runs on a push to `master` cannot be tried before it lands
-there: the signed Android APK, for instance, is the first place the release
-keystore is exercised, and waiting for a merge to find out that it does not
-work is the wrong order. `workflow_dispatch` gives each workflow a "Run
-workflow" button and a `gh workflow run` target for a branch, and the
-`pull_request` trigger makes that trial automatic: without it a pull request
-merges with every build unrun, and master is where the red is found.
-
-The triggers are easy to lose - they live in the same `on:` mapping as the
-push filter, and a workflow without one is not an error anywhere, it simply
-never starts that way. These tests read the workflows the way GitHub does for
-those properties: the `on:` mapping has to keep `push` *and* carry
-`workflow_dispatch` and `pull_request`, so a build cannot quietly become
-push-only again.
-
-The same quiet-rot rule applies to the repo-state suites themselves: a tools
-test no workflow names never runs in CI, however green it is by hand. The last
-test below fails the suite that forgets to wire a new test file into a job.
-
-The workflows are parsed as text rather than with a YAML library: the CI jobs
-that run these tests install nothing beyond the standard library.
+This catches duplicate post-merge builds while retaining pre-merge feedback and
+manual release builds. Every tools test must also be wired into a workflow.
+The parser uses only the standard library, as in CI.
 """
 import pathlib
 import unittest
@@ -63,46 +45,34 @@ def workflow_files():
     return sorted(WORKFLOWS.glob('*.yml'))
 
 
-def job_blocks(text):
-    """The `jobs:` mapping as {job name: raw block text}.
 
-    Text-based like trigger_names: a job starts at a two-space `name:` line
-    under `jobs:` and runs until the next one.
-    """
+def job_blocks(text):
+    """Extract top-level job blocks; indented step gates are not job gates."""
     lines = text.splitlines()
-    start = None
-    for number, line in enumerate(lines):
-        if line.rstrip() == 'jobs:':
-            start = number
-            break
-    if start is None:
-        raise AssertionError('the workflow has no `jobs:` section')
+    try:
+        start = lines.index('jobs:')
+    except ValueError:
+        raise AssertionError('the workflow has no jobs section')
     blocks = {}
     current = None
     for line in lines[start + 1:]:
-        if not line.startswith(' '):
-            break                                     # the next top-level key
-        if line.startswith('  ') and not line.startswith('   ') \
-                and line.rstrip().endswith(':'):
+        if line and not line.startswith(' '):
+            break
+        if line.startswith('  ') and not line.startswith('   ') and line.rstrip().endswith(':'):
             current = line.strip()[:-1]
             blocks[current] = []
         elif current is not None:
             blocks[current].append(line)
-    return {name: '\n'.join(body) for name, body in blocks.items()}
+    return {name: '\n'.join(block) for name, block in blocks.items()}
 
 
 def job_runs_on_pull_request(block):
-    """Whether the job's `if:` gates (if any) let a pull request through.
-
-    A job with no gate runs; a gate that names pull_request without `!=`
-    includes it. Anything fancier than that fails closed: write the gate
-    plainly.
-    """
-    gates = [line.strip() for line in block.splitlines()
-             if line.strip().startswith('if:')]
+    # Keep event conditions simple and explicit; unknown gates fail closed.
+    gates = [line.strip()[3:].strip() for line in block.splitlines()
+             if line.startswith('    if:')]
     if not gates:
         return True
-    return any('pull_request' in gate and '!=' not in gate for gate in gates)
+    return any("github.event_name == 'pull_request'" in gate for gate in gates)
 
 
 class WorkflowTriggerTests(unittest.TestCase):
@@ -118,26 +88,31 @@ class WorkflowTriggerTests(unittest.TestCase):
                     f'{path.name} cannot be run manually; add workflow_dispatch '
                     f'to its `on:` mapping')
 
-    def test_every_workflow_still_builds_master(self):
-        # The manual trigger is an addition, not a replacement: a push to master
-        # has to keep building, or nothing catches a broken merge.
-        for path in workflow_files():
-            with self.subTest(workflow=path.name):
-                text = path.read_text(encoding='utf-8')
-                triggers = trigger_names(text)
-                self.assertIn('push', triggers, path.name)
-                self.assertIn('branches: [master]', text, path.name)
-
-    def test_every_workflow_builds_pull_requests(self):
-        # Same shape as the push-only failure, one level up: a workflow that
-        # never runs on a pull request lets the PR merge unbuilt.
+    def test_every_workflow_runs_on_pull_requests_not_pushes(self):
         for path in workflow_files():
             with self.subTest(workflow=path.name):
                 triggers = trigger_names(path.read_text(encoding='utf-8'))
-                self.assertIn(
-                    'pull_request', triggers,
-                    f'{path.name} never builds a pull request; add pull_request '
-                    f'to its `on:` mapping')
+                self.assertIn('pull_request', triggers, path.name)
+                self.assertNotIn('pull_request_target', triggers, path.name)
+                self.assertNotIn('push', triggers, path.name)
+                self.assertEqual(set(triggers), {'pull_request', 'workflow_dispatch'}, path.name)
+
+    def test_each_workflow_has_a_job_that_runs_on_pull_requests(self):
+        for path in workflow_files():
+            with self.subTest(workflow=path.name):
+                jobs = job_blocks(path.read_text(encoding='utf-8'))
+                self.assertTrue(any(job_runs_on_pull_request(block) for block in jobs.values()),
+                                f'{path.name} has no job enabled for pull requests')
+                for name, block in jobs.items():
+                    if any(line.startswith('    environment:') for line in block.splitlines()):
+                        self.assertFalse(job_runs_on_pull_request(block),
+                                         f'{path.name} job {name} exposes a protected environment to PRs')
+
+    def test_android_signed_release_is_manual_only(self):
+        jobs = job_blocks((WORKFLOWS / 'android-build.yml').read_text(encoding='utf-8'))
+        self.assertIn("if: github.event_name == 'workflow_dispatch'", jobs['build'])
+        self.assertIn('environment: android-release', jobs['build'])
+        self.assertTrue(job_runs_on_pull_request(jobs['check']))
 
     def test_every_tools_test_is_named_by_some_workflow(self):
         # A repo-state suite that no job runs is a green lie: it passes by
@@ -154,36 +129,12 @@ class WorkflowTriggerTests(unittest.TestCase):
                     f'{test_file.name} runs in no CI job; wire it into a '
                     f'workflow step')
 
-    def test_a_protected_environment_never_runs_on_a_pull_request(self):
-        # The PR #93 Android failure, locked in: a job that names a protected
-        # environment is rejected for a pull-request ref before any step runs,
-        # so such a job has to gate itself off pull requests. The unsigned
-        # work belongs in a separate job that names no environment.
-        for path in workflow_files():
-            text = path.read_text(encoding='utf-8')
-            with self.subTest(workflow=path.name):
-                for job, block in job_blocks(text).items():
-                    if 'environment:' in block:
-                        self.assertFalse(
-                            job_runs_on_pull_request(block),
-                            f'{path.name} job {job!r} names an environment but '
-                            f'no `if:` keeps it off pull requests')
-
-    def test_some_job_actually_runs_on_a_pull_request(self):
-        # The mirror image: gating every job off pull requests would turn the
-        # pull_request trigger into green skips, which is the no-checks
-        # problem wearing a passing badge.
-        for path in workflow_files():
-            text = path.read_text(encoding='utf-8')
-            if 'pull_request' not in trigger_names(text):
-                continue
-            with self.subTest(workflow=path.name):
-                capable = [job for job, block in job_blocks(text).items()
-                           if job_runs_on_pull_request(block)]
-                self.assertTrue(
-                    capable,
-                    f'{path.name} triggers on pull_request but no job runs on '
-                    f'one; every job is gated off')
+    def test_pull_request_triggers_are_detected_even_with_filters(self):
+        self.assertEqual(
+            trigger_names('on:\n  push:\n    branches: [master]\n'
+                          "  pull_request:\n    paths-ignore:\n      - 'docs/**'\n"
+                          '  pull_request_target:\n  workflow_dispatch:\n\njobs:\n'),
+            ['push', 'pull_request', 'pull_request_target', 'workflow_dispatch'])
 
     def test_a_scalar_trigger_is_reported(self):
         with self.assertRaises(AssertionError):

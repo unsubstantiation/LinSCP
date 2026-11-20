@@ -154,20 +154,24 @@ desktop entry; see [docs/debian.md](docs/debian.md).
 
 The experimental Android target uses the Tauri WebView and Rust backend. See
 [docs/android.md](docs/android.md) for the signed release APK's build and signing
-instructions and important limitations, including app-private storage only and
-no background transfers.
+instructions and important limitations, including app-private storage defaults and
+non-durable foreground-service transfers.
 
 ## Continuous integration
 
-The workflows in `.github/workflows/` build the Debian package, the Windows
-application and the signed Android APK, and upload each as an uncompressed
-artifact for the manual release process (GitHub delivers artifacts as a zip
-envelope; no GitHub Release is created). Each runs on a push to `master` and can
-also be started by hand, from the Actions tab ("Run workflow", where the branch
-to build can be chosen) or with `gh workflow run "Android build" --ref <branch>`.
-GitHub only offers that button for workflows whose default-branch copy declares
-`workflow_dispatch`, which all three do; a run of the Android build uses the
-`android-release` environment and therefore its release keystore.
+The workflows in `.github/workflows/` run on pull requests and can also be
+started by hand from the Actions tab ("Run workflow") or with, for example,
+`gh workflow run "Android build" --ref <branch>`. They do not run on pushes to
+`master`, including a PR merge; run a workflow manually after merging if a
+build of the merged commit is needed. GitHub only offers manual dispatch when
+the default-branch workflow declares `workflow_dispatch`.
+
+The Debian and Windows jobs build and test their applications on pull requests.
+Android pull requests run an unsigned debug check without release secrets; its
+signed release APK and emulator checks run on manual dispatch using the
+`android-release` environment and release keystore. The manual Android run
+also runs the unsigned check. Build artifacts are uploaded for the manual
+release process; no GitHub Release is created by these workflows.
 
 ## Historical material
 

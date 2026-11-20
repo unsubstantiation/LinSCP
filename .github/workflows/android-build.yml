@@ -1,8 +1,6 @@
 name: Android build
 
 on:
-  push:
-    branches: [master]
   pull_request:
   workflow_dispatch:
 
@@ -12,8 +10,8 @@ concurrency:
 
 jobs:
   check:
-    name: Android pull-request check
-    if: github.event_name == 'pull_request'
+    name: Android unsigned check
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -66,7 +64,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: android-pr
+          key: android-check
 
       - name: Build and test the UI
         run: |
@@ -106,7 +104,7 @@ jobs:
 
   build:
     name: Signed Android release APK
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     environment: android-release

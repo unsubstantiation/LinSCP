@@ -302,7 +302,7 @@ pub fn launch_remote_desktop(
     // Never start an external X2Go/NX client or report a gateway as a working
     // built-in viewer, even for old or manually constructed tickets.
     if matches!(ticket.kind.trim().to_ascii_lowercase().as_str(), "x2go" | "nx" | "nx3") {
-        return Err("The built-in X2Go KDrive viewer is not implemented yet; NX support has been removed.".to_string());
+        return Err("X2Go is not supported by the ticket launcher; use the experimental built-in KDrive viewer. NX is not supported.".to_string());
     }
     let viewer_bin = resolve_viewer_binary(ticket);
     let spawn_allowed = !force_file_ticket && host_can_spawn_gui_viewer();
@@ -427,7 +427,7 @@ pub fn desktop_recommendations() -> &'static str {
      \x20 RDP  — Linux: xfreerdp3 / xfreerdp / wlfreerdp (FreeRDP 3.x, recommended), sdl-freerdp (Wayland). Windows: mstsc.exe (built-in). macOS: open rdp:// / Microsoft Remote Desktop. Android: aFreeRDP / aRDP (intent rdp://). Embedded fallback: Devolutions/ironrdp WASM (HTML5/WebSocket) when no native viewer is installed.\n\
      \x20 VNC  — Linux: tigervnc-viewer / remmina / gvncviewer (TigerVNC, recommended for 5900-5999). Windows: TightVNC / RealVNC viewer. Android: androidVNC / VNC Viewer (443).\n\
      \x20 SPICE — Linux/Windows: remote-viewer / virt-viewer (virt-viewer, recommended for QEMU/KVM). Fallback: spicy (spice-gtk). Uses spice://host:port?tls-port=... and .vv virt-viewer files.\n\
-     \x20 X2Go KDrive — built-in viewer planned but not yet implemented; NX is not supported.\n\
+     \x20 X2Go KDrive — experimental built-in viewer; a KDrive server is required. NX is not supported.\n\
      \x20 X11 forwarding — Linux: waypipe ssh (Wayland, recommended) or ssh -X / ssh -Y (X11). Detects WAYLAND_DISPLAY / XDG_SESSION_TYPE / DISPLAY.\n\
      \x20 XDMCP — Not recommended; plain UDP port 177 with no encryption. Use X2Go or waypipe-over-SSH instead.\n"
 }
@@ -457,7 +457,7 @@ mod tests {
             assert!(resolve_viewer_binary(&ticket).is_none());
             for force_file in [false, true] {
                 let error = launch_remote_desktop(&ticket, Path::new("."), force_file).unwrap_err();
-                assert!(error.contains("not implemented"), "{error}");
+                assert!(error.contains("ticket launcher"), "{error}");
             }
         }
     }

@@ -281,7 +281,7 @@ pub fn parse_filezilla_xml(text: &str) -> Result<ImportReport, String> {
     if text.len() > MAX_XML_BYTES {
         return Err("XML file exceeds 2 MiB safety limit".to_string());
     }
-    let lower_head = text[..text.len().min(8192)].to_ascii_lowercase();
+    let lower_head = text.to_ascii_lowercase();
     if lower_head.contains("<!doctype") || lower_head.contains("<!entity") {
         return Err("DOCTYPE and ENTITY declarations are not allowed in FileZilla XML".to_string());
     }
@@ -449,6 +449,14 @@ mod tests {
         let expected_key = home.join(".ssh/id_ed25519").to_string_lossy().into_owned();
         assert_eq!(site.private_key.as_deref(), Some(expected_key.as_str()));
         assert_eq!(report.skipped.len(), 3);
+    }
+
+    #[test]
+    fn filezilla_parser_handles_multibyte_boundary_and_late_doctype() {
+        let xml = format!("<!--{}é--><FileZilla3/>", "a".repeat(8187));
+        assert!(parse_filezilla_xml(&xml).is_ok());
+        let xxe = format!("{}<!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><FileZilla3/>", " ".repeat(9000));
+        assert!(parse_filezilla_xml(&xxe).is_err());
     }
 
     #[test]

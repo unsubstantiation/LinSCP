@@ -150,7 +150,7 @@ const responses = {
   '/api/bookmarks/delete': { success: true, file: '/tmp/cfg/bookmarks.json' },
   '/api/sessions/import': { success: true, sources: [{
     source: 'openssh', path: '/home/user/.ssh/config', exists: true,
-    error: '', skipped: [{ name: '*', reason: 'Only a Host line with one plain alias is imported.' }],
+    fingerprint: 'fixture-digest', error: '', skipped: [{ name: '*', reason: 'Only a Host line with one plain alias is imported.' }],
     entries: [
       { name: 'prod', host: 'prod.example.test', port: 2222, username: 'deploy',
         protocol: 'sftp', has_password: false, keyfile: '/home/user/.ssh/id_ed25519' },
@@ -2100,6 +2100,14 @@ function options(id) {
   check('the import scan never lists a password',
     !text('importList').includes('secret') &&
       !text('importStatus').includes('secret'));
+  const importPostsBefore = calls.filter(call => call.path === '/api/sessions/import' &&
+    (call.options.method || 'GET').toUpperCase() === 'POST').length;
+  doc.getElementById('importPath').value = '/changed/source';
+  await window.runSessionImport();
+  check('changing the import path requires a fresh scan before importing',
+    calls.filter(call => call.path === '/api/sessions/import' &&
+      (call.options.method || 'GET').toUpperCase() === 'POST').length === importPostsBefore);
+  doc.getElementById('importPath').value = '';
   doc.querySelectorAll('#importList input[type="checkbox"]')[1].checked = false;
   const sessionsBefore = calls.filter(call => call.path === '/api/sessions').length;
   doc.getElementById('importOverwrite').checked = true;
@@ -2110,7 +2118,7 @@ function options(id) {
   check('importing posts only the ticked sites and the overwrite choice',
     importPayload.source === 'openssh' &&
       JSON.stringify(importPayload.names) === JSON.stringify(['prod']) &&
-      importPayload.overwrite === true, JSON.stringify(importPayload));
+      importPayload.overwrite === true && importPayload.fingerprint === 'fixture-digest', JSON.stringify(importPayload));
   check('a finished import reloads the stored site list',
     calls.filter(call => call.path === '/api/sessions').length > sessionsBefore);
   window.closeModal('importSessionsModal');

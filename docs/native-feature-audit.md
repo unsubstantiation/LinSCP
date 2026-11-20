@@ -90,9 +90,9 @@ contract for intended common UI surface, not evidence that every listed action
 is wired end to end. The incomplete paths above apply to all native hosts unless
 called out otherwise. Android additionally provides registered SAF,
 incoming-share, foreground-service, and external-viewer intent integrations.
-The viewer hand-off currently covers direct RDP/VNC/SPICE only. The planned
-built-in X2Go KDrive viewer is not yet implemented on any platform; NX support
-has been removed. Android Keystore, X11 viewer intents, real-device SAF/share coverage, and
+The viewer hand-off currently covers direct RDP/VNC/SPICE only. An experimental
+built-in X2Go KDrive viewer is wired separately but remains unverified against a
+live server; it requires a KDrive backend. NX support has been removed. Android Keystore, X11 viewer intents, real-device SAF/share coverage, and
 Windows/Linux-versus-Android integration parity remain outstanding. Android
 outgoing file sharing is implemented with private staged copies and read-only
 URI grants, but still needs device and receiver validation; see `docs/android.md`.

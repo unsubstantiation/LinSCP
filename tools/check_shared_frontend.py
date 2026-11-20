@@ -18,7 +18,8 @@ PAGE = ROOT / 'source/gui/web/index.html'
 SERVICE = ROOT / 'crates/linscp-service/src/lib.rs'
 
 PAGE_ENDPOINT = re.compile(r"""['"`](/api/[a-zA-Z0-9/_.-]+)""")
-ROUTE = re.compile(r'\("(?:GET|POST)",\s*"(/api/[^"]+)"\)')
+ROUTE = re.compile(r'\("(GET|POST)",\s*"(/api/[^"]+)"\)')
+PAGE_CALL = re.compile(r"""\bapi(Get|Post)\s*\(\s*['"`](/api/[a-zA-Z0-9/_.-]+)""")
 
 
 def page_endpoints(page_text):
@@ -27,7 +28,7 @@ def page_endpoints(page_text):
 
 
 def routed_endpoints(service_text):
-    return {match.group(1) for match in ROUTE.finditer(service_text)}
+    return {match.group(2) for match in ROUTE.finditer(service_text)}
 
 
 def unrouted(page_text, service_text):
@@ -35,15 +36,29 @@ def unrouted(page_text, service_text):
     return sorted(set(page_endpoints(page_text)) - routed_endpoints(service_text))
 
 
+def unrouted_methods(page_text, service_text):
+    """Check literal apiGet/apiPost calls against method/path pairs.
+
+    Dynamic paths and non-helper calls still require integration tests.
+    """
+    calls = {(match.group(1).upper(), match.group(2)) for match in PAGE_CALL.finditer(page_text)}
+    routes = {(match.group(1), match.group(2)) for match in ROUTE.finditer(service_text)}
+    return sorted(calls - routes)
+
+
 def main():
-    problems = unrouted(PAGE.read_text(encoding='utf-8'),
-                        SERVICE.read_text(encoding='utf-8'))
-    if problems:
+    page = PAGE.read_text(encoding='utf-8')
+    service = SERVICE.read_text(encoding='utf-8')
+    problems = unrouted(page, service)
+    method_problems = unrouted_methods(page, service)
+    if problems or method_problems:
+        for method, path in method_problems:
+            print(f'{PAGE.relative_to(ROOT)}: no route for {method} {path}')
         for path in problems:
             print(f'{PAGE.relative_to(ROOT)}: no route for {path}')
-        print(f'{len(problems)} endpoint(s) the shared page calls are not served.')
+        print(f'{len(problems)} endpoint(s) and {len(method_problems)} method/path pair(s) are not served.')
         return 1
-    print('Every endpoint the shared page calls is served by the service.')
+    print('All literal page endpoints and apiGet/apiPost method pairs have routes; dynamic calls and behavior require integration tests.')
     return 0
 
 
