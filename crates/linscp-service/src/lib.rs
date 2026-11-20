@@ -3874,8 +3874,8 @@ impl CommanderService {
             if session_val.get("preset").is_none() && stored.preset.is_empty() && !old.preset.is_empty() {
                 stored.preset = old.preset.clone();
             }
-            if stored.last_used.is_empty() && !old.last_used.is_empty() {
-                stored.last_used = old.last_used.clone();
+            if stored.last_used.is_none() && old.last_used.is_some() {
+                stored.last_used = old.last_used;
             }
             if session_val.get("tls_key_file").is_none()
                 && session_val.get("tls_certificate_key_file").is_none()
@@ -6760,7 +6760,7 @@ fn offlineotp_entries_from_sessions(
                 if allowed_hostkeys.contains(&entry.host_port) {
                     if let Some((hk_host, hk_port_str)) = entry.host_port.rsplit_once('@') {
                         if let Ok(hk_port) = hk_port_str.parse::<u16>() {
-                            scoped_cache.set(hk_host, hk_port, &entry.key_type, &entry.fingerprint);
+                            scoped_cache.upsert(hk_host, hk_port, &entry.key_type, &entry.key)?;
                         }
                     }
                 }
@@ -7262,10 +7262,10 @@ fn import_offlineotp_entries(
             for hk in &candidate.cached_hostkeys {
                 let Some((hk_host, hk_port_str)) = hk.host_port.rsplit_once('@') else { continue; };
                 let Ok(hk_port) = hk_port_str.parse::<u16>() else { continue; };
-                let existing_fp = hostkey_cache.get(hk_host, hk_port, &hk.key_type);
+                let existing_fp = hostkey_cache.lookup(hk_host, hk_port, &hk.key_type);
                 if existing_fp.is_none() || replace_same_names {
-                    if existing_fp != Some(hk.fingerprint.as_str()) {
-                        hostkey_cache.set(hk_host, hk_port, &hk.key_type, &hk.fingerprint);
+                    if existing_fp != Some(hk.key.as_str()) {
+                        hostkey_cache.upsert(hk_host, hk_port, &hk.key_type, &hk.key)?;
                         hostkeys_changed = true;
                     }
                 }
@@ -7361,7 +7361,6 @@ fn validate_imported_site(site: &StoredSite) -> Result<(), String> {
         return Err("The imported session name is invalid.".to_string());
     }
     let text_values = [
-        ("folder", site.folder.as_str()),
         ("host", site.host.as_str()),
         ("username", site.username.as_str()),
         ("password", site.password.as_deref().unwrap_or("")),
@@ -7370,9 +7369,6 @@ fn validate_imported_site(site: &StoredSite) -> Result<(), String> {
         ("remote directory", site.remote_directory.as_str()),
         ("local directory", site.local_directory.as_str()),
         ("preset", site.preset.as_str()),
-        ("color", site.color.as_str()),
-        ("note", site.note.as_str()),
-        ("last used", site.last_used.as_str()),
         ("proxy method", site.proxy_method.as_str()),
         ("proxy host", site.proxy_host.as_str()),
         ("proxy username", site.proxy_username.as_str()),
@@ -8685,26 +8681,28 @@ mod tests {
         ).unwrap();
 
         let mut preset_store = linscp_engine::presets::TransferPresetStore::default();
-        let mut preset = linscp_engine::presets::TransferPreset::new("NightlySync");
-        preset.transfer_mode = Some(linscp_types::TransferMode::Binary);
-        preset.newer_only = Some(true);
-        preset.speed_kbytes_per_sec = Some(4096);
-        preset.mask = "*.tar.gz|*.tmp".into();
+        let preset = linscp_engine::presets::TransferPreset {
+            name: "NightlySync".into(),
+            transfer_mode: Some(linscp_types::TransferMode::Binary),
+            newer_only: Some(true),
+            speed_kbytes_per_sec: Some(4096),
+            mask: "*.tar.gz|*.tmp".into(),
+            ..Default::default()
+        };
         preset_store.add_or_update(preset).unwrap();
         preset_store.save_to_dir(src_dir.path()).unwrap();
 
         let mut hk_cache = linscp_engine::hostkeys::HostKeyCache::new();
-        hk_cache.set("prod.example.test", 2222, "ssh-ed25519", "SHA256:PrimaryKeyFp");
-        hk_cache.set("dr.example.test", 2223, "ssh-ed25519", "SHA256:AltKeyFp");
-        hk_cache.set("bastion.example.test", 2200, "ssh-ed25519", "SHA256:BastionKeyFp");
-        hk_cache.set("unrelated.example.test", 22, "ssh-ed25519", "SHA256:UnrelatedKeyFp");
+        hk_cache.upsert("prod.example.test", 2222, "ssh-ed25519", "SHA256:PrimaryKeyFp").unwrap();
+        hk_cache.upsert("dr.example.test", 2223, "ssh-ed25519", "SHA256:AltKeyFp").unwrap();
+        hk_cache.upsert("bastion.example.test", 2200, "ssh-ed25519", "SHA256:BastionKeyFp").unwrap();
+        hk_cache.upsert("unrelated.example.test", 22, "ssh-ed25519", "SHA256:UnrelatedKeyFp").unwrap();
         hk_cache.save_protected(&src_dir.path().join("sshhostkeys"), src_svc.secret_vault.as_ref()).unwrap();
 
         let mut store = SessionStore::new();
 
-        // 1. Rich SFTP session with folder, note, color, sudo_password_auto, proxy, jump-host, alt-host, preset, hostkeys
-        let mut sftp = StoredSite::new("Prod Bastion SFTP", ProtocolScheme::Sftp, "prod.example.test");
-        sftp.folder = "Production/ClusterA".into();
+        // 1. Rich SFTP session with folder path in name, note, color, sudo_password_auto, proxy, jump-host, alt-host, preset, hostkeys
+        let mut sftp = StoredSite::new("Production/ClusterA/Prod Bastion SFTP", ProtocolScheme::Sftp, "prod.example.test");
         sftp.port = 2222;
         sftp.username = "DOMAIN\\alice smith".into();
         sftp.password = Some("sftp-pass".into());
@@ -8714,9 +8712,7 @@ mod tests {
         sftp.remote_directory = "/srv/releases".into();
         sftp.local_directory = "/var/staging/releases".into();
         sftp.preset = "NightlySync".into();
-        sftp.color = "#22aa88".into();
-        sftp.note = "Primary release node".into();
-        sftp.last_used = "2026-11-20T12:00:00Z".into();
+        sftp.last_used = Some(1_795_176_000);
         sftp.proxy_method = "3".into();
         sftp.proxy_host = "proxy.internal.test".into();
         sftp.proxy_port = 8080;
@@ -8734,6 +8730,8 @@ mod tests {
         sftp.tunnel.local_port = 12222;
         sftp.tunnel.hostkey = "ssh-ed25519 255 SHA256:BastionKeyFp".into();
         sftp.tunnel_passphrase = Some("jump-key-pass".into());
+        sftp.extra_fields.insert("color".into(), "#22aa88".into());
+        sftp.extra_fields.insert("note".into(), "Primary release node".into());
         sftp.extra_fields.insert("sudo_password_auto".into(), "1".into());
         sftp.extra_fields.insert("alt_hostname".into(), "dr.example.test".into());
         sftp.extra_fields.insert("alt_port".into(), "2223".into());
@@ -8768,8 +8766,7 @@ mod tests {
         let right_local = dst_dir.path().join("pane-right");
         std::fs::create_dir_all(&left_local).unwrap();
         std::fs::create_dir_all(&right_local).unwrap();
-        let mut local_site = StoredSite::new("Dual Local Workspace", ProtocolScheme::Local, "");
-        local_site.folder = "Workspaces".into();
+        let mut local_site = StoredSite::new("Workspaces/Dual Local Workspace", ProtocolScheme::Local, "");
         local_site.local_directory = left_local.to_string_lossy().into_owned();
         local_site.extra_fields.insert("other_local_dir".into(), right_local.to_string_lossy().into_owned());
         store.upsert(local_site);
@@ -8812,9 +8809,9 @@ mod tests {
 
         // Seed a stale auto-reconnect intention on destination for a session we will overwrite with replace=true
         let mut stale_store = SessionStore::new();
-        let stale_site = StoredSite::new("Prod Bastion SFTP", ProtocolScheme::Sftp, "old.example.test");
+        let stale_site = StoredSite::new("Production/ClusterA/Prod Bastion SFTP", ProtocolScheme::Sftp, "old.example.test");
         let mut stale_intentions = auto_reconnect::Intentions::new();
-        stale_intentions.insert("Prod Bastion SFTP".into(), auto_reconnect::Identity::of(&stale_site));
+        stale_intentions.insert("Production/ClusterA/Prod Bastion SFTP".into(), auto_reconnect::Identity::of(&stale_site));
         stale_store.upsert(stale_site);
         stale_store.save_to_dir(dst_dir.path(), dst_svc.secret_vault.as_ref()).unwrap();
         auto_reconnect::save(dst_dir.path(), dst_svc.secret_vault.as_ref(), &stale_intentions).unwrap();
@@ -8833,23 +8830,22 @@ mod tests {
         let restored_store = SessionStore::load_from_dir(dst_dir.path(), dst_svc.secret_vault.as_ref()).unwrap();
 
         // Verify 1: SFTP session + hostkeys + preset
-        let r_sftp = restored_store.find("Prod Bastion SFTP").unwrap();
-        assert_eq!(r_sftp.folder, "Production/ClusterA");
+        let r_sftp = restored_store.find("Production/ClusterA/Prod Bastion SFTP").unwrap();
         assert_eq!(r_sftp.username, "DOMAIN\\alice smith");
         assert_eq!(r_sftp.password.as_deref(), Some("sftp-pass"));
         assert_eq!(r_sftp.key_passphrase.as_deref(), Some("main-key-pass"));
         assert_eq!(r_sftp.remote_directory, "/srv/releases");
         assert_eq!(r_sftp.local_directory, "/var/staging/releases");
         assert_eq!(r_sftp.preset, "NightlySync");
-        assert_eq!(r_sftp.color, "#22aa88");
-        assert_eq!(r_sftp.note, "Primary release node");
-        assert_eq!(r_sftp.last_used, "2026-11-20T12:00:00Z");
+        assert_eq!(r_sftp.last_used, Some(1_795_176_000));
         assert_eq!(r_sftp.proxy_password.as_deref(), Some("proxy-secret"));
         assert!(r_sftp.proxy_localhost);
         assert_eq!(r_sftp.tunnel.username, "jump user");
         assert_eq!(r_sftp.tunnel.password.as_deref(), Some("jump-pass"));
         assert_eq!(r_sftp.tunnel_passphrase.as_deref(), Some("jump-key-pass"));
         assert!(r_sftp.tunnel.keyfile.as_deref().unwrap().starts_with(LOCAL_VAULT_KEY_PREFIX));
+        assert_eq!(r_sftp.extra_fields.get("color").map(String::as_str), Some("#22aa88"));
+        assert_eq!(r_sftp.extra_fields.get("note").map(String::as_str), Some("Primary release node"));
         assert_eq!(r_sftp.extra_fields.get("sudo_password_auto").map(String::as_str), Some("1"));
         assert_eq!(r_sftp.extra_fields.get("alt_hostname").map(String::as_str), Some("dr.example.test"));
         assert_eq!(r_sftp.extra_fields.get("alt_port").map(String::as_str), Some("2223"));
@@ -8861,10 +8857,10 @@ mod tests {
             &dst_dir.path().join("sshhostkeys"),
             dst_svc.secret_vault.as_ref(),
         ).unwrap();
-        assert_eq!(dst_hk.get("prod.example.test", 2222, "ssh-ed25519"), Some("SHA256:PrimaryKeyFp"));
-        assert_eq!(dst_hk.get("dr.example.test", 2223, "ssh-ed25519"), Some("SHA256:AltKeyFp"));
-        assert_eq!(dst_hk.get("bastion.example.test", 2200, "ssh-ed25519"), Some("SHA256:BastionKeyFp"));
-        assert_eq!(dst_hk.get("unrelated.example.test", 22, "ssh-ed25519"), None);
+        assert_eq!(dst_hk.lookup("prod.example.test", 2222, "ssh-ed25519"), Some("SHA256:PrimaryKeyFp"));
+        assert_eq!(dst_hk.lookup("dr.example.test", 2223, "ssh-ed25519"), Some("SHA256:AltKeyFp"));
+        assert_eq!(dst_hk.lookup("bastion.example.test", 2200, "ssh-ed25519"), Some("SHA256:BastionKeyFp"));
+        assert_eq!(dst_hk.lookup("unrelated.example.test", 22, "ssh-ed25519"), None);
 
         let dst_presets = linscp_engine::presets::TransferPresetStore::load_from_dir(dst_dir.path()).unwrap();
         let restored_preset = dst_presets.find("NightlySync").unwrap();
@@ -8888,13 +8884,13 @@ mod tests {
         assert!(!mat_key_path.exists());
 
         // Verify 3: Dual-local session opens directly as a local dual-pane tab
-        let r_local = restored_store.find("Dual Local Workspace").unwrap();
+        let r_local = restored_store.find("Workspaces/Dual Local Workspace").unwrap();
         assert_eq!(r_local.local_directory, left_local.to_string_lossy());
         assert_eq!(r_local.extra_fields.get("other_local_dir").map(String::as_str), Some(right_local.to_string_lossy().as_ref()));
         let open_local = dst_svc.dispatch_async(ApiEnvelope {
             method: "POST".into(),
             path: "/api/tabs".into(),
-            body: json!({"site_name": "Dual Local Workspace", "session": {"protocol": "local"}}),
+            body: json!({"site_name": "Workspaces/Dual Local Workspace", "session": {"protocol": "local"}}),
         }).await;
         assert_eq!(open_local.status, 200, "{}", open_local.payload);
         assert_eq!(open_local.payload["tab"]["is_local"], true);

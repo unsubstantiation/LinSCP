@@ -627,6 +627,8 @@ pub fn parse_gui_session_spec(
     // Extra protocol fields (`s3_*`, `ftp_*`, `tls_*`, `proxy_*`, Kerberos)
     let extra_keys = [
         "other_local_dir",
+        "color",
+        "note",
         "sudo_password_auto",
         "alt_hostname",
         "alt_fallback",
