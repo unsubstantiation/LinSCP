@@ -5336,7 +5336,8 @@
               if (f && f.cacheId === 0 && f.x === 0 && f.y === 0 && f.width === 1 && f.height === 1) run.viewer.acknowledgeInputBarrier();
             }
           }
-          if (!run.cancelled) run.timer = setTimeout(poll, 100);
+          // Drain queued frames promptly, but back off when the channel is idle.
+          if (!run.cancelled) run.timer = setTimeout(poll, reply.message ? 0 : 100);
         } catch (error) {
           if (!run.cancelled) { toast(errorMessage(String(error), t('The X2Go viewer session ended.')), true); closeX2GoViewer(); }
         }

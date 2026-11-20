@@ -3,8 +3,10 @@
 LinSCP now wires an **experimental** built-in X2Go KDrive viewer through the
 selected authenticated SSH tab. It starts a new agent, opens its graphics
 channel, renders frames and forwards input through a service bridge. It has
-not been tested against a live X2Go server, and Rust changes have not been
-compiled in the available sandbox. Do not treat the wiring as proof that a
+not been tested against a live X2Go server, and the complete Rust application
+has not been compiled in the available sandbox. The parser, control, transport
+and bridge modules were compiled and tested in isolation with stubbed SSH and
+zeroization dependencies; those tests do not validate the full integration. Do not treat the wiring as proof that a
 working desktop opens. NX3 and the former external NX launch path are not
 supported; a KDrive server backend is required. Clipboard, sound, file sharing,
 resizing and session resume are not implemented.
@@ -56,8 +58,9 @@ an abandoned viewer lease expires after 60 seconds. The experimental X2Go
 open route registers that bridge and the page polls it, forwards input, and
 requests close. Poll, input and close carry a service-issued generation so
 delayed requests from an earlier viewer cannot operate on a replacement bridge.
-This generation is not an authentication credential. The bridge sends protocol keepalives. New Rust tests have not
-been run in the toolchain-free development sandbox.
+This generation is not an authentication credential. The bridge sends protocol keepalives and closes on prolonged server silence
+while it is able to read. The corresponding modules passed isolated tests with stubbed SSH; the complete
+Rust workspace has not been built or tested here.
 
 Wire-layout facts were researched from the public GPL-3.0
 [Casement KDrive client](https://github.com/Inkbraid/casement-plugin-x2go)
@@ -198,9 +201,9 @@ is not authorization to install server packages without an explicit action.
   or captured test data has been copied into LinSCP. Its Windows-specific
   implementation and claimed tests are useful evidence, not proof that this
   project supports Linux, Windows, or macOS.
-- A usable viewer still needs to deliver parsed wire messages to the frame
-  pipeline, translate browser input with KDrive keyboard-state semantics,
-  synchronize transport and lifecycle, and run live integration tests.
+- The viewer now delivers parsed messages to the frame pipeline, translates
+  browser input and coordinates transport and lifecycle, but these paths still
+  need live integration tests.
   Clipboard, cursor and UDP support are not present.
 - A [public KDrive client release announcement](https://www.mail-archive.com/x2go-announcements@lists.x2go.org/msg00217.html)
   mentions version negotiation before requesting the main image and geometry
@@ -224,7 +227,8 @@ setup failure, or drop. Cleanup on drop is best-effort: runtime shutdown,
 process termination, a broken SSH connection, or an invalid/lost startup reply
 can still leave an agent behind. The cookie is redacted in debug output and
 zeroized when the parsed session is dropped. These primitives are wired into
-the service; their Rust code and tests have not been compiled in this sandbox.
+the service; their tests passed in an isolated harness with stubbed SSH and
+zeroization, but the complete Rust application has not been compiled here.
 Startup replies and command behavior still need verification against live X2Go
 servers.
 

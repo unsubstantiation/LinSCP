@@ -1,8 +1,8 @@
 //! X2Go KDrive session-control primitives.
 //!
 //! Session-control primitives, guarded startup and best-effort termination for
-//! X2Go KDrive. The service does not yet expose startup to users. Callers must
-//! not start an agent until they can attach graphics and manage its lifecycle.
+//! X2Go KDrive. The experimental service route uses these primitives; callers
+//! must attach graphics and manage the agent lifecycle.
 
 use std::fmt;
 use std::future::Future;

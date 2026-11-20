@@ -21,6 +21,9 @@ const OUTPUT_QUEUE: usize = 1;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 // A viewer that disappears without closing must not leave the agent running.
 const VIEWER_LEASE: Duration = Duration::from_secs(60);
+// A connected server normally sends keepalives during idle periods. Bound a
+// silent/broken SSH graphics channel rather than displaying a frozen desktop.
+const SERVER_SILENCE: Duration = Duration::from_secs(45);
 
 fn u32_at(packet: &[u8; CLIENT_EVENT_SIZE], offset: usize) -> u32 {
     u32::from_le_bytes([packet[offset], packet[offset + 1], packet[offset + 2], packet[offset + 3]])
@@ -100,7 +103,7 @@ impl X2GoBridge {
     where F: Future<Output = Result<(), &'static str>> + Send + 'static {
         let (commands, input) = mpsc::channel(INPUT_QUEUE);
         let (output, messages) = mpsc::channel(OUTPUT_QUEUE);
-        let task = tokio::spawn(run(reader, writer, input, output, cleanup));
+        let task = tokio::spawn(run(reader, writer, input, output, cleanup, SERVER_SILENCE));
         Self { commands, messages, task }
     }
 
@@ -150,14 +153,15 @@ pub(crate) fn test_bridge(client: tokio::io::DuplexStream, cleanup_signal: onesh
 }
 
 async fn run<F>(mut reader: KDriveReader, mut writer: KDriveWriter,
-                mut commands: mpsc::Receiver<Command>, output: mpsc::Sender<Value>, cleanup: F)
-                -> Result<(), &'static str>
+                mut commands: mpsc::Receiver<Command>, output: mpsc::Sender<Value>, cleanup: F,
+                server_silence: Duration) -> Result<(), &'static str>
 where F: Future<Output = Result<(), &'static str>> {
     let mut pending = None;
     let mut remote_closed = false;
     let mut result = Ok(());
     let mut lease = tokio::time::Instant::now() + VIEWER_LEASE;
     let mut keepalive = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut last_server_message = tokio::time::Instant::now();
     loop {
         tokio::select! {
             command = commands.recv() => match command {
@@ -173,13 +177,24 @@ where F: Future<Output = Result<(), &'static str>> {
             },
             permit = output.reserve(), if pending.is_some() => {
                 match permit {
-                    Ok(permit) => { permit.send(pending.take().expect("pending event")); }
+                    Ok(permit) => {
+                        permit.send(pending.take().expect("pending event"));
+                        // Pausing reads can make a stale silence deadline fire
+                        // before buffered SSH data gets another read opportunity.
+                        last_server_message = tokio::time::Instant::now();
+                    }
                     Err(_) => break,
                 }
                 if remote_closed { break; }
             },
             _ = output.closed() => break,
             _ = tokio::time::sleep_until(lease) => { result = Err("KDrive viewer lease expired."); break; },
+            // Do not time out while reads are deliberately paused by output
+            // backpressure; the server may already have data waiting for us.
+            _ = tokio::time::sleep_until(last_server_message + server_silence), if pending.is_none() => {
+                result = Err("KDrive server is not responding.");
+                break;
+            },
             _ = tokio::time::sleep_until(keepalive) => {
                 let mut packet = [0u8; CLIENT_EVENT_SIZE];
                 packet[..4].copy_from_slice(&12u32.to_le_bytes());
@@ -192,6 +207,7 @@ where F: Future<Output = Result<(), &'static str>> {
             message = reader.next_message(), if pending.is_none() => {
                 match message {
                     Ok(message) => {
+                        last_server_message = tokio::time::Instant::now();
                         remote_closed = matches!(&message, Message::Disconnect);
                         match viewer_message(message) {
                             Ok(Some(value)) => pending = Some(value),
@@ -297,6 +313,21 @@ mod tests {
         // Dropping the viewer releases the bounded output queue and triggers cleanup.
         drop(bridge);
         assert!(tokio::time::timeout(Duration::from_secs(1), observed).await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn silent_server_ends_session_and_attempts_cleanup() {
+        let (client, _server) = tokio::io::duplex(1024);
+        let channel = KDriveChannel { stream: Box::new(client), decoder: Decoder::new(), server_version: 8 };
+        let (reader, writer) = channel.into_halves();
+        let (_commands, input) = mpsc::channel(INPUT_QUEUE);
+        let (output, _messages) = mpsc::channel(OUTPUT_QUEUE);
+        let (signal, observed) = oneshot::channel();
+        let cleanup = async move { let _ = signal.send(()); Ok(()) };
+        let result = tokio::time::timeout(Duration::from_secs(1),
+            run(reader, writer, input, output, cleanup, Duration::from_millis(20))).await.unwrap();
+        assert_eq!(result, Err("KDrive server is not responding."));
+        assert!(observed.await.is_ok());
     }
 
     #[tokio::test]
