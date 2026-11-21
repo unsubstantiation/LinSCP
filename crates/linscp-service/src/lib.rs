@@ -11106,8 +11106,8 @@ mod tests {
         assert_eq!(reopened.status, 200, "{}", reopened.payload);
         assert_eq!(std::fs::metadata(&expired_path).unwrap().len(), 0, "NoSuchUpload should resolve the journal");
         assert_eq!(std::fs::read(&other_path).unwrap(), other_bytes, "unrelated 404 must remain unresolved");
-        // Enforce the supported upper bound without an unconditional fallback.
-        std::fs::OpenOptions::new().write(true).open(local.join("upload.txt")).unwrap().set_len(1024 * 1024 * 1024 + 1).unwrap();
+        // Enforce the supported upper bound (5 TiB S3 object limit) without an unconditional fallback.
+        std::fs::OpenOptions::new().write(true).open(local.join("upload.txt")).unwrap().set_len(5u64 * 1024 * 1024 * 1024 * 1024 + 1).unwrap();
         let conflict = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"]}))).await;
         let large_index = svc.queue.snapshot().0.len();
         let large = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"], "overwrite": "overwrite", "conflict_versions": conflict.payload["conflict_versions"]}))).await;
