@@ -7,7 +7,9 @@ use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
 
 use crate::terminal::local_ymdhms;
-use crate::{sys, write_private_file_atomic, PlatformError};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use crate::write_private_file_atomic;
+use crate::{sys, PlatformError};
 
 /// Rich local metadata snapshot used by the Commander GUI properties dialog
 /// and atomic local text editor (`mtime_ns` conflict guard).

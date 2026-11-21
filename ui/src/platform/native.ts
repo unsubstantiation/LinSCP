@@ -39,7 +39,8 @@ interface SafTreeReply {
 
 export { nativeInvoker };
 
-/** Builds a direct Android viewer URI; Android viewer apps cannot reuse an SSH jump tunnel. */
+/** Builds a validated Android viewer URI; when `tunneled` is true, only a bound
+ * `127.0.0.1:<port>` local SSH forwarder endpoint is accepted. */
 export function androidDesktopViewerUri(
   kind: string,
   endpoint: string,
@@ -47,11 +48,12 @@ export function androidDesktopViewerUri(
 ): string | null {
   const normalizedKind = kind.toLowerCase();
   const scheme = ['rdp', 'vnc', 'spice'].includes(normalizedKind) ? normalizedKind : null;
-  if (!scheme || tunneled) return null;
+  if (!scheme) return null;
   try {
     const target = new URL(`${scheme}://${endpoint}`);
     if (!target.hostname || target.username || target.password ||
         (target.pathname !== '' && target.pathname !== '/') || target.search || target.hash) return null;
+    if (tunneled && (target.hostname !== '127.0.0.1' || !target.port)) return null;
     return `${scheme}://${target.host}`;
   } catch {
     return null;

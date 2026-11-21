@@ -2091,11 +2091,13 @@
       "id": "dav.locks",
       "area": "WebDAV",
       "status": "partial",
-      "notes": "'lock <file> [-timeout=SECONDS]' takes an exclusive write lock and keeps its token in the session; 'unlock <file>' releases it. Every later upload, delete and move of that path carries the token as the If header, so a second writer without it is refused with 423 and the locked file keeps its content. A server that does not implement LOCK answers 405 and the command prints that instead of reporting a protected write. Upstream's WebDAV backend sends no LOCK or UNLOCK at all, so this is a LinSCP extension.",
+      "notes": "'lock <file> [-timeout=SECONDS]' takes an exclusive write lock and keeps its token in the session; 'unlock <file>' releases it. Every later upload, delete and move of that path carries the token as the If header, so a second writer without it is refused with 423 and the locked file keeps its content. A server that does not implement LOCK answers 405 and the command prints that instead of reporting a protected write. Upstream's WebDAV backend sends no LOCK or UNLOCK at all, so this is a LinSCP extension. Exposed in the native GUI via /api/dav/lock and /api/dav/unlock (#davToolsModal).",
       "source": [
         "crates/linscp-proto/src/webdav.rs",
         "crates/linscp-types/src/lib.rs",
-        "crates/linscp-engine/src/script.rs"
+        "crates/linscp-engine/src/script.rs",
+        "crates/linscp-service/src/lib.rs",
+        "source/gui/web/index.html"
       ],
       "checks": {
         "unit": [
@@ -2103,20 +2105,32 @@
         ],
         "live-dav": [
           "test_webdav_lock_makes_the_other_writer_wait"
+        ],
+        "service": [
+          "s3_dav_x2go_and_desktop_tunnel_routes_validate_and_track_state"
+        ],
+        "gui": [
+          "WebDAV lock populates the returned lock token",
+          "WebDAV unlock posts the lock token and clears it"
         ]
       },
       "verified_on": {
         "linux": [
           "live-dav",
-          "unit"
+          "unit",
+          "service",
+          "gui"
         ],
         "windows": [
           "live-dav",
-          "unit"
+          "unit",
+          "service",
+          "gui"
         ],
         "android": [
           "live-dav",
-          "unit"
+          "unit",
+          "gui"
         ]
       },
       "gap": "No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.",
@@ -2130,10 +2144,12 @@
       "id": "dav.dead-properties-and-preconditions",
       "area": "WebDAV",
       "status": "partial",
-      "notes": "'property <file> -set=NAME=VALUE' stores one dead property through PROPPATCH and 'property <file> -get=NAME' reads it back with a named-property PROPFIND; both use this client's own namespace (urn:linscp:properties), a name that would build invalid XML is refused before any request, and a property the server does not have prints 'NAME is not set' rather than failing. The conditional write is the lock token: PUT, DELETE and MOVE of a locked path send If, which is what makes the server refuse a write whose lock is gone (423).",
+      "notes": "'property <file> -set=NAME=VALUE' stores one dead property through PROPPATCH and 'property <file> -get=NAME' reads it back with a named-property PROPFIND; both use this client's own namespace (urn:linscp:properties), a name that would build invalid XML is refused before any request, and a property the server does not have prints 'NAME is not set' rather than failing. The conditional write is the lock token: PUT, DELETE and MOVE of a locked path send If, which is what makes the server refuse a write whose lock is gone (423). Exposed in the native GUI via /api/dav/property (#davToolsModal).",
       "source": [
         "crates/linscp-proto/src/webdav.rs",
-        "crates/linscp-engine/src/script.rs"
+        "crates/linscp-engine/src/script.rs",
+        "crates/linscp-service/src/lib.rs",
+        "source/gui/web/index.html"
       ],
       "checks": {
         "unit": [
@@ -2142,20 +2158,32 @@
         "live-dav": [
           "test_webdav_dead_property_roundtrip",
           "test_webdav_lock_makes_the_other_writer_wait"
+        ],
+        "service": [
+          "s3_dav_x2go_and_desktop_tunnel_routes_validate_and_track_state"
+        ],
+        "gui": [
+          "WebDAV get property populates the value field",
+          "WebDAV set property posts action set and value"
         ]
       },
       "verified_on": {
         "linux": [
           "live-dav",
-          "unit"
+          "unit",
+          "service",
+          "gui"
         ],
         "windows": [
           "live-dav",
-          "unit"
+          "unit",
+          "service",
+          "gui"
         ],
         "android": [
           "live-dav",
-          "unit"
+          "unit",
+          "gui"
         ]
       },
       "gap": "No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.",
@@ -3187,11 +3215,12 @@
       "id": "security.password-key-agent",
       "area": "Security/authentication",
       "status": "partial",
-      "notes": "Password, unencrypted and passphrase-protected private-key (-passphrase=), ssh-agent and copyid public/private key installation work against the live SFTP server.",
+      "notes": "Password, unencrypted and passphrase-protected private-key (-passphrase=), ssh-agent and copyid public/private key installation work against the live SFTP server. On Windows, SSH agent probing connects to OpenSSH's named pipe first and falls back to same-user Pageant WM_COPYDATA IPC.",
       "source": [
         "crates/linscp-crypto/src/ppk.rs",
         "crates/linscp-engine/src/session_store.rs",
-        "crates/linscp-engine/src/script.rs"
+        "crates/linscp-engine/src/script.rs",
+        "crates/linscp-platform/src/windows.rs"
       ],
       "checks": {
         "unit": [
@@ -3203,6 +3232,9 @@
         "proto-ssh": [
           "test_open_with_a_wrong_password_is_refused",
           "test_ssh_agent_and_encrypted_private_key_passphrase"
+        ],
+        "platform-windows-acl": [
+          "pageant_agent_probe_returns_cleanly_when_no_pageant_window_exists"
         ]
       },
       "verified_on": {
@@ -3214,7 +3246,8 @@
         "windows": [
           "script",
           "unit",
-          "proto-ssh"
+          "proto-ssh",
+          "platform-windows-acl"
         ],
         "android": [
           "script",
@@ -3421,8 +3454,8 @@
       "id": "security.gssapi-and-tunnels",
       "area": "Security/authentication",
       "status": "partial",
-      "notes": "Authenticated SSH jump-host connections work for SFTP/SCP/SSH and for FTP/FTPS/WebDAV/S3 destinations. SSH destinations still use a private socketpair (or TunnelLocalPortNumber on loopback); curl and native FTP/S3 sessions start a loopback SOCKS5 multiplexer on the jump so each CONNECT or data channel is a separate direct-tcpip, TLS SNI and S3 signing keep the original hostname, and a refused forward never falls back to a direct connection. Kerberos/GSSAPI settings persist and gssapi-with-mic is attempted before public-key with password fallback; credential delegation stays off unless GSSAPIFwdTGT=1. GSSAPI authentication support is detected through libssh's public ssh_gssapi_set_creds symbol, not its version string. RFC 4462 KEX support is probed independently; AuthGSSAPIKEX is refused if the loaded libssh cannot honor it or a host-key pin is configured, rather than silently skipping either policy. The live SFTP suite provisions an isolated loopback MIT KDC and OpenSSH server and tests principal selection, missing/expired tickets, the service identity, and default-off versus opt-in TGT delegation. A second realm, PARTNER.TEST, is trusted directly through krbtgt/LINSCP.TEST@PARTNER.TEST. It covers cross-realm login, refusal of an unmapped principal of the trusted realm, and default-off versus opt-in delegation of the partner realm's TGT. CI requires a GSSAPI-enabled libssh and zero skips for these cases. As upstream's CreateTunnelData does, the jump session inherits the destination's Kerberos settings except LogicalHostName, so GSSAPIFwdTGT=1 also delegates to the jump host. docs/gssapi-delegation-review.md is the brief for the independent review; that review and production-KDC validation remain open. On Linux the GUI settings now flow to a real GSSAPI attempt (the parser used to drop all four Kerberos keys); on Windows and Android the site manager labels the section Linux-only, key exchange is noted as unsupported on every build, and explicit settings fail closed naming the requirement. The Windows and Android citations below evidence that labeling and refusal, not Kerberos authentication itself.",
-      "gap": "Production-KDC validation (for example Active Directory, FreeIPA or Heimdal) and an independent security review of opt-in TGT delegation remain outstanding; the review brief is docs/gssapi-delegation-review.md. The isolated CI realms already cover a direct cross-realm trust. Windows has no SSPI backend, so Kerberos authentication is Linux-only; the site manager says so and explicit settings fail closed.",
+      "notes": "Authenticated SSH jump-host connections work for SFTP/SCP/SSH and for FTP/FTPS/WebDAV/S3 destinations. SSH destinations still use a private socketpair (or TunnelLocalPortNumber on loopback); curl and native FTP/S3 sessions start a loopback SOCKS5 multiplexer on the jump so each CONNECT or data channel is a separate direct-tcpip, TLS SNI and S3 signing keep the original hostname, and a refused forward never falls back to a direct connection. Kerberos/GSSAPI settings persist and gssapi-with-mic is attempted before public-key with password fallback; credential delegation stays off unless GSSAPIFwdTGT=1. GSSAPI authentication support is detected through libssh's public ssh_gssapi_set_creds symbol, not its version string. RFC 4462 KEX support is probed independently; AuthGSSAPIKEX is refused if the loaded libssh cannot honor it or a host-key pin is configured, rather than silently skipping either policy. The live SFTP suite provisions an isolated loopback MIT KDC and OpenSSH server and tests principal selection, missing/expired tickets, the service identity, and default-off versus opt-in TGT delegation. A second realm, PARTNER.TEST, is trusted directly through krbtgt/LINSCP.TEST@PARTNER.TEST. It covers cross-realm login, refusal of an unmapped principal of the trusted realm, and default-off versus opt-in delegation of the partner realm's TGT. CI requires a GSSAPI-enabled libssh and zero skips for these cases. As upstream's CreateTunnelData does, the jump session inherits the destination's Kerberos settings except LogicalHostName, so GSSAPIFwdTGT=1 also delegates to the jump host. docs/gssapi-delegation-review.md is the brief for the independent review; that review and production-KDC validation remain open. On Linux the GUI settings now flow to a real GSSAPI attempt (the parser used to drop all four Kerberos keys); on Windows and Android the site manager labels the section Linux-only, key exchange is noted as unsupported on every build, and explicit settings fail closed naming the requirement. The Windows and Android citations below evidence that labeling and refusal, not Kerberos authentication itself. Windows loads System32\\secur32.dll SSPI (AcquireCredentialsHandleW/InitializeSecurityContextW/MakeSignature for Kerberos HOST/<host>) behind GssapiTokenProvider.",
+      "gap": "Production-KDC validation (Active Directory, FreeIPA or Heimdal) and an independent security review of opt-in TGT delegation remain outstanding; the review brief is docs/gssapi-delegation-review.md.",
       "acceptance": [
         "Run the isolated-realm GSSAPI cases in CI with a GSSAPI-enabled libssh and no skipped cases; cover principal selection, missing/expired credentials, service mutual authentication, default-off delegation and opt-in TGT delegation.",
         "Obtain an independent security review of delegated TGT handling and validate cross-realm/production-KDC behavior before claiming general Kerberos parity.",
@@ -3437,7 +3470,9 @@
         "crates/linscp-service/src/lib.rs",
         "crates/linscp-service/src/tabs.rs",
         "ui/src/platform/capabilities.ts",
-        "source/gui/web/index.html"
+        "source/gui/web/index.html",
+        "crates/linscp-platform/src/gssapi_sys.rs",
+        "crates/linscp-engine/src/url_and_raw.rs"
       ],
       "checks": {
         "unit": [
@@ -4738,12 +4773,14 @@
       "id": "platform.android-saf-local-copy-move",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "Local copies and moves with a granted end run on LocalFs in the queue worker: bytes cross the bridge whole between plain and granted panes and between two granted trees, with the same conflict policies as plain pairs. Every granted move is a copy that deletes its source (queue jobs always carry the same leaf on both sides, so a provider-side rename could only retarget a name onto itself); same-directory renames stay on the rename endpoint, which renames directly. Files over the 64 MiB document cap refuse at enqueue time and in the worker naming the file; symbolic links refuse by name; a plain target keeps the source's seconds while a granted target gets fresh stamps, and directory copies keep the plain panes' refusal word for word. The page offers transfers and moves on local tabs and still gates session transfers and moves on remote tabs.",
+      "notes": "Local copies and moves with a granted end run on LocalFs in the queue worker: bytes cross the bridge whole between plain and granted panes and between two granted trees, with the same conflict policies as plain pairs. Every granted move is a copy that deletes its source (queue jobs always carry the same leaf on both sides, so a provider-side rename could only retarget a name onto itself); same-directory renames stay on the rename endpoint, which renames directly. Files over the 64 MiB document cap refuse at enqueue time and in the worker naming the file; symbolic links refuse by name; a plain target keeps the source's seconds while a granted target gets fresh stamps, and directory copies keep the plain panes' refusal word for word. The page offers transfers and moves on local tabs and still gates session transfers and moves on remote tabs. Chunked 1 MiB SAF streaming (readUriChunk/beginWriteUri/appendUriChunk and LocalFs::copy_streamed) eliminates whole-file Base64/JSON heap spikes.",
       "source": [
         "crates/linscp-service/src/lib.rs",
         "crates/linscp-service/src/queue.rs",
         "ui/src/platform/capabilities.ts",
-        "source/gui/web/index.html"
+        "source/gui/web/index.html",
+        "crates/linscp-platform/src/android.rs",
+        "crates/linscp-tauri/android/LinSCPAndroidPlugin.kt"
       ],
       "checks": {
         "service": [
@@ -4777,13 +4814,15 @@
       "id": "platform.android-saf-session-transfers",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "Session transfers with a granted local side stage through private temporary files in the queue worker: uploads stage the granted source (keeping its seconds, so the remote keeps its stamps) and run the guarded upload unchanged from the stage; downloads land in a stage and publish across the bridge file by file. Trees stage and publish whole in both directions; merges add to an existing granted tree without replacing any file and fail instead of replacing. Files over the 64 MiB document cap refuse at enqueue time naming the file; verified resume refuses for granted folders, since the bridge has no appends or partial files; WebDAV moves delete the remote source by ETag after the staged download publishes. The page offers transfers and moves for granted folders on both tab kinds.",
+      "notes": "Session transfers with a granted local side stage through private temporary files in the queue worker: uploads stage the granted source (keeping its seconds, so the remote keeps its stamps) and run the guarded upload unchanged from the stage; downloads land in a stage and publish across the bridge file by file. Trees stage and publish whole in both directions; merges add to an existing granted tree without replacing any file and fail instead of replacing. Files over the 64 MiB document cap refuse at enqueue time naming the file; verified resume refuses for granted folders, since the bridge has no appends or partial files; WebDAV moves delete the remote source by ETag after the staged download publishes. The page offers transfers and moves for granted folders on both tab kinds. Staging and publication stream in 1 MiB chunks via LocalFs::stage_to_file and LocalFs::publish_from_file.",
       "source": [
         "crates/linscp-engine/src/transfer.rs",
         "crates/linscp-service/src/lib.rs",
         "crates/linscp-service/src/queue.rs",
         "ui/src/platform/capabilities.ts",
-        "source/gui/web/index.html"
+        "source/gui/web/index.html",
+        "crates/linscp-platform/src/android.rs",
+        "crates/linscp-tauri/android/LinSCPAndroidPlugin.kt"
       ],
       "checks": {
         "service": [
@@ -4909,27 +4948,42 @@
       "id": "s3.versioned-objects",
       "area": "Amazon S3",
       "status": "partial",
-      "notes": "`versions` lists exact-key or prefix history and delete markers through guarded ListObjectVersions pagination; `get -versionid=` reads one version, HEAD metadata handles delete markers, and resumable staging uses an ID-specific suffix; `rm -versionid=` deletes only the named version/marker. Live tests cover opaque query characters, a 1001-record two-page history plus missing/repeated pagination-marker refusals, historical/current downloads, isolated resume staging and marker creation/removal without losing other versions.",
+      "notes": "`versions` lists exact-key or prefix history and delete markers through guarded ListObjectVersions pagination; `get -versionid=` reads one version, HEAD metadata handles delete markers, and resumable staging uses an ID-specific suffix; `rm -versionid=` deletes only the named version/marker. Live tests cover opaque query characters, a 1001-record two-page history plus missing/repeated pagination-marker refusals, historical/current downloads, isolated resume staging and marker creation/removal without losing other versions. Exposed in the native GUI via /api/s3/versions, /api/s3/version-download and /api/s3/version-delete (#s3VersionsModal), with conditional If-Match DELETE support for guarded moves.",
       "source": [
         "crates/linscp-proto/src/s3.rs",
-        "crates/linscp-engine/src/script.rs"
+        "crates/linscp-engine/src/script.rs",
+        "crates/linscp-service/src/lib.rs",
+        "source/gui/web/index.html"
       ],
       "checks": {
         "live-s3": [
           "test_version_listing_get_delete_markers_and_versioned_resume",
           "test_version_listing_paginates_all_versions",
           "test_version_listing_rejects_broken_pagination_state"
+        ],
+        "service": [
+          "s3_dav_x2go_and_desktop_tunnel_routes_validate_and_track_state"
+        ],
+        "gui": [
+          "S3 object versions modal lists returned versions",
+          "S3 version download queues the selected version_id",
+          "S3 version delete posts the selected version_id"
         ]
       },
       "verified_on": {
         "linux": [
-          "live-s3"
+          "live-s3",
+          "service",
+          "gui"
         ],
         "windows": [
-          "live-s3"
+          "live-s3",
+          "service",
+          "gui"
         ],
         "android": [
-          "live-s3"
+          "live-s3",
+          "gui"
         ]
       },
       "gap": "No runnable suite evidences this: live-s3 needs a `linscp` binary this repo does not build.",
@@ -5418,29 +5472,59 @@
       "id": "desktop.remote",
       "area": "Desktop integration",
       "status": "partial",
-      "notes": "RDP/VNC/SPICE are direct-TCP (3389/5900) with optional SSH jump SOCKS5h relay; X11 uses SSH. X2Go KDrive viewer is not yet implemented, and NX is removed. Native viewers are resolved via PATH (xfreerdp3→xfreerdp→wlfreerdp/sdl-freerdp, mstsc, open, vncviewer, remote-viewer/spicy, waypipe/ssh -X) with Windows/macOS/Android specifics, and dial the same proxy/tunnel/TLS/SPKI stack as file protocols. A ticket carries the viewer plan of the build it was made on (mstsc + .rdp body on Windows, `open rdp://` on macOS, FreeRDP argv on Linux), and only the ticket that matches the launcher is ever spawned; a host that cannot show a window is handed the .rdp/.vv body or a BrowserGateway hint instead of a spawn, never a spawn it cannot display; XDMCP (UDP 177, unencrypted) is explicitly refused/recommended against. Wayland vs X11 detection drives waypipe vs ssh -X. Verified by unit ticket/argv tests; live viewer integration and ironrdp gateway tests are outstanding.",
+      "notes": "RDP/VNC/SPICE support direct TCP (3389/5900), SSH jump SOCKS5h relays, and on-demand loopback SSH port forwarders (/api/desktop/launch tunnel_via_ssh + /api/desktop/tunnel-close), including Android external viewer launch with foreground keepalive. The built-in experimental X2Go KDrive viewer supports session listing, resume, suspend, termination, server cursors, live window resize, and opt-in clipboard sync (/api/x2go/{sessions,open,poll,input,clipboard,suspend,terminate,close}).",
       "source": [
         "crates/linscp-platform/src/desktop.rs",
         "crates/linscp-proto/src/remote_desktop.rs",
-        "crates/linscp-engine/src/url_and_raw.rs"
+        "crates/linscp-engine/src/url_and_raw.rs",
+        "crates/linscp-proto/src/x2go_control.rs",
+        "crates/linscp-proto/src/x2go_transport.rs",
+        "crates/linscp-proto/src/tunnel.rs",
+        "crates/linscp-service/src/x2go_bridge.rs",
+        "crates/linscp-service/src/lib.rs",
+        "ui/src/platform/kdrive-viewer-session.ts",
+        "ui/src/platform/native.ts",
+        "source/gui/web/index.html"
       ],
       "checks": {
         "unit": [
           "TestDesktopSessionDetection"
+        ],
+        "service": [
+          "s3_dav_x2go_and_desktop_tunnel_routes_validate_and_track_state"
+        ],
+        "ui-transport": [
+          "Android desktop viewer URIs allow direct RDP/VNC/SPICE targets and reject unsupported or unsafe targets"
+        ],
+        "gui": [
+          "X2Go session picker lists resumable sessions without cookies",
+          "X2Go launch forwards resume_session_id and allow_clipboard",
+          "Suspending the X2Go viewer calls /api/x2go/suspend without /api/x2go/close",
+          "Terminating a listed X2Go session posts session_id to /api/x2go/terminate",
+          "Android tunneled desktop launch forwards tunnel_via_ssh, starts keepalive and opens loopback URI",
+          "Closing the desktop tunnel stops keepalive and posts /api/desktop/tunnel-close"
         ]
       },
       "verified_on": {
         "linux": [
-          "unit"
+          "unit",
+          "service",
+          "ui-transport",
+          "gui"
         ],
         "windows": [
-          "unit"
+          "unit",
+          "service",
+          "ui-transport",
+          "gui"
         ],
         "android": [
-          "unit"
+          "unit",
+          "ui-transport",
+          "gui"
         ]
       },
-      "gap": "No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.",
+      "gap": "Live desktop server validation (xrdp, TigerVNC, SPICE, and live X2Go KDrive server) and gateway security review remain open.",
       "acceptance": [
         "Live RDP launch with xfreerdp/mstsc against a throwaway RDP stub verifies argv, port 3389, TLS/NLA option, and jump-host SOCKS5h relay without exposing credentials (live-desktop).",
         "Live VNC (5900) and SPICE (5900/.vv) launches verify viewer resolution (tigervnc/remote-viewer), TLS port, and headless .vv/.rdp ticket generation (live-desktop).",

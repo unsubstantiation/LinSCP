@@ -418,7 +418,7 @@ class S3Handler(BaseHTTPRequestHandler):
             elif method == "DELETE" and "uploadId" in params:
                 self.abort_multipart(params)
             elif method == "DELETE":
-                self.delete_object(bucket, key, params)
+                self.delete_object(bucket, key, params, headers)
             else:
                 self.send_error_xml(405, "MethodNotAllowed",
                                     "Method %s is not allowed." % method)
@@ -1040,10 +1040,29 @@ class S3Handler(BaseHTTPRequestHandler):
         })
         self.send_bytes(204, b"")
 
-    def delete_object(self, bucket, key, params):
+    def delete_object(self, bucket, key, params, headers=None):
         if bucket not in STORE.buckets:
             self.send_error_xml(404, "NoSuchBucket",
                                 "The specified bucket does not exist.")
+            return
+
+        if headers is not None and headers.get("if-match") is not None:
+            match = headers.get("if-match", "").strip()
+            with STORE.write_lock:
+                current = STORE.get(bucket, key)
+                if current is None:
+                    self.send_error_xml(404, "NoSuchKey",
+                                        "The specified key does not exist.")
+                    return
+                current_etag = '"%s"' % hashlib.sha256(current[0]).hexdigest()[:32]
+                if match != current_etag:
+                    self.send_error_xml(412, "PreconditionFailed",
+                                        "The object has changed.")
+                    return
+                epoch = datetime.datetime.now(datetime.timezone.utc).timestamp()
+                version_id = STORE.delete(bucket, key, epoch=epoch)
+            self.send_bytes(204, b"", extra=(("x-amz-delete-marker", "true"),
+                                              ("x-amz-version-id", version_id)))
             return
 
         version_values = params.get("versionId")

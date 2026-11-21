@@ -11,7 +11,6 @@ use std::time::UNIX_EPOCH;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use filetime::{set_file_mtime, FileTime};
 use linscp_types::{FileEntry, LocalRootEntry};
 use rand::RngCore;
 use thiserror::Error;
@@ -229,6 +228,33 @@ pub trait LocalFs: Send + Sync {
     fn write_bytes_atomic(&self, path: &str, data: &[u8]) -> Result<(), PlatformError>;
     fn set_mtime(&self, path: &str, mtime: i64) -> Result<(), PlatformError>;
     fn set_permissions_mode(&self, path: &str, mode: u32) -> Result<(), PlatformError>;
+
+    /// Streams `source` (`content://` or OS path) into `dest_path` without holding
+    /// the entire file in memory when backed by a chunked SAF bridge.
+    fn stage_to_file(&self, source: &str, dest_path: &Path) -> Result<u64, PlatformError> {
+        let bytes = self.read_bytes(source)?;
+        if let Some(parent) = dest_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(dest_path, &bytes)?;
+        Ok(bytes.len() as u64)
+    }
+
+    /// Streams `staged_path` into `dest` (`content://` or OS path) without holding
+    /// the entire file in memory when backed by a chunked SAF bridge.
+    fn publish_from_file(&self, staged_path: &Path, dest: &str) -> Result<u64, PlatformError> {
+        let bytes = std::fs::read(staged_path)?;
+        self.write_bytes_atomic(dest, &bytes)?;
+        Ok(bytes.len() as u64)
+    }
+
+    /// Copies a single regular file between any two `LocalFs` paths (`content://` or OS)
+    /// in bounded chunks.
+    fn copy_streamed(&self, source: &str, dest: &str) -> Result<u64, PlatformError> {
+        let bytes = self.read_bytes(source)?;
+        self.write_bytes_atomic(dest, &bytes)?;
+        Ok(bytes.len() as u64)
+    }
 }
 
 /// Platform-neutral `sessions.key` master-key vault. The key file itself is an
@@ -619,7 +645,11 @@ impl LocalFs for NativeLocalFs {
                 "Timestamps cannot be set on a granted Android folder.".to_string(),
             ));
         }
-        set_file_mtime(resolve_os_path(path), FileTime::from_unix_time(mtime, 0))?;
+        let target = resolve_os_path(path);
+        let file = terminal::open_path_for_set_times(&target)?;
+        let times = std::fs::FileTimes::new()
+            .set_modified(terminal::system_time_from_unix_secs(mtime));
+        file.set_times(times)?;
         Ok(())
     }
 
@@ -630,6 +660,161 @@ impl LocalFs for NativeLocalFs {
             ));
         }
         sys::set_mode(Path::new(path), mode)
+    }
+
+    fn stage_to_file(&self, source: &str, dest_path: &Path) -> Result<u64, PlatformError> {
+        if let Some(parent) = dest_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(resolve_os_path(&parent.to_string_lossy()))?;
+        }
+        if source.starts_with("content://") {
+            let Some(bridge) = self.saf.as_deref() else {
+                return Err(PlatformError::UnsupportedUri(source.to_string()));
+            };
+            let mut out = sys::open_private_temp_file(&resolve_os_path(&dest_path.to_string_lossy()))?;
+            let mut offset = 0u64;
+            loop {
+                let chunk = bridge.read_uri_chunk(source, offset, android::SAF_CHUNK_BYTES)?;
+                if chunk.is_empty() {
+                    break;
+                }
+                out.write_all(&chunk)?;
+                let len = chunk.len();
+                offset = offset.saturating_add(len as u64);
+                if len < android::SAF_CHUNK_BYTES {
+                    break;
+                }
+            }
+            out.sync_all()?;
+            return Ok(offset);
+        }
+        let mut src = std::fs::File::open(resolve_os_path(source))?;
+        let mut out = sys::open_private_temp_file(&resolve_os_path(&dest_path.to_string_lossy()))?;
+        let written = std::io::copy(&mut src, &mut out)?;
+        out.sync_all()?;
+        Ok(written)
+    }
+
+    fn publish_from_file(&self, staged_path: &Path, dest: &str) -> Result<u64, PlatformError> {
+        if dest.starts_with("content://") {
+            let Some(bridge) = self.saf.as_deref() else {
+                return Err(PlatformError::UnsupportedUri(dest.to_string()));
+            };
+            if !bridge.supports_chunked_write() {
+                let bytes = std::fs::read(resolve_os_path(&staged_path.to_string_lossy()))?;
+                saf_write_bytes(bridge, dest, &bytes)?;
+                return Ok(bytes.len() as u64);
+            }
+            let parsed = parse_saf_document_uri(dest)?;
+            if parsed.documents.is_empty() {
+                return Err(PlatformError::UnsupportedUri(dest.to_string()));
+            }
+            let name = parsed.leaf_name();
+            if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+                return Err(PlatformError::UnsupportedUri(dest.to_string()));
+            }
+            let target_uri = bridge.begin_write_uri(&parsed.parent_uri(), &name)?;
+            let mut src = std::fs::File::open(resolve_os_path(&staged_path.to_string_lossy()))?;
+            let mut buf = vec![0u8; android::SAF_CHUNK_BYTES];
+            let mut total = 0u64;
+            loop {
+                use std::io::Read as _;
+                let n = src.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                bridge.append_uri_chunk(&target_uri, &buf[..n])?;
+                total = total.saturating_add(n as u64);
+            }
+            return Ok(total);
+        }
+        let mut src = std::fs::File::open(resolve_os_path(&staged_path.to_string_lossy()))?;
+        let target = Path::new(dest);
+        let parent = target
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(resolve_os_path(&parent.to_string_lossy()))?;
+        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{}.tmp.{}.{}",
+            target.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+            std::process::id(),
+            seq
+        ));
+        let written = {
+            let mut out = std::fs::File::create(resolve_os_path(&temp_path.to_string_lossy()))?;
+            let w = std::io::copy(&mut src, &mut out)?;
+            out.sync_all()?;
+            w
+        };
+        if let Err(err) = sys::atomic_replace(&temp_path, target) {
+            let _ = std::fs::remove_file(resolve_os_path(&temp_path.to_string_lossy()));
+            return Err(err);
+        }
+        Ok(written)
+    }
+
+    fn copy_streamed(&self, source: &str, dest: &str) -> Result<u64, PlatformError> {
+        if !source.starts_with("content://") && !dest.starts_with("content://") {
+            return self.publish_from_file(Path::new(source), dest);
+        }
+        let Some(bridge) = self.saf.as_deref() else {
+            return Err(PlatformError::UnsupportedUri(
+                if source.starts_with("content://") { source } else { dest }.to_string(),
+            ));
+        };
+        if dest.starts_with("content://") && !bridge.supports_chunked_write() {
+            let bytes = self.read_bytes(source)?;
+            self.write_bytes_atomic(dest, &bytes)?;
+            return Ok(bytes.len() as u64);
+        }
+        if source.starts_with("content://") && !dest.starts_with("content://") {
+            let target = Path::new(dest);
+            let parent = target
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            std::fs::create_dir_all(resolve_os_path(&parent.to_string_lossy()))?;
+            let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let temp_path = parent.join(format!(
+                ".{}.tmp.{}.{}",
+                target.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+                std::process::id(),
+                seq
+            ));
+            let written = self.stage_to_file(source, &temp_path)?;
+            if let Err(err) = sys::atomic_replace(&temp_path, target) {
+                let _ = std::fs::remove_file(resolve_os_path(&temp_path.to_string_lossy()));
+                return Err(err);
+            }
+            return Ok(written);
+        }
+        if !source.starts_with("content://") && dest.starts_with("content://") {
+            return self.publish_from_file(Path::new(source), dest);
+        }
+        let parsed = parse_saf_document_uri(dest)?;
+        if parsed.documents.is_empty() {
+            return Err(PlatformError::UnsupportedUri(dest.to_string()));
+        }
+        let name = parsed.leaf_name();
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return Err(PlatformError::UnsupportedUri(dest.to_string()));
+        }
+        let target_uri = bridge.begin_write_uri(&parsed.parent_uri(), &name)?;
+        let mut offset = 0u64;
+        loop {
+            let chunk = bridge.read_uri_chunk(source, offset, android::SAF_CHUNK_BYTES)?;
+            if chunk.is_empty() {
+                break;
+            }
+            bridge.append_uri_chunk(&target_uri, &chunk)?;
+            let len = chunk.len();
+            offset = offset.saturating_add(len as u64);
+            if len < android::SAF_CHUNK_BYTES {
+                break;
+            }
+        }
+        Ok(offset)
     }
 }
 
@@ -979,8 +1164,24 @@ mod tests {
                 return Err(PlatformError::UnsupportedUri(name.to_string()));
             }
             let uri = format!("{parent_uri}/document/{name}");
-            self.documents.lock().unwrap().push((uri.clone(), data.to_vec()));
+            let mut docs = self.documents.lock().unwrap();
+            if let Some((_, existing)) = docs.iter_mut().find(|(n, _)| n == &uri) {
+                *existing = data.to_vec();
+            } else {
+                docs.push((uri.clone(), data.to_vec()));
+            }
             Ok(uri)
+        }
+        fn append_uri_chunk(&self, uri: &str, data: &[u8]) -> Result<(), PlatformError> {
+            let mut docs = self.documents.lock().unwrap();
+            let Some((_, existing)) = docs.iter_mut().find(|(n, _)| n == uri) else {
+                return Err(PlatformError::UnsupportedUri(uri.to_string()));
+            };
+            existing.extend_from_slice(data);
+            Ok(())
+        }
+        fn supports_chunked_write(&self) -> bool {
+            true
         }
         fn mkdir_uri(&self, parent_uri: &str, name: &str) -> Result<String, PlatformError> {
             if name.is_empty() || name.contains('/') {
@@ -1172,5 +1373,42 @@ mod tests {
             ssh_agent_missing_reason(),
             Some(SSH_AGENT_MISSING_MESSAGE)
         );
+    }
+
+    #[test]
+    fn saf_chunked_stage_publish_and_streamed_copy_across_multi_chunk_payload() {
+        let bridge = std::sync::Arc::new(MockSaf::default());
+        let fs = NativeLocalFs::with_saf(bridge);
+        let dir = std::env::temp_dir().join(format!(
+            "linscp-saf-chunk-test-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 2.5 MiB payload crosses three 1 MiB SAF chunks (`SAF_CHUNK_BYTES`).
+        let total = android::SAF_CHUNK_BYTES * 2 + (512 * 1024);
+        let payload: Vec<u8> = (0..total).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
+        let local_src = dir.join("source.bin");
+        std::fs::write(&local_src, &payload).unwrap();
+
+        let tree = "content://mock.tree/tree/primary%3ADownload";
+        let saf_a = format!("{tree}/document/multi_a.bin");
+        let saf_b = format!("{tree}/document/multi_b.bin");
+
+        let published = fs.publish_from_file(&local_src, &saf_a).expect("chunked publish");
+        assert_eq!(published, total as u64);
+        assert_eq!(fs.stat(&saf_a).unwrap().size, total as u64);
+
+        let copied = fs.copy_streamed(&saf_a, &saf_b).expect("streamed SAF->SAF copy");
+        assert_eq!(copied, total as u64);
+        assert_eq!(fs.stat(&saf_b).unwrap().size, total as u64);
+
+        let local_roundtrip = dir.join("roundtrip.bin");
+        let staged = fs.stage_to_file(&saf_b, &local_roundtrip).expect("chunked stage");
+        assert_eq!(staged, total as u64);
+        assert_eq!(std::fs::read(&local_roundtrip).unwrap(), payload);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

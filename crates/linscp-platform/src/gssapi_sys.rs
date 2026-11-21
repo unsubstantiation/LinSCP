@@ -22,29 +22,42 @@ pub trait SystemGssapiContext: Send + Sync {
     ) -> Result<PlatformGssStep, String>;
 }
 
-/// Returns `true` if a system Kerberos V5 GSSAPI runtime library can be loaded.
+/// Returns `true` if a system Kerberos V5 GSSAPI / SSPI runtime library can be loaded.
 pub fn is_system_gssapi_available() -> bool {
     #[cfg(target_os = "linux")]
     {
         linux_impl::load_gss_api().is_some()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows_impl::load_sspi_api().is_some()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         false
     }
 }
 
-/// Attempts to open a Kerberos V5 `host@<service_host>` initiator context.
+/// Attempts to open a Kerberos V5 `host@<service_host>` / `HOST/<service_host>` initiator context.
 pub fn try_create_system_gssapi_context(
     service_host: &str,
     delegate_creds: bool,
 ) -> Option<Box<dyn SystemGssapiContext>> {
+    let host = service_host.trim();
+    if host.is_empty() || host.contains('\0') {
+        return None;
+    }
     #[cfg(target_os = "linux")]
     {
-        linux_impl::DlopenKrb5Context::new(service_host, delegate_creds)
+        linux_impl::DlopenKrb5Context::new(host, delegate_creds)
             .map(|ctx| Box::new(ctx) as Box<dyn SystemGssapiContext>)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows_impl::SspiKrb5Context::new(service_host, delegate_creds)
+            .map(|ctx| Box::new(ctx) as Box<dyn SystemGssapiContext>)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = (service_host, delegate_creds);
         None
@@ -468,6 +481,390 @@ mod linux_impl {
                     let _ = (self.api.release_name)(&mut minor, &mut self.target_name);
                 }
             }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod windows_impl {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    use super::{PlatformGssStep, SystemGssapiContext};
+
+    type SecurityStatus = i32;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct SecHandle {
+        dw_lower: usize,
+        dw_upper: usize,
+    }
+
+    #[repr(C)]
+    struct SecBuffer {
+        cb_buffer: u32,
+        buffer_type: u32,
+        pv_buffer: *mut c_void,
+    }
+
+    #[repr(C)]
+    struct SecBufferDesc {
+        ul_version: u32,
+        c_buffers: u32,
+        p_buffers: *mut SecBuffer,
+    }
+
+    const SECBUFFER_VERSION: u32 = 0;
+    const SECBUFFER_DATA: u32 = 1;
+    const SECBUFFER_TOKEN: u32 = 2;
+    const SECPKG_CRED_OUTBOUND: u32 = 2;
+    const SECURITY_NATIVE_DREP: u32 = 0x0000_0010;
+
+    const ISC_REQ_DELEGATE: u32 = 0x0000_0001;
+    const ISC_REQ_MUTUAL_AUTH: u32 = 0x0000_0002;
+    const ISC_REQ_REPLAY_DETECT: u32 = 0x0000_0004;
+    const ISC_REQ_ALLOCATE_MEMORY: u32 = 0x0000_0100;
+    const ISC_REQ_INTEGRITY: u32 = 0x0001_0000;
+
+    const SEC_E_OK: SecurityStatus = 0;
+    const SEC_I_CONTINUE_NEEDED: SecurityStatus = 0x0009_0312;
+    const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryExW(
+            lp_lib_file_name: *const u16,
+            h_file: *mut c_void,
+            dw_flags: u32,
+        ) -> *mut c_void;
+        fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const u8) -> *mut c_void;
+    }
+
+    type FnAcquireCredentialsHandleW = unsafe extern "system" fn(
+        *const u16,
+        *const u16,
+        u32,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+        *mut SecHandle,
+        *mut i64,
+    ) -> SecurityStatus;
+
+    type FnInitializeSecurityContextW = unsafe extern "system" fn(
+        *const SecHandle,
+        *const SecHandle,
+        *const u16,
+        u32,
+        u32,
+        u32,
+        *const SecBufferDesc,
+        u32,
+        *mut SecHandle,
+        *mut SecBufferDesc,
+        *mut u32,
+        *mut i64,
+    ) -> SecurityStatus;
+
+    type FnMakeSignature = unsafe extern "system" fn(
+        *mut SecHandle,
+        u32,
+        *mut SecBufferDesc,
+        u32,
+    ) -> SecurityStatus;
+
+    type FnFreeContextBuffer = unsafe extern "system" fn(*mut c_void) -> SecurityStatus;
+    type FnDeleteSecurityContext = unsafe extern "system" fn(*mut SecHandle) -> SecurityStatus;
+    type FnFreeCredentialsHandle = unsafe extern "system" fn(*mut SecHandle) -> SecurityStatus;
+
+    pub(super) struct SspiApi {
+        acquire_creds: FnAcquireCredentialsHandleW,
+        init_sec_context: FnInitializeSecurityContextW,
+        make_signature: FnMakeSignature,
+        free_context_buffer: FnFreeContextBuffer,
+        delete_sec_context: FnDeleteSecurityContext,
+        free_creds: FnFreeCredentialsHandle,
+    }
+
+    // SAFETY: Function pointers point into the pinned system32 `secur32.dll`.
+    unsafe impl Send for SspiApi {}
+    unsafe impl Sync for SspiApi {}
+
+    fn wide_nul(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    pub(super) fn load_sspi_api() -> Option<&'static SspiApi> {
+        static API: OnceLock<Option<SspiApi>> = OnceLock::new();
+        API.get_or_init(|| {
+            let dll = wide_nul("secur32.dll");
+            // SAFETY: Loads `secur32.dll` exclusively from `System32` and looks
+            // up standard SSPI entry points.
+            unsafe {
+                let handle = LoadLibraryExW(
+                    dll.as_ptr(),
+                    std::ptr::null_mut(),
+                    LOAD_LIBRARY_SEARCH_SYSTEM32,
+                );
+                if handle.is_null() {
+                    return None;
+                }
+                macro_rules! sym {
+                    ($name:literal, $ty:ty) => {{
+                        let ptr = GetProcAddress(handle, concat!($name, "\0").as_ptr());
+                        if ptr.is_null() {
+                            return None;
+                        }
+                        std::mem::transmute::<*mut c_void, $ty>(ptr)
+                    }};
+                }
+                Some(SspiApi {
+                    acquire_creds: sym!("AcquireCredentialsHandleW", FnAcquireCredentialsHandleW),
+                    init_sec_context: sym!(
+                        "InitializeSecurityContextW",
+                        FnInitializeSecurityContextW
+                    ),
+                    make_signature: sym!("MakeSignature", FnMakeSignature),
+                    free_context_buffer: sym!("FreeContextBuffer", FnFreeContextBuffer),
+                    delete_sec_context: sym!("DeleteSecurityContext", FnDeleteSecurityContext),
+                    free_creds: sym!("FreeCredentialsHandle", FnFreeCredentialsHandle),
+                })
+            }
+        })
+        .as_ref()
+    }
+
+    pub(super) struct SspiKrb5Context {
+        api: &'static SspiApi,
+        target_spn: Vec<u16>,
+        delegate_creds: bool,
+        cred: Option<SecHandle>,
+        ctx: Option<SecHandle>,
+    }
+
+    impl SspiKrb5Context {
+        pub(super) fn new(service_host: &str, delegate_creds: bool) -> Option<Self> {
+            let host = service_host.trim();
+            if host.is_empty() || host.contains('\0') {
+                return None;
+            }
+            let api = load_sspi_api()?;
+            Some(Self {
+                api,
+                target_spn: wide_nul(&format!("HOST/{host}")),
+                delegate_creds,
+                cred: None,
+                ctx: None,
+            })
+        }
+
+        fn ensure_credentials(&mut self) -> Result<SecHandle, String> {
+            if let Some(c) = self.cred {
+                return Ok(c);
+            }
+            let pkg = wide_nul("Kerberos");
+            let mut cred = SecHandle::default();
+            let mut expiry: i64 = 0;
+            // SAFETY: Acquires outbound Kerberos SSPI handle for current logon session.
+            let status = unsafe {
+                (self.api.acquire_creds)(
+                    std::ptr::null(),
+                    pkg.as_ptr(),
+                    SECPKG_CRED_OUTBOUND,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut cred,
+                    &mut expiry,
+                )
+            };
+            if status != SEC_E_OK {
+                return Err(format!(
+                    "SSPI AcquireCredentialsHandleW(Kerberos) failed (0x{:08x})",
+                    status as u32
+                ));
+            }
+            self.cred = Some(cred);
+            Ok(cred)
+        }
+    }
+
+    impl SystemGssapiContext for SspiKrb5Context {
+        fn step(
+            &mut self,
+            input_token: Option<&[u8]>,
+            mic_data: &[u8],
+        ) -> Result<PlatformGssStep, String> {
+            if input_token.is_none() {
+                if let Some(mut old_ctx) = self.ctx.take() {
+                    // SAFETY: Releases prior security context before starting a fresh handshake.
+                    unsafe {
+                        let _ = (self.api.delete_sec_context)(&mut old_ctx);
+                    }
+                }
+            }
+            let cred = self.ensure_credentials()?;
+            let mut req_flags = ISC_REQ_MUTUAL_AUTH
+                | ISC_REQ_REPLAY_DETECT
+                | ISC_REQ_INTEGRITY
+                | ISC_REQ_ALLOCATE_MEMORY;
+            if self.delegate_creds {
+                req_flags |= ISC_REQ_DELEGATE;
+            }
+
+            let mut in_buf = SecBuffer {
+                cb_buffer: input_token.map_or(0, |t| t.len() as u32),
+                buffer_type: SECBUFFER_TOKEN,
+                pv_buffer: input_token
+                    .map_or(std::ptr::null_mut(), |t| t.as_ptr() as *mut c_void),
+            };
+            let in_desc = SecBufferDesc {
+                ul_version: SECBUFFER_VERSION,
+                c_buffers: 1,
+                p_buffers: &mut in_buf,
+            };
+
+            let mut out_buf = SecBuffer {
+                cb_buffer: 0,
+                buffer_type: SECBUFFER_TOKEN,
+                pv_buffer: std::ptr::null_mut(),
+            };
+            let mut out_desc = SecBufferDesc {
+                ul_version: SECBUFFER_VERSION,
+                c_buffers: 1,
+                p_buffers: &mut out_buf,
+            };
+
+            let prev_ctx = self.ctx;
+            let mut new_ctx = prev_ctx.unwrap_or_default();
+            let mut ctx_attrs: u32 = 0;
+            let mut expiry: i64 = 0;
+
+            // SAFETY: Calls `InitializeSecurityContextW` with valid descriptors;
+            // any allocated output buffer is freed via `FreeContextBuffer` below.
+            let status = unsafe {
+                (self.api.init_sec_context)(
+                    &cred,
+                    prev_ctx
+                        .as_ref()
+                        .map_or(std::ptr::null(), |c| c as *const SecHandle),
+                    self.target_spn.as_ptr(),
+                    req_flags,
+                    0,
+                    SECURITY_NATIVE_DREP,
+                    if input_token.is_some() {
+                        &in_desc
+                    } else {
+                        std::ptr::null()
+                    },
+                    0,
+                    &mut new_ctx,
+                    &mut out_desc,
+                    &mut ctx_attrs,
+                    &mut expiry,
+                )
+            };
+
+            let out_token = if !out_buf.pv_buffer.is_null() && out_buf.cb_buffer > 0 {
+                // SAFETY: `out_buf` was allocated by SSPI (`ISC_REQ_ALLOCATE_MEMORY`).
+                unsafe {
+                    std::slice::from_raw_parts(
+                        out_buf.pv_buffer as *const u8,
+                        out_buf.cb_buffer as usize,
+                    )
+                    .to_vec()
+                }
+            } else {
+                Vec::new()
+            };
+            if !out_buf.pv_buffer.is_null() {
+                // SAFETY: Releases SSPI-allocated output token buffer.
+                unsafe {
+                    let _ = (self.api.free_context_buffer)(out_buf.pv_buffer);
+                }
+            }
+
+            if status == SEC_I_CONTINUE_NEEDED {
+                self.ctx = Some(new_ctx);
+                return Ok(PlatformGssStep::Continue(out_token));
+            }
+            if status != SEC_E_OK {
+                return Err(format!(
+                    "SSPI InitializeSecurityContextW failed (0x{:08x})",
+                    status as u32
+                ));
+            }
+            self.ctx = Some(new_ctx);
+
+            // Compute RFC 4462 GSSAPI MIC using Kerberos SSPI `MakeSignature`.
+            let mut data_copy = mic_data.to_vec();
+            let mut sig_storage = vec![0u8; 512];
+            let mut sig_bufs = [
+                SecBuffer {
+                    cb_buffer: data_copy.len() as u32,
+                    buffer_type: SECBUFFER_DATA,
+                    pv_buffer: data_copy.as_mut_ptr() as *mut c_void,
+                },
+                SecBuffer {
+                    cb_buffer: sig_storage.len() as u32,
+                    buffer_type: SECBUFFER_TOKEN,
+                    pv_buffer: sig_storage.as_mut_ptr() as *mut c_void,
+                },
+            ];
+            let mut sig_desc = SecBufferDesc {
+                ul_version: SECBUFFER_VERSION,
+                c_buffers: 2,
+                p_buffers: sig_bufs.as_mut_ptr(),
+            };
+            let ctx_mut = self.ctx.as_mut().expect("established context");
+            // SAFETY: `sig_bufs` points to valid stack/heap buffers outliving `MakeSignature`.
+            let mic_status = unsafe { (self.api.make_signature)(ctx_mut, 0, &mut sig_desc, 0) };
+            if mic_status != SEC_E_OK || sig_bufs[1].cb_buffer == 0 {
+                return Err(format!(
+                    "SSPI MakeSignature failed (0x{:08x})",
+                    mic_status as u32
+                ));
+            }
+            sig_storage.truncate(sig_bufs[1].cb_buffer as usize);
+            Ok(PlatformGssStep::Complete {
+                token: (!out_token.is_empty()).then_some(out_token),
+                mic: sig_storage,
+            })
+        }
+    }
+
+    impl Drop for SspiKrb5Context {
+        fn drop(&mut self) {
+            // SAFETY: Releases owned SSPI security context and credentials handles.
+            unsafe {
+                if let Some(mut ctx) = self.ctx.take() {
+                    let _ = (self.api.delete_sec_context)(&mut ctx);
+                }
+                if let Some(mut cred) = self.cred.take() {
+                    let _ = (self.api.free_creds)(&mut cred);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn gss_context_rejects_empty_and_nul_service_hosts() {
+        assert!(super::try_create_system_gssapi_context("", false).is_none());
+        assert!(super::try_create_system_gssapi_context("   ", true).is_none());
+        assert!(super::try_create_system_gssapi_context("bad\0host", false).is_none());
+        #[cfg(target_os = "windows")]
+        {
+            assert!(
+                super::is_system_gssapi_available(),
+                "Windows System32\\secur32.dll SSPI provider must resolve"
+            );
+            assert!(super::try_create_system_gssapi_context("ssh.example.test", false).is_some());
         }
     }
 }

@@ -389,13 +389,325 @@ pub fn ssh_agent_missing_reason() -> Option<&'static str> {
 }
 
 pub async fn connect_ssh_agent() -> Result<Option<Box<dyn crate::AsyncStream>>, PlatformError> {
-    let pipe_path = std::env::var_os("SSH_AUTH_SOCK")
-        .filter(|v| !v.is_empty())
+    let explicit_sock = std::env::var_os("SSH_AUTH_SOCK").filter(|v| !v.is_empty());
+    let pipe_path = explicit_sock
+        .clone()
         .unwrap_or_else(|| std::ffi::OsString::from(r"\\.\pipe\openssh-ssh-agent"));
     match tokio::net::windows::named_pipe::ClientOptions::new().open(pipe_path) {
         Ok(client) => Ok(Some(Box::new(client))),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if explicit_sock.is_none() {
+                if let Some(stream) = pageant::connect_pageant_stream() {
+                    return Ok(Some(stream));
+                }
+            }
+            Ok(None)
+        }
         Err(err) => Err(PlatformError::Io(err)),
+    }
+}
+
+mod pageant {
+    use std::ffi::c_void;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    use super::{str_to_wide_null, SDDL_REVISION_1};
+
+    const AGENT_COPYDATA_ID: usize = 0x804e_50ba;
+    const AGENT_MAX_MSGLEN: usize = 8192;
+    const WM_COPYDATA: u32 = 0x004A;
+    const SMTO_NORMAL: u32 = 0x0000;
+    const PAGE_READWRITE: u32 = 0x04;
+    const FILE_MAP_WRITE: u32 = 0x0002;
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER_CLASS: u32 = 1;
+    const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
+
+    #[repr(C)]
+    struct SecurityAttributes {
+        n_length: u32,
+        lp_security_descriptor: *mut c_void,
+        b_inherit_handle: i32,
+    }
+
+    #[repr(C)]
+    struct CopyDataStruct {
+        dw_data: usize,
+        cb_data: u32,
+        lp_data: *const u8,
+    }
+
+    #[repr(C)]
+    struct SidAndAttributes {
+        sid: *mut c_void,
+        attributes: u32,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn FindWindowW(lp_class_name: *const u16, lp_window_name: *const u16) -> isize;
+        fn GetWindowThreadProcessId(hwnd: isize, lpdw_process_id: *mut u32) -> u32;
+        fn SendMessageTimeoutA(
+            hwnd: isize,
+            msg: u32,
+            w_param: usize,
+            l_param: isize,
+            fu_flags: u32,
+            u_timeout: u32,
+            lpdw_result: *mut usize,
+        ) -> isize;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> HANDLE;
+        fn GetCurrentThreadId() -> u32;
+        fn CreateFileMappingA(
+            h_file: HANDLE,
+            lp_file_mapping_attributes: *const SecurityAttributes,
+            fl_protect: u32,
+            dw_maximum_size_high: u32,
+            dw_maximum_size_low: u32,
+            lp_name: *const u8,
+        ) -> HANDLE;
+        fn MapViewOfFile(
+            h_file_mapping_object: HANDLE,
+            dw_desired_access: u32,
+            dw_file_offset_high: u32,
+            dw_file_offset_low: u32,
+            dw_number_of_bytes_to_map: usize,
+        ) -> *mut u8;
+        fn UnmapViewOfFile(lp_base_address: *const c_void) -> i32;
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(
+            process_handle: HANDLE,
+            desired_access: u32,
+            token_handle: *mut HANDLE,
+        ) -> i32;
+        fn GetTokenInformation(
+            token_handle: HANDLE,
+            token_information_class: u32,
+            token_information: *mut c_void,
+            token_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+        fn EqualSid(p_sid1: *mut c_void, p_sid2: *mut c_void) -> i32;
+    }
+
+    fn token_user_buf(process: HANDLE) -> Option<Vec<u8>> {
+        // SAFETY: `OpenProcessToken` and `GetTokenInformation` query read-only
+        // token metadata and close the token handle before returning.
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 || token.is_null() {
+                return None;
+            }
+            let mut needed: u32 = 0;
+            let _ = GetTokenInformation(
+                token,
+                TOKEN_USER_CLASS,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+            if needed == 0 || needed > 4096 {
+                let _ = CloseHandle(token);
+                return None;
+            }
+            let mut buf = vec![0u8; needed as usize];
+            let ok = GetTokenInformation(
+                token,
+                TOKEN_USER_CLASS,
+                buf.as_mut_ptr() as *mut c_void,
+                needed,
+                &mut needed,
+            );
+            let _ = CloseHandle(token);
+            if ok == 0 {
+                return None;
+            }
+            Some(buf)
+        }
+    }
+
+    fn verify_same_user_hwnd(hwnd: isize) -> bool {
+        // SAFETY: Queries the target HWND's owning PID, opens it with limited
+        // query rights, and compares its user SID with the current process SID.
+        unsafe {
+            let mut pid: u32 = 0;
+            if GetWindowThreadProcessId(hwnd, &mut pid) == 0 || pid == 0 {
+                return false;
+            }
+            let Some(cur_buf) = token_user_buf(GetCurrentProcess()) else {
+                return false;
+            };
+            let proc_handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if proc_handle.is_null() {
+                return false;
+            }
+            let target_buf = token_user_buf(proc_handle);
+            let _ = CloseHandle(proc_handle);
+            let Some(target_buf) = target_buf else {
+                return false;
+            };
+            if cur_buf.len() < std::mem::size_of::<SidAndAttributes>()
+                || target_buf.len() < std::mem::size_of::<SidAndAttributes>()
+            {
+                return false;
+            }
+            let cur_sid = (*(cur_buf.as_ptr() as *const SidAndAttributes)).sid;
+            let target_sid = (*(target_buf.as_ptr() as *const SidAndAttributes)).sid;
+            !cur_sid.is_null() && !target_sid.is_null() && EqualSid(cur_sid, target_sid) != 0
+        }
+    }
+
+    fn find_verified_pageant_hwnd() -> Option<isize> {
+        let name = str_to_wide_null("Pageant");
+        // SAFETY: `name` is NUL-terminated UTF-16 and outlives `FindWindowW`.
+        let hwnd = unsafe { FindWindowW(name.as_ptr(), name.as_ptr()) };
+        if hwnd == 0 || !verify_same_user_hwnd(hwnd) {
+            return None;
+        }
+        Some(hwnd)
+    }
+
+    pub(super) fn transact_hwnd(hwnd: isize, request: &[u8]) -> std::io::Result<Vec<u8>> {
+        if request.len() < 4 || request.len() > AGENT_MAX_MSGLEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SSH agent message exceeds Pageant limit",
+            ));
+        }
+        let sddl = str_to_wide_null("D:P(A;;GA;;;OW)");
+        // SAFETY: Creates an owner-only anonymous file mapping, writes the
+        // framed SSH agent request, sends `WM_COPYDATA`, copies the reply,
+        // volatile-zeroes the shared view, and releases every Win32 handle.
+        unsafe {
+            let mut sd: *mut c_void = std::ptr::null_mut();
+            let mut sd_len: u32 = 0;
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                &mut sd_len,
+            ) == 0
+                || sd.is_null()
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let sa = SecurityAttributes {
+                n_length: std::mem::size_of::<SecurityAttributes>() as u32,
+                lp_security_descriptor: sd,
+                b_inherit_handle: 0,
+            };
+            let map_name = format!(
+                "PageantRequest{:08x}{:08x}\0",
+                GetCurrentThreadId(),
+                rand::random::<u32>()
+            );
+            let mapping = CreateFileMappingA(
+                INVALID_HANDLE_VALUE,
+                &sa,
+                PAGE_READWRITE,
+                0,
+                AGENT_MAX_MSGLEN as u32,
+                map_name.as_ptr(),
+            );
+            let _ = LocalFree(sd as HLOCAL);
+            if mapping.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            let view = MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, AGENT_MAX_MSGLEN);
+            if view.is_null() {
+                let err = std::io::Error::last_os_error();
+                let _ = CloseHandle(mapping);
+                return Err(err);
+            }
+            std::ptr::copy_nonoverlapping(request.as_ptr(), view, request.len());
+            let cds = CopyDataStruct {
+                dw_data: AGENT_COPYDATA_ID,
+                cb_data: map_name.len() as u32,
+                lp_data: map_name.as_ptr(),
+            };
+            let mut msg_res: usize = 0;
+            let sent = SendMessageTimeoutA(
+                hwnd,
+                WM_COPYDATA,
+                0,
+                &cds as *const CopyDataStruct as isize,
+                SMTO_NORMAL,
+                15_000,
+                &mut msg_res,
+            );
+            let reply = if sent != 0 && msg_res != 0 {
+                let mut hdr = [0u8; 4];
+                std::ptr::copy_nonoverlapping(view, hdr.as_mut_ptr(), 4);
+                let reply_body_len = u32::from_be_bytes(hdr) as usize;
+                if let Some(total) = reply_body_len.checked_add(4).filter(|&n| n <= AGENT_MAX_MSGLEN) {
+                    let mut out = vec![0u8; total];
+                    std::ptr::copy_nonoverlapping(view, out.as_mut_ptr(), total);
+                    Ok(out)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Pageant returned an oversized reply",
+                    ))
+                }
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "Pageant rejected or timed out the SSH agent request",
+                ))
+            };
+            for i in 0..AGENT_MAX_MSGLEN {
+                std::ptr::write_volatile(view.add(i), 0);
+            }
+            let _ = UnmapViewOfFile(view as *const c_void);
+            let _ = CloseHandle(mapping);
+            reply
+        }
+    }
+
+    pub(super) fn connect_pageant_stream() -> Option<Box<dyn crate::AsyncStream>> {
+        let _hwnd = find_verified_pageant_hwnd()?;
+        let (client_stream, mut server_stream) = tokio::io::duplex(16384);
+        tokio::spawn(async move {
+            loop {
+                let mut len_buf = [0u8; 4];
+                if server_stream.read_exact(&mut len_buf).await.is_err() {
+                    break;
+                }
+                let msg_len = u32::from_be_bytes(len_buf) as usize;
+                if msg_len == 0 || msg_len + 4 > AGENT_MAX_MSGLEN {
+                    break;
+                }
+                let mut packet = vec![0u8; 4 + msg_len];
+                packet[..4].copy_from_slice(&len_buf);
+                if server_stream.read_exact(&mut packet[4..]).await.is_err() {
+                    break;
+                }
+                let Some(hwnd) = find_verified_pageant_hwnd() else {
+                    break;
+                };
+                let Ok(Ok(reply)) =
+                    tokio::task::spawn_blocking(move || transact_hwnd(hwnd, &packet)).await
+                else {
+                    break;
+                };
+                if server_stream.write_all(&reply).await.is_err()
+                    || server_stream.flush().await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Some(Box::new(client_stream))
     }
 }
 
@@ -537,5 +849,16 @@ mod tests {
         let (count, _, _, _) = dacl_summary(&dir).expect("the DACL reads back");
         assert_eq!(count, 1, "re-applying replaces the DACL, never appends");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pageant_agent_probe_returns_cleanly_when_no_pageant_window_exists() {
+        // On a headless Windows CI runner without Pageant running, `connect_ssh_agent`
+        // (and its Pageant fallback) must return cleanly without hanging or panicking.
+        let probed = connect_ssh_agent().await.expect("ssh/pageant probe succeeds");
+        if let Some(mut stream) = probed {
+            use tokio::io::AsyncWriteExt;
+            let _ = stream.shutdown().await;
+        }
     }
 }

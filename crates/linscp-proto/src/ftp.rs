@@ -126,6 +126,24 @@ pub fn is_unroutable_pasv_address(address: &str) -> bool {
     false
 }
 
+fn parse_ftp_etag(etag: &str) -> Result<(u64, i64), ProtoError> {
+    let inner = etag
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .and_then(|s| s.strip_prefix("ftp:"))
+        .ok_or_else(|| ProtoError::Transport("Invalid FTP identity tag.".to_string()))?;
+    let (sz, mt) = inner
+        .split_once(':')
+        .ok_or_else(|| ProtoError::Transport("Invalid FTP identity tag.".to_string()))?;
+    let size = sz
+        .parse::<u64>()
+        .map_err(|_| ProtoError::Transport("Invalid FTP identity size.".to_string()))?;
+    let mtime = mt
+        .parse::<i64>()
+        .map_err(|_| ProtoError::Transport("Invalid FTP identity mtime.".to_string()))?;
+    Ok((size, mtime))
+}
+
 fn validate_ftp_arg(arg: &str) -> Result<(), ProtoError> {
     if arg.bytes().any(|b| matches!(b, 0 | b'\r' | b'\n')) {
         return Err(ProtoError::Transport(
@@ -1237,6 +1255,78 @@ impl RemoteSession for FtpSession {
             )));
         }
         Ok(transferred)
+    }
+
+    async fn download_if_match(
+        &self,
+        remote_path: &str,
+        etag: &str,
+        opts: TransferRequest,
+        sink: &mut (dyn AsyncWrite + Unpin + Send),
+        progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        let (expected_size, expected_mtime) = parse_ftp_etag(etag)?;
+        let before = self
+            .stat(remote_path)
+            .await?
+            .ok_or_else(|| ProtoError::Transport(format!("Remote FTP file '{remote_path}' does not exist.")))?;
+        if before.is_dir || before.is_symlink || before.size != expected_size || before.mtime != expected_mtime {
+            return Err(ProtoError::Transport(format!(
+                "Remote FTP file '{remote_path}' changed before conditional download."
+            )));
+        }
+        let received = self.download(remote_path, opts, sink, progress).await?;
+        let after = self
+            .stat(remote_path)
+            .await?
+            .ok_or_else(|| ProtoError::Transport(format!("Remote FTP file '{remote_path}' disappeared during download.")))?;
+        if after.is_dir || after.is_symlink || after.size != expected_size || after.mtime != expected_mtime {
+            return Err(ProtoError::Transport(format!(
+                "Remote FTP file '{remote_path}' changed during conditional download."
+            )));
+        }
+        Ok(received)
+    }
+
+    async fn verify_prefix_if_match(
+        &self,
+        remote_path: &str,
+        etag: &str,
+        prefix_len: u64,
+        total_len: u64,
+        prefix: &mut (dyn AsyncRead + Unpin + Send),
+    ) -> Result<(), ProtoError> {
+        let (expected_size, expected_mtime) = parse_ftp_etag(etag)?;
+        if expected_size != total_len || prefix_len > total_len {
+            return Err(ProtoError::Transport("FTP resume prefix metadata mismatch.".to_string()));
+        }
+        let before = self
+            .stat(remote_path)
+            .await?
+            .ok_or_else(|| ProtoError::Transport(format!("Remote FTP file '{remote_path}' does not exist.")))?;
+        if before.is_dir || before.is_symlink || before.size != expected_size || before.mtime != expected_mtime {
+            return Err(ProtoError::Transport(format!(
+                "Remote FTP file '{remote_path}' changed before resume verification."
+            )));
+        }
+        let mut remote_bytes = Vec::with_capacity(expected_size.min(16 * 1024 * 1024) as usize);
+        self.download(remote_path, TransferRequest::default(), &mut remote_bytes, None).await?;
+        if (remote_bytes.len() as u64) < prefix_len {
+            return Err(ProtoError::Transport(
+                "Remote FTP file ended early during resume verification.".to_string(),
+            ));
+        }
+        let mut local_prefix = vec![0u8; prefix_len as usize];
+        prefix
+            .read_exact(&mut local_prefix)
+            .await
+            .map_err(|e| ProtoError::Transport(format!("Reading local partial failed: {e}")))?;
+        if local_prefix.as_slice() != &remote_bytes[..prefix_len as usize] {
+            return Err(ProtoError::Transport(
+                "Existing partial file bytes do not match the remote FTP file.".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     async fn upload(

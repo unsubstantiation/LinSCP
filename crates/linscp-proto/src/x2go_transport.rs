@@ -156,15 +156,34 @@ impl GuardedKDriveSession {
         drop(writer);
         agent.close().await
     }
+
+    pub async fn suspend(self) -> Result<(), ProtoError> {
+        let Self { reader, writer, agent, .. } = self;
+        drop(reader);
+        drop(writer);
+        agent.suspend().await
+    }
 }
 
 /// Translate parsed graphics messages into the viewer IPC contract. The caller
 /// must keep this stream ordered and bound the number of queued replies. Screen
 /// contents are sensitive: do not log the JSON or send it to another session.
-/// Clipboard, selection and cursor messages are deliberately not forwarded;
-/// no clipboard sharing is enabled by this adapter. Rootless windows and UDP
-/// cannot be rendered by the current viewer and therefore fail closed.
+/// Clipboard, selection and cursor messages are deliberately not forwarded by
+/// this minimal helper; see `viewer_message_extended` for cursor and opt-in
+/// clipboard forwarding. Rootless windows and UDP fail closed.
 pub fn viewer_message(message: Message) -> Result<Option<serde_json::Value>, ProtoError> {
+    if matches!(&message, Message::Cursor(_) | Message::DeletedCursors(_) | Message::Selection(_) | Message::DemandSelection(_)) {
+        return Ok(None);
+    }
+    viewer_message_extended(message, false)
+}
+
+/// Extended viewer IPC adapter that forwards server cursor shapes/deletions and,
+/// when `allow_clipboard` is explicitly enabled, selection/clipboard events.
+pub fn viewer_message_extended(
+    message: Message,
+    allow_clipboard: bool,
+) -> Result<Option<serde_json::Value>, ProtoError> {
     use base64::Engine as _;
     use serde_json::json;
     let result = match message {
@@ -180,10 +199,48 @@ pub fn viewer_message(message: Message) -> Result<Option<serde_json::Value>, Pro
             }})
         }
         Message::DeletedFrames(ids) => json!({"type": "deleted-frames", "ids": ids}),
+        Message::Cursor(cursor) => {
+            if cursor.width == 0 || cursor.width > 256 || cursor.height == 0 || cursor.height > 256
+                || cursor.data.len() > 256 * 256 * 4
+            {
+                return Ok(None);
+            }
+            json!({"type": "cursor", "cursor": {
+                "serial": cursor.serial,
+                "width": cursor.width,
+                "height": cursor.height,
+                "hotX": cursor.hot_x.min(cursor.width.saturating_sub(1)),
+                "hotY": cursor.hot_y.min(cursor.height.saturating_sub(1)),
+                "foreground": cursor.foreground,
+                "background": cursor.background,
+                "data": base64::engine::general_purpose::STANDARD.encode(&cursor.data),
+            }})
+        }
+        Message::DeletedCursors(ids) => json!({"type": "deleted-cursors", "ids": ids}),
+        Message::Selection(sel) => {
+            if !allow_clipboard {
+                return Ok(None);
+            }
+            json!({"type": "selection", "selection": {
+                "selection": sel.selection,
+                "format": sel.format,
+                "chunkSize": sel.chunk_size,
+                "first": sel.first,
+                "last": sel.last,
+                "compressedSize": sel.compressed_size,
+                "total": sel.total,
+                "data": base64::engine::general_purpose::STANDARD.encode(&sel.data),
+            }})
+        }
+        Message::DemandSelection(selection) => {
+            if !allow_clipboard {
+                return Ok(None);
+            }
+            json!({"type": "demand-selection", "selection": selection})
+        }
         Message::Reinitialize => json!({"type": "reinitialize"}),
         Message::Keepalive => json!({"type": "keepalive"}),
         Message::Disconnect => json!({"type": "disconnect"}),
-        Message::Cursor(_) | Message::DeletedCursors(_) | Message::Selection(_) | Message::DemandSelection(_) => return Ok(None),
         Message::WindowUpdate(_) | Message::UdpOpen | Message::UdpFailed | Message::ServerVersion(_) => {
             return Err(ProtoError::Transport("Unsupported KDrive viewer message.".into()));
         }
@@ -275,6 +332,41 @@ impl KDriveWriter {
             _ => {
                 self.closed = true;
                 Err(ProtoError::Transport("Could not write KDrive graphics event.".into()))
+            }
+        }
+    }
+
+    /// Write an opt-in UTF-8 text clipboard selection packet (KDrive event 9).
+    pub async fn write_selection(&mut self, selection: u32, text: &[u8], timeout: Duration) -> Result<(), ProtoError> {
+        const MAX_CLIPBOARD_WRITE: usize = 64 * 1024;
+        if self.closed {
+            return Err(ProtoError::Transport("KDrive graphics writer is closed.".into()));
+        }
+        if selection > 1 || text.len() > MAX_CLIPBOARD_WRITE {
+            return Err(ProtoError::Transport("Invalid KDrive clipboard selection.".into()));
+        }
+        let len = text.len() as u32;
+        let mut header = [0u8; crate::kdrive_wire::CLIENT_EVENT_SIZE];
+        header[0..4].copy_from_slice(&9u32.to_le_bytes());
+        header[4..8].copy_from_slice(&selection.to_le_bytes());
+        header[8..12].copy_from_slice(&0u32.to_le_bytes()); // format 0 = UTF-8 text
+        header[12..16].copy_from_slice(&len.to_le_bytes());
+        header[16..20].copy_from_slice(&1u32.to_le_bytes()); // first
+        header[20..24].copy_from_slice(&1u32.to_le_bytes()); // last
+        header[24..28].copy_from_slice(&0u32.to_le_bytes()); // uncompressed
+        header[28..32].copy_from_slice(&len.to_le_bytes()); // total
+        let write = async {
+            self.stream.write_all(&header).await?;
+            if !text.is_empty() {
+                self.stream.write_all(text).await?;
+            }
+            self.stream.flush().await
+        };
+        match tokio::time::timeout(timeout, write).await {
+            Ok(Ok(())) => Ok(()),
+            _ => {
+                self.closed = true;
+                Err(ProtoError::Transport("Could not write KDrive clipboard selection.".into()))
             }
         }
     }
@@ -421,5 +513,67 @@ mod handshake_tests {
             }
             peer.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn extended_viewer_message_gates_clipboard_and_writes_selection() {
+        let cursor = crate::kdrive_wire::Cursor {
+            foreground: [0xff, 0xff, 0xff],
+            background: [0x00, 0x00, 0x00],
+            width: 2,
+            height: 2,
+            hot_x: 1,
+            hot_y: 1,
+            serial: 7,
+            data: vec![0xff; 16],
+        };
+        let cur_json = viewer_message_extended(Message::Cursor(cursor), false)
+            .unwrap()
+            .expect("cursor forwarded");
+        assert_eq!(cur_json["type"], "cursor");
+        assert_eq!(cur_json["cursor"]["serial"], 7);
+
+        let make_sel = || crate::kdrive_wire::Selection {
+            selection: 1,
+            format: 0,
+            chunk_size: 5,
+            first: true,
+            last: true,
+            compressed_size: 0,
+            total: 5,
+            data: b"hello".to_vec(),
+        };
+        assert!(viewer_message_extended(Message::Selection(make_sel()), false)
+            .unwrap()
+            .is_none());
+        let sel_json = viewer_message_extended(Message::Selection(make_sel()), true)
+            .unwrap()
+            .expect("selection forwarded when opted in");
+        assert_eq!(sel_json["type"], "selection");
+        assert_eq!(sel_json["selection"]["format"], 0);
+
+        assert!(viewer_message_extended(Message::DemandSelection(1), false)
+            .unwrap()
+            .is_none());
+        let demand_json = viewer_message_extended(Message::DemandSelection(1), true)
+            .unwrap()
+            .expect("demand-selection forwarded when opted in");
+        assert_eq!(demand_json["type"], "demand-selection");
+
+        let (client, mut server) = tokio::io::duplex(256);
+        let channel = KDriveChannel {
+            stream: Box::new(client),
+            decoder: Decoder::new(),
+            server_version: 8,
+        };
+        let (_reader, mut writer) = channel.into_halves();
+        writer
+            .write_selection(1, b"clip-test", Duration::from_secs(1))
+            .await
+            .expect("write selection");
+        let mut wire = vec![0u8; CLIENT_EVENT_SIZE + 9];
+        server.read_exact(&mut wire).await.unwrap();
+        assert_eq!(u32::from_le_bytes(wire[0..4].try_into().unwrap()), 9);
+        assert_eq!(&wire[CLIENT_EVENT_SIZE..], b"clip-test");
     }
 }

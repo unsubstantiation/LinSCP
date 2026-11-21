@@ -91,6 +91,8 @@ struct InnerState {
     x2go: HashMap<u64, X2GoRegistered>,
     x2go_next_generation: u64,
     x2go_pending: std::collections::HashSet<u64>,
+    desktop_tunnels: HashMap<u64, (Option<u64>, linscp_proto::tunnel::LocalForwardRelay)>,
+    next_desktop_tunnel_id: u64,
     monitors: monitor::Monitors,
 }
 
@@ -228,6 +230,8 @@ impl CommanderService {
                 x2go: HashMap::new(),
                 x2go_pending: std::collections::HashSet::new(),
                 x2go_next_generation: 0,
+                desktop_tunnels: HashMap::new(),
+                next_desktop_tunnel_id: 0,
                 monitors: monitor::Monitors::default(),
             })),
             event_tx: Arc::new(Mutex::new(None)),
@@ -529,7 +533,11 @@ impl CommanderService {
             ("POST", "/api/monitor/sample") => self.monitor_sample_async(req.body).await,
             ("POST", "/api/session/terminal") => self.open_terminal_async(req.body).await,
             ("POST", "/api/x2go/open") => self.x2go_open(req.body).await,
+            ("POST", "/api/x2go/sessions") => self.x2go_sessions(req.body).await,
             ("POST", "/api/x2go/input") => self.x2go_input(req.body).await,
+            ("POST", "/api/x2go/clipboard") => self.x2go_clipboard(req.body).await,
+            ("POST", "/api/x2go/suspend") => self.x2go_suspend(req.body).await,
+            ("POST", "/api/x2go/terminate") => self.x2go_terminate(req.body).await,
             ("POST", "/api/x2go/close") => self.x2go_close(req.body).await,
             ("POST", "/api/shell/consume") => self.consume_shell_offer_async(req.body).await,
             ("GET", "/api/remote/edit") => self.remote_edit_read_async(&parse_query(req.path.split_once('?').map(|(_, q)| q).unwrap_or(""))).await,
@@ -553,8 +561,16 @@ impl CommanderService {
             ("POST", "/api/desktop/check") => self.handle_desktop_check_async(req.body).await,
             ("POST", "/api/desktop/install") => self.handle_desktop_install_async(req.body).await,
             ("POST", "/api/desktop/launch") => self.handle_desktop_launch_async(req.body).await,
+            ("POST", "/api/desktop/tunnel-close") => self.handle_desktop_tunnel_close_async(req.body).await,
+            ("GET", "/api/desktop/tunnels") => self.handle_desktop_tunnels_list(),
             ("POST", "/api/desktop/ticket") => self.handle_desktop_ticket(req.body),
             ("POST", "/api/mosh/check") => self.handle_mosh_check_async(req.body).await,
+            ("POST", "/api/s3/versions") => self.s3_list_versions_async(req.body).await,
+            ("POST", "/api/s3/version-download") => self.s3_version_download_async(req.body).await,
+            ("POST", "/api/s3/version-delete") => self.s3_version_delete_async(req.body).await,
+            ("POST", "/api/dav/lock") => self.dav_lock_async(req.body).await,
+            ("POST", "/api/dav/unlock") => self.dav_unlock_async(req.body).await,
+            ("POST", "/api/dav/property") => self.dav_property_async(req.body).await,
             _ => self.dispatch_inner(req),
         }
     }
@@ -841,6 +857,7 @@ impl CommanderService {
             if let Some(name) = tab.site_name.as_ref() { state.pending_sites.insert(id, name.clone()); }
             if body.get("automatic").and_then(Value::as_bool) == Some(true) { state.auto_pending.insert(id); }
             if let Some(current) = state.tabs.get_mut(&id) { current.connected = false; current.remote = None; current.error.clear(); }
+            state.desktop_tunnels.retain(|_, (owner, _)| *owner != Some(id));
             let ended_viewer = state.x2go.remove(&id);
             (tab, ended_viewer)
         };
@@ -992,7 +1009,20 @@ impl CommanderService {
             _ => return api_error(400, "A single valid directory name is required."),
         };
         let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
-        if !matches!(session.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes | linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs) {
+        if !matches!(
+            session.scheme(),
+            linscp_types::ProtocolScheme::Sftp
+                | linscp_types::ProtocolScheme::Scp
+                | linscp_types::ProtocolScheme::Ssh
+                | linscp_types::ProtocolScheme::Ftp
+                | linscp_types::ProtocolScheme::Ftps
+                | linscp_types::ProtocolScheme::Ftpes
+                | linscp_types::ProtocolScheme::Dav
+                | linscp_types::ProtocolScheme::Davs
+                | linscp_types::ProtocolScheme::Webdav
+                | linscp_types::ProtocolScheme::Webdavs
+                | linscp_types::ProtocolScheme::S3
+        ) {
             return api_error(501, "Safe directory creation is not supported for this protocol.");
         }
         let base = body.get("remote_dir").and_then(Value::as_str)
@@ -1149,17 +1179,42 @@ impl CommanderService {
         };
         let target_session = match target_tab.remote { Some(session) => session, None => return api_error(400, "Destination session is not connected") };
         let same_tab = target_id == id;
-        if (!same_tab || !move_item) && !matches!(target_session.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs | linscp_types::ProtocolScheme::S3) {
-            return api_error(501, "Cross-server moves require an exclusively creatable destination.");
+        let target_is_ftp = matches!(target_session.scheme(), linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes);
+        let ftp_risk_accepted = body.get("accept_ftp_rename_risk").and_then(Value::as_bool).unwrap_or(false);
+        if (!same_tab || !move_item) && !matches!(
+            target_session.scheme(),
+            linscp_types::ProtocolScheme::Sftp
+                | linscp_types::ProtocolScheme::Scp
+                | linscp_types::ProtocolScheme::Ssh
+                | linscp_types::ProtocolScheme::Ftp
+                | linscp_types::ProtocolScheme::Ftps
+                | linscp_types::ProtocolScheme::Ftpes
+                | linscp_types::ProtocolScheme::Dav
+                | linscp_types::ProtocolScheme::Davs
+                | linscp_types::ProtocolScheme::Webdav
+                | linscp_types::ProtocolScheme::Webdavs
+                | linscp_types::ProtocolScheme::S3
+        ) {
+            return api_error(501, "Remote transfers are not supported for this destination protocol.");
         }
         if !same_tab && move_item && !body.get("accept_cross_move_risk").and_then(Value::as_bool).unwrap_or(false) {
             return ApiReply { status: 409, payload: json!({"success": false, "error": "Cross-server move requires confirmation", "cross_move_risk": true}) };
         }
+        if (!same_tab || !move_item) && target_is_ftp && !ftp_risk_accepted {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP upload requires confirmation of rename risks", "ftp_rename_risk": true}) };
+        }
         let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
         let source_is_dav = matches!(session.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs);
         let source_is_sftp = session.scheme() == linscp_types::ProtocolScheme::Sftp;
+        let source_is_scp = matches!(session.scheme(), linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh);
+        let source_is_ftp = matches!(session.scheme(), linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes);
         let source_is_s3 = session.scheme() == linscp_types::ProtocolScheme::S3;
-        if !source_is_dav && (move_item || !(source_is_sftp || source_is_s3)) { return api_error(501, "Remote transfers support WebDAV sources, or SFTP and S3 sources for copies only."); }
+        if !(source_is_dav || source_is_sftp || source_is_scp || source_is_ftp || source_is_s3) {
+            return api_error(501, "Remote transfers are not supported for this source protocol.");
+        }
+        if same_tab && move_item && !source_is_dav && !source_is_s3 && !source_is_sftp && !source_is_scp && !source_is_ftp {
+            return api_error(501, "Same-session move is not supported for this protocol.");
+        }
         if source_is_sftp && !body.get("accept_sftp_copy_risk").and_then(Value::as_bool).unwrap_or(false) {
             return ApiReply { status: 409, payload: json!({"success": false, "error": "SFTP copy requires confirmation", "sftp_copy_risk": true}) };
         }
@@ -1195,42 +1250,58 @@ impl CommanderService {
                 }
             } else if source_is_s3 {
                 let entry = match session.stat(&source).await {
-                    Ok(Some(entry)) if !entry.is_symlink && !entry.is_dir => entry,
-                    Ok(_) => return api_error(400, "S3 copies require an existing object."),
+                    Ok(Some(entry)) if !entry.is_symlink => entry,
+                    Ok(_) => return api_error(400, "S3 transfers require an existing object or prefix."),
                     Err(error) => return api_error(400, error.to_string()),
                 };
-                let tag = match session.s3_get_etag(&source).await {
-                    Ok(Some(tag)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => tag,
-                    Ok(_) => return api_error(400, "S3 copies require a strong source ETag."),
-                    Err(error) => return api_error(400, error.to_string()),
-                };
-                (entry, Some(tag))
+                if entry.is_dir {
+                    (entry, None)
+                } else {
+                    let tag = match session.s3_get_etag(&source).await {
+                        Ok(Some(tag)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => tag,
+                        Ok(_) => return api_error(400, "S3 transfers require a strong source ETag."),
+                        Err(error) => return api_error(400, error.to_string()),
+                    };
+                    (entry, Some(tag))
+                }
             } else {
                 match session.stat(&source).await {
                     Ok(Some(entry)) if !entry.is_symlink => (entry, None),
-                    Ok(_) => return api_error(400, "SFTP copies require an existing non-symlink source."),
+                    Ok(_) => return api_error(400, "Remote transfers require an existing non-symlink source."),
                     Err(error) => return api_error(400, error.to_string()),
                 }
             };
             let is_dir = source_entry.is_dir;
-            if (!same_tab || !move_item) && target_session.scheme() == linscp_types::ProtocolScheme::S3 && source_entry.size > 1024 * 1024 * 1024 {
-                return api_error(400, "Remote transfers to S3 are limited to 1 GiB per file.");
+            const MAX_S3_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
+            if (!same_tab || !move_item) && target_session.scheme() == linscp_types::ProtocolScheme::S3 && source_entry.size > MAX_S3_OBJECT_BYTES {
+                return api_error(400, "Remote transfers to S3 cannot exceed 5 TiB per object.");
             }
-            if is_dir && (!same_tab || !move_item) && (move_item || !(source_is_sftp || source_is_dav) || !matches!(target_session.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs)) { return api_error(501, "Directory copies require SFTP or WebDAV sources and destinations; cross-server directory moves are unsupported."); }
+            if is_dir && move_item && (!same_tab || !source_is_dav) {
+                return api_error(501, "Cross-server and non-WebDAV directory moves are unsupported.");
+            }
             if is_dir && !move_item && source_is_dav && !body.get("accept_directory_copy_risk").and_then(Value::as_bool).unwrap_or(false) {
                 return ApiReply { status: 409, payload: json!({"success": false, "error": "Directory copy requires confirmation", "directory_copy_risk": true}) };
             }
-            if is_dir && same_tab && target.starts_with(&format!("{source}/")) { return api_error(400, "Cannot move a directory into itself."); }
+            if is_dir && same_tab && target.starts_with(&format!("{source}/")) { return api_error(400, "Cannot move or copy a directory into itself."); }
             if is_dir && move_item && !body.get("accept_directory_move_risk").and_then(Value::as_bool).unwrap_or(false) {
                 return ApiReply { status: 409, payload: json!({"success": false, "error": "Directory move requires confirmation", "directory_move_risk": true}) };
             }
-            let entry = if same_tab && move_item { None } else { Some(source_entry) };
+            let entry = if same_tab && move_item && source_is_dav { None } else { Some(source_entry) };
             jobs.push((name.to_string(), source, target, tag, is_dir, entry));
         }
         for (name, source, target, etag, is_dir, entry) in jobs {
             let size = entry.as_ref().map(|entry| entry.size).unwrap_or(0);
             let job = if let Some(source_entry) = entry {
-                queue::QueueJob::StagedRemoteTransfer { source_session: session.clone(), target_session: target_session.clone(), source: source.clone(), target: target.clone(), etag, source_entry, move_item }
+                queue::QueueJob::StagedRemoteTransfer {
+                    source_session: session.clone(),
+                    target_session: target_session.clone(),
+                    source: source.clone(),
+                    target: target.clone(),
+                    etag,
+                    source_entry,
+                    move_item,
+                    target_ftp_risky_publish: target_is_ftp && ftp_risk_accepted,
+                }
             } else {
                 queue::QueueJob::DavMove { session: session.clone(), source: source.clone(), target: target.clone(), etag: etag.expect("WebDAV move preflight requires an ETag"), is_dir }
             };
@@ -1280,17 +1351,18 @@ impl CommanderService {
         let names = remote_names(&body);
         if names.is_empty() { return api_error(400, "Select at least one file") }
         if names.len() > 1000 { return api_error(400, "Too many files selected") }
-        // A recursive change would alter a whole tree from one click; the
-        // console asks the user to select the entries instead, and so do we.
-        let mut modes = Vec::new();
+        // Validate all leaf names and the mode specification before touching any entry.
+        let raw_mode = body.get("permissions").and_then(Value::as_str).unwrap_or("").trim();
+        if let Err(error) = linscp_engine::parse_chmod_spec(raw_mode, 0o644) {
+            return api_error(400, error);
+        }
+        let mut leaves = Vec::new();
         for name in &names {
             let leaf = match ops::validate_leaf_name(name) { Ok(leaf) => leaf, Err(error) => return api_error(400, error) };
-            let raw = body.get("permissions").and_then(Value::as_str).unwrap_or("");
-            let mode = match parse_octal_mode(raw) { Some(mode) => mode, None => return api_error(400, "A symbolic or malformed mode is not supported here; enter an octal mode such as 644.") };
-            modes.push((leaf.to_string(), mode));
+            leaves.push(leaf.to_string());
         }
         let mut failures = Vec::new();
-        for (name, mode) in modes {
+        for name in leaves {
             let path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
             let entry = match session.stat(&path).await {
                 Ok(Some(entry)) => entry,
@@ -1298,10 +1370,194 @@ impl CommanderService {
                 Err(error) => { failures.push(format!("{name}: {error}")); continue; }
             };
             if entry.is_symlink { failures.push(format!("{name}: a symbolic link is changed through its target")); continue; }
+            let current = linscp_engine::filemask::mode_from_permissions_str(&entry.permissions);
+            let mode = match linscp_engine::parse_chmod_spec(raw_mode, current) {
+                Ok(mode) => mode,
+                Err(error) => { failures.push(format!("{name}: {error}")); continue; }
+            };
             if let Err(error) = session.chmod(&path, mode).await { failures.push(format!("{name}: {error}")); }
         }
         if failures.is_empty() { ApiReply { status: 200, payload: json!({"success": true}) } }
         else { ApiReply { status: 400, payload: json!({"success": false, "error": failures.join("; ")}) } }
+    }
+
+    async fn s3_list_versions_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected"),
+        };
+        let session = match tab.remote { Some(session) if session.scheme() == linscp_types::ProtocolScheme::S3 => session, _ => return api_error(400, "S3 object versions require an active S3 session.") };
+        let name = match ops::validate_leaf_name(body.get("name").and_then(Value::as_str).unwrap_or("")) {
+            Ok(leaf) => leaf,
+            Err(error) => return api_error(400, error),
+        };
+        let path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
+        match session.s3_list_versions(&path).await {
+            Ok(versions) => ApiReply {
+                status: 200,
+                payload: json!({"success": true, "path": path, "name": name, "versions": versions}),
+            },
+            Err(error) => api_error(400, error.to_string()),
+        }
+    }
+
+    async fn s3_version_download_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected"),
+        };
+        let session = match tab.remote { Some(session) if session.scheme() == linscp_types::ProtocolScheme::S3 => session, _ => return api_error(400, "S3 object versions require an active S3 session.") };
+        let name = match ops::validate_leaf_name(body.get("name").and_then(Value::as_str).unwrap_or("")) {
+            Ok(leaf) => leaf,
+            Err(error) => return api_error(400, error),
+        };
+        let version_id = body.get("version_id").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        if version_id.is_empty() || version_id.chars().any(char::is_control) {
+            return api_error(400, "A valid S3 version ID is required.");
+        }
+        let local_dir = match body.get("local_dir").and_then(Value::as_str) {
+            Some(dir) => match check_local_pane_directory(dir, "local_dir") { Ok(p) => p, Err(error) => return api_error(400, error) },
+            None => tab.local_dir.clone(),
+        };
+        let target_leaf = match body.get("target_name").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+            Some(custom) => match ops::validate_leaf_name(custom) { Ok(leaf) => leaf.to_string(), Err(error) => return api_error(400, error) },
+            None => name.to_string(),
+        };
+        let local_dest = match resolve_contained(&local_dir, &target_leaf) {
+            Ok(path) => PathBuf::from(path),
+            Err(error) => return api_error(400, error),
+        };
+        let remote_path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
+        let entry = match session.s3_stat_version(&remote_path, &version_id).await {
+            Ok(Some(entry)) if !entry.is_dir && !entry.is_symlink => entry,
+            Ok(_) => return api_error(400, "The requested S3 object version does not exist or is not a regular object."),
+            Err(error) => return api_error(400, error.to_string()),
+        };
+        let exists = if is_saf_path(&local_dest.to_string_lossy()) {
+            self.local_fs.stat(&local_dest.to_string_lossy()).is_ok()
+        } else {
+            std::fs::symlink_metadata(&local_dest).is_ok()
+        };
+        let overwrite = body.get("overwrite").and_then(Value::as_str).unwrap_or("ask");
+        if exists && overwrite != "overwrite" {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "Destination exists", "conflicts": [target_leaf]}) };
+        }
+        let mut flags = linscp_engine::transfer::TransferFlags::default();
+        flags.version_id = Some(version_id.clone());
+        flags.preserve_time = true;
+        let dest_str = local_dest.to_string_lossy().into_owned();
+        let job = queue::QueueJob::RemoteDownload {
+            session,
+            remote_path: remote_path.clone(),
+            local_dest,
+            allow_overwrite: exists && overwrite == "overwrite",
+            delete_source: false,
+            flags,
+        };
+        let task_id = self.queue.enqueue(Some(id), "download", format!("{target_leaf} (v:{version_id})"), remote_path, dest_str, entry.size, false, job);
+        ApiReply { status: 200, payload: json!({"success": true, "task_id": task_id}) }
+    }
+
+    async fn s3_version_delete_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected"),
+        };
+        let session = match tab.remote { Some(session) if session.scheme() == linscp_types::ProtocolScheme::S3 => session, _ => return api_error(400, "S3 object versions require an active S3 session.") };
+        let name = match ops::validate_leaf_name(body.get("name").and_then(Value::as_str).unwrap_or("")) {
+            Ok(leaf) => leaf,
+            Err(error) => return api_error(400, error),
+        };
+        let version_id = body.get("version_id").and_then(Value::as_str).unwrap_or("").trim();
+        if version_id.is_empty() || version_id.chars().any(char::is_control) {
+            return api_error(400, "A valid S3 version ID is required.");
+        }
+        let path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
+        match session.s3_remove_version(&path, version_id).await {
+            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
+            Err(error) => api_error(400, error.to_string()),
+        }
+    }
+
+    async fn dav_lock_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected"),
+        };
+        let session = match tab.remote {
+            Some(session) if matches!(session.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs) => session,
+            _ => return api_error(400, "WebDAV locks require an active WebDAV session."),
+        };
+        let name = match ops::validate_leaf_name(body.get("name").and_then(Value::as_str).unwrap_or("")) {
+            Ok(leaf) => leaf,
+            Err(error) => return api_error(400, error),
+        };
+        let timeout_secs = body.get("timeout_secs").and_then(Value::as_u64).unwrap_or(300).clamp(1, 86_400) as u32;
+        let path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
+        match session.dav_lock(&path, timeout_secs).await {
+            Ok(token) => ApiReply { status: 200, payload: json!({"success": true, "path": path, "token": token}) },
+            Err(error) => api_error(400, error.to_string()),
+        }
+    }
+
+    async fn dav_unlock_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected"),
+        };
+        let session = match tab.remote {
+            Some(session) if matches!(session.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs) => session,
+            _ => return api_error(400, "WebDAV locks require an active WebDAV session."),
+        };
+        let name = match ops::validate_leaf_name(body.get("name").and_then(Value::as_str).unwrap_or("")) {
+            Ok(leaf) => leaf,
+            Err(error) => return api_error(400, error),
+        };
+        let token = body.get("token").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+        if let Some(tok) = token {
+            if tok.chars().any(char::is_control) {
+                return api_error(400, "Invalid lock token.");
+            }
+        }
+        let path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
+        match session.dav_unlock(&path, token).await {
+            Ok(()) => ApiReply { status: 200, payload: json!({"success": true, "path": path}) },
+            Err(error) => api_error(400, error.to_string()),
+        }
+    }
+
+    async fn dav_property_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected"),
+        };
+        let session = match tab.remote {
+            Some(session) if matches!(session.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs) => session,
+            _ => return api_error(400, "WebDAV dead properties require an active WebDAV session."),
+        };
+        let name = match ops::validate_leaf_name(body.get("name").and_then(Value::as_str).unwrap_or("")) {
+            Ok(leaf) => leaf,
+            Err(error) => return api_error(400, error),
+        };
+        let prop_name = body.get("property").and_then(Value::as_str).unwrap_or("").trim();
+        if prop_name.is_empty() {
+            return api_error(400, "A WebDAV property name is required.");
+        }
+        let path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
+        match body.get("action").and_then(Value::as_str).unwrap_or("get") {
+            "get" => match session.dav_get_property(&path, prop_name).await {
+                Ok(value) => ApiReply { status: 200, payload: json!({"success": true, "path": path, "property": prop_name, "value": value}) },
+                Err(error) => api_error(400, error.to_string()),
+            },
+            "set" => {
+                let value = body.get("value").and_then(Value::as_str).unwrap_or("");
+                match session.dav_set_property(&path, prop_name, value).await {
+                    Ok(()) => ApiReply { status: 200, payload: json!({"success": true, "path": path, "property": prop_name, "value": value}) },
+                    Err(error) => api_error(400, error.to_string()),
+                }
+            }
+            _ => api_error(400, "Unsupported WebDAV property action (expected 'get' or 'set')."),
+        }
     }
 
     /// Starts watching a local directory and copying changes to the server.
@@ -1859,18 +2115,29 @@ impl CommanderService {
     /// Starts only on an existing authenticated tab; no host or credentials
     /// from the request can redirect the graphics connection to another host.
     async fn x2go_open(&self, body: Value) -> ApiReply {
-        use linscp_proto::x2go_control::{start_command, start_guarded_agent, X2GoDesktop, X2GoLink};
+        use linscp_proto::x2go_control::{
+            resume_command, resume_guarded_agent, start_command, start_guarded_agent, X2GoDesktop, X2GoLink,
+        };
         use linscp_proto::x2go_transport::GuardedKDriveSession;
         let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else { return api_error(400, "No active tab"); };
+        let resume_session_id = body.get("resume_session_id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+        let allow_clipboard = body.get("clipboard").and_then(Value::as_bool).unwrap_or(false);
         let desktop = match body.get("desktop").and_then(Value::as_str) {
-            Some("XFCE") => X2GoDesktop::Xfce,
-            Some("MATE") => X2GoDesktop::Mate,
-            Some("LXDE") => X2GoDesktop::Lxde,
+            Some("XFCE") => Some(X2GoDesktop::Xfce),
+            Some("MATE") => Some(X2GoDesktop::Mate),
+            Some("LXDE") => Some(X2GoDesktop::Lxde),
+            _ if resume_session_id.is_some() => None,
             _ => return api_error(400, "Select an available X2Go desktop."),
         };
         let width = body.get("width").and_then(Value::as_u64).and_then(|n| u16::try_from(n).ok()).unwrap_or(0);
         let height = body.get("height").and_then(Value::as_u64).and_then(|n| u16::try_from(n).ok()).unwrap_or(0);
-        if start_command(width, height, desktop, X2GoLink::Lan).is_err() { return api_error(400, "Invalid X2Go desktop dimensions."); }
+        if let Some(resume_id) = resume_session_id {
+            if resume_command(resume_id, width, height, X2GoLink::Lan).is_err() {
+                return api_error(400, "Invalid X2Go resume session or dimensions.");
+            }
+        } else if start_command(width, height, desktop.unwrap_or(X2GoDesktop::Xfce), X2GoLink::Lan).is_err() {
+            return api_error(400, "Invalid X2Go desktop dimensions.");
+        }
         let (session, ssh) = {
             let mut state = self.state.lock().expect("state mutex");
             if state.x2go.contains_key(&id) || state.x2go_pending.contains(&id) { return api_error(409, "An X2Go viewer is already open or starting for this tab."); }
@@ -1887,21 +2154,31 @@ impl CommanderService {
             Ok(Ok(false)) => return api_error(400, "X2Go KDrive components were not detected on this server."),
             _ => return api_error(400, "Could not check the X2Go server."),
         }
-        let agent = match start_guarded_agent(ssh.clone(), width, height, desktop, X2GoLink::Lan, std::time::Duration::from_secs(75)).await {
-            Ok(agent) => agent,
-            Err(error) => return api_error(400, error.to_string()),
+        let (agent, is_resumed) = if let Some(resume_id) = resume_session_id {
+            match resume_guarded_agent(ssh.clone(), resume_id, width, height, X2GoLink::Lan, std::time::Duration::from_secs(75)).await {
+                Ok(agent) => (agent, true),
+                Err(error) => return api_error(400, error.to_string()),
+            }
+        } else {
+            match start_guarded_agent(ssh.clone(), width, height, desktop.expect("desktop validated"), X2GoLink::Lan, std::time::Duration::from_secs(75)).await {
+                Ok(agent) => (agent, false),
+                Err(error) => return api_error(400, error.to_string()),
+            }
         };
+        let session_id_out = agent.session().session_id().to_string();
         let mut channel = match GuardedKDriveSession::attach(agent, width, height, std::time::Duration::from_secs(15)).await {
             Ok(channel) => channel,
             Err(error) => return api_error(400, error.to_string()),
         };
-        if channel.start_desktop(desktop).await.is_err() {
-            return match channel.close().await {
-                Ok(()) => api_error(400, "Could not start the X2Go desktop."),
-                Err(_) => api_error(400, "Could not start the X2Go desktop; agent cleanup could not be confirmed."),
-            };
+        if !is_resumed {
+            if channel.start_desktop(desktop.expect("desktop validated")).await.is_err() {
+                return match channel.close().await {
+                    Ok(()) => api_error(400, "Could not start the X2Go desktop."),
+                    Err(_) => api_error(400, "Could not start the X2Go desktop; agent cleanup could not be confirmed."),
+                };
+            }
         }
-        let bridge = x2go_bridge::X2GoBridge::start(channel);
+        let bridge = x2go_bridge::X2GoBridge::start_with_options(channel, allow_clipboard);
         let generation = match self.register_x2go_bridge(id, &ssh, bridge) {
             Ok(generation) => generation,
             Err(bridge) => return match bridge.close().await {
@@ -1909,7 +2186,71 @@ impl CommanderService {
                 Err(_) => api_error(409, "The SSH session changed while X2Go was starting; agent cleanup could not be confirmed."),
             },
         };
-        ApiReply { status: 200, payload: json!({"success": true, "tab": id, "generation": generation, "width": width, "height": height}) }
+        ApiReply {
+            status: 200,
+            payload: json!({
+                "success": true,
+                "tab": id,
+                "generation": generation,
+                "session_id": session_id_out,
+                "resumed": is_resumed,
+                "clipboard": allow_clipboard,
+                "width": width,
+                "height": height
+            }),
+        }
+    }
+
+    async fn x2go_sessions(&self, body: Value) -> ApiReply {
+        let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else { return api_error(400, "No active tab"); };
+        let ssh = {
+            let state = self.state.lock().expect("state mutex");
+            let Some(tab) = state.tabs.get(&id).filter(|tab| tab.connected && !tab.is_local) else {
+                return api_error(400, "Not connected");
+            };
+            let Some(ssh) = tab.remote.as_ref().and_then(|r| r.ssh_connection()).cloned() else {
+                return api_error(400, "This session has no SSH connection.");
+            };
+            ssh
+        };
+        match linscp_proto::x2go_control::list_sessions(ssh.as_ref(), std::time::Duration::from_secs(15)).await {
+            Ok(list) => {
+                let items: Vec<Value> = list.into_iter().map(|s| json!({
+                    "session_id": s.session_id,
+                    "display": s.display,
+                    "agent_pid": s.agent_pid,
+                    "status": s.status,
+                    "created_at": s.created_at,
+                    "desktop": s.desktop,
+                })).collect();
+                ApiReply { status: 200, payload: json!({ "success": true, "sessions": items }) }
+            }
+            Err(error) => api_error(400, error.to_string()),
+        }
+    }
+
+    async fn x2go_terminate(&self, body: Value) -> ApiReply {
+        let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else { return api_error(400, "No active tab"); };
+        let Some(session_id) = body.get("session_id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else {
+            return api_error(400, "Session ID required.");
+        };
+        if linscp_proto::x2go_control::validate_session_id(session_id).is_err() {
+            return api_error(400, "Invalid X2Go session ID.");
+        }
+        let ssh = {
+            let state = self.state.lock().expect("state mutex");
+            let Some(tab) = state.tabs.get(&id).filter(|tab| tab.connected && !tab.is_local) else {
+                return api_error(400, "Not connected");
+            };
+            let Some(ssh) = tab.remote.as_ref().and_then(|r| r.ssh_connection()).cloned() else {
+                return api_error(400, "This session has no SSH connection.");
+            };
+            ssh
+        };
+        match linscp_proto::x2go_control::terminate_listed_session(ssh.as_ref(), session_id, std::time::Duration::from_secs(15)).await {
+            Ok(()) => ApiReply { status: 200, payload: json!({ "success": true }) },
+            Err(error) => api_error(400, error.to_string()),
+        }
     }
 
     /// Install only on the exact connection that started the agent. The caller
@@ -1960,6 +2301,43 @@ impl CommanderService {
         };
         match input.write(packet).await {
             Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
+            Err(error) => api_error(400, error),
+        }
+    }
+
+    async fn x2go_clipboard(&self, body: Value) -> ApiReply {
+        let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else { return api_error(400, "No active tab"); };
+        let Some(text) = body.get("text").and_then(Value::as_str) else {
+            return api_error(400, "Clipboard text is required.");
+        };
+        let input = {
+            let state = self.state.lock().expect("state mutex");
+            match state.x2go.get(&id).filter(|entry| body.get("generation").and_then(Value::as_str) == Some(entry.generation.as_str())) {
+                Some(entry) => entry.bridge.input(),
+                None => return api_error(400, "X2Go viewer is not open."),
+            }
+        };
+        match input.write_clipboard(text).await {
+            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
+            Err(error) => api_error(400, error),
+        }
+    }
+
+    async fn x2go_suspend(&self, body: Value) -> ApiReply {
+        let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else { return api_error(400, "No active tab"); };
+        let bridge = {
+            let mut state = self.state.lock().expect("state mutex");
+            if state.x2go.get(&id).is_some_and(|entry| body.get("generation").and_then(Value::as_str) == Some(entry.generation.as_str())) {
+                state.x2go.remove(&id).map(|entry| entry.bridge)
+            } else {
+                None
+            }
+        };
+        let Some(bridge) = bridge else {
+            return api_error(400, "X2Go viewer is not open.");
+        };
+        match bridge.suspend().await {
+            Ok(()) => ApiReply { status: 200, payload: json!({"success": true, "suspended": true}) },
             Err(error) => api_error(400, error),
         }
     }
@@ -2874,43 +3252,94 @@ impl CommanderService {
         let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
             Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
         };
-        if move_item && !tab.is_local {
-            let dav = tab.remote.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs));
-            if upload || !dav { return api_error(501, "Only WebDAV file moves to a new local destination are supported."); }
-        }
         let names = match body.get("names").and_then(Value::as_array) {
             Some(names) if !names.is_empty() && names.len() <= 1000 => names,
             _ => return api_error(400, "Select at least one file"),
         };
-        // Until the queue implements these options, reject rather than silently ignore them.
-        for key in ["append", "newer_only"] {
-            if body.get(key).and_then(Value::as_bool).unwrap_or(false) { return api_error(400, format!("{key} is not yet supported")); }
+        let append = body.get("append").and_then(Value::as_bool).unwrap_or(false);
+        let newer_only = body.get("newer_only").and_then(Value::as_bool).unwrap_or(false);
+        let no_permissions = body.get("no_permissions").and_then(Value::as_bool).unwrap_or(false);
+        let speed_kb = match body.get("speed") {
+            None => 0u64,
+            Some(v) => match v.as_u64() {
+                Some(n) if n <= 100_000_000 => n,
+                _ => return api_error(400, "Speed limit must be an integer between 0 and 100000000 KiB/s."),
+            },
+        };
+        let transfer_mode = match body.get("transfer").and_then(Value::as_str).unwrap_or("").trim().to_ascii_lowercase().as_str() {
+            "" | "binary" => linscp_types::TransferMode::Binary,
+            "ascii" => linscp_types::TransferMode::Ascii,
+            "automatic" | "auto" => linscp_types::TransferMode::Automatic,
+            _ => return api_error(400, "Unsupported transfer mode (expected binary, ascii, or automatic)."),
+        };
+        let mask_raw = body.get("filemask").and_then(Value::as_str).unwrap_or("").trim();
+        if !mask_raw.is_empty() && move_item {
+            return api_error(400, "File masks are not supported for moves.");
         }
-        for key in ["filemask", "resumesupport"] {
-            if body.get(key).and_then(Value::as_str).is_some_and(|s| !s.is_empty()) { return api_error(400, format!("{key} is not yet supported")); }
+        let parsed_mask = if mask_raw.is_empty() {
+            linscp_engine::filemask::FileMask::default()
+        } else {
+            match linscp_engine::filemask::FileMask::parse(mask_raw) {
+                Ok(mask) => mask,
+                Err(error) => return api_error(400, error),
+            }
+        };
+        let resume_support_raw = body.get("resumesupport").and_then(Value::as_str).unwrap_or("").trim();
+        let (parsed_resume_support, explicit_resume_support) = match resume_support_raw.to_ascii_lowercase().as_str() {
+            "" => (linscp_engine::presets::ResumeSupportMode::On, false),
+            "on" => (linscp_engine::presets::ResumeSupportMode::On, true),
+            "off" => (linscp_engine::presets::ResumeSupportMode::Off, true),
+            "default" => (linscp_engine::presets::ResumeSupportMode::Smart(100 * 1024), true),
+            other => match other.parse::<u64>() {
+                Ok(kb) => (linscp_engine::presets::ResumeSupportMode::Smart(kb.saturating_mul(1024)), true),
+                Err(_) => return api_error(400, "Invalid resumesupport value (expected on, off, default, or size in KiB)."),
+            },
+        };
+        if move_item && (append || newer_only) {
+            return api_error(400, "Moves cannot be combined with append or newer-only filtering.");
         }
-        if body.get("speed").and_then(Value::as_u64).unwrap_or(0) != 0 { return api_error(400, "Speed limits are not yet supported"); }
-        if !matches!(body.get("transfer").and_then(Value::as_str).unwrap_or(""), "" | "binary") { return api_error(400, "Only binary transfers are supported"); }
         let local_dir = match body.get("local_dir").and_then(Value::as_str) {
             Some(path) => match check_local_pane_directory(path, "local_dir") { Ok(path) => path, Err(error) => return api_error(400, error) },
             None => return api_error(400, "Missing local directory"),
         };
-        // The pane check accepts a granted folder structurally. Session
-        // transfers stage its bytes through temporary files in the queue
-        // worker, so a granted local side is statted through `LocalFs`
-        // below instead of refused.
         let other_dir = body.get("remote_dir").and_then(Value::as_str).unwrap_or("");
         if other_dir.is_empty() || other_dir.chars().any(char::is_control) { return api_error(400, "Missing remote directory"); }
         let session = tab.remote.clone();
         if !tab.is_local && session.is_none() { return api_error(400, "Not connected"); }
-        let is_ftp_upload = upload && !move_item && !tab.is_local && session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes));
+        if !tab.is_local {
+            let scheme = session.as_ref().unwrap().scheme();
+            if matches!(scheme, linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)
+                && explicit_resume_support
+                && !matches!(parsed_resume_support, linscp_engine::presets::ResumeSupportMode::Off)
+            {
+                return api_error(400, "The SCP protocol cannot resume transfers.");
+            }
+        }
+        let is_ftp_upload = upload && !tab.is_local && session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes));
         let ftp_risk_accepted = body.get("accept_ftp_rename_risk").and_then(Value::as_bool).unwrap_or(false);
-        if is_ftp_upload && !ftp_risk_accepted {
+        if is_ftp_upload && !append && !ftp_risk_accepted {
             return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP upload requires confirmation of rename risks", "ftp_rename_risk": true}) };
         }
         let resume = body.get("resume").and_then(Value::as_bool).unwrap_or(false);
-        if resume && (move_item || upload || tab.is_local || session.as_ref().is_none_or(|s| !matches!(s.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs | linscp_types::ProtocolScheme::S3))) {
-            return api_error(400, "Verified resume is supported only for WebDAV and S3 file downloads.");
+        if resume && append {
+            return api_error(400, "Cannot combine resume and append.");
+        }
+        if resume && transfer_mode != linscp_types::TransferMode::Binary {
+            return api_error(400, "Verified resume requires binary transfer mode.");
+        }
+        if resume && matches!(parsed_resume_support, linscp_engine::presets::ResumeSupportMode::Off) && explicit_resume_support {
+            return api_error(400, "Cannot request resume when resume support is disabled.");
+        }
+        if append {
+            if tab.is_local {
+                return api_error(400, "Append is supported only on remote transfers.");
+            }
+            if upload && !session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes)) {
+                return api_error(400, "Upload append is supported only for SFTP and FTP/FTPS sessions.");
+            }
+        }
+        if resume && (move_item || upload || tab.is_local || session.as_ref().is_none_or(|s| !matches!(s.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs | linscp_types::ProtocolScheme::S3 | linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes))) {
+            return api_error(400, "Verified resume is supported only for SFTP, FTP/FTPS, WebDAV, and S3 file downloads.");
         }
         let overwrite = body.get("overwrite").and_then(Value::as_str).unwrap_or("ask");
         if overwrite != "ask" && overwrite != "overwrite" { return api_error(400, "Unsupported overwrite policy"); }
@@ -2926,7 +3355,7 @@ impl CommanderService {
         let mut seen = std::collections::HashSet::new();
         for value in names {
             let name = match value.as_str() { Some(name) => name, None => return api_error(400, "Invalid file name") };
-            if !seen.insert(name) { return api_error(400, "Duplicate file name"); }
+            if !seen.insert(name) { return api_error(400, "Duplicate file name") };
             let local = match resolve_contained(&local_dir, name) { Ok(path) => PathBuf::from(path), Err(error) => return api_error(400, error) };
             let other = if tab.is_local {
                 let directory = match check_local_pane_directory(other_dir, "other_local_dir") { Ok(path) => path, Err(error) => return api_error(400, error) };
@@ -2939,41 +3368,49 @@ impl CommanderService {
             let size;
             let exists;
             let is_dir;
+            let src_mtime: i64;
+            let mut remote_entry_opt: Option<linscp_types::FileEntry> = None;
             if tab.is_local {
-                // Either end may be a granted folder; `LocalFs` stats both
-                // sides of a granted copy, while plain pairs keep the direct
-                // metadata and its exact rule.
-                let (src_is_dir, src_len) = if is_saf_path(&source) || is_saf_path(&destination) {
+                let (src_is_dir, src_len, mtime_val) = if is_saf_path(&source) || is_saf_path(&destination) {
                     let info = match self.local_fs.stat(&source) {
-                        Ok(info) if (!info.is_dir || move_item) && !info.is_symlink => info,
-                        Ok(_) => return api_error(400, "Only regular files and movable directories are supported"),
+                        Ok(info) if !info.is_symlink => info,
+                        Ok(_) => return api_error(400, "Only regular files and directories are supported"),
                         Err(error) => return api_error(400, error.to_string()),
                     };
-                    (info.is_dir, if info.is_dir { 0 } else { info.size })
+                    (info.is_dir, if info.is_dir { 0 } else { info.size }, info.mtime)
                 } else {
-                    let meta = match std::fs::symlink_metadata(&source) { Ok(meta) if (meta.is_file() || (move_item && meta.is_dir())) && !meta.file_type().is_symlink() => meta, Ok(_) => return api_error(400, "Only regular files and movable directories are supported"), Err(error) => return api_error(400, error.to_string()) };
-                    (meta.is_dir(), if meta.is_dir() { 0 } else { meta.len() })
+                    let meta = match std::fs::symlink_metadata(&source) { Ok(meta) if (meta.is_file() || meta.is_dir()) && !meta.file_type().is_symlink() => meta, Ok(_) => return api_error(400, "Only regular files and directories are supported"), Err(error) => return api_error(400, error.to_string()) };
+                    let mt = gui_os::stat_extended(Path::new(&source)).map(|s| s.mtime_secs).unwrap_or(0);
+                    (meta.is_dir(), if meta.is_dir() { 0 } else { meta.len() }, mt)
                 };
+                if src_is_dir {
+                    let canon_src = std::fs::canonicalize(&source).unwrap_or_else(|_| PathBuf::from(&source));
+                    let canon_dst = std::fs::canonicalize(&destination).unwrap_or_else(|_| PathBuf::from(&destination));
+                    if canon_dst.starts_with(&canon_src) {
+                        return api_error(400, "Cannot copy or move a directory into itself.");
+                    }
+                }
                 is_dir = src_is_dir;
                 size = src_len;
+                src_mtime = mtime_val;
                 exists = if is_saf_path(&destination) { self.local_fs.stat(&destination).is_ok() } else { std::fs::symlink_metadata(&destination).is_ok() };
             } else if upload {
-                // A granted source is statted through `LocalFs`; the worker
-                // stages it before the guarded upload runs.
                 let local_str = local.to_string_lossy();
-                let (src_is_dir, src_len) = if is_saf_path(&local_str) {
+                let (src_is_dir, src_len, mtime_val) = if is_saf_path(&local_str) {
                     let info = match self.local_fs.stat(&local_str) {
                         Ok(info) if !info.is_symlink => info,
                         Ok(_) => return api_error(400, "Only regular files and directories can be transferred"),
                         Err(error) => return api_error(400, error.to_string()),
                     };
-                    (info.is_dir, if info.is_dir { 0 } else { info.size })
+                    (info.is_dir, if info.is_dir { 0 } else { info.size }, info.mtime)
                 } else {
                     let meta = match std::fs::symlink_metadata(&local) { Ok(meta) if (meta.is_file() || meta.is_dir()) && !meta.file_type().is_symlink() => meta, Ok(_) => return api_error(400, "Only regular files and directories can be transferred"), Err(error) => return api_error(400, error.to_string()) };
-                    (meta.is_dir(), if meta.is_dir() { 0 } else { meta.len() })
+                    let mt = gui_os::stat_extended(&local).map(|s| s.mtime_secs).unwrap_or(0);
+                    (meta.is_dir(), if meta.is_dir() { 0 } else { meta.len() }, mt)
                 };
                 is_dir = src_is_dir;
                 size = src_len;
+                src_mtime = mtime_val;
                 exists = match session.as_ref().unwrap().stat(&other).await {
                     Ok(Some(entry)) if entry.is_symlink || entry.is_dir != is_dir => return api_error(400, "Destination type conflicts with source or is a symlink"),
                     Ok(entry) => entry.is_some(), Err(error) => return api_error(400, error.to_string()),
@@ -2982,16 +3419,20 @@ impl CommanderService {
                 let entry = match session.as_ref().unwrap().stat(&other).await { Ok(Some(entry)) if !entry.is_symlink => entry, Ok(_) => return api_error(400, "Only existing files and directories can be transferred"), Err(error) => return api_error(400, error.to_string()) };
                 is_dir = entry.is_dir;
                 size = if is_dir { 0 } else { entry.size };
+                src_mtime = entry.mtime;
+                remote_entry_opt = Some(entry);
                 exists = if is_saf_path(&local.to_string_lossy()) { self.local_fs.stat(&local.to_string_lossy()).is_ok() } else { std::fs::symlink_metadata(&local).is_ok() };
             }
-            if resume && is_dir { return api_error(400, "Verified resume is supported only for individual files."); }
-            if resume && is_saf_path(&local.to_string_lossy()) { return api_error(400, "Verified resume is not supported for granted folders."); }
-            if move_item && !tab.is_local && is_dir { return api_error(400, "WebDAV directory moves are not supported."); }
+            if !parsed_mask.is_empty() && !parsed_mask.accepts(name, is_dir, size, src_mtime.max(0) as u64, name) {
+                continue;
+            }
+            if (resume || append) && is_dir { return api_error(400, "Resume and append are supported only for individual files."); }
+            if (resume || append) && is_saf_path(&local.to_string_lossy()) { return api_error(400, "Verified resume is not supported for granted folders; append is also unsupported."); }
+            if move_item && !tab.is_local && is_dir { return api_error(400, "Remote directory moves are not supported."); }
             if is_dir && !move_item {
                 let scheme = session.as_ref().map(|s| s.scheme());
                 let dav = matches!(scheme, Some(linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs));
-                if tab.is_local || (scheme != Some(linscp_types::ProtocolScheme::Sftp) && !dav) { return api_error(400, "Directory copies require SFTP or WebDAV."); }
-                if dav && !body.get("accept_directory_copy_risk").and_then(Value::as_bool).unwrap_or(false) {
+                if !tab.is_local && dav && !body.get("accept_directory_copy_risk").and_then(Value::as_bool).unwrap_or(false) {
                     return ApiReply { status: 409, payload: json!({"success": false, "error": "WebDAV directory copy requires confirmation", "directory_copy_risk": true}) };
                 }
                 if exists && !merge_names.contains(name) { directory_conflicts.push(name.to_string()); }
@@ -3000,9 +3441,6 @@ impl CommanderService {
                 return api_error(409, "Moves require a new destination; overwriting is not supported.");
             }
             if !upload || tab.is_local {
-                // A granted destination — a copy target or a download
-                // landing — is statted through `LocalFs`; uploads check the
-                // remote side instead, above.
                 let conflict = if is_saf_path(&destination) {
                     self.local_fs.stat(&destination).is_ok_and(|info| info.is_symlink || (is_dir && !info.is_dir) || (!is_dir && info.is_dir))
                 } else {
@@ -3011,16 +3449,12 @@ impl CommanderService {
                 };
                 if conflict { return api_error(400, "Destination type conflicts with source or is a symlink"); }
             }
-            // A granted end always carries bytes across the bridge whole,
-            // so an over-cap file refuses here — on a copy, an upload or a
-            // download; directories report size zero and are judged per
-            // file in the worker instead.
             if !is_dir && (is_saf_path(&source) || is_saf_path(&destination)) && size > linscp_platform::MAX_SAF_DOCUMENT_BYTES {
                 return api_error(400, linscp_platform::saf_document_too_large(name, size));
             }
             let is_dav_upload = !tab.is_local && upload && matches!(session.as_ref().unwrap().scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs);
             let is_s3_upload = !tab.is_local && upload && session.as_ref().unwrap().scheme() == linscp_types::ProtocolScheme::S3;
-            if exists && !is_dir && overwrite == "ask" {
+            if exists && !is_dir && !append && overwrite == "ask" {
                 conflicts.push(name.to_string());
                 let tag = if is_dav_upload {
                     match session.as_ref().unwrap().dav_get_etag(&other).await {
@@ -3040,33 +3474,66 @@ impl CommanderService {
             }
             // Approval applies only to destinations actually present at enqueue.
             // A different item appearing later must not inherit that approval.
-            let allow_overwrite = overwrite == "overwrite" && exists && !is_dir;
+            let allow_overwrite = overwrite == "overwrite" && exists && !is_dir && !append;
             if resume && allow_overwrite { return api_error(400, "Verified resume requires a new local destination."); }
-            if allow_overwrite && !is_dav_upload && !is_s3_upload && !is_ftp_upload {
-                return api_error(501, "Safe approved overwrites are not yet supported for this transfer. The destination was not changed.");
-            }
             let mut flags = linscp_engine::transfer::TransferFlags::default();
-            // Resuming existing partial files without verifying their source can
-            // splice unrelated bytes into the result. Always stage a fresh copy.
             flags.resume = resume;
-            flags.ftp_risky_publish = is_ftp_upload && ftp_risk_accepted;
-            // Approval is per root and only applies to directories that exist now.
+            flags.append = append;
+            flags.newer_only = newer_only;
+            flags.transfer_mode = transfer_mode;
+            flags.file_mask = parsed_mask.clone();
+            flags.speed_kbytes_per_sec = if speed_kb == 0 { None } else { Some(speed_kb) };
+            flags.permissions = if no_permissions {
+                linscp_engine::presets::PresetPermissions::Off
+            } else {
+                linscp_engine::presets::PresetPermissions::FromFile
+            };
+            flags.ftp_risky_publish = is_ftp_upload && !append && ftp_risk_accepted;
             flags.merge_directories = is_dir && exists && merge_names.contains(name);
-            flags.resume_support = linscp_engine::presets::ResumeSupportMode::On;
+            let is_scp_sess = session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh));
+            flags.resume_support = if is_scp_sess && !explicit_resume_support {
+                linscp_engine::presets::ResumeSupportMode::Off
+            } else {
+                parsed_resume_support
+            };
+            flags.explicit_resume_support = explicit_resume_support;
             flags.preserve_time = body.get("preserve_time").and_then(Value::as_bool).unwrap_or(true);
-            if (move_item && !tab.is_local) || resume {
+            if (!upload && move_item && !tab.is_local) || resume {
                 let sess = session.as_ref().unwrap();
-                let tag = if sess.scheme() == linscp_types::ProtocolScheme::S3 {
-                    sess.s3_get_etag(&other).await
-                } else {
-                    sess.dav_get_etag(&other).await.map(|(tag, missing)| if missing { None } else { tag })
-                };
-                let tag = match tag {
-                    Ok(Some(tag)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => tag,
-                    Ok(_) => return api_error(400, "Moves and verified resume require a strong source ETag."),
-                    Err(error) => return api_error(400, error.to_string()),
-                };
-                flags.source_etag = Some(tag);
+                match sess.scheme() {
+                    linscp_types::ProtocolScheme::S3 => {
+                        let tag = match sess.s3_get_etag(&other).await {
+                            Ok(Some(tag)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => tag,
+                            Ok(_) => return api_error(400, "S3 moves and verified resume require a strong source ETag."),
+                            Err(error) => return api_error(400, error.to_string()),
+                        };
+                        flags.source_etag = Some(tag);
+                    }
+                    linscp_types::ProtocolScheme::Dav
+                    | linscp_types::ProtocolScheme::Davs
+                    | linscp_types::ProtocolScheme::Webdav
+                    | linscp_types::ProtocolScheme::Webdavs => {
+                        let tag = match sess.dav_get_etag(&other).await.map(|(tag, missing)| if missing { None } else { tag }) {
+                            Ok(Some(tag)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => tag,
+                            Ok(_) => return api_error(400, "WebDAV moves and verified resume require a strong source ETag."),
+                            Err(error) => return api_error(400, error.to_string()),
+                        };
+                        flags.source_etag = Some(tag);
+                    }
+                    linscp_types::ProtocolScheme::Sftp if resume => {
+                        let entry = remote_entry_opt.as_ref().expect("remote download entry");
+                        flags.source_etag = Some(format!("\"sftp:{}:{}\"", entry.size, entry.mtime));
+                    }
+                    linscp_types::ProtocolScheme::Ftp
+                    | linscp_types::ProtocolScheme::Ftps
+                    | linscp_types::ProtocolScheme::Ftpes
+                        if resume =>
+                    {
+                        let entry = remote_entry_opt.as_ref().expect("remote download entry");
+                        flags.source_etag = Some(format!("\"ftp:{}:{}\"", entry.size, entry.mtime));
+                    }
+                    _ => {}
+                }
             }
             if allow_overwrite && (is_dav_upload || is_s3_upload) {
                 let tag = body.get("conflict_versions").and_then(|v| v.get(name)).and_then(Value::as_str);
@@ -3076,15 +3543,22 @@ impl CommanderService {
                 }
             }
             let job = if tab.is_local {
-                queue::QueueJob::LocalCopyOrMove { source: PathBuf::from(&source), target: PathBuf::from(&destination), move_item, policy: if allow_overwrite { queue::ConflictPolicy::Overwrite } else { queue::ConflictPolicy::Ask } }
+                queue::QueueJob::LocalCopyOrMove {
+                    source: PathBuf::from(&source),
+                    target: PathBuf::from(&destination),
+                    move_item,
+                    policy: if allow_overwrite { queue::ConflictPolicy::Overwrite } else { queue::ConflictPolicy::Ask },
+                    flags,
+                }
             } else if upload {
-                queue::QueueJob::RemoteUpload { session: session.as_ref().unwrap().clone(), local_src: local, remote_dest: other, allow_overwrite, delete_source: false, cleanup_path: None, flags }
+                queue::QueueJob::RemoteUpload { session: session.as_ref().unwrap().clone(), local_src: local, remote_dest: other, allow_overwrite, delete_source: move_item, cleanup_path: None, flags }
             } else {
                 queue::QueueJob::RemoteDownload { session: session.as_ref().unwrap().clone(), remote_path: other, local_dest: local, allow_overwrite, delete_source: move_item, flags }
             };
             jobs.push((name.to_string(), source, destination, size, job));
         }
         if !conflicts.is_empty() || !directory_conflicts.is_empty() { return ApiReply { status: 409, payload: json!({"success": false, "error": "Destination exists", "conflicts": conflicts, "directory_conflicts": directory_conflicts, "conflict_versions": conflict_versions}) }; }
+        if jobs.is_empty() { return api_error(400, "The file mask does not match any of the selected items."); }
         for (name, source, destination, size, job) in jobs {
             self.queue.enqueue(Some(id), if upload { "upload" } else { "download" }, name, source, destination, size, body.get("priority").and_then(Value::as_bool).unwrap_or(false), job);
         }
@@ -3455,6 +3929,7 @@ impl CommanderService {
             // request waits on this mutex.
             let ended = tab.remote.take();
             state.auto_retry_at.insert(format!("tab:{tab_id}"), std::time::Instant::now());
+            state.desktop_tunnels.retain(|_, (owner, _)| *owner != Some(tab_id));
             let ended_viewer = state.x2go.remove(&tab_id);
             (format!("[Session] {name}: {}", REASON.to_lowercase()), ended, ended_viewer)
         };
@@ -4535,6 +5010,7 @@ impl CommanderService {
         // A terminal lives in a tab's connection; closing the tab must not
         // leave the shell running with no window to show it.
         g.terminals.close_for_tab(tab_id);
+        g.desktop_tunnels.retain(|_, (owner, _)| *owner != Some(tab_id));
         let ended_viewer = g.x2go.remove(&tab_id);
         g.monitors.forget(tab_id);
         if g.active_tab_id == Some(tab_id) { g.active_tab_id = g.tabs.keys().next().cloned(); }
@@ -5170,7 +5646,7 @@ impl CommanderService {
             // retry is the same drop plus one decision.
             for key in ["accept_directory_copy_risk", "accept_ftp_rename_risk", "merge_directories",
                         "overwrite", "priority", "preserve_time", "conflict_versions", "resume",
-                        "transfer", "speed", "filemask", "resumesupport"] {
+                        "transfer", "speed", "filemask", "resumesupport", "newer_only", "append", "no_permissions"] {
                 if let Some(value) = body.get(key) {
                     request[key] = value.clone();
                 }
@@ -5221,12 +5697,19 @@ impl CommanderService {
         if let Err(error) = std::fs::write(&staged, &bytes) {
             return api_error(500, format!("Cannot stage the dropped file: {error}"));
         }
-        let request = json!({
+        let mut request = json!({
             "tab": tab.id,
             "local_dir": staging.to_string_lossy(),
             "remote_dir": destination_dir,
             "names": [name],
         });
+        for key in ["accept_directory_copy_risk", "accept_ftp_rename_risk", "merge_directories",
+                    "overwrite", "priority", "preserve_time", "conflict_versions", "resume",
+                    "transfer", "speed", "filemask", "resumesupport", "newer_only", "append", "no_permissions"] {
+            if let Some(value) = body.get(key) {
+                request[key] = value.clone();
+            }
+        }
         let reply = self.queue_transfer_async(request, true, false).await;
         if !reply.payload.get("success").and_then(Value::as_bool).unwrap_or(false) {
             // The queue never took it, so the staged copy is ours to remove.
@@ -6292,16 +6775,23 @@ impl CommanderService {
             (target_host.clone(), target_port, match kind { RemoteDesktopKind::Rdp => linscp_types::ProtocolScheme::Rdp, RemoteDesktopKind::Vnc => linscp_types::ProtocolScheme::Vnc, RemoteDesktopKind::Spice => linscp_types::ProtocolScheme::Spice, RemoteDesktopKind::X2Go => linscp_types::ProtocolScheme::X2Go, RemoteDesktopKind::X11 => linscp_types::ProtocolScheme::X11 })
         };
         // Try to find the desktop tab to get full spec (including raw_fields, tunnel)
+        let want_ssh_tunnel = body.get("tunnel_via_ssh").and_then(Value::as_bool).unwrap_or(false);
         let tab_for_launch = if let Some(tid) = tab_id { self.state.lock().expect("m").tabs.get(&tid).cloned() } else { None };
-        let (cfg, target, tunneled) = if let Some(tab) = tab_for_launch.as_ref() {
+        let (cfg, target, mut tunneled) = if let Some(tab) = tab_for_launch.as_ref() {
             if let Some(spec) = tab.spec.as_ref() {
+                let is_desktop_spec = spec.session.protocol.is_remote_desktop();
                 let k = RemoteDesktopKind::from_scheme(spec.session.protocol).unwrap_or(kind);
-                let p = if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port };
-                let t = format!("{}:{}", spec.session.host, p);
+                let host_eff = if is_desktop_spec { spec.session.host.clone() } else if !spec_host.is_empty() { spec_host.clone() } else { spec.session.host.clone() };
+                let p = if is_desktop_spec {
+                    if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port }
+                } else {
+                    spec_port
+                };
+                let t = format!("{}:{}", host_eff, p);
                 let mut opts = DesktopOptions::from_raw_fields(&spec.raw_fields);
                 if kind == RemoteDesktopKind::X2Go { opts.use_detected_x2go_desktop(detected_desktop); }
-                let tun = spec.session.tunnel.as_ref().map(|t| t.enabled && !t.host.trim().is_empty()).unwrap_or(false);
-                let c = RemoteDesktopConnectConfig{ scheme: spec.session.protocol, kind: k, host: spec.session.host.clone(), port: p, username: if spec.session.username.is_empty() { None } else { Some(spec.session.username.clone()) }, password: spec.session.password.clone().map(zeroize::Zeroizing::new), domain: opts.domain.clone(), desktop_opts: opts, tls: linscp_proto::tls::TlsSettings::default(), proxy: None, timeout: std::time::Duration::from_secs(15) };
+                let tun = spec.session.tunnel.as_ref().map(|t| t.enabled && !t.host.trim().is_empty()).unwrap_or(false) || want_ssh_tunnel;
+                let c = RemoteDesktopConnectConfig{ scheme: if is_desktop_spec { spec.session.protocol } else { spec_protocol }, kind: k, host: host_eff, port: p, username: if spec.session.username.is_empty() { None } else { Some(spec.session.username.clone()) }, password: spec.session.password.clone().map(zeroize::Zeroizing::new), domain: opts.domain.clone(), desktop_opts: opts, tls: linscp_proto::tls::TlsSettings::default(), proxy: None, timeout: std::time::Duration::from_secs(15) };
                 (c, t, tun)
             } else { return ApiReply{ status:400, payload: json!({"success": false, "error": "Tab has no session spec"})}; }
         } else {
@@ -6310,20 +6800,105 @@ impl CommanderService {
             if kind == RemoteDesktopKind::X2Go { opts.use_detected_x2go_desktop(detected_desktop); }
             let c = RemoteDesktopConnectConfig{ scheme: spec_protocol, kind, host: spec_host.clone(), port: spec_port, username: None, password: None, domain: None, desktop_opts: opts, tls: linscp_proto::tls::TlsSettings::default(), proxy: None, timeout: std::time::Duration::from_secs(15) };
             let t = format!("{}:{}", spec_host, spec_port);
-            (c, t, false)
+            (c, t, want_ssh_tunnel)
         };
-        let proto_ticket = ticket_from_config(&cfg, kind, &target, tunneled, None);
+        let mut tunnel_port_opt = None;
+        let mut tunnel_id_opt: Option<u64> = None;
+        if (tunneled || want_ssh_tunnel) && matches!(kind, RemoteDesktopKind::Rdp | RemoteDesktopKind::Vnc | RemoteDesktopKind::Spice) {
+            if let Some(ssh) = via_session.as_ref().and_then(|s| s.ssh_connection()).cloned() {
+                match linscp_proto::tunnel::start_local_forward_relay(
+                    ssh,
+                    cfg.host.clone(),
+                    cfg.port,
+                    std::time::Duration::from_secs(900),
+                )
+                .await
+                {
+                    Ok(relay) => {
+                        let bound = relay.local_port();
+                        let mut state = self.state.lock().expect("m");
+                        state.next_desktop_tunnel_id = state.next_desktop_tunnel_id.saturating_add(1);
+                        let tid = state.next_desktop_tunnel_id;
+                        state.desktop_tunnels.insert(tid, (via_tab_id, relay));
+                        tunnel_port_opt = Some(bound);
+                        tunnel_id_opt = Some(tid);
+                        tunneled = true;
+                    }
+                    Err(e) => return api_error(500, format!("Could not open local SSH forwarder: {e}")),
+                }
+            }
+        }
+        let proto_ticket = ticket_from_config(
+            &cfg,
+            kind,
+            &target,
+            tunneled,
+            tunnel_port_opt.map(|p| format!("127.0.0.1:{p}")),
+        );
         let ticket = linscp_platform::desktop::DesktopTicket{ kind: proto_ticket.kind.clone(), target: proto_ticket.target.clone(), viewer: proto_ticket.viewer.clone(), argv: proto_ticket.argv.clone(), file_content: proto_ticket.file_content.clone(), file_extension: proto_ticket.file_extension.clone(), tunneled: proto_ticket.tunneled, local_endpoint: proto_ticket.local_endpoint.clone() };
         let config_root = self.state.lock().expect("m").config_root.clone();
         let force_file_ticket = !self.desktop_spawn_allowed;
         match linscp_platform::desktop::launch_remote_desktop(&ticket, &config_root, force_file_ticket) {
-            Ok(linscp_platform::desktop::DesktopLaunchResult::Spawned{ pid, viewer, argv }) => ApiReply{ status:200, payload: json!({"success": true, "launched": true, "available": true, "pid": pid, "viewer": viewer.display().to_string(), "argv": argv, "kind": kind.as_str(), "host": target_host, "target": ticket.target, "local_endpoint": ticket.local_endpoint, "tunneled": ticket.tunneled})},
+            Ok(linscp_platform::desktop::DesktopLaunchResult::Spawned{ pid, viewer, argv }) => ApiReply{ status:200, payload: json!({"success": true, "launched": true, "available": true, "pid": pid, "viewer": viewer.display().to_string(), "argv": argv, "kind": kind.as_str(), "host": target_host, "target": ticket.target, "local_endpoint": ticket.local_endpoint, "tunneled": ticket.tunneled, "tunnel_id": tunnel_id_opt})},
             Ok(linscp_platform::desktop::DesktopLaunchResult::FileTicket{ path, viewer_hint }) => {
                 let file_content = proto_ticket.file_content.clone().or_else(|| std::fs::read_to_string(&path).ok());
-                ApiReply{ status:200, payload: json!({"success": true, "launched": false, "available": true, "file": path.display().to_string(), "file_content": file_content, "file_extension": proto_ticket.file_extension, "viewer_hint": viewer_hint, "kind": ticket.kind, "target": ticket.target, "local_endpoint": ticket.local_endpoint, "tunneled": ticket.tunneled})}
+                ApiReply{ status:200, payload: json!({"success": true, "launched": false, "available": true, "file": path.display().to_string(), "file_content": file_content, "file_extension": proto_ticket.file_extension, "viewer_hint": viewer_hint, "kind": ticket.kind, "target": ticket.target, "local_endpoint": ticket.local_endpoint, "tunneled": ticket.tunneled, "tunnel_id": tunnel_id_opt})}
             },
-            Ok(linscp_platform::desktop::DesktopLaunchResult::BrowserGateway{ url_hint }) => ApiReply{ status:200, payload: json!({"success": true, "launched": false, "available": true, "gateway": url_hint, "kind": ticket.kind, "viewer": ticket.viewer, "argv": ticket.argv, "target": ticket.target, "local_endpoint": ticket.local_endpoint, "tunneled": ticket.tunneled})},
-            Err(e) => ApiReply{ status:500, payload: json!({"success": false, "error": e})},
+            Ok(linscp_platform::desktop::DesktopLaunchResult::BrowserGateway{ url_hint }) => ApiReply{ status:200, payload: json!({"success": true, "launched": false, "available": true, "gateway": url_hint, "kind": ticket.kind, "viewer": ticket.viewer, "argv": ticket.argv, "target": ticket.target, "local_endpoint": ticket.local_endpoint, "tunneled": ticket.tunneled, "tunnel_id": tunnel_id_opt})},
+            Err(e) => {
+                if let Some(tid) = tunnel_id_opt {
+                    let removed = self.state.lock().expect("m").desktop_tunnels.remove(&tid);
+                    if let Some((_, relay)) = removed { relay.shutdown().await; }
+                }
+                ApiReply{ status:500, payload: json!({"success": false, "error": e})}
+            },
+        }
+    }
+
+    async fn handle_desktop_tunnel_close_async(&self, body: Value) -> ApiReply {
+        let mut relays = Vec::new();
+        if let Some(id) = body.get("tunnel_id").and_then(Value::as_u64) {
+            if let Some((_, relay)) = self.state.lock().expect("m").desktop_tunnels.remove(&id) {
+                relays.push(relay);
+            }
+        } else if let Some(tab_id) = tabs::parse_tab_id_value(body.get("tab")) {
+            let mut state = self.state.lock().expect("m");
+            let matching_ids: Vec<u64> = state
+                .desktop_tunnels
+                .iter()
+                .filter_map(|(id, (tab, _))| (*tab == Some(tab_id)).then_some(*id))
+                .collect();
+            for id in matching_ids {
+                if let Some((_, relay)) = state.desktop_tunnels.remove(&id) {
+                    relays.push(relay);
+                }
+            }
+        } else {
+            return api_error(400, "tunnel_id or tab is required");
+        }
+        let closed = !relays.is_empty();
+        for relay in relays {
+            relay.shutdown().await;
+        }
+        ApiReply { status: 200, payload: json!({ "success": true, "closed": closed }) }
+    }
+
+    fn handle_desktop_tunnels_list(&self) -> ApiReply {
+        let state = self.state.lock().expect("m");
+        let tunnels: Vec<Value> = state
+            .desktop_tunnels
+            .iter()
+            .map(|(id, (tab, relay))| {
+                json!({
+                    "tunnel_id": id,
+                    "tab": tab,
+                    "local_endpoint": format!("127.0.0.1:{}", relay.local_port()),
+                })
+            })
+            .collect();
+        ApiReply {
+            status: 200,
+            payload: json!({ "success": true, "active": tunnels.len(), "tunnels": tunnels }),
         }
     }
 }
@@ -9187,7 +9762,7 @@ mod tests {
         assert!(service.ensure_full_restore_quiescent().is_ok());
         service.queue.pause();
         let id = service.queue.enqueue(None, "local", "fixture".into(), "source".into(), "target".into(), 0, false,
-            queue::QueueJob::LocalCopyOrMove { source: PathBuf::from("source"), target: PathBuf::from("target"), move_item: false, policy: queue::ConflictPolicy::Ask });
+            queue::QueueJob::LocalCopyOrMove { source: PathBuf::from("source"), target: PathBuf::from("target"), move_item: false, policy: queue::ConflictPolicy::Ask, flags: linscp_engine::transfer::TransferFlags::default() });
         assert!(service.ensure_full_restore_quiescent().is_err());
         assert!(service.queue.cancel(id));
         assert!(service.ensure_full_restore_quiescent().is_ok());
@@ -9264,6 +9839,7 @@ mod tests {
                 target: PathBuf::from("target"),
                 move_item: false,
                 policy: queue::ConflictPolicy::Ask,
+                flags: linscp_engine::transfer::TransferFlags::default(),
             },
         );
         assert_eq!(dst.dispatch(restore_req()).status, 409);
@@ -9859,9 +10435,17 @@ mod tests {
         let conflict = svc.dispatch_async(request()).await;
         assert_eq!(conflict.status, 409);
         assert_eq!(std::fs::read(right.join("data.txt")).unwrap(), b"do not overwrite");
-        let refused = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": left, "remote_dir": right, "names": ["data.txt"], "overwrite": "overwrite"}) }).await;
-        assert_eq!(refused.status, 501, "{}", refused.payload);
-        assert_eq!(std::fs::read(right.join("data.txt")).unwrap(), b"do not overwrite");
+        let approved_existing = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": left, "remote_dir": right, "names": ["data.txt"], "overwrite": "overwrite"}) }).await;
+        assert_eq!(approved_existing.status, 200, "{}", approved_existing.payload);
+        let mut overwritten = false;
+        for _ in 0..200 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(1).and_then(|v| v["status"].as_str()) == Some("Completed") { overwritten = true; break; }
+            if tasks.get(1).and_then(|v| v["status"].as_str()) == Some("Failed") { panic!("approved overwrite failure: {tasks:?}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(overwritten, "approved overwrite did not complete");
+        assert_eq!(std::fs::read(right.join("data.txt")).unwrap(), b"test content");
         let invalid = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": left, "remote_dir": right, "names": ["../data.txt"]}) }).await;
         assert_eq!(invalid.status, 400);
         std::fs::write(left.join("later.txt"), b"new data").unwrap();
@@ -9873,7 +10457,7 @@ mod tests {
         let mut failed = false;
         for _ in 0..200 {
             let (tasks, _) = svc.queue.snapshot();
-            if tasks.get(1).and_then(|v| v["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(2).and_then(|v| v["status"].as_str()) == Some("Failed") { failed = true; break; }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(failed, "new destination should fail without overwrite approval");
@@ -9887,7 +10471,7 @@ mod tests {
         let mut failed = false;
         for _ in 0..200 {
             let (tasks, _) = svc.queue.snapshot();
-            if tasks.get(2).and_then(|v| v["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(3).and_then(|v| v["status"].as_str()) == Some("Failed") { failed = true; break; }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(failed, "approval for existing destinations must not apply to new files");
@@ -10115,9 +10699,34 @@ mod tests {
         }
         assert!(failed);
         assert!(dest.stat("/source-race.txt").await.unwrap().is_none());
-        let rejected = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": source_id, "target": format!("tab:{dest_id}"), "directory": "/", "names": ["copy.txt"], "operation": "move", "accept_cross_move_risk": true}))).await;
-        assert_eq!(rejected.status, 501);
+        let idx = svc.queue.snapshot().0.len();
+        let moved = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": source_id, "target": format!("tab:{dest_id}"), "directory": "/", "names": ["copy.txt"], "operation": "move", "accept_cross_move_risk": true}))).await;
+        assert_eq!(moved.status, 200, "{}", moved.payload);
+        // Note: `/copy.txt` already exists on `dest` from earlier copy, so exclusive move fails without deleting S3 source!
+        let mut failed = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { failed = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("move overwrote existing destination"); }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(failed);
         assert_eq!(linscp_proto::download_bytes(source.as_ref(), "/photos/copy.txt", Default::default()).await.unwrap(), b"S3 source");
+        // Moving to a fresh destination uploads conditionally and deletes the S3 source conditionally.
+        dest.mkdir("/moved").await.unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let moved_ok = svc.dispatch_async(request("/api/remote/transfer", json!({"tab": source_id, "target": format!("tab:{dest_id}"), "directory": "/moved", "names": ["copy.txt"], "operation": "move", "accept_cross_move_risk": true}))).await;
+        assert_eq!(moved_ok.status, 200, "{}", moved_ok.payload);
+        let mut done = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { done = true; break; }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") { panic!("S3 cross-move failed: {:?}", tasks.get(idx)); }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(done);
+        assert_eq!(linscp_proto::download_bytes(dest.as_ref(), "/moved/copy.txt", Default::default()).await.unwrap(), b"S3 source");
+        assert!(source.stat("/photos/copy.txt").await.unwrap().is_none());
         drop(s3); drop(dav); let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -10497,8 +11106,8 @@ mod tests {
         assert_eq!(reopened.status, 200, "{}", reopened.payload);
         assert_eq!(std::fs::metadata(&expired_path).unwrap().len(), 0, "NoSuchUpload should resolve the journal");
         assert_eq!(std::fs::read(&other_path).unwrap(), other_bytes, "unrelated 404 must remain unresolved");
-        // Enforce the supported upper bound without an unconditional fallback.
-        std::fs::OpenOptions::new().write(true).open(local.join("upload.txt")).unwrap().set_len(1024 * 1024 * 1024 + 1).unwrap();
+        // Enforce the supported upper bound (5 TiB S3 object limit) without an unconditional fallback.
+        std::fs::OpenOptions::new().write(true).open(local.join("upload.txt")).unwrap().set_len(5u64 * 1024 * 1024 * 1024 * 1024 + 1).unwrap();
         let conflict = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"]}))).await;
         let large_index = svc.queue.snapshot().0.len();
         let large = svc.dispatch_async(request("/api/transfer/upload", json!({"tab": id, "local_dir": local, "remote_dir": "/photos", "names": ["upload.txt"], "overwrite": "overwrite", "conflict_versions": conflict.payload["conflict_versions"]}))).await;
@@ -13757,6 +14366,20 @@ mod tests {
             docs.insert(uri.clone(), MockDoc { bytes: Some(data.to_vec()) });
             Ok(uri)
         }
+        fn append_uri_chunk(&self, uri: &str, data: &[u8]) -> Result<(), PlatformError> {
+            let mut docs = self.docs.lock().expect("m");
+            let Some(doc) = docs.get_mut(uri) else {
+                return Err(PlatformError::Unsupported(format!("Unknown document: {uri}")));
+            };
+            let Some(bytes) = doc.bytes.as_mut() else {
+                return Err(PlatformError::Unsupported(format!("Cannot append to directory: {uri}")));
+            };
+            bytes.extend_from_slice(data);
+            Ok(())
+        }
+        fn supports_chunked_write(&self) -> bool {
+            true
+        }
         fn mkdir_uri(&self, parent_uri: &str, name: &str) -> Result<String, PlatformError> {
             let uri = format!("{parent_uri}/document/{name}");
             let mut docs = self.docs.lock().expect("m");
@@ -13946,10 +14569,12 @@ mod tests {
         let refused = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": right, "names": ["big.bin"]}) }).await;
         assert_eq!(refused.status, 400, "{}", refused.payload);
         assert!(refused.payload["error"].as_str().unwrap_or("").contains("larger than a granted folder can carry"), "{}", refused.payload);
-        // A directory copy keeps the plain panes' refusal.
+        // A directory copy recursively copies granted directories across the bridge.
+        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/folder/document/inside.txt"), b"nested bytes");
         let dir_copy = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": right, "names": ["folder"]}) }).await;
-        assert_eq!(dir_copy.status, 400, "{}", dir_copy.payload);
-        assert!(dir_copy.payload["error"].as_str().unwrap_or("").contains("Only regular files and movable directories are supported"), "{}", dir_copy.payload);
+        assert_eq!(dir_copy.status, 200, "{}", dir_copy.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(std::fs::read(right.join("folder").join("inside.txt")).unwrap(), b"nested bytes".to_vec());
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -14994,5 +15619,103 @@ mod tests {
             })
             .await;
         assert_eq!(check_disconnected.status, 400);
+    }
+
+    #[tokio::test]
+    async fn s3_dav_x2go_and_desktop_tunnel_routes_validate_and_track_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(temp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
+
+        // Active desktop tunnels start empty and tunnel-close is idempotent.
+        let tunnels = svc
+            .dispatch_async(ApiEnvelope {
+                method: "GET".into(),
+                path: "/api/desktop/tunnels".into(),
+                body: json!({}),
+            })
+            .await;
+        assert_eq!(tunnels.status, 200);
+        assert_eq!(tunnels.payload["tunnels"], json!([]));
+
+        let close_none = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/desktop/tunnel-close".into(),
+                body: json!({"tab": 1, "kind": "rdp"}),
+            })
+            .await;
+        assert_eq!(close_none.status, 200);
+        assert_eq!(close_none.payload["closed"], false);
+
+        // Register a live loopback forwarder under tunnel_id 1 (tab 1) and verify listing + close.
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let relay = linscp_proto::tunnel::start_local_forward_relay_with_connector(
+            std::time::Duration::from_secs(60),
+            move || async move {
+                let stream = tokio::net::TcpStream::connect(upstream_addr)
+                    .await
+                    .map_err(|e| linscp_proto::ProtoError::Transport(e.to_string()))?;
+                let boxed: Box<dyn linscp_platform::AsyncStream> = Box::new(stream);
+                Ok(boxed)
+            },
+        )
+        .await
+        .unwrap();
+        let bound_port = relay.local_port();
+        svc.state
+            .lock()
+            .unwrap()
+            .desktop_tunnels
+            .insert(1, (Some(1), relay));
+
+        let listed = svc
+            .dispatch_async(ApiEnvelope {
+                method: "GET".into(),
+                path: "/api/desktop/tunnels".into(),
+                body: json!({}),
+            })
+            .await;
+        assert_eq!(listed.status, 200);
+        assert_eq!(listed.payload["tunnels"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            listed.payload["tunnels"][0]["local_endpoint"],
+            format!("127.0.0.1:{bound_port}")
+        );
+
+        let closed = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/desktop/tunnel-close".into(),
+                body: json!({"tab": 1, "kind": "rdp"}),
+            })
+            .await;
+        assert_eq!(closed.status, 200);
+        assert_eq!(closed.payload["closed"], true);
+
+        // S3 versioning, WebDAV lock/property, and X2Go session/suspend/clipboard routes
+        // fail closed when disconnected or on a local tab.
+        for path in [
+            "/api/s3/versions",
+            "/api/s3/version-download",
+            "/api/s3/version-delete",
+            "/api/dav/lock",
+            "/api/dav/unlock",
+            "/api/dav/property",
+            "/api/x2go/sessions",
+            "/api/x2go/suspend",
+            "/api/x2go/terminate",
+            "/api/x2go/clipboard",
+        ] {
+            let reply = svc
+                .dispatch_async(ApiEnvelope {
+                    method: "POST".into(),
+                    path: path.into(),
+                    body: json!({"tab": 1, "name": "item.txt", "generation": "1"}),
+                })
+                .await;
+            assert_eq!(reply.status, 400, "{path}: {}", reply.payload);
+        }
     }
 }

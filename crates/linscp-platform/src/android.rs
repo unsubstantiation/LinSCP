@@ -16,6 +16,11 @@ use linscp_types::{FileEntry, LocalRootEntry};
 
 use crate::PlatformError;
 
+/// Default chunk size (1 MiB) for streaming Storage Access Framework reads/writes
+/// across the Android plugin bridge so multi-megabyte transfers never materialize
+/// a full Base64 JSON buffer in the JVM or Rust heap.
+pub const SAF_CHUNK_BYTES: usize = 1024 * 1024;
+
 /// Bridge implemented by the Tauri Android plugin to enumerate and operate on
 /// user-granted Storage Access Framework (`content://`) document trees without
 /// leaking JNI types into shared Rust crates.
@@ -35,6 +40,39 @@ pub trait SafBridge: Send + Sync {
     fn mkdir_uri(&self, parent_uri: &str, name: &str) -> Result<String, PlatformError>;
     fn delete_uri(&self, uri: &str) -> Result<(), PlatformError>;
     fn rename_uri(&self, uri: &str, new_name: &str) -> Result<String, PlatformError>;
+
+    /// Reads up to `length` bytes starting at `offset` from a `content://` URI.
+    /// Returning fewer than `length` bytes (or empty) signals EOF.
+    fn read_uri_chunk(&self, uri: &str, offset: u64, length: usize) -> Result<Vec<u8>, PlatformError> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let all = self.read_uri_bytes(uri)?;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        if start >= all.len() {
+            return Ok(Vec::new());
+        }
+        let end = start.saturating_add(length).min(all.len());
+        Ok(all[start..end].to_vec())
+    }
+
+    /// Creates or truncates a document under `parent_uri` and returns its URI
+    /// for subsequent `append_uri_chunk` calls.
+    fn begin_write_uri(&self, parent_uri: &str, name: &str) -> Result<String, PlatformError> {
+        self.write_uri_bytes(parent_uri, name, &[])
+    }
+
+    /// Appends a chunk of bytes to a document previously opened with `begin_write_uri`.
+    fn append_uri_chunk(&self, uri: &str, _data: &[u8]) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported(format!(
+            "Chunked SAF append is not implemented by this bridge for '{uri}'"
+        )))
+    }
+
+    /// Whether this bridge implements `begin_write_uri` + `append_uri_chunk`.
+    fn supports_chunked_write(&self) -> bool {
+        false
+    }
 }
 
 /// Bridge for staging incoming Android Share Sheet intents (`ACTION_SEND` /

@@ -111,7 +111,8 @@ class AndroidApplicationIdTests(unittest.TestCase):
         self.assertTrue(source.is_file())
         kotlin = source.read_text(encoding='utf-8')
         for command in ['pickTree', 'grantedTrees', 'listTree', 'statUri', 'readUri',
-                        'writeUri', 'mkdirUri', 'deleteUri', 'renameUri',
+                        'readUriChunk', 'writeUri', 'beginWriteUri', 'appendUriChunk',
+                        'mkdirUri', 'deleteUri', 'renameUri',
                         'stageUris', 'takePendingShares', 'openExternalUri',
                         'foregroundStart', 'foregroundUpdate', 'foregroundStop']:
             self.assertIn('fun ' + command + '(', kotlin)
@@ -125,13 +126,14 @@ class AndroidApplicationIdTests(unittest.TestCase):
         self.assertIn("'linscp_open_external_uri'", smoke)
         self.assertIn('unsafeUriRejected', smoke)
         page = (ROOT / 'source/gui/web/index.html').read_text(encoding='utf-8')
-        self.assertIn('LinSCPCore.androidDesktopViewerUri(kind, endpoint, false)', page)
+        self.assertIn('LinSCPCore.androidDesktopViewerUri(kind, endpoint, !!data.tunneled)', page)
         self.assertIn("androidViewers.includes(option.value)", page)
         self.assertIn("kindSelect.value = 'rdp'", page)
         # Content providers may block for remote/cloud-backed documents. Keep
         # their work off the Activity thread and marshal only the result back.
         for command in ['grantedTrees', 'listTree', 'statUri', 'readUri',
-                        'writeUri', 'mkdirUri', 'deleteUri', 'renameUri', 'stageUris']:
+                        'readUriChunk', 'writeUri', 'beginWriteUri', 'appendUriChunk',
+                        'mkdirUri', 'deleteUri', 'renameUri', 'stageUris']:
             match = re.search(
                 r'fun ' + command + r'\(invoke: Invoke\) \{(.*?)(?=\n  @Command|\n  private fun)',
                 kotlin, re.DOTALL)

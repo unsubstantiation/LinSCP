@@ -39,3 +39,22 @@ test('checks aggregate decoded image size before allocating images', () => {
   value.frame.regions = [{...value.frame.regions[0],data:'AAAA'.repeat(5_592_406)}];
   assert.throws(() => decodeKDriveViewerMessage(value), /limit|encoding/);
 });
+
+test('decodes cursor, deleted-cursors, selection and demand-selection messages', () => {
+  const cur = decodeKDriveViewerMessage({
+    type: 'cursor',
+    cursor: { serial: 7, width: 2, height: 1, hotX: 1, hotY: 0, foreground: [255, 255, 255], background: [0, 0, 0], data: 'AQIDBAUGBwg=' }
+  });
+  assert.equal(cur.type, 'cursor');
+  assert.equal(cur.cursor.serial, 7);
+  assert.equal(cur.cursor.data.byteLength, 8);
+  assert.deepEqual(decodeKDriveViewerMessage({ type: 'deleted-cursors', ids: [7, 8] }), { type: 'deleted-cursors', ids: [7, 8] });
+  const sel = decodeKDriveViewerMessage({
+    type: 'selection',
+    selection: { selection: 0, format: 0, chunkSize: 5, first: true, last: true, compressedSize: 0, total: 5, data: 'aGVsbG8=' }
+  });
+  assert.equal(sel.type, 'selection');
+  assert.equal(new TextDecoder().decode(sel.selection.data), 'hello');
+  assert.deepEqual(decodeKDriveViewerMessage({ type: 'demand-selection', selection: 0 }), { type: 'demand-selection', selection: 0 });
+});
+

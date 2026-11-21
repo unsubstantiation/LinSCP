@@ -586,7 +586,7 @@ pub async fn download_single_file(
     }
 
     let use_stage = should_use_filepart(flags, session.scheme(), false, false, info.size);
-    if flags.cleanup_download_stage && (flags.resume || flags.append || !use_stage) {
+    if flags.cleanup_download_stage && (flags.resume || flags.append) {
         return Err("Automatic cleanup requires a fresh staged download.".to_string());
     }
     // The private temp file is created exclusively in the destination directory
@@ -922,8 +922,8 @@ pub async fn upload_single_file(
     }
 
     if flags.sftp_risky_publish {
-        if !matches!(session.scheme(), ProtocolScheme::Sftp) {
-            return Err("The acknowledged staged publish is for SFTP sessions; FTP(S) uploads have their own staged mode, and WebDAV and S3 have their own approved overwrite preconditions.".to_string());
+        if !matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Scp | ProtocolScheme::Ssh) {
+            return Err("The acknowledged staged publish is for SFTP/SCP sessions; FTP(S) uploads have their own staged mode, and WebDAV and S3 have their own approved overwrite preconditions.".to_string());
         }
         if flags.resume || flags.append || effective_ascii || flags.delete_source {
             return Err("SFTP staged upload requires a fresh binary copy.".to_string());
@@ -1355,8 +1355,7 @@ pub fn stage_saf_upload_source(
         if info.size > MAX_SAF_DOCUMENT_BYTES {
             return Err(saf_document_too_large(saf_leaf(uri), info.size));
         }
-        let bytes = fs.read_bytes(uri).map_err(|e| e.to_string())?;
-        std::fs::write(&root, &bytes).map_err(|e| format!("Cannot stage '{uri}' for upload: {e}"))?;
+        fs.stage_to_file(uri, &root).map_err(|e| format!("Cannot stage '{uri}' for upload: {e}"))?;
         let _ = set_local_file_times(&root, info.mtime, info.mtime);
     }
     Ok(SafUploadStage { _guard: guard, root })
@@ -1385,8 +1384,7 @@ fn stage_saf_tree(
             if info.size > MAX_SAF_DOCUMENT_BYTES {
                 return Err(saf_document_too_large(&child.name, info.size));
             }
-            let bytes = fs.read_bytes(&from).map_err(|e| e.to_string())?;
-            std::fs::write(&to, &bytes).map_err(|e| format!("Cannot stage '{from}' for upload: {e}"))?;
+            fs.stage_to_file(&from, &to).map_err(|e| format!("Cannot stage '{from}' for upload: {e}"))?;
             let _ = set_local_file_times(&to, info.mtime, info.mtime);
         }
     }
@@ -1412,10 +1410,8 @@ pub fn publish_staged_file_to_saf(
     if meta.len() > MAX_SAF_DOCUMENT_BYTES {
         return Err(saf_document_too_large(saf_leaf(dest_uri), meta.len()));
     }
-    let bytes = std::fs::read(staged).map_err(|e| format!("Cannot read staged download '{}': {e}", staged.display()))?;
     if cancel.load(Ordering::SeqCst) { return Err("Transfer cancelled before publication.".to_string()); }
-    fs.write_bytes_atomic(dest_uri, &bytes).map_err(|e| e.to_string())?;
-    Ok(bytes.len() as u64)
+    fs.publish_from_file(staged, dest_uri).map_err(|e| e.to_string())
 }
 
 /// Publishes a staged download tree across the bridge. A fresh publish
