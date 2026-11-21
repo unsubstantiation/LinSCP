@@ -980,7 +980,10 @@ impl ScriptInterpreter {
             if !available {
                 let pkg = linscp_proto::remote_desktop::server_package_name(kind);
                 let descr = linscp_proto::remote_desktop::server_description(kind);
-                let install_script = linscp_proto::remote_desktop::install_script_for_kind(kind);
+                let prefs = crate::PreferencesStore::load(&self.cfg.config_dir).unwrap_or_default();
+                let install_script = crate::resolve_install_script(&prefs, kind.as_str())
+                    .map(|(eff, _, _)| eff)
+                    .unwrap_or_else(|| linscp_proto::remote_desktop::install_script_for_kind(kind));
                 let msg = self.trp(
                     "Remote desktop ({kind}) is not available on server '{host}': {descr} ({pkg}) not found. Install it now?",
                     &[
@@ -1115,7 +1118,13 @@ impl ScriptInterpreter {
                 if !tcp_available {
                     let pkg = linscp_proto::remote_desktop::server_package_name(kind);
                     let descr = linscp_proto::remote_desktop::server_description(kind);
-                    let install_script = linscp_proto::remote_desktop::install_script_for_kind(kind);
+                    let prefs =
+                        crate::PreferencesStore::load(&self.cfg.config_dir).unwrap_or_default();
+                    let install_script = crate::resolve_install_script(&prefs, kind.as_str())
+                        .map(|(eff, _, _)| eff)
+                        .unwrap_or_else(|| {
+                            linscp_proto::remote_desktop::install_script_for_kind(kind)
+                        });
                     // Only prompt if interactive; otherwise just log and continue to ticket
                     // (the viewer will fail with connection refused, but we have already warned).
                     if self.is_interactive_confirm() {
@@ -5480,7 +5489,11 @@ impl ScriptInterpreter {
                 .await
                 .map_err(|e| e.to_string())?;
             if !installed {
-                let script = linscp_proto::mosh::mosh_install_script();
+                let prefs =
+                    crate::PreferencesStore::load(&self.cfg.config_dir).unwrap_or_default();
+                let script = crate::resolve_install_script(&prefs, "mosh")
+                    .map(|(eff, _, _)| eff)
+                    .unwrap_or_else(linscp_proto::mosh::mosh_install_script);
                 let _ = conn.disconnect().await;
                 if let Some(j) = jump {
                     let _ = j.close().await;

@@ -289,6 +289,8 @@ pub struct UserPreferences {
     pub priority: bool,
     pub confirm_overwrite: bool,
     pub confirm_delete: bool,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub custom_install_scripts: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for UserPreferences {
@@ -306,6 +308,7 @@ impl Default for UserPreferences {
             priority: false,
             confirm_overwrite: true,
             confirm_delete: true,
+            custom_install_scripts: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -400,8 +403,22 @@ mod tests {
         assert_eq!(value["transfer"], "binary");
         assert_eq!(value["confirm_overwrite"], true);
         assert_eq!(value["preserve_time"], true);
+        assert!(value.get("custom_install_scripts").is_none());
         let decoded: UserPreferences = serde_json::from_value(value).expect("deserialize");
         assert_eq!(decoded, prefs);
+
+        let mut customized = UserPreferences::default();
+        customized
+            .custom_install_scripts
+            .insert("mosh".to_string(), "#!/bin/sh\ndoas apk add mosh\n".to_string());
+        let encoded_custom = serde_json::to_value(&customized).expect("serialize custom");
+        assert_eq!(
+            encoded_custom["custom_install_scripts"]["mosh"],
+            "#!/bin/sh\ndoas apk add mosh\n"
+        );
+        let decoded_custom: UserPreferences =
+            serde_json::from_value(encoded_custom).expect("deserialize custom");
+        assert_eq!(decoded_custom, customized);
     }
 }
 

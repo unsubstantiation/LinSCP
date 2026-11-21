@@ -24,7 +24,12 @@ pub mod xml_log;
 use linscp_crypto::SessionMasterKey;
 use linscp_types::SessionConfig;
 
-pub use config_stores::{BookmarksStore, PreferencesStore, WorkspacesStore};
+pub use config_stores::{
+    canonical_install_script_target, default_install_script_for_target,
+    normalize_install_script_text, resolve_install_script, sanitize_custom_install_scripts_map,
+    BookmarksStore, PreferencesStore, WorkspacesStore, INSTALL_SCRIPT_TARGETS,
+    MAX_CUSTOM_INSTALL_SCRIPT_BYTES,
+};
 pub use hostkeys::{format_host_port_key, CachedHostKeyEntry, HostKeyCache};
 pub use importers::{decode_filezilla_remote_dir, parse_filezilla_xml, parse_openssh_config};
 pub use session_store::{escape_ini_value, unescape_ini_value, SessionStore, StoredSite};

@@ -465,13 +465,14 @@ impl CommanderService {
             ("POST", "/api/custom-commands") => self.handle_custom_commands(req.body),
             ("POST", "/api/command/exec") => self.handle_command_exec(req.body),
             ("GET", "/api/desktop/recommendations") => self.handle_desktop_recommendations(),
-            ("GET", "/api/desktop/install-script") => self.handle_desktop_install_script(&query, req.body),
-            ("POST", "/api/desktop/install-script") => self.handle_desktop_install_script(&query, req.body),
+            ("GET", "/api/desktop/install-script") => self.handle_desktop_install_script("GET", &query, req.body),
+            ("POST", "/api/desktop/install-script") => self.handle_desktop_install_script("POST", &query, req.body),
             ("POST", "/api/desktop/ticket") => self.handle_desktop_ticket(req.body),
             ("POST", "/api/desktop/launch") => self.handle_desktop_launch(req.body),
             ("POST", "/api/desktop/check") => self.handle_desktop_check(req.body),
             ("POST", "/api/desktop/install") => self.handle_desktop_install_sync(req.body),
-            ("GET", "/api/mosh/install-script") => self.handle_mosh_install_script(),
+            ("GET", "/api/mosh/install-script") => self.handle_mosh_install_script("GET", Value::Null),
+            ("POST", "/api/mosh/install-script") => self.handle_mosh_install_script("POST", req.body),
             ("POST", "/api/mosh/check") => self.handle_mosh_check_sync(req.body),
             // A terminal window reads the model and paints it from here: none
             // of these needs the interpreter or the network, because the shell
@@ -2357,16 +2358,96 @@ impl CommanderService {
         }
     }
 
-    fn handle_mosh_install_script(&self) -> ApiReply {
+    fn resolve_target_install_script(&self, target: &str) -> Option<(String, String, bool)> {
+        let prefs = self.state.lock().expect("state mutex").preferences.clone();
+        linscp_engine::resolve_install_script(&prefs, target)
+    }
+
+    fn mutate_custom_install_script(
+        &self,
+        target: &str,
+        body: &Value,
+    ) -> Result<(String, String, bool), ApiReply> {
+        let Some(canon) = linscp_engine::canonical_install_script_target(target) else {
+            return Err(api_error(400, format!("Unsupported installer script target '{target}'.")));
+        };
+        let reset = body.get("reset").and_then(Value::as_bool).unwrap_or(false)
+            || body.get("action").and_then(Value::as_str) == Some("reset");
+        let default_script =
+            linscp_engine::default_install_script_for_target(canon).expect("known target");
+        let (cfg, mut prefs) = {
+            let g = self.state.lock().expect("state mutex");
+            (g.config_root.clone(), g.preferences.clone())
+        };
+        if reset {
+            prefs.custom_install_scripts.remove(canon);
+        } else {
+            let Some(raw) = body
+                .get("script")
+                .or_else(|| body.get("install_script"))
+                .and_then(Value::as_str)
+            else {
+                return Err(api_error(
+                    400,
+                    "Provide a 'script' string or set 'reset: true' to restore the default installer.",
+                ));
+            };
+            let normalized = match linscp_engine::normalize_install_script_text(raw) {
+                Ok(s) => s,
+                Err(err) => return Err(api_error(400, err)),
+            };
+            let default_norm = default_script.replace("\r\n", "\n").replace('\r', "\n");
+            if normalized == default_norm {
+                prefs.custom_install_scripts.remove(canon);
+            } else {
+                prefs
+                    .custom_install_scripts
+                    .insert(canon.to_string(), normalized);
+            }
+        }
+        if let Err(err) = PreferencesStore::save(&cfg, &prefs) {
+            return Err(ApiReply {
+                status: 500,
+                payload: json!({ "success": false, "error": err }),
+            });
+        }
+        {
+            let mut g = self.state.lock().expect("state mutex");
+            g.preferences = prefs.clone();
+        }
+        Ok(linscp_engine::resolve_install_script(&prefs, canon).expect("known target"))
+    }
+
+    fn handle_mosh_install_script(&self, method: &str, body: Value) -> ApiReply {
+        let is_mutation = method == "POST"
+            && (body.get("script").is_some()
+                || body.get("install_script").is_some()
+                || body.get("reset").is_some()
+                || body.get("action").is_some());
+        let (install_script, default_install_script, is_custom) = if is_mutation {
+            match self.mutate_custom_install_script("mosh", &body) {
+                Ok(triple) => triple,
+                Err(reply) => return reply,
+            }
+        } else {
+            self.resolve_target_install_script("mosh")
+                .unwrap_or_else(|| {
+                    let d = linscp_proto::mosh::mosh_install_script();
+                    (d.clone(), d, false)
+                })
+        };
         ApiReply {
             status: 200,
             payload: json!({
                 "success": true,
+                "target": "mosh",
                 "package": "mosh",
                 "description": "Mosh (Mobile Shell) server (mosh-server) over SSH + UDP",
                 "default_port_range": linscp_proto::mosh::MOSH_DEFAULT_PORT_RANGE,
                 "probe_command": linscp_proto::mosh::MOSH_PROBE_COMMAND,
-                "install_script": linscp_proto::mosh::mosh_install_script(),
+                "install_script": install_script,
+                "default_install_script": default_install_script,
+                "is_custom": is_custom,
             }),
         }
     }
@@ -2424,6 +2505,13 @@ impl CommanderService {
             .map(|s| if s.session.port == 0 { 22 } else { s.session.port })
             .unwrap_or(22);
 
+        let (mosh_script, mosh_default_script, mosh_is_custom) = self
+            .resolve_target_install_script("mosh")
+            .unwrap_or_else(|| {
+                let d = linscp_proto::mosh::mosh_install_script();
+                (d.clone(), d, false)
+            });
+
         match linscp_proto::mosh::check_mosh_on_ssh_connection(&ssh).await {
             Ok(available) => ApiReply {
                 status: 200,
@@ -2440,7 +2528,9 @@ impl CommanderService {
                     "description": "Mosh (Mobile Shell) server (mosh-server) over SSH + UDP",
                     "default_port_range": linscp_proto::mosh::MOSH_DEFAULT_PORT_RANGE,
                     "probe_command": linscp_proto::mosh::MOSH_PROBE_COMMAND,
-                    "install_script": linscp_proto::mosh::mosh_install_script(),
+                    "install_script": mosh_script,
+                    "default_install_script": mosh_default_script,
+                    "is_custom": mosh_is_custom,
                     "can_install": true,
                     "reason": if available {
                         format!("Mosh server (mosh-server) detected on {host}.")
@@ -2515,6 +2605,12 @@ impl CommanderService {
 
             match linscp_proto::mosh::check_mosh_on_ssh_connection(&ssh).await {
                 Ok(false) => {
+                    let (mosh_script, mosh_default_script, mosh_is_custom) = self
+                        .resolve_target_install_script("mosh")
+                        .unwrap_or_else(|| {
+                            let d = linscp_proto::mosh::mosh_install_script();
+                            (d.clone(), d, false)
+                        });
                     return ApiReply {
                         status: 409,
                         payload: json!({
@@ -2531,7 +2627,9 @@ impl CommanderService {
                             "description": "Mosh (Mobile Shell) server (mosh-server) over SSH + UDP",
                             "default_port_range": linscp_proto::mosh::MOSH_DEFAULT_PORT_RANGE,
                             "probe_command": linscp_proto::mosh::MOSH_PROBE_COMMAND,
-                            "install_script": linscp_proto::mosh::mosh_install_script(),
+                            "install_script": mosh_script,
+                            "default_install_script": mosh_default_script,
+                            "is_custom": mosh_is_custom,
                             "can_install": true,
                             "reason": format!("Mosh server (mosh-server) was not found on {host}."),
                             "error": format!("Mosh server (mosh-server) is not installed on {host}."),
@@ -4063,10 +4161,46 @@ impl CommanderService {
         ApiReply{ status: 200, payload: json!({"success": true, "preferences": g.preferences, "defaults": UserPreferences::default(), "file": g.config_root.join("preferences.json").to_string_lossy()})}
     }
     fn handle_save_preferences(&self, body: Value) -> ApiReply {
-        let prefs_val = body.get("preferences").cloned().unwrap_or(body.clone());
-        let parsed: Result<UserPreferences,_> = serde_json::from_value(prefs_val.clone());
-        let parsed = match parsed {
-            Ok(p) => p, Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": format!("Invalid preferences: {e}")})},
+        let parsed = if body.get("action").and_then(Value::as_str) == Some("reset") {
+            UserPreferences::default()
+        } else {
+            let prefs_val = body.get("preferences").cloned().unwrap_or(body.clone());
+            let has_custom_scripts_field = prefs_val
+                .as_object()
+                .is_some_and(|m| m.contains_key("custom_install_scripts"));
+            let parsed: Result<UserPreferences, _> = serde_json::from_value(prefs_val);
+            let mut parsed = match parsed {
+                Ok(p) => p,
+                Err(e) => {
+                    return ApiReply {
+                        status: 400,
+                        payload: json!({"success": false, "error": format!("Invalid preferences: {e}")}),
+                    }
+                }
+            };
+            if has_custom_scripts_field {
+                match linscp_engine::sanitize_custom_install_scripts_map(
+                    &parsed.custom_install_scripts,
+                ) {
+                    Ok(cleaned) => parsed.custom_install_scripts = cleaned,
+                    Err(err) => {
+                        return ApiReply {
+                            status: 400,
+                            payload: json!({"success": false, "error": err}),
+                        }
+                    }
+                }
+            } else {
+                let existing = self
+                    .state
+                    .lock()
+                    .expect("m")
+                    .preferences
+                    .custom_install_scripts
+                    .clone();
+                parsed.custom_install_scripts = existing;
+            }
+            parsed
         };
         let cfg = self.state.lock().expect("m").config_root.clone();
         if let Err(e) = PreferencesStore::save(&cfg, &parsed) {
@@ -6286,22 +6420,104 @@ impl CommanderService {
         })
     }
 
-    fn handle_desktop_install_script(&self, query: &BTreeMap<String, String>, body: Value) -> ApiReply {
-        use linscp_proto::remote_desktop::{server_description, server_package_name, probe_command_for_kind, install_script_for_kind};
-        let kind_str = query.get("kind").map(|s| s.as_str()).or_else(|| body.get("kind").and_then(|v| v.as_str()));
-        let kind = match Self::parse_desktop_kind_str(kind_str) { Ok(kind) => kind, Err(error) => return api_error(400, error) };
+    fn handle_desktop_install_script(
+        &self,
+        method: &str,
+        query: &BTreeMap<String, String>,
+        body: Value,
+    ) -> ApiReply {
+        use linscp_proto::remote_desktop::{
+            install_script_for_kind, probe_command_for_kind, server_description,
+            server_package_name, x2go_xfce_install_script, RemoteDesktopKind, X2GO_DESKTOP_PROBE,
+        };
+        let raw_kind = query
+            .get("kind")
+            .map(String::as_str)
+            .or_else(|| body.get("kind").and_then(Value::as_str))
+            .or_else(|| body.get("target").and_then(Value::as_str));
+        let is_xfce_target = raw_kind.is_some_and(|k| {
+            matches!(
+                k.trim().to_ascii_lowercase().as_str(),
+                "x2go_xfce" | "x2go-xfce" | "xfce"
+            )
+        });
+        let is_mutation = method == "POST"
+            && (body.get("script").is_some()
+                || body.get("install_script").is_some()
+                || body.get("reset").is_some()
+                || body.get("action").is_some());
+
+        if is_xfce_target {
+            let (script, default_script, is_custom) = if is_mutation {
+                match self.mutate_custom_install_script("x2go_xfce", &body) {
+                    Ok(triple) => triple,
+                    Err(reply) => return reply,
+                }
+            } else {
+                self.resolve_target_install_script("x2go_xfce")
+                    .unwrap_or_else(|| {
+                        let d = x2go_xfce_install_script().to_string();
+                        (d.clone(), d, false)
+                    })
+            };
+            return ApiReply {
+                status: 200,
+                payload: json!({
+                    "success": true,
+                    "kind": "x2go_xfce",
+                    "target": "x2go_xfce",
+                    "package": "xfce4",
+                    "description": "XFCE desktop environment for X2Go",
+                    "probe_command": X2GO_DESKTOP_PROBE,
+                    "install_script": script,
+                    "default_install_script": default_script,
+                    "is_custom": is_custom,
+                }),
+            };
+        }
+
+        let kind = match Self::parse_desktop_kind_str(raw_kind) {
+            Ok(kind) => kind,
+            Err(error) => return api_error(400, error),
+        };
         let pkg = server_package_name(kind);
         let descr = server_description(kind);
-        let script = install_script_for_kind(kind);
         let probe = probe_command_for_kind(kind);
-        ApiReply{ status:200, payload: json!({
+        let (script, default_script, is_custom) = if is_mutation {
+            match self.mutate_custom_install_script(kind.as_str(), &body) {
+                Ok(triple) => triple,
+                Err(reply) => return reply,
+            }
+        } else {
+            self.resolve_target_install_script(kind.as_str())
+                .unwrap_or_else(|| {
+                    let d = install_script_for_kind(kind);
+                    (d.clone(), d, false)
+                })
+        };
+        let mut payload = json!({
             "success": true,
             "kind": kind.as_str(),
+            "target": kind.as_str(),
             "package": pkg,
             "description": descr,
             "probe_command": probe,
-            "install_script": script
-        })}
+            "install_script": script,
+            "default_install_script": default_script,
+            "is_custom": is_custom,
+        });
+        if kind == RemoteDesktopKind::X2Go {
+            let (xfce_script, xfce_default, xfce_custom) = self
+                .resolve_target_install_script("x2go_xfce")
+                .unwrap_or_else(|| {
+                    let d = x2go_xfce_install_script().to_string();
+                    (d.clone(), d, false)
+                });
+            payload["xfce_install_script"] = json!(xfce_script);
+            payload["default_xfce_install_script"] = json!(xfce_default);
+            payload["xfce_is_custom"] = json!(xfce_custom);
+        }
+        ApiReply { status: 200, payload }
     }
 
     fn handle_desktop_check(&self, body: Value) -> ApiReply {
@@ -6350,7 +6566,12 @@ impl CommanderService {
         }
         let pkg = server_package_name(kind);
         let descr = server_description(kind);
-        let script = install_script_for_kind(kind);
+        let (script, default_script, is_custom) = self
+            .resolve_target_install_script(kind.as_str())
+            .unwrap_or_else(|| {
+                let d = install_script_for_kind(kind);
+                (d.clone(), d, false)
+            });
         let probe = probe_command_for_kind(kind);
         // Sync cannot safely run SSH exec; report not_available with script and
         // instruct client to call async /api/desktop/check for a live probe.
@@ -6365,6 +6586,8 @@ impl CommanderService {
             "description": descr,
             "probe_command": probe,
             "install_script": script,
+            "default_install_script": default_script,
+            "is_custom": is_custom,
             "reason": format!("{descr} ({pkg}) not verified synchronously — call POST /api/desktop/check via dispatch_async with via_tab for live SSH probe, or run: {probe}"),
             "can_install": true,
             "message": format!("Remote desktop ({}) is not available on server '{}': {} ({}) not found. Install it now? The following compatible installer works on Debian/Ubuntu, Fedora/RHEL, Arch, openSUSE and detects the OS automatically.", kind.as_str(), target_host, descr, pkg)
@@ -6438,7 +6661,20 @@ impl CommanderService {
         if target_port == 0 { target_port = match kind { RemoteDesktopKind::Rdp => 3389, RemoteDesktopKind::Vnc => 5900, RemoteDesktopKind::Spice => 5900, _ => 22 }; }
         let pkg = server_package_name(kind);
         let descr = server_description(kind);
-        let script = install_script_for_kind(kind);
+        let (script, default_script, is_custom) = self
+            .resolve_target_install_script(kind.as_str())
+            .unwrap_or_else(|| {
+                let d = install_script_for_kind(kind);
+                (d.clone(), d, false)
+            });
+        let xfce_resolved = if kind == RemoteDesktopKind::X2Go {
+            Some(self.resolve_target_install_script("x2go_xfce").unwrap_or_else(|| {
+                let d = linscp_proto::remote_desktop::x2go_xfce_install_script().to_string();
+                (d.clone(), d, false)
+            }))
+        } else {
+            None
+        };
         let probe = probe_command_for_kind(kind);
 
         // If we have an SSH session, probe via exec
@@ -6456,7 +6692,9 @@ impl CommanderService {
                         "via_tab": via_tab_id,
                         "desktop_checked": desktop.as_ref().is_some_and(Result::is_ok),
                         "desktop": desktop.as_ref().and_then(|result| result.as_ref().ok()).and_then(|name| *name),
-                        "xfce_install_script": if kind == RemoteDesktopKind::X2Go { Some(linscp_proto::remote_desktop::x2go_xfce_install_script()) } else { None },
+                        "xfce_install_script": xfce_resolved.as_ref().map(|(s, _, _)| s.clone()),
+                        "default_xfce_install_script": xfce_resolved.as_ref().map(|(_, d, _)| d.clone()),
+                        "xfce_is_custom": xfce_resolved.as_ref().map(|(_, _, c)| *c),
                         "kind": kind.as_str(),
                         "host": target_host,
                         "port": target_port,
@@ -6464,6 +6702,8 @@ impl CommanderService {
                         "description": descr,
                         "probe_command": probe,
                         "install_script": script,
+                        "default_install_script": default_script,
+                        "is_custom": is_custom,
                         "reason": format!("{descr} ({pkg}) is installed on {target_host}"),
                         "can_install": true,
                         "message": format!("Remote desktop ({}) is available on server '{}'.", kind.as_str(), target_host)
@@ -6478,7 +6718,9 @@ impl CommanderService {
                         "via_tab": via_tab_id,
                         "desktop_checked": desktop.as_ref().is_some_and(Result::is_ok),
                         "desktop": desktop.as_ref().and_then(|result| result.as_ref().ok()).and_then(|name| *name),
-                        "xfce_install_script": if kind == RemoteDesktopKind::X2Go { Some(linscp_proto::remote_desktop::x2go_xfce_install_script()) } else { None },
+                        "xfce_install_script": xfce_resolved.as_ref().map(|(s, _, _)| s.clone()),
+                        "default_xfce_install_script": xfce_resolved.as_ref().map(|(_, d, _)| d.clone()),
+                        "xfce_is_custom": xfce_resolved.as_ref().map(|(_, _, c)| *c),
                         "kind": kind.as_str(),
                         "host": target_host,
                         "port": target_port,
@@ -6486,6 +6728,8 @@ impl CommanderService {
                         "description": descr,
                         "probe_command": probe,
                         "install_script": script,
+                        "default_install_script": default_script,
+                        "is_custom": is_custom,
                         "reason": format!("{descr} ({pkg}) not found on {target_host} — command `{probe}` failed"),
                         "can_install": true,
                         "message": format!("Remote desktop ({}) is not available on server '{}': {} ({}) not found. Install it now?", kind.as_str(), target_host, descr, pkg),
@@ -6506,7 +6750,9 @@ impl CommanderService {
                         "via_tab": via_tab_id,
                         "desktop_checked": desktop.as_ref().is_some_and(Result::is_ok),
                         "desktop": desktop.as_ref().and_then(|result| result.as_ref().ok()).and_then(|name| *name),
-                        "xfce_install_script": if kind == RemoteDesktopKind::X2Go { Some(linscp_proto::remote_desktop::x2go_xfce_install_script()) } else { None },
+                        "xfce_install_script": xfce_resolved.as_ref().map(|(s, _, _)| s.clone()),
+                        "default_xfce_install_script": xfce_resolved.as_ref().map(|(_, d, _)| d.clone()),
+                        "xfce_is_custom": xfce_resolved.as_ref().map(|(_, _, c)| *c),
                         "kind": kind.as_str(),
                         "host": target_host,
                         "port": target_port,
@@ -6514,6 +6760,8 @@ impl CommanderService {
                         "description": descr,
                         "probe_command": probe,
                         "install_script": script,
+                        "default_install_script": default_script,
+                        "is_custom": is_custom,
                         "reason": format!("Probe failed: {e}"),
                         "can_install": false,
                         "message": format!("Could not verify {} on {}: {e}. Installer available.", descr, target_host)
@@ -6541,6 +6789,8 @@ impl CommanderService {
                 "description": descr,
                 "probe_command": probe,
                 "install_script": script,
+                "default_install_script": default_script,
+                "is_custom": is_custom,
                 "reason": format!("TCP connect to {target_host}:{target_port} succeeded"),
                 "can_install": false
             })};
@@ -6557,6 +6807,8 @@ impl CommanderService {
             "description": descr,
             "probe_command": probe,
             "install_script": script,
+            "default_install_script": default_script,
+            "is_custom": is_custom,
             "reason": format!("{descr} ({pkg}) not reachable on {target_host}:{target_port} and no SSH session to probe"),
             "can_install": false,
             "message": format!("Remote desktop ({}) does not appear to be listening on {}:{} ({}, {}). If you have SSH access, connect via SSH first and run the installer, or run this script manually on the server.", kind.as_str(), target_host, target_port, descr, pkg),
@@ -6576,6 +6828,17 @@ impl CommanderService {
         if kind == RemoteDesktopKind::X2Go {
             return api_error(400, "Run the X2Go installer in an interactive terminal so sudo can request authorization.");
         }
+        let explicit_script = if let Some(val) = body.get("script").or_else(|| body.get("install_script")) {
+            let Some(raw) = val.as_str() else {
+                return api_error(400, "Installer 'script' must be a string.");
+            };
+            match linscp_engine::normalize_install_script_text(raw) {
+                Ok(s) => Some(s),
+                Err(err) => return api_error(400, err),
+            }
+        } else {
+            None
+        };
         let via_tab = body.get("via_tab").and_then(|v| v.as_u64()).or_else(|| body.get("viaTab").and_then(|v| v.as_u64())).or_else(|| tabs::parse_tab_id_value(body.get("tab"))).or_else(|| body.get("tabId").and_then(|v| v.as_u64()));
         let mut target_host = body.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let Some(vid) = via_tab else {
@@ -6590,12 +6853,24 @@ impl CommanderService {
             return api_error(400, "The selected SSH session is connected to a different host.");
         }
         target_host = spec.session.host.clone();
-        let Some(sess) = tab.remote.as_ref().filter(|s| s.ssh_connection().is_some()) else {
+        let Some(sess) = tab.remote.as_ref().filter(|s| {
+            s.ssh_connection().is_some()
+                || matches!(
+                    s.scheme(),
+                    linscp_types::ProtocolScheme::Sftp
+                        | linscp_types::ProtocolScheme::Scp
+                        | linscp_types::ProtocolScheme::Ssh
+                )
+        }) else {
             return api_error(400, "The selected session has no SSH connection.");
         };
         let via_tab_id = Some(vid);
         let pkg = server_package_name(kind);
-        let script = install_script_for_kind(kind);
+        let script = explicit_script.unwrap_or_else(|| {
+            self.resolve_target_install_script(kind.as_str())
+                .map(|(eff, _, _)| eff)
+                .unwrap_or_else(|| install_script_for_kind(kind))
+        });
         // For X11/SPICE etc the script is short; for RDP/VNC/X2Go it may take minutes
         match sess.exec_command(&script).await {
             Ok(out) => {
@@ -6694,7 +6969,12 @@ impl CommanderService {
         if target_port == 0 { target_port = match kind { RemoteDesktopKind::Rdp => 3389, RemoteDesktopKind::Vnc => 5900, RemoteDesktopKind::Spice => 5900, _ => 22 }; }
         let pkg = server_package_name(kind);
         let descr = server_description(kind);
-        let script = install_script_for_kind(kind);
+        let (script, default_script, is_custom) = self
+            .resolve_target_install_script(kind.as_str())
+            .unwrap_or_else(|| {
+                let d = install_script_for_kind(kind);
+                (d.clone(), d, false)
+            });
         let probe = probe_command_for_kind(kind);
         if kind == RemoteDesktopKind::X2Go && via_session.is_none() {
             return api_error(400, "Connect an SSH session to this server to check X2Go before opening it.");
@@ -6717,6 +6997,8 @@ impl CommanderService {
                         "description": descr,
                         "probe_command": probe,
                         "install_script": script,
+                        "default_install_script": default_script,
+                        "is_custom": is_custom,
                         "reason": format!("{descr} ({pkg}) not found on {target_host}"),
                         "can_install": true,
                         "message": format!("Remote desktop ({}) is not available on server '{}': {} ({}) not found. Install it now?", kind.as_str(), target_host, descr, pkg),
@@ -6752,6 +7034,8 @@ impl CommanderService {
                     "description": descr,
                     "probe_command": probe,
                     "install_script": script,
+                    "default_install_script": default_script,
+                    "is_custom": is_custom,
                     "reason": format!("TCP connect to {target_host}:{target_port} failed"),
                     "can_install": false,
                     "message": format!("Remote desktop ({}) does not appear to be listening on {}:{} ({}, {}). Connect via SSH first to install, or run installer manually.", kind.as_str(), target_host, target_port, descr, pkg),
@@ -15717,5 +16001,258 @@ mod tests {
                 .await;
             assert_eq!(reply.status, 400, "{path}: {}", reply.payload);
         }
+    }
+
+    struct MockSshInstallSession {
+        executed: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl RemoteSession for MockSshInstallSession {
+        fn scheme(&self) -> ProtocolScheme {
+            ProtocolScheme::Sftp
+        }
+        async fn pwd(&self) -> Result<String, ProtoError> {
+            Ok("/".to_string())
+        }
+        async fn stat(&self, _remote_path: &str) -> Result<Option<FileEntry>, ProtoError> {
+            Ok(None)
+        }
+        async fn list_dir(&self, _remote_path: &str) -> Result<Vec<FileEntry>, ProtoError> {
+            Ok(Vec::new())
+        }
+        async fn download_stream(
+            &self,
+            _remote_path: &str,
+            _opts: TransferRequest,
+            _sink: &mut (dyn AsyncWrite + Unpin + Send),
+            _progress: Option<&ProgressCallback>,
+        ) -> Result<u64, ProtoError> {
+            Ok(0)
+        }
+        async fn upload_stream(
+            &self,
+            _remote_path: &str,
+            _opts: TransferRequest,
+            _source: &mut (dyn AsyncRead + Unpin + Send),
+            _total_size: Option<u64>,
+            _progress: Option<&ProgressCallback>,
+        ) -> Result<u64, ProtoError> {
+            Ok(0)
+        }
+        async fn mkdir(&self, _remote_path: &str) -> Result<(), ProtoError> {
+            Ok(())
+        }
+        async fn remove_file(&self, _remote_path: &str) -> Result<(), ProtoError> {
+            Ok(())
+        }
+        async fn remove_dir(&self, _remote_path: &str) -> Result<(), ProtoError> {
+            Ok(())
+        }
+        async fn rename(&self, _from: &str, _to: &str) -> Result<(), ProtoError> {
+            Ok(())
+        }
+        async fn exec_command(&self, command: &str) -> Result<linscp_proto::ssh::ExecOutput, ProtoError> {
+            self.executed.lock().expect("m").push(command.to_string());
+            Ok(linscp_proto::ssh::ExecOutput {
+                exit_code: Some(0),
+                stdout: b"custom-ok\n".to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn customizable_install_scripts_persist_reset_and_execute_edited_script() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg_dir = temp.path().to_path_buf();
+        let svc = CommanderService::new(cfg_dir.clone(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
+
+        // 1. Default Mosh & Desktop install scripts report is_custom = false.
+        let mosh_default = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/mosh/install-script".into(),
+            body: json!({}),
+        });
+        assert_eq!(mosh_default.status, 200);
+        assert_eq!(mosh_default.payload["is_custom"], false);
+        assert_eq!(
+            mosh_default.payload["install_script"],
+            mosh_default.payload["default_install_script"]
+        );
+
+        // 2. Saving custom Mosh, RDP, and X2Go XFCE scripts normalizes CRLF and persists.
+        let save_mosh = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/mosh/install-script".into(),
+            body: json!({ "script": "#!/bin/sh\r\ndoas apk add mosh\r\n" }),
+        });
+        assert_eq!(save_mosh.status, 200, "{}", save_mosh.payload);
+        assert_eq!(save_mosh.payload["is_custom"], true);
+        assert_eq!(
+            save_mosh.payload["install_script"],
+            "#!/bin/sh\ndoas apk add mosh\n"
+        );
+        assert!(save_mosh.payload["default_install_script"]
+            .as_str()
+            .unwrap()
+            .contains("command -v mosh-server"));
+
+        let save_rdp = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/desktop/install-script".into(),
+            body: json!({ "kind": "rdp", "script": "#!/bin/sh\r\necho custom-rdp\r\n" }),
+        });
+        assert_eq!(save_rdp.status, 200, "{}", save_rdp.payload);
+        assert_eq!(save_rdp.payload["is_custom"], true);
+        assert_eq!(save_rdp.payload["install_script"], "#!/bin/sh\necho custom-rdp\n");
+
+        let save_xfce = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/desktop/install-script".into(),
+            body: json!({ "kind": "x2go_xfce", "script": "#!/bin/sh\necho custom-xfce\n" }),
+        });
+        assert_eq!(save_xfce.status, 200, "{}", save_xfce.payload);
+        assert_eq!(save_xfce.payload["is_custom"], true);
+
+        let get_x2go = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/desktop/install-script?kind=x2go".into(),
+            body: json!({}),
+        });
+        assert_eq!(get_x2go.status, 200);
+        assert_eq!(get_x2go.payload["xfce_is_custom"], true);
+        assert_eq!(get_x2go.payload["xfce_install_script"], "#!/bin/sh\necho custom-xfce\n");
+
+        // 3. Partial /api/preferences save preserves custom_install_scripts.
+        let partial_prefs = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/preferences".into(),
+            body: json!({
+                "preferences": {
+                    "transfer": "binary",
+                    "filemask": "*.log",
+                    "speed": 0,
+                    "resumesupport": "",
+                    "resume": false,
+                    "preserve_time": true,
+                    "newer_only": false,
+                    "append": false,
+                    "no_permissions": false,
+                    "priority": false,
+                    "confirm_overwrite": true,
+                    "confirm_delete": true
+                }
+            }),
+        });
+        assert_eq!(partial_prefs.status, 200, "{}", partial_prefs.payload);
+        let check_rdp_sync = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/desktop/check".into(),
+            body: json!({ "kind": "rdp", "host": "10.0.0.5" }),
+        });
+        assert_eq!(check_rdp_sync.payload["is_custom"], true);
+        assert_eq!(check_rdp_sync.payload["install_script"], "#!/bin/sh\necho custom-rdp\n");
+
+        // 4. Invalid scripts fail closed with 400.
+        for bad in [json!({ "script": "   " }), json!({ "script": "bad\0nul" })] {
+            let rej = svc.dispatch(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/mosh/install-script".into(),
+                body: bad,
+            });
+            assert_eq!(rej.status, 400);
+        }
+
+        // 5. /api/desktop/install executes saved custom script by default, and executes
+        //    an inline one-off edited script when provided in the request body.
+        let ssh_session = Arc::new(MockSshInstallSession {
+            executed: Mutex::new(Vec::new()),
+        });
+        let spec = linscp_engine::url_and_raw::parse_site_url("sftp://ops@10.0.0.5:22").unwrap();
+        let tab = TabRuntime {
+            id: 42,
+            name: "ops@10.0.0.5".to_string(),
+            site_name: None,
+            is_local: false,
+            connected: true,
+            local_dir: temp.path().to_string_lossy().to_string(),
+            remote_dir: "/".to_string(),
+            other_local_dir: String::new(),
+            observed_hostkey: String::new(),
+            hostkey_role: "destination".to_string(),
+            hostkey_changed: false,
+            error: String::new(),
+            spec: Some(spec),
+            session_json: json!({"protocol": "sftp", "host": "10.0.0.5", "port": 22}),
+            remote: Some(ssh_session.clone()),
+        };
+        svc.state.lock().expect("state mutex").tabs.insert(42, tab);
+
+        let run_saved = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/desktop/install".into(),
+                body: json!({ "tab": 42, "kind": "rdp", "host": "10.0.0.5" }),
+            })
+            .await;
+        assert_eq!(run_saved.status, 200, "{}", run_saved.payload);
+
+        let run_edited = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/desktop/install".into(),
+                body: json!({
+                    "tab": 42,
+                    "kind": "rdp",
+                    "host": "10.0.0.5",
+                    "script": "#!/bin/sh\r\necho inline-edited-rdp\r\n"
+                }),
+            })
+            .await;
+        assert_eq!(run_edited.status, 200, "{}", run_edited.payload);
+
+        let ran = ssh_session.executed.lock().expect("m").clone();
+        // First call ran saved custom script + check probe; second call ran inline edited script + check probe.
+        assert_eq!(ran[0], "#!/bin/sh\necho custom-rdp\n");
+        assert_eq!(ran[2], "#!/bin/sh\necho inline-edited-rdp\n");
+
+        // Empty inline script is rejected before executing anything on SSH.
+        let rej_inline = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/desktop/install".into(),
+                body: json!({ "tab": 42, "kind": "rdp", "host": "10.0.0.5", "script": "   " }),
+            })
+            .await;
+        assert_eq!(rej_inline.status, 400);
+
+        // 6. Reset restores the shipped built-in script and reloads cleanly across restarts.
+        drop(svc);
+        let svc2 = CommanderService::new(cfg_dir, Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc2);
+        let persisted_mosh = svc2.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/mosh/install-script".into(),
+            body: json!({}),
+        });
+        assert_eq!(persisted_mosh.payload["is_custom"], true);
+        assert_eq!(
+            persisted_mosh.payload["install_script"],
+            "#!/bin/sh\ndoas apk add mosh\n"
+        );
+
+        let reset_mosh = svc2.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/mosh/install-script".into(),
+            body: json!({ "reset": true }),
+        });
+        assert_eq!(reset_mosh.status, 200);
+        assert_eq!(reset_mosh.payload["is_custom"], false);
+        assert_eq!(
+            reset_mosh.payload["install_script"],
+            reset_mosh.payload["default_install_script"]
+        );
     }
 }
