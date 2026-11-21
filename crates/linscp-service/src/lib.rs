@@ -17468,16 +17468,31 @@ mod tests {
         assert_eq!(search_latin.payload["matches"].as_array().unwrap().len(), 1);
 
         // 4. XML action log preference validation and /api/logs/xml.
+        let base_prefs = svc
+            .dispatch(ApiEnvelope {
+                method: "GET".into(),
+                path: "/api/preferences".into(),
+                body: json!({}),
+            })
+            .payload["preferences"]
+            .clone();
+        let mut bad_prefs = base_prefs.clone();
+        bad_prefs["xml_log_enabled"] = json!(true);
+        bad_prefs["xml_log_path"] = json!("../escape.xml");
         let bad_xml_pref = svc.dispatch(ApiEnvelope {
             method: "POST".into(),
             path: "/api/preferences".into(),
-            body: json!({"xml_log_enabled": true, "xml_log_path": "../escape.xml"}),
+            body: json!({"action": "save", "preferences": bad_prefs}),
         });
         assert_eq!(bad_xml_pref.status, 400);
+        assert!(bad_xml_pref.payload["error"].as_str().unwrap_or("").contains(".."));
+        let mut ok_prefs = base_prefs;
+        ok_prefs["xml_log_enabled"] = json!(true);
+        ok_prefs["xml_log_path"] = json!("actions.xml");
         let ok_xml_pref = svc.dispatch(ApiEnvelope {
             method: "POST".into(),
             path: "/api/preferences".into(),
-            body: json!({"xml_log_enabled": true, "xml_log_path": "actions.xml"}),
+            body: json!({"action": "save", "preferences": ok_prefs}),
         });
         assert_eq!(ok_xml_pref.status, 200, "{}", ok_xml_pref.payload);
         svc.record_gui_xml_action("unit-test", |logger| {
