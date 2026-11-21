@@ -112,10 +112,23 @@ export function isDesktopProtocol(p?: ProtocolScheme): boolean {
 export interface DesktopInstallScriptResponse {
   success: boolean;
   kind: string;
+  target?: string;
   package: string;
   description: string;
   probe_command: string;
   install_script: string;
+  default_install_script?: string;
+  is_custom?: boolean;
+  xfce_install_script?: string;
+  default_xfce_install_script?: string;
+  xfce_is_custom?: boolean;
+}
+
+export interface DesktopInstallScriptMutationRequest {
+  kind?: string;
+  target?: string;
+  script?: string;
+  reset?: boolean;
 }
 
 export interface DesktopCheckRequest {
@@ -147,10 +160,30 @@ export interface DesktopCheckResponse {
   description: string;
   probe_command: string;
   install_script: string;
+  default_install_script?: string;
+  is_custom?: boolean;
+  xfce_install_script?: string;
+  default_xfce_install_script?: string;
+  xfce_is_custom?: boolean;
   reason: string;
   can_install: boolean;
   message?: string;
   prompt?: DesktopCheckPrompt;
+}
+
+export interface MoshInstallScriptResponse {
+  success: boolean;
+  package: string;
+  probe_command: string;
+  install_script: string;
+  default_install_script?: string;
+  is_custom?: boolean;
+  default_udp_ports: string;
+}
+
+export interface MoshInstallScriptMutationRequest {
+  script?: string;
+  reset?: boolean;
 }
 
 export interface DesktopInstallRequest {
@@ -159,6 +192,7 @@ export interface DesktopInstallRequest {
   host?: string;
   kind?: string;
   protocol?: string;
+  script?: string;
 }
 
 export interface DesktopInstallResponse {

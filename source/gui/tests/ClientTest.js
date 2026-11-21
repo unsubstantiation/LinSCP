@@ -4017,6 +4017,201 @@ function options(id) {
     window.LinSCPCore = savedCoreForAndroid;
     delete responses['/api/desktop/launch'];
     delete responses['/api/desktop/tunnel-close'];
+
+    // Editable & customizable installer scripts (Mosh, Remote Desktop, Preferences).
+    const internals = window.__TAURI_INTERNALS__;
+    const prevInvokeForScripts = internals.invoke;
+    internals.invoke = async (command, args) => {
+      if (command === 'linscp_open_terminal_window') return { label: 'terminal-script-test' };
+      return prevInvokeForScripts(command, args);
+    };
+    check('installer script views are editable textareas',
+      doc.getElementById('moshScript').tagName === 'TEXTAREA' &&
+      doc.getElementById('remoteDesktopScript').tagName === 'TEXTAREA' &&
+      doc.getElementById('prefInstallScriptEditor').tagName === 'TEXTAREA');
+
+    // 1. Mosh inline edit + UTF-8 base64 execution + save/reset custom script.
+    responses['/api/session/terminal'] = {
+      success: false, mosh_missing: true, via_ssh: true, can_install: true,
+      host: '127.0.0.1', port: 2222,
+      install_script: '#!/bin/bash\necho default-mosh\n',
+      default_install_script: '#!/bin/bash\necho default-mosh\n',
+      is_custom: false,
+      reason: 'Mosh server (mosh-server) was not found on 127.0.0.1.'
+    };
+    await window.openTerminal(null, false, null, { mosh: true });
+    const moshEditor = doc.getElementById('moshScript');
+    moshEditor.value = '#!/bin/bash\n# édité\nsudo apt-get install -y mosh\n';
+    window.onMoshScriptInput();
+    check('editing Mosh installer marks toolbar state as unsaved',
+      text('moshScriptState').includes('Edited'));
+    responses['/api/mosh/install-script'] = {
+      success: true,
+      install_script: moshEditor.value,
+      default_install_script: '#!/bin/bash\necho default-mosh\n',
+      is_custom: true
+    };
+    await window.saveCustomMoshScript();
+    const saveMoshCall = calls.filter(call => call.path === '/api/mosh/install-script' && call.options && call.options.method === 'POST').pop();
+    check('saving custom Mosh script posts script to /api/mosh/install-script',
+      !!saveMoshCall &&
+      JSON.parse(saveMoshCall.options.body).script.includes('# édité') &&
+      text('moshScriptState').includes('Custom saved script'));
+    responses['/api/session/terminal'] = { success: true, terminal: 88, cols: 80, rows: 24 };
+    await window.installMoshOnServer();
+    const editedMoshInput = JSON.parse(calls.filter(call => call.path === '/api/terminal/input').pop().options.body);
+    const editedMoshCmd = Buffer.from(editedMoshInput.data, 'base64').toString();
+    const editedMoshB64 = (editedMoshCmd.match(/printf %s '([^']+)' \| base64 -d \| bash/) || [])[1] || '';
+    check('installing edited Mosh script executes the exact UTF-8 edited script',
+      Buffer.from(editedMoshB64, 'base64').toString('utf8') === '#!/bin/bash\n# édité\nsudo apt-get install -y mosh\n');
+    window.closeTerminal();
+    responses['/api/mosh/install-script'] = {
+      success: true,
+      install_script: '#!/bin/bash\necho default-mosh\n',
+      default_install_script: '#!/bin/bash\necho default-mosh\n',
+      is_custom: false
+    };
+    await window.resetCustomMoshScript();
+    const resetMoshCall = calls.filter(call => call.path === '/api/mosh/install-script' && call.options && call.options.method === 'POST').pop();
+    check('resetting custom Mosh script posts reset and restores default script',
+      !!resetMoshCall &&
+      JSON.parse(resetMoshCall.options.body).reset === true &&
+      moshEditor.value === '#!/bin/bash\necho default-mosh\n');
+    delete responses['/api/mosh/install-script'];
+
+    // 2. Remote Desktop (RDP) inline edit + /api/desktop/install script forwarding + Load/Save/Reset.
+    responses['/api/desktop/check'] = {
+      success: true, checked: true, available: false, via_ssh: true, can_install: true,
+      kind: 'rdp', host: '127.0.0.1', port: 3389,
+      install_script: '#!/bin/bash\necho default-rdp\n',
+      default_install_script: '#!/bin/bash\necho default-rdp\n',
+      is_custom: false,
+      reason: 'RDP not listening'
+    };
+    responses['/api/desktop/install'] = {
+      success: true, host: '127.0.0.1', kind: 'rdp', package: 'xrdp',
+      exit_code: 0, stdout: 'ok', stderr: '', now_available: true,
+      install_script: '#!/bin/bash\necho custom-inline-rdp\n', message: 'Installed'
+    };
+    window.openRemoteDesktop();
+    doc.getElementById('remoteDesktopKind').value = 'rdp';
+    window.remoteDesktopKindChanged();
+    await new Promise(resolve => setTimeout(resolve, 40));
+    const rdEditor = doc.getElementById('remoteDesktopScript');
+    rdEditor.value = '#!/bin/bash\necho custom-inline-rdp\n';
+    window.onRemoteDesktopScriptInput();
+    responses['/api/desktop/check'] = {
+      success: true, checked: true, available: true, via_ssh: true, can_install: false,
+      kind: 'rdp', host: '127.0.0.1', port: 3389,
+      install_script: '#!/bin/bash\necho default-rdp\n',
+      default_install_script: '#!/bin/bash\necho default-rdp\n',
+      is_custom: false,
+      reason: ''
+    };
+    await window.installRemoteDesktop();
+    const rdpInstallCall = calls.filter(call => call.path === '/api/desktop/install').pop();
+    check('installing edited RDP script forwards edited script in /api/desktop/install',
+      !!rdpInstallCall &&
+      JSON.parse(rdpInstallCall.options.body).script === '#!/bin/bash\necho custom-inline-rdp\n');
+    responses['/api/desktop/install-script'] = {
+      success: true, kind: 'rdp', target: 'rdp',
+      install_script: '#!/bin/bash\necho loaded-rdp\n',
+      default_install_script: '#!/bin/bash\necho default-rdp\n',
+      is_custom: false
+    };
+    await window.loadRemoteDesktopScriptForEdit();
+    check('Load script button populates Remote Desktop script editor even when already installed',
+      rdEditor.value === '#!/bin/bash\necho loaded-rdp\n');
+    rdEditor.value = '#!/bin/bash\necho saved-rdp\n';
+    window.onRemoteDesktopScriptInput();
+    responses['/api/desktop/install-script'] = {
+      success: true, kind: 'rdp', target: 'rdp',
+      install_script: '#!/bin/bash\necho saved-rdp\n',
+      default_install_script: '#!/bin/bash\necho default-rdp\n',
+      is_custom: true
+    };
+    await window.saveCustomRemoteDesktopScript();
+    const saveRdpCall = calls.filter(call => call.path === '/api/desktop/install-script' && call.options && call.options.method === 'POST').pop();
+    check('Save custom script in Remote Desktop posts target and script',
+      !!saveRdpCall &&
+      JSON.parse(saveRdpCall.options.body).kind === 'rdp' &&
+      JSON.parse(saveRdpCall.options.body).script === '#!/bin/bash\necho saved-rdp\n');
+
+    // 3. Edited X2Go script runs exact edited script in SSH terminal.
+    responses['/api/desktop/check'] = {
+      success: true, checked: true, available: false, via_ssh: true, can_install: true,
+      kind: 'x2go', host: '127.0.0.1', port: 2222,
+      desktop_checked: true, desktop: 'XFCE',
+      install_script: '#!/bin/bash\necho default-x2go\n',
+      default_install_script: '#!/bin/bash\necho default-x2go\n',
+      reason: 'x2goserver missing'
+    };
+    doc.getElementById('remoteDesktopKind').value = 'x2go';
+    window.remoteDesktopKindChanged();
+    await new Promise(resolve => setTimeout(resolve, 40));
+    rdEditor.value = '#!/bin/bash\necho edited-x2go-custom\n';
+    window.onRemoteDesktopScriptInput();
+    await window.installRemoteDesktop();
+    const x2goEditedInput = JSON.parse(calls.filter(call => call.path === '/api/terminal/input').pop().options.body);
+    const x2goEditedCmd = Buffer.from(x2goEditedInput.data, 'base64').toString();
+    const x2goEditedB64 = (x2goEditedCmd.match(/printf %s '([^']+)' \| base64 -d \| bash/) || [])[1] || '';
+    check('installing edited X2Go script executes the edited script instead of reverting to default',
+      Buffer.from(x2goEditedB64, 'base64').toString('utf8') === '#!/bin/bash\necho edited-x2go-custom\n');
+    window.closeTerminal();
+    window.closeModal('remoteDesktopModal');
+    delete responses['/api/desktop/install'];
+    delete responses['/api/desktop/install-script'];
+
+    // 4. Preferences modal customizable installer scripts editor.
+    responses['/api/mosh/install-script'] = {
+      success: true,
+      install_script: '#!/bin/bash\necho pref-default-mosh\n',
+      default_install_script: '#!/bin/bash\necho pref-default-mosh\n',
+      is_custom: false
+    };
+    responses['/api/desktop/install-script'] = {
+      success: true, kind: 'x2go_xfce', target: 'x2go_xfce',
+      install_script: '#!/bin/bash\necho pref-default-xfce\n',
+      default_install_script: '#!/bin/bash\necho pref-default-xfce\n',
+      is_custom: false
+    };
+    await window.openPreferences();
+    check('opening Preferences loads selected installer script target',
+      doc.getElementById('prefInstallScriptEditor').value === '#!/bin/bash\necho pref-default-mosh\n');
+    doc.getElementById('prefInstallScriptTarget').value = 'x2go_xfce';
+    await window.loadPrefInstallScriptTarget();
+    check('switching Preferences installer target loads that target script',
+      doc.getElementById('prefInstallScriptEditor').value === '#!/bin/bash\necho pref-default-xfce\n');
+    doc.getElementById('prefInstallScriptEditor').value = '#!/bin/bash\necho pref-custom-xfce\n';
+    window.onPrefInstallScriptInput();
+    responses['/api/desktop/install-script'] = {
+      success: true, kind: 'x2go_xfce', target: 'x2go_xfce',
+      install_script: '#!/bin/bash\necho pref-custom-xfce\n',
+      default_install_script: '#!/bin/bash\necho pref-default-xfce\n',
+      is_custom: true
+    };
+    await window.savePrefInstallScript();
+    const prefSaveCall = calls.filter(call => call.path === '/api/desktop/install-script' && call.options && call.options.method === 'POST').pop();
+    check('saving custom script in Preferences posts target and script',
+      !!prefSaveCall &&
+      JSON.parse(prefSaveCall.options.body).kind === 'x2go_xfce' &&
+      JSON.parse(prefSaveCall.options.body).script === '#!/bin/bash\necho pref-custom-xfce\n');
+    responses['/api/desktop/install-script'] = {
+      success: true, kind: 'x2go_xfce', target: 'x2go_xfce',
+      install_script: '#!/bin/bash\necho pref-default-xfce\n',
+      default_install_script: '#!/bin/bash\necho pref-default-xfce\n',
+      is_custom: false
+    };
+    await window.resetPrefInstallScript();
+    const prefResetCall = calls.filter(call => call.path === '/api/desktop/install-script' && call.options && call.options.method === 'POST').pop();
+    check('resetting custom script in Preferences posts reset and restores default',
+      !!prefResetCall &&
+      JSON.parse(prefResetCall.options.body).reset === true &&
+      doc.getElementById('prefInstallScriptEditor').value === '#!/bin/bash\necho pref-default-xfce\n');
+    window.closeModal('preferencesModal');
+    delete responses['/api/mosh/install-script'];
+    delete responses['/api/desktop/install-script'];
+    internals.invoke = prevInvokeForScripts;
   }
 
   check('no script errors', errors.length === 0, errors.join(' | '));
