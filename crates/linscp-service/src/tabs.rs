@@ -207,6 +207,10 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
     obj.insert("remote_dir".into(), json!(site.remote_directory));
     obj.insert("initial_dir".into(), json!(site.remote_directory));
     obj.insert("local_dir".into(), json!(site.local_directory));
+    obj.insert(
+        "other_local_dir".into(),
+        json!(site.extra_fields.get("other_local_dir").cloned().unwrap_or_default()),
+    );
     obj.insert("preset".into(), json!(site.preset));
     obj.insert("proxy_method".into(), json!(site.proxy_method));
     obj.insert("proxy_host".into(), json!(site.proxy_host));
@@ -613,9 +617,18 @@ pub fn parse_gui_session_spec(
         }
         None => stored_base.as_ref().and_then(|b| b.key_passphrase.clone()),
     };
+    if let Some(preset) = session.get("preset").and_then(Value::as_str) {
+        if preset.chars().any(char::is_control) {
+            return Err("Preset name contains invalid control characters.".to_string());
+        }
+        spec.preset_name = preset.trim().to_string();
+    }
 
     // Extra protocol fields (`s3_*`, `ftp_*`, `tls_*`, `proxy_*`, Kerberos)
     let extra_keys = [
+        "other_local_dir",
+        "color",
+        "note",
         "sudo_password_auto",
         "alt_hostname",
         "alt_fallback",
@@ -643,7 +656,9 @@ pub fn parse_gui_session_spec(
         "min_tls_version",
         "max_tls_version",
         "tls_certificate_file",
+        "tls_certificate_key_file",
         "ca_certificate_file",
+        "ca_certificate_dir",
         "pinned_public_key",
         "pinned_pubkey",
         "certificate",
@@ -676,6 +691,19 @@ pub fn parse_gui_session_spec(
                 }
                 _ => {}
             }
+        }
+    }
+    if protocol != ProtocolScheme::Local {
+        spec.raw_fields.remove("other_local_dir");
+    } else if let Some(other_dir) = spec.raw_fields.get("other_local_dir").cloned() {
+        let trimmed = other_dir.trim();
+        if trimmed.chars().any(char::is_control) {
+            return Err("The other_local_dir must not contain control characters.".to_string());
+        }
+        if trimmed.is_empty() {
+            spec.raw_fields.remove("other_local_dir");
+        } else {
+            spec.raw_fields.insert("other_local_dir".to_string(), trimmed.to_string());
         }
     }
     if session.get("alt_hostname").is_some_and(|v| !v.is_string()) ||

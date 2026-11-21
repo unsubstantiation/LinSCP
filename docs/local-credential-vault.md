@@ -74,9 +74,10 @@ settings file exists. Restore removes optional files that were absent in the
 backup and clears the destination's previous auto-reconnect intentions, which
 are device-local activity state rather than portable settings.
 
-Vault SSH keys and session secrets are decrypted in memory from the backup and
-re-encrypted under the destination's existing unlocked vault key so the
-destination vault password and `sessions.key` remain unchanged. Saved-session
+Vault SSH keys (`keys/<id>.key.vault`), vault TLS certificate/CA/key blobs
+(`keys/<id>.tls.vault`), and session secrets are decrypted in memory from the
+backup and re-encrypted under the destination's existing unlocked vault key so
+the destination vault password and `sessions.key` remain unchanged. Saved-session
 and tunnel references retain their IDs. Existing keys are never overwritten: a
 conflicting key ID or mismatched key material causes restore to fail before any
 files are modified; identical keys retain their existing destination metadata.

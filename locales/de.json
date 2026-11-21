@@ -1342,7 +1342,7 @@
     "The backend refused this request.": "Das Backend hat diese Anfrage abgelehnt.",
     "The backup contains no LinSCP sessions.": "Das Backup enthält keine LinSCP-Sitzungen.",
     "The backup could not be read.": "Das Backup konnte nicht gelesen werden.",
-    "The backup password is not saved. The export is a timestamped LinSCP backup; import it with Key/Session Import. Local directory and certificate-file paths are omitted; SSH key contents are included.": "Das Backup-Passwort wird nicht gespeichert. Der Export ist ein zeitgestempeltes LinSCP-Backup; importieren Sie ihn mit Key/Session Import. Lokale Verzeichnis- und Zertifikatsdateipfade entfallen; die SSH-Schlüsselinhalte sind enthalten.",
+    "The backup password is not saved. The export is a timestamped LinSCP backup; import it with Key/Session Import. All saved session settings, directories, SSH keys, TLS certificates, remembered host keys and transfer presets are included.": "Das Backup-Passwort wird nicht gespeichert. Der Export ist ein zeitgestempeltes LinSCP-Backup; importieren Sie ihn mit Key/Session Import. Alle gespeicherten Sitzungseinstellungen, Verzeichnisse, SSH-Schlüssel, TLS-Zertifikate, gemerkten Hostschlüssel und Übertragungsvorgaben sind enthalten.",
     "The backup passwords do not match.": "Die Sicherungspasswörter stimmen nicht überein.",
     "The command finished.": "Der Befehl ist beendet.",
     "The copy is queued.": "Die Kopie ist in die Warteschlange gestellt.",

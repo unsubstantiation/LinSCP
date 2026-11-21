@@ -2333,6 +2333,31 @@ function options(id) {
    * only the ticked sessions are sent. */
   const origSessionsList = responses['/api/sessions'].sessions;
   responses['/api/sessions'].sessions = [
+    Object.assign({}, origSessionsList[0], {
+      has_password: false,
+      has_proxy_password: true,
+      has_key_passphrase: false,
+      has_tunnel_passphrase: true,
+      linscp_public_key_file: 'vaultpub://0123456789abcdef0123456789abcdef',
+    }),
+    {
+      name: 'Workspaces/DualLocal',
+      protocol: 'local',
+      host: '',
+      port: 0,
+      username: '',
+      local_dir: '/srv/left',
+      other_local_dir: '/srv/right',
+    },
+  ];
+  await window.openKeySessionExport();
+  check('the export dialog flags proxy/tunnel secrets, public SSH keys, and dual-local directories',
+    text('keyExportList').includes('Password') &&
+      text('keyExportList').includes('Key password') &&
+      text('keyExportList').includes('SSH key') &&
+      text('keyExportList').includes('/srv/left ↔ /srv/right'),
+    text('keyExportList'));
+  responses['/api/sessions'].sessions = [
     Object.assign({}, origSessionsList[0], { tunnel_private_key: 'vaultkey://fedcba9876543210fedcba9876543210' })
   ];
   await window.openKeySessionExport();
