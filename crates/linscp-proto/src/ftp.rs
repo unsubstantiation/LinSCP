@@ -439,8 +439,14 @@ impl FtpInner {
         let mut lines = vec![trimmed_first.to_string()];
 
         if sep == b'-' {
+            const MAX_FTP_REPLY_LINES: usize = 4096;
             let end_prefix = format!("{code:03} ");
             loop {
+                if lines.len() >= MAX_FTP_REPLY_LINES {
+                    return Err(ProtoError::Transport(format!(
+                        "FTP multi-line reply exceeded {MAX_FTP_REPLY_LINES} lines."
+                    )));
+                }
                 let line = self.ctrl.read_line_capped().await?;
                 let clean = line.trim_end_matches(['\r', '\n']).to_string();
                 let done = clean.starts_with(&end_prefix);

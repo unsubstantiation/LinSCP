@@ -864,7 +864,7 @@ pub fn open_encrypted_backup(bytes: &[u8], password: &str) -> Result<BackupBundl
 pub fn export_backup_to_file(config_dir: &Path, dest_path: &Path, vault: &dyn SecretVault, password: &str) -> Result<(), String> {
     let bundle = export_backup(config_dir, vault)?;
     let bytes = seal_backup(&bundle, password)?;
-    linscp_platform::write_private_file_atomic(dest_path, &bytes).map_err(|e| e.to_string())
+    linscp_platform::write_owner_only_file_atomic(dest_path, &bytes).map_err(|e| e.to_string())
 }
 
 pub fn import_backup_from_file_transactional(

@@ -513,17 +513,25 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun foregroundUpdate(invoke: Invoke) {
     val args = invoke.parseArgs(ProgressArgs::class.java)
-    ContextCompat.startForegroundService(activity, Intent(activity, LinSCPTransferService::class.java).apply {
-      action = LinSCPTransferService.ACTION_UPDATE
-      putExtra("done", args.done); putExtra("total", args.total)
-    })
+    if (running.get()) {
+      try {
+        activity.startService(Intent(activity, LinSCPTransferService::class.java).apply {
+          action = LinSCPTransferService.ACTION_UPDATE
+          putExtra("done", args.done); putExtra("total", args.total)
+        })
+      } catch (_: Exception) {
+        // Ignore late progress updates if the transfer service already stopped or backgrounded.
+      }
+    }
     invoke.resolveObject(mapOf("success" to true))
   }
 
   @Command
   fun foregroundStop(invoke: Invoke) {
-    activity.stopService(Intent(activity, LinSCPTransferService::class.java))
     running.set(false)
+    try {
+      activity.stopService(Intent(activity, LinSCPTransferService::class.java))
+    } catch (_: Exception) {}
     invoke.resolveObject(mapOf("running" to false))
   }
 
@@ -645,8 +653,12 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
           }
         } ?: throw IllegalStateException("cannot open $uri")
       } catch (e: Exception) {
-        file.delete()
-        staged.forEach { File(it).delete() }
+        batch.deleteRecursively()
+        staged.forEach { path ->
+          val f = File(path)
+          f.delete()
+          f.parentFile?.takeIf { it.parentFile == shareDir }?.deleteRecursively()
+        }
         throw e
       }
       file.setReadable(false, false); file.setWritable(false, false)
@@ -692,12 +704,27 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
    * listing a folder through this plugin - working unchanged.
    */
   private fun resolveDocument(uri: Uri): Uri {
-    if (!DocumentsContract.isTreeUri(uri)) return uri
+    if (!DocumentsContract.isTreeUri(uri)) {
+      throw IllegalArgumentException("URI is not inside a granted SAF tree")
+    }
     val segments = uri.pathSegments
     val treeIndex = segments.indexOf("tree")
     val childIndex = segments.indexOf("document")
     // The tree itself, or a URI that already names one document by id.
     if (treeIndex < 0 || treeIndex + 1 >= segments.size || childIndex < 0) return documentUri(uri)
+    if (segments.size == childIndex + 2) {
+      val direct = DocumentsContract.buildDocumentUriUsingTree(uri, segments[childIndex + 1])
+      val existsDirectly = try {
+        activity.contentResolver.query(
+          direct,
+          arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID),
+          null, null, null
+        )?.use { it.moveToFirst() } == true
+      } catch (_: Exception) {
+        false
+      }
+      if (existsDirectly) return direct
+    }
     val grantId = segments[treeIndex + 1]
     var current = DocumentsContract.buildDocumentUriUsingTree(uri, grantId)
     var i = childIndex + 1
@@ -799,10 +826,11 @@ class LinSCPTransferService : Service() {
           (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIFICATION_ID, notification(activeTitle, 1, done, total))
         }
       }
-      ACTION_STOP -> { stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
+      ACTION_STOP -> { foreground = false; stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
     }
     return START_NOT_STICKY
   }
+  override fun onDestroy() { foreground = false; super.onDestroy() }
   private fun createChannel() {
     if (Build.VERSION.SDK_INT >= 26) {
       (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(NotificationChannel(channelId, "File transfers", NotificationManager.IMPORTANCE_LOW))

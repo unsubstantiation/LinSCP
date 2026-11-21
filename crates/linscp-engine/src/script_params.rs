@@ -229,20 +229,21 @@ pub fn try_relative_time(spec: &str, base_epoch: i64, add: bool) -> Result<i64, 
     let mut min = n0 as i32;
     let mut sec = s0 as i32;
 
+    let out_of_range = || format!("relative timestamp '{trimmed}' is outside the representable range");
     match unit {
-        'S' => sec += amount,
+        'S' => sec = sec.checked_add(amount).ok_or_else(out_of_range)?,
         'N' => {
             if start_of_unit {
                 sec = 0;
             }
-            min += amount;
+            min = min.checked_add(amount).ok_or_else(out_of_range)?;
         }
         'H' => {
             if start_of_unit {
                 sec = 0;
                 min = 0;
             }
-            hour += amount;
+            hour = hour.checked_add(amount).ok_or_else(out_of_range)?;
         }
         'D' => {
             if start_of_unit {
@@ -250,7 +251,7 @@ pub fn try_relative_time(spec: &str, base_epoch: i64, add: bool) -> Result<i64, 
                 min = 0;
                 hour = 0;
             }
-            day += amount;
+            day = day.checked_add(amount).ok_or_else(out_of_range)?;
         }
         'Y' => {
             if start_of_unit {
@@ -260,7 +261,7 @@ pub fn try_relative_time(spec: &str, base_epoch: i64, add: bool) -> Result<i64, 
                 month = 1;
                 day = 1;
             }
-            year += amount;
+            year = year.checked_add(amount).ok_or_else(out_of_range)?;
             let max_d = days_in_month(year, month);
             day = day.clamp(1, max_d);
         }
@@ -369,12 +370,14 @@ pub fn expand_script_parameters(line: &str, parameters: &[String]) -> Result<Str
             pos = start + 1;
             continue;
         }
-        if let Ok(val) = std::env::var(name) {
-            expanded.replace_range(start..=close, &val);
-            pos = start + val.len();
-        } else {
-            pos = close + 1;
+        if !name.chars().any(char::is_whitespace) {
+            if let Ok(val) = std::env::var(name) {
+                expanded.replace_range(start..=close, &val);
+                pos = start + val.len();
+                continue;
+            }
         }
+        pos = close;
     }
     Ok(expanded)
 }
@@ -535,6 +538,15 @@ mod tests {
             .unwrap();
         assert_eq!(got, "put report.csv %UNSET_VAR_XYZ%");
         assert!(expand_script_parameters("%TIMESTAMP+1D%", &[]).is_err());
+        // Huge relative timestamp offsets must return a clean error instead of overflowing i32.
+        assert!(expand_script_parameters("%TIMESTAMP+2147483647S#yyyy%", &[]).is_err());
+        assert!(expand_script_parameters("%TIMESTAMP+2147483647Y#yyyy%", &[]).is_err());
+        // A literal `%` before `%ENV%` must not swallow the opening `%` of the environment token.
+        std::env::set_var("LINSCP_TEST_PARAM_VAR", "ok_val");
+        let after_pct =
+            expand_script_parameters("100% of %LINSCP_TEST_PARAM_VAR%", &[]).unwrap();
+        assert_eq!(after_pct, "100% of ok_val");
+        std::env::remove_var("LINSCP_TEST_PARAM_VAR");
         assert_eq!(
             censored_for_log("open sftp://alice:s3cr3t@example.com/ -passphrase=mykey"),
             "open sftp://alice:***@example.com/ -passphrase=***"

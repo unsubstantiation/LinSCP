@@ -1883,6 +1883,14 @@
     }
   }
 
+  function encodeSafSegment(name) {
+    return String(name === null || name === undefined ? '' : name)
+      .replace(/%/g, '%25')
+      .replace(/\?/g, '%3F')
+      .replace(/#/g, '%23')
+      .replace(/\//g, '%2F');
+  }
+
   function joinPath(base, name) {
     // Stripping the trailing slashes first and then adding one back is what
     // keeps the root from producing '//name': at '/', the stripped base is
@@ -1892,7 +1900,7 @@
     // a plain '/' produced a URI the shell cannot open, which looked like a
     // broken folder deep inside a granted tree.
     if (isSafPath(trimmed)) {
-      return trimmed + '/document/' + name;
+      return trimmed + '/document/' + encodeSafSegment(name);
     }
     return trimmed + '/' + name;
   }
@@ -7130,15 +7138,23 @@
     $('fullBackupExport').disabled = true;
     status.textContent = t('Exporting…');
     try {
-      const data = await apiPost('/api/backup/export', { password });
+      const data = await apiPost('/api/backup/export', {
+        password,
+        save_dir: (state.local && state.local.path) || '',
+      });
       if (!data || !data.success) { status.textContent = data && data.error || t('Export failed'); return; }
-      const raw = atob(data.data_base64);
-      const bytes = new Uint8Array(raw.length);
-      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-      const url = URL.createObjectURL(new Blob([bytes], {type: 'application/octet-stream'}));
-      const link = document.createElement('a'); link.href = url; link.download = data.filename;
-      document.body.appendChild(link); link.click(); link.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      if (data.saved_path) {
+        if (state.local && state.local.path) await loadLocal(state.local.path);
+      } else {
+        const raw = atob(data.data_base64);
+        const bytes = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+        const url = URL.createObjectURL(new Blob([bytes], {type: 'application/octet-stream'}));
+        bytes.fill(0);
+        const link = document.createElement('a'); link.href = url; link.download = data.filename;
+        document.body.appendChild(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
       status.textContent = t('Encrypted backup download started.');
     } catch (e) { status.textContent = String(e && e.message ? e.message : e); }
     finally {
@@ -7188,20 +7204,25 @@
         password: password,
         plain_text: false,
         sessions: names,
+        save_dir: (state.local && state.local.path) || '',
       });
       if (!data || !data.success) { $('keyExportStatus').textContent = data && data.error || t('Export failed'); return; }
-      const raw = atob(data.data_base64);
-      const bytes = new Uint8Array(raw.length);
-      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-      const objectUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
-      bytes.fill(0);
-      const link = document.createElement('a');
-      link.href = objectUrl;
-      link.download = data.filename;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+      if (data.saved_path) {
+        if (state.local && state.local.path) await loadLocal(state.local.path);
+      } else {
+        const raw = atob(data.data_base64);
+        const bytes = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+        const objectUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+        bytes.fill(0);
+        const link = document.createElement('a');
+        link.href = objectUrl;
+        link.download = data.filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+      }
       $('keyExportStatus').textContent = t('Encrypted export written: {filename} ({count} entries).', { filename: data.filename, count: data.entry_count });
       $('keyExportPassword').value = '';
       $('keyExportPasswordConfirm').value = '';

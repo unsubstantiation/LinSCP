@@ -210,7 +210,10 @@ pub fn write_local_text_file_encoded(
         }
     }
 
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let mut rnd = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut rnd);
     let tmp = parent.join(format!(
@@ -219,18 +222,26 @@ pub fn write_local_text_file_encoded(
     ));
 
     let write_res = (|| -> Result<(), String> {
-        write_private_file_atomic(&tmp, &encoded_bytes).map_err(|e| e.to_string())?;
-        if let Some(ref info) = existing {
-            let _ = set_local_permissions(&tmp, info.mode);
-        }
         let mut f = std::fs::OpenOptions::new()
             .write(true)
+            .create_new(true)
             .open(&tmp)
             .map_err(|e| e.to_string())?;
+        f.write_all(&encoded_bytes).map_err(|e| e.to_string())?;
         f.flush().map_err(|e| e.to_string())?;
         f.sync_all().map_err(|e| e.to_string())?;
         drop(f);
-        std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+        if let Some(ref info) = existing {
+            if (info.mode & 0o200) != 0 {
+                let _ = set_local_permissions(&tmp, info.mode);
+            }
+        }
+        linscp_platform::atomic_replace_file(&tmp, path).map_err(|e| e.to_string())?;
+        if let Some(ref info) = existing {
+            if (info.mode & 0o200) == 0 {
+                let _ = set_local_permissions(path, info.mode);
+            }
+        }
         Ok(())
     })();
 
@@ -443,7 +454,9 @@ pub async fn write_remote_text_file(
 
     if let Some(ref prev) = existing {
         let mode = mode_from_permissions_str(&prev.permissions);
+        if mode != 0 {
             let _ = session.chmod(remote_path, mode).await;
+        }
     }
     let updated = session.stat(remote_path).await.ok().flatten();
     Ok(json!({
@@ -1894,5 +1907,33 @@ mod tests {
         assert_eq!(reloaded.len(), 1, "{reloaded:?}");
         assert_eq!(reloaded[0]["command"], "call wc {file}");
         let _ = std::fs::remove_dir_all(config);
+    }
+
+    #[test]
+    fn write_local_text_file_preserves_parent_dir_mode_and_file_permissions() {
+        let dir = scratch("local-edit-perms");
+        let _ = set_local_permissions(&dir, 0o755);
+        let dir_mode_before = stat_extended(&dir).unwrap().mode & 0o777;
+
+        let target = dir.join("script.sh");
+        std::fs::write(&target, b"#!/bin/sh\necho one\n").unwrap();
+        let _ = set_local_permissions(&target, 0o755);
+        let file_mode_before = stat_extended(&target).unwrap().mode & 0o777;
+
+        write_local_text_file_encoded(&target, "#!/bin/sh\necho two\n", None, None, None, None)
+            .expect("atomic replacement of existing file must succeed");
+        assert_eq!(std::fs::read(&target).unwrap(), b"#!/bin/sh\necho two\n");
+
+        let dir_mode_after = stat_extended(&dir).unwrap().mode & 0o777;
+        let file_mode_after = stat_extended(&target).unwrap().mode & 0o777;
+        assert_eq!(
+            dir_mode_after, dir_mode_before,
+            "editing a file must not alter its parent directory permissions"
+        );
+        assert_eq!(
+            file_mode_after, file_mode_before,
+            "editing a file must preserve its executable/permission bits"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

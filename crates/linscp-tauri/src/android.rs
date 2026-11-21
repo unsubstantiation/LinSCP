@@ -419,14 +419,13 @@ pub fn local_filesystem(state: &AndroidState) -> linscp_platform::NativeLocalFs 
     }
 }
 
-/// Validates that a SAF tree URI looks like `content://...`
+/// Validates that a SAF tree URI looks like `content://<authority>/tree/<id>...`
+/// without dot-segment traversal.
 pub fn validate_saf_tree_uri(uri: &str) -> Result<(), String> {
     if !uri.starts_with("content://") {
         return Err("SAF tree URI must start with content://".to_string());
     }
-    if uri.len() < 14 || uri.contains("..") || uri.contains('\0') {
-        return Err("Invalid SAF tree URI.".to_string());
-    }
+    linscp_platform::parse_saf_document_uri(uri).map_err(|_| "Invalid SAF tree URI.".to_string())?;
     Ok(())
 }
 
@@ -444,6 +443,7 @@ pub fn register_saf_tree(state: &AndroidState, uri: &str) -> Result<linscp_types
         .next()
         .filter(|s| !s.is_empty())
         .map(urlencoding_decode)
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "SAF Folder".to_string());
     Ok(linscp_types::LocalRootEntry {
         path: uri.to_string(),
@@ -454,29 +454,29 @@ pub fn register_saf_tree(state: &AndroidState, uri: &str) -> Result<linscp_types
 }
 
 fn urlencoding_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '%' {
-            let hi = chars.next().unwrap_or('0');
-            let lo = chars.next().unwrap_or('0');
-            let hex = format!("{hi}{lo}");
-            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                out.push(byte as char);
-            } else {
-                out.push('%');
-                out.push(hi);
-                out.push(lo);
+    let raw = s.as_bytes();
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] == b'%' && index + 2 < raw.len() {
+            if let (Some(hi), Some(lo)) = (
+                (raw[index + 1] as char).to_digit(16),
+                (raw[index + 2] as char).to_digit(16),
+            ) {
+                bytes.push(((hi << 4) | lo) as u8);
+                index += 3;
+                continue;
             }
-        } else {
-            out.push(ch);
         }
+        bytes.push(raw[index]);
+        index += 1;
     }
-    if let Some(idx) = out.rfind(':') {
-        out[idx + 1..].to_string()
-    } else {
-        out
-    }
+    let decoded = String::from_utf8_lossy(&bytes);
+    decoded
+        .rsplit(['/', ':'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(decoded.as_ref())
+        .to_string()
 }
 
 #[cfg(test)]
@@ -493,6 +493,22 @@ mod tests {
         assert!(entry.label.contains("Download"));
         assert!(validate_saf_tree_uri(uri).is_ok());
         assert!(validate_saf_tree_uri("file:///tmp").is_err());
+
+        // Non-ASCII UTF-8 SAF folder names must decode cleanly instead of Latin-1 mojibake.
+        let utf8_uri = "content://com.android.externalstorage.documents/tree/primary%3ADownload%2F%E6%97%A5%E6%9C%AC%E8%AA%9E";
+        let utf8_entry = register_saf_tree(&state, utf8_uri).unwrap();
+        assert_eq!(utf8_entry.label, "日本語 (SAF)");
+
+        // Consecutive dots in folder names are legal, while dot-segment traversal is rejected.
+        assert!(validate_saf_tree_uri(
+            "content://com.android.externalstorage.documents/tree/primary%3A2025..2026"
+        )
+        .is_ok());
+        assert!(validate_saf_tree_uri(
+            "content://com.android.externalstorage.documents/tree/primary%3A..%2Fsecret"
+        )
+        .is_err());
+        assert!(validate_saf_tree_uri("content://com.android.contacts/contacts/1").is_err());
     }
 
     #[test]
