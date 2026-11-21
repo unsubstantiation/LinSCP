@@ -247,9 +247,19 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
         "tunnel_hostkey".into(),
         json!(site.tunnel.hostkey.clone()),
     );
+    obj.insert(
+        "has_s3_session_token".into(),
+        json!(site.extra_fields.get("s3_session_token").is_some_and(|t| !t.is_empty())),
+    );
     for (k, v) in &site.extra_fields {
         if matches!(k.as_str(), "s3_secret_key" | "s3_session_token" | "proxy_password" | "passphrase" | "key_passphrase" | "tunnel_passphrase") { continue; }
         obj.entry(k.clone()).or_insert_with(|| json!(v));
+    }
+    if let Some(alg) = site.extra_fields.get("s3_sse_algorithm") {
+        obj.entry("s3_sse").or_insert_with(|| json!(alg));
+    }
+    if let Some(kms) = site.extra_fields.get("s3_sse_kms_key_id") {
+        obj.entry("s3_kms_key").or_insert_with(|| json!(kms));
     }
     Value::Object(obj)
 }
@@ -624,6 +634,8 @@ pub fn parse_gui_session_spec(
             return Err("Preset name contains invalid control characters.".to_string());
         }
         spec.preset_name = preset.trim().to_string();
+    } else if let Some(ref base) = stored_base {
+        spec.preset_name = base.preset.clone();
     }
 
     // Extra protocol fields (`s3_*`, `ftp_*`, `tls_*`, `proxy_*`, Kerberos)
@@ -643,9 +655,12 @@ pub fn parse_gui_session_spec(
         "s3_url_style",
         "s3_default_region",
         "s3_sse",
+        "s3_sse_algorithm",
         "s3_kms_key",
+        "s3_sse_kms_key_id",
         "s3_acl",
         "s3_storage_class",
+        "s3_metadata",
         "ftp_pasv_mode",
         "ftp_account",
         "ftp_use_mlsd",
@@ -759,6 +774,35 @@ pub fn parse_gui_session_spec(
         }
         if let Some(secret) = spec.raw_fields.remove("s3_secret_key") {
             if spec.session.password.is_none() && !secret.is_empty() { spec.session.password = Some(secret); }
+        }
+    }
+    for (gui, engine) in [
+        ("s3_sse", "s3_sse_algorithm"),
+        ("s3_kms_key", "s3_sse_kms_key_id"),
+    ] {
+        if let Some(value) = spec.raw_fields.remove(gui) {
+            spec.raw_fields
+                .entry(engine.to_string())
+                .or_insert(value);
+        }
+    }
+    for s3_opt in [
+        "s3_storage_class",
+        "s3_acl",
+        "s3_sse_algorithm",
+        "s3_sse_kms_key_id",
+        "s3_metadata",
+    ] {
+        if let Some(val) = spec.raw_fields.get(s3_opt).cloned() {
+            let trimmed = val.trim();
+            if trimmed.chars().any(char::is_control) {
+                return Err(format!("S3 option '{s3_opt}' contains invalid control characters."));
+            }
+            if trimmed.is_empty() {
+                spec.raw_fields.remove(s3_opt);
+            } else {
+                spec.raw_fields.insert(s3_opt.to_string(), trimmed.to_string());
+            }
         }
     }
     // Translate GUI TLS option names to the names consumed by the engine.
@@ -1011,7 +1055,7 @@ pub fn format_session_url(spec: &ParsedSiteSpec, remote_dir_override: Option<&st
     format!("{proto}://{user_part}{host_part}{port_part}{path_part}")
 }
 
-fn percent_encode_userinfo(raw: &str) -> String {
+pub(crate) fn percent_encode_userinfo(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for b in raw.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
@@ -1261,6 +1305,60 @@ mod tests {
         } else {
             assert!(err.contains("Linux"), "kex refusal names Linux, got: {err}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gui_s3_advanced_options_and_preset_round_trip() {
+        let dir = test_config_dir("s3-options");
+        let vault = linscp_platform::NativeSecretVault::new();
+        let session = json!({
+            "protocol": "s3",
+            "host": "s3.amazonaws.com",
+            "username": "AKIAEXAMPLE",
+            "password": "secret",
+            "s3_storage_class": "STANDARD_IA",
+            "s3_acl": "bucket-owner-full-control",
+            "s3_sse": "aws:kms",
+            "s3_kms_key": "alias/my-key",
+            "s3_metadata": "env=prod,team=storage",
+            "preset": "TextLogs",
+        });
+        let (spec, _) = parse_gui_session_spec(&session, None, &dir, &vault).unwrap();
+        assert_eq!(spec.preset_name, "TextLogs");
+        let hdrs = linscp_engine::url_and_raw::collect_s3_object_write_headers(&spec.raw_fields);
+        assert_eq!(
+            hdrs.get("x-amz-storage-class").map(String::as_str),
+            Some("STANDARD_IA")
+        );
+        assert_eq!(
+            hdrs.get("x-amz-acl").map(String::as_str),
+            Some("bucket-owner-full-control")
+        );
+        assert_eq!(
+            hdrs.get("x-amz-server-side-encryption").map(String::as_str),
+            Some("aws:kms")
+        );
+        assert_eq!(
+            hdrs.get("x-amz-server-side-encryption-aws-kms-key-id")
+                .map(String::as_str),
+            Some("alias/my-key")
+        );
+        assert_eq!(
+            hdrs.get("x-amz-meta-env").map(String::as_str),
+            Some("prod")
+        );
+        assert_eq!(
+            hdrs.get("x-amz-meta-team").map(String::as_str),
+            Some("storage")
+        );
+        let mut site = build_stored_site_for_save("prod-s3", &spec);
+        site.password = None;
+        let gui_json = stored_site_to_gui_json(&site);
+        assert_eq!(gui_json["s3_sse"], "aws:kms");
+        assert_eq!(gui_json["s3_kms_key"], "alias/my-key");
+        assert_eq!(gui_json["s3_metadata"], "env=prod,team=storage");
+        assert_eq!(gui_json["preset"], "TextLogs");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

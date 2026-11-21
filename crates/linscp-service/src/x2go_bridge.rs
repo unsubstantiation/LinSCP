@@ -7,6 +7,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+use linscp_proto::desktop_frame_cache::WireFrameTracker;
 use linscp_proto::kdrive_wire::{Message, CLIENT_EVENT_SIZE};
 use linscp_proto::x2go_transport::{viewer_message_extended, GuardedKDriveSession, KDriveReader, KDriveWriter};
 use serde_json::Value;
@@ -217,6 +218,7 @@ where
     let mut remote_closed = false;
     let mut exit_mode = ExitMode::Terminate;
     let mut result = Ok(());
+    let mut frame_tracker = WireFrameTracker::default();
     let mut lease = tokio::time::Instant::now() + VIEWER_LEASE;
     let mut keepalive = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut last_server_message = tokio::time::Instant::now();
@@ -275,6 +277,10 @@ where
                     Ok(message) => {
                         last_server_message = tokio::time::Instant::now();
                         remote_closed = matches!(&message, Message::Disconnect);
+                        if frame_tracker.observe_message(&message).is_err() {
+                            result = Err("Invalid KDrive frame cache reference or geometry.");
+                            break;
+                        }
                         match viewer_message_extended(message, allow_clipboard) {
                             Ok(Some(value)) => pending = Some(value),
                             Ok(None) => {},

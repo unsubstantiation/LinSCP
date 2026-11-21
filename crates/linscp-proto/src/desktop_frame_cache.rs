@@ -1,9 +1,11 @@
-//! Bounded RGBA image cache and composition primitives for a desktop viewer.
+//! Bounded RGBA image cache, wire-frame cache tracker, and composition
+//! primitives for a desktop viewer.
 //!
-//! This module is protocol-independent: it does not parse KDrive messages or
-//! decode JPEG/PNG. A future decoder must translate verified messages into these
-//! operations and handle cache misses/resynchronization according to the wire
-//! protocol. Cache entries are never evicted implicitly.
+//! `FrameCache` composes tightly packed RGBA pixels for decoded frames, while
+//! `WireFrameTracker` enforces the same bounded KDrive cache/geometry/work
+//! invariants (`MAX_CACHE_ENTRIES`, `MAX_CACHE_BYTES`, `MAX_COMPOSITION_BYTES`)
+//! on incoming `kdrive_wire::Message` traffic before forwarding compressed
+//! regions to a viewer. Cache entries are never evicted implicitly.
 
 use std::collections::HashMap;
 
@@ -123,6 +125,66 @@ impl FrameCache {
         self.bytes = 0;
     }
 
+    /// Delete all listed cached entries explicitly (`DeletedFrames`).
+    pub fn apply_deleted_frames(&mut self, ids: &[u32]) -> usize {
+        let mut removed = 0;
+        for &id in ids {
+            if self.remove(id) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Compose a `kdrive_wire::Frame` whose pixel regions have already been
+    /// decoded to tightly packed RGBA (`region.data.len() == width * height * 4`)
+    /// or refer to prior cached frames (`region.source_id != 0` and empty `data`).
+    pub fn compose_wire_rgba_frame(
+        &mut self,
+        frame: &crate::kdrive_wire::Frame,
+    ) -> Result<&Image, CacheError> {
+        let main = frame.is_main_image();
+        let ox = if frame.cache_id == 0 && !main { frame.x } else { 0 };
+        let oy = if frame.cache_id == 0 && !main { frame.y } else { 0 };
+        if frame.regions.is_empty() {
+            if frame.cache_id == 0 {
+                return Err(CacheError::MissingSource);
+            }
+            let existing = self.images.get(&frame.cache_id).ok_or(CacheError::MissingSource)?;
+            if existing.width != frame.width || existing.height != frame.height {
+                return Err(CacheError::InvalidDimensions);
+            }
+            return Ok(self.images.get(&frame.cache_id).expect("verified cache entry"));
+        }
+        let mut patches = Vec::with_capacity(frame.regions.len());
+        for r in &frame.regions {
+            let dx = u32::try_from(i64::from(r.x) - i64::from(ox))
+                .map_err(|_| CacheError::InvalidRectangle)?;
+            let dy = u32::try_from(i64::from(r.y) - i64::from(oy))
+                .map_err(|_| CacheError::InvalidRectangle)?;
+            if r.source_id != 0 {
+                if !r.data.is_empty() {
+                    return Err(CacheError::InvalidPixelLength);
+                }
+                let sx = u32::try_from(r.source_x).map_err(|_| CacheError::InvalidRectangle)?;
+                let sy = u32::try_from(r.source_y).map_err(|_| CacheError::InvalidRectangle)?;
+                patches.push(Patch::Copy {
+                    source_id: r.source_id,
+                    source: Rect { x: sx, y: sy, width: r.width, height: r.height },
+                    x: dx,
+                    y: dy,
+                });
+            } else {
+                patches.push(Patch::Pixels {
+                    destination: Rect { x: dx, y: dy, width: r.width, height: r.height },
+                    rgba: &r.data,
+                });
+            }
+        }
+        let target_id = frame.cache_id;
+        self.compose(target_id, frame.width, frame.height, &patches)
+    }
+
     /// Compose a new image, initially transparent black, and store it under id.
     /// Patches are applied in order as overwrites. Copy sources refer to the
     /// cache as it was before this call, including when replacing the same id.
@@ -187,6 +249,173 @@ impl FrameCache {
         self.images.insert(id, Image { width, height, rgba: output });
         self.bytes = total;
         Ok(&self.images[&id])
+    }
+}
+
+/// Server-side KDrive wire-frame cache and region validator.
+///
+/// Tracks cached frame dimensions and decoded RGBA byte equivalents without
+/// needing a JPEG/PNG codec on the SSH bridge thread, rejecting cache misses,
+/// out-of-bounds copy references, main-image ordering violations, and cache
+/// entry/byte budget overflows before messages cross IPC.
+#[derive(Debug)]
+pub struct WireFrameTracker {
+    entries: HashMap<u32, (u32, u32, usize)>,
+    rgba_cache: FrameCache,
+    bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+    screen_width: u32,
+    screen_height: u32,
+}
+
+impl Default for WireFrameTracker {
+    fn default() -> Self {
+        Self::new(MAX_CACHE_ENTRIES, MAX_CACHE_BYTES)
+    }
+}
+
+impl WireFrameTracker {
+    pub fn new(max_entries: usize, max_bytes: usize) -> Self {
+        let clamped_entries = max_entries.min(MAX_CACHE_ENTRIES);
+        let clamped_bytes = max_bytes.min(MAX_CACHE_BYTES);
+        Self {
+            entries: HashMap::new(),
+            rgba_cache: FrameCache::new(clamped_entries.min(128), clamped_bytes.min(32 * 1024 * 1024)),
+            bytes: 0,
+            max_entries: clamped_entries,
+            max_bytes: clamped_bytes,
+            screen_width: 0,
+            screen_height: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize { self.entries.len() }
+    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn bytes(&self) -> usize { self.bytes }
+    pub fn screen_size(&self) -> (u32, u32) { (self.screen_width, self.screen_height) }
+    pub fn rgba_cache(&self) -> &FrameCache { &self.rgba_cache }
+
+    pub fn reset(&mut self) {
+        self.entries.clear();
+        self.rgba_cache.clear();
+        self.bytes = 0;
+        self.screen_width = 0;
+        self.screen_height = 0;
+    }
+
+    pub fn delete_frames(&mut self, ids: &[u32]) {
+        self.rgba_cache.apply_deleted_frames(ids);
+        for &id in ids {
+            if let Some((_, _, sz)) = self.entries.remove(&id) {
+                self.bytes = self.bytes.saturating_sub(sz);
+            }
+        }
+    }
+
+    pub fn observe_message(&mut self, msg: &crate::kdrive_wire::Message) -> Result<(), CacheError> {
+        match msg {
+            crate::kdrive_wire::Message::Frame(frame) => self.observe_frame(frame),
+            crate::kdrive_wire::Message::DeletedFrames(ids) => {
+                self.delete_frames(ids);
+                Ok(())
+            }
+            crate::kdrive_wire::Message::Reinitialize => {
+                self.reset();
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn observe_frame(&mut self, frame: &crate::kdrive_wire::Frame) -> Result<(), CacheError> {
+        let size = image_bytes(frame.width, frame.height)?;
+        if frame.window_id != 0 {
+            return Err(CacheError::InvalidDimensions);
+        }
+        let main = frame.is_main_image();
+        if !main && (self.screen_width == 0 || self.screen_height == 0) {
+            return Err(CacheError::MissingSource);
+        }
+        if frame.regions.len() > MAX_PATCHES {
+            return Err(CacheError::TooManyPatches);
+        }
+        if frame.regions.is_empty() {
+            if frame.cache_id == 0 {
+                return Err(CacheError::MissingSource);
+            }
+            let &(ew, eh, _) = self.entries.get(&frame.cache_id).ok_or(CacheError::MissingSource)?;
+            if ew != frame.width || eh != frame.height {
+                return Err(CacheError::InvalidDimensions);
+            }
+            return Ok(());
+        }
+        let old_size = if frame.cache_id != 0 {
+            self.entries.get(&frame.cache_id).map_or(0, |e| e.2)
+        } else {
+            0
+        };
+        if frame.cache_id != 0 {
+            if old_size == 0 && self.entries.len() >= self.max_entries {
+                return Err(CacheError::EntryLimit);
+            }
+            let total = self.bytes.checked_sub(old_size).and_then(|n| n.checked_add(size)).ok_or(CacheError::ByteLimit)?;
+            if total > self.max_bytes {
+                return Err(CacheError::ByteLimit);
+            }
+        }
+        let ox = if frame.cache_id == 0 && !main { frame.x } else { 0 };
+        let oy = if frame.cache_id == 0 && !main { frame.y } else { 0 };
+        let work_limit = size.saturating_mul(4).min(MAX_COMPOSITION_BYTES);
+        let mut work = 0usize;
+        let mut all_raw_rgba = frame.cache_id != 0;
+        for r in &frame.regions {
+            let patch_bytes = image_bytes(r.width, r.height)?;
+            let dx = u32::try_from(i64::from(r.x) - i64::from(ox)).map_err(|_| CacheError::InvalidRectangle)?;
+            let dy = u32::try_from(i64::from(r.y) - i64::from(oy)).map_err(|_| CacheError::InvalidRectangle)?;
+            if !fits(Rect { x: dx, y: dy, width: r.width, height: r.height }, frame.width, frame.height) {
+                return Err(CacheError::InvalidRectangle);
+            }
+            if r.source_id != 0 {
+                if !r.data.is_empty() {
+                    return Err(CacheError::InvalidPixelLength);
+                }
+                let &(sw, sh, _) = self.entries.get(&r.source_id).ok_or(CacheError::MissingSource)?;
+                let sx = u32::try_from(r.source_x).map_err(|_| CacheError::InvalidRectangle)?;
+                let sy = u32::try_from(r.source_y).map_err(|_| CacheError::InvalidRectangle)?;
+                if !fits(Rect { x: sx, y: sy, width: r.width, height: r.height }, sw, sh) {
+                    return Err(CacheError::InvalidRectangle);
+                }
+                if self.rgba_cache.get(r.source_id).is_none() {
+                    all_raw_rgba = false;
+                }
+            } else {
+                if r.data.is_empty() {
+                    return Err(CacheError::InvalidPixelLength);
+                }
+                if r.data.len() != patch_bytes {
+                    all_raw_rgba = false;
+                }
+            }
+            work = work.checked_add(patch_bytes).ok_or(CacheError::WorkLimit)?;
+            if work > work_limit {
+                return Err(CacheError::WorkLimit);
+            }
+        }
+        if main {
+            self.screen_width = frame.width;
+            self.screen_height = frame.height;
+        }
+        if frame.cache_id != 0 {
+            self.bytes = self.bytes.saturating_sub(old_size) + size;
+            self.entries.insert(frame.cache_id, (frame.width, frame.height, size));
+            if all_raw_rgba {
+                let _ = self.rgba_cache.compose_wire_rgba_frame(frame);
+            } else {
+                self.rgba_cache.remove(frame.cache_id);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -320,5 +549,46 @@ mod tests {
         assert_eq!(cache.compose(2, 1, 1, &[Patch::Copy { source_id: 1, source: rect(0, 0, 2, 1), x: 0, y: 0 }]).unwrap_err(), CacheError::InvalidRectangle);
         assert_eq!(cache.compose(2, 1, 1, &[Patch::Copy { source_id: 1, source: rect(0, 0, 1, 1), x: u32::MAX, y: 0 }]).unwrap_err(), CacheError::InvalidRectangle);
         assert!(cache.get(2).is_none());
+    }
+
+    #[test]
+    fn wire_frame_tracker_validates_cache_hits_misses_and_deletions() {
+        use crate::kdrive_wire::{Frame, Message, Region};
+        let mut tracker = WireFrameTracker::new(16, 1024 * 1024);
+        // Delta before main image is rejected.
+        let premature = Frame {
+            width: 2, height: 1, x: 0, y: 0, cache_id: 1, window_id: 0,
+            regions: vec![Region { source_id: 0, source_x: 0, source_y: 0, x: 0, y: 0, width: 2, height: 1, data: vec![1; 8] }],
+        };
+        assert_eq!(tracker.observe_frame(&premature), Err(CacheError::MissingSource));
+
+        // Main image initializes screen geometry.
+        let main = Frame {
+            width: 4, height: 4, x: -1, y: -1, cache_id: 0, window_id: 0,
+            regions: vec![Region { source_id: 0, source_x: 0, source_y: 0, x: 0, y: 0, width: 4, height: 4, data: vec![0xaa; 64] }],
+        };
+        tracker.observe_frame(&main).unwrap();
+        assert_eq!(tracker.screen_size(), (4, 4));
+
+        // Cached tile composes into RGBA cache and tracks geometry.
+        let tile = Frame {
+            width: 2, height: 1, x: 0, y: 0, cache_id: 7, window_id: 0,
+            regions: vec![Region { source_id: 0, source_x: 0, source_y: 0, x: 0, y: 0, width: 2, height: 1, data: vec![1, 2, 3, 4, 5, 6, 7, 8] }],
+        };
+        tracker.observe_frame(&tile).unwrap();
+        assert_eq!(tracker.len(), 1);
+        assert_eq!(tracker.rgba_cache().get(7).unwrap().rgba(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        // Copy patch from cached tile 7 into tile 8 succeeds; DeletedFrames evicts 7.
+        let copy_tile = Frame {
+            width: 1, height: 1, x: 1, y: 0, cache_id: 8, window_id: 0,
+            regions: vec![Region { source_id: 7, source_x: 1, source_y: 0, x: 0, y: 0, width: 1, height: 1, data: Vec::new() }],
+        };
+        tracker.observe_frame(&copy_tile).unwrap();
+        assert_eq!(tracker.rgba_cache().get(8).unwrap().rgba(), &[5, 6, 7, 8]);
+
+        tracker.observe_message(&Message::DeletedFrames(vec![7])).unwrap();
+        let replay_deleted = Frame { width: 2, height: 1, x: 0, y: 0, cache_id: 7, window_id: 0, regions: Vec::new() };
+        assert_eq!(tracker.observe_frame(&replay_deleted), Err(CacheError::MissingSource));
     }
 }

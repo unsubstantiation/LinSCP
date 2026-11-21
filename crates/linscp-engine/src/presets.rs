@@ -38,6 +38,7 @@ pub struct TransferPreset {
     pub permissions: Option<PresetPermissions>,
     pub resume_support: Option<ResumeSupportMode>,
     pub speed_kbytes_per_sec: Option<u64>,
+    pub eol: Option<crate::text_mode::EolStyle>,
     pub host: String,
     pub username: String,
     pub remote_directory: String,
@@ -192,6 +193,11 @@ impl TransferPreset {
                 }
             },
             "host" => self.host = val.to_string(),
+            "eol" => {
+                let style = crate::text_mode::EolStyle::parse(val)
+                    .ok_or_else(|| "The value of 'eol' must be lf, crlf or cr.".to_string())?;
+                self.eol = Some(style);
+            }
             "user" | "username" => self.username = val.to_string(),
             "remotedir" | "remotedirectory" => self.remote_directory = val.to_string(),
             "localdir" | "localdirectory" => self.local_directory = val.to_string(),
@@ -336,6 +342,9 @@ impl TransferPresetStore {
                     PresetPermissions::FromFile => out.push_str("permissions = fromfile\n"),
                     PresetPermissions::Mode(m) => out.push_str(&format!("permissions = {m:o}\n")),
                 }
+            }
+            if let Some(eol) = p.eol {
+                out.push_str(&format!("eol = {}\n", eol.name()));
             }
             if !p.host.is_empty() {
                 out.push_str(&format!("host = {}\n", p.host));

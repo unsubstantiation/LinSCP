@@ -1145,6 +1145,19 @@ impl RemoteSession for FtpSession {
             if rep.code == 213 || rep.code == 250 {
                 return Ok(());
             }
+        } else {
+            // Opportunistically try MFMT when FEAT omitted it, then fall back to SITE UTIME.
+            if let Ok(rep) = inner.command(&format!("MFMT {stamp} {remote_path}")).await {
+                if rep.code == 213 || rep.code == 250 {
+                    inner.supports_mfmt = true;
+                    return Ok(());
+                }
+            }
+            if let Ok(rep) = inner.command(&format!("SITE UTIME {stamp} {remote_path}")).await {
+                if matches!(rep.code, 200 | 213 | 250) {
+                    return Ok(());
+                }
+            }
         }
         Err(ProtoError::UnsupportedCapability("set_mtime", self.cfg.scheme))
     }

@@ -8,6 +8,9 @@ use linscp_types::{ImportReport, ImportedSite, ProtocolScheme, SkippedImportEntr
 
 const MAX_IMPORT_ENTRIES: usize = 500;
 const MAX_XML_BYTES: usize = 2 * 1024 * 1024;
+const MAX_INCLUDE_DEPTH: usize = 3;
+const MAX_INCLUDE_FILES: usize = 64;
+const MAX_INCLUDE_FILE_BYTES: u64 = 256 * 1024;
 
 fn has_control_char(s: &str) -> bool {
     s.bytes().any(|b| b < 0x20 || b == 0x7f)
@@ -46,95 +49,368 @@ fn expand_tilde(raw: &str, home_dir: Option<&Path>) -> String {
     raw.to_string()
 }
 
-/// Parses an OpenSSH `~/.ssh/config` file into `ImportedSite` entries,
-/// skipping wildcard hosts, `Match` blocks, `Include` directives, and `%` tokens.
-pub fn parse_openssh_config(text: &str, home_dir: Option<&Path>) -> ImportReport {
-    let mut report = ImportReport::default();
+fn expand_openssh_tokens(
+    raw: &str,
+    alias: &str,
+    host: &str,
+    port: u16,
+    user: &str,
+    home_dir: Option<&Path>,
+) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    let effective_user = if user.is_empty() {
+        std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_default()
+    } else {
+        user.to_string()
+    };
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            match chars.peek().copied() {
+                Some('%') => {
+                    chars.next();
+                    out.push('%');
+                }
+                Some('h') => {
+                    chars.next();
+                    out.push_str(host);
+                }
+                Some('n') => {
+                    chars.next();
+                    out.push_str(alias);
+                }
+                Some('p') => {
+                    chars.next();
+                    out.push_str(&port.to_string());
+                }
+                Some('r') if !effective_user.is_empty() => {
+                    chars.next();
+                    out.push_str(&effective_user);
+                }
+                Some('d') if home_dir.is_some() => {
+                    chars.next();
+                    out.push_str(&home_dir.unwrap().to_string_lossy());
+                }
+                _ => out.push('%'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
 
+fn simple_glob_matches(pattern: &str, candidate: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let c: Vec<char> = candidate.chars().collect();
+    let (mut pi, mut ci) = (0usize, 0usize);
+    let (mut star_pi, mut star_ci) = (None::<usize>, 0usize);
+    while ci < c.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == c[ci]) {
+            pi += 1;
+            ci += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            pi += 1;
+            star_ci = ci;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ci += 1;
+            ci = star_ci;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn resolve_ssh_include_files(
+    patterns: &[String],
+    home_dir: Option<&Path>,
+    included_budget: &mut usize,
+) -> Vec<String> {
+    let Some(home) = home_dir else {
+        return Vec::new();
+    };
+    let Ok(canon_home) = std::fs::canonicalize(home) else {
+        return Vec::new();
+    };
+    let ssh_dir = home.join(".ssh");
+    let mut contents = Vec::new();
+    for raw_pat in patterns {
+        if *included_budget >= MAX_INCLUDE_FILES || has_control_char(raw_pat) {
+            break;
+        }
+        let expanded = if raw_pat.starts_with("~/") {
+            home.join(&raw_pat[2..])
+        } else {
+            let p = Path::new(raw_pat);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                ssh_dir.join(p)
+            }
+        };
+        let Some(file_pat) = expanded.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(parent_dir) = expanded.parent() else {
+            continue;
+        };
+        if parent_dir.to_string_lossy().contains(['*', '?']) {
+            continue;
+        }
+        let Ok(canon_parent) = std::fs::canonicalize(parent_dir) else {
+            continue;
+        };
+        if !canon_parent.starts_with(&canon_home) {
+            continue;
+        }
+        let mut matched_paths = Vec::new();
+        if file_pat.contains(['*', '?']) {
+            let Ok(entries) = std::fs::read_dir(&canon_parent) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if simple_glob_matches(file_pat, &name) {
+                    matched_paths.push(entry.path());
+                }
+            }
+            matched_paths.sort();
+        } else {
+            matched_paths.push(canon_parent.join(file_pat));
+        }
+        for candidate in matched_paths {
+            if *included_budget >= MAX_INCLUDE_FILES {
+                break;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
+                continue;
+            };
+            if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > MAX_INCLUDE_FILE_BYTES {
+                continue;
+            }
+            let Ok(canon_file) = std::fs::canonicalize(&candidate) else {
+                continue;
+            };
+            if !canon_file.starts_with(&canon_home) {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&canon_file) {
+                *included_budget += 1;
+                contents.push(text);
+            }
+        }
+    }
+    contents
+}
+
+fn parse_proxy_jump_spec(raw: &str) -> Option<(Option<String>, String, Option<u16>)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") || has_control_char(trimmed) {
+        return None;
+    }
+    // For comma-chained ProxyJump hops (`bastion1,bastion2`), use the final jump hop
+    // directly when single-hop tunnel settings are stored; reject multi-hop chains
+    // that cannot be represented faithfully by a single SSH jump tunnel.
+    if trimmed.contains(',') {
+        return None;
+    }
+    let (user_opt, host_port) = if let Some((u, rest)) = trimmed.rsplit_once('@') {
+        let u = u.trim();
+        ((!u.is_empty()).then(|| u.to_string()), rest.trim())
+    } else {
+        (None, trimmed)
+    };
+    let (host, port_opt) = if let Some(rest) = host_port.strip_prefix('[') {
+        if let Some((ipv6, tail)) = rest.split_once(']') {
+            let port = if let Some(p_str) = tail.strip_prefix(':') {
+                Some(p_str.parse::<u16>().ok().filter(|p| *p > 0)?)
+            } else if tail.is_empty() {
+                None
+            } else {
+                return None;
+            };
+            (format!("[{ipv6}]"), port)
+        } else {
+            return None;
+        }
+    } else if host_port.matches(':').count() == 1 {
+        let (h, p_str) = host_port.split_once(':').unwrap();
+        let p = p_str.parse::<u16>().ok().filter(|p| *p > 0)?;
+        (h.trim().to_string(), Some(p))
+    } else {
+        (host_port.to_string(), None)
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((user_opt, host, port_opt))
+}
+
+/// Parses an OpenSSH `~/.ssh/config` file into `ImportedSite` entries,
+/// expanding multi-alias `Host` blocks, `ProxyJump`, `ProxyCommand` (`%h`/`%p`/`%r`),
+/// and safe `Include` files under `home_dir`, while skipping wildcard hosts and `Match` blocks.
+pub fn parse_openssh_config(text: &str, home_dir: Option<&Path>) -> ImportReport {
+    #[derive(Default)]
     struct PendingBlock {
-        alias: String,
+        aliases: Vec<String>,
         hostname: Option<String>,
         user: Option<String>,
         port: Option<String>,
         identity_file: Option<String>,
+        proxy_jump: Option<String>,
+        proxy_command: Option<String>,
     }
 
-    let mut current: Option<PendingBlock> = None;
-
-    let flush_block = |blk: Option<PendingBlock>, out: &mut ImportReport| {
+    fn flush_block(
+        blk: Option<PendingBlock>,
+        home_dir: Option<&Path>,
+        out: &mut ImportReport,
+    ) {
         let Some(block) = blk else { return };
-        if out.imported.len() >= MAX_IMPORT_ENTRIES {
-            return;
-        }
-        let host = block
-            .hostname
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&block.alias)
-            .to_string();
-        if host.is_empty() || has_control_char(&host) {
-            out.skipped.push(SkippedImportEntry {
-                label: block.alias,
-                reason: "Invalid HostName".to_string(),
-            });
-            return;
-        }
-        let port = match block.port.as_deref() {
-            None | Some("") => 22u16,
-            Some(raw_p) => match raw_p.parse::<u16>() {
-                Ok(p) if p > 0 => p,
-                _ => {
-                    out.skipped.push(SkippedImportEntry {
-                        label: block.alias,
-                        reason: format!("Invalid Port: {raw_p}"),
-                    });
-                    return;
-                }
-            },
-        };
-        let username = block.user.unwrap_or_default();
-        if has_control_char(&username) {
-            out.skipped.push(SkippedImportEntry {
-                label: block.alias,
-                reason: "Invalid User".to_string(),
-            });
-            return;
-        }
-        let mut private_key = None;
-        if let Some(raw_key) = block.identity_file.filter(|s| !s.is_empty()) {
-            if raw_key.contains('%') {
-                // Ignore OpenSSH %-tokens without aborting the host
-            } else {
-                let expanded = expand_tilde(&raw_key, home_dir);
-                if !has_control_char(&expanded) {
-                    private_key = Some(expanded);
+        for alias in block.aliases {
+            if out.imported.len() >= MAX_IMPORT_ENTRIES {
+                return;
+            }
+            let raw_host = block
+                .hostname
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&alias);
+            let host = expand_openssh_tokens(raw_host, &alias, &alias, 22, "", home_dir);
+            if host.is_empty() || has_control_char(&host) || host.contains('%') {
+                out.skipped.push(SkippedImportEntry {
+                    label: alias,
+                    reason: "Invalid HostName".to_string(),
+                });
+                continue;
+            }
+            let port = match block.port.as_deref() {
+                None | Some("") => 22u16,
+                Some(raw_p) => match raw_p.parse::<u16>() {
+                    Ok(p) if p > 0 => p,
+                    _ => {
+                        out.skipped.push(SkippedImportEntry {
+                            label: alias,
+                            reason: format!("Invalid Port: {raw_p}"),
+                        });
+                        continue;
+                    }
+                },
+            };
+            let username = block.user.clone().unwrap_or_default();
+            if has_control_char(&username) {
+                out.skipped.push(SkippedImportEntry {
+                    label: alias,
+                    reason: "Invalid User".to_string(),
+                });
+                continue;
+            }
+            let mut private_key = None;
+            if let Some(raw_key) = block.identity_file.as_deref().filter(|s| !s.is_empty()) {
+                let expanded_tok =
+                    expand_openssh_tokens(raw_key, &alias, &host, port, &username, home_dir);
+                if !expanded_tok.contains('%') {
+                    let expanded = expand_tilde(&expanded_tok, home_dir);
+                    if !has_control_char(&expanded) {
+                        private_key = Some(expanded);
+                    }
                 }
             }
-        }
-        out.imported.push(ImportedSite {
-            source: "openssh".to_string(),
-            name: block.alias,
-            protocol: ProtocolScheme::Sftp,
-            host,
-            port,
-            username,
-            password: None,
-            private_key,
-            remote_directory: String::new(),
-            local_directory: String::new(),
-        });
-    };
+            let mut tunnel_host = None;
+            let mut tunnel_port = None;
+            let mut tunnel_username = None;
+            let mut tunnel_private_key = None;
+            if let Some(ref pj) = block.proxy_jump {
+                if !pj.trim().eq_ignore_ascii_case("none") && !pj.trim().is_empty() {
+                    if let Some((pj_user, pj_host, pj_port)) = parse_proxy_jump_spec(pj) {
+                        // Resolve against an already-imported Host alias if ProxyJump names one.
+                        if let Some(jump_site) = out.imported.iter().find(|s| s.name == pj_host) {
+                            tunnel_host = Some(jump_site.host.clone());
+                            tunnel_port = Some(pj_port.unwrap_or(jump_site.port));
+                            let eff_u = pj_user.unwrap_or_else(|| jump_site.username.clone());
+                            if !eff_u.is_empty() {
+                                tunnel_username = Some(eff_u);
+                            }
+                            tunnel_private_key = jump_site.private_key.clone();
+                        } else {
+                            tunnel_host = Some(pj_host);
+                            tunnel_port = Some(pj_port.unwrap_or(22));
+                            tunnel_username = pj_user;
+                        }
+                    } else {
+                        out.skipped.push(SkippedImportEntry {
+                            label: format!("{alias} (ProxyJump {pj})"),
+                            reason: "Unsupported multi-hop or malformed ProxyJump".to_string(),
+                        });
+                    }
+                }
+            }
+            let proxy_command = block
+                .proxy_command
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
+                .map(|raw_cmd| {
+                    expand_openssh_tokens(raw_cmd, &alias, &host, port, &username, home_dir)
+                })
+                .filter(|cmd| !has_control_char(cmd));
 
-    for raw_line in text.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+            out.imported.push(ImportedSite {
+                source: "openssh".to_string(),
+                name: alias,
+                protocol: ProtocolScheme::Sftp,
+                host,
+                port,
+                username,
+                password: None,
+                private_key,
+                remote_directory: String::new(),
+                local_directory: String::new(),
+                tunnel_host,
+                tunnel_port,
+                tunnel_username,
+                tunnel_private_key,
+                proxy_command,
+            });
         }
-        let (key, val_tokens) = if let Some((lhs, rhs)) = line.split_once('=') {
-            let k = lhs.trim();
-            if !k.contains(char::is_whitespace) {
-                (k.to_ascii_lowercase(), split_ssh_config_tokens(rhs))
+    }
+
+    fn parse_text_recursive(
+        text: &str,
+        home_dir: Option<&Path>,
+        depth: usize,
+        included_budget: &mut usize,
+        current: &mut Option<PendingBlock>,
+        report: &mut ImportReport,
+    ) {
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (key, val_tokens) = if let Some((lhs, rhs)) = line.split_once('=') {
+                let k = lhs.trim();
+                if !k.contains(char::is_whitespace) {
+                    (k.to_ascii_lowercase(), split_ssh_config_tokens(rhs))
+                } else {
+                    let mut toks = split_ssh_config_tokens(line);
+                    if toks.len() < 2 {
+                        continue;
+                    }
+                    let first = toks.remove(0).to_ascii_lowercase();
+                    (first, toks)
+                }
             } else {
                 let mut toks = split_ssh_config_tokens(line);
                 if toks.len() < 2 {
@@ -142,79 +418,117 @@ pub fn parse_openssh_config(text: &str, home_dir: Option<&Path>) -> ImportReport
                 }
                 let first = toks.remove(0).to_ascii_lowercase();
                 (first, toks)
-            }
-        } else {
-            let mut toks = split_ssh_config_tokens(line);
-            if toks.len() < 2 {
+            };
+            if val_tokens.is_empty() {
                 continue;
             }
-            let first = toks.remove(0).to_ascii_lowercase();
-            (first, toks)
-        };
-        if val_tokens.is_empty() {
-            continue;
-        }
 
-        match key.as_str() {
-            "host" => {
-                flush_block(current.take(), &mut report);
-                let plain: Vec<&String> = val_tokens
-                    .iter()
-                    .filter(|p| !p.contains(['*', '?', '!']))
-                    .collect();
-                if plain.len() == 1 && val_tokens.len() == 1 && !has_control_char(plain[0]) {
-                    current = Some(PendingBlock {
-                        alias: plain[0].clone(),
-                        hostname: None,
-                        user: None,
-                        port: None,
-                        identity_file: None,
-                    });
-                } else {
+            match key.as_str() {
+                "host" => {
+                    flush_block(current.take(), home_dir, report);
+                    let mut plain = Vec::new();
+                    let mut skipped_patterns = Vec::new();
+                    for tok in &val_tokens {
+                        if tok.contains(['*', '?', '!']) || has_control_char(tok) {
+                            skipped_patterns.push(tok.clone());
+                        } else {
+                            plain.push(tok.clone());
+                        }
+                    }
+                    if !skipped_patterns.is_empty() {
+                        report.skipped.push(SkippedImportEntry {
+                            label: skipped_patterns.join(" "),
+                            reason: "Wildcard or negated Host pattern".to_string(),
+                        });
+                    }
+                    if !plain.is_empty() {
+                        *current = Some(PendingBlock {
+                            aliases: plain,
+                            ..PendingBlock::default()
+                        });
+                    }
+                }
+                "match" => {
+                    flush_block(current.take(), home_dir, report);
                     report.skipped.push(SkippedImportEntry {
-                        label: val_tokens.join(" "),
-                        reason: "Wildcard or multi-pattern Host block".to_string(),
+                        label: format!("Match {}", val_tokens.join(" ")),
+                        reason: "Conditional Match blocks are not supported".to_string(),
                     });
                 }
-            }
-            "match" => {
-                flush_block(current.take(), &mut report);
-                report.skipped.push(SkippedImportEntry {
-                    label: format!("Match {}", val_tokens.join(" ")),
-                    reason: "Conditional Match blocks are not supported".to_string(),
-                });
-            }
-            "include" => {
-                report.skipped.push(SkippedImportEntry {
-                    label: format!("Include {}", val_tokens.join(" ")),
-                    reason: "Include directives are not expanded automatically".to_string(),
-                });
-            }
-            "hostname" => {
-                if let Some(blk) = current.as_mut() {
-                    blk.hostname.get_or_insert_with(|| val_tokens[0].clone());
+                "include" => {
+                    if depth < MAX_INCLUDE_DEPTH {
+                        let included =
+                            resolve_ssh_include_files(&val_tokens, home_dir, included_budget);
+                        if !included.is_empty() {
+                            for sub_text in included {
+                                parse_text_recursive(
+                                    &sub_text,
+                                    home_dir,
+                                    depth + 1,
+                                    included_budget,
+                                    current,
+                                    report,
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                    report.skipped.push(SkippedImportEntry {
+                        label: format!("Include {}", val_tokens.join(" ")),
+                        reason: "Include directives matched no readable files under ~/.ssh"
+                            .to_string(),
+                    });
                 }
-            }
-            "user" => {
-                if let Some(blk) = current.as_mut() {
-                    blk.user.get_or_insert_with(|| val_tokens[0].clone());
+                "hostname" => {
+                    if let Some(blk) = current.as_mut() {
+                        blk.hostname.get_or_insert_with(|| val_tokens[0].clone());
+                    }
                 }
-            }
-            "port" => {
-                if let Some(blk) = current.as_mut() {
-                    blk.port.get_or_insert_with(|| val_tokens[0].clone());
+                "user" => {
+                    if let Some(blk) = current.as_mut() {
+                        blk.user.get_or_insert_with(|| val_tokens[0].clone());
+                    }
                 }
-            }
-            "identityfile" => {
-                if let Some(blk) = current.as_mut() {
-                    blk.identity_file
-                        .get_or_insert_with(|| val_tokens.join(" "));
+                "port" => {
+                    if let Some(blk) = current.as_mut() {
+                        blk.port.get_or_insert_with(|| val_tokens[0].clone());
+                    }
                 }
+                "identityfile" => {
+                    if let Some(blk) = current.as_mut() {
+                        blk.identity_file
+                            .get_or_insert_with(|| val_tokens.join(" "));
+                    }
+                }
+                "proxyjump" => {
+                    if let Some(blk) = current.as_mut() {
+                        blk.proxy_jump
+                            .get_or_insert_with(|| val_tokens.join(" "));
+                    }
+                }
+                "proxycommand" => {
+                    if let Some(blk) = current.as_mut() {
+                        blk.proxy_command
+                            .get_or_insert_with(|| val_tokens.join(" "));
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
-    flush_block(current, &mut report);
+
+    let mut report = ImportReport::default();
+    let mut current: Option<PendingBlock> = None;
+    let mut included_budget = 0usize;
+    parse_text_recursive(
+        text,
+        home_dir,
+        0,
+        &mut included_budget,
+        &mut current,
+        &mut report,
+    );
+    flush_block(current, home_dir, &mut report);
     report
 }
 
@@ -415,6 +729,11 @@ pub fn parse_filezilla_xml(text: &str) -> Result<ImportReport, String> {
             } else {
                 local_dir
             },
+            tunnel_host: None,
+            tunnel_port: None,
+            tunnel_username: None,
+            tunnel_private_key: None,
+            proxy_command: None,
         });
     }
 
@@ -449,6 +768,43 @@ mod tests {
         let expected_key = home.join(".ssh/id_ed25519").to_string_lossy().into_owned();
         assert_eq!(site.private_key.as_deref(), Some(expected_key.as_str()));
         assert_eq!(report.skipped.len(), 3);
+    }
+
+    #[test]
+    fn openssh_importer_expands_multi_alias_proxy_jump_tokens_and_safe_includes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let conf_d = home.join(".ssh").join("conf.d");
+        std::fs::create_dir_all(&conf_d).unwrap();
+        std::fs::write(
+            conf_d.join("included.conf"),
+            "Host bastion\n  HostName 203.0.113.5\n  User jump\n  Port 2200\n",
+        )
+        .unwrap();
+        let cfg = "\
+            Include ~/.ssh/conf.d/*.conf\n\
+            Host app-a app-b\n\
+              HostName %n.internal.example\n\
+              User deploy\n\
+              Port 2222\n\
+              ProxyJump bastion\n\
+              ProxyCommand ssh -W %h:%p gateway.example\n";
+        let report = parse_openssh_config(cfg, Some(home));
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert_eq!(report.imported.len(), 3);
+        assert_eq!(report.imported[0].name, "bastion");
+        let app_a = report.imported.iter().find(|s| s.name == "app-a").unwrap();
+        assert_eq!(app_a.host, "app-a.internal.example");
+        assert_eq!(app_a.tunnel_host.as_deref(), Some("203.0.113.5"));
+        assert_eq!(app_a.tunnel_port, Some(2200));
+        assert_eq!(app_a.tunnel_username.as_deref(), Some("jump"));
+        assert_eq!(
+            app_a.proxy_command.as_deref(),
+            Some("ssh -W app-a.internal.example:2222 gateway.example")
+        );
+        let app_b = report.imported.iter().find(|s| s.name == "app-b").unwrap();
+        assert_eq!(app_b.host, "app-b.internal.example");
+        assert_eq!(app_b.tunnel_host.as_deref(), Some("203.0.113.5"));
     }
 
     #[test]

@@ -339,13 +339,14 @@ test('all native targets expose the shared feature contract and report only inst
   assert.equal(hostDifferenceReason('sshAgent', debian), null);
   assert.match(hostDifferenceReason('sshAgent', android) ?? '', /private key file/);
 
-  // Kerberos is a Linux-backend ability: the other native builds lack it, and
-  // key exchange is unwired everywhere so it is off on all three apps.
+  // Kerberos is supported on Linux (libgssapi_krb5) and Windows (SSPI);
+  // Android lacks it, and key exchange is unwired everywhere so it is off on all three apps.
   assert.equal(debian.gssapi, true);
-  assert.equal(windows.gssapi, false);
+  assert.equal(windows.gssapi, true);
   assert.equal(android.gssapi, false);
   assert.equal(hostDifferenceReason('gssapi', debian), null);
-  assert.match(hostDifferenceReason('gssapi', windows) ?? '', /only available on Linux/);
+  assert.equal(hostDifferenceReason('gssapi', windows), null);
+  assert.match(hostDifferenceReason('gssapi', android) ?? '', /Linux Kerberos runtime or Windows SSPI/);
   for (const caps of [debian, windows, android]) {
     assert.equal(caps.gssapiKex, false, `key exchange is unwired on ${caps.platform}`);
   }

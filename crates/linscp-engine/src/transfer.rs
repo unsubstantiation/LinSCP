@@ -114,6 +114,9 @@ impl TransferFlags {
         if let Some(sp) = preset.speed_kbytes_per_sec {
             self.speed_kbytes_per_sec = if sp == 0 { None } else { Some(sp) };
         }
+        if let Some(eol) = preset.eol {
+            self.eol_override = Some(eol);
+        }
         if !preset.mask.is_empty() && self.file_mask.is_empty() {
             if let Ok(m) = FileMask::parse(&preset.mask) {
                 self.file_mask = m;

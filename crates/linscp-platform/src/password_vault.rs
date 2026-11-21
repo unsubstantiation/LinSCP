@@ -5,7 +5,7 @@
 //! while the vault is unlocked.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -13,9 +13,11 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use rand::RngCore;
 use zeroize::Zeroizing;
 
+use crate::android::KeystoreBridge;
 use crate::{write_private_file_atomic, PlatformError, SecretVault};
 
 const WRAP_MAGIC: &[u8; 8] = b"LSCPVLT1";
+const KEYSTORE_MAGIC: &[u8; 8] = b"LSCPKST1";
 const BLOB_MAGIC: &[u8; 8] = b"LSCPBLB1";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
@@ -26,16 +28,34 @@ const ARGON_ITERATIONS: u32 = 3;
 #[derive(Default)]
 pub struct PasswordSecretVault {
     master_key: Mutex<Option<Zeroizing<[u8; MASTER_KEY_LEN]>>>,
+    keystore: Mutex<Option<Arc<dyn KeystoreBridge>>>,
 }
 
 impl PasswordSecretVault {
     pub fn new() -> Self { Self::default() }
 
+    pub fn with_keystore(keystore: Arc<dyn KeystoreBridge>) -> Self {
+        Self {
+            master_key: Mutex::new(None),
+            keystore: Mutex::new(Some(keystore)),
+        }
+    }
+
+    pub fn set_keystore(&self, keystore: Arc<dyn KeystoreBridge>) {
+        if let Ok(mut guard) = self.keystore.lock() {
+            *guard = Some(keystore);
+        }
+    }
+
+    pub fn has_keystore(&self) -> bool {
+        self.keystore.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
     /// `setup_required`, `locked`, or `unlocked`.
     pub fn status(&self, config_dir: &Path) -> Result<&'static str, PlatformError> {
         if self.master_key.lock().map_err(lock_error)?.is_some() { return Ok("unlocked"); }
         match std::fs::read(config_dir.join("sessions.key")) {
-            Ok(bytes) if bytes.starts_with(WRAP_MAGIC) => Ok("locked"),
+            Ok(bytes) if bytes.starts_with(WRAP_MAGIC) || bytes.starts_with(KEYSTORE_MAGIC) => Ok("locked"),
             Ok(_) => Ok("setup_required"),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok("setup_required"),
             Err(err) => Err(PlatformError::Io(err)),
@@ -43,27 +63,58 @@ impl PasswordSecretVault {
     }
 
     /// Set the password on first use (migrating any legacy master key), or
-    /// unlock an existing password-wrapped master key.
+    /// unlock an existing password-wrapped (or Android Keystore + password) master key.
     pub fn unlock_or_setup(&self, config_dir: &Path, password: &str, legacy_vault: &dyn SecretVault) -> Result<(), PlatformError> {
         validate_password(password)?;
+        let keystore = self.keystore.lock().map_err(lock_error)?.clone();
         let key_path = config_dir.join("sessions.key");
         let existing = match std::fs::read(&key_path) {
             Ok(bytes) => Some(bytes),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => return Err(PlatformError::Io(err)),
         };
+        let mut needs_save = false;
         let master = match existing.as_deref() {
-            Some(bytes) if bytes.starts_with(WRAP_MAGIC) => unwrap_master_key(bytes, password)?,
-            Some(_) => legacy_vault.load_master_key(config_dir)?.ok_or_else(|| vault_error("Legacy master key is missing"))?,
+            Some(bytes) if bytes.starts_with(KEYSTORE_MAGIC) => {
+                let ks = keystore.as_deref().ok_or_else(|| {
+                    vault_error("Vault key is bound to Android Keystore, which is unavailable on this host")
+                })?;
+                let inner = ks.unwrap_key(&bytes[KEYSTORE_MAGIC.len()..])?;
+                if !inner.starts_with(WRAP_MAGIC) {
+                    return Err(vault_error("Corrupted Android Keystore vault envelope"));
+                }
+                unwrap_master_key(&inner, password)?
+            }
+            Some(bytes) if bytes.starts_with(WRAP_MAGIC) => {
+                let unwrapped = unwrap_master_key(bytes, password)?;
+                if keystore.is_some() {
+                    needs_save = true;
+                }
+                unwrapped
+            }
+            Some(_) => {
+                needs_save = true;
+                legacy_vault.load_master_key(config_dir)?.ok_or_else(|| vault_error("Legacy master key is missing"))?
+            }
             None => {
+                needs_save = true;
                 let mut generated = Zeroizing::new([0u8; MASTER_KEY_LEN]);
                 rand::thread_rng().fill_bytes(&mut *generated);
                 generated
             }
         };
-        if existing.as_deref().is_none_or(|bytes| !bytes.starts_with(WRAP_MAGIC)) {
+        if needs_save {
             let wrapped = wrap_master_key(&master, password)?;
-            write_private_file_atomic(&key_path, &wrapped)?;
+            let persisted = if let Some(ks) = keystore.as_deref() {
+                let hw = ks.wrap_key(&wrapped)?;
+                let mut out = Vec::with_capacity(KEYSTORE_MAGIC.len() + hw.len());
+                out.extend_from_slice(KEYSTORE_MAGIC);
+                out.extend_from_slice(&hw);
+                out
+            } else {
+                wrapped
+            };
+            write_private_file_atomic(&key_path, &persisted)?;
         }
         *self.master_key.lock().map_err(lock_error)? = Some(master);
         Ok(())
@@ -237,6 +288,65 @@ mod tests {
                 "{prefix} must fail closed, got {err:?}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn android_keystore_bridge_wraps_and_upgrades_master_key_envelope() {
+        struct MockKeystore {
+            secret: [u8; 32],
+        }
+        impl KeystoreBridge for MockKeystore {
+            fn wrap_key(&self, plaintext: &[u8]) -> Result<Vec<u8>, PlatformError> {
+                let mut nonce = [0u8; NONCE_LEN];
+                rand::thread_rng().fill_bytes(&mut nonce);
+                let cipher = Aes256Gcm::new_from_slice(&self.secret).unwrap();
+                let ct = cipher.encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad: KEYSTORE_MAGIC }).unwrap();
+                let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+                out.extend_from_slice(&nonce);
+                out.extend_from_slice(&ct);
+                Ok(out)
+            }
+            fn unwrap_key(&self, wrapped: &[u8]) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
+                if wrapped.len() < NONCE_LEN + 16 {
+                    return Err(vault_error("Invalid keystore ciphertext"));
+                }
+                let cipher = Aes256Gcm::new_from_slice(&self.secret).unwrap();
+                let pt = cipher
+                    .decrypt(Nonce::from_slice(&wrapped[..NONCE_LEN]), Payload { msg: &wrapped[NONCE_LEN..], aad: KEYSTORE_MAGIC })
+                    .map_err(|_| vault_error("Keystore unwrap failed"))?;
+                Ok(Zeroizing::new(pt))
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("linscp-keystore-vault-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = NativeSecretVault::new();
+        let plain_vault = PasswordSecretVault::new();
+        plain_vault.unlock_or_setup(&dir, "correct horse battery staple", &legacy).unwrap();
+        let sealed = plain_vault.seal_local_blob(b"site-secret").unwrap();
+        plain_vault.lock().unwrap();
+        assert!(std::fs::read(dir.join("sessions.key")).unwrap().starts_with(WRAP_MAGIC));
+
+        let ks = Arc::new(MockKeystore { secret: [0x5a; 32] });
+        let hw_vault = PasswordSecretVault::with_keystore(ks.clone());
+        assert_eq!(hw_vault.status(&dir).unwrap(), "locked");
+        hw_vault.unlock_or_setup(&dir, "correct horse battery staple", &legacy).unwrap();
+        let disk = std::fs::read(dir.join("sessions.key")).unwrap();
+        assert!(disk.starts_with(KEYSTORE_MAGIC));
+        assert_eq!(hw_vault.open_local_blob(&sealed).unwrap().as_slice(), b"site-secret");
+        hw_vault.lock().unwrap();
+
+        // Without the device Keystore key, an offline copy fails closed even with the right password.
+        let offline = PasswordSecretVault::new();
+        assert!(offline.unlock_or_setup(&dir, "correct horse battery staple", &legacy).is_err());
+
+        // With the device Keystore key, unlocking succeeds and wrong passwords still fail.
+        let reopened = PasswordSecretVault::with_keystore(ks);
+        assert!(reopened.unlock_or_setup(&dir, "wrong password!", &legacy).is_err());
+        reopened.unlock_or_setup(&dir, "correct horse battery staple", &legacy).unwrap();
+        assert_eq!(reopened.open_local_blob(&sealed).unwrap().as_slice(), b"site-secret");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

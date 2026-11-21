@@ -2601,6 +2601,62 @@ pub async fn connect_gui_site_spec(
     }
 }
 
+/// Connects to the configured SSH jump host (`spec.session.tunnel`) for a
+/// remote desktop session (RDP/VNC/SPICE) so a loopback `direct-tcpip` relay
+/// (`127.0.0.1:<port>`) can forward desktop viewer traffic over the bastion.
+#[allow(clippy::result_large_err)]
+pub async fn connect_desktop_jump_tunnel(
+    spec: &ParsedSiteSpec,
+    config_dir: &Path,
+    cache_pinned_hostkeys: bool,
+    locale: &str,
+    vault: Arc<dyn linscp_platform::SecretVault>,
+) -> Result<Arc<SshConnection>, GuiConnectError> {
+    let proxy = build_proxy_config(spec).map_err(GuiConnectError::Failed)?;
+    let (_, tunnel_ssh_cfg, _) = build_ssh_configs(
+        spec,
+        config_dir,
+        false,
+        false,
+        locale,
+        0,
+        None,
+        proxy,
+    );
+    let Some(mut tun_cfg) = tunnel_ssh_cfg else {
+        return Err(GuiConnectError::Failed(
+            "No SSH jump tunnel is configured for this desktop session.".to_string(),
+        ));
+    };
+    let capture: Arc<std::sync::Mutex<Option<GuiHostKeyChallenge>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    tun_cfg.role = "tunnel".to_string();
+    tun_cfg.host_key_decision = Some(make_gui_ssh_host_key_callback(
+        true,
+        spec.session
+            .tunnel
+            .as_ref()
+            .map(|t| t.hostkey.clone())
+            .unwrap_or_default(),
+        config_dir.to_path_buf(),
+        cache_pinned_hostkeys,
+        locale.to_string(),
+        vault,
+        Arc::clone(&capture),
+    ));
+    match SshConnection::connect(&tun_cfg).await {
+        Ok(ssh) => Ok(Arc::new(ssh)),
+        Err(err) => {
+            if let Ok(mut guard) = capture.lock() {
+                if let Some(challenge) = guard.take() {
+                    return Err(GuiConnectError::HostKeyChallenge(challenge));
+                }
+            }
+            Err(GuiConnectError::Failed(format!("SSH tunnel: {err}")))
+        }
+    }
+}
+
 /// Opens a direct (or jump-tunneled) SSH connection for `-shell` or `terminal`.
 #[allow(clippy::too_many_arguments)]
 pub async fn connect_ssh_for_shell(

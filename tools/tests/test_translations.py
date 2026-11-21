@@ -68,6 +68,11 @@ class TranslationTests(unittest.TestCase):
             # the user types must keep their exact spelling in every locale.
             "*.local, 192.168.*", "/etc/ssl/certs/ca.crt", "/tmp/linscp-backup.json",
             "nc %host %port", "proxy.example.test", "sha256/...",
+            "us-east-1", "session-actions.xml",
+            "STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING",
+            "GLACIER_IR", "DEEP_ARCHIVE", "REDUCED_REDUNDANCY",
+            "public-read", "authenticated-read", "bucket-owner-read",
+            "bucket-owner-full-control", "SSE-S3 (AES256)", "SSE-KMS (aws:kms)",
             # Product names of the services and tools being launched. Their
             # spelling is part of the name; only the surrounding words are
             # translated.

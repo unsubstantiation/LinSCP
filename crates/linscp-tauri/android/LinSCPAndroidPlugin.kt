@@ -33,6 +33,16 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import android.webkit.MimeTypeMap
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import java.security.KeyStore
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
+
+@InvokeArg
+internal class KeystoreBlobArgs { lateinit var data_base64: String }
 
 @InvokeArg
 internal class TreeArgs { lateinit var uri: String }
@@ -515,6 +525,62 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     activity.stopService(Intent(activity, LinSCPTransferService::class.java))
     running.set(false)
     invoke.resolveObject(mapOf("running" to false))
+  }
+
+  private val keystoreLock = Any()
+  private val keystoreAlias = "linscp_master_key_v1"
+  private val keystoreAad = "LSCPKST1".toByteArray(Charsets.US_ASCII)
+
+  private fun getOrCreateKeystoreKey(): SecretKey = synchronized(keystoreLock) {
+    val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+    val existing = (ks.getEntry(keystoreAlias, null) as? KeyStore.SecretKeyEntry)?.secretKey
+    if (existing != null) return existing
+    val keyGen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+    val spec = KeyGenParameterSpec.Builder(
+      keystoreAlias,
+      KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+    )
+      .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+      .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+      .setKeySize(256)
+      .build()
+    keyGen.init(spec)
+    keyGen.generateKey()
+  }
+
+  @Command
+  fun keystoreWrap(invoke: Invoke) {
+    val args = invoke.parseArgs(KeystoreBlobArgs::class.java)
+    runIo(invoke, "Cannot wrap vault key in Android Keystore") {
+      val plaintext = android.util.Base64.decode(args.data_base64, android.util.Base64.DEFAULT)
+      val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+      cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKeystoreKey())
+      cipher.updateAAD(keystoreAad)
+      val iv = cipher.iv ?: throw IllegalStateException("Android Keystore cipher omitted IV")
+      if (iv.size != 12) throw IllegalStateException("Unexpected Android Keystore GCM IV length")
+      val ct = cipher.doFinal(plaintext)
+      val out = ByteArray(iv.size + ct.size)
+      System.arraycopy(iv, 0, out, 0, iv.size)
+      System.arraycopy(ct, 0, out, iv.size, ct.size)
+      mapOf("base64" to android.util.Base64.encodeToString(out, android.util.Base64.NO_WRAP))
+    }
+  }
+
+  @Command
+  fun keystoreUnwrap(invoke: Invoke) {
+    val args = invoke.parseArgs(KeystoreBlobArgs::class.java)
+    runIo(invoke, "Cannot unwrap vault key from Android Keystore") {
+      val wrapped = android.util.Base64.decode(args.data_base64, android.util.Base64.DEFAULT)
+      if (wrapped.size < 12 + 16) throw IllegalStateException("Corrupted Android Keystore envelope")
+      val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+      val secret = (ks.getEntry(keystoreAlias, null) as? KeyStore.SecretKeyEntry)?.secretKey
+        ?: throw IllegalStateException("Android Keystore master key entry is missing")
+      val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+      cipher.init(Cipher.DECRYPT_MODE, secret, GCMParameterSpec(128, wrapped, 0, 12))
+      cipher.updateAAD(keystoreAad)
+      val pt = cipher.doFinal(wrapped, 12, wrapped.size - 12)
+      mapOf("base64" to android.util.Base64.encodeToString(pt, android.util.Base64.NO_WRAP))
+    }
   }
 
   @Command

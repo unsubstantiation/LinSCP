@@ -604,6 +604,75 @@ pub fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<(
     }
 }
 
+/// Returns `true` on desktop targets that support launching an external GUI text editor.
+pub fn supports_external_desktop_editor() -> bool {
+    !cfg!(target_os = "android")
+}
+
+/// Safely launches an external desktop editor on `file_path` via direct `Command::new(prog)`
+/// argument vectors (never invoking `/bin/sh -c` or `cmd /C`).
+pub fn spawn_safe_external_editor(file_path: &Path) -> Result<String, String> {
+    use std::process::{Command, Stdio};
+    if let Ok(raw_vis) = std::env::var("LINSCP_EDITOR").or_else(|_| std::env::var("VISUAL")) {
+        let trimmed = raw_vis.trim();
+        if !trimmed.is_empty() && !trimmed.chars().any(char::is_control) {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if let Some((prog, rest)) = parts.split_first() {
+                if Command::new(prog)
+                    .args(rest)
+                    .arg(file_path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .is_ok()
+                {
+                    return Ok((*prog).to_string());
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("notepad.exe")
+            .arg(file_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| "notepad.exe".to_string())
+            .map_err(|e| format!("Failed to launch external editor: {e}"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg("-t")
+            .arg(file_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| "open -t".to_string())
+            .map_err(|e| format!("Failed to launch external editor: {e}"))
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        for candidate in ["xdg-open", "gedit", "kate", "mousepad", "code"] {
+            if Command::new(candidate)
+                .arg(file_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok()
+            {
+                return Ok(candidate.to_string());
+            }
+        }
+        Err("No graphical desktop editor found (set $VISUAL or install xdg-open).".to_string())
+    }
+}
+
 /// Serialises tests that edit `$XDG_DATA_HOME`.
 ///
 /// Cargo runs a crate's tests as threads in one process, so the environment is

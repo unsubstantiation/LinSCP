@@ -185,6 +185,16 @@ pub struct ImportedSite {
     pub remote_directory: String,
     #[serde(default)]
     pub local_directory: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_private_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_command: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +299,10 @@ pub struct UserPreferences {
     pub priority: bool,
     pub confirm_overwrite: bool,
     pub confirm_delete: bool,
+    #[serde(default)]
+    pub xml_log_enabled: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub xml_log_path: String,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub custom_install_scripts: std::collections::BTreeMap<String, String>,
 }
@@ -308,6 +322,8 @@ impl Default for UserPreferences {
             priority: false,
             confirm_overwrite: true,
             confirm_delete: true,
+            xml_log_enabled: false,
+            xml_log_path: String::new(),
             custom_install_scripts: std::collections::BTreeMap::new(),
         }
     }

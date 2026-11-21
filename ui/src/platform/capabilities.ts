@@ -149,10 +149,10 @@ export function hostCapabilities(options: HostCapabilityOptions = {}): HostCapab
     shareIntents,
     foregroundTransfers,
     sshAgent: options.sshAgent ?? !android,
-    // Only a native non-Linux build is known to lack Kerberos, and the backend
-    // refuses explicit Kerberos settings where it cannot honor them. Key
-    // exchange is unwired on every build, so it stays off unless overridden.
-    gssapi: options.gssapi ?? platform === 'linux',
+    // Linux (libgssapi_krb5) and Windows (SSPI) builds support Kerberos
+    // authentication; Android lacks a Kerberos runtime. Key exchange remains
+    // unwired on every build, so it stays off unless overridden.
+    gssapi: options.gssapi ?? (platform === 'linux' || platform === 'windows'),
     gssapiKex: options.gssapiKex ?? false,
     fileDrop: true,
     nativeFileDrop: options.nativeFileDrop ?? (native && !android),
@@ -224,7 +224,7 @@ export function hostDifferenceReason(
     return 'SSH agent authentication is not available on this build; use a private key file instead.';
   }
   if (capability === 'gssapi' && !caps.gssapi) {
-    return 'Kerberos (GSSAPI) authentication is only available on Linux; this build cannot use these settings.';
+    return 'Kerberos (GSSAPI) authentication needs a Linux Kerberos runtime or Windows SSPI; this build cannot use these settings.';
   }
   if (capability === 'gssapiKex' && !caps.gssapiKex) {
     return 'GSSAPI key exchange is not supported; leave it off or the connection is refused.';
