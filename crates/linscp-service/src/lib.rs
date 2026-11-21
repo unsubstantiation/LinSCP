@@ -3427,7 +3427,7 @@ impl CommanderService {
                 continue;
             }
             if (resume || append) && is_dir { return api_error(400, "Resume and append are supported only for individual files."); }
-            if (resume || append) && is_saf_path(&local.to_string_lossy()) { return api_error(400, "Verified resume and append are not supported for granted folders."); }
+            if (resume || append) && is_saf_path(&local.to_string_lossy()) { return api_error(400, "Verified resume is not supported for granted folders; append is also unsupported."); }
             if move_item && !tab.is_local && is_dir { return api_error(400, "Remote directory moves are not supported."); }
             if is_dir && !move_item {
                 let scheme = session.as_ref().map(|s| s.scheme());
@@ -14569,10 +14569,12 @@ mod tests {
         let refused = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": right, "names": ["big.bin"]}) }).await;
         assert_eq!(refused.status, 400, "{}", refused.payload);
         assert!(refused.payload["error"].as_str().unwrap_or("").contains("larger than a granted folder can carry"), "{}", refused.payload);
-        // A directory copy keeps the plain panes' refusal.
+        // A directory copy recursively copies granted directories across the bridge.
+        bridge.add_file(&format!("{SAF_GRANTED_DIR}/document/folder/document/inside.txt"), b"nested bytes");
         let dir_copy = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": right, "names": ["folder"]}) }).await;
-        assert_eq!(dir_copy.status, 400, "{}", dir_copy.payload);
-        assert!(dir_copy.payload["error"].as_str().unwrap_or("").contains("Only regular files and movable directories are supported"), "{}", dir_copy.payload);
+        assert_eq!(dir_copy.status, 200, "{}", dir_copy.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(std::fs::read(right.join("folder").join("inside.txt")).unwrap(), b"nested bytes".to_vec());
         let _ = std::fs::remove_dir_all(tmp);
     }
 

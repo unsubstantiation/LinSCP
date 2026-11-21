@@ -43,9 +43,13 @@ pub fn try_create_system_gssapi_context(
     service_host: &str,
     delegate_creds: bool,
 ) -> Option<Box<dyn SystemGssapiContext>> {
+    let host = service_host.trim();
+    if host.is_empty() || host.contains('\0') {
+        return None;
+    }
     #[cfg(target_os = "linux")]
     {
-        linux_impl::DlopenKrb5Context::new(service_host, delegate_creds)
+        linux_impl::DlopenKrb5Context::new(host, delegate_creds)
             .map(|ctx| Box::new(ctx) as Box<dyn SystemGssapiContext>)
     }
     #[cfg(target_os = "windows")]

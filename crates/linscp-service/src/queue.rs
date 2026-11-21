@@ -955,7 +955,7 @@ impl QueueManager {
                     let leaf = remote_path.rsplit('/').next().unwrap_or(remote_path);
                     let ascii_conv = wants_ascii_conversion(f.transfer_mode, leaf);
                     if saf_dest {
-                        if f.resume || f.append { return Err("Verified resume and append are not supported for granted folders.".to_string()); }
+                        if f.resume || f.append { return Err("Verified resume is not supported for granted folders; append is also unsupported.".to_string()); }
                         let stage = tempfile::Builder::new().prefix("linscp-saf-download-").rand_bytes(16).tempdir()
                             .map_err(|e| format!("Cannot create download staging directory: {e}"))?;
                         let staged_file = stage.path().join("contents");
