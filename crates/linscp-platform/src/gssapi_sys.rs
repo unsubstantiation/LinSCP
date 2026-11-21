@@ -717,7 +717,7 @@ mod windows_impl {
                 pv_buffer: input_token
                     .map_or(std::ptr::null_mut(), |t| t.as_ptr() as *mut c_void),
             };
-            let mut in_desc = SecBufferDesc {
+            let in_desc = SecBufferDesc {
                 ul_version: SECBUFFER_VERSION,
                 c_buffers: 1,
                 p_buffers: &mut in_buf,
@@ -849,20 +849,18 @@ mod windows_impl {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn gss_context_rejects_empty_and_nul_service_hosts() {
-        assert!(PlatformGssContext::new("", false).is_none());
-        assert!(PlatformGssContext::new("   ", true).is_none());
-        assert!(PlatformGssContext::new("bad\0host", false).is_none());
+        assert!(super::try_create_system_gssapi_context("", false).is_none());
+        assert!(super::try_create_system_gssapi_context("   ", true).is_none());
+        assert!(super::try_create_system_gssapi_context("bad\0host", false).is_none());
         #[cfg(target_os = "windows")]
         {
             assert!(
-                is_system_gssapi_available(),
+                super::is_system_gssapi_available(),
                 "Windows System32\\secur32.dll SSPI provider must resolve"
             );
-            assert!(PlatformGssContext::new("ssh.example.test", false).is_some());
+            assert!(super::try_create_system_gssapi_context("ssh.example.test", false).is_some());
         }
     }
 }

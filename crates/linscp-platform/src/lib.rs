@@ -670,7 +670,7 @@ impl LocalFs for NativeLocalFs {
             let Some(bridge) = self.saf.as_deref() else {
                 return Err(PlatformError::UnsupportedUri(source.to_string()));
             };
-            let mut out = open_private_temp_file(&resolve_os_path(&dest_path.to_string_lossy()))?;
+            let mut out = sys::open_private_temp_file(&resolve_os_path(&dest_path.to_string_lossy()))?;
             let mut offset = 0u64;
             loop {
                 let chunk = bridge.read_uri_chunk(source, offset, android::SAF_CHUNK_BYTES)?;
@@ -688,7 +688,7 @@ impl LocalFs for NativeLocalFs {
             return Ok(offset);
         }
         let mut src = std::fs::File::open(resolve_os_path(source))?;
-        let mut out = open_private_temp_file(&resolve_os_path(&dest_path.to_string_lossy()))?;
+        let mut out = sys::open_private_temp_file(&resolve_os_path(&dest_path.to_string_lossy()))?;
         let written = std::io::copy(&mut src, &mut out)?;
         out.sync_all()?;
         Ok(written)
@@ -1400,11 +1400,11 @@ mod tests {
         assert_eq!(published, total as u64);
         assert_eq!(fs.stat(&saf_a).unwrap().size, total as u64);
 
-        let copied = fs.copy_streamed(&saf_a, &saf_b, false).expect("streamed SAF->SAF copy");
+        let copied = fs.copy_streamed(&saf_a, &saf_b).expect("streamed SAF->SAF copy");
         assert_eq!(copied, total as u64);
         assert!(
-            fs.copy_streamed(&saf_a, &saf_b, false).is_err(),
-            "copy_streamed without allow_overwrite must refuse existing SAF destination"
+            fs.copy_streamed(&saf_a, &saf_b).is_err(),
+            "copy_streamed must refuse overwriting an existing SAF destination"
         );
 
         let local_roundtrip = dir.join("roundtrip.bin");
