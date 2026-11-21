@@ -49,6 +49,7 @@ jobs:
           python3 -m unittest discover -s tools/tests -p test_gui_distribution.py
           python3 -m unittest discover -s tools/tests -p test_workflow_triggers.py
           python3 -m unittest discover -s tools/tests -p test_x2go_installer.py
+          python3 -m unittest discover -s tools/tests -p test_mosh_installer.py
           python3 -m unittest discover -s tools/tests -p test_ppk_fixture_format.py
           
       - name: Install and test the shared frontend

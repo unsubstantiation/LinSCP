@@ -18,6 +18,9 @@ export interface TerminalWindowOptions {
   /** The terminal to show, or a tab to open one on. */
   terminal?: string | null;
   tab?: number | null;
+  /** Optional Mosh transport override when opening directly from a tab id. */
+  mosh?: boolean;
+  moshPort?: string;
   /** The transport; defaults to the one the page built. */
   transport?: TransportClient | null;
   /** Called when the shell ends, with the reason when the backend gave one. */
@@ -94,11 +97,18 @@ export class TerminalWindow {
         return false;
       }
       try {
-        const reply = await transport.post<OpenReply>('/api/session/terminal', {
+        const openBody: Record<string, unknown> = {
           tab,
           cols: 80,
           rows: 24,
-        });
+        };
+        if (typeof this.options.mosh === 'boolean') {
+          openBody.mosh = this.options.mosh;
+        }
+        if (typeof this.options.moshPort === 'string' && this.options.moshPort.trim()) {
+          openBody.mosh_port = this.options.moshPort.trim();
+        }
+        const reply = await transport.post<OpenReply>('/api/session/terminal', openBody);
         if (!reply || !reply.success || !reply.terminal) {
           this.fail(reply && reply.error ? reply.error : 'Cannot open a terminal.');
           return false;

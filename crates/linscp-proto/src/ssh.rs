@@ -25,7 +25,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use zeroize::Zeroizing;
 
 use crate::gssapi::{ensure_gssapi_available, GssapiTokenProvider};
-use crate::proxy::{connect_stream_maybe_proxied, ProxyConfig};
+use crate::proxy::{connect_stream_maybe_proxied, connect_tcp_maybe_proxied, ProxyConfig, ProxyKind};
 use crate::{evaluate_host_key_extended, ProtoError};
 
 const DEFAULT_SSH_TIMEOUT_SECS: u64 = 20;
@@ -405,6 +405,7 @@ pub struct SshConnection {
     observed_key_type: String,
     observed_fingerprint: String,
     timeout: Duration,
+    direct_peer_ip: Option<std::net::IpAddr>,
 }
 
 impl SshConnection {
@@ -414,15 +415,30 @@ impl SshConnection {
             ensure_gssapi_available(cfg.request_gssapi_kex)?;
         }
         if let Some(log) = &cfg.event_logger { log("Opening SSH transport (including any configured proxy)."); }
-        let stream = connect_stream_maybe_proxied(
-            &cfg.host,
-            cfg.port,
-            cfg.proxy.as_ref(),
-            cfg.connect_timeout,
-        )
-        .await?;
-        if let Some(log) = &cfg.event_logger { log("SSH transport established; starting handshake and host-key verification."); }
-        Self::connect_over_stream(cfg, stream).await
+        if cfg.proxy.as_ref().is_none_or(|p| p.kind == ProxyKind::None) {
+            let tcp = connect_tcp_maybe_proxied(&cfg.host, cfg.port, None, cfg.connect_timeout).await?;
+            let direct_peer_ip = tcp.peer_addr().ok().map(|addr| addr.ip());
+            if let Some(log) = &cfg.event_logger { log("SSH transport established; starting handshake and host-key verification."); }
+            let mut conn = Self::connect_over_stream(cfg, tcp).await?;
+            conn.direct_peer_ip = direct_peer_ip;
+            Ok(conn)
+        } else {
+            let stream = connect_stream_maybe_proxied(
+                &cfg.host,
+                cfg.port,
+                cfg.proxy.as_ref(),
+                cfg.connect_timeout,
+            )
+            .await?;
+            if let Some(log) = &cfg.event_logger { log("SSH transport established; starting handshake and host-key verification."); }
+            Self::connect_over_stream(cfg, stream).await
+        }
+    }
+
+    /// Returns the direct TCP peer IP address when the SSH connection was opened
+    /// without a proxy or jump-host stream.
+    pub fn direct_peer_ip(&self) -> Option<std::net::IpAddr> {
+        self.direct_peer_ip
     }
 
     /// Runs the SSH handshake, fail-closed host-key verification, and user
@@ -505,6 +521,7 @@ impl SshConnection {
             observed_key_type,
             observed_fingerprint,
             timeout: cfg.connect_timeout.max(Duration::from_secs(1)),
+            direct_peer_ip: None,
         })
     }
 

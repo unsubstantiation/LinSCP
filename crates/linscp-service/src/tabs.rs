@@ -186,6 +186,8 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
     obj.insert("user".into(), json!(site.username));
     obj.insert("has_password".into(), json!(has_password));
     obj.insert("sudo_password_auto".into(), json!(site.extra_fields.get("sudo_password_auto").is_some_and(|v| v == "1")));
+    obj.insert("mosh".into(), json!(site.extra_fields.get("mosh").is_some_and(|v| v == "1")));
+    obj.insert("mosh_port".into(), json!(site.extra_fields.get("mosh_port").cloned().unwrap_or_default()));
     obj.insert("auto_reconnect".into(), json!(crate::auto_reconnect::enabled(site)));
     obj.insert("auto_reconnect_seconds".into(), json!(crate::auto_reconnect::interval(site)));
     obj.insert("alt_hostname".into(), json!(site.extra_fields.get("alt_hostname").cloned().unwrap_or_default()));
@@ -630,6 +632,8 @@ pub fn parse_gui_session_spec(
         "color",
         "note",
         "sudo_password_auto",
+        "mosh",
+        "mosh_port",
         "alt_hostname",
         "alt_fallback",
         "s3_access_key",
@@ -776,6 +780,29 @@ pub fn parse_gui_session_spec(
     }
     // proxy fields remain in raw_fields; no direct spec fields to set
 
+    if let Some(mosh_port) = spec.raw_fields.get("mosh_port").cloned() {
+        let trimmed = mosh_port.trim();
+        if trimmed.is_empty() {
+            spec.raw_fields.remove("mosh_port");
+        } else {
+            let parsed = linscp_proto::mosh::MoshPortSpec::parse_optional(trimmed)?;
+            if let Some(p) = parsed {
+                spec.raw_fields.insert("mosh_port".into(), p.as_cli_arg());
+            }
+        }
+    }
+    if let Some(mosh_val) = spec.raw_fields.get("mosh").cloned() {
+        match mosh_val.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "false" | "no" | "off" => {
+                spec.raw_fields.insert("mosh".into(), "0".into());
+            }
+            "1" | "true" | "yes" | "on" => {
+                spec.raw_fields.insert("mosh".into(), "1".into());
+            }
+            other => return Err(format!("Invalid Mosh setting '{other}'.")),
+        }
+    }
+
     apply_env_credential_fallbacks(&mut spec);
     if protocol != ProtocolScheme::Local {
         validate_session_settings(&spec)?;
@@ -796,6 +823,14 @@ pub fn parse_gui_session_spec(
         obj.insert(
             "has_password".into(),
             json!(spec.session.password.as_ref().is_some_and(|p| !p.is_empty())),
+        );
+        obj.insert(
+            "mosh".into(),
+            json!(spec.raw_fields.get("mosh").is_some_and(|v| v == "1")),
+        );
+        obj.insert(
+            "mosh_port".into(),
+            json!(spec.raw_fields.get("mosh_port").cloned().unwrap_or_default()),
         );
         obj.insert("remote_dir".into(), json!(initial_dir));
         obj.insert("local_dir".into(), json!(local_dir));
