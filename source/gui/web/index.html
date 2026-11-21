@@ -5010,8 +5010,11 @@
       task && (task.status === 'Running' || task.status === 'Queued'));
     foregroundTaskCount = active.length;
     if (!active.length) {
-      // Nothing left to protect: the notification goes away with the work.
-      if (bridge.isRunning) void bridge.stop();
+      // Nothing left to protect: the notification goes away with the work,
+      // unless an Android SSH desktop tunnel keepalive is still active.
+      if (bridge.isRunning && !(androidDesktopTunnelKeepalive && androidDesktopTunnelKeepalive.isRunning)) {
+        void bridge.stop();
+      }
       return;
     }
     const running = active.find(task => task.status === 'Running') || active[0];
@@ -6739,7 +6742,7 @@
               androidDesktopTunnelKeepalive = new window.LinSCPCore.ForegroundTransferBridge();
             }
             if (typeof androidDesktopTunnelKeepalive.start === 'function') {
-              await androidDesktopTunnelKeepalive.start(1);
+              await androidDesktopTunnelKeepalive.start(t('Remote desktop'), 1);
             }
           } catch (_) {}
         }
@@ -6747,6 +6750,10 @@
           ? await window.LinSCPCore.openExternalUri(uri)
           : false;
         if (!opened) {
+          if (androidDesktopTunnelKeepalive && typeof androidDesktopTunnelKeepalive.stop === 'function') {
+            try { await androidDesktopTunnelKeepalive.stop(); } catch (_) {}
+            androidDesktopTunnelKeepalive = null;
+          }
           toast(t('No Android viewer app can open this {kind} connection.', {kind: kind.toUpperCase()}), true);
           return;
         }

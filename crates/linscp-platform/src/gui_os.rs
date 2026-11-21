@@ -207,9 +207,24 @@ fn find_program_on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Opens an `http://127.0.0.1:<port>/` URL in the user's desktop browser
-/// (Wayland and X11 aware on Linux, `cmd /C start` on Windows, `termux-open-url` on Android).
+fn validate_browser_http_url(url: &str) -> Result<&str, String> {
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err("refusing to open non-HTTP(S) URL in browser".to_string());
+    }
+    if trimmed.len() <= "https://".len()
+        || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err("refusing to open malformed URL containing whitespace or control characters".to_string());
+    }
+    Ok(trimmed)
+}
+
+/// Opens an `http(s)://` URL in the user's desktop browser
+/// (Wayland and X11 aware on Linux, `rundll32 url.dll,FileProtocolHandler` on Windows, `termux-open-url` on Android).
 pub fn open_url_in_browser(url: &str) -> Result<(), String> {
+    let url = validate_browser_http_url(url)?;
     #[cfg(target_os = "linux")]
     {
         use crate::linux::{detect_desktop_session, DesktopSessionKind};
@@ -259,8 +274,8 @@ pub fn open_url_in_browser(url: &str) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        Command::new("cmd")
-            .args(["/C", "start", "", url])
+        Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", url])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -655,8 +670,27 @@ pub fn spawn_safe_external_editor(file_path: &Path) -> Result<String, String> {
             .map(|_| "open -t".to_string())
             .map_err(|e| format!("Failed to launch external editor: {e}"))
     }
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    #[cfg(target_os = "android")]
     {
+        let _ = file_path;
+        Err("External desktop editors are not supported on Android.".to_string())
+    }
+    #[cfg(all(
+        not(target_os = "windows"),
+        not(target_os = "macos"),
+        not(target_os = "android")
+    ))]
+    {
+        #[cfg(target_os = "linux")]
+        {
+            use crate::linux::{detect_desktop_session, DesktopSessionKind};
+            if detect_desktop_session() == DesktopSessionKind::Headless {
+                return Err(
+                    "No graphical desktop session (WAYLAND_DISPLAY or DISPLAY is not set; set $LINSCP_EDITOR or $VISUAL)."
+                        .to_string(),
+                );
+            }
+        }
         for candidate in ["xdg-open", "gedit", "kate", "mousepad", "code"] {
             if Command::new(candidate)
                 .arg(file_path)
@@ -865,5 +899,18 @@ mod shell_integration_tests {
             assert_eq!(outcome, "not installed");
         }
         let _ = std::fs::remove_dir_all(&data_home);
+    }
+
+    #[test]
+    fn browser_url_validator_accepts_http_and_rejects_non_http_or_control_chars() {
+        assert_eq!(
+            validate_browser_http_url("http://127.0.0.1:8080/?tab=1&view=2").unwrap(),
+            "http://127.0.0.1:8080/?tab=1&view=2"
+        );
+        assert!(validate_browser_http_url("https://example.com/docs").is_ok());
+        assert!(validate_browser_http_url("file:///etc/passwd").is_err());
+        assert!(validate_browser_http_url("javascript:alert(1)").is_err());
+        assert!(validate_browser_http_url("http://127.0.0.1:8080/ & calc.exe").is_err());
+        assert!(validate_browser_http_url("http://127.0.0.1:8080/\r\ncalc").is_err());
     }
 }

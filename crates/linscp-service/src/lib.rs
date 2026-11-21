@@ -15873,7 +15873,10 @@ mod tests {
         }
 
         fn doc_uri(name: &str) -> String {
-            format!("{SAF_GRANTED_DIR}/document/{name}")
+            format!(
+                "{SAF_GRANTED_DIR}/document/{}",
+                linscp_platform::encode_saf_segment(name)
+            )
         }
 
         fn add_file(&self, uri: &str, content: &[u8]) {
@@ -15885,7 +15888,9 @@ mod tests {
         }
 
         fn leaf_of(uri: &str) -> String {
-            uri.rsplit("/document/").next().unwrap_or("").to_string()
+            linscp_platform::parse_saf_document_uri(uri)
+                .map(|p| p.leaf_name())
+                .unwrap_or_else(|_| uri.rsplit("/document/").next().unwrap_or("").to_string())
         }
 
         fn parent_of(uri: &str) -> String {
@@ -15928,7 +15933,10 @@ mod tests {
             self.bytes_of_uri(uri).ok_or_else(|| PlatformError::Unsupported(format!("Unknown document: {uri}")))
         }
         fn write_uri_bytes(&self, parent_uri: &str, name: &str, data: &[u8]) -> Result<String, PlatformError> {
-            let uri = format!("{parent_uri}/document/{name}");
+            let uri = format!(
+                "{parent_uri}/document/{}",
+                linscp_platform::encode_saf_segment(name)
+            );
             let mut docs = self.docs.lock().expect("m");
             if docs.get(&uri).is_some_and(|doc| doc.bytes.is_none()) {
                 return Err(PlatformError::Unsupported(format!("Cannot replace the directory: {uri}")));
@@ -15951,7 +15959,10 @@ mod tests {
             true
         }
         fn mkdir_uri(&self, parent_uri: &str, name: &str) -> Result<String, PlatformError> {
-            let uri = format!("{parent_uri}/document/{name}");
+            let uri = format!(
+                "{parent_uri}/document/{}",
+                linscp_platform::encode_saf_segment(name)
+            );
             let mut docs = self.docs.lock().expect("m");
             if docs.get(&uri).is_some_and(|doc| doc.bytes.is_some()) {
                 return Err(PlatformError::Unsupported(format!("Cannot make a directory over the file: {uri}")));
@@ -15965,7 +15976,11 @@ mod tests {
             Ok(())
         }
         fn rename_uri(&self, uri: &str, new_name: &str) -> Result<String, PlatformError> {
-            let new_uri = format!("{}/document/{new_name}", Self::parent_of(uri));
+            let new_uri = format!(
+                "{}/document/{}",
+                Self::parent_of(uri),
+                linscp_platform::encode_saf_segment(new_name)
+            );
             let old_prefix = format!("{uri}/document/");
             let new_prefix = format!("{new_uri}/document/");
             let mut docs = self.docs.lock().expect("m");
@@ -17880,5 +17895,235 @@ mod tests {
         assert!(saved_path.is_file());
         let export_dir_mode_after = gui_os::stat_extended(&export_dir).unwrap().mode & 0o777;
         assert_eq!(export_dir_mode_after, export_dir_mode_before);
+    }
+
+    #[tokio::test]
+    async fn skipped_moves_keep_sources_keepuptodate_cancels_and_saf_special_chars_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local_dir = tmp.path().join("local");
+        std::fs::create_dir_all(&local_dir).unwrap();
+
+        let svc = CommanderService::new(tmp.path().join("cfg"), Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSession::new());
+        session.add_file("/keep_remote.txt", b"remote line\r\n");
+        let tab_id = insert_remote_tab(&svc, session.clone(), &local_dir.to_string_lossy());
+
+        // 1a. Single-file ASCII move download skipped by file_mask must NOT fail on missing stage OR delete remote source!
+        let mut dl_flags = linscp_engine::transfer::TransferFlags::default();
+        dl_flags.transfer_mode = linscp_types::TransferMode::Ascii;
+        dl_flags.file_mask = linscp_engine::filemask::FileMask::parse("|*.txt").unwrap();
+        let dl_id = svc.queue.enqueue(
+            Some(tab_id),
+            "download",
+            "Move download".into(),
+            "/keep_remote.txt".into(),
+            local_dir.join("keep_remote.txt").to_string_lossy().into_owned(),
+            13,
+            false,
+            queue::QueueJob::RemoteDownload {
+                session: session.clone(),
+                remote_path: "/keep_remote.txt".into(),
+                local_dest: local_dir.join("keep_remote.txt"),
+                allow_overwrite: false,
+                delete_source: true,
+                flags: dl_flags,
+            },
+        );
+
+        // 1b. Single-file move upload skipped by file_mask must NOT delete local source!
+        let local_keep = local_dir.join("keep_local.txt");
+        std::fs::write(&local_keep, b"local payload\n").unwrap();
+        let mut ul_flags = linscp_engine::transfer::TransferFlags::default();
+        ul_flags.file_mask = linscp_engine::filemask::FileMask::parse("|*.txt").unwrap();
+        let ul_id = svc.queue.enqueue(
+            Some(tab_id),
+            "upload",
+            "Move upload".into(),
+            local_keep.to_string_lossy().into_owned(),
+            "/keep_local.txt".into(),
+            14,
+            false,
+            queue::QueueJob::RemoteUpload {
+                session: session.clone(),
+                local_src: local_keep.clone(),
+                remote_dest: "/keep_local.txt".into(),
+                allow_overwrite: false,
+                delete_source: true,
+                cleanup_path: None,
+                flags: ul_flags,
+            },
+        );
+
+        for _ in 0..80 {
+            if !svc.queue.has_unfinished_work() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let q = svc.queue.snapshot_json();
+        let tasks = q["transfers"].as_array().unwrap();
+        let dl_task = tasks.iter().find(|t| t["id"].as_u64() == Some(dl_id)).unwrap();
+        let ul_task = tasks.iter().find(|t| t["id"].as_u64() == Some(ul_id)).unwrap();
+        assert_eq!(dl_task["status"], "Completed", "{dl_task}");
+        assert_eq!(ul_task["status"], "Completed", "{ul_task}");
+        assert!(session.bytes_of("/keep_remote.txt").is_some(), "skipped move download must preserve remote source");
+        assert!(!local_dir.join("keep_remote.txt").exists());
+        assert!(local_keep.is_file(), "skipped move upload must preserve local source");
+        assert!(session.bytes_of("/keep_local.txt").is_none());
+
+        // 2. KeepUpToDate in GUI queue (`count: 0`) must be cancellable via `/api/queue/cancel` and tab close.
+        let watch_res = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/keepuptodate".into(),
+            body: json!({"tab": tab_id, "local_dir": local_dir, "remote_dir": "/", "interval": 5, "count": 0}),
+        }).await;
+        assert_eq!(watch_res.status, 200, "{}", watch_res.payload);
+        let watch_id = watch_res.payload["task_id"].as_u64().unwrap();
+
+        for _ in 0..80 {
+            let snap = svc.queue.snapshot_json();
+            let st = snap["transfers"].as_array().unwrap().iter()
+                .find(|t| t["id"].as_u64() == Some(watch_id))
+                .and_then(|t| t["status"].as_str())
+                .unwrap_or("");
+            if st == "Running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let cancel_res = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/queue/cancel".into(),
+            body: json!({"task_id": watch_id}),
+        });
+        assert_eq!(cancel_res.status, 200, "{}", cancel_res.payload);
+        for _ in 0..80 {
+            let snap = svc.queue.snapshot_json();
+            let st = snap["transfers"].as_array().unwrap().iter()
+                .find(|t| t["id"].as_u64() == Some(watch_id))
+                .and_then(|t| t["status"].as_str())
+                .unwrap_or("");
+            if st == "Cancelled" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let watch_after = svc.queue.snapshot_json()["transfers"].as_array().unwrap().iter()
+            .find(|t| t["id"].as_u64() == Some(watch_id)).cloned().unwrap();
+        assert_eq!(watch_after["status"], "Cancelled", "{watch_after}");
+
+        // Tab close cancels an active KeepUpToDate as well.
+        let watch2_res = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/keepuptodate".into(),
+            body: json!({"tab": tab_id, "local_dir": local_dir, "remote_dir": "/", "interval": 5, "count": 0}),
+        }).await;
+        let watch2_id = watch2_res.payload["task_id"].as_u64().unwrap();
+        for _ in 0..80 {
+            let snap = svc.queue.snapshot_json();
+            let st = snap["transfers"].as_array().unwrap().iter()
+                .find(|t| t["id"].as_u64() == Some(watch2_id))
+                .and_then(|t| t["status"].as_str())
+                .unwrap_or("");
+            if st == "Running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let closed = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/tabs/close".into(),
+            body: json!({"tab": tab_id}),
+        }).await;
+        assert_eq!(closed.status, 200);
+        for _ in 0..80 {
+            if !svc.queue.has_unfinished_work() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let watch2_after = svc.queue.snapshot_json()["transfers"].as_array().unwrap().iter()
+            .find(|t| t["id"].as_u64() == Some(watch2_id)).cloned().unwrap();
+        assert_eq!(watch2_after["status"], "Cancelled", "{watch2_after}");
+
+        // 3. SAF local queue copy with `ConflictPolicy::Rename` on filenames containing `?`, `#`, and `%`.
+        let saf_bridge = Arc::new(MockBridge::new());
+        let tricky = "report?v1#final%20.txt";
+        saf_bridge.add_dir(&format!("{SAF_GRANTED_DIR}/document/dst"));
+        saf_bridge.add_file(&MockBridge::doc_uri(tricky), b"new saf copy");
+        saf_bridge.add_file(
+            &format!("{SAF_GRANTED_DIR}/document/dst/document/{}", linscp_platform::encode_saf_segment(tricky)),
+            b"existing saf file",
+        );
+        let saf_fs: Arc<dyn LocalFs> = Arc::new(NativeLocalFs::with_saf(saf_bridge.clone()));
+        let saf_svc = CommanderService::new(tmp.path().join("saf_cfg"), saf_fs);
+        let saf_copy_id = saf_svc.queue.enqueue(
+            None,
+            "local_copy",
+            "SAF copy".into(),
+            MockBridge::doc_uri(tricky),
+            format!("{SAF_GRANTED_DIR}/document/dst/document/{}", linscp_platform::encode_saf_segment(tricky)),
+            12,
+            false,
+            queue::QueueJob::LocalCopyOrMove {
+                source: PathBuf::from(MockBridge::doc_uri(tricky)),
+                target: PathBuf::from(format!(
+                    "{SAF_GRANTED_DIR}/document/dst/document/{}",
+                    linscp_platform::encode_saf_segment(tricky)
+                )),
+                move_item: false,
+                policy: queue::ConflictPolicy::Rename,
+                flags: linscp_engine::transfer::TransferFlags::default(),
+            },
+        );
+        for _ in 0..80 {
+            if !saf_svc.queue.has_unfinished_work() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let saf_task = saf_svc.queue.snapshot_json()["transfers"].as_array().unwrap().iter()
+            .find(|t| t["id"].as_u64() == Some(saf_copy_id)).cloned().unwrap();
+        assert_eq!(saf_task["status"], "Completed", "{saf_task}");
+        let renamed_uri = format!(
+            "{SAF_GRANTED_DIR}/document/dst/document/{}",
+            linscp_platform::encode_saf_segment("report?v1#final%20 (1).txt")
+        );
+        assert_eq!(saf_bridge.bytes_of_uri(&renamed_uri).as_deref(), Some(b"new saf copy".as_slice()));
+
+        // 4. Local copy applies `PresetPermissions::Mode` when configured.
+        let perm_src = local_dir.join("perm_src.txt");
+        let perm_dst = local_dir.join("perm_dst.txt");
+        std::fs::write(&perm_src, b"mode test").unwrap();
+        let mut perm_flags = linscp_engine::transfer::TransferFlags::default();
+        perm_flags.permissions = linscp_engine::presets::PresetPermissions::Mode(0o600);
+        let perm_id = svc.queue.enqueue(
+            None,
+            "local_copy",
+            "Perm copy".into(),
+            perm_src.to_string_lossy().into_owned(),
+            perm_dst.to_string_lossy().into_owned(),
+            9,
+            false,
+            queue::QueueJob::LocalCopyOrMove {
+                source: perm_src,
+                target: perm_dst.clone(),
+                move_item: false,
+                policy: queue::ConflictPolicy::Overwrite,
+                flags: perm_flags,
+            },
+        );
+        for _ in 0..80 {
+            if !svc.queue.has_unfinished_work() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let perm_task = svc.queue.snapshot_json()["transfers"].as_array().unwrap().iter()
+            .find(|t| t["id"].as_u64() == Some(perm_id)).cloned().unwrap();
+        assert_eq!(perm_task["status"], "Completed", "{perm_task}");
+        if cfg!(unix) {
+            assert_eq!(gui_os::stat_extended(&perm_dst).unwrap().mode & 0o777, 0o600);
+        }
     }
 }

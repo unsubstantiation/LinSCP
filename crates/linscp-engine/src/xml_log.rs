@@ -275,9 +275,15 @@ impl SessionLogger {
             if f.seek(SeekFrom::Start(tail_start)).is_ok() {
                 let mut tail = Vec::new();
                 if f.read_to_end(&mut tail).is_ok() {
-                    let tail_str = String::from_utf8_lossy(&tail);
-                    let trimmed = tail_str.trim_end();
-                    if let Some(prefix) = trimmed.strip_suffix("</session>") {
+                    let mut trimmed = tail.as_slice();
+                    while let Some((&last, rest)) = trimmed.split_last() {
+                        if matches!(last, b' ' | b'\t' | b'\r' | b'\n') {
+                            trimmed = rest;
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Some(prefix) = trimmed.strip_suffix(b"</session>") {
                         let new_len = tail_start + prefix.len() as u64;
                         if f.set_len(new_len).is_ok() && f.seek(SeekFrom::End(0)).is_ok() {
                             let _ = f.write_all(b"\n");
@@ -808,5 +814,48 @@ mod tests {
         assert!(xml.contains("alice:***@example.com"));
         assert!(xml.contains("line1&#10;line2"));
         assert!(xml.ends_with("</session>\n"));
+    }
+
+    #[test]
+    fn xml_log_open_append_preserves_valid_xml_when_multibyte_utf8_straddles_tail_boundary() {
+        let tmp = std::env::temp_dir().join(format!(
+            "linscp_xmllog_utf8_boundary_{}.xml",
+            std::process::id()
+        ));
+        // Construct a valid XML session log whose `len - 64` offset lands inside a 4-byte UTF-8 sequence (`🚀`).
+        // Everything after `tail_start` has 2 trailing continuation bytes + ASCII padding + `</session>\n` = 64 bytes.
+        let suffix_after_emoji = format!("{}</session>\n", "x".repeat(51)); // 51 + 11 = 62 bytes
+        let initial = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<session xmlns=\"http://winscp.net/schema/session/1.0\" name=\"s\" start=\"2026-01-01T00:00:00.000Z\">\n<!-- 🚀{suffix_after_emoji}"
+        );
+        // Replace closing of comment cleanly while keeping exact 64-byte tail split inside `🚀` (4 bytes: F0 9F 9A 80).
+        let body_pad = "a".repeat(47); // 47 + " -->\n" (5) + "</session>\n" (11) = 63 bytes -> 1 continuation byte in tail!
+        let initial = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<session xmlns=\"http://winscp.net/schema/session/1.0\" name=\"s\" start=\"2026-01-01T00:00:00.000Z\">\n<!-- 🚀{body_pad} -->\n</session>\n"
+        );
+        let _ = suffix_after_emoji;
+        let tail_start = initial.len() - 64;
+        assert!(
+            !initial.is_char_boundary(tail_start),
+            "tail_start must split the 4-byte UTF-8 character"
+        );
+        std::fs::write(&tmp, initial.as_bytes()).unwrap();
+
+        {
+            let mut logger = SessionLogger::open_append_xml(&tmp, "gui").unwrap();
+            logger.record_mkdir("/new-folder", Ok(()));
+        }
+
+        let appended = std::fs::read_to_string(&tmp).expect("must remain valid UTF-8");
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(
+            appended.matches("</session>").count(),
+            1,
+            "closing tag must appear once without leftover '<' fragments: {appended}"
+        );
+        assert!(!appended.contains("-->\n<\n"), "must not leave partial '<' before appended entry: {appended}");
+        assert!(appended.contains("🚀"));
+        assert!(appended.contains("/new-folder"));
+        assert!(appended.ends_with("</session>\n"));
     }
 }

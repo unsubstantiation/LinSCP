@@ -313,25 +313,34 @@ pub fn launch_remote_desktop(
             .file_content
             .as_deref()
             .ok_or_else(|| format!("No file content for a {} ticket", ticket.kind))?;
-        let ext = ticket.file_extension.as_deref().unwrap_or(".rdp");
-        let safe_target = ticket
+        let ext = match ticket.file_extension.as_deref() {
+            Some(".vv") => ".vv",
+            _ => ".rdp",
+        };
+        let mut safe_target: String = ticket
             .target
-            .replace('/', "_")
-            .replace(':', "_")
-            .replace(' ', "_");
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        while safe_target.contains("..") {
+            safe_target = safe_target.replace("..", "_");
+        }
+        let safe_target = safe_target.trim_matches('.').trim_matches('_');
+        let safe_target = if safe_target.is_empty() {
+            "session"
+        } else {
+            safe_target
+        };
         let file_name = format!("linscp-{safe_target}{ext}");
         let path = config_dir.join(file_name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Cannot create config dir {}: {e}", parent.display()))?;
-        }
-        std::fs::write(&path, content)
+        crate::write_private_file_atomic(&path, content.as_bytes())
             .map_err(|e| format!("Cannot write desktop ticket '{}': {e}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
         return Ok(DesktopLaunchResult::FileTicket {
             path,
             viewer_hint: ticket.viewer.clone(),
@@ -532,5 +541,29 @@ mod tests {
         for proto in ["RDP", "VNC", "SPICE", "X2Go", "X11", "XDMCP", "ironrdp"] {
             assert!(rec.contains(proto), "missing {proto}");
         }
+    }
+
+    #[test]
+    fn forced_file_ticket_sanitizes_target_and_extension_inside_config_dir() {
+        use rand::RngCore;
+        let mut rnd = [0u8; 8];
+        rand::thread_rng().fill_bytes(&mut rnd);
+        let dir = std::env::temp_dir().join(format!(
+            "linscp-desktop-test-{}",
+            rnd.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ));
+        let mut ticket = rdp_ticket(Some("full address:s:127.0.0.1:3389\r\n"));
+        ticket.target = "..\\..\\Startup\\evil:3389".to_string();
+        ticket.file_extension = Some("/../../evil.cmd".to_string());
+        let res = launch_remote_desktop(&ticket, &dir, true).expect("write ticket");
+        match res {
+            DesktopLaunchResult::FileTicket { path, .. } => {
+                assert_eq!(path.parent(), Some(dir.as_path()));
+                assert_eq!(path.extension().and_then(|s| s.to_str()), Some("rdp"));
+                assert!(path.is_file());
+            }
+            other => panic!("expected FileTicket, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

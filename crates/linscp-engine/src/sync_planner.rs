@@ -4,7 +4,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use linscp_crypto::digests::sha256_hex;
 use linscp_platform::terminal::stat_local_path;
@@ -233,6 +234,8 @@ pub struct SyncOptions {
     pub file_mask: FileMask,
     /// The user acknowledged the staged SFTP publish (see `TransferFlags::sftp_risky_publish`).
     pub sftp_risky_publish: bool,
+    /// Optional per-task cancellation flag for GUI queue / session teardown.
+    pub cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 impl Default for SyncOptions {
@@ -251,6 +254,7 @@ impl Default for SyncOptions {
             speed_kbytes_per_sec: None,
             file_mask: FileMask::default(),
             sftp_risky_publish: false,
+            cancel_flag: None,
         }
     }
 }
@@ -575,6 +579,9 @@ pub async fn plan_synchronization(
     state: &SyncState,
     local_fs: Option<&dyn LocalFs>,
 ) -> Result<Vec<SyncItem>, String> {
+    if opts.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) {
+        return Err("Synchronization cancelled.".to_string());
+    }
     if opts.mode == SyncMode::Both {
         if opts.criteria.checksum {
             return Err(
@@ -1047,16 +1054,19 @@ pub async fn apply_sync_plan(
         permissions: opts.permissions,
         speed_kbytes_per_sec: opts.speed_kbytes_per_sec,
         sftp_risky_publish: opts.sftp_risky_publish,
+        cancel_flag: opts.cancel_flag.clone(),
         ..TransferFlags::default()
     };
 
     let local_root_str = local_root.to_string_lossy();
     let saf_fs = local_fs.filter(|_| is_saf_sync_root(&local_root_str));
-    // Synchronization predates cancellation: the staging helpers take a
-    // switch, and this one stays off.
     let no_cancel = AtomicBool::new(false);
+    let cancel_switch: &AtomicBool = opts.cancel_flag.as_deref().unwrap_or(&no_cancel);
 
     for item in items {
+        if cancel_switch.load(Ordering::SeqCst) {
+            return Err("Synchronization cancelled.".to_string());
+        }
         let local_path = local_root.join(&item.rel_path);
         let remote_path = join_remote_path(remote_root, &item.rel_path);
         match item.action {
@@ -1091,7 +1101,7 @@ pub async fn apply_sync_plan(
                     let staged_file = stage.path().join("contents");
                     download_single_file(session, &remote_path, None, &staged_file, &tflags, logger, None).await?;
                     let dest_uri = join_saf_rel(&local_root_str, &item.rel_path);
-                    publish_staged_file_to_saf(fs, &staged_file, &dest_uri, false, &no_cancel)?;
+                    publish_staged_file_to_saf(fs, &staged_file, &dest_uri, false, cancel_switch)?;
                     let l_after = fs.stat(&dest_uri).map_err(|e| e.to_string())?;
                     let r_mtime = if item.remote_mtime > 0 {
                         item.remote_mtime as u64
@@ -1150,7 +1160,7 @@ pub async fn apply_sync_plan(
                     }
                 } else {
                     if let Some(fs) = saf_fs {
-                        let stage = stage_saf_upload_source(fs, &join_saf_rel(&local_root_str, &item.rel_path), &no_cancel)?;
+                        let stage = stage_saf_upload_source(fs, &join_saf_rel(&local_root_str, &item.rel_path), cancel_switch)?;
                         upload_single_file(session, &stage.root, &remote_path, &tflags, logger, None).await?;
                     } else {
                         upload_single_file(session, &local_path, &remote_path, &tflags, logger, None)

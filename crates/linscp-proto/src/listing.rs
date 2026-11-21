@@ -190,13 +190,13 @@ pub fn split_long_listing(line: &str) -> Option<Vec<String>> {
 
 pub fn looks_like_permissions(text: &str) -> bool {
     let b = text.as_bytes();
-    if b.len() != 10 {
+    if b.len() != 10 && !(b.len() == 11 && matches!(b[10], b'.' | b'+' | b'@')) {
         return false;
     }
     if !matches!(b[0], b'-' | b'd' | b'l' | b'b' | b'c' | b'p' | b's') {
         return false;
     }
-    b[1..]
+    b[1..10]
         .iter()
         .all(|c| matches!(c, b'r' | b'w' | b'x' | b's' | b't' | b'S' | b'T' | b'-'))
 }
@@ -410,27 +410,37 @@ pub fn parse_unix_listing_line(line: &str) -> Option<ParsedListingEntry> {
     };
 
     if file_type == S_IFCHR || file_type == S_IFBLK {
-        // Device nodes carry `major, minor` in two columns instead of one size column.
-        if let Some(dev_fields) = split_long_listing_into(trimmed, 10) {
-            if let Some(ts) =
-                parse_full_time_columns(dev_fields[6], dev_fields[7], dev_fields[8])
-            {
-                if let Some(full_dev) = split_long_listing_into(trimmed, 10) {
-                    entry.name = full_dev[9].to_string();
-                }
-                entry.mtime = ts;
-                entry.time_known = true;
-            } else {
-                entry.name = dev_fields[9].to_string();
+        // Device nodes carry `major, minor` in two columns (or compact `major,minor` in one).
+        if fields[4].ends_with(',') {
+            if let Some(dev_fields) = split_long_listing_into(trimmed, 10) {
                 if let Some(ts) =
-                    parse_traditional_ls_date(dev_fields[6], dev_fields[7], dev_fields[8])
+                    parse_full_time_columns(dev_fields[6], dev_fields[7], dev_fields[8])
                 {
+                    entry.name = dev_fields[9].to_string();
                     entry.mtime = ts;
                     entry.time_known = true;
+                } else {
+                    entry.name = dev_fields[9].to_string();
+                    if let Some(ts) =
+                        parse_traditional_ls_date(dev_fields[6], dev_fields[7], dev_fields[8])
+                    {
+                        entry.mtime = ts;
+                        entry.time_known = true;
+                    }
                 }
+            } else {
+                entry.name = fields[8].to_string();
             }
+        } else if let Some(ts) = parse_full_time_columns(fields[5], fields[6], fields[7]) {
+            entry.name = fields[8].to_string();
+            entry.mtime = ts;
+            entry.time_known = true;
         } else {
             entry.name = fields[8].to_string();
+            if let Some(ts) = parse_traditional_ls_date(fields[5], fields[6], fields[7]) {
+                entry.mtime = ts;
+                entry.time_known = true;
+            }
         }
         entry.size = 0;
     } else {
@@ -936,6 +946,36 @@ mod tests {
             parse_unix_listing_line("crw-rw-rw- 1 root root 1, 3 Oct 25 20:00 null").unwrap();
         assert_eq!(dev.name, "null");
         assert_eq!(dev.size, 0);
+
+        let compact_dev =
+            parse_unix_listing_line("crw-rw-rw- 1 root root 1,3 Oct 25 20:00 my null").unwrap();
+        assert_eq!(compact_dev.name, "my null");
+        assert_eq!(compact_dev.size, 0);
+        assert!(compact_dev.time_known);
+
+        // SELinux (`.`), POSIX ACL (`+`), and macOS/BSD xattr (`@`) 11-char permission strings.
+        let selinux_file = parse_unix_listing_line(
+            "-rw-r--r--. 1 root root 1234 2026-10-16 05:33:07.000000000 +0000 config.cfg",
+        )
+        .expect("SELinux '.' indicator must be accepted");
+        assert_eq!(selinux_file.name, "config.cfg");
+        assert_eq!(selinux_file.size, 1234);
+        assert_eq!(permissions_string(selinux_file.permissions), "-rw-r--r--");
+
+        let acl_dir = parse_unix_listing_line("drwxr-xr-x+ 2 alice staff 4096 Oct 16 05:33 shared")
+            .expect("POSIX ACL '+' indicator must be accepted");
+        assert!(acl_dir.is_dir);
+        assert_eq!(acl_dir.name, "shared");
+        assert_eq!(permissions_string(acl_dir.permissions), "drwxr-xr-x");
+
+        let xattr_file =
+            parse_unix_listing_line("-rw-r--r--@ 1 alice staff 512 Oct 16 05:33 notes.txt")
+                .expect("xattr '@' indicator must be accepted");
+        assert_eq!(xattr_file.name, "notes.txt");
+        assert_eq!(xattr_file.size, 512);
+
+        assert!(!looks_like_permissions("-rw-r--r--?"));
+        assert!(!looks_like_permissions("-rw-r--r--.."));
     }
 
     #[test]
