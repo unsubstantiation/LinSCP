@@ -853,9 +853,9 @@ mod tests {
 
     #[tokio::test]
     async fn pageant_agent_probe_returns_cleanly_when_no_pageant_window_exists() {
-        // On a headless Windows CI runner without Pageant running, `connect_pageant_agent`
-        // must return `Ok(None)` without hanging or panicking.
-        let probed = connect_pageant_agent().await.expect("pageant probe succeeds");
+        // On a headless Windows CI runner without Pageant running, `connect_ssh_agent`
+        // (and its Pageant fallback) must return cleanly without hanging or panicking.
+        let probed = connect_ssh_agent().await.expect("ssh/pageant probe succeeds");
         if let Some(mut stream) = probed {
             use tokio::io::AsyncWriteExt;
             let _ = stream.shutdown().await;

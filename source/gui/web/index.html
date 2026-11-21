@@ -5872,7 +5872,7 @@
       androidDesktopTunnelKeepalive = null;
     }
     if (!tunnel) return;
-    await apiPost('/api/desktop/tunnel-close', { tab: tunnel.tab, kind: tunnel.kind });
+    await apiPost('/api/desktop/tunnel-close', { tunnel_id: tunnel.tunnel_id, tab: tunnel.tab, kind: tunnel.kind });
     toast(t('Closed the SSH desktop tunnel.'));
   }
 
@@ -5937,7 +5937,7 @@
         return;
       }
       if (data.tunneled) {
-        activeDesktopTunnel = { tab: tabId, kind: kind };
+        activeDesktopTunnel = { tunnel_id: data.tunnel_id || null, tab: tabId, kind: kind };
         if ($('remoteDesktopCloseTunnelBtn')) $('remoteDesktopCloseTunnelBtn').style.display = 'inline-block';
       }
       const caps = hostCaps();

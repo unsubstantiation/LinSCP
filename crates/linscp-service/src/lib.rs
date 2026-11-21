@@ -6848,14 +6848,31 @@ impl CommanderService {
     }
 
     async fn handle_desktop_tunnel_close_async(&self, body: Value) -> ApiReply {
-        let Some(id) = body.get("tunnel_id").and_then(Value::as_u64) else {
-            return api_error(400, "tunnel_id is required");
-        };
-        let removed = self.state.lock().expect("m").desktop_tunnels.remove(&id);
-        if let Some((_, relay)) = removed {
+        let mut relays = Vec::new();
+        if let Some(id) = body.get("tunnel_id").and_then(Value::as_u64) {
+            if let Some((_, relay)) = self.state.lock().expect("m").desktop_tunnels.remove(&id) {
+                relays.push(relay);
+            }
+        } else if let Some(tab_id) = tabs::parse_tab_id_value(body.get("tab")) {
+            let mut state = self.state.lock().expect("m");
+            let matching_ids: Vec<u64> = state
+                .desktop_tunnels
+                .iter()
+                .filter_map(|(id, (tab, _))| (*tab == Some(tab_id)).then_some(*id))
+                .collect();
+            for id in matching_ids {
+                if let Some((_, relay)) = state.desktop_tunnels.remove(&id) {
+                    relays.push(relay);
+                }
+            }
+        } else {
+            return api_error(400, "tunnel_id or tab is required");
+        }
+        let closed = !relays.is_empty();
+        for relay in relays {
             relay.shutdown().await;
         }
-        ApiReply { status: 200, payload: json!({ "success": true }) }
+        ApiReply { status: 200, payload: json!({ "success": true, "closed": closed }) }
     }
 
     fn handle_desktop_tunnels_list(&self) -> ApiReply {
@@ -15621,23 +15638,27 @@ mod tests {
         assert_eq!(close_none.status, 200);
         assert_eq!(close_none.payload["closed"], false);
 
-        // Register a live loopback forwarder under (1, "rdp") and verify listing + close.
+        // Register a live loopback forwarder under tunnel_id 1 (tab 1) and verify listing + close.
         let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
-        let relay = linscp_proto::tunnel::start_local_forward_relay(move || async move {
-            let stream = tokio::net::TcpStream::connect(upstream_addr)
-                .await
-                .map_err(|e| linscp_proto::ProtoError::Transport(e.to_string()))?;
-            let boxed: Box<dyn linscp_platform::AsyncStream> = Box::new(stream);
-            Ok(boxed)
-        })
+        let relay = linscp_proto::tunnel::start_local_forward_relay_with_connector(
+            std::time::Duration::from_secs(60),
+            move || async move {
+                let stream = tokio::net::TcpStream::connect(upstream_addr)
+                    .await
+                    .map_err(|e| linscp_proto::ProtoError::Transport(e.to_string()))?;
+                let boxed: Box<dyn linscp_platform::AsyncStream> = Box::new(stream);
+                Ok(boxed)
+            },
+        )
         .await
         .unwrap();
         let bound_port = relay.local_port();
-        svc.desktop_tunnels
+        svc.state
             .lock()
             .unwrap()
-            .insert((1, "rdp".into()), relay);
+            .desktop_tunnels
+            .insert(1, (Some(1), relay));
 
         let listed = svc
             .dispatch_async(ApiEnvelope {

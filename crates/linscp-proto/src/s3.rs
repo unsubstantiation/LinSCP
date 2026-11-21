@@ -1974,11 +1974,11 @@ impl RemoteSession for S3Session {
         }
         let headers = vec![("if-match".to_string(), etag.to_string())];
         let resp = self.send_signed(Method::DELETE, Some(&bucket), &key, &[], &headers, Vec::new()).await?;
-        if !matches!(resp.status().as_u16(), 200 | 204) {
+        let status = resp.status();
+        if !matches!(status.as_u16(), 200 | 204) {
             let body = resp.text().await.unwrap_or_default();
             return Err(ProtoError::Transport(format!(
-                "Conditional S3 DELETE '{remote_path}' was not confirmed (HTTP {}): {}",
-                resp.status(),
+                "Conditional S3 DELETE '{remote_path}' was not confirmed (HTTP {status}): {}",
                 body.trim()
             )));
         }

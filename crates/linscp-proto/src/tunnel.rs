@@ -383,7 +383,7 @@ impl Drop for SshJumpTunnel {
 pub struct LocalForwardRelay {
     local_port: u16,
     shutdown_tx: watch::Sender<bool>,
-    accept_task: JoinHandle<()>,
+    accept_task: Option<JoinHandle<()>>,
 }
 
 impl LocalForwardRelay {
@@ -391,9 +391,11 @@ impl LocalForwardRelay {
         self.local_port
     }
 
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         let _ = self.shutdown_tx.send(true);
-        let _ = self.accept_task.await;
+        if let Some(task) = self.accept_task.take() {
+            let _ = task.await;
+        }
     }
 }
 
@@ -409,6 +411,28 @@ pub async fn start_local_forward_relay(
     remote_port: u16,
     idle_lease: std::time::Duration,
 ) -> Result<LocalForwardRelay, ProtoError> {
+    start_local_forward_relay_with_connector(idle_lease, move || {
+        let ssh_conn = Arc::clone(&ssh);
+        let host = remote_host.clone();
+        async move {
+            let remote = ssh_conn.open_direct_tcpip_stream(&host, remote_port).await?;
+            let boxed: Box<dyn linscp_platform::AsyncStream> = Box::new(remote);
+            Ok(boxed)
+        }
+    })
+    .await
+}
+
+pub async fn start_local_forward_relay_with_connector<F, Fut>(
+    idle_lease: std::time::Duration,
+    connector: F,
+) -> Result<LocalForwardRelay, ProtoError>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<Box<dyn linscp_platform::AsyncStream>, ProtoError>>
+        + Send
+        + 'static,
+{
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.map_err(|e| {
         ProtoError::Transport(format!("Cannot bind local desktop forwarder on 127.0.0.1: {e}"))
     })?;
@@ -419,6 +443,7 @@ pub async fn start_local_forward_relay(
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let active_clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let accept_clients = Arc::clone(&active_clients);
+    let connector = Arc::new(connector);
 
     let accept_task = tokio::spawn(async move {
         let mut deadline = tokio::time::Instant::now() + idle_lease;
@@ -438,12 +463,11 @@ pub async fn start_local_forward_relay(
                     };
                     let _ = stream.set_nodelay(true);
                     deadline = tokio::time::Instant::now() + idle_lease;
-                    let ssh_conn = Arc::clone(&ssh);
-                    let host = remote_host.clone();
+                    let connect_fn = Arc::clone(&connector);
                     let counter = Arc::clone(&accept_clients);
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     tokio::spawn(async move {
-                        if let Ok(mut remote) = ssh_conn.open_direct_tcpip_stream(&host, remote_port).await {
+                        if let Ok(mut remote) = connect_fn().await {
                             let _ = tokio::io::copy_bidirectional(&mut stream, &mut remote).await;
                         }
                         counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -456,7 +480,7 @@ pub async fn start_local_forward_relay(
     Ok(LocalForwardRelay {
         local_port,
         shutdown_tx,
-        accept_task,
+        accept_task: Some(accept_task),
     })
 }
 
@@ -602,13 +626,16 @@ mod tests {
             sock.shutdown().await.expect("shutdown upstream");
         });
 
-        let relay = start_local_forward_relay(move || async move {
-            let stream = tokio::net::TcpStream::connect(upstream_addr)
-                .await
-                .map_err(|e| ProtoError::Transport(e.to_string()))?;
-            let boxed: Box<dyn linscp_platform::AsyncStream> = Box::new(stream);
-            Ok(boxed)
-        })
+        let relay = start_local_forward_relay_with_connector(
+            std::time::Duration::from_secs(60),
+            move || async move {
+                let stream = tokio::net::TcpStream::connect(upstream_addr)
+                    .await
+                    .map_err(|e| ProtoError::Transport(e.to_string()))?;
+                let boxed: Box<dyn linscp_platform::AsyncStream> = Box::new(stream);
+                Ok(boxed)
+            },
+        )
         .await
         .expect("start local forward relay");
 
@@ -623,7 +650,7 @@ mod tests {
         assert_eq!(echoed, b"rdp-probe-payload");
         echo_task.await.unwrap();
 
-        relay.stop().await;
+        relay.shutdown().await;
         assert!(
             tokio::net::TcpStream::connect(("127.0.0.1", relay_port))
                 .await

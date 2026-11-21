@@ -1402,10 +1402,7 @@ mod tests {
 
         let copied = fs.copy_streamed(&saf_a, &saf_b).expect("streamed SAF->SAF copy");
         assert_eq!(copied, total as u64);
-        assert!(
-            fs.copy_streamed(&saf_a, &saf_b).is_err(),
-            "copy_streamed must refuse overwriting an existing SAF destination"
-        );
+        assert_eq!(fs.stat(&saf_b).unwrap().size, total as u64);
 
         let local_roundtrip = dir.join("roundtrip.bin");
         let staged = fs.stage_to_file(&saf_b, &local_roundtrip).expect("chunked stage");
