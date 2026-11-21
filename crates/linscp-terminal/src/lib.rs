@@ -685,6 +685,157 @@ impl TerminalScreen {
             shape,
         }
     }
+
+    /// Serialises the current visible viewport, SGR attributes, terminal modes,
+    /// window title and cursor position into a self-contained VT sequence that
+    /// reconstructs an equivalent [`TerminalScreen`] of the same [`Size`].
+    ///
+    /// Used by Mosh SSP state-sync recovery when a packet/ACK branch rollover
+    /// requires replaying diffs from an earlier committed anchor screen.
+    pub fn to_vt_snapshot(&self) -> Vec<u8> {
+        use std::io::Write as _;
+
+        let modes = self.modes();
+        let cursor = self.cursor_snapshot();
+        let title = self.title();
+        let mut out = Vec::with_capacity(self.size.columns * self.size.lines * 4 + 128);
+
+        // Full terminal reset + disable auto-wrap while painting the exact grid.
+        out.extend_from_slice(b"\x1bc\x1b[?7l");
+        if modes.alternate_screen {
+            out.extend_from_slice(b"\x1b[?1049h");
+        }
+        if modes.app_cursor {
+            out.extend_from_slice(b"\x1b[?1h");
+        }
+        if modes.bracketed_paste {
+            out.extend_from_slice(b"\x1b[?2004h");
+        }
+        if modes.mouse_reporting {
+            out.extend_from_slice(b"\x1b[?1000h");
+        }
+        if let Some(t) = title {
+            let clean: String = t.chars().filter(|c| !c.is_control()).collect();
+            let _ = write!(out, "\x1b]2;{clean}\x07");
+        }
+
+        let style_flags = Flags::BOLD
+            | Flags::DIM
+            | Flags::ITALIC
+            | Flags::ALL_UNDERLINES
+            | Flags::INVERSE
+            | Flags::HIDDEN
+            | Flags::STRIKEOUT;
+        let mut cur_flags = Flags::empty();
+        let mut cur_fg = Color::Named(NamedColor::Foreground);
+        let mut cur_bg = Color::Named(NamedColor::Background);
+
+        {
+            let content = self.term.renderable_content();
+            let display_offset = content.display_offset;
+            for indexed in content.display_iter {
+                if indexed.point.column.0 == 0 {
+                    let vrow = viewport_line(indexed.point.line, display_offset, self.size.lines);
+                    let _ = write!(out, "\x1b[{};1H", vrow + 1);
+                }
+                if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let f = indexed.cell.flags & style_flags;
+                let fg = indexed.cell.fg;
+                let bg = indexed.cell.bg;
+                if f != cur_flags || fg != cur_fg || bg != cur_bg {
+                    emit_sgr(&mut out, f, fg, bg);
+                    cur_flags = f;
+                    cur_fg = fg;
+                    cur_bg = bg;
+                }
+                let mut utf8 = [0u8; 4];
+                out.extend_from_slice(indexed.cell.c.encode_utf8(&mut utf8).as_bytes());
+                if let Some(zw) = indexed.cell.zerowidth() {
+                    for &zc in zw {
+                        out.extend_from_slice(zc.encode_utf8(&mut utf8).as_bytes());
+                    }
+                }
+            }
+        }
+
+        out.extend_from_slice(b"\x1b[0m\x1b[?7h");
+        match cursor.shape {
+            "underline" => out.extend_from_slice(b"\x1b[4 q"),
+            "beam" => out.extend_from_slice(b"\x1b[6 q"),
+            _ => out.extend_from_slice(b"\x1b[2 q"),
+        }
+        if modes.show_cursor && cursor.shape != "hidden" {
+            out.extend_from_slice(b"\x1b[?25h");
+        } else {
+            out.extend_from_slice(b"\x1b[?25l");
+        }
+        let _ = write!(out, "\x1b[{};{}H", cursor.line + 1, cursor.column + 1);
+        out
+    }
+}
+
+fn emit_sgr(out: &mut Vec<u8>, flags: Flags, fg: Color, bg: Color) {
+    use std::io::Write as _;
+
+    out.extend_from_slice(b"\x1b[0");
+    if flags.contains(Flags::BOLD) {
+        out.extend_from_slice(b";1");
+    }
+    if flags.contains(Flags::DIM) {
+        out.extend_from_slice(b";2");
+    }
+    if flags.contains(Flags::ITALIC) {
+        out.extend_from_slice(b";3");
+    }
+    if flags.intersects(Flags::ALL_UNDERLINES) {
+        out.extend_from_slice(b";4");
+    }
+    if flags.contains(Flags::INVERSE) {
+        out.extend_from_slice(b";7");
+    }
+    if flags.contains(Flags::HIDDEN) {
+        out.extend_from_slice(b";8");
+    }
+    if flags.contains(Flags::STRIKEOUT) {
+        out.extend_from_slice(b";9");
+    }
+    match fg {
+        Color::Named(NamedColor::Foreground) => {}
+        Color::Named(named) => {
+            let idx = named as u16;
+            if idx < 8 {
+                let _ = write!(out, ";{}", 30 + idx);
+            } else if idx < 16 {
+                let _ = write!(out, ";{}", 90 + (idx - 8));
+            }
+        }
+        Color::Indexed(idx) => {
+            let _ = write!(out, ";38;5;{idx}");
+        }
+        Color::Spec(rgb) => {
+            let _ = write!(out, ";38;2;{};{};{}", rgb.r, rgb.g, rgb.b);
+        }
+    }
+    match bg {
+        Color::Named(NamedColor::Background) => {}
+        Color::Named(named) => {
+            let idx = named as u16;
+            if idx < 8 {
+                let _ = write!(out, ";{}", 40 + idx);
+            } else if idx < 16 {
+                let _ = write!(out, ";{}", 100 + (idx - 8));
+            }
+        }
+        Color::Indexed(idx) => {
+            let _ = write!(out, ";48;5;{idx}");
+        }
+        Color::Spec(rgb) => {
+            let _ = write!(out, ";48;2;{};{};{}", rgb.r, rgb.g, rgb.b);
+        }
+    }
+    out.push(b'm');
 }
 
 /// The character a cell contributes to plain text, or `None` when it draws
@@ -1310,5 +1461,22 @@ mod tests {
         assert_eq!(json["columns"], 4);
         assert_eq!(json["cells"][0]["text"][0], 'a' as u32);
         assert_eq!(json["cursor"]["shape"], "block");
+    }
+
+    #[test]
+    fn vt_snapshot_reconstructs_cells_styles_wide_glyphs_and_cursor() {
+        let mut src = screen(20, 4);
+        src.advance(b"\x1b]2;mosh-host\x07\x1b[?2004h\x1b[1;31mERR\x1b[0m \xe4\xb8\xad\r\n\x1b[38;2;10;20;30mline2");
+        let encoded = src.to_vt_snapshot();
+
+        let mut dst = screen(20, 4);
+        dst.advance(&encoded);
+
+        let f_src = src.snapshot();
+        let f_dst = dst.snapshot();
+        assert_eq!(f_src.cells, f_dst.cells);
+        assert_eq!(f_src.cursor, f_dst.cursor);
+        assert_eq!(f_src.title, f_dst.title);
+        assert_eq!(f_src.modes, f_dst.modes);
     }
 }

@@ -6,6 +6,7 @@
 //! - PuTTY `.ppk` v2 & v3 + Argon2 parser and OpenSSH converter (`ppk`)
 
 pub mod digests;
+pub mod ocb3;
 pub mod ppk;
 pub mod sigv4;
 

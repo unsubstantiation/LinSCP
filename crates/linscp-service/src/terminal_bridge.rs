@@ -14,9 +14,13 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine as _;
+use linscp_proto::mosh::{
+    start_mosh_session, HostOp, MoshPortSpec, MoshSessionEvent, MoshSessionHandle,
+};
 use linscp_proto::ssh::{PtyShellEvent, PtyShellHandle, SshConnection};
 use linscp_terminal::{Size, TerminalScreen};
 use serde_json::{json, Value};
@@ -92,11 +96,74 @@ struct TerminalRingState {
 }
 
 #[derive(Clone)]
+enum TerminalTransportHandle {
+    Ssh(PtyShellHandle),
+    Mosh(MoshSessionHandle),
+}
+
+impl TerminalTransportHandle {
+    fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Ssh(_) => "ssh",
+            Self::Mosh(_) => "mosh",
+        }
+    }
+
+    fn mosh_udp_port(&self) -> Option<u16> {
+        match self {
+            Self::Ssh(_) => None,
+            Self::Mosh(h) => Some(h.server_addr.port()),
+        }
+    }
+
+    fn write_bytes(&self, data: Vec<u8>) -> bool {
+        match self {
+            Self::Ssh(h) => h.write_bytes(data).is_ok(),
+            Self::Mosh(h) => h.write_bytes(data).is_ok(),
+        }
+    }
+
+    fn resize(&self, cols: u32, rows: u32) -> bool {
+        match self {
+            Self::Ssh(h) => h.resize(cols, rows).is_ok(),
+            Self::Mosh(h) => h.resize(cols, rows).is_ok(),
+        }
+    }
+
+    fn close(&self) {
+        match self {
+            Self::Ssh(h) => h.close(),
+            Self::Mosh(h) => h.close(),
+        }
+    }
+}
+
+fn apply_mosh_ops_to_screen(screen: &mut TerminalScreen, ops: &[HostOp], out_bytes: &mut Vec<u8>) {
+    for op in ops {
+        match op {
+            HostOp::HostBytes(bytes) => {
+                if !bytes.is_empty() {
+                    screen.advance(bytes);
+                    // mosh-server runs its own authoritative VT emulator on the remote PTY;
+                    // discard any local query replies so they are never echoed as user keystrokes.
+                    let _ = screen.take_replies();
+                    out_bytes.extend_from_slice(bytes);
+                }
+            }
+            HostOp::Resize { width, height } => {
+                screen.resize(Size::new(usize::from(*width).max(1), usize::from(*height).max(1)));
+            }
+            HostOp::EchoAck(_) => {}
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct EmbeddedTerminal {
     pub id: String,
     pub tab_id: u64,
     buffer_limit: usize,
-    handle: PtyShellHandle,
+    handle: TerminalTransportHandle,
     sudo: Option<Arc<Mutex<SudoPasswordResponder>>>,
     ring: Arc<Mutex<TerminalRingState>>,
     /// The parsed screen, shared so a window can paint without owning the
@@ -245,11 +312,188 @@ impl EmbeddedTerminal {
             id,
             tab_id,
             buffer_limit,
-            handle,
+            handle: TerminalTransportHandle::Ssh(handle),
             sudo,
             ring,
             screen,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_over_mosh(
+        id: String,
+        tab_id: u64,
+        ssh: &Arc<SshConnection>,
+        host: &str,
+        port_spec: Option<MoshPortSpec>,
+        cols: u32,
+        rows: u32,
+        initial_dir: Option<&str>,
+        sudo_credentials: Option<(String, String)>,
+        event_tx: broadcast::Sender<Value>,
+    ) -> Result<Self, String> {
+        let init_cols = if (1..=1000).contains(&cols) { cols } else { 100 };
+        let init_rows = if (1..=1000).contains(&rows) { rows } else { 30 };
+
+        let (handle, mut rx) = start_mosh_session(
+            ssh,
+            host,
+            port_spec,
+            init_cols as u16,
+            init_rows as u16,
+            Duration::from_secs(4),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if let Some(dir) = initial_dir.map(str::trim).filter(|s| !s.is_empty() && *s != "~") {
+            let escaped = dir.replace('\'', "'\\''");
+            let cd_cmd = format!("cd -- '{escaped}' 2>/dev/null\n");
+            let _ = handle.write_bytes(cd_cmd.into_bytes());
+        }
+
+        let screen = Arc::new(Mutex::new(
+            TerminalScreen::new(Size::new(init_cols as usize, init_rows as usize)).ok(),
+        ));
+        let ring = Arc::new(Mutex::new(TerminalRingState {
+            buffer: Vec::new(),
+            dropped: 0,
+            alive: true,
+            exit_code: None,
+            failure: None,
+            cols: init_cols,
+            rows: init_rows,
+        }));
+
+        let sudo = sudo_credentials
+            .and_then(|(user, password)| SudoPasswordResponder::new(&user, password))
+            .map(|responder| Arc::new(Mutex::new(responder)));
+        let sudo_bg = sudo.clone();
+        let ring_bg = Arc::clone(&ring);
+        let screen_bg = Arc::clone(&screen);
+        let handle_bg = handle.clone();
+        let id_bg = id.clone();
+        let buffer_limit = DEFAULT_TERMINAL_BUFFER_LIMIT;
+
+        tokio::spawn(async move {
+            // mosh-server state 0 starts at 80x24 before applying our initial Resize.
+            let mut anchor_screen =
+                TerminalScreen::with_scrollback(Size::new(80, 24), 0).ok();
+            let mut scratch_bytes = Vec::new();
+
+            while let Some(evt) = rx.recv().await {
+                scratch_bytes.clear();
+                match evt {
+                    MoshSessionEvent::AdvanceAnchor(ops) => {
+                        if let Some(anchor) = anchor_screen.as_mut() {
+                            let mut ignored = Vec::new();
+                            apply_mosh_ops_to_screen(anchor, &ops, &mut ignored);
+                        }
+                    }
+                    MoshSessionEvent::Incremental(ops) => {
+                        if let Ok(mut slot) = screen_bg.lock() {
+                            if let Some(live) = slot.as_mut() {
+                                apply_mosh_ops_to_screen(live, &ops, &mut scratch_bytes);
+                            }
+                        }
+                        if !scratch_bytes.is_empty() {
+                            if let Some(responder) = &sudo_bg {
+                                if let Ok(mut responder) = responder.lock() {
+                                    if let Some(response) = responder.output(&scratch_bytes) {
+                                        let _ = handle_bg.write_bytes(response);
+                                    }
+                                }
+                            }
+                            let offset = {
+                                let mut g = ring_bg.lock().expect("terminal ring mutex");
+                                g.buffer.extend_from_slice(&scratch_bytes);
+                                if g.buffer.len() > buffer_limit {
+                                    let excess = g.buffer.len() - buffer_limit;
+                                    g.buffer.drain(0..excess);
+                                    g.dropped += excess as u64;
+                                }
+                                g.dropped + g.buffer.len() as u64
+                            };
+                            let _ = event_tx.send(json!({
+                                "type": "terminal_output",
+                                "terminal": id_bg,
+                                "data": BASE64_STD.encode(&scratch_bytes),
+                                "offset": offset,
+                            }));
+                        }
+                    }
+                    MoshSessionEvent::RebranchFromAnchor(ops) => {
+                        if let Some(anchor) = anchor_screen.as_ref() {
+                            let base_vt = anchor.to_vt_snapshot();
+                            let target_size = ring_bg
+                                .lock()
+                                .map(|g| Size::new(g.cols as usize, g.rows as usize))
+                                .unwrap_or_else(|_| anchor.size());
+                            if let Ok(mut rebuilt) = TerminalScreen::new(anchor.size()) {
+                                rebuilt.advance(&base_vt);
+                                let _ = rebuilt.take_replies();
+                                apply_mosh_ops_to_screen(&mut rebuilt, &ops, &mut scratch_bytes);
+                                rebuilt.resize(target_size);
+                                let full_vt = rebuilt.to_vt_snapshot();
+                                if let Ok(mut slot) = screen_bg.lock() {
+                                    *slot = Some(rebuilt);
+                                }
+                                let offset = {
+                                    let mut g = ring_bg.lock().expect("terminal ring mutex");
+                                    g.buffer.extend_from_slice(&full_vt);
+                                    if g.buffer.len() > buffer_limit {
+                                        let excess = g.buffer.len() - buffer_limit;
+                                        g.buffer.drain(0..excess);
+                                        g.dropped += excess as u64;
+                                    }
+                                    g.dropped + g.buffer.len() as u64
+                                };
+                                let _ = event_tx.send(json!({
+                                    "type": "terminal_output",
+                                    "terminal": id_bg,
+                                    "data": BASE64_STD.encode(&full_vt),
+                                    "offset": offset,
+                                }));
+                            }
+                        }
+                    }
+                    MoshSessionEvent::Closed => {
+                        let exit_code = {
+                            let mut g = ring_bg.lock().expect("terminal ring mutex");
+                            g.alive = false;
+                            if g.exit_code.is_none() {
+                                g.exit_code = Some(0);
+                            }
+                            g.exit_code
+                        };
+                        let _ = event_tx.send(json!({
+                            "type": "terminal_closed",
+                            "terminal": id_bg,
+                            "exit_code": exit_code,
+                        }));
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            id,
+            tab_id,
+            buffer_limit,
+            handle: TerminalTransportHandle::Mosh(handle),
+            sudo,
+            ring,
+            screen,
+        })
+    }
+
+    pub fn transport_kind(&self) -> &'static str {
+        self.handle.kind_str()
+    }
+
+    pub fn mosh_udp_port(&self) -> Option<u16> {
+        self.handle.mosh_udp_port()
     }
 
     pub fn poll(&self, after: u64) -> (Vec<u8>, u64, bool, Option<i32>) {
@@ -284,7 +528,7 @@ impl EmbeddedTerminal {
                 screen.resize(Size::new(cols as usize, rows as usize));
             }
         }
-        self.handle.resize(cols, rows).is_ok()
+        self.handle.resize(cols, rows)
     }
 
     pub fn write(&self, data: &[u8]) -> bool {
@@ -294,7 +538,7 @@ impl EmbeddedTerminal {
         if let Some(responder) = &self.sudo {
             if let Ok(mut responder) = responder.lock() { responder.input(data); }
         }
-        self.handle.write_bytes(data.to_vec()).is_ok()
+        self.handle.write_bytes(data.to_vec())
     }
 
     pub fn is_alive(&self) -> bool {
@@ -385,6 +629,7 @@ impl TerminalRegistry {
                 json!({
                     "terminal": term.id,
                     "tab": term.tab_id,
+                    "transport": term.transport_kind(),
                     "cols": cols,
                     "rows": rows,
                     "alive": term.is_alive(),

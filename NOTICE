@@ -18,12 +18,13 @@ Third-party components
 The pure-Rust workspace replaces the former C++ dependencies:
 
 - SSH, SFTP and SCP transport, jump tunnels and host-key handling via `russh`
-  and `russh-sftp` (Apache-2.0), key parsing via `ssh-key`/`ssh-encoding` (MIT/Apache-2.0).
+  and `russh-sftp` (Apache-2.0), key parsing via `ssh-key`/`ssh-encoding` (MIT/Apache-2.0),
+  zlib payload compression for clean-room Mosh v2 UDP state sync via `flate2` (MIT/Apache-2.0).
 - Cryptography: `argon2` (MIT), `aes`/`cbc` (MIT/Apache-2.0), `hmac`/`sha1`/`sha2`/`pbkdf2`
   (MIT/Apache-2.0), `base64` (MIT/Apache-2.0), `zeroize` (MIT/Apache-2.0),
   `bcrypt-pbkdf` (MIT/Apache-2.0), `ed25519-dalek`/`p256`/`p384`/`p521` (BSD/Apache-2.0),
-  `crc32fast`/`md-5` (MIT/Apache-2.0). PPK v2/v3 and `lscp1$` session encryption live in
-  `crates/linscp-crypto`.
+  `crc32fast`/`md-5` (MIT/Apache-2.0). PPK v2/v3, RFC 7253 AES-128-OCB3 and `lscp1$`
+  session encryption live in `crates/linscp-crypto`.
 - TLS: `rustls` (Apache-2.0/MIT/ISC) with `ring` (ISC) and `webpki-roots`
   (MPL-2.0), `tokio-rustls` (MIT/Apache-2.0), `rustls-pki-types` (MIT/Apache-2.0),
   custom `ServerCertVerifier` wrapping `WebPkiServerVerifier` for SPKI pinning and

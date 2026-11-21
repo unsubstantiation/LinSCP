@@ -405,6 +405,7 @@ pub struct SshConnection {
     observed_key_type: String,
     observed_fingerprint: String,
     timeout: Duration,
+    direct_peer_ip: Option<std::net::IpAddr>,
 }
 
 impl SshConnection {
@@ -421,8 +422,21 @@ impl SshConnection {
             cfg.connect_timeout,
         )
         .await?;
+        let direct_peer_ip = if cfg.proxy.is_none() {
+            stream.peer_addr().ok().map(|addr| addr.ip())
+        } else {
+            None
+        };
         if let Some(log) = &cfg.event_logger { log("SSH transport established; starting handshake and host-key verification."); }
-        Self::connect_over_stream(cfg, stream).await
+        let mut conn = Self::connect_over_stream(cfg, stream).await?;
+        conn.direct_peer_ip = direct_peer_ip;
+        Ok(conn)
+    }
+
+    /// Returns the direct TCP peer IP address when the SSH connection was opened
+    /// without a proxy or jump-host stream.
+    pub fn direct_peer_ip(&self) -> Option<std::net::IpAddr> {
+        self.direct_peer_ip
     }
 
     /// Runs the SSH handshake, fail-closed host-key verification, and user
@@ -505,6 +519,7 @@ impl SshConnection {
             observed_key_type,
             observed_fingerprint,
             timeout: cfg.connect_timeout.max(Duration::from_secs(1)),
+            direct_peer_ip: None,
         })
     }
 

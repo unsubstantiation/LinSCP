@@ -580,10 +580,13 @@ fn validate_stored_extra_fields(fields: &BTreeMap<String, String>) -> Result<(),
     for (k, v) in fields {
         match k.as_str() {
             "auth_gssapi" | "auth_gssapi_kex" | "gssapi_fwd_tgt" | "ftp_pasv_mode"
-            | "s3_request_payer" | "s3_protocol" => {
+            | "s3_request_payer" | "s3_protocol" | "mosh" => {
                 if parse_zero_one(v).is_none() {
                     return Err(format!("Invalid stored setting '{k}' value '{v}'."));
                 }
+            }
+            "mosh_port" => {
+                linscp_proto::mosh::MoshPortSpec::parse_optional(v)?;
             }
             "ftp_force_pasv_ip" | "ftp_use_mlsd" if !matches!(v.trim(), "0" | "1" | "2") => {
                 return Err(format!("Invalid stored setting '{k}' value '{v}'."));
@@ -793,6 +796,35 @@ pub fn apply_raw_settings(spec: &mut ParsedSiteSpec, pairs: &[String]) -> Result
             "tunnelkeypassphrase" | "tunnelpassphrase" | "tunnelpassphraseplain" => {
                 spec.raw_fields
                     .insert("tunnel_passphrase".to_string(), raw_v.to_string());
+            }
+
+            // Mosh (Mobile Shell) terminal transport over SSH + UDP
+            "mosh" => {
+                if !is_ssh && !matches!(proto, ProtocolScheme::X2Go | ProtocolScheme::X11) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for SSH-backed sessions."
+                    ));
+                }
+                let b = parse_zero_one(val)
+                    .ok_or_else(|| format!("Invalid Mosh '{val}' (expected 0 or 1)."))?;
+                spec.raw_fields
+                    .insert("mosh".to_string(), if b { "1" } else { "0" }.to_string());
+            }
+            "moshport" | "mosh_port" => {
+                if !is_ssh && !matches!(proto, ProtocolScheme::X2Go | ProtocolScheme::X11) {
+                    return Err(format!(
+                        "Raw setting '{key_trimmed}' is supported only for SSH-backed sessions."
+                    ));
+                }
+                match linscp_proto::mosh::MoshPortSpec::parse_optional(val)? {
+                    Some(parsed) => {
+                        spec.raw_fields
+                            .insert("mosh_port".to_string(), parsed.as_cli_arg());
+                    }
+                    None => {
+                        spec.raw_fields.remove("mosh_port");
+                    }
+                }
             }
             "tunnelhostkey" => {
                 let tun = spec.session.tunnel.get_or_insert_with(TunnelConfig::default);
@@ -1440,7 +1472,51 @@ pub fn validate_session_settings(spec: &ParsedSiteSpec) -> Result<(), String> {
             );
         }
     }
+    if let Some(mosh_val) = spec.raw_fields.get("mosh") {
+        if !mosh_val.trim().is_empty() && parse_zero_one(mosh_val).is_none() {
+            return Err(format!("Invalid Mosh setting '{mosh_val}' (expected 0 or 1)."));
+        }
+    }
+    if let Some(mosh_port) = spec.raw_fields.get("mosh_port") {
+        linscp_proto::mosh::MoshPortSpec::parse_optional(mosh_port)?;
+    }
     Ok(())
+}
+
+/// Returns a human-readable incompatibility reason when `spec` cannot carry
+/// direct Mosh UDP traffic (non-SSH protocol, SSH jump tunnel, or TCP proxy).
+pub fn mosh_direct_udp_incompatibility(spec: &ParsedSiteSpec) -> Option<String> {
+    let proto = spec.session.protocol;
+    if !is_ssh_scheme(proto) && !matches!(proto, ProtocolScheme::X2Go | ProtocolScheme::X11) {
+        return Some(format!(
+            "Mosh requires an SSH-backed session (SFTP or SCP), not '{}'.",
+            proto.as_str()
+        ));
+    }
+    if spec
+        .session
+        .tunnel
+        .as_ref()
+        .is_some_and(|t| t.enabled && !t.host.trim().is_empty())
+    {
+        return Some(
+            "Mosh requires direct UDP connectivity to the server and cannot traverse SSH jump tunnels. Open a standard SSH terminal instead."
+                .to_string(),
+        );
+    }
+    if let Some(pm) = spec
+        .raw_fields
+        .get("proxy_method")
+        .map(|s| s.trim().to_ascii_lowercase())
+    {
+        if !pm.is_empty() && pm != "none" && pm != "0" {
+            return Some(
+                "Mosh requires direct UDP connectivity to the server and cannot traverse TCP proxies. Open a standard SSH terminal instead."
+                    .to_string(),
+            );
+        }
+    }
+    None
 }
 
 fn parse_byte_size_setting(val: &str, name: &str) -> Result<u64, String> {
@@ -2859,5 +2935,36 @@ mod tests {
         assert_eq!(parse_site_url("x2go://alice@example.com/").unwrap().session.protocol, ProtocolScheme::X2Go);
         assert!(parse_site_url("nx://alice@example.com/").is_err());
         assert!(parse_site_url("nx3://alice@example.com/").is_err());
+    }
+
+    #[test]
+    fn mosh_raw_settings_and_direct_udp_constraints_validate_cleanly() {
+        let mut spec = parse_site_url("sftp://alice@example.com/").unwrap();
+        let pairs = vec![
+            "Mosh=1".to_string(),
+            "MoshPort=60000:60010".to_string(),
+        ];
+        apply_raw_settings(&mut spec, &pairs).unwrap();
+        assert_eq!(spec.raw_fields.get("mosh").map(String::as_str), Some("1"));
+        assert_eq!(
+            spec.raw_fields.get("mosh_port").map(String::as_str),
+            Some("60000:60010")
+        );
+        assert!(validate_session_settings(&spec).is_ok());
+        assert!(mosh_direct_udp_incompatibility(&spec).is_none());
+
+        // Jump tunnels and proxies block direct Mosh UDP.
+        let mut tunneled = spec.clone();
+        tunneled.session.tunnel = Some(TunnelConfig {
+            enabled: true,
+            host: "bastion.example.com".into(),
+            ..TunnelConfig::default()
+        });
+        assert!(mosh_direct_udp_incompatibility(&tunneled).is_some());
+
+        // Non-SSH protocols reject Mosh raw setting.
+        let mut ftp = parse_site_url("ftp://alice@example.com/").unwrap();
+        assert!(apply_raw_settings(&mut ftp, &["Mosh=1".to_string()]).is_err());
+        assert!(apply_raw_settings(&mut spec, &["MoshPort=61000:60000".to_string()]).is_err());
     }
 }

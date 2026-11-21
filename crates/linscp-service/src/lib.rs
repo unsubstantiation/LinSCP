@@ -467,6 +467,8 @@ impl CommanderService {
             ("POST", "/api/desktop/launch") => self.handle_desktop_launch(req.body),
             ("POST", "/api/desktop/check") => self.handle_desktop_check(req.body),
             ("POST", "/api/desktop/install") => self.handle_desktop_install_sync(req.body),
+            ("GET", "/api/mosh/install-script") => self.handle_mosh_install_script(),
+            ("POST", "/api/mosh/check") => self.handle_mosh_check_sync(req.body),
             // A terminal window reads the model and paints it from here: none
             // of these needs the interpreter or the network, because the shell
             // behind them was opened with the tab's own connection. Opening one
@@ -552,6 +554,7 @@ impl CommanderService {
             ("POST", "/api/desktop/install") => self.handle_desktop_install_async(req.body).await,
             ("POST", "/api/desktop/launch") => self.handle_desktop_launch_async(req.body).await,
             ("POST", "/api/desktop/ticket") => self.handle_desktop_ticket(req.body),
+            ("POST", "/api/mosh/check") => self.handle_mosh_check_async(req.body).await,
             _ => self.dispatch_inner(req),
         }
     }
@@ -1976,7 +1979,103 @@ impl CommanderService {
         }
     }
 
-    /// Opens an embedded terminal on a tab's pooled SSH connection.
+    fn handle_mosh_install_script(&self) -> ApiReply {
+        ApiReply {
+            status: 200,
+            payload: json!({
+                "success": true,
+                "package": "mosh",
+                "description": "Mosh (Mobile Shell) server (mosh-server) over SSH + UDP",
+                "default_port_range": linscp_proto::mosh::MOSH_DEFAULT_PORT_RANGE,
+                "probe_command": linscp_proto::mosh::MOSH_PROBE_COMMAND,
+                "install_script": linscp_proto::mosh::mosh_install_script(),
+            }),
+        }
+    }
+
+    fn handle_mosh_check_sync(&self, body: Value) -> ApiReply {
+        if tabs::parse_tab_id_value(body.get("tab")).is_none() {
+            return api_error(400, "No active tab");
+        }
+        api_error(400, "Mosh server probing requires an active asynchronous SSH session.")
+    }
+
+    async fn handle_mosh_check_async(&self, body: Value) -> ApiReply {
+        let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else {
+            return api_error(400, "No active tab");
+        };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected && !tab.is_local => tab,
+            _ => return api_error(400, "Not connected"),
+        };
+        let Some(session) = tab.remote.as_ref() else {
+            return api_error(400, "Not connected");
+        };
+        let Some(ssh) = session.ssh_connection() else {
+            return api_error(
+                501,
+                "This connection has no SSH shell; open an SSH or SFTP session to check Mosh.",
+            );
+        };
+        if let Some(spec) = tab.spec.as_ref() {
+            if let Some(incompat) = linscp_engine::url_and_raw::mosh_direct_udp_incompatibility(spec) {
+                return api_error(400, incompat);
+            }
+        }
+        let raw_port = body
+            .get("mosh_port")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                tab.spec
+                    .as_ref()
+                    .and_then(|s| s.raw_fields.get("mosh_port").map(String::as_str))
+            })
+            .unwrap_or("");
+        let port_spec = match linscp_proto::mosh::MoshPortSpec::parse_optional(raw_port) {
+            Ok(p) => p,
+            Err(err) => return api_error(400, err),
+        };
+        let host = tab
+            .spec
+            .as_ref()
+            .map(|s| s.session.host.clone())
+            .unwrap_or_default();
+        let ssh_port = tab
+            .spec
+            .as_ref()
+            .map(|s| if s.session.port == 0 { 22 } else { s.session.port })
+            .unwrap_or(22);
+
+        match linscp_proto::mosh::check_mosh_on_ssh_connection(&ssh).await {
+            Ok(available) => ApiReply {
+                status: 200,
+                payload: json!({
+                    "success": true,
+                    "available": available,
+                    "checked": true,
+                    "via_ssh": true,
+                    "tab": id,
+                    "host": host,
+                    "port": ssh_port,
+                    "mosh_port": port_spec.map(|p| p.as_cli_arg()).unwrap_or_default(),
+                    "package": "mosh",
+                    "description": "Mosh (Mobile Shell) server (mosh-server) over SSH + UDP",
+                    "default_port_range": linscp_proto::mosh::MOSH_DEFAULT_PORT_RANGE,
+                    "probe_command": linscp_proto::mosh::MOSH_PROBE_COMMAND,
+                    "install_script": linscp_proto::mosh::mosh_install_script(),
+                    "can_install": true,
+                    "reason": if available {
+                        format!("Mosh server (mosh-server) detected on {host}.")
+                    } else {
+                        format!("Mosh server (mosh-server) was not found on {host}.")
+                    },
+                }),
+            },
+            Err(err) => api_error(502, format!("Could not check mosh-server on {host}: {err}")),
+        }
+    }
+
+    /// Opens an embedded terminal on a tab's pooled SSH connection (either standard SSH PTY or Mosh UDP).
     async fn open_terminal_async(&self, body: Value) -> ApiReply {
         let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
         let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
@@ -1991,14 +2090,128 @@ impl CommanderService {
         };
         let cols = body.get("cols").and_then(Value::as_u64).unwrap_or(100) as u32;
         let rows = body.get("rows").and_then(Value::as_u64).unwrap_or(30) as u32;
+        let force_ssh = body.get("force_ssh").and_then(Value::as_bool).unwrap_or(false);
+        let tab_mosh = tab
+            .spec
+            .as_ref()
+            .and_then(|s| s.raw_fields.get("mosh"))
+            .is_some_and(|v| v == "1");
+        let use_mosh = !force_ssh
+            && body
+                .get("mosh")
+                .and_then(Value::as_bool)
+                .unwrap_or(tab_mosh);
+
+        let sudo_credentials = SessionStore::load_from_dir(&self.config_root(), self.secret_vault.as_ref())
+            .ok().and_then(|store| saved_sudo_credentials(&tab, &store));
+
+        if use_mosh {
+            if let Some(spec) = tab.spec.as_ref() {
+                if let Some(incompat) = linscp_engine::url_and_raw::mosh_direct_udp_incompatibility(spec) {
+                    return api_error(400, incompat);
+                }
+            }
+            let raw_port = body
+                .get("mosh_port")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    tab.spec
+                        .as_ref()
+                        .and_then(|s| s.raw_fields.get("mosh_port").map(String::as_str))
+                })
+                .unwrap_or("");
+            let port_spec = match linscp_proto::mosh::MoshPortSpec::parse_optional(raw_port) {
+                Ok(p) => p,
+                Err(err) => return api_error(400, err),
+            };
+            let host = tab
+                .spec
+                .as_ref()
+                .map(|s| s.session.host.clone())
+                .unwrap_or_default();
+            let ssh_port = tab
+                .spec
+                .as_ref()
+                .map(|s| if s.session.port == 0 { 22 } else { s.session.port })
+                .unwrap_or(22);
+
+            match linscp_proto::mosh::check_mosh_on_ssh_connection(&ssh).await {
+                Ok(false) => {
+                    return ApiReply {
+                        status: 409,
+                        payload: json!({
+                            "success": false,
+                            "mosh_missing": true,
+                            "available": false,
+                            "checked": true,
+                            "via_ssh": true,
+                            "tab": id,
+                            "host": host,
+                            "port": ssh_port,
+                            "mosh_port": port_spec.map(|p| p.as_cli_arg()).unwrap_or_default(),
+                            "package": "mosh",
+                            "description": "Mosh (Mobile Shell) server (mosh-server) over SSH + UDP",
+                            "default_port_range": linscp_proto::mosh::MOSH_DEFAULT_PORT_RANGE,
+                            "probe_command": linscp_proto::mosh::MOSH_PROBE_COMMAND,
+                            "install_script": linscp_proto::mosh::mosh_install_script(),
+                            "can_install": true,
+                            "reason": format!("Mosh server (mosh-server) was not found on {host}."),
+                            "error": format!("Mosh server (mosh-server) is not installed on {host}."),
+                        }),
+                    };
+                }
+                Ok(true) => {}
+                Err(err) => {
+                    return api_error(502, format!("Could not check mosh-server on {host}: {err}"));
+                }
+            }
+
+            let (terminal_id, event_tx) = {
+                let mut g = self.state.lock().expect("state mutex");
+                let terminal_id = g.terminals.allocate_id();
+                let event_tx = self.event_sender();
+                (terminal_id, event_tx)
+            };
+            return match terminal_bridge::EmbeddedTerminal::open_over_mosh(
+                terminal_id.clone(),
+                id,
+                &ssh,
+                &host,
+                port_spec,
+                cols,
+                rows,
+                Some(tab.remote_dir.as_str()),
+                sudo_credentials,
+                event_tx,
+            )
+            .await
+            {
+                Ok(terminal) => {
+                    let (cols, rows) = terminal.dimensions();
+                    let udp_port = terminal.mosh_udp_port();
+                    self.state.lock().expect("state mutex").terminals.insert(terminal);
+                    ApiReply {
+                        status: 200,
+                        payload: json!({
+                            "success": true,
+                            "terminal": terminal_id,
+                            "transport": "mosh",
+                            "udp_port": udp_port,
+                            "cols": cols,
+                            "rows": rows,
+                        }),
+                    }
+                }
+                Err(error) => api_error(400, error),
+            };
+        }
+
         let (terminal_id, event_tx) = {
             let mut g = self.state.lock().expect("state mutex");
             let terminal_id = g.terminals.allocate_id();
             let event_tx = self.event_sender();
             (terminal_id, event_tx)
         };
-        let sudo_credentials = SessionStore::load_from_dir(&self.config_root(), self.secret_vault.as_ref())
-            .ok().and_then(|store| saved_sudo_credentials(&tab, &store));
         match terminal_bridge::EmbeddedTerminal::open_over_ssh(
             terminal_id.clone(), id, &ssh, cols, rows, Some(tab.remote_dir.as_str()), sudo_credentials, event_tx,
         ).await {
@@ -2008,6 +2221,7 @@ impl CommanderService {
                 ApiReply { status: 200, payload: json!({
                     "success": true,
                     "terminal": terminal_id,
+                    "transport": "ssh",
                     "cols": cols,
                     "rows": rows,
                 }) }
@@ -14699,5 +14913,86 @@ mod tests {
         assert_eq!(scan_keys.payload["entries"][0]["host"], "bastion.example.test");
         assert_eq!(scan_keys.payload["entries"][1]["name"], "portable-laptop-key");
         assert_eq!(scan_keys.payload["entries"][1]["has_ssh_key"], true);
+    }
+
+    #[tokio::test]
+    async fn mosh_install_script_check_and_session_settings_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(temp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
+
+        let script_reply = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/mosh/install-script".into(),
+            body: json!({}),
+        });
+        assert_eq!(script_reply.status, 200);
+        assert_eq!(script_reply.payload["success"], true);
+        assert_eq!(script_reply.payload["package"], "mosh");
+        let script = script_reply.payload["install_script"].as_str().unwrap();
+        assert!(script.contains("command -v mosh-server"));
+
+        // Saving a site with mosh + mosh_port persists and reloads cleanly.
+        let save = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/sessions/save".into(),
+            body: json!({
+                "name": "mosh-prod",
+                "session": {
+                    "protocol": "sftp",
+                    "host": "mosh.example.test",
+                    "port": 22,
+                    "username": "ops",
+                    "hostkey": "ssh-ed25519 SHA256:example",
+                    "mosh": true,
+                    "mosh_port": "60010:60020",
+                }
+            }),
+        });
+        assert_eq!(save.status, 200, "{}", save.payload);
+
+        let list = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/sessions".into(),
+            body: json!({}),
+        });
+        assert_eq!(list.status, 200);
+        let site = list.payload["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "mosh-prod")
+            .unwrap();
+        assert_eq!(site["mosh"], true);
+        assert_eq!(site["mosh_port"], "60010:60020");
+
+        // Invalid mosh_port is rejected at save time.
+        let bad_save = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/sessions/save".into(),
+            body: json!({
+                "name": "bad-mosh",
+                "session": {
+                    "protocol": "sftp",
+                    "host": "mosh.example.test",
+                    "port": 22,
+                    "username": "ops",
+                    "hostkey": "ssh-ed25519 SHA256:example",
+                    "mosh": true,
+                    "mosh_port": "61000:60000",
+                }
+            }),
+        });
+        assert_eq!(bad_save.status, 400);
+
+        // Unconnected / missing tab check refuses cleanly.
+        let check_disconnected = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/mosh/check".into(),
+                body: json!({"tab": 999}),
+            })
+            .await;
+        assert_eq!(check_disconnected.status, 400);
     }
 }

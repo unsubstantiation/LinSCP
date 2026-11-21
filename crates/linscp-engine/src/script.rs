@@ -5424,11 +5424,16 @@ impl ScriptInterpreter {
 
     async fn cmd_terminal(&mut self, args: &[String]) -> Result<(), String> {
         let mut desktop = false;
+        let mut mosh_override: Option<bool> = None;
         for a in args {
             if a.eq_ignore_ascii_case("-desktop") {
                 desktop = true;
+            } else if a.eq_ignore_ascii_case("-mosh") {
+                mosh_override = Some(true);
+            } else if a.eq_ignore_ascii_case("-ssh") {
+                mosh_override = Some(false);
             } else {
-                return Err("Syntax: terminal [-desktop]".to_string());
+                return Err("Syntax: terminal [-desktop] [-mosh | -ssh]".to_string());
             }
         }
         let spec = self.active_slot()?.spec.clone();
@@ -5448,6 +5453,17 @@ impl ScriptInterpreter {
                 &self.slots[self.active_slot].remote_cwd,
             );
         }
+        let use_mosh = mosh_override
+            .unwrap_or_else(|| spec.raw_fields.get("mosh").is_some_and(|v| v == "1"));
+        if use_mosh {
+            if let Some(reason) = crate::url_and_raw::mosh_direct_udp_incompatibility(&spec) {
+                return Err(reason);
+            }
+        }
+        let mosh_port = linscp_proto::mosh::MoshPortSpec::parse_optional(
+            spec.raw_fields.get("mosh_port").map_or("", String::as_str),
+        )?;
+
         let (conn, jump) = connect_ssh_for_shell(
             &spec,
             &self.cfg.config_dir,
@@ -5458,6 +5474,34 @@ impl ScriptInterpreter {
             None,
         )
         .await?;
+
+        if use_mosh {
+            let installed = linscp_proto::mosh::check_mosh_on_ssh_connection(&conn)
+                .await
+                .map_err(|e| e.to_string())?;
+            if !installed {
+                let script = linscp_proto::mosh::mosh_install_script();
+                let _ = conn.disconnect().await;
+                if let Some(j) = jump {
+                    let _ = j.close().await;
+                }
+                return Err(format!(
+                    "Mosh server (mosh-server) was not detected on '{}'.\n\
+                     Review the automated installer script below and run it in an interactive SSH session (`terminal -ssh`), then retry `terminal -mosh`:\n\
+                     --- begin mosh installer script ---\n\
+                     {script}\
+                     --- end mosh installer script ---",
+                    spec.session.host
+                ));
+            }
+            let res = run_mosh_shell_session(&conn, &spec.session.host, mosh_port).await;
+            let _ = conn.disconnect().await;
+            if let Some(j) = jump {
+                let _ = j.close().await;
+            }
+            return res;
+        }
+
         let code = run_pty_shell_session(&conn).await?;
         let _ = conn.disconnect().await;
         if let Some(j) = jump {
@@ -5690,6 +5734,108 @@ pub async fn run_pty_shell_session(conn: &SshConnection) -> Result<i32, String> 
         ),
         (None, _) => Err("Remote SSH shell closed without reporting an exit status.".to_string()),
     }
+}
+
+pub async fn run_mosh_shell_session(
+    conn: &SshConnection,
+    host: &str,
+    port_spec: Option<linscp_proto::mosh::MoshPortSpec>,
+) -> Result<(), String> {
+    use linscp_proto::mosh::{start_mosh_session, HostOp, MoshSessionEvent};
+
+    let (cols, rows) = terminal_size();
+    let (handle, mut events) = start_mosh_session(
+        conn,
+        host,
+        port_spec,
+        cols.clamp(1, u32::from(u16::MAX)) as u16,
+        rows.clamp(1, u32::from(u16::MAX)) as u16,
+        Duration::from_secs(4),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Once mosh-server has forked and UDP association is live, SSH TCP is no longer needed.
+    let _ = conn.disconnect().await;
+
+    let _raw_guard = RawTerminalGuard::enter();
+
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Option<Vec<u8>>>(16);
+    let stop_stdin = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag = stop_stdin.clone();
+
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            match read_stdin_chunk(&mut buf) {
+                Ok(0) => {
+                    let _ = stdin_tx.blocking_send(None);
+                    break;
+                }
+                Ok(n) => {
+                    if stdin_tx.blocking_send(Some(buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    let _ = stdin_tx.blocking_send(None);
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut resize_tick = tokio::time::interval(Duration::from_millis(100));
+    let mut stdin_closed = false;
+
+    loop {
+        tokio::select! {
+            evt_opt = events.recv() => {
+                match evt_opt {
+                    Some(MoshSessionEvent::AdvanceAnchor(_)) => {}
+                    Some(MoshSessionEvent::Incremental(ops) | MoshSessionEvent::RebranchFromAnchor(ops)) => {
+                        for op in ops {
+                            if let HostOp::HostBytes(bytes) = op {
+                                let _ = std::io::stdout().write_all(&bytes);
+                            }
+                        }
+                        let _ = std::io::stdout().flush();
+                    }
+                    Some(MoshSessionEvent::Closed) | None => {
+                        break;
+                    }
+                }
+            }
+            in_item = stdin_rx.recv(), if !stdin_closed => {
+                match in_item {
+                    Some(Some(bytes)) => {
+                        if handle.write_bytes(bytes).is_err() {
+                            break;
+                        }
+                    }
+                    Some(None) | None => {
+                        stdin_closed = true;
+                        let _ = handle.write_bytes(vec![4]); // Ctrl-D EOF to remote shell
+                    }
+                }
+            }
+            _ = resize_tick.tick() => {
+                if take_window_resized() {
+                    let (nc, nr) = terminal_size();
+                    let _ = handle.resize(nc, nr);
+                }
+            }
+        }
+    }
+
+    handle.close();
+    stop_stdin.store(true, std::sync::atomic::Ordering::Relaxed);
+    drop(_raw_guard);
+    Ok(())
 }
 
 pub fn parse_open_switch_bool(val: Option<&str>) -> Option<bool> {

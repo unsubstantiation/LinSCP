@@ -22,6 +22,7 @@ pub mod ftp;
 pub mod gssapi;
 pub mod kdrive_wire;
 pub mod listing;
+pub mod mosh;
 pub mod proxy;
 pub mod remote_desktop;
 pub mod s3;

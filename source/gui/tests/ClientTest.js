@@ -3531,6 +3531,114 @@ function options(id) {
     delete responses['/api/x2go/open']; delete responses['/api/x2go/input'];
     delete responses['/api/x2go/poll']; delete responses['/api/x2go/close'];
 
+    // Mosh option in Site Manager and inspectable Mosh server installer modal.
+    window.fillSiteForm({
+      name: 'Mosh site', protocol: 'sftp', host: 'mosh.example.test', port: 22,
+      username: 'ops', mosh: true, mosh_port: '60010:60020'
+    });
+    const moshForm = window.currentSiteForm();
+    check('site form round-trips Mosh option and UDP port range',
+      moshForm.mosh === true && moshForm.mosh_port === '60010:60020' &&
+      doc.getElementById('siteMoshSettings').open === true);
+    window.newSite();
+    check('new site defaults Mosh off with collapsed settings',
+      window.currentSiteForm().mosh === false &&
+      window.currentSiteForm().mosh_port === '' &&
+      doc.getElementById('siteMoshSettings').open === false);
+
+    {
+      const savedTermResp = responses['/api/session/terminal'];
+      const moshWindows = [];
+      internals.invoke = async (command, args) => {
+        if (command === 'linscp_open_terminal_window') {
+          moshWindows.push(args);
+          return { label: 'terminal-mosh-test' };
+        }
+        return originalInvoke(command, args);
+      };
+      const fakeMoshScript = '#!/bin/bash\necho install-mosh-server\n';
+      const realMoshTransport = window.LinSCPTransport.request;
+      window.LinSCPTransport.request = async (method, path, body) => {
+        if (path === '/api/session/terminal' && body && body.mosh && !body.force_ssh && !window.__moshInstalledTest) {
+          return {
+            success: false,
+            mosh_missing: true,
+            available: false,
+            checked: true,
+            via_ssh: true,
+            can_install: true,
+            host: '127.0.0.1',
+            port: 22,
+            mosh_port: '60010:60020',
+            reason: 'Mosh server (mosh-server) was not found on 127.0.0.1.',
+            install_script: fakeMoshScript,
+          };
+        }
+        if (path === '/api/session/terminal' && body && body.mosh && window.__moshInstalledTest) {
+          calls.push({ path, url: path, options: { method, body: JSON.stringify(body) } });
+          return { success: true, terminal: 'term-mosh-1', transport: 'mosh', udp_port: 60011, cols: 100, rows: 30 };
+        }
+        return realMoshTransport.call(window.LinSCPTransport, method, path, body);
+      };
+      window.__moshInstalledTest = false;
+      const moshMissingOpened = await window.openTerminal(null, false, null, { mosh: true });
+      check('missing mosh-server opens the inspectable Mosh setup modal instead of a broken shell',
+        moshMissingOpened === false &&
+        doc.getElementById('moshSetupModal').classList.contains('open') &&
+        doc.getElementById('moshSetupPrompt').style.display === 'block' &&
+        !doc.getElementById('moshInstallBtn').disabled &&
+        doc.getElementById('moshOpenBtn').disabled &&
+        doc.getElementById('moshScriptDetails').open &&
+        doc.getElementById('moshScript').textContent === fakeMoshScript);
+
+      const moshInputsBefore = calls.filter(call => call.path === '/api/terminal/input').length;
+      doc.getElementById('moshScriptDetails').open = false;
+      await window.installMoshOnServer();
+      check('a collapsed Mosh installer preview is reopened without executing the script',
+        doc.getElementById('moshScriptDetails').open &&
+        calls.filter(call => call.path === '/api/terminal/input').length === moshInputsBefore);
+
+      await window.installMoshOnServer();
+      const moshTermCalls = calls.filter(call => call.path === '/api/session/terminal');
+      const lastTermOpenBody = JSON.parse(moshTermCalls.at(-1).options.body);
+      const lastMoshInput = JSON.parse(calls.filter(call => call.path === '/api/terminal/input').at(-1).options.body);
+      const decodedMoshCmd = Buffer.from(lastMoshInput.data, 'base64').toString();
+      check('approving Mosh install opens a standard SSH terminal (force_ssh) and runs the reviewed script',
+        lastTermOpenBody.force_ssh === true &&
+        decodedMoshCmd.includes('base64 -d | bash') &&
+        Buffer.from(decodedMoshCmd.match(/'([^']+)'/)[1], 'base64').toString().includes('install-mosh-server'));
+
+      // Re-open Mosh setup, verify Check enables Open Mosh terminal, and launch Mosh window.
+      await window.openTerminal(null, false, null, { mosh: true });
+      responses['/api/mosh/check'] = {
+        success: true, available: true, checked: true, via_ssh: true,
+        host: '127.0.0.1', port: 22, mosh_port: '60010:60020',
+        can_install: true, install_script: fakeMoshScript,
+      };
+      await window.checkMoshServer();
+      check('checking Mosh after installation enables Open Mosh terminal',
+        !doc.getElementById('moshOpenBtn').disabled &&
+        doc.getElementById('moshSetupPrompt').style.display === 'none');
+      window.__moshInstalledTest = true;
+      const retriedMosh = await window.retryOpenMoshTerminal();
+      check('retrying Mosh opens a Mosh-titled terminal window',
+        retriedMosh === true &&
+        moshWindows.some(w => w.terminal === 'term-mosh-1' && String(w.title).includes('Mosh')));
+
+      // Fallback button opens standard SSH terminal with force_ssh: true.
+      window.__moshInstalledTest = false;
+      await window.openTerminal(null, false, null, { mosh: true });
+      const fbOpened = await window.fallbackMoshToSshTerminal();
+      const fbBody = JSON.parse(calls.filter(call => call.path === '/api/session/terminal').at(-1).options.body);
+      check('Open SSH terminal instead bypasses Mosh via force_ssh',
+        fbOpened === true && fbBody.force_ssh === true);
+
+      delete window.__moshInstalledTest;
+      delete responses['/api/mosh/check'];
+      window.LinSCPTransport.request = realMoshTransport;
+      responses['/api/session/terminal'] = savedTermResp;
+    }
+
     internals.invoke = originalInvoke;
     /* The Android path starts here: a touch host, no OS windows. */
     window.LinSCPCore = asPlatform('android');
