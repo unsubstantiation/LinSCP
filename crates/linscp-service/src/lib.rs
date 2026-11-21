@@ -17961,8 +17961,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let q = svc.queue.snapshot();
-        let tasks = q["transfers"].as_array().unwrap();
+        let (tasks, _) = svc.queue.snapshot();
         let dl_task = tasks.iter().find(|t| t["id"].as_u64() == Some(dl_id)).unwrap();
         let ul_task = tasks.iter().find(|t| t["id"].as_u64() == Some(ul_id)).unwrap();
         assert_eq!(dl_task["status"], "Completed", "{dl_task}");
@@ -17975,15 +17974,15 @@ mod tests {
         // 2. KeepUpToDate in GUI queue (`count: 0`) must be cancellable via `/api/queue/cancel` and tab close.
         let watch_res = svc.dispatch_async(ApiEnvelope {
             method: "POST".into(),
-            path: "/api/keepuptodate".into(),
+            path: "/api/transfer/keepuptodate".into(),
             body: json!({"tab": tab_id, "local_dir": local_dir, "remote_dir": "/", "interval": 5, "count": 0}),
         }).await;
         assert_eq!(watch_res.status, 200, "{}", watch_res.payload);
         let watch_id = watch_res.payload["task_id"].as_u64().unwrap();
 
         for _ in 0..80 {
-            let snap = svc.queue.snapshot();
-            let st = snap["transfers"].as_array().unwrap().iter()
+            let (tasks, _) = svc.queue.snapshot();
+            let st = tasks.iter()
                 .find(|t| t["id"].as_u64() == Some(watch_id))
                 .and_then(|t| t["status"].as_str())
                 .unwrap_or("");
@@ -17999,8 +17998,8 @@ mod tests {
         });
         assert_eq!(cancel_res.status, 200, "{}", cancel_res.payload);
         for _ in 0..80 {
-            let snap = svc.queue.snapshot();
-            let st = snap["transfers"].as_array().unwrap().iter()
+            let (tasks, _) = svc.queue.snapshot();
+            let st = tasks.iter()
                 .find(|t| t["id"].as_u64() == Some(watch_id))
                 .and_then(|t| t["status"].as_str())
                 .unwrap_or("");
@@ -18009,20 +18008,20 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let watch_after = svc.queue.snapshot()["transfers"].as_array().unwrap().iter()
-            .find(|t| t["id"].as_u64() == Some(watch_id)).cloned().unwrap();
+        let watch_after = svc.queue.snapshot().0.into_iter()
+            .find(|t| t["id"].as_u64() == Some(watch_id)).unwrap();
         assert_eq!(watch_after["status"], "Cancelled", "{watch_after}");
 
         // Tab close cancels an active KeepUpToDate as well.
         let watch2_res = svc.dispatch_async(ApiEnvelope {
             method: "POST".into(),
-            path: "/api/keepuptodate".into(),
+            path: "/api/transfer/keepuptodate".into(),
             body: json!({"tab": tab_id, "local_dir": local_dir, "remote_dir": "/", "interval": 5, "count": 0}),
         }).await;
         let watch2_id = watch2_res.payload["task_id"].as_u64().unwrap();
         for _ in 0..80 {
-            let snap = svc.queue.snapshot();
-            let st = snap["transfers"].as_array().unwrap().iter()
+            let (tasks, _) = svc.queue.snapshot();
+            let st = tasks.iter()
                 .find(|t| t["id"].as_u64() == Some(watch2_id))
                 .and_then(|t| t["status"].as_str())
                 .unwrap_or("");
@@ -18043,8 +18042,8 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let watch2_after = svc.queue.snapshot()["transfers"].as_array().unwrap().iter()
-            .find(|t| t["id"].as_u64() == Some(watch2_id)).cloned().unwrap();
+        let watch2_after = svc.queue.snapshot().0.into_iter()
+            .find(|t| t["id"].as_u64() == Some(watch2_id)).unwrap();
         assert_eq!(watch2_after["status"], "Cancelled", "{watch2_after}");
 
         // 3. SAF local queue copy with `ConflictPolicy::Rename` on filenames containing `?`, `#`, and `%`.
@@ -18082,8 +18081,8 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let saf_task = saf_svc.queue.snapshot()["transfers"].as_array().unwrap().iter()
-            .find(|t| t["id"].as_u64() == Some(saf_copy_id)).cloned().unwrap();
+        let saf_task = saf_svc.queue.snapshot().0.into_iter()
+            .find(|t| t["id"].as_u64() == Some(saf_copy_id)).unwrap();
         assert_eq!(saf_task["status"], "Completed", "{saf_task}");
         let renamed_uri = format!(
             "{SAF_GRANTED_DIR}/document/dst/document/{}",
@@ -18119,10 +18118,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let perm_task = svc.queue.snapshot()["transfers"].as_array().unwrap().iter()
-            .find(|t| t["id"].as_u64() == Some(perm_id)).cloned().unwrap();
+        let perm_task = svc.queue.snapshot().0.into_iter()
+            .find(|t| t["id"].as_u64() == Some(perm_id)).unwrap();
         assert_eq!(perm_task["status"], "Completed", "{perm_task}");
-        if !linscp_platform::is_windows_platform() {
+        if cfg!(unix) {
             assert_eq!(gui_os::stat_extended(&perm_dst).unwrap().mode & 0o777, 0o600);
         }
     }
