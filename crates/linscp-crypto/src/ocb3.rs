@@ -61,6 +61,14 @@ impl MoshDirection {
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct MoshBase64Key([u8; OCB3_KEY_BYTES]);
 
+impl PartialEq for MoshBase64Key {
+    fn eq(&self, other: &Self) -> bool {
+        bool::from(self.0.ct_eq(&other.0))
+    }
+}
+
+impl Eq for MoshBase64Key {}
+
 impl fmt::Debug for MoshBase64Key {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("MoshBase64Key([REDACTED])")

@@ -101,7 +101,7 @@ impl MoshPortSpec {
 /// Probes whether `mosh-server` is installed on an authenticated SSH session.
 pub async fn check_mosh_via_ssh(session: &dyn RemoteSession) -> Result<bool, ProtoError> {
     let ssh = session.ssh_connection().ok_or_else(|| {
-        ProtoError::Unsupported(
+        ProtoError::Transport(
             "Mosh server check requires an active SSH-backed session (SFTP or SCP).".to_string(),
         )
     })?;
@@ -185,10 +185,10 @@ fn decode_varint(buf: &mut &[u8]) -> Result<u64, ProtoError> {
     for _ in 0..10 {
         let (&byte, rest) = buf
             .split_first()
-            .ok_or_else(|| ProtoError::Protocol("Truncated Mosh protobuf varint.".to_string()))?;
+            .ok_or_else(|| ProtoError::Transport("Truncated Mosh protobuf varint.".to_string()))?;
         *buf = rest;
         if shift == 63 && byte > 1 {
-            return Err(ProtoError::Protocol(
+            return Err(ProtoError::Transport(
                 "Overflow in Mosh protobuf varint.".to_string(),
             ));
         }
@@ -198,7 +198,7 @@ fn decode_varint(buf: &mut &[u8]) -> Result<u64, ProtoError> {
         }
         shift += 7;
     }
-    Err(ProtoError::Protocol(
+    Err(ProtoError::Transport(
         "Malformed Mosh protobuf varint.".to_string(),
     ))
 }
@@ -220,9 +220,9 @@ fn encode_bytes_field(field_number: u32, bytes: &[u8], out: &mut Vec<u8>) {
 
 fn decode_length_delimited<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8], ProtoError> {
     let len = usize::try_from(decode_varint(buf)?)
-        .map_err(|_| ProtoError::Protocol("Mosh protobuf field length overflow.".to_string()))?;
+        .map_err(|_| ProtoError::Transport("Mosh protobuf field length overflow.".to_string()))?;
     if buf.len() < len {
-        return Err(ProtoError::Protocol(
+        return Err(ProtoError::Transport(
             "Truncated Mosh length-delimited protobuf field.".to_string(),
         ));
     }
@@ -239,7 +239,7 @@ fn skip_unknown_field(wire_type: u8, buf: &mut &[u8]) -> Result<(), ProtoError> 
         }
         1 => {
             if buf.len() < 8 {
-                return Err(ProtoError::Protocol(
+                return Err(ProtoError::Transport(
                     "Truncated 64-bit protobuf field.".to_string(),
                 ));
             }
@@ -252,14 +252,14 @@ fn skip_unknown_field(wire_type: u8, buf: &mut &[u8]) -> Result<(), ProtoError> 
         }
         5 => {
             if buf.len() < 4 {
-                return Err(ProtoError::Protocol(
+                return Err(ProtoError::Transport(
                     "Truncated 32-bit protobuf field.".to_string(),
                 ));
             }
             *buf = &buf[4..];
             Ok(())
         }
-        other => Err(ProtoError::Protocol(format!(
+        other => Err(ProtoError::Transport(format!(
             "Unsupported Mosh protobuf wire type {other}."
         ))),
     }
@@ -320,7 +320,7 @@ impl TransportInstruction {
             match (field, wire_type) {
                 (1, 0) => {
                     inst.protocol_version = u32::try_from(decode_varint(&mut buf)?).map_err(|_| {
-                        ProtoError::Protocol("Mosh protocol_version overflow.".to_string())
+                        ProtoError::Transport("Mosh protocol_version overflow.".to_string())
                     })?;
                 }
                 (2, 0) => inst.old_num = decode_varint(&mut buf)?,
@@ -333,7 +333,7 @@ impl TransportInstruction {
             }
         }
         if inst.protocol_version != MOSH_PROTOCOL_VERSION {
-            return Err(ProtoError::Protocol(format!(
+            return Err(ProtoError::Transport(format!(
                 "Unsupported Mosh protocol version {} (expected {}).",
                 inst.protocol_version, MOSH_PROTOCOL_VERSION
             )));
@@ -531,10 +531,10 @@ pub fn compress_instruction(inst: &TransportInstruction) -> Result<Vec<u8>, Prot
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder
         .write_all(&raw)
-        .map_err(|e| ProtoError::Protocol(format!("Mosh zlib compression failed: {e}")))?;
+        .map_err(|e| ProtoError::Transport(format!("Mosh zlib compression failed: {e}")))?;
     encoder
         .finish()
-        .map_err(|e| ProtoError::Protocol(format!("Mosh zlib finish failed: {e}")))
+        .map_err(|e| ProtoError::Transport(format!("Mosh zlib finish failed: {e}")))
 }
 
 pub fn decompress_instruction(compressed: &[u8]) -> Result<TransportInstruction, ProtoError> {
@@ -543,9 +543,9 @@ pub fn decompress_instruction(compressed: &[u8]) -> Result<TransportInstruction,
     let mut out = Vec::new();
     bounded
         .read_to_end(&mut out)
-        .map_err(|e| ProtoError::Protocol(format!("Mosh zlib decompression failed: {e}")))?;
+        .map_err(|e| ProtoError::Transport(format!("Mosh zlib decompression failed: {e}")))?;
     if out.len() > MOSH_DECOMPRESS_CAP_BYTES {
-        return Err(ProtoError::Protocol(
+        return Err(ProtoError::Transport(
             "Mosh decompressed instruction exceeded 1 MiB safety limit.".to_string(),
         ));
     }
@@ -572,7 +572,7 @@ impl MoshFragment {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtoError> {
         if bytes.len() < MOSH_FRAGMENT_HEADER_BYTES {
-            return Err(ProtoError::Protocol(
+            return Err(ProtoError::Transport(
                 "Truncated Mosh transport fragment header.".to_string(),
             ));
         }
@@ -647,7 +647,7 @@ impl Fragmenter {
         } else {
             let total_chunks = compressed.len().div_ceil(step);
             if total_chunks > MOSH_MAX_FRAGMENTS_PER_INSTRUCTION {
-                return Err(ProtoError::Protocol(
+                return Err(ProtoError::Transport(
                     "Mosh instruction requires too many UDP fragments.".to_string(),
                 ));
             }
@@ -685,7 +685,7 @@ impl FragmentAssembly {
     ) -> Result<Option<TransportInstruction>, ProtoError> {
         let idx = usize::from(frag.fragment_num);
         if idx >= MOSH_MAX_FRAGMENTS_PER_INSTRUCTION {
-            return Err(ProtoError::Protocol(
+            return Err(ProtoError::Transport(
                 "Mosh fragment index exceeded safety cap.".to_string(),
             ));
         }
@@ -710,7 +710,7 @@ impl FragmentAssembly {
             if self.bytes_accumulated + frag.contents.len() > MOSH_DECOMPRESS_CAP_BYTES {
                 self.current_id = None;
                 self.fragments.clear();
-                return Err(ProtoError::Protocol(
+                return Err(ProtoError::Transport(
                     "Mosh fragment assembly exceeded 1 MiB cap.".to_string(),
                 ));
             }
@@ -1050,26 +1050,26 @@ pub fn parse_mosh_connect_output(stdout_and_stderr: &str) -> Result<MoshConnectH
         } else if let Some(rest) = line.strip_prefix("MOSH CONNECT ") {
             let mut parts = rest.split_whitespace();
             let port_str = parts.next().ok_or_else(|| {
-                ProtoError::Protocol("Malformed MOSH CONNECT line (missing UDP port).".to_string())
+                ProtoError::Transport("Malformed MOSH CONNECT line (missing UDP port).".to_string())
             })?;
             let key_str = parts.next().ok_or_else(|| {
-                ProtoError::Protocol("Malformed MOSH CONNECT line (missing session key).".to_string())
+                ProtoError::Transport("Malformed MOSH CONNECT line (missing session key).".to_string())
             })?;
             if parts.next().is_some() {
-                return Err(ProtoError::Protocol(
+                return Err(ProtoError::Transport(
                     "Malformed MOSH CONNECT line (unexpected trailing tokens).".to_string(),
                 ));
             }
             let port: u16 = port_str.parse().map_err(|_| {
-                ProtoError::Protocol(format!("Invalid Mosh UDP port '{port_str}'."))
+                ProtoError::Transport(format!("Invalid Mosh UDP port '{port_str}'."))
             })?;
             if port == 0 {
-                return Err(ProtoError::Protocol(
+                return Err(ProtoError::Transport(
                     "Mosh server returned invalid UDP port 0.".to_string(),
                 ));
             }
             let key = MoshBase64Key::from_printable(key_str)
-                .map_err(|e| ProtoError::Protocol(format!("Invalid Mosh session key: {e}")))?;
+                .map_err(|e| ProtoError::Transport(format!("Invalid Mosh session key: {e}")))?;
             found_port_and_key = Some((port, key));
             break;
         }
@@ -1223,7 +1223,7 @@ async fn transmit_instruction(
         plaintext.extend_from_slice(&frag_bytes);
         let (_seq, datagram) = crypto
             .seal(MoshDirection::ToServer, &plaintext)
-            .map_err(|e| ProtoError::Protocol(format!("Mosh OCB3 seal error: {e}")))?;
+            .map_err(|e| ProtoError::Transport(format!("Mosh OCB3 seal error: {e}")))?;
         let _ = socket.send(&datagram).await;
     }
     Ok(())

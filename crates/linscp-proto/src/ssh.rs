@@ -25,7 +25,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use zeroize::Zeroizing;
 
 use crate::gssapi::{ensure_gssapi_available, GssapiTokenProvider};
-use crate::proxy::{connect_stream_maybe_proxied, ProxyConfig};
+use crate::proxy::{connect_stream_maybe_proxied, connect_tcp_maybe_proxied, ProxyConfig, ProxyKind};
 use crate::{evaluate_host_key_extended, ProtoError};
 
 const DEFAULT_SSH_TIMEOUT_SECS: u64 = 20;
@@ -415,22 +415,24 @@ impl SshConnection {
             ensure_gssapi_available(cfg.request_gssapi_kex)?;
         }
         if let Some(log) = &cfg.event_logger { log("Opening SSH transport (including any configured proxy)."); }
-        let stream = connect_stream_maybe_proxied(
-            &cfg.host,
-            cfg.port,
-            cfg.proxy.as_ref(),
-            cfg.connect_timeout,
-        )
-        .await?;
-        let direct_peer_ip = if cfg.proxy.is_none() {
-            stream.peer_addr().ok().map(|addr| addr.ip())
+        if cfg.proxy.as_ref().is_none_or(|p| p.kind == ProxyKind::None) {
+            let tcp = connect_tcp_maybe_proxied(&cfg.host, cfg.port, None, cfg.connect_timeout).await?;
+            let direct_peer_ip = tcp.peer_addr().ok().map(|addr| addr.ip());
+            if let Some(log) = &cfg.event_logger { log("SSH transport established; starting handshake and host-key verification."); }
+            let mut conn = Self::connect_over_stream(cfg, tcp).await?;
+            conn.direct_peer_ip = direct_peer_ip;
+            Ok(conn)
         } else {
-            None
-        };
-        if let Some(log) = &cfg.event_logger { log("SSH transport established; starting handshake and host-key verification."); }
-        let mut conn = Self::connect_over_stream(cfg, stream).await?;
-        conn.direct_peer_ip = direct_peer_ip;
-        Ok(conn)
+            let stream = connect_stream_maybe_proxied(
+                &cfg.host,
+                cfg.port,
+                cfg.proxy.as_ref(),
+                cfg.connect_timeout,
+            )
+            .await?;
+            if let Some(log) = &cfg.event_logger { log("SSH transport established; starting handshake and host-key verification."); }
+            Self::connect_over_stream(cfg, stream).await
+        }
     }
 
     /// Returns the direct TCP peer IP address when the SSH connection was opened
