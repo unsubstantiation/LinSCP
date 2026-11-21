@@ -186,6 +186,58 @@ test('LocalRootSwitcher renders Windows drives and Android SAF folder picker wit
   assert.ok(navigated[1].path.startsWith('content://'));
 });
 
+test('LocalRootSwitcher selects the most specific matching root and enforces path boundaries', async () => {
+  const dom = new JSDOM('<!doctype html><select id="roots"></select>');
+  const selectEl = dom.window.document.getElementById('roots');
+  let roots = [
+    { path: '/home/alice', label: 'Home (~)', kind: 'home', read_only: false },
+    { path: '/', label: '/', kind: 'filesystem', read_only: false },
+  ];
+  const navigated = [];
+  const mockTransport = new TauriTransport({
+    invoke: async (_cmd, { envelope }) => {
+      if (envelope.path === '/api/local/roots') return { status: 200, payload: { roots } };
+      if (envelope.path.startsWith('/api/local/list?path=')) {
+        const decoded = decodeURIComponent(envelope.path.split('=')[1]);
+        return { status: 200, payload: { path: decoded, entries: [] } };
+      }
+      return { status: 404, payload: { error: 'not found' } };
+    },
+  });
+  const switcher = new LocalRootSwitcher({
+    transport: mockTransport,
+    selectElement: selectEl,
+    onNavigate: (listing) => navigated.push(listing),
+  });
+
+  // Under `/home/alice/projects`, `Home (~)` must stay selected instead of `/` overriding it.
+  await switcher.refreshRoots('/home/alice/projects');
+  assert.equal(selectEl.value, '/home/alice');
+
+  // Switching from `Home (~)` to `/` fires `change` and navigates to `/`.
+  selectEl.value = '/';
+  selectEl.dispatchEvent(new dom.window.Event('change'));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(navigated.length, 1);
+  assert.equal(navigated[0].path, '/');
+
+  // Segment boundary: `/home/al` must NOT match `/home/alice`.
+  roots = [
+    { path: '/home/al', label: 'Other', kind: 'home', read_only: false },
+    { path: '/', label: '/', kind: 'filesystem', read_only: false },
+  ];
+  await switcher.refreshRoots('/home/alice');
+  assert.equal(selectEl.value, '/');
+
+  // Windows `Home` vs `C:\`: `Home` wins for `C:\Users\Alice\Documents`.
+  roots = [
+    { path: 'C:\\Users\\Alice', label: 'Home', kind: 'home', read_only: false },
+    { path: 'C:\\', label: 'C:\\', kind: 'drive', read_only: false },
+  ];
+  await switcher.refreshRoots('C:\\Users\\Alice\\Documents');
+  assert.equal(selectEl.value, 'C:\\Users\\Alice');
+});
+
 test('MobileShellController handles touch pane switching and terminal extra-key sequences', () => {
   const dom = new JSDOM('<!doctype html><div id="app"></div>');
   const root = dom.window.document.getElementById('app');

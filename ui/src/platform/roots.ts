@@ -95,11 +95,24 @@ export class LocalRootSwitcher {
       this.selectEl.appendChild(empty);
     }
 
-    for (const root of this.roots) {
+    let bestIdx = -1;
+    let bestSpecificity = -1;
+    for (const [i, root] of this.roots.entries()) {
+      const rootPath = root.path;
+      if (this.matchesRoot(this.currentPath, rootPath)) {
+        const specificity = rootPath.replace(/[\\/]+$/, '').length;
+        if (specificity > bestSpecificity) {
+          bestSpecificity = specificity;
+          bestIdx = i;
+        }
+      }
+    }
+
+    for (const [i, root] of this.roots.entries()) {
       const opt = doc.createElement('option');
       opt.value = root.path;
       opt.textContent = root.read_only ? `${root.label} · read-only` : root.label;
-      if (this.matchesRoot(this.currentPath, root.path)) {
+      if (i === bestIdx) {
         opt.selected = true;
       }
       this.selectEl.appendChild(opt);
@@ -117,18 +130,33 @@ export class LocalRootSwitcher {
   }
 
   private matchesRoot(currentPath: string, rootPath: string): boolean {
-    if (!currentPath) {
+    if (!currentPath || !rootPath) {
       return false;
     }
     if (currentPath === rootPath) {
       return true;
     }
-    if (rootPath === '/' || /^[A-Za-z]:[\\/]?$/.test(rootPath)) {
-      return rootPath === '/' || currentPath.toLowerCase().startsWith(rootPath.slice(0, 2).toLowerCase());
+    if (rootPath.startsWith('content://') || currentPath.startsWith('content://')) {
+      const cleanRoot = rootPath.replace(/\/+$/, '');
+      const cleanCur = currentPath.replace(/\/+$/, '');
+      return cleanCur === cleanRoot || cleanCur.startsWith(`${cleanRoot}/document/`);
     }
-    const normCurrent = currentPath.replace(/\\/g, '/').toLowerCase();
-    const normRoot = rootPath.replace(/\\/g, '/').toLowerCase();
-    return normCurrent.startsWith(normRoot);
+    if (rootPath === '/') {
+      return currentPath.startsWith('/');
+    }
+    if (/^[A-Za-z]:[\\/]?$/.test(rootPath)) {
+      const drive = rootPath.slice(0, 2).toLowerCase();
+      const normCur = currentPath.replace(/\\/g, '/').toLowerCase();
+      return normCur === drive || normCur.startsWith(`${drive}/`);
+    }
+    const isWindowsRoot = /^[A-Za-z]:[\\/]/.test(rootPath);
+    const normCurrent = (isWindowsRoot ? currentPath.toLowerCase() : currentPath)
+      .replace(/\\/g, '/')
+      .replace(/\/+$/, '');
+    const normRoot = (isWindowsRoot ? rootPath.toLowerCase() : rootPath)
+      .replace(/\\/g, '/')
+      .replace(/\/+$/, '');
+    return normCurrent === normRoot || normCurrent.startsWith(`${normRoot}/`);
   }
 
   private async handleSelectionChange(): Promise<void> {

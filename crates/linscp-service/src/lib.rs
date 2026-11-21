@@ -89,6 +89,7 @@ struct ExternalEditSession {
 
 struct InnerState {
     config_root: PathBuf,
+    current_local_dir: Option<String>,
     next_tab_id: u64,
     active_tab_id: Option<u64>,
     tabs: HashMap<u64, TabRuntime>,
@@ -236,6 +237,7 @@ impl CommanderService {
             legacy_secret_vault: secret_vault,
             state: Arc::new(Mutex::new(InnerState {
                 config_root,
+                current_local_dir: None,
                 next_tab_id: 1,
                 active_tab_id: None,
                 tabs: HashMap::new(),
@@ -3182,26 +3184,19 @@ impl CommanderService {
             Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
         };
         if tab.is_local {
-            // "Save as" on a local tab writes to the other pane's directory,
-            // which is the local filesystem the tab already owns.
+            // Saving on a local tab writes to the other pane's directory,
+            // accepting either a single leaf name or the full path the editor
+            // opened inside `tab.other_local_dir`. Remove `"tab"` afterwards so
+            // `handle_local_save` does not re-resolve against `tab.local_dir`.
+            let raw_path = body.get("path").and_then(Value::as_str).unwrap_or("");
+            let resolved = match resolve_editor_local_path(&tab.other_local_dir, raw_path) {
+                Ok(resolved) => resolved,
+                Err(error) => return api_error(400, error),
+            };
             let mut local_body = body.clone();
-            if let Some(path) = body.get("path").and_then(Value::as_str) {
-                if path.starts_with('/') { local_body["path"] = json!(path); }
-                else if is_saf_path(&tab.other_local_dir) {
-                    // "Save as" into a granted other pane: a leaf resolves
-                    // to a document URI, which saves verbatim (without a
-                    // tab), while a joined path keeps the pane's path error.
-                    let resolved = match resolve_contained(&tab.other_local_dir, path) {
-                        Ok(resolved) => resolved,
-                        Err(error) => return api_error(400, error),
-                    };
-                    local_body["path"] = json!(resolved);
-                    if let Some(obj) = local_body.as_object_mut() { obj.remove("tab"); }
-                }
-                else {
-                    let joined = format!("{}/{}", tab.other_local_dir.trim_end_matches('/'), path);
-                    local_body["path"] = json!(joined);
-                }
+            local_body["path"] = json!(resolved);
+            if let Some(obj) = local_body.as_object_mut() {
+                obj.remove("tab");
             }
             return self.handle_local_save(local_body);
         }
@@ -4012,6 +4007,20 @@ impl CommanderService {
         "/".to_string()
     }
 
+    fn active_local_dir(&self, tab_id: Option<u64>) -> String {
+        let g = self.state.lock().expect("state mutex");
+        if let Some(id) = tab_id {
+            if let Some(tab) = g.tabs.get(&id) {
+                return tab.local_dir.clone();
+            }
+        }
+        if let Some(ref cur) = g.current_local_dir {
+            return cur.clone();
+        }
+        drop(g);
+        self.default_local_dir()
+    }
+
     fn handle_vault_status(&self) -> ApiReply {
         let config_root = self.config_root();
         match self.secret_vault.status(&config_root) {
@@ -4407,16 +4416,29 @@ impl CommanderService {
     }
 
     fn handle_local_list(&self, query: &BTreeMap<String,String>) -> ApiReply {
-        let requested = query.get("path").cloned().filter(|s| !s.is_empty()).unwrap_or_else(|| self.default_local_dir());
-        let tab = query.get("tab").and_then(|id| parse_tab_id_str(Some(id))).and_then(|id| self.state.lock().expect("m").tabs.get(&id).cloned());
-        let base_path = tab.map(|t| t.local_dir).unwrap_or(requested.clone());
-        let path_to_list = if query.contains_key("path") { requested } else { base_path };
+        let tab_id = query.get("tab").and_then(|id| parse_tab_id_str(Some(id)));
+        let base_path = self.active_local_dir(tab_id);
+        let path_to_list = query
+            .get("path")
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(base_path);
         let resolved = match resolve_local_path_for_list(&path_to_list) {
             Ok(p) => p,
             Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e, "path": path_to_list})},
         };
         match self.local_fs.list_dir(&resolved) {
-            Ok(entries) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "entries": entries})},
+            Ok(entries) => {
+                {
+                    let mut g = self.state.lock().expect("m");
+                    if let Some(tab) = tab_id.and_then(|id| g.tabs.get_mut(&id)) {
+                        tab.local_dir = resolved.clone();
+                    } else {
+                        g.current_local_dir = Some(resolved.clone());
+                    }
+                }
+                ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "entries": entries})}
+            }
             Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string(), "path": resolved})},
         }
     }
@@ -4424,9 +4446,8 @@ impl CommanderService {
     fn handle_local_edit_get(&self, query: &BTreeMap<String,String>) -> ApiReply {
         let path = query.get("path").cloned().unwrap_or_default();
         let tab_id = query.get("tab").and_then(|s| parse_tab_id_str(Some(s)));
-        let tab = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).cloned());
-        let base = tab.as_ref().map(|t| t.local_dir.clone()).unwrap_or_else(|| self.default_local_dir());
-        let resolved = match resolve_contained(&base, &path) {
+        let base = self.active_local_dir(tab_id);
+        let resolved = match resolve_editor_local_path(&base, &path) {
             Ok(p) => p,
             Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
         };
@@ -4454,13 +4475,22 @@ impl CommanderService {
         };
         drop(g);
         if tab.is_local {
-            let req = query.get("path").cloned().unwrap_or(tab.other_local_dir.clone());
+            let req = query
+                .get("path")
+                .cloned()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(tab.other_local_dir.clone());
             let resolved = match resolve_local_path_for_list(&req) {
                 Ok(p) => p,
                 Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
             };
             match self.local_fs.list_dir(&resolved) {
-                Ok(entries) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "entries": entries})},
+                Ok(entries) => {
+                    if let Some(current) = self.state.lock().expect("m").tabs.get_mut(&tab.id) {
+                        current.other_local_dir = resolved.clone();
+                    }
+                    ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "entries": entries})}
+                }
                 Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})},
             }
         } else {
@@ -4478,10 +4508,9 @@ impl CommanderService {
         };
         drop(g);
         if tab.is_local {
-            // A leaf resolves against the granted other pane to a document
-            // URI and reads through the bridge; a joined path keeps the
-            // pane's path error, as on plain directories.
-            let resolved = match resolve_contained(&tab.other_local_dir, &path) {
+            // Accepts either a leaf name or the full URI/path inside the other
+            // local pane that the GUI editor constructed from its listing.
+            let resolved = match resolve_editor_local_path(&tab.other_local_dir, &path) {
                 Ok(p) => p, Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
             };
             let encoding_opt = query.get("encoding").map(String::as_str);
@@ -4742,6 +4771,20 @@ impl CommanderService {
         }
     }
 
+    fn write_backup_export_to_dir(&self, save_dir: &str, filename: &str, bytes: &[u8]) -> Result<String, String> {
+        let checked_dir = check_local_pane_directory(save_dir, "save_dir")?;
+        let dest = resolve_contained(&checked_dir, filename)?;
+        if is_saf_path(&dest) {
+            self.local_fs
+                .write_bytes_atomic(&dest, bytes)
+                .map_err(|e| e.to_string())?;
+        } else {
+            linscp_platform::write_owner_only_file_atomic(Path::new(&dest), bytes)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(dest)
+    }
+
     fn handle_full_backup_export(&self, mut body: Value) -> ApiReply {
         const MAX_BACKUP: usize = 16 * 1024 * 1024;
         let _guard = self.session_key_lock.lock().expect("session key lock");
@@ -4754,8 +4797,20 @@ impl CommanderService {
             let bundle = linscp_engine::backup::export_backup(&cfg, self.secret_vault.as_ref())?;
             let bytes = linscp_engine::backup::seal_backup(&bundle, password)?;
             if bytes.len() > MAX_BACKUP { return Err("Full backups are limited to 16 MiB in the GUI.".into()); }
-            Ok(json!({"success": true, "data_base64": BASE64_STD.encode(bytes),
-                "filename": format!("linscp-full-backup-{}.lscpbak", unix_now_seconds())}))
+            let filename = format!("linscp-full-backup-{}.lscpbak", unix_now_seconds());
+            let saved_path = match body.get("save_dir").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                Some(dir) => Some(self.write_backup_export_to_dir(dir, &filename, &bytes)?),
+                None => None,
+            };
+            let mut resp = json!({
+                "success": true,
+                "data_base64": BASE64_STD.encode(&bytes),
+                "filename": filename,
+            });
+            if let Some(saved) = saved_path {
+                resp["saved_path"] = json!(saved);
+            }
+            Ok(resp)
         })();
         if let Some(Value::String(password)) = body.get_mut("password") {
             zeroize::Zeroize::zeroize(password);
@@ -4811,15 +4866,23 @@ impl CommanderService {
             let (data, filename) = offlineotp_vault::seal(&entries, password)
                 .map(|data| (data, offlineotp_vault::timestamped_filename(unix_seconds)))
                 .map_err(|error| api_error(400, &error))?;
+            let saved_path = match body.get("save_dir").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                Some(dir) => Some(self.write_backup_export_to_dir(dir, &filename, &data).map_err(|error| api_error(400, &error))?),
+                None => None,
+            };
+            let mut payload = json!({
+                "success": true,
+                "filename": filename,
+                "data_base64": BASE64_STD.encode(&data),
+                "entry_count": entries.len(),
+                "plain_text": plain_text,
+            });
+            if let Some(saved) = saved_path {
+                payload["saved_path"] = json!(saved);
+            }
             Ok(ApiReply {
                 status: 200,
-                payload: json!({
-                    "success": true,
-                    "filename": filename,
-                    "data_base64": BASE64_STD.encode(data),
-                    "entry_count": entries.len(),
-                    "plain_text": plain_text,
-                }),
+                payload,
             })
         })();
         zeroize_json_secret_fields(&mut body, &["password"]);
@@ -5540,7 +5603,7 @@ impl CommanderService {
 
     fn handle_local_mkdir(&self, body: Value) -> ApiReply {
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
-        let base = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).map(|t| t.local_dir.clone())).unwrap_or_else(|| self.default_local_dir());
+        let base = self.active_local_dir(tab_id);
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let target = match resolve_contained(&base, &name) {
             Ok(p) => p, Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
@@ -5554,7 +5617,7 @@ impl CommanderService {
     }
     fn handle_local_link(&self, body: Value) -> ApiReply {
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
-        let base = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).map(|t| t.local_dir.clone())).unwrap_or_else(|| self.default_local_dir());
+        let base = self.active_local_dir(tab_id);
         let target = body.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         match create_local_link(&base, &target, &name) {
@@ -5564,7 +5627,7 @@ impl CommanderService {
     }
     fn handle_local_delete(&self, body: Value) -> ApiReply {
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
-        let base = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).map(|t| t.local_dir.clone())).unwrap_or_else(|| self.default_local_dir());
+        let base = self.active_local_dir(tab_id);
         let names: Vec<String> = body.get("names").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect()).unwrap_or_else(|| body.get("name").and_then(|v| v.as_str()).map(|s| vec![s.to_string()]).unwrap_or_default());
         if names.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "Select an item first."})}; }
         let mut errs = Vec::new();
@@ -5584,7 +5647,7 @@ impl CommanderService {
     }
     fn handle_local_rename(&self, body: Value) -> ApiReply {
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
-        let base = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).map(|t| t.local_dir.clone())).unwrap_or_else(|| self.default_local_dir());
+        let base = self.active_local_dir(tab_id);
         let old = body.get("old_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let new = body.get("new_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if old.is_empty() || new.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Both names are required"})}; }
@@ -5595,7 +5658,21 @@ impl CommanderService {
         // the entry the user asked to keep. A granted SAF document has no
         // pathname to move, so its rename stays the bridge's own operation.
         if src.starts_with("content://") || dst.starts_with("content://") {
-            return match self.local_fs.rename(&src, &dst) {
+            if src != dst && self.local_fs.stat(&dst).is_ok() {
+                if !overwrite {
+                    return ApiReply{ status: 400, payload: json!({
+                        "success": false,
+                        "conflict": true,
+                        "error": format!("An item already exists at {dst}."),
+                    })};
+                }
+                let is_dir = self.local_fs.stat(&dst).map(|e| e.is_dir).unwrap_or(false);
+                let del = if is_dir { self.local_fs.remove_dir_all(&dst) } else { self.local_fs.remove_file(&dst) };
+                if let Err(e) = del {
+                    return ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})};
+                }
+            }
+            return match self.local_fs.rename(&src, &new) {
                 Ok(_) => ApiReply{ status: 200, payload: json!({"success": true})},
                 Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})},
             };
@@ -5627,9 +5704,12 @@ impl CommanderService {
     /// the page collected. A refused move says which name is taken, so the page
     /// can ask about that one instead of guessing at the error text.
     fn rename_local_path(from: &Path, to: &Path, overwrite: bool) -> Result<(), String> {
+        if from == to {
+            return Ok(());
+        }
         if overwrite && std::fs::symlink_metadata(to).is_ok() {
-            return std::fs::remove_file(to)
-                .map_err(|error| format!("Cannot replace '{}': {error}", to.display()));
+            std::fs::remove_file(to)
+                .map_err(|error| format!("Cannot replace '{}': {error}", to.display()))?;
         }
         linscp_platform::gui_os::rename_no_replace(from, to).map_err(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -5641,7 +5721,7 @@ impl CommanderService {
     }
     fn handle_local_chmod(&self, body: Value) -> ApiReply {
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
-        let base = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).map(|t| t.local_dir.clone())).unwrap_or_else(|| self.default_local_dir());
+        let base = self.active_local_dir(tab_id);
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let perm = body.get("permissions").or_else(|| body.get("mode")).and_then(|v| v.as_str()).unwrap_or("").to_string();
         if name.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Select an item first."})}; }
@@ -5672,13 +5752,49 @@ impl CommanderService {
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
         let base = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).map(|t| t.local_dir.clone()));
         let resolved = if let Some(b) = base {
-            match resolve_contained(&b, &path) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},}
-        } else { path.clone() };
+            match resolve_editor_local_path(&b, &path) {
+                Ok(p) => p,
+                Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
+            }
+        } else if is_saf_path(&path) {
+            match linscp_platform::parse_saf_document_uri(&path) {
+                Ok(parsed) if !parsed.documents.is_empty() => path.clone(),
+                _ => return ApiReply{ status: 400, payload: json!({"success": false, "error": "Invalid SAF document URI."})},
+            }
+        } else if Path::new(&path).is_absolute() {
+            if path.chars().any(char::is_control)
+                || Path::new(&path)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return ApiReply{ status: 400, payload: json!({"success": false, "error": "Invalid file path."})};
+            }
+            path.clone()
+        } else {
+            match resolve_contained(&self.active_local_dir(None), &path) {
+                Ok(p) => p,
+                Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
+            }
+        };
         let content = body.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let encoding_opt = body.get("encoding").and_then(Value::as_str);
         let eol_opt = body.get("eol").and_then(Value::as_str);
         let include_bom = body.get("bom").and_then(Value::as_bool);
-        let mtime_ns = body.get("base_mtime_ns").and_then(|v| v.as_i64()).map(|v| v as i128).or_else(|| body.get("base_mtime").and_then(|v| v.as_i64()).map(|v| (v as i128)*1_000_000_000));
+        let mtime_ns = body
+            .get("base_mtime_ns")
+            .and_then(|v| {
+                v.as_i64()
+                    .map(|n| n as i128)
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<i128>().ok()))
+            })
+            .or_else(|| {
+                body.get("base_mtime")
+                    .and_then(|v| {
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                    })
+                    .map(|v| (v as i128) * 1_000_000_000)
+            });
         // A granted document writes through the bridge; a plain path keeps
         // the direct writer and its permission-bit recovery.
         if is_saf_path(&resolved) {
@@ -5994,17 +6110,14 @@ impl CommanderService {
         let tab_opt = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).cloned());
         if side == "local" || tab_opt.as_ref().is_some_and(|t| t.is_local && side == "remote") {
             let base = if side == "local" {
-                tab_opt
-                    .as_ref()
-                    .map(|t| t.local_dir.clone())
-                    .unwrap_or_else(|| self.default_local_dir())
+                self.active_local_dir(tab_id)
             } else {
                 tab_opt
                     .as_ref()
                     .map(|t| t.other_local_dir.clone())
                     .unwrap_or_default()
             };
-            let resolved = match resolve_contained(&base, raw_path) {
+            let resolved = match resolve_editor_local_path(&base, raw_path) {
                 Ok(p) => p,
                 Err(e) => return api_error(400, e),
             };
@@ -6464,7 +6577,7 @@ impl CommanderService {
         let base = query.get(dir_key).cloned()
             .or_else(|| body.get(dir_key).and_then(Value::as_str).map(str::to_string))
             .or_else(|| tab.as_ref().map(|tab| if local { tab.local_dir.clone() } else { tab.remote_dir.clone() }))
-            .unwrap_or_else(|| if local { self.default_local_dir() } else { "/".to_string() });
+            .unwrap_or_else(|| if local { self.active_local_dir(tab_id) } else { "/".to_string() });
         let base = base.trim().to_string();
         if base.is_empty() {
             return Err(api_error(400, "The panel directory of this drop is not set."));
@@ -7084,12 +7197,33 @@ impl CommanderService {
         let old = body.get("old_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let new = body.get("new_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if tab.is_local {
+            if old.is_empty() || new.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Both names are required"})}; }
             let src = match resolve_contained(&tab.other_local_dir, &old) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
             let dst = match resolve_contained(&tab.other_local_dir, &new) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
+            let overwrite = body.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
+            if src.starts_with("content://") || dst.starts_with("content://") {
+                if src != dst && self.local_fs.stat(&dst).is_ok() {
+                    if !overwrite {
+                        return ApiReply{ status: 400, payload: json!({
+                            "success": false,
+                            "conflict": true,
+                            "error": format!("An item already exists at {dst}."),
+                        })};
+                    }
+                    let is_dir = self.local_fs.stat(&dst).map(|e| e.is_dir).unwrap_or(false);
+                    let del = if is_dir { self.local_fs.remove_dir_all(&dst) } else { self.local_fs.remove_file(&dst) };
+                    if let Err(e) = del {
+                        return ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})};
+                    }
+                }
+                return match self.local_fs.rename(&src, &new) {
+                    Ok(_) => ApiReply{ status: 200, payload: json!({"success": true})},
+                    Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})},
+                };
+            }
             // The other local pane renames through the same move, so neither
             // pane can overwrite an entry without the confirmation the other one
             // requires.
-            let overwrite = body.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
             match Self::rename_local_path(Path::new(&src), Path::new(&dst), overwrite) {
                 Ok(())=> ApiReply{ status:200, payload: json!({"success": true})},
                 Err(e)=> ApiReply{ status:400, payload: json!({"success": false, "conflict": e.ends_with(":conflict"), "error": Self::rename_error_message(&e)})},
@@ -10101,7 +10235,10 @@ fn resolve_contained(base: &str, name: &str) -> Result<String, String> {
     if is_saf_path(base) {
         let base = base.trim_end_matches('/');
         linscp_platform::parse_saf_document_uri(base).map_err(|error| error.to_string())?;
-        return Ok(format!("{base}/document/{name}"));
+        return Ok(format!(
+            "{base}/document/{}",
+            linscp_platform::encode_saf_segment(name)
+        ));
     }
     if base.is_empty() || !Path::new(base).is_absolute() { return Err("The local directory of this panel is not set.".to_string()); }
     let base_path = Path::new(base);
@@ -10114,6 +10251,57 @@ fn resolve_contained(base: &str, name: &str) -> Result<String, String> {
     let target_str = target_abs.to_string_lossy().to_string();
     if !target_str.starts_with(&base_str) { return Err("The path is outside the panel directory.".to_string()); }
     Ok(target_str)
+}
+
+/// Resolves an editor target inside `base`, accepting either a single leaf
+/// name (`"note.txt"`) or the full child path/URI that the Commander GUI
+/// constructs via `joinPath(state[side].path, entry.name)`.
+fn resolve_editor_local_path(base: &str, raw_path: &str) -> Result<String, String> {
+    if raw_path.is_empty() {
+        return Err("No file given".to_string());
+    }
+    if is_saf_path(raw_path) {
+        if !is_saf_path(base) {
+            return Err("The path is outside the panel directory.".to_string());
+        }
+        let parsed_base =
+            linscp_platform::parse_saf_document_uri(base.trim_end_matches('/'))
+                .map_err(|error| error.to_string())?;
+        let parsed_target = linscp_platform::parse_saf_document_uri(raw_path)
+            .map_err(|error| error.to_string())?;
+        if parsed_target.documents.is_empty()
+            || parsed_target.tree_uri() != parsed_base.tree_uri()
+        {
+            return Err("The path is outside the panel directory.".to_string());
+        }
+        return Ok(raw_path.to_string());
+    }
+    let candidate = Path::new(raw_path);
+    if candidate.is_absolute() && !is_saf_path(base) {
+        if raw_path.chars().any(char::is_control)
+            || candidate.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err("The path is outside the panel directory.".to_string());
+        }
+        let base_path = Path::new(base);
+        if let (Some(parent), Some(leaf)) =
+            (candidate.parent(), candidate.file_name().and_then(|n| n.to_str()))
+        {
+            let same_parent = parent == base_path
+                || (parent.canonicalize().ok().is_some()
+                    && parent.canonicalize().ok() == base_path.canonicalize().ok());
+            if same_parent {
+                return resolve_contained(base, leaf);
+            }
+        }
+        return Err("The path is outside the panel directory.".to_string());
+    }
+    resolve_contained(base, raw_path)
 }
 /// The names a remote operation targets: an object list (`names: [{name}]`),
 /// a string list, or a single `name`. Order is kept and duplicates removed.
@@ -17550,5 +17738,147 @@ mod tests {
         assert_eq!(internal["tunnel_username"], "bastion");
         assert_eq!(internal["proxy_method"], "CMD");
         assert_eq!(internal["proxy_command"], "ssh -W 10.20.30.40:22 proxy.example");
+    }
+
+    #[tokio::test]
+    async fn local_and_dual_local_navigation_editor_conflict_rename_overwrite_and_backup_save_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("cfg");
+        let left_root = tmp.path().join("left");
+        let left_sub = left_root.join("sub");
+        let right_root = tmp.path().join("right");
+        let right_sub = right_root.join("sub");
+        let export_dir = tmp.path().join("exports");
+        for d in [&cfg, &left_sub, &right_sub, &export_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let _ = linscp_platform::terminal::set_local_permissions(&export_dir, 0o755);
+        let export_dir_mode_before = gui_os::stat_extended(&export_dir).unwrap().mode & 0o777;
+
+        let svc = CommanderService::new(cfg, Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
+
+        // 1. Navigating before opening any tab updates `current_local_dir`, so `mkdir`
+        //    and `rename` (with `overwrite: true`) act in the listed folder.
+        let list_no_tab = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: format!("/api/local/list?path={}&tab=", tabs::percent_encode_userinfo(&left_sub.to_string_lossy())),
+            body: json!({}),
+        });
+        assert_eq!(list_no_tab.status, 200, "{}", list_no_tab.payload);
+        let mk_no_tab = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/mkdir".into(),
+            body: json!({"tab": "", "name": "created-here"}),
+        });
+        assert_eq!(mk_no_tab.status, 200, "{}", mk_no_tab.payload);
+        assert!(left_sub.join("created-here").is_dir());
+        assert!(!left_root.join("created-here").exists());
+
+        std::fs::write(left_sub.join("src.txt"), b"winner").unwrap();
+        std::fs::write(left_sub.join("dst.txt"), b"old").unwrap();
+        let conflict_ren = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/rename".into(),
+            body: json!({"tab": "", "old_name": "src.txt", "new_name": "dst.txt"}),
+        });
+        assert_eq!(conflict_ren.status, 400);
+        assert_eq!(conflict_ren.payload["conflict"], true);
+        let confirmed_ren = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/rename".into(),
+            body: json!({"tab": "", "old_name": "src.txt", "new_name": "dst.txt", "overwrite": true}),
+        });
+        assert_eq!(confirmed_ren.status, 200, "{}", confirmed_ren.payload);
+        assert!(!left_sub.join("src.txt").exists(), "source must be moved, not left behind");
+        assert_eq!(std::fs::read(left_sub.join("dst.txt")).unwrap(), b"winner");
+
+        // 2. Local-to-local tab: navigating both panes into subfolders updates both
+        //    `tab.local_dir` and `tab.other_local_dir`; GUI joined-path edits & saves
+        //    work on BOTH panes and enforce string `base_mtime_ns` conflict checks.
+        let open = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/tabs/open".into(),
+            body: json!({"session": {"protocol": "local", "local_dir": left_root, "other_local_dir": right_root}}),
+        }).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let tab_id = open.payload["tab"]["id"].as_u64().unwrap();
+
+        assert_eq!(svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: format!("/api/local/list?path={}&tab={tab_id}", tabs::percent_encode_userinfo(&left_sub.to_string_lossy())),
+            body: json!({}),
+        }).status, 200);
+        assert_eq!(svc.dispatch_async(ApiEnvelope {
+            method: "GET".into(),
+            path: format!("/api/remote/list?path={}&tab={tab_id}", tabs::percent_encode_userinfo(&right_sub.to_string_lossy())),
+            body: json!({}),
+        }).await.status, 200);
+
+        let left_joined = format!("{}/dst.txt", left_sub.to_string_lossy());
+        let left_edit = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: format!("/api/local/edit?tab={tab_id}&path={}", tabs::percent_encode_userinfo(&left_joined)),
+            body: json!({}),
+        });
+        assert_eq!(left_edit.status, 200, "{}", left_edit.payload);
+        let mtime_ns_str = left_edit.payload["info"]["mtime_ns"].as_str().unwrap().to_string();
+        let stale_ns_str = (mtime_ns_str.parse::<i128>().unwrap() - 1).to_string();
+
+        // String `base_mtime_ns` (as sent by the GUI) must reject stale saves!
+        let stale_save = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/save".into(),
+            body: json!({"tab": tab_id, "path": left_joined, "content": "stale\n", "base_mtime_ns": stale_ns_str}),
+        });
+        assert_eq!(stale_save.status, 400, "{}", stale_save.payload);
+        assert!(stale_save.payload["error"].as_str().unwrap_or("").contains("changed while it was open"));
+
+        let good_save = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/save".into(),
+            body: json!({"tab": tab_id, "path": left_joined, "content": "fresh-left\n", "base_mtime_ns": mtime_ns_str}),
+        });
+        assert_eq!(good_save.status, 200, "{}", good_save.payload);
+        assert_eq!(std::fs::read(left_sub.join("dst.txt")).unwrap(), b"fresh-left\n");
+
+        // Right pane of local-to-local tab (`/api/remote/edit` + `/api/remote/save` on non-SAF OS dir).
+        std::fs::write(right_sub.join("right.txt"), b"right-initial\n").unwrap();
+        let right_joined = format!("{}/right.txt", right_sub.to_string_lossy());
+        let right_edit = svc.dispatch_async(ApiEnvelope {
+            method: "GET".into(),
+            path: format!("/api/remote/edit?tab={tab_id}&path={}", tabs::percent_encode_userinfo(&right_joined)),
+            body: json!({}),
+        }).await;
+        assert_eq!(right_edit.status, 200, "{}", right_edit.payload);
+        let right_mtime_ns = right_edit.payload["info"]["mtime_ns"].as_str().unwrap().to_string();
+
+        let right_save = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/save".into(),
+            body: json!({"tab": tab_id, "path": right_joined, "content": "right-saved\n", "base_mtime_ns": right_mtime_ns}),
+        }).await;
+        assert_eq!(right_save.status, 200, "{}", right_save.payload);
+        assert_eq!(std::fs::read(right_sub.join("right.txt")).unwrap(), b"right-saved\n");
+
+        // Outside-directory path must still be rejected.
+        let outside = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: format!("/api/local/edit?tab={tab_id}&path={}", tabs::percent_encode_userinfo(&right_joined)),
+            body: json!({}),
+        });
+        assert_eq!(outside.status, 400);
+
+        // 3. `/api/backup/export` with `save_dir` writes directly to disk without altering `export_dir` mode.
+        let exported = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/backup/export".into(),
+            body: json!({"password": "strong-backup-passphrase", "save_dir": export_dir}),
+        });
+        assert_eq!(exported.status, 200, "{}", exported.payload);
+        let saved_path = PathBuf::from(exported.payload["saved_path"].as_str().expect("saved_path"));
+        assert!(saved_path.is_file());
+        let export_dir_mode_after = gui_os::stat_extended(&export_dir).unwrap().mode & 0o777;
+        assert_eq!(export_dir_mode_after, export_dir_mode_before);
     }
 }

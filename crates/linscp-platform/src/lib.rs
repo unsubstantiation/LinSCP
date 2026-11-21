@@ -115,15 +115,6 @@ mod fallback_unix {
         Ok(())
     }
 
-    pub fn list_roots() -> Vec<LocalRootEntry> {
-        vec![LocalRootEntry {
-            path: "/".to_string(),
-            label: "/".to_string(),
-            kind: "filesystem".to_string(),
-            read_only: false,
-        }]
-    }
-
     pub fn open_regular_file_no_follow(path: &Path) -> Option<File> {
         let file = OpenOptions::new().read(true).write(true).open(path).ok()?;
         let metadata = file.metadata().ok()?;
@@ -338,15 +329,44 @@ impl<'a> SafDocumentPath<'a> {
     }
 }
 
+/// Escapes URI-reserved characters (`%`, `?`, `#`, `/`) in a single SAF child
+/// display name so appending `/document/<encoded>` preserves literal `%XX`,
+/// `?`, and `#` characters across `Uri.parse` and `percent_decode_saf`.
+pub fn encode_saf_segment(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '?' => out.push_str("%3F"),
+            '#' => out.push_str("%23"),
+            '/' => out.push_str("%2F"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn saf_segment_has_dot_traversal(decoded: &str) -> bool {
+    decoded.is_empty()
+        || decoded.chars().any(char::is_control)
+        || decoded
+            .split(['/', '\\', ':'])
+            .any(|part| part == "." || part == "..")
+}
+
 /// Parses `content://authority/tree/<tree>[/document/<id>[/document/<id>...]]`.
 pub fn parse_saf_document_uri(uri: &str) -> Result<SafDocumentPath<'_>, PlatformError> {
     let unsupported = || PlatformError::UnsupportedUri(uri.to_string());
-    if uri.contains("..") || uri.contains('\0') || uri.chars().any(char::is_control) {
+    if uri.contains('\0')
+        || uri.contains('?')
+        || uri.contains('#')
+        || uri.chars().any(char::is_control)
+    {
         return Err(unsupported());
     }
     let rest = uri.strip_prefix("content://").ok_or_else(unsupported)?;
     let (authority, path) = rest.split_once('/').ok_or_else(unsupported)?;
-    if authority.is_empty() {
+    if authority.is_empty() || authority == "." || authority == ".." {
         return Err(unsupported());
     }
     let tree_and_rest = path.strip_prefix("tree/").ok_or_else(unsupported)?;
@@ -354,14 +374,14 @@ pub fn parse_saf_document_uri(uri: &str) -> Result<SafDocumentPath<'_>, Platform
         Some((tree, tail)) => (tree, tail),
         None => (tree_and_rest, ""),
     };
-    if tree.is_empty() {
+    if tree.is_empty() || saf_segment_has_dot_traversal(&percent_decode_saf(tree)) {
         return Err(unsupported());
     }
     let mut documents = Vec::new();
     if !tail.is_empty() {
         let document = tail.strip_prefix("document/").ok_or_else(unsupported)?;
         for segment in document.split("/document/") {
-            if segment.is_empty() {
+            if segment.is_empty() || saf_segment_has_dot_traversal(&percent_decode_saf(segment)) {
                 return Err(unsupported());
             }
             documents.push(segment);
@@ -410,7 +430,18 @@ fn saf_rename(
     from: &str,
     to: &str,
 ) -> Result<(), PlatformError> {
-    if to.starts_with("content://") || to.contains('/') || to == "." || to == ".." {
+    let parsed = parse_saf_document_uri(from)?;
+    if parsed.documents.is_empty() {
+        return Err(PlatformError::UnsupportedUri(from.to_string()));
+    }
+    if to.is_empty()
+        || to.starts_with("content://")
+        || to.contains('/')
+        || to.contains('\\')
+        || to.chars().any(char::is_control)
+        || to == "."
+        || to == ".."
+    {
         return Err(PlatformError::UnsupportedUri(to.to_string()));
     }
     bridge.rename_uri(from, to)?;
@@ -508,6 +539,7 @@ impl LocalFs for NativeLocalFs {
 
     fn list_dir(&self, path: &str) -> Result<Vec<FileEntry>, PlatformError> {
         if path.starts_with("content://") {
+            let _ = parse_saf_document_uri(path)?;
             if let Some(bridge) = self.saf.as_deref() {
                 return bridge.list_tree(path);
             }
@@ -529,6 +561,7 @@ impl LocalFs for NativeLocalFs {
 
     fn stat(&self, path: &str) -> Result<FileEntry, PlatformError> {
         if path.starts_with("content://") {
+            let _ = parse_saf_document_uri(path)?;
             if let Some(bridge) = self.saf.as_deref() {
                 return bridge.stat_uri(path);
             }
@@ -556,6 +589,10 @@ impl LocalFs for NativeLocalFs {
 
     fn remove_file(&self, path: &str) -> Result<(), PlatformError> {
         if path.starts_with("content://") {
+            let parsed = parse_saf_document_uri(path)?;
+            if parsed.documents.is_empty() {
+                return Err(PlatformError::UnsupportedUri(path.to_string()));
+            }
             if let Some(bridge) = self.saf.as_deref() {
                 return bridge.delete_uri(path);
             }
@@ -567,6 +604,10 @@ impl LocalFs for NativeLocalFs {
 
     fn remove_dir_all(&self, path: &str) -> Result<(), PlatformError> {
         if path.starts_with("content://") {
+            let parsed = parse_saf_document_uri(path)?;
+            if parsed.documents.is_empty() {
+                return Err(PlatformError::UnsupportedUri(path.to_string()));
+            }
             if let Some(bridge) = self.saf.as_deref() {
                 return bridge.delete_uri(path);
             }
@@ -588,6 +629,10 @@ impl LocalFs for NativeLocalFs {
 
     fn read_bytes(&self, path: &str) -> Result<Vec<u8>, PlatformError> {
         if path.starts_with("content://") {
+            let parsed = parse_saf_document_uri(path)?;
+            if parsed.documents.is_empty() {
+                return Err(PlatformError::UnsupportedUri(path.to_string()));
+            }
             if let Some(bridge) = self.saf.as_deref() {
                 return bridge.read_uri_bytes(path);
             }
@@ -665,6 +710,10 @@ impl LocalFs for NativeLocalFs {
             std::fs::create_dir_all(resolve_os_path(&parent.to_string_lossy()))?;
         }
         if source.starts_with("content://") {
+            let parsed = parse_saf_document_uri(source)?;
+            if parsed.documents.is_empty() {
+                return Err(PlatformError::UnsupportedUri(source.to_string()));
+            }
             let Some(bridge) = self.saf.as_deref() else {
                 return Err(PlatformError::UnsupportedUri(source.to_string()));
             };
@@ -790,6 +839,10 @@ impl LocalFs for NativeLocalFs {
         if !source.starts_with("content://") && dest.starts_with("content://") {
             return self.publish_from_file(Path::new(source), dest);
         }
+        let parsed_src = parse_saf_document_uri(source)?;
+        if parsed_src.documents.is_empty() {
+            return Err(PlatformError::UnsupportedUri(source.to_string()));
+        }
         let parsed = parse_saf_document_uri(dest)?;
         if parsed.documents.is_empty() {
             return Err(PlatformError::UnsupportedUri(dest.to_string()));
@@ -874,6 +927,43 @@ pub fn write_private_file_atomic(target: &Path, content: &[u8]) -> Result<(), Pl
         return Err(err);
     }
     Ok(())
+}
+
+/// Atomically writes a sensitive file (such as an encrypted backup export)
+/// with owner-only (`0600` / owner-only DACL) file permissions into an
+/// arbitrary user directory WITHOUT altering the parent directory's existing
+/// permissions or Windows DACL.
+pub fn write_owner_only_file_atomic(target: &Path, content: &[u8]) -> Result<(), PlatformError> {
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(resolve_os_path(&parent.to_string_lossy()))?;
+
+    let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = target
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "linscp".to_string());
+    let temp_path = parent.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
+
+    {
+        let mut file = sys::open_private_temp_file(&resolve_os_path(&temp_path.to_string_lossy()))?;
+        file.write_all(content)?;
+        file.sync_all()?;
+    }
+
+    if let Err(err) = sys::atomic_replace(&temp_path, target) {
+        let _ = std::fs::remove_file(resolve_os_path(&temp_path.to_string_lossy()));
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Atomically replaces `target_path` with `temp_path` on the same filesystem
+/// (handling Windows `MOVEFILE_REPLACE_EXISTING` and extended-length paths).
+pub fn atomic_replace_file(temp_path: &Path, target_path: &Path) -> Result<(), PlatformError> {
+    sys::atomic_replace(temp_path, target_path)
 }
 
 /// Publishes `source` at `target` when, and only when, nothing exists there.
@@ -1407,6 +1497,65 @@ mod tests {
         assert_eq!(staged, total as u64);
         assert_eq!(std::fs::read(&local_roundtrip).unwrap(), payload);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saf_uri_parser_allows_double_dots_in_names_and_rejects_traversal_and_raw_providers() {
+        let tree = "content://mock.tree/tree/primary%3ADownload";
+        // Legitimate filenames containing consecutive dots must not be rejected.
+        let double_dot = format!("{tree}/document/notes..txt");
+        assert_eq!(
+            parse_saf_document_uri(&double_dot).unwrap().leaf_name(),
+            "notes..txt"
+        );
+        // Special URI characters round-trip through encode_saf_segment -> leaf_name.
+        let tricky = "budget_50%#1?.csv";
+        let encoded_uri = format!("{tree}/document/{}", encode_saf_segment(tricky));
+        assert_eq!(
+            parse_saf_document_uri(&encoded_uri).unwrap().leaf_name(),
+            tricky
+        );
+
+        // Actual dot-segment traversal (literal or percent-encoded) must be rejected.
+        assert!(parse_saf_document_uri(&format!("{tree}/document/..")).is_err());
+        assert!(parse_saf_document_uri(&format!("{tree}/document/%2e%2e")).is_err());
+        assert!(parse_saf_document_uri(&format!("{tree}/document/sub%2F..%2Fsecret")).is_err());
+        assert!(parse_saf_document_uri("content://com.android.contacts/contacts/1").is_err());
+
+        // NativeLocalFs refuses non-tree providers and refuses deleting/renaming the tree root.
+        let fs = NativeLocalFs::with_saf(std::sync::Arc::new(MockSaf::default()));
+        assert!(fs.stat("content://com.android.contacts/contacts/1").is_err());
+        assert!(fs.read_bytes("content://com.android.contacts/contacts/1").is_err());
+        assert!(fs.remove_file(tree).is_err());
+        assert!(fs.remove_dir_all(tree).is_err());
+        assert!(fs.rename(tree, "renamed").is_err());
+    }
+
+    #[test]
+    fn write_owner_only_file_atomic_preserves_parent_directory_permissions() {
+        let dir = std::env::temp_dir().join(format!(
+            "linscp-owner-file-test-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let target = dir.join("export.lscpbak");
+        write_owner_only_file_atomic(&target, b"encrypted-payload").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"encrypted-payload");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            let file_mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o755, "parent folder mode must not be tightened to 0700");
+            assert_eq!(file_mode, 0o600, "exported file itself must remain 0600");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

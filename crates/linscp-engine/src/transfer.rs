@@ -1322,7 +1322,11 @@ pub fn safe_tree_name(name: &str) -> Result<(), String> {
 /// built, so every `/document/` segment inverts exactly. Shared with the
 /// sync planner, which walks granted trees the same way.
 pub(crate) fn join_saf_child(dir_uri: &str, name: &str) -> String {
-    format!("{}/document/{}", dir_uri.trim_end_matches('/'), name)
+    format!(
+        "{}/document/{}",
+        dir_uri.trim_end_matches('/'),
+        linscp_platform::encode_saf_segment(name)
+    )
 }
 
 /// The leaf of a granted URI, for messages that name a file.

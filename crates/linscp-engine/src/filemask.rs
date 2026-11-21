@@ -9,20 +9,51 @@ pub fn has_wildcard(path: &str) -> bool {
     path.contains('*') || path.contains('?')
 }
 
-/// Iterative wildcard matcher supporting `*` and `?` (case-sensitive).
+/// Iterative wildcard matcher supporting `*` and `?` (case-sensitive, Unicode-scalar aware).
 pub fn matches_wildcard(mask: &str, name: &str) -> bool {
-    let m = mask.as_bytes();
-    let n = name.as_bytes();
+    if mask.is_ascii() && name.is_ascii() {
+        let m = mask.as_bytes();
+        let n = name.as_bytes();
+        let mut mi = 0usize;
+        let mut ni = 0usize;
+        let mut last_star: Option<usize> = None;
+        let mut retry_ni = 0usize;
+
+        while ni < n.len() {
+            if mi < m.len() && (m[mi] == b'?' || m[mi] == n[ni]) {
+                mi += 1;
+                ni += 1;
+            } else if mi < m.len() && m[mi] == b'*' {
+                last_star = Some(mi);
+                mi += 1;
+                retry_ni = ni;
+            } else if let Some(star_pos) = last_star {
+                mi = star_pos + 1;
+                retry_ni += 1;
+                ni = retry_ni;
+            } else {
+                return false;
+            }
+        }
+
+        while mi < m.len() && m[mi] == b'*' {
+            mi += 1;
+        }
+        return mi == m.len();
+    }
+
+    let m: Vec<char> = mask.chars().collect();
+    let n: Vec<char> = name.chars().collect();
     let mut mi = 0usize;
     let mut ni = 0usize;
     let mut last_star: Option<usize> = None;
     let mut retry_ni = 0usize;
 
     while ni < n.len() {
-        if mi < m.len() && (m[mi] == b'?' || m[mi] == n[ni]) {
+        if mi < m.len() && (m[mi] == '?' || m[mi] == n[ni]) {
             mi += 1;
             ni += 1;
-        } else if mi < m.len() && m[mi] == b'*' {
+        } else if mi < m.len() && m[mi] == '*' {
             last_star = Some(mi);
             mi += 1;
             retry_ni = ni;
@@ -35,7 +66,7 @@ pub fn matches_wildcard(mask: &str, name: &str) -> bool {
         }
     }
 
-    while mi < m.len() && m[mi] == b'*' {
+    while mi < m.len() && m[mi] == '*' {
         mi += 1;
     }
     mi == m.len()
@@ -43,7 +74,11 @@ pub fn matches_wildcard(mask: &str, name: &str) -> bool {
 
 /// Case-insensitive wildcard matcher used by host and preset rules.
 pub fn matches_wildcard_icase(mask: &str, name: &str) -> bool {
-    matches_wildcard(&mask.to_ascii_lowercase(), &name.to_ascii_lowercase())
+    if mask.is_ascii() && name.is_ascii() {
+        matches_wildcard(&mask.to_ascii_lowercase(), &name.to_ascii_lowercase())
+    } else {
+        matches_wildcard(&mask.to_lowercase(), &name.to_lowercase())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -870,5 +905,14 @@ mod tests {
             0o544
         );
         assert_eq!(parse_permissions_expr("u=", 0o4755, false).unwrap(), 0o055);
+    }
+
+    #[test]
+    fn wildcard_question_mark_matches_single_unicode_character() {
+        assert!(matches_wildcard("?.txt", "ä.txt"));
+        assert!(matches_wildcard("?.txt", "日.txt"));
+        assert!(!matches_wildcard("??.txt", "ä.txt"));
+        assert!(matches_wildcard_icase("?.txt", "Ä.TXT"));
+        assert!(matches_wildcard_icase("ü*.md", "Übersicht.MD"));
     }
 }

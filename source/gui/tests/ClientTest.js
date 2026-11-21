@@ -240,16 +240,23 @@ function propertiesBody(options) {
 function vaultBackupBody(path, options) {
   let request = {};
   try { request = JSON.parse((options && options.body) || '{}'); } catch (error) {}
-  if (path === '/api/backup/export') return { success: true, filename: 'backup.lscpbak', data_base64: 'TFNDUEJBSzE=' };
+  if (path === '/api/backup/export') {
+    const out = { success: true, filename: 'backup.lscpbak', data_base64: 'TFNDUEJBSzE=' };
+    if (request.save_dir) out.saved_path = request.save_dir.replace(/\/+$/, '') + '/backup.lscpbak';
+    return out;
+  }
   if (path === '/api/backup/import') return { success: true };
   if (path === '/api/vault/export') {
-    return { success: true,
-      filename: request.plain_text
-        ? 'key_session_2026-11-15_00-00-00.json'
-        : 'key_session_2026-11-15_00-00-00.json.aes',
+    const filename = request.plain_text
+      ? 'key_session_2026-11-15_00-00-00.json'
+      : 'key_session_2026-11-15_00-00-00.json.aes';
+    const out = { success: true,
+      filename: filename,
       data_base64: 'W10=',
       entry_count: (request.sessions || []).length,
       plain_text: !!request.plain_text };
+    if (request.save_dir) out.saved_path = request.save_dir.replace(/\/+$/, '') + '/' + filename;
+    return out;
   }
   if (path === '/api/vault/scan') {
     return { success: true, encrypted: false, fingerprint: 'b'.repeat(64), ignored_entries: 1,
@@ -4425,6 +4432,37 @@ function options(id) {
       text('hostKeyFingerprint') === 'ssh-ed25519 SHA256:wschal');
     await window.cancelHostKey();
     responses['/api/workspaces/open'] = prevWsOpen;
+
+    // 7. SAF joinPath escapes URI-reserved characters (`%`, `?`, `#`, `/`).
+    const safJoined = window.joinPath(
+      'content://com.android.externalstorage.documents/tree/primary%3ADownload',
+      'budget_50%#1?.csv'
+    );
+    check('joinPath escapes reserved URI characters inside SAF document segments',
+      safJoined === 'content://com.android.externalstorage.documents/tree/primary%3ADownload/document/budget_50%25%231%3F.csv');
+
+    // 8. Native backup export with `saved_path` refreshes local pane without blob navigation.
+    const prevBackupExport = responses['/api/backup/export'];
+    responses['/api/backup/export'] = {
+      success: true,
+      filename: 'linscp-full-backup-direct.lscpbak',
+      saved_path: '/tmp/slowlocal/linscp-full-backup-direct.lscpbak',
+      data_base64: 'TFNDUEJBSzE='
+    };
+    const listsBeforeExport = calls.filter(c => c.path && c.path.startsWith('/api/local/list')).length;
+    window.openFullBackup();
+    doc.getElementById('fullBackupPassword').value = 'direct-save-password';
+    doc.getElementById('fullBackupConfirm').value = 'direct-save-password';
+    await window.exportFullBackup();
+    const directExportCall = calls.filter(c => c.path === '/api/backup/export').pop();
+    const listsAfterExport = calls.filter(c => c.path && c.path.startsWith('/api/local/list')).length;
+    check('full backup passes save_dir and refreshes local pane when saved_path is returned',
+      directExportCall &&
+      typeof JSON.parse(directExportCall.options.body).save_dir === 'string' &&
+      listsAfterExport > listsBeforeExport &&
+      text('fullBackupStatus').includes('Encrypted backup download started.'));
+    window.closeFullBackup();
+    responses['/api/backup/export'] = prevBackupExport;
   }
 
   check('no script errors', errors.length === 0, errors.join(' | '));
