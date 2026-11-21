@@ -823,17 +823,11 @@ mod tests {
             std::process::id()
         ));
         // Construct a valid XML session log whose `len - 64` offset lands inside a 4-byte UTF-8 sequence (`🚀`).
-        // Everything after `tail_start` has 2 trailing continuation bytes + ASCII padding + `</session>\n` = 64 bytes.
-        let suffix_after_emoji = format!("{}</session>\n", "x".repeat(51)); // 51 + 11 = 62 bytes
-        let initial = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<session xmlns=\"http://winscp.net/schema/session/1.0\" name=\"s\" start=\"2026-01-01T00:00:00.000Z\">\n<!-- 🚀{suffix_after_emoji}"
-        );
-        // Replace closing of comment cleanly while keeping exact 64-byte tail split inside `🚀` (4 bytes: F0 9F 9A 80).
-        let body_pad = "a".repeat(47); // 47 + " -->\n" (5) + "</session>\n" (11) = 63 bytes -> 1 continuation byte in tail!
+        // 47 ASCII bytes + " -->\n" (5) + "</session>\n" (11) = 63 bytes -> 1 trailing continuation byte of `🚀` in tail!
+        let body_pad = "a".repeat(47);
         let initial = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<session xmlns=\"http://winscp.net/schema/session/1.0\" name=\"s\" start=\"2026-01-01T00:00:00.000Z\">\n<!-- 🚀{body_pad} -->\n</session>\n"
         );
-        let _ = suffix_after_emoji;
         let tail_start = initial.len() - 64;
         assert!(
             !initial.is_char_boundary(tail_start),

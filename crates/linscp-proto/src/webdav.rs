@@ -1830,7 +1830,7 @@ mod tests {
             username: None,
             password: None,
             remote_dns: true,
-            local_command: String::new(),
+            command: String::new(),
         };
         assert!(
             build_reqwest_proxy(&ipv6_proxy).expect("IPv6 SOCKS5h proxy URL must parse").is_some()

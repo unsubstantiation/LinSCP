@@ -17899,6 +17899,7 @@ mod tests {
 
     #[tokio::test]
     async fn skipped_moves_keep_sources_keepuptodate_cancels_and_saf_special_chars_copy() {
+        use std::time::Duration;
         let tmp = tempfile::tempdir().unwrap();
         let local_dir = tmp.path().join("local");
         std::fs::create_dir_all(&local_dir).unwrap();
@@ -17960,7 +17961,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let q = svc.queue.snapshot_json();
+        let q = svc.queue.snapshot();
         let tasks = q["transfers"].as_array().unwrap();
         let dl_task = tasks.iter().find(|t| t["id"].as_u64() == Some(dl_id)).unwrap();
         let ul_task = tasks.iter().find(|t| t["id"].as_u64() == Some(ul_id)).unwrap();
@@ -17981,7 +17982,7 @@ mod tests {
         let watch_id = watch_res.payload["task_id"].as_u64().unwrap();
 
         for _ in 0..80 {
-            let snap = svc.queue.snapshot_json();
+            let snap = svc.queue.snapshot();
             let st = snap["transfers"].as_array().unwrap().iter()
                 .find(|t| t["id"].as_u64() == Some(watch_id))
                 .and_then(|t| t["status"].as_str())
@@ -17998,7 +17999,7 @@ mod tests {
         });
         assert_eq!(cancel_res.status, 200, "{}", cancel_res.payload);
         for _ in 0..80 {
-            let snap = svc.queue.snapshot_json();
+            let snap = svc.queue.snapshot();
             let st = snap["transfers"].as_array().unwrap().iter()
                 .find(|t| t["id"].as_u64() == Some(watch_id))
                 .and_then(|t| t["status"].as_str())
@@ -18008,7 +18009,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let watch_after = svc.queue.snapshot_json()["transfers"].as_array().unwrap().iter()
+        let watch_after = svc.queue.snapshot()["transfers"].as_array().unwrap().iter()
             .find(|t| t["id"].as_u64() == Some(watch_id)).cloned().unwrap();
         assert_eq!(watch_after["status"], "Cancelled", "{watch_after}");
 
@@ -18020,7 +18021,7 @@ mod tests {
         }).await;
         let watch2_id = watch2_res.payload["task_id"].as_u64().unwrap();
         for _ in 0..80 {
-            let snap = svc.queue.snapshot_json();
+            let snap = svc.queue.snapshot();
             let st = snap["transfers"].as_array().unwrap().iter()
                 .find(|t| t["id"].as_u64() == Some(watch2_id))
                 .and_then(|t| t["status"].as_str())
@@ -18042,15 +18043,14 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let watch2_after = svc.queue.snapshot_json()["transfers"].as_array().unwrap().iter()
+        let watch2_after = svc.queue.snapshot()["transfers"].as_array().unwrap().iter()
             .find(|t| t["id"].as_u64() == Some(watch2_id)).cloned().unwrap();
         assert_eq!(watch2_after["status"], "Cancelled", "{watch2_after}");
 
         // 3. SAF local queue copy with `ConflictPolicy::Rename` on filenames containing `?`, `#`, and `%`.
-        let saf_bridge = Arc::new(MockBridge::new());
         let tricky = "report?v1#final%20.txt";
+        let saf_bridge = Arc::new(MockBridge::with_file(tricky, b"new saf copy"));
         saf_bridge.add_dir(&format!("{SAF_GRANTED_DIR}/document/dst"));
-        saf_bridge.add_file(&MockBridge::doc_uri(tricky), b"new saf copy");
         saf_bridge.add_file(
             &format!("{SAF_GRANTED_DIR}/document/dst/document/{}", linscp_platform::encode_saf_segment(tricky)),
             b"existing saf file",
@@ -18082,7 +18082,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let saf_task = saf_svc.queue.snapshot_json()["transfers"].as_array().unwrap().iter()
+        let saf_task = saf_svc.queue.snapshot()["transfers"].as_array().unwrap().iter()
             .find(|t| t["id"].as_u64() == Some(saf_copy_id)).cloned().unwrap();
         assert_eq!(saf_task["status"], "Completed", "{saf_task}");
         let renamed_uri = format!(
@@ -18119,10 +18119,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let perm_task = svc.queue.snapshot_json()["transfers"].as_array().unwrap().iter()
+        let perm_task = svc.queue.snapshot()["transfers"].as_array().unwrap().iter()
             .find(|t| t["id"].as_u64() == Some(perm_id)).cloned().unwrap();
         assert_eq!(perm_task["status"], "Completed", "{perm_task}");
-        if cfg!(unix) {
+        if !linscp_platform::is_windows_platform() {
             assert_eq!(gui_os::stat_extended(&perm_dst).unwrap().mode & 0o777, 0o600);
         }
     }
