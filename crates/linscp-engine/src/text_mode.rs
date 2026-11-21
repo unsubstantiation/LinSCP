@@ -137,7 +137,34 @@ pub fn has_utf8_bom(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0xEF, 0xBB, 0xBF])
 }
 
-/// Strictly decodes `bytes` from `encoding_label` into UTF-8 `(utf8_string, had_utf8_bom)`.
+pub const SUPPORTED_ENCODINGS: &[&str] = &[
+    "utf-8",
+    "utf-16le",
+    "utf-16be",
+    "windows-1252",
+    "iso-8859-1",
+    "iso-8859-15",
+    "windows-1251",
+    "koi8-r",
+    "shift_jis",
+    "euc-jp",
+    "gbk",
+    "big5",
+    "euc-kr",
+];
+
+/// Detects predominant line-ending style (`"crlf"`, `"cr"`, or `"lf"`).
+pub fn detect_eol_style(bytes: &[u8]) -> EolStyle {
+    if uses_pure_crlf(bytes) {
+        return EolStyle::Crlf;
+    }
+    if !bytes.contains(&b'\n') && bytes.contains(&b'\r') {
+        return EolStyle::Cr;
+    }
+    EolStyle::Lf
+}
+
+/// Strictly decodes `bytes` from `encoding_label` into UTF-8 `(utf8_string, had_bom)`.
 /// Any invalid byte sequence returns `Err` instead of inserting U+FFFD replacement characters.
 pub fn decode_to_utf8_strict(bytes: &[u8], encoding_label: &str) -> Result<(String, bool), String> {
     let label = encoding_label.trim();
@@ -152,27 +179,34 @@ pub fn decode_to_utf8_strict(bytes: &[u8], encoding_label: &str) -> Result<(Stri
 
     let enc = Encoding::for_label(label.as_bytes())
         .ok_or_else(|| format!("Unsupported character encoding '{label}'."))?;
-    let (cow, had_errors) = enc.decode_without_bom_handling_and_without_replacement(bytes).map_or_else(
+    let (slice, had_bom) = if enc == encoding_rs::UTF_16LE && bytes.starts_with(&[0xFF, 0xFE]) {
+        (&bytes[2..], true)
+    } else if enc == encoding_rs::UTF_16BE && bytes.starts_with(&[0xFE, 0xFF]) {
+        (&bytes[2..], true)
+    } else {
+        (bytes, false)
+    };
+    let (cow, had_errors) = enc.decode_without_bom_handling_and_without_replacement(slice).map_or_else(
         || (std::borrow::Cow::Borrowed(""), true),
         |c| (c, false),
     );
     if had_errors {
         return Err(format!("Invalid byte sequence for encoding '{label}'."));
     }
-    Ok((cow.into_owned(), false))
+    Ok((cow.into_owned(), had_bom))
 }
 
 /// Strictly encodes UTF-8 `text` into `encoding_label`, failing if any code point is unrepresentable.
 pub fn encode_from_utf8_strict(
     text: &str,
     encoding_label: &str,
-    include_utf8_bom: bool,
+    include_bom: bool,
 ) -> Result<Vec<u8>, String> {
     let label = encoding_label.trim();
     if label.is_empty() || label.eq_ignore_ascii_case("utf-8") || label.eq_ignore_ascii_case("utf8")
     {
-        let mut out = Vec::with_capacity(text.len() + if include_utf8_bom { 3 } else { 0 });
-        if include_utf8_bom {
+        let mut out = Vec::with_capacity(text.len() + if include_bom { 3 } else { 0 });
+        if include_bom {
             out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
         }
         out.extend_from_slice(text.as_bytes());
@@ -182,7 +216,27 @@ pub fn encode_from_utf8_strict(
     let enc = Encoding::for_label(label.as_bytes())
         .ok_or_else(|| format!("Unsupported character encoding '{label}'."))?;
     if enc == UTF_8 {
-        return encode_from_utf8_strict(text, "utf-8", include_utf8_bom);
+        return encode_from_utf8_strict(text, "utf-8", include_bom);
+    }
+    if enc == encoding_rs::UTF_16LE {
+        let mut out = Vec::with_capacity(text.len() * 2 + if include_bom { 2 } else { 0 });
+        if include_bom {
+            out.extend_from_slice(&[0xFF, 0xFE]);
+        }
+        for unit in text.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        return Ok(out);
+    }
+    if enc == encoding_rs::UTF_16BE {
+        let mut out = Vec::with_capacity(text.len() * 2 + if include_bom { 2 } else { 0 });
+        if include_bom {
+            out.extend_from_slice(&[0xFE, 0xFF]);
+        }
+        for unit in text.encode_utf16() {
+            out.extend_from_slice(&unit.to_be_bytes());
+        }
+        return Ok(out);
     }
     let (cow, _, had_errors) = enc.encode(text);
     if had_errors {

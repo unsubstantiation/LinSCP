@@ -18,58 +18,54 @@ In scope is the **client side** of LinSCP's GSSAPI use:
 
 Out of scope, but relevant to the threat model:
 
-- the GSSAPI implementations themselves (libssh and the system's MIT krb5
-  mechanism);
+- the underlying Kerberos mechanisms themselves (MIT/Heimdal `libgssapi_krb5.so.2`
+  loaded dynamically on Linux, and Windows `secur32.dll` SSPI Kerberos);
 - what an SSH server does with a delegated TGT (for OpenSSH, see
   `GSSAPICleanupCredentials`);
 - KDC policy.
 
-LinSCP never reads, copies, stores or logs ticket material itself. It turns
-libssh options on or off. libssh and the GSSAPI mechanism acquire the service
-ticket from the process's default credential cache (`KRB5CCNAME`) and build the
-forwarded credential.
+LinSCP never reads, copies, stores or logs raw Kerberos ticket keys itself. It
+invokes the platform's runtime GSSAPI (`gss_init_sec_context` + `gss_get_mic`)
+or Windows SSPI (`AcquireCredentialsHandleW` + `InitializeSecurityContextW` +
+`MakeSignature`) initiator APIs over RFC 4462 `gssapi-with-mic`, acquiring the
+service ticket from the OS user's default credential cache (`KRB5CCNAME` on
+Linux or the LSA logon session on Windows) and forwarding credentials only when
+explicitly requested.
 
 ## 2. Behaviour summary
 
 | Setting (upstream name) | Default | Effect |
 | --- | --- | --- |
-| `AuthGSSAPI` | on (as upstream) | `gssapi-with-mic` is tried first when the server offers it, before agent and key files, keyboard-interactive and password. If it fails, the next method is tried. |
-| `GSSAPIFwdTGT` | **off** | When `1`, LinSCP sets `SSH_OPTIONS_GSSAPI_DELEGATE_CREDENTIALS`. libssh then requests credential delegation from GSSAPI, and the mechanism sends a forwarded TGT in the client's first context token. |
-| `AuthGSSAPIKEX` | off | Offers the RFC 4462 `gss-*` key exchanges. The server is then authenticated by Kerberos instead of a host key. This is refused when a host key is pinned, and refused when the loaded libssh cannot honour it. |
-| `LogicalHostName` | empty | Selects the service principal (`host/<name>`) via `SSH_OPTIONS_GSSAPI_SERVER_IDENTITY`. It never changes where the TCP connection goes. Whitespace and control characters are rejected. |
+| `AuthGSSAPI` | on (as upstream) | `gssapi-with-mic` is tried first when the server offers it and a runtime GSSAPI/SSPI library is available, before agent and key files, keyboard-interactive and password. If it fails, the next method is tried. |
+| `GSSAPIFwdTGT` | **off** | When `1`, LinSCP passes `delegate_creds = true`, setting `GSS_C_DELEG_FLAG` (Linux GSSAPI) or `ISC_REQ_DELEGATE` (Windows SSPI) so the mechanism includes a forwarded TGT in the context token. |
+| `AuthGSSAPIKEX` | off | Parsed and validated fail-closed: refused when a host key is pinned, and refused on every build because RFC 4462 `gss-*` key exchange is intentionally unwired. |
+| `LogicalHostName` | empty | Overrides the target SPN host (`host@<name>` on Linux GSSAPI, `HOST/<name>` on Windows SSPI) without changing where the TCP connection goes. Whitespace and control characters are rejected. |
 
 Facts a reviewer should confirm:
 
-1. **No client identity is pinned.** `SSH_OPTIONS_GSSAPI_CLIENT_IDENTITY` is
-   never set, so the default principal of the credential cache is used. That
-   includes a principal of another realm (see the cross-realm test).
+1. **No client identity is pinned.** Default initiator credentials are acquired,
+   so the default principal of the credential cache / Windows logon session is
+   used (including cross-realm principals).
 2. **The delegated TGT belongs to the client's home realm.** Delegating to a
    server in a trusting realm gives that server `krbtgt/HOME@HOME`, not a
-   ticket limited to the server's realm. The cross-realm test asserts this.
+   ticket limited to the server's realm.
 3. **The jump host receives the TGT too.** With an SSH jump host and
-   `GSSAPIFwdTGT=1`, the TGT is delegated to the jump host as well as to the
-   destination. `SshJumpTunnel::Start` and `SshJumpTunnel::StartSocks` copy the
-   destination's whole GSSAPI policy except `LogicalHostName`. This matches
-   the upstream implementation: `TSessionData::CreateTunnelData` copies
-   `AuthGSSAPI`, `AuthGSSAPIKEX` and `GSSAPIFwdTGT` into the tunnel
-   session.
-4. **The delegation notice is not shown by default.** "Kerberos credentials
-   will be delegated to the server (GSSAPIFwdTGT)" goes through
-   `Console::LogEvent`. It appears only with `-verbose` or in a `-log` file.
+   `GSSAPIFwdTGT=1`, `build_ssh_configs` propagates the session's GSSAPI
+   settings (except `LogicalHostName`, which targets the destination host) to
+   the jump-host SSH configuration, matching upstream `TSessionData::CreateTunnelData`.
+4. **The delegation notice is logged in SSH event logs.** When `delegate_creds`
+   is true, the SSH client records the delegation notice in the session event log.
 5. **Delegation happens before authorization.** The forwarded TGT travels in
-   the first `gssapi-with-mic` token. The server can decrypt it as soon as it
-   accepts the security context, before it decides whether the principal may
-   log in as the requested user. A refused login therefore does not mean the
-   TGT stayed private.
-6. **The GUI shares one Kerberos identity across accounts.** The GUI backend
-   runs as one OS user and uses that user's credential cache for every tab.
-   With optional GUI account sign-in, every signed-in account can open
-   sessions that authenticate as, or delegate, that one OS user's Kerberos
-   identity. The documentation already says sign-in gives no per-user
-   isolation of OS resources; the ssh-agent is shared the same way.
+   the `gssapi-with-mic` context establishment token. The server can decrypt it
+   as soon as it accepts the security context, before it decides whether the
+   principal may log in as the requested user. A refused login therefore does
+   not mean the TGT stayed private.
+6. **Single-user native application.** LinSCP runs as a single-user native
+   desktop/mobile application (`accounts_enabled: false` on `/api/login` and
+   `/api/logout`), using the OS user's credential cache across tabs.
 7. **Importers never enable delegation.** The OpenSSH-config and FileZilla
-   importers do not import GSSAPI settings, so `GSSAPIDelegateCredentials yes`
-   in `~/.ssh/config` does not turn delegation on.
+   importers do not import GSSAPI delegation settings, so
+   `GSSAPIDelegateCredentials yes` in `~/.ssh/config` does not turn delegation on.
 
 ## 3. Code map
 
@@ -77,17 +73,11 @@ Function names are stable; line numbers are not given on purpose.
 
 | Location | What to look at |
 | --- | --- |
-| `source/linux/Session.h`: `GssapiSettings` | Defaults: `auth=true`, `authKex=false`, `forwardTgt=false`. |
-| `source/linux/Session.cpp`: `ApplySessionRawSetting` | The one parser for `-rawsettings`, stored sites and scripts. The boolean settings accept only `0` or `1`. |
-| `source/linux/Session.cpp`: `ValidateSessionCapabilities` | Fail-closed rules: Kerberos settings are refused when libssh lacks GSSAPI or GSSAPI key exchange, and `AuthGSSAPIKEX` is refused with a pinned host key. |
-| `source/linux/Session.cpp`: `Session::Connect` | Sets the delegation flag and the server identity, and logs the delegation notice. Builds the `gss-*` KEX list via `GssapiKeyExchangeList`. |
-| `source/linux/Session.cpp`: `VerifyServerKey` | Host-key verification. This runs before user authentication. The `gss-*` path accepts a missing host key only if no key is pinned. |
-| `source/linux/Session.cpp`: `AuthenticateServer` | Method order: `gssapi-with-mic` first, then the fallbacks. |
-| `source/linux/SshTunnel.cpp`: `IsGssapiSupported`, `IsGssapiKeyExchangeSupported` | Capability detection: a weak reference to `ssh_gssapi_set_creds`, and a KEX probe on an unconnected session. |
-| `source/linux/SshTunnel.cpp`: `SshJumpTunnel::Start`, `SshJumpTunnel::StartSocks` | The jump session inherits the destination's GSSAPI policy (fact 3). |
-| `source/linux/SessionStore.cpp` | Persistence: `auth_gssapi`, `auth_gssapi_kex`, `gssapi_fwd_tgt`, `logical_host`. Stored values go through `ApplySessionRawSetting`. |
-| `source/gui/linscp_gui.py`: `GSSAPI_RAW_FIELDS`, `GSSAPI_DEFAULTS`, `gssapi_raw_settings`, `validate_session_data` | The GUI always passes every Kerberos setting explicitly, including `GSSAPIFwdTGT=0`. |
-| `source/gui/web/index.html`: `siteGssapiFwdTgt` | The site editor's delegation checkbox, unchecked by default. |
+| `crates/linscp-platform/src/gssapi_sys.rs`: `is_system_gssapi_available`, `try_create_system_gssapi_context` | Runtime `dlopen` of `libgssapi_krb5.so.2` on Linux (`GSS_C_DELEG_FLAG`) and `secur32.dll` SSPI (`ISC_REQ_DELEGATE`) on Windows; `false`/`None` on Android. |
+| `crates/linscp-proto/src/ssh.rs`: `SshAuthConfig`, `try_gssapi_with_mic` | RFC 4462 `gssapi-with-mic` exchange (`SSH_MSG_USERAUTH_INFO_REQUEST` / token exchange / `SSH_MSG_USERAUTH_GSSAPI_MIC`), method order after host-key verification. |
+| `crates/linscp-engine/src/url_and_raw.rs`: `apply_raw_session_setting`, `validate_session_settings`, `validate_ssh_gssapi_policy`, `build_ssh_configs` | Strict `0`/`1` boolean parsing, `LogicalHostName` validation, fail-closed refusal when GSSAPI runtime or `AuthGSSAPIKEX` is unavailable, and jump-host config construction. |
+| `crates/linscp-service/src/tabs.rs`: `parse_gui_session_spec`, `stored_site_to_gui_json` | Persistence and validation of `auth_gssapi`, `auth_gssapi_kex`, `gssapi_fwd_tgt`, and `logical_host`. |
+| `ui/src/platform/capabilities.ts` & `source/gui/web/index.html`: `hostCapabilities`, `siteGssapiFwdTgt` | Host/runtime capability reporting (`gssapi_available`) and the site editor's delegation checkbox (unchecked by default). |
 
 ## 4. Threat model
 

@@ -455,6 +455,7 @@ pub struct QueueManager {
     notify: Arc<Notify>,
     event_tx: broadcast::Sender<Value>,
     local_fs: Arc<dyn LocalFs>,
+    xml_log_path: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl QueueManager {
@@ -470,7 +471,25 @@ impl QueueManager {
             notify: Arc::new(Notify::new()),
             event_tx,
             local_fs,
+            xml_log_path: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn set_xml_log_path(&self, path: Option<PathBuf>) {
+        if let Ok(mut guard) = self.xml_log_path.lock() {
+            *guard = path;
+        }
+    }
+
+    fn open_task_logger(&self) -> SessionLogger {
+        if let Ok(guard) = self.xml_log_path.lock() {
+            if let Some(ref p) = *guard {
+                if let Ok(logger) = SessionLogger::open_append_xml(p, "gui") {
+                    return logger;
+                }
+            }
+        }
+        SessionLogger::open(None, 0, false, None, None, false, "").unwrap()
     }
 
     fn ensure_worker_running(&self) {
@@ -872,7 +891,7 @@ impl QueueManager {
             }
         }
         let progress = self.make_progress_cb(task.id, Arc::clone(&task.cancel_flag));
-        let mut logger = SessionLogger::open(None, 0, false, None, None, false, "").unwrap();
+        let mut logger = self.open_task_logger();
 
         match &task.job {
             QueueJob::RemoteDownload {
@@ -1016,7 +1035,15 @@ impl QueueManager {
                         download_single_file(session.as_ref(), remote_path, Some(&entry), local_dest, &f, &mut logger, Some(&*progress)).await?;
                     }
                     if *delete_source {
-                        if let Some(etag) = f.source_etag.as_deref() {
+                        let supports_if_match = matches!(
+                            session.scheme(),
+                            ProtocolScheme::S3
+                                | ProtocolScheme::Dav
+                                | ProtocolScheme::Davs
+                                | ProtocolScheme::Webdav
+                                | ProtocolScheme::Webdavs
+                        );
+                        if let Some(etag) = f.source_etag.as_deref().filter(|_| supports_if_match) {
                             session.remove_if_match(remote_path, etag).await.map_err(|e| format!("Move incomplete: local file was published, but remote source deletion could not be confirmed; the source may or may not exist: {e}"))?;
                         } else {
                             let after = session.stat(remote_path).await.map_err(|e| format!("Move incomplete: local file was published, but remote source could not be verified before deletion: {e}"))?

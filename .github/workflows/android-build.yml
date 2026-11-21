@@ -71,11 +71,13 @@ jobs:
           npm ci --prefix ui --no-audit --no-fund
           python3 tools/run_cargo_ci.py npm --prefix ui test
 
-      - name: Exercise Android SAF and tunnel Rust unit tests
+      - name: Exercise Android SAF, Keystore, share export and tunnel Rust unit tests
         run: |
           python3 tools/run_cargo_ci.py cargo test -p linscp-platform saf_ -- --nocapture
+          python3 tools/run_cargo_ci.py cargo test -p linscp-platform android_keystore -- --nocapture
           python3 tools/run_cargo_ci.py cargo test -p linscp-proto tunnel -- --nocapture
           python3 tools/run_cargo_ci.py cargo test -p linscp-service saf_ -- --nocapture --test-threads=1
+          python3 tools/run_cargo_ci.py cargo test -p linscp-service share_export -- --nocapture
 
       - name: Check the Android application ID and signing configuration
         run: |

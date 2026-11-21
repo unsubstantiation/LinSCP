@@ -4214,6 +4214,196 @@ function options(id) {
     internals.invoke = prevInvokeForScripts;
   }
 
+  // ---- S3 options, transfer presets, encodings, external editor, XML logs, share cancel & workspace challenge ----
+  {
+    // 1. S3 advanced options & preset round-trip in Site Manager.
+    window.openSiteManager();
+    window.newSite();
+    doc.getElementById('siteName').value = 's3-prod';
+    doc.getElementById('siteProtocol').value = 's3';
+    window.siteProtocolChanged();
+    doc.getElementById('siteHost').value = 's3.amazonaws.com';
+    doc.getElementById('siteUser').value = 'AKIAEXAMPLE';
+    doc.getElementById('siteS3Region').value = 'eu-west-1';
+    doc.getElementById('siteS3UrlStyle').value = 'path';
+    doc.getElementById('siteS3StorageClass').value = 'STANDARD_IA';
+    doc.getElementById('siteS3Acl').value = 'bucket-owner-full-control';
+    doc.getElementById('siteS3Sse').value = 'aws:kms';
+    doc.getElementById('siteS3KmsKey').value = 'alias/prod-key';
+    doc.getElementById('siteS3Metadata').value = 'env=prod,team=ops';
+    doc.getElementById('sitePreset').value = 'TextLogs';
+    await window.saveSite();
+    const s3Save = JSON.parse(calls.filter(c => c.path === '/api/sessions/save').pop().options.body);
+    check('S3 advanced options and site preset are posted when saving a site',
+      s3Save.session.protocol === 's3' &&
+      s3Save.session.s3_region === 'eu-west-1' &&
+      s3Save.session.s3_url_style === 'path' &&
+      s3Save.session.s3_storage_class === 'STANDARD_IA' &&
+      s3Save.session.s3_acl === 'bucket-owner-full-control' &&
+      s3Save.session.s3_sse === 'aws:kms' &&
+      s3Save.session.s3_kms_key === 'alias/prod-key' &&
+      s3Save.session.s3_metadata === 'env=prod,team=ops' &&
+      s3Save.session.preset === 'TextLogs');
+    window.closeModal('siteModal');
+
+    // 2. Transfer presets load, apply, save and delete.
+    responses['/api/presets'] = {
+      success: true,
+      presets: [{ name: 'TextLogs', transfer: 'ascii', filemask: '*.log', speed: 256, preserve_time: true, newer_only: true }]
+    };
+    responses['/api/presets/save'] = { success: true, preset: { name: 'TextLogs' } };
+    responses['/api/presets/delete'] = { success: true };
+    window.openTransferSettings();
+    await window.loadTransferPresets();
+    doc.getElementById('transferPresetSelect').value = 'TextLogs';
+    window.selectTransferPreset();
+    check('selecting a transfer preset populates transfer form fields',
+      doc.getElementById('transferMode').value === 'ascii' &&
+      doc.getElementById('transferMask').value === '*.log' &&
+      doc.getElementById('transferSpeed').value === '256' &&
+      doc.getElementById('transferNewerOnly').checked === true &&
+      window.transferOptions().preset === 'TextLogs');
+    doc.getElementById('transferPresetName').value = 'FastBin';
+    doc.getElementById('transferMode').value = 'binary';
+    await window.saveCurrentTransferPreset();
+    const presetSaveCall = calls.filter(c => c.path === '/api/presets/save').pop();
+    check('saving a transfer preset posts settings to /api/presets/save',
+      !!presetSaveCall && JSON.parse(presetSaveCall.options.body).name === 'FastBin' &&
+      JSON.parse(presetSaveCall.options.body).transfer === 'binary');
+    await window.deleteSelectedTransferPreset();
+    const presetDeleteCall = calls.filter(c => c.path === '/api/presets/delete').pop();
+    check('deleting a transfer preset posts name to /api/presets/delete',
+      !!presetDeleteCall && JSON.parse(presetDeleteCall.options.body).name === 'FastBin');
+    await window.resetTransferSettings();
+    window.closeModal('transferModal');
+    delete responses['/api/presets'];
+    delete responses['/api/presets/save'];
+    delete responses['/api/presets/delete'];
+
+    // 3. Editor encoding/EOL/BOM + External desktop editor + Search encoding.
+    const prevStatus = responses['/api/status'];
+    responses['/api/status'] = Object.assign({}, prevStatus, {
+      gssapi_available: true,
+      supported_encodings: ['UTF-8', 'UTF-16LE', 'Windows-1252', 'Shift_JIS'],
+      external_editor_supported: true
+    });
+    await window.refreshStatus();
+    const prevRemoteEdit = responses['/api/remote/edit'];
+    responses['/api/remote/edit'] = {
+      success: true, path: '/tmp/slowremote/keep.txt', content: 'encoded\n',
+      info: { size: 8, mtime: 1791875271, mtime_ns: '1791875271', encoding: 'Windows-1252', eol: 'crlf', bom: false }
+    };
+    await window.openEditor('/tmp/slowremote/keep.txt', 'remote', false);
+    check('editor reflects encoding, line endings and external editor support',
+      doc.getElementById('editorEncoding').value === 'Windows-1252' &&
+      doc.getElementById('editorEol').value === 'crlf' &&
+      doc.getElementById('editorExternalBtn').hidden === false);
+    doc.getElementById('editorBom').checked = true;
+    window.markDirty();
+    await window.saveEditorFile();
+    const encSaveCall = calls.filter(c => c.path === '/api/remote/save').pop();
+    const encSaveBody = JSON.parse(encSaveCall.options.body);
+    check('editor save forwards encoding, eol and bom metadata',
+      encSaveBody.encoding === 'Windows-1252' && encSaveBody.eol === 'crlf' && encSaveBody.bom === true);
+    responses['/api/editor/external'] = { success: true, id: 'ext-42', editor: 'code', is_remote: true };
+    responses['/api/editor/external/close'] = { success: true };
+    await window.openInExternalEditor();
+    const extOpenCall = calls.filter(c => c.path === '/api/editor/external' && (c.options.method || 'GET').toUpperCase() === 'POST').pop();
+    check('external editor button posts file to /api/editor/external and reveals stop button',
+      !!extOpenCall && JSON.parse(extOpenCall.options.body).path === '/tmp/slowremote/keep.txt' &&
+      doc.getElementById('editorExternalCloseBtn').hidden === false);
+    await window.closeExternalEditorSession();
+    const extCloseCall = calls.filter(c => c.path === '/api/editor/external/close').pop();
+    check('closing external editor session posts id to /api/editor/external/close',
+      !!extCloseCall && JSON.parse(extCloseCall.options.body).id === 'ext-42');
+    window.closeEditor();
+    responses['/api/remote/edit'] = prevRemoteEdit;
+    responses['/api/status'] = prevStatus;
+    delete responses['/api/editor/external'];
+    delete responses['/api/editor/external/close'];
+
+    window.openSearch();
+    doc.getElementById('searchContents').checked = true;
+    window.toggleSearchContents();
+    doc.getElementById('searchText').value = 'latin';
+    doc.getElementById('searchEncoding').value = 'Windows-1252';
+    await window.runSearch();
+    const encSearchCall = calls.filter(c => c.path === '/api/remote/search').pop();
+    check('content search forwards selected text encoding',
+      !!encSearchCall && JSON.parse(encSearchCall.options.body).encoding === 'Windows-1252');
+    window.closeModal('searchModal');
+
+    // 4. Preferences XML log settings & XML log viewer/clear.
+    await window.openPreferences();
+    doc.getElementById('prefXmlLogEnabled').checked = true;
+    doc.getElementById('prefXmlLogPath').value = 'audit-actions.xml';
+    await window.savePreferences();
+    const xmlPrefCall = calls.filter(c => c.path === '/api/preferences' && (c.options.method || 'GET').toUpperCase() === 'POST').pop();
+    const xmlPrefBody = JSON.parse(xmlPrefCall.options.body);
+    check('saving Preferences includes xml_log_enabled and xml_log_path',
+      xmlPrefBody.preferences.xml_log_enabled === true &&
+      xmlPrefBody.preferences.xml_log_path === 'audit-actions.xml');
+    responses['/api/logs/xml'] = {
+      success: true, enabled: true, exists: true, size: 64,
+      path: '/tmp/cfg/audit-actions.xml', content: '<session><upload filename="/a"/></session>'
+    };
+    responses['/api/logs/xml/clear'] = { success: true };
+    await window.openXmlLogViewer();
+    check('XML log viewer renders XML log content and path',
+      doc.getElementById('xmlLogModal').classList.contains('open') &&
+      text('xmlLogContent').includes('<upload filename="/a"/>'));
+    await window.clearXmlLogFile();
+    check('clearing XML log posts /api/logs/xml/clear',
+      calls.some(c => c.path === '/api/logs/xml/clear'));
+    window.closeModal('xmlLogModal');
+    delete responses['/api/logs/xml'];
+    delete responses['/api/logs/xml/clear'];
+
+    // 5. Android remote share staging progress & cancel.
+    const origCore = window.LinSCPCore;
+    let releaseShare = null;
+    responses['/api/android/share/status'] = {
+      success: true, active: true, cancelled: false, files_done: 0, files_total: 1, bytes_done: 4096, bytes_total: 8192
+    };
+    responses['/api/android/share/cancel'] = { success: true };
+    window.LinSCPCore = new Proxy(origCore, { get(target, key) {
+      if (key === 'hostCapabilities') return () => ({ ...target.hostCapabilities({ host: window }), platform: 'android', nativeIpc: true });
+      if (key === 'shareFiles') return () => new Promise(resolve => { releaseShare = resolve; });
+      return Reflect.get(target, key);
+    }});
+    window.focusPane('remote');
+    window.clearFocusedSelection();
+    doc.getElementById('remoteFileList').children[0].click();
+    const pendingShare = window.shareSelectedFiles();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await window.pollAndroidShareStatus();
+    check('Android remote share opens progress modal and displays staged byte status',
+      doc.getElementById('androidShareModal').classList.contains('open') &&
+      text('androidShareProgressText').includes('1'));
+    await window.cancelAndroidShare();
+    check('cancelling Android share posts /api/android/share/cancel',
+      calls.some(c => c.path === '/api/android/share/cancel'));
+    if (releaseShare) releaseShare();
+    await pendingShare;
+    window.clearFocusedSelection();
+    window.LinSCPCore = origCore;
+    delete responses['/api/android/share/status'];
+    delete responses['/api/android/share/cancel'];
+
+    // 6. Workspace open surfaces pending SSH host-key challenge.
+    const prevWsOpen = responses['/api/workspaces/open'];
+    responses['/api/workspaces/open'] = {
+      success: true, name: 'ops', opened: [], failed: [], active_tab: null,
+      challenges: [{ tab: 88, host: 'ws-host.example', port: 22, role: 'destination', fingerprint: 'ssh-ed25519 SHA256:wschal' }]
+    };
+    await window.openWorkspace('ops');
+    check('workspace open surfaces pending SSH host-key challenge modal',
+      doc.getElementById('hostKeyModal').classList.contains('open') &&
+      text('hostKeyFingerprint') === 'ssh-ed25519 SHA256:wschal');
+    await window.cancelHostKey();
+    responses['/api/workspaces/open'] = prevWsOpen;
+  }
+
   check('no script errors', errors.length === 0, errors.join(' | '));
   window.close();
 })();

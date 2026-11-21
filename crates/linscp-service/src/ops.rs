@@ -64,9 +64,81 @@ pub fn validate_relative_subpath(rel: &str) -> Result<PathBuf, String> {
     Ok(out)
 }
 
-/// Reads a UTF-8 text file locally for the Commander editor, enforcing `MAX_GUI_EDIT_BYTES`
+/// Decodes raw file bytes for the Commander editor using `encoding_opt` (default `"utf-8"`),
+/// returning `(utf8_content, encoding_label, eol_style, had_bom)`.
+pub fn decode_editor_bytes(
+    bytes: &[u8],
+    encoding_opt: Option<&str>,
+) -> Result<(String, String, String, bool), String> {
+    let raw_enc = encoding_opt.unwrap_or("").trim();
+    let is_utf8 = raw_enc.is_empty()
+        || raw_enc.eq_ignore_ascii_case("utf-8")
+        || raw_enc.eq_ignore_ascii_case("utf8");
+    if is_utf8 {
+        if bytes.contains(&0) {
+            return Err("Refusing to edit binary file containing NUL bytes.".to_string());
+        }
+        let eol = linscp_engine::text_mode::detect_eol_style(bytes)
+            .as_str()
+            .to_string();
+        let (text, had_bom) = linscp_engine::text_mode::decode_to_utf8_strict(bytes, "utf-8")
+            .map_err(|_| "File is not valid UTF-8 binary/encoded text.".to_string())?;
+        return Ok((text, "utf-8".to_string(), eol, had_bom));
+    }
+    let is_utf16 = raw_enc.eq_ignore_ascii_case("utf-16le")
+        || raw_enc.eq_ignore_ascii_case("utf-16be")
+        || raw_enc.eq_ignore_ascii_case("utf-16");
+    if !is_utf16 && bytes.contains(&0) {
+        return Err("Refusing to edit binary file containing NUL bytes.".to_string());
+    }
+    let (text, had_bom) = linscp_engine::text_mode::decode_to_utf8_strict(bytes, raw_enc)?;
+    if text.contains('\0') {
+        return Err("Refusing to edit binary file containing NUL bytes.".to_string());
+    }
+    let eol = linscp_engine::text_mode::detect_eol_style(text.as_bytes())
+        .as_str()
+        .to_string();
+    Ok((text, raw_enc.to_ascii_lowercase(), eol, had_bom))
+}
+
+/// Encodes edited UTF-8 text into target `encoding_opt` and optional `eol_opt` (`"lf"`, `"crlf"`, `"cr"`).
+pub fn encode_editor_text(
+    content: &str,
+    encoding_opt: Option<&str>,
+    eol_opt: Option<&str>,
+    include_bom: Option<bool>,
+) -> Result<Vec<u8>, String> {
+    let normalized = match eol_opt.map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("preserve")) {
+        None => content.to_string(),
+        Some(raw_eol) => {
+            let style = linscp_engine::text_mode::EolStyle::parse(raw_eol)
+                .ok_or_else(|| format!("Unsupported line-ending style '{raw_eol}' (expected lf, crlf, or cr)."))?;
+            let converted = linscp_engine::text_mode::convert_eol_bytes(content.as_bytes(), style);
+            String::from_utf8(converted).map_err(|e| e.to_string())?
+        }
+    };
+    let enc = encoding_opt
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("utf-8");
+    linscp_engine::text_mode::encode_from_utf8_strict(
+        &normalized,
+        enc,
+        include_bom.unwrap_or(false),
+    )
+}
+
+/// Reads a text file locally for the Commander editor, enforcing `MAX_GUI_EDIT_BYTES`
 /// and rejecting binary files containing NUL bytes.
 pub fn read_local_text_file(path: &Path, max_bytes: u64) -> Result<(String, Value), String> {
+    read_local_text_file_encoded(path, max_bytes, None)
+}
+
+pub fn read_local_text_file_encoded(
+    path: &Path,
+    max_bytes: u64,
+    encoding: Option<&str>,
+) -> Result<(String, Value), String> {
     let info = stat_extended(path).map_err(|e| format!("Cannot read '{}': {e}", path.display()))?;
     if info.is_dir {
         return Err("Cannot open a directory in the text editor.".to_string());
@@ -82,17 +154,16 @@ pub fn read_local_text_file(path: &Path, max_bytes: u64) -> Result<(String, Valu
     if bytes.len() as u64 > max_bytes {
         return Err("File is too large for the built-in editor.".to_string());
     }
-    if bytes.contains(&0) {
-        return Err("Refusing to edit binary file containing NUL bytes.".to_string());
-    }
-    let content = String::from_utf8(bytes)
-        .map_err(|_| "File is not valid UTF-8 binary/encoded text.".to_string())?;
+    let (content, enc_label, eol_style, had_bom) = decode_editor_bytes(&bytes, encoding)?;
     let meta_json = json!({
         "size": info.size,
         "mtime": info.mtime_secs,
         "mtime_ns": info.mtime_ns.to_string(),
         "mtime_ns_num": info.mtime_ns as i64,
         "permissions": info.permissions,
+        "encoding": enc_label,
+        "eol": eol_style,
+        "bom": had_bom,
     });
     Ok((content, meta_json))
 }
@@ -103,7 +174,22 @@ pub fn write_local_text_file(
     content: &str,
     expected_mtime_ns: Option<i128>,
 ) -> Result<Value, String> {
+    write_local_text_file_encoded(path, content, expected_mtime_ns, None, None, None)
+}
+
+pub fn write_local_text_file_encoded(
+    path: &Path,
+    content: &str,
+    expected_mtime_ns: Option<i128>,
+    encoding: Option<&str>,
+    eol: Option<&str>,
+    include_bom: Option<bool>,
+) -> Result<Value, String> {
     if content.len() as u64 > MAX_GUI_EDIT_BYTES {
+        return Err("Edited content is too large for the built-in editor.".to_string());
+    }
+    let encoded_bytes = encode_editor_text(content, encoding, eol, include_bom)?;
+    if encoded_bytes.len() as u64 > MAX_GUI_EDIT_BYTES {
         return Err("Edited content is too large for the built-in editor.".to_string());
     }
     let existing = stat_extended(path).ok();
@@ -133,7 +219,7 @@ pub fn write_local_text_file(
     ));
 
     let write_res = (|| -> Result<(), String> {
-        write_private_file_atomic(&tmp, content.as_bytes()).map_err(|e| e.to_string())?;
+        write_private_file_atomic(&tmp, &encoded_bytes).map_err(|e| e.to_string())?;
         if let Some(ref info) = existing {
             let _ = set_local_permissions(&tmp, info.mode);
         }
@@ -172,6 +258,15 @@ pub fn read_local_text_file_via_fs(
     path: &str,
     max_bytes: u64,
 ) -> Result<(String, Value), String> {
+    read_local_text_file_via_fs_encoded(fs, path, max_bytes, None)
+}
+
+pub fn read_local_text_file_via_fs_encoded(
+    fs: &dyn LocalFs,
+    path: &str,
+    max_bytes: u64,
+    encoding: Option<&str>,
+) -> Result<(String, Value), String> {
     let info = fs
         .stat(path)
         .map_err(|e| format!("Cannot read '{path}': {e}"))?;
@@ -190,11 +285,7 @@ pub fn read_local_text_file_via_fs(
     if bytes.len() as u64 > max_bytes {
         return Err("File is too large for the built-in editor.".to_string());
     }
-    if bytes.contains(&0) {
-        return Err("Refusing to edit binary file containing NUL bytes.".to_string());
-    }
-    let content =
-        String::from_utf8(bytes).map_err(|_| "File is not valid UTF-8 binary/encoded text.".to_string())?;
+    let (content, enc_label, eol_style, had_bom) = decode_editor_bytes(&bytes, encoding)?;
     let mtime_ns = (info.mtime as i128) * 1_000_000_000;
     let meta_json = json!({
         "size": info.size,
@@ -202,6 +293,9 @@ pub fn read_local_text_file_via_fs(
         "mtime_ns": mtime_ns.to_string(),
         "mtime_ns_num": mtime_ns as i64,
         "permissions": info.permissions,
+        "encoding": enc_label,
+        "eol": eol_style,
+        "bom": had_bom,
     });
     Ok((content, meta_json))
 }
@@ -220,7 +314,23 @@ pub fn write_local_text_file_via_fs(
     content: &str,
     expected_mtime_ns: Option<i128>,
 ) -> Result<Value, String> {
+    write_local_text_file_via_fs_encoded(fs, path, content, expected_mtime_ns, None, None, None)
+}
+
+pub fn write_local_text_file_via_fs_encoded(
+    fs: &dyn LocalFs,
+    path: &str,
+    content: &str,
+    expected_mtime_ns: Option<i128>,
+    encoding: Option<&str>,
+    eol: Option<&str>,
+    include_bom: Option<bool>,
+) -> Result<Value, String> {
     if content.len() as u64 > MAX_GUI_EDIT_BYTES {
+        return Err("Edited content is too large for the built-in editor.".to_string());
+    }
+    let encoded_bytes = encode_editor_text(content, encoding, eol, include_bom)?;
+    if encoded_bytes.len() as u64 > MAX_GUI_EDIT_BYTES {
         return Err("Edited content is too large for the built-in editor.".to_string());
     }
     if let Ok(info) = fs.stat(path) {
@@ -239,7 +349,7 @@ pub fn write_local_text_file_via_fs(
             }
         }
     }
-    fs.write_bytes_atomic(path, content.as_bytes())
+    fs.write_bytes_atomic(path, &encoded_bytes)
         .map_err(|e| e.to_string())?;
     let saved = fs.stat(path).map_err(|e| e.to_string())?;
     let mtime_ns = (saved.mtime as i128) * 1_000_000_000;
@@ -372,7 +482,7 @@ fn find_text_line(content: &str, needle: &str, case_sensitive: bool) -> Option<(
     None
 }
 
-/// Bounded recursive remote search supporting filename mask AND optional UTF-8 content substring.
+/// Bounded recursive remote search supporting filename mask AND optional content substring.
 pub async fn search_remote_bounded(
     session: &dyn RemoteSession,
     root_dir: &str,
@@ -381,6 +491,35 @@ pub async fn search_remote_bounded(
     case_sensitive: bool,
     max_results: usize,
 ) -> Result<SearchStats, String> {
+    search_remote_bounded_with_encoding(
+        session,
+        root_dir,
+        mask,
+        text_query,
+        case_sensitive,
+        None,
+        max_results,
+    )
+    .await
+}
+
+pub async fn search_remote_bounded_with_encoding(
+    session: &dyn RemoteSession,
+    root_dir: &str,
+    mask: &FileMask,
+    text_query: Option<&str>,
+    case_sensitive: bool,
+    encoding: Option<&str>,
+    max_results: usize,
+) -> Result<SearchStats, String> {
+    if let Some(enc) = encoding.map(str::trim).filter(|s| !s.is_empty()) {
+        if !enc.eq_ignore_ascii_case("utf-8")
+            && !enc.eq_ignore_ascii_case("utf8")
+            && encoding_rs::Encoding::for_label(enc.as_bytes()).is_none()
+        {
+            return Err(format!("Unsupported character encoding '{enc}'."));
+        }
+    }
     let mut stats = SearchStats::default();
     let limit = max_results.clamp(1, 2000);
     search_remote_walk(
@@ -390,6 +529,7 @@ pub async fn search_remote_bounded(
         mask,
         text_query,
         case_sensitive,
+        encoding,
         limit,
         &mut stats,
     )
@@ -405,6 +545,7 @@ async fn search_remote_walk(
     mask: &FileMask,
     text_query: Option<&str>,
     case_sensitive: bool,
+    encoding: Option<&str>,
     limit: usize,
     stats: &mut SearchStats,
 ) -> Result<(), String> {
@@ -455,6 +596,7 @@ async fn search_remote_walk(
                     mask,
                     text_query,
                     case_sensitive,
+                    encoding,
                     limit,
                     stats,
                 ))
@@ -489,11 +631,7 @@ async fn search_remote_walk(
             };
             stats.scanned += 1;
             stats.bytes_scanned = stats.bytes_scanned.saturating_add(bytes.len() as u64);
-            if bytes.contains(&0) {
-                stats.skipped += 1;
-                continue;
-            }
-            let Ok(text) = String::from_utf8(bytes) else {
+            let Ok((text, _, _, _)) = decode_editor_bytes(&bytes, encoding) else {
                 stats.skipped += 1;
                 continue;
             };
@@ -535,6 +673,25 @@ pub fn search_local_bounded(
     case_sensitive: bool,
     max_results: usize,
 ) -> Result<SearchStats, String> {
+    search_local_bounded_with_encoding(root_dir, mask, text_query, case_sensitive, None, max_results)
+}
+
+pub fn search_local_bounded_with_encoding(
+    root_dir: &Path,
+    mask: &FileMask,
+    text_query: Option<&str>,
+    case_sensitive: bool,
+    encoding: Option<&str>,
+    max_results: usize,
+) -> Result<SearchStats, String> {
+    if let Some(enc) = encoding.map(str::trim).filter(|s| !s.is_empty()) {
+        if !enc.eq_ignore_ascii_case("utf-8")
+            && !enc.eq_ignore_ascii_case("utf8")
+            && encoding_rs::Encoding::for_label(enc.as_bytes()).is_none()
+        {
+            return Err(format!("Unsupported character encoding '{enc}'."));
+        }
+    }
     let mut stats = SearchStats::default();
     let limit = max_results.clamp(1, 2000);
     search_local_walk(
@@ -543,18 +700,21 @@ pub fn search_local_bounded(
         mask,
         text_query,
         case_sensitive,
+        encoding,
         limit,
         &mut stats,
     )?;
     Ok(stats)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_local_walk(
     dir: &Path,
     depth: usize,
     mask: &FileMask,
     text_query: Option<&str>,
     case_sensitive: bool,
+    encoding: Option<&str>,
     limit: usize,
     stats: &mut SearchStats,
 ) -> Result<(), String> {
@@ -602,7 +762,16 @@ fn search_local_walk(
                 }));
             }
             if depth + 1 <= MAX_SEARCH_DEPTH {
-                search_local_walk(&path, depth + 1, mask, text_query, case_sensitive, limit, stats)?;
+                search_local_walk(
+                    &path,
+                    depth + 1,
+                    mask,
+                    text_query,
+                    case_sensitive,
+                    encoding,
+                    limit,
+                    stats,
+                )?;
             } else {
                 stats.truncated = true;
             }
@@ -631,11 +800,7 @@ fn search_local_walk(
             };
             stats.scanned += 1;
             stats.bytes_scanned = stats.bytes_scanned.saturating_add(bytes.len() as u64);
-            if bytes.contains(&0) {
-                stats.skipped += 1;
-                continue;
-            }
-            let Ok(text) = String::from_utf8(bytes) else {
+            let Ok((text, _, _, _)) = decode_editor_bytes(&bytes, encoding) else {
                 stats.skipped += 1;
                 continue;
             };

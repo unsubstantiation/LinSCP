@@ -389,7 +389,8 @@ pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
         let service = CommanderService::new(
             linscp_platform::default_config_dir(),
             std::sync::Arc::new(filesystem),
-        );
+        )
+        .with_keystore_bridge(state.clone());
         app.manage(TauriBridge::for_android_app(service, state));
         Ok(())
     });
