@@ -386,10 +386,13 @@ pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
         // setup hook; the exact same state must back both service and commands.
         let state = app.state::<std::sync::Arc<android::AndroidState>>().inner().clone();
         let filesystem = android::local_filesystem(&state);
-        let service = CommanderService::new(
+        let mut service = CommanderService::new(
             linscp_platform::default_config_dir(),
             std::sync::Arc::new(filesystem),
         );
+        if let Some(keystore) = state.keystore_bridge() {
+            service = service.with_keystore_bridge(keystore);
+        }
         app.manage(TauriBridge::for_android_app(service, state));
         Ok(())
     });

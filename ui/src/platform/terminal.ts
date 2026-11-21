@@ -114,6 +114,8 @@ export interface RendererOptions {
   fontFamily?: string;
   /** Cell height in CSS pixels; the width is measured from this font. */
   fontSize?: number;
+  /** Draws draggable touch selection handles at the start and end edges. */
+  selectionHandles?: boolean;
   /** Called when the measured cell size changes, for the pixel-size report. */
   onCellSize?: (size: { width: number; height: number }) => void;
 }
@@ -130,6 +132,7 @@ export class TerminalRenderer {
   private readonly theme: RendererTheme;
   private readonly fontFamily: string;
   private fontSize: number;
+  private readonly selectionHandles: boolean;
   private readonly onCellSize?: RendererOptions['onCellSize'];
   private readonly canvas: HTMLCanvasElement;
   private readonly ctx: CanvasRenderingContext2D | null;
@@ -148,6 +151,7 @@ export class TerminalRenderer {
     this.fontFamily = options.fontFamily
       ?? 'ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace';
     this.fontSize = Math.max(8, Math.min(32, options.fontSize ?? 14));
+    this.selectionHandles = options.selectionHandles === true;
     this.onCellSize = options.onCellSize;
     const createElement = options.context?.createElement
       ?? ((tag: 'canvas') => document.createElement(tag));
@@ -374,6 +378,19 @@ export class TerminalRenderer {
         continue;
       }
       ctx.fillRect(from * cw, row * ch, (to - from + 1) * cw, ch);
+    }
+    if (this.selectionHandles) {
+      const barWidth = 2;
+      const knobSize = Math.max(6, Math.round(Math.min(cw, ch) * 0.55));
+      const startX = Math.max(0, firstColumn * cw);
+      const startY = top * ch;
+      const endX = Math.max(barWidth, (lastColumn + 1) * cw);
+      const endY = bottom * ch;
+      ctx.fillStyle = this.theme.cursor || '#5ea1ff';
+      ctx.fillRect(startX, startY, barWidth, ch);
+      ctx.fillRect(Math.max(0, startX - Math.floor(knobSize / 2)), Math.max(0, startY - knobSize), knobSize, knobSize);
+      ctx.fillRect(endX - barWidth, endY, barWidth, ch);
+      ctx.fillRect(Math.max(0, endX - Math.ceil(knobSize / 2)), endY + ch, knobSize, knobSize);
     }
   }
 

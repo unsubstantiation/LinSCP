@@ -170,8 +170,11 @@ jobs:
           set -euo pipefail
           if xvfb-run -a bash -euo pipefail -c '
             export WEBKIT_DISABLE_COMPOSITING_MODE=1
+            export WEBKIT_DISABLE_DMABUF_RENDERER=1
+            export LIBGL_ALWAYS_SOFTWARE=1
             openbox >/dev/null 2>&1 &
             wm=$!
+            sleep 1
             linscp-gui &
             app=$!
             trap "kill $app $wm 2>/dev/null || true" EXIT

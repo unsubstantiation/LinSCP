@@ -14,7 +14,7 @@ mod imp {
     use std::sync::{Arc, Mutex};
 
     use linscp_platform::android::{
-        ExternalUriBridge, ForegroundServiceBridge, SafBridge, ShareBridge,
+        ExternalUriBridge, ForegroundServiceBridge, KeystoreBridge, SafBridge, ShareBridge,
     };
     use linscp_platform::PlatformError;
     use linscp_types::{FileEntry, LocalRootEntry};
@@ -25,6 +25,7 @@ mod imp {
         share: Mutex<Option<Arc<dyn ShareBridge>>>,
         external_uri: Mutex<Option<Arc<dyn ExternalUriBridge>>>,
         fg: Mutex<Option<Arc<dyn ForegroundServiceBridge>>>,
+        keystore: Mutex<Option<Arc<dyn KeystoreBridge>>>,
     }
 
     impl AndroidState {
@@ -48,6 +49,12 @@ mod imp {
         }
         pub fn set_foreground_service(&self, bridge: Arc<dyn ForegroundServiceBridge>) {
             *self.fg.lock().unwrap() = Some(bridge);
+        }
+        pub fn set_keystore(&self, bridge: Arc<dyn KeystoreBridge>) {
+            *self.keystore.lock().unwrap() = Some(bridge);
+        }
+        pub fn keystore_bridge(&self) -> Option<Arc<dyn KeystoreBridge>> {
+            self.keystore.lock().unwrap().clone()
         }
         /// The registered SAF bridge, for the local filesystem to use.
         pub fn saf_bridge(&self) -> Option<Arc<dyn SafBridge>> {
@@ -148,6 +155,9 @@ mod imp {
         pub fn saf_bridge(&self) -> Option<std::sync::Arc<dyn linscp_platform::android::SafBridge>> {
             None
         }
+        pub fn keystore_bridge(&self) -> Option<std::sync::Arc<dyn linscp_platform::android::KeystoreBridge>> {
+            None
+        }
         /// Nothing to pick on a desktop, and that is not an error.
         pub fn pick_saf_tree(&self) -> Result<Option<String>, PlatformError> {
             Ok(None)
@@ -214,7 +224,7 @@ mod mobile_plugin {
     use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 
     use base64::Engine as _;
-    use linscp_platform::{android::{ExternalUriBridge, ForegroundServiceBridge, SafBridge, ShareBridge}, PlatformError};
+    use linscp_platform::{android::{ExternalUriBridge, ForegroundServiceBridge, KeystoreBridge, SafBridge, ShareBridge}, PlatformError};
     use linscp_types::{FileEntry, LocalRootEntry};
     use serde::{Deserialize, Serialize};
     use tauri::{plugin::{Builder, PluginHandle, TauriPlugin}, Manager, Wry};
@@ -355,6 +365,25 @@ mod mobile_plugin {
         }
         fn is_running(&self) -> bool { self.foreground_running.load(Ordering::SeqCst) }
     }
+    impl KeystoreBridge for MobileBridge {
+        fn wrap_key(&self, plaintext: &[u8]) -> Result<Vec<u8>, PlatformError> {
+            #[derive(Serialize)] struct Args { data_base64: String }
+            let result: Base64Result = self.call("keystoreWrap", Args {
+                data_base64: base64::engine::general_purpose::STANDARD.encode(plaintext),
+            })?;
+            base64::engine::general_purpose::STANDARD.decode(result.base64)
+                .map_err(|e| PlatformError::SecretVault(format!("Invalid Android Keystore wrap encoding: {e}")))
+        }
+        fn unwrap_key(&self, wrapped: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>, PlatformError> {
+            #[derive(Serialize)] struct Args { data_base64: String }
+            let result: Base64Result = self.call("keystoreUnwrap", Args {
+                data_base64: base64::engine::general_purpose::STANDARD.encode(wrapped),
+            })?;
+            let decoded = base64::engine::general_purpose::STANDARD.decode(&result.base64)
+                .map_err(|e| PlatformError::SecretVault(format!("Invalid Android Keystore unwrap encoding: {e}")))?;
+            Ok(zeroize::Zeroizing::new(decoded))
+        }
+    }
 
     pub fn plugin() -> TauriPlugin<Wry> {
         Builder::new("linscp-android")
@@ -365,7 +394,8 @@ mod mobile_plugin {
                 state.set_saf(bridge.clone());
                 state.set_share(bridge.clone());
                 state.set_external_uri(bridge.clone());
-                state.set_foreground_service(bridge);
+                state.set_foreground_service(bridge.clone());
+                state.set_keystore(bridge);
                 app.manage(state);
                 Ok(())
             })

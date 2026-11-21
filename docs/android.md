@@ -16,35 +16,42 @@ upload). Android support is incomplete:
 - An Android foreground service displays an ongoing transfer notification while
   queued work is active, so the Rust process can continue when the activity is
   backgrounded. Android can still stop work after a force-stop, device shutdown,
-  or other process termination; this is not a durable job queue. Android
-  Keystore/biometric integration remains unwired, and the session master key is
-  stored in the app sandbox rather than backed by Android Keystore.
+  or other process termination; this is not a durable job queue. When the native
+  Android Keystore bridge is registered, `PasswordVault` double-wraps the
+  Argon2id-sealed master-key envelope inside an `AndroidKeyStore` AES-256-GCM
+  hardware-bound key (`LSCPKST1`), transparently upgrading existing `LSCPVLT1`
+  vault envelopes when unlocked; biometric unlock prompts remain unwired.
 - One `hostCapabilities()` description drives host-dependent controls. SAF,
   incoming share intents, foreground transfers, and external viewer intents are
   reported for the registered native Android build; a browser running on Android
-  does not inherit those native capabilities. Android can hand direct RDP, VNC,
-  and SPICE targets to installed viewer apps. X2Go/X11 and SSH jump-tunnel viewer
-  launches are not supported by Android intents yet. Debian/Windows use native
-  desktop viewers and OS file-drop events; Android uses document grants and the
-  Share Sheet instead. `hostDifferenceReason()` explains unavailable
-  integrations. `linscp-gui --install-shell-integration` is one of those
-  differences: it writes per-user file-manager menus into an XDG data directory,
-  which Android has neither of, so the command refuses by name ("available on
-  Linux and Windows only") rather than creating directories inside the sandbox.
-  The receiving half is shared: a Share Sheet selection and a desktop
-  `--shell-upload` end up in the same pending manifest, offered by the same
-  confirmation dialog.
+  does not inherit those native capabilities. Android can hand direct or
+  SSH-tunneled RDP, VNC, and SPICE targets to installed viewer apps (tunneling
+  binds an ephemeral `127.0.0.1` loopback forwarder over either an open SSH tab
+  or the site's standalone SSH jump-tunnel settings). X2Go/X11 external Android
+  intents are not supported (X2Go uses the built-in experimental KDrive viewer).
+  Debian/Windows use native desktop viewers and OS file-drop events; Android
+  uses document grants and the Share Sheet instead. `hostDifferenceReason()`
+  explains unavailable integrations. `linscp-gui --install-shell-integration` is
+  one of those differences: it writes per-user file-manager menus into an XDG
+  data directory, which Android has neither of, so the command refuses by name
+  ("available on Linux and Windows only") rather than creating directories
+  inside the sandbox. The receiving half is shared: a Share Sheet selection and
+  a desktop `--shell-upload` end up in the same pending manifest, offered by the
+  same confirmation dialog.
 - **Files → Share files…** offers selected app-storage, granted-folder or
   remote files to Android's chooser. Up to 32 regular files and 512 MiB in total
   are copied to private cache; remote files must finish downloading before the
+  chooser opens. While remote files are staging, the UI displays live file/byte
+  progress (`/api/android/share/status`) and supports cooperative cancellation
+  (`/api/android/share/cancel`), discarding incomplete batches before any
   chooser opens. The recipient gets read-only content-URI grants, not raw paths.
   Copies remain after the chooser closes and are removed best-effort at a later
   app launch or share after 24 hours; Android may evict them earlier, and the
-  receiving app may retain its own copy. Failed preparation is cleaned up
-  best-effort. There is currently no progress or cancellation control, and the
-  operation is not part of the transfer queue. A remote file can change during
-  download; checking its size does not establish a snapshot. This integration
-  has not yet been verified on a device or with a real receiving app.
+  receiving app may retain its own copy. Failed or cancelled preparation is
+  cleaned up best-effort, and the operation remains separate from the transfer
+  queue. A remote file can change during download; checking its size does not
+  establish a snapshot. This integration still requires end-to-end verification
+  on a live device with external receiving apps.
 - Remote transfer restrictions and cleanup caveats in the main README still
   apply. The shared GUI actions listed in the native feature audit are routed
   through the service, but some remain protocol-limited or lack Android

@@ -71,6 +71,22 @@ enum DroppedKind {
     SafUri,
 }
 
+#[derive(Clone)]
+struct ExternalEditSession {
+    id: String,
+    tab_id: Option<u64>,
+    is_remote: bool,
+    target_path: String,
+    staged_path: PathBuf,
+    staged_dir: Option<PathBuf>,
+    last_mtime_ns: i128,
+    base_remote_mtime: Option<i64>,
+    editor_label: String,
+    upload_count: u64,
+    last_error: Option<String>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
 struct InnerState {
     config_root: PathBuf,
     next_tab_id: u64,
@@ -94,6 +110,7 @@ struct InnerState {
     desktop_tunnels: HashMap<u64, (Option<u64>, linscp_proto::tunnel::LocalForwardRelay)>,
     next_desktop_tunnel_id: u64,
     monitors: monitor::Monitors,
+    external_edits: HashMap<String, ExternalEditSession>,
 }
 
 // Releases a site reservation even if the requesting window disappears mid-dial.
@@ -160,6 +177,9 @@ pub struct CommanderService {
     // exclusive permit, so it cannot overlap requests that began before it.
     config_activity: Arc<tokio::sync::RwLock<()>>,
     queue: queue::QueueManager,
+    xml_log_lock: Arc<Mutex<()>>,
+    share_export_status: Arc<Mutex<share_export::ShareExportStatus>>,
+    share_export_cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Whether the caller that built this service can show a *server-side* window.
     ///
     /// A launch is only allowed to start a viewer when the transport that asked for
@@ -207,8 +227,11 @@ impl CommanderService {
         } else {
             UserPreferences::default()
         };
+        let queue = queue::QueueManager::new(tokio::sync::broadcast::channel(64).0, local_fs.clone());
+        let initial_xml = Self::resolve_xml_log_path(&config_root, &preferences).ok().flatten();
+        queue.set_xml_log_path(initial_xml);
         Self {
-            local_fs: local_fs.clone(),
+            local_fs,
             secret_vault: Arc::new(linscp_platform::password_vault::PasswordSecretVault::new()),
             legacy_secret_vault: secret_vault,
             state: Arc::new(Mutex::new(InnerState {
@@ -233,14 +256,91 @@ impl CommanderService {
                 desktop_tunnels: HashMap::new(),
                 next_desktop_tunnel_id: 0,
                 monitors: monitor::Monitors::default(),
+                external_edits: HashMap::new(),
             })),
             event_tx: Arc::new(Mutex::new(None)),
             session_key_lock: Arc::new(Mutex::new(())),
             config_lock: Arc::new(config_lock),
             recovery_gate: Arc::new(std::sync::atomic::AtomicBool::new(recovery_needed)),
             config_activity: Arc::new(tokio::sync::RwLock::new(())),
-            queue: queue::QueueManager::new(tokio::sync::broadcast::channel(64).0, local_fs),
+            queue,
+            xml_log_lock: Arc::new(Mutex::new(())),
+            share_export_status: Arc::new(Mutex::new(share_export::ShareExportStatus::default())),
+            share_export_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             desktop_spawn_allowed: false,
+        }
+    }
+
+    /// Attaches an Android Keystore hardware-backed key wrapper so the local
+    /// password vault also binds `sessions.key` to the device's `AndroidKeyStore`.
+    pub fn with_keystore_bridge(
+        mut self,
+        bridge: Arc<dyn linscp_platform::android::KeystoreBridge>,
+    ) -> Self {
+        self.secret_vault = Arc::new(
+            linscp_platform::password_vault::PasswordSecretVault::with_keystore(bridge),
+        );
+        self
+    }
+
+    fn resolve_xml_log_path(
+        config_root: &Path,
+        prefs: &UserPreferences,
+    ) -> Result<Option<PathBuf>, String> {
+        if !prefs.xml_log_enabled {
+            return Ok(None);
+        }
+        let raw = prefs.xml_log_path.trim();
+        if raw.is_empty() {
+            return Ok(Some(config_root.join("session-actions.xml")));
+        }
+        if raw.chars().any(char::is_control) {
+            return Err("XML log path must not contain control characters.".to_string());
+        }
+        let candidate = Path::new(raw);
+        if candidate
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("XML log path must not contain '..' parent traversal.".to_string());
+        }
+        let resolved = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            config_root.join(candidate)
+        };
+        let ext_ok = resolved
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("xml"));
+        if !ext_ok {
+            return Err("XML log file path must end with '.xml'.".to_string());
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(&resolved) {
+            if meta.file_type().is_symlink() || meta.is_dir() {
+                return Err("XML log path must be a regular file, not a directory or symlink.".to_string());
+            }
+        }
+        Ok(Some(resolved))
+    }
+
+    fn record_gui_xml_action(
+        &self,
+        session_name: &str,
+        record_fn: impl FnOnce(&mut linscp_engine::xml_log::SessionLogger),
+    ) {
+        let xml_path = {
+            let Ok(g) = self.state.lock() else { return };
+            Self::resolve_xml_log_path(&g.config_root, &g.preferences)
+                .ok()
+                .flatten()
+        };
+        let Some(path) = xml_path else { return };
+        let Ok(_guard) = self.xml_log_lock.lock() else { return };
+        if let Ok(mut logger) =
+            linscp_engine::xml_log::SessionLogger::open_append_xml(&path, session_name)
+        {
+            record_fn(&mut logger);
         }
     }
 
@@ -373,12 +473,21 @@ impl CommanderService {
             // host, and an unrouted answer there was a 404 the person saw as a
             // broken menu item.
             ("GET", "/api/login") => ApiReply { status: 200, payload: json!({
-                "success": true, "logged_in": false, "username": "", "csrf_token": "",
+                "success": true, "logged_in": false, "accounts_enabled": false, "username": "", "csrf_token": "",
             }) },
             ("POST", "/api/login") => ApiReply { status: 400, payload: json!({
-                "success": false, "error": "Accounts not enabled",
+                "success": false, "accounts_enabled": false, "error": "Accounts not enabled",
             }) },
-            ("POST", "/api/logout") => ApiReply { status: 200, payload: json!({ "success": true }) },
+            ("POST", "/api/logout") => ApiReply { status: 200, payload: json!({ "success": true, "accounts_enabled": false }) },
+            ("GET", "/api/presets") => self.handle_presets_get(&query),
+            ("POST", "/api/presets/save") => self.handle_presets_save(req.body),
+            ("POST", "/api/presets/delete") => self.handle_presets_delete(req.body),
+            ("GET", "/api/logs/xml") => self.handle_xml_logs_get(),
+            ("POST", "/api/logs/xml/clear") => self.handle_xml_logs_clear(),
+            ("GET", "/api/android/share/status") => self.handle_android_share_status(),
+            ("POST", "/api/android/share/cancel") => self.handle_android_share_cancel(),
+            ("GET", "/api/editor/external") => self.handle_external_editor_list(),
+            ("POST", "/api/editor/external/close") => self.handle_external_editor_close(req.body),
             ("GET", "/api/vault/status") => self.handle_vault_status(),
             ("POST", "/api/vault/unlock") => self.handle_vault_unlock(req.body),
             ("POST", "/api/vault/lock") => self.handle_vault_lock(),
@@ -543,6 +652,8 @@ impl CommanderService {
             ("POST", "/api/shell/consume") => self.consume_shell_offer_async(req.body).await,
             ("GET", "/api/remote/edit") => self.remote_edit_read_async(&parse_query(req.path.split_once('?').map(|(_, q)| q).unwrap_or(""))).await,
             ("POST", "/api/remote/save") => self.remote_save_async(req.body).await,
+            ("POST", "/api/editor/external") => self.open_external_editor_async(req.body).await,
+            ("POST", "/api/editor/external/sync") => self.sync_external_editor_async(req.body).await,
             ("POST", "/api/command/exec") => Box::pin(self.exec_cli_command_async(req.body)).await,
             ("POST", "/api/sync/preview") => Box::pin(self.sync_preview_async(req.body)).await,
             ("POST", "/api/sync/run") => Box::pin(self.sync_run_async(req.body)).await,
@@ -1031,8 +1142,19 @@ impl CommanderService {
             .unwrap_or(tab.remote_dir.as_str());
         let path = format!("{}/{}", base.trim_end_matches('/'), name);
         match session.mkdir(&path).await {
-            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
-            Err(error) => api_error(400, format!("Directory creation was not confirmed; the directory may already exist: {error}")),
+            Ok(()) => {
+                self.record_gui_xml_action(&tab.name, |logger| {
+                    logger.record_mkdir(&path, Ok(()));
+                });
+                ApiReply { status: 200, payload: json!({"success": true}) }
+            }
+            Err(error) => {
+                let msg = error.to_string();
+                self.record_gui_xml_action(&tab.name, |logger| {
+                    logger.record_mkdir(&path, Err(&msg));
+                });
+                api_error(400, format!("Directory creation was not confirmed; the directory may already exist: {error}"))
+            }
         }
     }
 
@@ -1076,6 +1198,7 @@ impl CommanderService {
         let active = workspace.get("active").and_then(Value::as_u64).unwrap_or(0) as usize;
         let mut opened = Vec::new();
         let mut failed = Vec::new();
+        let mut challenges = Vec::new();
         let mut active_id = None;
         for (index, entry) in entries.iter().enumerate() {
             let label = entry.get("name").and_then(Value::as_str).unwrap_or("Unnamed tab");
@@ -1096,15 +1219,21 @@ impl CommanderService {
                     if index == active { active_id = Some(id); }
                     opened.push(json!({"name": label, "id": id}));
                 } else { failed.push(json!({"name": label, "error": "Opened tab has no ID."})); }
+            } else if result.payload["challenge"]["tab"].as_u64().is_some() {
+                // Keep the pending challenge alive in `state.challenges` so the UI can
+                // present an interactive host-key prompt for each challenged workspace tab
+                // via `POST /api/tabs/verify` (or reject it via `POST /api/tabs/close`)
+                // without silently approving an unknown or changed SSH host key.
+                let mut challenge = result.payload["challenge"].clone();
+                challenge["name"] = json!(label);
+                challenge["want_active"] = json!(index == active);
+                challenges.push(challenge);
             } else {
-                // Workspace opening cannot silently approve a new SSH key.
-                // Leave that tab unopened and let the user connect manually.
-                if let Some(id) = result.payload["challenge"]["tab"].as_u64() { self.handle_tabs_close(json!({"tab": id})); }
                 failed.push(json!({"name": label, "error": result.payload["error"].as_str().unwrap_or("Cannot open tab")}));
             }
         }
         if let Some(id) = active_id { self.handle_tabs_select(json!({"tab": id})); }
-        ApiReply { status: 200, payload: json!({"success": true, "name": name, "opened": opened, "failed": failed, "active_tab": active_id}) }
+        ApiReply { status: 200, payload: json!({"success": true, "name": name, "opened": opened, "failed": failed, "challenges": challenges, "active_tab": active_id}) }
     }
 
     async fn verify_tab_async(&self, body: Value) -> ApiReply {
@@ -1376,7 +1505,20 @@ impl CommanderService {
                 Ok(mode) => mode,
                 Err(error) => { failures.push(format!("{name}: {error}")); continue; }
             };
-            if let Err(error) = session.chmod(&path, mode).await { failures.push(format!("{name}: {error}")); }
+            match session.chmod(&path, mode).await {
+                Ok(()) => {
+                    self.record_gui_xml_action(&tab.name, |logger| {
+                        logger.record_chmod(&path, mode, false, Ok(()));
+                    });
+                }
+                Err(error) => {
+                    let msg = error.to_string();
+                    self.record_gui_xml_action(&tab.name, |logger| {
+                        logger.record_chmod(&path, mode, false, Err(&msg));
+                    });
+                    failures.push(format!("{name}: {error}"));
+                }
+            }
         }
         if failures.is_empty() { ApiReply { status: 200, payload: json!({"success": true}) } }
         else { ApiReply { status: 400, payload: json!({"success": false, "error": failures.join("; ")}) } }
@@ -1738,9 +1880,10 @@ impl CommanderService {
         let query = body.get("content_query").and_then(Value::as_str).unwrap_or("").to_string();
         if contents && query.is_empty() { return api_error(400, "Enter text to search for.") }
         let case_sensitive = body.get("case_sensitive").and_then(Value::as_bool).unwrap_or(false);
+        let encoding = body.get("encoding").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
         // A name search also matches directories; a content search only files.
-        match ops::search_remote_bounded(session.as_ref(), &root, &mask,
-            if contents { Some(query.as_str()) } else { None }, case_sensitive, 500).await
+        match ops::search_remote_bounded_with_encoding(session.as_ref(), &root, &mask,
+            if contents { Some(query.as_str()) } else { None }, case_sensitive, encoding, 500).await
         {
             Ok(stats) => ApiReply { status: 200, payload: json!({
                 "success": true,
@@ -1798,13 +1941,21 @@ impl CommanderService {
             match queue::delete_remote_recursive_quiet(session.as_ref(), &path).await {
                 Ok(()) => {
                     self.add_log(&format!("Deleted '{path}'."), "info");
+                    self.record_gui_xml_action(&tab.name, |logger| {
+                        logger.record_rm(&path, false, Ok(()));
+                    });
                     removed.push(name);
                 }
                 // A name that is already gone is the state the user asked for.
                 Err(error) if error.to_lowercase().contains("not found") => {
                     removed.push(name);
                 }
-                Err(error) => failed.push(json!({"name": name, "error": error})),
+                Err(error) => {
+                    self.record_gui_xml_action(&tab.name, |logger| {
+                        logger.record_rm(&path, false, Err(&error));
+                    });
+                    failed.push(json!({"name": name, "error": error}));
+                }
             }
         }
         if removed.is_empty() && !failed.is_empty() {
@@ -1853,8 +2004,19 @@ impl CommanderService {
         // Renaming onto an existing name would replace it on most servers.
         if let Ok(Some(_)) = session.stat(&to).await { return api_error(400, "The new name already exists.") }
         match session.rename(&from, &to).await {
-            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
-            Err(error) => api_error(400, error.to_string()),
+            Ok(()) => {
+                self.record_gui_xml_action(&tab.name, |logger| {
+                    logger.record_mv_or_cp(false, &from, &to, Ok(()));
+                });
+                ApiReply { status: 200, payload: json!({"success": true}) }
+            }
+            Err(error) => {
+                let msg = error.to_string();
+                self.record_gui_xml_action(&tab.name, |logger| {
+                    logger.record_mv_or_cp(false, &from, &to, Err(&msg));
+                });
+                api_error(400, msg)
+            }
         }
     }
 
@@ -2991,16 +3153,23 @@ impl CommanderService {
             Ok(bytes) => bytes,
             Err(error) => return api_error(400, error.to_string()),
         };
-        if bytes.contains(&0) { return api_error(400, "Refusing to edit binary file containing NUL bytes.") }
-        let content = match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(_) => return api_error(400, "File is not valid UTF-8 binary/encoded text."),
+        let requested_encoding = query.get("encoding").map(String::as_str);
+        let (content, enc_label, eol_style, had_bom) = match ops::decode_editor_bytes(&bytes, requested_encoding) {
+            Ok(decoded) => decoded,
+            Err(error) => return api_error(400, error),
         };
         ApiReply { status: 200, payload: json!({
             "success": true,
             "path": path,
             "content": content,
-            "info": {"size": entry.size, "mtime": entry.mtime, "mtime_ns": entry.mtime.to_string()},
+            "info": {
+                "size": entry.size,
+                "mtime": entry.mtime,
+                "mtime_ns": entry.mtime.to_string(),
+                "encoding": enc_label,
+                "eol": eol_style,
+                "bom": had_bom,
+            },
         })}
     }
 
@@ -3058,19 +3227,40 @@ impl CommanderService {
                 }
             }
         }
+        let encoding_opt = body.get("encoding").and_then(Value::as_str);
+        let eol_opt = body.get("eol").and_then(Value::as_str);
+        let include_bom = body.get("bom").and_then(Value::as_bool);
+        let encoded_bytes = match ops::encode_editor_text(content, encoding_opt, eol_opt, include_bom) {
+            Ok(bytes) => bytes,
+            Err(error) => return api_error(400, error),
+        };
+        if encoded_bytes.len() as u64 > ops::MAX_GUI_EDIT_BYTES {
+            return api_error(400, "Edited content is too large for the built-in editor.");
+        }
         // The editor writes through the same upload path as a queued
         // transfer, so the transport's own atomic replace is what the user gets.
-        match linscp_proto::upload_bytes(session.as_ref(), &path, content.as_bytes(),
+        match linscp_proto::upload_bytes(session.as_ref(), &path, &encoded_bytes,
             linscp_proto::TransferRequest::default()).await
         {
-            Ok(_) => match session.stat(&path).await {
-                Ok(Some(entry)) => ApiReply { status: 200, payload: json!({
-                    "success": true,
-                    "info": {"size": entry.size, "mtime": entry.mtime, "mtime_ns": entry.mtime.to_string()},
-                })},
-                _ => ApiReply { status: 200, payload: json!({"success": true}) },
-            },
-            Err(error) => api_error(400, error.to_string()),
+            Ok(_) => {
+                self.record_gui_xml_action(&tab.name, |logger| {
+                    logger.record_transfer(true, "(editor)", &path, Some(encoded_bytes.len() as u64), Ok(()));
+                });
+                match session.stat(&path).await {
+                    Ok(Some(entry)) => ApiReply { status: 200, payload: json!({
+                        "success": true,
+                        "info": {"size": entry.size, "mtime": entry.mtime, "mtime_ns": entry.mtime.to_string()},
+                    })},
+                    _ => ApiReply { status: 200, payload: json!({"success": true}) },
+                }
+            }
+            Err(error) => {
+                let msg = error.to_string();
+                self.record_gui_xml_action(&tab.name, |logger| {
+                    logger.record_transfer(true, "(editor)", &path, Some(encoded_bytes.len() as u64), Err(&msg));
+                });
+                api_error(400, msg)
+            }
         }
     }
 
@@ -3327,22 +3517,109 @@ impl CommanderService {
             if expected_total > MAX_EXPORT_BYTES { return Err("Shared files exceed the 512 MiB limit.".to_string()); }
             items.push((remote, name, entry.size));
         }
-        let mut used = 0u64;
-        for (remote, name, expected) in items {
-            let target = destination.join(name);
-            let file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&target).await
-                .map_err(|e| format!("Cannot create private share copy: {e}"))?;
-            let mut sink = LimitedWriter::new(file, MAX_EXPORT_BYTES - used);
-            let received = session.download(&remote, Default::default(), &mut sink, None).await.map_err(|e| e.to_string())?;
-            sink.flush().await.map_err(|e| e.to_string())?;
-            drop(sink);
-            let actual = tokio::fs::metadata(&target).await.map_err(|e| e.to_string())?.len();
-            if received != actual || actual != expected {
-                return Err(format!("The source changed or the download was incomplete: {name}"));
-            }
-            used = used.checked_add(actual).ok_or("Shared files exceed the 512 MiB limit.")?;
+        let files_total = items.len();
+        self.share_export_cancel
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Ok(mut st) = self.share_export_status.lock() {
+            *st = share_export::ShareExportStatus {
+                active: true,
+                cancelled: false,
+                files_done: 0,
+                files_total,
+                bytes_done: 0,
+                bytes_total: expected_total,
+                current_file: items
+                    .first()
+                    .map(|(_, n, _)| (*n).clone())
+                    .unwrap_or_default(),
+                error: None,
+            };
         }
-        Ok(())
+        let progress_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut used = 0u64;
+        let export_res: Result<(), String> = async {
+            for (idx, (remote, name, expected)) in items.into_iter().enumerate() {
+                if self
+                    .share_export_cancel
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err("Share export cancelled by user.".to_string());
+                }
+                if let Ok(mut st) = self.share_export_status.lock() {
+                    st.files_done = idx;
+                    st.bytes_done = progress_bytes.load(std::sync::atomic::Ordering::Acquire);
+                    st.current_file = name.clone();
+                }
+                let target = destination.join(name);
+                let file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target)
+                    .await
+                    .map_err(|e| format!("Cannot create private share copy: {e}"))?;
+                let mut sink = LimitedWriter::with_tracking(
+                    file,
+                    MAX_EXPORT_BYTES - used,
+                    Arc::clone(&self.share_export_cancel),
+                    Arc::clone(&progress_bytes),
+                );
+                let status_ref = Arc::clone(&self.share_export_status);
+                let bytes_ref = Arc::clone(&progress_bytes);
+                let progress_cb = move |_done: u64, _total: u64| {
+                    if let Ok(mut st) = status_ref.lock() {
+                        st.bytes_done = bytes_ref.load(std::sync::atomic::Ordering::Acquire);
+                    }
+                };
+                let received = session
+                    .download(
+                        &remote,
+                        Default::default(),
+                        &mut sink,
+                        Some(&progress_cb as &linscp_proto::ProgressCallback),
+                    )
+                    .await
+                    .map_err(|e| {
+                        if self
+                            .share_export_cancel
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            "Share export cancelled by user.".to_string()
+                        } else {
+                            e.to_string()
+                        }
+                    })?;
+                sink.flush().await.map_err(|e| e.to_string())?;
+                drop(sink);
+                let actual = tokio::fs::metadata(&target)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .len();
+                if received != actual || actual != expected {
+                    return Err(format!(
+                        "The source changed or the download was incomplete: {name}"
+                    ));
+                }
+                used = used
+                    .checked_add(actual)
+                    .ok_or("Shared files exceed the 512 MiB limit.")?;
+                if let Ok(mut st) = self.share_export_status.lock() {
+                    st.files_done = idx + 1;
+                    st.bytes_done = used;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Ok(mut st) = self.share_export_status.lock() {
+            st.active = false;
+            st.cancelled = self
+                .share_export_cancel
+                .load(std::sync::atomic::Ordering::Acquire);
+            if let Err(ref err) = export_res {
+                st.error = Some(err.clone());
+            }
+        }
+        export_res
     }
 
     async fn queue_transfer_async(&self, body: Value, upload: bool, move_item: bool) -> ApiReply {
@@ -3354,18 +3631,57 @@ impl CommanderService {
             Some(names) if !names.is_empty() && names.len() <= 1000 => names,
             _ => return api_error(400, "Select at least one file"),
         };
+        let cfg_root = self.config_root();
+        let preset_store = linscp_engine::presets::TransferPresetStore::load_from_dir(&cfg_root).unwrap_or_default();
+        let requested_preset_raw = body.get("preset").and_then(Value::as_str).unwrap_or("").trim();
+        let matched_preset: Option<linscp_engine::presets::TransferPreset> = if requested_preset_raw.eq_ignore_ascii_case("off") || requested_preset_raw.eq_ignore_ascii_case("none") {
+            None
+        } else if !requested_preset_raw.is_empty() && !requested_preset_raw.eq_ignore_ascii_case("auto") {
+            match preset_store.find(requested_preset_raw).cloned() {
+                Some(p) => Some(p),
+                None => return api_error(400, format!("There is no transfer preset named '{requested_preset_raw}'.")),
+            }
+        } else {
+            let site_preset_name = tab.spec.as_ref().map(|s| s.preset_name.trim()).unwrap_or("");
+            if !site_preset_name.is_empty() && !site_preset_name.eq_ignore_ascii_case("off") && !site_preset_name.eq_ignore_ascii_case("none") {
+                preset_store.find(site_preset_name).cloned()
+            } else {
+                let first_name = names.first().and_then(Value::as_str).unwrap_or("");
+                let host = tab.spec.as_ref().map(|s| s.session.host.as_str()).unwrap_or("");
+                let user = tab.spec.as_ref().map(|s| s.session.username.as_str()).unwrap_or("");
+                let rdir = body.get("remote_dir").and_then(Value::as_str).unwrap_or(&tab.remote_dir);
+                let ldir = body.get("local_dir").and_then(Value::as_str).unwrap_or(&tab.local_dir);
+                preset_store
+                    .match_mask(first_name)
+                    .or_else(|| preset_store.match_session(host, user, rdir, ldir))
+                    .cloned()
+            }
+        };
         let append = body.get("append").and_then(Value::as_bool).unwrap_or(false);
-        let newer_only = body.get("newer_only").and_then(Value::as_bool).unwrap_or(false);
+        let newer_only = body
+            .get("newer_only")
+            .and_then(Value::as_bool)
+            .or_else(|| {
+                if move_item {
+                    None
+                } else {
+                    matched_preset.as_ref().and_then(|p| p.newer_only)
+                }
+            })
+            .unwrap_or(false);
         let no_permissions = body.get("no_permissions").and_then(Value::as_bool).unwrap_or(false);
+        let has_explicit_no_permissions = body.get("no_permissions").is_some();
         let speed_kb = match body.get("speed") {
-            None => 0u64,
+            None => matched_preset.as_ref().and_then(|p| p.speed_kbytes_per_sec).unwrap_or(0u64),
             Some(v) => match v.as_u64() {
                 Some(n) if n <= 100_000_000 => n,
                 _ => return api_error(400, "Speed limit must be an integer between 0 and 100000000 KiB/s."),
             },
         };
-        let transfer_mode = match body.get("transfer").and_then(Value::as_str).unwrap_or("").trim().to_ascii_lowercase().as_str() {
-            "" | "binary" => linscp_types::TransferMode::Binary,
+        let transfer_raw = body.get("transfer").and_then(Value::as_str).unwrap_or("").trim();
+        let transfer_mode = match transfer_raw.to_ascii_lowercase().as_str() {
+            "" => matched_preset.as_ref().and_then(|p| p.transfer_mode).unwrap_or(linscp_types::TransferMode::Binary),
+            "binary" => linscp_types::TransferMode::Binary,
             "ascii" => linscp_types::TransferMode::Ascii,
             "automatic" | "auto" => linscp_types::TransferMode::Automatic,
             _ => return api_error(400, "Unsupported transfer mode (expected binary, ascii, or automatic)."),
@@ -3375,7 +3691,15 @@ impl CommanderService {
             return api_error(400, "File masks are not supported for moves.");
         }
         let parsed_mask = if mask_raw.is_empty() {
-            linscp_engine::filemask::FileMask::default()
+            if !move_item {
+                matched_preset
+                    .as_ref()
+                    .filter(|p| !p.mask.is_empty())
+                    .and_then(|p| linscp_engine::filemask::FileMask::parse(&p.mask).ok())
+                    .unwrap_or_default()
+            } else {
+                linscp_engine::filemask::FileMask::default()
+            }
         } else {
             match linscp_engine::filemask::FileMask::parse(mask_raw) {
                 Ok(mask) => mask,
@@ -3384,7 +3708,10 @@ impl CommanderService {
         };
         let resume_support_raw = body.get("resumesupport").and_then(Value::as_str).unwrap_or("").trim();
         let (parsed_resume_support, explicit_resume_support) = match resume_support_raw.to_ascii_lowercase().as_str() {
-            "" => (linscp_engine::presets::ResumeSupportMode::On, false),
+            "" => match matched_preset.as_ref().and_then(|p| p.resume_support) {
+                Some(rs) => (rs, false),
+                None => (linscp_engine::presets::ResumeSupportMode::On, false),
+            },
             "on" => (linscp_engine::presets::ResumeSupportMode::On, true),
             "off" => (linscp_engine::presets::ResumeSupportMode::Off, true),
             "default" => (linscp_engine::presets::ResumeSupportMode::Smart(100 * 1024), true),
@@ -3436,8 +3763,8 @@ impl CommanderService {
                 return api_error(400, "Upload append is supported only for SFTP and FTP/FTPS sessions.");
             }
         }
-        if resume && (move_item || upload || tab.is_local || session.as_ref().is_none_or(|s| !matches!(s.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs | linscp_types::ProtocolScheme::S3 | linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes))) {
-            return api_error(400, "Verified resume is supported only for SFTP, FTP/FTPS, WebDAV, and S3 file downloads.");
+        if resume && (upload || tab.is_local || session.as_ref().is_none_or(|s| !matches!(s.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs | linscp_types::ProtocolScheme::S3 | linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes))) {
+            return api_error(400, "Verified resume is supported only for SFTP, FTP/FTPS, WebDAV, and S3 file downloads and remote-to-local moves.");
         }
         let overwrite = body.get("overwrite").and_then(Value::as_str).unwrap_or("ask");
         if overwrite != "ask" && overwrite != "overwrite" { return api_error(400, "Unsupported overwrite policy"); }
@@ -3581,11 +3908,19 @@ impl CommanderService {
             flags.transfer_mode = transfer_mode;
             flags.file_mask = parsed_mask.clone();
             flags.speed_kbytes_per_sec = if speed_kb == 0 { None } else { Some(speed_kb) };
-            flags.permissions = if no_permissions {
-                linscp_engine::presets::PresetPermissions::Off
+            flags.permissions = if has_explicit_no_permissions {
+                if no_permissions {
+                    linscp_engine::presets::PresetPermissions::Off
+                } else {
+                    linscp_engine::presets::PresetPermissions::FromFile
+                }
             } else {
-                linscp_engine::presets::PresetPermissions::FromFile
+                matched_preset
+                    .as_ref()
+                    .and_then(|p| p.permissions)
+                    .unwrap_or(linscp_engine::presets::PresetPermissions::FromFile)
             };
+            flags.eol_override = matched_preset.as_ref().and_then(|p| p.eol);
             flags.ftp_risky_publish = is_ftp_upload && !append && ftp_risk_accepted;
             flags.merge_directories = is_dir && exists && merge_names.contains(name);
             let is_scp_sess = session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh));
@@ -3595,7 +3930,11 @@ impl CommanderService {
                 parsed_resume_support
             };
             flags.explicit_resume_support = explicit_resume_support;
-            flags.preserve_time = body.get("preserve_time").and_then(Value::as_bool).unwrap_or(true);
+            flags.preserve_time = body
+                .get("preserve_time")
+                .and_then(Value::as_bool)
+                .or_else(|| matched_preset.as_ref().and_then(|p| p.preserve_time))
+                .unwrap_or(true);
             if (!upload && move_item && !tab.is_local) || resume {
                 let sess = session.as_ref().unwrap();
                 match sess.scheme() {
@@ -4054,6 +4393,9 @@ impl CommanderService {
             "vault": self.secret_vault.status(&g.config_root).unwrap_or("locked"),
             "preferences": g.preferences,
             "sessions_file": g.config_root.join("sessions.ini").to_string_lossy(),
+            "gssapi_available": linscp_platform::gssapi_sys::is_system_gssapi_available(),
+            "supported_encodings": linscp_engine::text_mode::SUPPORTED_ENCODINGS,
+            "external_editor_supported": self.desktop_spawn_allowed && gui_os::supports_external_desktop_editor(),
         })}
     }
 
@@ -4088,15 +4430,16 @@ impl CommanderService {
             Ok(p) => p,
             Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
         };
+        let encoding_opt = query.get("encoding").map(String::as_str);
         // A granted document reads through the bridge; a plain path keeps the
         // direct reader.
         if is_saf_path(&resolved) {
-            return match ops::read_local_text_file_via_fs(self.local_fs.as_ref(), &resolved, ops::MAX_GUI_EDIT_BYTES) {
+            return match ops::read_local_text_file_via_fs_encoded(self.local_fs.as_ref(), &resolved, ops::MAX_GUI_EDIT_BYTES, encoding_opt) {
                 Ok((content, info)) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "content": content, "info": info})},
                 Err(error) => ApiReply{ status: 400, payload: json!({"success": false, "error": error})},
             };
         }
-        match ops::read_local_text_file(Path::new(&resolved), ops::MAX_GUI_EDIT_BYTES) {
+        match ops::read_local_text_file_encoded(Path::new(&resolved), ops::MAX_GUI_EDIT_BYTES, encoding_opt) {
             Ok((content, info)) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "content": content, "info": info})},
             Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
         }
@@ -4141,13 +4484,14 @@ impl CommanderService {
             let resolved = match resolve_contained(&tab.other_local_dir, &path) {
                 Ok(p) => p, Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
             };
+            let encoding_opt = query.get("encoding").map(String::as_str);
             if is_saf_path(&resolved) {
-                return match ops::read_local_text_file_via_fs(self.local_fs.as_ref(), &resolved, ops::MAX_GUI_EDIT_BYTES) {
+                return match ops::read_local_text_file_via_fs_encoded(self.local_fs.as_ref(), &resolved, ops::MAX_GUI_EDIT_BYTES, encoding_opt) {
                     Ok((content, info)) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "content": content, "info": info})},
                     Err(error) => ApiReply{ status: 400, payload: json!({"success": false, "error": error})},
                 };
             }
-            match ops::read_local_text_file(Path::new(&resolved), ops::MAX_GUI_EDIT_BYTES) {
+            match ops::read_local_text_file_encoded(Path::new(&resolved), ops::MAX_GUI_EDIT_BYTES, encoding_opt) {
                 Ok((c,i)) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "content": c, "info": i})},
                 Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
             }
@@ -4203,9 +4547,19 @@ impl CommanderService {
             parsed
         };
         let cfg = self.state.lock().expect("m").config_root.clone();
+        let resolved_xml = match Self::resolve_xml_log_path(&cfg, &parsed) {
+            Ok(path_opt) => path_opt,
+            Err(err) => {
+                return ApiReply {
+                    status: 400,
+                    payload: json!({"success": false, "error": err}),
+                };
+            }
+        };
         if let Err(e) = PreferencesStore::save(&cfg, &parsed) {
             return ApiReply{ status: 500, payload: json!({"success": false, "error": e})};
         }
+        self.queue.set_xml_log_path(resolved_xml);
         { let mut g = self.state.lock().expect("m"); g.preferences = parsed.clone(); }
         ApiReply{ status: 200, payload: json!({"success": true, "preferences": parsed})}
     }
@@ -4877,6 +5231,17 @@ impl CommanderService {
                 site.private_key = candidate.private_key;
                 site.remote_directory = candidate.remote_directory;
                 site.local_directory = candidate.local_directory;
+                if let Some(th) = candidate.tunnel_host.filter(|h| !h.trim().is_empty()) {
+                    site.tunnel.enabled = true;
+                    site.tunnel.host = th;
+                    site.tunnel.port = candidate.tunnel_port.unwrap_or(22);
+                    site.tunnel.username = candidate.tunnel_username.unwrap_or_default();
+                    site.tunnel.keyfile = candidate.tunnel_private_key;
+                }
+                if let Some(pc) = candidate.proxy_command.filter(|c| !c.trim().is_empty()) {
+                    site.proxy_method = "CMD".to_string();
+                    site.proxy_command = pc;
+                }
                 validate_imported_site(&site)?;
                 protect_stored_ssh_keys(&mut site, &cfg, self.secret_vault.as_ref(), &mut created)?;
                 if let Some(existing) = existing { store.remove(&existing); }
@@ -5310,16 +5675,19 @@ impl CommanderService {
             match resolve_contained(&b, &path) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},}
         } else { path.clone() };
         let content = body.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let encoding_opt = body.get("encoding").and_then(Value::as_str);
+        let eol_opt = body.get("eol").and_then(Value::as_str);
+        let include_bom = body.get("bom").and_then(Value::as_bool);
         let mtime_ns = body.get("base_mtime_ns").and_then(|v| v.as_i64()).map(|v| v as i128).or_else(|| body.get("base_mtime").and_then(|v| v.as_i64()).map(|v| (v as i128)*1_000_000_000));
         // A granted document writes through the bridge; a plain path keeps
         // the direct writer and its permission-bit recovery.
         if is_saf_path(&resolved) {
-            return match ops::write_local_text_file_via_fs(self.local_fs.as_ref(), &resolved, &content, mtime_ns) {
+            return match ops::write_local_text_file_via_fs_encoded(self.local_fs.as_ref(), &resolved, &content, mtime_ns, encoding_opt, eol_opt, include_bom) {
                 Ok(info) => ApiReply{ status: 200, payload: json!({"success": true, "info": info})},
                 Err(error) => ApiReply{ status: 400, payload: json!({"success": false, "error": error})},
             };
         }
-        match ops::write_local_text_file(Path::new(&resolved), &content, mtime_ns) {
+        match ops::write_local_text_file_encoded(Path::new(&resolved), &content, mtime_ns, encoding_opt, eol_opt, include_bom) {
             Ok(info) => ApiReply{ status: 200, payload: json!({"success": true, "info": info})},
             Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
         }
@@ -5328,6 +5696,618 @@ impl CommanderService {
     fn handle_logs(&self) -> ApiReply {
         let g = self.state.lock().expect("m");
         ApiReply{ status: 200, payload: json!({"logs": g.logs})}
+    }
+
+    fn preset_to_json(p: &linscp_engine::presets::TransferPreset) -> Value {
+        let transfer = p.transfer_mode.map(|m| match m {
+            linscp_types::TransferMode::Binary => "binary",
+            linscp_types::TransferMode::Ascii => "ascii",
+            linscp_types::TransferMode::Automatic => "automatic",
+        });
+        let preserve_time = p.preserve_time.map(|pt| {
+            if pt && p.preserve_time_dirs == Some(true) {
+                "all"
+            } else if pt {
+                "on"
+            } else {
+                "off"
+            }
+        });
+        let resume_support = p.resume_support.map(|rs| match rs {
+            linscp_engine::presets::ResumeSupportMode::On => "on".to_string(),
+            linscp_engine::presets::ResumeSupportMode::Off => "off".to_string(),
+            linscp_engine::presets::ResumeSupportMode::Smart(b) => (b / 1024).to_string(),
+        });
+        let permissions = p.permissions.map(|perm| match perm {
+            linscp_engine::presets::PresetPermissions::Off => "off".to_string(),
+            linscp_engine::presets::PresetPermissions::FromFile => "fromfile".to_string(),
+            linscp_engine::presets::PresetPermissions::Mode(m) => format!("{m:o}"),
+        });
+        let eol = p.eol.map(|e| e.name().to_string());
+        json!({
+            "name": p.name,
+            "description": p.describe(),
+            "transfer": transfer,
+            "preserve_time": preserve_time,
+            "newer_only": p.newer_only,
+            "speed": p.speed_kbytes_per_sec,
+            "resumesupport": resume_support,
+            "permissions": permissions,
+            "eol": eol,
+            "filemask": (!p.mask.is_empty()).then(|| p.mask.clone()),
+            "host": p.host,
+            "username": p.username,
+            "remote_dir": p.remote_directory,
+            "local_dir": p.local_directory,
+            "mask": p.mask,
+        })
+    }
+
+    fn handle_presets_get(&self, query: &BTreeMap<String, String>) -> ApiReply {
+        let cfg = self.config_root();
+        let store = match linscp_engine::presets::TransferPresetStore::load_from_dir(&cfg) {
+            Ok(store) => store,
+            Err(error) => return api_error(500, error),
+        };
+        let presets: Vec<Value> = store.presets().iter().map(Self::preset_to_json).collect();
+        let mut matched: Option<String> = None;
+        if let Some(tid) = query.get("tab").and_then(|s| parse_tab_id_str(Some(s))) {
+            let tab_opt = self.state.lock().expect("m").tabs.get(&tid).cloned();
+            if let Some(tab) = tab_opt {
+                let site_preset = tab.spec.as_ref().map(|s| s.preset_name.trim()).unwrap_or("");
+                if !site_preset.is_empty() && !site_preset.eq_ignore_ascii_case("off") && !site_preset.eq_ignore_ascii_case("none") {
+                    matched = store.find(site_preset).map(|p| p.name.clone());
+                } else {
+                    let filename = query.get("filename").map(String::as_str).unwrap_or("");
+                    let host = tab.spec.as_ref().map(|s| s.session.host.as_str()).unwrap_or("");
+                    let user = tab.spec.as_ref().map(|s| s.session.username.as_str()).unwrap_or("");
+                    matched = store
+                        .match_mask(filename)
+                        .or_else(|| store.match_session(host, user, &tab.remote_dir, &tab.local_dir))
+                        .map(|p| p.name.clone());
+                }
+            }
+        }
+        ApiReply {
+            status: 200,
+            payload: json!({
+                "success": true,
+                "presets": presets,
+                "matched": matched,
+                "file": linscp_engine::presets::TransferPresetStore::default_path(&cfg).to_string_lossy(),
+            }),
+        }
+    }
+
+    fn handle_presets_save(&self, body: Value) -> ApiReply {
+        let name = body.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        if name.is_empty() {
+            return api_error(400, "A preset name is required.");
+        }
+        let mut preset = linscp_engine::presets::TransferPreset {
+            name,
+            ..Default::default()
+        };
+        let mask_val = body
+            .get("mask")
+            .filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty()))
+            .or_else(|| body.get("filemask"));
+        let str_pairs = [
+            ("transfer", body.get("transfer")),
+            ("preservetime", body.get("preserve_time").or_else(|| body.get("preservetime"))),
+            ("resumesupport", body.get("resumesupport")),
+            ("permissions", body.get("permissions")),
+            ("eol", body.get("eol")),
+            ("host", body.get("host")),
+            ("username", body.get("username")),
+            ("remotedir", body.get("remote_dir").or_else(|| body.get("remotedir"))),
+            ("localdir", body.get("local_dir").or_else(|| body.get("localdir"))),
+            ("mask", mask_val),
+        ];
+        for (key, val_opt) in str_pairs {
+            if let Some(s) = val_opt.and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                if let Err(err) = preset.parse_setting(key, s) {
+                    return api_error(400, err);
+                }
+            }
+        }
+        if let Some(no) = body.get("newer_only").and_then(Value::as_bool) {
+            preset.newer_only = Some(no);
+        }
+        if let Some(sp_val) = body.get("speed") {
+            match sp_val {
+                Value::Null => {}
+                Value::Number(n) => {
+                    if let Some(sp) = n.as_u64() {
+                        if sp > 0 {
+                            if let Err(err) = preset.parse_setting("speed", &sp.to_string()) {
+                                return api_error(400, err);
+                            }
+                        }
+                    } else {
+                        return api_error(400, "Invalid speed value.");
+                    }
+                }
+                Value::String(s) if !s.trim().is_empty() => {
+                    if let Err(err) = preset.parse_setting("speed", s.trim()) {
+                        return api_error(400, err);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let cfg = self.config_root();
+        let mut store = match linscp_engine::presets::TransferPresetStore::load_from_dir(&cfg) {
+            Ok(store) => store,
+            Err(error) => return api_error(500, error),
+        };
+        if let Err(error) = store.add_or_update(preset.clone()) {
+            return api_error(400, error);
+        }
+        if let Err(error) = store.save_to_dir(&cfg) {
+            return api_error(500, error);
+        }
+        ApiReply {
+            status: 200,
+            payload: json!({"success": true, "preset": Self::preset_to_json(&preset)}),
+        }
+    }
+
+    fn handle_presets_delete(&self, body: Value) -> ApiReply {
+        let name = body.get("name").and_then(Value::as_str).unwrap_or("").trim();
+        if name.is_empty() {
+            return api_error(400, "A preset name is required.");
+        }
+        let cfg = self.config_root();
+        let mut store = match linscp_engine::presets::TransferPresetStore::load_from_dir(&cfg) {
+            Ok(store) => store,
+            Err(error) => return api_error(500, error),
+        };
+        if let Err(error) = store.remove(name) {
+            return api_error(404, error);
+        }
+        if let Err(error) = store.save_to_dir(&cfg) {
+            return api_error(500, error);
+        }
+        ApiReply { status: 200, payload: json!({"success": true}) }
+    }
+
+    fn handle_xml_logs_get(&self) -> ApiReply {
+        let (cfg, prefs) = {
+            let g = self.state.lock().expect("m");
+            (g.config_root.clone(), g.preferences.clone())
+        };
+        let default_path = cfg.join("session-actions.xml");
+        let target = if prefs.xml_log_enabled {
+            match Self::resolve_xml_log_path(&cfg, &prefs) {
+                Ok(Some(p)) => p,
+                Ok(None) => default_path,
+                Err(err) => return api_error(400, err),
+            }
+        } else if !prefs.xml_log_path.trim().is_empty() {
+            let mut probe = prefs.clone();
+            probe.xml_log_enabled = true;
+            Self::resolve_xml_log_path(&cfg, &probe).ok().flatten().unwrap_or(default_path)
+        } else {
+            default_path
+        };
+        let _guard = self.xml_log_lock.lock().expect("xml log lock");
+        match std::fs::read(&target) {
+            Ok(bytes) => {
+                let max = 512 * 1024usize;
+                let truncated = bytes.len() > max;
+                let slice = if truncated { &bytes[bytes.len() - max..] } else { &bytes[..] };
+                ApiReply {
+                    status: 200,
+                    payload: json!({
+                        "success": true,
+                        "enabled": prefs.xml_log_enabled,
+                        "path": target.to_string_lossy(),
+                        "exists": true,
+                        "size": bytes.len(),
+                        "truncated": truncated,
+                        "content": String::from_utf8_lossy(slice),
+                    }),
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ApiReply {
+                status: 200,
+                payload: json!({
+                    "success": true,
+                    "enabled": prefs.xml_log_enabled,
+                    "path": target.to_string_lossy(),
+                    "exists": false,
+                    "size": 0,
+                    "truncated": false,
+                    "content": "",
+                }),
+            },
+            Err(e) => api_error(500, format!("Cannot read XML log '{}': {e}", target.display())),
+        }
+    }
+
+    fn handle_xml_logs_clear(&self) -> ApiReply {
+        let (cfg, prefs) = {
+            let g = self.state.lock().expect("m");
+            (g.config_root.clone(), g.preferences.clone())
+        };
+        let mut probe = prefs.clone();
+        probe.xml_log_enabled = true;
+        let target = match Self::resolve_xml_log_path(&cfg, &probe) {
+            Ok(Some(p)) => p,
+            _ => cfg.join("session-actions.xml"),
+        };
+        let _guard = self.xml_log_lock.lock().expect("xml log lock");
+        match std::fs::remove_file(&target) {
+            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                ApiReply { status: 200, payload: json!({"success": true}) }
+            }
+            Err(e) => api_error(500, format!("Cannot clear XML log '{}': {e}", target.display())),
+        }
+    }
+
+    fn handle_android_share_status(&self) -> ApiReply {
+        let st = self.share_export_status.lock().expect("share status").clone();
+        ApiReply {
+            status: 200,
+            payload: json!({
+                "success": true,
+                "active": st.active,
+                "cancelled": st.cancelled,
+                "files_done": st.files_done,
+                "files_total": st.files_total,
+                "bytes_done": st.bytes_done,
+                "bytes_total": st.bytes_total,
+                "current_file": st.current_file,
+                "error": st.error,
+            }),
+        }
+    }
+
+    fn handle_android_share_cancel(&self) -> ApiReply {
+        self.share_export_cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Ok(mut st) = self.share_export_status.lock() {
+            st.cancelled = true;
+        }
+        ApiReply { status: 200, payload: json!({"success": true}) }
+    }
+
+    fn spawn_safe_gui_external_editor(file_path: &Path) -> Result<String, String> {
+        gui_os::spawn_safe_external_editor(file_path)
+    }
+
+    async fn open_external_editor_async(&self, body: Value) -> ApiReply {
+        if !self.desktop_spawn_allowed || !gui_os::supports_external_desktop_editor() {
+            return api_error(
+                501,
+                "External desktop editors are only available in the native desktop window.",
+            );
+        }
+        let side = body.get("side").and_then(Value::as_str).unwrap_or("remote");
+        let raw_path = body.get("path").and_then(Value::as_str).unwrap_or("");
+        if raw_path.is_empty() {
+            return api_error(400, "No file path specified.");
+        }
+        let tab_id = tabs::parse_tab_id_value(body.get("tab"));
+        let tab_opt = tab_id.and_then(|id| self.state.lock().expect("m").tabs.get(&id).cloned());
+        if side == "local" || tab_opt.as_ref().is_some_and(|t| t.is_local && side == "remote") {
+            let base = if side == "local" {
+                tab_opt
+                    .as_ref()
+                    .map(|t| t.local_dir.clone())
+                    .unwrap_or_else(|| self.default_local_dir())
+            } else {
+                tab_opt
+                    .as_ref()
+                    .map(|t| t.other_local_dir.clone())
+                    .unwrap_or_default()
+            };
+            let resolved = match resolve_contained(&base, raw_path) {
+                Ok(p) => p,
+                Err(e) => return api_error(400, e),
+            };
+            if is_saf_path(&resolved) {
+                return api_error(400, "External desktop editors cannot open Android SAF URIs directly.");
+            }
+            let info = match gui_os::stat_extended(Path::new(&resolved)) {
+                Ok(i) if !i.is_dir && !i.is_symlink => i,
+                Ok(_) => return api_error(400, "Only regular files can be opened in an external editor."),
+                Err(e) => return api_error(400, e.to_string()),
+            };
+            let editor_label = match Self::spawn_safe_gui_external_editor(Path::new(&resolved)) {
+                Ok(lbl) => lbl,
+                Err(e) => return api_error(400, e),
+            };
+            let edit_id = format!(
+                "ext-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            );
+            self.state.lock().expect("m").external_edits.insert(
+                edit_id.clone(),
+                ExternalEditSession {
+                    id: edit_id.clone(),
+                    tab_id,
+                    is_remote: false,
+                    target_path: resolved.clone(),
+                    staged_path: PathBuf::from(&resolved),
+                    staged_dir: None,
+                    last_mtime_ns: info.mtime_ns,
+                    base_remote_mtime: None,
+                    editor_label: editor_label.clone(),
+                    upload_count: 0,
+                    last_error: None,
+                    closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                },
+            );
+            return ApiReply {
+                status: 200,
+                payload: json!({
+                    "success": true,
+                    "id": edit_id,
+                    "editor": editor_label,
+                    "path": resolved,
+                    "is_remote": false,
+                }),
+            };
+        }
+
+        let Some(tab) = tab_opt.filter(|t| t.connected && !t.is_local) else {
+            return api_error(400, "Not connected");
+        };
+        let Some(session) = tab.remote.clone() else {
+            return api_error(400, "Not connected");
+        };
+        let remote_path = match validate_remote_absolute_path(raw_path) {
+            Ok(p) => p,
+            Err(e) => return api_error(400, e),
+        };
+        let entry = match session.stat(&remote_path).await {
+            Ok(Some(e)) if !e.is_dir && !e.is_symlink => e,
+            Ok(Some(_)) => return api_error(400, "Only regular files can be opened in an external editor."),
+            Ok(None) => return api_error(400, "The file does not exist."),
+            Err(e) => return api_error(400, e.to_string()),
+        };
+        if entry.size > 16 * 1024 * 1024 {
+            return api_error(400, "File exceeds the 16 MiB external editor staging limit.");
+        }
+        let bytes = match linscp_proto::download_bytes(
+            session.as_ref(),
+            &remote_path,
+            linscp_proto::TransferRequest::default(),
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => return api_error(400, e.to_string()),
+        };
+        let cfg = self.config_root();
+        let stage_base = cfg.join("external-edit");
+        let _ = linscp_platform::create_private_dir(&stage_base);
+        let mut rnd = [0u8; 8];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut rnd);
+        let edit_id = format!(
+            "ext-{}",
+            rnd.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        let stage_dir = stage_base.join(&edit_id);
+        if let Err(e) = linscp_platform::create_private_dir(&stage_dir) {
+            return api_error(500, format!("Cannot create external editor staging directory: {e}"));
+        }
+        let leaf: String = remote_path
+            .rsplit('/')
+            .next()
+            .unwrap_or("file.txt")
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+            .collect();
+        let safe_leaf = if leaf.is_empty() || leaf == "." || leaf == ".." {
+            "file.txt".to_string()
+        } else {
+            leaf
+        };
+        let staged_path = stage_dir.join(&safe_leaf);
+        if let Err(e) = linscp_platform::write_private_file_atomic(&staged_path, &bytes) {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return api_error(500, format!("Cannot write staged file: {e}"));
+        }
+        let initial_mtime_ns = gui_os::stat_extended(&staged_path)
+            .map(|i| i.mtime_ns)
+            .unwrap_or(0);
+        let editor_label = match Self::spawn_safe_gui_external_editor(&staged_path) {
+            Ok(lbl) => lbl,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&stage_dir);
+                return api_error(400, e);
+            }
+        };
+        let closed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.state.lock().expect("m").external_edits.insert(
+            edit_id.clone(),
+            ExternalEditSession {
+                id: edit_id.clone(),
+                tab_id: Some(tab.id),
+                is_remote: true,
+                target_path: remote_path.clone(),
+                staged_path: staged_path.clone(),
+                staged_dir: Some(stage_dir),
+                last_mtime_ns: initial_mtime_ns,
+                base_remote_mtime: Some(entry.mtime),
+                editor_label: editor_label.clone(),
+                upload_count: 0,
+                last_error: None,
+                closed: Arc::clone(&closed_flag),
+            },
+        );
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let svc = self.clone();
+            let eid = edit_id.clone();
+            handle.spawn(async move {
+                for _ in 0..3600 {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    if closed_flag.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    let _ = svc.sync_external_editor_by_id(&eid, false).await;
+                }
+            });
+        }
+        ApiReply {
+            status: 200,
+            payload: json!({
+                "success": true,
+                "id": edit_id,
+                "editor": editor_label,
+                "path": remote_path,
+                "staged_path": staged_path.to_string_lossy(),
+                "is_remote": true,
+            }),
+        }
+    }
+
+    async fn sync_external_editor_by_id(&self, edit_id: &str, force: bool) -> Result<bool, String> {
+        let entry_opt = self.state.lock().expect("m").external_edits.get(edit_id).cloned();
+        let Some(edit) = entry_opt else {
+            return Err("External editor session is no longer active.".to_string());
+        };
+        if !edit.is_remote {
+            return Ok(false);
+        }
+        let info = gui_os::stat_extended(&edit.staged_path)
+            .map_err(|e| format!("Staged file missing: {e}"))?;
+        if info.is_symlink || info.is_dir {
+            return Err("Staged external edit file is no longer a regular file.".to_string());
+        }
+        if !force && info.mtime_ns == edit.last_mtime_ns {
+            return Ok(false);
+        }
+        let Some(tid) = edit.tab_id else {
+            return Err("Remote tab is gone.".to_string());
+        };
+        let (session, tab_name) = {
+            let st = self.state.lock().expect("m");
+            let Some(t) = st.tabs.get(&tid).filter(|t| t.connected && !t.is_local) else {
+                return Err("Remote session is disconnected.".to_string());
+            };
+            let Some(s) = t.remote.clone() else {
+                return Err("Remote session is disconnected.".to_string());
+            };
+            (s, t.name.clone())
+        };
+        if let Some(expected_mtime) = edit.base_remote_mtime.filter(|m| *m > 0) {
+            if let Ok(Some(rem)) = session.stat(&edit.target_path).await {
+                if rem.mtime != expected_mtime {
+                    let msg = format!(
+                        "Remote file '{}' changed on server while open in external editor.",
+                        edit.target_path
+                    );
+                    if let Ok(mut st) = self.state.lock() {
+                        if let Some(cur) = st.external_edits.get_mut(edit_id) {
+                            cur.last_error = Some(msg.clone());
+                        }
+                    }
+                    return Err(msg);
+                }
+            }
+        }
+        let bytes = std::fs::read(&edit.staged_path).map_err(|e| e.to_string())?;
+        linscp_proto::upload_bytes(
+            session.as_ref(),
+            &edit.target_path,
+            &bytes,
+            linscp_proto::TransferRequest::default(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let new_remote_mtime = session
+            .stat(&edit.target_path)
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.mtime);
+        self.record_gui_xml_action(&tab_name, |logger| {
+            logger.record_transfer(
+                true,
+                &edit.staged_path.to_string_lossy(),
+                &edit.target_path,
+                Some(bytes.len() as u64),
+                Ok(()),
+            );
+        });
+        if let Ok(mut st) = self.state.lock() {
+            if let Some(cur) = st.external_edits.get_mut(edit_id) {
+                cur.last_mtime_ns = info.mtime_ns;
+                cur.base_remote_mtime = new_remote_mtime;
+                cur.upload_count += 1;
+                cur.last_error = None;
+            }
+        }
+        self.add_log(
+            &format!("Uploaded external editor changes to '{}'.", edit.target_path),
+            "success",
+        );
+        let _ = self.event_sender().send(json!({
+            "event": "external_edit_uploaded",
+            "id": edit_id,
+            "path": edit.target_path,
+        }));
+        Ok(true)
+    }
+
+    async fn sync_external_editor_async(&self, body: Value) -> ApiReply {
+        let edit_id = body.get("id").and_then(Value::as_str).unwrap_or("");
+        if edit_id.is_empty() {
+            return api_error(400, "Missing external edit id.");
+        }
+        match self.sync_external_editor_by_id(edit_id, true).await {
+            Ok(uploaded) => ApiReply {
+                status: 200,
+                payload: json!({"success": true, "uploaded": uploaded}),
+            },
+            Err(error) => api_error(400, error),
+        }
+    }
+
+    fn handle_external_editor_list(&self) -> ApiReply {
+        let g = self.state.lock().expect("m");
+        let items: Vec<Value> = g
+            .external_edits
+            .values()
+            .map(|e| {
+                json!({
+                    "id": e.id,
+                    "tab": e.tab_id,
+                    "is_remote": e.is_remote,
+                    "path": e.target_path,
+                    "editor": e.editor_label,
+                    "upload_count": e.upload_count,
+                    "last_error": e.last_error,
+                })
+            })
+            .collect();
+        ApiReply {
+            status: 200,
+            payload: json!({"success": true, "sessions": items}),
+        }
+    }
+
+    fn handle_external_editor_close(&self, body: Value) -> ApiReply {
+        let edit_id = body.get("id").and_then(Value::as_str).unwrap_or("");
+        let removed = self.state.lock().expect("m").external_edits.remove(edit_id);
+        if let Some(entry) = removed {
+            entry
+                .closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Some(dir) = entry.staged_dir {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+        ApiReply { status: 200, payload: json!({"success": true}) }
     }
     fn handle_cleanup_get(&self) -> ApiReply {
         let cfg = self.state.lock().expect("m").config_root.clone();
@@ -6062,7 +7042,11 @@ impl CommanderService {
         if tab.is_local {
             let target = match resolve_contained(&tab.other_local_dir, &name) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
             match self.local_fs.mkdir_all(&target) { Ok(_)=> ApiReply{ status:200, payload: json!({"success": true})}, Err(e)=> ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})}}
-        } else { ApiReply{ status:400, payload: json!({"success": false, "error": "Remote mkdir not implemented"})}}
+        } else {
+            ApiReply{ status:400, payload: json!({
+                "success": false,
+                "error": "The remote mkdir needs the session-capable request path."})}
+        }
     }
     fn handle_remote_delete(&self, body: Value) -> ApiReply {
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
@@ -6110,7 +7094,11 @@ impl CommanderService {
                 Ok(())=> ApiReply{ status:200, payload: json!({"success": true})},
                 Err(e)=> ApiReply{ status:400, payload: json!({"success": false, "conflict": e.ends_with(":conflict"), "error": Self::rename_error_message(&e)})},
             }
-        } else { ApiReply{ status:400, payload: json!({"success": false, "error": "not implemented"})}}
+        } else {
+            ApiReply{ status:400, payload: json!({
+                "success": false,
+                "error": "The remote rename needs the session-capable request path."})}
+        }
     }
     // The panel's own mutation calls arrive through `dispatch_async`, which
     // has the session; only a local tab reaches this table, and a local tab
@@ -6188,9 +7176,58 @@ impl CommanderService {
         ApiReply{ status:200, payload: json!({"success": true, "properties": rows, "name": rows.get(0).and_then(|v| v.get("name")).cloned().unwrap_or(json!(""))})}
     }
     fn handle_remote_rights(&self, body: Value) -> ApiReply { self.handle_remote_chmod(body) }
-    // Reaching this table means no connected session, and a search walks a
-    // server tree; there is nothing local to search here.
-    fn handle_remote_search(&self, _body: Value) -> ApiReply { api_error(400, "Not connected") }
+    fn handle_remote_search(&self, body: Value) -> ApiReply {
+        let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else {
+            return api_error(400, "Not connected");
+        };
+        let Some(tab) = self.state.lock().expect("m").tabs.get(&id).cloned() else {
+            return api_error(400, "Not connected");
+        };
+        if !tab.connected || !tab.is_local {
+            return api_error(400, "Not connected");
+        }
+        if is_saf_path(&tab.other_local_dir) {
+            return api_error(400, "Recursive content search is not supported on granted Android SAF folders.");
+        }
+        let raw_root = body.get("path").and_then(Value::as_str).filter(|p| !p.is_empty()).unwrap_or(&tab.other_local_dir);
+        let resolved_root = match resolve_local_path_for_list(raw_root) {
+            Ok(p) => p,
+            Err(e) => return api_error(400, e),
+        };
+        let mask_spec = body.get("pattern").and_then(Value::as_str).unwrap_or("*");
+        let mask = match FileMask::parse(mask_spec) {
+            Ok(m) => m,
+            Err(e) => return api_error(400, e),
+        };
+        let contents = body.get("search_contents").and_then(Value::as_bool).unwrap_or(false);
+        let query = body.get("content_query").and_then(Value::as_str).unwrap_or("").to_string();
+        if contents && query.is_empty() {
+            return api_error(400, "Enter text to search for.");
+        }
+        let case_sensitive = body.get("case_sensitive").and_then(Value::as_bool).unwrap_or(false);
+        let encoding = body.get("encoding").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+        match ops::search_local_bounded_with_encoding(
+            Path::new(&resolved_root),
+            &mask,
+            if contents { Some(query.as_str()) } else { None },
+            case_sensitive,
+            encoding,
+            500,
+        ) {
+            Ok(stats) => ApiReply {
+                status: 200,
+                payload: json!({
+                    "success": true,
+                    "matches": stats.matches,
+                    "truncated": stats.truncated,
+                    "scanned": stats.scanned,
+                    "skipped": stats.skipped,
+                    "bytes_scanned": stats.bytes_scanned,
+                }),
+            },
+            Err(error) => api_error(400, error),
+        }
+    }
     fn handle_remote_checksum(&self, body: Value) -> ApiReply {
         ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}
     }
@@ -7019,8 +8056,18 @@ impl CommanderService {
                 Err(e) => return api_error(400, format!("Could not verify the remote desktop server: {e}")),
             }
         } else if !target_host.is_empty() && matches!(kind, RemoteDesktopKind::Rdp | RemoteDesktopKind::Vnc | RemoteDesktopKind::Spice) {
-            // No SSH, try TCP probe for direct desktop ports
-            let tcp_ok = linscp_proto::remote_desktop::check_tcp_availability(&target_host, target_port).await;
+            let has_jump_tunnel = desktop_tab_spec
+                .as_ref()
+                .and_then(|t| t.spec.as_ref())
+                .and_then(|s| s.session.tunnel.as_ref())
+                .is_some_and(|tun| tun.enabled && !tun.host.trim().is_empty());
+            // When no SSH jump tunnel is configured, probe direct TCP reachability;
+            // when a jump tunnel is configured, the desktop port is reached via SSH forwarding below.
+            let tcp_ok = if has_jump_tunnel {
+                true
+            } else {
+                linscp_proto::remote_desktop::check_tcp_availability(&target_host, target_port).await
+            };
             if !tcp_ok {
                 return ApiReply{ status: 409, payload: json!({
                     "success": false,
@@ -7089,7 +8136,58 @@ impl CommanderService {
         let mut tunnel_port_opt = None;
         let mut tunnel_id_opt: Option<u64> = None;
         if (tunneled || want_ssh_tunnel) && matches!(kind, RemoteDesktopKind::Rdp | RemoteDesktopKind::Vnc | RemoteDesktopKind::Spice) {
-            if let Some(ssh) = via_session.as_ref().and_then(|s| s.ssh_connection()).cloned() {
+            let ssh_opt = if let Some(ssh) = via_session.as_ref().and_then(|s| s.ssh_connection()).cloned() {
+                Some(ssh)
+            } else if let Some(mut spec) = tab_for_launch
+                .as_ref()
+                .and_then(|t| t.spec.clone())
+                .filter(|s| {
+                    s.session
+                        .tunnel
+                        .as_ref()
+                        .is_some_and(|tun| tun.enabled && !tun.host.trim().is_empty())
+                })
+            {
+                let cfg_dir = self.config_root();
+                let _temp_keys = match materialize_vault_key_paths(
+                    &mut spec,
+                    &cfg_dir,
+                    self.secret_vault.as_ref(),
+                ) {
+                    Ok(files) => files,
+                    Err(error) => return api_error(400, error),
+                };
+                match linscp_engine::url_and_raw::connect_desktop_jump_tunnel(
+                    &spec,
+                    &cfg_dir,
+                    false,
+                    "en",
+                    self.secret_vault.clone(),
+                )
+                .await
+                {
+                    Ok(ssh) => Some(ssh),
+                    Err(linscp_engine::url_and_raw::GuiConnectError::HostKeyChallenge(ch)) => {
+                        return ApiReply {
+                            status: 409,
+                            payload: json!({
+                                "success": false,
+                                "error": ch.error,
+                                "hostkey_challenge": true,
+                                "fingerprint": ch.display_fingerprint,
+                                "role": ch.role,
+                                "changed": ch.changed,
+                            }),
+                        };
+                    }
+                    Err(linscp_engine::url_and_raw::GuiConnectError::Failed(msg)) => {
+                        return api_error(400, msg);
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(ssh) = ssh_opt {
                 match linscp_proto::tunnel::start_local_forward_relay(
                     ssh,
                     cfg.host.clone(),
@@ -7103,7 +8201,7 @@ impl CommanderService {
                         let mut state = self.state.lock().expect("m");
                         state.next_desktop_tunnel_id = state.next_desktop_tunnel_id.saturating_add(1);
                         let tid = state.next_desktop_tunnel_id;
-                        state.desktop_tunnels.insert(tid, (via_tab_id, relay));
+                        state.desktop_tunnels.insert(tid, (via_tab_id.or(tab_id), relay));
                         tunnel_port_opt = Some(bound);
                         tunnel_id_opt = Some(tid);
                         tunneled = true;
@@ -16269,5 +17367,188 @@ mod tests {
             reset_mosh.payload["install_script"],
             reset_mosh.payload["default_install_script"]
         );
+    }
+
+    #[tokio::test]
+    async fn presets_encodings_xml_logs_and_openssh_proxy_import_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("cfg");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        let svc = CommanderService::new(cfg.clone(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
+
+        // 1. /api/status exposes gssapi_available and supported_encodings.
+        let st = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/status".into(),
+            body: json!({}),
+        });
+        assert_eq!(st.status, 200);
+        assert!(st.payload.get("gssapi_available").and_then(Value::as_bool).is_some());
+        assert!(st.payload["supported_encodings"].as_array().unwrap().iter().any(|v| v == "windows-1252"));
+
+        // 2. /api/presets CRUD round-trips into transfer-presets.ini.
+        let save_p = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/presets/save".into(),
+            body: json!({
+                "name": "TextLogs",
+                "transfer": "ascii",
+                "preserve_time": "on",
+                "newer_only": true,
+                "speed": 512,
+                "mask": "*.log",
+            }),
+        });
+        assert_eq!(save_p.status, 200, "{}", save_p.payload);
+        let list_p = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/presets".into(),
+            body: json!({}),
+        });
+        assert_eq!(list_p.status, 200);
+        assert_eq!(list_p.payload["presets"][0]["name"], "TextLogs");
+        assert_eq!(list_p.payload["presets"][0]["transfer"], "ascii");
+        let del_p = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/presets/delete".into(),
+            body: json!({"name": "TextLogs"}),
+        });
+        assert_eq!(del_p.status, 200);
+
+        // 3. Non-UTF-8 local edit/save (ISO-8859-1 + CRLF) and UTF-16LE round-trip.
+        let latin_file = work.join("latin.txt");
+        std::fs::write(&latin_file, b"caf\xe9\r\nline2\r\n").unwrap();
+        let open_tab = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/tabs/local".into(),
+            body: json!({"local_dir": work.to_string_lossy(), "remote_dir": work.to_string_lossy()}),
+        });
+        let tab_id = open_tab.payload["tab"]["id"].as_u64().unwrap();
+        let read_latin = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: format!("/api/local/edit?tab={tab_id}&path=latin.txt&encoding=iso-8859-1"),
+            body: json!({}),
+        });
+        assert_eq!(read_latin.status, 200, "{}", read_latin.payload);
+        assert_eq!(read_latin.payload["content"], "caf\u{00e9}\r\nline2\r\n");
+        assert_eq!(read_latin.payload["info"]["encoding"], "iso-8859-1");
+        assert_eq!(read_latin.payload["info"]["eol"], "crlf");
+        let save_latin = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/save".into(),
+            body: json!({
+                "tab": tab_id,
+                "path": "latin.txt",
+                "content": "na\u{00ef}ve\nsecond\n",
+                "encoding": "iso-8859-1",
+                "eol": "crlf",
+            }),
+        });
+        assert_eq!(save_latin.status, 200, "{}", save_latin.payload);
+        assert_eq!(std::fs::read(&latin_file).unwrap(), b"na\xefve\r\nsecond\r\n");
+
+        // Local search with non-UTF-8 encoding finds ISO-8859-1 content.
+        let search_latin = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/remote/search".into(),
+                body: json!({
+                    "tab": tab_id,
+                    "pattern": "*.txt",
+                    "search_contents": true,
+                    "content_query": "na\u{00ef}ve",
+                    "encoding": "iso-8859-1",
+                }),
+            })
+            .await;
+        assert_eq!(search_latin.status, 200, "{}", search_latin.payload);
+        assert_eq!(search_latin.payload["matches"].as_array().unwrap().len(), 1);
+
+        // 4. XML action log preference validation and /api/logs/xml.
+        let base_prefs = svc
+            .dispatch(ApiEnvelope {
+                method: "GET".into(),
+                path: "/api/preferences".into(),
+                body: json!({}),
+            })
+            .payload["preferences"]
+            .clone();
+        let mut bad_prefs = base_prefs.clone();
+        bad_prefs["xml_log_enabled"] = json!(true);
+        bad_prefs["xml_log_path"] = json!("../escape.xml");
+        let bad_xml_pref = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/preferences".into(),
+            body: json!({"action": "save", "preferences": bad_prefs}),
+        });
+        assert_eq!(bad_xml_pref.status, 400);
+        assert!(bad_xml_pref.payload["error"].as_str().unwrap_or("").contains(".."));
+        let mut ok_prefs = base_prefs;
+        ok_prefs["xml_log_enabled"] = json!(true);
+        ok_prefs["xml_log_path"] = json!("actions.xml");
+        let ok_xml_pref = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/preferences".into(),
+            body: json!({"action": "save", "preferences": ok_prefs}),
+        });
+        assert_eq!(ok_xml_pref.status, 200, "{}", ok_xml_pref.payload);
+        svc.record_gui_xml_action("unit-test", |logger| {
+            logger.record_mkdir("/srv/releases", Ok(()));
+        });
+        let xml_reply = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/logs/xml".into(),
+            body: json!({}),
+        });
+        assert_eq!(xml_reply.status, 200);
+        assert_eq!(xml_reply.payload["exists"], true);
+        let xml_text = xml_reply.payload["content"].as_str().unwrap();
+        assert!(xml_text.contains("<mkdir>") && xml_text.contains("</session>"), "{xml_text}");
+
+        // 5. OpenSSH import persists ProxyJump tunnel and ProxyCommand.
+        let ssh_cfg_path = tmp.path().join("ssh_config_import");
+        std::fs::write(
+            &ssh_cfg_path,
+            "Host jump\n  HostName 198.51.100.10\n  User bastion\n  Port 2202\n\nHost internal\n  HostName 10.20.30.40\n  User ubuntu\n  ProxyJump jump\n  ProxyCommand ssh -W %h:%p proxy.example\n",
+        )
+        .unwrap();
+        let preview = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: format!("/api/sessions/import?source=openssh&path={}", tabs::percent_encode_userinfo(&ssh_cfg_path.to_string_lossy())),
+            body: json!({}),
+        });
+        assert_eq!(preview.status, 200, "{}", preview.payload);
+        let fp = preview.payload["sources"][0]["fingerprint"].as_str().unwrap().to_string();
+        let imported = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/sessions/import".into(),
+            body: json!({
+                "source": "openssh",
+                "path": ssh_cfg_path.to_string_lossy(),
+                "fingerprint": fp,
+                "names": ["jump", "internal"],
+            }),
+        });
+        assert_eq!(imported.status, 200, "{}", imported.payload);
+        let sessions = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/sessions".into(),
+            body: json!({}),
+        });
+        let internal = sessions.payload["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "internal")
+            .unwrap();
+        assert_eq!(internal["tunnel"], true);
+        assert_eq!(internal["tunnel_host"], "198.51.100.10");
+        assert_eq!(internal["tunnel_port"], 2202);
+        assert_eq!(internal["tunnel_username"], "bastion");
+        assert_eq!(internal["proxy_method"], "CMD");
+        assert_eq!(internal["proxy_command"], "ssh -W 10.20.30.40:22 proxy.example");
     }
 }

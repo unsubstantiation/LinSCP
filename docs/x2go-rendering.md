@@ -39,20 +39,25 @@ for a server-version message with an overall timeout, and sends one-screen
 geometry. It retains any subsequently received bytes in the decoder. Failure
 closes the channel, but does **not** terminate the remote agent; callers must
 provide reliable agent lifecycle cleanup. The guarded session uses it during startup.
-It declares feature version 3 and Windows-style clipboard mode; clipboard
-handling is not implemented. Only server feature versions 7 and 8 are accepted;
-other versions are refused conservatively until compatibility is verified.
+It declares feature version 3 and Windows-style clipboard mode. Only server
+feature versions 7 and 8 are accepted; other versions are refused conservatively
+until compatibility is verified.
 A negotiated channel can now be split into an ordered reader and independent
 writer. The reader retains coalesced messages from the handshake and fails
 closed on malformed data; writes are bounded by a timeout. The owner must drop
 both halves after an error or interrupted write and separately terminate the
-agent. `viewer_message` translates parsed frames and cache/control events to
-bounded viewer JSON with base64 image payloads; clipboard and cursor messages
-are not forwarded, and rootless-window and UDP messages are rejected. The
+agent. `viewer_message` translates parsed frames, cache deletions, control
+events (`Sync`, `Disconnect`), server cursors (`Cursor`, `DeletedCursors`), and
+opt-in UTF-8 clipboard events (`Selection`, `DemandSelection`) to bounded viewer
+JSON with base64 payloads; rootless-window and UDP messages are rejected. The
 TypeScript IPC decoder validates and converts this contract before handing it
-to `KDriveViewerSession`. The service now has an `X2GoBridge` for an already
-negotiated, guarded channel: it validates input packets, preserves output order,
-applies bounded backpressure and attempts agent cleanup on closure. The service
+to `KDriveViewerSession`. The service has an `X2GoBridge` for an already
+negotiated, guarded channel: it validates input, resize (`resize`), and
+clipboard (`write_selection`) packets, tracks live wire frame-cache IDs and
+evictions via `WireFrameTracker` + `FrameCache::apply_deleted_frames` (failing
+closed on unknown cached frame references), preserves output order, applies
+bounded backpressure, and supports explicit session suspend (`x2gosuspend-session`)
+or termination (`x2goterminate-session`) as well as best-effort cleanup on closure. The service
 can associate a bridge with the exact connected SSH tab and exposes nonblocking
 poll, input, and close routes. Closing or reconnecting a tab releases its bridge;
 an abandoned viewer lease expires after 60 seconds. The experimental X2Go
@@ -101,8 +106,11 @@ can temporarily allocate one additional image (up to 64 MiB), in addition to
 caller-owned decoded pixels and allocator/hash-table overhead. Callers must
 select lower limits as needed and bound input before decoding. These are LinSCP
 safety limits, not negotiated KDrive limits: real protocol compatibility and
-how to recover after a limit or cache miss remain to be determined. The module
-is not connected to a wire parser or viewer.
+how to recover after a limit or cache miss remain to be determined. In the
+backend bridge (`crates/linscp-service/src/x2go_bridge.rs`), `WireFrameTracker`
+uses `FrameCache::apply_deleted_frames` and metadata tracking to validate cached
+region references and evictions on the incoming KDrive wire stream, while
+`FrameCache::compose_wire_rgba_frame` supports decoded RGBA region composition.
 
 ## Input capture
 
@@ -202,10 +210,11 @@ is not authorization to install server packages without an explicit action.
   or captured test data has been copied into LinSCP. Its Windows-specific
   implementation and claimed tests are useful evidence, not proof that this
   project supports Linux, Windows, or macOS.
-- The viewer now delivers parsed messages to the frame pipeline, translates
-  browser input and coordinates transport and lifecycle, but these paths still
-  need live integration tests.
-  Clipboard, cursor and UDP support are not present.
+- The viewer delivers parsed frame, cursor, and opt-in clipboard messages to
+  the frame pipeline, translates browser input and window resize events, and
+  coordinates session listing, resume, suspend, termination, and transport
+  lifecycle; live server integration tests remain required across distributions.
+  UDP and rootless-window support are not present.
 - A [public KDrive client release announcement](https://www.mail-archive.com/x2go-announcements@lists.x2go.org/msg00217.html)
   mentions version negotiation before requesting the main image and geometry
   updates to elicit an initial image. It does not provide a complete message

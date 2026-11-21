@@ -3,7 +3,7 @@
 //! `docs/linscp-session-1.0.xsd`.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use linscp_platform::terminal::utc_ymdhms;
@@ -250,6 +250,66 @@ impl SessionLogger {
         };
         logger.log_text(0, "LinSCP session log started.");
         Ok(logger)
+    }
+
+    /// Opens an XSD-valid XML session log at `xp`, appending inside the root `<session>`
+    /// element if an earlier GUI operation already created and closed the file.
+    pub fn open_append_xml(xp: &Path, initial_session_name: &str) -> Result<Self, String> {
+        if let Some(parent) = xp.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!("Cannot create XML log directory '{}': {e}", parent.display())
+            })?;
+        }
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(xp)
+            .map_err(|e| format!("Cannot open XML log file '{}': {e}", xp.display()))?;
+        let _ = linscp_platform::terminal::set_local_permissions(xp, 0o600);
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut header_already_present = false;
+        if len > 0 {
+            let tail_start = len.saturating_sub(64);
+            if f.seek(SeekFrom::Start(tail_start)).is_ok() {
+                let mut tail = Vec::new();
+                if f.read_to_end(&mut tail).is_ok() {
+                    let tail_str = String::from_utf8_lossy(&tail);
+                    let trimmed = tail_str.trim_end();
+                    if let Some(prefix) = trimmed.strip_suffix("</session>") {
+                        let new_len = tail_start + prefix.len() as u64;
+                        if f.set_len(new_len).is_ok() && f.seek(SeekFrom::End(0)).is_ok() {
+                            let _ = f.write_all(b"\n");
+                            header_already_present = true;
+                        }
+                    }
+                }
+            }
+            if !header_already_present {
+                let _ = f.set_len(0);
+                let _ = f.seek(SeekFrom::Start(0));
+            }
+        }
+        let xml_session_name =
+            if initial_session_name.is_empty() || initial_session_name == "session" {
+                "nosession".to_string()
+            } else {
+                initial_session_name.to_string()
+            };
+        Ok(Self {
+            text_path: None,
+            text_level: 0,
+            text_log_sensitive: false,
+            rotation: None,
+            xml_file: Some(f),
+            xml_session_name,
+            xml_header_written: header_already_present,
+            pending_group_line: None,
+            xml_groups: false,
+            group_open: false,
+            xml_closed: false,
+        })
     }
 
     pub fn set_session_name(&mut self, name: &str) {

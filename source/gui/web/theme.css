@@ -213,6 +213,10 @@ body {
   user-select: none;
 }
 button, input, select, textarea { font: inherit; }
+input, textarea, pre, code, [contenteditable="true"], [contenteditable=""], .selectable-text {
+  -webkit-user-select: text;
+  user-select: text;
+}
 button { color: inherit; }
 button:focus-visible, input:focus-visible, select:focus-visible,
 textarea:focus-visible, [tabindex]:focus-visible {
@@ -883,6 +887,12 @@ button.site-item { display: block; width: 100%; border: 0; background: transpare
   flex: 1;
   min-height: 160px;
   background: var(--surface-input);
+  -webkit-user-select: text;
+  user-select: text;
+}
+.editor-host .cm-content,
+.editor-host .cm-line {
+  -webkit-user-select: text;
   user-select: text;
 }
 .editor-host .cm-editor { height: 100%; }
@@ -1483,7 +1493,7 @@ body {
 #remoteDesktopStatus { font-weight: var(--fw-semibold); }
 
 /* Backup modal: file path + CLI hint are both visible, not truncated */
-var(--border-strong)kupModal .hint code { user-select: all; background: var(--surface-raised); border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--space-1) var(--space-2); }
+#backupModal .hint code { -webkit-user-select: all; user-select: all; background: var(--surface-raised); border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--space-1) var(--space-2); }
 
 /* Commander actions: ensure Synchronize / Terminal / Desktop all visible, no clipping */
 .commander-actions { gap: var(--space-3); }

@@ -197,6 +197,8 @@ const editorTheme = EditorView.theme({
   '.cm-content': {
     caretColor: 'var(--accent)',
     padding: 'var(--space-3) 0',
+    userSelect: 'text',
+    WebkitUserSelect: 'text',
   },
   '.cm-cursor': { borderLeftColor: 'var(--accent)' },
   '.cm-gutters': {
@@ -260,8 +262,27 @@ const editorTheme = EditorView.theme({
   },
 }, { dark: true });
 
+function usesNativeTouchSelection(host: HTMLElement): boolean {
+  const win = host.ownerDocument?.defaultView;
+  const ua = win?.navigator?.userAgent ?? '';
+  if (/android/i.test(ua)) {
+    return true;
+  }
+  if (typeof win?.matchMedia === 'function') {
+    try {
+      if (win.matchMedia('(pointer: coarse)').matches) {
+        return true;
+      }
+    } catch {
+      // Ignore environments with incomplete matchMedia stubs.
+    }
+  }
+  return false;
+}
+
 export function mount(host: HTMLElement, options: MountOptions): MountedEditor {
   const readOnly = options.readOnly === true;
+  const nativeTouchSelection = usesNativeTouchSelection(host);
   const path = options.languagePath || '';
   const editable = new Compartment();
   const language = new Compartment();
@@ -272,6 +293,10 @@ export function mount(host: HTMLElement, options: MountOptions): MountedEditor {
     }
   });
 
+  const pointerSelectionExtensions = nativeTouchSelection
+    ? []
+    : [drawSelection(), rectangularSelection(), crosshairCursor()];
+
   const view = new EditorView({
     parent: host,
     state: EditorState.create({
@@ -280,10 +305,8 @@ export function mount(host: HTMLElement, options: MountOptions): MountedEditor {
         lineNumbers(),
         foldGutter(),
         history(),
-        drawSelection(),
+        ...pointerSelectionExtensions,
         dropCursor(),
-        rectangularSelection(),
-        crosshairCursor(),
         highlightActiveLine(),
         highlightActiveLineGutter(),
         highlightSelectionMatches(),

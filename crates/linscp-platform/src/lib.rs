@@ -165,13 +165,11 @@ const MASTER_KEY_LEN: usize = 32;
 /// agent socket instead, so they report no static reason.
 pub const SSH_AGENT_MISSING_MESSAGE: &str = "SSH agent authentication is not available on Android: the platform has no agent. Use a private key file instead.";
 
-/// Largest single document the granted-folder bridge carries (64 MiB). The
-/// bridge has no streaming reads or appends: every document crosses as one
-/// base64 value inside one plugin call, so the bytes transiently occupy
-/// several times their size in RAM. Callers enforce this with a stat before
-/// they read — the bridge itself cannot, because by the time it sees the
-/// bytes the memory is already spent — and refuse larger documents naming
-/// the cap and the app-storage workaround.
+/// Largest single document the granted-folder policy allows (64 MiB). Reads and
+/// writes stream across the bridge in 1 MiB (`SAF_CHUNK_BYTES`) chunks when
+/// supported (`readUriChunk`, `beginWriteUri`, `appendUriChunk`), while callers
+/// keep this explicit per-document bound via `stat` before staging or publishing
+/// and refuse larger documents naming the cap and the app-storage workaround.
 pub const MAX_SAF_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Names the document, its size and the bridge cap when a file is too large
@@ -997,7 +995,7 @@ impl NativeSecretVault {
 }
 
 fn decode_stored_master_key(raw_bytes: &[u8]) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-    if raw_bytes.starts_with(b"LSCPVLT1") {
+    if raw_bytes.starts_with(b"LSCPVLT1") || raw_bytes.starts_with(b"LSCPKST1") {
         return Err(PlatformError::SecretVault(
             "sessions.key is protected by the local vault; unlock it in LinSCP Commander first".to_string(),
         ));

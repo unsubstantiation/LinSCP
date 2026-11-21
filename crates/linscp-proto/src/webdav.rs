@@ -1531,8 +1531,75 @@ impl RemoteSession for WebDavSession {
         Err(ProtoError::UnsupportedCapability("chmod", self.cfg.scheme))
     }
 
-    async fn set_mtime(&self, _remote_path: &str, _mtime: i64) -> Result<(), ProtoError> {
-        Err(ProtoError::UnsupportedCapability("set_mtime", self.cfg.scheme))
+    async fn set_mtime(&self, remote_path: &str, mtime: i64) -> Result<(), ProtoError> {
+        let days = mtime.div_euclid(86_400);
+        let rem = mtime.rem_euclid(86_400);
+        let (year, month, day) = crate::listing::civil_from_days(days);
+        let dow = match (days + 4).rem_euclid(7) {
+            0 => "Sun", 1 => "Mon", 2 => "Tue", 3 => "Wed",
+            4 => "Thu", 5 => "Fri", _ => "Sat",
+        };
+        let mon = match month {
+            1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr", 5 => "May", 6 => "Jun",
+            7 => "Jul", 8 => "Aug", 9 => "Sep", 10 => "Oct", 11 => "Nov", _ => "Dec",
+        };
+        let http_date = format!(
+            "{dow}, {day:02} {mon} {year:04} {:02}:{:02}:{:02} GMT",
+            rem / 3600,
+            (rem % 3600) / 60,
+            rem % 60
+        );
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+             <d:propertyupdate xmlns:d=\"DAV:\" xmlns:lp1=\"http://apache.org/dav/props/\">\
+             <d:set><d:prop><lp1:lastmodified>{http_date}</lp1:lastmodified></d:prop></d:set>\
+             </d:propertyupdate>"
+        );
+        let method = reqwest::Method::from_bytes(b"PROPPATCH")
+            .map_err(|e| ProtoError::Transport(format!("Invalid PROPPATCH method: {e}")))?;
+        let mut req = self
+            .apply_auth(
+                self.no_redirect_client
+                    .request(method, self.url_for(remote_path, false)),
+            )
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .header("X-OC-MTime", mtime.to_string())
+            .body(body);
+        if let Some(if_hdr) = self.if_header_for(remote_path).await {
+            req = req.header("If", if_hdr);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| {
+                ProtoError::Transport(format!(
+                    "WebDAV PROPPATCH '{remote_path}' failed: {}",
+                    format_reqwest_err(&e)
+                ))
+            })?;
+        let status = resp.status().as_u16();
+        if status == 404 {
+            return Err(ProtoError::Transport("No such file or directory.".to_string()));
+        }
+        if matches!(status, 403 | 405 | 409 | 501) {
+            return Err(ProtoError::UnsupportedCapability("set_mtime", self.cfg.scheme));
+        }
+        if status == 200 || status == 204 {
+            return Ok(());
+        }
+        if status == 207 {
+            let xml = resp.text().await.unwrap_or_default();
+            reject_xxe_declarations(&xml)?;
+            let lower = xml.to_ascii_lowercase();
+            if lower.contains(" 200 ") && !lower.contains(" 403 ") && !lower.contains(" 409 ") && !lower.contains(" 424 ") {
+                return Ok(());
+            }
+            return Err(ProtoError::UnsupportedCapability("set_mtime", self.cfg.scheme));
+        }
+        Err(ProtoError::Transport(format!(
+            "WebDAV PROPPATCH '{remote_path}' failed with HTTP {}.",
+            resp.status()
+        )))
     }
 
     async fn checksum(&self, algorithm: &str, remote_path: &str) -> Result<String, ProtoError> {

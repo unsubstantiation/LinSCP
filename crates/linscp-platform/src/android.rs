@@ -103,6 +103,14 @@ pub trait ForegroundServiceBridge: Send + Sync {
     fn is_running(&self) -> bool;
 }
 
+/// Hardware-backed `AndroidKeyStore` AES-256-GCM key wrapper for binding the
+/// local vault envelope (`LSCPKST1`) to the device keystore so offline copies
+/// of `sessions.key` cannot be attacked outside AndroidKeyStore.
+pub trait KeystoreBridge: Send + Sync {
+    fn wrap_key(&self, plaintext: &[u8]) -> Result<Vec<u8>, PlatformError>;
+    fn unwrap_key(&self, wrapped: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>, PlatformError>;
+}
+
 pub fn default_config_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("LINSCP_ANDROID_FILES_DIR").filter(|v| !v.is_empty()) {
         return PathBuf::from(dir).join("config");
