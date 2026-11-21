@@ -229,7 +229,7 @@ pub fn try_relative_time(spec: &str, base_epoch: i64, add: bool) -> Result<i64, 
     let mut min = n0 as i32;
     let mut sec = s0 as i32;
 
-    let out_of_range = || format!("relative timestamp '{s}' is outside the representable range");
+    let out_of_range = || format!("relative timestamp '{trimmed}' is outside the representable range");
     match unit {
         'S' => sec = sec.checked_add(amount).ok_or_else(out_of_range)?,
         'N' => {
