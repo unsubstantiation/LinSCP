@@ -78,6 +78,34 @@ test('closing while decoding prevents later painting', async () => {
   s.dom.window.close();
 });
 
+test('resize enqueues geometry event and selection/cursor messages update state', async () => {
+  const selections = [];
+  const s = setup({ onSelection: (text, sel) => selections.push([text, sel]) });
+  s.dom.window.HTMLCanvasElement.prototype.toDataURL = () => 'data:image/png;base64,iVBORw0KGgo=';
+  await s.viewer.receive(main());
+  await s.viewer.resize(1280, 720);
+  assert.deepEqual(s.writes, [7]);
+  await s.viewer.receive({
+    type: 'cursor',
+    cursor: { serial: 11, width: 1, height: 1, hotX: 0, hotY: 0, foreground: [255, 255, 255], background: [0, 0, 0], data: new Uint8Array([0, 0, 255, 255]) }
+  });
+  assert.match(s.viewer.element.style.cursor, /^url\(data:image\/png;base64,/);
+  await s.viewer.receive({ type: 'deleted-cursors', ids: [11] });
+  assert.equal(s.viewer.element.style.cursor, 'default');
+  await s.viewer.receive({
+    type: 'selection',
+    selection: { selection: 0, format: 0, chunkSize: 5, first: true, last: false, compressedSize: 0, total: 10, data: new TextEncoder().encode('hello') }
+  });
+  await s.viewer.receive({
+    type: 'selection',
+    selection: { selection: 0, format: 0, chunkSize: 6, first: false, last: true, compressedSize: 0, total: 11, data: new TextEncoder().encode(' world') }
+  });
+  assert.deepEqual(selections, [['hello world', 0]]);
+  s.viewer.close();
+  s.dom.window.close();
+});
+
+
 test('closing interrupts a pending main-image request', async () => {
   const s = setup(); await s.viewer.receive(main());
   s.transport.requestMainImage = () => new Promise(() => {});

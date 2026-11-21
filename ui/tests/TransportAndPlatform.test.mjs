@@ -389,6 +389,9 @@ test('Android desktop viewer URIs allow direct RDP/VNC/SPICE targets and reject 
   assert.equal(androidDesktopViewerUri('x2go', 'desktop.example:22'), null);
   assert.equal(androidDesktopViewerUri('toString', 'desktop.example:3389'), null);
   assert.equal(androidDesktopViewerUri('rdp', 'desktop.example:3389', true), null);
+  assert.equal(androidDesktopViewerUri('rdp', '127.0.0.1:41234', true), 'rdp://127.0.0.1:41234');
+  assert.equal(androidDesktopViewerUri('vnc', '127.0.0.1:45900', true), 'vnc://127.0.0.1:45900');
+  assert.equal(androidDesktopViewerUri('rdp', '127.0.0.1', true), null);
   assert.equal(androidDesktopViewerUri('rdp', 'user:secret@desktop.example:3389'), null);
   assert.equal(androidDesktopViewerUri('rdp', 'desktop.example/path'), null);
   assert.equal(androidDesktopViewerUri('rdp', 'desktop.example:3389?password=secret'), null);

@@ -41,7 +41,11 @@ internal class UriArgs { lateinit var uris: ArrayList<String> }
 @InvokeArg
 internal class SingleUriArgs { lateinit var uri: String }
 @InvokeArg
+internal class ReadChunkArgs { lateinit var uri: String; var offset: Long = 0; var length: Int = 1048576 }
+@InvokeArg
 internal class WriteArgs { lateinit var parent_uri: String; lateinit var name: String; lateinit var data_base64: String }
+@InvokeArg
+internal class AppendChunkArgs { lateinit var uri: String; lateinit var data_base64: String }
 @InvokeArg
 internal class NameArgs { lateinit var parent_uri: String; lateinit var name: String }
 @InvokeArg
@@ -153,6 +157,103 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
       val bytes = activity.contentResolver.openInputStream(resolved)?.use { it.readBytes() }
         ?: throw IllegalStateException("provider returned no stream")
       mapOf("base64" to android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))
+    }
+  }
+
+  @Command
+  fun readUriChunk(invoke: Invoke) {
+    val args = invoke.parseArgs(ReadChunkArgs::class.java)
+    val resolved = resolveDocument(Uri.parse(args.uri))
+    val want = args.length.coerceIn(0, 4 * 1024 * 1024)
+    val offset = args.offset.coerceAtLeast(0L)
+    runIo(invoke, "Cannot read SAF document chunk") {
+      if (want == 0) return@runIo mapOf("base64" to "")
+      val buf = ByteArray(want)
+      var totalRead = 0
+      val pfd = try { activity.contentResolver.openFileDescriptor(resolved, "r") } catch (_: Exception) { null }
+      if (pfd != null) {
+        pfd.use { fd ->
+          java.io.FileInputStream(fd.fileDescriptor).use { fis ->
+            fis.channel.position(offset)
+            while (totalRead < want) {
+              val n = fis.read(buf, totalRead, want - totalRead)
+              if (n <= 0) break
+              totalRead += n
+            }
+          }
+        }
+      } else {
+        activity.contentResolver.openInputStream(resolved)?.use { stream ->
+          var remaining = offset
+          while (remaining > 0) {
+            val skipped = stream.skip(remaining)
+            if (skipped <= 0) {
+              if (stream.read() < 0) break
+              remaining -= 1
+            } else {
+              remaining -= skipped
+            }
+          }
+          if (remaining == 0L) {
+            while (totalRead < want) {
+              val n = stream.read(buf, totalRead, want - totalRead)
+              if (n <= 0) break
+              totalRead += n
+            }
+          }
+        } ?: throw IllegalStateException("provider returned no stream")
+      }
+      val slice = if (totalRead == buf.size) buf else buf.copyOf(totalRead)
+      mapOf("base64" to android.util.Base64.encodeToString(slice, android.util.Base64.NO_WRAP))
+    }
+  }
+
+  @Command
+  fun beginWriteUri(invoke: Invoke) {
+    val args = invoke.parseArgs(NameArgs::class.java)
+    runIo(invoke, "Cannot create SAF document") {
+      val parent = resolveDocument(Uri.parse(args.parent_uri))
+      val existing = findChild(parent, args.name)
+      if (existing != null && readEntry(existing)["is_dir"] == true) {
+        throw IllegalStateException("a folder already has that name")
+      }
+      val target = existing ?: DocumentsContract.createDocument(activity.contentResolver, parent, "application/octet-stream", args.name)
+        ?: throw IllegalStateException("provider did not create the document")
+      activity.contentResolver.openOutputStream(target, "wt")?.close()
+        ?: throw IllegalStateException("provider returned no output stream")
+      mapOf("uri" to target.toString())
+    }
+  }
+
+  @Command
+  fun appendUriChunk(invoke: Invoke) {
+    val args = invoke.parseArgs(AppendChunkArgs::class.java)
+    runIo(invoke, "Cannot append SAF document chunk") {
+      val target = resolveDocument(Uri.parse(args.uri))
+      val bytes = android.util.Base64.decode(args.data_base64, android.util.Base64.DEFAULT)
+      if (bytes.isNotEmpty()) {
+        val appended = try {
+          activity.contentResolver.openOutputStream(target, "wa")?.use { out ->
+            out.write(bytes)
+            out.flush()
+            true
+          } ?: false
+        } catch (_: Exception) {
+          false
+        }
+        if (!appended) {
+          val pfd = activity.contentResolver.openFileDescriptor(target, "rw")
+            ?: throw IllegalStateException("provider returned no writable descriptor")
+          pfd.use { fd ->
+            java.io.FileOutputStream(fd.fileDescriptor).use { fos ->
+              fos.channel.position(fos.channel.size())
+              fos.write(bytes)
+              fos.flush()
+            }
+          }
+        }
+      }
+      mapOf("ok" to true)
     }
   }
 

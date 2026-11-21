@@ -8,7 +8,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use linscp_proto::kdrive_wire::{Message, CLIENT_EVENT_SIZE};
-use linscp_proto::x2go_transport::{viewer_message, GuardedKDriveSession, KDriveReader, KDriveWriter};
+use linscp_proto::x2go_transport::{viewer_message_extended, GuardedKDriveSession, KDriveReader, KDriveWriter};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -65,22 +65,47 @@ pub fn validate_input(packet: &[u8; CLIENT_EVENT_SIZE]) -> bool {
     }
 }
 
+const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitMode {
+    Terminate,
+    Suspend,
+}
+
 enum Command {
     Write([u8; CLIENT_EVENT_SIZE], oneshot::Sender<Result<(), &'static str>>),
+    WriteClipboard(Vec<u8>, oneshot::Sender<Result<(), &'static str>>),
     Touch,
     Close,
+    Suspend,
 }
 
 /// Cloneable write side so an API request never holds the service state mutex
 /// while waiting for a remote write.
 #[derive(Clone)]
-pub struct X2GoInput { commands: mpsc::Sender<Command> }
+pub struct X2GoInput {
+    commands: mpsc::Sender<Command>,
+    allow_clipboard: bool,
+}
 
 impl X2GoInput {
     pub async fn write(&self, packet: [u8; CLIENT_EVENT_SIZE]) -> Result<(), &'static str> {
         if !validate_input(&packet) { return Err("Invalid KDrive input event."); }
         let (reply, answer) = oneshot::channel();
         self.commands.send(Command::Write(packet, reply)).await.map_err(|_| "KDrive bridge is closed.")?;
+        answer.await.map_err(|_| "KDrive bridge is closed.")?
+    }
+
+    pub async fn write_clipboard(&self, text: &str) -> Result<(), &'static str> {
+        if !self.allow_clipboard {
+            return Err("X2Go clipboard sharing is disabled for this session.");
+        }
+        if text.len() > MAX_CLIPBOARD_BYTES {
+            return Err("X2Go clipboard text exceeds the 64 KiB limit.");
+        }
+        let (reply, answer) = oneshot::channel();
+        self.commands.send(Command::WriteClipboard(text.as_bytes().to_vec(), reply)).await.map_err(|_| "KDrive bridge is closed.")?;
         answer.await.map_err(|_| "KDrive bridge is closed.")?
     }
 }
@@ -91,20 +116,38 @@ pub struct X2GoBridge {
     commands: mpsc::Sender<Command>,
     messages: mpsc::Receiver<Value>,
     task: JoinHandle<Result<(), &'static str>>,
+    allow_clipboard: bool,
 }
 
 impl X2GoBridge {
     pub fn start(session: GuardedKDriveSession) -> Self {
+        Self::start_with_options(session, false)
+    }
+
+    pub fn start_with_options(session: GuardedKDriveSession, allow_clipboard: bool) -> Self {
         let (reader, writer, agent) = session.into_parts();
-        Self::spawn(reader, writer, async move { agent.close().await.map_err(|_| "X2Go agent cleanup failed.") })
+        Self::spawn_with_mode(reader, writer, allow_clipboard, move |mode| async move {
+            match mode {
+                ExitMode::Terminate => agent.close().await.map_err(|_| "X2Go agent cleanup failed."),
+                ExitMode::Suspend => agent.suspend().await.map_err(|_| "X2Go session suspend failed."),
+            }
+        })
     }
 
     fn spawn<F>(reader: KDriveReader, writer: KDriveWriter, cleanup: F) -> Self
     where F: Future<Output = Result<(), &'static str>> + Send + 'static {
+        Self::spawn_with_mode(reader, writer, false, move |_| cleanup)
+    }
+
+    fn spawn_with_mode<C, F>(reader: KDriveReader, writer: KDriveWriter, allow_clipboard: bool, cleanup: C) -> Self
+    where
+        C: FnOnce(ExitMode) -> F + Send + 'static,
+        F: Future<Output = Result<(), &'static str>> + Send + 'static,
+    {
         let (commands, input) = mpsc::channel(INPUT_QUEUE);
         let (output, messages) = mpsc::channel(OUTPUT_QUEUE);
-        let task = tokio::spawn(run(reader, writer, input, output, cleanup, SERVER_SILENCE));
-        Self { commands, messages, task }
+        let task = tokio::spawn(run(reader, writer, input, output, allow_clipboard, cleanup, SERVER_SILENCE));
+        Self { commands, messages, task, allow_clipboard }
     }
 
     /// Returns the next frame/control message or None when the bridge has ended.
@@ -112,7 +155,9 @@ impl X2GoBridge {
 
     /// A successful write means bytes were flushed, not that the remote server
     /// processed the event or barrier. Calls must be serialized by the viewer.
-    pub fn input(&self) -> X2GoInput { X2GoInput { commands: self.commands.clone() } }
+    pub fn input(&self) -> X2GoInput {
+        X2GoInput { commands: self.commands.clone(), allow_clipboard: self.allow_clipboard }
+    }
 
     /// Nonblocking poll; touch renews the lease even when no frame is ready.
     pub fn poll(&mut self) -> Result<Option<Value>, &'static str> {
@@ -134,10 +179,19 @@ impl X2GoBridge {
     /// Terminates the bridge and waits for the remote-agent cleanup attempt.
     /// Dropping without close also releases the channels and schedules cleanup.
     pub async fn close(self) -> Result<(), &'static str> {
-        let Self { commands, messages, task } = self;
+        let Self { commands, messages, task, .. } = self;
         // Release backpressure first so a full output queue cannot delay close.
         drop(messages);
         let _ = commands.send(Command::Close).await;
+        drop(commands);
+        task.await.map_err(|_| "KDrive bridge task failed.")?
+    }
+
+    /// Suspends the remote X2Go session without terminating its desktop.
+    pub async fn suspend(self) -> Result<(), &'static str> {
+        let Self { commands, messages, task, .. } = self;
+        drop(messages);
+        let _ = commands.send(Command::Suspend).await;
         drop(commands);
         task.await.map_err(|_| "KDrive bridge task failed.")?
     }
@@ -152,12 +206,16 @@ pub(crate) fn test_bridge(client: tokio::io::DuplexStream, cleanup_signal: onesh
     X2GoBridge::spawn(reader, writer, async move { let _ = cleanup_signal.send(()); Ok(()) })
 }
 
-async fn run<F>(mut reader: KDriveReader, mut writer: KDriveWriter,
-                mut commands: mpsc::Receiver<Command>, output: mpsc::Sender<Value>, cleanup: F,
-                server_silence: Duration) -> Result<(), &'static str>
-where F: Future<Output = Result<(), &'static str>> {
+async fn run<C, F>(mut reader: KDriveReader, mut writer: KDriveWriter,
+                   mut commands: mpsc::Receiver<Command>, output: mpsc::Sender<Value>,
+                   allow_clipboard: bool, cleanup: C, server_silence: Duration) -> Result<(), &'static str>
+where
+    C: FnOnce(ExitMode) -> F,
+    F: Future<Output = Result<(), &'static str>>,
+{
     let mut pending = None;
     let mut remote_closed = false;
+    let mut exit_mode = ExitMode::Terminate;
     let mut result = Ok(());
     let mut lease = tokio::time::Instant::now() + VIEWER_LEASE;
     let mut keepalive = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -172,7 +230,15 @@ where F: Future<Output = Result<(), &'static str>> {
                     let _ = reply.send(sent);
                     if failed { result = Err("KDrive input write failed."); break; }
                 }
+                Some(Command::WriteClipboard(bytes, reply)) => {
+                    lease = tokio::time::Instant::now() + VIEWER_LEASE;
+                    let sent = writer.write_selection(0, &bytes, WRITE_TIMEOUT).await.map_err(|_| "KDrive clipboard write failed.");
+                    let failed = sent.is_err();
+                    let _ = reply.send(sent);
+                    if failed { result = Err("KDrive clipboard write failed."); break; }
+                }
                 Some(Command::Touch) => { lease = tokio::time::Instant::now() + VIEWER_LEASE; }
+                Some(Command::Suspend) => { exit_mode = ExitMode::Suspend; break; }
                 Some(Command::Close) | None => break,
             },
             permit = output.reserve(), if pending.is_some() => {
@@ -209,7 +275,7 @@ where F: Future<Output = Result<(), &'static str>> {
                     Ok(message) => {
                         last_server_message = tokio::time::Instant::now();
                         remote_closed = matches!(&message, Message::Disconnect);
-                        match viewer_message(message) {
+                        match viewer_message_extended(message, allow_clipboard) {
                             Ok(Some(value)) => pending = Some(value),
                             Ok(None) => {},
                             Err(_) => { result = Err("Unsupported KDrive message."); break; }
@@ -220,11 +286,15 @@ where F: Future<Output = Result<(), &'static str>> {
             }
         }
     }
-    // Drop both halves before termination, without holding any service mutex.
+    // Drop both halves before termination/suspend, without holding any service mutex.
     drop(reader);
     drop(writer);
     drop(output);
-    if cleanup.await.is_err() { return Err("X2Go agent cleanup failed."); }
+    let cleanup_err = match exit_mode {
+        ExitMode::Terminate => "X2Go agent cleanup failed.",
+        ExitMode::Suspend => "X2Go session suspend failed.",
+    };
+    if cleanup(exit_mode).await.is_err() { return Err(cleanup_err); }
     result
 }
 
@@ -323,9 +393,9 @@ mod tests {
         let (_commands, input) = mpsc::channel(INPUT_QUEUE);
         let (output, _messages) = mpsc::channel(OUTPUT_QUEUE);
         let (signal, observed) = oneshot::channel();
-        let cleanup = async move { let _ = signal.send(()); Ok(()) };
+        let cleanup = move |_| async move { let _ = signal.send(()); Ok(()) };
         let result = tokio::time::timeout(Duration::from_secs(1),
-            run(reader, writer, input, output, cleanup, Duration::from_millis(20))).await.unwrap();
+            run(reader, writer, input, output, false, cleanup, Duration::from_millis(20))).await.unwrap();
         assert_eq!(result, Err("KDrive server is not responding."));
         assert!(observed.await.is_ok());
     }

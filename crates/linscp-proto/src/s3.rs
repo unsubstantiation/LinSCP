@@ -767,14 +767,14 @@ impl S3Session {
         source: &mut (dyn AsyncRead + Unpin + Send), total_size: Option<u64>,
         progress: Option<&ProgressCallback>, header_name: &str, header_value: &str,
     ) -> Result<u64, ProtoError> {
-        // Multipart conditional completion is not implemented; fail closed.
         const MAX_CONDITIONAL_BYTES: u64 = 16 * 1024 * 1024;
+        const MAX_S3_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024; // 5 TiB S3 protocol maximum
         let Some(expected) = total_size else { return Err(ProtoError::UnsupportedCapability("conditional upload without known size", self.scheme())); };
         if opts.append || opts.resume_offset != 0 {
             return Err(ProtoError::UnsupportedCapability("conditional resume or append", self.scheme()));
         }
-        if expected > 1024 * 1024 * 1024 {
-            return Err(ProtoError::UnsupportedCapability("conditional uploads over 1 GiB", self.scheme()));
+        if expected > MAX_S3_OBJECT_BYTES {
+            return Err(ProtoError::UnsupportedCapability("conditional uploads over 5 TiB", self.scheme()));
         }
         if expected > MAX_CONDITIONAL_BYTES {
             return self.conditional_multipart(remote_path, opts, source, expected, progress, header_name, header_value).await;
@@ -808,12 +808,12 @@ impl S3Session {
         source: &mut (dyn AsyncRead + Unpin + Send), expected: u64,
         progress: Option<&ProgressCallback>, header_name: &str, header_value: &str,
     ) -> Result<u64, ProtoError> {
-        const PART_SIZE: usize = 8 * 1024 * 1024;
+        let part_size = ((expected + 9_999) / 10_000).max(8 * 1024 * 1024) as usize;
         let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else {
             return Err(ProtoError::Transport("S3 upload requires a bucket and object key.".to_string()));
         };
         if key.is_empty() { return Err(ProtoError::Transport("S3 object key must not be empty.".to_string())); }
-        let checkpoint = self.initiate_multipart(&bucket, &key, expected, PART_SIZE as u64).await
+        let checkpoint = self.initiate_multipart(&bucket, &key, expected, part_size as u64).await
             .map_err(|e| ProtoError::Transport(format!("S3 multipart initiation was not confirmed; an unfinished upload may remain: {e}")))?;
         let upload_id = checkpoint.upload_id;
         let mut journal = if let Some(directory) = self.cfg.conditional_cleanup_dir.as_ref() {
@@ -833,7 +833,7 @@ impl S3Session {
             let mut transferred = 0u64;
             let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
             while transferred < expected {
-                let size = ((expected - transferred) as usize).min(PART_SIZE);
+                let size = ((expected - transferred) as usize).min(part_size);
                 let mut data = vec![0u8; size];
                 source.read_exact(&mut data).await.map_err(|e| ProtoError::Transport(format!("Reading S3 multipart source failed: {e}")))?;
                 let number = parts.len() as u32 + 1;
@@ -1960,6 +1960,29 @@ impl RemoteSession for S3Session {
             return Err(ProtoError::Transport(format!("S3 HEAD '{remote_path}' failed with HTTP {}.", resp.status())));
         }
         Ok(resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(str::to_string))
+    }
+
+    async fn remove_if_match(&self, remote_path: &str, etag: &str) -> Result<(), ProtoError> {
+        if !etag.starts_with('"') || !etag.ends_with('"') || etag.len() < 2 || etag[1..etag.len() - 1].contains('"') || etag.chars().any(char::is_control) {
+            return Err(ProtoError::Transport("Conditional S3 DELETE requires a single strong ETag.".to_string()));
+        }
+        let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else {
+            return Err(ProtoError::Transport("S3 DELETE requires a bucket and object key.".to_string()));
+        };
+        if key.is_empty() {
+            return Err(ProtoError::Transport("S3 object key must not be empty.".to_string()));
+        }
+        let headers = vec![("if-match".to_string(), etag.to_string())];
+        let resp = self.send_signed(Method::DELETE, Some(&bucket), &key, &[], &headers, Vec::new()).await?;
+        if !matches!(resp.status().as_u16(), 200 | 204) {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProtoError::Transport(format!(
+                "Conditional S3 DELETE '{remote_path}' was not confirmed (HTTP {}): {}",
+                resp.status(),
+                body.trim()
+            )));
+        }
+        Ok(())
     }
 
     async fn probe_endpoint(&self, _initial_dir: &str) -> Result<(), ProtoError> {

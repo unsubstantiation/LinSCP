@@ -862,6 +862,52 @@ impl RemoteSession for ScpSession {
         res
     }
 
+    async fn upload_exclusive(
+        &self,
+        remote_path: &str,
+        opts: TransferRequest,
+        source: &mut (dyn AsyncRead + Unpin + Send),
+        total_size: Option<u64>,
+        progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        let norm = prepare_remote_path(remote_path)?;
+        let (dir, leaf) = match norm.rsplit_once('/') {
+            Some(("", leaf)) => ("/", leaf),
+            Some((dir, leaf)) => (dir, leaf),
+            None => (".", norm.as_str()),
+        };
+        validate_scp_received_name(leaf)?;
+        let mut rnd = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut rnd);
+        let hex: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+        let stage = if dir == "/" {
+            format!("/.{leaf}.linscp-scp-stage-{hex}")
+        } else {
+            format!("{dir}/.{leaf}.linscp-scp-stage-{hex}")
+        };
+        let stage_q = scp_shell_quote(&stage);
+        let norm_q = scp_shell_quote(&norm);
+        self.run_shell_checked(&format!("(umask 077 && set -C && : > {stage_q})"))
+            .await?;
+        let uploaded = match self.upload(&stage, opts, source, total_size, progress).await {
+            Ok(n) => n,
+            Err(err) => {
+                let _ = self.run_shell_checked(&format!("rm -f -- {stage_q}")).await;
+                return Err(err);
+            }
+        };
+        if let Err(err) = self
+            .run_shell_checked(&format!("ln -- {stage_q} {norm_q} && rm -f -- {stage_q}"))
+            .await
+        {
+            let _ = self.run_shell_checked(&format!("rm -f -- {stage_q}")).await;
+            return Err(ProtoError::Transport(format!(
+                "Exclusive SCP publish to '{norm}' failed (destination may already exist): {err}"
+            )));
+        }
+        Ok(uploaded)
+    }
+
     async fn realpath(&self, remote_path: &str) -> Result<String, ProtoError> {
         let target = if remote_path.is_empty() || remote_path == "." {
             return Ok(self.home_dir.clone());

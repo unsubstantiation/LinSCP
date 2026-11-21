@@ -3849,6 +3849,176 @@ function options(id) {
     delete window.LinSCPCore.terminalWindow;
   }
 
+  /* Transfer default resume alignment, S3 object versions, WebDAV locks/properties,
+   * X2Go session resume/suspend/terminate, and Android tunneled desktop launch. */
+  {
+    const savedPrefDoc = responses['/api/preferences'].preferences;
+    responses['/api/preferences'].preferences = Object.assign({}, savedPrefDoc, { resume: false });
+    await window.resetTransferSettings();
+    check('resetting transfer settings defaults resume to false',
+      doc.getElementById('transferResume').checked === false &&
+      window.transferOptions().resume === false);
+    window.closeModal('transferModal');
+    responses['/api/preferences'].preferences = savedPrefDoc;
+    await window.loadTransferSettings();
+
+    responses['/api/s3/versions'] = {
+      success: true,
+      versions: [
+        { key: '/Remote/report.csv', version_id: 'ver-2', is_latest: true, is_delete_marker: false, size: 128, mtime: 1700000100 },
+        { key: '/Remote/report.csv', version_id: 'ver-1', is_latest: false, is_delete_marker: false, size: 64, mtime: 1700000000 }
+      ]
+    };
+    responses['/api/s3/version-download'] = { success: true, task_id: 99 };
+    responses['/api/s3/version-delete'] = { success: true };
+    doc.getElementById('s3VersionsName').value = 'report.csv';
+    await window.openS3Versions();
+    check('S3 object versions modal lists returned versions',
+      doc.getElementById('s3VersionsModal').classList.contains('open') &&
+      doc.querySelectorAll('#s3VersionsList tr').length === 2 &&
+      text('s3VersionsList').includes('ver-2'));
+    await window.downloadS3Version('report.csv', 'ver-1');
+    const s3DlCall = calls.filter(call => call.path === '/api/s3/version-download').pop();
+    check('S3 version download queues the selected version_id',
+      !!s3DlCall && JSON.parse(s3DlCall.options.body).version_id === 'ver-1');
+    await window.deleteS3Version('report.csv', 'ver-1');
+    const s3DelCall = calls.filter(call => call.path === '/api/s3/version-delete').pop();
+    check('S3 version delete posts the selected version_id',
+      !!s3DelCall && JSON.parse(s3DelCall.options.body).version_id === 'ver-1');
+    window.closeModal('s3VersionsModal');
+    delete responses['/api/s3/versions'];
+    delete responses['/api/s3/version-download'];
+    delete responses['/api/s3/version-delete'];
+
+    responses['/api/dav/lock'] = { success: true, path: '/Remote/report.csv', token: 'opaquelocktoken:test-123' };
+    responses['/api/dav/unlock'] = { success: true, path: '/Remote/report.csv' };
+    responses['/api/dav/property'] = { success: true, path: '/Remote/report.csv', property: 'tag', value: 'approved' };
+    doc.getElementById('davResourceName').value = 'report.csv';
+    window.openDavTools();
+    await window.lockDavResource();
+    check('WebDAV lock populates the returned lock token',
+      doc.getElementById('davLockToken').value === 'opaquelocktoken:test-123');
+    await window.unlockDavResource();
+    const davUnlockCall = calls.filter(call => call.path === '/api/dav/unlock').pop();
+    check('WebDAV unlock posts the lock token and clears it',
+      !!davUnlockCall &&
+      JSON.parse(davUnlockCall.options.body).token === 'opaquelocktoken:test-123' &&
+      doc.getElementById('davLockToken').value === '');
+    doc.getElementById('davPropName').value = 'tag';
+    await window.getDavProperty();
+    check('WebDAV get property populates the value field',
+      doc.getElementById('davPropValue').value === 'approved');
+    doc.getElementById('davPropValue').value = 'updated';
+    await window.saveDavProperty();
+    const davSetCall = calls.filter(call => call.path === '/api/dav/property').pop();
+    check('WebDAV set property posts action set and value',
+      !!davSetCall &&
+      JSON.parse(davSetCall.options.body).action === 'set' &&
+      JSON.parse(davSetCall.options.body).value === 'updated');
+    window.closeModal('davToolsModal');
+    delete responses['/api/dav/lock'];
+    delete responses['/api/dav/unlock'];
+    delete responses['/api/dav/property'];
+
+    const savedCtx2 = window.HTMLCanvasElement.prototype.getContext;
+    const savedBmp2 = window.createImageBitmap;
+    window.HTMLCanvasElement.prototype.getContext = () => ({
+      imageSmoothingEnabled: true, clearRect() {}, drawImage() {},
+      getImageData: (_x, _y, w, h) => ({ data: new Uint8ClampedArray(w * h * 4), width: w, height: h }),
+      putImageData() {}
+    });
+    window.createImageBitmap = async () => ({ width: 1024, height: 768, close() {} });
+    responses['/api/desktop/check'] = {
+      success: true, checked: true, available: true, via_ssh: true,
+      desktop_checked: true, desktop: 'XFCE'
+    };
+    responses['/api/x2go/sessions'] = {
+      success: true,
+      sessions: [{ session_id: 'alice-50-1700000000_stDXFCE_dp24', display: 50, status: 'S', desktop: 'XFCE' }]
+    };
+    responses['/api/x2go/terminate'] = { success: true };
+    responses['/api/x2go/open'] = { success: true, generation: '9' };
+    responses['/api/x2go/poll'] = { success: true, message: null };
+    responses['/api/x2go/input'] = { success: true };
+    responses['/api/x2go/suspend'] = { success: true };
+    window.openRemoteDesktop();
+    doc.getElementById('remoteDesktopKind').value = 'x2go';
+    window.remoteDesktopKindChanged();
+    await new Promise(resolve => setTimeout(resolve, 40));
+    await window.refreshX2GoSessions();
+    check('X2Go session picker lists resumable sessions without cookies',
+      doc.querySelectorAll('#x2goSessionSelect option').length === 2);
+    doc.getElementById('x2goSessionSelect').value = 'alice-50-1700000000_stDXFCE_dp24';
+    doc.getElementById('x2goClipboardOptIn').checked = true;
+    await window.launchRemoteDesktop();
+    await new Promise(resolve => setTimeout(resolve, 40));
+    const resumedOpen = calls.filter(call => call.path === '/api/x2go/open').pop();
+    const resumedBody = resumedOpen ? JSON.parse(resumedOpen.options.body) : {};
+    check('X2Go launch forwards resume_session_id and allow_clipboard',
+      resumedBody.resume_session_id === 'alice-50-1700000000_stDXFCE_dp24' &&
+      resumedBody.allow_clipboard === true);
+    await window.suspendX2GoViewer();
+    const suspendCall = calls.filter(call => call.path === '/api/x2go/suspend').pop();
+    check('Suspending the X2Go viewer calls /api/x2go/suspend without /api/x2go/close',
+      !!suspendCall && JSON.parse(suspendCall.options.body).generation === '9' &&
+      !doc.getElementById('x2goViewerModal').classList.contains('open'));
+    window.openRemoteDesktop();
+    doc.getElementById('remoteDesktopKind').value = 'x2go';
+    window.remoteDesktopKindChanged();
+    await window.refreshX2GoSessions();
+    doc.getElementById('x2goSessionSelect').value = 'alice-50-1700000000_stDXFCE_dp24';
+    await window.terminateSelectedX2GoSession();
+    const termCall = calls.filter(call => call.path === '/api/x2go/terminate').pop();
+    check('Terminating a listed X2Go session posts session_id to /api/x2go/terminate',
+      !!termCall && JSON.parse(termCall.options.body).session_id === 'alice-50-1700000000_stDXFCE_dp24');
+    window.closeModal('remoteDesktopModal');
+    window.HTMLCanvasElement.prototype.getContext = savedCtx2;
+    window.createImageBitmap = savedBmp2;
+    delete responses['/api/x2go/sessions'];
+    delete responses['/api/x2go/terminate'];
+    delete responses['/api/x2go/open'];
+    delete responses['/api/x2go/poll'];
+    delete responses['/api/x2go/input'];
+    delete responses['/api/x2go/suspend'];
+
+    const savedCoreForAndroid = window.LinSCPCore;
+    let openedExternalUri = null;
+    let fgStarted = false;
+    let fgStopped = false;
+    window.LinSCPCore = Object.assign({}, savedCoreForAndroid, {
+      hostCapabilities: () => ({
+        platform: 'android', desktopLaunchers: true, saf: true, share: true, separateWindows: false
+      }),
+      openExternalUri: async uri => { openedExternalUri = uri; return true; },
+      ForegroundTransferBridge: function () {
+        this.start = async () => { fgStarted = true; };
+        this.stop = async () => { fgStopped = true; };
+      }
+    });
+    responses['/api/desktop/launch'] = {
+      success: true, kind: 'rdp', tunneled: true, local_endpoint: '127.0.0.1:43389'
+    };
+    responses['/api/desktop/tunnel-close'] = { success: true, closed: true };
+    window.openRemoteDesktop();
+    doc.getElementById('remoteDesktopKind').value = 'rdp';
+    window.remoteDesktopKindChanged();
+    doc.getElementById('remoteDesktopTunnel').checked = true;
+    await window.launchRemoteDesktop();
+    const launchTunCall = calls.filter(call => call.path === '/api/desktop/launch').pop();
+    check('Android tunneled desktop launch forwards tunnel_via_ssh, starts keepalive and opens loopback URI',
+      !!launchTunCall &&
+      JSON.parse(launchTunCall.options.body).tunnel_via_ssh === true &&
+      fgStarted === true &&
+      openedExternalUri === 'rdp://127.0.0.1:43389');
+    await window.closeRemoteDesktopTunnel();
+    const closeTunCall = calls.filter(call => call.path === '/api/desktop/tunnel-close').pop();
+    check('Closing the desktop tunnel stops keepalive and posts /api/desktop/tunnel-close',
+      !!closeTunCall && fgStopped === true && JSON.parse(closeTunCall.options.body).kind === 'rdp');
+    window.LinSCPCore = savedCoreForAndroid;
+    delete responses['/api/desktop/launch'];
+    delete responses['/api/desktop/tunnel-close'];
+  }
+
   check('no script errors', errors.length === 0, errors.join(' | '));
   window.close();
 })();

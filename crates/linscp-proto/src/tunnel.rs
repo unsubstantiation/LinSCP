@@ -377,6 +377,89 @@ impl Drop for SshJumpTunnel {
     }
 }
 
+/// Loopback (`127.0.0.1:<port>`) port-forwarding relay backed by an active
+/// `SshConnection`, used for external remote-desktop viewers (e.g. Android
+/// RDP/VNC/SPICE viewers) over SSH tunnels with an automatic idle lease.
+pub struct LocalForwardRelay {
+    local_port: u16,
+    shutdown_tx: watch::Sender<bool>,
+    accept_task: JoinHandle<()>,
+}
+
+impl LocalForwardRelay {
+    pub fn local_port(&self) -> u16 {
+        self.local_port
+    }
+
+    pub async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(true);
+        let _ = self.accept_task.await;
+    }
+}
+
+impl Drop for LocalForwardRelay {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+}
+
+pub async fn start_local_forward_relay(
+    ssh: Arc<SshConnection>,
+    remote_host: String,
+    remote_port: u16,
+    idle_lease: std::time::Duration,
+) -> Result<LocalForwardRelay, ProtoError> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.map_err(|e| {
+        ProtoError::Transport(format!("Cannot bind local desktop forwarder on 127.0.0.1: {e}"))
+    })?;
+    let local_port = listener
+        .local_addr()
+        .map_err(|e| ProtoError::Transport(format!("Cannot query local forwarder port: {e}")))?
+        .port();
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let active_clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accept_clients = Arc::clone(&active_clients);
+
+    let accept_task = tokio::spawn(async move {
+        let mut deadline = tokio::time::Instant::now() + idle_lease;
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline), if accept_clients.load(std::sync::atomic::Ordering::SeqCst) == 0 => {
+                    break;
+                }
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _peer)) = accepted else {
+                        break;
+                    };
+                    let _ = stream.set_nodelay(true);
+                    deadline = tokio::time::Instant::now() + idle_lease;
+                    let ssh_conn = Arc::clone(&ssh);
+                    let host = remote_host.clone();
+                    let counter = Arc::clone(&accept_clients);
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        if let Ok(mut remote) = ssh_conn.open_direct_tcpip_stream(&host, remote_port).await {
+                            let _ = tokio::io::copy_bidirectional(&mut stream, &mut remote).await;
+                        }
+                        counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    });
+                }
+            }
+        }
+    });
+
+    Ok(LocalForwardRelay {
+        local_port,
+        shutdown_tx,
+        accept_task,
+    })
+}
+
 async fn handle_socks5_jump_client(
     mut stream: TcpStream,
     ssh: Arc<SshConnection>,
@@ -505,5 +588,47 @@ mod tests {
         assert!(parse_tunnel_spec("80x:example.com:80", TunnelType::Local).is_err());
         assert!(parse_tunnel_spec("70000:example.com:80", TunnelType::Local).is_err());
         assert!(parse_tunnel_spec("8080:*:80", TunnelType::Local).is_err());
+    }
+
+    #[tokio::test]
+    async fn local_forward_relay_streams_both_directions_and_shuts_down_on_drop() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.expect("bind upstream");
+        let upstream_addr = upstream.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.expect("accept upstream");
+            let mut buf = [0u8; 64];
+            let n = sock.read(&mut buf).await.expect("read upstream");
+            sock.write_all(&buf[..n]).await.expect("echo upstream");
+            sock.shutdown().await.expect("shutdown upstream");
+        });
+
+        let relay = start_local_forward_relay(move || async move {
+            let stream = tokio::net::TcpStream::connect(upstream_addr)
+                .await
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            let boxed: Box<dyn linscp_platform::AsyncStream> = Box::new(stream);
+            Ok(boxed)
+        })
+        .await
+        .expect("start local forward relay");
+
+        let relay_port = relay.local_port();
+        assert!(relay_port > 0);
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", relay_port))
+            .await
+            .expect("connect to relay");
+        client.write_all(b"rdp-probe-payload").await.unwrap();
+        let mut echoed = Vec::new();
+        client.read_to_end(&mut echoed).await.unwrap();
+        assert_eq!(echoed, b"rdp-probe-payload");
+        echo_task.await.unwrap();
+
+        relay.stop().await;
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", relay_port))
+                .await
+                .is_err(),
+            "stopped relay must close its loopback listener"
+        );
     }
 }

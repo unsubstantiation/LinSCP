@@ -428,6 +428,24 @@ impl SftpTransport {
     }
 }
 
+fn parse_sftp_etag(etag: &str) -> Result<(u64, i64), ProtoError> {
+    let inner = etag
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .and_then(|s| s.strip_prefix("sftp:"))
+        .ok_or_else(|| ProtoError::Transport("Invalid SFTP identity tag.".to_string()))?;
+    let (sz, mt) = inner
+        .split_once(':')
+        .ok_or_else(|| ProtoError::Transport("Invalid SFTP identity tag.".to_string()))?;
+    let size = sz
+        .parse::<u64>()
+        .map_err(|_| ProtoError::Transport("Invalid SFTP identity size.".to_string()))?;
+    let mtime = mt
+        .parse::<i64>()
+        .map_err(|_| ProtoError::Transport("Invalid SFTP identity mtime.".to_string()))?;
+    Ok((size, mtime))
+}
+
 fn join_posix_path(dir: &str, name: &str) -> String {
     if dir.is_empty() || dir == "." {
         name.to_string()
@@ -1154,6 +1172,107 @@ impl RemoteSession for SftpClientSession {
 
         let _ = t.close_handle(&handle).await;
         res
+    }
+
+    async fn download_if_match(
+        &self,
+        remote_path: &str,
+        etag: &str,
+        opts: TransferRequest,
+        sink: &mut (dyn AsyncWrite + Unpin + Send),
+        progress: Option<&ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        let (expected_size, expected_mtime) = parse_sftp_etag(etag)?;
+        let before = self
+            .stat(remote_path)
+            .await?
+            .ok_or_else(|| ProtoError::Transport(format!("Remote file '{remote_path}' does not exist.")))?;
+        if before.is_dir || before.is_symlink || before.size != expected_size || before.mtime != expected_mtime {
+            return Err(ProtoError::Transport(format!(
+                "Remote file '{remote_path}' changed before conditional SFTP download."
+            )));
+        }
+        let received = self.download(remote_path, opts, sink, progress).await?;
+        let after = self
+            .stat(remote_path)
+            .await?
+            .ok_or_else(|| ProtoError::Transport(format!("Remote file '{remote_path}' disappeared during download.")))?;
+        if after.is_dir || after.is_symlink || after.size != expected_size || after.mtime != expected_mtime {
+            return Err(ProtoError::Transport(format!(
+                "Remote file '{remote_path}' changed during conditional SFTP download."
+            )));
+        }
+        Ok(received)
+    }
+
+    async fn verify_prefix_if_match(
+        &self,
+        remote_path: &str,
+        etag: &str,
+        prefix_len: u64,
+        total_len: u64,
+        prefix: &mut (dyn AsyncRead + Unpin + Send),
+    ) -> Result<(), ProtoError> {
+        let (expected_size, expected_mtime) = parse_sftp_etag(etag)?;
+        if expected_size != total_len || prefix_len > total_len {
+            return Err(ProtoError::Transport("SFTP resume prefix metadata mismatch.".to_string()));
+        }
+        let mut t = self.sftp.lock().await;
+        let attrs = t
+            .stat_internal(SSH_FXP_LSTAT, remote_path)
+            .await?
+            .ok_or_else(|| ProtoError::Transport(format!("Remote file '{remote_path}' does not exist.")))?;
+        if (attrs.permissions & S_IFMT) == S_IFLNK
+            || (attrs.permissions & S_IFMT) == S_IFDIR
+            || attrs.size != expected_size
+            || i64::from(attrs.mtime) != expected_mtime
+        {
+            return Err(ProtoError::Transport(format!(
+                "Remote file '{remote_path}' changed before SFTP resume verification."
+            )));
+        }
+        let handle = t
+            .open_handle(remote_path, SSH_FXF_READ, &SftpWireAttrs::default())
+            .await?;
+        let verify_res: Result<(), ProtoError> = async {
+            let mut offset = 0u64;
+            let mut local_buf = vec![0u8; SFTP_CHUNK_SIZE];
+            while offset < prefix_len {
+                let want = ((prefix_len - offset) as usize).min(SFTP_CHUNK_SIZE);
+                let mut rw = SftpPacketWriter::new();
+                rw.push_bytes(&handle);
+                rw.push_u64(offset);
+                rw.push_u32(want as u32);
+                let (rtype, rbody) = t.request(SSH_FXP_READ, rw).await?;
+                if rtype != SSH_FXP_DATA {
+                    return Err(ProtoError::Transport(
+                        "Remote SFTP file ended early during resume verification.".to_string(),
+                    ));
+                }
+                let mut r = SftpPacketReader::new(&rbody);
+                let remote_chunk = r.read_bytes()?;
+                if remote_chunk.is_empty() {
+                    return Err(ProtoError::Transport(
+                        "Remote SFTP file ended early during resume verification.".to_string(),
+                    ));
+                }
+                let slice = &remote_chunk[..remote_chunk.len().min(want)];
+                prefix
+                    .read_exact(&mut local_buf[..slice.len()])
+                    .await
+                    .map_err(|e| ProtoError::Transport(format!("Reading local partial failed: {e}")))?;
+                if &local_buf[..slice.len()] != slice {
+                    return Err(ProtoError::Transport(
+                        "Existing partial file bytes do not match the remote SFTP file.".to_string(),
+                    ));
+                }
+                offset += slice.len() as u64;
+            }
+            Ok(())
+        }
+        .await;
+        let _ = t.close_handle(&handle).await;
+        verify_res
     }
 
     async fn upload(

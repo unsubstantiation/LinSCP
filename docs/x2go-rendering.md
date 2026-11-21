@@ -1,15 +1,16 @@
 # Built-in X2Go rendering: current status
 
-LinSCP now wires an **experimental** built-in X2Go KDrive viewer through the
-selected authenticated SSH tab. It starts a new agent, opens its graphics
-channel, renders frames and forwards input through a service bridge. It has
-not been tested against a live X2Go server, and the complete Rust application
-has not been compiled in the available sandbox. The parser, control, transport
-and bridge modules were compiled and tested in isolation with stubbed SSH and
-zeroization dependencies; those tests do not validate the full integration. Do not treat the wiring as proof that a
-working desktop opens. NX3 and the former external NX launch path are not
-supported; a KDrive server backend is required. Clipboard, sound, file sharing,
-resizing and session resume are not implemented.
+LinSCP wires an **experimental** built-in X2Go KDrive viewer through the
+selected authenticated SSH tab. It lists resumable (`S`/`R`) server sessions,
+starts a new agent or resumes an existing session, opens its graphics channel,
+renders frames and server cursors, supports live window resizing (`resize`),
+optional text clipboard sync (`Selection` / `DemandSelection` / `write_selection`),
+explicit session suspend (`x2gosuspend-session`) or termination (`x2goterminate-session`),
+and forwards keyboard/pointer input through a service bridge. Live-server validation
+across diverse KDrive deployments remains required before removing the experimental
+designation. NX3 and the former external NX launch path are not supported; a KDrive
+server backend is required. Sound and X2Go server-side folder sharing are not
+implemented.
 
 ## Decoded-frame surface
 

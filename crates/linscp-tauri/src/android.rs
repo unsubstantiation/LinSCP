@@ -245,14 +245,57 @@ mod mobile_plugin {
         fn list_tree(&self, tree_uri: &str) -> Result<Vec<FileEntry>, PlatformError> { self.call("listTree", UriArg { uri: tree_uri }) }
         fn stat_uri(&self, uri: &str) -> Result<FileEntry, PlatformError> { self.call("statUri", UriArg { uri }) }
         fn read_uri_bytes(&self, uri: &str) -> Result<Vec<u8>, PlatformError> {
-            let result: Base64Result = self.call("readUri", UriArg { uri })?;
+            let mut out = Vec::new();
+            let mut offset = 0u64;
+            loop {
+                let chunk = self.read_uri_chunk(uri, offset, linscp_platform::android::SAF_CHUNK_BYTES)?;
+                if chunk.is_empty() {
+                    break;
+                }
+                let len = chunk.len();
+                out.extend_from_slice(&chunk);
+                offset = offset.saturating_add(len as u64);
+                if len < linscp_platform::android::SAF_CHUNK_BYTES {
+                    break;
+                }
+            }
+            Ok(out)
+        }
+        fn write_uri_bytes(&self, parent_uri: &str, name: &str, data: &[u8]) -> Result<String, PlatformError> {
+            if data.len() <= linscp_platform::android::SAF_CHUNK_BYTES {
+                #[derive(Serialize)] struct Args<'a> { parent_uri: &'a str, name: &'a str, data_base64: String }
+                let result: UriResult = self.call("writeUri", Args { parent_uri, name, data_base64: base64::engine::general_purpose::STANDARD.encode(data) })?;
+                return Ok(result.uri);
+            }
+            let target_uri = self.begin_write_uri(parent_uri, name)?;
+            for chunk in data.chunks(linscp_platform::android::SAF_CHUNK_BYTES) {
+                self.append_uri_chunk(&target_uri, chunk)?;
+            }
+            Ok(target_uri)
+        }
+        fn read_uri_chunk(&self, uri: &str, offset: u64, length: usize) -> Result<Vec<u8>, PlatformError> {
+            #[derive(Serialize)] struct Args<'a> { uri: &'a str, offset: u64, length: usize }
+            let result: Base64Result = self.call("readUriChunk", Args { uri, offset, length })?;
+            if result.base64.is_empty() {
+                return Ok(Vec::new());
+            }
             base64::engine::general_purpose::STANDARD.decode(result.base64)
                 .map_err(|error| PlatformError::Unsupported(error.to_string()))
         }
-        fn write_uri_bytes(&self, parent_uri: &str, name: &str, data: &[u8]) -> Result<String, PlatformError> {
-            #[derive(Serialize)] struct Args<'a> { parent_uri: &'a str, name: &'a str, data_base64: String }
-            let result: UriResult = self.call("writeUri", Args { parent_uri, name, data_base64: base64::engine::general_purpose::STANDARD.encode(data) })?;
-            Ok(result.uri)
+        fn begin_write_uri(&self, parent_uri: &str, name: &str) -> Result<String, PlatformError> {
+            #[derive(Serialize)] struct Args<'a> { parent_uri: &'a str, name: &'a str }
+            Ok(self.call::<UriResult, _>("beginWriteUri", Args { parent_uri, name })?.uri)
+        }
+        fn append_uri_chunk(&self, uri: &str, data: &[u8]) -> Result<(), PlatformError> {
+            #[derive(Serialize)] struct Args<'a> { uri: &'a str, data_base64: String }
+            let _: serde_json::Value = self.call("appendUriChunk", Args {
+                uri,
+                data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+            })?;
+            Ok(())
+        }
+        fn supports_chunked_write(&self) -> bool {
+            true
         }
         fn mkdir_uri(&self, parent_uri: &str, name: &str) -> Result<String, PlatformError> {
             #[derive(Serialize)] struct Args<'a> { parent_uri: &'a str, name: &'a str }

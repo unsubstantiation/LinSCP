@@ -8,9 +8,8 @@ use std::pin::Pin;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use filetime::{set_file_times, FileTime};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{AsyncStream, PlatformError};
@@ -499,6 +498,30 @@ pub fn stat_local_path(path: &Path) -> LocalMetadataInfo {
     }
 }
 
+pub(crate) fn system_time_from_unix_secs(secs: i64) -> SystemTime {
+    if secs >= 0 {
+        UNIX_EPOCH + Duration::from_secs(secs as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
+    }
+}
+
+pub(crate) fn open_path_for_set_times(target: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(target)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::fs::File::open(target)
+    }
+}
+
 /// Sets both access and modification timestamps on a local path.
 pub fn set_local_file_times(path: &Path, atime: i64, mtime: i64) -> Result<(), PlatformError> {
     #[cfg(target_os = "windows")]
@@ -506,9 +529,11 @@ pub fn set_local_file_times(path: &Path, atime: i64, mtime: i64) -> Result<(), P
     #[cfg(not(target_os = "windows"))]
     let target = path.to_path_buf();
 
-    let at = FileTime::from_unix_time(if atime != 0 { atime } else { mtime }, 0);
-    let mt = FileTime::from_unix_time(mtime, 0);
-    set_file_times(target, at, mt)?;
+    let at = system_time_from_unix_secs(if atime != 0 { atime } else { mtime });
+    let mt = system_time_from_unix_secs(mtime);
+    let file = open_path_for_set_times(&target)?;
+    let times = std::fs::FileTimes::new().set_accessed(at).set_modified(mt);
+    file.set_times(times)?;
     Ok(())
 }
 

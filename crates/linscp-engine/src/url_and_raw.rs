@@ -1910,7 +1910,7 @@ pub fn validate_ssh_gssapi_policy(spec: &ParsedSiteSpec) -> Result<(), String> {
     }
     if !is_system_gssapi_available() && (auth_kex || gss_delegate || has_logical_host) {
         return Err(
-            "Kerberos (GSSAPI) authentication needs a Linux build with a Kerberos runtime, so this build cannot honor the session's Kerberos settings (AuthGSSAPIKEX, GSSAPIFwdTGT, LogicalHostName)."
+            "Kerberos (GSSAPI) authentication needs a Linux Kerberos runtime or Windows SSPI, so this build cannot honor the session's Kerberos settings (AuthGSSAPIKEX, GSSAPIFwdTGT, LogicalHostName)."
                 .to_string(),
         );
     }

@@ -10,11 +10,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use linscp_engine::filemask::join_remote_path;
+use linscp_engine::filemask::{join_remote_path, mode_from_permissions_str};
 use linscp_engine::keepuptodate::{run_keep_up_to_date, KeepUpToDateOptions};
+use linscp_engine::presets::PresetPermissions;
 use linscp_engine::sync_planner::{
     apply_sync_plan, plan_synchronization, SyncOptions, SyncState,
 };
+use linscp_engine::text_mode::{convert_eol_bytes, wants_ascii_conversion, EolStyle};
 use linscp_engine::transfer::{
     download_directory_recursive, download_single_file, publish_staged_file_to_saf,
     publish_staged_tree_to_saf, safe_tree_name, stage_saf_upload_source,
@@ -27,7 +29,7 @@ use linscp_platform::terminal::{
     clear_interrupted, is_interrupted, set_local_file_times, set_local_permissions,
 };
 use linscp_proto::{ProgressCallback, RemoteSession};
-use linscp_types::ProtocolScheme;
+use linscp_types::{ProtocolScheme, TransferMode};
 use rand::RngCore;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Notify};
@@ -82,6 +84,7 @@ pub enum QueueJob {
         target: PathBuf,
         move_item: bool,
         policy: ConflictPolicy,
+        flags: TransferFlags,
     },
     DavMove {
         session: Arc<dyn RemoteSession>,
@@ -98,6 +101,7 @@ pub enum QueueJob {
         etag: Option<String>,
         source_entry: linscp_types::FileEntry,
         move_item: bool,
+        target_ftp_risky_publish: bool,
     },
     RemoteToRemote {
         src_session: Arc<dyn RemoteSession>,
@@ -184,13 +188,29 @@ async fn download_staged_remote_tree(
         let from = join_remote_path(remote, &item.name);
         let to = local.join(&item.name);
         let is_dav = matches!(session.scheme(), ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs);
+        let is_s3 = session.scheme() == ProtocolScheme::S3;
         let (current, child_etag) = if is_dav {
             let (entry, etag) = session.dav_stat_with_etag(&from).await.map_err(|e| e.to_string())?;
             (entry.ok_or("Remote entry disappeared.")?, etag)
+        } else if is_s3 && !item.is_dir {
+            let entry = session.stat(&from).await.map_err(|e| e.to_string())?.ok_or("Remote entry disappeared.")?;
+            let etag = session.s3_get_etag(&from).await.map_err(|e| e.to_string())?;
+            (entry, etag)
         } else {
             (session.stat(&from).await.map_err(|e| e.to_string())?.ok_or("Remote entry disappeared.")?, None)
         };
         if current.is_symlink { return Err("Refusing to transfer a remote symlink.".to_string()); }
+        if !flags.file_mask.is_empty()
+            && !flags.file_mask.accepts(
+                &item.name,
+                current.is_dir,
+                current.size,
+                current.mtime.max(0) as u64,
+                &item.name,
+            )
+        {
+            continue;
+        }
         if current.is_dir {
             Box::pin(download_staged_remote_tree(session, &from, &to, flags, logger, progress, depth + 1)).await?;
         } else {
@@ -201,16 +221,97 @@ async fn download_staged_remote_tree(
                     Err(error) => return Err(format!("Cannot inspect '{}': {error}", to.display())),
                 }
             }
+            let ascii_conv = wants_ascii_conversion(flags.transfer_mode, &item.name);
             let mut child_flags = flags.clone();
-            child_flags.source_etag = if is_dav { Some(child_etag.ok_or("WebDAV tree files require a strong ETag.")?) } else { None };
-            download_single_file(session, &from, Some(&current), &to, &child_flags, logger, progress).await?;
-            let received = std::fs::metadata(&to).map_err(|e| format!("Cannot inspect staged file '{}': {e}", to.display()))?.len();
-            if received != current.size {
-                return Err(format!("Remote file '{from}' changed length or was incompletely downloaded; refusing to publish the tree."));
+            child_flags.transfer_mode = TransferMode::Binary;
+            child_flags.source_etag = if is_dav {
+                Some(child_etag.ok_or("WebDAV tree files require a strong ETag.")?)
+            } else if is_s3 {
+                child_etag
+            } else {
+                None
+            };
+            let transferred = download_single_file(session, &from, Some(&current), &to, &child_flags, logger, progress).await?;
+            if transferred {
+                let received = std::fs::metadata(&to).map_err(|e| format!("Cannot inspect staged file '{}': {e}", to.display()))?.len();
+                if received != current.size {
+                    return Err(format!("Remote file '{from}' changed length or was incompletely downloaded; refusing to publish the tree."));
+                }
+                if ascii_conv {
+                    let raw = std::fs::read(&to).map_err(|e| format!("Cannot read staged file '{}': {e}", to.display()))?;
+                    let converted = convert_eol_bytes(&raw, child_flags.eol_override.unwrap_or_else(EolStyle::local_native));
+                    std::fs::write(&to, &converted).map_err(|e| format!("Cannot write converted file '{}': {e}", to.display()))?;
+                    apply_local_flags_attrs(&to, &current, flags);
+                }
             }
         }
     }
     Ok(())
+}
+
+fn apply_local_flags_attrs(local_dest: &Path, info: &linscp_types::FileEntry, flags: &TransferFlags) {
+    match flags.permissions {
+        PresetPermissions::Off => {}
+        PresetPermissions::FromFile => {
+            let mode = mode_from_permissions_str(&info.permissions);
+            if mode != 0 {
+                let _ = set_local_permissions(local_dest, mode);
+            }
+        }
+        PresetPermissions::Mode(m) => {
+            let _ = set_local_permissions(local_dest, m);
+        }
+    }
+    if flags.preserve_time && info.mtime > 0 {
+        let _ = set_local_file_times(local_dest, info.mtime, info.mtime);
+    }
+}
+
+async fn upload_staged_or_binary_file(
+    session: &dyn RemoteSession,
+    local_src: &Path,
+    remote_dest: &str,
+    flags: &TransferFlags,
+    logger: &mut SessionLogger,
+    progress: Option<&ProgressCallback>,
+) -> Result<bool, String> {
+    let leaf = local_src
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !flags.append && wants_ascii_conversion(flags.transfer_mode, &leaf) {
+        if flags.newer_only {
+            if let (Ok(ext), Ok(Some(remote_stat))) = (
+                linscp_platform::gui_os::stat_extended(local_src),
+                session.stat(remote_dest).await,
+            ) {
+                if !remote_stat.is_dir && remote_stat.mtime >= ext.mtime_secs && ext.mtime_secs > 0 {
+                    return Ok(false);
+                }
+            }
+        }
+        let raw = std::fs::read(local_src)
+            .map_err(|e| format!("Cannot read local file '{}': {e}", local_src.display()))?;
+        let target_eol = flags.eol_override.unwrap_or(EolStyle::Crlf);
+        let converted = convert_eol_bytes(&raw, target_eol);
+        let stage_dir = tempfile::Builder::new()
+            .prefix("linscp-ascii-up-")
+            .rand_bytes(16)
+            .tempdir()
+            .map_err(|e| format!("Cannot create temporary ASCII staging directory: {e}"))?;
+        let stage_file = stage_dir.path().join(if leaf.is_empty() { "payload" } else { &leaf });
+        std::fs::write(&stage_file, &converted)
+            .map_err(|e| format!("Cannot stage converted file: {e}"))?;
+        if let Ok(ext) = linscp_platform::gui_os::stat_extended(local_src) {
+            let _ = set_local_permissions(&stage_file, ext.mode);
+            let _ = set_local_file_times(&stage_file, ext.mtime_secs, ext.mtime_secs);
+        }
+        let mut bin_flags = flags.clone();
+        bin_flags.transfer_mode = TransferMode::Binary;
+        bin_flags.delete_source = false;
+        return upload_single_file(session, &stage_file, remote_dest, &bin_flags, logger, progress).await;
+    }
+    upload_single_file(session, local_src, remote_dest, flags, logger, progress).await
 }
 
 async fn upload_new_remote_tree(
@@ -238,6 +339,14 @@ async fn upload_new_remote_tree(
         let to = join_remote_path(remote, &name);
         let meta = std::fs::symlink_metadata(&from).map_err(|e| e.to_string())?;
         if meta.file_type().is_symlink() { return Err("Refusing to transfer a local symlink.".to_string()); }
+        let mtime_u64 = linscp_platform::gui_os::stat_extended(&from)
+            .map(|s| s.mtime_secs.max(0) as u64)
+            .unwrap_or(0);
+        if !flags.file_mask.is_empty()
+            && !flags.file_mask.accepts(&name, meta.is_dir(), meta.len(), mtime_u64, &name)
+        {
+            continue;
+        }
         if meta.is_dir() {
             Box::pin(upload_new_remote_tree(session, &from, &to, flags, logger, progress, depth + 1)).await?;
         } else if meta.is_file() {
@@ -247,7 +356,7 @@ async fn upload_new_remote_tree(
                     None => {},
                 }
             }
-            upload_single_file(session, &from, &to, flags, logger, progress).await?;
+            upload_staged_or_binary_file(session, &from, &to, flags, logger, progress).await?;
         } else { return Err("Refusing to transfer a non-file.".to_string()); }
     }
     Ok(())
@@ -257,10 +366,10 @@ fn task_supports_cancellation(job: &QueueJob) -> bool {
     match job {
         QueueJob::LocalCopyOrMove { .. } | QueueJob::StagedRemoteTransfer { .. } => true,
         QueueJob::RemoteDownload { session, .. } => {
-            matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs | ProtocolScheme::S3 | ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes)
+            matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Scp | ProtocolScheme::Ssh | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs | ProtocolScheme::S3 | ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes)
         }
         QueueJob::RemoteUpload { session, .. } => {
-            matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs | ProtocolScheme::S3 | ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes)
+            matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Scp | ProtocolScheme::Ssh | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs | ProtocolScheme::S3 | ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes)
         }
         _ => false,
     }
@@ -774,38 +883,44 @@ impl QueueManager {
                 delete_source,
                 flags,
             } => {
-                let entry = session
-                    .stat(remote_path)
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("Remote item '{remote_path}' does not exist."))?;
+                let entry = if let Some(ref vid) = flags.version_id {
+                    session
+                        .s3_stat_version(remote_path, vid)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| format!("Remote item '{remote_path}' (version '{vid}') does not exist."))?
+                } else {
+                    session
+                        .stat(remote_path)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| format!("Remote item '{remote_path}' does not exist."))?
+                };
                 let saf_dest = crate::is_saf_path(&local_dest.to_string_lossy());
                 if saf_dest {
                     if let Ok(info) = self.local_fs.stat(&local_dest.to_string_lossy()) {
                         let allowed_dir = entry.is_dir && flags.merge_directories && info.is_dir && !info.is_symlink;
-                        let allowed_file = !entry.is_dir && *allow_overwrite && !info.is_dir && !info.is_symlink;
+                        let allowed_file = !entry.is_dir && (*allow_overwrite || flags.append) && !info.is_dir && !info.is_symlink;
                         if !allowed_dir && !allowed_file { return Err("Destination changed or merge/overwrite was not approved.".to_string()); }
                     }
                 } else if let Ok(meta) = std::fs::symlink_metadata(local_dest) {
                     let allowed_dir = entry.is_dir && flags.merge_directories && meta.is_dir() && !meta.file_type().is_symlink();
-                    let allowed_file = !entry.is_dir && *allow_overwrite && meta.is_file() && !meta.file_type().is_symlink();
+                    let allowed_file = !entry.is_dir && (*allow_overwrite || flags.append) && meta.is_file() && !meta.file_type().is_symlink();
                     if !allowed_dir && !allowed_file { return Err("Destination changed or merge/overwrite was not approved.".to_string()); }
                 }
                 let mut f = flags.clone();
-                // Moves delete separately with the original ETag, only after
-                // no-replace local publication has succeeded.
+                // Moves delete separately with source verification, only after
+                // local publication has succeeded.
                 f.delete_source = false;
                 f.cancel_flag = Some(Arc::clone(&task.cancel_flag));
-                f.no_clobber = !allow_overwrite;
-                f.cleanup_download_stage = true;
+                f.no_clobber = !*allow_overwrite && !f.append;
+                f.cleanup_download_stage = !f.append && !f.resume;
                 if entry.is_dir {
-                    if !matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs) || *delete_source { return Err("Directory downloads require SFTP or WebDAV and cannot delete the source.".to_string()); }
+                    if *delete_source { return Err("Directory downloads cannot delete the remote source.".to_string()); }
                     f.no_clobber = true;
+                    f.cleanup_download_stage = true;
                     let mut stage_flags = f.clone(); stage_flags.merge_directories = false;
                     if saf_dest {
-                        // A granted tree has no parent directory to stage in:
-                        // the tree lands in a private directory and is
-                        // published file by file across the bridge.
                         let stage = tempfile::Builder::new().prefix("linscp-saf-download-").rand_bytes(16).tempdir()
                             .map_err(|e| format!("Cannot create download staging directory: {e}"))?;
                         let staged_tree = stage.path().join("contents");
@@ -822,8 +937,6 @@ impl QueueManager {
                         .map_err(|e| format!("Local worker panicked: {e}"))?;
                         published?;
                     } else {
-                        // Stage both new trees and merges privately. Cancelling a
-                        // download before publication leaves an existing tree alone.
                         let parent = local_dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
                         let stage = tempfile::Builder::new().prefix(".linscp-tree-").rand_bytes(16).tempdir_in(parent)
                             .map_err(|e| format!("Cannot create temporary directory in '{}': {e}", parent.display()))?;
@@ -839,33 +952,80 @@ impl QueueManager {
                     }
                 } else {
                     if entry.is_symlink { return Err("Refusing to transfer a remote symlink.".to_string()); }
+                    let leaf = remote_path.rsplit('/').next().unwrap_or(remote_path);
+                    let ascii_conv = wants_ascii_conversion(f.transfer_mode, leaf);
                     if saf_dest {
-                        // The bridge has no appends and no partial files, so a
-                        // granted download never resumes; preflight refuses
-                        // this combination, and the worker fails closed too.
-                        if f.resume { return Err("Verified resume is not supported for granted folders.".to_string()); }
+                        if f.resume || f.append { return Err("Verified resume and append are not supported for granted folders.".to_string()); }
                         let stage = tempfile::Builder::new().prefix("linscp-saf-download-").rand_bytes(16).tempdir()
                             .map_err(|e| format!("Cannot create download staging directory: {e}"))?;
                         let staged_file = stage.path().join("contents");
-                        download_single_file(session.as_ref(), remote_path, Some(&entry), &staged_file, &f, &mut logger, Some(&*progress)).await?;
-                        let fs = self.local_fs.clone();
-                        let dest = local_dest.to_string_lossy().into_owned();
-                        let no_replace = !*allow_overwrite;
-                        let cancel = Arc::clone(&task.cancel_flag);
-                        let published = tokio::task::spawn_blocking(move || {
-                            publish_staged_file_to_saf(fs.as_ref(), &staged_file, &dest, no_replace, &cancel)
-                        })
-                        .await
-                        .map_err(|e| format!("Local worker panicked: {e}"))?;
-                        published?;
+                        let mut sf = f.clone();
+                        sf.transfer_mode = TransferMode::Binary;
+                        let transferred = download_single_file(session.as_ref(), remote_path, Some(&entry), &staged_file, &sf, &mut logger, Some(&*progress)).await?;
+                        if transferred {
+                            if ascii_conv {
+                                let raw = std::fs::read(&staged_file).map_err(|e| e.to_string())?;
+                                let converted = convert_eol_bytes(&raw, f.eol_override.unwrap_or_else(EolStyle::local_native));
+                                std::fs::write(&staged_file, &converted).map_err(|e| e.to_string())?;
+                            }
+                            let fs = self.local_fs.clone();
+                            let dest = local_dest.to_string_lossy().into_owned();
+                            let no_replace = !*allow_overwrite;
+                            let cancel = Arc::clone(&task.cancel_flag);
+                            let published = tokio::task::spawn_blocking(move || {
+                                publish_staged_file_to_saf(fs.as_ref(), &staged_file, &dest, no_replace, &cancel)
+                            })
+                            .await
+                            .map_err(|e| format!("Local worker panicked: {e}"))?;
+                            published?;
+                        }
                     } else if f.resume {
                         linscp_engine::transfer::download_verified_resume(session.as_ref(), remote_path, &entry, local_dest, &f, &mut logger, Some(&*progress)).await?;
+                    } else if ascii_conv && !f.append {
+                        let parent = local_dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+                        std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create local directory '{}': {e}", parent.display()))?;
+                        let stage_dir = tempfile::Builder::new().prefix(".linscp-ascii-dl-").rand_bytes(16).tempdir_in(parent)
+                            .map_err(|e| format!("Cannot create temporary download directory: {e}"))?;
+                        let staged_raw = stage_dir.path().join("raw");
+                        let mut sf = f.clone();
+                        sf.transfer_mode = TransferMode::Binary;
+                        sf.no_clobber = true;
+                        sf.cleanup_download_stage = true;
+                        if sf.newer_only {
+                            if let Ok(ext) = linscp_platform::gui_os::stat_extended(local_dest) {
+                                if !ext.is_dir && entry.mtime > 0 && ext.mtime_secs >= entry.mtime {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        download_single_file(session.as_ref(), remote_path, Some(&entry), &staged_raw, &sf, &mut logger, Some(&*progress)).await?;
+                        let raw = std::fs::read(&staged_raw).map_err(|e| format!("Cannot read staged download: {e}"))?;
+                        let converted = convert_eol_bytes(&raw, f.eol_override.unwrap_or_else(EolStyle::local_native));
+                        let staged_conv = stage_dir.path().join("converted");
+                        std::fs::write(&staged_conv, &converted).map_err(|e| format!("Cannot write converted download: {e}"))?;
+                        apply_local_flags_attrs(&staged_conv, &entry, &f);
+                        if task.cancel_flag.load(Ordering::SeqCst) {
+                            return Err("Transfer cancelled before publication.".to_string());
+                        }
+                        if f.no_clobber {
+                            linscp_platform::publish_no_replace(&staged_conv, local_dest).map_err(|e| format!("Cannot publish downloaded file '{}': {e}", local_dest.display()))?;
+                        } else {
+                            std::fs::rename(&staged_conv, local_dest).map_err(|e| format!("Cannot replace local file '{}': {e}", local_dest.display()))?;
+                        }
                     } else {
                         download_single_file(session.as_ref(), remote_path, Some(&entry), local_dest, &f, &mut logger, Some(&*progress)).await?;
                     }
                     if *delete_source {
-                        let etag = f.source_etag.as_deref().ok_or("Move incomplete: local file was published but source identity is missing.")?;
-                        session.remove_if_match(remote_path, etag).await.map_err(|e| format!("Move incomplete: local file was published, but remote source deletion could not be confirmed; the source may or may not exist: {e}"))?;
+                        if let Some(etag) = f.source_etag.as_deref() {
+                            session.remove_if_match(remote_path, etag).await.map_err(|e| format!("Move incomplete: local file was published, but remote source deletion could not be confirmed; the source may or may not exist: {e}"))?;
+                        } else {
+                            let after = session.stat(remote_path).await.map_err(|e| format!("Move incomplete: local file was published, but remote source could not be verified before deletion: {e}"))?
+                                .ok_or_else(|| "Move incomplete: local file was published, and remote source disappeared before deletion.".to_string())?;
+                            if after.is_dir || after.is_symlink || after.size != entry.size || after.mtime != entry.mtime {
+                                return Err("Move incomplete: local file was published, but remote source changed during transfer and was kept intact.".to_string());
+                            }
+                            session.remove_file(remote_path).await.map_err(|e| format!("Move incomplete: local file was published, but remote source deletion failed: {e}"))?;
+                        }
                     }
                 }
                 Ok(())
@@ -879,12 +1039,11 @@ impl QueueManager {
                 flags,
                 ..
             } => {
-                // A granted source cannot go through the engine's path I/O:
-                // it is staged onto a plain path first, and the guarded
-                // upload below runs unchanged from the stage.
-                let upload_stage = if crate::is_saf_path(&local_src.to_string_lossy()) {
+                let orig_local_src = local_src.clone();
+                let saf_source = crate::is_saf_path(&orig_local_src.to_string_lossy());
+                let upload_stage = if saf_source {
                     let fs = self.local_fs.clone();
-                    let uri = local_src.to_string_lossy().into_owned();
+                    let uri = orig_local_src.to_string_lossy().into_owned();
                     let cancel = Arc::clone(&task.cancel_flag);
                     let staged = tokio::task::spawn_blocking(move || {
                         stage_saf_upload_source(fs.as_ref(), &uri, &cancel)
@@ -899,29 +1058,34 @@ impl QueueManager {
                 let source_meta = std::fs::symlink_metadata(local_src).map_err(|e| format!("Cannot inspect local source '{}': {e}", local_src.display()))?;
                 if let Some(entry) = session.stat(remote_dest).await.map_err(|e| e.to_string())? {
                     let allowed_dir = source_meta.is_dir() && !source_meta.file_type().is_symlink() && flags.merge_directories && entry.is_dir && !entry.is_symlink;
-                    let allowed_file = source_meta.is_file() && *allow_overwrite && !entry.is_dir && !entry.is_symlink;
+                    let allowed_file = source_meta.is_file() && (*allow_overwrite || flags.append) && !entry.is_dir && !entry.is_symlink;
                     if !allowed_dir && !allowed_file { return Err("Destination changed or merge/overwrite was not approved.".to_string()); }
                 }
-                if !flags.ftp_risky_publish { if let Some(stage) = linscp_engine::transfer::remote_stage_path(remote_dest, None) {
-                    if session.stat(&stage).await.map_err(|e| e.to_string())?.is_some() {
-                        return Err(format!("A partial file already exists at '{stage}'; remove it before retrying."));
+                if !flags.ftp_risky_publish && !flags.append {
+                    if let Some(stage) = linscp_engine::transfer::remote_stage_path(remote_dest, None) {
+                        if session.stat(&stage).await.map_err(|e| e.to_string())?.is_some() {
+                            return Err(format!("A partial file already exists at '{stage}'; remove it before retrying."));
+                        }
                     }
-                }
                 }
                 let meta = source_meta;
                 let mut f = flags.clone();
-                f.delete_source = *delete_source;
+                f.delete_source = false;
                 f.cancel_flag = Some(Arc::clone(&task.cancel_flag));
-                // Fail closed if the protocol has no atomic exclusive-create capability.
-                f.no_clobber = !allow_overwrite;
+                f.no_clobber = !*allow_overwrite && !f.append && !f.ftp_risky_publish;
+                if *allow_overwrite && !f.append && matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Scp | ProtocolScheme::Ssh) {
+                    f.sftp_risky_publish = true;
+                    f.no_clobber = false;
+                }
                 if meta.is_dir() {
-                    if !matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs) || *delete_source { return Err("Directory uploads require SFTP or WebDAV and cannot delete the source.".to_string()); }
-                    f.no_clobber = true;
+                    if *delete_source { return Err("Directory uploads cannot delete the local source.".to_string()); }
+                    f.no_clobber = !f.ftp_risky_publish;
+                    f.sftp_risky_publish = false;
                     upload_new_remote_tree(session.as_ref(), local_src, remote_dest, &f, &mut logger, Some(&*progress), 0).await
                         .map_err(|e| format!("Upload failed; a partial remote tree may remain: {e}"))?;
                 } else {
                     if meta.file_type().is_symlink() || !meta.is_file() { return Err("Refusing to transfer a symlink or non-file.".to_string()); }
-                    upload_single_file(
+                    upload_staged_or_binary_file(
                         session.as_ref(),
                         local_src,
                         remote_dest,
@@ -930,6 +1094,18 @@ impl QueueManager {
                         Some(&*progress),
                     )
                     .await.map_err(|e| format!("Upload failed; a partial or completed remote destination or temporary file may remain: {e}"))?;
+                    if *delete_source {
+                        if task.cancel_flag.load(Ordering::SeqCst) {
+                            return Err("Move incomplete: destination was uploaded, but cancellation left the local source intact.".to_string());
+                        }
+                        if saf_source {
+                            self.local_fs.remove_file(&orig_local_src.to_string_lossy())
+                                .map_err(|e| format!("Move incomplete: destination was uploaded, but local source could not be removed: {e}"))?;
+                        } else {
+                            std::fs::remove_file(&orig_local_src)
+                                .map_err(|e| format!("Move incomplete: destination was uploaded, but local source could not be removed: {e}"))?;
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -938,14 +1114,13 @@ impl QueueManager {
                 target,
                 move_item,
                 policy,
+                flags,
             } => {
                 let mv = *move_item;
                 let pol = *policy;
+                let local_flags = flags.clone();
                 let cancel = Arc::clone(&task.cancel_flag);
                 let prog = progress.clone();
-                // A `content://` endpoint cannot go through `std::fs`: the
-                // whole item runs on `LocalFs`, which serves the plain side
-                // of a mixed copy the same calls.
                 if crate::is_saf_path(&source.to_string_lossy()) || crate::is_saf_path(&target.to_string_lossy()) {
                     let fs = self.local_fs.clone();
                     let src = source.to_string_lossy().into_owned();
@@ -959,13 +1134,13 @@ impl QueueManager {
                     let src = source.clone();
                     let dst = target.clone();
                     tokio::task::spawn_blocking(move || {
-                        execute_local_item(&src, &dst, mv, pol, &cancel, &*prog)
+                        execute_local_item_with_flags(&src, &dst, mv, pol, &local_flags, &cancel, &*prog)
                     })
                     .await
                     .map_err(|e| format!("Local worker panicked: {e}"))?
                 }
             }
-            QueueJob::StagedRemoteTransfer { source_session, target_session, source, target, etag, source_entry, move_item } => {
+            QueueJob::StagedRemoteTransfer { source_session, target_session, source, target, etag, source_entry, move_item, target_ftp_risky_publish } => {
                 let stage = tempfile::Builder::new().prefix("linscp-cross-move-").rand_bytes(16).tempdir()
                     .map_err(|e| format!("Cannot create local move staging directory: {e}"))?;
                 let payload = stage.path().join("payload");
@@ -976,13 +1151,14 @@ impl QueueManager {
                 download_flags.source_etag = etag.clone();
                 download_flags.cancel_flag = Some(Arc::clone(&task.cancel_flag));
                 if source_entry.is_dir {
-                    if *move_item || !matches!(source_session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs) || !matches!(target_session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Dav | ProtocolScheme::Davs | ProtocolScheme::Webdav | ProtocolScheme::Webdavs) {
-                        return Err("Directory copies require SFTP or WebDAV sources and destinations.".to_string());
+                    if *move_item {
+                        return Err("Cross-server directory moves are unsupported.".to_string());
                     }
                     download_staged_remote_tree(source_session.as_ref(), source, &payload, &download_flags, &mut logger, Some(&*progress), 0).await?;
                     if task.cancel_flag.load(Ordering::SeqCst) { return Err("Cancelled before upload; source remains.".to_string()); }
                     let mut flags = TransferFlags::default();
-                    flags.no_clobber = true;
+                    flags.ftp_risky_publish = *target_ftp_risky_publish;
+                    flags.no_clobber = !*target_ftp_risky_publish;
                     flags.preserve_time = false;
                     flags.cancel_flag = Some(Arc::clone(&task.cancel_flag));
                     upload_new_remote_tree(target_session.as_ref(), &payload, target, &flags, &mut logger, Some(&*progress), 0).await
@@ -994,15 +1170,27 @@ impl QueueManager {
                 if staged_len != source_entry.size { return Err("Source length changed during conditional download; source remains.".to_string()); }
                 if task.cancel_flag.load(Ordering::SeqCst) { return Err("Cancelled before upload; source remains.".to_string()); }
                 let mut upload_flags = TransferFlags::default();
-                upload_flags.no_clobber = true;
+                upload_flags.ftp_risky_publish = *target_ftp_risky_publish;
+                upload_flags.no_clobber = !*target_ftp_risky_publish;
                 upload_flags.preserve_time = false;
                 upload_flags.cancel_flag = Some(Arc::clone(&task.cancel_flag));
                 upload_single_file(target_session.as_ref(), &payload, target, &upload_flags, &mut logger, Some(&*progress)).await
                     .map_err(|e| if *move_item { format!("Move incomplete: source remains; destination may contain a partial or completed file: {e}") } else { format!("Copy failed; source remains and destination may contain a partial or completed file: {e}") })?;
                 if !*move_item { return Ok(()); }
                 if task.cancel_flag.load(Ordering::SeqCst) { return Err("Move incomplete: destination was uploaded; cancellation left the source in place.".to_string()); }
-                source_session.remove_if_match(source, etag.as_deref().ok_or("Move incomplete: source identity is missing.")?).await
-                    .map_err(|e| format!("Move incomplete: destination was uploaded; source deletion was not confirmed and the source may or may not remain: {e}"))?;
+                if let Some(etag) = etag.as_deref() {
+                    source_session.remove_if_match(source, etag).await
+                        .map_err(|e| format!("Move incomplete: destination was uploaded; source deletion was not confirmed and the source may or may not remain: {e}"))?;
+                } else {
+                    let after = source_session.stat(source).await
+                        .map_err(|e| format!("Move incomplete: destination was uploaded; source could not be verified before deletion: {e}"))?
+                        .ok_or_else(|| "Move incomplete: destination was uploaded; source disappeared before deletion.".to_string())?;
+                    if after.is_dir || after.is_symlink || after.size != source_entry.size || after.mtime != source_entry.mtime {
+                        return Err("Move incomplete: destination was uploaded, but source changed during transfer and was kept intact.".to_string());
+                    }
+                    source_session.remove_file(source).await
+                        .map_err(|e| format!("Move incomplete: destination was uploaded; source deletion failed: {e}"))?;
+                }
                 Ok(())
             }
             QueueJob::DavMove { session, source, target, etag, is_dir } => {
@@ -1208,11 +1396,12 @@ pub fn remove_path_any(path: &Path) -> Result<(), String> {
     }
 }
 
-fn execute_local_item(
+fn execute_local_item_with_flags(
     source: &Path,
     target: &Path,
     move_item: bool,
     policy: ConflictPolicy,
+    flags: &TransferFlags,
     cancel: &AtomicBool,
     progress: &ProgressCallback,
 ) -> Result<(), String> {
@@ -1230,7 +1419,7 @@ fn execute_local_item(
     }
 
     let mut effective_target = target.to_path_buf();
-    if std::fs::symlink_metadata(&effective_target).is_ok() {
+    if let Ok(dst_meta) = std::fs::symlink_metadata(&effective_target) {
         match policy {
             ConflictPolicy::Skip => {
                 if !src_meta.is_dir() || src_meta.file_type().is_symlink() {
@@ -1241,35 +1430,143 @@ fn execute_local_item(
                 effective_target = unique_local_target(&effective_target);
             }
             ConflictPolicy::Overwrite => {
-                // Keep the old file in place until the replacement has been
-                // completely copied and is ready to publish.
                 if src_meta.file_type().is_symlink() {
                     remove_path_any(&effective_target)?;
                 }
             }
             ConflictPolicy::Ask => {
-                return Err(format!(
-                    "Destination '{}' already exists.",
-                    effective_target.display()
-                ));
+                if !(src_meta.is_dir()
+                    && !src_meta.file_type().is_symlink()
+                    && flags.merge_directories
+                    && dst_meta.is_dir()
+                    && !dst_meta.file_type().is_symlink())
+                {
+                    return Err(format!(
+                        "Destination '{}' already exists.",
+                        effective_target.display()
+                    ));
+                }
             }
         }
     }
 
     let mut copied = 0u64;
     let total = compute_local_size(source);
-    local_copy_recursive(
+    local_copy_recursive_with_flags(
         source,
         &effective_target,
         policy,
+        flags,
         cancel,
         &mut copied,
         total,
         progress,
-    )?;
+    )
+}
 
+fn execute_local_item(
+    source: &Path,
+    target: &Path,
+    move_item: bool,
+    policy: ConflictPolicy,
+    cancel: &AtomicBool,
+    progress: &ProgressCallback,
+) -> Result<(), String> {
+    execute_local_item_with_flags(
+        source,
+        target,
+        move_item,
+        policy,
+        &TransferFlags::default(),
+        cancel,
+        progress,
+    )
+}
+
+fn local_copy_recursive_with_flags(
+    source: &Path,
+    target: &Path,
+    policy: ConflictPolicy,
+    flags: &TransferFlags,
+    cancel: &AtomicBool,
+    copied: &mut u64,
+    total: u64,
+    progress: &ProgressCallback,
+) -> Result<(), String> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err("Cancelled by user.".to_string());
+    }
+    let meta = std::fs::symlink_metadata(source).map_err(|e| e.to_string())?;
+    let ft = meta.file_type();
+    if ft.is_dir() {
+        if let Ok(existing) = std::fs::symlink_metadata(target) {
+            if existing.file_type().is_symlink() || !existing.is_dir() {
+                match policy {
+                    ConflictPolicy::Skip => return Ok(()),
+                    ConflictPolicy::Overwrite => remove_path_any(target)?,
+                    ConflictPolicy::Rename => {
+                        let alt = unique_local_target(target);
+                        return local_copy_recursive_with_flags(source, &alt, policy, flags, cancel, copied, total, progress);
+                    }
+                    ConflictPolicy::Ask => return Err("Destination is not a directory.".to_string()),
+                }
+            }
+        }
+        std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
+        let mut children: Vec<_> = std::fs::read_dir(source)
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        children.sort_by_key(|e| e.file_name());
+        for child in children {
+            let child_src = child.path();
+            let child_name = child.file_name().to_string_lossy().into_owned();
+            if let Ok(cmeta) = std::fs::symlink_metadata(&child_src) {
+                let cmtime = linscp_platform::gui_os::stat_extended(&child_src)
+                    .map(|s| s.mtime_secs.max(0) as u64)
+                    .unwrap_or(0);
+                if !flags.file_mask.is_empty()
+                    && !flags.file_mask.accepts(&child_name, cmeta.is_dir(), cmeta.len(), cmtime, &child_name)
+                {
+                    continue;
+                }
+            }
+            let child_dst = target.join(child.file_name());
+            local_copy_recursive_with_flags(&child_src, &child_dst, policy, flags, cancel, copied, total, progress)?;
+        }
+        return Ok(());
+    }
+    if flags.newer_only {
+        if let (Ok(src_ext), Ok(dst_ext)) = (
+            linscp_platform::gui_os::stat_extended(source),
+            linscp_platform::gui_os::stat_extended(target),
+        ) {
+            if !dst_ext.is_dir && src_ext.mtime_secs > 0 && dst_ext.mtime_secs >= src_ext.mtime_secs {
+                return Ok(());
+            }
+        }
+    }
+    let bytes_before = *copied;
+    local_copy_recursive(source, target, policy, cancel, copied, total, progress)?;
+    if matches!(flags.permissions, PresetPermissions::Off) || !flags.preserve_time {
+        if let Ok(now_secs) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            if !flags.preserve_time {
+                let now = now_secs.as_secs() as i64;
+                let _ = set_local_file_times(target, now, now);
+            }
+        }
+    }
+    if let Some(kb) = flags.speed_kbytes_per_sec.filter(|&s| s > 0) {
+        let delta = copied.saturating_sub(bytes_before);
+        let millis = delta.saturating_mul(1000) / kb.saturating_mul(1024).max(1);
+        if millis > 0 {
+            std::thread::sleep(Duration::from_millis(millis.min(5_000)));
+        }
+    }
     Ok(())
 }
+
+fn _keep_legacy_local_anchor() {}
 
 fn compute_local_size(path: &Path) -> u64 {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
@@ -1643,17 +1940,16 @@ fn local_copy_recursive_fs(
         let name = source.rsplit('/').next().unwrap_or(source);
         return Err(saf_document_too_large(name, meta.size));
     }
-    let bytes = fs.read_bytes(source).map_err(|e| e.to_string())?;
     if cancel.load(Ordering::SeqCst) {
         return Err("Cancelled by user.".to_string());
     }
-    fs.write_bytes_atomic(target, &bytes).map_err(|e| e.to_string())?;
+    let written = fs.copy_streamed(source, target).map_err(|e| e.to_string())?;
     // A granted target has no timestamps to set; a plain target keeps the
     // source's seconds, modes aside (a granted source has none to give).
     if !crate::is_saf_path(target) {
         let _ = fs.set_mtime(target, meta.mtime);
     }
-    *copied = copied.saturating_add(bytes.len() as u64);
+    *copied = copied.saturating_add(written);
     progress(*copied, total);
     if cancel.load(Ordering::SeqCst) {
         return Err("Cancelled by user.".to_string());
@@ -1821,7 +2117,7 @@ mod transfer_safety_tests {
         assert!(!queue.has_unfinished_work());
         // This synchronous test has no Tokio runtime, so the task stays queued.
         let id = queue.enqueue(None, "local", "fixture".into(), "source".into(), "target".into(), 0, false,
-            QueueJob::LocalCopyOrMove { source: PathBuf::from("source"), target: PathBuf::from("target"), move_item: false, policy: ConflictPolicy::Ask });
+            QueueJob::LocalCopyOrMove { source: PathBuf::from("source"), target: PathBuf::from("target"), move_item: false, policy: ConflictPolicy::Ask, flags: TransferFlags::default() });
         assert!(queue.has_unfinished_work());
         assert!(queue.cancel(id));
         assert!(!queue.has_unfinished_work());

@@ -112,6 +112,42 @@ impl X2GoStartedSession {
     pub fn terminate_command(&self) -> String {
         format!("x2goterminate-session {}", self.session_id)
     }
+
+    /// A safe command to suspend the session without terminating the desktop.
+    pub fn suspend_command(&self) -> String {
+        format!("x2gosuspend-session {}", self.session_id)
+    }
+}
+
+/// Public, cookie-free metadata describing an active or suspended X2Go session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct X2GoListedSession {
+    pub session_id: String,
+    pub display: u16,
+    pub agent_pid: u32,
+    pub status: String,
+    pub created_at: String,
+    pub desktop: Option<String>,
+    pub graphics_port: u16,
+}
+
+/// Validates an X2Go session ID before using it as a shell argument.
+pub fn validate_session_id(session_id: &str) -> Result<&str, &'static str> {
+    if session_id.is_empty() || session_id.len() > 255 || session_id.starts_with('-') ||
+        !session_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'@')) {
+        return Err("Invalid X2Go session ID.");
+    }
+    Ok(session_id)
+}
+
+/// Builds a validated `x2goresume-session` command without arbitrary shell input.
+pub fn resume_command(session_id: &str, width: u16, height: u16, link: X2GoLink) -> Result<String, &'static str> {
+    let id = validate_session_id(session_id)?;
+    if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION ||
+        u32::from(width) * u32::from(height) > MAX_PIXELS {
+        return Err("Invalid X2Go desktop dimensions.");
+    }
+    Ok(format!("x2goresume-session {id} {width}x{height} {} 16m-jpeg-9 us pc105/us 0 none", link.argument()))
 }
 
 impl Drop for X2GoStartedSession {
@@ -130,7 +166,7 @@ impl Drop for X2GoStartedSession {
 pub struct X2GoAgentGuard {
     session: X2GoStartedSession,
     ssh: Option<Arc<SshConnection>>,
-    release: Option<tokio::sync::oneshot::Sender<()>>,
+    release: Option<tokio::sync::oneshot::Sender<bool>>,
     cleanup: Option<tokio::task::JoinHandle<Result<(), ProtoError>>>,
 }
 
@@ -157,8 +193,11 @@ impl X2GoAgentGuard {
     where F: Future<Output = Result<(), ProtoError>> + Send + 'static {
         let (release, wait) = tokio::sync::oneshot::channel();
         let task = runtime.spawn(async move {
-            // Receiving either a signal or sender drop means the owner ended.
-            let _ = wait.await;
+            // Either `send(true)` or dropping the sender runs termination;
+            // `send(false)` disarms termination so explicit suspend can run.
+            if matches!(wait.await, Ok(false)) {
+                return Ok(());
+            }
             cleanup.await
         });
         Self { session, ssh: None, release: Some(release), cleanup: Some(task) }
@@ -173,7 +212,7 @@ impl X2GoAgentGuard {
     /// Trigger cleanup and wait for its result. If this future is cancelled the
     /// detached cleanup task continues while the runtime is still running.
     pub async fn close(mut self) -> Result<(), ProtoError> {
-        if let Some(release) = self.release.take() { let _ = release.send(()); }
+        if let Some(release) = self.release.take() { let _ = release.send(true); }
         let Some(task) = self.cleanup.take() else {
             return Err(ProtoError::Transport("X2Go cleanup is unavailable.".into()));
         };
@@ -181,6 +220,25 @@ impl X2GoAgentGuard {
             Ok(result) => result,
             Err(_) => Err(ProtoError::Transport("X2Go cleanup task failed.".into())),
         }
+    }
+
+    /// Disarm automatic termination and explicitly suspend the remote session
+    /// so it can be resumed later.
+    pub async fn suspend(mut self) -> Result<(), ProtoError> {
+        let ssh = self.ssh.take();
+        if let Some(release) = self.release.take() { let _ = release.send(false); }
+        if let Some(task) = self.cleanup.take() {
+            let _ = task.await;
+        }
+        let Some(ssh) = ssh else {
+            return Err(ProtoError::Transport("Missing X2Go SSH connection for suspend.".into()));
+        };
+        let command = self.session.suspend_command();
+        let output = ssh.exec_command_bounded(&command, Duration::from_secs(10), 8192).await?;
+        if output.exit_code != Some(0) {
+            return Err(ProtoError::Transport("Could not suspend the X2Go session.".into()));
+        }
+        Ok(())
     }
 }
 
@@ -277,11 +335,7 @@ pub fn parse_start_reply(stdout: &[u8], exit_status: Option<u32>) -> Result<X2Go
     }
     if !unsigned(fields[2]) { return Err("Invalid X2Go agent PID."); }
     let agent_pid = fields[2].parse::<u32>().ok().filter(|pid| *pid != 0).ok_or("Invalid X2Go agent PID.")?;
-    let session_id = fields[3];
-    if session_id.is_empty() || session_id.len() > 255 || session_id.starts_with('-') ||
-        !session_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'@')) {
-        return Err("Invalid X2Go session ID.");
-    }
+    let session_id = validate_session_id(fields[3])?;
     Ok(X2GoStartedSession {
         display,
         cookie: cookie.to_string(),
@@ -292,6 +346,191 @@ pub fn parse_start_reply(stdout: &[u8], exit_status: Option<u32>) -> Result<X2Go
         sshfs_port: port(fields[6])?,
         telekinesis_ports: if fields.len() == 9 { Some((port(fields[7])?, port(fields[8])?)) } else { None },
     })
+}
+
+const MAX_LIST_BYTES: usize = 65536;
+
+fn infer_desktop_from_session_id(session_id: &str) -> Option<String> {
+    let upper = session_id.to_ascii_uppercase();
+    for candidate in ["XFCE", "MATE", "LXDE"] {
+        if upper.contains(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn sanitize_timestamp(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.' | 'T' | ' '))
+        .take(64)
+        .collect()
+}
+
+fn parse_listed_sessions_with_secrets(
+    stdout: &[u8],
+    exit_status: Option<u32>,
+) -> Result<Vec<(X2GoListedSession, X2GoStartedSession)>, &'static str> {
+    if exit_status != Some(0) {
+        return Err("X2Go session listing did not succeed.");
+    }
+    if stdout.len() > MAX_LIST_BYTES {
+        return Err("X2Go session listing is too large.");
+    }
+    let text = std::str::from_utf8(stdout).map_err(|_| "Invalid X2Go session listing encoding.")?;
+    let mut out = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('|').collect();
+        if parts.len() < 14 {
+            return Err("Invalid X2Go session listing fields.");
+        }
+        let status = parts[4].trim();
+        if status == "F" {
+            continue;
+        }
+        if status != "S" && status != "R" {
+            continue;
+        }
+        if !unsigned(parts[0]) {
+            return Err("Invalid X2Go agent PID.");
+        }
+        let agent_pid = parts[0].parse::<u32>().ok().filter(|pid| *pid != 0).ok_or("Invalid X2Go agent PID.")?;
+        let session_id = validate_session_id(parts[1])?;
+        let display = port(parts[2]).map_err(|_| "Invalid X2Go display number.")?;
+        let cookie = parts[6].trim();
+        if cookie.len() != 32 || !cookie.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("Invalid X2Go session cookie.");
+        }
+        let graphics_port = port(parts[8])?;
+        let sound_port = if parts[9].is_empty() || parts[9] == "0" { 1 } else { port(parts[9])? };
+        let sshfs_port = if parts[13].is_empty() || parts[13] == "0" { 1 } else { port(parts[13])? };
+        let listed = X2GoListedSession {
+            session_id: session_id.to_string(),
+            display,
+            agent_pid,
+            status: status.to_string(),
+            created_at: sanitize_timestamp(parts[5]),
+            desktop: infer_desktop_from_session_id(session_id),
+            graphics_port,
+        };
+        let secret = X2GoStartedSession {
+            display,
+            cookie: cookie.to_string(),
+            agent_pid,
+            session_id: session_id.to_string(),
+            graphics_port,
+            sound_port,
+            sshfs_port,
+            telekinesis_ports: None,
+        };
+        out.push((listed, secret));
+    }
+    Ok(out)
+}
+
+/// Parses `x2golistsessions` output into cookie-free session metadata.
+pub fn parse_listed_sessions(stdout: &[u8], exit_status: Option<u32>) -> Result<Vec<X2GoListedSession>, &'static str> {
+    let entries = parse_listed_sessions_with_secrets(stdout, exit_status)?;
+    Ok(entries.into_iter().map(|(listed, _secret_zeroized_on_drop)| listed).collect())
+}
+
+/// Lists active and suspended X2Go sessions on the authenticated SSH server.
+/// Secret session cookies in `x2golistsessions` stdout are zeroized immediately
+/// and never returned.
+pub async fn list_sessions(ssh: &SshConnection, timeout: Duration) -> Result<Vec<X2GoListedSession>, ProtoError> {
+    if timeout.is_zero() || timeout > Duration::from_secs(60) {
+        return Err(ProtoError::Transport("Invalid X2Go session list timeout.".into()));
+    }
+    let output = ssh.exec_command_bounded("x2golistsessions", timeout, MAX_LIST_BYTES).await?;
+    let stdout = Zeroizing::new(output.stdout);
+    let _stderr = Zeroizing::new(output.stderr);
+    parse_listed_sessions(&stdout, output.exit_code)
+        .map_err(|msg| ProtoError::Transport(msg.into()))
+}
+
+/// Explicitly terminates a listed session by validated ID.
+pub async fn terminate_listed_session(ssh: &SshConnection, session_id: &str, timeout: Duration) -> Result<(), ProtoError> {
+    let id = validate_session_id(session_id)
+        .map_err(|msg| ProtoError::Transport(msg.into()))?;
+    if timeout.is_zero() || timeout > Duration::from_secs(60) {
+        return Err(ProtoError::Transport("Invalid X2Go termination timeout.".into()));
+    }
+    let command = format!("x2goterminate-session {id}");
+    let output = ssh.exec_command_bounded(&command, timeout, 8192).await?;
+    if output.exit_code != Some(0) {
+        return Err(ProtoError::Transport("Could not terminate the X2Go session.".into()));
+    }
+    Ok(())
+}
+
+fn apply_resume_port_overrides(session: &mut X2GoStartedSession, stdout: &[u8]) -> Result<(), &'static str> {
+    if stdout.len() > MAX_REPLY_BYTES {
+        return Err("X2Go resume response is too large.");
+    }
+    let text = std::str::from_utf8(stdout).map_err(|_| "Invalid X2Go resume response encoding.")?;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if let Some(rest) = line.strip_prefix("gr_port=") {
+            session.graphics_port = port(rest)?;
+        } else if let Some(rest) = line.strip_prefix("sound_port=") {
+            if !rest.is_empty() && rest != "0" {
+                session.sound_port = port(rest)?;
+            }
+        } else if let Some(rest) = line.strip_prefix("fs_port=") {
+            if !rest.is_empty() && rest != "0" {
+                session.sshfs_port = port(rest)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resumes a suspended X2Go session and wraps it in a cleanup guard.
+pub async fn resume_guarded_agent(
+    ssh: Arc<SshConnection>,
+    session_id: &str,
+    width: u16,
+    height: u16,
+    link: X2GoLink,
+    timeout: Duration,
+) -> Result<X2GoAgentGuard, ProtoError> {
+    let command = resume_command(session_id, width, height, link)
+        .map_err(|msg| ProtoError::Transport(msg.into()))?;
+    let target_id = session_id.to_string();
+    if timeout.is_zero() || timeout > Duration::from_secs(120) {
+        return Err(ProtoError::Transport("Invalid X2Go resume timeout.".into()));
+    }
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|_| ProtoError::Transport("X2Go resume requires an active runtime.".into()))?;
+    let task_runtime = runtime.clone();
+    detach_startup(&runtime, async move {
+        let list_out = ssh.exec_command_bounded("x2golistsessions", Duration::from_secs(15), MAX_LIST_BYTES).await
+            .map_err(|_| ProtoError::Transport("Could not inspect suspended X2Go sessions.".into()))?;
+        let list_stdout = Zeroizing::new(list_out.stdout);
+        let _list_stderr = Zeroizing::new(list_out.stderr);
+        let entries = parse_listed_sessions_with_secrets(&list_stdout, list_out.exit_code)
+            .map_err(|msg| ProtoError::Transport(msg.into()))?;
+        let Some((listed, mut session)) = entries.into_iter().find(|(l, _)| l.session_id == target_id) else {
+            return Err(ProtoError::Transport("The selected X2Go session no longer exists.".into()));
+        };
+        if listed.status != "S" {
+            return Err(ProtoError::Transport("Only suspended X2Go sessions can be resumed.".into()));
+        }
+        let resume_out = ssh.exec_command_bounded(&command, timeout, MAX_REPLY_BYTES).await
+            .map_err(|_| ProtoError::Transport("X2Go session resume failed.".into()))?;
+        let resume_stdout = Zeroizing::new(resume_out.stdout);
+        let _resume_stderr = Zeroizing::new(resume_out.stderr);
+        if resume_out.exit_code != Some(0) {
+            return Err(ProtoError::Transport("X2Go session resume did not succeed.".into()));
+        }
+        apply_resume_port_overrides(&mut session, &resume_stdout)
+            .map_err(|msg| ProtoError::Transport(msg.into()))?;
+        Ok(X2GoAgentGuard::new(&task_runtime, ssh, session))
+    }).await
 }
 
 #[cfg(test)]
@@ -455,5 +694,25 @@ mod tests {
         assert!(parse_start_reply(format!("{}31004\n", reply("safe-id")).as_bytes(), Some(0)).is_err());
         assert!(parse_start_reply(&[0xff, 0xfe], Some(0)).is_err());
         assert!(parse_start_reply(reply("safe-id").replace(COOKIE, "bad-cookie-with-sensitive-details").as_bytes(), Some(0)).is_err());
+    }
+
+    #[test]
+    fn listed_sessions_strip_cookies_and_validate_ids() {
+        let raw = format!(
+            "12345|alice-50-1700000_stDKXFCE_dp24|50|host|S|2026-11-20T10:00:00|{COOKIE}|127.0.0.1|31001|31002|2026-11-20T10:05:00|alice|300|31003\n\
+             22222|alice-51-old|51|host|F|2026-11-19|{COOKIE}|127.0.0.1|31011|31012|2026-11-19|alice|900|31013\n"
+        );
+        let listed = parse_listed_sessions(raw.as_bytes(), Some(0)).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, "alice-50-1700000_stDKXFCE_dp24");
+        assert_eq!(listed[0].status, "S");
+        assert_eq!(listed[0].desktop.as_deref(), Some("XFCE"));
+        assert_eq!(listed[0].graphics_port, 31001);
+        assert!(!format!("{listed:?}").contains(COOKIE));
+        assert_eq!(
+            resume_command(&listed[0].session_id, 1280, 720, X2GoLink::Lan).unwrap(),
+            "x2goresume-session alice-50-1700000_stDKXFCE_dp24 1280x720 lan 16m-jpeg-9 us pc105/us 0 none"
+        );
+        assert!(resume_command("-bad", 1280, 720, X2GoLink::Lan).is_err());
     }
 }
