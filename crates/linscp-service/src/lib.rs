@@ -5577,6 +5577,7 @@ impl CommanderService {
         g.monitors.forget(tab_id);
         if g.active_tab_id == Some(tab_id) { g.active_tab_id = g.tabs.keys().next().cloned(); }
         drop(g);
+        self.queue.cancel_for_tab(tab_id);
         drop(ended_viewer);
         ApiReply{ status: 200, payload: json!({"success": true})}
     }

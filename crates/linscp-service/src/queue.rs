@@ -651,6 +651,7 @@ impl QueueManager {
             t.cleanup_staging();
         }
         self.broadcast_snapshot();
+        self.notify.notify_waiters();
     }
 
     pub fn retry(&self, id: u64) -> bool {
