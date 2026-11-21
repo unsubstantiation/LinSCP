@@ -518,35 +518,39 @@ mod handshake_tests {
     #[tokio::test]
     async fn extended_viewer_message_gates_clipboard_and_writes_selection() {
         let cursor = crate::kdrive_wire::Cursor {
-            serial_number: 7,
-            xhot: 2,
-            yhot: 3,
+            foreground: [0xff, 0xff, 0xff],
+            background: [0x00, 0x00, 0x00],
             width: 2,
             height: 2,
-            bits: vec![0xff; 16],
+            hot_x: 1,
+            hot_y: 1,
+            serial: 7,
+            data: vec![0xff; 16],
         };
         let cur_json = viewer_message_extended(Message::Cursor(cursor), false)
             .unwrap()
             .expect("cursor forwarded");
         assert_eq!(cur_json["type"], "cursor");
-        assert_eq!(cur_json["serialNumber"], 7);
+        assert_eq!(cur_json["cursor"]["serial"], 7);
 
-        let sel = crate::kdrive_wire::Selection {
+        let make_sel = || crate::kdrive_wire::Selection {
             selection: 1,
-            mime_data: 0,
-            compressed: false,
+            format: 0,
+            chunk_size: 5,
+            first: true,
+            last: true,
             compressed_size: 0,
             total: 5,
             data: b"hello".to_vec(),
         };
-        assert!(viewer_message_extended(Message::Selection(sel.clone()), false)
+        assert!(viewer_message_extended(Message::Selection(make_sel()), false)
             .unwrap()
             .is_none());
-        let sel_json = viewer_message_extended(Message::Selection(sel), true)
+        let sel_json = viewer_message_extended(Message::Selection(make_sel()), true)
             .unwrap()
             .expect("selection forwarded when opted in");
         assert_eq!(sel_json["type"], "selection");
-        assert_eq!(sel_json["mime"], "text");
+        assert_eq!(sel_json["selection"]["format"], 0);
 
         assert!(viewer_message_extended(Message::DemandSelection(1), false)
             .unwrap()
@@ -564,12 +568,12 @@ mod handshake_tests {
         };
         let (_reader, mut writer) = channel.into_halves();
         writer
-            .write_selection("clip-test", Duration::from_secs(1))
+            .write_selection(1, b"clip-test", Duration::from_secs(1))
             .await
             .expect("write selection");
         let mut wire = vec![0u8; CLIENT_EVENT_SIZE + 9];
         server.read_exact(&mut wire).await.unwrap();
-        assert_eq!(u32::from_le_bytes(wire[0..4].try_into().unwrap()), 12);
+        assert_eq!(u32::from_le_bytes(wire[0..4].try_into().unwrap()), 9);
         assert_eq!(&wire[CLIENT_EVENT_SIZE..], b"clip-test");
     }
 }

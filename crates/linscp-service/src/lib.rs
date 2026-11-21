@@ -91,6 +91,8 @@ struct InnerState {
     x2go: HashMap<u64, X2GoRegistered>,
     x2go_next_generation: u64,
     x2go_pending: std::collections::HashSet<u64>,
+    desktop_tunnels: HashMap<u64, (Option<u64>, linscp_proto::tunnel::LocalForwardRelay)>,
+    next_desktop_tunnel_id: u64,
     monitors: monitor::Monitors,
 }
 
@@ -3366,7 +3368,7 @@ impl CommanderService {
             let size;
             let exists;
             let is_dir;
-            let mut src_mtime: i64 = 0;
+            let src_mtime: i64;
             let mut remote_entry_opt: Option<linscp_types::FileEntry> = None;
             if tab.is_local {
                 let (src_is_dir, src_len, mtime_val) = if is_saf_path(&source) || is_saf_path(&destination) {
@@ -6826,7 +6828,13 @@ impl CommanderService {
                 }
             }
         }
-        let proto_ticket = ticket_from_config(&cfg, kind, &target, tunneled, tunnel_port_opt);
+        let proto_ticket = ticket_from_config(
+            &cfg,
+            kind,
+            &target,
+            tunneled,
+            tunnel_port_opt.map(|p| format!("127.0.0.1:{p}")),
+        );
         let ticket = linscp_platform::desktop::DesktopTicket{ kind: proto_ticket.kind.clone(), target: proto_ticket.target.clone(), viewer: proto_ticket.viewer.clone(), argv: proto_ticket.argv.clone(), file_content: proto_ticket.file_content.clone(), file_extension: proto_ticket.file_extension.clone(), tunneled: proto_ticket.tunneled, local_endpoint: proto_ticket.local_endpoint.clone() };
         let config_root = self.state.lock().expect("m").config_root.clone();
         let force_file_ticket = !self.desktop_spawn_allowed;
