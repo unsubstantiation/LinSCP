@@ -16021,25 +16021,6 @@ mod tests {
         async fn list_dir(&self, _remote_path: &str) -> Result<Vec<FileEntry>, ProtoError> {
             Ok(Vec::new())
         }
-        async fn download_stream(
-            &self,
-            _remote_path: &str,
-            _opts: TransferRequest,
-            _sink: &mut (dyn AsyncWrite + Unpin + Send),
-            _progress: Option<&ProgressCallback>,
-        ) -> Result<u64, ProtoError> {
-            Ok(0)
-        }
-        async fn upload_stream(
-            &self,
-            _remote_path: &str,
-            _opts: TransferRequest,
-            _source: &mut (dyn AsyncRead + Unpin + Send),
-            _total_size: Option<u64>,
-            _progress: Option<&ProgressCallback>,
-        ) -> Result<u64, ProtoError> {
-            Ok(0)
-        }
         async fn mkdir(&self, _remote_path: &str) -> Result<(), ProtoError> {
             Ok(())
         }
@@ -16051,6 +16032,40 @@ mod tests {
         }
         async fn rename(&self, _from: &str, _to: &str) -> Result<(), ProtoError> {
             Ok(())
+        }
+        async fn copy_file(&self, _from: &str, _to: &str) -> Result<(), ProtoError> {
+            Ok(())
+        }
+        async fn symlink(&self, _target: &str, _link_path: &str) -> Result<(), ProtoError> {
+            Ok(())
+        }
+        async fn chmod(&self, _remote_path: &str, _mode: u32) -> Result<(), ProtoError> {
+            Ok(())
+        }
+        async fn set_mtime(&self, _remote_path: &str, _mtime: i64) -> Result<(), ProtoError> {
+            Ok(())
+        }
+        async fn checksum(&self, _algorithm: &str, _remote_path: &str) -> Result<String, ProtoError> {
+            Ok(String::new())
+        }
+        async fn download(
+            &self,
+            _remote_path: &str,
+            _opts: TransferRequest,
+            _sink: &mut (dyn AsyncWrite + Unpin + Send),
+            _progress: Option<&ProgressCallback>,
+        ) -> Result<u64, ProtoError> {
+            Ok(0)
+        }
+        async fn upload(
+            &self,
+            _remote_path: &str,
+            _opts: TransferRequest,
+            _source: &mut (dyn AsyncRead + Unpin + Send),
+            _total_size: Option<u64>,
+            _progress: Option<&ProgressCallback>,
+        ) -> Result<u64, ProtoError> {
+            Ok(0)
         }
         async fn exec_command(&self, command: &str) -> Result<linscp_proto::ssh::ExecOutput, ProtoError> {
             self.executed.lock().expect("m").push(command.to_string());
