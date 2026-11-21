@@ -279,6 +279,13 @@ async fn upload_staged_or_binary_file(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
+    if !flags.file_mask.is_empty() {
+        if let Ok(ext) = linscp_platform::gui_os::stat_extended(local_src) {
+            if !flags.file_mask.accepts(&leaf, ext.is_dir, ext.size, ext.mtime_secs.max(0) as u64, &leaf) {
+                return Ok(false);
+            }
+        }
+    }
     if !flags.append && wants_ascii_conversion(flags.transfer_mode, &leaf) {
         if flags.newer_only {
             if let (Ok(ext), Ok(Some(remote_stat))) = (
@@ -1020,8 +1027,14 @@ impl QueueManager {
                         }
                         transferred
                     } else if f.resume {
-                        linscp_engine::transfer::download_verified_resume(session.as_ref(), remote_path, &entry, local_dest, &f, &mut logger, Some(&*progress)).await?;
-                        true
+                        if !f.file_mask.is_empty()
+                            && !f.file_mask.accepts(leaf, false, entry.size, entry.mtime.max(0) as u64, leaf)
+                        {
+                            false
+                        } else {
+                            linscp_engine::transfer::download_verified_resume(session.as_ref(), remote_path, &entry, local_dest, &f, &mut logger, Some(&*progress)).await?;
+                            true
+                        }
                     } else if ascii_conv && !f.append {
                         let parent = local_dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
                         std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create local directory '{}': {e}", parent.display()))?;

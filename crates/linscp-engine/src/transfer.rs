@@ -471,6 +471,19 @@ pub async fn download_single_file(
         }
     };
 
+    let src_leaf = remote_path.rsplit('/').next().unwrap_or(remote_path);
+    if !flags.file_mask.is_empty()
+        && !flags.file_mask.accepts(
+            src_leaf,
+            info.is_dir,
+            info.size,
+            info.mtime.max(0) as u64,
+            src_leaf,
+        )
+    {
+        return Ok(false);
+    }
+
     if local_dest == Path::new("-") {
         let mut mem: Vec<u8> = Vec::with_capacity(info.size as usize);
         let req = TransferRequest {
@@ -826,6 +839,22 @@ pub async fn upload_single_file(
         let msg = format!("Local file '{src_label}' does not exist.");
         logger.record_transfer(true, &src_label, remote_dest, None, Err(&msg));
         return Err(msg);
+    }
+
+    let src_leaf = local_src
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !flags.file_mask.is_empty()
+        && !flags.file_mask.accepts(
+            &src_leaf,
+            local_info.is_dir,
+            local_info.size,
+            local_info.mtime.max(0) as u64,
+            &src_leaf,
+        )
+    {
+        return Ok(false);
     }
 
     if flags.newer_only {
