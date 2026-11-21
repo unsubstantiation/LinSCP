@@ -1162,3 +1162,124 @@ test('terminal text size remeasures, repaints and reports the new grid and cell 
   assert.equal(session.changeTextSize(Number.NaN), 32);
   session.stop(); dom.cleanup();
 });
+
+test('Android touch selection adjusts both start and end handles, unsticks on tap/re-press, and tolerates jitter', async () => {
+  const dom = installDom();
+  const written = installClipboard(dom.dom);
+  Object.defineProperty(dom.dom.window.navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      writeText: async (text) => { written.push(text); },
+      readText: async () => 'UNWANTED_PASTE',
+    },
+  });
+  const frameWithSelection = () => ({
+    ...textFrame('alpha bravo charlie'),
+    selection: [0, 6, 0, 10],
+  });
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: frameWithSelection() }),
+    '/api/terminal/selection': { success: true, text: 'adjusted' },
+  });
+  const opens = [];
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-android-adjust',
+    container: fakeContainer(180, 90),
+    pollInterval: 5,
+    keyboard: true,
+    onSelection: (open) => opens.push(open),
+  });
+  session.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const el = session.element;
+  const touch = (x, y) => ({ clientX: x, clientY: y });
+
+  // 1. Long-press at column 6 (x = 54px, y = 4px) with minor 4px thumb jitter (< TOUCH_SLOP_PX)
+  //    and an Android touch contextmenu event firing mid-press: must still select and NOT paste!
+  const startHold = new dom.dom.window.Event('touchstart');
+  startHold.touches = [touch(54, 4)];
+  el.dispatchEvent(startHold);
+  const jitter = new dom.dom.window.Event('touchmove', { cancelable: true });
+  jitter.touches = [touch(57, 6)];
+  el.dispatchEvent(jitter);
+  el.dispatchEvent(new dom.dom.window.MouseEvent('contextmenu', { button: 2, cancelable: true }));
+  await new Promise((resolve) => setTimeout(resolve, TerminalSession.LONG_PRESS_MS + 40));
+
+  assert.deepEqual(opens, [true], 'minor thumb jitter does not cancel long-press');
+  assert.equal(
+    transport.calls.filter((c) => c.path === '/api/terminal/input' && c.body.data !== '').length,
+    0,
+    'touch long-press contextmenu must not paste clipboard text into the shell',
+  );
+
+  // Drag initial selection to column 10 (x = 92px) and release.
+  const initialExtend = new dom.dom.window.Event('touchmove', { cancelable: true });
+  initialExtend.touches = [touch(92, 4)];
+  el.dispatchEvent(initialExtend);
+  el.dispatchEvent(new dom.dom.window.Event('touchend'));
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.deepEqual(session.selection, { start: { row: 0, column: 6 }, end: { row: 0, column: 10 } });
+
+  // 2. Grab the START handle near column 6 (x = 54px) and drag LEFT to column 2 (x = 20px):
+  //    must adjust selectionStart to column 2 while keeping selectionEnd anchored at column 10!
+  const grabStart = new dom.dom.window.Event('touchstart');
+  grabStart.touches = [touch(54, 4)];
+  el.dispatchEvent(grabStart);
+  const moveStart = new dom.dom.window.Event('touchmove', { cancelable: true });
+  moveStart.touches = [touch(20, 4)];
+  el.dispatchEvent(moveStart);
+  el.dispatchEvent(new dom.dom.window.Event('touchend'));
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.deepEqual(
+    session.selection,
+    { start: { row: 0, column: 2 }, end: { row: 0, column: 10 } },
+    'dragging the start handle adjusts the start boundary instead of getting stuck at column 6',
+  );
+
+  // 3. Grab the END handle near column 10's right edge (x = 99px) and drag RIGHT to column 14 (x = 128px):
+  //    must adjust selectionEnd to column 14 while keeping selectionStart anchored at column 2!
+  const grabEnd = new dom.dom.window.Event('touchstart');
+  grabEnd.touches = [touch(99, 13)];
+  el.dispatchEvent(grabEnd);
+  const moveEnd = new dom.dom.window.Event('touchmove', { cancelable: true });
+  moveEnd.touches = [touch(128, 13)];
+  el.dispatchEvent(moveEnd);
+  el.dispatchEvent(new dom.dom.window.Event('touchend'));
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.deepEqual(
+    session.selection,
+    { start: { row: 0, column: 2 }, end: { row: 0, column: 14 } },
+    'dragging the end handle adjusts the end boundary cleanly',
+  );
+
+  // 4. Long-press far away (row 3, column 1 -> x = 12px, y = 60px) while selection is open:
+  //    must re-anchor at the new spot instead of staying stuck to (0, 2)!
+  const pressElsewhere = new dom.dom.window.Event('touchstart');
+  pressElsewhere.touches = [touch(12, 60)];
+  el.dispatchEvent(pressElsewhere);
+  await new Promise((resolve) => setTimeout(resolve, TerminalSession.LONG_PRESS_MS + 40));
+  const dragElsewhere = new dom.dom.window.Event('touchmove', { cancelable: true });
+  dragElsewhere.touches = [touch(48, 60)];
+  el.dispatchEvent(dragElsewhere);
+  el.dispatchEvent(new dom.dom.window.Event('touchend'));
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.deepEqual(
+    session.selection,
+    { start: { row: 3, column: 1 }, end: { row: 3, column: 5 } },
+    'long-pressing a new location starts a fresh selection at that location',
+  );
+
+  // 5. Plain tap away from handles (row 0, column 18 -> x = 165px, y = 4px) dismisses selection.
+  const tapAway = new dom.dom.window.Event('touchstart');
+  tapAway.touches = [touch(165, 4)];
+  el.dispatchEvent(tapAway);
+  el.dispatchEvent(new dom.dom.window.Event('touchend'));
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.equal(session.selection, null, 'tapping away from handles clears the selection');
+  assert.equal(opens.at(-1), false);
+
+  await session.close();
+  dom.cleanup();
+});
+

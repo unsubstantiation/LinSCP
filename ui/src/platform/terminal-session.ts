@@ -250,8 +250,18 @@ export class TerminalSession {
   private canvas: HTMLCanvasElement | null = null;
   /** The document the mouse drag listeners are on, for the same removal. */
   private eventDoc: Document | null = null;
-  /** Where a one-finger drag started, and how far it has travelled. */
-  private drag: { y: number; lines: number; selecting: boolean; start: Cell } | null = null;
+  /** Where a one-finger drag started, how far it travelled, and which selection end is anchored. */
+  private drag: {
+    x: number;
+    y: number;
+    lines: number;
+    selecting: boolean;
+    moved: boolean;
+    start: Cell;
+    anchor: Cell;
+  } | null = null;
+  /** Suppresses the synthesized `click` after a selection, scroll, or dismiss gesture. */
+  private suppressNextTap = false;
   /** Where a mouse drag anchored, and whether it has moved off that cell. */
   private mouseDrag: { anchor: Cell; moved: boolean } | null = null;
   /** The long-press timer; a press that lasts becomes a selection. */
@@ -275,6 +285,18 @@ export class TerminalSession {
    * threshold the platform's own text views use.
    */
   public static readonly LONG_PRESS_MS = 450;
+
+  /**
+   * Maximum finger drift (in CSS pixels) tolerated while holding a long press.
+   * High-DPI touchscreens report slight thumb movement during a stationary hold.
+   */
+  public static readonly TOUCH_SLOP_PX = 10;
+
+  /**
+   * Hit radius (in CSS pixels) around either end of an open selection so a
+   * finger can grab and adjust either boundary without re-triggering long press.
+   */
+  public static readonly HANDLE_HIT_RADIUS_PX = 36;
 
   /**
    * How long after a touch its emulated mouse events are ignored.
@@ -316,6 +338,7 @@ export class TerminalSession {
     this.onClipboardError = options.onClipboardError;
     this.renderer = new TerminalRenderer({
       container: options.container,
+      selectionHandles: Boolean(options.keyboard),
       onCellSize: (size) => {
         // The model answers a program that asks how large the text area is in
         // pixels, and only the renderer knows what a cell measures.
@@ -364,6 +387,7 @@ export class TerminalSession {
       canvas.addEventListener('touchstart', this.handleTouchStart, { passive: true });
       canvas.addEventListener('touchmove', this.handleTouchMove, { passive: false });
       canvas.addEventListener('touchend', this.handleTouchEnd);
+      canvas.addEventListener('touchcancel', this.handleTouchCancel);
     }
   }
 
@@ -484,6 +508,7 @@ export class TerminalSession {
       this.canvas.removeEventListener('touchstart', this.handleTouchStart);
       this.canvas.removeEventListener('touchmove', this.handleTouchMove);
       this.canvas.removeEventListener('touchend', this.handleTouchEnd);
+      this.canvas.removeEventListener('touchcancel', this.handleTouchCancel);
       this.canvas.removeEventListener('wheel', this.handleWheel);
       this.canvas.removeEventListener('mousedown', this.handleMouseDown);
       this.canvas.removeEventListener('contextmenu', this.handleContextMenu);
@@ -641,13 +666,21 @@ export class TerminalSession {
    * about which text that is.
    */
   public async select(start: Cell, end: Cell = start): Promise<void> {
+    const [first, last] =
+      start.row < end.row || (start.row === end.row && start.column <= end.column)
+        ? [start, end]
+        : [end, start];
+    if (this.selecting) {
+      this.selectionStart = first;
+      this.selectionEnd = last;
+    }
     const run = async (): Promise<void> => {
       await this.transport.post('/api/terminal/select', {
-        terminal: this.terminal, action: 'start', row: start.row, column: start.column,
+        terminal: this.terminal, action: 'start', row: first.row, column: first.column,
       });
-      if (end.row !== start.row || end.column !== start.column) {
+      if (last.row !== first.row || last.column !== first.column) {
         await this.transport.post('/api/terminal/select', {
-          terminal: this.terminal, action: 'extend', row: end.row, column: end.column,
+          terminal: this.terminal, action: 'extend', row: last.row, column: last.column,
         });
       }
     };
@@ -741,7 +774,10 @@ export class TerminalSession {
 
   private readonly handleContextMenu = (event: MouseEvent): void => {
     event.preventDefault();
-    if (!this.stopped) void this.pasteClipboard();
+    if (this.stopped || this.isEmulatedMouse() || this.drag !== null || this.selecting) {
+      return;
+    }
+    void this.pasteClipboard();
   };
 
   /** Scrolls the model's viewport; positive is up into history. */
@@ -769,11 +805,45 @@ export class TerminalSession {
     if (this.stopped || !this.keyboard) {
       return;
     }
+    if (this.suppressNextTap) {
+      this.suppressNextTap = false;
+      return;
+    }
+    if (this.selecting) {
+      void this.endSelection();
+      return;
+    }
     this.keyboard.toggle();
   };
 
   /**
-   * Drags through scrollback.
+   * If a touch lands near either end of an open selection, returns the opposite
+   * end as the fixed anchor so dragging adjusts whichever boundary was grabbed.
+   */
+  private selectionHandleAnchor(touch: { clientX: number; clientY: number }): Cell | null {
+    if (!this.selecting || !this.selectionStart) {
+      return null;
+    }
+    const startCell = this.selectionStart;
+    const endCell = this.selectionEnd ?? startCell;
+    const box = this.renderer.element.getBoundingClientRect?.() ?? { left: 0, top: 0 };
+    const size = this.renderer.cellSize();
+    const cw = size.width || 9;
+    const ch = size.height || 18;
+    const startX = box.left + startCell.column * cw;
+    const startY = box.top + startCell.row * ch + ch * 0.25;
+    const endX = box.left + (endCell.column + 1) * cw;
+    const endY = box.top + endCell.row * ch + ch * 0.75;
+    const distStart = Math.hypot(touch.clientX - startX, touch.clientY - startY);
+    const distEnd = Math.hypot(touch.clientX - endX, touch.clientY - endY);
+    if (Math.min(distStart, distEnd) > TerminalSession.HANDLE_HIT_RADIUS_PX) {
+      return null;
+    }
+    return distStart < distEnd ? endCell : startCell;
+  }
+
+  /**
+   * Drags through scrollback or adjusts an open touch selection.
    *
    * The model's viewport moves, not the page: scrolling a canvas terminal by
    * scrolling the document would move the keyboard and the extra-keys row with
@@ -787,21 +857,50 @@ export class TerminalSession {
     // A touch also fires emulated mouse events; the mouse handlers use this
     // stamp to stay out of a finger's way.
     this.lastTouch = Date.now();
+    this.cancelLongPress();
+    if (event.touches.length > 1) {
+      this.drag = null;
+      return;
+    }
     const touch = event.touches[0];
     if (!touch) {
       return;
     }
     const start = this.cellAt(touch);
-    this.drag = { y: touch.clientY, lines: 0, selecting: this.selecting, start };
-    if (!this.selecting) {
-      // A press that stays still becomes a selection; a press that moves
-      // scrolls. This is the gesture every phone app teaches, and it is the
-      // only way to copy text into another app from here.
-      this.longPress = setTimeout(() => {
-        this.longPress = null;
-        this.beginSelection(start);
-      }, TerminalSession.LONG_PRESS_MS);
+    const handleAnchor = this.selectionHandleAnchor(touch);
+    if (handleAnchor) {
+      this.drag = {
+        x: touch.clientX,
+        y: touch.clientY,
+        lines: 0,
+        selecting: true,
+        moved: false,
+        start,
+        anchor: handleAnchor,
+      };
+      return;
     }
+    this.drag = {
+      x: touch.clientX,
+      y: touch.clientY,
+      lines: 0,
+      selecting: false,
+      moved: false,
+      start,
+      anchor: start,
+    };
+    // A press that stays still becomes a selection at the new cell (even when a
+    // previous selection was open elsewhere); a press that moves scrolls, and a
+    // quick tap away from an open selection dismisses it.
+    this.longPress = setTimeout(() => {
+      this.longPress = null;
+      if (this.drag) {
+        this.drag.selecting = true;
+        this.drag.anchor = start;
+      }
+      this.suppressNextTap = true;
+      this.beginSelection(start);
+    }, TerminalSession.LONG_PRESS_MS);
   };
 
   private readonly handleTouchMove = (event: TouchEvent): void => {
@@ -812,16 +911,22 @@ export class TerminalSession {
     if (!touch) {
       return;
     }
-    if (this.selecting) {
-      // Dragging with a selection open extends it: the person is choosing how
-      // much text to copy, not scrolling away from it.
+    if (this.drag.selecting) {
+      // Dragging with a selection gesture active adjusts the grabbed boundary
+      // relative to the opposite anchor, rather than staying stuck on the
+      // original press cell.
       event.preventDefault?.();
+      this.drag.moved = true;
       const cell = this.cellAt(touch);
-      this.selectionEnd = cell;
-      void this.select(this.selectionStart ?? this.drag.start, cell);
+      void this.select(this.drag.anchor, cell);
       return;
     }
-    // A finger that moved is not a long press.
+    const drift = Math.hypot(touch.clientX - this.drag.x, touch.clientY - this.drag.y);
+    if (!this.drag.moved && drift < TerminalSession.TOUCH_SLOP_PX) {
+      return;
+    }
+    this.drag.moved = true;
+    // A finger that moved past touch slop is scrolling, not long-pressing.
     this.cancelLongPress();
     const cell = this.renderer.cellSize().height || 18;
     // Dragging down reveals what is above, which is the history; the model
@@ -842,14 +947,34 @@ export class TerminalSession {
   };
 
   private readonly handleTouchEnd = (): void => {
+    const drag = this.drag;
     this.cancelLongPress();
     this.drag = null;
     // The emulated mouse events of this touch arrive right after it; the stamp
     // has to be the release, not the press, or a long drag's mouse events
     // would fall outside the window that ignores them.
     this.lastTouch = Date.now();
-    // Like a mouse drag, a completed touch selection copies on release.
-    if (this.selecting) void this.copySelectionKeepHighlight();
+    if (drag?.selecting) {
+      this.suppressNextTap = true;
+      if (this.selecting) void this.copySelectionKeepHighlight();
+      return;
+    }
+    if (drag?.moved) {
+      this.suppressNextTap = true;
+      return;
+    }
+    if (this.selecting) {
+      // Tapping outside the selection handles dismisses the open selection
+      // instead of leaving the initial anchor stuck on screen.
+      this.suppressNextTap = true;
+      void this.endSelection();
+    }
+  };
+
+  private readonly handleTouchCancel = (): void => {
+    this.cancelLongPress();
+    this.drag = null;
+    this.lastTouch = Date.now();
   };
 
   private cancelLongPress(): void {
@@ -1022,15 +1147,23 @@ export class TerminalSession {
 
   /** Opens a selection over a range and tells the model to draw it. */
   private openSelection(start: Cell, end: Cell): void {
+    const [first, last] =
+      start.row < end.row || (start.row === end.row && start.column <= end.column)
+        ? [start, end]
+        : [end, start];
+    const wasSelecting = this.selecting;
     this.selecting = true;
-    this.onSelection?.(true);
-    this.selectionStart = start;
-    this.selectionEnd = end;
+    if (!wasSelecting) {
+      this.onSelection?.(true);
+    }
+    this.selectionStart = first;
+    this.selectionEnd = last;
     if (this.drag) {
       this.drag.selecting = true;
-      this.drag.start = start;
+      this.drag.start = first;
+      this.drag.anchor = first;
     }
-    void this.select(start, end);
+    void this.select(first, last);
   }
 
   /** Ends a selection and tells the model to stop drawing one. */

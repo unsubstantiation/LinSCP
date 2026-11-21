@@ -1167,9 +1167,10 @@
              none of them. The shared bundle fills it; the stylesheet shows it
              only while the terminal is focused. -->
         <div class="terminal-extra-keys" id="terminalExtraKeys"></div>
-        <!-- A touch selection is copied on release; dismiss its highlight here. -->
+        <!-- A touch selection is copied on release; copy or dismiss its highlight here. -->
         <div class="terminal-selection-bar" id="terminalSelectionBar" hidden>
-          <button class="btn" onclick="clearTerminalSelection()">Cancel</button>
+          <button class="btn btn-primary" type="button" onclick="copyTerminalSelection()">Copy</button>
+          <button class="btn" type="button" onclick="clearTerminalSelection()">Cancel</button>
         </div>
       </div>
       <div class="modal-footer">
@@ -5191,15 +5192,28 @@
     if (logsRenderPending && !logSelecting && !logCopying && !logSelection()) renderLogs();
   }
 
+  let lastLogTouchAt = 0;
   $('logOutput').addEventListener('mousedown', event => {
     if (event.button === 0) logSelecting = true;
   });
+  $('logOutput').addEventListener('touchstart', () => {
+    lastLogTouchAt = Date.now();
+    logSelecting = true;
+  }, { passive: true });
   function finishLogDrag() {
     if (!logSelecting) return;
     logSelecting = false;
     if (logsRenderPending && !logSelection()) renderLogs();
   }
   document.addEventListener('mouseup', finishLogDrag);
+  document.addEventListener('touchend', () => {
+    lastLogTouchAt = Date.now();
+    finishLogDrag();
+  }, { passive: true });
+  document.addEventListener('touchcancel', () => {
+    lastLogTouchAt = Date.now();
+    finishLogDrag();
+  }, { passive: true });
   window.addEventListener('blur', finishLogDrag);
   document.addEventListener('selectionchange', () => {
     if (logsRenderPending && !logSelecting && !logSelection()) renderLogs();
@@ -5207,6 +5221,12 @@
   $('logOutput').addEventListener('contextmenu', event => {
     const line = event.target.closest && event.target.closest('.log-line');
     if (!line || !$('logOutput').contains(line)) return;
+    // Touch long-press on Android opens native draggable selection handles and
+    // the system Copy/Select All bar; stealing focus with the custom menu
+    // freezes the initial selection anchor.
+    if (Date.now() - lastLogTouchAt < 1000 || (event.sourceCapabilities && event.sourceCapabilities.firesTouchEvents)) {
+      return;
+    }
     event.preventDefault();
     const selection = logSelection();
     logCopyRanges = selection ? Array.from({ length: selection.rangeCount }, (_, i) => selection.getRangeAt(i).cloneRange()) : [];
@@ -5774,6 +5794,19 @@
       toast(text ? t('Copied to the clipboard.') : t('There is no terminal text to copy.'), !text);
     } catch (_) {
       toast(t('Cannot copy terminal text to the clipboard.'), true);
+    }
+  }
+
+  async function copyTerminalSelection() {
+    const view = embeddedTerminal && embeddedTerminal.view;
+    if (!view) return;
+    try {
+      const text = await view.copySelection();
+      toast(text ? t('Copied to the clipboard.') : t('There is no terminal text to copy.'), !text);
+    } catch (_) {
+      toast(t('Cannot copy terminal text to the clipboard.'), true);
+    } finally {
+      syncTerminalSelectionBar();
     }
   }
 

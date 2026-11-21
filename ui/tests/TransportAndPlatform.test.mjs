@@ -1021,3 +1021,118 @@ test('granted Android folders name the app-storage limitation per action', () =>
   // An unknown action still fails closed with the generic limitation.
   assert.match(safLimitationReason('watch', granted) ?? '', /app storage/);
 });
+
+test('Android text selection inside inputs, logs, or active ranges never triggers a mobile pane swipe, and CodeMirror uses native selection on Android', async () => {
+  const { AppShell } = await import('../dist/linscp-core.mjs');
+  const dom = new JSDOM(`<!doctype html><body>
+    <div id="app">
+      <div class="commander-main">
+        <input id="localPath" value="/storage/emulated/0/Download" />
+        <div id="logOutput"><div class="log-line"><span>selectable log text</span></div></div>
+        <div id="editorHost" class="editor-host"></div>
+      </div>
+    </div>
+    <nav id="nav"></nav><div id="bar"></div><div id="keys"></div>
+  </body>`, {
+    url: 'http://127.0.0.1:8080/',
+    pretendToBeVisual: true,
+    runScripts: 'outside-only',
+    userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36',
+  });
+  const doc = dom.window.document;
+  Object.defineProperty(dom.window, 'innerWidth', { value: 375, configurable: true });
+  const panes = [];
+  const shell = new AppShell({
+    rootElement: doc.getElementById('app'),
+    bottomNavElement: doc.getElementById('nav'),
+    swipeContainer: doc.querySelector('.commander-main'),
+    extraKeysElement: doc.getElementById('keys'),
+    actionBarElement: doc.getElementById('bar'),
+    onPaneChange: (pane) => panes.push(pane),
+  });
+
+  // Dragging horizontally inside an input or #logOutput must NOT flip panes.
+  for (const target of [doc.getElementById('localPath'), doc.querySelector('#logOutput span')]) {
+    const ts = new dom.window.Event('touchstart', { bubbles: true });
+    ts.touches = [{ clientX: 220, clientY: 30 }];
+    target.dispatchEvent(ts);
+    const te = new dom.window.Event('touchend', { bubbles: true });
+    te.changedTouches = [{ clientX: 40, clientY: 30 }];
+    target.dispatchEvent(te);
+  }
+  assert.deepEqual(panes, [], 'dragging inside selectable text controls does not switch panes');
+
+  // Dragging while a DOM text selection is open must NOT flip panes either.
+  const range = doc.createRange();
+  range.selectNodeContents(doc.querySelector('#logOutput span'));
+  const sel = dom.window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+  const main = doc.querySelector('.commander-main');
+  const tsSel = new dom.window.Event('touchstart', { bubbles: true });
+  tsSel.touches = [{ clientX: 240, clientY: 80 }];
+  main.dispatchEvent(tsSel);
+  const teSel = new dom.window.Event('touchend', { bubbles: true });
+  teSel.changedTouches = [{ clientX: 40, clientY: 80 }];
+  main.dispatchEvent(teSel);
+  assert.deepEqual(panes, [], 'adjusting an active DOM text selection does not switch panes');
+  sel.removeAllRanges();
+
+  // Once selection is cleared, swiping on .commander-main switches panes normally.
+  const tsOk = new dom.window.Event('touchstart', { bubbles: true });
+  tsOk.touches = [{ clientX: 240, clientY: 80 }];
+  main.dispatchEvent(tsOk);
+  const teOk = new dom.window.Event('touchend', { bubbles: true });
+  teOk.changedTouches = [{ clientX: 40, clientY: 80 }];
+  main.dispatchEvent(teOk);
+  assert.deepEqual(panes, ['remote'], 'plain swipe outside text selection still switches panes');
+
+  // Verify CodeMirror on Android omits drawSelection() so native teardrop handles work,
+  // while desktop keeps drawSelection().
+  Object.defineProperty(dom.window.navigator, 'userAgent', {
+    value: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36',
+    configurable: true,
+  });
+  dom.window.Range.prototype.getClientRects = () => [];
+  dom.window.Range.prototype.getBoundingClientRect = () => ({ left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 });
+  const editorBundle = fs.readFileSync(new URL('../dist/linscp-editor.iife.js', import.meta.url), 'utf8');
+  dom.window.eval(editorBundle + '; window.LinSCPEditor = LinSCPEditor;');
+  const editorHost = doc.getElementById('editorHost');
+  const mounted = dom.window.LinSCPEditor.mount(editorHost, {
+    value: 'hello android world',
+    readOnly: true,
+    languagePath: 'notes.txt',
+  });
+  assert.equal(
+    editorHost.querySelector('.cm-selectionLayer'),
+    null,
+    'Android CodeMirror omits drawSelection layer so native WebView selection handles remain active',
+  );
+  mounted.destroy();
+
+  const desktopDom = new JSDOM('<!doctype html><body><div id="host"></div></body>', {
+    url: 'http://127.0.0.1:8080/',
+    pretendToBeVisual: true,
+    runScripts: 'outside-only',
+  });
+  desktopDom.window.Range.prototype.getClientRects = () => [];
+  desktopDom.window.Range.prototype.getBoundingClientRect = () => ({ left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 });
+  desktopDom.window.eval(editorBundle + '; window.LinSCPEditor = LinSCPEditor;');
+  const desktopHost = desktopDom.window.document.getElementById('host');
+  const desktopMounted = desktopDom.window.LinSCPEditor.mount(desktopHost, {
+    value: 'hello desktop world',
+    readOnly: true,
+    languagePath: 'notes.txt',
+  });
+  assert.notEqual(
+    desktopHost.querySelector('.cm-selectionLayer'),
+    null,
+    'Desktop CodeMirror retains drawSelection layer',
+  );
+  desktopMounted.destroy();
+  desktopDom.window.close();
+
+  shell.destroy();
+  dom.window.close();
+});
+

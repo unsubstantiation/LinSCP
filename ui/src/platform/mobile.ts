@@ -305,11 +305,32 @@ export class MobileShellController {
     this.shouldSwipe = filter;
   }
 
+  private isNoSwipeTarget(target: EventTarget | null): boolean {
+    const el = target as Element | null;
+    if (!el || typeof el.closest !== 'function') {
+      return false;
+    }
+    return Boolean(
+      el.closest(
+        'input, textarea, select, [contenteditable="true"], [contenteditable=""], [data-no-swipe], .cm-editor, #logOutput, pre, code, .selectable-text',
+      ),
+    );
+  }
+
+  private hasActiveTextSelection(): boolean {
+    const sel = this.swipeContainer?.ownerDocument?.getSelection?.();
+    return Boolean(sel && !sel.isCollapsed && sel.toString().length > 0);
+  }
+
   private onTouchStart = (event: TouchEvent): void => {
     if (event.touches.length !== 1) return;
     const touch = event.touches[0];
     if (!touch) return;
-    if (this.shouldSwipe && !this.shouldSwipe(event)) {
+    if (
+      this.isNoSwipeTarget(event.target) ||
+      this.hasActiveTextSelection() ||
+      (this.shouldSwipe && !this.shouldSwipe(event))
+    ) {
       this.swipeTracking = false;
       return;
     }
@@ -325,6 +346,7 @@ export class MobileShellController {
   private onTouchEnd = (event: TouchEvent): void => {
     if (!this.swipeTracking) return;
     this.swipeTracking = false;
+    if (this.hasActiveTextSelection()) return;
     const touch = event.changedTouches[0];
     if (!touch) return;
     const dx = touch.clientX - this.swipeStartX;
@@ -339,6 +361,9 @@ export class MobileShellController {
   };
 
   private onMouseDown = (event: MouseEvent): void => {
+    if (this.isNoSwipeTarget(event.target) || this.hasActiveTextSelection()) {
+      return;
+    }
     // Simple mouse drag swipe for desktop testing: track 40px drag.
     const view = (this.swipeContainer?.ownerDocument?.defaultView ?? globalThis) as
       Window & typeof globalThis;

@@ -2823,6 +2823,24 @@ function options(id) {
   doc.dispatchEvent(new window.Event('selectionchange'));
   check('the latest logs appear after the selection is cleared', text('logOutput').includes('new entry'));
   check('clipboard failure is reported instead of claiming success', text('logOutput').includes('Copy failed — select the log text and copy it manually.'));
+  // Touch long-press on Android must NOT preventDefault or steal focus with #logContextMenu,
+  // so native draggable teardrop selection handles stay adjustable.
+  {
+    const freshFirstLog = logOutput.querySelector('.log-line');
+    const freshRange = doc.createRange();
+    freshRange.setStart(freshFirstLog.lastElementChild.firstChild, 0);
+    freshRange.setEnd(freshFirstLog.lastElementChild.firstChild, 5);
+    selection.removeAllRanges();
+    selection.addRange(freshRange);
+    freshFirstLog.dispatchEvent(new window.Event('touchstart', { bubbles: true }));
+    const touchCtx = new window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 20, clientY: 30 });
+    freshFirstLog.dispatchEvent(touchCtx);
+    doc.dispatchEvent(new window.Event('touchend', { bubbles: true }));
+    check('touch long-press on log leaves native selection handles unblocked',
+      touchCtx.defaultPrevented === false && contextMenu.hidden === true && selection.toString() === 'first');
+    selection.removeAllRanges();
+    doc.dispatchEvent(new window.Event('selectionchange'));
+  }
   Object.defineProperty(logScroller, 'scrollHeight', { configurable: true, value: 1000 });
   Object.defineProperty(logScroller, 'clientHeight', { configurable: true, value: 100 });
   logScroller.scrollTop = 20;
@@ -3686,7 +3704,12 @@ function options(id) {
     await window.copyTerminalAllText();
     lastWindow.selectAll();
     check('selecting text offers to copy it',
-      selectionBar.hidden === false, String(selectionBar.hidden));
+      selectionBar.hidden === false && !!selectionBar.querySelector('button[onclick="copyTerminalSelection()"]'),
+      String(selectionBar.hidden));
+    await window.copyTerminalSelection();
+    check('copying from the terminal selection bar closes the bar',
+      selectionBar.hidden === true, String(selectionBar.hidden));
+    lastWindow.selectAll();
     await window.clearTerminalSelection();
     await new Promise(resolve => setTimeout(resolve, 20));
     check('clearing the selection puts the bar away',

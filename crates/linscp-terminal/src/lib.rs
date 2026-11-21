@@ -338,6 +338,7 @@ pub struct TerminalScreen {
     shared: Arc<Shared>,
     size: Size,
     dirty: bool,
+    selection_anchor: Option<Point>,
 }
 
 impl TerminalScreen {
@@ -374,6 +375,7 @@ impl TerminalScreen {
             shared,
             size,
             dirty: true,
+            selection_anchor: None,
         })
     }
 
@@ -487,21 +489,31 @@ impl TerminalScreen {
     /// text the person did not touch.
     pub fn select_start(&mut self, row: usize, column: usize) {
         let point = self.point_at(row, column);
-        self.term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+        self.selection_anchor = Some(point);
+        let mut selection = Selection::new(SelectionType::Simple, point, Side::Left);
+        selection.update(point, Side::Right);
+        self.term.selection = Some(selection);
         self.dirty = true;
     }
 
     /// Extends the selection to a cell of the viewport.
     pub fn select_extend(&mut self, row: usize, column: usize) {
         let point = self.point_at(row, column);
-        if let Some(selection) = self.term.selection.as_mut() {
-            selection.update(point, Side::Right);
-            self.dirty = true;
-        }
+        let anchor = self.selection_anchor.unwrap_or(point);
+        let (first, last) = if anchor <= point {
+            (anchor, point)
+        } else {
+            (point, anchor)
+        };
+        let mut selection = Selection::new(SelectionType::Simple, first, Side::Left);
+        selection.update(last, Side::Right);
+        self.term.selection = Some(selection);
+        self.dirty = true;
     }
 
     /// Drops the selection, so the screen paints plain again.
     pub fn clear_selection(&mut self) {
+        self.selection_anchor = None;
         if self.term.selection.take().is_some() {
             self.dirty = true;
         }
@@ -1168,6 +1180,19 @@ mod tests {
         screen.clear_selection();
         assert_eq!(screen.selection(), None);
         assert_eq!(screen.snapshot().selection, None);
+    }
+
+    #[test]
+    fn a_selection_highlights_initial_cell_and_supports_reverse_adjustment() {
+        let mut screen = screen(10, 3);
+        screen.advance(b"alpha\r\nbravo\r\ncharlie");
+        screen.select_start(1, 4);
+        assert_eq!(screen.selection().as_deref(), Some("o"));
+        assert_eq!(screen.snapshot().selection, Some((1, 4, 1, 4)));
+
+        screen.select_extend(1, 0);
+        assert_eq!(screen.selection().as_deref(), Some("bravo"));
+        assert_eq!(screen.snapshot().selection, Some((1, 0, 1, 4)));
     }
 
     /// The same drag after scrolling back must copy the row under the finger,
