@@ -79,7 +79,7 @@ pub fn decode_editor_bytes(
             return Err("Refusing to edit binary file containing NUL bytes.".to_string());
         }
         let eol = linscp_engine::text_mode::detect_eol_style(bytes)
-            .as_str()
+            .name()
             .to_string();
         let (text, had_bom) = linscp_engine::text_mode::decode_to_utf8_strict(bytes, "utf-8")
             .map_err(|_| "File is not valid UTF-8 binary/encoded text.".to_string())?;
@@ -96,7 +96,7 @@ pub fn decode_editor_bytes(
         return Err("Refusing to edit binary file containing NUL bytes.".to_string());
     }
     let eol = linscp_engine::text_mode::detect_eol_style(text.as_bytes())
-        .as_str()
+        .name()
         .to_string();
     Ok((text, raw_enc.to_ascii_lowercase(), eol, had_bom))
 }
@@ -513,10 +513,7 @@ pub async fn search_remote_bounded_with_encoding(
     max_results: usize,
 ) -> Result<SearchStats, String> {
     if let Some(enc) = encoding.map(str::trim).filter(|s| !s.is_empty()) {
-        if !enc.eq_ignore_ascii_case("utf-8")
-            && !enc.eq_ignore_ascii_case("utf8")
-            && encoding_rs::Encoding::for_label(enc.as_bytes()).is_none()
-        {
+        if !linscp_engine::text_mode::is_supported_encoding(enc) {
             return Err(format!("Unsupported character encoding '{enc}'."));
         }
     }
@@ -685,10 +682,7 @@ pub fn search_local_bounded_with_encoding(
     max_results: usize,
 ) -> Result<SearchStats, String> {
     if let Some(enc) = encoding.map(str::trim).filter(|s| !s.is_empty()) {
-        if !enc.eq_ignore_ascii_case("utf-8")
-            && !enc.eq_ignore_ascii_case("utf8")
-            && encoding_rs::Encoding::for_label(enc.as_bytes()).is_none()
-        {
+        if !linscp_engine::text_mode::is_supported_encoding(enc) {
             return Err(format!("Unsupported character encoding '{enc}'."));
         }
     }

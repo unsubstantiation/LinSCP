@@ -278,7 +278,7 @@ impl CommanderService {
         bridge: Arc<dyn linscp_platform::android::KeystoreBridge>,
     ) -> Self {
         self.secret_vault = Arc::new(
-            linscp_platform::password_vault::PasswordSecretVault::with_keystore_bridge(bridge),
+            linscp_platform::password_vault::PasswordSecretVault::with_keystore(bridge),
         );
         self
     }
@@ -3564,17 +3564,19 @@ impl CommanderService {
                     Arc::clone(&progress_bytes),
                 );
                 let status_ref = Arc::clone(&self.share_export_status);
-                let cancel_ref = Arc::clone(&self.share_export_cancel);
                 let bytes_ref = Arc::clone(&progress_bytes);
-                let progress_cb: linscp_proto::ProgressCallback =
-                    Box::new(move |_done, _total| {
-                        if let Ok(mut st) = status_ref.lock() {
-                            st.bytes_done = bytes_ref.load(std::sync::atomic::Ordering::Acquire);
-                        }
-                        !cancel_ref.load(std::sync::atomic::Ordering::Acquire)
-                    });
+                let progress_cb = move |_done: u64, _total: u64| {
+                    if let Ok(mut st) = status_ref.lock() {
+                        st.bytes_done = bytes_ref.load(std::sync::atomic::Ordering::Acquire);
+                    }
+                };
                 let received = session
-                    .download(&remote, Default::default(), &mut sink, Some(&progress_cb))
+                    .download(
+                        &remote,
+                        Default::default(),
+                        &mut sink,
+                        Some(&progress_cb as &linscp_proto::ProgressCallback),
+                    )
                     .await
                     .map_err(|e| {
                         if self
@@ -3692,7 +3694,8 @@ impl CommanderService {
             if !move_item {
                 matched_preset
                     .as_ref()
-                    .and_then(|p| p.file_mask.clone())
+                    .filter(|p| !p.mask.is_empty())
+                    .and_then(|p| linscp_engine::filemask::FileMask::parse(&p.mask).ok())
                     .unwrap_or_default()
             } else {
                 linscp_engine::filemask::FileMask::default()
@@ -5720,7 +5723,7 @@ impl CommanderService {
             linscp_engine::presets::PresetPermissions::FromFile => "fromfile".to_string(),
             linscp_engine::presets::PresetPermissions::Mode(m) => format!("{m:o}"),
         });
-        let eol = p.eol.map(|e| e.as_str().to_string());
+        let eol = p.eol.map(|e| e.name().to_string());
         json!({
             "name": p.name,
             "description": p.describe(),
@@ -5731,7 +5734,7 @@ impl CommanderService {
             "resumesupport": resume_support,
             "permissions": permissions,
             "eol": eol,
-            "filemask": p.file_mask.as_ref().map(|m| m.raw().to_string()),
+            "filemask": (!p.mask.is_empty()).then(|| p.mask.clone()),
             "host": p.host,
             "username": p.username,
             "remote_dir": p.remote_directory,
@@ -5785,18 +5788,21 @@ impl CommanderService {
             name,
             ..Default::default()
         };
+        let mask_val = body
+            .get("mask")
+            .filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty()))
+            .or_else(|| body.get("filemask"));
         let str_pairs = [
             ("transfer", body.get("transfer")),
             ("preservetime", body.get("preserve_time").or_else(|| body.get("preservetime"))),
             ("resumesupport", body.get("resumesupport")),
             ("permissions", body.get("permissions")),
             ("eol", body.get("eol")),
-            ("filemask", body.get("filemask")),
             ("host", body.get("host")),
             ("username", body.get("username")),
             ("remotedir", body.get("remote_dir").or_else(|| body.get("remotedir"))),
             ("localdir", body.get("local_dir").or_else(|| body.get("localdir"))),
-            ("mask", body.get("mask")),
+            ("mask", mask_val),
         ];
         for (key, val_opt) in str_pairs {
             if let Some(s) = val_opt.and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
@@ -8142,14 +8148,7 @@ impl CommanderService {
                         .is_some_and(|tun| tun.enabled && !tun.host.trim().is_empty())
                 })
             {
-                let (cfg_dir, cache_pinned, locale) = {
-                    let g = self.state.lock().expect("m");
-                    (
-                        g.config_root.clone(),
-                        g.preferences.cache_pinned_hostkeys,
-                        g.preferences.locale.clone(),
-                    )
-                };
+                let cfg_dir = self.config_root();
                 let _temp_keys = match materialize_vault_key_paths(
                     &mut spec,
                     &cfg_dir,
@@ -8161,8 +8160,8 @@ impl CommanderService {
                 match linscp_engine::url_and_raw::connect_desktop_jump_tunnel(
                     &spec,
                     &cfg_dir,
-                    cache_pinned,
-                    &locale,
+                    false,
+                    "en",
                     self.secret_vault.clone(),
                 )
                 .await
@@ -17425,7 +17424,7 @@ mod tests {
         let open_tab = svc.dispatch(ApiEnvelope {
             method: "POST".into(),
             path: "/api/tabs/local".into(),
-            body: json!({"local_dir": work.to_string_lossy(), "other_local_dir": work.to_string_lossy()}),
+            body: json!({"local_dir": work.to_string_lossy(), "remote_dir": work.to_string_lossy()}),
         });
         let tab_id = open_tab.payload["tab"]["id"].as_u64().unwrap();
         let read_latin = svc.dispatch(ApiEnvelope {
@@ -17452,17 +17451,19 @@ mod tests {
         assert_eq!(std::fs::read(&latin_file).unwrap(), b"na\xefve\r\nsecond\r\n");
 
         // Local search with non-UTF-8 encoding finds ISO-8859-1 content.
-        let search_latin = svc.dispatch(ApiEnvelope {
-            method: "POST".into(),
-            path: "/api/remote/search".into(),
-            body: json!({
-                "tab": tab_id,
-                "pattern": "*.txt",
-                "search_contents": true,
-                "content_query": "na\u{00ef}ve",
-                "encoding": "iso-8859-1",
-            }),
-        });
+        let search_latin = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/remote/search".into(),
+                body: json!({
+                    "tab": tab_id,
+                    "pattern": "*.txt",
+                    "search_contents": true,
+                    "content_query": "na\u{00ef}ve",
+                    "encoding": "iso-8859-1",
+                }),
+            })
+            .await;
         assert_eq!(search_latin.status, 200, "{}", search_latin.payload);
         assert_eq!(search_latin.payload["matches"].as_array().unwrap().len(), 1);
 
@@ -17501,18 +17502,18 @@ mod tests {
         .unwrap();
         let preview = svc.dispatch(ApiEnvelope {
             method: "GET".into(),
-            path: format!("/api/sessions/import?source=openssh&path={}", tabs::percent_encode_query(&ssh_cfg_path.to_string_lossy())),
+            path: format!("/api/sessions/import?source=openssh&path={}", tabs::percent_encode_userinfo(&ssh_cfg_path.to_string_lossy())),
             body: json!({}),
         });
         assert_eq!(preview.status, 200, "{}", preview.payload);
-        let fp = preview.payload["source_fingerprint"].as_str().unwrap().to_string();
+        let fp = preview.payload["sources"][0]["fingerprint"].as_str().unwrap().to_string();
         let imported = svc.dispatch(ApiEnvelope {
             method: "POST".into(),
             path: "/api/sessions/import".into(),
             body: json!({
                 "source": "openssh",
                 "path": ssh_cfg_path.to_string_lossy(),
-                "source_fingerprint": fp,
+                "fingerprint": fp,
                 "names": ["jump", "internal"],
             }),
         });

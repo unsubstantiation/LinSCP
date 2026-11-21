@@ -137,6 +137,16 @@ pub fn has_utf8_bom(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0xEF, 0xBB, 0xBF])
 }
 
+pub fn is_supported_encoding(label: &str) -> bool {
+    let trimmed = label.trim();
+    trimmed.eq_ignore_ascii_case("utf-8")
+        || trimmed.eq_ignore_ascii_case("utf8")
+        || trimmed.eq_ignore_ascii_case("utf-16")
+        || trimmed.eq_ignore_ascii_case("utf-16le")
+        || trimmed.eq_ignore_ascii_case("utf-16be")
+        || Encoding::for_label(trimmed.as_bytes()).is_some()
+}
+
 pub const SUPPORTED_ENCODINGS: &[&str] = &[
     "utf-8",
     "utf-16le",

@@ -256,10 +256,10 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
         obj.entry(k.clone()).or_insert_with(|| json!(v));
     }
     if let Some(alg) = site.extra_fields.get("s3_sse_algorithm") {
-        obj.entry("s3_sse".into()).or_insert_with(|| json!(alg));
+        obj.entry("s3_sse").or_insert_with(|| json!(alg));
     }
     if let Some(kms) = site.extra_fields.get("s3_sse_kms_key_id") {
-        obj.entry("s3_kms_key".into()).or_insert_with(|| json!(kms));
+        obj.entry("s3_kms_key").or_insert_with(|| json!(kms));
     }
     Value::Object(obj)
 }
@@ -1055,7 +1055,7 @@ pub fn format_session_url(spec: &ParsedSiteSpec, remote_dir_override: Option<&st
     format!("{proto}://{user_part}{host_part}{port_part}{path_part}")
 }
 
-fn percent_encode_userinfo(raw: &str) -> String {
+pub(crate) fn percent_encode_userinfo(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for b in raw.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
