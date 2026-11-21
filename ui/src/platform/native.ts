@@ -194,12 +194,16 @@ export class ForegroundTransferBridge {
     return this.running;
   }
 
-  public async start(title: string, ongoing: number): Promise<boolean> {
+  public async start(title: string, ongoing = 1): Promise<boolean> {
     if (!this.invoker) {
       return false;
     }
+    const safeTitle = String(title ?? '');
+    const safeOngoing = typeof ongoing === 'number' && Number.isFinite(ongoing)
+      ? Math.max(0, Math.floor(ongoing))
+      : 1;
     try {
-      await this.invoker.invoke('linscp_foreground_start', { title, ongoing });
+      await this.invoker.invoke('linscp_foreground_start', { title: safeTitle, ongoing: safeOngoing });
       this.running = true;
       return true;
     } catch {

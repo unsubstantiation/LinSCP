@@ -520,7 +520,13 @@ test('the foreground bridge drops duplicate percentages and stops cleanly', asyn
     calls.map(([cmd]) => cmd),
     ['linscp_foreground_start', 'linscp_foreground_update', 'linscp_foreground_update', 'linscp_foreground_stop'],
   );
+  assert.deepEqual(calls[0][1], { title: 'Uploading 3 files', ongoing: 3 });
   assert.equal(bridge.isRunning, false);
+
+  // Default ongoing count is coerced to a valid integer for Tauri command deserialization.
+  assert.equal(await bridge.start('Remote desktop'), true);
+  assert.deepEqual(calls.at(-1), ['linscp_foreground_start', { title: 'Remote desktop', ongoing: 1 }]);
+  assert.equal(await bridge.stop(), true);
 
   // Without a shell the bridge is inert rather than throwing at every call.
   const absent = new ForegroundTransferBridge(null);

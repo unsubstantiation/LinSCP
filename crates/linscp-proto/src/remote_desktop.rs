@@ -210,9 +210,21 @@ pub struct RemoteDesktopConnectConfig {
     pub timeout: std::time::Duration,
 }
 
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn sanitize_rdp_field(val: &str) -> String {
+    val.chars().filter(|&c| !c.is_control()).collect()
+}
+
 impl RemoteDesktopConnectConfig {
     pub fn target(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        format_host_port(&self.host, self.port)
     }
 }
 
@@ -317,7 +329,7 @@ impl RemoteDesktopSession {
         } else {
             // Best-effort TCP probe with short timeout — do not fail the session on timeout,
             // just on immediate "connection refused / no route" which indicates a hard misconfiguration.
-            let dial_target = format!("{}:{}", cfg.host, cfg.port);
+            let dial_target = format_host_port(&cfg.host, cfg.port);
             let probe = tokio::time::timeout(
                 std::time::Duration::from_millis(800),
                 tokio::net::TcpStream::connect(&dial_target),
@@ -456,11 +468,18 @@ pub fn ticket_from_config(
 /// directory the user may share or sync, and the credentials live in the vault.
 fn rdp_file_body(sess: &RemoteDesktopSession, endpoint: &str) -> String {
     let opts = &sess.config.desktop_opts;
+    let safe_endpoint = sanitize_rdp_field(endpoint);
+    let safe_user = sanitize_rdp_field(sess.config.username.as_deref().unwrap_or(""));
+    let safe_domain = opts
+        .domain
+        .as_deref()
+        .map(sanitize_rdp_field)
+        .filter(|d| !d.is_empty());
     format!(
         "full address:s:{}\r\nusername:s:{}\r\n{domain}{sec}{bpp}{screen}\r\n",
-        endpoint,
-        sess.config.username.as_deref().unwrap_or(""),
-        domain = opts.domain.as_deref().map(|d| format!("domain:s:{d}\r\n")).unwrap_or_default(),
+        safe_endpoint,
+        safe_user,
+        domain = safe_domain.map(|d| format!("domain:s:{d}\r\n")).unwrap_or_default(),
         sec = opts.security.as_deref().map(|s| format!("authentication level:i:{}\r\n", if s=="nla"{2} else {1})).unwrap_or_default(),
         bpp = opts.color_depth.map(|d| format!("session bpp:i:{d}\r\n")).unwrap_or_default(),
         screen = if opts.fullscreen { "screen mode id:i:2\r\n".to_string() } else { format!("desktopwidth:i:{}\r\ndesktopheight:i:{}\r\n", opts.width.unwrap_or(1024), opts.height.unwrap_or(768)) },
@@ -536,11 +555,6 @@ fn build_rdp_argv(viewer: &str, sess: &RemoteDesktopSession, tunneled: bool, end
 fn build_vnc_argv(viewer: &str, sess: &RemoteDesktopSession, tunneled: bool, endpoint: &str) -> Vec<String> {
     let opts = &sess.config.desktop_opts;
     let mut argv = vec![viewer.to_string(), endpoint.to_string()];
-    if sess.config.password.is_some() {
-        // Most viewers read password from stdin / -passwd file; we pass via env/file in launcher.
-        argv.push("-PasswordFile".to_string());
-        argv.push("/tmp/linscp-vnc-passwd".to_string());
-    }
     if opts.vnc_view_only {
         argv.push("-ViewOnly".to_string());
     }
@@ -559,31 +573,40 @@ fn build_vnc_argv(viewer: &str, sess: &RemoteDesktopSession, tunneled: bool, end
 
 fn build_spice_argv(_viewer: &str, sess: &RemoteDesktopSession, tunneled: bool, endpoint: &str) -> Vec<String> {
     let opts = &sess.config.desktop_opts;
-    let host = &sess.config.host;
-    let port = sess.config.port;
+    let host_port = format_host_port(&sess.config.host, sess.config.port);
     let tls_port = opts.spice_tls_port.map(|p| p.to_string()).unwrap_or_default();
     let insecure = if opts.spice_insecure { "1" } else { "0" };
     // remote-viewer expects spice://host:port?tls-port=... ; we also support .vv file.
     let uri = if !tls_port.is_empty() {
-        format!("spice://{}:{}?tls-port={tls_port}&insecure={insecure}", host, port)
+        format!("spice://{host_port}?tls-port={tls_port}&insecure={insecure}")
     } else if tunneled {
         format!("spice://{endpoint}")
     } else {
-        format!("spice://{host}:{port}")
+        format!("spice://{host_port}")
     };
     vec!["remote-viewer".to_string(), uri]
 }
 
 fn build_x11_argv(viewer: &str, sess: &RemoteDesktopSession) -> Vec<String> {
     let opts = &sess.config.desktop_opts;
-    if viewer == "waypipe" && (opts.waypipe || std::env::var_os("WAYLAND_DISPLAY").is_some()) {
+    let clean_host: String = sess
+        .config
+        .host
+        .chars()
+        .filter(|&c| !c.is_control())
+        .collect();
+    let clean_user: Option<String> = sess
+        .config
+        .username
+        .as_deref()
+        .map(|u| u.chars().filter(|&c| !c.is_control()).collect::<String>())
+        .filter(|u| !u.is_empty() && !u.starts_with('-'));
+    let mut argv = if viewer == "waypipe" && (opts.waypipe || std::env::var_os("WAYLAND_DISPLAY").is_some()) {
         vec![
             "waypipe".to_string(),
             "ssh".to_string(),
-            format!("{}@{}", sess.config.username.as_deref().unwrap_or(""), sess.config.host),
             "-p".to_string(),
             sess.config.port.to_string(),
-            sess.config.host.clone(),
         ]
     } else {
         vec![
@@ -591,9 +614,15 @@ fn build_x11_argv(viewer: &str, sess: &RemoteDesktopSession) -> Vec<String> {
             "-X".to_string(),
             "-p".to_string(),
             sess.config.port.to_string(),
-            format!("{}@{}", sess.config.username.as_deref().unwrap_or(""), sess.config.host),
         ]
+    };
+    if let Some(user) = clean_user {
+        argv.push("-l".to_string());
+        argv.push(user);
     }
+    argv.push("--".to_string());
+    argv.push(clean_host);
+    argv
 }
 
 /// Human-readable server package and description for UI prompts.
@@ -744,7 +773,7 @@ echo "[linscp] xauth installed. For Wayland hosts, also: apt/dnf install waypipe
 /// Lightweight TCP probe — tries to connect to `host:port` with 1.5s timeout.
 /// Used when no SSH session is available for a remote-exec probe.
 pub async fn check_tcp_availability(host: &str, port: u16) -> bool {
-    let target = format!("{host}:{port}");
+    let target = format_host_port(host, port);
     match tokio::time::timeout(
         std::time::Duration::from_millis(1500),
         tokio::net::TcpStream::connect(&target),
@@ -1006,5 +1035,60 @@ mod tests {
         // the browser transport downloads, and it never contains the password.
         assert_eq!(ticket.file_extension.as_deref(), Some(".rdp"));
         assert!(ticket.file_content.is_some());
+    }
+
+    #[test]
+    fn desktop_tickets_handle_ipv6_sanitization_vnc_and_x11_flags() {
+        let mut opts = DesktopOptions::default();
+        opts.domain = Some("CORP\r\nalternate shell:s:cmd.exe".to_string());
+        opts.waypipe = true;
+
+        let rdp_cfg = RemoteDesktopConnectConfig {
+            scheme: ProtocolScheme::Rdp,
+            kind: RemoteDesktopKind::Rdp,
+            host: "2001:db8::10".to_string(),
+            port: 3389,
+            username: Some("alice\r\ninjected:i:1".to_string()),
+            password: Some(zeroize::Zeroizing::new("secret".to_string())),
+            domain: None,
+            desktop_opts: opts.clone(),
+            tls: crate::tls::TlsSettings::default(),
+            proxy: None,
+            timeout: std::time::Duration::from_secs(15),
+        };
+        assert_eq!(rdp_cfg.target(), "[2001:db8::10]:3389");
+        let rdp_ticket = ticket_from_config(&rdp_cfg, RemoteDesktopKind::Rdp, &rdp_cfg.target(), false, None);
+        let body = rdp_ticket.file_content.expect(".rdp content");
+        assert!(body.contains("full address:s:[2001:db8::10]:3389\r\n"), "{body}");
+        assert!(!body.contains("\r\nalternate shell:"), "CRLF injection must be stripped: {body}");
+        assert!(!body.contains("\r\ninjected:"), "CRLF injection must be stripped: {body}");
+
+        let vnc_ticket = ticket_from_config(&rdp_cfg, RemoteDesktopKind::Vnc, &rdp_cfg.target(), false, None);
+        assert!(
+            !vnc_ticket.argv.iter().any(|a| a.contains("/tmp/linscp-vnc-passwd")),
+            "VNC argv must not reference nonexistent /tmp password file: {:?}",
+            vnc_ticket.argv
+        );
+
+        let spice_ticket = ticket_from_config(&rdp_cfg, RemoteDesktopKind::Spice, &rdp_cfg.target(), false, None);
+        assert_eq!(spice_ticket.argv, vec!["remote-viewer", "spice://[2001:db8::10]:3389"]);
+
+        let mut x11_cfg = rdp_cfg.clone();
+        x11_cfg.scheme = ProtocolScheme::X11;
+        x11_cfg.kind = RemoteDesktopKind::X11;
+        x11_cfg.host = "x11.example.test".to_string();
+        x11_cfg.port = 2222;
+        x11_cfg.username = Some("alice".to_string());
+        let x11_waypipe = ticket_from_config(&x11_cfg, RemoteDesktopKind::X11, "x11.example.test:2222", false, None);
+        assert_eq!(
+            x11_waypipe.argv,
+            vec!["waypipe", "ssh", "-p", "2222", "-l", "alice", "--", "x11.example.test"]
+        );
+
+        x11_cfg.username = None;
+        x11_cfg.desktop_opts.waypipe = false;
+        let x11_anon = ticket_from_config(&x11_cfg, RemoteDesktopKind::X11, "x11.example.test:2222", false, None);
+        assert!(!x11_anon.argv.iter().any(|a| a.starts_with('@')), "{:?}", x11_anon.argv);
+        assert_eq!(x11_anon.argv.last().map(String::as_str), Some("x11.example.test"));
     }
 }

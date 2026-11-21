@@ -223,6 +223,11 @@ pub fn dav_property_value_from_xml(xml: &str, name: &str) -> Result<Option<Strin
 }
 
 pub(crate) fn build_reqwest_proxy(proxy: &ProxyConfig) -> Result<Option<Proxy>, ProtoError> {
+    let host = if proxy.host.contains(':') && !proxy.host.starts_with('[') {
+        format!("[{}]", proxy.host)
+    } else {
+        proxy.host.clone()
+    };
     let url = match proxy.kind {
         ProxyKind::None => return Ok(None),
         ProxyKind::Socks5 => {
@@ -231,7 +236,7 @@ pub(crate) fn build_reqwest_proxy(proxy: &ProxyConfig) -> Result<Option<Proxy>, 
             } else {
                 "socks5"
             };
-            format!("{scheme}://{}:{}", proxy.host, proxy.port)
+            format!("{scheme}://{host}:{}", proxy.port)
         }
         ProxyKind::Socks4 => {
             let scheme = if proxy.remote_dns {
@@ -239,9 +244,9 @@ pub(crate) fn build_reqwest_proxy(proxy: &ProxyConfig) -> Result<Option<Proxy>, 
             } else {
                 "socks4"
             };
-            format!("{scheme}://{}:{}", proxy.host, proxy.port)
+            format!("{scheme}://{host}:{}", proxy.port)
         }
-        ProxyKind::HttpConnect => format!("http://{}:{}", proxy.host, proxy.port),
+        ProxyKind::HttpConnect => format!("http://{host}:{}", proxy.port),
         ProxyKind::Telnet => {
             return Err(ProtoError::Transport(
                 "This protocol connects through curl, which cannot run a telnet proxy; use SOCKS4, SOCKS5 or HTTP, or a protocol this build serves with its own transport.".to_string(),
@@ -1817,5 +1822,18 @@ mod tests {
 
         assert!(dav_valid_property_name("9bad").is_err());
         assert!(dav_lock_token_from_xml("<!DOCTYPE foo><x/>").is_err());
+
+        let ipv6_proxy = ProxyConfig {
+            kind: ProxyKind::Socks5,
+            host: "::1".to_string(),
+            port: 1080,
+            username: None,
+            password: None,
+            remote_dns: true,
+            command: None,
+        };
+        assert!(
+            build_reqwest_proxy(&ipv6_proxy).expect("IPv6 SOCKS5h proxy URL must parse").is_some()
+        );
     }
 }

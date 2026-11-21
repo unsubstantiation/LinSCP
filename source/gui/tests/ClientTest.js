@@ -4014,15 +4014,25 @@ function options(id) {
     const savedCoreForAndroid = window.LinSCPCore;
     let openedExternalUri = null;
     let fgStarted = false;
+    let fgStartArgs = null;
     let fgStopped = false;
+    let allowOpenExternal = true;
     window.LinSCPCore = Object.assign({}, savedCoreForAndroid, {
       hostCapabilities: () => ({
         platform: 'android', desktopLaunchers: true, saf: true, share: true, separateWindows: false
       }),
-      openExternalUri: async uri => { openedExternalUri = uri; return true; },
+      openExternalUri: async uri => { openedExternalUri = uri; return allowOpenExternal; },
       ForegroundTransferBridge: function () {
-        this.start = async () => { fgStarted = true; };
-        this.stop = async () => { fgStopped = true; };
+        this.isRunning = false;
+        this.start = async (title, ongoing) => {
+          fgStarted = true;
+          fgStartArgs = [title, ongoing];
+          this.isRunning = true;
+        };
+        this.stop = async () => {
+          fgStopped = true;
+          this.isRunning = false;
+        };
       }
     });
     responses['/api/desktop/launch'] = {
@@ -4039,11 +4049,26 @@ function options(id) {
       !!launchTunCall &&
       JSON.parse(launchTunCall.options.body).tunnel_via_ssh === true &&
       fgStarted === true &&
+      Array.isArray(fgStartArgs) &&
+      typeof fgStartArgs[0] === 'string' && fgStartArgs[0].length > 0 &&
+      fgStartArgs[1] === 1 &&
       openedExternalUri === 'rdp://127.0.0.1:43389');
     await window.closeRemoteDesktopTunnel();
     const closeTunCall = calls.filter(call => call.path === '/api/desktop/tunnel-close').pop();
     check('Closing the desktop tunnel stops keepalive and posts /api/desktop/tunnel-close',
       !!closeTunCall && fgStopped === true && JSON.parse(closeTunCall.options.body).kind === 'rdp');
+
+    fgStarted = false;
+    fgStopped = false;
+    allowOpenExternal = false;
+    window.openRemoteDesktop();
+    doc.getElementById('remoteDesktopKind').value = 'rdp';
+    window.remoteDesktopKindChanged();
+    doc.getElementById('remoteDesktopTunnel').checked = true;
+    await window.launchRemoteDesktop();
+    check('Failed Android viewer intent stops tunneled foreground keepalive immediately',
+      fgStarted === true && fgStopped === true);
+    window.closeModal('remoteDesktopModal');
     window.LinSCPCore = savedCoreForAndroid;
     delete responses['/api/desktop/launch'];
     delete responses['/api/desktop/tunnel-close'];

@@ -2,6 +2,8 @@
 //! `linscp_platform::watcher::LocalDirWatcher` with deterministic tree snapshots.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use linscp_platform::terminal::{
@@ -51,6 +53,10 @@ pub struct KeepUpToDateOptions {
     pub file_mask: FileMask,
     /// The user acknowledged the staged SFTP publish (see `TransferFlags::sftp_risky_publish`).
     pub sftp_risky_publish: bool,
+    /// Optional per-task cancellation flag for GUI queue / session teardown.
+    pub cancel_flag: Option<Arc<AtomicBool>>,
+    /// Install process-wide CLI signal handlers (`SIGINT`/`SIGTERM`); `false` inside GUI hosts.
+    pub install_signal_handlers: bool,
 }
 
 impl Default for KeepUpToDateOptions {
@@ -66,6 +72,8 @@ impl Default for KeepUpToDateOptions {
             speed_kbytes_per_sec: None,
             file_mask: FileMask::default(),
             sftp_risky_publish: false,
+            cancel_flag: None,
+            install_signal_handlers: true,
         }
     }
 }
@@ -103,6 +111,12 @@ where
         ));
     }
 
+    let is_cancelled = || opts.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst));
+    let is_stopped = || is_interrupted() || is_cancelled();
+    if is_cancelled() {
+        return Err("Cancelled by user.".to_string());
+    }
+
     let sync_opts = SyncOptions {
         mode: SyncMode::Remote,
         criteria: SyncCriteria {
@@ -118,6 +132,7 @@ where
         speed_kbytes_per_sec: opts.speed_kbytes_per_sec,
         file_mask: opts.file_mask.clone(),
         sftp_risky_publish: opts.sftp_risky_publish,
+        cancel_flag: opts.cancel_flag.clone(),
         ..SyncOptions::default()
     };
 
@@ -132,7 +147,7 @@ where
     } else {
         LocalDirWatcher::watch(local_root, true).ok()
     };
-    let _sig_guard = if opts.max_passes == 1 {
+    let _sig_guard = if !opts.install_signal_handlers || opts.max_passes == 1 {
         None
     } else {
         Some(SignalHandlerGuard::acquire())
@@ -163,11 +178,13 @@ where
                     total_applied += applied;
                     format!("Pass {passes}: synchronized {applied} item(s).")
                 }
+                Err(_) if is_cancelled() => return Err("Cancelled by user.".to_string()),
                 Err(e) if opts.continue_on_error => format!("Error: {e}"),
                 Err(e) => return Err(e),
             }
         }
         Ok(_) => format!("Pass {passes}: nothing to do (every file is up to date)."),
+        Err(_) if is_cancelled() => return Err("Cancelled by user.".to_string()),
         Err(e) if opts.continue_on_error => format!("Error: {e}"),
         Err(e) => return Err(e),
     };
@@ -177,42 +194,37 @@ where
     on_status(&pass1_status);
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
+    if is_cancelled() {
+        return Err("Cancelled by user.".to_string());
+    }
     if opts.max_passes > 0 && passes >= opts.max_passes {
         return Ok(total_applied);
     }
 
     let wait_dur = Duration::from_millis(opts.interval_ms.max(50));
-    let slice_dur = Duration::from_millis(200);
+    let poll_dur = Duration::from_millis(50);
 
-    while !is_interrupted() {
+    while !is_stopped() {
         if opts.max_passes > 0 && passes >= opts.max_passes {
             break;
         }
-        if let Some(ref w) = watcher {
-            let deadline = std::time::Instant::now() + wait_dur;
-            while !is_interrupted() {
-                let now = std::time::Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                let rem = (deadline - now).min(slice_dur);
-                if w.recv_timeout(rem).is_some() {
-                    // Brief quiet settle so multi-step writes/renames coalesce into one pass
-                    let _ = w.recv_timeout(Duration::from_millis(50));
+        let deadline = tokio::time::Instant::now() + wait_dur;
+        while !is_stopped() {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            if let Some(ref w) = watcher {
+                if !w.drain_changed_paths().is_empty() {
+                    // Brief quiet settle so multi-step writes/renames coalesce into one pass.
+                    tokio::time::sleep(poll_dur).await;
+                    let _ = w.drain_changed_paths();
                     break;
                 }
             }
-        } else {
-            let deadline = tokio::time::Instant::now() + wait_dur;
-            while !is_interrupted() {
-                let now = tokio::time::Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                tokio::time::sleep((deadline - now).min(slice_dur)).await;
-            }
+            tokio::time::sleep((deadline - now).min(poll_dur)).await;
         }
-        if is_interrupted() {
+        if is_stopped() {
             break;
         }
         passes += 1;
@@ -236,6 +248,7 @@ where
                         total_applied += applied;
                         on_status(&format!("Pass {passes}: synchronized {applied} item(s)."));
                     }
+                    Err(_) if is_cancelled() => return Err("Cancelled by user.".to_string()),
                     Err(e) if opts.continue_on_error => on_status(&format!("Error: {e}")),
                     Err(e) => return Err(e),
                 }
@@ -245,10 +258,14 @@ where
                     "Pass {passes}: nothing to do (every file is up to date)."
                 ));
             }
+            Err(_) if is_cancelled() => return Err("Cancelled by user.".to_string()),
             Err(e) if opts.continue_on_error => on_status(&format!("Error: {e}")),
             Err(e) => return Err(e),
         }
     }
 
+    if is_cancelled() {
+        return Err("Cancelled by user.".to_string());
+    }
     Ok(total_applied)
 }
