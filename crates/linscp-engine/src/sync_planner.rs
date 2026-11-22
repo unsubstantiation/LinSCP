@@ -427,6 +427,17 @@ fn join_saf_rel(root_uri: &str, rel: &str) -> String {
 /// skips, same mask, same map. Provider names are untrusted, so a separator
 /// in one refuses the plan — it would join onto the wrong document — while
 /// links are skipped, as they refuse on transfer anyway.
+fn mark_ancestor_retained(retained: &mut BTreeSet<String>, rel_dir: &str) {
+    let mut cur = rel_dir;
+    while !cur.is_empty() {
+        retained.insert(cur.to_string());
+        cur = match cur.rsplit_once('/') {
+            Some((parent, _)) => parent,
+            None => "",
+        };
+    }
+}
+
 fn collect_local_tree_fs(
     fs: &dyn LocalFs,
     root_uri: &str,
@@ -434,6 +445,7 @@ fn collect_local_tree_fs(
     recursive: bool,
     mask: &FileMask,
     out: &mut BTreeMap<String, TreeEntry>,
+    retained_dirs: &mut BTreeSet<String>,
 ) -> Result<(), String> {
     let mut children = fs.list_dir(root_uri).map_err(|e| format!("Cannot read local directory '{root_uri}': {e}"))?;
     children.sort_by(|a, b| a.name.cmp(&b.name));
@@ -449,6 +461,7 @@ fn collect_local_tree_fs(
             return Err("Invalid directory entry name.".to_string());
         }
         if child.is_symlink {
+            mark_ancestor_retained(retained_dirs, rel_prefix);
             continue;
         }
         let rel = if rel_prefix.is_empty() {
@@ -457,6 +470,7 @@ fn collect_local_tree_fs(
             format!("{rel_prefix}/{}", child.name)
         };
         if !mask.accepts(&child.name, child.is_dir, child.size, child.mtime.max(0) as u64, &rel) {
+            mark_ancestor_retained(retained_dirs, rel_prefix);
             continue;
         }
         out.insert(
@@ -468,8 +482,20 @@ fn collect_local_tree_fs(
                 mode: mode_from_permissions_str(&child.permissions),
             },
         );
-        if child.is_dir && recursive {
-            collect_local_tree_fs(fs, &join_saf_child(root_uri, &child.name), &rel, true, mask, out)?;
+        if child.is_dir {
+            if recursive {
+                collect_local_tree_fs(
+                    fs,
+                    &join_saf_child(root_uri, &child.name),
+                    &rel,
+                    true,
+                    mask,
+                    out,
+                    retained_dirs,
+                )?;
+            } else {
+                mark_ancestor_retained(retained_dirs, &rel);
+            }
         }
     }
     Ok(())
@@ -481,6 +507,7 @@ fn collect_local_tree(
     recursive: bool,
     mask: &FileMask,
     out: &mut BTreeMap<String, TreeEntry>,
+    retained_dirs: &mut BTreeSet<String>,
 ) -> Result<(), String> {
     let rd = std::fs::read_dir(root)
         .map_err(|e| format!("Cannot read local directory '{}': {e}", root.display()))?;
@@ -493,12 +520,17 @@ fn collect_local_tree(
         }
         let full = de.path();
         let st = stat_local_path(&full);
+        if st.is_symlink || (!st.is_dir && !st.is_regular) {
+            mark_ancestor_retained(retained_dirs, rel_prefix);
+            continue;
+        }
         let rel = if rel_prefix.is_empty() {
             name.clone()
         } else {
             format!("{rel_prefix}/{name}")
         };
         if !mask.accepts(&name, st.is_dir, st.size, st.mtime.max(0) as u64, &rel) {
+            mark_ancestor_retained(retained_dirs, rel_prefix);
             continue;
         }
         out.insert(
@@ -510,8 +542,12 @@ fn collect_local_tree(
                 mode: st.mode,
             },
         );
-        if st.is_dir && recursive {
-            collect_local_tree(&full, &rel, true, mask, out)?;
+        if st.is_dir {
+            if recursive {
+                collect_local_tree(&full, &rel, true, mask, out, retained_dirs)?;
+            } else {
+                mark_ancestor_retained(retained_dirs, &rel);
+            }
         }
     }
     Ok(())
@@ -524,6 +560,7 @@ async fn collect_remote_tree(
     recursive: bool,
     mask: &FileMask,
     out: &mut BTreeMap<String, TreeEntry>,
+    retained_dirs: &mut BTreeSet<String>,
 ) -> Result<(), String> {
     let entries = session
         .list_dir(root)
@@ -535,6 +572,10 @@ async fn collect_remote_tree(
             || entry.name.ends_with(".filepart")
             || entry.name.contains(".filepart.v")
         {
+            continue;
+        }
+        if entry.is_symlink {
+            mark_ancestor_retained(retained_dirs, rel_prefix);
             continue;
         }
         let rel = if rel_prefix.is_empty() {
@@ -549,6 +590,7 @@ async fn collect_remote_tree(
             entry.mtime.max(0) as u64,
             &rel,
         ) {
+            mark_ancestor_retained(retained_dirs, rel_prefix);
             continue;
         }
         out.insert(
@@ -560,9 +602,22 @@ async fn collect_remote_tree(
                 mode: mode_from_permissions_str(&entry.permissions),
             },
         );
-        if entry.is_dir && recursive {
-            let child = join_remote_path(root, &entry.name);
-            Box::pin(collect_remote_tree(session, &child, &rel, true, mask, out)).await?;
+        if entry.is_dir {
+            if recursive {
+                let child = join_remote_path(root, &entry.name);
+                Box::pin(collect_remote_tree(
+                    session,
+                    &child,
+                    &rel,
+                    true,
+                    mask,
+                    out,
+                    retained_dirs,
+                ))
+                .await?;
+            } else {
+                mark_ancestor_retained(retained_dirs, &rel);
+            }
         }
     }
     Ok(())
@@ -607,10 +662,27 @@ pub async fn plan_synchronization(
     let saf_fs = local_fs.filter(|_| is_saf_sync_root(&local_root_str));
     let mut local_map = BTreeMap::new();
     let mut remote_map = BTreeMap::new();
+    let mut local_retained = BTreeSet::new();
+    let mut remote_retained = BTreeSet::new();
     if let Some(fs) = saf_fs {
-        collect_local_tree_fs(fs, &local_root_str, "", opts.recursive, &opts.file_mask, &mut local_map)?;
+        collect_local_tree_fs(
+            fs,
+            &local_root_str,
+            "",
+            opts.recursive,
+            &opts.file_mask,
+            &mut local_map,
+            &mut local_retained,
+        )?;
     } else {
-        collect_local_tree(local_root, "", opts.recursive, &opts.file_mask, &mut local_map)?;
+        collect_local_tree(
+            local_root,
+            "",
+            opts.recursive,
+            &opts.file_mask,
+            &mut local_map,
+            &mut local_retained,
+        )?;
     }
     collect_remote_tree(
         session,
@@ -619,6 +691,7 @@ pub async fn plan_synchronization(
         opts.recursive,
         &opts.file_mask,
         &mut remote_map,
+        &mut remote_retained,
     )
     .await?;
 
@@ -717,7 +790,7 @@ pub async fn plan_synchronization(
                 let act = match opts.mode {
                     SyncMode::Local => Some((SyncAction::Download, "missing locally")),
                     SyncMode::Remote => {
-                        if opts.delete_obsolete {
+                        if opts.delete_obsolete && !(r.is_dir && remote_retained.contains(&rel)) {
                             Some((SyncAction::DeleteRemote, "deleted locally"))
                         } else {
                             None
@@ -750,7 +823,7 @@ pub async fn plan_synchronization(
                 let act = match opts.mode {
                     SyncMode::Remote => Some((SyncAction::Upload, "missing on remote")),
                     SyncMode::Local => {
-                        if opts.delete_obsolete {
+                        if opts.delete_obsolete && !(l.is_dir && local_retained.contains(&rel)) {
                             Some((SyncAction::DeleteLocal, "deleted on remote"))
                         } else {
                             None
@@ -1193,12 +1266,15 @@ pub async fn apply_sync_plan(
                 if let Some(fs) = saf_fs {
                     let uri = join_saf_rel(&local_root_str, &item.rel_path);
                     if item.is_directory {
-                        let _ = fs.remove_dir_all(&uri);
+                        if fs.list_dir(&uri).map(|v| v.is_empty()).unwrap_or(false) {
+                            let _ = fs.remove_dir_all(&uri);
+                        }
                     } else if fs.stat(&uri).is_ok() {
                         fs.remove_file(&uri).map_err(|e| e.to_string())?;
                     }
                 } else if item.is_directory {
-                    let _ = std::fs::remove_dir_all(&local_path);
+                    // Remove only empty directories so excluded files or skipped symlinks survive!
+                    let _ = std::fs::remove_dir(&local_path);
                 } else if local_path.exists() {
                     std::fs::remove_file(&local_path).map_err(|e| {
                         format!("Cannot remove local file '{}': {e}", local_path.display())

@@ -516,6 +516,39 @@ pub async fn search_remote_bounded(
     .await
 }
 
+fn directory_matches_search_mask(
+    mask: &FileMask,
+    name: &str,
+    mtime: u64,
+    rel_path: &str,
+) -> bool {
+    if !mask.accepts(name, true, 0, mtime, rel_path) {
+        return false;
+    }
+    if mask.include.is_empty() {
+        return true;
+    }
+    for token in &mask.include {
+        let single = FileMask {
+            include: vec![token.clone()],
+            exclude: Vec::new(),
+        };
+        if token.directory_only {
+            if single.accepts(name, true, 0, mtime, rel_path) {
+                return true;
+            }
+        } else if token
+            .criteria
+            .iter()
+            .all(|c| !matches!(c, linscp_engine::filemask::MaskCriterion::Size { .. }))
+            && single.accepts(name, false, 0, mtime, rel_path)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 pub async fn search_remote_bounded_with_encoding(
     session: &dyn RemoteSession,
     root_dir: &str,
@@ -535,6 +568,7 @@ pub async fn search_remote_bounded_with_encoding(
     search_remote_walk(
         session,
         root_dir,
+        "",
         0,
         mask,
         text_query,
@@ -551,6 +585,7 @@ pub async fn search_remote_bounded_with_encoding(
 async fn search_remote_walk(
     session: &dyn RemoteSession,
     dir: &str,
+    rel_prefix: &str,
     depth: usize,
     mask: &FileMask,
     text_query: Option<&str>,
@@ -587,8 +622,19 @@ async fn search_remote_walk(
             stats.skipped += 1;
             continue;
         }
+        let rel_path = if rel_prefix.is_empty() {
+            entry.name.clone()
+        } else {
+            format!("{rel_prefix}/{}", entry.name)
+        };
+        let mtime_u64 = entry.mtime.max(0) as u64;
         if entry.is_dir {
-            if text_query.is_none() && mask.accepts_name(&entry.name, true) {
+            if !mask.accepts(&entry.name, true, 0, mtime_u64, &rel_path) {
+                continue;
+            }
+            if text_query.is_none()
+                && directory_matches_search_mask(mask, &entry.name, mtime_u64, &rel_path)
+            {
                 stats.matches.push(json!({
                     "path": full_path,
                     "name": entry.name,
@@ -602,6 +648,7 @@ async fn search_remote_walk(
                 Box::pin(search_remote_walk(
                     session,
                     &full_path,
+                    &rel_path,
                     depth + 1,
                     mask,
                     text_query,
@@ -617,7 +664,7 @@ async fn search_remote_walk(
             continue;
         }
 
-        if !mask.accepts(&entry.name, false, entry.size, entry.mtime as u64, &entry.name) {
+        if !mask.accepts(&entry.name, false, entry.size, mtime_u64, &rel_path) {
             continue;
         }
 
@@ -703,6 +750,7 @@ pub fn search_local_bounded_with_encoding(
     let limit = max_results.clamp(1, 2000);
     search_local_walk(
         root_dir,
+        "",
         0,
         mask,
         text_query,
@@ -717,6 +765,7 @@ pub fn search_local_bounded_with_encoding(
 #[allow(clippy::too_many_arguments)]
 fn search_local_walk(
     dir: &Path,
+    rel_prefix: &str,
     depth: usize,
     mask: &FileMask,
     text_query: Option<&str>,
@@ -749,6 +798,9 @@ fn search_local_walk(
         }
         let path = item.path();
         let name = item.file_name().to_string_lossy().into_owned();
+        if name == "." || name == ".." {
+            continue;
+        }
         let Ok(info) = stat_extended(&path) else {
             stats.skipped += 1;
             continue;
@@ -757,8 +809,19 @@ fn search_local_walk(
             stats.skipped += 1;
             continue;
         }
+        let rel_path = if rel_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel_prefix}/{name}")
+        };
+        let mtime_u64 = info.mtime_secs.max(0) as u64;
         if info.is_dir {
-            if text_query.is_none() && mask.accepts_name(&name, true) {
+            if !mask.accepts(&name, true, 0, mtime_u64, &rel_path) {
+                continue;
+            }
+            if text_query.is_none()
+                && directory_matches_search_mask(mask, &name, mtime_u64, &rel_path)
+            {
                 stats.matches.push(json!({
                     "path": path.to_string_lossy(),
                     "name": name,
@@ -771,6 +834,7 @@ fn search_local_walk(
             if depth + 1 <= MAX_SEARCH_DEPTH {
                 search_local_walk(
                     &path,
+                    &rel_path,
                     depth + 1,
                     mask,
                     text_query,
@@ -785,7 +849,7 @@ fn search_local_walk(
             continue;
         }
 
-        if !mask.accepts(&name, false, info.size, info.mtime_secs as u64, &name) {
+        if !mask.accepts(&name, false, info.size, mtime_u64, &rel_path) {
             continue;
         }
         if let Some(needle) = text_query {
@@ -821,6 +885,7 @@ fn search_local_walk(
                     "permissions": info.permissions,
                     "line": line_no,
                     "preview": preview,
+                    "snippet": preview,
                 }));
             }
         } else {
@@ -832,6 +897,185 @@ fn search_local_walk(
                 "size": info.size,
                 "mtime": info.mtime_secs,
                 "permissions": info.permissions,
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// Bounded recursive search over a granted Android SAF folder (`content://`) via `LocalFs`.
+pub fn search_saf_bounded_with_encoding(
+    fs: &dyn LocalFs,
+    root_uri: &str,
+    mask: &FileMask,
+    text_query: Option<&str>,
+    case_sensitive: bool,
+    encoding: Option<&str>,
+    max_results: usize,
+) -> Result<SearchStats, String> {
+    if let Some(enc) = encoding.map(str::trim).filter(|s| !s.is_empty()) {
+        if !linscp_engine::text_mode::is_supported_encoding(enc) {
+            return Err(format!("Unsupported character encoding '{enc}'."));
+        }
+    }
+    let mut stats = SearchStats::default();
+    let limit = max_results.clamp(1, 2000);
+    search_saf_walk(
+        fs,
+        root_uri,
+        "",
+        0,
+        mask,
+        text_query,
+        case_sensitive,
+        encoding,
+        limit,
+        &mut stats,
+    )?;
+    Ok(stats)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_saf_walk(
+    fs: &dyn LocalFs,
+    dir_uri: &str,
+    rel_prefix: &str,
+    depth: usize,
+    mask: &FileMask,
+    text_query: Option<&str>,
+    case_sensitive: bool,
+    encoding: Option<&str>,
+    limit: usize,
+    stats: &mut SearchStats,
+) -> Result<(), String> {
+    if depth > MAX_SEARCH_DEPTH || stats.truncated {
+        stats.truncated = true;
+        return Ok(());
+    }
+    let mut entries = match fs.list_dir(dir_uri) {
+        Ok(list) => list,
+        Err(e) => {
+            if depth == 0 {
+                return Err(e.to_string());
+            }
+            stats.skipped += 1;
+            return Ok(());
+        }
+    };
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    for entry in entries {
+        if entry.name == "." || entry.name == ".." {
+            continue;
+        }
+        if stats.matches.len() >= limit {
+            stats.truncated = true;
+            return Ok(());
+        }
+        if entry.is_symlink {
+            stats.skipped += 1;
+            continue;
+        }
+        let full_uri = format!(
+            "{}/document/{}",
+            dir_uri.trim_end_matches('/'),
+            linscp_platform::encode_saf_segment(&entry.name)
+        );
+        let rel_path = if rel_prefix.is_empty() {
+            entry.name.clone()
+        } else {
+            format!("{rel_prefix}/{}", entry.name)
+        };
+        let mtime_u64 = entry.mtime.max(0) as u64;
+        if entry.is_dir {
+            if !mask.accepts(&entry.name, true, 0, mtime_u64, &rel_path) {
+                continue;
+            }
+            if text_query.is_none()
+                && directory_matches_search_mask(mask, &entry.name, mtime_u64, &rel_path)
+            {
+                stats.matches.push(json!({
+                    "path": full_uri,
+                    "name": entry.name,
+                    "is_dir": true,
+                    "size": 0,
+                    "mtime": entry.mtime,
+                    "permissions": entry.permissions,
+                }));
+            }
+            if depth + 1 <= MAX_SEARCH_DEPTH {
+                search_saf_walk(
+                    fs,
+                    &full_uri,
+                    &rel_path,
+                    depth + 1,
+                    mask,
+                    text_query,
+                    case_sensitive,
+                    encoding,
+                    limit,
+                    stats,
+                )?;
+            } else {
+                stats.truncated = true;
+            }
+            continue;
+        }
+
+        if !mask.accepts(&entry.name, false, entry.size, mtime_u64, &rel_path) {
+            continue;
+        }
+        if let Some(needle) = text_query {
+            if stats.scanned >= MAX_SEARCH_CONTENT_FILES {
+                stats.truncated = true;
+                return Ok(());
+            }
+            if entry.size > MAX_SEARCH_FILE_BYTES
+                || entry.size > linscp_platform::MAX_SAF_DOCUMENT_BYTES
+            {
+                stats.skipped += 1;
+                continue;
+            }
+            if stats.bytes_scanned.saturating_add(entry.size) > MAX_SEARCH_TOTAL_BYTES {
+                stats.truncated = true;
+                return Ok(());
+            }
+            let Ok(bytes) = fs.read_bytes(&full_uri) else {
+                stats.skipped += 1;
+                continue;
+            };
+            if bytes.len() as u64 > MAX_SEARCH_FILE_BYTES {
+                stats.skipped += 1;
+                continue;
+            }
+            stats.scanned += 1;
+            stats.bytes_scanned = stats.bytes_scanned.saturating_add(bytes.len() as u64);
+            let Ok((text, _, _, _)) = decode_editor_bytes(&bytes, encoding) else {
+                stats.skipped += 1;
+                continue;
+            };
+            if let Some((line_no, preview)) = find_text_line(&text, needle, case_sensitive) {
+                stats.matches.push(json!({
+                    "path": full_uri,
+                    "name": entry.name,
+                    "is_dir": false,
+                    "size": entry.size,
+                    "mtime": entry.mtime,
+                    "permissions": entry.permissions,
+                    "line": line_no,
+                    "preview": preview,
+                    "snippet": preview,
+                }));
+            }
+        } else {
+            stats.scanned += 1;
+            stats.matches.push(json!({
+                "path": full_uri,
+                "name": entry.name,
+                "is_dir": false,
+                "size": entry.size,
+                "mtime": entry.mtime,
+                "permissions": entry.permissions,
             }));
         }
     }

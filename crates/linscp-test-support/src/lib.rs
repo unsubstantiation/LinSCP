@@ -339,6 +339,7 @@ pub enum MemNode {
 
 pub struct MemFs {
     pub nodes: HashMap<String, MemNode>,
+    pub disable_shell_cp: bool,
 }
 
 impl MemFs {
@@ -365,7 +366,10 @@ impl MemFs {
                 mtime: 1_760_000_000,
             },
         );
-        Self { nodes }
+        Self {
+            nodes,
+            disable_shell_cp: false,
+        }
     }
 
     pub fn normalize(path: &str) -> String {
@@ -788,10 +792,13 @@ async fn handle_mock_exec(channel: Channel<Msg>, cmd: String, fs: Arc<Mutex<MemF
                 }
             }
             "cp" => {
-                if args.len() >= 2 {
+                let mut guard = fs.lock().await;
+                if guard.disable_shell_cp {
+                    code = 127;
+                    stderr.push_str("sh: 1: cp: not found\n");
+                } else if args.len() >= 2 {
                     let dst = MemFs::normalize(&args[args.len() - 1]);
                     let src = MemFs::normalize(&args[args.len() - 2]);
-                    let mut guard = fs.lock().await;
                     if let Some(node) = guard.nodes.get(&src).cloned() {
                         guard.nodes.insert(dst, node);
                     } else {

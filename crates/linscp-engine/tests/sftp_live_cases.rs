@@ -798,3 +798,99 @@ async fn test_etag_names_a_protocol_that_has_no_etags() {
 
     sftp.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_synchronize_preserves_masked_files_in_deleted_dirs_and_skips_symlinks() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let local = tmp.path().join("sync-mask-dir");
+    fs::create_dir_all(local.join("local_only_sub")).unwrap();
+    fs::write(local.join("local_only_sub").join("secret.env"), b"LOCAL_KEY=1\n").unwrap();
+    fs::write(local.join("local_only_sub").join("obsolete.txt"), b"remove me\n").unwrap();
+    fs::write(local.join("root.txt"), b"shared root\n").unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(".", local.join("self_loop")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent-linscp-target", local.join("broken_link")).unwrap();
+    }
+
+    let (sftp, _fp) = connect_mock(0x5f, 0x60).await;
+    sftp.mkdir("/home/tester/sync-mask-dir").await.unwrap();
+    sftp.mkdir("/home/tester/sync-mask-dir/remote_only_sub").await.unwrap();
+    seed_remote(
+        &sftp,
+        "/home/tester/sync-mask-dir/remote_only_sub/secret.env",
+        b"REMOTE_KEY=2\n",
+        None,
+    )
+    .await;
+    seed_remote(
+        &sftp,
+        "/home/tester/sync-mask-dir/remote_only_sub/stale.txt",
+        b"delete remotely\n",
+        None,
+    )
+    .await;
+    seed_remote(&sftp, "/home/tester/sync-mask-dir/root.txt", b"shared root\n", None).await;
+    sftp.symlink(".", "/home/tester/sync-mask-dir/remote_loop")
+        .await
+        .unwrap();
+    sftp.symlink(
+        "/missing-remote-target",
+        "/home/tester/sync-mask-dir/remote_broken",
+    )
+    .await
+    .unwrap();
+
+    let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
+    adopt(&mut interp, Arc::clone(&sftp), tmp.path());
+
+    // 1. `synchronize local -filemask=|*.env -delete`: deletes `local_only_sub/obsolete.txt`
+    //    without wiping `local_only_sub/secret.env` or looping on symlinks.
+    let (ok_loc, out_loc) = run_script(
+        &mut interp,
+        "option confirm off ; synchronize local -filemask=|*.env -delete ./sync-mask-dir /home/tester/sync-mask-dir ; exit",
+    )
+    .await;
+    assert!(ok_loc, "synchronize local with masked child succeeds: {out_loc}");
+    assert!(
+        !local.join("local_only_sub").join("obsolete.txt").exists(),
+        "included obsolete local file is deleted"
+    );
+    assert_eq!(
+        fs::read(local.join("local_only_sub").join("secret.env")).unwrap(),
+        b"LOCAL_KEY=1\n",
+        "excluded local .env file inside obsolete directory MUST survive -delete"
+    );
+
+    // 2. `synchronize remote -filemask=|*.env -delete`: deletes `remote_only_sub/stale.txt`
+    //    without attempting `rmdir` on `remote_only_sub` (which still holds `secret.env`).
+    let mut interp2 = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
+    adopt(&mut interp2, Arc::clone(&sftp), tmp.path());
+    let (ok_rem, out_rem) = run_script(
+        &mut interp2,
+        "option sftpriskypublish on ; option confirm off ; synchronize remote -filemask=|*.env -delete ./sync-mask-dir /home/tester/sync-mask-dir ; exit",
+    )
+    .await;
+    assert!(ok_rem, "synchronize remote with masked child succeeds: {out_rem}");
+    assert!(
+        sftp.stat("/home/tester/sync-mask-dir/remote_only_sub/stale.txt")
+            .await
+            .unwrap()
+            .is_none(),
+        "included stale remote file is deleted"
+    );
+    assert_eq!(
+        download_bytes(
+            &*sftp,
+            "/home/tester/sync-mask-dir/remote_only_sub/secret.env",
+            TransferRequest::default()
+        )
+        .await
+        .unwrap(),
+        b"REMOTE_KEY=2\n",
+        "excluded remote .env file survives -delete"
+    );
+
+    sftp.close().await.unwrap();
+}
+

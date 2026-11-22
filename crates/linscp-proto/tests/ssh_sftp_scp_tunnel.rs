@@ -987,3 +987,47 @@ Private-MAC: 1459a716b2ebdea871aa101e3a6fe0801798df2f
     assert_eq!(sftp.pwd().await.unwrap(), "/home/tester");
     sftp.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn scp_copy_file_refuses_self_copy_and_signals_unsupported_when_cp_missing() {
+    let user_key = common::generate_ed25519_ssh_key(0x4a, "scp-nocp");
+    let (port, host_sha256, _host_md5, fs) =
+        start_mock_ssh_server(0x4b, user_key.private_key.public_key().clone(), false).await;
+    let cfg = SshConnectConfig {
+        tab_id: 91,
+        role: "destination".to_string(),
+        host: "127.0.0.1".to_string(),
+        port,
+        username: "tester".to_string(),
+        private_key_pem: Some(Zeroizing::new(user_key.openssh_pem)),
+        pinned_host_key: Some(host_sha256),
+        ..Default::default()
+    };
+    let scp = ScpSession::connect(&cfg, None, 0).await.expect("SCP connect");
+    upload_bytes(&scp, "/home/tester/src.txt", b"streamed fallback", TransferRequest::default())
+        .await
+        .unwrap();
+
+    // Self-copy must be rejected before invoking remote `cp`.
+    let self_err = scp
+        .copy_file("/home/tester/src.txt", "/home/tester/src.txt")
+        .await
+        .expect_err("self-copy must fail");
+    assert!(self_err.to_string().contains("onto itself"), "{self_err}");
+
+    // When the remote shell lacks `cp` (exit 127), `copy_file` must return
+    // `UnsupportedCapability("cp", ProtocolScheme::Scp)` so callers fall back
+    // to streaming through the client.
+    fs.lock().await.disable_shell_cp = true;
+    match scp
+        .copy_file("/home/tester/src.txt", "/home/tester/dst.txt")
+        .await
+    {
+        Err(ProtoError::UnsupportedCapability(cap, ProtocolScheme::Scp)) => {
+            assert_eq!(cap, "cp");
+        }
+        other => panic!("expected UnsupportedCapability(cp, Scp), got {other:?}"),
+    }
+    scp.close().await.unwrap();
+}
+

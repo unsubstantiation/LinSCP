@@ -4609,6 +4609,70 @@ function options(id) {
     responses['/api/status'] = prevStatusResp;
     responses['/api/remote/list'] = prevRemoteListResp;
     await window.refreshStatus();
+
+    // 13. Windows & SAF parent-path navigation + local directory search (`/api/local/search`).
+    check('localParentPath navigates Windows drive paths without corrupting to /',
+      window.localParentPath('C:\\Users\\alice\\Documents') === 'C:\\Users\\alice' &&
+      window.localParentPath('C:\\Users') === 'C:\\' &&
+      window.localParentPath('C:\\') === 'C:\\');
+    check('localParentPath preserves encoded Android SAF document URIs',
+      window.localParentPath('content://com.android.externalstorage.documents/tree/primary%3ADownload/document/primary%3ADownload%2Fnotes%2Ftodo.txt') ===
+      'content://com.android.externalstorage.documents/tree/primary%3ADownload');
+
+    const prevLocalList = responses['/api/local/list'];
+    let lastLocalListPath = null;
+    responses['/api/local/search'] = {
+      success: true,
+      matches: [{
+        path: 'C:\\Users\\alice\\Documents\\todo.txt',
+        name: 'todo.txt',
+        is_dir: false,
+        size: 42,
+        line: 3,
+        snippet: 'ship release'
+      }],
+      scanned: 2,
+      skipped: 0,
+      bytes_scanned: 128,
+      truncated: false
+    };
+    const origInvokeSearch = window.__TAURI_INTERNALS__.invoke;
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      if (cmd === 'linscp_invoke' && args && args.envelope && args.envelope.path.startsWith('/api/local/list')) {
+        const q = args.envelope.path.split('?')[1] || '';
+        const params = new URLSearchParams(q);
+        lastLocalListPath = params.get('path');
+        return {
+          status: 200,
+          payload: { path: lastLocalListPath, entries: [{ name: 'todo.txt', is_dir: false, size: 42, permissions: '-rw-r--r--', date: '2026-11-20' }] }
+        };
+      }
+      return origInvokeSearch(cmd, args);
+    };
+    window.openSearch('local');
+    check('openSearch("local") selects local target and populates local path',
+      doc.getElementById('searchTarget').value === 'local' &&
+      doc.getElementById('searchModalTitle').textContent.indexOf('local') >= 0);
+    doc.getElementById('searchPath').value = 'C:\\Users\\alice';
+    doc.getElementById('searchPattern').value = '*.txt|node_modules/';
+    doc.getElementById('searchContents').checked = true;
+    window.toggleSearchContents();
+    doc.getElementById('searchText').value = 'ship';
+    await window.runSearch();
+    const localSearchCall = calls.filter(c => c.path === '/api/local/search').pop();
+    check('local search posts to /api/local/search with pattern and content query',
+      !!localSearchCall &&
+      JSON.parse(localSearchCall.options.body).path === 'C:\\Users\\alice' &&
+      JSON.parse(localSearchCall.options.body).pattern === '*.txt|node_modules/' &&
+      JSON.parse(localSearchCall.options.body).content_query === 'ship');
+    const firstMatchRow = doc.getElementById('searchResults').children[0];
+    await firstMatchRow.ondblclick();
+    check('double-clicking a Windows local search result navigates local pane to Windows parent directory',
+      lastLocalListPath === 'C:\\Users\\alice\\Documents');
+    window.__TAURI_INTERNALS__.invoke = origInvokeSearch;
+    responses['/api/local/list'] = prevLocalList;
+    delete responses['/api/local/search'];
+    await window.loadLocal('/tmp/slowlocal');
   }
 
   check('no script errors', errors.length === 0, errors.join(' | '));

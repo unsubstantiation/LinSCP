@@ -1245,6 +1245,81 @@ impl S3Session {
             completed_parts: BTreeMap::new(),
         })
     }
+
+    async fn list_all_keys_with_prefix(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>, ProtoError> {
+        let mut keys = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        loop {
+            let mut qp = vec![
+                ("list-type".to_string(), "2".to_string()),
+                ("prefix".to_string(), prefix.to_string()),
+            ];
+            if let Some(tok) = &continuation_token {
+                qp.push(("continuation-token".to_string(), tok.clone()));
+            }
+            let resp = self
+                .send_signed(Method::GET, Some(bucket), "", &qp, &[], Vec::new())
+                .await?;
+            let status = resp.status();
+            let xml = resp.text().await.map_err(|e| {
+                ProtoError::Transport(format!("Reading S3 ListObjectsV2 XML failed: {e}"))
+            })?;
+            if !status.is_success() {
+                return Err(parse_s3_error_xml(status, &xml));
+            }
+            reject_xxe_declarations(&xml)?;
+            let doc = roxmltree::Document::parse(&xml).map_err(|e| {
+                ProtoError::Transport(format!("Malformed S3 ListObjectsV2 XML: {e}"))
+            })?;
+            for item in doc
+                .descendants()
+                .filter(|n| n.is_element() && n.tag_name().name() == "Contents")
+            {
+                if let Some(key) = item
+                    .children()
+                    .find(|c| c.is_element() && c.tag_name().name() == "Key")
+                    .and_then(|c| c.text())
+                {
+                    if key.starts_with(prefix) {
+                        keys.push(key.to_string());
+                    }
+                }
+            }
+            let is_truncated = doc
+                .descendants()
+                .find(|n| n.is_element() && n.tag_name().name() == "IsTruncated")
+                .and_then(|n| n.text())
+                .map(|t| t.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !is_truncated {
+                break;
+            }
+            let next_tok = doc
+                .descendants()
+                .find(|n| n.is_element() && n.tag_name().name() == "NextContinuationToken")
+                .and_then(|n| n.text())
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    ProtoError::Transport(
+                        "Truncated S3 ListObjectsV2 response has no continuation token."
+                            .to_string(),
+                    )
+                })?;
+            if continuation_token.as_deref() == Some(next_tok.as_str()) {
+                return Err(ProtoError::Transport(
+                    "Truncated S3 ListObjectsV2 response repeated a continuation token."
+                        .to_string(),
+                ));
+            }
+            continuation_token = Some(next_tok);
+        }
+        Ok(keys)
+    }
 }
 
 #[async_trait]
@@ -1495,9 +1570,23 @@ impl RemoteSession for S3Session {
                     "Cannot create the directory '/{bucket}': that name already exists."
                 )));
             }
-            // CreateBucket (`PUT /bucket`)
+            // CreateBucket (`PUT /bucket`), sending LocationConstraint outside us-east-1.
+            let (hdrs, req_body) = if self.region.is_empty()
+                || self.region.eq_ignore_ascii_case("us-east-1")
+            {
+                (Vec::new(), Vec::new())
+            } else {
+                let cfg_xml = format!(
+                    "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>{}</LocationConstraint></CreateBucketConfiguration>",
+                    xml_escape(&self.region)
+                );
+                (
+                    vec![("content-type".to_string(), "application/xml".to_string())],
+                    cfg_xml.into_bytes(),
+                )
+            };
             let resp = self
-                .send_signed(Method::PUT, Some(&bucket), "", &[], &[], Vec::new())
+                .send_signed(Method::PUT, Some(&bucket), "", &[], &hdrs, req_body)
                 .await?;
             let status = resp.status();
             if !status.is_success() {
@@ -1557,8 +1646,61 @@ impl RemoteSession for S3Session {
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<(), ProtoError> {
-        self.copy_file(from, to).await?;
-        self.remove_file(from).await
+        let (Some(src_bucket), src_raw_key) = self.split_bucket_and_key(from)? else {
+            return Err(ProtoError::Transport(
+                "S3 rename source requires bucket and key.".to_string(),
+            ));
+        };
+        let (Some(dst_bucket), dst_raw_key) = self.split_bucket_and_key(to)? else {
+            return Err(ProtoError::Transport(
+                "S3 rename destination requires bucket and key.".to_string(),
+            ));
+        };
+        let src_trimmed = src_raw_key.trim_matches('/');
+        let dst_trimmed = dst_raw_key.trim_matches('/');
+        if src_trimmed.is_empty() || dst_trimmed.is_empty() {
+            return Err(ProtoError::Transport(
+                "S3 bucket roots cannot be renamed.".to_string(),
+            ));
+        }
+        if src_bucket == dst_bucket && (src_raw_key == dst_raw_key || src_trimmed == dst_trimmed) {
+            return Ok(());
+        }
+        // Scalar object rename when an exact key exists at `from`.
+        if !src_raw_key.ends_with('/') {
+            if self.stat_version(from, "").await?.is_some() {
+                self.copy_file(from, to).await?;
+                return self.remove_file(from).await;
+            }
+        }
+        // Virtual folder / prefix rename (`src_trimmed/...` -> `dst_trimmed/...`):
+        // copy every matching object first before removing any source key.
+        let src_prefix = format!("{src_trimmed}/");
+        let dst_prefix = format!("{dst_trimmed}/");
+        if src_bucket == dst_bucket && dst_prefix.starts_with(&src_prefix) {
+            return Err(ProtoError::Transport(format!(
+                "Cannot move S3 directory '{from}' into its own subdirectory '{to}'."
+            )));
+        }
+        let keys = self
+            .list_all_keys_with_prefix(&src_bucket, &src_prefix)
+            .await?;
+        if keys.is_empty() {
+            return Err(ProtoError::Transport(format!(
+                "S3 object or directory '{from}' does not exist."
+            )));
+        }
+        for full_src_key in &keys {
+            let suffix = full_src_key.strip_prefix(&src_prefix).unwrap_or("");
+            let src_obj_path = format!("/{src_bucket}/{full_src_key}");
+            let dst_obj_path = format!("/{dst_bucket}/{dst_prefix}{suffix}");
+            self.copy_file(&src_obj_path, &dst_obj_path).await?;
+        }
+        for full_src_key in &keys {
+            let src_obj_path = format!("/{src_bucket}/{full_src_key}");
+            self.remove_file(&src_obj_path).await?;
+        }
+        Ok(())
     }
 
     async fn copy_file(&self, from: &str, to: &str) -> Result<(), ProtoError> {
@@ -1572,6 +1714,16 @@ impl RemoteSession for S3Session {
                 "S3 copy destination requires bucket and key.".to_string(),
             ));
         };
+        if src_key.is_empty() || dst_key.is_empty() {
+            return Err(ProtoError::Transport(
+                "S3 copy source and destination object keys must not be empty.".to_string(),
+            ));
+        }
+        if src_bucket == dst_bucket && src_key == dst_key {
+            return Err(ProtoError::Transport(format!(
+                "Cannot copy S3 object '{from}' onto itself."
+            )));
+        }
         let copy_source = s3_uri_encode_path(&format!("/{src_bucket}/{src_key}"));
 
         // Objects exceeding `multipart_threshold` (except `.filepart` stage renames)
@@ -1740,6 +1892,11 @@ impl RemoteSession for S3Session {
                 "S3 download requires a bucket and object key.".to_string(),
             ));
         };
+        if key.is_empty() {
+            return Err(ProtoError::Transport(
+                "S3 download object key must not be empty.".to_string(),
+            ));
+        }
         let mut qp = Vec::new();
         if let Some(vid) = opts.version_id.as_deref().filter(|v| !v.is_empty()) {
             qp.push(("versionId".to_string(), vid.to_string()));
@@ -1812,6 +1969,9 @@ impl RemoteSession for S3Session {
         let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else {
             return Err(ProtoError::Transport("S3 download requires a bucket and object key.".to_string()));
         };
+        if key.is_empty() {
+            return Err(ProtoError::Transport("S3 download object key must not be empty.".to_string()));
+        }
         let mut headers = vec![("if-match".to_string(), etag.to_string())];
         if opts.resume_offset > 0 { headers.push(("range".to_string(), format!("bytes={}-", opts.resume_offset))); }
         let mut response = self.send_signed(Method::GET, Some(&bucket), &key, &[], &headers, Vec::new()).await?;
@@ -1852,6 +2012,9 @@ impl RemoteSession for S3Session {
         let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else {
             return Err(ProtoError::Transport("S3 download requires a bucket and object key.".to_string()));
         };
+        if key.is_empty() {
+            return Err(ProtoError::Transport("S3 download object key must not be empty.".to_string()));
+        }
         let headers = vec![("if-match".to_string(), etag.to_string()), ("range".to_string(), format!("bytes=0-{}", prefix_len - 1))];
         let mut response = self.send_signed(Method::GET, Some(&bucket), &key, &[], &headers, Vec::new()).await?;
         let expected = format!("bytes 0-{}/{}", prefix_len - 1, total_len);
