@@ -539,6 +539,7 @@ impl CommanderService {
             ("POST", "/api/local/delete") => self.handle_local_delete(req.body),
             ("POST", "/api/local/rename") => self.handle_local_rename(req.body),
             ("POST", "/api/local/chmod") => self.handle_local_chmod(req.body),
+            ("POST", "/api/local/checksum") => self.handle_local_checksum(req.body),
             ("POST", "/api/local/link") => self.handle_local_link(req.body),
             ("POST", "/api/local/save") => self.handle_local_save(req.body),
             ("POST", "/api/local/drop") => self.handle_local_drop(&query, req.body),
@@ -656,6 +657,7 @@ impl CommanderService {
             ("POST", "/api/remote/save") => self.remote_save_async(req.body).await,
             ("POST", "/api/editor/external") => self.open_external_editor_async(req.body).await,
             ("POST", "/api/editor/external/sync") => self.sync_external_editor_async(req.body).await,
+            ("POST", "/api/editor/external/close") => self.close_external_editor_async(req.body).await,
             ("POST", "/api/command/exec") => Box::pin(self.exec_cli_command_async(req.body)).await,
             ("POST", "/api/sync/preview") => Box::pin(self.sync_preview_async(req.body)).await,
             ("POST", "/api/sync/run") => Box::pin(self.sync_run_async(req.body)).await,
@@ -1768,7 +1770,87 @@ impl CommanderService {
         self.chmod_remote_async(body).await
     }
 
-    /// Server-side copy: one source name and one absolute destination path.
+    async fn stream_remote_copy_via_temp(
+        &self,
+        session: &dyn linscp_proto::RemoteSession,
+        from: &str,
+        src_entry: &linscp_types::FileEntry,
+        destination: &str,
+    ) -> Result<(), String> {
+        let stage_base = self.config_root().join("copy-staging");
+        linscp_platform::create_private_dir(&stage_base).map_err(|e| e.to_string())?;
+        let mut rnd = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut rnd);
+        let tmp_path = stage_base.join(format!(
+            "copy-{}.tmp",
+            linscp_crypto::digests::hex_encode(&rnd)
+        ));
+        let outcome = async {
+            {
+                let mut sink = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                session
+                    .download(from, linscp_proto::TransferRequest::default(), &mut sink, None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                tokio::io::AsyncWriteExt::flush(&mut sink)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            let len = std::fs::metadata(&tmp_path)
+                .map(|m| m.len())
+                .unwrap_or(src_entry.size);
+            let mode = linscp_engine::filemask::mode_from_permissions_str(&src_entry.permissions);
+            let opts = linscp_proto::TransferRequest {
+                preserve_time: src_entry.mtime > 0,
+                mtime: (src_entry.mtime > 0).then_some(src_entry.mtime),
+                permissions: (mode != 0).then_some(mode),
+                ..Default::default()
+            };
+            let is_ftp = matches!(
+                session.scheme(),
+                linscp_types::ProtocolScheme::Ftp
+                    | linscp_types::ProtocolScheme::Ftps
+                    | linscp_types::ProtocolScheme::Ftpes
+            );
+            let mut reader = tokio::fs::File::open(&tmp_path)
+                .await
+                .map_err(|e| e.to_string())?;
+            if is_ftp {
+                session
+                    .upload(destination, opts, &mut reader, Some(len), None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            } else {
+                match session
+                    .upload_exclusive(destination, opts.clone(), &mut reader, Some(len), None)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(linscp_proto::ProtoError::UnsupportedCapability(_, _)) => {
+                        let mut fallback_reader = tokio::fs::File::open(&tmp_path)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        session
+                            .upload(destination, opts, &mut fallback_reader, Some(len), None)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Err(err) => return Err(err.to_string()),
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let _ = std::fs::remove_file(&tmp_path);
+        outcome
+    }
+
+    /// Server-side copy: one source name and an absolute or relative destination path.
     async fn copy_remote_async(&self, body: Value) -> ApiReply {
         let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
         let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
@@ -1778,25 +1860,74 @@ impl CommanderService {
         let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
         let source = body.get("source").and_then(Value::as_str).unwrap_or("");
         let source = match ops::validate_leaf_name(source) { Ok(leaf) => leaf, Err(error) => return api_error(400, error) };
-        let destination = body.get("destination").and_then(Value::as_str).unwrap_or("");
-        let destination = match validate_remote_absolute_path(destination) {
-            Ok(path) => path,
-            Err(error) => return api_error(400, error),
+        let raw_dest = body.get("destination").and_then(Value::as_str).unwrap_or("").trim();
+        if raw_dest.is_empty() {
+            return api_error(400, "A destination path or file name is required.");
+        }
+        let dest_ends_slash = raw_dest.ends_with('/') && raw_dest.len() > 1;
+        let mut destination = if raw_dest.starts_with('/') {
+            match validate_remote_absolute_path(raw_dest) {
+                Ok(path) => path,
+                Err(error) => return api_error(400, error),
+            }
+        } else {
+            let sub = match ops::validate_relative_subpath(raw_dest) {
+                Ok(path) => path.to_string_lossy().replace('\\', "/"),
+                Err(error) => return api_error(400, error),
+            };
+            let joined = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), sub);
+            match validate_remote_absolute_path(&joined) {
+                Ok(path) => path,
+                Err(error) => return api_error(400, error),
+            }
         };
         let from = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), source);
         if from == destination { return api_error(400, "Source and destination are the same file.") }
-        match session.stat(&from).await {
+        let src_entry = match session.stat(&from).await {
             Ok(Some(entry)) if entry.is_dir => return api_error(400, "Only a single file can be copied on the server; select the files instead."),
             Ok(Some(entry)) if entry.is_symlink => return api_error(400, "A symbolic link is not copied by name; copy its target."),
-            Ok(Some(_)) => {}
+            Ok(Some(entry)) => entry,
             Ok(None) => return api_error(400, "The source file does not exist."),
             Err(error) => return api_error(400, error.to_string()),
+        };
+        // Never replace an existing file from a dialogue that did not say so;
+        // copying into an existing directory places the file inside it under its leaf name.
+        match session.stat(&destination).await {
+            Ok(Some(existing)) if existing.is_dir && !existing.is_symlink => {
+                destination = format!("{}/{}", destination.trim_end_matches('/'), source);
+                if from == destination {
+                    return api_error(400, "Source and destination are the same file.");
+                }
+                if let Ok(Some(_)) = session.stat(&destination).await {
+                    return api_error(400, "The destination already exists.");
+                }
+            }
+            Ok(Some(_)) => return api_error(400, "The destination already exists."),
+            Ok(None) if dest_ends_slash => return api_error(400, "The destination directory does not exist."),
+            Ok(None) => {}
+            Err(error) => return api_error(400, error.to_string()),
         }
-        // Never replace an existing file from a dialogue that did not say so.
-        if let Ok(Some(_)) = session.stat(&destination).await { return api_error(400, "The destination already exists.") }
-        match session.copy_file(&from, &destination).await {
-            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
-            Err(error) => api_error(400, error.to_string()),
+        let copy_outcome = match session.copy_file(&from, &destination).await {
+            Ok(()) => Ok(()),
+            Err(linscp_proto::ProtoError::UnsupportedCapability(..)) => {
+                self.stream_remote_copy_via_temp(session.as_ref(), &from, &src_entry, &destination)
+                    .await
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        match copy_outcome {
+            Ok(()) => {
+                self.record_gui_xml_action(&tab.name, |logger| {
+                    logger.record_mv_or_cp(true, &from, &destination, Ok(()));
+                });
+                ApiReply { status: 200, payload: json!({"success": true, "destination": destination}) }
+            }
+            Err(msg) => {
+                self.record_gui_xml_action(&tab.name, |logger| {
+                    logger.record_mv_or_cp(true, &from, &destination, Err(&msg));
+                });
+                api_error(400, msg)
+            }
         }
     }
 
@@ -1817,8 +1948,13 @@ impl CommanderService {
             };
         }
         let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
-        if !matches!(session.scheme(), linscp_types::ProtocolScheme::Sftp) {
-            return api_error(501, "Symbolic links can be created only over SFTP.");
+        if !matches!(
+            session.scheme(),
+            linscp_types::ProtocolScheme::Sftp
+                | linscp_types::ProtocolScheme::Scp
+                | linscp_types::ProtocolScheme::Ssh
+        ) {
+            return api_error(501, "Symbolic links can be created only over SFTP or SCP/SSH.");
         }
         let target = body.get("target").and_then(Value::as_str).unwrap_or("");
         let target = match ops::validate_leaf_name(target) { Ok(leaf) => leaf, Err(error) => return api_error(400, error) };
@@ -1829,7 +1965,7 @@ impl CommanderService {
         let link = format!("{dir}/{name}");
         if let Ok(Some(_)) = session.stat(&link).await { return api_error(400, "The link name already exists.") }
         // The target is relative to the link's directory, which is what a
-        // server-side link means; an absolute target is passed through as is.
+        // server-side link means.
         match session.symlink(&target, &link).await {
             Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
             Err(error) => api_error(400, error.to_string()),
@@ -1858,8 +1994,19 @@ impl CommanderService {
             // A directory has no checksum; report it per file instead of
             // failing the whole selection.
             let item = match session.checksum(&algorithm, &path).await {
-                Ok(hex) => json!({"name": leaf, "checksum": hex}),
-                Err(error) => json!({"name": leaf, "error": error.to_string()}),
+                Ok(hex) => {
+                    self.record_gui_xml_action(&tab.name, |logger| {
+                        logger.record_checksum(&path, &algorithm, Some(&hex), Ok(()));
+                    });
+                    json!({"name": leaf, "checksum": hex})
+                }
+                Err(error) => {
+                    let msg = error.to_string();
+                    self.record_gui_xml_action(&tab.name, |logger| {
+                        logger.record_checksum(&path, &algorithm, None, Err(&msg));
+                    });
+                    json!({"name": leaf, "error": msg})
+                }
             };
             results.push(item);
         }
@@ -3234,8 +3381,15 @@ impl CommanderService {
         }
         // The editor writes through the same upload path as a queued
         // transfer, so the transport's own atomic replace is what the user gets.
-        match linscp_proto::upload_bytes(session.as_ref(), &path, &encoded_bytes,
-            linscp_proto::TransferRequest::default()).await
+        let preserved_mode = existing
+            .as_ref()
+            .map(|entry| linscp_engine::filemask::mode_from_permissions_str(&entry.permissions))
+            .filter(|&mode| mode != 0);
+        let save_opts = linscp_proto::TransferRequest {
+            permissions: preserved_mode,
+            ..linscp_proto::TransferRequest::default()
+        };
+        match linscp_proto::upload_bytes(session.as_ref(), &path, &encoded_bytes, save_opts).await
         {
             Ok(_) => {
                 self.record_gui_xml_action(&tab.name, |logger| {
@@ -3983,7 +4137,19 @@ impl CommanderService {
                     flags,
                 }
             } else if upload {
-                queue::QueueJob::RemoteUpload { session: session.as_ref().unwrap().clone(), local_src: local, remote_dest: other, allow_overwrite, delete_source: move_item, cleanup_path: None, flags }
+                let cleanup_staging = body
+                    .get("__cleanup_staging")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                queue::QueueJob::RemoteUpload {
+                    session: session.as_ref().unwrap().clone(),
+                    local_src: local.clone(),
+                    remote_dest: other,
+                    allow_overwrite,
+                    delete_source: move_item,
+                    cleanup_path: cleanup_staging.then_some(local),
+                    flags,
+                }
             } else {
                 queue::QueueJob::RemoteDownload { session: session.as_ref().unwrap().clone(), remote_path: other, local_dest: local, allow_overwrite, delete_source: move_item, flags }
             };
@@ -4109,8 +4275,14 @@ impl CommanderService {
         for tab_id in tab_ids {
             self.queue.cancel_for_tab(tab_id);
             state.terminals.close_for_tab(tab_id);
+            state.monitors.forget(tab_id);
         }
         self.queue.clear_finished();
+        let drained_tunnels: Vec<_> = state.desktop_tunnels.drain().collect();
+        let drained_x2go: Vec<_> = state.x2go.drain().collect();
+        state.x2go_pending.clear();
+        let drained_edits: Vec<ExternalEditSession> =
+            state.external_edits.drain().map(|(_, e)| e).collect();
         state.tabs.clear();
         state.challenges.clear();
         state.pending_connections.clear();
@@ -4120,6 +4292,15 @@ impl CommanderService {
         state.auto_suspended.clear();
         state.active_tab_id = None;
         wipe_logs(&mut state.logs);
+        drop(state);
+        drop(drained_tunnels);
+        drop(drained_x2go);
+        for edit in drained_edits {
+            edit.closed.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(dir) = edit.staged_dir {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
         ApiReply { status: 200, payload: json!({"success": true, "vault": "locked"}) }
     }
 
@@ -5574,11 +5755,30 @@ impl CommanderService {
         g.terminals.close_for_tab(tab_id);
         g.desktop_tunnels.retain(|_, (owner, _)| *owner != Some(tab_id));
         let ended_viewer = g.x2go.remove(&tab_id);
+        g.x2go_pending.remove(&tab_id);
         g.monitors.forget(tab_id);
+        let closed_edit_ids: Vec<String> = g
+            .external_edits
+            .iter()
+            .filter(|(_, e)| e.is_remote && e.tab_id == Some(tab_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut closed_edits = Vec::with_capacity(closed_edit_ids.len());
+        for edit_id in closed_edit_ids {
+            if let Some(entry) = g.external_edits.remove(&edit_id) {
+                closed_edits.push(entry);
+            }
+        }
         if g.active_tab_id == Some(tab_id) { g.active_tab_id = g.tabs.keys().next().cloned(); }
         drop(g);
         self.queue.cancel_for_tab(tab_id);
         drop(ended_viewer);
+        for entry in closed_edits {
+            entry.closed.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(dir) = entry.staged_dir {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
         ApiReply{ status: 200, payload: json!({"success": true})}
     }
     fn handle_tabs_select(&self, body: Value) -> ApiReply {
@@ -5722,31 +5922,143 @@ impl CommanderService {
     }
     fn handle_local_chmod(&self, body: Value) -> ApiReply {
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
-        let base = self.active_local_dir(tab_id);
-        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let base = body
+            .get("local_dir")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.active_local_dir(tab_id));
+        let names = remote_names(&body);
         let perm = body.get("permissions").or_else(|| body.get("mode")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if name.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Select an item first."})}; }
-        let target = match resolve_contained(&base, &name) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
-        if is_saf_path(&target) {
-            // `set_permissions_mode` is the bridge's own refusal: permissions
-            // do not exist on a granted folder, so it answers before reading
-            // the mode and the 0 marks the argument unused. Routing chmod
-            // through it keeps the message in one place instead of restating
-            // it here, and a success would mean the bridge grew a permission
-            // model worth honouring.
-            return match self.local_fs.set_permissions_mode(&target, 0) {
-                Ok(()) => ApiReply{ status: 200, payload: json!({"success": true})},
-                Err(linscp_platform::PlatformError::UnsupportedUri(message)) => ApiReply{ status:400, payload: json!({"success": false, "error": message})},
-                Err(error) => ApiReply{ status:400, payload: json!({"success": false, "error": error.to_string()})},
+        if names.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Select an item first."})}; }
+        if names.len() > 1000 { return api_error(400, "Too many files selected"); }
+        for name in names {
+            let target = match resolve_contained(&base, &name) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
+            if is_saf_path(&target) {
+                // `set_permissions_mode` is the bridge's own refusal: permissions
+                // do not exist on a granted folder, so it answers before reading
+                // the mode and the 0 marks the argument unused. Routing chmod
+                // through it keeps the message in one place instead of restating
+                // it here, and a success would mean the bridge grew a permission
+                // model worth honouring.
+                match self.local_fs.set_permissions_mode(&target, 0) {
+                    Ok(()) => continue,
+                    Err(linscp_platform::PlatformError::UnsupportedUri(message)) => return ApiReply{ status:400, payload: json!({"success": false, "error": message})},
+                    Err(error) => return ApiReply{ status:400, payload: json!({"success": false, "error": error.to_string()})},
+                }
+            }
+            let current = match gui_os::stat_extended(Path::new(&target)) { Ok(s)=> s.mode, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})},};
+            let new_mode = match linscp_engine::parse_chmod_spec(&perm, current) { Ok(m)=>m, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
+            if let Err(e) = gui_os::stat_extended(Path::new(&target))
+                .and_then(|_| linscp_platform::terminal::set_local_permissions(Path::new(&target), new_mode))
+            {
+                return ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})};
+            }
+        }
+        ApiReply{ status: 200, payload: json!({"success": true})}
+    }
+
+    fn compute_local_file_checksum(
+        &self,
+        target: &str,
+        alg: linscp_crypto::digests::DigestAlgorithm,
+    ) -> Result<String, String> {
+        if is_saf_path(target) {
+            let entry = self.local_fs.stat(target).map_err(|e| e.to_string())?;
+            if entry.is_dir {
+                return Err("Cannot compute a checksum of a directory.".to_string());
+            }
+            if entry.is_symlink {
+                return Err("Cannot compute a checksum of a symbolic link.".to_string());
+            }
+            let bytes = self.local_fs.read_bytes(target).map_err(|e| e.to_string())?;
+            let mut hasher = linscp_crypto::digests::StreamingHasher::new(alg);
+            hasher.update(&bytes);
+            return Ok(hasher.finalize_hex());
+        }
+        let meta = std::fs::symlink_metadata(target).map_err(|e| e.to_string())?;
+        if meta.is_dir() {
+            return Err("Cannot compute a checksum of a directory.".to_string());
+        }
+        if meta.file_type().is_symlink() {
+            return Err("Cannot compute a checksum of a symbolic link.".to_string());
+        }
+        let mut file = std::fs::File::open(target).map_err(|e| e.to_string())?;
+        let mut hasher = linscp_crypto::digests::StreamingHasher::new(alg);
+        let mut buf = [0u8; 65_536];
+        loop {
+            let n = std::io::Read::read(&mut file, &mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(hasher.finalize_hex())
+    }
+
+    fn compute_local_checksums_in_dir(&self, base_dir: &str, body: &Value) -> ApiReply {
+        let raw_alg = body
+            .get("algorithm")
+            .and_then(Value::as_str)
+            .unwrap_or("sha-256");
+        let Some(algorithm) = checksum_algorithm(raw_alg) else {
+            return api_error(
+                400,
+                "Unsupported checksum algorithm; use sha-256, sha-1, md5 or crc32.",
+            );
+        };
+        let Some(alg) = linscp_crypto::digests::DigestAlgorithm::parse(&algorithm) else {
+            return api_error(
+                400,
+                "Unsupported checksum algorithm; use sha-256, sha-1, md5 or crc32.",
+            );
+        };
+        let names = remote_names(body);
+        if names.is_empty() {
+            return api_error(400, "Select at least one file");
+        }
+        if names.len() > 1000 {
+            return api_error(400, "Too many files selected");
+        }
+        let mut results = Vec::new();
+        for name in names {
+            let leaf = match ops::validate_leaf_name(&name) {
+                Ok(leaf) => leaf,
+                Err(error) => return api_error(400, error),
             };
+            let target = match resolve_contained(base_dir, &leaf) {
+                Ok(path) => path,
+                Err(error) => return api_error(400, error),
+            };
+            let item = match self.compute_local_file_checksum(&target, alg) {
+                Ok(hex) => json!({"name": leaf, "checksum": hex}),
+                Err(err) => json!({"name": leaf, "error": err}),
+            };
+            results.push(item);
         }
-        // Validate permission mode via ops
-        let current = match gui_os::stat_extended(Path::new(&target)) { Ok(s)=> s.mode, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})},};
-        let new_mode = match linscp_engine::parse_chmod_spec(&perm, current) { Ok(m)=>m, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
-        match gui_os::stat_extended(Path::new(&target)).and_then(|_| linscp_platform::terminal::set_local_permissions(Path::new(&target), new_mode).map_err(|e| e)) {
-            Ok(_) => ApiReply{ status: 200, payload: json!({"success": true})},
-            Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})},
+        ApiReply {
+            status: 200,
+            payload: json!({
+                "success": true,
+                "algorithm": algorithm,
+                "results": results,
+            }),
         }
+    }
+
+    fn handle_local_checksum(&self, body: Value) -> ApiReply {
+        let tab_id = tabs::parse_tab_id_value(body.get("tab"));
+        let base = body
+            .get("local_dir")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.active_local_dir(tab_id));
+        let checked_base = match check_local_pane_directory(&base, "local_dir") {
+            Ok(path) => path,
+            Err(error) => return api_error(400, error),
+        };
+        self.compute_local_checksums_in_dir(&checked_base, &body)
     }
     fn handle_local_save(&self, body: Value) -> ApiReply {
         let path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -6313,8 +6625,18 @@ impl CommanderService {
             };
             (s, t.name.clone())
         };
-        if let Some(expected_mtime) = edit.base_remote_mtime.filter(|m| *m > 0) {
-            if let Ok(Some(rem)) = session.stat(&edit.target_path).await {
+        let existing_remote = session
+            .stat(&edit.target_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(ref rem) = existing_remote {
+            if rem.is_dir {
+                return Err("Cannot overwrite a remote directory from the external editor.".to_string());
+            }
+            if rem.is_symlink {
+                return Err("Refusing to overwrite a remote symbolic link from the external editor.".to_string());
+            }
+            if let Some(expected_mtime) = edit.base_remote_mtime.filter(|m| *m > 0) {
                 if rem.mtime != expected_mtime {
                     let msg = format!(
                         "Remote file '{}' changed on server while open in external editor.",
@@ -6330,11 +6652,21 @@ impl CommanderService {
             }
         }
         let bytes = std::fs::read(&edit.staged_path).map_err(|e| e.to_string())?;
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err("Edited file exceeds the 16 MiB external editor staging limit.".to_string());
+        }
+        let preserved_mode = existing_remote
+            .as_ref()
+            .map(|rem| linscp_engine::filemask::mode_from_permissions_str(&rem.permissions))
+            .filter(|&mode| mode != 0);
         linscp_proto::upload_bytes(
             session.as_ref(),
             &edit.target_path,
             &bytes,
-            linscp_proto::TransferRequest::default(),
+            linscp_proto::TransferRequest {
+                permissions: preserved_mode,
+                ..linscp_proto::TransferRequest::default()
+            },
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -6410,6 +6742,25 @@ impl CommanderService {
         }
     }
 
+    async fn close_external_editor_async(&self, body: Value) -> ApiReply {
+        let edit_id = body.get("id").and_then(Value::as_str).unwrap_or("");
+        let force = body.get("force").and_then(Value::as_bool).unwrap_or(false);
+        let is_remote = self
+            .state
+            .lock()
+            .expect("m")
+            .external_edits
+            .get(edit_id)
+            .map(|e| e.is_remote)
+            .unwrap_or(false);
+        if is_remote && !force {
+            if let Err(err) = self.sync_external_editor_by_id(edit_id, false).await {
+                return api_error(400, err);
+            }
+        }
+        self.handle_external_editor_close(body)
+    }
+
     fn handle_external_editor_close(&self, body: Value) -> ApiReply {
         let edit_id = body.get("id").and_then(Value::as_str).unwrap_or("");
         let removed = self.state.lock().expect("m").external_edits.remove(edit_id);
@@ -6434,6 +6785,19 @@ impl CommanderService {
         }
         let ids: Vec<String> = body.get("ids").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
         if ids.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "Select at least one item to remove."})}; }
+        if ids.iter().any(|id| id == "external_edit") {
+            let drained: Vec<ExternalEditSession> = self
+                .state
+                .lock()
+                .expect("m")
+                .external_edits
+                .drain()
+                .map(|(_, e)| e)
+                .collect();
+            for entry in drained {
+                entry.closed.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         let cfg = self.state.lock().expect("m").config_root.clone();
         match ops::execute_cleanup(&cfg, &ids) {
             Ok(removed) => {
@@ -6483,7 +6847,7 @@ impl CommanderService {
     /// A drop that named no path carries its content instead: base64 from the
     /// page, a bare value, or an array. One representation inside the service
     /// keeps the drop identical everywhere.
-    fn drop_payload(body: &Value) -> Result<Vec<u8>, String> {
+    fn drop_payload(&self, body: &Value) -> Result<Vec<u8>, String> {
         // Bound first: a borrow of a temporary would tie the path to the end of
         // the `if let`, which is exactly where it is needed longest.
         let paths = Self::drop_source_paths(body);
@@ -6491,7 +6855,7 @@ impl CommanderService {
             // A native window's drop is a path, not bytes: the backend reads
             // the file itself, so the page never has to hold a whole file in
             // memory and the same endpoint serves both kinds of drop.
-            return Self::read_dropped_path(path);
+            return self.read_dropped_path(path);
         }
         if let Some(text) = body.get("data_base64").and_then(Value::as_str) {
             return BASE64_STD
@@ -6508,12 +6872,13 @@ impl CommanderService {
     }
 
     /// Reads one file a drop named.
-    fn read_dropped_path(path: &str) -> Result<Vec<u8>, String> {
+    fn read_dropped_path(&self, path: &str) -> Result<Vec<u8>, String> {
         if is_saf_path(path) {
             // A granted Android folder is not a pathname: its bytes come from
-            // the document provider, so the ordinary local filesystem reads
-            // them rather than `std::fs` guessing at a `content://` string.
-            return NativeLocalFs::new()
+            // the document provider via `self.local_fs` (which carries the
+            // active `SafBridge`), rather than `std::fs` guessing at `content://`.
+            return self
+                .local_fs
                 .read_bytes(path)
                 .map_err(|error| format!("The dropped file cannot be read: {error}"));
         }
@@ -6549,6 +6914,16 @@ impl CommanderService {
 
     /// The parent directory of a dropped path and its leaf name.
     fn dropped_path_split(path: &str) -> Result<(String, String), String> {
+        if is_saf_path(path) {
+            let parsed = linscp_platform::parse_saf_document_uri(path)
+                .map_err(|error| error.to_string())?;
+            if parsed.documents.is_empty() {
+                return Err(
+                    "The dropped SAF URI must name a document, not a tree root.".to_string(),
+                );
+            }
+            return Ok((parsed.parent_uri(), parsed.leaf_name()));
+        }
         let path = Path::new(path);
         let leaf = path
             .file_name()
@@ -6629,7 +7004,7 @@ impl CommanderService {
         if let Err(error) = ops::validate_leaf_name(&name) {
             return api_error(400, error);
         }
-        let bytes = match Self::drop_payload(&body) {
+        let bytes = match self.drop_payload(&body) {
             Ok(bytes) => bytes,
             Err(error) => return api_error(400, error),
         };
@@ -6637,15 +7012,31 @@ impl CommanderService {
             Ok(path) => path,
             Err(error) => return api_error(400, error),
         };
+        let target_path = target.to_string_lossy().into_owned();
+        let overwrite = body.get("overwrite").and_then(Value::as_str) == Some("overwrite");
+        let exists = if is_saf_path(&target_path) {
+            self.local_fs.stat(&target_path).is_ok()
+        } else {
+            std::fs::symlink_metadata(&target).is_ok()
+        };
+        if exists && !overwrite {
+            return ApiReply {
+                status: 409,
+                payload: json!({
+                    "success": false,
+                    "error": "Destination exists",
+                    "conflicts": [name],
+                }),
+            };
+        }
         if let Some(parent) = target.parent() {
             let parent = parent.to_string_lossy();
-            if !parent.is_empty() {
+            if !parent.is_empty() && !is_saf_path(&parent) {
                 if let Err(error) = self.local_fs.mkdir_all(&parent) {
                     return api_error(400, format!("Cannot create the drop folder: {error}"));
                 }
             }
         }
-        let target_path = target.to_string_lossy().into_owned();
         if let Err(error) = self.local_fs.write_bytes_atomic(&target_path, &bytes) {
             return api_error(400, format!("Cannot save the dropped file: {error}"));
         }
@@ -6716,7 +7107,7 @@ impl CommanderService {
                     }
                 }
                 Ok(DroppedKind::SafUri) | Ok(DroppedKind::File) => {
-                    let bytes = match Self::read_dropped_path(path) {
+                    let bytes = match self.read_dropped_path(path) {
                         Ok(bytes) => bytes,
                         Err(error) => {
                             refused.push(error);
@@ -6813,7 +7204,15 @@ impl CommanderService {
             _ => return api_error(400, "Not connected"),
         };
         if tab.is_local {
-            return api_error(400, "This panel has no server to upload to.");
+            let mut local_body = body.clone();
+            let dir = body
+                .get("remote_dir")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| tab.other_local_dir.clone());
+            local_body["local_dir"] = json!(dir);
+            return self.handle_local_drop(&BTreeMap::new(), local_body);
         }
         // An operating-system drop is a list of paths: a native window hands
         // over one path per item, and the page only names them. Each item is
@@ -6834,7 +7233,7 @@ impl CommanderService {
             let mut staged_paths: Vec<PathBuf> = Vec::new();
             // A failed drop removes what it already staged: the queue never saw
             // those names, so nothing else will.
-            let tidy = |staged: &[PathBuf]| {
+            let tidy = |staged: &[PathBuf], batch_dir: &Path| {
                 for path in staged {
                     if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
                         let _ = std::fs::remove_dir_all(path);
@@ -6842,26 +7241,27 @@ impl CommanderService {
                         let _ = std::fs::remove_file(path);
                     }
                 }
+                let _ = std::fs::remove_dir(batch_dir);
             };
             for path in &source_paths {
-                let relative = match Self::stage_dropped_path(path, &staging) {
+                let relative = match self.stage_dropped_path(path, &staging) {
                     Ok(relative) => relative,
                     Err(error) => {
-                        tidy(&staged_paths);
+                        tidy(&staged_paths, &staging);
                         return api_error(400, error);
                     }
                 };
                 if names.contains(&relative) {
                     // Two items of one drop cannot share a name: the queue
                     // would upload the same staging path twice.
-                    tidy(&staged_paths);
+                    tidy(&staged_paths, &staging);
                     return api_error(400, "Two dropped items have the same name.");
                 }
                 staged_paths.push(staging.join(&relative));
                 names.push(relative);
             }
             if names.is_empty() {
-                tidy(&staged_paths);
+                tidy(&staged_paths, &staging);
                 return api_error(400, "The drop contained nothing that can be uploaded.");
             }
             let mut request = json!({
@@ -6869,6 +7269,7 @@ impl CommanderService {
                 "local_dir": staging.to_string_lossy(),
                 "remote_dir": remote_dir,
                 "names": names,
+                "__cleanup_staging": true,
             });
             // The approvals a dialog collected belong to the same request, so a
             // retry is the same drop plus one decision.
@@ -6885,11 +7286,11 @@ impl CommanderService {
                 // refusal), so the staged copy is ours again. It has to go now:
                 // the page retries the same drop with the decision, and a
                 // staging entry that already exists would refuse that retry.
-                tidy(&staged_paths);
+                tidy(&staged_paths, &staging);
             }
             return reply;
         }
-        let bytes = match Self::drop_payload(&body) {
+        let bytes = match self.drop_payload(&body) {
             Ok(bytes) => bytes,
             Err(error) => return api_error(400, error),
         };
@@ -6898,7 +7299,7 @@ impl CommanderService {
         if name.is_empty() {
             name = source_paths
                 .first()
-                .and_then(|path| Path::new(path).file_name().map(|leaf| leaf.to_string_lossy().into_owned()))
+                .and_then(|path| Self::dropped_path_split(path).ok().map(|(_, leaf)| leaf))
                 .unwrap_or_default();
         }
         if name.is_empty() {
@@ -6923,6 +7324,7 @@ impl CommanderService {
         };
         let staged = staging.join(&name);
         if let Err(error) = std::fs::write(&staged, &bytes) {
+            let _ = std::fs::remove_dir_all(&staging);
             return api_error(500, format!("Cannot stage the dropped file: {error}"));
         }
         let mut request = json!({
@@ -6930,6 +7332,7 @@ impl CommanderService {
             "local_dir": staging.to_string_lossy(),
             "remote_dir": destination_dir,
             "names": [name],
+            "__cleanup_staging": true,
         });
         for key in ["accept_directory_copy_risk", "accept_ftp_rename_risk", "merge_directories",
                     "overwrite", "priority", "preserve_time", "conflict_versions", "resume",
@@ -6941,13 +7344,28 @@ impl CommanderService {
         let reply = self.queue_transfer_async(request, true, false).await;
         if !reply.payload.get("success").and_then(Value::as_bool).unwrap_or(false) {
             // The queue never took it, so the staged copy is ours to remove.
-            let _ = std::fs::remove_file(&staged);
+            let _ = std::fs::remove_dir_all(&staging);
         }
         reply
     }
 
     /// Creates the remote directories a dropped folder contained.
     async fn handle_transfer_drop_dir(&self, body: Value) -> ApiReply {
+        if let Some(tab_id) = tabs::parse_tab_id_value(body.get("tab")) {
+            if let Some(tab) = self.state.lock().expect("m").tabs.get(&tab_id).cloned() {
+                if tab.connected && tab.is_local {
+                    let mut local_body = body.clone();
+                    let dir = body
+                        .get("remote_dir")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| tab.other_local_dir.clone());
+                    local_body["local_dir"] = json!(dir);
+                    return self.handle_local_drop_dir(&BTreeMap::new(), local_body);
+                }
+            }
+        }
         let remote_dir = body.get("remote_dir").and_then(Value::as_str).unwrap_or("").trim().to_string();
         if remote_dir.is_empty() || !remote_dir.starts_with('/') {
             return api_error(400, "A destination directory is required.");
@@ -7045,7 +7463,7 @@ impl CommanderService {
     ///
     /// The staged root is created exclusively: a drop must not replace a
     /// staging entry another request is uploading from.
-    fn stage_dropped_path(source: &str, staging: &Path) -> Result<String, String> {
+    fn stage_dropped_path(&self, source: &str, staging: &Path) -> Result<String, String> {
         let (_, leaf) = Self::dropped_path_split(source)?;
         let relative = leaf.clone();
         let staged = staging.join(&leaf);
@@ -7064,7 +7482,7 @@ impl CommanderService {
                 }
             }
             Ok(_) => {
-                let bytes = Self::read_dropped_path(source)?;
+                let bytes = self.read_dropped_path(source)?;
                 let mut file = std::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
@@ -7079,11 +7497,18 @@ impl CommanderService {
         }
     }
 
-    /// The private directory a dropped file waits in until its upload runs.
+    /// Allocates a private per-drop staging directory so concurrent or multi-folder
+    /// drops with identical leaf names never overwrite each other's staged files.
     fn drop_staging_dir(&self) -> Result<PathBuf, String> {
-        let staging = self.config_root().join("drop-staging");
-        std::fs::create_dir_all(&staging).map_err(|error| format!("Cannot stage the dropped file: {error}"))?;
-        Ok(staging)
+        let root = self.config_root().join("drop-staging");
+        linscp_platform::create_private_dir(&root)
+            .map_err(|error| format!("Cannot stage the dropped file: {error}"))?;
+        let mut rnd = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut rnd);
+        let batch = root.join(format!("drop-{}", linscp_crypto::digests::hex_encode(&rnd)));
+        linscp_platform::create_private_dir(&batch)
+            .map_err(|error| format!("Cannot stage the dropped file: {error}"))?;
+        Ok(batch)
     }
 
 
@@ -7246,36 +7671,39 @@ impl CommanderService {
         match tab {
             Some(tab) if tab.is_local => {
                 // A local tab's "remote" side is the other local directory.
-                let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if name.is_empty() { return api_error(400, "Select an item first."); }
+                let names = remote_names(&body);
+                if names.is_empty() { return api_error(400, "Select an item first."); }
+                if names.len() > 1000 { return api_error(400, "Too many files selected"); }
                 let perm = body.get("permissions").or_else(|| body.get("mode"))
                     .and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let target = match resolve_contained(&tab.other_local_dir, &name) {
-                    Ok(path) => path,
-                    Err(error) => return api_error(400, error),
-                };
-                if is_saf_path(&target) {
-                    // The other pane refuses through the bridge, exactly as
-                    // the main pane does: the mode is unread, the 0 only
-                    // satisfies a trait written for filesystems with modes.
-                    return match self.local_fs.set_permissions_mode(&target, 0) {
-                        Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
-                        Err(linscp_platform::PlatformError::UnsupportedUri(message)) => api_error(400, message),
-                        Err(error) => api_error(400, error.to_string()),
+                for name in names {
+                    let target = match resolve_contained(&tab.other_local_dir, &name) {
+                        Ok(path) => path,
+                        Err(error) => return api_error(400, error),
                     };
+                    if is_saf_path(&target) {
+                        // The other pane refuses through the bridge, exactly as
+                        // the main pane does: the mode is unread, the 0 only
+                        // satisfies a trait written for filesystems with modes.
+                        match self.local_fs.set_permissions_mode(&target, 0) {
+                            Ok(()) => continue,
+                            Err(linscp_platform::PlatformError::UnsupportedUri(message)) => return api_error(400, message),
+                            Err(error) => return api_error(400, error.to_string()),
+                        }
+                    }
+                    let current = match gui_os::stat_extended(Path::new(&target)) {
+                        Ok(info) => info.mode,
+                        Err(error) => return api_error(400, error.to_string()),
+                    };
+                    let new_mode = match linscp_engine::parse_chmod_spec(&perm, current) {
+                        Ok(mode) => mode,
+                        Err(error) => return api_error(400, error),
+                    };
+                    if let Err(error) = linscp_platform::terminal::set_local_permissions(Path::new(&target), new_mode) {
+                        return api_error(400, error.to_string());
+                    }
                 }
-                let current = match gui_os::stat_extended(Path::new(&target)) {
-                    Ok(info) => info.mode,
-                    Err(error) => return api_error(400, error.to_string()),
-                };
-                let new_mode = match linscp_engine::parse_chmod_spec(&perm, current) {
-                    Ok(mode) => mode,
-                    Err(error) => return api_error(400, error),
-                };
-                match linscp_platform::terminal::set_local_permissions(Path::new(&target), new_mode) {
-                    Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
-                    Err(error) => api_error(400, error.to_string()),
-                }
+                ApiReply { status: 200, payload: json!({"success": true}) }
             }
             _ => api_error(400, "Not connected"),
         }
@@ -7295,14 +7723,36 @@ impl CommanderService {
             // shows the error beside the name instead of dying.
             if is_saf_path(&p) {
                 match self.local_fs.stat(&p) {
-                    Ok(entry) => rows.push(json!({"name": n, "size": entry.size, "is_dir": entry.is_dir, "permissions": entry.permissions, "owner": entry.owner.clone().unwrap_or_default(), "group": entry.group.clone().unwrap_or_default()})),
+                    Ok(entry) => rows.push(json!({
+                        "name": n,
+                        "path": p,
+                        "size": entry.size,
+                        "is_dir": entry.is_dir,
+                        "is_link": entry.is_symlink,
+                        "permissions": entry.permissions,
+                        "mode": linscp_engine::filemask::mode_from_permissions_str(&entry.permissions),
+                        "mtime": entry.mtime,
+                        "owner": entry.owner.clone().unwrap_or_default(),
+                        "group": entry.group.clone().unwrap_or_default(),
+                    })),
                     Err(error) => rows.push(json!({"name": n, "error": error.to_string()})),
                 }
                 continue;
             }
             let info = if tab.is_local {
                 match gui_os::stat_extended(Path::new(&p)) {
-                    Ok(s)=> json!({"name": n, "size": s.size, "is_dir": s.is_dir, "permissions": s.permissions, "owner": s.owner, "group": s.group}),
+                    Ok(s)=> json!({
+                        "name": n,
+                        "path": p,
+                        "size": s.size,
+                        "is_dir": s.is_dir,
+                        "is_link": s.is_symlink,
+                        "permissions": s.permissions,
+                        "mode": s.mode,
+                        "mtime": s.mtime_secs,
+                        "owner": s.owner,
+                        "group": s.group,
+                    }),
                     Err(e)=> json!({"name": n, "error": e.to_string()}),
                 }
             } else { json!({"name": n, "size": 0, "is_dir": false, "permissions": "-rw-r--r--"})};
@@ -7364,15 +7814,126 @@ impl CommanderService {
         }
     }
     fn handle_remote_checksum(&self, body: Value) -> ApiReply {
-        ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}
+        let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else {
+            return api_error(400, "Not connected");
+        };
+        let Some(tab) = self.state.lock().expect("m").tabs.get(&id).cloned() else {
+            return api_error(400, "Not connected");
+        };
+        if !tab.connected || !tab.is_local {
+            return api_error(400, "Not connected");
+        }
+        let checked_base = match check_local_pane_directory(&tab.other_local_dir, "other_local_dir") {
+            Ok(path) => path,
+            Err(error) => return api_error(400, error),
+        };
+        self.compute_local_checksums_in_dir(&checked_base, &body)
     }
     // The editor's save is answered in `dispatch_async`; without a session
     // there is no remote path to write to.
     fn handle_remote_save(&self, _body: Value) -> ApiReply { api_error(400, "Not connected") }
-    // The remote forms of these need a session, so they are answered in
-    // `dispatch_async`; reaching the synchronous table means a local tab.
-    fn handle_remote_copy(&self, _body: Value) -> ApiReply { api_error(501, "A server-side copy needs a remote session.") }
-    fn handle_remote_link(&self, _body: Value) -> ApiReply { api_error(501, "A symbolic link needs an SFTP session.") }
+    fn handle_remote_copy(&self, body: Value) -> ApiReply {
+        let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else {
+            return api_error(400, "Not connected");
+        };
+        let Some(tab) = self.state.lock().expect("m").tabs.get(&id).cloned() else {
+            return api_error(400, "Not connected");
+        };
+        if !tab.connected || !tab.is_local {
+            return api_error(501, "A server-side copy needs a remote session.");
+        }
+        let source_raw = body.get("source").and_then(Value::as_str).unwrap_or("");
+        let source_leaf = match ops::validate_leaf_name(source_raw) {
+            Ok(leaf) => leaf,
+            Err(error) => return api_error(400, error),
+        };
+        let from = match resolve_contained(&tab.other_local_dir, &source_leaf) {
+            Ok(path) => path,
+            Err(error) => return api_error(400, error),
+        };
+        let dest_raw = body.get("destination").and_then(Value::as_str).unwrap_or("").trim();
+        if dest_raw.is_empty() {
+            return api_error(400, "A destination path or file name is required.");
+        }
+        let mut destination = if is_saf_path(&tab.other_local_dir) {
+            let sub = match ops::validate_relative_subpath(dest_raw) {
+                Ok(p) => p,
+                Err(error) => return api_error(400, error),
+            };
+            let mut cur = tab.other_local_dir.clone();
+            for comp in sub.components() {
+                let seg = comp.as_os_str().to_string_lossy();
+                cur = match resolve_contained(&cur, &seg) {
+                    Ok(next) => next,
+                    Err(error) => return api_error(400, error),
+                };
+            }
+            cur
+        } else if Path::new(dest_raw).is_absolute() {
+            if dest_raw.chars().any(char::is_control) {
+                return api_error(400, "The destination must not contain control characters.");
+            }
+            dest_raw.to_string()
+        } else {
+            let sub = match ops::validate_relative_subpath(dest_raw) {
+                Ok(p) => p,
+                Err(error) => return api_error(400, error),
+            };
+            Path::new(&tab.other_local_dir).join(sub).to_string_lossy().into_owned()
+        };
+        if from == destination {
+            return api_error(400, "Source and destination are the same file.");
+        }
+        if is_saf_path(&from) || is_saf_path(&destination) {
+            let src_stat = match self.local_fs.stat(&from) {
+                Ok(entry) if entry.is_dir => return api_error(400, "Only a single file can be copied; select the files instead."),
+                Ok(entry) if entry.is_symlink => return api_error(400, "A symbolic link is not copied by name; copy its target."),
+                Ok(entry) => entry,
+                Err(error) => return api_error(400, error.to_string()),
+            };
+            if let Ok(dst_stat) = self.local_fs.stat(&destination) {
+                if dst_stat.is_dir && !dst_stat.is_symlink {
+                    destination = match resolve_contained(&destination, &source_leaf) {
+                        Ok(next) => next,
+                        Err(error) => return api_error(400, error),
+                    };
+                    if from == destination || self.local_fs.stat(&destination).is_ok() {
+                        return api_error(400, "The destination already exists.");
+                    }
+                } else {
+                    return api_error(400, "The destination already exists.");
+                }
+            }
+            if let Err(error) = self.local_fs.copy_streamed(&from, &destination) {
+                return api_error(400, error.to_string());
+            }
+            let _ = self.local_fs.set_mtime(&destination, src_stat.mtime);
+            return ApiReply { status: 200, payload: json!({"success": true, "destination": destination}) };
+        }
+        let src_meta = match std::fs::symlink_metadata(&from) {
+            Ok(meta) if meta.file_type().is_symlink() => return api_error(400, "A symbolic link is not copied by name; copy its target."),
+            Ok(meta) if meta.is_dir() => return api_error(400, "Only a single file can be copied; select the files instead."),
+            Ok(meta) if meta.is_file() => meta,
+            Ok(_) => return api_error(400, "Only a regular file can be copied."),
+            Err(error) => return api_error(400, error.to_string()),
+        };
+        if let Ok(dst_meta) = std::fs::symlink_metadata(&destination) {
+            if dst_meta.is_dir() && !dst_meta.file_type().is_symlink() {
+                destination = Path::new(&destination).join(&source_leaf).to_string_lossy().into_owned();
+                if from == destination || std::fs::symlink_metadata(&destination).is_ok() {
+                    return api_error(400, "The destination already exists.");
+                }
+            } else {
+                return api_error(400, "The destination already exists.");
+            }
+        }
+        let _ = src_meta;
+        match self.local_fs.copy_streamed(&from, &destination) {
+            Ok(_) => ApiReply { status: 200, payload: json!({"success": true, "destination": destination}) },
+            Err(error) => api_error(400, error.to_string()),
+        }
+    }
+    fn handle_remote_link(&self, _body: Value) -> ApiReply { api_error(501, "Symbolic links can be created only over SFTP or SCP/SSH.") }
     fn handle_sync_preview(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
     fn handle_sync_run(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
     fn handle_transfer_upload(&self, _body: Value) -> ApiReply { Self::not_implemented() }
@@ -16249,6 +16810,11 @@ mod tests {
         /// Whether the connection this session runs on is gone, which is what
         /// a host that was told to shut down leaves behind.
         lost: Mutex<bool>,
+        scheme_override: Mutex<Option<ProtocolScheme>>,
+        copy_unsupported: Mutex<bool>,
+        perms: Mutex<HashMap<String, String>>,
+        modes: Mutex<HashMap<String, u32>>,
+        symlinks: Mutex<Vec<(String, String)>>,
     }
 
     impl MockSession {
@@ -16256,9 +16822,37 @@ mod tests {
         const ETAG: &'static str = "\"mock-etag\"";
 
         fn new() -> Self {
-            let session = MockSession { docs: Mutex::new(HashMap::new()), lost: Mutex::new(false) };
+            let session = MockSession {
+                docs: Mutex::new(HashMap::new()),
+                lost: Mutex::new(false),
+                scheme_override: Mutex::new(None),
+                copy_unsupported: Mutex::new(false),
+                perms: Mutex::new(HashMap::new()),
+                modes: Mutex::new(HashMap::new()),
+                symlinks: Mutex::new(Vec::new()),
+            };
             session.add_dir("/");
             session
+        }
+
+        fn set_scheme(&self, scheme: ProtocolScheme) {
+            *self.scheme_override.lock().expect("m") = Some(scheme);
+        }
+
+        fn set_copy_unsupported(&self, unsupported: bool) {
+            *self.copy_unsupported.lock().expect("m") = unsupported;
+        }
+
+        fn set_permissions_str(&self, path: &str, perms: &str) {
+            self.perms.lock().expect("m").insert(path.to_string(), perms.to_string());
+        }
+
+        fn mode_of(&self, path: &str) -> Option<u32> {
+            self.modes.lock().expect("m").get(path).copied()
+        }
+
+        fn symlinks_created(&self) -> Vec<(String, String)> {
+            self.symlinks.lock().expect("m").clone()
         }
 
         /// Ends the connection the way a host that shut down does: the session
@@ -16316,6 +16910,9 @@ mod tests {
             source.read_to_end(&mut bytes).await.map_err(|e| ProtoError::Transport(e.to_string()))?;
             let sent = bytes.len() as u64;
             let mtime = if opts.preserve_time { opts.mtime.unwrap_or(0) } else { 0 };
+            if let Some(mode) = opts.permissions {
+                self.modes.lock().expect("m").insert(path.to_string(), mode);
+            }
             self.docs.lock().expect("m").insert(path.to_string(), MockRemoteDoc { bytes, is_dir: false, mtime });
             if let Some(report) = progress { report(sent, sent); }
             Ok(sent)
@@ -16324,7 +16921,9 @@ mod tests {
 
     #[async_trait]
     impl RemoteSession for MockSession {
-        fn scheme(&self) -> ProtocolScheme { ProtocolScheme::Dav }
+        fn scheme(&self) -> ProtocolScheme {
+            self.scheme_override.lock().expect("m").unwrap_or(ProtocolScheme::Dav)
+        }
 
         fn connection_lost(&self) -> bool { *self.lost.lock().expect("m") }
 
@@ -16332,7 +16931,14 @@ mod tests {
 
         async fn stat(&self, remote_path: &str) -> Result<Option<FileEntry>, ProtoError> {
             let docs = self.docs.lock().expect("m");
-            Ok(docs.get(remote_path).map(|doc| Self::entry_for(remote_path, doc)))
+            let perms = self.perms.lock().expect("m");
+            Ok(docs.get(remote_path).map(|doc| {
+                let mut entry = Self::entry_for(remote_path, doc);
+                if let Some(p) = perms.get(remote_path) {
+                    entry.permissions = p.clone();
+                }
+                entry
+            }))
         }
 
         async fn list_dir(&self, remote_path: &str) -> Result<Vec<FileEntry>, ProtoError> {
@@ -16377,6 +16983,9 @@ mod tests {
         }
 
         async fn copy_file(&self, from: &str, to: &str) -> Result<(), ProtoError> {
+            if *self.copy_unsupported.lock().expect("m") {
+                return Err(ProtoError::UnsupportedCapability("copy-data", self.scheme()));
+            }
             let mut docs = self.docs.lock().expect("m");
             let doc = docs.get(from).ok_or_else(|| Self::missing(from))?;
             if doc.is_dir { return Err(ProtoError::Transport(format!("Cannot copy directory '{from}' as a file."))); }
@@ -16386,11 +16995,23 @@ mod tests {
             Ok(())
         }
 
-        async fn symlink(&self, _target: &str, _link_path: &str) -> Result<(), ProtoError> {
-            Err(ProtoError::UnsupportedCapability("symlink", self.scheme()))
+        async fn symlink(&self, target: &str, link_path: &str) -> Result<(), ProtoError> {
+            match self.scheme() {
+                ProtocolScheme::Sftp | ProtocolScheme::Scp | ProtocolScheme::Ssh => {
+                    self.symlinks
+                        .lock()
+                        .expect("m")
+                        .push((target.to_string(), link_path.to_string()));
+                    Ok(())
+                }
+                other => Err(ProtoError::UnsupportedCapability("symlink", other)),
+            }
         }
 
-        async fn chmod(&self, _remote_path: &str, _mode: u32) -> Result<(), ProtoError> { Ok(()) }
+        async fn chmod(&self, remote_path: &str, mode: u32) -> Result<(), ProtoError> {
+            self.modes.lock().expect("m").insert(remote_path.to_string(), mode);
+            Ok(())
+        }
 
         async fn set_mtime(&self, remote_path: &str, mtime: i64) -> Result<(), ProtoError> {
             let mut docs = self.docs.lock().expect("m");
@@ -18125,5 +18746,492 @@ mod tests {
         if cfg!(unix) {
             assert_eq!(gui_os::stat_extended(&perm_dst).unwrap().mode & 0o777, 0o600);
         }
+    }
+
+    #[tokio::test]
+    async fn remote_copy_link_checksum_xml_and_save_permission_preservation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local_dir = tmp.path().join("local");
+        let cfg_dir = tmp.path().join("cfg");
+        std::fs::create_dir_all(&local_dir).unwrap();
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+
+        let svc = CommanderService::new(cfg_dir.clone(), Arc::new(NativeLocalFs::new()));
+        let mut prefs = svc
+            .dispatch(ApiEnvelope { method: "GET".into(), path: "/api/preferences".into(), body: json!({}) })
+            .payload["preferences"]
+            .clone();
+        prefs["xml_log_enabled"] = json!(true);
+        prefs["xml_log_path"] = json!("actions.xml");
+        let saved_prefs = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/preferences".into(),
+            body: json!({"action": "save", "preferences": prefs}),
+        });
+        assert_eq!(saved_prefs.status, 200, "{}", saved_prefs.payload);
+
+        let session = Arc::new(MockSession::new());
+        session.set_scheme(ProtocolScheme::Scp);
+        session.add_dir("/work");
+        session.add_dir("/work/archive");
+        session.add_file("/work/report.txt", b"quarterly report");
+        session.set_permissions_str("/work/report.txt", "-rwxr-xr-x");
+        session.add_file("/work/taken.txt", b"do not clobber");
+
+        let tab_id = insert_remote_tab(&svc, session.clone(), &local_dir.to_string_lossy());
+        svc.state.lock().unwrap().tabs.get_mut(&tab_id).unwrap().remote_dir = "/work".to_string();
+
+        // 1a. Relative leaf destination (the GUI prompt default `report.txt.copy`) resolves in `remote_dir`.
+        let cp_rel = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/copy".into(),
+            body: json!({"tab": tab_id, "source": "report.txt", "destination": "report.txt.copy"}),
+        }).await;
+        assert_eq!(cp_rel.status, 200, "{}", cp_rel.payload);
+        assert_eq!(session.bytes_of("/work/report.txt.copy").as_deref(), Some(b"quarterly report".as_slice()));
+
+        // 1b. Destination naming an existing remote directory copies `<dir>/<leaf>`.
+        let cp_dir = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/copy".into(),
+            body: json!({"tab": tab_id, "source": "report.txt", "destination": "/work/archive"}),
+        }).await;
+        assert_eq!(cp_dir.status, 200, "{}", cp_dir.payload);
+        assert_eq!(session.bytes_of("/work/archive/report.txt").as_deref(), Some(b"quarterly report".as_slice()));
+
+        // 1c. Existing destination file and missing trailing-slash directory are refused without clobbering.
+        let cp_conflict = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/copy".into(),
+            body: json!({"tab": tab_id, "source": "report.txt", "destination": "taken.txt"}),
+        }).await;
+        assert_eq!(cp_conflict.status, 400);
+        assert_eq!(session.bytes_of("/work/taken.txt").as_deref(), Some(b"do not clobber".as_slice()));
+
+        let cp_missing_dir = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/copy".into(),
+            body: json!({"tab": tab_id, "source": "report.txt", "destination": "missing_dir/"}),
+        }).await;
+        assert_eq!(cp_missing_dir.status, 400);
+
+        // 1d. When server-side copy is unsupported, `copy_remote_async` streams via a temp file and preserves 0755.
+        session.set_copy_unsupported(true);
+        let cp_streamed = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/copy".into(),
+            body: json!({"tab": tab_id, "source": "report.txt", "destination": "streamed.sh"}),
+        }).await;
+        assert_eq!(cp_streamed.status, 200, "{}", cp_streamed.payload);
+        assert_eq!(session.bytes_of("/work/streamed.sh").as_deref(), Some(b"quarterly report".as_slice()));
+        assert_eq!(session.mode_of("/work/streamed.sh"), Some(0o755));
+
+        // 2. `/api/remote/link` works over SCP and SSH, and still rejects FTP with 501.
+        let link_scp = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/link".into(),
+            body: json!({"tab": tab_id, "target": "report.txt", "name": "latest.txt"}),
+        }).await;
+        assert_eq!(link_scp.status, 200, "{}", link_scp.payload);
+        session.set_scheme(ProtocolScheme::Ssh);
+        let link_ssh = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/link".into(),
+            body: json!({"tab": tab_id, "target": "report.txt", "name": "latest-ssh.txt"}),
+        }).await;
+        assert_eq!(link_ssh.status, 200, "{}", link_ssh.payload);
+        assert_eq!(
+            session.symlinks_created(),
+            vec![
+                ("report.txt".to_string(), "/work/latest.txt".to_string()),
+                ("report.txt".to_string(), "/work/latest-ssh.txt".to_string()),
+            ]
+        );
+        session.set_scheme(ProtocolScheme::Ftp);
+        let link_ftp = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/link".into(),
+            body: json!({"tab": tab_id, "target": "report.txt", "name": "nope.txt"}),
+        }).await;
+        assert_eq!(link_ftp.status, 501);
+        session.set_scheme(ProtocolScheme::Sftp);
+
+        // 3. `/api/remote/checksum` and `/api/remote/copy` record `<checksum>` and `<cp>` into XML log.
+        let cs = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/checksum".into(),
+            body: json!({"tab": tab_id, "algorithm": "sha-256", "names": ["report.txt"]}),
+        }).await;
+        assert_eq!(cs.status, 200, "{}", cs.payload);
+        let xml_reply = svc.dispatch(ApiEnvelope { method: "GET".into(), path: "/api/logs/xml".into(), body: json!({}) });
+        assert_eq!(xml_reply.status, 200, "{}", xml_reply.payload);
+        let xml = xml_reply.payload["content"].as_str().unwrap_or("");
+        assert!(xml.contains("<cp>"), "XML log missing <cp>: {xml}");
+        assert!(xml.contains("<checksum>"), "XML log missing <checksum>: {xml}");
+
+        // 4. `/api/remote/save` preserves executable remote POSIX permissions (`0755`).
+        session.add_file("/work/deploy.sh", b"#!/bin/sh\necho v1\n");
+        session.set_permissions_str("/work/deploy.sh", "-rwxr-xr-x");
+        let save = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/save".into(),
+            body: json!({"tab": tab_id, "path": "/work/deploy.sh", "content": "#!/bin/sh\necho v2\n", "base_mtime": 0}),
+        }).await;
+        assert_eq!(save.status, 200, "{}", save.payload);
+        assert_eq!(session.mode_of("/work/deploy.sh"), Some(0o755));
+    }
+
+    #[tokio::test]
+    async fn local_and_dual_local_checksum_multi_chmod_properties_and_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let left_dir = tmp.path().join("left");
+        let right_dir = tmp.path().join("right");
+        std::fs::create_dir_all(left_dir.join("subdir")).unwrap();
+        std::fs::create_dir_all(right_dir.join("dest_folder")).unwrap();
+        std::fs::write(left_dir.join("alpha.bin"), b"linscp-checksum-payload").unwrap();
+        std::fs::write(left_dir.join("beta.sh"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(right_dir.join("r1.sh"), b"echo 1\n").unwrap();
+        std::fs::write(right_dir.join("r2.sh"), b"echo 2\n").unwrap();
+
+        let svc = CommanderService::new(tmp.path().join("cfg"), Arc::new(NativeLocalFs::new()));
+        let opened = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/tabs/open".into(),
+            body: json!({"session": {"protocol": "local", "local_dir": left_dir, "other_local_dir": right_dir}}),
+        }).await;
+        assert_eq!(opened.status, 200, "{}", opened.payload);
+        let tab_id = opened.payload["tab"]["id"].as_u64().unwrap();
+
+        // 1. `/api/local/checksum` supports sha-256, sha-1, md5, and crc32, and reports per-item error on directories.
+        for alg in ["sha-256", "sha-1", "md5", "crc32"] {
+            let parsed = linscp_crypto::digests::DigestAlgorithm::parse(alg).unwrap();
+            let expected = linscp_crypto::digests::compute_digest_hex(parsed, b"linscp-checksum-payload");
+            let reply = svc.dispatch(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/local/checksum".into(),
+                body: json!({"tab": tab_id, "local_dir": left_dir, "algorithm": alg, "names": ["alpha.bin", "subdir"]}),
+            });
+            assert_eq!(reply.status, 200, "{}", reply.payload);
+            let results = reply.payload["results"].as_array().unwrap();
+            assert_eq!(results[0]["checksum"], expected);
+            assert!(results[1]["error"].as_str().unwrap_or("").contains("directory"));
+        }
+
+        // 2. Dual-local right pane `/api/remote/checksum` computes local digests on `other_local_dir`.
+        let right_cs = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/checksum".into(),
+            body: json!({"tab": tab_id, "algorithm": "sha-256", "names": ["r1.sh"]}),
+        }).await;
+        assert_eq!(right_cs.status, 200, "{}", right_cs.payload);
+        assert_eq!(
+            right_cs.payload["results"][0]["checksum"],
+            linscp_crypto::digests::sha256_hex(b"echo 1\n")
+        );
+
+        // 3. Multi-item chmod (`names` array) works on both `/api/local/chmod` and dual-local `/api/remote/rights`.
+        let l_chmod = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/chmod".into(),
+            body: json!({"tab": tab_id, "local_dir": left_dir, "names": ["alpha.bin", "beta.sh"], "mode": "750"}),
+        });
+        assert_eq!(l_chmod.status, 200, "{}", l_chmod.payload);
+        let r_chmod = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/rights".into(),
+            body: json!({"tab": tab_id, "names": ["r1.sh", "r2.sh"], "mode": "750"}),
+        });
+        assert_eq!(r_chmod.status, 200, "{}", r_chmod.payload);
+        if cfg!(unix) {
+            assert_eq!(gui_os::stat_extended(&left_dir.join("alpha.bin")).unwrap().mode & 0o777, 0o750);
+            assert_eq!(gui_os::stat_extended(&left_dir.join("beta.sh")).unwrap().mode & 0o777, 0o750);
+            assert_eq!(gui_os::stat_extended(&right_dir.join("r1.sh")).unwrap().mode & 0o777, 0o750);
+            assert_eq!(gui_os::stat_extended(&right_dir.join("r2.sh")).unwrap().mode & 0o777, 0o750);
+        }
+
+        // 4. Dual-local `/api/remote/properties` exposes `path`, `mode`, `mtime`, and `is_link`.
+        let props = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/properties".into(),
+            body: json!({"tab": tab_id, "names": ["r1.sh"]}),
+        }).await;
+        assert_eq!(props.status, 200, "{}", props.payload);
+        let row = &props.payload["properties"][0];
+        assert!(row["path"].as_str().unwrap_or("").ends_with("r1.sh"), "{row}");
+        assert!(row["mtime"].is_i64(), "{row}");
+        assert_eq!(row["is_link"], false, "{row}");
+        if cfg!(unix) {
+            assert_eq!(row["mode"].as_u64().unwrap_or(0) & 0o777, 0o750, "{row}");
+        }
+
+        // 5. Dual-local `/api/remote/copy` duplicates files by relative leaf and into existing directories, refusing overwrites.
+        let r_copy_leaf = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/copy".into(),
+            body: json!({"tab": tab_id, "source": "r1.sh", "destination": "r1.sh.copy"}),
+        });
+        assert_eq!(r_copy_leaf.status, 200, "{}", r_copy_leaf.payload);
+        assert_eq!(std::fs::read(right_dir.join("r1.sh.copy")).unwrap(), b"echo 1\n");
+
+        let r_copy_dir = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/copy".into(),
+            body: json!({"tab": tab_id, "source": "r1.sh", "destination": right_dir.join("dest_folder")}),
+        });
+        assert_eq!(r_copy_dir.status, 200, "{}", r_copy_dir.payload);
+        assert_eq!(std::fs::read(right_dir.join("dest_folder/r1.sh")).unwrap(), b"echo 1\n");
+
+        let r_copy_dup = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/copy".into(),
+            body: json!({"tab": tab_id, "source": "r2.sh", "destination": "r1.sh.copy"}),
+        });
+        assert_eq!(r_copy_dup.status, 400);
+        assert_eq!(std::fs::read(right_dir.join("r1.sh.copy")).unwrap(), b"echo 1\n");
+    }
+
+    #[tokio::test]
+    async fn drop_batch_isolation_saf_source_uri_and_external_editor_close_and_teardown() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_dir = tmp.path().join("cfg");
+        let local_dir = tmp.path().join("local");
+        std::fs::create_dir_all(&local_dir).unwrap();
+
+        let svc = CommanderService::new(cfg_dir.clone(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
+        let session = Arc::new(MockSession::new());
+        session.add_dir("/app1");
+        session.add_dir("/app2");
+        let tab_id = insert_remote_tab(&svc, session.clone(), &local_dir.to_string_lossy());
+
+        // 1. `/api/local/drop` byte-drop refuses clobbering an existing file with 409 until `overwrite: "overwrite"`.
+        std::fs::write(local_dir.join("dup.txt"), b"original").unwrap();
+        let byte_conflict = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/drop".into(),
+            body: json!({
+                "local_dir": local_dir,
+                "name": "dup.txt",
+                "data_base64": BASE64_STD.encode(b"replacement"),
+            }),
+        });
+        assert_eq!(byte_conflict.status, 409, "{}", byte_conflict.payload);
+        assert_eq!(byte_conflict.payload["conflicts"], json!(["dup.txt"]));
+        assert_eq!(std::fs::read(local_dir.join("dup.txt")).unwrap(), b"original");
+
+        let byte_approved = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/drop".into(),
+            body: json!({
+                "local_dir": local_dir,
+                "name": "dup.txt",
+                "data_base64": BASE64_STD.encode(b"replacement"),
+                "overwrite": "overwrite",
+            }),
+        });
+        assert_eq!(byte_approved.status, 200, "{}", byte_approved.payload);
+        assert_eq!(std::fs::read(local_dir.join("dup.txt")).unwrap(), b"replacement");
+
+        // 2. Concurrent remote drops with the same filename stay isolated in per-drop batch folders
+        //    and delete their staged files + batch dirs once uploaded.
+        assert_eq!(svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/queue/pause".into(), body: json!({}) }).status, 200);
+        let d1 = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/transfer/drop".into(),
+            body: json!({"tab": tab_id, "remote_dir": "/app1", "name": "package.json", "data_base64": BASE64_STD.encode(b"{\"app\":1}")}),
+        }).await;
+        let d2 = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/transfer/drop".into(),
+            body: json!({"tab": tab_id, "remote_dir": "/app2", "name": "package.json", "data_base64": BASE64_STD.encode(b"{\"app\":2}")}),
+        }).await;
+        assert_eq!(d1.status, 200, "{}", d1.payload);
+        assert_eq!(d2.status, 200, "{}", d2.payload);
+
+        let staging_root = cfg_dir.join("drop-staging");
+        let staged_batches: Vec<_> = std::fs::read_dir(&staging_root).unwrap().filter_map(Result::ok).collect();
+        assert_eq!(staged_batches.len(), 2, "each drop allocates its own batch staging folder");
+
+        assert_eq!(svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/queue/resume".into(), body: json!({}) }).status, 200);
+        for _ in 0..80 {
+            if !svc.queue.has_unfinished_work() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(session.bytes_of("/app1/package.json").as_deref(), Some(b"{\"app\":1}".as_slice()));
+        assert_eq!(session.bytes_of("/app2/package.json").as_deref(), Some(b"{\"app\":2}".as_slice()));
+        let remaining_batches: Vec<_> = std::fs::read_dir(&staging_root)
+            .map(|rd| rd.filter_map(Result::ok).collect())
+            .unwrap_or_default();
+        assert!(remaining_batches.is_empty(), "completed drop uploads must clean up batch staging dirs: {remaining_batches:?}");
+
+        // 3. SAF `content://` `source_path` drops decode SAF leaf names and read via `SafBridge`.
+        let saf_leaf = "invoice #42.pdf";
+        let saf_bridge = Arc::new(MockBridge::with_file(saf_leaf, b"saf-pdf-bytes"));
+        let saf_fs: Arc<dyn LocalFs> = Arc::new(NativeLocalFs::with_saf(saf_bridge));
+        let saf_svc = CommanderService::new(tmp.path().join("saf_drop_cfg"), saf_fs);
+        let saf_local_drop = saf_svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/drop".into(),
+            body: json!({
+                "local_dir": local_dir,
+                "name": "ignored.pdf",
+                "source_path": MockBridge::doc_uri(saf_leaf),
+            }),
+        });
+        assert_eq!(saf_local_drop.status, 200, "{}", saf_local_drop.payload);
+        assert_eq!(std::fs::read(local_dir.join(saf_leaf)).unwrap(), b"saf-pdf-bytes");
+
+        // 4. External editor close flushes pending edits with preserved permissions, refuses conflicts unless forced,
+        //    and tab close / vault lock / `/api/cleanup` wipe staged external-edit buffers.
+        session.add_file("/run.sh", b"#!/bin/sh\necho old\n");
+        session.set_permissions_str("/run.sh", "-rwxr-xr-x");
+        let ext1_dir = cfg_dir.join("external-edit").join("edit-test-1");
+        std::fs::create_dir_all(&ext1_dir).unwrap();
+        let ext1_file = ext1_dir.join("run.sh");
+        std::fs::write(&ext1_file, b"#!/bin/sh\necho old\n").unwrap();
+        let initial_ns = gui_os::stat_extended(&ext1_file).unwrap().mtime_ns;
+        std::fs::write(&ext1_file, b"#!/bin/sh\necho final-edit\n").unwrap();
+        // Ensure mtime_ns differs even on coarse filesystems.
+        svc.state.lock().unwrap().external_edits.insert(
+            "edit-1".to_string(),
+            ExternalEditSession {
+                id: "edit-1".to_string(),
+                tab_id: Some(tab_id),
+                is_remote: true,
+                target_path: "/run.sh".to_string(),
+                staged_path: ext1_file.clone(),
+                staged_dir: Some(ext1_dir.clone()),
+                last_mtime_ns: initial_ns.saturating_sub(1_000_000_000),
+                base_remote_mtime: Some(0),
+                editor_label: "nvim".to_string(),
+                upload_count: 0,
+                last_error: None,
+                closed: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let closed_ok = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/editor/external/close".into(),
+            body: json!({"id": "edit-1"}),
+        }).await;
+        assert_eq!(closed_ok.status, 200, "{}", closed_ok.payload);
+        assert_eq!(session.bytes_of("/run.sh").as_deref(), Some(b"#!/bin/sh\necho final-edit\n".as_slice()));
+        assert_eq!(session.mode_of("/run.sh"), Some(0o755));
+        assert!(!ext1_dir.exists(), "staged_dir must be deleted after close sync");
+
+        // Conflict on remote mtime refuses unforced close and preserves staged edits until `force: true`.
+        let ext2_dir = cfg_dir.join("external-edit").join("edit-test-2");
+        std::fs::create_dir_all(&ext2_dir).unwrap();
+        let ext2_file = ext2_dir.join("run.sh");
+        std::fs::write(&ext2_file, b"#!/bin/sh\necho conflicting\n").unwrap();
+        session.set_mtime("/run.sh", 999).await.unwrap();
+        svc.state.lock().unwrap().external_edits.insert(
+            "edit-2".to_string(),
+            ExternalEditSession {
+                id: "edit-2".to_string(),
+                tab_id: Some(tab_id),
+                is_remote: true,
+                target_path: "/run.sh".to_string(),
+                staged_path: ext2_file.clone(),
+                staged_dir: Some(ext2_dir.clone()),
+                last_mtime_ns: 1,
+                base_remote_mtime: Some(100),
+                editor_label: "nvim".to_string(),
+                upload_count: 0,
+                last_error: None,
+                closed: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let refused_close = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/editor/external/close".into(),
+            body: json!({"id": "edit-2"}),
+        }).await;
+        assert_eq!(refused_close.status, 400);
+        assert!(ext2_file.exists(), "refused close must keep user's unsaved staged buffer");
+
+        let forced_close = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/editor/external/close".into(),
+            body: json!({"id": "edit-2", "force": true}),
+        }).await;
+        assert_eq!(forced_close.status, 200);
+        assert!(!ext2_dir.exists());
+
+        // Tab close and vault lock wipe external-edit staging directories and mark sessions closed;
+        // `/api/cleanup` inventories `external_edit` and `drop_staging`.
+        let ext3_dir = cfg_dir.join("external-edit").join("edit-test-3");
+        let ext4_dir = cfg_dir.join("external-edit").join("edit-test-4");
+        std::fs::create_dir_all(&ext3_dir).unwrap();
+        std::fs::create_dir_all(&ext4_dir).unwrap();
+        std::fs::write(ext3_dir.join("secret.txt"), b"tab secret").unwrap();
+        std::fs::write(ext4_dir.join("vault.txt"), b"vault secret").unwrap();
+        let closed3 = Arc::new(AtomicBool::new(false));
+        let closed4 = Arc::new(AtomicBool::new(false));
+        {
+            let mut st = svc.state.lock().unwrap();
+            st.external_edits.insert(
+                "edit-3".to_string(),
+                ExternalEditSession {
+                    id: "edit-3".to_string(),
+                    tab_id: Some(tab_id),
+                    is_remote: true,
+                    target_path: "/secret.txt".to_string(),
+                    staged_path: ext3_dir.join("secret.txt"),
+                    staged_dir: Some(ext3_dir.clone()),
+                    last_mtime_ns: 1,
+                    base_remote_mtime: Some(0),
+                    editor_label: "nvim".to_string(),
+                    upload_count: 0,
+                    last_error: None,
+                    closed: closed3.clone(),
+                },
+            );
+            st.external_edits.insert(
+                "edit-4".to_string(),
+                ExternalEditSession {
+                    id: "edit-4".to_string(),
+                    tab_id: None,
+                    is_remote: false,
+                    target_path: local_dir.join("dup.txt").to_string_lossy().into_owned(),
+                    staged_path: ext4_dir.join("vault.txt"),
+                    staged_dir: Some(ext4_dir.clone()),
+                    last_mtime_ns: 1,
+                    base_remote_mtime: None,
+                    editor_label: "nvim".to_string(),
+                    upload_count: 0,
+                    last_error: None,
+                    closed: closed4.clone(),
+                },
+            );
+        }
+        let inv = svc.dispatch(ApiEnvelope { method: "GET".into(), path: "/api/cleanup".into(), body: json!({}) });
+        assert_eq!(inv.status, 200);
+        let target_ids: Vec<_> = inv.payload["locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["id"].as_str())
+            .collect();
+        assert!(target_ids.contains(&"external_edit") && target_ids.contains(&"drop_staging"), "{target_ids:?}");
+
+        assert_eq!(
+            svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/tabs/close".into(), body: json!({"tab": tab_id}) }).status,
+            200
+        );
+        assert!(closed3.load(Ordering::Relaxed));
+        assert!(!ext3_dir.exists());
+
+        assert_eq!(
+            svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/vault/lock".into(), body: json!({}) }).status,
+            200
+        );
+        assert!(closed4.load(Ordering::Relaxed));
+        assert!(!ext4_dir.exists());
     }
 }

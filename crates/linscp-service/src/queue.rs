@@ -446,6 +446,15 @@ impl QueuedTransferTask {
         } = self.job
         {
             let _ = remove_path_any(p);
+            if let Some(parent) = p.parent() {
+                if parent
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("drop-"))
+                {
+                    let _ = std::fs::remove_dir(parent);
+                }
+            }
         }
     }
 }

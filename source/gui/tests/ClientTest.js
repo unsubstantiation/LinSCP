@@ -4488,6 +4488,127 @@ function options(id) {
       text('fullBackupStatus').includes('Encrypted backup download started.'));
     window.closeFullBackup();
     responses['/api/backup/export'] = prevBackupExport;
+
+    // 9. Local checksum modal posts /api/local/checksum with local_dir, algorithm, and names.
+    const prevPromptForCs = window.prompt;
+    window.prompt = () => 'sha-256';
+    responses['/api/local/checksum'] = {
+      success: true,
+      algorithm: 'sha-256',
+      results: [{ name: 'local-a.txt', checksum: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' }]
+    };
+    window.focusPane('local');
+    window.clearFocusedSelection();
+    const localFileRow = Array.from(doc.getElementById('localFileList').children)
+      .find(el => el.dataset && el.dataset.name && el.dataset.name !== '..' && el.dataset.dir !== '1');
+    if (localFileRow) localFileRow.click();
+    await window.openChecksum();
+    const localCsCall = calls.filter(c => c.path === '/api/local/checksum').pop();
+    check('local checksum posts /api/local/checksum and opens checksum modal',
+      localCsCall &&
+      JSON.parse(localCsCall.options.body).algorithm === 'sha-256' &&
+      Array.isArray(JSON.parse(localCsCall.options.body).names) &&
+      JSON.parse(localCsCall.options.body).names.length === 1 &&
+      doc.getElementById('propertiesModal').classList.contains('open') &&
+      text('propertiesBody').includes('0123456789abcdef'));
+    window.closeModal('propertiesModal');
+    window.clearFocusedSelection();
+    window.prompt = prevPromptForCs;
+    delete responses['/api/local/checksum'];
+
+    // 10. Byte-drop conflict on /api/local/drop asks for overwrite approval and retries with overwrite='overwrite'.
+    const origTauriInvoke = window.__TAURI_INTERNALS__.invoke;
+    const localDropBodies = [];
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      const envelope = args && args.envelope;
+      if (envelope && envelope.path === '/api/local/drop') {
+        localDropBodies.push(envelope.body);
+        if (!envelope.body.overwrite) {
+          return {
+            status: 409,
+            payload: {
+              success: false,
+              conflicts: ['dup.txt']
+            }
+          };
+        }
+        return { status: 200, payload: { success: true } };
+      }
+      return origTauriInvoke(cmd, args);
+    };
+    const prevConfirm = confirmResult;
+    confirmResult = true;
+    await window.saveLocalDesktopFile(new window.File(['hello'], 'dup.txt'), 'dup.txt');
+    check('local byte-drop 409 conflict retries with overwrite approval',
+      localDropBodies.length === 2 &&
+      !localDropBodies[0].overwrite &&
+      localDropBodies[1].overwrite === 'overwrite');
+    confirmResult = prevConfirm;
+    window.__TAURI_INTERNALS__.invoke = origTauriInvoke;
+
+    // 11. External editor close conflict prompts before retrying with force=true.
+    let closeCalls = [];
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      const envelope = args && args.envelope;
+      if (envelope && envelope.path === '/api/editor/external/close') {
+        closeCalls.push(envelope.body);
+        if (!envelope.body.force) {
+          return {
+            status: 400,
+            payload: { success: false, error: 'Remote file changed while open.' }
+          };
+        }
+        return { status: 200, payload: { success: true } };
+      }
+      return origTauriInvoke(cmd, args);
+    };
+    await window.openEditor('/tmp/slowremote/keep.txt', 'remote', false);
+    responses['/api/editor/external'] = { success: true, id: 404, editor: 'nvim', staged_path: '/tmp/ext-404/keep.txt' };
+    await window.openInExternalEditor();
+    confirmResult = true;
+    await window.closeExternalEditorSession();
+    check('external editor close conflict confirms and retries with force=true',
+      closeCalls.length === 2 &&
+      closeCalls[0].id === 404 && !closeCalls[0].force &&
+      closeCalls[1].id === 404 && closeCalls[1].force === true);
+    confirmResult = prevConfirm;
+    window.__TAURI_INTERNALS__.invoke = origTauriInvoke;
+    window.closeEditor();
+    delete responses['/api/editor/external'];
+
+    // 12. Native desktop drop onto right pane of a dual-local tab routes target='local' to state.remote.path.
+    const prevDropCore = window.LinSCPCore;
+    let capturedDropTarget = null;
+    window.LinSCPCore = new Proxy(prevDropCore, { get(target, key) {
+      if (key === 'dropPaths') {
+        return async (_transport, _items, opts) => {
+          capturedDropTarget = opts;
+          return { queued: 1, failed: [] };
+        };
+      }
+      return Reflect.get(target, key);
+    }});
+    const prevTabs = JSON.parse(JSON.stringify(window.__testTabsSnapshot ? window.__testTabsSnapshot() : null));
+    const prevStatusResp = responses['/api/status'];
+    responses['/api/status'] = Object.assign({}, prevStatusResp, {
+      connected: true,
+      active_tab: 99,
+      tabs: [{ id: 99, name: 'Local', connected: true, is_local: true, local_dir: '/tmp/slowlocal', remote_dir: '/tmp/otherlocal', protocol: 'local' }]
+    });
+    const prevRemoteListResp = responses['/api/remote/list'];
+    responses['/api/remote/list'] = { path: '/tmp/otherlocal', entries: [] };
+    await window.refreshStatus();
+    await window.loadRemote('/tmp/otherlocal');
+    await window.handleNativeDrop({ paths: ['/tmp/desktop-note.txt'], side: 'remote' });
+    check('dual-local native drop onto right pane uses target=local and right-pane directory',
+      capturedDropTarget &&
+      capturedDropTarget.target === 'local' &&
+      capturedDropTarget.directory === '/tmp/otherlocal' &&
+      capturedDropTarget.tab === 99);
+    window.LinSCPCore = prevDropCore;
+    responses['/api/status'] = prevStatusResp;
+    responses['/api/remote/list'] = prevRemoteListResp;
+    await window.refreshStatus();
   }
 
   check('no script errors', errors.length === 0, errors.join(' | '));

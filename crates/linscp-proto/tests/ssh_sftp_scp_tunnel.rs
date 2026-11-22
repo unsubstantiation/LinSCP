@@ -806,6 +806,85 @@ async fn test_cp_uses_native_copy_data_when_the_server_advertises_it() {
     sftp.close().await.unwrap();
 }
 
+/// When `copy-data` is not advertised (or `from == to`), `copy_file` must
+/// reject before creating a 0-byte destination or truncating an existing file.
+#[tokio::test]
+async fn test_cp_without_copy_data_or_onto_self_does_not_clobber_or_leave_empty_dest() {
+    let user_key = common::generate_ed25519_ssh_key(0x4d, "tester@linscp");
+    let (port, host_sha256, _host_md5, _fs) = start_mock_ssh_server_with(
+        0x4e,
+        user_key.private_key.public_key().clone(),
+        false,
+        /* check_file_name */ true,
+        /* copy_data */ false,
+    )
+    .await;
+
+    let cfg = SshConnectConfig {
+        tab_id: 60,
+        role: "destination".to_string(),
+        host: "127.0.0.1".to_string(),
+        port,
+        username: "tester".to_string(),
+        password: Some(Zeroizing::new("correct-horse-battery".to_string())),
+        pinned_host_key: Some(host_sha256),
+        ..Default::default()
+    };
+    let sftp = SftpClientSession::connect(ProtocolScheme::Sftp, &cfg, None, 0)
+        .await
+        .expect("connect to the mock");
+
+    let source_bytes = b"important-source-bytes";
+    let existing_bytes = b"existing-target-must-survive";
+    upload_bytes(&sftp, "/home/tester/src.bin", source_bytes, TransferRequest::default())
+        .await
+        .unwrap();
+    upload_bytes(&sftp, "/home/tester/existing.bin", existing_bytes, TransferRequest::default())
+        .await
+        .unwrap();
+
+    // 1. Self-copy is rejected without truncating the source file.
+    let self_err = sftp
+        .copy_file("/home/tester/src.bin", "/home/tester/src.bin")
+        .await
+        .expect_err("self-copy must fail");
+    assert!(matches!(self_err, linscp_proto::ProtoError::Transport(_)), "{self_err:?}");
+    assert_eq!(
+        download_bytes(&sftp, "/home/tester/src.bin", TransferRequest::default()).await.unwrap(),
+        source_bytes
+    );
+
+    // 2. Unadvertised `copy-data` to a new path returns `UnsupportedCapability` without creating a 0-byte orphan.
+    let missing_cap = sftp
+        .copy_file("/home/tester/src.bin", "/home/tester/orphan.bin")
+        .await
+        .expect_err("copy-data is disabled");
+    assert!(
+        matches!(missing_cap, linscp_proto::ProtoError::UnsupportedCapability("copy-data", ProtocolScheme::Sftp)),
+        "{missing_cap:?}"
+    );
+    assert!(
+        sftp.stat("/home/tester/orphan.bin").await.unwrap().is_none(),
+        "unsupported copy-data must not leave a 0-byte file at destination"
+    );
+
+    // 3. Unadvertised `copy-data` onto an existing file does not truncate `existing.bin`.
+    let existing_cap = sftp
+        .copy_file("/home/tester/src.bin", "/home/tester/existing.bin")
+        .await
+        .expect_err("copy-data is disabled");
+    assert!(
+        matches!(existing_cap, linscp_proto::ProtoError::UnsupportedCapability("copy-data", ProtocolScheme::Sftp)),
+        "{existing_cap:?}"
+    );
+    assert_eq!(
+        download_bytes(&sftp, "/home/tester/existing.bin", TransferRequest::default()).await.unwrap(),
+        existing_bytes
+    );
+
+    sftp.close().await.unwrap();
+}
+
 /// PuTTYgen-generated keys exercise the real SSH authentication path, not just
 /// the converter. The committed keys are public, disposable test fixtures.
 #[tokio::test]

@@ -2968,7 +2968,7 @@
   }
 
   async function queueDesktopFile(file, relativePath) {
-    return apiPost('/api/transfer/drop', {
+    return queueWithOverwriteDecision('/api/transfer/drop', {
       tab: tabId(),
       remote_dir: state.remote.path,
       name: file.name,
@@ -2978,7 +2978,7 @@
   }
 
   async function saveLocalDesktopFile(file, relativePath) {
-    return apiPost('/api/local/drop', {
+    return queueWithOverwriteDecision('/api/local/drop', {
       tab: tabId(),
       local_dir: state.local.path,
       name: file.name,
@@ -3036,8 +3036,14 @@
         if (result && result.success) queued++;
         else failed++;
       }
-      if (queued) toast(tn("Queued {count} desktop item for upload.", "Queued {count} desktop items for upload.", queued));
+      if (queued) {
+        const dropTab = activeTab();
+        toast(dropTab && dropTab.is_local
+          ? tn("Saved {count} desktop item to local directory.", "Saved {count} desktop items to local directory.", queued)
+          : tn("Queued {count} desktop item for upload.", "Queued {count} desktop items for upload.", queued));
+      }
       if (failed) toast(tn("{count} desktop item refused.", "{count} desktop items refused.", failed), true);
+      if (activeTab() && activeTab().is_local) await loadRemote(state.remote.path);
       refreshQueue();
       return;
     }
@@ -3148,15 +3154,17 @@
     // unless the event names one.
     const requested = payload && payload.side === 'local' ? 'local' : payload && payload.side === 'remote' ? 'remote' : null;
     const side = requested || (state.focusPane === 'local' ? 'local' : 'remote');
-    if (side === 'remote') {
-      const tab = activeTab();
-      if (!tab || !tab.connected || tab.is_local) { toast(t("Not connected."), true); return; }
+    const tab = activeTab();
+    if (side === 'remote' && (!tab || !tab.connected)) {
+      toast(t("Not connected."), true);
+      return;
     }
+    const localTarget = side === 'local' || !!(tab && tab.is_local);
     nativeDropBusy = true;
     try {
       const transport = nativeDropTransport();
       const target = {
-        target: side,
+        target: localTarget ? 'local' : 'remote',
         directory: side === 'local' ? state.local.path : state.remote.path,
         tab: tabId(),
       };
@@ -3173,7 +3181,7 @@
         return;
       }
       if (outcome.queued) {
-        toast(side === 'local'
+        toast(localTarget
           ? tn("Saved {count} desktop item to local directory.", "Saved {count} desktop items to local directory.", outcome.queued)
           : tn("Queued {count} desktop item for upload.", "Queued {count} desktop items for upload.", outcome.queued));
       }
@@ -3186,7 +3194,7 @@
           {reason: outcome.failed[0].error}), true);
       }
       await refreshPanes(side);
-      if (side === 'remote') refreshQueue();
+      if (!localTarget) refreshQueue();
     } finally {
       nativeDropBusy = false;
     }
@@ -4696,9 +4704,13 @@
   async function closeExternalEditorSession() {
     if (!state.editor || !state.editor.externalId) return;
     const editId = state.editor.externalId;
+    let result = await apiPost('/api/editor/external/close', { id: editId });
+    if (result && result.success === false) {
+      if (!confirm(t("Close without saving your changes?"))) return;
+      result = await apiPost('/api/editor/external/close', { id: editId, force: true });
+    }
     state.editor.externalId = null;
     if (externalEditorPollTimer) { clearInterval(externalEditorPollTimer); externalEditorPollTimer = null; }
-    await apiPost('/api/editor/external/close', { id: editId });
     updateExternalEditorControls();
     await reloadEditorFile();
   }
@@ -8306,15 +8318,14 @@
 
   async function openChecksum() {
     const side = state.focusPane;
-    if (side !== 'remote') {
-      toast(t('A checksum is read from the remote side; select the remote panel.'),
-        true);
+    const tab = activeTab();
+    if (side === 'remote' && (!tab || !tab.connected)) {
+      toast(t('Not connected.'), true);
       return;
     }
-    const tab = activeTab();
-    if (!tab || !tab.connected) { toast(t('Not connected.'), true); return; }
+    const paneEntries = state[side] ? state[side].entries : [];
     const names = selectedNames(side).filter(name => {
-      const entry = state.remote.entries.find(item => item.name === name);
+      const entry = paneEntries.find(item => item.name === name);
       return entry && !entry.is_dir;
     });
     if (!names.length) {
@@ -8324,8 +8335,11 @@
     }
     const algorithm = prompt(t('Algorithm (sha-256, sha-1, md5 or crc32):'), 'sha-256');
     if (!algorithm) return;
-    const result = await apiPost('/api/remote/checksum',
-      { tab: tab.id, algorithm: algorithm.trim(), names: names });
+    const result = side === 'local'
+      ? await apiPost('/api/local/checksum',
+          { tab: tab ? tab.id : 0, local_dir: state.local.path, algorithm: algorithm.trim(), names: names })
+      : await apiPost('/api/remote/checksum',
+          { tab: tab.id, algorithm: algorithm.trim(), names: names });
     if (!result.success) {
       toast(errorMessage(result.error, t('Cannot read the checksum.')), true);
       return;
