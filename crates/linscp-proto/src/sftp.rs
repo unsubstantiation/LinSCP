@@ -986,7 +986,22 @@ impl RemoteSession for SftpClientSession {
     }
 
     async fn copy_file(&self, from: &str, to: &str) -> Result<(), ProtoError> {
+        if from == to {
+            return Err(ProtoError::Transport(
+                "Source and destination paths are identical.".to_string(),
+            ));
+        }
         let mut t = self.sftp.lock().await;
+        if !t.extensions.contains_key("copy-data") {
+            return Err(ProtoError::UnsupportedCapability("copy-data", self.scheme));
+        }
+        let src_mode = t
+            .stat_internal(SSH_FXP_STAT, from)
+            .await?
+            .map(|attrs| attrs.permissions & 0o7777)
+            .filter(|&mode| mode != 0)
+            .unwrap_or(0o644);
+        let dest_existed = t.stat_internal(SSH_FXP_LSTAT, to).await?.is_some();
         let read_handle = t
             .open_handle(from, SSH_FXF_READ, &SftpWireAttrs::default())
             .await?;
@@ -996,7 +1011,7 @@ impl RemoteSession for SftpClientSession {
                 SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_TRUNC,
                 &SftpWireAttrs {
                     flags: SSH_FILEXFER_ATTR_PERMISSIONS,
-                    permissions: 0o644,
+                    permissions: src_mode,
                     ..Default::default()
                 },
             )
@@ -1020,12 +1035,27 @@ impl RemoteSession for SftpClientSession {
         let _ = t.close_handle(&read_handle).await;
         let _ = t.close_handle(&write_handle).await;
 
-        let (rtype, rbody) = req_res?;
+        async fn cleanup_created_dest(t: &mut SftpTransport, dest_existed: bool, to: &str) {
+            if !dest_existed {
+                let mut rm = SftpPacketWriter::new();
+                rm.push_str(to);
+                let _ = t.request(SSH_FXP_REMOVE, rm).await;
+            }
+        }
+
+        let (rtype, rbody) = match req_res {
+            Ok(pair) => pair,
+            Err(err) => {
+                cleanup_created_dest(&mut t, dest_existed, to).await;
+                return Err(err);
+            }
+        };
         if rtype == SSH_FXP_STATUS {
             let (code, msg) = SftpTransport::parse_status(&rbody)?;
             if code == SSH_FX_OK {
                 return Ok(());
             }
+            cleanup_created_dest(&mut t, dest_existed, to).await;
             if code == SSH_FX_OP_UNSUPPORTED {
                 return Err(ProtoError::UnsupportedCapability("copy-data", self.scheme));
             }
@@ -1033,6 +1063,7 @@ impl RemoteSession for SftpClientSession {
                 "Server-side copy '{from}' -> '{to}' failed: {msg}"
             )));
         }
+        cleanup_created_dest(&mut t, dest_existed, to).await;
         Err(ProtoError::Transport(format!(
             "Unexpected SFTP packet {rtype} for copy-data."
         )))

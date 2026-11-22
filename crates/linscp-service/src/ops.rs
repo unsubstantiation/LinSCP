@@ -1425,6 +1425,16 @@ fn cleanup_catalog(config_root: &Path) -> Vec<(&'static str, &'static str, PathB
             "Temporary remote editor buffers",
             config_root.join("edit-tmp"),
         ),
+        (
+            "external_edit",
+            "External editor staged buffers",
+            config_root.join("external-edit"),
+        ),
+        (
+            "drop_staging",
+            "Drag-and-drop upload staging",
+            config_root.join("drop-staging"),
+        ),
     ]
 }
 
