@@ -205,6 +205,7 @@ export class ForegroundTransferBridge {
     try {
       await this.invoker.invoke('linscp_foreground_start', { title: safeTitle, ongoing: safeOngoing });
       this.running = true;
+      this.lastProgress = -1;
       return true;
     } catch {
       return false;

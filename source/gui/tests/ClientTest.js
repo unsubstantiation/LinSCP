@@ -3875,6 +3875,103 @@ function options(id) {
       await new Promise(resolve => setTimeout(resolve, 120));
     }
 
+    // Android mobile terminal survival across app switches + WebView reload reattachment.
+    {
+      const savedCoreTermBg = window.LinSCPCore;
+      const savedTransfersBg = responses['/api/transfers'];
+      const savedTermListBg = responses['/api/terminal/list'];
+      let termFgStarts = [];
+      let termFgStops = 0;
+
+      responses['/api/transfers'] = { transfers: [], paused: false };
+      await window.refreshQueue();
+      const FakeForegroundBridge = function () {
+        this.available = true;
+        this.isRunning = false;
+        this.start = async (title, ongoing) => {
+          termFgStarts.push([title, ongoing]);
+          this.isRunning = true;
+          return true;
+        };
+        this.update = async () => true;
+        this.stop = async () => {
+          termFgStops += 1;
+          this.isRunning = false;
+          return true;
+        };
+      };
+      window.LinSCPCore = new Proxy(realCore, {
+        get(target, key) {
+          if (key === 'hostCapabilities') {
+            return () => Object.assign(target.hostCapabilities({ host: window }), {
+              platform: 'android',
+              foregroundTransfers: true,
+              separateWindows: false
+            });
+          }
+          if (key === 'ForegroundTransferBridge') {
+            return FakeForegroundBridge;
+          }
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        }
+      });
+
+      await window.openTerminal();
+      await new Promise(resolve => setTimeout(resolve, 120));
+      check('opening an Android terminal starts the foreground service keepalive immediately',
+        termFgStarts.length >= 1 && termFgStarts[0][1] === 1 && termFgStops === 0,
+        JSON.stringify({ starts: termFgStarts, stops: termFgStops }));
+
+      await window.refreshQueue();
+      check('empty transfer queue poll keeps Android foreground service running while terminal is open',
+        termFgStops === 0 && doc.getElementById('terminalModal').classList.contains('open'),
+        'stops=' + termFgStops);
+
+      let fakeVisibility = 'hidden';
+      Object.defineProperty(doc, 'visibilityState', {
+        configurable: true,
+        get: () => fakeVisibility
+      });
+      doc.dispatchEvent(new window.Event('visibilitychange'));
+      await new Promise(resolve => setTimeout(resolve, 100));
+      fakeVisibility = 'visible';
+      doc.dispatchEvent(new window.Event('visibilitychange'));
+      await new Promise(resolve => setTimeout(resolve, 80));
+      check('Android terminal modal stays open and alive across app-switch visibility transitions',
+        doc.getElementById('terminalModal').classList.contains('open') && termFgStops === 0,
+        'open=' + doc.getElementById('terminalModal').classList.contains('open') + ' stops=' + termFgStops);
+
+      window.closeTerminal();
+      await new Promise(resolve => setTimeout(resolve, 80));
+      check('closing the Android terminal stops the foreground service when no transfers are active',
+        termFgStops === 1 && !doc.getElementById('terminalModal').classList.contains('open'),
+        'stops=' + termFgStops);
+
+      termFgStarts = [];
+      termFgStops = 0;
+      responses['/api/terminal/list'] = {
+        success: true,
+        terminals: [{ terminal: 'term-surviving-42', tab: 1, transport: 'mosh', cols: 80, rows: 24, alive: true, title: 'mosh@prod' }]
+      };
+      const reattached = await window.restoreOpenInPageTerminal();
+      await new Promise(resolve => setTimeout(resolve, 100));
+      check('restoreOpenInPageTerminal reattaches a surviving backend terminal and restarts foreground keepalive',
+        reattached === true &&
+        doc.getElementById('terminalModal').classList.contains('open') &&
+        termFgStarts.length >= 1,
+        JSON.stringify({ reattached, starts: termFgStarts }));
+      responses['/api/terminal/list'] = { success: true, terminals: [] };
+      window.closeTerminal();
+      await new Promise(resolve => setTimeout(resolve, 80));
+
+      delete doc.visibilityState;
+      window.LinSCPCore = savedCoreTermBg;
+      responses['/api/transfers'] = savedTransfersBg;
+      if (savedTermListBg === undefined) delete responses['/api/terminal/list'];
+      else responses['/api/terminal/list'] = savedTermListBg;
+    }
+
     window.LinSCPCore = realCore;
     delete window.LinSCPCore.terminalWindow;
   }

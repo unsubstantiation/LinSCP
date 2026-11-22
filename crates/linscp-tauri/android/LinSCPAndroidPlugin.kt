@@ -26,8 +26,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
+import android.content.pm.ServiceInfo
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -78,6 +80,7 @@ class LinSCPExportProvider : FileProvider()
 @TauriPlugin
 class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   private val running = AtomicBoolean(false)
+  private val notificationPermissionAsked = AtomicBoolean(false)
   private val shareLock = Any()
   private val pendingShares = mutableListOf<String>()
   private val shareDir: File get() = File(activity.cacheDir, "incoming-shares")
@@ -496,7 +499,9 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   fun foregroundStart(invoke: Invoke) {
     val args = invoke.parseArgs(ForegroundStartArgs::class.java)
     try {
-      if (Build.VERSION.SDK_INT >= 33 && activity.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+      if (Build.VERSION.SDK_INT >= 33 &&
+          activity.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED &&
+          notificationPermissionAsked.compareAndSet(false, true)) {
         activity.requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 7302)
       }
       val intent = Intent(activity, LinSCPTransferService::class.java).apply {
@@ -814,14 +819,12 @@ class LinSCPTransferService : Service() {
       ACTION_START -> {
         activeTitle = intent.getStringExtra("title") ?: "LinSCP transfers"
         val count = intent.getIntExtra("ongoing", 0)
-        startForeground(NOTIFICATION_ID, notification(activeTitle, count, 0, 0))
-        foreground = true
+        startServiceForeground(notification(activeTitle, count, 0, 0))
       }
       ACTION_UPDATE -> {
         val done = intent.getLongExtra("done", 0); val total = intent.getLongExtra("total", 0)
         if (!foreground) {
-          startForeground(NOTIFICATION_ID, notification(activeTitle, 1, done, total))
-          foreground = true
+          startServiceForeground(notification(activeTitle, 1, done, total))
         } else {
           (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIFICATION_ID, notification(activeTitle, 1, done, total))
         }
@@ -830,15 +833,50 @@ class LinSCPTransferService : Service() {
     }
     return START_NOT_STICKY
   }
+  override fun onTimeout(startId: Int) {
+    foreground = false
+    stopForeground(STOP_FOREGROUND_REMOVE)
+    stopSelf(startId)
+  }
   override fun onDestroy() { foreground = false; super.onDestroy() }
+  private fun startServiceForeground(notification: Notification) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+      startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+    } else {
+      startForeground(NOTIFICATION_ID, notification)
+    }
+    foreground = true
+  }
   private fun createChannel() {
     if (Build.VERSION.SDK_INT >= 26) {
-      (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(NotificationChannel(channelId, "File transfers", NotificationManager.IMPORTANCE_LOW))
+      (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(NotificationChannel(channelId, "Background sessions & transfers", NotificationManager.IMPORTANCE_LOW))
     }
   }
   private fun notification(title: String, count: Int, done: Long, total: Long): Notification {
-    val builder = NotificationCompat.Builder(this, channelId).setSmallIcon(android.R.drawable.stat_sys_upload).setContentTitle(title).setContentText(if (total > 0) "${done / 1024} KiB of ${total / 1024} KiB" else "$count active transfer(s)").setOngoing(true).setOnlyAlertOnce(true)
-    if (total > 0) builder.setProgress(100, ((done.coerceAtMost(total) * 100) / total).toInt(), false) else builder.setProgress(0, 0, true)
+    val isTransfer = total > 0 || count > 1 || title.contains("transfer", ignoreCase = true)
+    val subtitle = when {
+      total > 0 -> "${done / 1024} KiB of ${total / 1024} KiB"
+      isTransfer -> "$count active transfer(s)"
+      else -> "Active session kept connected in background"
+    }
+    val builder = NotificationCompat.Builder(this, channelId)
+      .setSmallIcon(if (isTransfer) android.R.drawable.stat_sys_upload else android.R.drawable.stat_notify_sync_noanim)
+      .setContentTitle(title)
+      .setContentText(subtitle)
+      .setCategory(NotificationCompat.CATEGORY_SERVICE)
+      .setOngoing(true)
+      .setOnlyAlertOnce(true)
+    packageManager.getLaunchIntentForPackage(packageName)?.let { launchIntent ->
+      launchIntent.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+      val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or
+        (if (Build.VERSION.SDK_INT >= 23) PendingIntent.FLAG_IMMUTABLE else 0)
+      builder.setContentIntent(PendingIntent.getActivity(this, 0, launchIntent, pendingFlags))
+    }
+    if (total > 0) {
+      builder.setProgress(100, ((done.coerceAtMost(total) * 100) / total).toInt(), false)
+    } else if (isTransfer) {
+      builder.setProgress(0, 0, true)
+    }
     return builder.build()
   }
   companion object {
