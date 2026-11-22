@@ -16910,6 +16910,9 @@ mod tests {
             source.read_to_end(&mut bytes).await.map_err(|e| ProtoError::Transport(e.to_string()))?;
             let sent = bytes.len() as u64;
             let mtime = if opts.preserve_time { opts.mtime.unwrap_or(0) } else { 0 };
+            if let Some(mode) = opts.permissions {
+                self.modes.lock().expect("m").insert(path.to_string(), mode);
+            }
             self.docs.lock().expect("m").insert(path.to_string(), MockRemoteDoc { bytes, is_dir: false, mtime });
             if let Some(report) = progress { report(sent, sent); }
             Ok(sent)
@@ -18749,18 +18752,23 @@ mod tests {
     async fn remote_copy_link_checksum_xml_and_save_permission_preservation() {
         let tmp = tempfile::tempdir().unwrap();
         let local_dir = tmp.path().join("local");
+        let cfg_dir = tmp.path().join("cfg");
         std::fs::create_dir_all(&local_dir).unwrap();
-        let xml_path = tmp.path().join("actions.xml");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
 
-        let svc = CommanderService::new(tmp.path().join("cfg"), Arc::new(NativeLocalFs::new()));
-        assert_eq!(
-            svc.dispatch(ApiEnvelope {
-                method: "POST".into(),
-                path: "/api/preferences".into(),
-                body: json!({"xml_log_enabled": true, "xml_log_path": xml_path.to_string_lossy()}),
-            }).status,
-            200
-        );
+        let svc = CommanderService::new(cfg_dir.clone(), Arc::new(NativeLocalFs::new()));
+        let mut prefs = svc
+            .dispatch(ApiEnvelope { method: "GET".into(), path: "/api/preferences".into(), body: json!({}) })
+            .payload["preferences"]
+            .clone();
+        prefs["xml_log_enabled"] = json!(true);
+        prefs["xml_log_path"] = json!("actions.xml");
+        let saved_prefs = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/preferences".into(),
+            body: json!({"action": "save", "preferences": prefs}),
+        });
+        assert_eq!(saved_prefs.status, 200, "{}", saved_prefs.payload);
 
         let session = Arc::new(MockSession::new());
         session.set_scheme(ProtocolScheme::Scp);
@@ -18855,7 +18863,9 @@ mod tests {
             body: json!({"tab": tab_id, "algorithm": "sha-256", "names": ["report.txt"]}),
         }).await;
         assert_eq!(cs.status, 200, "{}", cs.payload);
-        let xml = std::fs::read_to_string(&xml_path).expect("xml log written");
+        let xml_reply = svc.dispatch(ApiEnvelope { method: "GET".into(), path: "/api/logs/xml".into(), body: json!({}) });
+        assert_eq!(xml_reply.status, 200, "{}", xml_reply.payload);
+        let xml = xml_reply.payload["content"].as_str().unwrap_or("");
         assert!(xml.contains("<cp>"), "XML log missing <cp>: {xml}");
         assert!(xml.contains("<checksum>"), "XML log missing <checksum>: {xml}");
 
@@ -18940,17 +18950,18 @@ mod tests {
         }
 
         // 4. Dual-local `/api/remote/properties` exposes `path`, `mode`, `mtime`, and `is_link`.
-        let props = svc.dispatch(ApiEnvelope {
+        let props = svc.dispatch_async(ApiEnvelope {
             method: "POST".into(),
             path: "/api/remote/properties".into(),
-            body: json!({"tab": tab_id, "name": "r1.sh"}),
-        });
+            body: json!({"tab": tab_id, "names": ["r1.sh"]}),
+        }).await;
         assert_eq!(props.status, 200, "{}", props.payload);
-        assert!(props.payload["entry"]["path"].as_str().unwrap_or("").ends_with("r1.sh"));
-        assert!(props.payload["entry"]["mtime"].is_i64());
-        assert_eq!(props.payload["entry"]["is_link"], false);
+        let row = &props.payload["properties"][0];
+        assert!(row["path"].as_str().unwrap_or("").ends_with("r1.sh"), "{row}");
+        assert!(row["mtime"].is_i64(), "{row}");
+        assert_eq!(row["is_link"], false, "{row}");
         if cfg!(unix) {
-            assert_eq!(props.payload["entry"]["mode"], "0750");
+            assert_eq!(row["mode"].as_u64().unwrap_or(0) & 0o777, 0o750, "{row}");
         }
 
         // 5. Dual-local `/api/remote/copy` duplicates files by relative leaf and into existing directories, refusing overwrites.
