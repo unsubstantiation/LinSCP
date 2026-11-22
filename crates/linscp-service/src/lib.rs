@@ -19139,7 +19139,7 @@ mod tests {
                 staged_path: ext2_file.clone(),
                 staged_dir: Some(ext2_dir.clone()),
                 last_mtime_ns: 1,
-                base_remote_mtime: Some(0),
+                base_remote_mtime: Some(100),
                 editor_label: "nvim".to_string(),
                 upload_count: 0,
                 last_error: None,
