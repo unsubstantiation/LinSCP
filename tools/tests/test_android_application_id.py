@@ -261,6 +261,58 @@ class AndroidApplicationIdTests(unittest.TestCase):
         self.assertIn("{tab, name: 'smoke-resume'}", between)
         self.assertNotIn("{name: 'smoke-resume'}", smoke)
 
+    def test_android_navigation_bar_is_hidden_while_app_is_active(self):
+        kotlin = (ROOT / 'crates/linscp-tauri/android/LinSCPAndroidPlugin.kt').read_text(encoding='utf-8')
+        self.assertIn('internal fun hideAndroidNavigationBar(activity: Activity)', kotlin)
+        self.assertIn('WindowCompat.getInsetsController(', kotlin)
+        self.assertIn('WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE', kotlin)
+        self.assertIn('controller.hide(WindowInsetsCompat.Type.navigationBars())', kotlin)
+        self.assertNotIn('controller.hide(WindowInsetsCompat.Type.systemBars())', kotlin)
+        self.assertNotIn('controller.hide(WindowInsetsCompat.Type.statusBars())', kotlin)
+        self.assertIn('installNavigationBarInsetsGuard(webView)', kotlin)
+        self.assertIn('WindowInsetsCompat.Type.ime()', kotlin)
+        self.assertIn('addOnWindowFocusChangeListener', kotlin)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for name in ['tools/prepare_android_project.py', 'tools/android_application_id.py',
+                         'crates/linscp-tauri/tauri.conf.json', 'crates/linscp-tauri/android/LinSCPAndroidPlugin.kt']:
+                target = root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / name, target)
+            app = root / 'crates/linscp-tauri/gen/android/app'
+            manifest = app / 'src/main/AndroidManifest.xml'
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text('''<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application>
+        <activity android:name=".MainActivity"></activity>
+    </application>
+</manifest>''')
+            (app / 'build.gradle.kts').write_text(f'applicationId = "{EXPECTED}"\n')
+            activity = app / 'src/main/java' / pathlib.Path(*EXPECTED.split('.')) / 'MainActivity.kt'
+            activity.parent.mkdir(parents=True, exist_ok=True)
+            activity.write_text(
+                f'package {EXPECTED}\n\n'
+                'import android.os.Bundle\n'
+                'import androidx.activity.enableEdgeToEdge\n\n'
+                'class MainActivity : TauriActivity() {\n'
+                '  override fun onCreate(savedInstanceState: Bundle?) {\n'
+                '    enableEdgeToEdge()\n'
+                '    super.onCreate(savedInstanceState)\n'
+                '  }\n'
+                '}\n'
+            )
+            command = [sys.executable, str(root / 'tools/prepare_android_project.py')]
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            first_pass = activity.read_text(encoding='utf-8')
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            second_pass = activity.read_text(encoding='utf-8')
+            self.assertEqual(first_pass, second_pass)
+            self.assertEqual(first_pass.count('hideAndroidNavigationBar(this)'), 3)
+            self.assertIn('override fun onResume()', first_pass)
+            self.assertIn('override fun onWindowFocusChanged(hasFocus: Boolean)', first_pass)
+
 
 if __name__ == '__main__':
     unittest.main()
