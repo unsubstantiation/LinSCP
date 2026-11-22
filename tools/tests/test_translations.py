@@ -67,7 +67,7 @@ class TranslationTests(unittest.TestCase):
             # Values, not words: paths, host patterns, ports and the commands
             # the user types must keep their exact spelling in every locale.
             "*.local, 192.168.*", "/etc/ssl/certs/ca.crt", "/tmp/linscp-backup.json",
-            "nc %host %port", "proxy.example.test", "sha256/...",
+            "nc %host %port", "xfce4-session", "proxy.example.test", "sha256/...",
             "us-east-1", "session-actions.xml",
             "STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING",
             "GLACIER_IR", "DEEP_ARCHIVE", "REDUCED_REDUNDANCY",

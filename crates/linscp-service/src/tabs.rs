@@ -84,7 +84,7 @@ impl TabRuntime {
     pub fn describe(&self) -> Value {
         let mut redacted = self.session_json.clone();
         if let Some(obj) = redacted.as_object_mut() {
-            for key in ["s3_secret_key", "s3_session_token", "proxy_password", "passphrase", "key_passphrase", "clear_key_passphrase", "keep_password", "keep_key_passphrase", "keep_tunnel_password", "keep_tunnel_passphrase"] { obj.remove(key); }
+            for key in ["s3_secret_key", "s3_session_token", "proxy_password", "passphrase", "key_passphrase", "clear_password", "clear_key_passphrase", "clear_proxy_password", "keep_password", "keep_key_passphrase", "keep_proxy_password", "keep_tunnel_password", "keep_tunnel_passphrase"] { obj.remove(key); }
             obj.remove("password");
             obj.remove("tunnel_password");
             obj.remove("tunnel_passphrase");
@@ -194,6 +194,7 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
     obj.insert("alt_port".into(), json!(effective_site_alt_port(site)));
     obj.insert("alt_fallback".into(), json!(site.extra_fields.get("alt_fallback").is_some_and(|v| v == "1")));
     obj.insert("has_key_passphrase".into(), json!(has_key_passphrase));
+    obj.insert("has_unreadable_secret".into(), json!(site.summary().has_unreadable_secret));
     obj.insert(
         "keyfile".into(),
         json!(site.private_key.clone().unwrap_or_default()),
@@ -694,6 +695,24 @@ pub fn parse_gui_session_spec(
         "auth_gssapi_kex",
         "gssapi_fwd_tgt",
         "logical_host",
+        "rdp_domain",
+        "rdp_security",
+        "rdp_color_depth",
+        "rdp_width",
+        "rdp_height",
+        "rdp_fullscreen",
+        "rdp_drive_redirection",
+        "rdp_audio_mode",
+        "rdp_compression",
+        "vnc_view_only",
+        "vnc_quality",
+        "spice_tls_port",
+        "x2go_session_type",
+        "x2go_command",
+        "x2go_link",
+        "x2go_pack",
+        "x11_display",
+        "waypipe",
     ];
     for k in extra_keys {
         if let Some(v) = session.get(k) {
@@ -805,6 +824,107 @@ pub fn parse_gui_session_spec(
             }
         }
     }
+    if let Some(color_val) = spec.raw_fields.get("color").cloned() {
+        let trimmed = color_val.trim();
+        if trimmed.is_empty() {
+            spec.raw_fields.remove("color");
+        } else if trimmed.len() == 7
+            && trimmed.starts_with('#')
+            && trimmed[1..].chars().all(|c| c.is_ascii_hexdigit())
+        {
+            spec.raw_fields
+                .insert("color".to_string(), trimmed.to_ascii_lowercase());
+        } else {
+            return Err("Session color must be empty or a 6-digit hex color (#rrggbb).".to_string());
+        }
+    }
+    if let Some(note_val) = spec.raw_fields.get("note").cloned() {
+        let trimmed = note_val.trim();
+        if trimmed.chars().any(char::is_control) {
+            return Err("Session note must not contain control characters.".to_string());
+        }
+        if trimmed.is_empty() {
+            spec.raw_fields.remove("note");
+        } else {
+            spec.raw_fields.insert("note".to_string(), trimmed.to_string());
+        }
+    }
+    for desktop_opt in [
+        "rdp_domain",
+        "rdp_security",
+        "x2go_session_type",
+        "x2go_command",
+        "x2go_link",
+        "x2go_pack",
+        "x11_display",
+    ] {
+        if let Some(val) = spec.raw_fields.get(desktop_opt).cloned() {
+            let trimmed = val.trim();
+            if trimmed.chars().any(char::is_control) {
+                return Err(format!("Desktop option '{desktop_opt}' contains invalid control characters."));
+            }
+            if trimmed.is_empty() {
+                spec.raw_fields.remove(desktop_opt);
+            } else {
+                spec.raw_fields.insert(desktop_opt.to_string(), trimmed.to_string());
+            }
+        }
+    }
+    if let Some(depth) = spec.raw_fields.get("rdp_color_depth").cloned() {
+        let trimmed = depth.trim();
+        if trimmed.is_empty() {
+            spec.raw_fields.remove("rdp_color_depth");
+        } else if matches!(trimmed, "8" | "15" | "16" | "24" | "32") {
+            spec.raw_fields.insert("rdp_color_depth".to_string(), trimmed.to_string());
+        } else {
+            return Err("RDP color depth must be 8, 15, 16, 24, or 32.".to_string());
+        }
+    }
+    for dim_key in ["rdp_width", "rdp_height"] {
+        if let Some(raw_dim) = spec.raw_fields.get(dim_key).cloned() {
+            let trimmed = raw_dim.trim();
+            if trimmed.is_empty() || trimmed == "0" {
+                spec.raw_fields.remove(dim_key);
+            } else if let Ok(px) = trimmed.parse::<u32>() {
+                if (1..=16384).contains(&px) {
+                    spec.raw_fields.insert(dim_key.to_string(), px.to_string());
+                } else {
+                    return Err(format!("Desktop dimension '{dim_key}' must be between 1 and 16384."));
+                }
+            } else {
+                return Err(format!("Desktop dimension '{dim_key}' must be an integer."));
+            }
+        }
+    }
+    if let Some(raw_q) = spec.raw_fields.get("vnc_quality").cloned() {
+        let trimmed = raw_q.trim();
+        if trimmed.is_empty() {
+            spec.raw_fields.remove("vnc_quality");
+        } else if let Ok(q) = trimmed.parse::<u8>() {
+            if q <= 9 {
+                spec.raw_fields.insert("vnc_quality".to_string(), q.to_string());
+            } else {
+                return Err("VNC quality must be between 0 and 9.".to_string());
+            }
+        } else {
+            return Err("VNC quality must be an integer between 0 and 9.".to_string());
+        }
+    }
+    if let Some(raw_spice_tls) = spec.raw_fields.get("spice_tls_port").cloned() {
+        let trimmed = raw_spice_tls.trim();
+        if trimmed.is_empty() || trimmed == "0" {
+            spec.raw_fields.remove("spice_tls_port");
+        } else if let Ok(p) = trimmed.parse::<u16>() {
+            if p > 0 {
+                spec.raw_fields.insert("spice_tls_port".to_string(), p.to_string());
+            } else {
+                return Err("SPICE TLS port must be between 1 and 65535.".to_string());
+            }
+        } else {
+            return Err("SPICE TLS port must be between 1 and 65535.".to_string());
+        }
+    }
+
     // Translate GUI TLS option names to the names consumed by the engine.
     for (gui, engine) in [
         ("tls_ca_file", "ca_certificate_file"),
@@ -878,7 +998,7 @@ pub fn parse_gui_session_spec(
         );
         obj.insert("remote_dir".into(), json!(initial_dir));
         obj.insert("local_dir".into(), json!(local_dir));
-        for key in ["s3_secret_key", "s3_session_token", "proxy_password", "passphrase", "key_passphrase", "clear_key_passphrase", "keep_password", "keep_key_passphrase", "keep_tunnel_password", "keep_tunnel_passphrase"] { obj.remove(key); }
+        for key in ["s3_secret_key", "s3_session_token", "proxy_password", "passphrase", "key_passphrase", "clear_password", "clear_key_passphrase", "clear_proxy_password", "keep_password", "keep_key_passphrase", "keep_proxy_password", "keep_tunnel_password", "keep_tunnel_passphrase"] { obj.remove(key); }
         obj.remove("password");
         obj.remove("tunnel_password");
         obj.remove("tunnel_passphrase");
@@ -1359,6 +1479,57 @@ mod tests {
         assert_eq!(gui_json["s3_kms_key"], "alias/my-key");
         assert_eq!(gui_json["s3_metadata"], "env=prod,team=storage");
         assert_eq!(gui_json["preset"], "TextLogs");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gui_desktop_options_and_metadata_round_trip() {
+        let dir = test_config_dir("desktop-options");
+        let vault = linscp_platform::NativeSecretVault::new();
+        let session = json!({
+            "protocol": "rdp",
+            "host": "winbox.example.test",
+            "port": 3389,
+            "username": "alice",
+            "color": "#3B82F6",
+            "note": "Primary jump workstation",
+            "rdp_domain": "CORP",
+            "rdp_security": "nla",
+            "rdp_color_depth": "32",
+            "rdp_width": 1920,
+            "rdp_height": 1080,
+            "rdp_fullscreen": true,
+            "rdp_drive_redirection": false,
+            "rdp_compression": true,
+            "vnc_quality": "7",
+            "spice_tls_port": 5901,
+            "x2go_session_type": "XFCE",
+            "x11_display": ":0",
+            "waypipe": true,
+        });
+        let (spec, _) = parse_gui_session_spec(&session, None, &dir, &vault).unwrap();
+        let opts = linscp_proto::remote_desktop::DesktopOptions::from_raw_fields(&spec.raw_fields);
+        assert_eq!(opts.domain.as_deref(), Some("CORP"));
+        assert_eq!(opts.security.as_deref(), Some("nla"));
+        assert_eq!(opts.color_depth, Some(32));
+        assert_eq!(opts.width, Some(1920));
+        assert_eq!(opts.height, Some(1080));
+        assert!(opts.fullscreen);
+        assert!(!opts.drive_redirection);
+        assert!(opts.compression);
+        assert_eq!(opts.vnc_quality, Some(7));
+        assert_eq!(opts.spice_tls_port, Some(5901));
+        assert_eq!(opts.x2go_session_type.as_deref(), Some("XFCE"));
+        assert_eq!(opts.x11_display.as_deref(), Some(":0"));
+        assert!(opts.waypipe);
+
+        let site = build_stored_site_for_save("corp-rdp", &spec);
+        let gui_json = stored_site_to_gui_json(&site);
+        assert_eq!(gui_json["color"], "#3b82f6");
+        assert_eq!(gui_json["note"], "Primary jump workstation");
+        assert_eq!(gui_json["rdp_domain"], "CORP");
+        assert_eq!(gui_json["rdp_width"], "1920");
+        assert_eq!(gui_json["spice_tls_port"], "5901");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

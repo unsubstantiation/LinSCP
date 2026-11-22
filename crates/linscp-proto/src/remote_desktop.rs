@@ -113,32 +113,33 @@ impl DesktopOptions {
     pub fn from_raw_fields(raw: &BTreeMap<String, String>) -> Self {
         let mut opts = Self::default();
         for (k, v) in raw {
+            let trimmed = v.trim();
             match k.as_str() {
-                "rdp_domain" | "domain" => opts.domain = Some(v.clone()).filter(|s| !s.is_empty()),
-                "rdp_security" | "security" => opts.security = Some(v.to_ascii_lowercase()),
+                "rdp_domain" | "domain" => opts.domain = (!trimmed.is_empty()).then(|| trimmed.to_string()),
+                "rdp_security" | "security" => opts.security = (!trimmed.is_empty()).then(|| trimmed.to_ascii_lowercase()),
                 "rdp_color_depth" | "color_depth" => {
-                    if let Ok(n) = v.parse::<u8>() {
+                    if let Ok(n) = trimmed.parse::<u8>() {
                         if matches!(n, 8 | 15 | 16 | 24 | 32) {
                             opts.color_depth = Some(n);
                         }
                     }
                 }
-                "rdp_width" => opts.width = v.parse().ok(),
-                "rdp_height" => opts.height = v.parse().ok(),
-                "rdp_fullscreen" | "fullscreen" => opts.fullscreen = parse_bool(v),
-                "rdp_drive_redirection" => opts.drive_redirection = parse_bool(v),
-                "rdp_audio_mode" => opts.audio_mode = v.parse().ok(),
-                "rdp_compression" => opts.compression = parse_bool(v),
-                "vnc_view_only" => opts.vnc_view_only = parse_bool(v),
-                "vnc_quality" => opts.vnc_quality = v.parse().ok(),
-                "spice_tls_port" => opts.spice_tls_port = v.parse().ok(),
-                "spice_tls_insecure" => opts.spice_insecure = parse_bool(v),
-                "x2go_session_type" => opts.x2go_session_type = Some(v.clone()),
-                "x2go_command" => opts.x2go_command = Some(v.clone()),
-                "x2go_link" => opts.x2go_link = Some(v.clone()),
-                "x2go_pack" => opts.x2go_pack = Some(v.clone()),
-                "x11_display" => opts.x11_display = Some(v.clone()),
-                "waypipe" => opts.waypipe = parse_bool(v),
+                "rdp_width" => opts.width = trimmed.parse::<u32>().ok().filter(|&n| n > 0),
+                "rdp_height" => opts.height = trimmed.parse::<u32>().ok().filter(|&n| n > 0),
+                "rdp_fullscreen" | "fullscreen" => opts.fullscreen = parse_bool(trimmed),
+                "rdp_drive_redirection" => opts.drive_redirection = parse_bool(trimmed),
+                "rdp_audio_mode" => opts.audio_mode = trimmed.parse().ok(),
+                "rdp_compression" => opts.compression = parse_bool(trimmed),
+                "vnc_view_only" => opts.vnc_view_only = parse_bool(trimmed),
+                "vnc_quality" => opts.vnc_quality = trimmed.parse().ok(),
+                "spice_tls_port" => opts.spice_tls_port = trimmed.parse::<u16>().ok().filter(|&n| n > 0),
+                "spice_tls_insecure" => opts.spice_insecure = parse_bool(trimmed),
+                "x2go_session_type" => opts.x2go_session_type = (!trimmed.is_empty()).then(|| trimmed.to_string()),
+                "x2go_command" => opts.x2go_command = (!trimmed.is_empty()).then(|| trimmed.to_string()),
+                "x2go_link" => opts.x2go_link = (!trimmed.is_empty()).then(|| trimmed.to_string()),
+                "x2go_pack" => opts.x2go_pack = (!trimmed.is_empty()).then(|| trimmed.to_string()),
+                "x11_display" => opts.x11_display = (!trimmed.is_empty()).then(|| trimmed.to_string()),
+                "waypipe" => opts.waypipe = parse_bool(trimmed),
                 _ => {}
             }
         }
@@ -444,7 +445,11 @@ pub fn ticket_from_config(
             (argv, content, Some(".rdp".to_string()))
         }
         RemoteDesktopKind::Vnc => (build_vnc_argv(&viewer, &tmp, tunneled, &local_endpoint), None, None),
-        RemoteDesktopKind::Spice => (build_spice_argv(&viewer, &tmp, tunneled, &local_endpoint), None, Some(".vv".to_string())),
+        RemoteDesktopKind::Spice => (
+            build_spice_argv(&viewer, &tmp, tunneled, &local_endpoint),
+            Some(spice_vv_file_body(&tmp, tunneled, &local_endpoint)),
+            Some(".vv".to_string()),
+        ),
         // No external viewer or command is offered for X2Go. The built-in
         // KDrive implementation is not yet connected to this ticket API.
         RemoteDesktopKind::X2Go => (Vec::new(), None, None),
@@ -585,6 +590,48 @@ fn build_spice_argv(_viewer: &str, sess: &RemoteDesktopSession, tunneled: bool, 
         format!("spice://{host_port}")
     };
     vec!["remote-viewer".to_string(), uri]
+}
+
+fn split_endpoint_host_port(endpoint: &str, fallback_port: u16) -> (&str, u16) {
+    if let Some(rest) = endpoint.strip_prefix('[') {
+        if let Some((host, port_part)) = rest.split_once(']') {
+            let port = port_part
+                .strip_prefix(':')
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(fallback_port);
+            return (host, port);
+        }
+    }
+    if let Some((host, port_str)) = endpoint.rsplit_once(':') {
+        if !host.contains(':') {
+            if let Ok(port) = port_str.parse::<u16>() {
+                return (host, port);
+            }
+        }
+    }
+    (endpoint, fallback_port)
+}
+
+/// Builds a standard `virt-viewer` `.vv` ticket file without embedding credentials.
+fn spice_vv_file_body(sess: &RemoteDesktopSession, tunneled: bool, endpoint: &str) -> String {
+    let opts = &sess.config.desktop_opts;
+    let (raw_host, raw_port) = if tunneled {
+        split_endpoint_host_port(endpoint, sess.config.port)
+    } else {
+        (
+            sess.config.host.trim_start_matches('[').trim_end_matches(']'),
+            sess.config.port,
+        )
+    };
+    let safe_host = sanitize_rdp_field(raw_host);
+    let mut out = format!("[virt-viewer]\ntype=spice\nhost={safe_host}\nport={raw_port}\n");
+    if let Some(tls_port) = opts.spice_tls_port {
+        out.push_str(&format!("tls-port={tls_port}\n"));
+    }
+    if opts.fullscreen {
+        out.push_str("fullscreen=1\n");
+    }
+    out
 }
 
 fn build_x11_argv(viewer: &str, sess: &RemoteDesktopSession) -> Vec<String> {
@@ -1072,6 +1119,9 @@ mod tests {
 
         let spice_ticket = ticket_from_config(&rdp_cfg, RemoteDesktopKind::Spice, &rdp_cfg.target(), false, None);
         assert_eq!(spice_ticket.argv, vec!["remote-viewer", "spice://[2001:db8::10]:3389"]);
+        let vv_body = spice_ticket.file_content.expect(".vv content");
+        assert!(vv_body.contains("[virt-viewer]\ntype=spice\nhost=2001:db8::10\nport=3389\n"), "{vv_body}");
+        assert_eq!(spice_ticket.file_extension.as_deref(), Some(".vv"));
 
         let mut x11_cfg = rdp_cfg.clone();
         x11_cfg.scheme = ProtocolScheme::X11;

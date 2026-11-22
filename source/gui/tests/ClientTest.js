@@ -860,7 +860,7 @@ function options(id) {
   doc.getElementById('syncMode').dispatchEvent(new window.Event('change'));
   check('the both direction refuses the comparisons it cannot make',
     options('syncCriteria').filter(option => option.disabled)
-      .map(option => option.value).join('|') === 'checksum|time,checksum|none',
+      .map(option => option.value).join('|') === 'checksum|time,checksum|size,checksum|time,size,checksum|none',
     options('syncCriteria').filter(option => option.disabled)
       .map(option => option.value).join('|'));
   check('the both direction keeps a comparison it can make',
@@ -5013,6 +5013,633 @@ function options(id) {
     responses['/api/terminal/input'] = prevTermInput;
     responses['/api/terminal/frame'] = prevTermFrame;
     responses['/api/terminal/close'] = prevTermClose;
+  }
+
+  // ---- Completed features: WebDAV ETag preconditions, external editor live sync, local tabs, desktop tunnels/tickets, Mark menu & site warnings ----
+  {
+    // Ensure a connected active remote tab is present for these checks.
+    responses['/api/status'] = {
+      external_editor_supported: true,
+      tabs: [{
+        id: 1,
+        name: 'dav-main',
+        connected: true,
+        is_local: false,
+        local_dir: '/work/local',
+        remote_dir: '/remote/dav',
+        session: { protocol: 'sftp', host: 'srv.example.test', port: 22 }
+      }],
+      active_tab: 1,
+    };
+    await window.eval('refreshStatus()');
+    window.eval('state.externalEditorSupported = true');
+
+    // 1. WebDAV ETag preconditions in #davToolsModal.
+    window.openDavTools();
+    doc.getElementById('davResourceName').value = 'report.xml';
+    responses['/api/dav/etag'] = { success: true, path: '/remote/dav/report.xml', etag: '"v42"', missing: false };
+    await window.getDavEtag();
+    check('WebDAV Get ETag populates #davEtagValue and status',
+      doc.getElementById('davEtagValue').value === '"v42"' &&
+      doc.getElementById('davToolsStatus').textContent.includes('"v42"'));
+
+    responses['/api/dav/etag'] = { success: true, path: '/remote/dav/report.xml', action: 'match', etag: '"v42"' };
+    await window.setDavEtagPrecondition('match');
+    const davMatchBody = JSON.parse(calls.filter(c => c.path === '/api/dav/etag').pop().options.body);
+    check('WebDAV Require If-Match posts action=match and etag',
+      davMatchBody.action === 'match' && davMatchBody.etag === '"v42"' && davMatchBody.name === 'report.xml');
+
+    responses['/api/dav/etag'] = { success: true, path: '/remote/dav/report.xml', action: 'nomatch', etag: '"v42"' };
+    await window.setDavEtagPrecondition('nomatch');
+    const davNoMatchBody = JSON.parse(calls.filter(c => c.path === '/api/dav/etag').pop().options.body);
+    check('WebDAV Require If-None-Match posts action=nomatch and etag',
+      davNoMatchBody.action === 'nomatch' && davNoMatchBody.etag === '"v42"');
+
+    responses['/api/dav/etag'] = { success: true, path: '/remote/dav/report.xml', action: 'clear' };
+    await window.clearDavEtagPrecondition();
+    const davClearBody = JSON.parse(calls.filter(c => c.path === '/api/dav/etag').pop().options.body);
+    check('WebDAV Clear ETag rule posts action=clear',
+      davClearBody.action === 'clear' && doc.getElementById('davToolsStatus').textContent.includes('Cleared'));
+    window.closeModal('davToolsModal');
+    delete responses['/api/dav/etag'];
+
+    // 2. External editor Sync now & live reload when upload_count increments.
+    responses['/api/remote/edit'] = {
+      success: true,
+      content: 'initial line\n',
+      info: { size: 13, mtime: 1700000000, encoding: 'UTF-8', eol: 'lf', bom: false }
+    };
+    responses['/api/editor/external'] = { success: true, id: 'ext-99', editor: 'nvim', sessions: [{ id: 'ext-99', editor: 'nvim', upload_count: 0 }] };
+    await window.openEditor('/remote/dav/notes.txt', 'remote', false);
+    await window.openInExternalEditor();
+    check('opening external editor reveals Sync now button',
+      doc.getElementById('editorExternalSyncBtn').hidden === false &&
+      doc.getElementById('editorExternalCloseBtn').hidden === false);
+
+    responses['/api/remote/edit'] = {
+      success: true,
+      content: 'updated from external sync\n',
+      info: { size: 27, mtime: 1700000005, encoding: 'UTF-8', eol: 'lf', bom: false }
+    };
+    responses['/api/editor/external/sync'] = { success: true, uploaded: true };
+    responses['/api/editor/external'] = { success: true, sessions: [{ id: 'ext-99', editor: 'nvim', upload_count: 1 }] };
+    await window.syncExternalEditorNow();
+    const extSyncCall = calls.filter(c => c.path === '/api/editor/external/sync').pop();
+    check('Sync now posts /api/editor/external/sync, reloads clean buffer and preserves externalId',
+      !!extSyncCall &&
+      JSON.parse(extSyncCall.options.body).id === 'ext-99' &&
+      window.getEditorValue() === 'updated from external sync\n' &&
+      window.eval('state.editor.externalId') === 'ext-99');
+
+    responses['/api/remote/edit'] = {
+      success: true,
+      content: 'background watcher save\n',
+      info: { size: 24, mtime: 1700000010, encoding: 'UTF-8', eol: 'lf', bom: false }
+    };
+    responses['/api/editor/external'] = { success: true, sessions: [{ id: 'ext-99', editor: 'nvim', upload_count: 2 }] };
+    await window.pollExternalEditorSessions();
+    check('pollExternalEditorSessions reloads clean editor buffer when upload_count increments',
+      window.getEditorValue() === 'background watcher save\n' &&
+      window.eval('state.editor.externalId') === 'ext-99');
+    responses['/api/editor/external/close'] = { success: true };
+    await window.closeEditor();
+    delete responses['/api/editor/external/sync'];
+
+    // 3. New local-to-local tab quick action (/api/tabs/local).
+    const prevPrompt = window.prompt;
+    window.prompt = () => '/var/backups';
+    responses['/api/tabs/local'] = {
+      success: true,
+      tab: { id: 42, name: 'local ↔ backups', is_local: true, connected: true, local_dir: '/work/local', remote_dir: '/var/backups' }
+    };
+    responses['/api/status'] = {
+      external_editor_supported: true,
+      tabs: [
+        { id: 1, name: 'dav-main', connected: true, is_local: false, local_dir: '/work/local', remote_dir: '/remote/dav', session: { protocol: 'sftp', host: 'srv.example.test', port: 22 } },
+        { id: 42, name: 'local ↔ backups', connected: true, is_local: true, local_dir: '/work/local', remote_dir: '/var/backups', session: { protocol: 'local', local_dir: '/work/local', other_local_dir: '/var/backups' } }
+      ],
+      active_tab: 42,
+    };
+    await window.openNewLocalTabPrompt();
+    const localTabCall = calls.filter(c => c.path === '/api/tabs/local').pop();
+    check('openNewLocalTabPrompt posts /api/tabs/local and activates the new dual-local tab',
+      !!localTabCall &&
+      JSON.parse(localTabCall.options.body).other_local_dir === '/var/backups' &&
+      window.eval('state.activeTab') === 42);
+    // Switch active tab back to SSH tab 1 for Remote Desktop tests.
+    responses['/api/status'].active_tab = 1;
+    await window.eval('refreshStatus()');
+    delete responses['/api/tabs/local'];
+
+    // 4. Remote Desktop active tunnels, recommendations & SPICE .vv ticket download.
+    responses['/api/desktop/tunnels'] = {
+      success: true,
+      active: 1,
+      tunnels: [{ tunnel_id: 7, tab: 1, local_endpoint: '127.0.0.1:45900' }]
+    };
+    responses['/api/desktop/recommendations'] = {
+      success: true,
+      recommendations: 'RDP: xfreerdp3\nSPICE: virt-viewer (remote-viewer)\n'
+    };
+    responses['/api/desktop/check'] = { success: true, available: true, checked: true, via_ssh: true };
+    responses['/api/desktop/ticket'] = {
+      success: true,
+      tab: 1,
+      ticket: {
+        kind: 'spice',
+        target: 'srv.example.test:5900',
+        file_extension: '.vv',
+        file_content: '[virt-viewer]\ntype=spice\nhost=srv.example.test\nport=5900\n',
+        has_file: true
+      }
+    };
+    let createdBlobUrl = false;
+    const prevCreateObjectUrl = window.URL && window.URL.createObjectURL;
+    const prevRevokeObjectUrl = window.URL && window.URL.revokeObjectURL;
+    if (window.URL) {
+      window.URL.createObjectURL = () => { createdBlobUrl = true; return 'blob:linscp-spice-test'; };
+      window.URL.revokeObjectURL = () => {};
+    }
+    window.openRemoteDesktop(1);
+    await wait(40);
+    doc.getElementById('remoteDesktopKind').value = 'spice';
+    window.remoteDesktopKindChanged();
+    await wait(40);
+    check('Remote Desktop modal loads active tunnel Close button and SPICE viewer recommendation',
+      doc.getElementById('remoteDesktopCloseTunnelBtn').style.display === 'inline-block' &&
+      doc.getElementById('remoteDesktopViewerHint').textContent.includes('SPICE: virt-viewer'));
+    await window.downloadRemoteDesktopTicket();
+    const ticketCall = calls.filter(c => c.path === '/api/desktop/ticket').pop();
+    check('Download ticket posts /api/desktop/ticket with kind=spice and triggers .vv blob download',
+      !!ticketCall &&
+      JSON.parse(ticketCall.options.body).kind === 'spice' &&
+      createdBlobUrl === true);
+    if (window.URL) {
+      window.URL.createObjectURL = prevCreateObjectUrl;
+      window.URL.revokeObjectURL = prevRevokeObjectUrl;
+    }
+    window.closeModal('remoteDesktopModal');
+    delete responses['/api/desktop/tunnels'];
+    delete responses['/api/desktop/recommendations'];
+    delete responses['/api/desktop/ticket'];
+
+    // 5. Commander Mark menu: select/unselect by mask & compareDirectories.
+    window.eval(`
+      state.focusPane = 'local';
+      state.local.entries = [
+        { name: 'app.log', size: 120, mtime: 200, is_dir: false, permissions: '-rw-r--r--' },
+        { name: 'debug.log', size: 80, mtime: 100, is_dir: false, permissions: '-rw-r--r--' },
+        { name: 'same.txt', size: 50, mtime: 150, is_dir: false, permissions: '-rw-r--r--' }
+      ];
+      state.remote.entries = [
+        { name: 'app.log', size: 100, mtime: 150, is_dir: false, permissions: '-rw-r--r--' },
+        { name: 'same.txt', size: 50, mtime: 150, is_dir: false, permissions: '-rw-r--r--' },
+        { name: 'remote-only.conf', size: 30, mtime: 180, is_dir: false, permissions: '-rw-r--r--' }
+      ];
+      state.local.selection.clear();
+      state.remote.selection.clear();
+    `);
+    window.prompt = () => '*.log|debug.log';
+    window.selectByMaskPrompt(true);
+    check('selectByMaskPrompt honors include and |exclude wildcard masks',
+      window.eval('state.local.selection.has("app.log") && !state.local.selection.has("debug.log") && !state.local.selection.has("same.txt")'));
+    window.prompt = () => '*.log';
+    window.selectByMaskPrompt(false);
+    check('selectByMaskPrompt(false) unselects matching entries',
+      window.eval('state.local.selection.size === 0'));
+    window.compareDirectories();
+    check('compareDirectories selects missing and newer entries on both panes',
+      window.eval('state.local.selection.has("app.log") && state.local.selection.has("debug.log") && !state.local.selection.has("same.txt")') &&
+      window.eval('state.remote.selection.has("remote-only.conf") && !state.remote.selection.has("same.txt") && !state.remote.selection.has("app.log")'));
+    window.prompt = prevPrompt;
+
+    // 6. Unreadable stored secret warning in Site Manager & session import directory preview.
+    const brokenSite = {
+      name: 'broken-vault-site',
+      protocol: 'sftp',
+      host: 'vault.example.test',
+      port: 22,
+      username: 'ops',
+      has_password: true,
+      has_unreadable_secret: true
+    };
+    window.eval(`state.sessions = [${JSON.stringify(brokenSite)}]; renderSites();`);
+    window.fillSiteForm(brokenSite);
+    check('Site Manager marks unreadable stored secrets in site list and password placeholder',
+      doc.getElementById('siteList').textContent.includes('⚠') &&
+      doc.getElementById('sitePass').placeholder.includes('unreadable'));
+
+    window.renderImportSource({
+      exists: true,
+      path: '/home/ops/.config/filezilla/sitemanager.xml',
+      entries: [{
+        name: 'prod-web',
+        protocol: 'sftp',
+        host: 'web.example.test',
+        port: 22,
+        username: 'deploy',
+        remote_dir: '/srv/www',
+        local_dir: '/home/ops/www'
+      }],
+      skipped: []
+    });
+    check('renderImportSource displays imported remote_dir and local_dir paths',
+      doc.getElementById('importList').textContent.includes('/srv/www') &&
+      doc.getElementById('importList').textContent.includes('(/home/ops/www)'));
+
+    // --- Batch 2 feature completion tests ---
+    // 1. Sortable file table columns + hidden files toggle + quick filter.
+    window.eval(`
+      state.showHidden = true;
+      state.local.sortKey = null;
+      state.local.sortDir = 'asc';
+      state.local.filter = '';
+      state.local.entries = [
+        { name: '.env', is_dir: false, size: 120, mtime: 100, permissions: 'rw-------' },
+        { name: 'zeta.rs', is_dir: false, size: 900, mtime: 300, permissions: 'rw-r--r--' },
+        { name: 'alpha.txt', is_dir: false, size: 200, mtime: 500, permissions: 'rwxr-xr-x' },
+        { name: 'docs', is_dir: true, size: 0, mtime: 50, permissions: 'rwxr-xr-x' }
+      ];
+      state.local.selection.clear();
+      state.local.selection.add('.env');
+      renderPane('local');
+    `);
+    window.togglePaneSort('local', 'size');
+    const localSizeAscNames = Array.from(doc.querySelectorAll('#localFileList tr')).map(r => r.dataset.name);
+    const sizeHeader = doc.querySelector('#localPane thead th[data-sort-col="size"]');
+    check('Clicking Size header sorts directories first then files ascending with aria-sort',
+      JSON.stringify(localSizeAscNames) === JSON.stringify(['docs', '.env', 'alpha.txt', 'zeta.rs']) &&
+      sizeHeader.getAttribute('aria-sort') === 'ascending' &&
+      sizeHeader.dataset.sortIndicator === '▲');
+    window.togglePaneSort('local', 'size');
+    const localSizeDescNames = Array.from(doc.querySelectorAll('#localFileList tr')).map(r => r.dataset.name);
+    check('Clicking Size header again flips sort descending while keeping directories first',
+      JSON.stringify(localSizeDescNames) === JSON.stringify(['docs', 'zeta.rs', 'alpha.txt', '.env']) &&
+      sizeHeader.getAttribute('aria-sort') === 'descending' &&
+      sizeHeader.dataset.sortIndicator === '▼');
+
+    window.toggleHiddenFiles();
+    const afterHideNames = Array.from(doc.querySelectorAll('#localFileList tr')).map(r => r.dataset.name);
+    check('toggleHiddenFiles hides dotfiles, updates menu label, and prunes hidden selection',
+      !afterHideNames.includes('.env') &&
+      doc.getElementById('hiddenFilesMenuLabel').textContent === 'Show hidden files' &&
+      !window.eval('state.local.selection.has(".env")'));
+    window.toggleHiddenFiles();
+
+    window.setPaneFilter('local', '*.rs');
+    const filteredWildcard = Array.from(doc.querySelectorAll('#localFileList tr')).map(r => r.dataset.name);
+    check('setPaneFilter supports wildcard masks in the pane quick filter',
+      JSON.stringify(filteredWildcard) === JSON.stringify(['zeta.rs']));
+    window.setPaneFilter('local', '');
+    window.eval('state.local.sortKey = null; state.local.sortDir = "asc"; renderPane("local");');
+
+    // 2. Right-click file pane context menu.
+    const alphaRow = doc.querySelector('#localFileList tr[data-name="alpha.txt"]');
+    const ctxEvt = new window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 80, clientY: 90 });
+    alphaRow.dispatchEvent(ctxEvt);
+    check('Right-clicking a file row selects it and opens #paneContextMenu with enabled file actions',
+      !doc.getElementById('paneContextMenu').hidden &&
+      window.eval('state.local.selection.has("alpha.txt")') &&
+      !doc.getElementById('paneCtxEditBtn').disabled &&
+      !doc.getElementById('paneCtxCopyPathBtn').disabled);
+    doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    check('Pressing Escape closes #paneContextMenu',
+      doc.getElementById('paneContextMenu').hidden);
+
+    // 3. Site Manager Remote Desktop options + Session color & notes + RDP connect opens launcher.
+    responses['/api/sessions/save'] = { success: true };
+    responses['/api/sessions'] = {
+      success: true,
+      sessions: [{
+        name: 'corp-rdp',
+        protocol: 'rdp',
+        host: 'win.example.test',
+        port: 3389,
+        username: 'alice',
+        color: '#3b82f6',
+        note: 'Primary Windows jump host',
+        rdp_domain: 'CORP',
+        rdp_security: 'nla',
+        rdp_color_depth: '32',
+        rdp_width: '1920',
+        rdp_height: '1080',
+        rdp_fullscreen: '1',
+        has_password: true
+      }]
+    };
+    window.newSite();
+    doc.getElementById('siteName').value = 'corp-rdp';
+    doc.getElementById('siteProtocol').value = 'rdp';
+    window.siteProtocolChanged();
+    check('Selecting RDP in Site Manager reveals #siteDesktopSettings and RDP-specific controls',
+      doc.getElementById('siteDesktopSettings').style.display !== 'none' &&
+      doc.querySelector('#siteDesktopSettings .desktop-opt-rdp').style.display !== 'none' &&
+      doc.querySelector('#siteDesktopSettings .desktop-opt-vnc').style.display === 'none');
+    doc.getElementById('siteHost').value = 'win.example.test';
+    doc.getElementById('siteColor').value = '#3b82f6';
+    doc.getElementById('siteNote').value = 'Primary Windows jump host';
+    doc.getElementById('siteRdpDomain').value = 'CORP';
+    doc.getElementById('siteRdpSecurity').value = 'nla';
+    doc.getElementById('siteRdpColorDepth').value = '32';
+    doc.getElementById('siteRdpWidth').value = '1920';
+    doc.getElementById('siteRdpHeight').value = '1080';
+    doc.getElementById('siteRdpFullscreen').checked = true;
+    await window.saveSite();
+    const savedRdpCall = calls.filter(c => c.path === '/api/sessions/save').pop();
+    const savedRdpBody = savedRdpCall ? JSON.parse(savedRdpCall.options.body) : {};
+    check('Saving an RDP site persists DesktopOptions, color swatch, and session note',
+      savedRdpBody.session &&
+      savedRdpBody.session.color === '#3b82f6' &&
+      savedRdpBody.session.note === 'Primary Windows jump host' &&
+      savedRdpBody.session.rdp_domain === 'CORP' &&
+      savedRdpBody.session.rdp_security === 'nla' &&
+      savedRdpBody.session.rdp_color_depth === '32' &&
+      savedRdpBody.session.rdp_width === '1920' &&
+      savedRdpBody.session.rdp_fullscreen === true &&
+      !!doc.querySelector('#siteList .site-color-swatch'));
+
+    const prevOpenResp = responses['/api/tabs/open'];
+    const prevStatusResp = responses['/api/status'];
+    responses['/api/tabs/open'] = {
+      success: true,
+      tab: { id: 9, name: 'corp-rdp', connected: true, protocol: 'rdp', session: { protocol: 'rdp', host: 'win.example.test', port: 3389, color: '#3b82f6' } }
+    };
+    responses['/api/status'] = Object.assign({}, prevStatusResp, {
+      active_tab: 9,
+      tabs: [{ id: 9, name: 'corp-rdp', connected: true, protocol: 'rdp', site: 'corp-rdp', session: { protocol: 'rdp', host: 'win.example.test', port: 3389, color: '#3b82f6' }, local_dir: '/tmp/slowlocal', remote_dir: '/' }]
+    });
+    doc.getElementById('siteRemember').checked = false;
+    doc.getElementById('sitePass').value = '';
+    await window.connectFromSiteManager();
+    const rdpOpenCall = calls.filter(c => c.path === '/api/tabs/open').pop();
+    const rdpOpenBody = rdpOpenCall ? JSON.parse(rdpOpenCall.options.body) : {};
+    check('Connecting an RDP site sends clear_password when Remember is unticked, colors the tab, and opens #remoteDesktopModal',
+      rdpOpenBody.session && rdpOpenBody.session.clear_password === true &&
+      doc.getElementById('remoteDesktopModal').classList.contains('open') &&
+      doc.getElementById('remoteDesktopKind').value === 'rdp' &&
+      doc.getElementById('remoteDesktopHost').value === 'win.example.test' &&
+      doc.querySelector('#tabStrip .session-tab').dataset.color === '#3b82f6');
+    window.closeModal('remoteDesktopModal');
+    responses['/api/tabs/open'] = prevOpenResp;
+    responses['/api/status'] = prevStatusResp;
+    await window.refreshStatus();
+
+    // 4. Built-in CLI command console history, Tab completion, and clear.
+    responses['/api/command/exec'] = { success: true, stdout: 'ok\n', stderr: '', exit_code: 0 };
+    const cliInput = doc.getElementById('cliInput');
+    cliInput.value = 'pwd';
+    await window.execCliCommand();
+    cliInput.value = 'stat alpha.txt';
+    await window.execCliCommand();
+    cliInput.value = 'draft';
+    window.handleCliInputKeydown(new window.KeyboardEvent('keydown', { key: 'ArrowUp', cancelable: true }));
+    const up1 = cliInput.value;
+    window.handleCliInputKeydown(new window.KeyboardEvent('keydown', { key: 'ArrowUp', cancelable: true }));
+    const up2 = cliInput.value;
+    window.handleCliInputKeydown(new window.KeyboardEvent('keydown', { key: 'ArrowDown', cancelable: true }));
+    window.handleCliInputKeydown(new window.KeyboardEvent('keydown', { key: 'ArrowDown', cancelable: true }));
+    const restoredDraft = cliInput.value;
+    cliInput.value = 'syn';
+    window.handleCliInputKeydown(new window.KeyboardEvent('keydown', { key: 'Tab', cancelable: true }));
+    const tabCompleted = cliInput.value;
+    cliInput.value = 'clear';
+    await window.execCliCommand();
+    check('CLI console supports ArrowUp/ArrowDown history with draft preservation, Tab completion, and clear',
+      up1 === 'stat alpha.txt' &&
+      up2 === 'pwd' &&
+      restoredDraft === 'draft' &&
+      tabCompleted === 'synchronize ' &&
+      doc.getElementById('cliOutput').textContent === '');
+
+    // --- Batch 3 feature completion tests ---
+    // 1. Transfer Presets: auto-matched banner, string preserve_time/permissions/eol/rules round-trip, and fill-from-tab.
+    responses['/api/presets'] = {
+      success: true,
+      matched: { name: 'ProdWeb' },
+      presets: [{
+        name: 'ProdWeb',
+        description: 'transfer=ascii preservetime=all permissions=644 for host=*.prod.example.com',
+        transfer: 'ascii',
+        preserve_time: 'all',
+        newer_only: true,
+        speed: 512,
+        resumesupport: '256',
+        permissions: '644',
+        eol: 'crlf',
+        filemask: '*.html;*.css',
+        host: '*.prod.example.com',
+        username: 'deploy',
+        remote_dir: '/var/www/*',
+        local_dir: '/srv/releases/*'
+      }]
+    };
+    responses['/api/presets/save'] = { success: true, preset: { name: 'ProdWeb' } };
+    window.openTransferSettings();
+    await window.loadTransferPresets();
+    check('loadTransferPresets renders auto-matched preset banner for current tab',
+      doc.getElementById('transferPresetMatchedHint').style.display === 'flex' &&
+      doc.getElementById('transferPresetMatchedHint').textContent.includes('ProdWeb'));
+    window.applyMatchedTransferPreset();
+    check('applyMatchedTransferPreset populates permissions, octal mode, EOL, preserve_time=all, and auto-selection rules',
+      doc.getElementById('transferPresetSelect').value === 'ProdWeb' &&
+      doc.getElementById('transferPreserveTime').checked === true &&
+      doc.getElementById('transferPresetPermissions').value === 'mode' &&
+      doc.getElementById('transferPresetModeOctal').value === '644' &&
+      doc.getElementById('transferPresetEol').value === 'crlf' &&
+      doc.getElementById('transferPresetHost').value === '*.prod.example.com' &&
+      doc.getElementById('transferPresetUser').value === 'deploy' &&
+      doc.getElementById('transferPresetRemoteDir').value === '/var/www/*' &&
+      doc.getElementById('transferPresetLocalDir').value === '/srv/releases/*' &&
+      doc.getElementById('transferPresetSummary').textContent.includes('permissions=644'));
+    await window.saveCurrentTransferPreset();
+    const fullPresetSaveBody = JSON.parse(calls.filter(c => c.path === '/api/presets/save').pop().options.body);
+    check('saveCurrentTransferPreset preserves permissions, eol, preserve_time=all, and auto-selection rules without data loss',
+      fullPresetSaveBody.name === 'ProdWeb' &&
+      fullPresetSaveBody.preserve_time === 'all' &&
+      fullPresetSaveBody.permissions === '644' &&
+      fullPresetSaveBody.eol === 'crlf' &&
+      fullPresetSaveBody.host === '*.prod.example.com' &&
+      fullPresetSaveBody.username === 'deploy' &&
+      fullPresetSaveBody.remote_dir === '/var/www/*' &&
+      fullPresetSaveBody.local_dir === '/srv/releases/*');
+    doc.getElementById('transferPresetHost').value = '';
+    doc.getElementById('transferPresetLocalDir').value = '';
+    window.fillPresetRulesFromActiveTab();
+    check('fillPresetRulesFromActiveTab populates host and local/remote paths from the active tab',
+      doc.getElementById('transferPresetHost').value === 'srv.example.test' &&
+      Boolean(doc.getElementById('transferPresetLocalDir').value));
+    await window.resetTransferSettings();
+    window.closeModal('transferModal');
+    delete responses['/api/presets'];
+    delete responses['/api/presets/save'];
+
+    // 2. S3 Object Versions: side-by-side target_name download + overwrite confirmation prompt on 409 conflicts.
+    responses['/api/s3/version-download'] = { success: true, task_id: 301 };
+    await window.downloadS3VersionCopy('reports/monthly.csv', 'v12345');
+    const s3CopyBody = JSON.parse(calls.filter(c => c.path === '/api/s3/version-download').pop().options.body);
+    check('downloadS3VersionCopy suggests a versioned leaf filename and posts target_name',
+      s3CopyBody.target_name === 'monthly.v-v12345.csv' &&
+      doc.getElementById('s3VersionsTargetName').value === 'monthly.v-v12345.csv');
+    doc.getElementById('s3VersionsTargetName').value = '';
+    const prevConfirm = window.confirm;
+    let s3DownloadAttempts = 0;
+    const origInvokeS3 = window.__TAURI_INTERNALS__.invoke;
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      if (cmd === 'linscp_invoke' && args && args.envelope && args.envelope.path === '/api/s3/version-download') {
+        s3DownloadAttempts++;
+        const body = args.envelope.body || {};
+        calls.push({ path: '/api/s3/version-download', options: { method: 'POST', body: JSON.stringify(body) } });
+        if (body.overwrite !== 'overwrite') {
+          return { status: 409, payload: { success: false, error: 'Destination exists', conflicts: ['monthly.csv'] } };
+        }
+        return { status: 200, payload: { success: true, task_id: 302 } };
+      }
+      return origInvokeS3(cmd, args);
+    };
+    window.confirm = () => false;
+    await window.downloadS3Version('monthly.csv', 'v12345');
+    check('downloadS3Version aborts overwrite when user declines overwrite confirmation',
+      s3DownloadAttempts === 1);
+    s3DownloadAttempts = 0;
+    let confirmPromptText = '';
+    window.confirm = (msg) => { confirmPromptText = String(msg || ''); return true; };
+    await window.downloadS3Version('monthly.csv', 'v12345');
+    check('downloadS3Version prompts with conflict filename and retries with overwrite when confirmed',
+      s3DownloadAttempts === 2 && confirmPromptText.includes('monthly.csv'));
+    window.confirm = prevConfirm;
+    window.__TAURI_INTERNALS__.invoke = origInvokeS3;
+    delete responses['/api/s3/version-download'];
+
+    // 3. Session Import File Picker: content-based scan + import + omitted external key notice.
+    const origInvokeImport = window.__TAURI_INTERNALS__.invoke;
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      if (cmd === 'linscp_invoke' && args && args.envelope && args.envelope.path === '/api/sessions/import' && args.envelope.method === 'POST') {
+        const body = args.envelope.body || {};
+        calls.push({ path: '/api/sessions/import', options: { method: 'POST', body: JSON.stringify(body) } });
+        if (body.scan_only) {
+          return {
+            status: 200,
+            payload: {
+              success: true,
+              sources: [{
+                source: body.source,
+                path: body.file_name,
+                exists: true,
+                fingerprint: 'fp-picked-xml',
+                entries: [{
+                  name: 'fz-mobile',
+                  protocol: 'sftp',
+                  host: 'fz.example.test',
+                  port: 22,
+                  username: 'alice',
+                  has_external_key: true
+                }],
+                skipped: []
+              }]
+            }
+          };
+        }
+        return {
+          status: 200,
+          payload: {
+            success: true,
+            path: body.file_name,
+            imported: ['fz-mobile'],
+            skipped: [],
+            omitted_keys: ['fz-mobile']
+          }
+        };
+      }
+      return origInvokeImport(cmd, args);
+    };
+    doc.getElementById('importSource').value = 'openssh';
+    await window.handleImportFilePicked({
+      target: {
+        value: 'sitemanager.xml',
+        files: [{
+          name: 'sitemanager.xml',
+          size: 180,
+          text: async () => '<FileZilla3><Servers></Servers></FileZilla3>'
+        }]
+      }
+    });
+    check('Picking an XML file in #importSessionsModal auto-selects FileZilla, scans content, and flags external keys',
+      doc.getElementById('importSource').value === 'filezilla' &&
+      doc.getElementById('importPath').value === 'sitemanager.xml' &&
+      doc.getElementById('importList').textContent.includes('fz-mobile') &&
+      doc.getElementById('importList').textContent.includes('external key omitted'));
+    await window.runSessionImport();
+    const pickedImportPost = JSON.parse(calls.filter(c => c.path === '/api/sessions/import').pop().options.body);
+    check('runSessionImport posts picked file content + fingerprint and surfaces omitted external key notice',
+      pickedImportPost.file_name === 'sitemanager.xml' &&
+      pickedImportPost.fingerprint === 'fp-picked-xml' &&
+      typeof pickedImportPost.content === 'string' &&
+      doc.getElementById('importStatus').textContent.includes('fz-mobile'));
+    window.__TAURI_INTERNALS__.invoke = origInvokeImport;
+
+    // 4. Transfer Queue full reordering controls (Top, Up, Down, Bottom).
+    const prevTransfers = responses['/api/transfers'];
+    responses['/api/transfers'] = {
+      paused: false,
+      transfers: [
+        { id: 41, type: 'Download', source: '/a', destination: '/b', status: 'Running', percent: 50, bytes_done: 50, bytes_total: 100 },
+        { id: 42, type: 'Download', source: '/c', destination: '/d', status: 'Queued', percent: 0 },
+        { id: 43, type: 'Upload', source: '/e', destination: '/f', status: 'Queued', percent: 0 }
+      ]
+    };
+    await window.refreshQueue();
+    const queueRows = doc.querySelectorAll('#queueList tr');
+    const firstQueuedBtns = Array.from(queueRows[1].querySelectorAll('button'));
+    const lastQueuedBtns = Array.from(queueRows[2].querySelectorAll('button'));
+    check('Queued tasks expose Top/Up/Down/Bottom controls with boundary buttons disabled appropriately',
+      firstQueuedBtns.some(b => b.textContent === 'Top' && b.disabled) &&
+      firstQueuedBtns.some(b => b.textContent === 'Up' && b.disabled) &&
+      firstQueuedBtns.some(b => b.textContent === 'Down' && !b.disabled) &&
+      firstQueuedBtns.some(b => b.textContent === 'Bottom' && !b.disabled) &&
+      lastQueuedBtns.some(b => b.textContent === 'Up' && !b.disabled) &&
+      lastQueuedBtns.some(b => b.textContent === 'Down' && b.disabled));
+    await window.prioritizeTask(42, 'down');
+    const downCall = JSON.parse(calls.filter(c => c.path === '/api/queue/priority').pop().options.body);
+    check('prioritizeTask supports down/up/bottom queue ordering',
+      downCall.task_id === 42 && downCall.position === 'down');
+    responses['/api/transfers'] = prevTransfers;
+    await window.refreshQueue();
+
+    // 5. Synchronize criteria parity + 6. Search result direct Go/View/Edit buttons.
+    const syncCriteriaValues = Array.from(doc.getElementById('syncCriteria').options).map(o => o.value);
+    check('#syncCriteria includes size,checksum and time,size,checksum options',
+      syncCriteriaValues.includes('size,checksum') &&
+      syncCriteriaValues.includes('time,size,checksum'));
+
+    responses['/api/remote/search'] = {
+      success: true,
+      matches: [
+        { name: 'notes.txt', path: '/tmp/slowremote/notes.txt', is_dir: false, size: 42, line: 3, snippet: 'hello' },
+        { name: 'subdir', path: '/tmp/slowremote/subdir', is_dir: true, size: 0 }
+      ]
+    };
+    responses['/api/remote/edit'] = {
+      success: true,
+      path: '/tmp/slowremote/notes.txt',
+      content: 'hello\n',
+      info: { size: 6, mtime: 1791875271, mtime_ns: '1791875271', encoding: 'UTF-8', eol: 'lf', bom: false }
+    };
+    doc.getElementById('searchTarget').value = 'remote';
+    doc.getElementById('searchContents').checked = false;
+    window.toggleSearchContents();
+    await window.runSearch();
+    const searchRows = doc.querySelectorAll('#searchResults .plan-item');
+    const fileMatchBtns = Array.from(searchRows[0].querySelectorAll('.search-match-actions button')).map(b => b.textContent);
+    const dirMatchBtns = Array.from(searchRows[1].querySelectorAll('.search-match-actions button')).map(b => b.textContent);
+    check('Search results render Go/View/Edit buttons for files and Go for directories',
+      JSON.stringify(fileMatchBtns) === JSON.stringify(['Go', 'View', 'Edit']) &&
+      JSON.stringify(dirMatchBtns) === JSON.stringify(['Go']));
+    searchRows[0].querySelectorAll('.search-match-actions button')[2].click();
+    await new Promise(resolve => setTimeout(resolve, 60));
+    check('Clicking Edit on a search result opens #editorModal in editable mode',
+      doc.getElementById('editorModal').classList.contains('open') &&
+      doc.getElementById('editorSaveBtn').style.display !== 'none');
+    window.closeEditor();
   }
 
   check('no script errors', errors.length === 0, errors.join(' | '));
