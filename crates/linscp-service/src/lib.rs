@@ -19401,7 +19401,7 @@ mod tests {
 
         // 3. WebDAV `/api/remote/rename` (`dav_move_if_match`) records `<mv>` in XML action log.
         let session = Arc::new(MockSession::new());
-        session.put_file("/draft.txt", b"hello dav");
+        session.add_file("/draft.txt", b"hello dav");
         let dav_tab = insert_remote_tab(&svc, session.clone(), search_root.to_str().unwrap());
         let renamed = svc
             .dispatch_async(ApiEnvelope {
