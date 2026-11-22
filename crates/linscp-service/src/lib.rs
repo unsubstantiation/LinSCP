@@ -19001,6 +19001,7 @@ mod tests {
         std::fs::create_dir_all(&local_dir).unwrap();
 
         let svc = CommanderService::new(cfg_dir.clone(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
         let session = Arc::new(MockSession::new());
         session.add_dir("/app1");
         session.add_dir("/app2");
@@ -19211,7 +19212,7 @@ mod tests {
         }
         let inv = svc.dispatch(ApiEnvelope { method: "GET".into(), path: "/api/cleanup".into(), body: json!({}) });
         assert_eq!(inv.status, 200);
-        let target_ids: Vec<_> = inv.payload["targets"]
+        let target_ids: Vec<_> = inv.payload["locations"]
             .as_array()
             .unwrap()
             .iter()
