@@ -32,6 +32,44 @@ class SharedFrontendTests(unittest.TestCase):
         service = '("POST", "/api/local/list") => self.list(),'
         self.assertEqual(check.unrouted(page, service), ['/api/local/'])
 
+    def test_commander_workflow_contracts(self):
+        root = pathlib.Path(__file__).resolve().parents[2]
+        lib_rs = (root / "crates/linscp-service/src/lib.rs").read_text(encoding="utf-8")
+        queue_rs = (root / "crates/linscp-service/src/queue.rs").read_text(encoding="utf-8")
+        tabs_rs = (root / "crates/linscp-service/src/tabs.rs").read_text(encoding="utf-8")
+        index_html = (root / "source/gui/web/index.html").read_text(encoding="utf-8")
+
+        self.assertIn('("POST", "/api/local/properties") => self.handle_local_properties(req.body)', lib_rs)
+        self.assertIn("fn scan_remote_dir_size(", lib_rs)
+        self.assertIn("fn scan_local_dir_size(", lib_rs)
+        self.assertIn("fn apply_local_chmod_in_dir(", lib_rs)
+        self.assertIn("pub fn filter_excluded_sync_items(", queue_rs)
+        self.assertIn("fn parse_sync_transfer_options(", lib_rs)
+        self.assertIn("fn parse_s3_byte_size_field(", tabs_rs)
+        for elem_id in (
+            "paneCtxCustomCmdBtn",
+            "siteS3Protocol",
+            "siteS3MultipartThreshold",
+            "siteS3MinPartSize",
+            "siteS3RequestPayer",
+            "siteFtpPasvIp",
+            "siteFtpMlsd",
+            "siteFtpAccount",
+            "siteTlsKey",
+            "siteCaCertDir",
+            "syncTransferMode",
+            "syncSpeed",
+            "syncPreserveTime",
+            "kudTransferMode",
+            "kudSpeed",
+            "kudPreserveTime",
+            "kudDelete",
+            "kudContinueOnError",
+            "customCmdDescription",
+            "customCmdDirs",
+        ):
+            self.assertIn(f'id="{elem_id}"', index_html)
+
 
 if __name__ == '__main__':
     unittest.main()
