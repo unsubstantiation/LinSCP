@@ -6917,12 +6917,12 @@ impl CommanderService {
         if is_saf_path(path) {
             let parsed = linscp_platform::parse_saf_document_uri(path)
                 .map_err(|error| error.to_string())?;
-            let leaf = parsed
-                .documents
-                .last()
-                .cloned()
-                .ok_or_else(|| "The dropped SAF URI must name a document, not a tree root.".to_string())?;
-            return Ok((parsed.tree_uri, leaf));
+            if parsed.documents.is_empty() {
+                return Err(
+                    "The dropped SAF URI must name a document, not a tree root.".to_string(),
+                );
+            }
+            return Ok((parsed.parent_uri(), parsed.leaf_name()));
         }
         let path = Path::new(path);
         let leaf = path
