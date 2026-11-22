@@ -3716,6 +3716,13 @@ function options(id) {
     check('terminal footer exposes copy all and help without a copy selected button', !!doc.querySelector('#terminalModal button[onclick="copyTerminalAllText()"]') && !!doc.querySelector('#terminalModal button[onclick="showTerminalCopyHelp()"]') && !doc.getElementById('terminalCopySelected'));
     const shrink = doc.querySelector('#terminalModal button[aria-label="Decrease terminal text size"]');
     const grow = doc.querySelector('#terminalModal button[aria-label="Increase terminal text size"]');
+    const terminalModalEl = doc.getElementById('terminalModal');
+    const terminalModalBox = terminalModalEl && terminalModalEl.querySelector('.modal-box');
+    check('Android terminal modal spans full display width without inline max-width or horizontal padding',
+      !!terminalModalEl && terminalModalEl.classList.contains('terminal-fullscreen') &&
+      !!terminalModalBox && !terminalModalBox.getAttribute('style') &&
+      themeCss.includes('#terminalModal.terminal-fullscreen') &&
+      themeCss.includes('padding: env(safe-area-inset-top, 0) 0 0 0;'));
     check('embedded terminal exposes both text size buttons', !!shrink && !!grow);
     check('embedded terminal opens at 11px default font size', painted.includes('initialSize:11'), JSON.stringify(painted));
     shrink.click(); grow.click(); grow.click();

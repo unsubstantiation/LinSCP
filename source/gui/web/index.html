@@ -1156,7 +1156,7 @@
        opens in its own OS window, which is the same page with
        `terminal=<id>`; Android draws it in this modal instead. -->
   <div class="modal-overlay" id="terminalModal" role="dialog" aria-modal="true" aria-label="Terminal">
-    <div class="modal-box" style="width:900px; max-width:96vw;">
+    <div class="modal-box">
       <div class="modal-header">
         <span>Terminal</span>
         <button type="button" class="modal-close" onclick="closeTerminal()" aria-label="Close">&#10005;</button>
@@ -5892,15 +5892,17 @@
 
   function openTerminalInPage(terminal, tab, returnToMonitor, isMosh = false) {
     const screen = $('terminalScreen');
-    if (!screen || !window.LinSCPCore || !window.LinSCPCore.TerminalWindow) return false;
+    const modal = $('terminalModal');
+    if (!screen || !modal || !window.LinSCPCore || !window.LinSCPCore.TerminalWindow) return false;
     const touchExtras = terminalTouchExtras();
+    modal.classList.toggle('terminal-fullscreen', touchExtras);
     screen.innerHTML = '';
     const defaultHeader = isMosh ? t('Mosh Terminal') : t('Terminal');
-    const modalHeader = $('terminalModal').querySelector('.modal-header span');
+    const modalHeader = modal.querySelector('.modal-header span');
     if (modalHeader) modalHeader.textContent = defaultHeader;
-    // The modal has to be on screen before the renderer measures its font: a
-    // terminal measured inside a display:none box has no cell at all, and
-    // every glyph afterwards lands at zero width.
+    // The modal and extra-keys bar have to be in their final layout before the
+    // renderer measures its container: a terminal measured inside a display:none
+    // or padded box under-reports its width and height to the remote PTY.
     openModal('terminalModal');
     const view = window.LinSCPCore.terminalWindow({
       container: screen,
@@ -5939,6 +5941,7 @@
     });
     embeddedTerminal = { view, returnToMonitor, extras: touchExtras, isMosh };
     syncForegroundService();
+    if (appShell) appShell.setTerminalFocused(true);
     // A new terminal has no selection, and the row it needs is the one a
     // previous terminal may have hidden. Syncing here is what makes the row
     // follow the terminal it belongs to rather than the last one.
@@ -5947,10 +5950,10 @@
       if (!started && embeddedTerminal && embeddedTerminal.view === view) {
         embeddedTerminal = null;
         syncForegroundService();
+        if (appShell) appShell.setTerminalFocused(false);
         closeModal('terminalModal');
       }
     });
-    if (appShell) appShell.setTerminalFocused(true);
     return true;
   }
 

@@ -292,8 +292,10 @@ export class TerminalRenderer {
     }
     const cw = this.cellWidth;
     const ch = this.cellHeight;
+    const clearWidth = Math.max(frame.columns * cw, this.container.clientWidth || 0);
+    const clearHeight = Math.max(frame.lines * ch, this.container.clientHeight || 0);
     ctx.fillStyle = this.theme.background;
-    ctx.fillRect(0, 0, frame.columns * cw, frame.lines * ch);
+    ctx.fillRect(0, 0, clearWidth, clearHeight);
     ctx.font = `${this.fontSize}px ${this.fontFamily}`;
     ctx.textBaseline = 'top';
 

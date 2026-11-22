@@ -1623,28 +1623,87 @@ body {
 .monitor-big-number { font-size: var(--fs-lg); font-weight: var(--fw-bold); }
 .monitor-custom { padding: var(--space-4); border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent); border-radius: var(--r-md); background: color-mix(in srgb, var(--warning) 6%, transparent); }
 .monitor-custom-error { border-color: var(--danger); }
-/* The terminal modal on a phone is the screen: a 560px box on a 360px display
- * wastes most of the width on margins nobody asked for, and the columns are
- * what a shell needs. The extra-keys row stays at the bottom, so it is laid out
- * inside that height rather than after it. */
-@media (max-width: 600px) {
-  #terminalModal .modal-box,
-  #terminalModal .modal-overlay > .modal-box {
+/* The terminal modal on Android / touch devices fills the entire display
+ * edge-to-edge in both portrait and landscape: overlay padding, inline box
+ * caps, borders, and body padding would all steal columns from the shell. */
+#terminalModal > .modal-box {
+  width: min(960px, 96vw);
+  min-width: 0;
+}
+#terminalModal .modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  width: 100%;
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+}
+#terminalModal .terminal-screen {
+  width: 100%;
+}
+#terminalModal.terminal-fullscreen {
+  padding: env(safe-area-inset-top, 0) 0 0 0;
+  align-items: stretch;
+  justify-content: stretch;
+}
+#terminalModal.terminal-fullscreen > .modal-box {
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+  height: 100%;
+  max-height: none;
+  margin: 0;
+  border-radius: 0;
+  border: 0;
+  box-shadow: none;
+}
+#terminalModal.terminal-fullscreen .modal-header {
+  padding: var(--space-2) var(--space-4);
+  min-height: 38px;
+}
+#terminalModal.terminal-fullscreen .modal-footer {
+  padding: var(--space-2) var(--space-3) calc(var(--space-2) + env(safe-area-inset-bottom, 0));
+  flex-wrap: nowrap;
+  overflow-x: auto;
+}
+#terminalModal.terminal-fullscreen .terminal-screen {
+  flex: 1 1 auto;
+  width: 100%;
+  height: auto;
+  max-height: none;
+  min-height: 0;
+}
+@media (max-width: 900px), (pointer: coarse) {
+  #terminalModal {
+    padding: env(safe-area-inset-top, 0) 0 0 0;
+    align-items: stretch;
+    justify-content: stretch;
+  }
+  #terminalModal > .modal-box,
+  #terminalModal .modal-box {
     width: 100%;
     max-width: none;
+    min-width: 0;
     height: 100%;
     max-height: none;
+    margin: 0;
     border-radius: 0;
     border: 0;
+    box-shadow: none;
   }
-  #terminalModal .modal-body {
-    flex: 1 1 auto;
-    min-height: 0;
-    padding: 0;
+  #terminalModal .modal-header {
+    padding: var(--space-2) var(--space-4);
+    min-height: 38px;
   }
-  #terminalModal .modal-footer { padding: var(--space-2) var(--space-4); flex-wrap: wrap; }
+  #terminalModal .modal-footer {
+    padding: var(--space-2) var(--space-3) calc(var(--space-2) + env(safe-area-inset-bottom, 0));
+    flex-wrap: nowrap;
+    overflow-x: auto;
+  }
   #terminalModal .terminal-screen {
     flex: 1 1 auto;
+    width: 100%;
     height: auto;
     max-height: none;
     min-height: 0;

@@ -425,6 +425,39 @@ test('a container-only layout change updates the PTY on the next frame', async (
   dom.cleanup();
 });
 
+test('ResizeObserver on the terminal container updates PTY columns immediately when display width expands', async () => {
+  const dom = installDom();
+  let observerCallback = null;
+  let disconnected = false;
+  dom.dom.window.ResizeObserver = class {
+    constructor(cb) { observerCallback = cb; }
+    observe() {}
+    disconnect() { disconnected = true; }
+  };
+  const container = fakeContainer(320, 600);
+  const transport = fakeTransport();
+  const resized = [];
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-ro',
+    container,
+    pollInterval: 5000,
+    onResize: grid => resized.push(grid),
+  });
+  session.start();
+  assert.ok(typeof observerCallback === 'function', 'ResizeObserver observes terminal container');
+  container.clientWidth = 412;
+  observerCallback();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  const inputs = transport.calls.filter(call => call.path === '/api/terminal/input');
+  assert.equal(inputs.at(-1).body.cols, Math.floor(412 / 9));
+  assert.equal(resized.at(-1).columns, Math.floor(412 / 9));
+  assert.equal(session.element.width, 412);
+  session.stop();
+  assert.equal(disconnected, true);
+  dom.cleanup();
+});
+
 test('the session polls frames and paints them', async () => {
   const dom = installDom();
   const { canvas } = fakeCanvas();
