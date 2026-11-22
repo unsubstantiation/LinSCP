@@ -688,6 +688,7 @@ impl CommanderService {
             ("POST", "/api/dav/lock") => self.dav_lock_async(req.body).await,
             ("POST", "/api/dav/unlock") => self.dav_unlock_async(req.body).await,
             ("POST", "/api/dav/property") => self.dav_property_async(req.body).await,
+            ("POST", "/api/dav/etag") => self.dav_etag_async(req.body).await,
             _ => self.dispatch_inner(req),
         }
     }
@@ -1732,6 +1733,68 @@ impl CommanderService {
         }
     }
 
+    async fn dav_etag_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected"),
+        };
+        let session = match tab.remote {
+            Some(session) if matches!(session.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs) => session,
+            _ => return api_error(400, "WebDAV ETag preconditions require an active WebDAV session."),
+        };
+        let name = match ops::validate_leaf_name(body.get("name").and_then(Value::as_str).unwrap_or("")) {
+            Ok(leaf) => leaf,
+            Err(error) => return api_error(400, error),
+        };
+        let path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
+        let action = body.get("action").and_then(Value::as_str).unwrap_or("get");
+        match action {
+            "get" => match session.dav_get_etag(&path).await {
+                Ok((etag, missing)) => ApiReply {
+                    status: 200,
+                    payload: json!({"success": true, "path": path, "etag": etag, "missing": missing}),
+                },
+                Err(error) => api_error(400, error.to_string()),
+            },
+            "clear" => match session.dav_set_etag_precondition(&path, None).await {
+                Ok(()) => ApiReply {
+                    status: 200,
+                    payload: json!({"success": true, "path": path, "action": "clear"}),
+                },
+                Err(error) => api_error(400, error.to_string()),
+            },
+            "match" | "nomatch" => {
+                let raw_etag = body.get("etag").and_then(Value::as_str).unwrap_or("").trim();
+                if raw_etag.is_empty() || raw_etag.chars().any(char::is_control) {
+                    return api_error(400, "A valid WebDAV entity tag is required.");
+                }
+                let normalized = linscp_proto::webdav::dav_entity_tag(raw_etag);
+                if normalized == "*" {
+                    return api_error(400, "'*' is not a specific WebDAV entity tag.");
+                }
+                let precondition = if action == "match" {
+                    linscp_proto::webdav::DavEtagPrecondition {
+                        if_match: Some(normalized.clone()),
+                        if_none_match: None,
+                    }
+                } else {
+                    linscp_proto::webdav::DavEtagPrecondition {
+                        if_match: None,
+                        if_none_match: Some(normalized.clone()),
+                    }
+                };
+                match session.dav_set_etag_precondition(&path, Some(precondition)).await {
+                    Ok(()) => ApiReply {
+                        status: 200,
+                        payload: json!({"success": true, "path": path, "action": action, "etag": normalized}),
+                    },
+                    Err(error) => api_error(400, error.to_string()),
+                }
+            }
+            _ => api_error(400, "Unsupported WebDAV ETag action (expected 'get', 'match', 'nomatch', or 'clear')."),
+        }
+    }
+
     /// Starts watching a local directory and copying changes to the server.
     /// It runs as a queue item, so cancelling it is the queue's cancel and a
     /// pause holds it before its next pass.
@@ -2214,7 +2277,7 @@ impl CommanderService {
                 "time" => criteria.time = true,
                 "size" => criteria.size = true,
                 "checksum" => criteria.checksum = true,
-                "either" => { criteria.time = true; criteria.size = true; }
+                "either" | "both" => { criteria.time = true; criteria.size = true; }
                 // 'none' means "copy whatever differs", which the planner
                 // expresses by comparing nothing but existence.
                 "none" => {}
@@ -5449,6 +5512,7 @@ impl CommanderService {
         let entries: Vec<Value> = report.imported.iter().map(|site| json!({
             "name": site.name, "protocol": site.protocol.as_str(), "host": site.host,
             "port": site.port, "username": site.username, "has_password": site.password.is_some(),
+            "remote_dir": site.remote_directory, "local_dir": site.local_directory,
         })).collect();
         let skipped: Vec<Value> = report.skipped.iter().map(|item| json!({"name":item.label, "reason":item.reason})).collect();
         ApiReply { status: 200, payload: json!({"success":true, "sources":[{
@@ -5457,14 +5521,49 @@ impl CommanderService {
         }]}) }
     }
 
-    fn handle_sessions_import_post(&self, body: Value) -> ApiReply {
+    fn handle_sessions_import_post(&self, mut body: Value) -> ApiReply {
         let _guard = self.session_key_lock.lock().expect("session key lock");
-        let source = body.get("source").and_then(Value::as_str).unwrap_or("");
-        let path = body.get("path").and_then(Value::as_str).unwrap_or("");
-        let (path, report, fingerprint) = match read_session_import(source, path) {
-            Ok(result) => result,
-            Err(error) => return api_error(400, error),
+        let source = body.get("source").and_then(Value::as_str).unwrap_or("").to_string();
+        let raw_path = body.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        let file_name = body.get("file_name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let scan_only = body.get("scan_only").and_then(Value::as_bool).unwrap_or(false);
+        let has_content = body.get("content").is_some();
+        let (display_path, report, fingerprint) = if has_content {
+            let parsed = match body.get("content").and_then(Value::as_str) {
+                Some(content_str) => parse_session_import_content(&source, content_str),
+                None => Err("The import content must be UTF-8 text.".to_string()),
+            };
+            zeroize_json_secret_fields(&mut body, &["content"]);
+            let (report, fingerprint) = match parsed {
+                Ok(result) => result,
+                Err(error) => return api_error(400, error),
+            };
+            let label = if file_name.is_empty() {
+                format!("(uploaded {source})")
+            } else {
+                file_name
+            };
+            (label, report, fingerprint)
+        } else {
+            let (path, report, fingerprint) = match read_session_import(&source, &raw_path) {
+                Ok(result) => result,
+                Err(error) => return api_error(400, error),
+            };
+            (path.to_string_lossy().into_owned(), report, fingerprint)
         };
+        if scan_only {
+            let entries: Vec<Value> = report.imported.iter().map(|site| json!({
+                "name": site.name, "protocol": site.protocol.as_str(), "host": site.host,
+                "port": site.port, "username": site.username, "has_password": site.password.is_some(),
+                "remote_dir": site.remote_directory, "local_dir": site.local_directory,
+                "has_external_key": site.private_key.is_some() || site.tunnel_private_key.is_some(),
+            })).collect();
+            let skipped: Vec<Value> = report.skipped.iter().map(|item| json!({"name":item.label, "reason":item.reason})).collect();
+            return ApiReply { status: 200, payload: json!({"success":true, "sources":[{
+                "source":source, "path":display_path, "exists":true,
+                "entries":entries, "skipped":skipped, "fingerprint":fingerprint
+            }]}) };
+        }
         if body.get("fingerprint").and_then(Value::as_str) != Some(fingerprint.as_str()) {
             return api_error(409, "The import source changed or has not been scanned. Refresh it before importing.");
         }
@@ -5481,9 +5580,10 @@ impl CommanderService {
         let mut found = std::collections::HashSet::new();
         let mut imported = Vec::new();
         let mut skipped = Vec::new();
+        let mut omitted_keys = Vec::new();
         let mut created = Vec::new();
         let result: Result<(), String> = (|| {
-            for candidate in report.imported.into_iter().filter(|site| selection.contains(&site.name)) {
+            for mut candidate in report.imported.into_iter().filter(|site| selection.contains(&site.name)) {
                 if !unique.insert(candidate.name.to_ascii_lowercase()) {
                     return Err("The import contains duplicate selected session names.".to_string());
                 }
@@ -5492,6 +5592,11 @@ impl CommanderService {
                 if existing.is_some() && !overwrite {
                     skipped.push(json!({"name":candidate.name,"reason":"A stored session with that name already exists."}));
                     continue;
+                }
+                if has_content {
+                    if candidate.private_key.take().is_some() || candidate.tunnel_private_key.take().is_some() {
+                        omitted_keys.push(candidate.name.clone());
+                    }
                 }
                 let mut site = StoredSite::new(&candidate.name, candidate.protocol, &candidate.host);
                 site.port = candidate.port;
@@ -5525,7 +5630,7 @@ impl CommanderService {
             for file in created { let _ = std::fs::remove_file(file); }
             return api_error(400, error);
         }
-        ApiReply { status: 200, payload: json!({"success":true, "path":path.to_string_lossy(), "imported":imported, "skipped":skipped}) }
+        ApiReply { status: 200, payload: json!({"success":true, "path":display_path, "imported":imported, "skipped":skipped, "omitted_keys":omitted_keys}) }
     }
 
     fn handle_import_openssh(&self, body: Value) -> ApiReply {
@@ -5533,9 +5638,10 @@ impl CommanderService {
         let report = parse_openssh_config(text, None);
         ApiReply{ status: 200, payload: serde_json::to_value(report).unwrap_or(json!({}))}
     }
-    fn handle_import_filezilla(&self, body: Value) -> ApiReply {
-        let text = body.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        match parse_filezilla_xml(text) {
+    fn handle_import_filezilla(&self, mut body: Value) -> ApiReply {
+        let parsed = parse_filezilla_xml(body.get("content").and_then(|v| v.as_str()).unwrap_or(""));
+        zeroize_json_secret_fields(&mut body, &["content"]);
+        match parsed {
             Ok(r) => ApiReply{ status: 200, payload: serde_json::to_value(r).unwrap_or(json!({}))},
             Err(e) => ApiReply{ status: 400, payload: json!({"error": e})},
         }
@@ -8103,23 +8209,60 @@ impl CommanderService {
         let Some(spec) = tab.spec.as_ref() else {
             return ApiReply{ status:400, payload: json!({"success": false, "error": "Tab has no session spec"})};
         };
-        if !spec.session.protocol.is_remote_desktop() {
-            return ApiReply{ status:400, payload: json!({"success": false, "error": format!("Protocol {} is not a desktop protocol", spec.session.protocol.as_str())})};
-        }
-        // Build ticket from stored spec via proto helper.
-        let kind = linscp_proto::remote_desktop::RemoteDesktopKind::from_scheme(spec.session.protocol)
-            .unwrap_or(linscp_proto::remote_desktop::RemoteDesktopKind::Rdp);
+        let explicit_kind = body.get("kind").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+        let kind = if let Some(raw_kind) = explicit_kind {
+            match Self::parse_desktop_kind_str(Some(raw_kind)) {
+                Ok(parsed) => parsed,
+                Err(msg) => return api_error(400, msg),
+            }
+        } else {
+            if !spec.session.protocol.is_remote_desktop() {
+                return ApiReply{ status:400, payload: json!({"success": false, "error": format!("Protocol {} is not a desktop protocol", spec.session.protocol.as_str())})};
+            }
+            linscp_proto::remote_desktop::RemoteDesktopKind::from_scheme(spec.session.protocol)
+                .unwrap_or(linscp_proto::remote_desktop::RemoteDesktopKind::Rdp)
+        };
         if kind == linscp_proto::remote_desktop::RemoteDesktopKind::X2Go {
             return api_error(501, "Use the experimental X2Go viewer in Remote desktop; NX support has been removed.");
         }
-        let port = if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port };
-        let target = format!("{}:{}", spec.session.host, port);
+        let host_override = body.get("host").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+        let host = host_override.unwrap_or(spec.session.host.as_str()).to_string();
+        if host.chars().any(char::is_control) {
+            return api_error(400, "Invalid desktop host.");
+        }
+        let default_kind_port = match kind {
+            linscp_proto::remote_desktop::RemoteDesktopKind::Rdp => 3389,
+            linscp_proto::remote_desktop::RemoteDesktopKind::Vnc | linscp_proto::remote_desktop::RemoteDesktopKind::Spice => 5900,
+            _ => if spec.session.port == 0 { 22 } else { spec.session.port },
+        };
+        let port = body
+            .get("port")
+            .and_then(Value::as_u64)
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|&p| p > 0)
+            .unwrap_or_else(|| {
+                if explicit_kind.is_some() {
+                    default_kind_port
+                } else if spec.session.port == 0 {
+                    spec.session.protocol.default_port()
+                } else {
+                    spec.session.port
+                }
+            });
+        let scheme = match kind {
+            linscp_proto::remote_desktop::RemoteDesktopKind::Rdp => linscp_types::ProtocolScheme::Rdp,
+            linscp_proto::remote_desktop::RemoteDesktopKind::Vnc => linscp_types::ProtocolScheme::Vnc,
+            linscp_proto::remote_desktop::RemoteDesktopKind::Spice => linscp_types::ProtocolScheme::Spice,
+            linscp_proto::remote_desktop::RemoteDesktopKind::X2Go => linscp_types::ProtocolScheme::X2Go,
+            linscp_proto::remote_desktop::RemoteDesktopKind::X11 => linscp_types::ProtocolScheme::X11,
+        };
         let desktop_opts = linscp_proto::remote_desktop::DesktopOptions::from_raw_fields(&spec.raw_fields);
-        let tunneled = spec.session.tunnel.as_ref().map(|t| t.enabled && !t.host.trim().is_empty()).unwrap_or(false);
+        let tunneled = body.get("tunnel_via_ssh").and_then(Value::as_bool).unwrap_or(false)
+            || spec.session.tunnel.as_ref().map(|t| t.enabled && !t.host.trim().is_empty()).unwrap_or(false);
         let cfg = linscp_proto::remote_desktop::RemoteDesktopConnectConfig {
-            scheme: spec.session.protocol,
+            scheme,
             kind,
-            host: spec.session.host.clone(),
+            host,
             port,
             username: if spec.session.username.is_empty() { None } else { Some(spec.session.username.clone()) },
             password: spec.session.password.clone().map(zeroize::Zeroizing::new),
@@ -8129,6 +8272,7 @@ impl CommanderService {
             proxy: None,
             timeout: std::time::Duration::from_secs(15),
         };
+        let target = cfg.target();
         let ticket = linscp_proto::remote_desktop::ticket_from_config(&cfg, kind, &target, tunneled, None);
         ApiReply{ status:200, payload: json!({
             "success": true,
@@ -9102,6 +9246,22 @@ fn read_session_import(source: &str, raw_path: &str) -> Result<(PathBuf, linscp_
     let report = if source == "openssh" { parse_openssh_config(text, home.as_deref()) }
         else { parse_filezilla_xml(text)? };
     Ok((path, report, fingerprint))
+}
+
+fn parse_session_import_content(source: &str, text: &str) -> Result<(linscp_types::ImportReport, String), String> {
+    if source != "openssh" && source != "filezilla" {
+        return Err("Unknown session import source.".to_string());
+    }
+    if text.len() > 2 * 1024 * 1024 {
+        return Err("The import source exceeds the 2 MiB limit.".to_string());
+    }
+    let fingerprint = linscp_crypto::digests::sha256_hex(text.as_bytes());
+    let report = if source == "openssh" {
+        parse_openssh_config(text, None)
+    } else {
+        parse_filezilla_xml(text)?
+    };
+    Ok((report, fingerprint))
 }
 
 fn zeroize_json_secret_fields(body: &mut Value, keys: &[&str]) {
@@ -15947,6 +16107,46 @@ mod tests {
     }
 
     #[test]
+    fn session_import_uploaded_content_scans_imports_and_omits_external_host_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&service);
+        let config_text = "Host mobile-prod\n HostName prod.example.test\n User ops\n IdentityFile /nonexistent/laptop/id_ed25519\n";
+        let scan = service.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/sessions/import".into(),
+            body: json!({
+                "source": "openssh",
+                "file_name": "ssh_config",
+                "content": config_text,
+                "scan_only": true,
+            }),
+        });
+        assert_eq!(scan.status, 200, "{}", scan.payload);
+        assert_eq!(scan.payload["sources"][0]["path"].as_str(), Some("ssh_config"));
+        assert_eq!(scan.payload["sources"][0]["entries"][0]["has_external_key"].as_bool(), Some(true));
+        let fingerprint = scan.payload["sources"][0]["fingerprint"].as_str().unwrap().to_string();
+        let imported = service.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/sessions/import".into(),
+            body: json!({
+                "source": "openssh",
+                "file_name": "ssh_config",
+                "content": config_text,
+                "fingerprint": fingerprint,
+                "names": ["mobile-prod"],
+            }),
+        });
+        assert_eq!(imported.status, 200, "{}", imported.payload);
+        assert_eq!(imported.payload["omitted_keys"], json!(["mobile-prod"]));
+        let store = SessionStore::load_from_dir(tmp.path(), service.secret_vault.as_ref()).unwrap();
+        let site = store.find("mobile-prod").unwrap();
+        assert_eq!(site.host, "prod.example.test");
+        assert_eq!(site.username, "ops");
+        assert!(site.private_key.is_none());
+    }
+
+    #[test]
     fn vault_key_deletion_requires_unlock_and_confirmation_and_keeps_saved_sites() {
         let tmp = tempfile::tempdir().unwrap();
         let service = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
@@ -17997,6 +18197,7 @@ mod tests {
             "/api/dav/lock",
             "/api/dav/unlock",
             "/api/dav/property",
+            "/api/dav/etag",
             "/api/x2go/sessions",
             "/api/x2go/suspend",
             "/api/x2go/terminate",
