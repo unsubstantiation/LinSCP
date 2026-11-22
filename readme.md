@@ -159,19 +159,18 @@ non-durable foreground-service transfers.
 
 ## Continuous integration
 
-The workflows in `.github/workflows/` run on pull requests and can also be
-started by hand from the Actions tab ("Run workflow") or with, for example,
-`gh workflow run "Android build" --ref <branch>`. They do not run on pushes to
-`master`, including a PR merge; run a workflow manually after merging if a
-build of the merged commit is needed. GitHub only offers manual dispatch when
-the default-branch workflow declares `workflow_dispatch`.
+The workflows in `.github/workflows/` run on pushes to `master` (not when
+creating or updating pull requests) and can also be started by hand from the
+Actions tab ("Run workflow") or with, for example,
+`gh workflow run "Android build" --ref <branch>`. GitHub only offers manual
+dispatch when the default-branch workflow declares `workflow_dispatch`.
 
-The Debian and Windows jobs build and test their applications on pull requests.
-Android pull requests run an unsigned debug check without release secrets; its
-signed release APK and emulator checks run on manual dispatch using the
-`android-release` environment and release keystore. The manual Android run
-also runs the unsigned check. Build artifacts are uploaded for the manual
-release process; no GitHub Release is created by these workflows.
+On `master`, the Debian, Windows and Android jobs build, test, smoke-test and
+upload uncompressed build artifacts for the manual release process; no GitHub
+Release is created by these workflows. The `master` Android build runs in the
+`android-release` environment using the release keystore to sign, verify and
+launch-check the release APK; manual Android runs on non-`master` branches run
+the unsigned debug build and emulator smoke check without release secrets.
 
 ## Historical material
 

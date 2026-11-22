@@ -248,6 +248,19 @@ class AndroidApplicationIdTests(unittest.TestCase):
         self.assertIn('embeddedTerminal && embeddedTerminal.view', page)
         self.assertIn('restoreOpenInPageTerminal', page)
 
+    def test_emulator_smoke_creates_resume_dir_under_app_root_after_subdir_list(self):
+        # Listing `root + '/smoke-download'` without a tab updates the service's
+        # tabless `current_local_dir`, so creating `smoke-resume` afterwards
+        # must address the root tab (`{tab, name: 'smoke-resume'}`) rather than
+        # silently creating `smoke-download/smoke-resume` and failing the `.filepart`
+        # save with ENOENT (`os error 2`).
+        smoke = (ROOT / 'tools/android_emulator_smoke.mjs').read_text(encoding='utf-8')
+        subdir_list = smoke.index("encodeURIComponent(root + '/smoke-download')")
+        partial_save = smoke.index("root + '/smoke-resume/smoke-upload.txt.filepart'")
+        between = smoke[subdir_list:partial_save]
+        self.assertIn("{tab, name: 'smoke-resume'}", between)
+        self.assertNotIn("{name: 'smoke-resume'}", smoke)
+
 
 if __name__ == '__main__':
     unittest.main()

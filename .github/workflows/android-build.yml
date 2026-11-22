@@ -1,7 +1,8 @@
 name: Android build
 
 on:
-  pull_request:
+  push:
+    branches: [master]
   workflow_dispatch:
 
 concurrency:
@@ -11,7 +12,7 @@ concurrency:
 jobs:
   check:
     name: Android unsigned check
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: github.ref != 'refs/heads/master'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -110,9 +111,25 @@ jobs:
       - name: Verify debug APK contents and package
         run: python3 tools/run_cargo_ci.py python3 tools/verify_android_apk.py --build-type debug
 
+      - name: Enable emulator acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Exercise the WebView, Rust IPC and WebDAV transfers
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: |
+            python3 tools/run_cargo_ci.py bash tools/android_emulator_smoke.sh
+
   build:
     name: Signed Android release APK
-    if: github.event_name == 'workflow_dispatch'
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     environment: android-release
@@ -173,6 +190,14 @@ jobs:
           npm ci --prefix ui --no-audit --no-fund
           python3 tools/run_cargo_ci.py npm --prefix ui test
 
+      - name: Exercise Android SAF, Keystore, share export and tunnel Rust unit tests
+        run: |
+          python3 tools/run_cargo_ci.py cargo test -p linscp-platform saf_ -- --nocapture
+          python3 tools/run_cargo_ci.py cargo test -p linscp-platform android_keystore -- --nocapture
+          python3 tools/run_cargo_ci.py cargo test -p linscp-proto tunnel -- --nocapture
+          python3 tools/run_cargo_ci.py cargo test -p linscp-service saf_ -- --nocapture --test-threads=1
+          python3 tools/run_cargo_ci.py cargo test -p linscp-service share_export -- --nocapture
+
       - name: Check the Android application ID and signing configuration
         run: |
           python3 -m unittest discover -s tools/tests -p test_android_application_id.py
@@ -201,6 +226,8 @@ jobs:
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: python3 tools/run_cargo_ci.py python3 tools/android_release_signing.py
 
       - name: Build signed release APK
