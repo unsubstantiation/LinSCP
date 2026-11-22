@@ -173,6 +173,8 @@ export interface TerminalSessionOptions {
   terminal: string;
   /** Where the canvas goes. Its size decides the grid. */
   container: HTMLElement;
+  /** Initial terminal font size in CSS pixels. */
+  fontSize?: number;
   /** Poll interval in milliseconds; the old page used 120. */
   pollInterval?: number;
   /** Called when the session ends, with the reason if the backend gave one. */
@@ -225,6 +227,7 @@ interface FrameReply {
  */
 export class TerminalSession {
   private readonly transport: TransportClient;
+  private readonly container: HTMLElement;
   private readonly pollInterval: number;
   private readonly onEnded?: TerminalSessionOptions['onEnded'];
   private readonly onTitle?: TerminalSessionOptions['onTitle'];
@@ -330,6 +333,7 @@ export class TerminalSession {
 
   constructor(options: TerminalSessionOptions) {
     this.transport = options.transport;
+    this.container = options.container;
     this.terminal = options.terminal;
     this.pollInterval = options.pollInterval ?? 120;
     this.onEnded = options.onEnded;
@@ -341,6 +345,7 @@ export class TerminalSession {
     this.onClipboardError = options.onClipboardError;
     this.renderer = new TerminalRenderer({
       container: options.container,
+      fontSize: options.fontSize,
       selectionHandles: Boolean(options.keyboard),
       onCellSize: (size) => {
         // The model answers a program that asks how large the text area is in
@@ -415,6 +420,11 @@ export class TerminalSession {
     return this.renderer.size();
   }
 
+  /** Current terminal font size in CSS pixels. */
+  public get textSize(): number {
+    return this.renderer.textSize;
+  }
+
   /** Change text size, remeasure cells and report the new grid to the PTY. */
   public changeTextSize(delta: number): number {
     return this.renderer.setTextSize(this.renderer.textSize + delta);
@@ -455,6 +465,17 @@ export class TerminalSession {
     this.windowView?.addEventListener('pageshow', this.handleWindowResume);
     this.visibilityDoc = doc ?? null;
     this.visibilityDoc?.addEventListener('visibilitychange', this.handleVisibilityChange);
+    const ResizeObserverCtor = (view as unknown as { ResizeObserver?: typeof ResizeObserver } | null)?.ResizeObserver
+      ?? (typeof ResizeObserver !== 'undefined' ? ResizeObserver : undefined);
+    if (typeof ResizeObserverCtor === 'function') {
+      try {
+        const observer = new ResizeObserverCtor(() => this.handleViewportChange());
+        observer.observe(this.container);
+        this.resizeObserver = observer;
+      } catch {
+        this.resizeObserver = null;
+      }
+    }
   }
 
   private isDocumentHidden(): boolean {
@@ -508,7 +529,8 @@ export class TerminalSession {
       // The frame's own `takeResize` would also notice this, but only on the
       // next poll; sending it here is what makes the prompt stay visible while
       // the keyboard is still animating open.
-      void this.resize({ columns: next.columns, lines: next.lines });
+      const cell = this.renderer.cellSize();
+      void this.resize({ columns: next.columns, lines: next.lines, width: cell.width, height: cell.height });
     }
     this.renderer.repaint();
   };
@@ -516,6 +538,7 @@ export class TerminalSession {
   private viewport: VisualViewport | null = null;
   private windowView: Window | null = null;
   private visibilityDoc: Document | null = null;
+  private resizeObserver: ResizeObserver | null = null;
 
   /** Stops polling and removes the canvas. The shell is told only by `close`. */
   public stop(): void {
@@ -525,6 +548,8 @@ export class TerminalSession {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
     this.viewport?.removeEventListener('resize', this.handleViewportChange);
     this.viewport = null;
     this.windowView?.removeEventListener('resize', this.handleViewportChange);

@@ -546,7 +546,12 @@ function options(id) {
     larger.click(); smaller.click();
     await new Promise(resolve => setTimeout(resolve, 30));
     const sizes = terminalCalls.filter(call => call && call.path === '/api/terminal/input' && call.body && call.body.cell_height).map(call => call.body.cell_height);
-    check('desktop text size buttons update terminal cell metrics', sizes.includes(21) && sizes.at(-1) === 18, JSON.stringify(sizes));
+    check('desktop text size buttons update terminal cell metrics by single 1px steps from 11px default',
+      sizes[0] === 15 && sizes.includes(16) && sizes.at(-1) === 15, JSON.stringify(sizes));
+    larger.click(); larger.click();
+    check('desktop terminal remembers adjusted font size in localStorage',
+      terminalWindow.localStorage.getItem('lscp-terminal-font-size') === '13',
+      terminalWindow.localStorage.getItem('lscp-terminal-font-size'));
     let terminalHelp = ''; terminalWindow.alert = text => { terminalHelp = text; };
     help.click();
     check('terminal help explains mouse selection and paste', terminalHelp.includes('mouse') && terminalHelp.includes('Right-click') && terminalHelp.includes('Ctrl+V'));
@@ -3223,10 +3228,16 @@ function options(id) {
       /* The real window exposes the open selection and can copy it from the
        * model; the page's copy bar is driven by both. */
       let selection = null;
+      let currentFontSize = typeof options.fontSize === 'number' ? options.fontSize : 11;
+      painted.push('initialSize:' + currentFontSize);
       lastWindow = {
         get selection() { return selection; },
         copyAllText: async () => 'all terminal text',
-        changeTextSize: delta => { painted.push('size:' + delta); return 14 + delta; },
+        changeTextSize: delta => {
+          currentFontSize = Math.max(8, Math.min(32, currentFontSize + delta));
+          painted.push('size:' + delta + '->' + currentFontSize);
+          return currentFontSize;
+        },
         copySelection: async () => {
           if (!selection) return null;
           selection = null;
@@ -3705,9 +3716,20 @@ function options(id) {
     check('terminal footer exposes copy all and help without a copy selected button', !!doc.querySelector('#terminalModal button[onclick="copyTerminalAllText()"]') && !!doc.querySelector('#terminalModal button[onclick="showTerminalCopyHelp()"]') && !doc.getElementById('terminalCopySelected'));
     const shrink = doc.querySelector('#terminalModal button[aria-label="Decrease terminal text size"]');
     const grow = doc.querySelector('#terminalModal button[aria-label="Increase terminal text size"]');
+    const terminalModalEl = doc.getElementById('terminalModal');
+    const terminalModalBox = terminalModalEl && terminalModalEl.querySelector('.modal-box');
+    check('Android terminal modal spans full display width without inline max-width or horizontal padding',
+      !!terminalModalEl && terminalModalEl.classList.contains('terminal-fullscreen') &&
+      !!terminalModalBox && !terminalModalBox.getAttribute('style') &&
+      themeCss.includes('#terminalModal.terminal-fullscreen') &&
+      themeCss.includes('padding: env(safe-area-inset-top, 0) 0 0 0;'));
     check('embedded terminal exposes both text size buttons', !!shrink && !!grow);
-    shrink.click(); grow.click();
-    check('embedded terminal size buttons reach its own view', painted.includes('size:-2') && painted.includes('size:2'));
+    check('embedded terminal opens at 11px default font size', painted.includes('initialSize:11'), JSON.stringify(painted));
+    shrink.click(); grow.click(); grow.click();
+    check('embedded terminal size buttons adjust by a single step and persist font size',
+      painted.includes('size:-1->10') && painted.includes('size:1->11') && painted.includes('size:1->12') &&
+      window.localStorage.getItem('lscp-terminal-font-size') === '12',
+      JSON.stringify(painted) + ' | saved=' + window.localStorage.getItem('lscp-terminal-font-size'));
     await window.copyTerminalAllText();
     lastWindow.selectAll();
     check('selecting text offers to copy it',
@@ -3733,6 +3755,8 @@ function options(id) {
     responses['/api/terminal/frame'] = {
       success: false, error: 'This terminal is no longer open.' };
     await window.openTerminal();
+    check('reopening embedded terminal restores the remembered font size',
+      painted.includes('initialSize:12'), JSON.stringify(painted));
     await new Promise(resolve => setTimeout(resolve, 500));
     check('a terminal the backend refuses is reported, not left black',
       lastLogLine().indexOf('The terminal session ended.') >= 0 ||
@@ -4770,6 +4794,225 @@ function options(id) {
     responses['/api/local/list'] = prevLocalList;
     delete responses['/api/local/search'];
     await window.loadLocal('/tmp/slowlocal');
+
+    // 14. Symlinks (`is_symlink` / `broken_link`), mtime date fallback, offline local chmod/link,
+    // Windows `joinPath` + `navigateSync`, `transportShim`, Site Manager secret placeholders,
+    // modal shortcut isolation, and embedded terminal Escape / selection copy / UTF-8 command.
+    const pageState = window.eval('state');
+    check('joinPath formats Windows drive roots and subdirectories cleanly',
+      window.joinPath('C:\\', 'Users') === 'C:\\Users' &&
+      window.joinPath('C:\\Users\\', 'alice') === 'C:\\Users\\alice' &&
+      window.joinPath('C:/Users', 'alice') === 'C:/Users/alice');
+
+    const shimReply = await window.transportShim().post('/api/local/mkdir', { name: 'shim_test' });
+    check('transportShim preserves parsed JSON reply objects on POST',
+      !!shimReply && shimReply.success === true);
+
+    // Render `is_symlink` + `broken_link` + `mtime` (with empty `date`) in local pane.
+    const savedLocalEntries = pageState.local.entries.slice();
+    pageState.local.entries = [
+      { name: 'dangling.lnk', size: 0, is_dir: false, is_symlink: true, broken_link: true, date: '', mtime: 1700000000, permissions: 'lrwxrwxrwx', owner: '1000', group: '1000' },
+      { name: 'dir_alias', size: 0, is_dir: true, is_symlink: true, broken_link: false, date: '2026-11-20 12:00', mtime: 1700000000, permissions: 'lrwxrwxrwx', owner: '1000', group: '1000' },
+      ...savedLocalEntries
+    ];
+    window.renderPane('local');
+    const danglingRow = Array.from(doc.querySelectorAll('#localFileList tr')).find(r => r.dataset.name === 'dangling.lnk');
+    const dirAliasRow = Array.from(doc.querySelectorAll('#localFileList tr')).find(r => r.dataset.name === 'dir_alias');
+    check('local broken symlink renders link icon, broken-link class and mtime fallback date',
+      !!danglingRow &&
+      danglingRow.classList.contains('broken-link') &&
+      danglingRow.children[0].textContent.includes('🔗') &&
+      danglingRow.children[0].textContent.includes('(broken link)') &&
+      danglingRow.children[2].textContent.trim().length > 0);
+    check('directory symlink renders symlink icon instead of plain folder icon',
+      !!dirAliasRow && dirAliasRow.children[0].textContent.includes('🔗'));
+
+    window.focusPane('local');
+    pageState.local.selection = new Set(['dangling.lnk']);
+    await window.openProperties();
+    const propHtml = doc.getElementById('propertiesBody').textContent;
+    check('local Properties identifies broken symlink, owner:group and missing-target hint',
+      propHtml.includes('Symbolic link') &&
+      propHtml.includes('The file this link points at does not exist.'));
+    window.closeModal('propertiesModal');
+
+    // Delete a remote directory symlink (`is_dir: true, is_symlink: true`): payload must send `is_dir: false`.
+    const savedRemoteEntries = pageState.remote.entries.slice();
+    pageState.remote.entries = [
+      { name: 'remote_dir_link', size: 0, is_dir: true, is_symlink: true, broken_link: false, date: '2026-11-20 12:00', mtime: 1700000000, permissions: 'lrwxrwxrwx' }
+    ];
+    pageState.remote.selection = new Set(['remote_dir_link']);
+    const prevDelConfirm = confirmResult;
+    confirmResult = true;
+    responses['/api/remote/delete'] = { success: true };
+    await window.deletePrompt('remote');
+    const remoteDelCall = calls.filter(c => c.path === '/api/remote/delete').pop();
+    const remoteDelBody = remoteDelCall ? JSON.parse(remoteDelCall.options.body) : {};
+    check('deleting a remote directory symlink sends is_dir=false so only the link is unlinked',
+      Array.isArray(remoteDelBody.names) &&
+      remoteDelBody.names.length === 1 &&
+      remoteDelBody.names[0].name === 'remote_dir_link' &&
+      remoteDelBody.names[0].is_dir === false);
+    confirmResult = prevDelConfirm;
+    pageState.remote.entries = savedRemoteEntries;
+
+    // Offline local `applyPropertiesRights` and `promptLink` work without an active remote tab.
+    const savedTabs = pageState.tabs.slice();
+    const savedActiveTab = pageState.activeTab;
+    pageState.tabs = [];
+    pageState.activeTab = null;
+    await window.openProperties();
+    doc.getElementById('propertiesMode').value = '0640';
+    responses['/api/local/chmod'] = { success: true };
+    await window.applyPropertiesRights('local', ['a.txt']);
+    const offlineChmodCall = calls.filter(c => c.path === '/api/local/chmod').pop();
+    check('local applyPropertiesRights works offline when no remote tab is open',
+      !!offlineChmodCall && JSON.parse(offlineChmodCall.options.body).permissions === '0640');
+    window.closeModal('propertiesModal');
+
+    const prevPromptAnswer = window.prompt;
+    window.prompt = () => 'a_offline.lnk';
+    pageState.local.entries = savedLocalEntries;
+    pageState.local.selection = new Set(['a.txt']);
+    responses['/api/local/link'] = { success: true };
+    await window.promptLink('local');
+    const offlineLinkCall = calls.filter(c => c.path === '/api/local/link').pop();
+    check('local promptLink works offline when no remote tab is open',
+      !!offlineLinkCall && JSON.parse(offlineLinkCall.options.body).name === 'a_offline.lnk');
+    window.prompt = prevPromptAnswer;
+    pageState.tabs = savedTabs;
+    pageState.activeTab = savedActiveTab;
+
+    // Windows synchronized browsing (`navigateSync` with `..` on remote side navigates Windows local parent).
+    const prevSyncLocalPath = pageState.local.path;
+    const prevSyncRemotePath = pageState.remote.path;
+    pageState.local.path = 'C:\\Users\\alice\\project';
+    pageState.remote.path = '/srv/alice/project';
+    let syncedLocalTarget = null;
+    const origSyncInvoke = window.__TAURI_INTERNALS__.invoke;
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      if (cmd === 'linscp_invoke' && args && args.envelope && args.envelope.path.startsWith('/api/local/list')) {
+        const params = new URLSearchParams(args.envelope.path.split('?')[1] || '');
+        syncedLocalTarget = params.get('path');
+        return { status: 200, payload: { path: syncedLocalTarget, entries: [] } };
+      }
+      return origSyncInvoke(cmd, args);
+    };
+    await window.navigateSync('remote', { name: '..', path: '/srv/alice' });
+    check('navigateSync uses localParentPath on Windows local counterpart instead of corrupting to /',
+      syncedLocalTarget === 'C:\\Users\\alice');
+    window.__TAURI_INTERNALS__.invoke = origSyncInvoke;
+    pageState.local.path = prevSyncLocalPath;
+    pageState.remote.path = prevSyncRemotePath;
+    await window.loadLocal('/tmp/slowlocal');
+    await window.loadRemote('/tmp/slowremote');
+
+    // Site Manager stored secret placeholders for tunnel password, tunnel passphrase, and proxy password.
+    window.fillSiteForm({
+      name: 'tunneled-site',
+      protocol: 'sftp',
+      host: 'example.com',
+      port: 22,
+      tunnel: true,
+      has_tunnel_password: true,
+      has_tunnel_passphrase: true,
+      has_proxy_password: true
+    });
+    check('fillSiteForm sets stored-secret placeholders for tunnel and proxy credentials',
+      doc.getElementById('siteTunnelPass').placeholder.includes('stored') &&
+      doc.getElementById('siteTunnelPassphrase').placeholder.includes('stored') &&
+      doc.getElementById('siteProxyPassword').placeholder.includes('stored'));
+
+    // Modal shortcut isolation: openModal moves focus into the modal, and Backspace / F8 on activeElement do not mutate background panes.
+    doc.getElementById('localPane').focus();
+    window.openModal('siteModal');
+    check('openModal moves activeElement inside the opened modal dialog',
+      doc.getElementById('siteModal').contains(doc.activeElement));
+    const localPathBeforeModalKey = pageState.local.path;
+    const deleteCallsBeforeModalKey = calls.filter(c => c.path === '/api/local/delete' || c.path === '/api/remote/delete').length;
+    doc.activeElement.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Backspace', bubbles: true, cancelable: true }));
+    doc.activeElement.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'F8', bubbles: true, cancelable: true }));
+    await wait(30);
+    check('background Commander shortcuts do not fire while a modal dialog holds focus',
+      pageState.local.path === localPathBeforeModalKey &&
+      calls.filter(c => c.path === '/api/local/delete' || c.path === '/api/remote/delete').length === deleteCallsBeforeModalKey);
+    window.closeModal('siteModal');
+
+    // Embedded terminal UTF-8 initialCommand + Escape forwarded to PTY + Ctrl+C copies canvas selection.
+    const prevTermCore = window.LinSCPCore;
+    const prevSessionTerm = responses['/api/session/terminal'];
+    const prevTermInput = responses['/api/terminal/input'];
+    const prevTermFrame = responses['/api/terminal/frame'];
+    const prevTermClose = responses['/api/terminal/close'];
+    let copiedEmbeddedText = '';
+    let mockEmbeddedSelection = null;
+    window.LinSCPCore = new Proxy(prevTermCore, {
+      get(target, key) {
+        if (key === 'hostCapabilities') {
+          return () => Object.assign(target.hostCapabilities({ host: window }), { platform: 'android' });
+        }
+        if (key === 'terminalWindow') {
+          return (opts) => ({
+            get selection() { return mockEmbeddedSelection; },
+            handleKey(ev) {
+              if (ev.key === 'Escape') {
+                ev.preventDefault();
+                void window.LinSCPTransport.request('POST', '/api/terminal/input', {
+                  terminal: opts.terminal, data: window.btoa('\x1b'), cols: 80, rows: 24
+                });
+                return true;
+              }
+              return false;
+            },
+            async copySelection() {
+              copiedEmbeddedText = String(mockEmbeddedSelection || '');
+              mockEmbeddedSelection = null;
+              return copiedEmbeddedText;
+            },
+            async clearSelection() { mockEmbeddedSelection = null; },
+            start() { return Promise.resolve(true); },
+            write() {},
+            stop() {},
+            async close() {},
+          });
+        }
+        const value = Reflect.get(target, key);
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    });
+    responses['/api/session/terminal'] = { success: true, terminal: 777, transport: 'ssh' };
+    responses['/api/terminal/input'] = { success: true };
+    responses['/api/terminal/frame'] = { success: true, dirty: false, alive: true };
+    responses['/api/terminal/close'] = { success: true };
+    const termInputCountBefore = calls.filter(c => c.path === '/api/terminal/input').length;
+    const openedUtf8Term = await window.openTerminal(null, false, 'echo "สวัสดี"');
+    const termInputsAfterOpen = calls.filter(c => c.path === '/api/terminal/input');
+    const initialCmdDecoded = termInputsAfterOpen.length > termInputCountBefore
+      ? Buffer.from(JSON.parse(termInputsAfterOpen[termInputsAfterOpen.length - 1].options.body).data, 'base64').toString('utf8')
+      : '';
+    check('openTerminal encodes UTF-8 initialCommand safely via utf8ToBase64',
+      openedUtf8Term === true && initialCmdDecoded === 'echo "สวัสดี"\n');
+    const termInputCountBeforeEsc = calls.filter(c => c.path === '/api/terminal/input').length;
+    doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    await wait(40);
+    const termInputsAfterEsc = calls.filter(c => c.path === '/api/terminal/input');
+    const escDecoded = termInputsAfterEsc.length > termInputCountBeforeEsc
+      ? Buffer.from(JSON.parse(termInputsAfterEsc[termInputsAfterEsc.length - 1].options.body).data, 'base64').toString('utf8')
+      : '';
+    check('Escape inside active embedded terminal sends ESC to PTY without closing terminalModal',
+      doc.getElementById('terminalModal').classList.contains('open') && escDecoded === '\x1b');
+    mockEmbeddedSelection = 'selected canvas output';
+    doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'c', ctrlKey: true, bubbles: true, cancelable: true }));
+    await wait(30);
+    check('Ctrl+C inside embedded terminal copies active canvas selection instead of sending SIGINT',
+      copiedEmbeddedText === 'selected canvas output');
+    window.closeTerminal();
+    await wait(40);
+    window.LinSCPCore = prevTermCore;
+    responses['/api/session/terminal'] = prevSessionTerm;
+    responses['/api/terminal/input'] = prevTermInput;
+    responses['/api/terminal/frame'] = prevTermFrame;
+    responses['/api/terminal/close'] = prevTermClose;
   }
 
   check('no script errors', errors.length === 0, errors.join(' | '));

@@ -6,7 +6,10 @@ with the project's release key**: it installs, updates and can be sideloaded lik
 any other APK, but it is not a production or Play Store release (no AAB, no
 upload). Android support is incomplete:
 
-- The generated Android host registers the Storage Access Framework picker,
+- The generated Android host hides the system navigation bar in transient-swipe
+  immersive mode (`WindowInsetsCompat.Type.navigationBars()` with
+  `BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE`) while the app is active, registers
+  the Storage Access Framework picker,
   persists the returned tree grants, and routes `content://` list/stat/read/write/
   create/rename/delete operations through the local filesystem. It also accepts
   `ACTION_SEND` and `ACTION_SEND_MULTIPLE`, stages received content URIs in the

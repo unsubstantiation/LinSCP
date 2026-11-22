@@ -4,6 +4,9 @@ import { JSDOM } from 'jsdom';
 
 import {
   DEFAULT_RENDERER_THEME,
+  DEFAULT_TERMINAL_FONT_SIZE,
+  TERMINAL_FONT_SIZE_STEP,
+  TERMINAL_FONT_SIZE_STORAGE_KEY,
   TerminalRenderer,
   TerminalSession,
   TerminalWindow,
@@ -309,7 +312,10 @@ test('a paste keeps its newlines and is wrapped only when asked', () => {
  * renderer, so it cannot be handed a fake one.
  */
 function installDom() {
-  const dom = new JSDOM('<!doctype html><div id="host"></div>', { pretendToBeVisual: true });
+  const dom = new JSDOM('<!doctype html><div id="host"></div>', {
+    pretendToBeVisual: true,
+    url: 'https://tauri.localhost/',
+  });
   const { canvas, context, calls } = fakeCanvas();
   dom.window.HTMLCanvasElement.prototype.getContext = () => context;
   globalThis.document = dom.window.document;
@@ -374,7 +380,9 @@ test('the session reports its initial window grid and later window resizes in or
   const session = new TerminalSession({ transport, terminal: 'term-1', container, pollInterval: 1000 });
   session.start();
   await new Promise(resolve => setTimeout(resolve, 5));
-  assert.deepEqual([calls[0].cols, calls[0].rows, calls[0].cell_width, calls[0].cell_height], [10, 2, 9, 18]);
+  assert.equal(DEFAULT_TERMINAL_FONT_SIZE, 11);
+  assert.equal(TERMINAL_FONT_SIZE_STEP, 1);
+  assert.deepEqual([calls[0].cols, calls[0].rows, calls[0].cell_width, calls[0].cell_height], [10, 2, 9, 15]);
   container.clientWidth = 180; container.clientHeight = 72;
   dom.dom.window.dispatchEvent(new dom.dom.window.Event('resize'));
   session.write('x');
@@ -384,7 +392,7 @@ test('the session reports its initial window grid and later window resizes in or
   assert.equal(calls.length, 1, 'later resizes wait for the first resize');
   releaseFirst();
   await new Promise(resolve => setTimeout(resolve, 15));
-  assert.deepEqual(calls.map(c => [c.cols, c.rows]), [[10, 2], [20, 4], [20, 4], [30, 5]]);
+  assert.deepEqual(calls.map(c => [c.cols, c.rows]), [[10, 2], [20, 4], [20, 4], [30, 6]]);
   assert.equal(Buffer.from(calls[2].data, 'base64').toString(), 'x');
   session.stop();
   assert.ok(removedListeners.includes('resize'), 'the window listener is detached on teardown');
@@ -414,6 +422,39 @@ test('a container-only layout change updates the PTY on the next frame', async (
   assert.equal(session.element.width, 180);
   assert.equal(session.element.height, 72);
   session.stop();
+  dom.cleanup();
+});
+
+test('ResizeObserver on the terminal container updates PTY columns immediately when display width expands', async () => {
+  const dom = installDom();
+  let observerCallback = null;
+  let disconnected = false;
+  dom.dom.window.ResizeObserver = class {
+    constructor(cb) { observerCallback = cb; }
+    observe() {}
+    disconnect() { disconnected = true; }
+  };
+  const container = fakeContainer(320, 600);
+  const transport = fakeTransport();
+  const resized = [];
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-ro',
+    container,
+    pollInterval: 5000,
+    onResize: grid => resized.push(grid),
+  });
+  session.start();
+  assert.ok(typeof observerCallback === 'function', 'ResizeObserver observes terminal container');
+  container.clientWidth = 412;
+  observerCallback();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  const inputs = transport.calls.filter(call => call.path === '/api/terminal/input');
+  assert.equal(inputs.at(-1).body.cols, Math.floor(412 / 9));
+  assert.equal(resized.at(-1).columns, Math.floor(412 / 9));
+  assert.equal(session.element.width, 412);
+  session.stop();
+  assert.equal(disconnected, true);
   dom.cleanup();
 });
 
@@ -487,9 +528,9 @@ test('a swipe over the terminal scrolls the model instead of the page', async ()
 
   const scrolls = transport.calls.filter((call) => call.path === '/api/terminal/scroll');
   assert.equal(scrolls.length, 1, 'one drag, one scroll request');
-  // Dragging up by 90px at an 18px cell is five lines back into history, which
-  // the model counts as positive.
-  assert.equal(scrolls[0].body.lines, 5);
+  // Dragging up by 90px at a 15px cell (11px default font) is six lines back
+  // into history, which the model counts as positive.
+  assert.equal(scrolls[0].body.lines, 6);
   assert.equal(move.defaultPrevented, true, 'the page must not scroll with the finger');
 
   // A wheel does the same thing for a desktop mouse.
@@ -1138,7 +1179,7 @@ test('touch selection copies on release after queued selection updates', async (
   session.stop(); dom.cleanup();
 });
 
-test('terminal text size remeasures, repaints and reports the new grid and cell pixels', async () => {
+test('terminal text size defaults to 11px, steps by 1px, remeasures, and is remembered across TerminalWindow sessions', async () => {
   const dom = installDom();
   const transport = fakeTransport();
   const grids = [];
@@ -1146,21 +1187,46 @@ test('terminal text size remeasures, repaints and reports the new grid and cell 
     onResize: grid => grids.push(grid) });
   const ctx = session.element.getContext('2d');
   ctx.measureText = text => ({ width: text.length * parseFloat(ctx.font) * 0.625 });
+  assert.equal(session.textSize, 11);
   session.start();
-  assert.equal(session.changeTextSize(2), 16);
+  assert.equal(session.changeTextSize(1), 12);
   await new Promise(resolve => setTimeout(resolve, 10));
   let last = transport.calls.filter(call => call.path === '/api/terminal/input').at(-1).body;
-  assert.deepEqual([last.cols, last.rows, last.cell_width, last.cell_height], [18, 4, 10, 21]);
-  assert.deepEqual(grids.at(-1), { columns: 18, lines: 4 });
-  assert.equal(session.changeTextSize(-2), 14);
+  assert.deepEqual([last.cols, last.rows, last.cell_width, last.cell_height], [22, 5, 8, 16]);
+  assert.deepEqual(grids.at(-1), { columns: 22, lines: 5 });
+  assert.equal(session.changeTextSize(-1), 11);
   await new Promise(resolve => setTimeout(resolve, 10));
   last = transport.calls.filter(call => call.path === '/api/terminal/input').at(-1).body;
-  assert.deepEqual([last.cols, last.rows, last.cell_width, last.cell_height], [20, 5, 9, 18]);
+  assert.deepEqual([last.cols, last.rows, last.cell_width, last.cell_height], [25, 6, 7, 15]);
   assert.equal(session.changeTextSize(-100), 8);
   assert.equal(session.changeTextSize(100), 32);
-  assert.equal(session.changeTextSize(2), 32);
+  assert.equal(session.changeTextSize(1), 32);
   assert.equal(session.changeTextSize(Number.NaN), 32);
-  session.stop(); dom.cleanup();
+  session.stop();
+
+  dom.dom.window.localStorage.removeItem(TERMINAL_FONT_SIZE_STORAGE_KEY);
+  const firstWindow = new TerminalWindow({
+    transport,
+    terminal: 'term-win-1',
+    container: fakeContainer(180, 90),
+  });
+  await firstWindow.start();
+  assert.equal(firstWindow.textSize, 11, 'default font size is 11px (3 steps smaller than 14px)');
+  assert.equal(firstWindow.changeTextSize(-1), 10);
+  assert.equal(firstWindow.changeTextSize(-1), 9);
+  assert.equal(firstWindow.changeTextSize(1), 10);
+  assert.equal(dom.dom.window.localStorage.getItem(TERMINAL_FONT_SIZE_STORAGE_KEY), '10');
+  firstWindow.stop();
+
+  const secondWindow = new TerminalWindow({
+    transport,
+    terminal: 'term-win-2',
+    container: fakeContainer(180, 90),
+  });
+  await secondWindow.start();
+  assert.equal(secondWindow.textSize, 10, 'reopening TerminalWindow restores remembered font size');
+  secondWindow.stop();
+  dom.cleanup();
 });
 
 test('Android touch selection adjusts both start and end handles, unsticks on tap/re-press, and tolerates jitter', async () => {
@@ -1186,6 +1252,7 @@ test('Android touch selection adjusts both start and end handles, unsticks on ta
     transport,
     terminal: 'term-android-adjust',
     container: fakeContainer(180, 90),
+    fontSize: 14,
     pollInterval: 5,
     keyboard: true,
     onSelection: (open) => opens.push(open),

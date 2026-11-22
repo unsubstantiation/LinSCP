@@ -1194,3 +1194,91 @@ test('Android text selection inside inputs, logs, or active ranges never trigger
   dom.window.close();
 });
 
+test('LocalRootSwitcher forwards active tab id and AppShell detaches swipe on desktop layouts', async () => {
+  const { LocalRootSwitcher, mountAppShell } = await import('../dist/linscp-core.mjs');
+
+  const dom = new JSDOM(`<!doctype html><body>
+    <select id="rootSelect"></select>
+    <div id="app">
+      <div class="commander-main">
+        <div class="pane active" id="localPane" data-shell-pane="local"><div class="file-table-container"></div></div>
+        <div class="pane" id="remotePane" data-shell-pane="remote"><div class="file-table-container"></div></div>
+      </div>
+    </div>
+  </body>`, { url: 'http://127.0.0.1:8080/' });
+  const doc = dom.window.document;
+
+  const requestedUrls = [];
+  let activeTabId = 42;
+  const switcher = new LocalRootSwitcher({
+    transport: {
+      async get(url) {
+        requestedUrls.push(url);
+        if (url === '/api/local/roots') {
+          return {
+            roots: [
+              { path: 'C:\\', label: 'C:\\', kind: 'drive', read_only: false },
+              { path: 'D:\\', label: 'D:\\', kind: 'drive', read_only: false },
+            ],
+          };
+        }
+        return { path: 'D:\\', entries: [] };
+      },
+      async post() { return {}; },
+      async request() { return {}; },
+    },
+    selectElement: doc.getElementById('rootSelect'),
+    getTabId: () => activeTabId,
+    onNavigate: () => {},
+  });
+
+  await switcher.refreshRoots('C:\\Users');
+  const select = doc.getElementById('rootSelect');
+  select.value = 'D:\\';
+  select.dispatchEvent(new dom.window.Event('change'));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.ok(
+    requestedUrls.includes('/api/local/list?path=D%3A%5C&tab=42'),
+    `expected active tab parameter in ${JSON.stringify(requestedUrls)}`,
+  );
+
+  activeTabId = null;
+  select.value = 'C:\\';
+  select.dispatchEvent(new dom.window.Event('change'));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.ok(
+    requestedUrls.includes('/api/local/list?path=C%3A%5C'),
+    `expected no tab parameter when offline in ${JSON.stringify(requestedUrls)}`,
+  );
+
+  // Desktop layout (1400px, fine pointer): mouse drag inside .commander-main must NOT flip panes.
+  Object.defineProperty(dom.window, 'innerWidth', { value: 1400, configurable: true });
+  dom.window.matchMedia = () => ({ matches: false });
+  const switchedPanes = [];
+  const shell = mountAppShell({
+    rootElement: doc.getElementById('app'),
+    swipeContainer: doc.querySelector('.commander-main'),
+    onPaneChange: (pane) => switchedPanes.push(pane),
+  });
+  assert.equal(shell.touchLayout, false);
+  const localPane = doc.getElementById('localPane');
+  localPane.dispatchEvent(new dom.window.MouseEvent('mousedown', { bubbles: true, clientX: 300, clientY: 80 }));
+  dom.window.dispatchEvent(new dom.window.MouseEvent('mouseup', { bubbles: true, clientX: 40, clientY: 80 }));
+  assert.deepEqual(switchedPanes, [], 'desktop mouse drags must not trigger mobile pane swipe');
+
+  // Resize into mobile viewport (375px): touch swipe inside #localPane switches to remote!
+  Object.defineProperty(dom.window, 'innerWidth', { value: 375, configurable: true });
+  dom.window.dispatchEvent(new dom.window.Event('resize'));
+  assert.equal(shell.touchLayout, true);
+  const ts = new dom.window.Event('touchstart', { bubbles: true });
+  ts.touches = [{ clientX: 260, clientY: 120 }];
+  localPane.dispatchEvent(ts);
+  const te = new dom.window.Event('touchend', { bubbles: true });
+  te.changedTouches = [{ clientX: 40, clientY: 120 }];
+  localPane.dispatchEvent(te);
+  assert.deepEqual(switchedPanes, ['remote'], 'touch swipe inside #localPane switches pane on mobile');
+
+  shell.destroy();
+  dom.window.close();
+});
+

@@ -488,13 +488,17 @@ fn entry_from_symlink_meta(
 ) -> FileEntry {
     let file_type = meta.file_type();
     let is_symlink = file_type.is_symlink();
-    let (is_dir, broken_link) = if is_symlink {
+    let (is_dir, broken_link, effective_size) = if is_symlink {
         match std::fs::metadata(full_path) {
-            Ok(target_meta) => (target_meta.is_dir(), false),
-            Err(_) => (false, true),
+            Ok(target_meta) => {
+                let dir = target_meta.is_dir();
+                (dir, false, if dir { 0 } else { target_meta.len() })
+            }
+            Err(_) => (false, true, 0),
         }
     } else {
-        (file_type.is_dir(), false)
+        let dir = file_type.is_dir();
+        (dir, false, if dir { 0 } else { meta.len() })
     };
     let mtime = meta
         .modified()
@@ -502,17 +506,28 @@ fn entry_from_symlink_meta(
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    #[cfg(unix)]
+    let (owner, group) = {
+        use std::os::unix::fs::MetadataExt;
+        (Some(meta.uid().to_string()), Some(meta.gid().to_string()))
+    };
+    #[cfg(not(unix))]
+    let (owner, group) = (None, None);
     FileEntry {
         name,
-        size: if is_dir { 0 } else { meta.len() },
+        size: effective_size,
         is_dir,
         is_symlink,
         broken_link,
-        date: String::new(),
+        date: if mtime > 0 {
+            gui_os::format_listing_date(mtime)
+        } else {
+            String::new()
+        },
         mtime,
         permissions: sys::format_permissions(meta),
-        owner: None,
-        group: None,
+        owner,
+        group,
     }
 }
 
@@ -598,8 +613,28 @@ impl LocalFs for NativeLocalFs {
             }
             return Err(PlatformError::UnsupportedUri(path.to_string()));
         }
-        std::fs::remove_file(resolve_os_path(path))?;
-        Ok(())
+        let resolved = resolve_os_path(path);
+        #[cfg(windows)]
+        {
+            match std::fs::remove_file(&resolved) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    if std::fs::symlink_metadata(&resolved)
+                        .map(|m| m.file_type().is_symlink())
+                        .unwrap_or(false)
+                    {
+                        std::fs::remove_dir(&resolved)?;
+                        return Ok(());
+                    }
+                    return Err(err.into());
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::remove_file(resolved)?;
+            Ok(())
+        }
     }
 
     fn remove_dir_all(&self, path: &str) -> Result<(), PlatformError> {
@@ -1368,6 +1403,21 @@ mod tests {
             .expect("set mtime");
         let st = fs.stat(&target.to_string_lossy()).expect("stat");
         assert_eq!(st.mtime, 1_700_000_000);
+        assert!(!st.date.is_empty(), "local stat must format modification date");
+        #[cfg(unix)]
+        {
+            assert!(st.owner.is_some() && st.group.is_some());
+            let sub = dir.join("real_subdir");
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join("inside.txt"), b"keep").unwrap();
+            let dir_link = dir.join("subdir_link");
+            std::os::unix::fs::symlink(&sub, &dir_link).unwrap();
+            let link_st = fs.stat(&dir_link.to_string_lossy()).unwrap();
+            assert!(link_st.is_symlink && link_st.is_dir && !link_st.broken_link);
+            fs.remove_file(&dir_link.to_string_lossy()).unwrap();
+            assert!(!dir_link.exists());
+            assert!(sub.join("inside.txt").exists(), "unlinking a directory symlink must keep target intact");
+        }
 
         // Exclusive private write refuses to overwrite an existing file
         let excl_err = write_exclusive_private_file(&target, b"clobber").unwrap_err();

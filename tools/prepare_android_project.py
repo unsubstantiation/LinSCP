@@ -169,4 +169,26 @@ if text.count(needle) != 1:
 # A debug-only DevTools endpoint lets CI verify the actual WebView-to-Rust IPC.
 if 'WebView.setWebContentsDebuggingEnabled' not in text:
     text = text.replace(needle, 'if (BuildConfig.DEBUG) android.webkit.WebView.setWebContentsDebuggingEnabled(true)\n        ' + needle)
+if 'hideAndroidNavigationBar(this)' not in text:
+    text = text.replace(needle, needle + '\n        hideAndroidNavigationBar(this)', 1)
+if 'class MainActivity' in text and 'override fun onResume()' not in text:
+    closing = text.rfind('}')
+    if closing == -1:
+        raise SystemExit('Unexpected MainActivity class body; review navigation-bar lifecycle hooks')
+    lifecycle_hooks = (
+        '\n'
+        '  override fun onResume() {\n'
+        '    super.onResume()\n'
+        '    hideAndroidNavigationBar(this)\n'
+        '  }\n'
+        '\n'
+        '  override fun onWindowFocusChanged(hasFocus: Boolean) {\n'
+        '    super.onWindowFocusChanged(hasFocus)\n'
+        '    if (hasFocus) {\n'
+        '      hideAndroidNavigationBar(this)\n'
+        '    }\n'
+        '  }\n'
+        '}'
+    )
+    text = text[:closing] + lifecycle_hooks + text[closing + 1:]
 activity.write_text(text)

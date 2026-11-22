@@ -278,6 +278,8 @@ export class MobileShellController {
   // Horizontal swipe ---------------------------------------------------------
 
   public attachSwipe(container: HTMLElement): void {
+    if (this.swipeContainer === container) return;
+    this.detachSwipe();
     this.swipeContainer = container;
     container.addEventListener('touchstart', this.onTouchStart, { passive: true });
     container.addEventListener('touchmove', this.onTouchMove, { passive: true });
@@ -310,9 +312,12 @@ export class MobileShellController {
     if (!el || typeof el.closest !== 'function') {
       return false;
     }
+    if (el.ownerDocument?.body?.classList.contains('pane-drag-active')) {
+      return true;
+    }
     return Boolean(
       el.closest(
-        'input, textarea, select, [contenteditable="true"], [contenteditable=""], [data-no-swipe], .cm-editor, #logOutput, pre, code, .selectable-text',
+        'input, textarea, select, button, a, [role="button"], [contenteditable="true"], [contenteditable=""], [data-no-swipe], .cm-editor, #logOutput, pre, code, .selectable-text',
       ),
     );
   }

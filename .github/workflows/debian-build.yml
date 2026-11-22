@@ -1,7 +1,8 @@
 name: Debian build
 
 on:
-  pull_request:
+  push:
+    branches: [master]
   workflow_dispatch:
 
 concurrency:
@@ -57,7 +58,7 @@ jobs:
           set -euo pipefail
           npm --prefix ui ci --no-audit --no-fund
           npm --prefix ui test
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "${{ github.event_name }}" = "push" ]; then
             python3 tools/compile_translations.py
             if ! git diff --quiet locales/; then
               git config user.name "github-actions[bot]"

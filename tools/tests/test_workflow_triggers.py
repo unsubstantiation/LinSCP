@@ -1,8 +1,9 @@
-"""Build workflows run on pull requests and manually, not on pushes.
+"""Build workflows run on pushes to master and manually, never on pull requests.
 
-This catches duplicate post-merge builds while retaining pre-merge feedback and
-manual release builds. Every tools test must also be wired into a workflow.
-The parser uses only the standard library, as in CI.
+Every build workflow triggers automatically only when commits land on `master`
+(not when creating or updating pull requests or pushing feature branches), while
+retaining `workflow_dispatch` for manual runs. Every tools test must also be
+wired into a workflow. The parser uses only the standard library, as in CI.
 """
 import pathlib
 import unittest
@@ -41,9 +42,47 @@ def trigger_names(text):
     return names
 
 
+def push_branches(text):
+    """Return the branch filter list under `on.push.branches`, or None if unfiltered."""
+    lines = text.splitlines()
+    in_on = False
+    in_push = False
+    in_branches_list = False
+    branches = []
+    for line in lines:
+        if line.rstrip() == 'on:':
+            in_on = True
+            continue
+        if not in_on:
+            continue
+        if line.strip() and not line.lstrip().startswith('#') and not line.startswith(' '):
+            break
+        if line.startswith('  ') and not line.startswith('   '):
+            key = line.strip().split(':')[0]
+            in_push = (key == 'push')
+            in_branches_list = False
+            continue
+        if not in_push:
+            continue
+        if line.startswith('    ') and not line.startswith('     '):
+            stripped = line.strip()
+            if stripped.startswith('branches:'):
+                rest = stripped[len('branches:'):].strip()
+                if rest.startswith('[') and rest.endswith(']'):
+                    items = [item.strip().strip('\'"') for item in rest[1:-1].split(',')
+                             if item.strip()]
+                    return items
+                in_branches_list = (rest == '')
+            else:
+                in_branches_list = False
+            continue
+        if in_branches_list and line.lstrip().startswith('- '):
+            branches.append(line.lstrip()[2:].strip().strip('\'"'))
+    return branches or None
+
+
 def workflow_files():
     return sorted(WORKFLOWS.glob('*.yml'))
-
 
 
 def job_blocks(text):
@@ -60,19 +99,25 @@ def job_blocks(text):
             break
         if line.startswith('  ') and not line.startswith('   ') and line.rstrip().endswith(':'):
             current = line.strip()[:-1]
-            blocks[current] = []
+            blocks[current].append(line) if current in blocks else blocks.setdefault(current, [])
         elif current is not None:
             blocks[current].append(line)
     return {name: '\n'.join(block) for name, block in blocks.items()}
 
 
-def job_runs_on_pull_request(block):
-    # Keep event conditions simple and explicit; unknown gates fail closed.
+def job_runs_on_master_push(block):
+    """Whether job-level `if:` gates permit a `push` to `refs/heads/master`."""
     gates = [line.strip()[3:].strip() for line in block.splitlines()
              if line.startswith('    if:')]
     if not gates:
         return True
-    return any("github.event_name == 'pull_request'" in gate for gate in gates)
+    for gate in gates:
+        if gate in ("github.ref == 'refs/heads/master'",
+                    "github.event_name == 'push'",
+                    "github.event_name != 'pull_request'"):
+            continue
+        return False
+    return True
 
 
 class WorkflowTriggerTests(unittest.TestCase):
@@ -88,31 +133,39 @@ class WorkflowTriggerTests(unittest.TestCase):
                     f'{path.name} cannot be run manually; add workflow_dispatch '
                     f'to its `on:` mapping')
 
-    def test_every_workflow_runs_on_pull_requests_not_pushes(self):
+    def test_every_workflow_runs_only_on_master_commits_not_pull_requests(self):
         for path in workflow_files():
             with self.subTest(workflow=path.name):
-                triggers = trigger_names(path.read_text(encoding='utf-8'))
-                self.assertIn('pull_request', triggers, path.name)
+                text = path.read_text(encoding='utf-8')
+                triggers = trigger_names(text)
+                self.assertIn('push', triggers, path.name)
+                self.assertNotIn('pull_request', triggers, path.name)
                 self.assertNotIn('pull_request_target', triggers, path.name)
-                self.assertNotIn('push', triggers, path.name)
-                self.assertEqual(set(triggers), {'pull_request', 'workflow_dispatch'}, path.name)
+                self.assertEqual(set(triggers), {'push', 'workflow_dispatch'}, path.name)
+                self.assertEqual(
+                    push_branches(text), ['master'],
+                    f'{path.name} must restrict `push:` to `branches: [master]`')
 
-    def test_each_workflow_has_a_job_that_runs_on_pull_requests(self):
+    def test_each_workflow_has_a_job_that_runs_on_master_commits(self):
         for path in workflow_files():
             with self.subTest(workflow=path.name):
                 jobs = job_blocks(path.read_text(encoding='utf-8'))
-                self.assertTrue(any(job_runs_on_pull_request(block) for block in jobs.values()),
-                                f'{path.name} has no job enabled for pull requests')
+                self.assertTrue(
+                    any(job_runs_on_master_push(block) for block in jobs.values()),
+                    f'{path.name} has no job enabled for pushes to master')
                 for name, block in jobs.items():
                     if any(line.startswith('    environment:') for line in block.splitlines()):
-                        self.assertFalse(job_runs_on_pull_request(block),
-                                         f'{path.name} job {name} exposes a protected environment to PRs')
+                        self.assertIn(
+                            "if: github.ref == 'refs/heads/master'", block,
+                            f'{path.name} job {name} exposes a protected environment outside master')
 
-    def test_android_signed_release_is_manual_only(self):
+    def test_android_signed_release_runs_on_master_commits_and_dispatch(self):
         jobs = job_blocks((WORKFLOWS / 'android-build.yml').read_text(encoding='utf-8'))
-        self.assertIn("if: github.event_name == 'workflow_dispatch'", jobs['build'])
+        self.assertIn("if: github.ref == 'refs/heads/master'", jobs['build'])
         self.assertIn('environment: android-release', jobs['build'])
-        self.assertTrue(job_runs_on_pull_request(jobs['check']))
+        self.assertTrue(job_runs_on_master_push(jobs['build']))
+        self.assertIn("if: github.ref != 'refs/heads/master'", jobs['check'])
+        self.assertFalse(job_runs_on_master_push(jobs['check']))
 
     def test_every_tools_test_is_named_by_some_workflow(self):
         # A repo-state suite that no job runs is a green lie: it passes by
@@ -135,6 +188,16 @@ class WorkflowTriggerTests(unittest.TestCase):
                           "  pull_request:\n    paths-ignore:\n      - 'docs/**'\n"
                           '  pull_request_target:\n  workflow_dispatch:\n\njobs:\n'),
             ['push', 'pull_request', 'pull_request_target', 'workflow_dispatch'])
+
+    def test_push_branch_filters_are_parsed_or_reported_missing(self):
+        self.assertEqual(
+            push_branches('on:\n  push:\n    branches: [master]\n  workflow_dispatch:\n'),
+            ['master'])
+        self.assertEqual(
+            push_branches('on:\n  push:\n    branches:\n      - master\n  workflow_dispatch:\n'),
+            ['master'])
+        self.assertIsNone(
+            push_branches('on:\n  push:\n  workflow_dispatch:\n'))
 
     def test_a_scalar_trigger_is_reported(self):
         with self.assertRaises(AssertionError):

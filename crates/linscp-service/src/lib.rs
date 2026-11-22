@@ -1180,9 +1180,17 @@ impl CommanderService {
             match session.stat(&path).await {
                 Ok(Some(entry)) => {
                     let is_link = entry.is_symlink;
+                    let is_broken = entry.broken_link;
+                    let link_target = if is_link {
+                        session.readlink(&path).await.ok().unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                     let mut row = json!(entry);
                     row["path"] = json!(path);
                     row["is_link"] = json!(is_link);
+                    row["is_broken"] = json!(is_broken);
+                    row["link_target"] = json!(link_target);
                     rows.push(row);
                 }
                 Ok(None) => rows.push(json!({"name": name, "error": "No such item"})),
@@ -1498,7 +1506,12 @@ impl CommanderService {
         if names.is_empty() { return api_error(400, "Select at least one file") }
         if names.len() > 1000 { return api_error(400, "Too many files selected") }
         // Validate all leaf names and the mode specification before touching any entry.
-        let raw_mode = body.get("permissions").and_then(Value::as_str).unwrap_or("").trim();
+        let raw_mode = body
+            .get("permissions")
+            .or_else(|| body.get("mode"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
         if let Err(error) = linscp_engine::parse_chmod_spec(raw_mode, 0o644) {
             return api_error(400, error);
         }
@@ -5849,7 +5862,13 @@ impl CommanderService {
                 Ok(p) => {
                     // The kind comes from `LocalFs`, so this works for a
                     // granted Android folder as well as for a POSIX path.
-                    let is_dir = self.local_fs.stat(&p).map(|entry| entry.is_dir).unwrap_or(false);
+                    // A symbolic link to a directory must be unlinked rather
+                    // than traversed with `remove_dir_all`.
+                    let is_dir = self
+                        .local_fs
+                        .stat(&p)
+                        .map(|entry| entry.is_dir && !entry.is_symlink)
+                        .unwrap_or(false);
                     let res = if is_dir { self.local_fs.remove_dir_all(&p) } else { self.local_fs.remove_file(&p) };
                     if let Err(e) = res { errs.push(format!("{name}: {e}")); }
                 },
@@ -7679,7 +7698,11 @@ impl CommanderService {
             for n in names {
                 match resolve_contained(&tab.other_local_dir, &n) {
                     Ok(p) => {
-                        let is_dir = self.local_fs.stat(&p).map(|entry| entry.is_dir).unwrap_or(false);
+                        let is_dir = self
+                            .local_fs
+                            .stat(&p)
+                            .map(|entry| entry.is_dir && !entry.is_symlink)
+                            .unwrap_or(false);
                         let res = if is_dir { self.local_fs.remove_dir_all(&p) } else { self.local_fs.remove_file(&p) };
                         if let Err(e)=res { errs.push(format!("{n}: {e}")); }
                     },
@@ -7810,6 +7833,10 @@ impl CommanderService {
                         "size": entry.size,
                         "is_dir": entry.is_dir,
                         "is_link": entry.is_symlink,
+                        "is_symlink": entry.is_symlink,
+                        "is_broken": entry.broken_link,
+                        "broken_link": entry.broken_link,
+                        "link_target": "",
                         "permissions": entry.permissions,
                         "mode": linscp_engine::filemask::mode_from_permissions_str(&entry.permissions),
                         "mtime": entry.mtime,
@@ -7828,6 +7855,10 @@ impl CommanderService {
                         "size": s.size,
                         "is_dir": s.is_dir,
                         "is_link": s.is_symlink,
+                        "is_symlink": s.is_symlink,
+                        "is_broken": s.broken_link,
+                        "broken_link": s.broken_link,
+                        "link_target": s.link_target,
                         "permissions": s.permissions,
                         "mode": s.mode,
                         "mtime": s.mtime_secs,

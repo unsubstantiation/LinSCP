@@ -10,11 +10,18 @@
  */
 
 import type { TransportClient } from '../transport/client.js';
+import {
+  DEFAULT_TERMINAL_FONT_SIZE,
+  TERMINAL_FONT_SIZE_STORAGE_KEY,
+  clampTerminalFontSize,
+} from './terminal.js';
 import { TerminalSession } from './terminal-session.js';
 
 export interface TerminalWindowOptions {
   /** The element the terminal fills. */
   container: HTMLElement;
+  /** Optional initial terminal font size in CSS pixels; defaults to remembered or 11px. */
+  fontSize?: number;
   /** The terminal to show, or a tab to open one on. */
   terminal?: string | null;
   tab?: number | null;
@@ -53,6 +60,8 @@ interface OpenReply {
   terminal?: string;
   error?: string;
 }
+
+let rememberedWindowFontSize: number | null = null;
 
 /**
  * Opens (or attaches to) one terminal and keeps it painted until it ends.
@@ -126,6 +135,7 @@ export class TerminalWindow {
       transport,
       terminal,
       container: this.options.container,
+      fontSize: this.resolveInitialFontSize(),
       onEnded: (reason) => {
         this.options.onEnded?.(reason);
       },
@@ -192,9 +202,18 @@ export class TerminalWindow {
     return (await this.session?.copySelection()) ?? null;
   }
 
-  /** Adjust the font of this terminal without affecting other windows. */
+  /** Current terminal font size in CSS pixels, once started. */
+  public get textSize(): number | null {
+    return this.session?.textSize ?? null;
+  }
+
+  /** Adjust the font of this terminal and remember the chosen size for future terminals. */
   public changeTextSize(delta: number): number | null {
-    return this.session?.changeTextSize(delta) ?? null;
+    const next = this.session?.changeTextSize(delta) ?? null;
+    if (next !== null) {
+      this.persistFontSize(next);
+    }
+    return next;
   }
 
   /** Copies all retained text, including scrollback. */
@@ -241,5 +260,53 @@ export class TerminalWindow {
 
   private fail(message: string): void {
     this.options.onEnded?.(message);
+  }
+
+  private getStorage(): Storage | null {
+    try {
+      const view = this.options.container?.ownerDocument?.defaultView;
+      if (view && view.localStorage) {
+        return view.localStorage;
+      }
+      return typeof localStorage !== 'undefined' ? localStorage : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private resolveInitialFontSize(): number {
+    if (typeof this.options.fontSize === 'number' && Number.isFinite(this.options.fontSize)) {
+      return clampTerminalFontSize(this.options.fontSize);
+    }
+    try {
+      const raw = this.getStorage()?.getItem(TERMINAL_FONT_SIZE_STORAGE_KEY) ?? null;
+      if (raw !== null && raw !== '') {
+        const parsed = Number(raw);
+        if (Number.isFinite(parsed)) {
+          const clamped = clampTerminalFontSize(parsed);
+          rememberedWindowFontSize = clamped;
+          return clamped;
+        }
+      }
+    } catch {
+      // Ignore unavailable storage and fall back to in-memory or default.
+    }
+    return rememberedWindowFontSize ?? DEFAULT_TERMINAL_FONT_SIZE;
+  }
+
+  private persistFontSize(size: number): void {
+    if (!Number.isFinite(size)) {
+      return;
+    }
+    const clamped = clampTerminalFontSize(size);
+    rememberedWindowFontSize = clamped;
+    try {
+      this.getStorage()?.setItem(
+        TERMINAL_FONT_SIZE_STORAGE_KEY,
+        String(clamped),
+      );
+    } catch {
+      // Ignore unavailable storage.
+    }
   }
 }

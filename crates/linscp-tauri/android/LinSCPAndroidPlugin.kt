@@ -34,6 +34,10 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import android.webkit.MimeTypeMap
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
@@ -73,6 +77,26 @@ internal class LocalExportArgs { lateinit var batch: String; lateinit var direct
 @InvokeArg
 internal class ExportBatchArgs { lateinit var batch: String }
 
+/**
+ * Hides Android's system navigation bar while LinSCP is active so the bottom
+ * panel switcher, selection bar and terminal extra-key row have the bottom edge
+ * to themselves; an edge swipe transiently reveals the system bar on demand.
+ */
+internal fun hideAndroidNavigationBar(activity: Activity) {
+  val window = activity.window ?: return
+  val decorView = window.decorView ?: return
+  val applyHide = Runnable {
+    val currentWindow = activity.window ?: return@Runnable
+    val currentDecor = currentWindow.decorView ?: return@Runnable
+    val controller = WindowCompat.getInsetsController(currentWindow, currentDecor)
+    controller.systemBarsBehavior =
+      WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+    controller.hide(WindowInsetsCompat.Type.navigationBars())
+  }
+  applyHide.run()
+  decorView.post(applyHide)
+}
+
 /** A distinct provider avoids merging another plugin's FileProvider settings. */
 class LinSCPExportProvider : FileProvider()
 
@@ -106,8 +130,30 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   override fun load(webView: WebView) {
+    activity.runOnUiThread {
+      webView.settings.domStorageEnabled = true
+      hideAndroidNavigationBar(activity)
+      installNavigationBarInsetsGuard(webView)
+    }
     Thread({ cleanupOldExports() }, "linscp-export-cleanup").start()
     activity.intent?.let { stageShareIntent(it) }
+  }
+
+  private fun installNavigationBarInsetsGuard(webView: WebView) {
+    var wasImeVisible = false
+    ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
+      val imeVisible = insets.isVisible(WindowInsetsCompat.Type.ime())
+      if (wasImeVisible && !imeVisible) {
+        view.post { hideAndroidNavigationBar(activity) }
+      }
+      wasImeVisible = imeVisible
+      ViewCompat.onApplyWindowInsets(view, insets)
+    }
+    webView.viewTreeObserver?.addOnWindowFocusChangeListener { hasFocus ->
+      if (hasFocus) {
+        hideAndroidNavigationBar(activity)
+      }
+    }
   }
 
   override fun onNewIntent(intent: Intent) {

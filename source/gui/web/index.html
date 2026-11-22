@@ -213,7 +213,7 @@
   <div class="commander-main">
 
     <!-- LEFT PANE: LOCAL -->
-    <div class="pane" id="localPane" role="region" aria-label="Local panel" tabindex="0" data-shell-pane="local" data-no-swipe onclick="focusPane('local')"
+    <div class="pane active" id="localPane" role="region" aria-label="Local panel" tabindex="0" data-shell-pane="local" onclick="focusPane('local')"
          ondragover="dragOverPane('local', event)"
          ondragleave="dragLeavePane('local', event)"
          ondrop="dropOnPane('local', event)">
@@ -281,7 +281,7 @@
     </div>
 
     <!-- RIGHT PANE: REMOTE -->
-    <div class="pane" id="remotePane" role="region" aria-label="Remote panel" tabindex="0" data-shell-pane="remote" data-no-swipe onclick="focusPane('remote')"
+    <div class="pane" id="remotePane" role="region" aria-label="Remote panel" tabindex="0" data-shell-pane="remote" onclick="focusPane('remote')"
          ondragover="dragOverPane('remote', event)"
          ondragleave="dragLeavePane('remote', event)"
          ondrop="dropOnPane('remote', event)">
@@ -1156,7 +1156,7 @@
        opens in its own OS window, which is the same page with
        `terminal=<id>`; Android draws it in this modal instead. -->
   <div class="modal-overlay" id="terminalModal" role="dialog" aria-modal="true" aria-label="Terminal">
-    <div class="modal-box" style="width:900px; max-width:96vw;">
+    <div class="modal-box">
       <div class="modal-header">
         <span>Terminal</span>
         <button type="button" class="modal-close" onclick="closeTerminal()" aria-label="Close">&#10005;</button>
@@ -1174,8 +1174,8 @@
         </div>
       </div>
       <div class="modal-footer">
-        <button class="btn" type="button" onclick="changeTerminalTextSize(-2)" aria-label="Decrease terminal text size" title="Decrease terminal text size">−</button>
-        <button class="btn" type="button" onclick="changeTerminalTextSize(2)" aria-label="Increase terminal text size" title="Increase terminal text size">+</button>
+        <button class="btn" type="button" onclick="changeTerminalTextSize(-1)" aria-label="Decrease terminal text size" title="Decrease terminal text size">−</button>
+        <button class="btn" type="button" onclick="changeTerminalTextSize(1)" aria-label="Increase terminal text size" title="Increase terminal text size">+</button>
         <button class="btn" type="button" onclick="copyTerminalAllText()">Copy All Text</button>
         <button class="btn" type="button" onclick="showTerminalCopyHelp()">Help</button>
         <button class="btn" onclick="closeTerminal()">Close</button>
@@ -1897,16 +1897,41 @@
       .replace(/\//g, '%2F');
   }
 
+  function isSymlinkEntry(entry) {
+    return Boolean(entry && (entry.is_symlink || entry.is_link));
+  }
+
+  function isBrokenEntry(entry) {
+    return Boolean(entry && (entry.broken_link || entry.is_broken));
+  }
+
+  function formatEntryDate(entry) {
+    if (!entry) return '';
+    if (entry.date) return String(entry.date);
+    if (typeof entry.mtime === 'number' && entry.mtime > 0) {
+      return new Date(entry.mtime * 1000).toLocaleString(languageTag);
+    }
+    return '';
+  }
+
   function joinPath(base, name) {
+    const rawBase = String(base || '');
     // Stripping the trailing slashes first and then adding one back is what
     // keeps the root from producing '//name': at '/', the stripped base is
     // empty and only the separator is added.
-    const trimmed = String(base || '').replace(/\/+$/, '');
+    const trimmed = rawBase.replace(/\/+$/, '');
     // Android documents are addressed as .../document/<id>. Joining them with
     // a plain '/' produced a URI the shell cannot open, which looked like a
     // broken folder deep inside a granted tree.
     if (isSafPath(trimmed)) {
       return trimmed + '/document/' + encodeSafSegment(name);
+    }
+    // Windows drive paths ('C:\', 'C:\Users') use their own separator without
+    // leaving 'C:\/Users' at the drive root.
+    if (/^[A-Za-z]:[\\/]/.test(rawBase)) {
+      const winTrimmed = rawBase.replace(/[\\/]+$/, '');
+      const sep = rawBase.indexOf('\\') >= 0 ? '\\' : '/';
+      return winTrimmed + sep + name;
     }
     return trimmed + '/' + name;
   }
@@ -2357,10 +2382,13 @@
     localRootSwitcher = window.LinSCPCore.localRootSwitcher({
       transport: window.LinSCPTransport || transportShim(),
       selectElement: select,
+      getTabId: () => tabId(),
       onNavigate: result => {
         state.local.path = result.path;
         state.local.entries = listingEntries(result.entries);
         state.local.selection.clear();
+        const tab = activeTab();
+        if (tab) tab.local_dir = result.path;
         $('localPathInput').value = result.path;
         renderPane('local');
       },
@@ -2384,13 +2412,14 @@
    * retry/error handling, so this adapter keeps the two honest: the switcher
    * never gets its own idea of the backend. */
   function transportShim() {
-    const parse = text => {
-      try { return text ? JSON.parse(text) : {}; }
+    const parse = value => {
+      if (value && typeof value === 'object') return value;
+      try { return value ? JSON.parse(value) : {}; }
       catch (error) { return {}; }
     };
     return {
       async get(url) {
-        const reply = await api(url);
+        const reply = await api(url).then(parse);
         if (reply && reply.success === false && reply.error) {
           throw new Error(errorMessage(reply.error, t('Cannot read the directory.')));
         }
@@ -2417,6 +2446,14 @@
    * shell instead of only the desktop layout. */
   let appShell = null;
 
+  function revealMobileSection(selector) {
+    const el = document.querySelector(selector);
+    if (el && typeof el.scrollIntoView === 'function') {
+      try { el.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }
+      catch (_) { /* non-scrolling host */ }
+    }
+  }
+
   function mountShell() {
     if (!window.LinSCPCore || typeof window.LinSCPCore.mountAppShell !== 'function') {
       return;
@@ -2432,8 +2469,14 @@
       extraKeyLabel: label => t(label),
       actionLabel: action => t(SHELL_ACTION_LABELS[action]),
       onPaneChange: pane => {
-        if (pane === 'local' || pane === 'remote') focusPane(pane);
-        if (pane === 'queue') switchTab('queue');
+        if (pane === 'local' || pane === 'remote') {
+          focusPane(pane);
+          revealMobileSection('.commander-main');
+        }
+        if (pane === 'queue') {
+          switchTab('queue');
+          revealMobileSection('.lower-panel');
+        }
       },
       /* The Terminal tab is not a pane that can be shown and hidden: it is a
        * button that opens a window, and closing that window leaves the tab
@@ -2445,6 +2488,15 @@
        * to. A window that is already open is left alone rather than replaced
        * under the person using it. */
       onPaneSelect: pane => {
+        if (pane === 'queue') {
+          switchTab('queue');
+          revealMobileSection('.lower-panel');
+          return;
+        }
+        if (pane === 'local' || pane === 'remote') {
+          revealMobileSection('.commander-main');
+          return;
+        }
         if (pane !== 'terminal') return;
         if ($('terminalModal') && $('terminalModal').classList.contains('open')) return;
         openTerminal();
@@ -2539,17 +2591,19 @@
         row.className = 'selected';
         selected++;
       }
-      const icon = entry.is_dir ? '📁' : (entry.is_link ? '🔗' : '📄');
+      const isLink = isSymlinkEntry(entry);
+      const isBroken = isBrokenEntry(entry);
+      const icon = isLink ? '🔗' : (entry.is_dir ? '📁' : '📄');
       // A broken link is still an entry: it is on disk, it takes a name,
       // and the panel is the only place the user can remove it from.
       const label = escapeHtml(entry.name) +
-        (entry.is_link ? escapeHtml(entry.link_target ? ' \u2192 ' + entry.link_target : '') : '') +
-        (entry.is_broken ? ' ' + escapeHtml(t('(broken link)')) : '');
-      if (entry.is_broken) row.classList.add('broken-link');
+        (isLink ? escapeHtml(entry.link_target ? ' \u2192 ' + entry.link_target : '') : '') +
+        (isBroken ? ' ' + escapeHtml(t('(broken link)')) : '');
+      if (isBroken) row.classList.add('broken-link');
       row.innerHTML =
         '<td title="' + escapeHtml(entry.name) + '">' + icon + ' ' + label + '</td>' +
         '<td>' + (entry.is_dir ? '&lt;DIR&gt;' : formatBytes(entry.size)) + '</td>' +
-        '<td>' + escapeHtml(entry.date || '') + '</td>' +
+        '<td>' + escapeHtml(formatEntryDate(entry)) + '</td>' +
         '<td>' + escapeHtml(entry.permissions || '') + '</td>';
       row.onclick = (event) => selectEntry(side, entry, event);
       row.ondblclick = () => openEntry(side, entry);
@@ -2614,9 +2668,17 @@
    */
   async function navigateSync(side, targetOfSide) {
     const other = side === 'local' ? 'remote' : 'local';
+    const otherCurrent = state[other].path;
+    const otherUsesLocal = other === 'local' ||
+      Boolean(activeTab() && activeTab().is_local) ||
+      isSafPath(otherCurrent);
+    if (targetOfSide.name === '..' && isSafPath(otherCurrent) && safAtTreeRoot(otherCurrent)) {
+      toast(t("Folder \"{name}\" does not exist on the {side} side.", {name: targetOfSide.name, side: sideLabel(other)}), true);
+      return false;
+    }
     const otherPath = targetOfSide.name === '..' ?
-      parentPath(state[other].path, other === 'remote') :
-      joinPath(state[other].path, targetOfSide.name, other === 'remote');
+      (otherUsesLocal ? localParentPath(otherCurrent) : parentPath(otherCurrent)) :
+      joinPath(otherCurrent, targetOfSide.name);
     const otherBefore = state[other].path;
     const otherOk = await loadPane(other, otherPath);
     if (!otherOk) {
@@ -3335,7 +3397,7 @@
     if (pane === 'remote' && (!tab || !tab.connected)) { toast(t("Not connected."), true); return; }
     if (names.length > 32 || names.some(name => {
       const entry = state[pane].entries.find(item => item.name === name);
-      return !entry || entry.is_dir || entry.is_symlink;
+      return !entry || entry.is_dir || isSymlinkEntry(entry);
     })) {
       toast(t("Select up to 32 regular files to share."), true); return;
     }
@@ -3531,7 +3593,7 @@
     const items = target === 'remote'
       ? names.map(name => {
           const entry = state.remote.entries.find(item => item.name === name);
-          return { name: name, is_dir: entry ? entry.is_dir : false };
+          return { name: name, is_dir: Boolean(entry && entry.is_dir && !isSymlinkEntry(entry)) };
         })
       : names;
     const payload = target === 'remote' ? { tab: tabId(), names: items } : { tab: tabId(), names: items };
@@ -3762,7 +3824,7 @@
     document.querySelectorAll('#siteModal .local-only-row').forEach(row => {
       row.style.display = local ? '' : 'none';
     });
-    if ($('siteS3Settings') && !local) {
+    if ($('siteS3Settings')) {
       $('siteS3Settings').style.display = protocol === 's3' ? '' : 'none';
       if (protocol === 's3') $('siteS3Settings').open = true;
     }
@@ -3810,8 +3872,14 @@
     $('siteTunnelPort').value = site.tunnel_port || 22;
     $('siteTunnelUser').value = site.tunnel_username || '';
     $('siteTunnelPass').value = site.tunnel_password || '';
+    $('siteTunnelPass').placeholder = site.has_tunnel_password
+      ? t('(stored - leave empty to use the saved one)')
+      : t('(not stored by default)');
     $('siteTunnelKey').value = site.tunnel_private_key || '';
     $('siteTunnelPassphrase').value = site.tunnel_passphrase || '';
+    $('siteTunnelPassphrase').placeholder = site.has_tunnel_passphrase
+      ? t('(stored - leave empty to use the saved one)')
+      : t('(not stored by default)');
     $('siteTunnelHostKey').value = site.tunnel_hostkey || '';
     $('siteTunnelRemember').checked = !!(site.has_tunnel_password || site.has_tunnel_passphrase);
     $('siteTunnelLocalPort').value = site.tunnel_local_port || 0;
@@ -3829,7 +3897,12 @@
     if ($('siteProxyHost')) $('siteProxyHost').value = site.proxy_host || '';
     if ($('siteProxyPort')) $('siteProxyPort').value = site.proxy_port || '';
     if ($('siteProxyUsername')) $('siteProxyUsername').value = site.proxy_username || '';
-    if ($('siteProxyPassword')) $('siteProxyPassword').value = site.proxy_password || '';
+    if ($('siteProxyPassword')) {
+      $('siteProxyPassword').value = site.proxy_password || '';
+      $('siteProxyPassword').placeholder = site.has_proxy_password
+        ? t('(stored - leave empty to use the saved one)')
+        : t('(not stored by default)');
+    }
     if ($('siteProxyCommand')) $('siteProxyCommand').value = site.proxy_command || '';
     if ($('siteProxyDns')) $('siteProxyDns').value = String(site.proxy_dns ?? 0);
     if ($('siteProxyLocalhost')) $('siteProxyLocalhost').checked = !!site.proxy_localhost;
@@ -5740,7 +5813,7 @@
     closeTerminal();
     const sendInitialCommand = async () => {
       if (!initialCommand) return true;
-      const sent = await apiPost('/api/terminal/input', { terminal: result.terminal, data: btoa(initialCommand + '\n') });
+      const sent = await apiPost('/api/terminal/input', { terminal: result.terminal, data: utf8ToBase64(initialCommand + '\n') });
       if (!sent.success) toast(errorMessage(sent.error, t("The terminal session ended.")), true);
       return !!sent.success;
     };
@@ -5791,20 +5864,49 @@
     return !!caps && caps.platform === 'android';
   }
 
+  let rememberedTerminalFontSize = null;
+  function readTerminalFontSize() {
+    const fallback = (window.LinSCPCore && Number.isFinite(window.LinSCPCore.DEFAULT_TERMINAL_FONT_SIZE))
+      ? window.LinSCPCore.DEFAULT_TERMINAL_FONT_SIZE : 11;
+    try {
+      const raw = localStorage.getItem('lscp-terminal-font-size');
+      if (raw !== null && raw !== '') {
+        const parsed = Number(raw);
+        if (Number.isFinite(parsed)) {
+          const clamped = Math.max(8, Math.min(32, Math.round(parsed)));
+          rememberedTerminalFontSize = clamped;
+          return clamped;
+        }
+      }
+    } catch (_) {}
+    return rememberedTerminalFontSize !== null ? rememberedTerminalFontSize : fallback;
+  }
+
+  function saveTerminalFontSize(size) {
+    if (!Number.isFinite(size)) return;
+    const clamped = Math.max(8, Math.min(32, Math.round(size)));
+    rememberedTerminalFontSize = clamped;
+    try { localStorage.setItem('lscp-terminal-font-size', String(clamped)); }
+    catch (_) {}
+  }
+
   function openTerminalInPage(terminal, tab, returnToMonitor, isMosh = false) {
     const screen = $('terminalScreen');
-    if (!screen || !window.LinSCPCore || !window.LinSCPCore.TerminalWindow) return false;
+    const modal = $('terminalModal');
+    if (!screen || !modal || !window.LinSCPCore || !window.LinSCPCore.TerminalWindow) return false;
     const touchExtras = terminalTouchExtras();
+    modal.classList.toggle('terminal-fullscreen', touchExtras);
     screen.innerHTML = '';
     const defaultHeader = isMosh ? t('Mosh Terminal') : t('Terminal');
-    const modalHeader = $('terminalModal').querySelector('.modal-header span');
+    const modalHeader = modal.querySelector('.modal-header span');
     if (modalHeader) modalHeader.textContent = defaultHeader;
-    // The modal has to be on screen before the renderer measures its font: a
-    // terminal measured inside a display:none box has no cell at all, and
-    // every glyph afterwards lands at zero width.
+    // The modal and extra-keys bar have to be in their final layout before the
+    // renderer measures its container: a terminal measured inside a display:none
+    // or padded box under-reports its width and height to the remote PTY.
     openModal('terminalModal');
     const view = window.LinSCPCore.terminalWindow({
       container: screen,
+      fontSize: readTerminalFontSize(),
       terminal,
       transport: window.LinSCPTransport || transportShim(),
       extraKeysElement: touchExtras ? $('terminalExtraKeys') : null,
@@ -5839,6 +5941,7 @@
     });
     embeddedTerminal = { view, returnToMonitor, extras: touchExtras, isMosh };
     syncForegroundService();
+    if (appShell) appShell.setTerminalFocused(true);
     // A new terminal has no selection, and the row it needs is the one a
     // previous terminal may have hidden. Syncing here is what makes the row
     // follow the terminal it belongs to rather than the last one.
@@ -5847,10 +5950,10 @@
       if (!started && embeddedTerminal && embeddedTerminal.view === view) {
         embeddedTerminal = null;
         syncForegroundService();
+        if (appShell) appShell.setTerminalFocused(false);
         closeModal('terminalModal');
       }
     });
-    if (appShell) appShell.setTerminalFocused(true);
     return true;
   }
 
@@ -5910,8 +6013,13 @@
   }
 
   function changeTerminalTextSize(delta) {
+    const step = delta < 0 ? -1 : (delta > 0 ? 1 : 0);
+    if (!step) return;
     const view = embeddedTerminal && embeddedTerminal.view;
-    if (view) view.changeTextSize(delta);
+    if (view) {
+      const next = view.changeTextSize(step);
+      saveTerminalFontSize(next);
+    }
   }
 
   async function copyTerminalAllText() {
@@ -5991,7 +6099,16 @@
   document.addEventListener('keydown', event => {
     if (!embeddedTerminal || !embeddedTerminal.view || event.defaultPrevented) return;
     if (!$('terminalModal') || !$('terminalModal').classList.contains('open')) return;
-    if (event.ctrlKey && event.key.toLowerCase() === 'c' && window.getSelection && String(window.getSelection())) return;
+    if (event.target && event.target.closest && event.target.closest('.modal-header, #terminalSelectionBar') &&
+        ['Enter', ' ', 'Tab'].includes(event.key)) return;
+    const key = typeof event.key === 'string' ? event.key.toLowerCase() : '';
+    if (event.ctrlKey && !event.metaKey && !event.altKey && key === 'c' &&
+        (event.shiftKey || embeddedTerminal.view.selection)) {
+      event.preventDefault();
+      void copyTerminalSelection();
+      return;
+    }
+    if (event.ctrlKey && key === 'c' && window.getSelection && String(window.getSelection())) return;
     if (embeddedTerminal.view.handleKey(event)) return;
   });
   document.addEventListener('paste', event => {
@@ -6082,7 +6199,15 @@
    * Modal and keyboard plumbing                                        *
    * ------------------------------------------------------------------ */
 
-  function openModal(id) { $(id).classList.add('open'); }
+  function openModal(id) {
+    const el = $(id);
+    if (!el) return;
+    el.classList.add('open');
+    if (!el.hasAttribute('tabindex')) el.setAttribute('tabindex', '-1');
+    if (!el.contains(document.activeElement) && typeof el.focus === 'function') {
+      try { el.focus({ preventScroll: true }); } catch (_) { el.focus(); }
+    }
+  }
   function closeModal(id) { $(id).classList.remove('open'); }
   function showHelp() {
     // The build stamps its Alaska Standard Time version (VYYYY-MM-DD-HH-MM)
@@ -6108,6 +6233,7 @@
   }
 
   document.addEventListener('keydown', async (event) => {
+    if (event.defaultPrevented) return;
     // Focused KDrive canvas owns keyboard shortcuts, including Escape.
     if (event.target && event.target.closest && event.target.closest('#x2goSurface')) return;
     /* CodeMirror edits in a contenteditable div, not a textarea, so the
@@ -6160,6 +6286,13 @@
      * the terminal modal is open took them from a shell that was waiting for
      * them. */
     if (inField) return;
+    if (serverMonitor && serverMonitor.isOpen && !$('terminalModal').classList.contains('open') &&
+        !$('hostKeyModal').classList.contains('open') && !$('editorModal').classList.contains('open') &&
+        serverMonitor.handleKey(event)) return;
+    if (($('vaultGate') && $('vaultGate').style.display === 'flex') ||
+        (event.target && event.target.closest && event.target.closest('.modal-overlay.open'))) {
+      return;
+    }
     if (event.ctrlKey && event.key.toLowerCase() === 'n') {
       event.preventDefault();
       openSiteManager();
@@ -6179,9 +6312,6 @@
       $('remotePathInput').select();
       return;
     }
-    if (serverMonitor && serverMonitor.isOpen && !$('terminalModal').classList.contains('open') &&
-        !$('hostKeyModal').classList.contains('open') && !$('editorModal').classList.contains('open') &&
-        serverMonitor.handleKey(event)) return;
     if (event.ctrlKey && event.key.toLowerCase() === 'a') {
       event.preventDefault();
       selectAllInFocusedPane();
@@ -8314,12 +8444,12 @@
     const mode = $('propertiesMode').value.trim();
     if (!mode) { toast(t('Type the rights to apply.'), true); return; }
     const tab = activeTab();
-    if (!tab) { toast(t('Not connected.'), true); return; }
+    if (side === 'remote' && (!tab || !tab.connected)) { toast(t('Not connected.'), true); return; }
     let failures = 0;
     for (const name of names) {
       const result = side === 'local'
         ? await apiPost('/api/local/chmod',
-            { tab: tab.id, name: name, permissions: mode })
+            { tab: tabId(), name: name, permissions: mode })
         : await apiPost('/api/remote/rights',
             { tab: tab.id, names: [name], mode: mode });
       if (!result.success) {
@@ -8348,15 +8478,20 @@
       for (const name of names) {
         const entry = state.local.entries.find(item => item.name === name);
         if (!entry) continue;
+        const localLink = isSymlinkEntry(entry);
+        const localBroken = isBrokenEntry(entry);
+        const ownerGroup = entry.owner && entry.group && entry.owner !== entry.group
+          ? entry.owner + ':' + entry.group
+          : (entry.owner || '');
         body.appendChild(propertyTable([
-          [t('Name'), entry.name], [t('Type'), entry.is_dir ? t('Directory') :
-            (entry.is_link ? t('Symbolic link') : t('File'))],
+          [t('Name'), entry.name], [t('Type'), localLink ? t('Symbolic link') :
+            (entry.is_dir ? t('Directory') : t('File'))],
           [t('Size'), entry.is_dir ? '' : formatBytes(entry.size)],
-          [t('Permissions'), entry.permissions], [t('Modified'), entry.date],
-          [t('Owner'), entry.owner],
-          [t('Link target'), entry.link_target || (entry.is_link ? '' : null)]
+          [t('Permissions'), entry.permissions], [t('Modified'), formatEntryDate(entry)],
+          [t('Owner'), ownerGroup],
+          [t('Link target'), entry.link_target || (localLink ? '' : null)]
         ]));
-        if (entry.is_broken) {
+        if (localBroken) {
           const warning = document.createElement('div');
           warning.className = 'hint';
           warning.textContent = t('The file this link points at does not exist.');
@@ -8392,11 +8527,13 @@
         body.appendChild(propertyTable([[t('Name'), row.name], [t('Error'), row.error]]));
         continue;
       }
+      const remoteLink = isSymlinkEntry(row);
+      const remoteBroken = isBrokenEntry(row);
       body.appendChild(propertyTable([
         [t('Name'), row.name],
         [t('Path on the server'), row.path],
-        [t('Type'), row.is_dir ? t('Directory') :
-          (row.is_link ? t('Symbolic link') : t('File'))],
+        [t('Type'), remoteLink ? t('Symbolic link') :
+          (row.is_dir ? t('Directory') : t('File'))],
         [t('Size'), row.is_dir ? '' : formatBytes(row.size)],
         [t('Size in bytes'), row.is_dir ? '' : row.size],
         [t('Permissions'), row.permissions],
@@ -8404,8 +8541,15 @@
         [t('Owner'), row.owner],
         [t('Group'), row.group],
         [t('Modified'), row.mtime
-          ? new Date(row.mtime * 1000).toLocaleString(languageTag) : '']
+          ? new Date(row.mtime * 1000).toLocaleString(languageTag) : ''],
+        [t('Link target'), row.link_target || (remoteLink ? '' : null)]
       ]));
+      if (remoteBroken) {
+        const warning = document.createElement('div');
+        warning.className = 'hint';
+        warning.textContent = t('The file this link points at does not exist.');
+        body.appendChild(warning);
+      }
     }
     // On a local tab the remote pane is the other local directory: its rows
     // already carry the backend's per-file refusal, and the rights editor a
@@ -8484,9 +8628,9 @@
   }
 
   async function promptLink(side) {
-    const tab = activeTab();
-    if (!tab || !tab.connected) { toast(t('Not connected.'), true); return; }
     const target = side || state.focusPane;
+    const tab = activeTab();
+    if (target === 'remote' && (!tab || !tab.connected)) { toast(t('Not connected.'), true); return; }
     const names = selectedNames(target);
     if (names.length !== 1) {
       toast(t('Select exactly one item in the {side} panel.',
@@ -8496,7 +8640,7 @@
     // The remote pane of a local tab is the other local directory, so it is
     // checked too; a server path can never be a granted folder.
     const linkPath = target === 'local' ? state.local.path :
-      (tab.is_local ? state.remote.path : null);
+      (tab && tab.is_local ? state.remote.path : null);
     const linkGap = linkPath === null ? null : safGap('symlink', linkPath);
     if (linkGap) { toast(linkGap, true); return; }
     const linkName = prompt(t('Name of the symbolic link to "{target}":',
@@ -8504,7 +8648,7 @@
     if (!linkName) return;
     const endpoint = target === 'local' ? '/api/local/link' : '/api/remote/link';
     const result = await apiPost(endpoint, {
-      tab: tab.id, target: names[0], name: linkName.trim()
+      tab: tabId(), target: names[0], name: linkName.trim()
     });
     if (!result.success) {
       toast(errorMessage(result.error, t('Cannot create the symbolic link.')), true);
@@ -8833,6 +8977,7 @@
     document.querySelectorAll('.modal-overlay').forEach(node => node.classList.add('modal-closed'));
     const view = window.LinSCPCore.terminalWindow({
       container: screen,
+      fontSize: readTerminalFontSize(),
       terminal,
       transport: window.LinSCPTransport || transportShim(),
       onClipboardError: () => { status.textContent = t('Cannot access the clipboard.'); },
@@ -8854,8 +8999,8 @@
         status.textContent = text ? t('Copied to the clipboard.') : t(selection ? 'There is nothing selected.' : 'There is no terminal text to copy.');
       } catch (_) { status.textContent = t('Cannot copy terminal text to the clipboard.'); }
     };
-    smaller.addEventListener('click', () => view.changeTextSize(-2));
-    larger.addEventListener('click', () => view.changeTextSize(2));
+    smaller.addEventListener('click', () => saveTerminalFontSize(view.changeTextSize(-1)));
+    larger.addEventListener('click', () => saveTerminalFontSize(view.changeTextSize(1)));
     all.addEventListener('click', () => void copyText(false));
     help.addEventListener('click', showTerminalCopyHelp);
     document.addEventListener('keydown', event => {

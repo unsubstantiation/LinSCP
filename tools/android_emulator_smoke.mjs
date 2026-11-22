@@ -74,8 +74,11 @@ const expression = `
   try { await invoke('POST', '/api/transfer/download', {tab, local_dir: root + '/smoke-download', remote_dir: '/', names: ['smoke-upload.txt']}); }
   catch (error) { conflict = error.status === 409; }
   if (!conflict) throw new Error('Existing download was not protected from overwrite');
-  await invoke('POST', '/api/local/mkdir', {name: 'smoke-resume'});
-  await invoke('POST', '/api/local/save', {path: root + '/smoke-resume/smoke-upload.txt.filepart', content: 'Android'});
+  await invoke('GET', '/api/local/list?path=' + encodeURIComponent(root));
+  const resumeMkdir = await invoke('POST', '/api/local/mkdir', {tab, name: 'smoke-resume'});
+  if (!resumeMkdir.success) throw new Error('Resume mkdir failed: ' + JSON.stringify(resumeMkdir));
+  const partialSave = await invoke('POST', '/api/local/save', {path: root + '/smoke-resume/smoke-upload.txt.filepart', content: 'Android'});
+  if (!partialSave.success) throw new Error('Partial save failed: ' + JSON.stringify(partialSave));
   await invoke('POST', '/api/transfer/download', {tab, local_dir: root + '/smoke-resume', remote_dir: '/', names: ['smoke-upload.txt'], resume: true});
   await waitTransfer(2);
   const resumedTab = await invoke('POST', '/api/tabs/local', {local_dir: root + '/smoke-resume', remote_dir: root});
