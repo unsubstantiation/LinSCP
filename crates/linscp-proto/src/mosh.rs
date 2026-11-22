@@ -1870,15 +1870,15 @@ mod tests {
     async fn mosh_udp_session_survives_transient_closed_socket_and_recovers() {
         let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_sock.local_addr().unwrap();
-        let key = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NM";
-        let key_srv = key.to_string();
+        let key = MoshBase64Key::generate();
+        let key_srv = key.clone();
 
         let srv_task = tokio::spawn(async move {
-            let mut srv_crypto = MoshCrypto::from_base64_key(&key_srv).unwrap();
-            let mut srv_asm = MoshFragmentAssembly::new();
-            let mut srv_frag = MoshFragmenter::new();
+            let mut srv_crypto = MoshCryptoSession::new(&key_srv);
+            let mut srv_asm = FragmentAssembly::new();
+            let mut srv_frag = Fragmenter::new();
             let epoch = Instant::now();
-            let mut buf = [0u8; 2048];
+            let mut buf = [0u8; MOSH_MAX_DATAGRAM_BYTES];
 
             let (n, client_addr) = server_sock.recv_from(&mut buf).await.unwrap();
             let (_seq, pt) = srv_crypto
@@ -1900,9 +1900,7 @@ mod tests {
                 .make_fragments(&reply_inst, 1100)
                 .unwrap()
                 .remove(0);
-            let mut reply_pt = Vec::new();
-            reply_pt.extend_from_slice(&timestamp16(epoch).to_be_bytes());
-            reply_pt.extend_from_slice(&0xffffu16.to_be_bytes());
+            let mut reply_pt = vec![0, 1, 0xff, 0xff];
             reply_pt.extend_from_slice(&reply_frag.encode());
             let (_s, wire) = srv_crypto.seal(MoshDirection::ToClient, &reply_pt).unwrap();
             server_sock.send_to(&wire, client_addr).await.unwrap();
@@ -1946,7 +1944,7 @@ mod tests {
         });
 
         let (handle, mut events) =
-            connect_mosh_udp_session(server_addr, key, 80, 24, Duration::from_secs(2))
+            connect_mosh_udp_session(server_addr, &key, 80, 24, Duration::from_secs(2))
                 .await
                 .unwrap();
 
