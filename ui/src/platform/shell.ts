@@ -140,7 +140,6 @@ export class AppShell {
     this.controller = new MobileShellController({
       rootElement: this.root,
       bottomNavElement: options.bottomNavElement ?? undefined,
-      swipeContainer: options.swipeContainer ?? undefined,
       paneLabel: options.paneLabel,
       onTerminalInput: (data) => this.emitTerminalInput(data),
       // The controller reports a pane the user chose; `syncPane` below marks
@@ -338,7 +337,12 @@ export class AppShell {
       return;
     }
     this.touch = touch;
-    if (!touch) {
+    if (touch) {
+      if (this.options.swipeContainer) {
+        this.controller.attachSwipe(this.options.swipeContainer);
+      }
+    } else {
+      this.controller.detachSwipe();
       // Leaving the touch layout must not leave a selection behind that the
       // desktop interaction model does not know how to clear.
       for (const pane of ['local', 'remote'] as ShellPane[]) {

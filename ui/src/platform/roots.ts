@@ -10,6 +10,8 @@ export interface LocalRootSwitcherOptions {
   transport: TransportClient;
   selectElement: HTMLSelectElement;
   onNavigate: (result: LocalListResult) => void;
+  /** Active session tab identifier so backend `tab.local_dir` stays in sync. */
+  getTabId?: () => number | string | null | undefined;
   onRequestAndroidSafTree?: () => Promise<LocalRootEntry | null>;
   /** Shown while the local root list is being read. */
   onBusy?: (busy: boolean) => void;
@@ -32,6 +34,7 @@ export class LocalRootSwitcher {
   private readonly transport: TransportClient;
   private readonly selectEl: HTMLSelectElement;
   private readonly onNavigate: (result: LocalListResult) => void;
+  private readonly getTabId?: () => number | string | null | undefined;
   private readonly onRequestSaf?: () => Promise<LocalRootEntry | null>;
   private readonly onBusy?: (busy: boolean) => void;
   private readonly onError?: (message: string) => void;
@@ -42,6 +45,7 @@ export class LocalRootSwitcher {
     this.transport = options.transport;
     this.selectEl = options.selectElement;
     this.onNavigate = options.onNavigate;
+    this.getTabId = options.getTabId;
     this.onRequestSaf = options.onRequestAndroidSafTree;
     this.onBusy = options.onBusy;
     this.onError = options.onError;
@@ -190,8 +194,12 @@ export class LocalRootSwitcher {
   private async navigateTo(path: string): Promise<void> {
     this.onBusy?.(true);
     try {
+      const tabId = this.getTabId?.();
+      const tabParam = tabId !== null && tabId !== undefined && tabId !== ''
+        ? `&tab=${encodeURIComponent(String(tabId))}`
+        : '';
       const listing = await this.transport.get<LocalListResult>(
-        `/api/local/list?path=${encodeURIComponent(path)}`,
+        `/api/local/list?path=${encodeURIComponent(path)}${tabParam}`,
       );
       this.currentPath = listing.path;
       this.render(this.currentPath);

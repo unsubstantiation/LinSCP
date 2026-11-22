@@ -1284,8 +1284,12 @@ body {
  * container can show, so they stay; the queue is reached by its own tab strip
  * and the terminal by its own dialog. */
 @media (max-width: 720px) {
-  [data-mobile-pane="local"] #remotePane { display: none !important; }
-  [data-mobile-pane="remote"] #localPane { display: none !important; }
+  [data-mobile-pane="local"] #remotePane,
+  [data-mobile-pane="remote"] #localPane,
+  [data-mobile-pane="queue"] .commander-main .pane:not(.active),
+  [data-mobile-pane="terminal"] .commander-main .pane:not(.active) {
+    display: none !important;
+  }
 }
 
 /* Touch devices read at arm's length and the small end of the ramp was still
