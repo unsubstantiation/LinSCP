@@ -417,6 +417,7 @@ impl SshConnection {
         if let Some(log) = &cfg.event_logger { log("Opening SSH transport (including any configured proxy)."); }
         if cfg.proxy.as_ref().is_none_or(|p| p.kind == ProxyKind::None) {
             let tcp = connect_tcp_maybe_proxied(&cfg.host, cfg.port, None, cfg.connect_timeout).await?;
+            let _ = tcp.set_nodelay(true);
             let direct_peer_ip = tcp.peer_addr().ok().map(|addr| addr.ip());
             if let Some(log) = &cfg.event_logger { log("SSH transport established; starting handshake and host-key verification."); }
             let mut conn = Self::connect_over_stream(cfg, tcp).await?;
@@ -469,11 +470,12 @@ impl SshConnection {
             }
         }
 
-        let russh_cfg = Arc::new(client::Config {
-            inactivity_timeout: Some(Duration::from_secs(120)),
-            keepalive_interval: Some(Duration::from_secs(30)),
-            ..Default::default()
-        });
+        let russh_cfg = Arc::new(build_russh_client_config());
+        let handshake_timeout = if cfg.host_key_decision.is_some() || cfg.keyboard_interactive.is_some() {
+            cfg.connect_timeout.max(Duration::from_secs(120))
+        } else {
+            cfg.connect_timeout.max(Duration::from_secs(5))
+        };
 
         let rejection: Arc<Mutex<Option<ProtoError>>> = Arc::new(Mutex::new(None));
         let observed: ObservedSshFingerprint = Arc::new(Mutex::new(None));
@@ -491,9 +493,14 @@ impl SshConnection {
             observed_fingerprint: Arc::clone(&observed),
         };
 
-        let mut handle = match client::connect_stream(russh_cfg, stream, handler).await {
-            Ok(h) => h,
-            Err(err) => {
+        let mut handle = match tokio::time::timeout(
+            handshake_timeout,
+            client::connect_stream(russh_cfg, stream, handler),
+        )
+        .await
+        {
+            Ok(Ok(h)) => h,
+            Ok(Err(err)) => {
                 if let Ok(mut guard) = rejection.lock() {
                     if let Some(proto_err) = guard.take() {
                         return Err(proto_err);
@@ -504,10 +511,27 @@ impl SshConnection {
                     cfg.host, cfg.port
                 )));
             }
+            Err(_) => {
+                return Err(ProtoError::Transport(format!(
+                    "SSH handshake with {}:{} timed out after {}s",
+                    cfg.host,
+                    cfg.port,
+                    handshake_timeout.as_secs()
+                )));
+            }
         };
 
         if let Some(log) = &cfg.event_logger { log("SSH handshake and host-key verification completed; starting authentication."); }
-        Self::authenticate(&mut handle, cfg).await?;
+        tokio::time::timeout(handshake_timeout, Self::authenticate(&mut handle, cfg))
+            .await
+            .map_err(|_| {
+                ProtoError::Transport(format!(
+                    "SSH authentication with {}:{} timed out after {}s",
+                    cfg.host,
+                    cfg.port,
+                    handshake_timeout.as_secs()
+                ))
+            })??;
         if let Some(log) = &cfg.event_logger { log("SSH authentication completed."); }
 
         let (observed_key_type, observed_fingerprint) = observed
@@ -1059,6 +1083,23 @@ impl SshConnection {
     }
 }
 
+/// Builds the `russh` client configuration used for authenticated SSH sessions.
+///
+/// Active SSH keepalives (`keepalive@openssh.com` with `want_reply = true`) are
+/// used instead of `inactivity_timeout`: in `russh`, `inactivity_timeout` is not
+/// reset when `keepalive_timer` elapses, so waking from a mobile app-switch or
+/// brief OS suspend >= `inactivity_timeout` immediately fails `flush_or_timeout`
+/// with `InactivityTimeout` before the server's keepalive response can arrive.
+fn build_russh_client_config() -> client::Config {
+    client::Config {
+        inactivity_timeout: None,
+        keepalive_interval: Some(Duration::from_secs(20)),
+        keepalive_max: 6,
+        nodelay: true,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,5 +1125,17 @@ Private-MAC: 1459a716b2ebdea871aa101e3a6fe0801798df2f
         assert_eq!(alg, "ssh-ed25519");
         assert!(sha256_fp.starts_with("SHA256:"));
         assert!(md5_fp.starts_with("MD5:"));
+    }
+
+    #[test]
+    fn russh_client_config_uses_keepalive_probes_without_blind_inactivity_cutoff() {
+        let cfg = build_russh_client_config();
+        assert_eq!(
+            cfg.inactivity_timeout, None,
+            "blind inactivity_timeout kills healthy SSH terminals after mobile suspend/app-switch"
+        );
+        assert_eq!(cfg.keepalive_interval, Some(Duration::from_secs(20)));
+        assert_eq!(cfg.keepalive_max, 6);
+        assert!(cfg.nodelay);
     }
 }

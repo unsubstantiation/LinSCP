@@ -243,6 +243,9 @@ export class TerminalSession {
   private backendClosed = false;
   private lastTitle: string | null = null;
   private pollFailures = 0;
+  private transientPollFailures = 0;
+  private refreshInFlight = false;
+  private refreshQueued = false;
   private grid: { columns: number; lines: number };
   /** The keyboard attachment, when the host asked for one. */
   private keyboard: TerminalInput | null = null;
@@ -448,10 +451,53 @@ export class TerminalSession {
     }
     this.windowView = view ?? null;
     this.windowView?.addEventListener('resize', this.handleViewportChange);
+    this.windowView?.addEventListener('focus', this.handleWindowResume);
+    this.windowView?.addEventListener('pageshow', this.handleWindowResume);
+    this.visibilityDoc = doc ?? null;
+    this.visibilityDoc?.addEventListener('visibilitychange', this.handleVisibilityChange);
+  }
+
+  private isDocumentHidden(): boolean {
+    return this.visibilityDoc?.visibilityState === 'hidden';
+  }
+
+  private readonly handleVisibilityChange = (): void => {
+    if (this.stopped) {
+      return;
+    }
+    if (this.isDocumentHidden()) {
+      // Stop background frame polling while another app owns the screen on
+      // mobile: nobody can see the canvas, and aborted WebView IPC fetches
+      // during backgrounding would otherwise look like a dead terminal.
+      if (this.timer !== null) {
+        clearTimeout(this.timer);
+        this.timer = null;
+      }
+      return;
+    }
+    this.resumeFromBackground();
+  };
+
+  private readonly handleWindowResume = (): void => {
+    if (this.stopped || this.isDocumentHidden()) {
+      return;
+    }
+    this.resumeFromBackground();
+  };
+
+  private resumeFromBackground(): void {
+    this.pollFailures = 0;
+    this.transientPollFailures = 0;
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    this.handleViewportChange();
+    void this.refresh();
   }
 
   private readonly handleViewportChange = (): void => {
-    if (this.stopped) {
+    if (this.stopped || this.isDocumentHidden()) {
       return;
     }
     this.renderer.resizeBackingStore();
@@ -469,10 +515,12 @@ export class TerminalSession {
 
   private viewport: VisualViewport | null = null;
   private windowView: Window | null = null;
+  private visibilityDoc: Document | null = null;
 
   /** Stops polling and removes the canvas. The shell is told only by `close`. */
   public stop(): void {
     this.stopped = true;
+    this.refreshQueued = false;
     if (this.timer !== null) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -480,7 +528,11 @@ export class TerminalSession {
     this.viewport?.removeEventListener('resize', this.handleViewportChange);
     this.viewport = null;
     this.windowView?.removeEventListener('resize', this.handleViewportChange);
+    this.windowView?.removeEventListener('focus', this.handleWindowResume);
+    this.windowView?.removeEventListener('pageshow', this.handleWindowResume);
     this.windowView = null;
+    this.visibilityDoc?.removeEventListener('visibilitychange', this.handleVisibilityChange);
+    this.visibilityDoc = null;
     // A long-press timer that outlived the session would open a selection on a
     // terminal that has already closed.
     this.cancelLongPress();
@@ -1197,38 +1249,74 @@ export class TerminalSession {
   };
 
   private poll(): void {
-    if (this.stopped) {
+    if (this.stopped || this.isDocumentHidden()) {
       return;
     }
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+    }
+    const delay = this.transientPollFailures > 0
+      ? Math.min(Math.max(this.pollInterval * 4, 250), 1000)
+      : this.pollInterval;
     this.timer = setTimeout(() => {
       this.timer = null;
       // A session can end between the timer being set and it firing - the
       // window closing is the common case - and polling from there would ask
       // for a frame of a terminal the caller has already been told about.
-      if (this.stopped) {
+      if (this.stopped || this.isDocumentHidden()) {
         return;
       }
       void this.refresh();
-    }, this.pollInterval);
+    }, delay);
+  }
+
+  private static isAuthoritativeTerminalError(error: unknown): string | null {
+    if (!error || typeof error !== 'object') {
+      return null;
+    }
+    const status = (error as { status?: unknown }).status;
+    if (status === 400 || status === 404) {
+      const msg = (error as { message?: unknown }).message;
+      return typeof msg === 'string' && msg.trim() ? msg : '';
+    }
+    return null;
   }
 
   private async refresh(): Promise<void> {
-    if (this.stopped) {
+    if (this.stopped || this.isDocumentHidden()) {
       return;
     }
+    if (this.refreshInFlight) {
+      this.refreshQueued = true;
+      return;
+    }
+    this.refreshInFlight = true;
     let reply: FrameReply | null = null;
+    let caughtError: unknown = null;
+    let hasError = false;
     try {
       reply = await this.transport.get<FrameReply>(
         `/api/terminal/frame?terminal=${encodeURIComponent(this.terminal)}`,
       );
-    } catch {
+    } catch (error) {
+      caughtError = error;
+      hasError = true;
       reply = null;
+    } finally {
+      this.refreshInFlight = false;
     }
     if (this.stopped) {
       return;
     }
+    if (this.isDocumentHidden()) {
+      // Any in-flight IPC rejection caused by Android pausing the WebView
+      // while switching apps is ignored; `visibilitychange` refreshes on return.
+      this.refreshQueued = false;
+      return;
+    }
     if (reply && reply.success && reply.frame) {
       this.pollFailures = 0;
+      this.transientPollFailures = 0;
       const frame = reply.frame;
       if (frame.modes.app_cursor !== this.modes.app_cursor) {
         // The on-screen row holds its own copy of this; nothing else changes it.
@@ -1261,33 +1349,53 @@ export class TerminalSession {
         this.keyboard?.moveTo(rect);
       }
       if (!reply.alive) {
-        this.finish(reply.error ?? null);
+        this.finish(reply.error ?? null, true);
         return;
       }
-    } else if (++this.pollFailures >= 5) {
-      // Five empty answers in a row is a terminal that is not coming back.
-      // Saying so is the difference between a slow shell and a dead one.
-      this.finish(reply && reply.error ? reply.error : null);
-      return;
+    } else {
+      const authoritativeError = TerminalSession.isAuthoritativeTerminalError(caughtError);
+      const authoritative =
+        (reply !== null && reply.success === false) ||
+        authoritativeError !== null ||
+        (!hasError && reply === null);
+      if (authoritative) {
+        if (++this.pollFailures >= 5) {
+          // Five authoritative refusals in a row is a terminal that is gone on
+          // the backend; report its reason rather than leaving a dead screen.
+          const reason = (reply && reply.error)
+            ? reply.error
+            : (authoritativeError || null);
+          this.finish(reason, true);
+          return;
+        }
+      } else if (++this.transientPollFailures >= 120) {
+        // Transient WebView IPC stalls during mobile app resume recover within
+        // a few ticks; only give up if the bridge stays unreachable for ~30s+.
+        this.finish(null, false);
+        return;
+      }
     }
     // A refresh that ended the session has already told the caller; scheduling
     // another poll here would ask for a frame of a terminal that is gone.
     if (this.stopped) {
       return;
     }
+    if (this.refreshQueued) {
+      this.refreshQueued = false;
+      void this.refresh();
+      return;
+    }
     this.poll();
   }
 
-  private finish(reason: string | null): void {
+  private finish(reason: string | null, backendClosed = true): void {
     if (this.stopped) {
       return;
     }
-    this.stopped = true;
-    this.backendClosed = true;
-    if (this.timer !== null) {
-      clearTimeout(this.timer);
-      this.timer = null;
+    if (backendClosed) {
+      this.backendClosed = true;
     }
+    this.stop();
     this.onEnded?.(reason);
   }
 }

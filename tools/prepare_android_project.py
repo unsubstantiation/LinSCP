@@ -1,9 +1,23 @@
 #!/usr/bin/env python3
 """Apply the small, security-critical customizations to Tauri's pinned template."""
 from pathlib import Path
+import re
 import xml.etree.ElementTree as ET
 
 from android_application_id import application_id
+
+REQUIRED_ACTIVITY_CONFIG_CHANGES = (
+    'orientation',
+    'keyboardHidden',
+    'keyboard',
+    'screenSize',
+    'locale',
+    'smallestScreenSize',
+    'screenLayout',
+    'uiMode',
+    'navigation',
+    'density',
+)
 
 root = Path(__file__).resolve().parents[1]
 manifest = root / 'crates/linscp-tauri/gen/android/app/src/main/AndroidManifest.xml'
@@ -26,6 +40,36 @@ if 'android.permission.FOREGROUND_SERVICE_DATA_SYNC' not in text:
         '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />')
 if text.count('android:name=".MainActivity"') != 1:
     raise SystemExit('Unexpected Android activity layout; review share intent filters')
+
+
+def _ensure_main_activity_config_changes(match: re.Match[str]) -> str:
+    tag = match.group(0)
+    existing = re.search(r'android:configChanges="([^"]*)"', tag)
+    tokens: list[str] = []
+    if existing:
+        for item in existing.group(1).split('|'):
+            cleaned = item.strip()
+            if cleaned and cleaned not in tokens:
+                tokens.append(cleaned)
+    for required in REQUIRED_ACTIVITY_CONFIG_CHANGES:
+        if required not in tokens:
+            tokens.append(required)
+    joined = '|'.join(tokens)
+    if existing:
+        return tag[:existing.start()] + f'android:configChanges="{joined}"' + tag[existing.end():]
+    if tag.endswith('/>'):
+        return tag[:-2] + f' android:configChanges="{joined}" />'
+    return tag[:-1] + f' android:configChanges="{joined}">'
+
+
+text, replaced_activities = re.subn(
+    r'<activity\b[^>]*android:name="\.MainActivity"[^>]*>',
+    _ensure_main_activity_config_changes,
+    text,
+    count=1,
+)
+if replaced_activities != 1:
+    raise SystemExit('Unexpected Android MainActivity tag; review configChanges policy')
 if 'android.intent.action.SEND_MULTIPLE' not in text:
     if text.count('</activity>') != 1:
         raise SystemExit('Unexpected Android activity closing tag; review share intent filters')

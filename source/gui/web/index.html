@@ -5036,21 +5036,28 @@
    * bridge (the desktop window) gets an inert object and pays one boolean
    * check per poll. */
   let foregroundBridge = null;
+  let foregroundBridgeCtor = null;
   let foregroundTaskCount = 0;
+  let foregroundMode = 'none';
 
   function foregroundService() {
-    if (foregroundBridge) return foregroundBridge;
-    if (!window.LinSCPCore || typeof window.LinSCPCore.ForegroundTransferBridge !== 'function') {
-      return null;
-    }
+    const ctor = window.LinSCPCore && typeof window.LinSCPCore.ForegroundTransferBridge === 'function'
+      ? window.LinSCPCore.ForegroundTransferBridge
+      : null;
+    if (!ctor) return null;
     const caps = hostCaps();
     if (caps && !caps.foregroundTransfers) return null;
+    if (foregroundBridge && foregroundBridgeCtor === ctor) return foregroundBridge;
     try {
-      foregroundBridge = new window.LinSCPCore.ForegroundTransferBridge(
+      foregroundBridge = new ctor(
         window.LinSCPCore.nativeInvoker ? window.LinSCPCore.nativeInvoker() : null,
       );
+      foregroundBridgeCtor = ctor;
+      foregroundMode = 'none';
     } catch (error) {
       foregroundBridge = null;
+      foregroundBridgeCtor = null;
+      foregroundMode = 'none';
     }
     return foregroundBridge;
   }
@@ -5061,21 +5068,34 @@
     const active = state.queue.filter(task =>
       task && (task.status === 'Running' || task.status === 'Queued'));
     foregroundTaskCount = active.length;
-    if (!active.length) {
-      // Nothing left to protect: the notification goes away with the work,
-      // unless an Android SSH desktop tunnel keepalive is still active.
-      if (bridge.isRunning && !(androidDesktopTunnelKeepalive && androidDesktopTunnelKeepalive.isRunning)) {
-        void bridge.stop();
+    if (active.length) {
+      const running = active.find(task => task.status === 'Running') || active[0];
+      if (!bridge.isRunning || foregroundMode !== 'transfers') {
+        foregroundMode = 'transfers';
+        void bridge.start(t("Transfer Queue ({count})", {count: active.length}), active.length);
+      }
+      const done = running.bytes_done || 0;
+      const total = running.bytes_total || 0;
+      if (total > 0) void bridge.update(done, total);
+      return;
+    }
+    if (embeddedTerminal && embeddedTerminal.view) {
+      // Keep the Android foreground service active while an embedded shell is
+      // open so switching to another app does not freeze Tokio keepalives or
+      // drop the terminal's SSH/Mosh socket.
+      const title = embeddedTerminal.isMosh ? t('Mosh Terminal') : t('Terminal');
+      if (!bridge.isRunning || foregroundMode !== 'terminal') {
+        foregroundMode = 'terminal';
+        void bridge.start(title, 1);
       }
       return;
     }
-    const running = active.find(task => task.status === 'Running') || active[0];
-    if (!bridge.isRunning) {
-      void bridge.start(t("Transfer Queue ({count})", {count: active.length}), active.length);
+    foregroundMode = 'none';
+    // Nothing left to protect: the notification goes away with the work,
+    // unless an Android SSH desktop tunnel keepalive is still active.
+    if (bridge.isRunning && !(androidDesktopTunnelKeepalive && androidDesktopTunnelKeepalive.isRunning)) {
+      void bridge.stop();
     }
-    const done = running.bytes_done || 0;
-    const total = running.bytes_total || 0;
-    if (total > 0) void bridge.update(done, total);
   }
 
   async function refreshQueue() {
@@ -5688,6 +5708,9 @@
     return await openTerminal(tabId, ret, cmd, { mosh: true, moshPort });
   }
 
+  let openingTerminalInProgress = false;
+  let restoringInPageTerminal = false;
+
   async function openTerminal(targetTab = null, returnToMonitor = false, initialCommand = null, options = null) {
     const tab = (targetTab === null || targetTab === undefined || typeof targetTab === 'object')
       ? activeTab()
@@ -5698,7 +5721,13 @@
     if (opts.forceSsh === true) openPayload.force_ssh = true;
     else if (typeof opts.mosh === 'boolean') openPayload.mosh = opts.mosh;
     if (typeof opts.moshPort === 'string' && opts.moshPort.trim()) openPayload.mosh_port = opts.moshPort.trim();
-    const result = await apiPost('/api/session/terminal', openPayload);
+    openingTerminalInProgress = true;
+    let result;
+    try {
+      result = await apiPost('/api/session/terminal', openPayload);
+    } finally {
+      openingTerminalInProgress = false;
+    }
     if (!result.success) {
       if (result.mosh_missing) {
         await presentMoshSetupModal(tab, result, returnToMonitor, initialCommand, opts);
@@ -5795,6 +5824,7 @@
       },
       onEnded: reason => {
         embeddedTerminal = null;
+        syncForegroundService();
         if (appShell) appShell.setTerminalFocused(false);
         toast(reason ? errorMessage(reason, t("The terminal session ended.")) : t("The terminal session ended."), true);
         closeModal('terminalModal');
@@ -5807,7 +5837,8 @@
         if (returnToMonitor && serverMonitor && serverMonitor.isOpen) serverMonitor.resume();
       }
     });
-    embeddedTerminal = { view, returnToMonitor, extras: touchExtras };
+    embeddedTerminal = { view, returnToMonitor, extras: touchExtras, isMosh };
+    syncForegroundService();
     // A new terminal has no selection, and the row it needs is the one a
     // previous terminal may have hidden. Syncing here is what makes the row
     // follow the terminal it belongs to rather than the last one.
@@ -5815,11 +5846,45 @@
     view.start().then(started => {
       if (!started && embeddedTerminal && embeddedTerminal.view === view) {
         embeddedTerminal = null;
+        syncForegroundService();
         closeModal('terminalModal');
       }
     });
     if (appShell) appShell.setTerminalFocused(true);
     return true;
+  }
+
+  /* Reattach a surviving backend terminal if Android recreated the Activity or
+   * reloaded the WebView while the foreground service kept `TerminalRegistry`
+   * alive in the Rust process. */
+  async function restoreOpenInPageTerminal() {
+    if (!terminalTouchExtras() || embeddedTerminal || openingTerminalInProgress || restoringInPageTerminal) {
+      return false;
+    }
+    restoringInPageTerminal = true;
+    try {
+      const data = await apiGet('/api/terminal/list');
+      if (!terminalTouchExtras() || embeddedTerminal || openingTerminalInProgress) {
+        return false;
+      }
+      const list = data && Array.isArray(data.terminals) ? data.terminals : [];
+      const alive = list.filter(item =>
+        item && typeof item === 'object' && item.alive === true &&
+        item.terminal !== undefined && item.terminal !== null && String(item.terminal).length > 0);
+      if (!alive.length) return false;
+      const chosen = alive.find(item => item.tab === state.activeTab) || alive[alive.length - 1];
+      const tab = state.tabs.find(candidate => candidate.id === chosen.tab)
+        || activeTab()
+        || { id: chosen.tab, name: chosen.title || '' };
+      const attached = openTerminalInPage(chosen.terminal, tab, false, chosen.transport === 'mosh');
+      if (attached && typeof chosen.title === 'string' && chosen.title.trim()) {
+        const header = $('terminalModal') && $('terminalModal').querySelector('.modal-header span');
+        if (header) header.textContent = chosen.title.trim();
+      }
+      return attached;
+    } finally {
+      restoringInPageTerminal = false;
+    }
   }
 
   /* The Android extra-key row: the soft keyboard has no Esc, Ctrl or arrows,
@@ -5894,6 +5959,7 @@
   function closeTerminal() {
     const state = embeddedTerminal;
     embeddedTerminal = null;
+    syncForegroundService();
     syncTerminalSelectionBar();
     if (appShell) appShell.setTerminalFocused(false);
     if (!state) return;
@@ -8877,6 +8943,7 @@
     initLocalRootSwitcher();
     await loadRemote(state.remote.path);
     refreshQueue();
+    await restoreOpenInPageTerminal();
     checkShellPending();
     setInterval(checkShellPending, 15000);
     setInterval(refreshQueue, 2000);
@@ -8890,9 +8957,15 @@
      * asked again when this window is looked at again rather than only every
      * fifteen seconds, so the badge has caught up by the time the panes are
      * being used. */
-    window.addEventListener('focus', () => { void refreshStatus(); });
+    window.addEventListener('focus', () => {
+      void refreshStatus();
+      void restoreOpenInPageTerminal();
+    });
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') void refreshStatus();
+      if (document.visibilityState === 'visible') {
+        void refreshStatus();
+        void restoreOpenInPageTerminal();
+      }
     });
   }
 

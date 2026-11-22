@@ -1283,3 +1283,144 @@ test('Android touch selection adjusts both start and end handles, unsticks on ta
   dom.cleanup();
 });
 
+test('switching apps on mobile pauses frame polling while hidden and resumes without killing the shell', async () => {
+  const dom = installDom();
+  const doc = dom.dom.window.document;
+  let visibility = 'visible';
+  Object.defineProperty(doc, 'visibilityState', {
+    configurable: true,
+    get: () => visibility,
+  });
+
+  let frameText = 'initial!';
+  const ended = [];
+  const frames = [];
+  const transport = {
+    calls: [],
+    async get(path) {
+      this.calls.push({ method: 'GET', path });
+      if (path.startsWith('/api/terminal/frame')) {
+        if (visibility === 'hidden') {
+          throw new Error('Failed to fetch while WebView paused');
+        }
+        return {
+          success: true,
+          dirty: true,
+          alive: true,
+          frame: textFrame(frameText),
+        };
+      }
+      return { success: true };
+    },
+    async post(path, body) {
+      this.calls.push({ method: 'POST', path, body });
+      return { success: true };
+    },
+  };
+
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-mobile-bg',
+    container: fakeContainer(90, 36),
+    pollInterval: 8,
+    onEnded: (reason) => ended.push(reason),
+    onFrame: (frame) => frames.push(frame),
+  });
+  session.start();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.ok(frames.length >= 1, 'initial foreground frame rendered');
+
+  // Simulate switching to another app on Android: document becomes hidden.
+  visibility = 'hidden';
+  doc.dispatchEvent(new dom.dom.window.Event('visibilitychange'));
+  const callsAtHide = transport.calls.filter((c) => c.path.startsWith('/api/terminal/frame')).length;
+
+  // Wait > 10x pollInterval (well past the old 5-strike threshold!).
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  const callsWhileHidden = transport.calls.filter((c) => c.path.startsWith('/api/terminal/frame')).length;
+  assert.equal(ended.length, 0, 'backgrounding must never end a live terminal');
+  assert.ok(callsWhileHidden <= callsAtHide + 1, 'polling pauses while the app is hidden');
+
+  // Simulate output arriving while backgrounded and switching back to LinSCP.
+  frameText = 'resumed!';
+  const framesBeforeReturn = frames.length;
+  visibility = 'visible';
+  doc.dispatchEvent(new dom.dom.window.Event('visibilitychange'));
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  assert.equal(ended.length, 0, 'returning from another app keeps the terminal alive');
+  assert.ok(frames.length > framesBeforeReturn, 'returning immediately refreshes the terminal screen');
+  const latestCodepoints = frames.at(-1).cells.slice(0, 'resumed!'.length).map((c) => c.text[0]);
+  assert.equal(String.fromCodePoint(...latestCodepoints), 'resumed!');
+
+  await session.close();
+  dom.cleanup();
+});
+
+test('transient IPC glitches on resume do not kill the terminal while HTTP 400 still reports closure', async () => {
+  const dom = installDom();
+  let transientCount = 0;
+  const ended = [];
+  const transport = {
+    calls: [],
+    async get(path) {
+      this.calls.push({ method: 'GET', path });
+      if (path.startsWith('/api/terminal/frame')) {
+        transientCount += 1;
+        // 8 consecutive transient WebView IPC rejections (more than 5!) before recovery.
+        if (transientCount <= 8) {
+          throw new TypeError('Failed to fetch');
+        }
+        return { success: true, dirty: true, alive: true, frame: textFrame('recovered') };
+      }
+      return { success: true };
+    },
+    async post(path, body) {
+      this.calls.push({ method: 'POST', path, body });
+      return { success: true };
+    },
+  };
+
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-resume-glitch',
+    container: fakeContainer(90, 36),
+    pollInterval: 2,
+    onEnded: (reason) => ended.push(reason),
+  });
+  // Speed up transient backoff via direct focus resumes to exercise >5 transient errors quickly.
+  session.start();
+  for (let i = 0; i < 9; i += 1) {
+    dom.dom.window.dispatchEvent(new dom.dom.window.Event('focus'));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(ended.length, 0, 'transient IPC errors without 400/404 status do not kill the terminal');
+  assert.ok(transientCount >= 9, 'recovered after >5 transient errors');
+  await session.close();
+
+  // Authoritative 400 TransportError ("This terminal is no longer open.") still finishes promptly.
+  const closedReasons = [];
+  const closedTransport = {
+    async get() {
+      const err = new Error('This terminal is no longer open.');
+      err.status = 400;
+      throw err;
+    },
+    async post() {
+      return { success: true };
+    },
+  };
+  const deadSession = new TerminalSession({
+    transport: closedTransport,
+    terminal: 'term-gone',
+    container: fakeContainer(90, 36),
+    pollInterval: 2,
+    onEnded: (reason) => closedReasons.push(reason),
+  });
+  deadSession.start();
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.deepEqual(closedReasons, ['This terminal is no longer open.']);
+  dom.cleanup();
+});
+
+

@@ -1448,37 +1448,53 @@ pub async fn connect_mosh_udp_session(
                 }
 
                 recv_res = socket.recv(&mut buf) => {
-                    if let Ok(n) = recv_res {
-                        if let Ok((_seq, pt)) = crypto.open(MoshDirection::ToClient, &buf[..n]) {
-                            if pt.len() >= MOSH_PACKET_HEADER_BYTES + MOSH_FRAGMENT_HEADER_BYTES {
-                                last_heard = Instant::now();
-                                retransmit_backoff = MOSH_RETRANSMIT_MIN;
-                                let r_ts = u16::from_be_bytes([pt[0], pt[1]]);
-                                saved_remote_ts = Some((r_ts, last_heard));
-                                if let Ok(frag) = MoshFragment::decode(&pt[MOSH_PACKET_HEADER_BYTES..]) {
-                                    if let Ok(Some(inst)) = assembly.add_fragment(frag) {
-                                        if let Ok((transitions, had_diff)) = engine.apply_incoming(&inst) {
-                                            if had_diff && pending_ack_at.is_none() {
-                                                pending_ack_at = Some(last_heard + MOSH_ACK_DELAY);
-                                            }
-                                            for tr in transitions {
-                                                let evt = match tr {
-                                                    MoshStateTransition::AdvanceAnchor(ops) => MoshSessionEvent::AdvanceAnchor(ops),
-                                                    MoshStateTransition::Incremental(ops) => MoshSessionEvent::Incremental(ops),
-                                                    MoshStateTransition::RebranchFromAnchor(ops) => MoshSessionEvent::RebranchFromAnchor(ops),
-                                                    MoshStateTransition::ServerClosed => {
-                                                        let _ = evt_tx.send(MoshSessionEvent::Closed);
+                    match recv_res {
+                        Ok(n) => {
+                            if let Ok((_seq, pt)) = crypto.open(MoshDirection::ToClient, &buf[..n]) {
+                                if pt.len() >= MOSH_PACKET_HEADER_BYTES + MOSH_FRAGMENT_HEADER_BYTES {
+                                    last_heard = Instant::now();
+                                    retransmit_backoff = MOSH_RETRANSMIT_MIN;
+                                    let r_ts = u16::from_be_bytes([pt[0], pt[1]]);
+                                    saved_remote_ts = Some((r_ts, last_heard));
+                                    if let Ok(frag) = MoshFragment::decode(&pt[MOSH_PACKET_HEADER_BYTES..]) {
+                                        if let Ok(Some(inst)) = assembly.add_fragment(frag) {
+                                            if let Ok((transitions, had_diff)) = engine.apply_incoming(&inst) {
+                                                if had_diff && pending_ack_at.is_none() {
+                                                    pending_ack_at = Some(last_heard + MOSH_ACK_DELAY);
+                                                }
+                                                for tr in transitions {
+                                                    let evt = match tr {
+                                                        MoshStateTransition::AdvanceAnchor(ops) => MoshSessionEvent::AdvanceAnchor(ops),
+                                                        MoshStateTransition::Incremental(ops) => MoshSessionEvent::Incremental(ops),
+                                                        MoshStateTransition::RebranchFromAnchor(ops) => MoshSessionEvent::RebranchFromAnchor(ops),
+                                                        MoshStateTransition::ServerClosed => {
+                                                            let _ = evt_tx.send(MoshSessionEvent::Closed);
+                                                            return;
+                                                        }
+                                                    };
+                                                    if evt_tx.send(evt).is_err() {
                                                         return;
                                                     }
-                                                };
-                                                if evt_tx.send(evt).is_err() {
-                                                    return;
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
+                        }
+                        Err(_) => {
+                            // On mobile app-switches or Wi-Fi <-> cellular handoffs, a
+                            // connected UDP socket can surface immediate OS errors
+                            // (EPERM/ENETUNREACH/ECONNREFUSED/ENETDOWN). Rebind at most
+                            // once per second and yield briefly so the loop never spins.
+                            let now_err = Instant::now();
+                            if now_err.duration_since(last_port_hop) >= Duration::from_secs(1) {
+                                if let Ok(new_sock) = bind_connected_udp_socket(server_addr).await {
+                                    socket = new_sock;
+                                }
+                                last_port_hop = now_err;
+                            }
+                            tokio::time::sleep(Duration::from_millis(100).min(sleep_dur)).await;
                         }
                     }
                 }
@@ -1848,5 +1864,118 @@ mod tests {
         assert!(!script.contains("wget "));
         assert!(!script.contains("add-apt-repository"));
         assert!(!script.contains("epel-release"));
+    }
+
+    #[tokio::test]
+    async fn mosh_udp_session_survives_transient_closed_socket_and_recovers() {
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let key = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NM";
+        let key_srv = key.to_string();
+
+        let srv_task = tokio::spawn(async move {
+            let mut srv_crypto = MoshCrypto::from_base64_key(&key_srv).unwrap();
+            let mut srv_asm = MoshFragmentAssembly::new();
+            let mut srv_frag = MoshFragmenter::new();
+            let epoch = Instant::now();
+            let mut buf = [0u8; 2048];
+
+            let (n, client_addr) = server_sock.recv_from(&mut buf).await.unwrap();
+            let (_seq, pt) = srv_crypto
+                .open(MoshDirection::ToServer, &buf[..n])
+                .unwrap();
+            let frag = MoshFragment::decode(&pt[4..]).unwrap();
+            let inst = srv_asm.add_fragment(frag).unwrap().unwrap();
+
+            let reply_inst = TransportInstruction {
+                protocol_version: MOSH_PROTOCOL_VERSION,
+                old_num: 0,
+                new_num: 1,
+                ack_num: inst.new_num,
+                throwaway_num: 0,
+                diff: encode_host_diff(&[HostOp::HostBytes(b"ready$ ".to_vec())]),
+                chaff: Vec::new(),
+            };
+            let reply_frag = srv_frag
+                .make_fragments(&reply_inst, 1100)
+                .unwrap()
+                .remove(0);
+            let mut reply_pt = Vec::new();
+            reply_pt.extend_from_slice(&timestamp16(epoch).to_be_bytes());
+            reply_pt.extend_from_slice(&0xffffu16.to_be_bytes());
+            reply_pt.extend_from_slice(&reply_frag.encode());
+            let (_s, wire) = srv_crypto.seal(MoshDirection::ToClient, &reply_pt).unwrap();
+            server_sock.send_to(&wire, client_addr).await.unwrap();
+
+            // Drop the server socket briefly so client keystroke retransmits hit ICMP Port Unreachable.
+            drop(server_sock);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+
+            let rebound = UdpSocket::bind(server_addr).await.unwrap();
+            loop {
+                let (n2, caddr2) = rebound.recv_from(&mut buf).await.unwrap();
+                let (_seq2, pt2) = srv_crypto
+                    .open(MoshDirection::ToServer, &buf[..n2])
+                    .unwrap();
+                let f2 = MoshFragment::decode(&pt2[4..]).unwrap();
+                if let Some(i2) = srv_asm.add_fragment(f2).unwrap() {
+                    if i2.new_num == u64::MAX {
+                        break;
+                    }
+                    if !i2.diff.is_empty() {
+                        let echo = TransportInstruction {
+                            protocol_version: MOSH_PROTOCOL_VERSION,
+                            old_num: 1,
+                            new_num: 2,
+                            ack_num: i2.new_num,
+                            throwaway_num: 1,
+                            diff: encode_host_diff(&[HostOp::HostBytes(b"still-alive\r\n".to_vec())]),
+                            chaff: Vec::new(),
+                        };
+                        let rf = srv_frag.make_fragments(&echo, 1100).unwrap().remove(0);
+                        let mut rpt = Vec::new();
+                        rpt.extend_from_slice(&timestamp16(epoch).to_be_bytes());
+                        rpt.extend_from_slice(&0xffffu16.to_be_bytes());
+                        rpt.extend_from_slice(&rf.encode());
+                        let (_s, w) = srv_crypto.seal(MoshDirection::ToClient, &rpt).unwrap();
+                        rebound.send_to(&w, caddr2).await.unwrap();
+                        break;
+                    }
+                }
+            }
+        });
+
+        let (handle, mut events) =
+            connect_mosh_udp_session(server_addr, key, 80, 24, Duration::from_secs(2))
+                .await
+                .unwrap();
+
+        match events.recv().await.unwrap() {
+            MoshSessionEvent::Incremental(ops) => {
+                assert_eq!(ops, vec![HostOp::HostBytes(b"ready$ ".to_vec())]);
+            }
+            other => panic!("unexpected initial event: {other:?}"),
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.write_bytes(b"pwd\r".to_vec()).unwrap();
+
+        let mut recovered = false;
+        while !recovered {
+            match tokio::time::timeout(Duration::from_secs(3), events.recv())
+                .await
+                .expect("mosh session timed out instead of recovering")
+                .expect("mosh channel unexpectedly closed")
+            {
+                MoshSessionEvent::AdvanceAnchor(_) => {}
+                MoshSessionEvent::Incremental(ops) => {
+                    assert_eq!(ops, vec![HostOp::HostBytes(b"still-alive\r\n".to_vec())]);
+                    recovered = true;
+                }
+                other => panic!("unexpected event during recovery: {other:?}"),
+            }
+        }
+        handle.close();
+        srv_task.await.unwrap();
     }
 }

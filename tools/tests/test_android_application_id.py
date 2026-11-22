@@ -176,7 +176,14 @@ class AndroidApplicationIdTests(unittest.TestCase):
             for _ in range(2):
                 subprocess.run(command, check=True, capture_output=True, text=True)
             android = '{http://schemas.android.com/apk/res/android}'
-            providers = ET.parse(manifest).getroot().find('application').findall('provider')
+            manifest_root = ET.parse(manifest).getroot()
+            main_activity = manifest_root.find('application').find('activity')
+            config_changes = set((main_activity.get(android + 'configChanges') or '').split('|'))
+            for required_flag in ('orientation', 'keyboardHidden', 'keyboard', 'screenSize',
+                                  'locale', 'smallestScreenSize', 'screenLayout',
+                                  'uiMode', 'navigation', 'density'):
+                self.assertIn(required_flag, config_changes)
+            providers = manifest_root.find('application').findall('provider')
             self.assertEqual(len(providers), 1)
             provider = providers[0]
             self.assertEqual(provider.get(android + 'name'), '.LinSCPExportProvider')
@@ -230,6 +237,16 @@ class AndroidApplicationIdTests(unittest.TestCase):
             self.assertNotIn('io.', desktop, name)
         self.assertIn('Exec=linscp-gui',
                       (ROOT / 'debian/linscp.desktop').read_text(encoding='utf-8'))
+
+    def test_foreground_service_declares_data_sync_type_timeout_and_resume_intent(self):
+        kotlin = (ROOT / 'crates/linscp-tauri/android/LinSCPAndroidPlugin.kt').read_text(encoding='utf-8')
+        self.assertIn('ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC', kotlin)
+        self.assertIn('override fun onTimeout(startId: Int)', kotlin)
+        self.assertIn('Intent.FLAG_ACTIVITY_SINGLE_TOP', kotlin)
+        self.assertIn('PendingIntent.FLAG_IMMUTABLE', kotlin)
+        page = (ROOT / 'source/gui/web/index.html').read_text(encoding='utf-8')
+        self.assertIn('embeddedTerminal && embeddedTerminal.view', page)
+        self.assertIn('restoreOpenInPageTerminal', page)
 
 
 if __name__ == '__main__':
