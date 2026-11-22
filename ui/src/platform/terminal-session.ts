@@ -173,6 +173,8 @@ export interface TerminalSessionOptions {
   terminal: string;
   /** Where the canvas goes. Its size decides the grid. */
   container: HTMLElement;
+  /** Initial terminal font size in CSS pixels. */
+  fontSize?: number;
   /** Poll interval in milliseconds; the old page used 120. */
   pollInterval?: number;
   /** Called when the session ends, with the reason if the backend gave one. */
@@ -341,6 +343,7 @@ export class TerminalSession {
     this.onClipboardError = options.onClipboardError;
     this.renderer = new TerminalRenderer({
       container: options.container,
+      fontSize: options.fontSize,
       selectionHandles: Boolean(options.keyboard),
       onCellSize: (size) => {
         // The model answers a program that asks how large the text area is in
@@ -413,6 +416,11 @@ export class TerminalSession {
   /** The grid the window can show, in cells. */
   public size(): { columns: number; lines: number } {
     return this.renderer.size();
+  }
+
+  /** Current terminal font size in CSS pixels. */
+  public get textSize(): number {
+    return this.renderer.textSize;
   }
 
   /** Change text size, remeasure cells and report the new grid to the PTY. */

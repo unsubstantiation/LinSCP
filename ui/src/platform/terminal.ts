@@ -105,6 +105,20 @@ const ATTR = {
   wide: 1 << 7,
 } as const;
 
+/** Default terminal font size in CSS pixels (3 single-pixel steps smaller than 14px). */
+export const DEFAULT_TERMINAL_FONT_SIZE = 11;
+export const MIN_TERMINAL_FONT_SIZE = 8;
+export const MAX_TERMINAL_FONT_SIZE = 32;
+export const TERMINAL_FONT_SIZE_STEP = 1;
+export const TERMINAL_FONT_SIZE_STORAGE_KEY = 'lscp-terminal-font-size';
+
+export function clampTerminalFontSize(size: number): number {
+  if (!Number.isFinite(size)) {
+    return DEFAULT_TERMINAL_FONT_SIZE;
+  }
+  return Math.max(MIN_TERMINAL_FONT_SIZE, Math.min(MAX_TERMINAL_FONT_SIZE, Math.round(size)));
+}
+
 export interface RendererOptions {
   /** The element the canvas is appended to; it owns the size. */
   container: HTMLElement;
@@ -150,7 +164,9 @@ export class TerminalRenderer {
     this.theme = options.theme ?? DEFAULT_RENDERER_THEME;
     this.fontFamily = options.fontFamily
       ?? 'ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace';
-    this.fontSize = Math.max(8, Math.min(32, options.fontSize ?? 14));
+    this.fontSize = options.fontSize !== undefined && Number.isFinite(options.fontSize)
+      ? clampTerminalFontSize(options.fontSize)
+      : DEFAULT_TERMINAL_FONT_SIZE;
     this.selectionHandles = options.selectionHandles === true;
     this.onCellSize = options.onCellSize;
     const createElement = options.context?.createElement
@@ -193,7 +209,7 @@ export class TerminalRenderer {
 
   public setTextSize(size: number): number {
     if (this.destroyed || !Number.isFinite(size)) return this.fontSize;
-    const next = Math.max(8, Math.min(32, Math.round(size)));
+    const next = clampTerminalFontSize(size);
     if (next !== this.fontSize) {
       this.fontSize = next;
       this.measureCell();

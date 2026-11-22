@@ -1174,8 +1174,8 @@
         </div>
       </div>
       <div class="modal-footer">
-        <button class="btn" type="button" onclick="changeTerminalTextSize(-2)" aria-label="Decrease terminal text size" title="Decrease terminal text size">−</button>
-        <button class="btn" type="button" onclick="changeTerminalTextSize(2)" aria-label="Increase terminal text size" title="Increase terminal text size">+</button>
+        <button class="btn" type="button" onclick="changeTerminalTextSize(-1)" aria-label="Decrease terminal text size" title="Decrease terminal text size">−</button>
+        <button class="btn" type="button" onclick="changeTerminalTextSize(1)" aria-label="Increase terminal text size" title="Increase terminal text size">+</button>
         <button class="btn" type="button" onclick="copyTerminalAllText()">Copy All Text</button>
         <button class="btn" type="button" onclick="showTerminalCopyHelp()">Help</button>
         <button class="btn" onclick="closeTerminal()">Close</button>
@@ -5864,6 +5864,32 @@
     return !!caps && caps.platform === 'android';
   }
 
+  let rememberedTerminalFontSize = null;
+  function readTerminalFontSize() {
+    const fallback = (window.LinSCPCore && Number.isFinite(window.LinSCPCore.DEFAULT_TERMINAL_FONT_SIZE))
+      ? window.LinSCPCore.DEFAULT_TERMINAL_FONT_SIZE : 11;
+    try {
+      const raw = localStorage.getItem('lscp-terminal-font-size');
+      if (raw !== null && raw !== '') {
+        const parsed = Number(raw);
+        if (Number.isFinite(parsed)) {
+          const clamped = Math.max(8, Math.min(32, Math.round(parsed)));
+          rememberedTerminalFontSize = clamped;
+          return clamped;
+        }
+      }
+    } catch (_) {}
+    return rememberedTerminalFontSize !== null ? rememberedTerminalFontSize : fallback;
+  }
+
+  function saveTerminalFontSize(size) {
+    if (!Number.isFinite(size)) return;
+    const clamped = Math.max(8, Math.min(32, Math.round(size)));
+    rememberedTerminalFontSize = clamped;
+    try { localStorage.setItem('lscp-terminal-font-size', String(clamped)); }
+    catch (_) {}
+  }
+
   function openTerminalInPage(terminal, tab, returnToMonitor, isMosh = false) {
     const screen = $('terminalScreen');
     if (!screen || !window.LinSCPCore || !window.LinSCPCore.TerminalWindow) return false;
@@ -5878,6 +5904,7 @@
     openModal('terminalModal');
     const view = window.LinSCPCore.terminalWindow({
       container: screen,
+      fontSize: readTerminalFontSize(),
       terminal,
       transport: window.LinSCPTransport || transportShim(),
       extraKeysElement: touchExtras ? $('terminalExtraKeys') : null,
@@ -5983,8 +6010,13 @@
   }
 
   function changeTerminalTextSize(delta) {
+    const step = delta < 0 ? -1 : (delta > 0 ? 1 : 0);
+    if (!step) return;
     const view = embeddedTerminal && embeddedTerminal.view;
-    if (view) view.changeTextSize(delta);
+    if (view) {
+      const next = view.changeTextSize(step);
+      saveTerminalFontSize(next);
+    }
   }
 
   async function copyTerminalAllText() {
@@ -8942,6 +8974,7 @@
     document.querySelectorAll('.modal-overlay').forEach(node => node.classList.add('modal-closed'));
     const view = window.LinSCPCore.terminalWindow({
       container: screen,
+      fontSize: readTerminalFontSize(),
       terminal,
       transport: window.LinSCPTransport || transportShim(),
       onClipboardError: () => { status.textContent = t('Cannot access the clipboard.'); },
@@ -8963,8 +8996,8 @@
         status.textContent = text ? t('Copied to the clipboard.') : t(selection ? 'There is nothing selected.' : 'There is no terminal text to copy.');
       } catch (_) { status.textContent = t('Cannot copy terminal text to the clipboard.'); }
     };
-    smaller.addEventListener('click', () => view.changeTextSize(-2));
-    larger.addEventListener('click', () => view.changeTextSize(2));
+    smaller.addEventListener('click', () => saveTerminalFontSize(view.changeTextSize(-1)));
+    larger.addEventListener('click', () => saveTerminalFontSize(view.changeTextSize(1)));
     all.addEventListener('click', () => void copyText(false));
     help.addEventListener('click', showTerminalCopyHelp);
     document.addEventListener('keydown', event => {

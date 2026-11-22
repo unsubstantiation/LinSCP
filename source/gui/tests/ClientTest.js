@@ -546,7 +546,12 @@ function options(id) {
     larger.click(); smaller.click();
     await new Promise(resolve => setTimeout(resolve, 30));
     const sizes = terminalCalls.filter(call => call && call.path === '/api/terminal/input' && call.body && call.body.cell_height).map(call => call.body.cell_height);
-    check('desktop text size buttons update terminal cell metrics', sizes.includes(21) && sizes.at(-1) === 18, JSON.stringify(sizes));
+    check('desktop text size buttons update terminal cell metrics by single 1px steps from 11px default',
+      sizes[0] === 15 && sizes.includes(16) && sizes.at(-1) === 15, JSON.stringify(sizes));
+    larger.click(); larger.click();
+    check('desktop terminal remembers adjusted font size in localStorage',
+      terminalWindow.localStorage.getItem('lscp-terminal-font-size') === '13',
+      terminalWindow.localStorage.getItem('lscp-terminal-font-size'));
     let terminalHelp = ''; terminalWindow.alert = text => { terminalHelp = text; };
     help.click();
     check('terminal help explains mouse selection and paste', terminalHelp.includes('mouse') && terminalHelp.includes('Right-click') && terminalHelp.includes('Ctrl+V'));
@@ -3223,10 +3228,16 @@ function options(id) {
       /* The real window exposes the open selection and can copy it from the
        * model; the page's copy bar is driven by both. */
       let selection = null;
+      let currentFontSize = typeof options.fontSize === 'number' ? options.fontSize : 11;
+      painted.push('initialSize:' + currentFontSize);
       lastWindow = {
         get selection() { return selection; },
         copyAllText: async () => 'all terminal text',
-        changeTextSize: delta => { painted.push('size:' + delta); return 14 + delta; },
+        changeTextSize: delta => {
+          currentFontSize = Math.max(8, Math.min(32, currentFontSize + delta));
+          painted.push('size:' + delta + '->' + currentFontSize);
+          return currentFontSize;
+        },
         copySelection: async () => {
           if (!selection) return null;
           selection = null;
@@ -3706,8 +3717,12 @@ function options(id) {
     const shrink = doc.querySelector('#terminalModal button[aria-label="Decrease terminal text size"]');
     const grow = doc.querySelector('#terminalModal button[aria-label="Increase terminal text size"]');
     check('embedded terminal exposes both text size buttons', !!shrink && !!grow);
-    shrink.click(); grow.click();
-    check('embedded terminal size buttons reach its own view', painted.includes('size:-2') && painted.includes('size:2'));
+    check('embedded terminal opens at 11px default font size', painted.includes('initialSize:11'), JSON.stringify(painted));
+    shrink.click(); grow.click(); grow.click();
+    check('embedded terminal size buttons adjust by a single step and persist font size',
+      painted.includes('size:-1->10') && painted.includes('size:1->11') && painted.includes('size:1->12') &&
+      window.localStorage.getItem('lscp-terminal-font-size') === '12',
+      JSON.stringify(painted) + ' | saved=' + window.localStorage.getItem('lscp-terminal-font-size'));
     await window.copyTerminalAllText();
     lastWindow.selectAll();
     check('selecting text offers to copy it',
@@ -3733,6 +3748,8 @@ function options(id) {
     responses['/api/terminal/frame'] = {
       success: false, error: 'This terminal is no longer open.' };
     await window.openTerminal();
+    check('reopening embedded terminal restores the remembered font size',
+      painted.includes('initialSize:12'), JSON.stringify(painted));
     await new Promise(resolve => setTimeout(resolve, 500));
     check('a terminal the backend refuses is reported, not left black',
       lastLogLine().indexOf('The terminal session ended.') >= 0 ||

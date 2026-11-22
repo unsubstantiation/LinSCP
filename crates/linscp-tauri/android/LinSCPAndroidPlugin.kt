@@ -131,6 +131,7 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
 
   override fun load(webView: WebView) {
     activity.runOnUiThread {
+      webView.settings.domStorageEnabled = true
       hideAndroidNavigationBar(activity)
       installNavigationBarInsetsGuard(webView)
     }
