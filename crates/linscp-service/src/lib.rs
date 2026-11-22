@@ -540,6 +540,7 @@ impl CommanderService {
             ("POST", "/api/local/rename") => self.handle_local_rename(req.body),
             ("POST", "/api/local/chmod") => self.handle_local_chmod(req.body),
             ("POST", "/api/local/checksum") => self.handle_local_checksum(req.body),
+            ("POST", "/api/local/search") => self.handle_local_search(req.body),
             ("POST", "/api/local/link") => self.handle_local_link(req.body),
             ("POST", "/api/local/save") => self.handle_local_save(req.body),
             ("POST", "/api/local/drop") => self.handle_local_drop(&query, req.body),
@@ -1467,8 +1468,19 @@ impl CommanderService {
             return ApiReply { status: 409, payload: json!({"success": false, "error": "Directory move requires confirmation", "directory_move_risk": true}) };
         }
         match session.dav_move_if_match(&from, &to, &tag, is_dir).await {
-            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
-            Err(error) => api_error(400, error.to_string()),
+            Ok(()) => {
+                self.record_gui_xml_action(&tab.name, |logger| {
+                    logger.record_mv_or_cp(false, &from, &to, Ok(()));
+                });
+                ApiReply { status: 200, payload: json!({"success": true}) }
+            }
+            Err(error) => {
+                let msg = error.to_string();
+                self.record_gui_xml_action(&tab.name, |logger| {
+                    logger.record_mv_or_cp(false, &from, &to, Err(&msg));
+                });
+                api_error(400, msg)
+            }
         }
     }
 
@@ -6060,6 +6072,75 @@ impl CommanderService {
         };
         self.compute_local_checksums_in_dir(&checked_base, &body)
     }
+
+    fn run_local_or_saf_search(&self, raw_root: &str, body: &Value) -> ApiReply {
+        let checked_root = match check_local_pane_directory(raw_root, "search directory") {
+            Ok(path) => path,
+            Err(error) => return api_error(400, error),
+        };
+        let mask_spec = body.get("pattern").and_then(Value::as_str).unwrap_or("*");
+        let mask = match FileMask::parse(mask_spec) {
+            Ok(m) => m,
+            Err(e) => return api_error(400, e),
+        };
+        let contents = body.get("search_contents").and_then(Value::as_bool).unwrap_or(false);
+        let query = body.get("content_query").and_then(Value::as_str).unwrap_or("").to_string();
+        if contents && query.is_empty() {
+            return api_error(400, "Enter text to search for.");
+        }
+        let case_sensitive = body.get("case_sensitive").and_then(Value::as_bool).unwrap_or(false);
+        let encoding = body
+            .get("encoding")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let search_res = if is_saf_path(&checked_root) {
+            ops::search_saf_bounded_with_encoding(
+                self.local_fs.as_ref(),
+                &checked_root,
+                &mask,
+                if contents { Some(query.as_str()) } else { None },
+                case_sensitive,
+                encoding,
+                500,
+            )
+        } else {
+            ops::search_local_bounded_with_encoding(
+                Path::new(&checked_root),
+                &mask,
+                if contents { Some(query.as_str()) } else { None },
+                case_sensitive,
+                encoding,
+                500,
+            )
+        };
+        match search_res {
+            Ok(stats) => ApiReply {
+                status: 200,
+                payload: json!({
+                    "success": true,
+                    "matches": stats.matches,
+                    "truncated": stats.truncated,
+                    "scanned": stats.scanned,
+                    "skipped": stats.skipped,
+                    "bytes_scanned": stats.bytes_scanned,
+                }),
+            },
+            Err(error) => api_error(400, error),
+        }
+    }
+
+    fn handle_local_search(&self, body: Value) -> ApiReply {
+        let tab_id = tabs::parse_tab_id_value(body.get("tab"));
+        let raw_root = body
+            .get("path")
+            .or_else(|| body.get("local_dir"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.active_local_dir(tab_id));
+        self.run_local_or_saf_search(&raw_root, &body)
+    }
     fn handle_local_save(&self, body: Value) -> ApiReply {
         let path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let tab_id = body.get("tab").and_then(|v| if v.is_number() { v.as_u64()} else { v.as_str().and_then(|s| s.parse().ok()) });
@@ -7771,47 +7852,13 @@ impl CommanderService {
         if !tab.connected || !tab.is_local {
             return api_error(400, "Not connected");
         }
-        if is_saf_path(&tab.other_local_dir) {
-            return api_error(400, "Recursive content search is not supported on granted Android SAF folders.");
-        }
-        let raw_root = body.get("path").and_then(Value::as_str).filter(|p| !p.is_empty()).unwrap_or(&tab.other_local_dir);
-        let resolved_root = match resolve_local_path_for_list(raw_root) {
-            Ok(p) => p,
-            Err(e) => return api_error(400, e),
-        };
-        let mask_spec = body.get("pattern").and_then(Value::as_str).unwrap_or("*");
-        let mask = match FileMask::parse(mask_spec) {
-            Ok(m) => m,
-            Err(e) => return api_error(400, e),
-        };
-        let contents = body.get("search_contents").and_then(Value::as_bool).unwrap_or(false);
-        let query = body.get("content_query").and_then(Value::as_str).unwrap_or("").to_string();
-        if contents && query.is_empty() {
-            return api_error(400, "Enter text to search for.");
-        }
-        let case_sensitive = body.get("case_sensitive").and_then(Value::as_bool).unwrap_or(false);
-        let encoding = body.get("encoding").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
-        match ops::search_local_bounded_with_encoding(
-            Path::new(&resolved_root),
-            &mask,
-            if contents { Some(query.as_str()) } else { None },
-            case_sensitive,
-            encoding,
-            500,
-        ) {
-            Ok(stats) => ApiReply {
-                status: 200,
-                payload: json!({
-                    "success": true,
-                    "matches": stats.matches,
-                    "truncated": stats.truncated,
-                    "scanned": stats.scanned,
-                    "skipped": stats.skipped,
-                    "bytes_scanned": stats.bytes_scanned,
-                }),
-            },
-            Err(error) => api_error(400, error),
-        }
+        let raw_root = body
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or(&tab.other_local_dir)
+            .to_string();
+        self.run_local_or_saf_search(&raw_root, &body)
     }
     fn handle_remote_checksum(&self, body: Value) -> ApiReply {
         let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else {
@@ -17038,6 +17085,15 @@ mod tests {
             Ok((self.stat(remote_path).await?, Some(Self::ETAG.to_string())))
         }
 
+        async fn dav_move_if_match(&self, from: &str, to: &str, etag: &str, _is_dir: bool) -> Result<(), ProtoError> {
+            if etag != Self::ETAG {
+                return Err(ProtoError::Transport(format!(
+                    "Remote file '{from}' changed; conditional move refused."
+                )));
+            }
+            self.rename(from, to).await
+        }
+
         async fn dav_get_etag(&self, _remote_path: &str) -> Result<(Option<String>, bool), ProtoError> {
             Ok((Some(Self::ETAG.to_string()), false))
         }
@@ -19233,5 +19289,139 @@ mod tests {
         );
         assert!(closed4.load(Ordering::Relaxed));
         assert!(!ext4_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn local_and_saf_search_prune_excluded_subtrees_and_dav_rename_logs_mv_xml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_dir = tmp.path().join("cfg");
+        let search_root = tmp.path().join("workspace");
+        std::fs::create_dir_all(search_root.join("src")).unwrap();
+        std::fs::create_dir_all(search_root.join("ignored")).unwrap();
+        std::fs::write(search_root.join("src").join("keep.txt"), b"first\nmagic needle here\n").unwrap();
+        std::fs::write(search_root.join("ignored").join("skip.txt"), b"magic needle in excluded dir\n").unwrap();
+
+        let svc = CommanderService::new(cfg_dir.clone(), Arc::new(NativeLocalFs::new()));
+        let base_prefs = svc
+            .dispatch(ApiEnvelope { method: "GET".into(), path: "/api/preferences".into(), body: json!({}) })
+            .payload["preferences"]
+            .clone();
+        let mut prefs = base_prefs;
+        prefs["xml_log_enabled"] = json!(true);
+        prefs["xml_log_path"] = json!("dav-rename.xml");
+        assert_eq!(
+            svc.dispatch(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/preferences".into(),
+                body: json!({"action": "save", "preferences": prefs}),
+            })
+            .status,
+            200
+        );
+
+        // 1. `/api/local/search` prunes `|ignored/`, excludes non-matching directories (`src`)
+        //    when searching for `*.txt`, and populates `snippet` on content search.
+        let by_name = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/search".into(),
+            body: json!({
+                "path": search_root,
+                "pattern": "*.txt|ignored/",
+            }),
+        });
+        assert_eq!(by_name.status, 200, "{}", by_name.payload);
+        let name_matches = by_name.payload["matches"].as_array().unwrap();
+        assert_eq!(name_matches.len(), 1, "{name_matches:?}");
+        assert_eq!(name_matches[0]["name"], "keep.txt");
+        assert_eq!(name_matches[0]["is_dir"], false);
+
+        let by_content = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/search".into(),
+            body: json!({
+                "path": search_root,
+                "pattern": "*.txt|ignored/",
+                "search_contents": true,
+                "content_query": "magic needle",
+            }),
+        });
+        assert_eq!(by_content.status, 200, "{}", by_content.payload);
+        let content_matches = by_content.payload["matches"].as_array().unwrap();
+        assert_eq!(content_matches.len(), 1, "{content_matches:?}");
+        assert_eq!(content_matches[0]["line"], 2);
+        assert_eq!(content_matches[0]["snippet"], "magic needle here");
+
+        // 2. SAF `content://` recursive search works via `/api/local/search` and `/api/remote/search`.
+        let saf_bridge = Arc::new(MockBridge::with_file("root.md", b"top doc"));
+        let nested_dir_uri = MockBridge::doc_uri("notes");
+        saf_bridge.add_dir(&nested_dir_uri);
+        saf_bridge.add_file(
+            &format!("{nested_dir_uri}/document/todo.txt"),
+            b"header\nsaf secret token\n",
+        );
+        let saf_fs: Arc<dyn LocalFs> = Arc::new(NativeLocalFs::with_saf(saf_bridge));
+        let saf_svc = CommanderService::new(tmp.path().join("saf_search_cfg"), saf_fs);
+
+        let saf_local = saf_svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/search".into(),
+            body: json!({
+                "path": SAF_GRANTED_DIR,
+                "pattern": "*.txt",
+                "search_contents": true,
+                "content_query": "saf secret",
+            }),
+        });
+        assert_eq!(saf_local.status, 200, "{}", saf_local.payload);
+        let saf_matches = saf_local.payload["matches"].as_array().unwrap();
+        assert_eq!(saf_matches.len(), 1, "{saf_matches:?}");
+        assert_eq!(saf_matches[0]["name"], "todo.txt");
+        assert_eq!(saf_matches[0]["snippet"], "saf secret token");
+
+        let saf_tab = saf_svc.create_local_tab(
+            search_root.to_string_lossy().into_owned(),
+            SAF_GRANTED_DIR.to_string(),
+        );
+        assert_eq!(saf_tab.status, 200);
+        let saf_tab_id = saf_tab.payload["tab"]["id"].as_u64().unwrap();
+        let saf_remote = saf_svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/remote/search".into(),
+                body: json!({
+                    "tab": saf_tab_id,
+                    "pattern": "*.txt",
+                    "search_contents": true,
+                    "content_query": "saf secret",
+                }),
+            })
+            .await;
+        assert_eq!(saf_remote.status, 200, "{}", saf_remote.payload);
+        assert_eq!(saf_remote.payload["matches"].as_array().unwrap().len(), 1);
+
+        // 3. WebDAV `/api/remote/rename` (`dav_move_if_match`) records `<mv>` in XML action log.
+        let session = Arc::new(MockSession::new());
+        session.add_file("/draft.txt", b"hello dav");
+        let dav_tab = insert_remote_tab(&svc, session.clone(), search_root.to_str().unwrap());
+        let renamed = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/remote/rename".into(),
+                body: json!({
+                    "tab": dav_tab,
+                    "old_name": "draft.txt",
+                    "new_name": "published.txt",
+                }),
+            })
+            .await;
+        assert_eq!(renamed.status, 200, "{}", renamed.payload);
+        assert!(session.bytes_of("/published.txt").is_some());
+        let xml_reply = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/logs/xml".into(),
+            body: json!({}),
+        });
+        let xml = xml_reply.payload["content"].as_str().unwrap_or("");
+        assert!(xml.contains("<mv>") && xml.contains("/published.txt"), "WebDAV rename must log <mv>: {xml}");
     }
 }

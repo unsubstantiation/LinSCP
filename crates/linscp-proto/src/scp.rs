@@ -550,13 +550,36 @@ impl RemoteSession for ScpSession {
     async fn copy_file(&self, from: &str, to: &str) -> Result<(), ProtoError> {
         let nf = prepare_remote_path(from)?;
         let nt = prepare_remote_path(to)?;
-        self.run_shell_checked(&format!(
-            "cp -p -- {} {}",
-            scp_shell_quote(&nf),
-            scp_shell_quote(&nt)
-        ))
-        .await?;
-        Ok(())
+        if nf == nt {
+            return Err(ProtoError::Transport(format!(
+                "Cannot copy '{from}' onto itself."
+            )));
+        }
+        let cmd = format!("cp -p -- {} {}", scp_shell_quote(&nf), scp_shell_quote(&nt));
+        let reply = self.exec_one_shot(&cmd).await?;
+        match reply.exit_code {
+            Some(0) => Ok(()),
+            Some(code) => {
+                let err_txt = String::from_utf8_lossy(&reply.stderr).trim().to_string();
+                let lower = err_txt.to_ascii_lowercase();
+                if code == 127
+                    || ((lower.contains("cp:") || lower.starts_with("cp "))
+                        && (lower.contains("command not found")
+                            || lower.contains("applet not found")
+                            || (lower.contains("not found") && !lower.contains("no such file"))))
+                {
+                    return Err(ProtoError::UnsupportedCapability("cp", ProtocolScheme::Scp));
+                }
+                Err(ProtoError::Transport(if err_txt.is_empty() {
+                    format!("Remote command '{cmd}' failed with exit status {code}.")
+                } else {
+                    err_txt
+                }))
+            }
+            None => Err(ProtoError::Transport(format!(
+                "SSH channel closed without exit status while running '{cmd}'."
+            ))),
+        }
     }
 
     async fn symlink(&self, target: &str, link_path: &str) -> Result<(), ProtoError> {

@@ -549,6 +549,7 @@ struct MockS3State {
     next_upload: u64,
     fail_part_2_once: AtomicBool,
     part_1_uploads: AtomicUsize,
+    last_create_bucket_xml: String,
 }
 
 impl MockS3State {
@@ -562,6 +563,7 @@ impl MockS3State {
             next_upload: 1,
             fail_part_2_once: AtomicBool::new(true),
             part_1_uploads: AtomicUsize::new(0),
+            last_create_bucket_xml: String::new(),
         }
     }
 }
@@ -651,8 +653,16 @@ async fn handle_mock_s3(
 
     // Bucket-level operations (`key.is_empty()`)
     if key.is_empty() {
+        if method == Method::HEAD {
+            if state.lock().await.buckets.contains_key(&bucket) {
+                return StatusCode::OK.into_response();
+            }
+            return StatusCode::NOT_FOUND.into_response();
+        }
         if method == Method::PUT {
-            state.lock().await.buckets.entry(bucket).or_default();
+            let mut guard = state.lock().await;
+            guard.last_create_bucket_xml = String::from_utf8_lossy(&body).into_owned();
+            guard.buckets.entry(bucket).or_default();
             return StatusCode::OK.into_response();
         }
         if method == Method::GET && qmap.contains_key("versions") {
@@ -1100,5 +1110,103 @@ async fn s3_sigv4_resumable_multipart_and_object_versioning_succeed() {
     s3.remove_version("/alpha-bucket/releases/changelog.txt", &versions[0].version_id)
         .await
         .unwrap();
+
+    // 4. Self-rename must be a safe no-op (never deleting the object!), self-copy and
+    //    bucket-root download must be rejected, virtual folder rename must move all
+    //    nested keys, and non-us-east-1 CreateBucket must send LocationConstraint.
+    s3.rename(
+        "/alpha-bucket/releases/bundle-final.bin",
+        "/alpha-bucket/releases/bundle-final.bin",
+    )
+    .await
+    .expect("self-rename must not fail or delete the object");
+    assert!(
+        s3.stat("/alpha-bucket/releases/bundle-final.bin")
+            .await
+            .unwrap()
+            .is_some(),
+        "object must survive self-rename"
+    );
+    assert!(
+        s3.copy_file(
+            "/alpha-bucket/releases/bundle-final.bin",
+            "/alpha-bucket/releases/bundle-final.bin"
+        )
+        .await
+        .is_err(),
+        "self-copy must be rejected"
+    );
+    assert!(
+        download_bytes(&s3, "/alpha-bucket", TransferRequest::default())
+            .await
+            .is_err(),
+        "bucket-root download must be rejected instead of returning ListBucketResult XML"
+    );
+
+    upload_bytes(
+        &s3,
+        "/alpha-bucket/releases/nested/notes.txt",
+        b"nested key",
+        TransferRequest::default(),
+    )
+    .await
+    .unwrap();
+    s3.rename("/alpha-bucket/releases", "/alpha-bucket/archive")
+        .await
+        .expect("virtual prefix directory rename must succeed");
+    assert!(
+        s3.stat("/alpha-bucket/releases/bundle-final.bin")
+            .await
+            .unwrap()
+            .is_none(),
+        "old prefix key removed after folder rename"
+    );
+    assert_eq!(
+        download_bytes(
+            &s3,
+            "/alpha-bucket/archive/nested/notes.txt",
+            TransferRequest::default()
+        )
+        .await
+        .unwrap(),
+        b"nested key"
+    );
+
+    let s3_eu = S3Session::connect(
+        S3ConnectConfig {
+            use_https: true,
+            host: "localhost".to_string(),
+            port,
+            region: Some("eu-west-1".to_string()),
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: Zeroizing::new(
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            ),
+            path_style: true,
+            tls: TlsSettings {
+                pinned_public_key: Some(pki.server_spki_pin.clone()),
+                ca_cert_pem: Some(pki.ca_cert_pem.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        None,
+        0,
+    )
+    .await
+    .unwrap();
+    s3_eu
+        .mkdir("/eu-regional-bucket")
+        .await
+        .expect("regional CreateBucket");
+    assert!(
+        state
+            .lock()
+            .await
+            .last_create_bucket_xml
+            .contains("<LocationConstraint>eu-west-1</LocationConstraint>"),
+        "non-us-east-1 CreateBucket must send LocationConstraint XML"
+    );
+    s3_eu.close().await.unwrap();
     s3.close().await.unwrap();
 }

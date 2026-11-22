@@ -333,21 +333,44 @@ fn percent_decode(input: &str) -> String {
 
 pub(crate) fn parse_http_date(text: &str) -> Option<i64> {
     let s = text.trim();
-    // Try RFC 3339 / ISO 8601 first (`2026-03-15T12:30:45Z`)
-    if let Some((date_p, time_p)) = s.split_once('T') {
+    // Try RFC 3339 / ISO 8601 first (`2026-03-15T12:30:45Z` or `+02:00` / `-0400`)
+    if let Some((date_p, time_p)) = s.split_once('T').or_else(|| s.split_once('t')) {
         let mut dp = date_p.split('-');
         let y: i32 = dp.next()?.parse().ok()?;
         let m: u32 = dp.next()?.parse().ok()?;
         let d: u32 = dp.next()?.parse().ok()?;
-        let clock = time_p
-            .trim_end_matches('Z')
-            .split(['+', '-', '.'])
-            .next()?;
+        let (clock_and_frac, tz_offset_secs) =
+            if let Some(stripped) = time_p.strip_suffix('Z').or_else(|| time_p.strip_suffix('z')) {
+                (stripped, 0i64)
+            } else if let Some(pos) = time_p.rfind(['+', '-']).filter(|&idx| idx > 0) {
+                let tz_str = &time_p[pos..];
+                let sign = if tz_str.starts_with('-') { -1i64 } else { 1i64 };
+                let digits = &tz_str[1..];
+                let (tz_h, tz_m): (u32, u32) = if let Some((h, mn)) = digits.split_once(':') {
+                    (h.parse().ok()?, mn.parse().ok()?)
+                } else if digits.len() == 4 {
+                    (digits[..2].parse().ok()?, digits[2..].parse().ok()?)
+                } else if digits.len() == 2 {
+                    (digits.parse().ok()?, 0)
+                } else {
+                    return None;
+                };
+                if tz_h >= 24 || tz_m >= 60 {
+                    return None;
+                }
+                (&time_p[..pos], sign * ((tz_h as i64) * 3600 + (tz_m as i64) * 60))
+            } else {
+                (time_p, 0i64)
+            };
+        let clock = clock_and_frac.split('.').next()?;
         let mut tp = clock.split(':');
         let hh: u32 = tp.next()?.parse().ok()?;
         let mm: u32 = tp.next()?.parse().ok()?;
         let ss: u32 = tp.next()?.parse().ok()?;
-        return utc_ymdhms_to_unix(y, m, d, hh, mm, ss);
+        if tp.next().is_some() {
+            return None;
+        }
+        return utc_ymdhms_to_unix(y, m, d, hh, mm, ss)?.checked_sub(tz_offset_secs);
     }
 
     // RFC 1123 (`Sun, 06 Nov 1994 08:49:37 GMT`)
@@ -1835,5 +1858,13 @@ mod tests {
         assert!(
             build_reqwest_proxy(&ipv6_proxy).expect("IPv6 SOCKS5h proxy URL must parse").is_some()
         );
+
+        // RFC 3339 timestamps with non-UTC offsets must convert to true UTC Unix seconds.
+        let utc = parse_http_date("2026-03-15T12:30:45Z").expect("UTC timestamp");
+        assert_eq!(parse_http_date("2026-03-15T14:30:45+02:00"), Some(utc));
+        assert_eq!(parse_http_date("2026-03-15T08:00:45-0430"), Some(utc));
+        assert_eq!(parse_http_date("2026-03-15t14:30:45.987654+02:00"), Some(utc));
+        assert_eq!(parse_http_date("2026-03-15T12:30:45+25:00"), None);
+        assert_eq!(parse_http_date("2026-03-15T12:30:45+02:60"), None);
     }
 }
