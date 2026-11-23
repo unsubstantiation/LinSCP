@@ -29,12 +29,60 @@ export interface Cell {
 /** The keyboard state a key press needs to become bytes. */
 export interface KeyEventLike {
   key: string;
+  code?: string;
   ctrlKey?: boolean;
   altKey?: boolean;
   shiftKey?: boolean;
   metaKey?: boolean;
   isComposing?: boolean;
+  getModifierState?: (keyArg: string) => boolean;
   preventDefault?: () => void;
+}
+
+const LEGACY_KEY_NAMES: Record<string, string> = {
+  Subtract: '-',
+  Add: '+',
+  Multiply: '*',
+  Divide: '/',
+  Decimal: '.',
+  Spacebar: ' ',
+  Esc: 'Escape',
+  Del: 'Delete',
+  Ins: 'Insert',
+  Up: 'ArrowUp',
+  Down: 'ArrowDown',
+  Left: 'ArrowLeft',
+  Right: 'ArrowRight',
+};
+
+/** Normalizes legacy WebView and numpad `KeyboardEvent.key` values to standard names. */
+export function normalizeKeyName(key: string): string {
+  if (typeof key !== 'string') {
+    return '';
+  }
+  return LEGACY_KEY_NAMES[key] ?? key;
+}
+
+/**
+ * True when a key press represents an international `AltGr` (`AltGraph` /
+ * `ISO_Level3_Shift`) printable character rather than a terminal `Ctrl+Alt` chord.
+ */
+export function isAltGraphKey(event: KeyEventLike): boolean {
+  if (typeof event.getModifierState === 'function' && event.getModifierState('AltGraph')) {
+    return true;
+  }
+  // Windows keyboard layouts and remote-desktop bridges often report AltGr as
+  // Ctrl+Alt without Shift for third-level symbols (`@`, `{`, `|`, `}`, `~`, `€`, ...).
+  if (event.ctrlKey === true && event.altKey === true && !event.metaKey && !event.shiftKey) {
+    const ch = normalizeKeyName(event.key);
+    if ([...ch].length === 1) {
+      const cp = ch.codePointAt(0) ?? 0;
+      if (cp > 0x7f || ch === '@' || ch === '{' || ch === '|' || ch === '}' || ch === '~') {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 /**
@@ -52,7 +100,7 @@ export function encodeKey(event: KeyEventLike, applicationCursor: boolean): stri
   if (event.isComposing) {
     return null;
   }
-  const { key } = event;
+  const key = normalizeKeyName(event.key);
   const ctrl = event.ctrlKey === true;
   const alt = event.altKey === true;
   const shift = event.shiftKey === true;
@@ -60,6 +108,12 @@ export function encodeKey(event: KeyEventLike, applicationCursor: boolean): stri
 
   if (meta && !ctrl && !alt) {
     return null;
+  }
+
+  // International AltGr third-level symbols (`@`, `|`, `\`, `[`, `]`, `{`, `}`, `~`, `€`, ...)
+  // arrive with AltGraph and/or Ctrl+Alt set on Windows/XWayland; pass the UTF-8 character directly.
+  if (isAltGraphKey(event) && [...key].length === 1) {
+    return key;
   }
 
   // Ctrl+letter and standard xterm Ctrl+symbol chords become ASCII control codes.
@@ -469,9 +523,36 @@ export class TerminalSession {
     return this.renderer.setTextSize(this.renderer.textSize + delta);
   }
 
+  /** Moves DOM focus onto the terminal input attachment or canvas surface. */
+  public focus(): void {
+    if (this.stopped) {
+      return;
+    }
+    if (this.keyboard) {
+      this.keyboard.focus();
+      return;
+    }
+    this.focusSurface();
+  }
+
+  private focusSurface(): void {
+    const canvas = this.canvas;
+    if (!canvas || typeof canvas.focus !== 'function') {
+      return;
+    }
+    try {
+      canvas.focus({ preventScroll: true });
+    } catch {
+      try { canvas.focus(); } catch { /* Ignore focus errors on detached surfaces. */ }
+    }
+  }
+
   /** Starts painting and polling. */
   public start(): void {
     this.watchViewport();
+    if (!this.keyboard) {
+      this.focusSurface();
+    }
     // The PTY was opened at a requested size, which need not match this
     // window's actual measured grid. Send it before the first keystroke.
     const cell = this.renderer.cellSize();
@@ -724,8 +805,11 @@ export class TerminalSession {
    * the text it produced.
    */
   public handleTypedKey(event: KeyEventLike): boolean {
-    // A single printable character (and no modifier) is the input event's job.
-    if ([...event.key].length === 1 && !event.ctrlKey && !event.altKey && !event.metaKey) {
+    const normalized = normalizeKeyName(event.key);
+    // A single printable character (including AltGr third-level symbols) is the
+    // input event's job so it is never sent twice.
+    if ([...normalized].length === 1 &&
+        ((!event.ctrlKey && !event.altKey && !event.metaKey) || isAltGraphKey(event))) {
       return false;
     }
     return this.handleKey(event);
@@ -736,18 +820,19 @@ export class TerminalSession {
     if (event.isComposing) {
       return false;
     }
-    const isCtrlPaste = event.ctrlKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 'v';
-    const isShiftInsertPaste = event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && event.key === 'Insert';
+    const normalized = normalizeKeyName(event.key);
+    const isCtrlPaste = event.ctrlKey && !event.altKey && !event.metaKey && !isAltGraphKey(event) && normalized.toLowerCase() === 'v';
+    const isShiftInsertPaste = event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && normalized === 'Insert';
     if (isCtrlPaste || isShiftInsertPaste) {
       event.preventDefault?.();
       void this.pasteClipboard(modes?.bracketed_paste);
       return true;
     }
     if (event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey &&
-        (event.key === 'PageUp' || event.key === 'PageDown')) {
+        (normalized === 'PageUp' || normalized === 'PageDown')) {
       event.preventDefault?.();
       const step = Math.max(1, this.grid.lines - 2);
-      void this.scroll(event.key === 'PageUp' ? step : -step);
+      void this.scroll(normalized === 'PageUp' ? step : -step);
       return true;
     }
     const active = modes ?? this.modes;
@@ -1249,18 +1334,16 @@ export class TerminalSession {
     if (this.stopped || event.button !== 0 || this.isEmulatedMouse()) {
       return;
     }
-    // Cancelling the press is what stops the WebView turning the drag into a
-    // native drag of the canvas picture or a selection of the page around it.
-    // Because preventDefault also suppresses the browser's automatic blur on
-    // any previously focused toolbar button, release external focus explicitly
-    // so Space, Enter and Tab go back to the terminal.
-    event.preventDefault?.();
     if (!this.keyboard) {
+      this.focusSurface();
       const active = this.eventDoc?.activeElement as HTMLElement | null | undefined;
-      if (active && active !== this.eventDoc?.body && !this.container.contains?.(active)) {
+      if (active && active !== this.canvas && active !== this.eventDoc?.body && !this.container.contains?.(active)) {
         try { active.blur?.(); } catch { /* Ignore focus errors. */ }
       }
     }
+    // Cancelling the press is what stops the WebView turning the drag into a
+    // native drag of the canvas picture or a selection of the page around it.
+    event.preventDefault?.();
     const cell = this.cellAt(event);
     if (event.detail >= 3) {
       const line = this.lineRange(cell);

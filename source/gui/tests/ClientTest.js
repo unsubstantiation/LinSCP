@@ -555,10 +555,14 @@ function options(id) {
     check('desktop terminal remembers adjusted font size in localStorage',
       terminalWindow.localStorage.getItem('lscp-terminal-font-size') === '13',
       terminalWindow.localStorage.getItem('lscp-terminal-font-size'));
+    const terminalCanvas = terminalWindow.document.querySelector('#terminalWindowScreen canvas.terminal-canvas');
+    check('desktop terminal canvas has tabIndex -1 and retains focus after toolbar clicks',
+      !!terminalCanvas && terminalCanvas.tabIndex === -1 &&
+      terminalWindow.document.activeElement === terminalCanvas);
     const terminalHelpModal = terminalWindow.document.getElementById('terminalHelpModal');
     help.click();
     const terminalHelpText = terminalHelpModal ? terminalHelpModal.textContent : '';
-    check('terminal help opens rich help modal documenting keyboard input, mouse selection, paste, and scrollback',
+    check('terminal help opens rich help modal documenting keyboard input, AltGr/Numpad, focus, mouse selection, paste, and scrollback',
       !!terminalHelpModal &&
       terminalHelpModal.classList.contains('open') &&
       terminalHelpText.includes('mouse') &&
@@ -566,14 +570,18 @@ function options(id) {
       terminalHelpText.includes('Ctrl+V') &&
       terminalHelpText.includes('Copy All Text') &&
       terminalHelpText.includes('F1–F12') &&
-      terminalHelpText.includes('- and +'));
+      terminalHelpText.includes('- and +') &&
+      terminalHelpText.includes('AltGr') &&
+      terminalHelpText.includes('Numpad'));
     const inputsBeforeHelpEsc = terminalCalls.filter(call => call && call.path === '/api/terminal/input' && call.body && call.body.data).length;
     terminalWindow.document.dispatchEvent(
       new terminalWindow.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
     await new Promise(resolve => setTimeout(resolve, 20));
     const inputsAfterHelpEsc = terminalCalls.filter(call => call && call.path === '/api/terminal/input' && call.body && call.body.data).length;
-    check('Escape closes terminal help modal without sending ESC to the underlying shell',
-      !terminalHelpModal.classList.contains('open') && inputsAfterHelpEsc === inputsBeforeHelpEsc);
+    check('Escape closes terminal help modal without sending ESC and returns focus to terminal canvas',
+      !terminalHelpModal.classList.contains('open') &&
+      inputsAfterHelpEsc === inputsBeforeHelpEsc &&
+      terminalWindow.document.activeElement === terminalCanvas);
     copyAll.click();
     await new Promise(resolve => setTimeout(resolve, 30));
     check('desktop copy all reads model text including history', terminalWindow.copiedTerminalText === 'history\ncurrent');
@@ -583,6 +591,11 @@ function options(id) {
       new terminalWindow.KeyboardEvent('keydown', Object.assign({ key, bubbles: true, cancelable: true }, extra)));
     pressPlain('-');
     pressPlain('+');
+    pressPlain('Subtract');
+    pressPlain('Add');
+    pressPlain('@', { ctrlKey: true, altKey: true });
+    pressPlain('|', { ctrlKey: true, altKey: true });
+    pressPlain('€', { ctrlKey: true, altKey: true });
     pressPlain(' ');
     pressPlain('Enter');
     pressPlain('Backspace');
@@ -597,10 +610,13 @@ function options(id) {
     const typedPayloads = terminalCalls
       .filter(call => call && call.path === '/api/terminal/input' && call.body && call.body.data)
       .map(call => Buffer.from(call.body.data, 'base64').toString('utf8'));
-    check('typing -, +, Space, Enter, Backspace, F1, F10, and Ctrl+N/L/R/A/H in desktop terminal sends bytes to PTY without triggering Commander popups',
+    check('typing -, +, Numpad Subtract/Add, AltGr symbols, Space, Enter, Backspace, F1, F10, and Ctrl+N/L/R/A/H in desktop terminal sends bytes to PTY without triggering Commander popups',
       unexpectedPrompts.length === 0 &&
-      typedPayloads.includes('-') &&
-      typedPayloads.includes('+') &&
+      typedPayloads.filter(x => x === '-').length >= 2 &&
+      typedPayloads.filter(x => x === '+').length >= 2 &&
+      typedPayloads.includes('@') &&
+      typedPayloads.includes('|') &&
+      typedPayloads.includes('€') &&
       typedPayloads.includes(' ') &&
       typedPayloads.includes('\r') &&
       typedPayloads.includes('\x7f') &&
@@ -6862,6 +6878,45 @@ function options(id) {
       !!doc.querySelector('#fullBackupModal .dialog-grid-2') &&
       !!doc.querySelector('#davToolsModal .dialog-grid-2'));
     window.switchPrefTab('transfers');
+
+    // CLI Console focus & shortcut isolation + Help menu Terminal Help entry.
+    {
+      const savedPromptCli = window.prompt;
+      const cliMaskPrompts = [];
+      window.prompt = question => { cliMaskPrompts.push(question); return null; };
+      doc.getElementById('tabCliBtn').focus();
+      window.dockTabClick('cli');
+      check('clicking CLI Console tab focuses #cliInput immediately',
+        doc.activeElement === doc.getElementById('cliInput'));
+      doc.activeElement.dispatchEvent(new window.KeyboardEvent('keydown', { key: '-', bubbles: true, cancelable: true }));
+      doc.activeElement.dispatchEvent(new window.KeyboardEvent('keydown', { key: '+', bubbles: true, cancelable: true }));
+      doc.getElementById('cliOutput').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+      check('clicking #cliOutput with no selection keeps #cliInput focused',
+        doc.activeElement === doc.getElementById('cliInput'));
+      doc.getElementById('tabCli').dispatchEvent(new window.KeyboardEvent('keydown', { key: '-', bubbles: true, cancelable: true }));
+      doc.getElementById('tabCli').dispatchEvent(new window.KeyboardEvent('keydown', { key: '+', bubbles: true, cancelable: true }));
+      window.clearCliConsole();
+      check('clearCliConsole returns focus to #cliInput and typing - or + in CLI Console never opens Commander mask popup',
+        doc.activeElement === doc.getElementById('cliInput') && cliMaskPrompts.length === 0,
+        JSON.stringify(cliMaskPrompts));
+      window.switchTab('queue');
+      await new Promise(resolve => setTimeout(resolve, 25));
+      check('switching away from CLI Console blurs #cliInput so file-pane shortcuts work normally',
+        doc.activeElement !== doc.getElementById('cliInput'));
+
+      check('Help menu and LinSCP Help modal both expose Terminal Help',
+        !!doc.querySelector('#helpMenu button[onclick*="showTerminalCopyHelp"]') &&
+        !!doc.querySelector('#helpModal button[onclick*="showTerminalCopyHelp"]'));
+      window.showTerminalCopyHelp();
+      doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: '-', bubbles: true, cancelable: true }));
+      doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: '+', bubbles: true, cancelable: true }));
+      check('Commander - and + mask shortcuts do not fire while #terminalHelpModal is open',
+        doc.getElementById('terminalHelpModal').classList.contains('open') && cliMaskPrompts.length === 0);
+      doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+      check('Escape closes #terminalHelpModal opened from Commander Help',
+        !doc.getElementById('terminalHelpModal').classList.contains('open'));
+      window.prompt = savedPromptCli;
+    }
   }
 
   check('no script errors', errors.length === 0, errors.join(' | '));

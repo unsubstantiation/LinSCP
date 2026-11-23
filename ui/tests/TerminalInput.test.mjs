@@ -42,6 +42,7 @@ test('the terminal gets an input element it can focus', () => {
   const { dom, host, cleanup } = installDom();
   const { input, element } = makeInput(host);
   assert.ok(element, 'a textarea exists for the input method to compose in');
+  assert.equal(element.className, 'terminal-input', 'marked as terminal-input so document listeners never double-send or blur it');
   assert.equal(element.getAttribute('spellcheck'), 'false');
   // Squiggly autocorrect on a shell command is the last thing anyone wants.
   assert.equal(element.getAttribute('autocorrect'), 'off');

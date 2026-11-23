@@ -236,6 +236,11 @@ export class TerminalWindow {
     return this.session?.input ?? null;
   }
 
+  /** Moves DOM focus onto the active terminal input or canvas surface. */
+  public focus(): void {
+    this.session?.focus();
+  }
+
   /** Handles a paste, wrapped when the program asked for bracketed paste. */
   public paste(text: string): void {
     this.session?.paste(text);
