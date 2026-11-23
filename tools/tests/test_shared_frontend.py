@@ -96,8 +96,35 @@ class SharedFrontendTests(unittest.TestCase):
             "bookmarkScopeSelect",
             "prefResumeSupport",
             "prefResumeSize",
+            "paneCtxDuplicateBtn",
+            "siteRenameBtn",
+            "workspaceCloseExisting",
+            "syncPermissions",
+            "syncPermissionsOctal",
         ):
             self.assertIn(f'id="{elem_id}"', index_html)
+        for fn_name in (
+            "promptDuplicate",
+            "renameSite",
+            "renameSiteFolder",
+            "renameWorkspace",
+            "appendMtimeEditor",
+            "applyPropertiesMtime",
+        ):
+            self.assertIn(f"function {fn_name}(", index_html)
+
+        for route in (
+            '"/api/local/touch"',
+            '"/api/remote/touch"',
+            '"/api/local/copy"',
+            '"/api/sessions/rename"',
+            '"/api/workspaces/rename"',
+        ):
+            self.assertIn(route, lib_rs)
+
+        ops_rs = (root / "crates/linscp-service/src/ops.rs").read_text(encoding="utf-8")
+        for cleanup_id in ('"presets"', '"sync_state"', '"monitor"', '"auto_reconnect"'):
+            self.assertIn(cleanup_id, ops_rs)
 
 
 if __name__ == '__main__':
