@@ -711,6 +711,135 @@ mod pageant {
     }
 }
 
+mod win32_clipboard {
+    use std::ffi::c_void;
+
+    use crate::PlatformError;
+
+    const CF_UNICODETEXT: u32 = 13;
+    const GMEM_MOVEABLE: u32 = 0x0002;
+    const MAX_CLIPBOARD_UTF16_UNITS: usize = 16 * 1024 * 1024;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn OpenClipboard(h_wnd_new_owner: isize) -> i32;
+        fn CloseClipboard() -> i32;
+        fn EmptyClipboard() -> i32;
+        fn GetClipboardData(u_format: u32) -> *mut c_void;
+        fn SetClipboardData(u_format: u32, h_mem: *mut c_void) -> *mut c_void;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalAlloc(u_flags: u32, dw_bytes: usize) -> *mut c_void;
+        fn GlobalFree(h_mem: *mut c_void) -> *mut c_void;
+        fn GlobalLock(h_mem: *mut c_void) -> *mut c_void;
+        fn GlobalUnlock(h_mem: *mut c_void) -> i32;
+        fn GlobalSize(h_mem: *mut c_void) -> usize;
+    }
+
+    fn open_with_retry() -> Result<(), PlatformError> {
+        for attempt in 0..5 {
+            // SAFETY: `OpenClipboard(0)` opens the task clipboard and takes no pointers.
+            if unsafe { OpenClipboard(0) } != 0 {
+                return Ok(());
+            }
+            if attempt < 4 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        Err(PlatformError::Io(std::io::Error::last_os_error()))
+    }
+
+    pub(super) fn read_text() -> Result<String, PlatformError> {
+        open_with_retry()?;
+        // SAFETY: Clipboard is open for this thread and closed before returning.
+        let result = unsafe {
+            let handle = GetClipboardData(CF_UNICODETEXT);
+            if handle.is_null() {
+                Ok(String::new())
+            } else {
+                let bytes = GlobalSize(handle);
+                if bytes < 2 {
+                    Ok(String::new())
+                } else {
+                    let ptr = GlobalLock(handle);
+                    if ptr.is_null() {
+                        Ok(String::new())
+                    } else {
+                        let units = (bytes / 2).min(MAX_CLIPBOARD_UTF16_UNITS);
+                        let slice = std::slice::from_raw_parts(ptr as *const u16, units);
+                        let end = slice.iter().position(|&ch| ch == 0).unwrap_or(slice.len());
+                        let text = String::from_utf16_lossy(&slice[..end]);
+                        let _ = GlobalUnlock(handle);
+                        Ok(text)
+                    }
+                }
+            }
+        };
+        // SAFETY: Matches the successful `OpenClipboard(0)` in `open_with_retry`.
+        unsafe {
+            let _ = CloseClipboard();
+        }
+        result
+    }
+
+    pub(super) fn write_text(text: &str) -> Result<(), PlatformError> {
+        let wide = super::str_to_wide_null(text);
+        let byte_len = wide
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(|| {
+                PlatformError::Unsupported("Clipboard text is too large.".to_string())
+            })?;
+        open_with_retry()?;
+        // SAFETY: Clipboard is open; `GlobalAlloc` allocates `byte_len` moveable
+        // bytes, unlocked before `SetClipboardData`, and freed only on failure.
+        let result = unsafe {
+            if EmptyClipboard() == 0 {
+                Err(PlatformError::Io(std::io::Error::last_os_error()))
+            } else {
+                let hmem = GlobalAlloc(GMEM_MOVEABLE, byte_len);
+                if hmem.is_null() {
+                    Err(PlatformError::Io(std::io::Error::last_os_error()))
+                } else {
+                    let dst = GlobalLock(hmem);
+                    if dst.is_null() {
+                        let _ = GlobalFree(hmem);
+                        Err(PlatformError::Io(std::io::Error::last_os_error()))
+                    } else {
+                        std::ptr::copy_nonoverlapping(wide.as_ptr(), dst as *mut u16, wide.len());
+                        let _ = GlobalUnlock(hmem);
+                        if SetClipboardData(CF_UNICODETEXT, hmem).is_null() {
+                            let err = std::io::Error::last_os_error();
+                            let _ = GlobalFree(hmem);
+                            Err(PlatformError::Io(err))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+            }
+        };
+        // SAFETY: Matches `open_with_retry`.
+        unsafe {
+            let _ = CloseClipboard();
+        }
+        result
+    }
+}
+
+/// Reads UTF-8 text from the Windows clipboard (`CF_UNICODETEXT`), even when the
+/// target WebView window has not yet acquired focus on right-click.
+pub fn read_clipboard_text() -> Result<String, PlatformError> {
+    win32_clipboard::read_text()
+}
+
+/// Writes UTF-8 text to the Windows clipboard (`CF_UNICODETEXT`).
+pub fn write_clipboard_text(text: &str) -> Result<(), PlatformError> {
+    win32_clipboard::write_text(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

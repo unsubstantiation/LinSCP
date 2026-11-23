@@ -1494,4 +1494,213 @@ test('transient IPC glitches on resume do not kill the terminal while HTTP 400 s
   dom.cleanup();
 });
 
+test('selecting text with the mouse and then right-clicking pastes and clears the highlight', async () => {
+  const dom = installDom();
+  let clipboardBuffer = '';
+  Object.defineProperty(dom.dom.window.navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      writeText: async (text) => { clipboardBuffer = text; },
+      readText: async () => clipboardBuffer,
+    },
+  });
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: textFrame('echo hello') }),
+    '/api/terminal/selection': { success: true, text: 'hello' },
+  });
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-select-then-paste',
+    container: fakeContainer(90, 36),
+    pollInterval: 5,
+  });
+  session.start();
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const win = dom.dom.window;
+    const doc = win.document;
+
+    // Double-click `hello` to select and auto-copy it; `session.selection` stays open.
+    session.element.dispatchEvent(new win.MouseEvent('mousedown', { button: 0, detail: 2, clientX: 67, clientY: 4, cancelable: true }));
+    doc.dispatchEvent(new win.MouseEvent('mouseup', { button: 0, detail: 2, clientX: 67, clientY: 4 }));
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    assert.equal(clipboardBuffer, 'hello');
+    assert.ok(session.selection, 'selection stays highlighted after auto-copy');
+
+    // Right-click while selection is still highlighted MUST paste and clear the finished highlight.
+    const rightClick = new win.MouseEvent('contextmenu', { button: 2, cancelable: true });
+    session.element.dispatchEvent(rightClick);
+    assert.equal(rightClick.defaultPrevented, true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const pasted = transport.calls
+      .filter((call) => call.path === '/api/terminal/input' && call.body.data)
+      .map((call) => Buffer.from(call.body.data, 'base64').toString());
+    assert.deepEqual(pasted, ['hello'], 'right-click pastes even when a selection was active');
+    assert.equal(session.selection, null, 'pasting clears the completed selection highlight');
+
+    // Shift+Insert also pastes clipboard text.
+    const shiftInsert = new win.KeyboardEvent('keydown', { key: 'Insert', shiftKey: true, cancelable: true });
+    assert.equal(session.handleKey(shiftInsert, { app_cursor: false, bracketed_paste: true }), true);
+    assert.equal(shiftInsert.defaultPrevented, true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const afterShiftInsert = transport.calls
+      .filter((call) => call.path === '/api/terminal/input' && call.body.data)
+      .map((call) => Buffer.from(call.body.data, 'base64').toString());
+    assert.equal(afterShiftInsert.at(-1), '\x1b[200~hello\x1b[201~');
+  } finally {
+    await session.close();
+    dom.cleanup();
+  }
+});
+
+test('right-click paste and mouse copy use native Tauri clipboard when WebView clipboard is denied', async () => {
+  const dom = installDom();
+  let nativeClip = 'from-wayland-clipboard';
+  let errors = 0;
+  dom.dom.window.__TAURI_INTERNALS__ = {
+    invoke: async (cmd, args) => {
+      if (cmd === 'linscp_read_clipboard') {
+        return { success: true, text: nativeClip };
+      }
+      if (cmd === 'linscp_write_clipboard') {
+        nativeClip = args.text;
+        return { success: true };
+      }
+      return { status: 200, payload: { success: true } };
+    },
+  };
+  Object.defineProperty(dom.dom.window.navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      readText: async () => { throw new Error('NotAllowedError: WebKitGTK clipboard denied'); },
+      writeText: async () => { throw new Error('NotAllowedError: user gesture expired'); },
+    },
+  });
+  dom.dom.window.document.execCommand = () => false;
+
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(10, 2) }),
+    '/api/terminal/selection': { success: true, text: 'copied-via-native' },
+  });
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-native-clip',
+    container: fakeContainer(90, 36),
+    pollInterval: 5,
+    onClipboardError: () => { errors += 1; },
+  });
+  session.start();
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    const win = dom.dom.window;
+    const doc = win.document;
+
+    // 1. Right-click pastes from native OS clipboard even though navigator.clipboard.readText throws.
+    session.element.dispatchEvent(new win.MouseEvent('contextmenu', { button: 2, cancelable: true }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const firstPaste = transport.calls
+      .filter((call) => call.path === '/api/terminal/input' && call.body.data)
+      .map((call) => Buffer.from(call.body.data, 'base64').toString());
+    assert.deepEqual(firstPaste, ['from-wayland-clipboard']);
+    assert.equal(errors, 0);
+
+    // 2. Mouse drag copies via native OS clipboard even though navigator.clipboard.writeText throws,
+    //    and subsequent right-click pastes the newly copied selection.
+    session.element.dispatchEvent(new win.MouseEvent('mousedown', { button: 0, detail: 1, clientX: 0, clientY: 0, cancelable: true }));
+    doc.dispatchEvent(new win.MouseEvent('mousemove', { button: 0, clientX: 27, clientY: 0, cancelable: true }));
+    doc.dispatchEvent(new win.MouseEvent('mouseup', { button: 0, clientX: 27, clientY: 0 }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(nativeClip, 'copied-via-native');
+    assert.equal(errors, 0);
+
+    session.element.dispatchEvent(new win.MouseEvent('contextmenu', { button: 2, cancelable: true }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const allPastes = transport.calls
+      .filter((call) => call.path === '/api/terminal/input' && call.body.data)
+      .map((call) => Buffer.from(call.body.data, 'base64').toString());
+    assert.deepEqual(allPastes, ['from-wayland-clipboard', 'copied-via-native']);
+    assert.equal(errors, 0);
+  } finally {
+    await session.close();
+    dom.cleanup();
+  }
+});
+
+test('encodeKey covers printable symbols, xterm modifier sequences, control chords, and IME/Meta guards', () => {
+  // Printable symbols including '-' and '+' (which Commander uses for mask selection) go straight through.
+  assert.equal(encodeKey({ key: '-' }, false), '-');
+  assert.equal(encodeKey({ key: '+' }, false), '+');
+  assert.equal(encodeKey({ key: '/' }, false), '/');
+  assert.equal(encodeKey({ key: '~' }, false), '~');
+  assert.equal(encodeKey({ key: '-', altKey: true }, false), '\x1b-');
+
+  // Standard xterm Ctrl chords for readline/bash undo, delete, and NUL.
+  assert.equal(encodeKey({ key: '/', ctrlKey: true }, false), '\x1f');
+  assert.equal(encodeKey({ key: '-', ctrlKey: true }, false), '\x1f');
+  assert.equal(encodeKey({ key: '_', ctrlKey: true, shiftKey: true }, false), '\x1f');
+  assert.equal(encodeKey({ key: '?', ctrlKey: true, shiftKey: true }, false), '\x7f');
+  assert.equal(encodeKey({ key: 'Backspace', ctrlKey: true }, false), '\x08');
+  assert.equal(encodeKey({ key: 'Backspace', altKey: true }, false), '\x1b\x7f');
+
+  // Unmapped Ctrl+symbol or OS Meta shortcuts must not leak literal printable characters into the PTY.
+  assert.equal(encodeKey({ key: '=', ctrlKey: true }, false), null);
+  assert.equal(encodeKey({ key: '9', ctrlKey: true }, false), null);
+  assert.equal(encodeKey({ key: 'k', metaKey: true }, false), null);
+  assert.equal(encodeKey({ key: 'a', isComposing: true }, false), null);
+
+  // Word navigation and modified function/editing keys use xterm CSI modifier parameters.
+  assert.equal(encodeKey({ key: 'ArrowLeft', ctrlKey: true }, false), '\x1b[1;5D');
+  assert.equal(encodeKey({ key: 'ArrowRight', ctrlKey: true }, true), '\x1b[1;5C');
+  assert.equal(encodeKey({ key: 'ArrowLeft', altKey: true }, false), '\x1b[1;3D');
+  assert.equal(encodeKey({ key: 'Delete', ctrlKey: true }, false), '\x1b[3;5~');
+  assert.equal(encodeKey({ key: 'Home', shiftKey: true }, true), '\x1b[1;2H');
+  assert.equal(encodeKey({ key: 'F2', shiftKey: true }, false), '\x1b[1;2Q');
+  assert.equal(encodeKey({ key: 'F10' }, false), '\x1b[21~');
+});
+
+test('Shift+PageUp/PageDown scrolls terminal history and canvas mousedown blurs external toolbar focus', async () => {
+  const dom = installDom();
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(80, 24) }),
+  });
+  const container = fakeContainer(720, 432);
+  const toolbarButton = dom.dom.window.document.createElement('button');
+  dom.dom.window.document.body.appendChild(toolbarButton);
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-keys-focus',
+    container,
+    pollInterval: 1000,
+  });
+  session.start();
+  try {
+    const win = dom.dom.window;
+    const pgUp = new win.KeyboardEvent('keydown', { key: 'PageUp', shiftKey: true, cancelable: true });
+    const pgDn = new win.KeyboardEvent('keydown', { key: 'PageDown', shiftKey: true, cancelable: true });
+    assert.equal(session.handleKey(pgUp), true);
+    assert.equal(session.handleKey(pgDn), true);
+    assert.equal(pgUp.defaultPrevented, true);
+    assert.equal(pgDn.defaultPrevented, true);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    const scrolls = transport.calls.filter((call) => call.path === '/api/terminal/scroll').map((call) => call.body.lines);
+    assert.equal(scrolls.length, 2);
+    assert.ok(scrolls[0] > 0 && scrolls[1] < 0);
+    assert.equal(
+      transport.calls.filter((call) => call.path === '/api/terminal/input' && call.body.data).length,
+      0,
+      'Shift+PageUp/PageDown scrolls history without sending bytes to the shell',
+    );
+
+    toolbarButton.focus();
+    assert.equal(win.document.activeElement, toolbarButton);
+    session.element.dispatchEvent(new win.MouseEvent('mousedown', { button: 0, detail: 1, clientX: 5, clientY: 5, cancelable: true }));
+    assert.notEqual(win.document.activeElement, toolbarButton, 'clicking terminal canvas releases focus from external toolbar buttons');
+  } finally {
+    await session.close();
+    dom.cleanup();
+  }
+});
+
+
 

@@ -241,6 +241,11 @@ export class TerminalWindow {
     this.session?.paste(text);
   }
 
+  /** Reads the clipboard and pastes it into the terminal. */
+  public async pasteClipboard(): Promise<boolean> {
+    return (await this.session?.pasteClipboard()) ?? false;
+  }
+
   /** Closes the shell and stops painting. */
   public async close(): Promise<void> {
     this.disposed = true;

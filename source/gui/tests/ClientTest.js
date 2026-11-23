@@ -555,12 +555,63 @@ function options(id) {
     check('desktop terminal remembers adjusted font size in localStorage',
       terminalWindow.localStorage.getItem('lscp-terminal-font-size') === '13',
       terminalWindow.localStorage.getItem('lscp-terminal-font-size'));
-    let terminalHelp = ''; terminalWindow.alert = text => { terminalHelp = text; };
+    const terminalHelpModal = terminalWindow.document.getElementById('terminalHelpModal');
     help.click();
-    check('terminal help explains mouse selection and paste', terminalHelp.includes('mouse') && terminalHelp.includes('Right-click') && terminalHelp.includes('Ctrl+V'));
+    const terminalHelpText = terminalHelpModal ? terminalHelpModal.textContent : '';
+    check('terminal help opens rich help modal documenting keyboard input, mouse selection, paste, and scrollback',
+      !!terminalHelpModal &&
+      terminalHelpModal.classList.contains('open') &&
+      terminalHelpText.includes('mouse') &&
+      terminalHelpText.includes('Right-click') &&
+      terminalHelpText.includes('Ctrl+V') &&
+      terminalHelpText.includes('Copy All Text') &&
+      terminalHelpText.includes('F1–F12') &&
+      terminalHelpText.includes('- and +'));
+    const inputsBeforeHelpEsc = terminalCalls.filter(call => call && call.path === '/api/terminal/input' && call.body && call.body.data).length;
+    terminalWindow.document.dispatchEvent(
+      new terminalWindow.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const inputsAfterHelpEsc = terminalCalls.filter(call => call && call.path === '/api/terminal/input' && call.body && call.body.data).length;
+    check('Escape closes terminal help modal without sending ESC to the underlying shell',
+      !terminalHelpModal.classList.contains('open') && inputsAfterHelpEsc === inputsBeforeHelpEsc);
     copyAll.click();
     await new Promise(resolve => setTimeout(resolve, 30));
     check('desktop copy all reads model text including history', terminalWindow.copiedTerminalText === 'history\ncurrent');
+    let unexpectedPrompts = [];
+    terminalWindow.prompt = question => { unexpectedPrompts.push(question); return null; };
+    const pressPlain = (key, extra = {}) => terminalWindow.document.dispatchEvent(
+      new terminalWindow.KeyboardEvent('keydown', Object.assign({ key, bubbles: true, cancelable: true }, extra)));
+    pressPlain('-');
+    pressPlain('+');
+    pressPlain(' ');
+    pressPlain('Enter');
+    pressPlain('Backspace');
+    pressPlain('F1');
+    pressPlain('F10');
+    pressPlain('n', { ctrlKey: true });
+    pressPlain('l', { ctrlKey: true });
+    pressPlain('r', { ctrlKey: true });
+    pressPlain('a', { ctrlKey: true });
+    pressPlain('h', { ctrlKey: true });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    const typedPayloads = terminalCalls
+      .filter(call => call && call.path === '/api/terminal/input' && call.body && call.body.data)
+      .map(call => Buffer.from(call.body.data, 'base64').toString('utf8'));
+    check('typing -, +, Space, Enter, Backspace, F1, F10, and Ctrl+N/L/R/A/H in desktop terminal sends bytes to PTY without triggering Commander popups',
+      unexpectedPrompts.length === 0 &&
+      typedPayloads.includes('-') &&
+      typedPayloads.includes('+') &&
+      typedPayloads.includes(' ') &&
+      typedPayloads.includes('\r') &&
+      typedPayloads.includes('\x7f') &&
+      typedPayloads.includes('\x1b[11~') &&
+      typedPayloads.includes('\x1b[21~') &&
+      typedPayloads.includes('\x0e') &&
+      typedPayloads.includes('\x0c') &&
+      typedPayloads.includes('\x12') &&
+      typedPayloads.includes('\x01') &&
+      typedPayloads.includes('\x08'),
+      'prompts=' + JSON.stringify(unexpectedPrompts) + ' typed=' + JSON.stringify(typedPayloads));
     const press = (key, shift) => terminalWindow.document.dispatchEvent(
       new terminalWindow.KeyboardEvent('keydown', { key, ctrlKey: true, shiftKey: !!shift, cancelable: true }));
     press('c', true);
@@ -578,6 +629,19 @@ function options(id) {
     check('a plain Ctrl+C still reaches the shell as its interrupt',
       inputs.some(call => call.body.data === Buffer.from('\x03').toString('base64')),
       JSON.stringify(inputs.map(call => call.body.data)));
+    const termCanvas = child.querySelector('canvas.terminal-canvas');
+    termCanvas.dispatchEvent(new terminalWindow.MouseEvent('mousedown', { button: 0, detail: 1, clientX: 0, clientY: 0, cancelable: true }));
+    terminalWindow.document.dispatchEvent(new terminalWindow.MouseEvent('mousemove', { button: 0, clientX: 27, clientY: 0, cancelable: true }));
+    terminalWindow.document.dispatchEvent(new terminalWindow.MouseEvent('mouseup', { button: 0, clientX: 27, clientY: 0 }));
+    await new Promise(resolve => setTimeout(resolve, 25));
+    const rightPasteEvt = new terminalWindow.MouseEvent('contextmenu', { button: 2, cancelable: true });
+    termCanvas.dispatchEvent(rightPasteEvt);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    const afterRightClickInputs = terminalCalls.filter(call => call && call.path === '/api/terminal/input' && call.body && call.body.data);
+    check('right-clicking terminal canvas pastes even immediately after selecting text',
+      rightPasteEvt.defaultPrevented &&
+      afterRightClickInputs.filter(call => Buffer.from(call.body.data, 'base64').toString() === 'pasted text').length === 3,
+      JSON.stringify(afterRightClickInputs.map(call => call.body.data)));
     terminalPage.window.close();
   }
   check('boot queried the status', paths.includes('/api/status'));
@@ -2304,9 +2368,23 @@ function options(id) {
   const gated = await window.requireLocalVaultUnlock();
   check('configuration startup errors remain visible and block vault setup',
     gated === false && doc.getElementById('vaultGate').style.display === 'flex' &&
-      doc.getElementById('vaultUnlockButton').disabled && text('vaultGateError').includes('another instance'));
+      doc.getElementById('vaultUnlockButton').disabled && text('vaultGateError').includes('another instance') &&
+      doc.getElementById('vaultPasswordFields').style.display === 'none' &&
+      doc.getElementById('vaultRetryButton').style.display === '');
+  responses['/api/vault/retry-lock'] = { success: false, error: 'Still locked.' };
+  const retryFailed = await window.retryVaultConfigurationLock();
+  check('retrying configuration lock while still held surfaces the error and keeps Retry active',
+    retryFailed === false && text('vaultGateError').includes('Still locked.') &&
+      !doc.getElementById('vaultRetryButton').disabled);
+  responses['/api/vault/retry-lock'] = { success: true };
   responses['/api/vault/status'] = previousVaultStatus;
-  doc.getElementById('vaultGate').style.display = 'none';
+  const retrySucceeded = await window.retryVaultConfigurationLock();
+  check('retrying configuration lock after release recovers and closes vaultGate',
+    retrySucceeded === true &&
+      calls.some(call => call.path === '/api/vault/retry-lock') &&
+      doc.getElementById('vaultGate').style.display === 'none' &&
+      doc.getElementById('vaultPasswordFields').style.display === '');
+  delete responses['/api/vault/retry-lock'];
   doc.getElementById('vaultUnlockButton').disabled = false;
   doc.getElementById('vaultGateError').textContent = '';
 
@@ -5015,6 +5093,30 @@ function options(id) {
     await wait(30);
     check('Ctrl+C inside embedded terminal copies active canvas selection instead of sending SIGINT',
       copiedEmbeddedText === 'selected canvas output');
+    const prevPromptEmbedded = window.prompt;
+    const embeddedPrompts = [];
+    window.prompt = question => { embeddedPrompts.push(question); return null; };
+    const disconnectsBeforeEmbeddedF10 = calls.filter(c => c.path === '/api/session/disconnect').length;
+    if (doc.activeElement && doc.activeElement !== doc.body && typeof doc.activeElement.blur === 'function') {
+      doc.activeElement.blur();
+    }
+    doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: '-', bubbles: true, cancelable: true }));
+    doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: '+', bubbles: true, cancelable: true }));
+    doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'F10', bubbles: true, cancelable: true }));
+    await wait(30);
+    window.prompt = prevPromptEmbedded;
+    check('Commander shortcuts (-, +, F10) never fire behind an open terminal modal even when body holds focus',
+      embeddedPrompts.length === 0 &&
+      calls.filter(c => c.path === '/api/session/disconnect').length === disconnectsBeforeEmbeddedF10);
+    window.showTerminalCopyHelp();
+    check('showTerminalCopyHelp opens #terminalHelpModal above #terminalModal',
+      doc.getElementById('terminalHelpModal').classList.contains('open') &&
+      doc.getElementById('terminalModal').classList.contains('open'));
+    doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    await wait(20);
+    check('Escape closes #terminalHelpModal while keeping #terminalModal open',
+      !doc.getElementById('terminalHelpModal').classList.contains('open') &&
+      doc.getElementById('terminalModal').classList.contains('open'));
     window.closeTerminal();
     await wait(40);
     window.LinSCPCore = prevTermCore;
@@ -6684,6 +6786,82 @@ function options(id) {
     doc.getElementById('siteProtocol').value = 'sftp';
     window.siteProtocolChanged();
     window.switchSiteFormTab('general');
+
+    // 38. Disconnected Remote Quick-Connect Hub, empty-filter clear action,
+    // toolbar hidden-files toggle, dock click-to-collapse, and 3-tab Preferences.
+    const prevTabs38 = wfState.tabs;
+    const prevActive38 = wfState.activeTab;
+    const prevSessions38 = wfState.sessions;
+    wfState.sessions = [
+      { name: 'Prod/api', protocol: 'sftp', host: 'api.example.internal', port: 22, username: 'deploy', color: '#3b82f6', last_used: 200 },
+      { name: 'Backups/s3', protocol: 's3', host: 's3.amazonaws.com', port: 443, username: 'AKIA', last_used: 100 }
+    ];
+    wfState.tabs = [];
+    wfState.activeTab = null;
+    window.renderTabs();
+    window.updateRemoteDesktopButton();
+    window.renderPane('remote');
+    check('disconnected remote pane shows Quick-Connect Hub, saved sites grid, and empty-tab hint instead of blank void',
+      !doc.getElementById('remoteEmptyHub').hidden &&
+      doc.getElementById('remoteFileTable').hidden &&
+      !doc.getElementById('emptyTabHint').hidden &&
+      doc.querySelectorAll('#quickConnectSites .quick-site-card').length === 2);
+    doc.getElementById('quickProtocol').value = 's3';
+    window.quickProtocolChanged();
+    check('quickProtocolChanged updates quickPort default from 22 to 443 for S3',
+      doc.getElementById('quickPort').value === '443');
+    doc.getElementById('quickProtocol').value = 'sftp';
+    window.quickProtocolChanged();
+
+    wfState.tabs = prevTabs38;
+    wfState.activeTab = prevActive38;
+    wfState.sessions = prevSessions38;
+    window.renderTabs();
+    window.updateRemoteDesktopButton();
+    window.renderPane('remote');
+    check('reconnected remote pane hides Quick-Connect Hub and shows uppercase protocol badge',
+      doc.getElementById('remoteEmptyHub').hidden &&
+      !doc.getElementById('remoteFileTable').hidden &&
+      doc.getElementById('emptyTabHint').hidden &&
+      !doc.getElementById('remoteProtoBadge').hidden);
+
+    doc.getElementById('localFilterInput').value = '__no_such_item_xyz__';
+    window.setPaneFilter('local', '__no_such_item_xyz__');
+    check('unmatched pane filter reveals empty-state message and Clear filter button',
+      !doc.getElementById('localEmptyState').hidden &&
+      !doc.getElementById('localClearFilterBtn').hidden);
+    window.clearPaneFilter('local');
+    check('clearPaneFilter resets filter input and hides empty-state notice',
+      doc.getElementById('localFilterInput').value === '' &&
+      doc.getElementById('localEmptyState').hidden);
+
+    const wasShowingHidden = Boolean(wfState.showHidden);
+    window.toggleHiddenFiles();
+    check('hiddenFilesToolbarBtn syncs active state and aria-pressed with toggleHiddenFiles',
+      doc.getElementById('hiddenFilesToolbarBtn').classList.contains('active') === !wasShowingHidden &&
+      doc.getElementById('hiddenFilesToolbarBtn').getAttribute('aria-pressed') === String(!wasShowingHidden));
+    window.toggleHiddenFiles();
+
+    window.switchTab('queue');
+    window.dockTabClick('queue');
+    check('clicking already-active dock tab collapses lowerPanel',
+      doc.getElementById('lowerPanel').classList.contains('collapsed'));
+    window.dockTabClick('queue');
+    await new Promise(resolve => setTimeout(resolve, 25));
+    check('clicking collapsed dock tab re-expands lowerPanel',
+      !doc.getElementById('lowerPanel').classList.contains('collapsed'));
+
+    window.switchPrefTab('safety');
+    check('Preferences 3-tab navigation switches cleanly between Transfers, Safety, and Scripts',
+      doc.getElementById('prefTabSafety').classList.contains('active') &&
+      !doc.getElementById('prefTabTransfers').classList.contains('active') &&
+      doc.getElementById('prefTabSafetyBtn').getAttribute('aria-selected') === 'true');
+    window.switchPrefTab('scripts');
+    check('Preferences Scripts sub-tab activates installer scripts section',
+      doc.getElementById('prefTabScripts').classList.contains('active') &&
+      !!doc.querySelector('#fullBackupModal .dialog-grid-2') &&
+      !!doc.querySelector('#davToolsModal .dialog-grid-2'));
+    window.switchPrefTab('transfers');
   }
 
   check('no script errors', errors.length === 0, errors.join(' | '));
