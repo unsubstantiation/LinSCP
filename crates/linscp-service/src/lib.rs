@@ -22214,7 +22214,14 @@ mod tests {
             })
             .await;
         assert_eq!(preview_both.status, 200, "{}", preview_both.payload);
-        assert!(!preview_both.payload["plan"].as_array().unwrap().is_empty());
+        assert!(
+            !preview_both.payload["plan"]["items"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "expected non-empty sync plan items: {}",
+            preview_both.payload
+        );
 
         let run_both = svc
             .dispatch_async(ApiEnvelope {
@@ -22257,7 +22264,7 @@ mod tests {
             .await;
         assert_eq!(preview_cs.status, 200, "{}", preview_cs.payload);
         assert!(
-            preview_cs.payload["plan"]
+            preview_cs.payload["plan"]["items"]
                 .as_array()
                 .unwrap()
                 .iter()

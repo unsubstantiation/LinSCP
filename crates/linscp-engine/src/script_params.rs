@@ -538,8 +538,11 @@ mod tests {
             .unwrap();
         assert_eq!(got, "put report.csv %UNSET_VAR_XYZ%");
         assert!(expand_script_parameters("%TIMESTAMP+1D%", &[]).is_err());
-        // Huge relative timestamp offsets must return a clean error instead of overflowing i32.
-        assert!(expand_script_parameters("%TIMESTAMP+2147483647S#yyyy%", &[]).is_err());
+        // Huge relative timestamp offsets must return a clean error instead of overflowing i32
+        // (use a fixed non-zero second for 2147483647S so running on an exact :00 wall-clock
+        // second does not evaluate 0i32 + i32::MAX without overflow).
+        assert!(try_relative_time("2147483647S", 1_700_000_005, true).is_err());
+        assert!(expand_script_parameters("%TIMESTAMP+2147483648S#yyyy%", &[]).is_err());
         assert!(expand_script_parameters("%TIMESTAMP+2147483647Y#yyyy%", &[]).is_err());
         // A literal `%` before `%ENV%` must not swallow the opening `%` of the environment token.
         std::env::set_var("LINSCP_TEST_PARAM_VAR", "ok_val");
