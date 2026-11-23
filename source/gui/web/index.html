@@ -7892,6 +7892,11 @@
     if (!text) return false;
     let copied = false;
     try {
+      if (window.LinSCPCore && typeof window.LinSCPCore.writeNativeClipboardText === 'function') {
+        copied = await window.LinSCPCore.writeNativeClipboardText(text, window);
+      }
+    } catch (_) { /* fall back to WebView clipboard */ }
+    try {
       if (navigator.clipboard && navigator.clipboard.writeText) {
         await navigator.clipboard.writeText(text);
         copied = true;
@@ -9987,20 +9992,31 @@
   async function sendX2GoClipboard() {
     const run = x2goViewerRun;
     if (!run || !run.opened || !run.allowClipboard) return;
-    if (!navigator.clipboard || typeof navigator.clipboard.readText !== 'function') {
-      toast(t('Clipboard access is unavailable in this window.'), true);
-      return;
-    }
+    let text = null;
     try {
-      const text = await navigator.clipboard.readText();
-      const res = await apiPost('/api/x2go/clipboard', { tab: run.tab, generation: run.generation, text: text || '' });
-      if (!res || !res.success) {
-        toast(errorMessage(res && res.error, t('Cannot send clipboard to X2Go.')), true);
-      } else {
-        toast(t('Clipboard sent to X2Go.'));
+      if (window.LinSCPCore && typeof window.LinSCPCore.readNativeClipboardText === 'function') {
+        text = await window.LinSCPCore.readNativeClipboardText(window);
       }
-    } catch (e) {
-      toast(t('Clipboard access is unavailable in this window.'), true);
+    } catch (_) {
+      text = null;
+    }
+    if (text === null) {
+      if (!navigator.clipboard || typeof navigator.clipboard.readText !== 'function') {
+        toast(t('Clipboard access is unavailable in this window.'), true);
+        return;
+      }
+      try {
+        text = await navigator.clipboard.readText();
+      } catch (e) {
+        toast(t('Clipboard access is unavailable in this window.'), true);
+        return;
+      }
+    }
+    const res = await apiPost('/api/x2go/clipboard', { tab: run.tab, generation: run.generation, text: text || '' });
+    if (!res || !res.success) {
+      toast(errorMessage(res && res.error, t('Cannot send clipboard to X2Go.')), true);
+    } else {
+      toast(t('Clipboard sent to X2Go.'));
     }
   }
 

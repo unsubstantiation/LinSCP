@@ -111,6 +111,13 @@ pub trait KeystoreBridge: Send + Sync {
     fn unwrap_key(&self, wrapped: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>, PlatformError>;
 }
 
+/// Bridge for reading and writing UTF-8 text on Android's `ClipboardManager`
+/// when WebView `navigator.clipboard` access is restricted.
+pub trait ClipboardBridge: Send + Sync {
+    fn read_text(&self) -> Result<String, PlatformError>;
+    fn write_text(&self, text: &str) -> Result<(), PlatformError>;
+}
+
 pub fn default_config_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("LINSCP_ANDROID_FILES_DIR").filter(|v| !v.is_empty()) {
         return PathBuf::from(dir).join("config");

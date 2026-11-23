@@ -578,6 +578,19 @@ function options(id) {
     check('a plain Ctrl+C still reaches the shell as its interrupt',
       inputs.some(call => call.body.data === Buffer.from('\x03').toString('base64')),
       JSON.stringify(inputs.map(call => call.body.data)));
+    const termCanvas = child.querySelector('canvas.terminal-canvas');
+    termCanvas.dispatchEvent(new terminalWindow.MouseEvent('mousedown', { button: 0, detail: 1, clientX: 0, clientY: 0, cancelable: true }));
+    terminalWindow.document.dispatchEvent(new terminalWindow.MouseEvent('mousemove', { button: 0, clientX: 27, clientY: 0, cancelable: true }));
+    terminalWindow.document.dispatchEvent(new terminalWindow.MouseEvent('mouseup', { button: 0, clientX: 27, clientY: 0 }));
+    await new Promise(resolve => setTimeout(resolve, 25));
+    const rightPasteEvt = new terminalWindow.MouseEvent('contextmenu', { button: 2, cancelable: true });
+    termCanvas.dispatchEvent(rightPasteEvt);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    const afterRightClickInputs = terminalCalls.filter(call => call && call.path === '/api/terminal/input' && call.body && call.body.data);
+    check('right-clicking terminal canvas pastes even immediately after selecting text',
+      rightPasteEvt.defaultPrevented &&
+      afterRightClickInputs.filter(call => Buffer.from(call.body.data, 'base64').toString() === 'pasted text').length === 3,
+      JSON.stringify(afterRightClickInputs.map(call => call.body.data)));
     terminalPage.window.close();
   }
   check('boot queried the status', paths.includes('/api/status'));

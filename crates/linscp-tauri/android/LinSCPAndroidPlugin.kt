@@ -3,6 +3,7 @@ package com.fairuniversal.linscp
 import android.app.Activity
 import android.content.Intent
 import android.content.ClipData
+import android.content.ClipboardManager
 import android.net.Uri
 import android.os.Build
 import android.provider.DocumentsContract
@@ -49,6 +50,8 @@ import javax.crypto.spec.GCMParameterSpec
 
 @InvokeArg
 internal class KeystoreBlobArgs { lateinit var data_base64: String }
+@InvokeArg
+internal class ClipboardTextArgs { var text: String = "" }
 
 @InvokeArg
 internal class TreeArgs { lateinit var uri: String }
@@ -644,6 +647,39 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
 
   @Command
   fun foregroundIsRunning(invoke: Invoke) { invoke.resolveObject(mapOf("running" to running.get())) }
+
+  @Command
+  fun readClipboard(invoke: Invoke) {
+    activity.runOnUiThread {
+      try {
+        val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        val clip = cm?.primaryClip
+        val text = if (clip != null && clip.itemCount > 0) {
+          clip.getItemAt(0)?.coerceToText(activity)?.toString() ?: ""
+        } else {
+          ""
+        }
+        invoke.resolveObject(mapOf("text" to text))
+      } catch (e: Exception) {
+        invoke.reject("Cannot read clipboard: ${e.message}")
+      }
+    }
+  }
+
+  @Command
+  fun writeClipboard(invoke: Invoke) {
+    val args = invoke.parseArgs(ClipboardTextArgs::class.java)
+    activity.runOnUiThread {
+      try {
+        val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+          ?: throw IllegalStateException("ClipboardManager unavailable")
+        cm.setPrimaryClip(ClipData.newPlainText("LinSCP", args.text))
+        invoke.resolveObject(mapOf("success" to true))
+      } catch (e: Exception) {
+        invoke.reject("Cannot write clipboard: ${e.message}")
+      }
+    }
+  }
 
   private fun stageShareIntent(intent: Intent) {
     if (intent.action != Intent.ACTION_SEND && intent.action != Intent.ACTION_SEND_MULTIPLE) return

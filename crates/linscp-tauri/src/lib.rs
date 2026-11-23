@@ -223,6 +223,108 @@ pub mod commands {
         Ok(json!({ "label": label, "existing": false }))
     }
 
+    /// Reads UTF-8 text from the native OS clipboard so terminal right-click
+    /// paste works reliably across Linux (Wayland/X11 WebKitGTK), Windows
+    /// (unfocused WebView2), and Android (`ClipboardManager`).
+    #[tauri::command]
+    pub async fn linscp_read_clipboard(
+        app: tauri::AppHandle,
+        state: tauri::State<'_, TauriBridge>,
+    ) -> Result<serde_json::Value, String> {
+        let _ = (&app, &state);
+        #[cfg(target_os = "linux")]
+        {
+            let result = if linscp_platform::linux::is_gtk_main_thread() {
+                linscp_platform::linux::read_clipboard_text_on_main_thread()
+                    .map_err(|e| e.to_string())
+            } else {
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                app.run_on_main_thread(move || {
+                    let _ = tx.send(
+                        linscp_platform::linux::read_clipboard_text_on_main_thread()
+                            .map_err(|e| e.to_string()),
+                    );
+                })
+                .map_err(|e| e.to_string())?;
+                rx.recv_timeout(std::time::Duration::from_millis(1500))
+                    .map_err(|_| "Timed out reading GTK clipboard.".to_string())?
+            };
+            match result {
+                Ok(text) => Ok(json!({ "success": true, "text": text })),
+                Err(error) => Ok(json!({ "success": false, "error": error })),
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            match linscp_platform::windows::read_clipboard_text() {
+                Ok(text) => Ok(json!({ "success": true, "text": text })),
+                Err(error) => Ok(json!({ "success": false, "error": error.to_string() })),
+            }
+        }
+        #[cfg(target_os = "android")]
+        {
+            match state.android_state().read_clipboard_text() {
+                Ok(text) => Ok(json!({ "success": true, "text": text })),
+                Err(error) => Ok(json!({ "success": false, "error": error.to_string() })),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
+        {
+            Ok(json!({ "success": false, "error": "Native clipboard bridge is unavailable on this host." }))
+        }
+    }
+
+    /// Writes UTF-8 text to the native OS clipboard across Linux, Windows, and Android.
+    #[tauri::command]
+    pub async fn linscp_write_clipboard(
+        app: tauri::AppHandle,
+        state: tauri::State<'_, TauriBridge>,
+        text: String,
+    ) -> Result<serde_json::Value, String> {
+        let _ = (&app, &state, &text);
+        #[cfg(target_os = "linux")]
+        {
+            let result = if linscp_platform::linux::is_gtk_main_thread() {
+                linscp_platform::linux::write_clipboard_text_on_main_thread(&text)
+                    .map_err(|e| e.to_string())
+            } else {
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                let owned = text.clone();
+                app.run_on_main_thread(move || {
+                    let _ = tx.send(
+                        linscp_platform::linux::write_clipboard_text_on_main_thread(&owned)
+                            .map_err(|e| e.to_string()),
+                    );
+                })
+                .map_err(|e| e.to_string())?;
+                rx.recv_timeout(std::time::Duration::from_millis(1500))
+                    .map_err(|_| "Timed out writing GTK clipboard.".to_string())?
+            };
+            match result {
+                Ok(()) => Ok(json!({ "success": true })),
+                Err(error) => Ok(json!({ "success": false, "error": error })),
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            match linscp_platform::windows::write_clipboard_text(&text) {
+                Ok(()) => Ok(json!({ "success": true })),
+                Err(error) => Ok(json!({ "success": false, "error": error.to_string() })),
+            }
+        }
+        #[cfg(target_os = "android")]
+        {
+            match state.android_state().write_clipboard_text(&text) {
+                Ok(()) => Ok(json!({ "success": true })),
+                Err(error) => Ok(json!({ "success": false, "error": error.to_string() })),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
+        {
+            Ok(json!({ "success": false, "error": "Native clipboard bridge is unavailable on this host." }))
+        }
+    }
+
     #[tauri::command]
     pub async fn linscp_request_saf_tree(
         state: tauri::State<'_, TauriBridge>,
@@ -417,6 +519,8 @@ pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
             commands::linscp_invoke,
             #[cfg(not(target_os = "android"))]
             commands::linscp_open_terminal_window,
+            commands::linscp_read_clipboard,
+            commands::linscp_write_clipboard,
             commands::linscp_request_saf_tree,
             commands::linscp_pick_saf_tree,
             commands::linscp_handle_share_intent,

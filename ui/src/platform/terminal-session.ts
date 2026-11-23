@@ -15,6 +15,7 @@
  */
 
 import type { TransportClient } from '../transport/client.js';
+import { readNativeClipboardText, writeNativeClipboardText } from '../transport/index.js';
 import type { TerminalFrame, TerminalModes } from './terminal.js';
 import { TerminalRenderer } from './terminal.js';
 import { TerminalInput } from './terminal-input.js';
@@ -372,6 +373,7 @@ export class TerminalSession {
     // document so a drag that leaves the canvas still finishes where it began.
     canvas.addEventListener('mousedown', this.handleMouseDown);
     canvas.addEventListener('contextmenu', this.handleContextMenu);
+    this.container.addEventListener?.('contextmenu', this.handleContainerContextMenu);
     doc?.addEventListener('mousemove', this.handleMouseMove);
     doc?.addEventListener('mouseup', this.handleMouseUp);
     if (options.keyboard) {
@@ -591,6 +593,7 @@ export class TerminalSession {
       this.canvas.removeEventListener('contextmenu', this.handleContextMenu);
       this.canvas = null;
     }
+    this.container.removeEventListener?.('contextmenu', this.handleContainerContextMenu);
     if (this.eventDoc) {
       this.eventDoc.removeEventListener('mousemove', this.handleMouseMove);
       this.eventDoc.removeEventListener('mouseup', this.handleMouseUp);
@@ -693,9 +696,11 @@ export class TerminalSession {
 
   /** Handles one key press and reports whether it was sent. */
   public handleKey(event: KeyEventLike, modes?: { app_cursor: boolean; bracketed_paste: boolean }): boolean {
-    if (event.ctrlKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 'v') {
+    const isCtrlPaste = event.ctrlKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 'v';
+    const isShiftInsertPaste = event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && event.key === 'Insert';
+    if (isCtrlPaste || isShiftInsertPaste) {
       event.preventDefault?.();
-      void this.pasteClipboard();
+      void this.pasteClipboard(modes?.bracketed_paste);
       return true;
     }
     const active = modes ?? this.modes;
@@ -819,13 +824,16 @@ export class TerminalSession {
     } catch { this.onClipboardError?.(); }
   }
 
-  /** Write via the clipboard API, with a native WebView fallback. */
+  /** Write via the native OS clipboard and WebView clipboard API, with a textarea fallback. */
   private async writeClipboard(text: string): Promise<void> {
     const doc = this.renderer.element.ownerDocument;
+    const win = doc?.defaultView;
+    const nativeWrote = await writeNativeClipboardText(text, win);
     try {
-      const clipboard = doc.defaultView?.navigator?.clipboard;
+      const clipboard = win?.navigator?.clipboard;
       if (clipboard?.writeText) { await clipboard.writeText(text); return; }
-    } catch { /* Fall back to the document copy command. */ }
+    } catch { /* Fall back to native clipboard result or the document copy command. */ }
+    if (nativeWrote) return;
     const field = doc.createElement('textarea');
     field.value = text;
     field.setAttribute('readonly', '');
@@ -839,22 +847,121 @@ export class TerminalSession {
     if (!copied) throw new Error('Cannot copy terminal text to the clipboard.');
   }
 
-  /** Paste only after an explicit gesture; never forward a refused read. */
-  private async pasteClipboard(): Promise<void> {
+  private readClipboardViaExecCommand(doc: Document): string | null {
+    if (typeof doc.execCommand !== 'function' || !doc.body) {
+      return null;
+    }
+    const active = doc.activeElement as HTMLElement | null;
+    const field = doc.createElement('textarea');
+    field.style.position = 'fixed';
+    field.style.left = '-10000px';
+    field.style.top = '0';
+    field.style.opacity = '0';
+    doc.body.appendChild(field);
+    let captured: string | null = null;
+    const onPaste = (ev: ClipboardEvent): void => {
+      ev.stopPropagation();
+      const data = ev.clipboardData?.getData('text');
+      if (typeof data === 'string') {
+        captured = data;
+        ev.preventDefault();
+      }
+    };
+    field.addEventListener('paste', onPaste);
+    let ok = false;
     try {
-      const clipboard = this.renderer.element.ownerDocument.defaultView?.navigator?.clipboard;
-      if (!clipboard?.readText) throw new Error('Clipboard unavailable');
-      const text = await clipboard.readText();
-      if (text && !this.stopped) this.paste(text);
-    } catch { this.onClipboardError?.(); }
+      field.focus();
+      ok = doc.execCommand('paste');
+    } catch {
+      ok = false;
+    } finally {
+      field.removeEventListener('paste', onPaste);
+      field.remove();
+      try { active?.focus?.(); } catch { /* Ignore focus restore errors. */ }
+    }
+    if (captured !== null) {
+      return captured;
+    }
+    return ok ? field.value : null;
+  }
+
+  private async readClipboardText(): Promise<string> {
+    const doc = this.renderer.element.ownerDocument;
+    const win = doc?.defaultView;
+
+    const nativeText = await readNativeClipboardText(win);
+    if (nativeText !== null && nativeText.length > 0) {
+      return nativeText;
+    }
+
+    let webError: unknown = null;
+    const clipboard = win?.navigator?.clipboard;
+    if (clipboard && typeof clipboard.readText === 'function') {
+      try {
+        const text = await clipboard.readText();
+        if (typeof text === 'string') {
+          return text;
+        }
+        return '';
+      } catch (err) {
+        webError = err;
+      }
+    } else {
+      webError = new Error('Clipboard unavailable');
+    }
+
+    if (nativeText !== null) {
+      return nativeText;
+    }
+
+    if (doc) {
+      const fallback = this.readClipboardViaExecCommand(doc);
+      if (fallback !== null) {
+        return fallback;
+      }
+    }
+
+    throw webError ?? new Error('Clipboard unavailable');
+  }
+
+  /** Paste only after an explicit gesture; never forward a refused read. */
+  public async pasteClipboard(bracketedPaste?: boolean): Promise<boolean> {
+    try {
+      const text = await this.readClipboardText();
+      if (text && !this.stopped) {
+        if (this.selecting) {
+          void this.endSelection();
+        }
+        this.paste(text, bracketedPaste);
+        return true;
+      }
+      return false;
+    } catch {
+      this.onClipboardError?.();
+      return false;
+    }
   }
 
   private readonly handleContextMenu = (event: MouseEvent): void => {
     event.preventDefault();
-    if (this.stopped || this.isEmulatedMouse() || this.drag !== null || this.selecting) {
+    const pointerType = (event as MouseEvent & { pointerType?: string }).pointerType;
+    if (
+      this.stopped ||
+      this.isEmulatedMouse() ||
+      this.drag !== null ||
+      this.mouseDrag !== null ||
+      pointerType === 'touch'
+    ) {
       return;
     }
     void this.pasteClipboard();
+  };
+
+  private readonly handleContainerContextMenu = (event: MouseEvent): void => {
+    if (event.target === this.canvas) {
+      return;
+    }
+    this.handleContextMenu(event);
   };
 
   /** Scrolls the model's viewport; positive is up into history. */

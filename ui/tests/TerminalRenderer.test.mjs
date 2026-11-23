@@ -1494,4 +1494,138 @@ test('transient IPC glitches on resume do not kill the terminal while HTTP 400 s
   dom.cleanup();
 });
 
+test('selecting text with the mouse and then right-clicking pastes and clears the highlight', async () => {
+  const dom = installDom();
+  let clipboardBuffer = '';
+  Object.defineProperty(dom.dom.window.navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      writeText: async (text) => { clipboardBuffer = text; },
+      readText: async () => clipboardBuffer,
+    },
+  });
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: textFrame('echo hello') }),
+    '/api/terminal/selection': { success: true, text: 'hello' },
+  });
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-select-then-paste',
+    container: fakeContainer(90, 36),
+    pollInterval: 5,
+  });
+  session.start();
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const win = dom.dom.window;
+    const doc = win.document;
+
+    // Double-click `hello` to select and auto-copy it; `session.selection` stays open.
+    session.element.dispatchEvent(new win.MouseEvent('mousedown', { button: 0, detail: 2, clientX: 67, clientY: 4, cancelable: true }));
+    doc.dispatchEvent(new win.MouseEvent('mouseup', { button: 0, detail: 2, clientX: 67, clientY: 4 }));
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    assert.equal(clipboardBuffer, 'hello');
+    assert.ok(session.selection, 'selection stays highlighted after auto-copy');
+
+    // Right-click while selection is still highlighted MUST paste and clear the finished highlight.
+    const rightClick = new win.MouseEvent('contextmenu', { button: 2, cancelable: true });
+    session.element.dispatchEvent(rightClick);
+    assert.equal(rightClick.defaultPrevented, true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const pasted = transport.calls
+      .filter((call) => call.path === '/api/terminal/input' && call.body.data)
+      .map((call) => Buffer.from(call.body.data, 'base64').toString());
+    assert.deepEqual(pasted, ['hello'], 'right-click pastes even when a selection was active');
+    assert.equal(session.selection, null, 'pasting clears the completed selection highlight');
+
+    // Shift+Insert also pastes clipboard text.
+    const shiftInsert = new win.KeyboardEvent('keydown', { key: 'Insert', shiftKey: true, cancelable: true });
+    assert.equal(session.handleKey(shiftInsert, { app_cursor: false, bracketed_paste: true }), true);
+    assert.equal(shiftInsert.defaultPrevented, true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const afterShiftInsert = transport.calls
+      .filter((call) => call.path === '/api/terminal/input' && call.body.data)
+      .map((call) => Buffer.from(call.body.data, 'base64').toString());
+    assert.equal(afterShiftInsert.at(-1), '\x1b[200~hello\x1b[201~');
+  } finally {
+    await session.close();
+    dom.cleanup();
+  }
+});
+
+test('right-click paste and mouse copy use native Tauri clipboard when WebView clipboard is denied', async () => {
+  const dom = installDom();
+  let nativeClip = 'from-wayland-clipboard';
+  let errors = 0;
+  dom.dom.window.__TAURI_INTERNALS__ = {
+    invoke: async (cmd, args) => {
+      if (cmd === 'linscp_read_clipboard') {
+        return { success: true, text: nativeClip };
+      }
+      if (cmd === 'linscp_write_clipboard') {
+        nativeClip = args.text;
+        return { success: true };
+      }
+      return { status: 200, payload: { success: true } };
+    },
+  };
+  Object.defineProperty(dom.dom.window.navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      readText: async () => { throw new Error('NotAllowedError: WebKitGTK clipboard denied'); },
+      writeText: async () => { throw new Error('NotAllowedError: user gesture expired'); },
+    },
+  });
+  dom.dom.window.document.execCommand = () => false;
+
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(10, 2) }),
+    '/api/terminal/selection': { success: true, text: 'copied-via-native' },
+  });
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-native-clip',
+    container: fakeContainer(90, 36),
+    pollInterval: 5,
+    onClipboardError: () => { errors += 1; },
+  });
+  session.start();
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    const win = dom.dom.window;
+    const doc = win.document;
+
+    // 1. Right-click pastes from native OS clipboard even though navigator.clipboard.readText throws.
+    session.element.dispatchEvent(new win.MouseEvent('contextmenu', { button: 2, cancelable: true }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const firstPaste = transport.calls
+      .filter((call) => call.path === '/api/terminal/input' && call.body.data)
+      .map((call) => Buffer.from(call.body.data, 'base64').toString());
+    assert.deepEqual(firstPaste, ['from-wayland-clipboard']);
+    assert.equal(errors, 0);
+
+    // 2. Mouse drag copies via native OS clipboard even though navigator.clipboard.writeText throws,
+    //    and subsequent right-click pastes the newly copied selection.
+    session.element.dispatchEvent(new win.MouseEvent('mousedown', { button: 0, detail: 1, clientX: 0, clientY: 0, cancelable: true }));
+    doc.dispatchEvent(new win.MouseEvent('mousemove', { button: 0, clientX: 27, clientY: 0, cancelable: true }));
+    doc.dispatchEvent(new win.MouseEvent('mouseup', { button: 0, clientX: 27, clientY: 0 }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(nativeClip, 'copied-via-native');
+    assert.equal(errors, 0);
+
+    session.element.dispatchEvent(new win.MouseEvent('contextmenu', { button: 2, cancelable: true }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const allPastes = transport.calls
+      .filter((call) => call.path === '/api/terminal/input' && call.body.data)
+      .map((call) => Buffer.from(call.body.data, 'base64').toString());
+    assert.deepEqual(allPastes, ['from-wayland-clipboard', 'copied-via-native']);
+    assert.equal(errors, 0);
+  } finally {
+    await session.close();
+    dom.cleanup();
+  }
+});
+
+
 

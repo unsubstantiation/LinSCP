@@ -202,3 +202,178 @@ pub async fn connect_ssh_agent() -> Result<Option<Box<dyn crate::AsyncStream>>, 
     }
 }
 
+mod gtk_clipboard {
+    use std::ffi::{c_char, c_void, CStr};
+    use std::sync::OnceLock;
+
+    use crate::PlatformError;
+
+    type FnMainContextDefault = unsafe extern "C" fn() -> *mut c_void;
+    type FnMainContextIsOwner = unsafe extern "C" fn(*mut c_void) -> i32;
+    type FnGdkDisplayGetDefault = unsafe extern "C" fn() -> *mut c_void;
+    type FnGdkAtomInternStaticString = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+    type FnGtkClipboardGetForDisplay =
+        unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type FnGtkClipboardWaitForText = unsafe extern "C" fn(*mut c_void) -> *mut c_char;
+    type FnGtkClipboardSetText = unsafe extern "C" fn(*mut c_void, *const c_char, i32);
+    type FnGFree = unsafe extern "C" fn(*mut c_void);
+
+    struct GtkClipboardSymbols {
+        main_context_default: FnMainContextDefault,
+        main_context_is_owner: FnMainContextIsOwner,
+        display_get_default: FnGdkDisplayGetDefault,
+        atom_intern_static: FnGdkAtomInternStaticString,
+        clipboard_get_for_display: FnGtkClipboardGetForDisplay,
+        clipboard_wait_for_text: FnGtkClipboardWaitForText,
+        clipboard_set_text: FnGtkClipboardSetText,
+        g_free: FnGFree,
+    }
+
+    // SAFETY: All fields are plain C function pointers resolved from the
+    // process's already-loaded GTK3/GDK3/GLib libraries; callers enforce GTK
+    // main-thread affinity via `is_main_thread()`.
+    unsafe impl Send for GtkClipboardSymbols {}
+    // SAFETY: See above.
+    unsafe impl Sync for GtkClipboardSymbols {}
+
+    static GTK_CLIPBOARD: OnceLock<Option<GtkClipboardSymbols>> = OnceLock::new();
+
+    unsafe fn sym<T: Copy>(name: &CStr) -> Option<T> {
+        // SAFETY: `RTLD_DEFAULT` inspects already-loaded shared libraries in
+        // this process without dlopening new ones, and `name` is NUL-terminated.
+        let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: Caller supplies the exact GTK3/GDK3/GLib C ABI signature `T`.
+        Some(unsafe { std::mem::transmute_copy(&ptr) })
+    }
+
+    fn api() -> Option<&'static GtkClipboardSymbols> {
+        GTK_CLIPBOARD
+            .get_or_init(|| {
+                // SAFETY: Resolves standard GTK3, GDK3, and GLib 2.0 C symbols
+                // when `linscp-gui` has linked them into the process.
+                unsafe {
+                    Some(GtkClipboardSymbols {
+                        main_context_default: sym(c"g_main_context_default")?,
+                        main_context_is_owner: sym(c"g_main_context_is_owner")?,
+                        display_get_default: sym(c"gdk_display_get_default")?,
+                        atom_intern_static: sym(c"gdk_atom_intern_static_string")?,
+                        clipboard_get_for_display: sym(c"gtk_clipboard_get_for_display")?,
+                        clipboard_wait_for_text: sym(c"gtk_clipboard_wait_for_text")?,
+                        clipboard_set_text: sym(c"gtk_clipboard_set_text")?,
+                        g_free: sym(c"g_free")?,
+                    })
+                }
+            })
+            .as_ref()
+    }
+
+    pub(super) fn is_main_thread() -> bool {
+        let Some(syms) = api() else {
+            return false;
+        };
+        // SAFETY: `g_main_context_default` returns GLib's global main context
+        // and `g_main_context_is_owner` is thread-safe.
+        unsafe {
+            let ctx = (syms.main_context_default)();
+            !ctx.is_null() && (syms.main_context_is_owner)(ctx) != 0
+        }
+    }
+
+    pub(super) fn read_text_on_main_thread() -> Result<String, PlatformError> {
+        let Some(syms) = api() else {
+            return Err(PlatformError::Unsupported(
+                "GTK clipboard symbols are unavailable in this process.".to_string(),
+            ));
+        };
+        if !is_main_thread() {
+            return Err(PlatformError::Unsupported(
+                "GTK clipboard access must run on the main thread.".to_string(),
+            ));
+        }
+        // SAFETY: Running on the GTK main thread; `display` and `clipboard` are
+        // owned by GDK/GTK (speaking Wayland `wl_data_device` or X11 `CLIPBOARD`
+        // according to the active GdkDisplay), and any non-null buffer returned
+        // by `gtk_clipboard_wait_for_text` is freed with `g_free`.
+        unsafe {
+            let display = (syms.display_get_default)();
+            if display.is_null() {
+                return Err(PlatformError::Unsupported(
+                    "No active GDK display.".to_string(),
+                ));
+            }
+            let atom = (syms.atom_intern_static)(c"CLIPBOARD".as_ptr());
+            let clipboard = (syms.clipboard_get_for_display)(display, atom);
+            if clipboard.is_null() {
+                return Err(PlatformError::Unsupported(
+                    "Cannot access the GDK clipboard.".to_string(),
+                ));
+            }
+            let raw = (syms.clipboard_wait_for_text)(clipboard);
+            if raw.is_null() {
+                return Ok(String::new());
+            }
+            let text = CStr::from_ptr(raw).to_string_lossy().into_owned();
+            (syms.g_free)(raw.cast::<c_void>());
+            Ok(text)
+        }
+    }
+
+    pub(super) fn write_text_on_main_thread(text: &str) -> Result<(), PlatformError> {
+        let len = i32::try_from(text.len()).map_err(|_| {
+            PlatformError::Unsupported("Clipboard text exceeds GTK size limit.".to_string())
+        })?;
+        let Some(syms) = api() else {
+            return Err(PlatformError::Unsupported(
+                "GTK clipboard symbols are unavailable in this process.".to_string(),
+            ));
+        };
+        if !is_main_thread() {
+            return Err(PlatformError::Unsupported(
+                "GTK clipboard access must run on the main thread.".to_string(),
+            ));
+        }
+        // SAFETY: Running on the GTK main thread; `gtk_clipboard_set_text` copies
+        // `len` UTF-8 bytes synchronously before returning.
+        unsafe {
+            let display = (syms.display_get_default)();
+            if display.is_null() {
+                return Err(PlatformError::Unsupported(
+                    "No active GDK display.".to_string(),
+                ));
+            }
+            let atom = (syms.atom_intern_static)(c"CLIPBOARD".as_ptr());
+            let clipboard = (syms.clipboard_get_for_display)(display, atom);
+            if clipboard.is_null() {
+                return Err(PlatformError::Unsupported(
+                    "Cannot access the GDK clipboard.".to_string(),
+                ));
+            }
+            let ptr = if text.is_empty() {
+                c"".as_ptr()
+            } else {
+                text.as_ptr().cast::<c_char>()
+            };
+            (syms.clipboard_set_text)(clipboard, ptr, len);
+            Ok(())
+        }
+    }
+}
+
+/// Returns whether the calling thread currently owns GLib/GTK's default main context.
+pub fn is_gtk_main_thread() -> bool {
+    gtk_clipboard::is_main_thread()
+}
+
+/// Reads UTF-8 text from the active Wayland or X11 `GdkDisplay` clipboard on the GTK main thread.
+pub fn read_clipboard_text_on_main_thread() -> Result<String, PlatformError> {
+    gtk_clipboard::read_text_on_main_thread()
+}
+
+/// Writes UTF-8 text to the active Wayland or X11 `GdkDisplay` clipboard on the GTK main thread.
+pub fn write_clipboard_text_on_main_thread(text: &str) -> Result<(), PlatformError> {
+    gtk_clipboard::write_text_on_main_thread(text)
+}
+

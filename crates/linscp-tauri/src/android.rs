@@ -14,7 +14,8 @@ mod imp {
     use std::sync::{Arc, Mutex};
 
     use linscp_platform::android::{
-        ExternalUriBridge, ForegroundServiceBridge, KeystoreBridge, SafBridge, ShareBridge,
+        ClipboardBridge, ExternalUriBridge, ForegroundServiceBridge, KeystoreBridge, SafBridge,
+        ShareBridge,
     };
     use linscp_platform::PlatformError;
     use linscp_types::{FileEntry, LocalRootEntry};
@@ -26,6 +27,7 @@ mod imp {
         external_uri: Mutex<Option<Arc<dyn ExternalUriBridge>>>,
         fg: Mutex<Option<Arc<dyn ForegroundServiceBridge>>>,
         keystore: Mutex<Option<Arc<dyn KeystoreBridge>>>,
+        clipboard: Mutex<Option<Arc<dyn ClipboardBridge>>>,
     }
 
     impl AndroidState {
@@ -55,6 +57,21 @@ mod imp {
         }
         pub fn keystore_bridge(&self) -> Option<Arc<dyn KeystoreBridge>> {
             self.keystore.lock().unwrap().clone()
+        }
+        pub fn set_clipboard(&self, bridge: Arc<dyn ClipboardBridge>) {
+            *self.clipboard.lock().unwrap() = Some(bridge);
+        }
+        pub fn read_clipboard_text(&self) -> Result<String, PlatformError> {
+            match self.clipboard.lock().unwrap().as_deref() {
+                Some(bridge) => bridge.read_text(),
+                None => Err(PlatformError::Unsupported("Android clipboard bridge is not available".to_string())),
+            }
+        }
+        pub fn write_clipboard_text(&self, text: &str) -> Result<(), PlatformError> {
+            match self.clipboard.lock().unwrap().as_deref() {
+                Some(bridge) => bridge.write_text(text),
+                None => Err(PlatformError::Unsupported("Android clipboard bridge is not available".to_string())),
+            }
         }
         /// The registered SAF bridge, for the local filesystem to use.
         pub fn saf_bridge(&self) -> Option<Arc<dyn SafBridge>> {
@@ -212,6 +229,12 @@ mod imp {
         pub fn is_foreground_running(&self) -> bool {
             false
         }
+        pub fn read_clipboard_text(&self) -> Result<String, PlatformError> {
+            Err(PlatformError::Unsupported("Android clipboard is only available on Android".to_string()))
+        }
+        pub fn write_clipboard_text(&self, _text: &str) -> Result<(), PlatformError> {
+            Err(PlatformError::Unsupported("Android clipboard is only available on Android".to_string()))
+        }
     }
 }
 
@@ -224,7 +247,7 @@ mod mobile_plugin {
     use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 
     use base64::Engine as _;
-    use linscp_platform::{android::{ExternalUriBridge, ForegroundServiceBridge, KeystoreBridge, SafBridge, ShareBridge}, PlatformError};
+    use linscp_platform::{android::{ClipboardBridge, ExternalUriBridge, ForegroundServiceBridge, KeystoreBridge, SafBridge, ShareBridge}, PlatformError};
     use linscp_types::{FileEntry, LocalRootEntry};
     use serde::{Deserialize, Serialize};
     use tauri::{plugin::{Builder, PluginHandle, TauriPlugin}, Manager, Wry};
@@ -384,6 +407,17 @@ mod mobile_plugin {
             Ok(zeroize::Zeroizing::new(decoded))
         }
     }
+    impl ClipboardBridge for MobileBridge {
+        fn read_text(&self) -> Result<String, PlatformError> {
+            #[derive(Deserialize)] struct Reply { text: Option<String> }
+            Ok(self.call::<Reply, _>("readClipboard", ())?.text.unwrap_or_default())
+        }
+        fn write_text(&self, text: &str) -> Result<(), PlatformError> {
+            #[derive(Serialize)] struct Args<'a> { text: &'a str }
+            let _: serde_json::Value = self.call("writeClipboard", Args { text })?;
+            Ok(())
+        }
+    }
 
     pub fn plugin() -> TauriPlugin<Wry> {
         Builder::new("linscp-android")
@@ -395,6 +429,7 @@ mod mobile_plugin {
                 state.set_share(bridge.clone());
                 state.set_external_uri(bridge.clone());
                 state.set_foreground_service(bridge.clone());
+                state.set_clipboard(bridge.clone());
                 state.set_keystore(bridge);
                 app.manage(state);
                 Ok(())
