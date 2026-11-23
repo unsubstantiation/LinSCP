@@ -1539,7 +1539,7 @@ impl RemoteSession for LocalSyncSession {
                 .await
                 .map_err(|e| ProtoError::Transport(e.to_string()))?;
         }
-        let mut limiter = linscp_proto::BandwidthLimiter::new(opts.speed_kbytes_per_sec);
+        let mut limiter = linscp_proto::RateLimiter::new(opts.speed_kbytes_per_sec);
         let mut copied = 0u64;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -1554,7 +1554,7 @@ impl RemoteSession for LocalSyncSession {
                 .await
                 .map_err(|e| ProtoError::Transport(e.to_string()))?;
             copied += n as u64;
-            limiter.throttle(n as u64).await;
+            limiter.consume(n).await;
             if let Some(cb) = progress {
                 cb(opts.resume_offset + copied, total);
             }
@@ -1587,7 +1587,7 @@ impl RemoteSession for LocalSyncSession {
             let mut out = tokio::fs::File::create(&staged_file)
                 .await
                 .map_err(|e| ProtoError::Transport(e.to_string()))?;
-            let mut limiter = linscp_proto::BandwidthLimiter::new(opts.speed_kbytes_per_sec);
+            let mut limiter = linscp_proto::RateLimiter::new(opts.speed_kbytes_per_sec);
             let mut written = 0u64;
             let mut buf = vec![0u8; 64 * 1024];
             loop {
@@ -1602,7 +1602,7 @@ impl RemoteSession for LocalSyncSession {
                     .await
                     .map_err(|e| ProtoError::Transport(e.to_string()))?;
                 written += n as u64;
-                limiter.throttle(n as u64).await;
+                limiter.consume(n).await;
                 if let Some(cb) = progress {
                     cb(written, total_size.unwrap_or(written));
                 }
@@ -1651,7 +1651,7 @@ impl RemoteSession for LocalSyncSession {
                 .await
                 .map_err(|e| ProtoError::Transport(e.to_string()))?
         };
-        let mut limiter = linscp_proto::BandwidthLimiter::new(opts.speed_kbytes_per_sec);
+        let mut limiter = linscp_proto::RateLimiter::new(opts.speed_kbytes_per_sec);
         let mut written = 0u64;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -1666,7 +1666,7 @@ impl RemoteSession for LocalSyncSession {
                 .await
                 .map_err(|e| ProtoError::Transport(e.to_string()))?;
             written += n as u64;
-            limiter.throttle(n as u64).await;
+            limiter.consume(n).await;
             if let Some(cb) = progress {
                 cb(
                     opts.resume_offset + written,
