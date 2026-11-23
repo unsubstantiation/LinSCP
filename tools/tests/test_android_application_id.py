@@ -181,8 +181,9 @@ class AndroidApplicationIdTests(unittest.TestCase):
             config_changes = set((main_activity.get(android + 'configChanges') or '').split('|'))
             for required_flag in ('orientation', 'keyboardHidden', 'keyboard', 'screenSize',
                                   'locale', 'smallestScreenSize', 'screenLayout',
-                                  'uiMode', 'navigation', 'density'):
+                                  'uiMode', 'navigation', 'density', 'fontScale', 'layoutDirection'):
                 self.assertIn(required_flag, config_changes)
+            self.assertEqual(main_activity.get(android + 'launchMode'), 'singleTask')
             providers = manifest_root.find('application').findall('provider')
             self.assertEqual(len(providers), 1)
             provider = providers[0]

@@ -152,6 +152,120 @@ mod imp {
                 .unwrap_or(false)
         }
     }
+
+    impl SafBridge for AndroidState {
+        fn request_tree(&self) -> Result<Option<String>, PlatformError> {
+            match self.saf_bridge() {
+                Some(b) => b.request_tree(),
+                None => Ok(None),
+            }
+        }
+        fn granted_trees(&self) -> Result<Vec<LocalRootEntry>, PlatformError> {
+            match self.saf_bridge() {
+                Some(b) => b.granted_trees(),
+                None => Ok(Vec::new()),
+            }
+        }
+        fn list_tree(&self, tree_uri: &str) -> Result<Vec<FileEntry>, PlatformError> {
+            self.saf_bridge()
+                .ok_or_else(|| PlatformError::UnsupportedUri(tree_uri.to_string()))?
+                .list_tree(tree_uri)
+        }
+        fn stat_uri(&self, uri: &str) -> Result<FileEntry, PlatformError> {
+            self.saf_bridge()
+                .ok_or_else(|| PlatformError::UnsupportedUri(uri.to_string()))?
+                .stat_uri(uri)
+        }
+        fn read_uri_bytes(&self, uri: &str) -> Result<Vec<u8>, PlatformError> {
+            self.saf_bridge()
+                .ok_or_else(|| PlatformError::UnsupportedUri(uri.to_string()))?
+                .read_uri_bytes(uri)
+        }
+        fn write_uri_bytes(
+            &self,
+            parent_uri: &str,
+            name: &str,
+            data: &[u8],
+        ) -> Result<String, PlatformError> {
+            self.saf_bridge()
+                .ok_or_else(|| PlatformError::UnsupportedUri(parent_uri.to_string()))?
+                .write_uri_bytes(parent_uri, name, data)
+        }
+        fn mkdir_uri(&self, parent_uri: &str, name: &str) -> Result<String, PlatformError> {
+            self.saf_bridge()
+                .ok_or_else(|| PlatformError::UnsupportedUri(parent_uri.to_string()))?
+                .mkdir_uri(parent_uri, name)
+        }
+        fn delete_uri(&self, uri: &str) -> Result<(), PlatformError> {
+            self.saf_bridge()
+                .ok_or_else(|| PlatformError::UnsupportedUri(uri.to_string()))?
+                .delete_uri(uri)
+        }
+        fn rename_uri(&self, uri: &str, new_name: &str) -> Result<String, PlatformError> {
+            self.saf_bridge()
+                .ok_or_else(|| PlatformError::UnsupportedUri(uri.to_string()))?
+                .rename_uri(uri, new_name)
+        }
+        fn read_uri_chunk(
+            &self,
+            uri: &str,
+            offset: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, PlatformError> {
+            self.saf_bridge()
+                .ok_or_else(|| PlatformError::UnsupportedUri(uri.to_string()))?
+                .read_uri_chunk(uri, offset, length)
+        }
+        fn begin_write_uri(&self, parent_uri: &str, name: &str) -> Result<String, PlatformError> {
+            self.saf_bridge()
+                .ok_or_else(|| PlatformError::UnsupportedUri(parent_uri.to_string()))?
+                .begin_write_uri(parent_uri, name)
+        }
+        fn append_uri_chunk(&self, uri: &str, data: &[u8]) -> Result<(), PlatformError> {
+            self.saf_bridge()
+                .ok_or_else(|| PlatformError::UnsupportedUri(uri.to_string()))?
+                .append_uri_chunk(uri, data)
+        }
+        fn supports_chunked_write(&self) -> bool {
+            self.saf_bridge()
+                .map(|b| b.supports_chunked_write())
+                .unwrap_or(false)
+        }
+    }
+
+    impl KeystoreBridge for AndroidState {
+        fn wrap_key(&self, plaintext: &[u8]) -> Result<Vec<u8>, PlatformError> {
+            self.keystore_bridge()
+                .ok_or_else(|| {
+                    PlatformError::SecretVault(
+                        "Android Keystore bridge is not available".to_string(),
+                    )
+                })?
+                .wrap_key(plaintext)
+        }
+        fn unwrap_key(&self, wrapped: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>, PlatformError> {
+            self.keystore_bridge()
+                .ok_or_else(|| {
+                    PlatformError::SecretVault(
+                        "Android Keystore bridge is not available".to_string(),
+                    )
+                })?
+                .unwrap_key(wrapped)
+        }
+    }
+
+    static SHARED_ANDROID_STATE: std::sync::OnceLock<Arc<AndroidState>> =
+        std::sync::OnceLock::new();
+
+    impl AndroidState {
+        /// Returns the process-wide `AndroidState` so Activity recreation updates
+        /// live plugin handles in place without invalidating `CommanderService`.
+        pub fn shared() -> Arc<Self> {
+            SHARED_ANDROID_STATE
+                .get_or_init(|| Arc::new(Self::new()))
+                .clone()
+        }
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -424,7 +538,7 @@ mod mobile_plugin {
             .setup(|app, api| {
                 let handle = api.register_android_plugin("com.fairuniversal.linscp", "LinSCPAndroidPlugin")?;
                 let bridge = Arc::new(MobileBridge { handle, foreground_running: Arc::new(AtomicBool::new(false)) });
-                let state = Arc::new(AndroidState::new());
+                let state = AndroidState::shared();
                 state.set_saf(bridge.clone());
                 state.set_share(bridge.clone());
                 state.set_external_uri(bridge.clone());

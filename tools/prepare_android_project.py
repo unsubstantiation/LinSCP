@@ -17,6 +17,8 @@ REQUIRED_ACTIVITY_CONFIG_CHANGES = (
     'uiMode',
     'navigation',
     'density',
+    'fontScale',
+    'layoutDirection',
 )
 
 root = Path(__file__).resolve().parents[1]
@@ -56,10 +58,17 @@ def _ensure_main_activity_config_changes(match: re.Match[str]) -> str:
             tokens.append(required)
     joined = '|'.join(tokens)
     if existing:
-        return tag[:existing.start()] + f'android:configChanges="{joined}"' + tag[existing.end():]
-    if tag.endswith('/>'):
-        return tag[:-2] + f' android:configChanges="{joined}" />'
-    return tag[:-1] + f' android:configChanges="{joined}">'
+        tag = tag[:existing.start()] + f'android:configChanges="{joined}"' + tag[existing.end():]
+    elif tag.endswith('/>'):
+        tag = tag[:-2] + f' android:configChanges="{joined}" />'
+    else:
+        tag = tag[:-1] + f' android:configChanges="{joined}">'
+    if 'android:launchMode=' not in tag:
+        if tag.endswith('/>'):
+            tag = tag[:-2] + ' android:launchMode="singleTask" />'
+        else:
+            tag = tag[:-1] + ' android:launchMode="singleTask">'
+    return tag
 
 
 text, replaced_activities = re.subn(

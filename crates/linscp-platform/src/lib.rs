@@ -1099,6 +1099,142 @@ impl ConfigDirectoryLock {
     }
 }
 
+const INSTANCE_IPC_FILE: &str = ".instance-ipc";
+
+fn constant_time_bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Owner-authenticated loopback IPC listener used by the primary desktop window
+/// so launching `linscp-gui` a second time activates/restores the existing
+/// window instead of failing with a configuration directory lock error.
+pub struct SingleInstanceServer {
+    endpoint_file: PathBuf,
+    addr: std::net::SocketAddr,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SingleInstanceServer {
+    pub fn start<F>(config_dir: &Path, on_activate: F) -> Result<Self, PlatformError>
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        create_private_dir(config_dir)?;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        let addr = listener.local_addr()?;
+        let mut raw_token = Zeroizing::new([0u8; 32]);
+        rand::thread_rng().fill_bytes(&mut *raw_token);
+        let token_hex = Zeroizing::new(
+            raw_token
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        );
+        let endpoint_file = config_dir.join(INSTANCE_IPC_FILE);
+        let record = Zeroizing::new(format!("{addr} {}\n", token_hex.as_str()));
+        write_private_file_atomic(&endpoint_file, record.as_bytes())?;
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let expected_line = Zeroizing::new(format!("ACTIVATE {}", token_hex.as_str()));
+        std::thread::Builder::new()
+            .name("linscp-single-instance".to_string())
+            .spawn(move || {
+                use std::io::{BufRead, BufReader};
+                for incoming in listener.incoming() {
+                    if stop_thread.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let Ok(mut stream) = incoming else {
+                        continue;
+                    };
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(400)));
+                    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(400)));
+                    let mut line = String::new();
+                    let read_ok = {
+                        let mut reader = BufReader::new(&stream);
+                        reader.read_line(&mut line).is_ok()
+                    };
+                    if !read_ok {
+                        continue;
+                    }
+                    let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+                    if constant_time_bytes_eq(trimmed.as_bytes(), expected_line.as_bytes()) {
+                        on_activate();
+                        let _ = stream.write_all(b"OK\n");
+                        let _ = stream.flush();
+                    }
+                }
+            })
+            .map_err(PlatformError::Io)?;
+
+        Ok(Self {
+            endpoint_file,
+            addr,
+            stop,
+        })
+    }
+}
+
+impl Drop for SingleInstanceServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = std::fs::remove_file(&self.endpoint_file);
+        let _ = std::net::TcpStream::connect_timeout(
+            &self.addr,
+            std::time::Duration::from_millis(50),
+        );
+    }
+}
+
+/// Signals an already-running primary desktop instance for `config_dir` to show
+/// and focus its main window, returning `true` when the primary acknowledged.
+pub fn try_signal_running_instance(config_dir: &Path) -> bool {
+    use std::io::{BufRead, BufReader, Read};
+    let endpoint_file = config_dir.join(INSTANCE_IPC_FILE);
+    let Ok(mut file) = open_private_file_no_follow(&endpoint_file) else {
+        return false;
+    };
+    let mut contents = Zeroizing::new(String::new());
+    if file.read_to_string(&mut contents).is_err() {
+        return false;
+    }
+    let mut parts = contents.split_whitespace();
+    let (Some(addr_str), Some(token)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    if !addr.ip().is_loopback() {
+        return false;
+    }
+    let Ok(mut stream) =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(350))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(350)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(350)));
+    let msg = Zeroizing::new(format!("ACTIVATE {token}\n"));
+    if stream.write_all(msg.as_bytes()).is_err() || stream.flush().is_err() {
+        return false;
+    }
+    let mut reply = String::new();
+    let mut reader = BufReader::new(stream);
+    reader.read_line(&mut reply).is_ok() && reply.trim() == "OK"
+}
+
 /// Creates a FIFO at `target` for tests that must prove a special file is
 /// refused. Only Unix can make one, so Windows reports `Unsupported` and the
 /// caller skips the assertion instead of pretending the case is covered.
@@ -1204,6 +1340,27 @@ mod tests {
         std::fs::create_dir_all(root.join(".configuration.lock")).unwrap();
         assert!(ConfigDirectoryLock::try_acquire(&root).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn single_instance_server_activates_callback_and_cleans_up_on_drop() {
+        let root = std::env::temp_dir().join(format!(
+            "linscp-single-instance-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        assert!(!try_signal_running_instance(&root));
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_cb = hits.clone();
+        let server = SingleInstanceServer::start(&root, move || {
+            hits_cb.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+        assert!(try_signal_running_instance(&root));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        drop(server);
+        assert!(!try_signal_running_instance(&root));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// In-memory SAF tree. It is deliberately strict: a name containing a

@@ -12774,17 +12774,49 @@
     else toast(result && result.error ? t(result.error) : t('Could not lock the local vault.'), true);
   }
 
+  async function retryVaultConfigurationLock() {
+    const retryBtn = $('vaultRetryButton');
+    if (retryBtn) retryBtn.disabled = true;
+    $('vaultGateError').textContent = '';
+    const retried = await apiPost('/api/vault/retry-lock', {});
+    if (!retried || !retried.success) {
+      $('vaultGateError').textContent = retried && retried.error ? t(retried.error) : t('Could not unlock the local vault.');
+      if (retryBtn) retryBtn.disabled = false;
+      return false;
+    }
+    if (await requireLocalVaultUnlock()) {
+      await completeCommanderBoot();
+      return true;
+    }
+    return false;
+  }
+
   async function requireLocalVaultUnlock() {
     const status = await apiGet('/api/vault/status');
     if (!status || !status.success) {
       $('vaultGate').style.display = 'flex';
       $('vaultGateTitle').textContent = t('Unlock LinSCP vault');
+      $('vaultGateDescription').textContent = '';
+      if ($('vaultPasswordFields')) $('vaultPasswordFields').style.display = 'none';
       $('vaultGateError').textContent = status && status.error ? t(status.error) : t('Could not unlock the local vault.');
       $('vaultUnlockButton').disabled = true;
+      $('vaultUnlockButton').style.display = 'none';
+      if ($('vaultRetryButton')) {
+        $('vaultRetryButton').textContent = t('Retry');
+        $('vaultRetryButton').disabled = false;
+        $('vaultRetryButton').style.display = '';
+      }
       return false;
     }
+    if ($('vaultPasswordFields')) $('vaultPasswordFields').style.display = '';
+    if ($('vaultRetryButton')) $('vaultRetryButton').style.display = 'none';
+    $('vaultUnlockButton').style.display = '';
+    $('vaultUnlockButton').disabled = false;
     const vaultState = status.vault;
-    if (vaultState === 'unlocked') return true;
+    if (vaultState === 'unlocked') {
+      $('vaultGate').style.display = 'none';
+      return true;
+    }
     const gate = $('vaultGate');
     const setup = vaultState === 'setup_required';
     $('vaultGateTitle').textContent = setup ? t('Set up your local credential vault') : t('Unlock LinSCP vault');
@@ -12959,23 +12991,10 @@
     } finally { autoReconnectRequests--; }
   }
 
-  async function boot() {
-    const terminalOnly = terminalWindowId();
-    if (terminalOnly) { bootTerminalWindow(terminalOnly); return; }
-    applyExplorerMode();
-    updateHiddenFilesMenuLabel();
-    mountShell();
-    const caps = hostCaps();
-    if ($('androidShareMenuItem')) $('androidShareMenuItem').hidden = !(caps && caps.platform === 'android' && caps.nativeIpc && window.LinSCPCore?.nativeInvoker(window));
-    mountServerMonitor();
-    /* The agent hint is static per host: say once why agent login is not
-     * offered instead of failing the connection later. */
-    updateAgentHint(sshAgentGap());
-    /* The Kerberos hint is static per host: say once why the settings
-     * cannot work here instead of failing the connection later. */
-    updateGssapiHint();
-    listenForNativeDrops();
-    if (!await requireLocalVaultUnlock()) return;
+  let commanderBootCompleted = false;
+  async function completeCommanderBoot() {
+    if (commanderBootCompleted) return;
+    commanderBootCompleted = true;
     await loadTransferSettings();
     await refreshStatus();
     await loadLocal(state.local.path || '');
@@ -13008,20 +13027,43 @@
     });
   }
 
+  async function boot() {
+    const terminalOnly = terminalWindowId();
+    if (terminalOnly) { bootTerminalWindow(terminalOnly); return; }
+    applyExplorerMode();
+    updateHiddenFilesMenuLabel();
+    mountShell();
+    const caps = hostCaps();
+    if ($('androidShareMenuItem')) $('androidShareMenuItem').hidden = !(caps && caps.platform === 'android' && caps.nativeIpc && window.LinSCPCore?.nativeInvoker(window));
+    mountServerMonitor();
+    /* The agent hint is static per host: say once why agent login is not
+     * offered instead of failing the connection later. */
+    updateAgentHint(sshAgentGap());
+    /* The Kerberos hint is static per host: say once why the settings
+     * cannot work here instead of failing the connection later. */
+    updateGssapiHint();
+    listenForNativeDrops();
+    if (!await requireLocalVaultUnlock()) return;
+    await completeCommanderBoot();
+  }
+
   boot();
   </script>
   <div id="vaultGate" role="dialog" aria-modal="true" aria-labelledby="vaultGateTitle">
     <form class="vault-card" id="vaultGateForm">
       <h1 id="vaultGateTitle">Unlock LinSCP vault</h1>
       <p id="vaultGateDescription">Enter your separate vault password to unlock saved credentials on this device.</p>
-      <label for="vaultPassword">Vault password</label>
-      <input id="vaultPassword" type="password" autocomplete="current-password" required minlength="6" maxlength="1024">
-      <div id="vaultConfirmRow" style="display:none">
-        <label for="vaultPasswordConfirm">Confirm vault password</label>
-        <input id="vaultPasswordConfirm" type="password" autocomplete="new-password" minlength="6" maxlength="1024">
+      <div id="vaultPasswordFields">
+        <label for="vaultPassword">Vault password</label>
+        <input id="vaultPassword" type="password" autocomplete="current-password" required minlength="6" maxlength="1024">
+        <div id="vaultConfirmRow" style="display:none">
+          <label for="vaultPasswordConfirm">Confirm vault password</label>
+          <input id="vaultPasswordConfirm" type="password" autocomplete="new-password" minlength="6" maxlength="1024">
+        </div>
       </div>
       <p id="vaultGateError" class="vault-error" role="alert"></p>
       <button id="vaultUnlockButton" class="btn" type="submit">Unlock vault</button>
+      <button id="vaultRetryButton" class="btn" type="button" style="display:none" onclick="retryVaultConfigurationLock()">Retry</button>
     </form>
   </div>
 </body>

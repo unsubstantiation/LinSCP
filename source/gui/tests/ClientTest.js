@@ -2317,9 +2317,23 @@ function options(id) {
   const gated = await window.requireLocalVaultUnlock();
   check('configuration startup errors remain visible and block vault setup',
     gated === false && doc.getElementById('vaultGate').style.display === 'flex' &&
-      doc.getElementById('vaultUnlockButton').disabled && text('vaultGateError').includes('another instance'));
+      doc.getElementById('vaultUnlockButton').disabled && text('vaultGateError').includes('another instance') &&
+      doc.getElementById('vaultPasswordFields').style.display === 'none' &&
+      doc.getElementById('vaultRetryButton').style.display === '');
+  responses['/api/vault/retry-lock'] = { success: false, error: 'Still locked.' };
+  const retryFailed = await window.retryVaultConfigurationLock();
+  check('retrying configuration lock while still held surfaces the error and keeps Retry active',
+    retryFailed === false && text('vaultGateError').includes('Still locked.') &&
+      !doc.getElementById('vaultRetryButton').disabled);
+  responses['/api/vault/retry-lock'] = { success: true };
   responses['/api/vault/status'] = previousVaultStatus;
-  doc.getElementById('vaultGate').style.display = 'none';
+  const retrySucceeded = await window.retryVaultConfigurationLock();
+  check('retrying configuration lock after release recovers and closes vaultGate',
+    retrySucceeded === true &&
+      calls.some(call => call.path === '/api/vault/retry-lock') &&
+      doc.getElementById('vaultGate').style.display === 'none' &&
+      doc.getElementById('vaultPasswordFields').style.display === '');
+  delete responses['/api/vault/retry-lock'];
   doc.getElementById('vaultUnlockButton').disabled = false;
   doc.getElementById('vaultGateError').textContent = '';
 

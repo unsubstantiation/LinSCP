@@ -459,8 +459,36 @@ pub mod commands {
     }
 }
 
+#[cfg(all(feature = "native-shell", target_os = "android"))]
+static SHARED_ANDROID_SERVICE: std::sync::OnceLock<CommanderService> = std::sync::OnceLock::new();
+
+#[cfg(all(feature = "native-shell", not(target_os = "android")))]
+fn focus_or_recreate_main_window(app: &tauri::AppHandle) {
+    use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+        return;
+    }
+    if let Ok(win) =
+        WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+            .title("LinSCP")
+            .inner_size(1280.0, 820.0)
+            .min_inner_size(360.0, 540.0)
+            .build()
+    {
+        if let Some(icon) = app.default_window_icon() {
+            let _ = win.set_icon(icon.clone());
+        }
+        let _ = win.set_focus();
+    }
+}
+
 #[cfg(feature = "native-shell")]
-pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
+fn build_native_app_with_bridge(
+    #[allow(unused_variables)] desktop_bridge: Option<TauriBridge>,
+) -> tauri::Builder<tauri::Wry> {
     let builder = tauri::Builder::default();
     #[cfg(target_os = "android")]
     let builder = builder.plugin(android::mobile_plugin());
@@ -468,7 +496,26 @@ pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
     // bridge's `Default` already knows which of the two this build is, so a future
     // host cannot forget to say it (A1 was exactly that kind of omission).
     #[cfg(not(target_os = "android"))]
-    let builder = builder.manage(TauriBridge::default());
+    let builder = builder
+        .manage(desktop_bridge.unwrap_or_default())
+        .setup(|app| {
+            use tauri::Manager;
+            if app.state::<TauriBridge>().service.has_config_lock() {
+                let app_handle = app.handle().clone();
+                if let Ok(instance_guard) = linscp_platform::SingleInstanceServer::start(
+                    &linscp_platform::config_dir(),
+                    move || {
+                        let handle = app_handle.clone();
+                        let _ = app_handle.run_on_main_thread(move || {
+                            focus_or_recreate_main_window(&handle);
+                        });
+                    },
+                ) {
+                    app.manage(instance_guard);
+                }
+            }
+            Ok(())
+        });
     #[cfg(target_os = "android")]
     let builder = builder.setup(|app| {
         use tauri::Manager;
@@ -480,21 +527,22 @@ pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
         // Set paths before constructing the service or starting any transfers.
         std::env::set_var("LINSCP_ANDROID_FILES_DIR", &files);
         std::env::set_var("TMPDIR", &cache);
-        // Build the service before the page can reach it, and let its local
-        // filesystem see the SAF bridge registered by the Kotlin plugin. A
-        // granted tree then behaves like any other local root: listing,
-        // creating, writing, renaming and deleting go through `LocalFs`.
-        // The mobile plugin registers SAF/share/foreground bridges before this
-        // setup hook; the exact same state must back both service and commands.
+        // Reuse one process-wide `CommanderService` across Android Activity
+        // destruction/recreation when returning after background idle so the
+        // new Activity never contends with the same process's `.configuration.lock`
+        // or discards active sessions and vault state.
         let state = app.state::<std::sync::Arc<android::AndroidState>>().inner().clone();
-        let filesystem = android::local_filesystem(&state);
-        let mut service = CommanderService::new(
-            linscp_platform::default_config_dir(),
-            std::sync::Arc::new(filesystem),
-        );
-        if let Some(keystore) = state.keystore_bridge() {
-            service = service.with_keystore_bridge(keystore);
-        }
+        let service = SHARED_ANDROID_SERVICE
+            .get_or_init(|| {
+                let filesystem = linscp_platform::NativeLocalFs::with_saf(state.clone());
+                CommanderService::new(
+                    linscp_platform::default_config_dir(),
+                    std::sync::Arc::new(filesystem),
+                )
+                .with_keystore_bridge(state.clone())
+            })
+            .clone();
+        let _ = service.retry_config_lock();
         app.manage(TauriBridge::for_android_app(service, state));
         Ok(())
     });
@@ -534,10 +582,40 @@ pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
 }
 
 #[cfg(feature = "native-shell")]
+pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
+    build_native_app_with_bridge(None)
+}
+
+#[cfg(feature = "native-shell")]
 pub fn run_native_app(context: tauri::Context<tauri::Wry>) {
-    build_native_app()
-        .run(context)
-        .expect("failed to run LinSCP Tauri shell");
+    #[cfg(not(target_os = "android"))]
+    {
+        let bridge = TauriBridge::default();
+        if !bridge.service.has_config_lock() {
+            let cfg_dir = linscp_platform::config_dir();
+            if linscp_platform::try_signal_running_instance(&cfg_dir) {
+                return;
+            }
+            for _ in 0..15 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if bridge.service.retry_config_lock().is_ok() {
+                    break;
+                }
+                if linscp_platform::try_signal_running_instance(&cfg_dir) {
+                    return;
+                }
+            }
+        }
+        build_native_app_with_bridge(Some(bridge))
+            .run(context)
+            .expect("failed to run LinSCP Tauri shell");
+    }
+    #[cfg(target_os = "android")]
+    {
+        build_native_app()
+            .run(context)
+            .expect("failed to run LinSCP Tauri shell");
+    }
 }
 
 #[cfg(all(feature = "native-shell", target_os = "android"))]

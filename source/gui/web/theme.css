@@ -1613,7 +1613,8 @@ body.pane-drag-active * {
   color: var(--danger);
   font-size: var(--fs-sm);
 }
-#vaultGate #vaultUnlockButton {
+#vaultGate #vaultUnlockButton,
+#vaultGate #vaultRetryButton {
   width: 100%;
   min-height: var(--control-lg);
   margin-top: var(--space-4);

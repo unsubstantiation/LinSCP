@@ -174,7 +174,7 @@ pub struct CommanderService {
     session_key_lock: Arc<Mutex<()>>,
     // Held for the service lifetime: a second cooperating instance must not
     // read or write a directory while restore or recovery is in progress.
-    config_lock: Arc<Result<linscp_platform::ConfigDirectoryLock, String>>,
+    config_lock: Arc<Mutex<Result<linscp_platform::ConfigDirectoryLock, String>>>,
     // Remains set through unlock, journal recovery, reload and migration; the
     // journal alone disappears before the in-memory state is ready to use.
     recovery_gate: Arc<std::sync::atomic::AtomicBool>,
@@ -269,7 +269,7 @@ impl CommanderService {
             })),
             event_tx: Arc::new(Mutex::new(None)),
             session_key_lock: Arc::new(Mutex::new(())),
-            config_lock: Arc::new(config_lock),
+            config_lock: Arc::new(Mutex::new(config_lock)),
             recovery_gate: Arc::new(std::sync::atomic::AtomicBool::new(recovery_needed)),
             config_activity: Arc::new(tokio::sync::RwLock::new(())),
             queue,
@@ -399,10 +399,48 @@ impl CommanderService {
         if g.logs.len() > 500 { let mut old = g.logs.remove(0); wipe_log_entry(&mut old); }
     }
 
+    /// Returns whether this service instance holds the configuration directory lock.
+    pub fn has_config_lock(&self) -> bool {
+        self.config_lock.lock().expect("config lock mutex").is_ok()
+    }
+
+    /// Explicitly retries acquiring the configuration directory lock after an
+    /// earlier startup contention has cleared. Ordinary IPC dispatch never
+    /// calls this implicitly.
+    pub fn retry_config_lock(&self) -> Result<(), String> {
+        let mut guard = self.config_lock.lock().expect("config lock mutex");
+        if guard.is_ok() {
+            return Ok(());
+        }
+        let config_root = self.config_root();
+        let acquired = linscp_platform::ConfigDirectoryLock::try_acquire(&config_root)
+            .map_err(|error| format!("Cannot open configuration: {error}"))?;
+        let recovery_needed = !matches!(
+            linscp_engine::backup::restore_recovery_required(&config_root),
+            Ok(false)
+        );
+        self.recovery_gate
+            .store(recovery_needed, std::sync::atomic::Ordering::Release);
+        if !recovery_needed {
+            let _ = linscp_platform::create_private_dir(&config_root.join("shell-manifests"));
+            cleanup_stale_temporary_keys(&config_root);
+            let preferences = PreferencesStore::load(&config_root).unwrap_or_default();
+            let initial_xml = Self::resolve_xml_log_path(&config_root, &preferences)
+                .ok()
+                .flatten();
+            self.queue.set_xml_log_path(initial_xml);
+            self.state.lock().expect("state mutex").preferences = preferences;
+        }
+        *guard = Ok(acquired);
+        Ok(())
+    }
+
     /// Check whether it is safe for the host to access configuration data.
     /// Only vault status/unlock may proceed while a restore journal exists.
     pub fn config_access_ready(&self) -> Result<(), String> {
-        self.config_lock.as_ref().as_ref().map_err(Clone::clone)?;
+        if let Err(error) = self.config_lock.lock().expect("config lock mutex").as_ref() {
+            return Err(error.clone());
+        }
         if self.recovery_gate.load(std::sync::atomic::Ordering::Acquire) {
             return Err("Unlock the vault to recover an interrupted full backup restore.".into());
         }
@@ -439,7 +477,7 @@ impl CommanderService {
             return false;
         }
         match req.path.split('?').next() {
-            Some("/api/backup/import" | "/api/vault/unlock") => true,
+            Some("/api/backup/import" | "/api/vault/unlock" | "/api/vault/retry-lock") => true,
             Some("/api/command/exec") => req
                 .body
                 .get("command")
@@ -450,7 +488,12 @@ impl CommanderService {
     }
 
     fn config_dispatch_error(&self, req: &ApiEnvelope) -> Option<ApiReply> {
-        if let Err(error) = self.config_lock.as_ref().as_ref() {
+        if req.method.eq_ignore_ascii_case("POST")
+            && req.path.split('?').next() == Some("/api/vault/retry-lock")
+        {
+            return None;
+        }
+        if let Err(error) = self.config_lock.lock().expect("config lock mutex").as_ref() {
             return Some(api_error(503, error));
         }
         let allowed_during_recovery = matches!(
@@ -515,6 +558,7 @@ impl CommanderService {
             ("GET", "/api/editor/external") => self.handle_external_editor_list(),
             ("POST", "/api/editor/external/close") => self.handle_external_editor_close(req.body),
             ("GET", "/api/vault/status") => self.handle_vault_status(),
+            ("POST", "/api/vault/retry-lock") => self.handle_vault_retry_lock(),
             ("POST", "/api/vault/unlock") => self.handle_vault_unlock(req.body),
             ("POST", "/api/vault/lock") => self.handle_vault_lock(),
             ("GET", "/api/vault/keys") => self.handle_vault_ssh_keys(),
@@ -5164,6 +5208,13 @@ impl CommanderService {
         self.default_local_dir()
     }
 
+    fn handle_vault_retry_lock(&self) -> ApiReply {
+        match self.retry_config_lock() {
+            Ok(()) => ApiReply { status: 200, payload: json!({ "success": true }) },
+            Err(error) => api_error(503, error),
+        }
+    }
+
     fn handle_vault_status(&self) -> ApiReply {
         let config_root = self.config_root();
         match self.secret_vault.status(&config_root) {
@@ -5196,9 +5247,15 @@ impl CommanderService {
             return api_error(400, error.to_string());
         }
         if pending {
-            let lock = match self.config_lock.as_ref().as_ref() {
+            let lock_guard = self.config_lock.lock().expect("config lock mutex");
+            let lock = match lock_guard.as_ref() {
                 Ok(lock) => lock,
-                Err(error) => { let _ = self.secret_vault.lock(); return api_error(503, error); },
+                Err(error) => {
+                    let msg = error.clone();
+                    drop(lock_guard);
+                    let _ = self.secret_vault.lock();
+                    return api_error(503, msg);
+                }
             };
             match linscp_engine::backup::recover_interrupted_restore(&config_root, self.secret_vault.as_ref(), lock) {
                 Ok(true) => {}
@@ -5999,10 +6056,9 @@ impl CommanderService {
         bundle: &linscp_engine::backup::BackupBundle,
     ) -> Result<(), ApiReply> {
         let _guard = self.session_key_lock.lock().expect("session key lock");
-        let lock = match self.config_lock.as_ref().as_ref() {
-            Ok(lock) => lock,
-            Err(error) => return Err(api_error(503, error)),
-        };
+        if let Err(error) = self.config_lock.lock().expect("config lock mutex").as_ref() {
+            return Err(api_error(503, error));
+        }
         let cfg = self.config_root();
         match self.secret_vault.load_master_key(&cfg) {
             Ok(Some(_)) => {}
@@ -6012,7 +6068,15 @@ impl CommanderService {
         if let Err(error) = self.ensure_full_restore_quiescent() {
             return Err(api_error(409, error));
         }
-        match linscp_engine::backup::import_backup_transactional(&cfg, bundle, self.secret_vault.as_ref(), lock) {
+        let restore_result = {
+            let lock_guard = self.config_lock.lock().expect("config lock mutex");
+            let lock = match lock_guard.as_ref() {
+                Ok(lock) => lock,
+                Err(error) => return Err(api_error(503, error)),
+            };
+            linscp_engine::backup::import_backup_transactional(&cfg, bundle, self.secret_vault.as_ref(), lock)
+        };
+        match restore_result {
             Ok(()) => {
                 let preferences = PreferencesStore::load(&cfg).unwrap_or_default();
                 self.queue.clear_finished();
@@ -14513,6 +14577,14 @@ mod tests {
         assert_eq!(second.dispatch(request()).status, 503);
         let third = CommanderService::new(temp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
         assert_eq!(third.dispatch(request()).status, 200);
+        // While `third` holds the lock, explicit retry on `second` still fails closed.
+        let retry_req = || ApiEnvelope { method: "POST".into(), path: "/api/vault/retry-lock".into(), body: json!({}) };
+        assert_eq!(second.dispatch(retry_req()).status, 503);
+        drop(third);
+        // Once free, only an explicit retry acquires the lock.
+        assert_eq!(second.dispatch(request()).status, 503);
+        assert_eq!(second.dispatch(retry_req()).status, 200);
+        assert_eq!(second.dispatch(request()).status, 200);
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
