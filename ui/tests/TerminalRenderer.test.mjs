@@ -1457,9 +1457,10 @@ test('transient IPC glitches on resume do not kill the terminal while HTTP 400 s
   });
   // Speed up transient backoff via direct focus resumes to exercise >5 transient errors quickly.
   session.start();
-  for (let i = 0; i < 9; i += 1) {
+  const transientDeadline = Date.now() + 1000;
+  while (transientCount < 9 && Date.now() < transientDeadline) {
     dom.dom.window.dispatchEvent(new dom.dom.window.Event('focus'));
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.equal(ended.length, 0, 'transient IPC errors without 400/404 status do not kill the terminal');
   assert.ok(transientCount >= 9, 'recovered after >5 transient errors');
@@ -1485,7 +1486,10 @@ test('transient IPC glitches on resume do not kill the terminal while HTTP 400 s
     onEnded: (reason) => closedReasons.push(reason),
   });
   deadSession.start();
-  await new Promise((resolve) => setTimeout(resolve, 40));
+  const closeDeadline = Date.now() + 1000;
+  while (closedReasons.length === 0 && Date.now() < closeDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
   assert.deepEqual(closedReasons, ['This terminal is no longer open.']);
   dom.cleanup();
 });

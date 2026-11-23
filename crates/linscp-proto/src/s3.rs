@@ -999,6 +999,153 @@ impl S3Session {
         Ok(())
     }
 
+    pub async fn restore_version(
+        &self,
+        remote_path: &str,
+        version_id: &str,
+    ) -> Result<(), ProtoError> {
+        let trimmed_vid = version_id.trim();
+        if trimmed_vid.is_empty() || trimmed_vid.chars().any(char::is_control) {
+            return Err(ProtoError::Transport(
+                "A valid S3 object version ID is required.".to_string(),
+            ));
+        }
+        let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else {
+            return Err(ProtoError::Transport(
+                "S3 version restore requires a bucket and object key.".to_string(),
+            ));
+        };
+        if key.is_empty() || key.ends_with('/') {
+            return Err(ProtoError::Transport(
+                "S3 version restore requires a regular object key.".to_string(),
+            ));
+        }
+        let Some(src_info) = self.stat_version(remote_path, trimmed_vid).await? else {
+            return Err(ProtoError::Transport(format!(
+                "S3 object version '{trimmed_vid}' for '{remote_path}' does not exist or is a delete marker."
+            )));
+        };
+        if src_info.is_dir || src_info.is_symlink {
+            return Err(ProtoError::Transport(
+                "S3 version restore requires a regular object version.".to_string(),
+            ));
+        }
+        let copy_source = format!(
+            "{}?versionId={}",
+            s3_uri_encode_path(&format!("/{bucket}/{key}")),
+            s3_query_encode(trimmed_vid)
+        );
+        if src_info.size > self.cfg.multipart_threshold {
+            let min_part = self.cfg.min_part_size.max(5 * 1024);
+            let part_size = if src_info.size > min_part * 9_999 {
+                src_info.size.div_ceil(9_999)
+            } else {
+                min_part
+            };
+            let cp = self
+                .initiate_multipart(&bucket, &key, src_info.size, part_size)
+                .await?;
+            let mut parts_etags: Vec<(u32, String)> = Vec::new();
+            let mut offset = 0u64;
+            let mut part_num = 1u32;
+            let copy_res: Result<(), ProtoError> = async {
+                while offset < src_info.size {
+                    let end = (offset + part_size).min(src_info.size) - 1;
+                    let qp = vec![
+                        ("partNumber".to_string(), part_num.to_string()),
+                        ("uploadId".to_string(), cp.upload_id.clone()),
+                    ];
+                    let hdrs = vec![
+                        ("x-amz-copy-source".to_string(), copy_source.clone()),
+                        (
+                            "x-amz-copy-source-range".to_string(),
+                            format!("bytes={offset}-{end}"),
+                        ),
+                    ];
+                    let resp = self
+                        .send_signed(
+                            Method::PUT,
+                            Some(&bucket),
+                            &key,
+                            &qp,
+                            &hdrs,
+                            Vec::new(),
+                        )
+                        .await?;
+                    let st = resp.status();
+                    let xml = resp.text().await.unwrap_or_default();
+                    if !st.is_success() || xml.contains("<Error>") {
+                        return Err(parse_s3_error_xml(st, &xml));
+                    }
+                    reject_xxe_declarations(&xml)?;
+                    let doc = roxmltree::Document::parse(&xml).map_err(|e| {
+                        ProtoError::Transport(format!("Malformed UploadPartCopy XML: {e}"))
+                    })?;
+                    let etag = doc
+                        .descendants()
+                        .find(|n| n.is_element() && n.tag_name().name() == "ETag")
+                        .and_then(|n| n.text())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            ProtoError::Transport(
+                                "UploadPartCopy XML missing ETag.".to_string(),
+                            )
+                        })?
+                        .to_string();
+                    parts_etags.push((part_num, etag));
+                    offset = end + 1;
+                    part_num += 1;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(err) = copy_res {
+                self.abort_multipart(&bucket, &key, &cp.upload_id).await;
+                return Err(err);
+            }
+            let mut complete_xml = String::from("<CompleteMultipartUpload>");
+            for (pn, etag) in &parts_etags {
+                complete_xml.push_str(&format!(
+                    "<Part><PartNumber>{pn}</PartNumber><ETag>{}</ETag></Part>",
+                    xml_escape(etag)
+                ));
+            }
+            complete_xml.push_str("</CompleteMultipartUpload>");
+            let qp = vec![("uploadId".to_string(), cp.upload_id.clone())];
+            let hdrs = vec![("content-type".to_string(), "application/xml".to_string())];
+            let resp = self
+                .send_signed(
+                    Method::POST,
+                    Some(&bucket),
+                    &key,
+                    &qp,
+                    &hdrs,
+                    complete_xml.into_bytes(),
+                )
+                .await?;
+            let st = resp.status();
+            let xml = resp.text().await.unwrap_or_default();
+            if !st.is_success() || xml.contains("<Error>") {
+                self.abort_multipart(&bucket, &key, &cp.upload_id).await;
+                return Err(parse_s3_error_xml(st, &xml));
+            }
+            return Ok(());
+        }
+
+        let mut headers = self.write_headers_vec();
+        headers.push(("x-amz-copy-source".to_string(), copy_source));
+        let resp = self
+            .send_signed(Method::PUT, Some(&bucket), &key, &[], &headers, Vec::new())
+            .await?;
+        let status = resp.status();
+        let xml = resp.text().await.unwrap_or_default();
+        if !status.is_success() || xml.contains("<Error>") {
+            return Err(parse_s3_error_xml(status, &xml));
+        }
+        Ok(())
+    }
+
     async fn abort_multipart(&self, bucket: &str, key: &str, upload_id: &str) {
         let qp = vec![("uploadId".to_string(), upload_id.to_string())];
         let _ = self
@@ -2170,6 +2317,14 @@ impl RemoteSession for S3Session {
         version_id: &str,
     ) -> Result<(), ProtoError> {
         self.remove_version(remote_path, version_id).await
+    }
+
+    async fn s3_restore_version(
+        &self,
+        remote_path: &str,
+        version_id: &str,
+    ) -> Result<(), ProtoError> {
+        self.restore_version(remote_path, version_id).await
     }
 
     async fn close(&self) -> Result<(), ProtoError> {

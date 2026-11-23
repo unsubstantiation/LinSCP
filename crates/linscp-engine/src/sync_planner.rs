@@ -11,8 +11,8 @@ use linscp_crypto::digests::sha256_hex;
 use linscp_platform::terminal::stat_local_path;
 use linscp_platform::write_private_file_atomic;
 use linscp_platform::{saf_document_too_large, LocalFs, MAX_SAF_DOCUMENT_BYTES};
-use linscp_proto::RemoteSession;
-use linscp_types::TransferMode;
+use linscp_proto::{ProtoError, RemoteSession};
+use linscp_types::{FileEntry, ProtocolScheme, TransferMode};
 
 use crate::filemask::{FileMask, join_remote_path, mode_from_permissions_str};
 use crate::transfer::{
@@ -1309,6 +1309,385 @@ pub async fn apply_sync_plan(
     }
 
     Ok((applied, conflicts))
+}
+
+/// Adapts a local directory (OS path or Android SAF `content://` tree) to
+/// [`RemoteSession`] so dual-local tabs can preview and execute one-way,
+/// mirror, checksum, and stateful bidirectional (`both`) synchronizations
+/// through [`plan_synchronization`] and [`apply_sync_plan`].
+pub struct LocalSyncSession {
+    root: String,
+    local_fs: Arc<dyn LocalFs>,
+}
+
+impl LocalSyncSession {
+    pub fn new(root: String, local_fs: Arc<dyn LocalFs>) -> Self {
+        Self { root, local_fs }
+    }
+
+    fn resolve(&self, virtual_path: &str) -> Result<String, ProtoError> {
+        let trimmed = virtual_path.trim().trim_matches('/');
+        if trimmed.is_empty() {
+            return Ok(self.root.clone());
+        }
+        for seg in trimmed.split('/') {
+            if seg.is_empty()
+                || seg == "."
+                || seg == ".."
+                || seg.contains('\\')
+                || seg.chars().any(char::is_control)
+            {
+                return Err(ProtoError::Transport(format!(
+                    "Invalid synchronization path '{virtual_path}'."
+                )));
+            }
+        }
+        if is_saf_sync_root(&self.root) {
+            Ok(join_saf_rel(&self.root, trimmed))
+        } else {
+            let mut pb = PathBuf::from(&self.root);
+            for seg in trimmed.split('/') {
+                pb.push(seg);
+            }
+            Ok(pb.to_string_lossy().into_owned())
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RemoteSession for LocalSyncSession {
+    fn scheme(&self) -> ProtocolScheme {
+        ProtocolScheme::Local
+    }
+
+    async fn pwd(&self) -> Result<String, ProtoError> {
+        Ok("/".to_string())
+    }
+
+    async fn stat(&self, remote_path: &str) -> Result<Option<FileEntry>, ProtoError> {
+        let target = self.resolve(remote_path)?;
+        match self.local_fs.stat(&target) {
+            Ok(entry) => Ok(Some(entry)),
+            Err(linscp_platform::PlatformError::Io(ref err))
+                if err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(ProtoError::Transport(err.to_string())),
+        }
+    }
+
+    async fn list_dir(&self, remote_path: &str) -> Result<Vec<FileEntry>, ProtoError> {
+        let target = self.resolve(remote_path)?;
+        self.local_fs
+            .list_dir(&target)
+            .map_err(|err| ProtoError::Transport(err.to_string()))
+    }
+
+    async fn mkdir(&self, remote_path: &str) -> Result<(), ProtoError> {
+        let target = self.resolve(remote_path)?;
+        self.local_fs
+            .mkdir_all(&target)
+            .map_err(|err| ProtoError::Transport(err.to_string()))
+    }
+
+    async fn remove_file(&self, remote_path: &str) -> Result<(), ProtoError> {
+        let target = self.resolve(remote_path)?;
+        self.local_fs
+            .remove_file(&target)
+            .map_err(|err| ProtoError::Transport(err.to_string()))
+    }
+
+    async fn remove_dir(&self, remote_path: &str) -> Result<(), ProtoError> {
+        let target = self.resolve(remote_path)?;
+        self.local_fs
+            .remove_dir_all(&target)
+            .map_err(|err| ProtoError::Transport(err.to_string()))
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), ProtoError> {
+        let src = self.resolve(from)?;
+        let dst = self.resolve(to)?;
+        self.local_fs
+            .rename(&src, &dst)
+            .map_err(|err| ProtoError::Transport(err.to_string()))
+    }
+
+    async fn copy_file(&self, from: &str, to: &str) -> Result<(), ProtoError> {
+        let src = self.resolve(from)?;
+        let dst = self.resolve(to)?;
+        self.local_fs
+            .copy_streamed(&src, &dst)
+            .map(|_| ())
+            .map_err(|err| ProtoError::Transport(err.to_string()))
+    }
+
+    async fn symlink(&self, _target: &str, _link_path: &str) -> Result<(), ProtoError> {
+        Err(ProtoError::UnsupportedCapability(
+            "symlink",
+            ProtocolScheme::Local,
+        ))
+    }
+
+    async fn chmod(&self, remote_path: &str, mode: u32) -> Result<(), ProtoError> {
+        let target = self.resolve(remote_path)?;
+        self.local_fs
+            .set_permissions_mode(&target, mode)
+            .map_err(|err| ProtoError::Transport(err.to_string()))
+    }
+
+    async fn set_mtime(&self, remote_path: &str, mtime: i64) -> Result<(), ProtoError> {
+        let target = self.resolve(remote_path)?;
+        self.local_fs
+            .set_mtime(&target, mtime)
+            .map_err(|err| ProtoError::Transport(err.to_string()))
+    }
+
+    async fn checksum(&self, algorithm: &str, remote_path: &str) -> Result<String, ProtoError> {
+        use linscp_crypto::digests::{DigestAlgorithm, DigestHasher};
+        use std::io::Read;
+
+        let alg = DigestAlgorithm::parse(algorithm).ok_or_else(|| {
+            ProtoError::Transport(format!("Unsupported checksum algorithm '{algorithm}'."))
+        })?;
+        let target = self.resolve(remote_path)?;
+        if is_saf_sync_root(&target) {
+            let stage = tempfile::Builder::new()
+                .prefix("linscp-local-sync-hash-")
+                .rand_bytes(16)
+                .tempdir()
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            let staged_file = stage.path().join("contents");
+            self.local_fs
+                .stage_to_file(&target, &staged_file)
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            let mut file = std::fs::File::open(&staged_file)
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            let mut hasher = DigestHasher::new(alg);
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = file
+                    .read(&mut buf)
+                    .map_err(|e| ProtoError::Transport(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            return Ok(hasher.finalize_hex());
+        }
+        let mut file =
+            std::fs::File::open(&target).map_err(|e| ProtoError::Transport(e.to_string()))?;
+        let mut hasher = DigestHasher::new(alg);
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = file
+                .read(&mut buf)
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(hasher.finalize_hex())
+    }
+
+    async fn checksum_server_only(
+        &self,
+        algorithm: &str,
+        remote_path: &str,
+    ) -> Result<Option<String>, ProtoError> {
+        self.checksum(algorithm, remote_path).await.map(Some)
+    }
+
+    async fn download(
+        &self,
+        remote_path: &str,
+        opts: linscp_proto::TransferRequest,
+        sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+        progress: Option<&linscp_proto::ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+        let target = self.resolve(remote_path)?;
+        let mut stage_holder = None;
+        let open_path = if is_saf_sync_root(&target) {
+            let stage = tempfile::Builder::new()
+                .prefix("linscp-local-sync-dl-")
+                .rand_bytes(16)
+                .tempdir()
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            let staged_file = stage.path().join("contents");
+            self.local_fs
+                .stage_to_file(&target, &staged_file)
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            stage_holder = Some(stage);
+            staged_file
+        } else {
+            PathBuf::from(&target)
+        };
+        let mut file = tokio::fs::File::open(&open_path)
+            .await
+            .map_err(|e| ProtoError::Transport(e.to_string()))?;
+        let total = file
+            .metadata()
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if opts.resume_offset > 0 {
+            file.seek(std::io::SeekFrom::Start(opts.resume_offset))
+                .await
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+        }
+        let mut limiter = linscp_proto::BandwidthLimiter::new(opts.speed_kbytes_per_sec);
+        let mut copied = 0u64;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = file
+                .read(&mut buf)
+                .await
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            sink.write_all(&buf[..n])
+                .await
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            copied += n as u64;
+            limiter.throttle(n as u64).await;
+            if let Some(cb) = progress {
+                cb(opts.resume_offset + copied, total);
+            }
+        }
+        sink.flush()
+            .await
+            .map_err(|e| ProtoError::Transport(e.to_string()))?;
+        drop(stage_holder);
+        Ok(copied)
+    }
+
+    async fn upload(
+        &self,
+        remote_path: &str,
+        opts: linscp_proto::TransferRequest,
+        source: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        total_size: Option<u64>,
+        progress: Option<&linscp_proto::ProgressCallback>,
+    ) -> Result<u64, ProtoError> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+        let target = self.resolve(remote_path)?;
+        if is_saf_sync_root(&target) {
+            let stage = tempfile::Builder::new()
+                .prefix("linscp-local-sync-ul-")
+                .rand_bytes(16)
+                .tempdir()
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            let staged_file = stage.path().join("contents");
+            let mut out = tokio::fs::File::create(&staged_file)
+                .await
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            let mut limiter = linscp_proto::BandwidthLimiter::new(opts.speed_kbytes_per_sec);
+            let mut written = 0u64;
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = source
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| ProtoError::Transport(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all(&buf[..n])
+                    .await
+                    .map_err(|e| ProtoError::Transport(e.to_string()))?;
+                written += n as u64;
+                limiter.throttle(n as u64).await;
+                if let Some(cb) = progress {
+                    cb(written, total_size.unwrap_or(written));
+                }
+            }
+            out.flush()
+                .await
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            drop(out);
+            self.local_fs
+                .publish_from_file(&staged_file, &target)
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            if opts.preserve_time {
+                if let Some(mt) = opts.mtime {
+                    let _ = self.local_fs.set_mtime(&target, mt);
+                }
+            }
+            return Ok(written);
+        }
+
+        let target_pb = PathBuf::from(&target);
+        if let Some(parent) = target_pb.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+        }
+        let mut out = if opts.append {
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&target_pb)
+                .await
+                .map_err(|e| ProtoError::Transport(e.to_string()))?
+        } else if opts.resume_offset > 0 {
+            let mut f = tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&target_pb)
+                .await
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            f.seek(std::io::SeekFrom::Start(opts.resume_offset))
+                .await
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            f
+        } else {
+            tokio::fs::File::create(&target_pb)
+                .await
+                .map_err(|e| ProtoError::Transport(e.to_string()))?
+        };
+        let mut limiter = linscp_proto::BandwidthLimiter::new(opts.speed_kbytes_per_sec);
+        let mut written = 0u64;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = source
+                .read(&mut buf)
+                .await
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n])
+                .await
+                .map_err(|e| ProtoError::Transport(e.to_string()))?;
+            written += n as u64;
+            limiter.throttle(n as u64).await;
+            if let Some(cb) = progress {
+                cb(
+                    opts.resume_offset + written,
+                    total_size.unwrap_or(opts.resume_offset + written),
+                );
+            }
+        }
+        out.flush()
+            .await
+            .map_err(|e| ProtoError::Transport(e.to_string()))?;
+        drop(out);
+        if let Some(mode) = opts.permissions {
+            let _ = self.local_fs.set_permissions_mode(&target, mode);
+        }
+        if opts.preserve_time {
+            if let Some(mt) = opts.mtime {
+                let _ = self.local_fs.set_mtime(&target, mt);
+            }
+        }
+        Ok(written)
+    }
 }
 
 #[cfg(test)]

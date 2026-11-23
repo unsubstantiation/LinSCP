@@ -4,7 +4,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-87 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+86 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -534,7 +534,7 @@ Time/size/checksum criteria, -mirror and two-way conflict policies are validated
 
 **Area:** Sessions/configuration · **Status:** partial
 
-Stored sites can be saved, opened, removed, exported and imported.
+Stored sites can be saved, renamed (including nested folders), filtered, sorted by name or last-connected timestamp (last_used), opened, removed, exported and imported.
 
 **Next:** No runnable suite evidences this: script needs a `linscp` binary this repo does not build.
 
@@ -1048,7 +1048,7 @@ Shared LIST parser handles Unix long listings, DOS/IIS listings (MM-DD-YY[YY] HH
 
 **Area:** Amazon S3 · **Status:** partial
 
-`versions` lists exact-key or prefix history and delete markers through guarded ListObjectVersions pagination; `get -versionid=` reads one version, HEAD metadata handles delete markers, and resumable staging uses an ID-specific suffix; `rm -versionid=` deletes only the named version/marker. Live tests cover opaque query characters, a 1001-record two-page history plus missing/repeated pagination-marker refusals, historical/current downloads, isolated resume staging and marker creation/removal without losing other versions. Exposed in the native GUI via /api/s3/versions, /api/s3/version-download and /api/s3/version-delete (#s3VersionsModal), with conditional If-Match DELETE support for guarded moves.
+`versions` lists exact-key or prefix history and delete markers through guarded ListObjectVersions pagination; `get -versionid=` reads one version, HEAD metadata handles delete markers, and resumable staging uses an ID-specific suffix; `rm -versionid=` deletes only the named version/marker. Live tests cover opaque query characters, a 1001-record two-page history plus missing/repeated pagination-marker refusals, historical/current downloads, isolated resume staging and marker creation/removal without losing other versions. Exposed in the native GUI via /api/s3/versions, /api/s3/version-download, /api/s3/version-delete and /api/s3/version-restore (#s3VersionsModal), with conditional If-Match DELETE support for guarded moves.
 
 **Next:** No runnable suite evidences this: live-s3 needs a `linscp` binary this repo does not build.
 
@@ -1083,19 +1083,6 @@ The XML action log (-xmllog=) now writes the upstream session format instead of 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
 - [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## gui.local-to-local
-
-**Area:** GUI · **Status:** partial
-
-A local-to-local session is a tab whose protocol is 'local' and which names two absolute local directories (the upstream IsLocalBrowser/OtherLocalDirectory shape). CoreSession.start, connect and alive never spawn the core and never open a socket; the right pane lists its directory through the same API the remote pane uses. Copies and moves are planned and run in-process on the queue with byte progress and cancellation: recursive trees, merge into an existing directory, atomic per-file replacement through a temporary file, timestamps and modes preserved, symbolic links copied as links, and ask/skip/overwrite/rename decisions (the browser answers 'ask' once and retries). Source equal to or inside the destination is refused before queueing. The second pane also supports mkdir, rename, delete, chmod, properties, checksums, editor save and find. The server-only terminal, synchronization and remote transfer dialogs are not offered in this mode.
-
-**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 
 ## gui.local-symlink
 

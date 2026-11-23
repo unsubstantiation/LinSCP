@@ -215,6 +215,7 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
         json!(site.extra_fields.get("other_local_dir").cloned().unwrap_or_default()),
     );
     obj.insert("preset".into(), json!(site.preset));
+    obj.insert("last_used".into(), json!(site.last_used));
     obj.insert("proxy_method".into(), json!(site.proxy_method));
     obj.insert("proxy_host".into(), json!(site.proxy_host));
     obj.insert("proxy_port".into(), json!(site.proxy_port));

@@ -141,6 +141,18 @@ pub fn dav_property_update_body(name: &str, value: &str) -> Result<String, Proto
     ))
 }
 
+/// Builds a RFC 4918 `PROPPATCH` `<D:remove>` document for a dead property in
+/// `urn:linscp:properties`.
+pub fn dav_property_remove_body(name: &str) -> Result<String, ProtoError> {
+    dav_valid_property_name(name)?;
+    Ok(format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+         <D:propertyupdate xmlns:D=\"DAV:\" xmlns:{DAV_PROPERTY_PREFIX}=\"{DAV_PROPERTY_NAMESPACE}\">\
+         <D:remove><D:prop><{DAV_PROPERTY_PREFIX}:{name}/></D:prop></D:remove>\
+         </D:propertyupdate>"
+    ))
+}
+
 pub(crate) fn reject_xxe_declarations(xml: &str) -> Result<(), ProtoError> {
     let upper = xml.to_ascii_uppercase();
     if upper.contains("<!DOCTYPE") || upper.contains("<!ENTITY") {
@@ -893,6 +905,12 @@ impl WebDavSession {
         Ok(token)
     }
 
+    /// Returns the active lock token held in this session for `remote_path`, if any.
+    pub async fn active_lock_token(&self, remote_path: &str) -> Option<String> {
+        let key = self.resolve_remote_path(remote_path);
+        self.state.lock().await.locks.get(&key).cloned()
+    }
+
     /// Releases a WebDAV `UNLOCK` token and clears any stored lock for `remote_path`.
     pub async fn unlock(&self, remote_path: &str, token: Option<&str>) -> Result<(), ProtoError> {
         let key = self.resolve_remote_path(remote_path);
@@ -1047,6 +1065,35 @@ impl WebDavSession {
             .await
             .map_err(|e| ProtoError::Transport(format!("Reading PROPFIND body failed: {e}")))?;
         dav_property_value_from_xml(&xml, name)
+    }
+
+    /// Removes a custom dead property in `urn:linscp:properties` via `PROPPATCH <D:remove>`.
+    pub async fn remove_property(
+        &self,
+        remote_path: &str,
+        name: &str,
+    ) -> Result<(), ProtoError> {
+        let body = dav_property_remove_body(name)?;
+        let method = Method::from_bytes(b"PROPPATCH")
+            .map_err(|e| ProtoError::Transport(format!("Invalid PROPPATCH method: {e}")))?;
+        let mut req = self
+            .apply_auth(self.client.request(method, self.url_for(remote_path, false)))
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .body(body);
+        if let Some(if_hdr) = self.if_header_for(remote_path).await {
+            req = req.header("If", if_hdr);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ProtoError::Transport(format!("WebDAV PROPPATCH failed: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(ProtoError::Transport(format!(
+                "WebDAV PROPPATCH '{remote_path}' failed with HTTP {}.",
+                resp.status()
+            )));
+        }
+        Ok(())
     }
 
     async fn propfind_raw(
@@ -1757,6 +1804,10 @@ impl RemoteSession for WebDavSession {
         self.unlock(remote_path, token).await
     }
 
+    async fn dav_active_lock_token(&self, remote_path: &str) -> Result<Option<String>, ProtoError> {
+        Ok(self.active_lock_token(remote_path).await)
+    }
+
     async fn dav_get_etag(&self, remote_path: &str) -> Result<(Option<String>, bool), ProtoError> {
         self.get_etag_with_existence(remote_path).await
     }
@@ -1785,6 +1836,14 @@ impl RemoteSession for WebDavSession {
         name: &str,
     ) -> Result<Option<String>, ProtoError> {
         self.get_property(remote_path, name).await
+    }
+
+    async fn dav_remove_property(
+        &self,
+        remote_path: &str,
+        name: &str,
+    ) -> Result<(), ProtoError> {
+        self.remove_property(remote_path, name).await
     }
 
     async fn close(&self) -> Result<(), ProtoError> {
@@ -1844,6 +1903,9 @@ mod tests {
         );
 
         assert!(dav_valid_property_name("9bad").is_err());
+        let rm_xml = dav_property_remove_body("release_tag").unwrap();
+        assert!(rm_xml.contains("<D:remove><D:prop><L:release_tag/></D:prop></D:remove>"));
+        assert!(dav_property_remove_body("9bad").is_err());
         assert!(dav_lock_token_from_xml("<!DOCTYPE foo><x/>").is_err());
 
         let ipv6_proxy = ProxyConfig {

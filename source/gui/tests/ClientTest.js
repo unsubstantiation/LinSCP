@@ -6212,6 +6212,144 @@ function options(id) {
     doc.getElementById('syncPermissions').value = '';
     window.syncPermissionsChanged();
     window.closeModal('syncModal');
+
+    // 22. S3 object version restore (`restoreS3Version` + `.s3-version-restore` button).
+    wfState.tabs = [{ id: 1, name: 's3-box', connected: true, is_local: false, remote_dir: '/bucket' }];
+    wfState.activeTab = 1;
+    responses['/api/s3/versions'] = {
+      success: true,
+      versions: [
+        { key: '/bucket/config.json', version_id: 'v-cur', is_latest: true, is_delete_marker: false, size: 100, mtime: 1700000200 },
+        { key: '/bucket/config.json', version_id: 'v-old', is_latest: false, is_delete_marker: false, size: 80, mtime: 1700000100 }
+      ]
+    };
+    responses['/api/s3/version-restore'] = { success: true, version_id: 'v-old' };
+    doc.getElementById('s3VersionsName').value = 'config.json';
+    await window.openS3Versions();
+    check('S3 versions modal renders Restore button only for non-latest object versions',
+      doc.querySelectorAll('#s3VersionsList .s3-version-restore').length === 1);
+    await window.restoreS3Version('config.json', 'v-old');
+    const s3RestoreCall = calls.filter(c => c.path === '/api/s3/version-restore').pop();
+    check('restoreS3Version posts name and version_id to /api/s3/version-restore',
+      !!s3RestoreCall &&
+      JSON.parse(s3RestoreCall.options.body).name === 'config.json' &&
+      JSON.parse(s3RestoreCall.options.body).version_id === 'v-old');
+    window.closeModal('s3VersionsModal');
+    delete responses['/api/s3/versions'];
+    delete responses['/api/s3/version-restore'];
+
+    // 23. WebDAV dead property removal (`removeDavProperty`) & active lock token query (`loadDavLockToken`).
+    wfState.tabs = [{ id: 1, name: 'dav-box', connected: true, is_local: false, remote_dir: '/dav' }];
+    wfState.activeTab = 1;
+    responses['/api/dav/lock'] = { success: true, path: '/dav/doc.xml', token: 'opaquelocktoken:loaded-77' };
+    responses['/api/dav/property'] = { success: true, path: '/dav/doc.xml', property: 'owner_tag', removed: true };
+    doc.getElementById('davResourceName').value = 'doc.xml';
+    window.openDavTools();
+    await window.loadDavLockToken();
+    const davLoadLockBody = JSON.parse(calls.filter(c => c.path === '/api/dav/lock').pop().options.body);
+    check('loadDavLockToken posts action=get and populates #davLockToken',
+      davLoadLockBody.action === 'get' &&
+      doc.getElementById('davLockToken').value === 'opaquelocktoken:loaded-77');
+    doc.getElementById('davLockToken').value = '';
+    window.openDavTools();
+    check('openDavTools restores cached session lock token synchronously for same resource',
+      doc.getElementById('davLockToken').value === 'opaquelocktoken:loaded-77');
+    doc.getElementById('davPropName').value = 'owner_tag';
+    doc.getElementById('davPropValue').value = 'stale';
+    await window.removeDavProperty();
+    const davRmPropBody = JSON.parse(calls.filter(c => c.path === '/api/dav/property').pop().options.body);
+    check('removeDavProperty posts action=remove and clears #davPropValue',
+      davRmPropBody.action === 'remove' &&
+      davRmPropBody.property === 'owner_tag' &&
+      doc.getElementById('davPropValue').value === '');
+    window.closeModal('davToolsModal');
+    delete responses['/api/dav/lock'];
+    delete responses['/api/dav/property'];
+
+    // 24. Interactive Checksum Verification, Algorithm Recalculation, & Manifest Export.
+    const savedLocalPath = wfState.local.path;
+    const savedLocalEntries = wfState.local.entries;
+    wfState.focusPane = 'local';
+    wfState.local.path = '/tmp/cs';
+    wfState.local.entries = [{ name: 'release.tar.gz', size: 512, is_dir: false, mtime: 1700000000 }];
+    wfState.local.selection.clear();
+    window.renderPane('local');
+    const csRow = Array.from(doc.getElementById('localFileList').children)
+      .find(el => el.dataset && el.dataset.name === 'release.tar.gz');
+    if (csRow) csRow.click();
+    responses['/api/local/checksum'] = {
+      success: true,
+      algorithm: 'sha-256',
+      results: [{ name: 'release.tar.gz', checksum: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }]
+    };
+    await window.openChecksum('sha-256');
+    doc.getElementById('checksumVerifyInput').value = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  release.tar.gz';
+    window.verifyChecksumsInModal();
+    check('verifyChecksumsInModal verifies matching sha256sum manifest line',
+      doc.getElementById('checksumVerifyStatus').textContent.includes('1/1'));
+    doc.getElementById('checksumVerifyInput').value = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    window.verifyChecksumsInModal();
+    check('verifyChecksumsInModal flags digest mismatch',
+      doc.getElementById('checksumVerifyStatus').textContent.toLowerCase().includes('mismatch'));
+    responses['/api/local/save'] = { success: true };
+    const origPromptCsSave = window.prompt;
+    window.prompt = () => 'release.tar.gz.sha256';
+    await window.saveChecksumManifestFile();
+    window.prompt = origPromptCsSave;
+    const csSaveCall = calls.filter(c => c.path === '/api/local/save').pop();
+    check('saveChecksumManifestFile writes GNU-formatted checksum file via /api/local/save',
+      !!csSaveCall &&
+      JSON.parse(csSaveCall.options.body).path === '/tmp/cs/release.tar.gz.sha256' &&
+      JSON.parse(csSaveCall.options.body).create_only === true &&
+      JSON.parse(csSaveCall.options.body).content.includes('  release.tar.gz\n'));
+    window.closeModal('propertiesModal');
+    wfState.local.path = savedLocalPath;
+    wfState.local.entries = savedLocalEntries;
+    wfState.local.selection.clear();
+    window.renderPane('local');
+    delete responses['/api/local/checksum'];
+    delete responses['/api/local/save'];
+
+    // 25. Site Manager search filter, Recent sort (`last_used`), & `#siteLastUsedHint`.
+    const prevSitesForFilter = wfState.sessions;
+    wfState.sessions = [
+      { name: 'Alpha/one', protocol: 'sftp', host: 'alpha.example', port: 22, last_used: 1700000100 },
+      { name: 'Beta/two', protocol: 'sftp', host: 'beta.example', port: 22, last_used: 1700000900 }
+    ];
+    doc.getElementById('siteSortSelect').value = 'recent';
+    window.renderSites();
+    check('Site Manager Recent sort orders most recently connected site first',
+      doc.querySelector('#siteList .site-item span').textContent.includes('Beta/two'));
+    doc.getElementById('siteSearchInput').value = 'alpha.example';
+    window.renderSites();
+    check('Site Manager filter narrows #siteList by host/name',
+      doc.querySelectorAll('#siteList .site-item').length === 1 &&
+      doc.querySelector('#siteList .site-item span').textContent.includes('Alpha/one'));
+    window.fillSiteForm(wfState.sessions[1]);
+    check('fillSiteForm displays Last connected timestamp when last_used is present',
+      doc.getElementById('siteLastUsedHint').style.display !== 'none' &&
+      doc.getElementById('siteLastUsedHint').textContent.includes('2023-11-14'));
+    doc.getElementById('siteSearchInput').value = '';
+    doc.getElementById('siteSortSelect').value = 'name';
+    wfState.sessions = prevSitesForFilter;
+    window.renderSites();
+
+    // 26. Built-in Editor Find / Replace toolbar button (`openEditorFind`).
+    responses['/api/local/edit'] = {
+      success: true,
+      content: 'line one\nline two\n',
+      encoding: 'UTF-8',
+      eol: 'lf',
+      bom: false,
+      info: { size: 18, mtime: 1700000000 }
+    };
+    await window.openEditor('/tmp/cs/sample.txt', 'local', false);
+    window.openEditorFind();
+    check('openEditorFind opens CodeMirror search panel inside #editorHost',
+      !!doc.querySelector('#editorHost .cm-search'));
+    await window.closeEditor();
+    delete responses['/api/local/edit'];
+
     wfState.tabs = savedWfTabs;
     wfState.activeTab = savedWfActiveTab;
   }
