@@ -23094,6 +23094,12 @@ mod tests {
             let mut g = svc.state.lock().expect("m");
             if let Some(t) = g.tabs.get_mut(&tab_id) {
                 t.remote_dir = "/srv".to_string();
+                t.spec = Some(
+                    linscp_engine::url_and_raw::parse_site_url(
+                        "sftp://alice@host.example.test:2222/srv",
+                    )
+                    .unwrap(),
+                );
             }
         }
 
