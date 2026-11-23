@@ -9059,6 +9059,12 @@ impl CommanderService {
         if !meta.is_file() {
             return Err("Only a regular file can be dropped as a file.".to_string());
         }
+        if meta.len() > self.drop_staging_max_bytes {
+            return Err(format!(
+                "Dropped items exceed the staging limit ({} MiB).",
+                self.drop_staging_max_bytes.div_ceil(1024 * 1024)
+            ));
+        }
         std::fs::read(path).map_err(|error| format!("The dropped file cannot be read: {error}"))
     }
 
@@ -23105,7 +23111,7 @@ mod tests {
                 body: json!({
                     "tab": tab_id,
                     "remote_dir": "/srv",
-                    "paths": [oversize_dir.to_string_lossy()],
+                    "source_paths": [oversize_dir.to_string_lossy()],
                     "accept_directory_copy_risk": true,
                 }),
             })
@@ -23132,7 +23138,7 @@ mod tests {
                 body: json!({
                     "tab": tab_id,
                     "remote_dir": "/srv",
-                    "paths": [too_many_dir.to_string_lossy()],
+                    "source_paths": [too_many_dir.to_string_lossy()],
                     "accept_directory_copy_risk": true,
                 }),
             })
@@ -23157,7 +23163,7 @@ mod tests {
                 body: json!({
                     "tab": tab_id,
                     "remote_dir": "/srv",
-                    "paths": [deep_dir.to_string_lossy()],
+                    "source_paths": [deep_dir.to_string_lossy()],
                     "accept_directory_copy_risk": true,
                 }),
             })
@@ -23189,7 +23195,7 @@ mod tests {
                 body: json!({
                     "tab": tab_id,
                     "remote_dir": "/srv",
-                    "paths": [ok_dir.to_string_lossy()],
+                    "source_paths": [ok_dir.to_string_lossy()],
                     "accept_directory_copy_risk": true,
                 }),
             })
