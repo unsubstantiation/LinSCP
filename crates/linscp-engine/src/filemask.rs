@@ -158,6 +158,41 @@ impl FileMask {
         Ok(out)
     }
 
+    /// Conjoins extra size/date criteria onto every include token (creating a
+    /// wildcard `*` include token when `include` is empty, e.g. exclude-only
+    /// masks like `|*.bak` or `*`).
+    pub fn with_extra_criteria(mut self, extra: &[MaskCriterion]) -> Self {
+        if extra.is_empty() {
+            return self;
+        }
+        if self.include.is_empty() {
+            self.include.push(FileMaskToken {
+                text: "*".to_string(),
+                pattern: "*".to_string(),
+                directory_only: false,
+                is_path: false,
+                criteria: extra.to_vec(),
+            });
+        } else {
+            for token in &mut self.include {
+                token.criteria.extend_from_slice(extra);
+            }
+        }
+        self
+    }
+
+    /// Parses an ISO local date (`yyyy-mm-dd` or `yyyy-mm-ddThh:mm[:ss]`) into
+    /// Unix epoch seconds using the same calendar rules as file-mask criteria.
+    pub fn parse_date_criterion_epoch(value: &str) -> Result<u64, String> {
+        match parse_criterion_value(value.trim(), MaskOp::Eq)? {
+            MaskCriterion::Time { epoch_secs, .. } => Ok(epoch_secs),
+            MaskCriterion::Size { .. } => Err(format!(
+                "The date '{}' is not valid (use yyyy-mm-dd or yyyy-mm-ddThh:mm[:ss]).",
+                value.trim()
+            )),
+        }
+    }
+
     pub fn accepts(
         &self,
         name: &str,
@@ -914,5 +949,44 @@ mod tests {
         assert!(!matches_wildcard("??.txt", "ä.txt"));
         assert!(matches_wildcard_icase("?.txt", "Ä.TXT"));
         assert!(matches_wildcard_icase("ü*.md", "Übersicht.MD"));
+    }
+
+    #[test]
+    fn with_extra_criteria_applies_across_multiple_include_and_exclude_only_masks() {
+        let extra = vec![
+            MaskCriterion::Size {
+                op: MaskOp::Ge,
+                bytes: 1024,
+            },
+            MaskCriterion::Size {
+                op: MaskOp::Le,
+                bytes: 4096,
+            },
+            MaskCriterion::Time {
+                op: MaskOp::Ge,
+                epoch_secs: 1_700_000_000,
+            },
+        ];
+        let multi = FileMask::parse("*.txt;*.log|debug.log")
+            .unwrap()
+            .with_extra_criteria(&extra);
+        assert!(multi.accepts("a.txt", false, 2048, 1_700_000_500, "a.txt"));
+        assert!(multi.accepts("b.log", false, 1024, 1_700_000_000, "b.log"));
+        assert!(!multi.accepts("b.log", false, 512, 1_700_000_500, "b.log"));
+        assert!(!multi.accepts("b.log", false, 8192, 1_700_000_500, "b.log"));
+        assert!(!multi.accepts("b.log", false, 2048, 1_699_999_999, "b.log"));
+        assert!(!multi.accepts("debug.log", false, 2048, 1_700_000_500, "debug.log"));
+        assert!(multi.accepts("subdir", true, 0, 0, "subdir"));
+
+        let exclude_only = FileMask::parse("|*.tmp")
+            .unwrap()
+            .with_extra_criteria(&extra);
+        assert!(exclude_only.accepts("keep.bin", false, 2048, 1_700_000_000, "keep.bin"));
+        assert!(!exclude_only.accepts("tiny.bin", false, 100, 1_700_000_000, "tiny.bin"));
+        assert!(!exclude_only.accepts("skip.tmp", false, 2048, 1_700_000_000, "skip.tmp"));
+
+        let parsed_epoch = FileMask::parse_date_criterion_epoch("2025-01-15").unwrap();
+        assert!(parsed_epoch > 1_700_000_000);
+        assert!(FileMask::parse_date_criterion_epoch("1024K").is_err());
     }
 }

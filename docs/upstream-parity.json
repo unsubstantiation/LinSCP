@@ -3734,7 +3734,7 @@
       "id": "gui.native-path-drop",
       "area": "GUI",
       "status": "partial",
-      "notes": "An operating-system drop in a native window arrives as paths, not as a File: `dragDropEnabled` makes the Tauri window consume the drop before the page sees it. The shell emits `native:file-drop` with those paths, the shared bundle turns them into one request (the first path plus the list, with the folders named), and the service stages and queues exactly what the browser's byte drop would - the same endpoints, the same queue, the same conflict answer, so one set of overwrite rules answers for all three apps. A local drop copies the tree directly; a grant-URI source is read through `LocalFs`; a link inside a dropped folder is refused rather than followed. Android's share hand-off records the desktop's pending manifest and the page queues it through the same path. What the drop still lacks is end-to-end evidence on a real window: the jsdom suite drives the request shape and the service test drives the filesystem, but neither can produce a WebKit drop event, and the share intent filter is registered by the generated Kotlin project rather than by this tree.",
+      "notes": "An operating-system drop in a native window arrives as paths, not as a File: `dragDropEnabled` makes the Tauri window consume the drop before the page sees it. The shell emits `native:file-drop` with those paths, the shared bundle turns them into one request (the first path plus the list, with the folders named), and the service stages and queues exactly what the browser's byte drop would - the same endpoints, the same queue, the same conflict answer, so one set of overwrite rules answers for all three apps. Dropped files and folders are streamed in 64 KiB chunks into private per-drop staging with cumulative file-count (`MAX_DROP_STAGING_FILES`), byte-size (`MAX_DROP_STAGING_BYTES`), and directory-depth (`MAX_DROP_STAGING_DEPTH`) bounds, cleaning up partial staging trees on refusal. A local drop copies the tree directly; a grant-URI source is read through `LocalFs`; a link inside a dropped folder is refused rather than followed. Android's share hand-off records the desktop's pending manifest and the page queues it through the same path. What the drop still lacks is end-to-end evidence on a real window: the jsdom suite drives the request shape and the service test drives the filesystem, but neither can produce a WebKit drop event, and the share intent filter is registered by the generated Kotlin project rather than by this tree.",
       "source": [
         "crates/linscp-tauri/src/lib.rs",
         "crates/linscp-service/src/lib.rs",
@@ -3749,10 +3749,11 @@
           "an operating-system drop names paths once and the queue answers once"
         ],
         "service": [
-          "a_native_window_drop_names_paths_and_the_backend_reads_them"
+          "a_native_window_drop_names_paths_and_the_backend_reads_them",
+          "drop_staging_bounds_search_filters_custom_prompts_and_bookmark_reorder"
         ]
       },
-      "gap": "The path a native window drops is queued and copied, but no test drives a real WebKit drop event or the Android share filter, and a large dropped folder is staged in the app's private directory with no bound on the space it takes.",
+      "gap": "The path a native window drops is streamed into bounded private staging and queued, but no automated test drives a real WebKit drop event or the Android share filter.",
       "acceptance": [
         "Drive a real WebKit/GTK drop onto the native window and show the queued task names the dropped paths (the shell's `dragDropEnabled` handler cannot be exercised by jsdom).",
         "Register the Android share intent filter in the generated Kotlin project and prove a shared file reaches the same drop path, including the conflict question and the queue entry.",
@@ -3866,14 +3867,18 @@
           "a template saved for one side is refused on the other side by name",
           "declining a custom command confirmation queues no work",
           "confirmed custom command runs only on the selected remote entry",
-          "custom command results are rendered as text"
+          "custom command results are rendered as text",
+          "customTemplateNamesFile distinguishes interactive prompts from !* and !. file tokens",
+          "runCustomCommand prompts for !?label?default! and posts prompt_values without requiring file selection"
         ],
         "service": [
-          "the_custom_command_run_button_answers_for_each_selected_file"
+          "the_custom_command_run_button_answers_for_each_selected_file",
+          "drop_staging_bounds_search_filters_custom_prompts_and_bookmark_reorder"
         ],
         "service-commands": [
           "a_hostile_name_stays_one_operand_of_the_command_line",
           "the_group_placeholder_quotes_every_member",
+          "custom_placeholders_star_stem_and_interactive_prompts_expand_safely",
           "only_a_template_that_names_the_file_runs_once_per_file",
           "one_files_failure_does_not_stop_the_others",
           "every_shipped_template_is_a_command_the_interpreter_knows",
@@ -5223,7 +5228,9 @@
           "a local bookmark loads its directory in the local panel",
           "adding a bookmark posts the panel, name and directory",
           "deleting a bookmark posts its panel and name",
-          "bookmark names are inserted as text, not markup"
+          "bookmark names are inserted as text, not markup",
+          "bookmarkSearchInput filters visible bookmark rows without mutating total count",
+          "reorderBookmark posts side, name, and direction to /api/bookmarks/reorder and updates order"
         ]
       },
       "verified_on": {

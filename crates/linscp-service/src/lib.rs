@@ -160,6 +160,10 @@ impl Drop for X2GoOpenReservation {
     }
 }
 
+pub const MAX_DROP_STAGING_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_DROP_STAGING_FILES: usize = 4_096;
+pub const MAX_DROP_STAGING_DEPTH: usize = 64;
+
 #[derive(Clone)]
 pub struct CommanderService {
     local_fs: Arc<dyn LocalFs>,
@@ -190,6 +194,9 @@ pub struct CommanderService {
     /// service built by code that never said where it runs must not spawn viewers
     /// on the user's behalf.
     desktop_spawn_allowed: bool,
+    drop_staging_max_files: usize,
+    drop_staging_max_bytes: u64,
+    drop_staging_max_depth: usize,
 }
 
 impl Default for CommanderService {
@@ -270,7 +277,24 @@ impl CommanderService {
             share_export_status: Arc::new(Mutex::new(share_export::ShareExportStatus::default())),
             share_export_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             desktop_spawn_allowed: false,
+            drop_staging_max_files: MAX_DROP_STAGING_FILES,
+            drop_staging_max_bytes: MAX_DROP_STAGING_BYTES,
+            drop_staging_max_depth: MAX_DROP_STAGING_DEPTH,
         }
+    }
+
+    /// Configures private drop-staging bounds (file count, total bytes, and
+    /// directory depth) enforced when staging dropped paths for upload.
+    pub fn with_drop_staging_limits(
+        mut self,
+        max_files: usize,
+        max_bytes: u64,
+        max_depth: usize,
+    ) -> Self {
+        self.drop_staging_max_files = max_files.max(1);
+        self.drop_staging_max_bytes = max_bytes.max(1);
+        self.drop_staging_max_depth = max_depth.max(1);
+        self
     }
 
     /// Attaches an Android Keystore hardware-backed key wrapper so the local
@@ -526,6 +550,7 @@ impl CommanderService {
             ("GET", "/api/bookmarks") => self.handle_get_bookmarks(&query),
             ("POST", "/api/bookmarks") => self.handle_save_bookmarks(req.body),
             ("POST", "/api/bookmarks/save") => self.handle_bookmarks_save(req.body),
+            ("POST", "/api/bookmarks/reorder") => self.handle_bookmarks_reorder(req.body),
             ("POST", "/api/bookmarks/delete") => self.handle_bookmarks_delete(req.body),
             ("GET", "/api/workspaces") => self.handle_get_workspaces(),
             ("POST", "/api/workspaces") => self.handle_save_workspaces(req.body),
@@ -2603,6 +2628,108 @@ impl CommanderService {
         ApiReply { status: 200, payload: json!({"success": true, "algorithm": algorithm, "results": results}) }
     }
 
+    fn parse_optional_search_u64(body: &Value, key: &str) -> Result<Option<u64>, String> {
+        let Some(val) = body.get(key) else {
+            return Ok(None);
+        };
+        if val.is_null() {
+            return Ok(None);
+        }
+        if let Some(n) = val.as_u64() {
+            return Ok(Some(n));
+        }
+        if let Some(s) = val.as_str() {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            return trimmed
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|_| format!("Invalid integer value for '{key}'."));
+        }
+        Err(format!("Invalid integer value for '{key}'."))
+    }
+
+    fn parse_optional_search_epoch(
+        body: &Value,
+        key: &str,
+        end_of_day_for_date_only: bool,
+    ) -> Result<Option<u64>, String> {
+        let Some(val) = body.get(key) else {
+            return Ok(None);
+        };
+        if val.is_null() {
+            return Ok(None);
+        }
+        if let Some(n) = val.as_u64() {
+            return Ok(Some(n));
+        }
+        if let Some(s) = val.as_str() {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            if let Ok(n) = trimmed.parse::<u64>() {
+                return Ok(Some(n));
+            }
+            let base = FileMask::parse_date_criterion_epoch(trimmed)?;
+            if end_of_day_for_date_only && trimmed.len() == 10 {
+                return Ok(Some(base.saturating_add(86_399)));
+            }
+            return Ok(Some(base));
+        }
+        Err(format!("Invalid timestamp value for '{key}'."))
+    }
+
+    fn parse_search_filter_bounds(
+        body: &Value,
+    ) -> Result<Vec<linscp_engine::filemask::MaskCriterion>, String> {
+        use linscp_engine::filemask::{MaskCriterion, MaskOp};
+        let min_size = Self::parse_optional_search_u64(body, "min_size")?;
+        let max_size = Self::parse_optional_search_u64(body, "max_size")?;
+        if let (Some(min_b), Some(max_b)) = (min_size, max_size) {
+            if min_b > max_b {
+                return Err("Minimum file size cannot exceed maximum file size.".to_string());
+            }
+        }
+        let modified_after = Self::parse_optional_search_epoch(body, "modified_after", false)?;
+        let modified_before = Self::parse_optional_search_epoch(body, "modified_before", true)?;
+        if let (Some(after_ts), Some(before_ts)) = (modified_after, modified_before) {
+            if after_ts > before_ts {
+                return Err(
+                    "Modified-after date cannot be later than modified-before date.".to_string(),
+                );
+            }
+        }
+        let mut criteria = Vec::new();
+        if let Some(bytes) = min_size {
+            criteria.push(MaskCriterion::Size {
+                op: MaskOp::Ge,
+                bytes,
+            });
+        }
+        if let Some(bytes) = max_size {
+            criteria.push(MaskCriterion::Size {
+                op: MaskOp::Le,
+                bytes,
+            });
+        }
+        if let Some(epoch_secs) = modified_after {
+            criteria.push(MaskCriterion::Time {
+                op: MaskOp::Ge,
+                epoch_secs,
+            });
+        }
+        if let Some(epoch_secs) = modified_before {
+            criteria.push(MaskCriterion::Time {
+                op: MaskOp::Le,
+                epoch_secs,
+            });
+        }
+        Ok(criteria)
+    }
+
     /// Recursive search of the remote tree by name mask and/or content.
     async fn search_remote_async(&self, body: Value) -> ApiReply {
         let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
@@ -2614,7 +2741,14 @@ impl CommanderService {
         let root = body.get("path").and_then(Value::as_str).filter(|p| !p.is_empty()).unwrap_or(&tab.remote_dir);
         let root = match validate_remote_absolute_path(root) { Ok(path) => path, Err(error) => return api_error(400, error) };
         let mask_spec = body.get("pattern").and_then(Value::as_str).unwrap_or("*");
-        let mask = match FileMask::parse(mask_spec) { Ok(mask) => mask, Err(error) => return api_error(400, error) };
+        let extra_bounds = match Self::parse_search_filter_bounds(&body) {
+            Ok(bounds) => bounds,
+            Err(error) => return api_error(400, error),
+        };
+        let mask = match FileMask::parse(mask_spec) {
+            Ok(mask) => mask.with_extra_criteria(&extra_bounds),
+            Err(error) => return api_error(400, error),
+        };
         let contents = body.get("search_contents").and_then(Value::as_bool).unwrap_or(false);
         let query = body.get("content_query").and_then(Value::as_str).unwrap_or("").to_string();
         if contents && query.is_empty() { return api_error(400, "Enter text to search for.") }
@@ -4350,6 +4484,16 @@ impl CommanderService {
                     .collect()
             })
             .unwrap_or_default();
+        let prompt_values: Vec<String> = body
+            .get("prompt_values")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
         // A template that names the file needs a selection to name. One that
         // does not (`terminal`, `presets`) runs once with nothing selected.
         if filenames.is_empty() && ops::template_names_a_file(&template) {
@@ -4386,11 +4530,20 @@ impl CommanderService {
                 .unwrap_or("The command interpreter could not be started.")
                 .to_string()),
         };
-        let results =
-            match ops::execute_custom_command_template(&mut factory, &template, &filenames, pane, &tab, &mut |_| {}).await {
-                Ok(results) => results,
-                Err(error) => return api_error(400, error),
-            };
+        let results = match ops::execute_custom_command_template_with_prompts(
+            &mut factory,
+            &template,
+            &filenames,
+            pane,
+            &tab,
+            &prompt_values,
+            &mut |_| {},
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err(error) => return api_error(400, error),
+        };
         // Nothing is written back into the tab's directories: the page refreshes
         // both panes after a run, and the interpreter started in the pane the
         // template applies to, so a `cd` inside a template moves the command's
@@ -6913,6 +7066,64 @@ impl CommanderService {
         }
         ApiReply{ status: 200, payload: json!({"success": true, "bookmark": entry_json, "file": file.to_string_lossy()})}
     }
+    fn handle_bookmarks_reorder(&self, body: Value) -> ApiReply {
+        let side = body.get("side").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        if !matches!(side.as_str(), "local" | "remote" | "both") {
+            return ApiReply {
+                status: 400,
+                payload: json!({"success": false, "error": "side must be local, remote or both"}),
+            };
+        }
+        let name = body.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        if name.is_empty() || name.chars().any(char::is_control) {
+            return ApiReply {
+                status: 400,
+                payload: json!({"success": false, "error": "A valid bookmark name is required"}),
+            };
+        }
+        let direction = body
+            .get("direction")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if !matches!(direction.as_str(), "up" | "down") {
+            return ApiReply {
+                status: 400,
+                payload: json!({"success": false, "error": "direction must be up or down"}),
+            };
+        }
+        let cfg = self.state.lock().expect("m").config_root.clone();
+        let file = cfg.join("bookmarks.json");
+        let mut data = match Self::read_json_store(&file, json!({"local": [], "remote": []}), "bookmarks") {
+            Ok(data) => data,
+            Err(e) => return api_error(500, e),
+        };
+        let Some(arr) = data.get_mut(&side).and_then(Value::as_array_mut) else {
+            return api_error(404, "Bookmark not found.");
+        };
+        let Some(idx) = arr
+            .iter()
+            .position(|entry| entry.get("name").and_then(Value::as_str) == Some(name.as_str()))
+        else {
+            return api_error(404, "Bookmark not found.");
+        };
+        if direction == "up" && idx > 0 {
+            arr.swap(idx, idx - 1);
+        } else if direction == "down" && idx + 1 < arr.len() {
+            arr.swap(idx, idx + 1);
+        }
+        let updated = arr.clone();
+        let bytes = serde_json::to_vec_pretty(&data).unwrap_or_default();
+        if let Err(e) = write_private_file_atomic(&file, &bytes) {
+            return api_error(500, e.to_string());
+        }
+        ApiReply {
+            status: 200,
+            payload: json!({"success": true, "bookmarks": updated, "file": file.to_string_lossy()}),
+        }
+    }
+
     fn handle_bookmarks_delete(&self, body: Value) -> ApiReply {
         let side = body.get("side").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if !matches!(side.as_str(), "local" | "remote" | "both") {
@@ -7934,8 +8145,12 @@ impl CommanderService {
             Err(error) => return api_error(400, error),
         };
         let mask_spec = body.get("pattern").and_then(Value::as_str).unwrap_or("*");
+        let extra_bounds = match Self::parse_search_filter_bounds(body) {
+            Ok(bounds) => bounds,
+            Err(e) => return api_error(400, e),
+        };
         let mask = match FileMask::parse(mask_spec) {
-            Ok(m) => m,
+            Ok(m) => m.with_extra_criteria(&extra_bounds),
             Err(e) => return api_error(400, e),
         };
         let contents = body.get("search_contents").and_then(Value::as_bool).unwrap_or(false);
@@ -9197,8 +9412,15 @@ impl CommanderService {
                 }
                 let _ = std::fs::remove_dir(batch_dir);
             };
+            let mut staged_files = 0usize;
+            let mut staged_bytes = 0u64;
             for path in &source_paths {
-                let relative = match self.stage_dropped_path(path, &staging) {
+                let relative = match self.stage_dropped_path_bounded(
+                    path,
+                    &staging,
+                    &mut staged_files,
+                    &mut staged_bytes,
+                ) {
                     Ok(relative) => relative,
                     Err(error) => {
                         tidy(&staged_paths, &staging);
@@ -9248,6 +9470,15 @@ impl CommanderService {
             Ok(bytes) => bytes,
             Err(error) => return api_error(400, error),
         };
+        if bytes.len() as u64 > self.drop_staging_max_bytes {
+            return api_error(
+                400,
+                format!(
+                    "Dropped items exceed the staging limit ({} MiB).",
+                    self.drop_staging_max_bytes.div_ceil(1024 * 1024)
+                ),
+            );
+        }
         // A byte drop is one file, so it needs the name it lands under. A drop
         // that named one path already carries it.
         if name.is_empty() {
@@ -9367,11 +9598,83 @@ impl CommanderService {
     /// link inside the tree is refused rather than followed: it is not a copy
     /// of the bytes the folder owns, and it would point outside the staging
     /// directory.
-    fn copy_dropped_tree(source: &str, target: &Path) -> Result<(usize, u64), String> {
-        let mut stack = vec![(PathBuf::from(source), target.to_path_buf())];
-        let mut files = 0usize;
-        let mut bytes = 0u64;
-        while let Some((from, to)) = stack.pop() {
+    fn stream_dropped_file_bounded(
+        from: &Path,
+        to: &Path,
+        staged_files: &mut usize,
+        staged_bytes: &mut u64,
+        max_files: usize,
+        max_bytes: u64,
+    ) -> Result<(), String> {
+        use std::io::{Read as _, Write as _};
+        if *staged_files >= max_files {
+            return Err(format!(
+                "Dropped folder exceeds the maximum of {max_files} files for staging."
+            ));
+        }
+        let meta = std::fs::symlink_metadata(from)
+            .map_err(|error| format!("The dropped file cannot be read: {error}"))?;
+        if meta.file_type().is_symlink() {
+            return Err("A dropped folder must not contain symbolic links.".to_string());
+        }
+        if !meta.is_file() {
+            return Err("A dropped folder may contain only files and folders.".to_string());
+        }
+        if staged_bytes.saturating_add(meta.len()) > max_bytes {
+            return Err(format!(
+                "Dropped items exceed the staging limit ({} MiB).",
+                max_bytes.div_ceil(1024 * 1024)
+            ));
+        }
+        let mut reader = std::fs::File::open(from)
+            .map_err(|error| format!("The dropped file cannot be read: {error}"))?;
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(to)
+            .map_err(|error| format!("Cannot write the dropped file: {error}"))?;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let read_n = reader
+                .read(&mut buf)
+                .map_err(|error| format!("The dropped file cannot be read: {error}"))?;
+            if read_n == 0 {
+                break;
+            }
+            let next_bytes = staged_bytes.saturating_add(read_n as u64);
+            if next_bytes > max_bytes {
+                drop(writer);
+                let _ = std::fs::remove_file(to);
+                return Err(format!(
+                    "Dropped items exceed the staging limit ({} MiB).",
+                    max_bytes.div_ceil(1024 * 1024)
+                ));
+            }
+            writer
+                .write_all(&buf[..read_n])
+                .map_err(|error| format!("Cannot write the dropped file: {error}"))?;
+            *staged_bytes = next_bytes;
+        }
+        *staged_files += 1;
+        Ok(())
+    }
+
+    fn copy_dropped_tree_bounded(
+        source: &str,
+        target: &Path,
+        staged_files: &mut usize,
+        staged_bytes: &mut u64,
+        max_files: usize,
+        max_bytes: u64,
+        max_depth: usize,
+    ) -> Result<(), String> {
+        let mut stack = vec![(PathBuf::from(source), target.to_path_buf(), 0usize)];
+        while let Some((from, to, depth)) = stack.pop() {
+            if depth > max_depth {
+                return Err(format!(
+                    "Dropped folder exceeds the maximum directory nesting depth ({max_depth})."
+                ));
+            }
             let meta = std::fs::symlink_metadata(&from)
                 .map_err(|error| format!("The dropped folder cannot be read: {error}"))?;
             if meta.file_type().is_symlink() {
@@ -9385,29 +9688,41 @@ impl CommanderService {
                 for entry in entries {
                     let entry =
                         entry.map_err(|error| format!("Cannot read a dropped entry: {error}"))?;
-                    stack.push((entry.path(), to.join(entry.file_name())));
+                    stack.push((entry.path(), to.join(entry.file_name()), depth + 1));
                 }
             } else if meta.is_file() {
-                let data = std::fs::read(&from)
-                    .map_err(|error| format!("The dropped file cannot be read: {error}"))?;
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&to)
-                    .map_err(|error| format!("Cannot write the dropped file: {error}"))?;
-                use std::io::Write as _;
-                file.write_all(&data)
-                    .map_err(|error| format!("Cannot write the dropped file: {error}"))?;
-                files += 1;
-                bytes += data.len() as u64;
+                Self::stream_dropped_file_bounded(
+                    &from,
+                    &to,
+                    staged_files,
+                    staged_bytes,
+                    max_files,
+                    max_bytes,
+                )?;
             } else {
                 return Err("A dropped folder may contain only files and folders.".to_string());
             }
         }
+        Ok(())
+    }
+
+    fn copy_dropped_tree(source: &str, target: &Path) -> Result<(usize, u64), String> {
+        let mut files = 0usize;
+        let mut bytes = 0u64;
+        Self::copy_dropped_tree_bounded(
+            source,
+            target,
+            &mut files,
+            &mut bytes,
+            usize::MAX,
+            u64::MAX,
+            MAX_DROP_STAGING_DEPTH,
+        )?;
         Ok((files, bytes))
     }
 
-    /// Copies one path a drop named into the staging tree, under its leaf name.
+    /// Copies one path a drop named into the staging tree, under its leaf name,
+    /// enforcing cumulative file-count, byte-size, and nesting-depth bounds.
     ///
     /// The queue only reads local paths, and a granted Android URI is not one,
     /// so the bytes are brought into the app's private staging first. The item
@@ -9417,7 +9732,13 @@ impl CommanderService {
     ///
     /// The staged root is created exclusively: a drop must not replace a
     /// staging entry another request is uploading from.
-    fn stage_dropped_path(&self, source: &str, staging: &Path) -> Result<String, String> {
+    fn stage_dropped_path_bounded(
+        &self,
+        source: &str,
+        staging: &Path,
+        staged_files: &mut usize,
+        staged_bytes: &mut u64,
+    ) -> Result<String, String> {
         let (_, leaf) = Self::dropped_path_split(source)?;
         let relative = leaf.clone();
         let staged = staging.join(&leaf);
@@ -9426,8 +9747,16 @@ impl CommanderService {
                 if std::fs::symlink_metadata(&staged).is_ok() {
                     return Err(format!("'{leaf}' is already being uploaded."));
                 }
-                match Self::copy_dropped_tree(source, &staged) {
-                    Ok(_) => Ok(relative),
+                match Self::copy_dropped_tree_bounded(
+                    source,
+                    &staged,
+                    staged_files,
+                    staged_bytes,
+                    self.drop_staging_max_files,
+                    self.drop_staging_max_bytes,
+                    self.drop_staging_max_depth,
+                ) {
+                    Ok(()) => Ok(relative),
                     Err(error) => {
                         // A half-copied tree is not left behind for the queue.
                         let _ = std::fs::remove_dir_all(&staged);
@@ -9435,8 +9764,35 @@ impl CommanderService {
                     }
                 }
             }
-            Ok(_) => {
+            Ok(DroppedKind::File) => {
+                if std::fs::symlink_metadata(&staged).is_ok() {
+                    return Err(format!("'{leaf}' is already being uploaded."));
+                }
+                Self::stream_dropped_file_bounded(
+                    Path::new(source),
+                    &staged,
+                    staged_files,
+                    staged_bytes,
+                    self.drop_staging_max_files,
+                    self.drop_staging_max_bytes,
+                )?;
+                Ok(relative)
+            }
+            Ok(DroppedKind::SafUri) => {
+                if *staged_files >= self.drop_staging_max_files {
+                    return Err(format!(
+                        "Dropped folder exceeds the maximum of {} files for staging.",
+                        self.drop_staging_max_files
+                    ));
+                }
                 let bytes = self.read_dropped_path(source)?;
+                let next_bytes = staged_bytes.saturating_add(bytes.len() as u64);
+                if next_bytes > self.drop_staging_max_bytes {
+                    return Err(format!(
+                        "Dropped items exceed the staging limit ({} MiB).",
+                        self.drop_staging_max_bytes.div_ceil(1024 * 1024)
+                    ));
+                }
                 let mut file = std::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
@@ -9445,6 +9801,8 @@ impl CommanderService {
                 use std::io::Write as _;
                 file.write_all(&bytes)
                     .map_err(|error| format!("Cannot stage the dropped file: {error}"))?;
+                *staged_files += 1;
+                *staged_bytes = next_bytes;
                 Ok(relative)
             }
             Err(error) => Err(error),
@@ -22710,5 +23068,334 @@ mod tests {
         });
         assert_eq!(retry_all.status, 200, "{}", retry_all.payload);
         assert_eq!(retry_all.payload["retried"], 0);
+    }
+
+    #[tokio::test]
+    async fn drop_staging_bounds_search_filters_custom_prompts_and_bookmark_reorder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_dir = tmp.path().join("cfg");
+        let local_dir = tmp.path().join("local");
+        let drop_src = tmp.path().join("drops");
+        std::fs::create_dir_all(&local_dir).unwrap();
+        std::fs::create_dir_all(&drop_src).unwrap();
+
+        let svc = CommanderService::new(cfg_dir.clone(), Arc::new(NativeLocalFs::new()))
+            .with_drop_staging_limits(2, 1024, 2);
+        let session = Arc::new(MockSession::new());
+        session.add_dir("/srv");
+        let tab_id = insert_remote_tab(&svc, session.clone(), &local_dir.to_string_lossy());
+        {
+            let mut g = svc.state.lock().expect("m");
+            if let Some(t) = g.tabs.get_mut(&tab_id) {
+                t.remote_dir = "/srv".to_string();
+            }
+        }
+
+        // 1. Bounded streaming native drop staging (`gui.native-path-drop`):
+        //    enforces byte ceiling, file-count ceiling, and directory depth ceiling,
+        //    leaving zero partial staging directories behind on refusal.
+        let oversize_dir = drop_src.join("oversize");
+        std::fs::create_dir_all(&oversize_dir).unwrap();
+        std::fs::write(oversize_dir.join("a.bin"), vec![b'x'; 700]).unwrap();
+        std::fs::write(oversize_dir.join("b.bin"), vec![b'y'; 700]).unwrap();
+        let over_bytes = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/transfer/drop".into(),
+                body: json!({
+                    "tab": tab_id,
+                    "remote_dir": "/srv",
+                    "paths": [oversize_dir.to_string_lossy()],
+                    "accept_directory_copy_risk": true,
+                }),
+            })
+            .await;
+        assert_eq!(over_bytes.status, 400, "{}", over_bytes.payload);
+        assert!(
+            over_bytes.payload["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("staging limit"),
+            "{}",
+            over_bytes.payload
+        );
+
+        let too_many_dir = drop_src.join("toomany");
+        std::fs::create_dir_all(&too_many_dir).unwrap();
+        for idx in 0..3 {
+            std::fs::write(too_many_dir.join(format!("f{idx}.txt")), b"hi").unwrap();
+        }
+        let over_files = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/transfer/drop".into(),
+                body: json!({
+                    "tab": tab_id,
+                    "remote_dir": "/srv",
+                    "paths": [too_many_dir.to_string_lossy()],
+                    "accept_directory_copy_risk": true,
+                }),
+            })
+            .await;
+        assert_eq!(over_files.status, 400, "{}", over_files.payload);
+        assert!(
+            over_files.payload["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("maximum of 2 files"),
+            "{}",
+            over_files.payload
+        );
+
+        let deep_dir = drop_src.join("deep");
+        std::fs::create_dir_all(deep_dir.join("l1").join("l2").join("l3")).unwrap();
+        std::fs::write(deep_dir.join("l1").join("l2").join("l3").join("leaf.txt"), b"ok").unwrap();
+        let over_depth = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/transfer/drop".into(),
+                body: json!({
+                    "tab": tab_id,
+                    "remote_dir": "/srv",
+                    "paths": [deep_dir.to_string_lossy()],
+                    "accept_directory_copy_risk": true,
+                }),
+            })
+            .await;
+        assert_eq!(over_depth.status, 400, "{}", over_depth.payload);
+        assert!(
+            over_depth.payload["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("nesting depth"),
+            "{}",
+            over_depth.payload
+        );
+
+        let staging_root = cfg_dir.join("drop-staging");
+        let leftover: Vec<_> = std::fs::read_dir(&staging_root)
+            .map(|rd| rd.filter_map(Result::ok).collect())
+            .unwrap_or_default();
+        assert!(leftover.is_empty(), "refused drops must clean up batch staging directories");
+
+        let ok_dir = drop_src.join("validpkg");
+        std::fs::create_dir_all(ok_dir.join("sub")).unwrap();
+        std::fs::write(ok_dir.join("readme.txt"), b"hello").unwrap();
+        std::fs::write(ok_dir.join("sub").join("data.txt"), b"world").unwrap();
+        let ok_drop = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/transfer/drop".into(),
+                body: json!({
+                    "tab": tab_id,
+                    "remote_dir": "/srv",
+                    "paths": [ok_dir.to_string_lossy()],
+                    "accept_directory_copy_risk": true,
+                }),
+            })
+            .await;
+        assert_eq!(ok_drop.status, 200, "{}", ok_drop.payload);
+        for _ in 0..80 {
+            if !svc.queue.has_unfinished_work() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(session.bytes_of("/srv/validpkg/readme.txt").as_deref(), Some(b"hello".as_slice()));
+        assert_eq!(session.bytes_of("/srv/validpkg/sub/data.txt").as_deref(), Some(b"world".as_slice()));
+
+        // 2. Search size & modification date bounds (`/api/local/search` & `/api/remote/search`).
+        std::fs::write(local_dir.join("small.log"), vec![b'a'; 100]).unwrap();
+        std::fs::write(local_dir.join("medium.log"), vec![b'b'; 600]).unwrap();
+        std::fs::write(local_dir.join("huge.txt"), vec![b'c'; 2000]).unwrap();
+        svc.local_fs
+            .set_mtime(&local_dir.join("small.log").to_string_lossy(), 1_700_000_100)
+            .unwrap();
+        svc.local_fs
+            .set_mtime(&local_dir.join("medium.log").to_string_lossy(), 1_700_500_000)
+            .unwrap();
+        svc.local_fs
+            .set_mtime(&local_dir.join("huge.txt").to_string_lossy(), 1_700_500_000)
+            .unwrap();
+
+        let bad_bounds = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/search".into(),
+            body: json!({
+                "local_dir": local_dir,
+                "pattern": "*",
+                "min_size": 1000,
+                "max_size": 500,
+            }),
+        });
+        assert_eq!(bad_bounds.status, 400);
+
+        let local_filtered = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/search".into(),
+            body: json!({
+                "local_dir": local_dir,
+                "pattern": "*.log;*.txt",
+                "min_size": 200,
+                "max_size": 1000,
+                "modified_after": 1_700_100_000u64,
+                "modified_before": 1_700_900_000u64,
+            }),
+        });
+        assert_eq!(local_filtered.status, 200, "{}", local_filtered.payload);
+        let local_matches = local_filtered.payload["matches"].as_array().unwrap();
+        assert_eq!(local_matches.len(), 1, "{local_matches:?}");
+        assert_eq!(local_matches[0]["name"], "medium.log");
+
+        session.docs.lock().expect("m").insert(
+            "/srv/old.log".to_string(),
+            MockRemoteDoc {
+                bytes: vec![b'1'; 500],
+                is_dir: false,
+                mtime: 1_700_000_000,
+            },
+        );
+        session.docs.lock().expect("m").insert(
+            "/srv/fresh.log".to_string(),
+            MockRemoteDoc {
+                bytes: vec![b'2'; 500],
+                is_dir: false,
+                mtime: 1_700_600_000,
+            },
+        );
+        let remote_filtered = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/remote/search".into(),
+                body: json!({
+                    "tab": tab_id,
+                    "path": "/srv",
+                    "pattern": "*.log",
+                    "min_size": 400,
+                    "max_size": 800,
+                    "modified_after": 1_700_500_000u64,
+                }),
+            })
+            .await;
+        assert_eq!(remote_filtered.status, 200, "{}", remote_filtered.payload);
+        let remote_matches = remote_filtered.payload["matches"].as_array().unwrap();
+        assert_eq!(remote_matches.len(), 1, "{remote_matches:?}");
+        assert_eq!(remote_matches[0]["name"], "fresh.log");
+
+        // 3. Custom Commands interactive prompt values (`!?prompt?default!`) & `!*` group token.
+        assert_eq!(
+            svc.dispatch(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/custom-commands".into(),
+                body: json!({
+                    "action": "save",
+                    "name": "Make Prompt Dir",
+                    "command": "mkdir !?Folder name?fallback-dir!",
+                    "scope": "remote",
+                }),
+            })
+            .status,
+            200
+        );
+        assert_eq!(
+            svc.dispatch(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/custom-commands".into(),
+                body: json!({
+                    "action": "save",
+                    "name": "Chmod Group Star",
+                    "command": "chmod 600 !*",
+                    "scope": "remote",
+                }),
+            })
+            .status,
+            200
+        );
+
+        let bad_prompt = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/custom-commands".into(),
+                body: json!({
+                    "action": "run",
+                    "tab": tab_id,
+                    "pane": "remote",
+                    "name": "Make Prompt Dir",
+                    "filenames": [],
+                    "prompt_values": ["evil\nrm /srv/fresh.log"],
+                }),
+            })
+            .await;
+        assert_eq!(bad_prompt.status, 400);
+
+        let ok_prompt = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/custom-commands".into(),
+                body: json!({
+                    "action": "run",
+                    "tab": tab_id,
+                    "pane": "remote",
+                    "name": "Make Prompt Dir",
+                    "filenames": [],
+                    "prompt_values": ["release 2026"],
+                }),
+            })
+            .await;
+        assert_eq!(ok_prompt.status, 200, "{}", ok_prompt.payload);
+        assert!(session.docs.lock().expect("m").get("/srv/release 2026").is_some_and(|d| d.is_dir));
+
+        let star_run = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/custom-commands".into(),
+                body: json!({
+                    "action": "run",
+                    "tab": tab_id,
+                    "pane": "remote",
+                    "name": "Chmod Group Star",
+                    "filenames": ["old.log", "fresh.log"],
+                }),
+            })
+            .await;
+        assert_eq!(star_run.status, 200, "{}", star_run.payload);
+        assert_eq!(
+            star_run.payload["results"].as_array().unwrap().len(),
+            1,
+            "`!*` runs once over the whole selection"
+        );
+        assert_eq!(star_run.payload["results"][0]["success"], true, "{}", star_run.payload);
+
+        // 4. Bookmarks reordering (`POST /api/bookmarks/reorder`).
+        for (bm_name, bm_path) in [("alpha", "/tmp/a"), ("beta", "/tmp/b"), ("gamma", "/tmp/c")] {
+            assert_eq!(
+                svc.dispatch(ApiEnvelope {
+                    method: "POST".into(),
+                    path: "/api/bookmarks/save".into(),
+                    body: json!({"side": "local", "name": bm_name, "path": bm_path}),
+                })
+                .status,
+                200
+            );
+        }
+        let move_up = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/bookmarks/reorder".into(),
+            body: json!({"side": "local", "name": "gamma", "direction": "up"}),
+        });
+        assert_eq!(move_up.status, 200, "{}", move_up.payload);
+        let move_down = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/bookmarks/reorder".into(),
+            body: json!({"side": "local", "name": "alpha", "direction": "down"}),
+        });
+        assert_eq!(move_down.status, 200, "{}", move_down.payload);
+        let ordered_names: Vec<&str> = move_down.payload["bookmarks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(ordered_names, vec!["gamma", "alpha", "beta"]);
     }
 }

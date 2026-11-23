@@ -6465,6 +6465,124 @@ function options(id) {
     delete responses['/api/remote/search'];
     delete responses['/api/transfer/download'];
 
+    // 32. Search dialog size (`min_size`/`max_size`) & modified date (`modified_after`/`modified_before`) bounds.
+    responses['/api/remote/search'] = { success: true, matches: [] };
+    window.openSearch('remote');
+    doc.getElementById('searchMinSize').value = '4';
+    doc.getElementById('searchMinSizeUnit').value = '1024';
+    doc.getElementById('searchMaxSize').value = '2';
+    doc.getElementById('searchMaxSizeUnit').value = '1024';
+    const beforeInvalidSearchCount = calls.filter(c => c.path === '/api/remote/search').length;
+    await window.runSearch();
+    check('runSearch rejects min_size > max_size before dispatching a search request',
+      calls.filter(c => c.path === '/api/remote/search').length === beforeInvalidSearchCount);
+    doc.getElementById('searchMaxSize').value = '1';
+    doc.getElementById('searchMaxSizeUnit').value = '1048576';
+    doc.getElementById('searchModifiedAfter').value = '2026-02-01';
+    doc.getElementById('searchModifiedBefore').value = '2026-02-10';
+    await window.runSearch();
+    const boundedSearchCall = calls.filter(c => c.path === '/api/remote/search').pop();
+    const boundedSearchBody = boundedSearchCall ? JSON.parse(boundedSearchCall.options.body) : {};
+    check('runSearch forwards scaled min_size, max_size, modified_after, and modified_before bounds',
+      boundedSearchBody.min_size === 4096 &&
+      boundedSearchBody.max_size === 1048576 &&
+      typeof boundedSearchBody.modified_after === 'number' &&
+      typeof boundedSearchBody.modified_before === 'number' &&
+      boundedSearchBody.modified_after < boundedSearchBody.modified_before);
+    window.closeModal('searchModal');
+    delete responses['/api/remote/search'];
+
+    // 33. Custom Commands interactive `!?prompt?default!` parameters, `!*`, `!.`, and token insertion.
+    check('customTemplateNamesFile distinguishes interactive prompts from !* and !. file tokens',
+      window.customTemplateNamesFile('mkdir !?Folder name?work!') === false &&
+      window.customTemplateNamesFile('chmod 600 !*') === true &&
+      window.customTemplateNamesFile('call mv ! !.') === true);
+    doc.getElementById('customCmdCommand').value = 'chmod 600';
+    window.insertCustomCommandToken('!*');
+    check('insertCustomCommandToken appends placeholder with spacing into #customCmdCommand',
+      doc.getElementById('customCmdCommand').value === 'chmod 600 !*');
+    await window.openCustomCommands();
+    doc.getElementById('customCmdName').value = 'Prompt Mkdir';
+    doc.getElementById('customCmdCommand').value = 'mkdir !?Folder label?default-dir!';
+    doc.getElementById('customCmdScope').value = 'remote';
+    await window.saveCustomCommand();
+    window.focusPane('remote');
+    const origPromptCc = window.prompt;
+    const origConfirmCc = window.confirm;
+    let seenPromptArgs = null;
+    window.prompt = (label, defVal) => {
+      seenPromptArgs = [label, defVal];
+      return 'release-2026';
+    };
+    window.confirm = () => true;
+    await window.runCustomCommand();
+    window.prompt = origPromptCc;
+    window.confirm = origConfirmCc;
+    const ccPromptRun = calls.filter(c => c.path === '/api/custom-commands' && JSON.parse(c.options.body || '{}').action === 'run').pop();
+    const ccPromptBody = ccPromptRun ? JSON.parse(ccPromptRun.options.body) : {};
+    check('runCustomCommand prompts for !?label?default! and posts prompt_values without requiring file selection',
+      !!seenPromptArgs &&
+      seenPromptArgs[0] === 'Folder label' &&
+      seenPromptArgs[1] === 'default-dir' &&
+      Array.isArray(ccPromptBody.prompt_values) &&
+      ccPromptBody.prompt_values[0] === 'release-2026' &&
+      Array.isArray(ccPromptBody.filenames) &&
+      ccPromptBody.filenames.length === 0);
+    window.closeModal('customCommandsModal');
+    delete responses['/api/custom-commands'];
+
+    // 34. Bookmarks filter (`#bookmarkSearchInput`) and reordering (`POST /api/bookmarks/reorder`).
+    responses['/api/bookmarks'].bookmarks.local = [
+      { name: 'alpha', path: '/srv/alpha' },
+      { name: 'beta', path: '/srv/beta' }
+    ];
+    responses['/api/bookmarks/reorder'] = {
+      success: true,
+      bookmarks: [
+        { name: 'beta', path: '/srv/beta' },
+        { name: 'alpha', path: '/srv/alpha' }
+      ]
+    };
+    await window.openBookmarks('local');
+    doc.getElementById('bookmarkSearchInput').value = 'beta';
+    window.filterBookmarksView();
+    check('bookmarkSearchInput filters visible bookmark rows without mutating total count',
+      doc.getElementById('bookmarkList').children.length === 1 &&
+      doc.getElementById('bookmarkList').textContent.includes('beta'));
+    doc.getElementById('bookmarkSearchInput').value = '';
+    window.filterBookmarksView();
+    await window.reorderBookmark('local', 'beta', 'up');
+    const bmReorderCall = calls.filter(c => c.path === '/api/bookmarks/reorder').pop();
+    check('reorderBookmark posts side, name, and direction to /api/bookmarks/reorder and updates order',
+      !!bmReorderCall &&
+      JSON.parse(bmReorderCall.options.body).name === 'beta' &&
+      JSON.parse(bmReorderCall.options.body).direction === 'up' &&
+      doc.getElementById('bookmarkList').children[0].textContent.includes('beta'));
+    window.closeModal('bookmarksModal');
+    delete responses['/api/bookmarks/reorder'];
+
+    // 35. Configurable Compare Directories modes (`#compareDirsModal`).
+    wfState.local.entries = [
+      { name: 'newer_same_size.txt', size: 100, mtime: 500, is_dir: false, permissions: '-rw-r--r--' },
+      { name: 'older_diff_size.txt', size: 250, mtime: 100, is_dir: false, permissions: '-rw-r--r--' },
+      { name: 'only_local_dir', size: 0, mtime: 300, is_dir: true, permissions: 'drwxr-xr-x' }
+    ];
+    wfState.remote.entries = [
+      { name: 'newer_same_size.txt', size: 100, mtime: 200, is_dir: false, permissions: '-rw-r--r--' },
+      { name: 'older_diff_size.txt', size: 100, mtime: 400, is_dir: false, permissions: '-rw-r--r--' }
+    ];
+    window.openCompareDirectoriesModal();
+    doc.getElementById('compareCriteriaSelect').value = 'size';
+    doc.getElementById('compareIncludeDirs').checked = false;
+    window.applyCompareDirectoriesModal();
+    check('Compare directories size-only mode with includeDirs=false selects size differences and skips missing folders',
+      wfState.local.selection.has('older_diff_size.txt') &&
+      !wfState.local.selection.has('newer_same_size.txt') &&
+      !wfState.local.selection.has('only_local_dir'));
+    window.compareDirectories('time_or_size', true);
+    wfState.compareCriteria = 'time_or_size';
+    wfState.compareIncludeDirs = true;
+
     wfState.tabs = savedWfTabs;
     wfState.activeTab = savedWfActiveTab;
   }
