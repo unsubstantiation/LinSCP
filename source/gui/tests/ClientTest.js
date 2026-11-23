@@ -6583,8 +6583,72 @@ function options(id) {
     wfState.compareCriteria = 'time_or_size';
     wfState.compareIncludeDirs = true;
 
+    // 36. High-density Commander shell: central transfer spine, protocol-contextual
+    // remote header pills, explorer-mode toolbar toggle, and collapsible/tall bottom dock.
+    const mainChildren = Array.from(doc.querySelector('.commander-main').children).map(el => el.id || el.className);
+    check('commander-main arranges localPane, central commander-actions spine, and remotePane in order',
+      mainChildren[0] === 'localPane' &&
+      mainChildren[1].includes('commander-actions') &&
+      mainChildren[2] === 'remotePane');
+    check('menu-bar-right hosts statusBadge, themeToggleBtn, and languageSelect without duplicate toolbar brand',
+      !!doc.querySelector('.menu-bar-right #statusBadge') &&
+      !!doc.querySelector('.menu-bar-right #themeToggleBtn') &&
+      !!doc.querySelector('.menu-bar-right #languageSelect') &&
+      doc.querySelectorAll('.app-toolbar .toolbar-cluster').length === 4);
+
+    window.toggleExplorerMode();
+    check('explorerModeBtn reflects active single-panel state and clears when exiting explorer mode',
+      doc.getElementById('explorerModeBtn').classList.contains('active') &&
+      doc.querySelector('.commander-main').classList.contains('explorer-mode'));
+    window.toggleExplorerMode();
+    check('exiting explorerModeBtn clears active class',
+      !doc.getElementById('explorerModeBtn').classList.contains('active'));
+
+    wfState.tabs = [{ id: 1, protocol: 's3', session: { protocol: 's3' }, connected: true, label: 's3://bucket', remote_dir: '/' }];
+    wfState.activeTab = 1;
+    window.updateRemoteDesktopButton();
+    check('remote header exposes S3 versions shortcut only on S3 tabs and WebDAV shortcut only on WebDAV tabs',
+      !doc.getElementById('remoteS3Btn').hidden &&
+      doc.getElementById('remoteDavBtn').hidden);
+    wfState.tabs = [{ id: 1, protocol: 'webdav', session: { protocol: 'webdav' }, connected: true, label: 'davs://cloud', remote_dir: '/' }];
+    window.updateRemoteDesktopButton();
+    check('remote header switches to DAV shortcut on WebDAV tabs',
+      !doc.getElementById('remoteDavBtn').hidden &&
+      doc.getElementById('remoteS3Btn').hidden);
+
+    const lowerPanelEl = doc.getElementById('lowerPanel');
+    window.switchTab('queue');
+    await new Promise(resolve => setTimeout(resolve, 25));
+    check('Transfer Queue tab shows queueControlsGroup and hides log/cli dock controls',
+      !doc.getElementById('queueControlsGroup').hidden &&
+      doc.getElementById('logControlsGroup').hidden &&
+      doc.getElementById('cliControlsGroup').hidden);
+    window.toggleLowerPanel();
+    check('toggleLowerPanel collapses lowerPanel and updates aria-expanded',
+      lowerPanelEl.classList.contains('collapsed') &&
+      doc.getElementById('toggleLowerPanelBtn').getAttribute('aria-expanded') === 'false');
+    window.switchTab('log');
+    await new Promise(resolve => setTimeout(resolve, 25));
+    check('selecting Log tab un-collapses lowerPanel and switches contextual controls to logControlsGroup',
+      !lowerPanelEl.classList.contains('collapsed') &&
+      doc.getElementById('queueControlsGroup').hidden &&
+      !doc.getElementById('logControlsGroup').hidden &&
+      doc.getElementById('cliControlsGroup').hidden);
+    window.switchTab('cli');
+    check('selecting CLI Console tab switches contextual controls to cliControlsGroup',
+      !doc.getElementById('cliControlsGroup').hidden &&
+      doc.getElementById('logControlsGroup').hidden);
+    window.toggleLowerPanelTall();
+    check('toggleLowerPanelTall expands lowerPanel height and marks expandLowerPanelBtn active',
+      lowerPanelEl.classList.contains('tall') &&
+      doc.getElementById('expandLowerPanelBtn').classList.contains('active'));
+    window.toggleLowerPanelTall();
+    window.switchTab('queue');
+    await new Promise(resolve => setTimeout(resolve, 25));
+
     wfState.tabs = savedWfTabs;
     wfState.activeTab = savedWfActiveTab;
+    window.updateRemoteDesktopButton();
   }
 
   check('no script errors', errors.length === 0, errors.join(' | '));
