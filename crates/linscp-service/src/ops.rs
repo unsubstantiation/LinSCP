@@ -1333,12 +1333,64 @@ fn side_directory(side: CommandSide, pane: &str, tab: &TabRuntime) -> String {
 /// `{files}` is the whole selection; the caller expands it once per run and hands
 /// the result in as `all_files`, so a template written for a multi-file command
 /// (`tar czf out.tgz {files}`) runs once rather than once per file.
+pub fn filename_stem_without_ext(filename: &str) -> &str {
+    match filename.rfind('.') {
+        Some(pos) if pos > 0 => &filename[..pos],
+        _ => filename,
+    }
+}
+
+/// Extracts interactive `!?prompt?default!` (or `!?prompt!`) parameters from a
+/// custom command template in left-to-right appearance order.
+pub fn extract_custom_command_prompts(template_cmd: &str) -> Vec<(String, String)> {
+    let mut prompts = Vec::new();
+    let chars: Vec<char> = template_cmd.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '!' {
+            match chars.get(i + 1).copied() {
+                Some('?') => {
+                    if let Some(rel) = chars[i + 2..].iter().position(|c| *c == '!') {
+                        let inner: String = chars[i + 2..i + 2 + rel].iter().collect();
+                        let (label, default_val) = match inner.split_once('?') {
+                            Some((l, d)) => (l.to_string(), d.to_string()),
+                            None => (inner, String::new()),
+                        };
+                        prompts.push((label, default_val));
+                        i += 2 + rel + 1;
+                        continue;
+                    }
+                }
+                Some('!') | Some('/') | Some('@') | Some('#') | Some('U') | Some('S')
+                | Some('*') | Some('.') => {
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    prompts
+}
+
 pub fn expand_custom_command(
     template_cmd: &str,
     filename: &str,
     all_files: &[String],
     dir: &str,
     tab: &TabRuntime,
+) -> String {
+    expand_custom_command_with_prompts(template_cmd, filename, all_files, dir, tab, &[])
+}
+
+pub fn expand_custom_command_with_prompts(
+    template_cmd: &str,
+    filename: &str,
+    all_files: &[String],
+    dir: &str,
+    tab: &TabRuntime,
+    prompt_values: &[String],
 ) -> String {
     let host = tab
         .spec
@@ -1369,13 +1421,14 @@ pub fn expand_custom_command(
     };
     let joined: Vec<String> = all_files.iter().map(|name| quote_operand(name)).collect();
     let all_quoted = joined.join(" ");
+    let stem = filename_stem_without_ext(filename);
 
     let mut out = String::with_capacity(template_cmd.len() + 32);
     let chars: Vec<char> = template_cmd.chars().collect();
     let mut i = 0;
+    let mut prompt_idx = 0usize;
     while i < chars.len() {
-        // `{file}` / `{files}`: the form this GUI documents, and the one a saved
-        // template from a previous version is most likely to use.
+        // `{file}` / `{files}` / `{stem}`: the brace forms documented by the GUI.
         if chars[i] == '{' {
             // Scan the character vector, not the string: `{` and `}` are ASCII,
             // but the template between them need not be, and a byte offset into
@@ -1385,6 +1438,7 @@ pub fn expand_custom_command(
                 let replacement = match name.as_str() {
                     "file" => Some(quote_operand(filename)),
                     "files" => Some(all_quoted.clone()),
+                    "stem" => Some(quote_operand(stem)),
                     _ => None,
                 };
                 if let Some(replacement) = replacement {
@@ -1404,6 +1458,33 @@ pub fn expand_custom_command(
                         out.push('!');
                         i += 2;
                         continue;
+                    }
+                    '*' => {
+                        out.push_str(&all_quoted);
+                        i += 2;
+                        continue;
+                    }
+                    '.' => {
+                        out.push_str(&quote_operand(stem));
+                        i += 2;
+                        continue;
+                    }
+                    '?' => {
+                        if let Some(rel) = chars[i + 2..].iter().position(|c| *c == '!') {
+                            let inner: String = chars[i + 2..i + 2 + rel].iter().collect();
+                            let default_val = inner
+                                .split_once('?')
+                                .map(|(_, d)| d)
+                                .unwrap_or("");
+                            let chosen = prompt_values
+                                .get(prompt_idx)
+                                .map(String::as_str)
+                                .unwrap_or(default_val);
+                            prompt_idx += 1;
+                            out.push_str(&quote_operand(chosen));
+                            i += 2 + rel + 1;
+                            continue;
+                        }
                     }
                     '/' => {
                         out.push_str(&quote_operand(&dir_slash));
@@ -1517,10 +1598,37 @@ pub async fn execute_custom_command_template(
     // that runs a template awaits it, and Tauri only polls `Send` futures.
     on_command: &mut (dyn FnMut(&str) + Send),
 ) -> Result<Vec<Value>, String> {
+    execute_custom_command_template_with_prompts(
+        make_interpreter,
+        template,
+        filenames,
+        pane,
+        tab,
+        &[],
+        on_command,
+    )
+    .await
+}
+
+pub async fn execute_custom_command_template_with_prompts(
+    make_interpreter: &mut (dyn FnMut(&TabRuntime) -> Result<linscp_engine::script::ScriptInterpreter, String>
+             + Send),
+    template: &Value,
+    filenames: &[String],
+    pane: &str,
+    tab: &TabRuntime,
+    prompt_values: &[String],
+    on_command: &mut (dyn FnMut(&str) + Send),
+) -> Result<Vec<Value>, String> {
     let raw_cmd = template
         .get("command")
         .and_then(Value::as_str)
         .ok_or_else(|| "Invalid command template.".to_string())?;
+    for val in prompt_values {
+        if val.chars().any(char::is_control) {
+            return Err("Prompt values must not contain control characters.".to_string());
+        }
+    }
     let scope = template.get("scope").and_then(Value::as_str).unwrap_or("remote");
     let (side, work_dir) = resolve_command_target(scope, pane, tab)?;
 
@@ -1532,11 +1640,12 @@ pub async fn execute_custom_command_template(
         .filter_map(|name| validate_leaf_name(name).ok())
         .collect();
 
-    let per_file = raw_cmd.contains("{file}") || names_an_operand(raw_cmd);
+    let per_file = names_single_operand(raw_cmd);
     let targets: Vec<Option<String>> = if per_file {
         filenames.iter().map(|name| Some(name.clone())).collect()
     } else {
-        // The command does not mention the selection: run it exactly once.
+        // The command either uses `{files}`/`!*` once over the whole selection
+        // or does not mention the selection at all: run it exactly once.
         vec![None]
     };
 
@@ -1552,7 +1661,14 @@ pub async fn execute_custom_command_template(
             },
             None => String::new(),
         };
-        let expanded = expand_custom_command(raw_cmd, &leaf, &validated, &work_dir, tab);
+        let expanded = expand_custom_command_with_prompts(
+            raw_cmd,
+            &leaf,
+            &validated,
+            &work_dir,
+            tab,
+            prompt_values,
+        );
         // One interpreter per file, starting in the pane's directory: a command
         // that fails half way must not leave the next file running in its
         // wreckage, and a `cd` in one template run is that run's own business.
@@ -1576,24 +1692,65 @@ pub fn template_names_a_file(template: &Value) -> bool {
     template
         .get("command")
         .and_then(Value::as_str)
-        .map(|cmd| cmd.contains("{file}") || cmd.contains("{files}") || names_an_operand(cmd))
+        .map(|cmd| names_single_operand(cmd) || names_group_operand(cmd))
         .unwrap_or(false)
 }
 
-/// Whether a template line mentions the current entry at all. `!` on its own does;
-/// the escapes `!!`, `!/`, `!@`, `!#`, `!U` and `!S` do not, because they name the
-/// directory, the host, the port, the user or the session rather than the file.
-fn names_an_operand(template_cmd: &str) -> bool {
+/// Whether a template line mentions a single-entry placeholder (`{file}`, `{stem}`,
+/// `!.`, or bare `!`) and therefore runs once per selected item.
+fn names_single_operand(template_cmd: &str) -> bool {
+    if template_cmd.contains("{file}") || template_cmd.contains("{stem}") {
+        return true;
+    }
     let chars: Vec<char> = template_cmd.chars().collect();
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '!' {
-            match chars.get(i + 1) {
-                Some('!') | Some('/') | Some('@') | Some('#') | Some('U') | Some('S') => {
+            match chars.get(i + 1).copied() {
+                Some('!') | Some('/') | Some('@') | Some('#') | Some('U') | Some('S')
+                | Some('*') => {
                     i += 2;
                     continue;
                 }
+                Some('?') => {
+                    if let Some(rel) = chars[i + 2..].iter().position(|c| *c == '!') {
+                        i += 2 + rel + 1;
+                        continue;
+                    }
+                    return true;
+                }
+                Some('.') => return true,
                 _ => return true,
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether a template line mentions a multi-entry placeholder (`{files}` or `!*`).
+fn names_group_operand(template_cmd: &str) -> bool {
+    if template_cmd.contains("{files}") {
+        return true;
+    }
+    let chars: Vec<char> = template_cmd.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '!' {
+            match chars.get(i + 1).copied() {
+                Some('*') => return true,
+                Some('?') => {
+                    if let Some(rel) = chars[i + 2..].iter().position(|c| *c == '!') {
+                        i += 2 + rel + 1;
+                        continue;
+                    }
+                }
+                Some('!') | Some('/') | Some('@') | Some('#') | Some('U') | Some('S')
+                | Some('.') => {
+                    i += 2;
+                    continue;
+                }
+                _ => {}
             }
         }
         i += 1;
@@ -1963,6 +2120,48 @@ mod tests {
             &tab(true),
         );
         assert_eq!(expanded, "call tar czf out.tgz a.txt 'two words.txt'");
+    }
+
+    #[test]
+    fn custom_placeholders_star_stem_and_interactive_prompts_expand_safely() {
+        let t = tab(true);
+        let prompts = extract_custom_command_prompts(
+            "call cp !! !?Target folder?/tmp/backup! !?Archive label!",
+        );
+        assert_eq!(
+            prompts,
+            vec![
+                ("Target folder".to_string(), "/tmp/backup".to_string()),
+                ("Archive label".to_string(), String::new()),
+            ]
+        );
+
+        assert!(template_names_a_file(&json!({"command": "call tar czf out.tgz !*"})));
+        assert!(template_names_a_file(&json!({"command": "call gzip -c ! > !."})));
+        assert!(template_names_a_file(&json!({"command": "checksum sha256 {stem}"})));
+        assert!(!template_names_a_file(&json!({"command": "mkdir !?Folder name?work!"})));
+        assert!(!names_single_operand("call tar czf !?Archive?out.tgz! !*"));
+        assert!(names_single_operand("call cp ! !..bak"));
+
+        let star = expand_custom_command_with_prompts(
+            "call tar czf !?Archive?out.tgz! !*",
+            "",
+            &["one.txt".to_string(), "two words.txt".to_string()],
+            "/tmp",
+            &t,
+            &["my; archive.tgz".to_string()],
+        );
+        assert_eq!(
+            star,
+            "call tar czf 'my; archive.tgz' one.txt 'two words.txt'"
+        );
+        let tokens = linscp_engine::script_params::tokenize_script_line(&star).expect("tokens");
+        assert_eq!(tokens, vec!["call", "tar", "czf", "my; archive.tgz", "one.txt", "two words.txt"]);
+
+        let stem_cmd = expand_custom_command("call mv ! !.", "report.tar.gz", &[], "/tmp", &t);
+        assert_eq!(stem_cmd, "call mv report.tar.gz report.tar");
+        let dotfile_stem = expand_custom_command("echo {stem}", ".env", &[], "/tmp", &t);
+        assert_eq!(dotfile_stem, "echo .env");
     }
 
     /// A template with no operand at all runs once, even with a whole selection,
