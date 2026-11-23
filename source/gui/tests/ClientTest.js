@@ -6649,6 +6649,41 @@ function options(id) {
     wfState.tabs = savedWfTabs;
     wfState.activeTab = savedWfActiveTab;
     window.updateRemoteDesktopButton();
+
+    // 37. Unified workspace-bar, logical pane-header order, cross-pane spine,
+    // categorized menu dropdowns, and 3-tab Site Manager sub-tabs.
+    check('workspace-bar combines session tabs-bar and app-toolbar on a single unified strip',
+      !!doc.querySelector('.workspace-bar > .tabs-bar') &&
+      !!doc.querySelector('.workspace-bar > .app-toolbar') &&
+      doc.querySelectorAll('.menu-bar .menu-item').length === 8 &&
+      doc.querySelectorAll('.menu-dropdown .menu-section-title').length >= 15);
+    const localHeaderGroups = Array.from(doc.querySelector('#localPane .pane-header').children).map(el => el.className);
+    check('pane-header orders pane-title, pane-nav-group, path-input-group, and pane-create-group left to right',
+      localHeaderGroups[0] === 'pane-title' &&
+      localHeaderGroups[1] === 'pane-nav-group' &&
+      localHeaderGroups[2] === 'path-input-group' &&
+      localHeaderGroups[3] === 'pane-create-group');
+    const spineLabels = Array.from(doc.querySelectorAll('.commander-actions .action-label')).map(el => el.textContent.trim());
+    check('commander-actions spine contains exclusively cross-pane transfer and directory comparison actions',
+      JSON.stringify(spineLabels) === JSON.stringify(['Upload', 'Download', 'Copy', 'Move', 'Compare', 'Synchronize']));
+
+    window.switchSiteFormTab('network');
+    check('switchSiteFormTab("network") activates Tunnel & Proxy pane and hides Connection pane',
+      doc.getElementById('siteTabNetwork').classList.contains('active') &&
+      !doc.getElementById('siteTabGeneral').classList.contains('active') &&
+      doc.getElementById('siteTabNetworkBtn').getAttribute('aria-selected') === 'true');
+    doc.getElementById('siteProtocol').value = 'local';
+    window.siteProtocolChanged();
+    check('switching Site Manager protocol to local while on network tab returns to general tab',
+      doc.getElementById('siteTabGeneral').classList.contains('active') &&
+      !doc.getElementById('siteTabProtocolBtn').classList.contains('has-proto-opts'));
+    doc.getElementById('siteProtocol').value = 's3';
+    window.siteProtocolChanged();
+    check('selecting S3 protocol marks Protocol & Options sub-tab with has-proto-opts indicator',
+      doc.getElementById('siteTabProtocolBtn').classList.contains('has-proto-opts'));
+    doc.getElementById('siteProtocol').value = 'sftp';
+    window.siteProtocolChanged();
+    window.switchSiteFormTab('general');
   }
 
   check('no script errors', errors.length === 0, errors.join(' | '));
