@@ -3668,7 +3668,7 @@ impl ScriptInterpreter {
 
         if linscp_crypto::digests::DigestAlgorithm::parse(alg).is_none() {
             let h = format!(
-                "Unsupported checksum algorithm '{alg}' (expected sha-256, sha-1, md5 or crc32)."
+                "Unsupported checksum algorithm '{alg}' (expected sha-256, sha-384, sha-512, sha-1, md5 or crc32)."
             );
             return Err(self.wrong_args("checksum", &h));
         }

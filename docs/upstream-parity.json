@@ -5099,7 +5099,7 @@
       "id": "gui.local-to-local",
       "area": "GUI",
       "status": "verified",
-      "notes": "A local-to-local session is a tab whose protocol is 'local' and which names two absolute local directories (the upstream IsLocalBrowser/OtherLocalDirectory shape). CoreSession.start, connect and alive never spawn the core and never open a socket; the right pane lists its directory through the same API the remote pane uses. Copies and moves are planned and run in-process on the queue with byte progress and cancellation: recursive trees, merge into an existing directory, atomic per-file replacement through a temporary file, timestamps and modes preserved, symbolic links copied as links, and ask/skip/overwrite/rename decisions. Source equal to or inside the destination is refused before queueing. The second pane also supports mkdir, rename, delete, chmod, touch (set_mtime), symlink, properties, checksums, editor save (including create_only), search, and full one-way/mirror/checksum/bidirectional ('both') directory synchronization via LocalSyncSession.",
+      "notes": "A local-to-local session is a tab whose protocol is 'local' and which names two absolute local directories (the upstream IsLocalBrowser/OtherLocalDirectory shape). CoreSession.start, connect and alive never spawn the core and never open a socket; the right pane lists its directory through the same API the remote pane uses. Copies and moves are planned and run in-process on the queue with byte progress and cancellation: recursive trees, merge into an existing directory, atomic per-file replacement through a temporary file, timestamps and modes preserved, symbolic links copied as links, and ask/skip/overwrite/rename decisions. Source equal to or inside the destination is refused before queueing. The second pane also supports mkdir, rename, delete, chmod, touch (set_mtime), symlink, properties, SHA-256/SHA-384/SHA-512/SHA-1/MD5/CRC32 checksums, editor save (including create_only), search, Keep Up to Date continuous watching, and full one-way/mirror/checksum/bidirectional ('both') directory synchronization via LocalSyncSession.",
       "source": [
         "crates/linscp-engine/src/sync_planner.rs",
         "crates/linscp-service/src/lib.rs",
@@ -5111,11 +5111,13 @@
           "saf_local_copy_moves_bytes_through_the_bridge",
           "local_and_dual_local_navigation_editor_conflict_rename_overwrite_and_backup_save_dir",
           "local_and_dual_local_checksum_multi_chmod_properties_and_copy",
-          "dual_local_sync_s3_restore_dav_property_remove_and_last_used_round_trip"
+          "dual_local_sync_s3_restore_dav_property_remove_and_last_used_round_trip",
+          "sha384_sha512_dual_local_keepuptodate_known_hosts_and_url_snippets"
         ],
         "gui": [
           "openNewLocalTabPrompt posts /api/tabs/local and activates the new dual-local tab",
-          "dual-local native drop onto right pane uses target=local and right-pane directory"
+          "dual-local native drop onto right pane uses target=local and right-pane directory",
+          "startKeepUpToDate supports dual-local tabs and forwards custom octal permissions"
         ]
       },
       "verified_on": {
@@ -5240,23 +5242,31 @@
       "id": "gui.generate-url",
       "area": "GUI",
       "status": "verified",
-      "notes": "Upstream's Generate URL dialog, as a Session URL dialog in the Commander: it shows the active tab's URL and the equivalent 'open' command, and offers the stored password only as an explicit tick. The password is absent from the default URL and from the command line; when it is included the dialog says the URL is a secret, and only the host reaches the logs. A local tab, which has no server or session, is refused by name instead of producing a meaningless URL. gui-local was cited here before the B-suite triage but is not runnable (see the suite registry), so only gui is cited.",
+      "notes": "Upstream's Generate URL/Code dialog, as a Session URL dialog in the Commander: it shows the active tab's URL, a LinSCP script snippet ('open' with pinned -hostkey and 'cd'), and an OpenSSH sftp/scp/ssh command where applicable, offering the stored password only as an explicit tick. The password is absent from the default URL and from the command line; when it is included the dialog says the URL is a secret, and only the host reaches the logs. A local tab, which has no server or session, is refused by name instead of producing a meaningless URL.",
       "source": [
         "crates/linscp-service/src/lib.rs",
-        "ui/src/index.ts"
+        "ui/src/index.ts",
+        "source/gui/web/index.html"
       ],
       "checks": {
         "gui": [
           "the session URL dialog shows a URL without the password",
           "the dialog offers the stored password explicitly",
-          "asking for the password asks the backend for it"
+          "asking for the password asks the backend for it",
+          "Session URL format=script displays script_snippet with hostkey and cd",
+          "Session URL format=openssh displays OpenSSH CLI command"
+        ],
+        "service": [
+          "sha384_sha512_dual_local_keepuptodate_known_hosts_and_url_snippets"
         ]
       },
       "verified_on": {
         "linux": [
+          "service",
           "gui"
         ],
         "windows": [
+          "service",
           "gui"
         ],
         "android": [

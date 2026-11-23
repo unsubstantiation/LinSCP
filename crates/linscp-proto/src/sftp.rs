@@ -742,6 +742,8 @@ impl SftpClientSession {
     ) -> Result<Option<(String, String)>, ProtoError> {
         let sftp_alg = match DigestAlgorithm::parse(algorithm) {
             Some(DigestAlgorithm::Sha256) => "sha-256",
+            Some(DigestAlgorithm::Sha384) => "sha-384",
+            Some(DigestAlgorithm::Sha512) => "sha-512",
             Some(DigestAlgorithm::Sha1) => "sha-1",
             Some(DigestAlgorithm::Md5) => "md5",
             Some(DigestAlgorithm::Crc32) => "crc32",

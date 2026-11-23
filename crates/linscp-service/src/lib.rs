@@ -2022,16 +2022,16 @@ impl CommanderService {
         }
     }
 
-    /// Starts watching a local directory and copying changes to the server.
+    /// Starts watching a local directory and copying changes to the destination
+    /// (either a remote session or the opposite local directory on a dual-local tab).
     /// It runs as a queue item, so cancelling it is the queue's cancel and a
     /// pause holds it before its next pass.
     async fn keep_up_to_date_async(&self, body: Value) -> ApiReply {
         use linscp_engine::keepuptodate::KeepUpToDateOptions;
         let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
         let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
-            Some(tab) if tab.connected && !tab.is_local => tab, _ => return api_error(400, "Not connected"),
+            Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
         };
-        let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
         let local_root = match check_sync_local_dir(body.get("local_dir").and_then(Value::as_str).unwrap_or("")) {
             Ok(dir) => dir,
             Err(error) => return api_error(400, error),
@@ -2042,8 +2042,57 @@ impl CommanderService {
             Path::new(&local_root).is_dir()
         };
         if !local_is_dir { return api_error(400, "The local directory does not exist.") }
-        let remote_root = match validate_remote_absolute_path(body.get("remote_dir").and_then(Value::as_str).unwrap_or("")) {
-            Ok(path) => path, Err(error) => return api_error(400, error),
+        let (session, job_remote_root, display_dest) = if tab.is_local {
+            let right_raw = body
+                .get("remote_dir")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(&tab.other_local_dir);
+            let right_root = match check_sync_local_dir(right_raw) {
+                Ok(dir) => dir,
+                Err(error) => return api_error(400, error),
+            };
+            let right_is_dir = if is_saf_path(&right_root) {
+                self.local_fs.stat(&right_root).is_ok_and(|info| info.is_dir && !info.is_symlink)
+            } else {
+                Path::new(&right_root).is_dir()
+            };
+            if !right_is_dir {
+                return api_error(400, "The destination directory does not exist.");
+            }
+            if local_root == right_root {
+                return api_error(400, "Source and destination directories must not be the same.");
+            }
+            if !is_saf_path(&local_root) && !is_saf_path(&right_root) {
+                if let (Ok(cl), Ok(cr)) = (
+                    std::fs::canonicalize(&local_root),
+                    std::fs::canonicalize(&right_root),
+                ) {
+                    if cl == cr || cl.starts_with(&cr) || cr.starts_with(&cl) {
+                        return api_error(
+                            400,
+                            "Source and destination directories must not be identical or nested inside one another.",
+                        );
+                    }
+                }
+            }
+            let local_session: Arc<dyn linscp_proto::RemoteSession> = Arc::new(
+                linscp_engine::sync_planner::LocalSyncSession::new(
+                    right_root.clone(),
+                    Arc::clone(&self.local_fs),
+                ),
+            );
+            (local_session, "/".to_string(), right_root)
+        } else {
+            let session = match tab.remote {
+                Some(session) => session,
+                None => return api_error(400, "Not connected"),
+            };
+            let remote_root = match validate_remote_absolute_path(body.get("remote_dir").and_then(Value::as_str).unwrap_or("")) {
+                Ok(path) => path,
+                Err(error) => return api_error(400, error),
+            };
+            (session, remote_root.clone(), remote_root)
         };
         let mask_text = body.get("filemask").and_then(Value::as_str).unwrap_or("").trim().to_string();
         let file_mask = if mask_text.is_empty() {
@@ -2062,6 +2111,10 @@ impl CommanderService {
                 Ok(parsed) => parsed,
                 Err(error) => return api_error(400, error),
             };
+        let permissions = match Self::parse_sync_permissions(&body) {
+            Ok(perms) => perms,
+            Err(error) => return api_error(400, error),
+        };
         let delete_obsolete = body
             .get("delete")
             .or_else(|| body.get("delete_obsolete"))
@@ -2078,6 +2131,7 @@ impl CommanderService {
             max_passes: body.get("count").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32,
             transfer_mode,
             preserve_time,
+            permissions,
             speed_kbytes_per_sec,
             file_mask,
             ..KeepUpToDateOptions::default()
@@ -2085,11 +2139,11 @@ impl CommanderService {
         let job = crate::queue::QueueJob::KeepUpToDate {
             session,
             local_root: std::path::PathBuf::from(&local_root),
-            remote_root: remote_root.clone(),
+            remote_root: job_remote_root,
             opts,
         };
         let task_id = self.queue.enqueue(Some(id), "keepuptodate",
-            format!("Watch {local_root}"), local_root.clone(), remote_root, 0,
+            format!("Watch {local_root}"), local_root.clone(), display_dest, 0,
             body.get("priority").and_then(Value::as_bool).unwrap_or(false), job);
         ApiReply { status: 200, payload: json!({"success": true, "task_id": task_id}) }
     }
@@ -2518,7 +2572,7 @@ impl CommanderService {
         let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
         let algorithm = match checksum_algorithm(body.get("algorithm").and_then(Value::as_str).unwrap_or("sha-256")) {
             Some(algorithm) => algorithm,
-            None => return api_error(400, "Unsupported checksum algorithm; use sha-256, sha-1, md5 or crc32."),
+            None => return api_error(400, "Unsupported checksum algorithm; use sha-256, sha-384, sha-512, sha-1, md5 or crc32."),
         };
         let names = remote_names(&body);
         if names.is_empty() { return api_error(400, "Select at least one file") }
@@ -5329,7 +5383,62 @@ impl CommanderService {
                     payload: json!({"success": true, "entries": []}),
                 }
             }
-            _ => api_error(400, "Unsupported host-key action; expected add, delete or clear."),
+            "import_known_hosts" => {
+                let text = if let Some(raw_content) = body.get("content").and_then(Value::as_str) {
+                    if raw_content.len() > 2 * 1024 * 1024 {
+                        return api_error(400, "known_hosts content is too large (limit 2 MiB).");
+                    }
+                    raw_content.to_string()
+                } else {
+                    let home = std::env::var_os("HOME")
+                        .filter(|v| !v.is_empty())
+                        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+                        .map(PathBuf::from);
+                    let Some(home) = home else {
+                        return api_error(400, "Cannot determine the home directory.");
+                    };
+                    let kh_path = home.join(".ssh").join("known_hosts");
+                    let meta = match std::fs::symlink_metadata(&kh_path) {
+                        Ok(m) => m,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            return api_error(404, "No ~/.ssh/known_hosts file was found.");
+                        }
+                        Err(err) => return api_error(400, format!("Cannot read ~/.ssh/known_hosts: {err}")),
+                    };
+                    if meta.file_type().is_symlink() || !meta.is_file() {
+                        return api_error(400, "~/.ssh/known_hosts must be a regular file.");
+                    }
+                    if meta.len() > 2 * 1024 * 1024 {
+                        return api_error(400, "~/.ssh/known_hosts is too large (limit 2 MiB).");
+                    }
+                    match std::fs::read_to_string(&kh_path) {
+                        Ok(s) => s,
+                        Err(err) => return api_error(400, format!("Cannot read ~/.ssh/known_hosts: {err}")),
+                    }
+                };
+                let (imported, skipped) = match cache.import_openssh_known_hosts(&text) {
+                    Ok(counts) => counts,
+                    Err(error) => return api_error(400, error),
+                };
+                if imported > 0 {
+                    if let Err(error) = cache.save_protected(&path, self.secret_vault.as_ref()) {
+                        return api_error(500, error);
+                    }
+                }
+                ApiReply {
+                    status: 200,
+                    payload: json!({
+                        "success": true,
+                        "imported": imported,
+                        "skipped": skipped,
+                        "entries": Self::hostkey_entries_json(&cache),
+                    }),
+                }
+            }
+            _ => api_error(
+                400,
+                "Unsupported host-key action; expected add, delete, clear or import_known_hosts.",
+            ),
         }
     }
 
@@ -7762,13 +7871,13 @@ impl CommanderService {
         let Some(algorithm) = checksum_algorithm(raw_alg) else {
             return api_error(
                 400,
-                "Unsupported checksum algorithm; use sha-256, sha-1, md5 or crc32.",
+                "Unsupported checksum algorithm; use sha-256, sha-384, sha-512, sha-1, md5 or crc32.",
             );
         };
         let Some(alg) = linscp_crypto::digests::DigestAlgorithm::parse(&algorithm) else {
             return api_error(
                 400,
-                "Unsupported checksum algorithm; use sha-256, sha-1, md5 or crc32.",
+                "Unsupported checksum algorithm; use sha-256, sha-384, sha-512, sha-1, md5 or crc32.",
             );
         };
         let names = remote_names(body);
@@ -9412,16 +9521,87 @@ impl CommanderService {
                 };
                 let clean_url = tabs::format_session_url(&spec, dir_override);
                 let url = tabs::format_session_url_with_options(&spec, dir_override, include_password);
+                let escaped_url = url.replace('"', "%22");
+                let hostkey_switch = spec
+                    .session
+                    .hostkey
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|hk| !hk.is_empty() && !hk.contains('"') && !hk.chars().any(char::is_control))
+                    .map(|hk| format!(" -hostkey=\"{hk}\""))
+                    .unwrap_or_default();
+                let mut script_snippet = format!("open \"{escaped_url}\"{hostkey_switch}");
+                if !t.remote_dir.is_empty()
+                    && t.remote_dir != "/"
+                    && !t.remote_dir.contains('"')
+                    && !t.remote_dir.chars().any(char::is_control)
+                {
+                    script_snippet.push_str(&format!("\ncd \"{}\"", t.remote_dir));
+                }
+                let proto_str = spec.session.protocol.as_str();
+                let openssh_command = if matches!(proto_str, "sftp" | "scp" | "ssh")
+                    && !spec.session.host.is_empty()
+                    && !spec.session.host.starts_with('-')
+                    && !spec.session.host.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    let port = if spec.session.port == 0 {
+                        spec.session.protocol.default_port()
+                    } else {
+                        spec.session.port
+                    };
+                    let user_prefix = if !spec.session.username.is_empty()
+                        && !spec.session.username.starts_with('-')
+                        && !spec.session.username.chars().any(|c| c.is_whitespace() || c.is_control())
+                    {
+                        format!("{}@", spec.session.username)
+                    } else {
+                        String::new()
+                    };
+                    let host_target = if spec.session.host.contains(':') && !spec.session.host.starts_with('[') {
+                        format!("[{}]", spec.session.host)
+                    } else {
+                        spec.session.host.clone()
+                    };
+                    let sh_dir = if !t.remote_dir.is_empty() && !t.remote_dir.chars().any(char::is_control) {
+                        format!("'{}'", t.remote_dir.replace('\'', "'\\''"))
+                    } else {
+                        String::new()
+                    };
+                    match proto_str {
+                        "ssh" => {
+                            let port_arg = if port != 22 { format!(" -p {port}") } else { String::new() };
+                            format!("ssh{port_arg} {user_prefix}{host_target}")
+                        }
+                        "scp" => {
+                            let port_arg = if port != 22 { format!(" -P {port}") } else { String::new() };
+                            let path_part = if sh_dir.is_empty() { "''".to_string() } else { sh_dir };
+                            format!("scp{port_arg} {user_prefix}{host_target}:{path_part} .")
+                        }
+                        _ => {
+                            let port_arg = if port != 22 { format!(" -P {port}") } else { String::new() };
+                            let suffix = if sh_dir.is_empty() || t.remote_dir == "/" {
+                                String::new()
+                            } else {
+                                format!(":{sh_dir}")
+                            };
+                            format!("sftp{port_arg} {user_prefix}{host_target}{suffix}")
+                        }
+                    }
+                } else {
+                    String::new()
+                };
                 return ApiReply {
                     status: 200,
                     payload: json!({
                         "success": true,
                         "url": url,
                         "open_command": format!("open {clean_url}"),
+                        "script_snippet": script_snippet,
+                        "openssh_command": openssh_command,
                         "path": t.remote_dir,
                         "include_password": include_password,
                         "has_password": has_password,
-                        "protocol": spec.session.protocol.as_str(),
+                        "protocol": proto_str,
                         "host": spec.session.host,
                     }),
                 };
@@ -9838,6 +10018,13 @@ impl CommanderService {
     }
     fn handle_queue_clear(&self) -> ApiReply { self.queue.clear_finished(); ApiReply{ status:200, payload: json!({"success": true})}}
     fn handle_queue_retry(&self, body: Value) -> ApiReply {
+        if body.get("all").and_then(Value::as_bool).unwrap_or(false) {
+            let retried = self.queue.retry_all_failed();
+            return ApiReply {
+                status: 200,
+                payload: json!({"success": true, "retried": retried}),
+            };
+        }
         let id = body.get("task_id").and_then(Value::as_u64).unwrap_or(0);
         if self.queue.retry(id) { ApiReply{ status:200, payload: json!({"success": true})} } else { api_error(400, "Task cannot be retried") }
     }
@@ -12872,6 +13059,8 @@ fn parse_octal_mode(raw: &str) -> Option<u32> {
 fn checksum_algorithm(raw: &str) -> Option<String> {
     match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
         "sha256" | "sha-256" => Some("sha-256".to_string()),
+        "sha384" | "sha-384" => Some("sha-384".to_string()),
+        "sha512" | "sha-512" => Some("sha-512".to_string()),
         "sha1" | "sha-1" => Some("sha-1".to_string()),
         "md5" => Some("md5".to_string()),
         "crc32" => Some("crc32".to_string()),
@@ -19017,9 +19206,11 @@ mod tests {
             Ok(())
         }
 
-        async fn checksum(&self, _algorithm: &str, remote_path: &str) -> Result<String, ProtoError> {
+        async fn checksum(&self, algorithm: &str, remote_path: &str) -> Result<String, ProtoError> {
             let bytes = self.bytes_of(remote_path).ok_or_else(|| Self::missing(remote_path))?;
-            Ok(linscp_crypto::digests::sha256_hex(&bytes))
+            let alg = linscp_crypto::digests::DigestAlgorithm::parse(algorithm)
+                .unwrap_or(linscp_crypto::digests::DigestAlgorithm::Sha256);
+            Ok(linscp_crypto::digests::compute_digest_hex(alg, &bytes))
         }
 
         async fn download(&self, remote_path: &str, opts: TransferRequest, sink: &mut (dyn AsyncWrite + Unpin + Send), progress: Option<&ProgressCallback>) -> Result<u64, ProtoError> {
@@ -22363,5 +22554,163 @@ mod tests {
             .await;
         assert_eq!(restore_res.status, 200, "{}", restore_res.payload);
         assert_eq!(s3_session.bytes_of("/bucket/config.json").as_deref(), Some(b"{\"v\":1}".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn sha384_sha512_dual_local_keepuptodate_known_hosts_and_url_snippets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_dir = tmp.path().join("cfg");
+        let left_dir = tmp.path().join("watch_src");
+        let right_dir = tmp.path().join("watch_dst");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&left_dir).unwrap();
+        std::fs::create_dir_all(&right_dir).unwrap();
+        std::fs::write(left_dir.join("abc.txt"), b"abc").unwrap();
+
+        let svc = CommanderService::new(cfg_dir.clone(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
+
+        // 1. SHA-384 & SHA-512 local & remote checksums.
+        let cs384 = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/checksum".into(),
+            body: json!({
+                "local_dir": left_dir.to_string_lossy(),
+                "names": ["abc.txt"],
+                "algorithm": "sha-384",
+            }),
+        });
+        assert_eq!(cs384.status, 200, "{}", cs384.payload);
+        assert_eq!(
+            cs384.payload["results"][0]["checksum"],
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"
+        );
+        let cs512 = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/checksum".into(),
+            body: json!({
+                "local_dir": left_dir.to_string_lossy(),
+                "names": ["abc.txt"],
+                "algorithm": "sha-512",
+            }),
+        });
+        assert_eq!(cs512.status, 200, "{}", cs512.payload);
+        assert_eq!(
+            cs512.payload["results"][0]["checksum"],
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        );
+
+        // 2. Dual-local Keep Up to Date (`count: 1` single pass + permissions + identical-dir rejection).
+        let open_local = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/tabs/open".into(),
+                body: json!({
+                    "session": {
+                        "protocol": "local",
+                        "local_dir": left_dir.to_string_lossy(),
+                        "other_local_dir": right_dir.to_string_lossy(),
+                    }
+                }),
+            })
+            .await;
+        assert_eq!(open_local.status, 200, "{}", open_local.payload);
+        let local_tab = open_local.payload["tab"]["id"].as_u64().unwrap();
+
+        let same_reject = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/transfer/keepuptodate".into(),
+                body: json!({
+                    "tab": local_tab,
+                    "local_dir": left_dir.to_string_lossy(),
+                    "remote_dir": left_dir.to_string_lossy(),
+                    "count": 1,
+                }),
+            })
+            .await;
+        assert_eq!(same_reject.status, 400);
+
+        let kud_ok = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/transfer/keepuptodate".into(),
+                body: json!({
+                    "tab": local_tab,
+                    "local_dir": left_dir.to_string_lossy(),
+                    "remote_dir": right_dir.to_string_lossy(),
+                    "count": 1,
+                    "interval": 1,
+                    "permissions": "0640",
+                }),
+            })
+            .await;
+        assert_eq!(kud_ok.status, 200, "{}", kud_ok.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(std::fs::read(right_dir.join("abc.txt")).unwrap(), b"abc");
+
+        // 3. OpenSSH known_hosts import via POST /api/hostkeys.
+        let ed_blob = "AAAAC3NzaC1lZDI1NTE5AAAAIAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g";
+        let import_kh = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/hostkeys".into(),
+            body: json!({
+                "action": "import_known_hosts",
+                "content": format!("deploy.example.test,[deploy.example.test]:2222 ssh-ed25519 {ed_blob}\n|1|hashed=|salt= ssh-ed25519 {ed_blob}\n"),
+            }),
+        });
+        assert_eq!(import_kh.status, 200, "{}", import_kh.payload);
+        assert_eq!(import_kh.payload["imported"], 2);
+        assert_eq!(import_kh.payload["skipped"], 1);
+        assert_eq!(import_kh.payload["entries"].as_array().unwrap().len(), 2);
+
+        // 4. Session URL snippets (`script_snippet` and `openssh_command`) + remote SHA-512 checksum.
+        let sftp_mock = Arc::new(MockSession::new());
+        sftp_mock.add_dir("/srv/app");
+        sftp_mock.add_file("/srv/app/abc.txt", b"abc");
+        let rem_tab = insert_remote_tab(&svc, sftp_mock, &left_dir.to_string_lossy());
+        {
+            let mut g = svc.state.lock().expect("m");
+            if let Some(t) = g.tabs.get_mut(&rem_tab) {
+                t.remote_dir = "/srv/app".to_string();
+                let mut spec = linscp_engine::url_and_raw::parse_site_url("sftp://alice@host.example.test:2222/srv/app").unwrap();
+                spec.session.hostkey = Some("ssh-ed25519 SHA256:TestPin1".to_string());
+                t.spec = Some(spec);
+            }
+        }
+        let url_reply = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: format!("/api/session/url?tab={rem_tab}&password=0"),
+            body: json!({}),
+        });
+        assert_eq!(url_reply.status, 200, "{}", url_reply.payload);
+        assert!(url_reply.payload["script_snippet"].as_str().unwrap().contains("-hostkey=\"ssh-ed25519 SHA256:TestPin1\""));
+        assert!(url_reply.payload["script_snippet"].as_str().unwrap().contains("\ncd \"/srv/app\""));
+        assert_eq!(
+            url_reply.payload["openssh_command"],
+            "sftp -P 2222 alice@host.example.test:'/srv/app'"
+        );
+
+        let rem_cs512 = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/remote/checksum".into(),
+                body: json!({"tab": rem_tab, "names": ["abc.txt"], "algorithm": "sha-512"}),
+            })
+            .await;
+        assert_eq!(rem_cs512.status, 200, "{}", rem_cs512.payload);
+        assert_eq!(
+            rem_cs512.payload["results"][0]["checksum"],
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        );
+
+        // 5. Batch queue retry (`POST /api/queue/retry` with `all: true`).
+        let retry_all = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/queue/retry".into(),
+            body: json!({"all": true}),
+        });
+        assert_eq!(retry_all.status, 200, "{}", retry_all.payload);
+        assert_eq!(retry_all.payload["retried"], 0);
     }
 }

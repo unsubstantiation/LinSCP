@@ -384,13 +384,16 @@ const dom = new JSDOM(html, {
         body = { success: true, file: '/tmp/cfg/bookmarks.json',
           bookmarks: side ? stored[side[1]] : stored };
       }
-      if (path === '/api/session/url') {
+      if (path === '/api/session/url' && !responses['/api/session/url']) {
         const include = /[?&]password=1(?:&|$)/.test(String(url));
+        const mockUrl = include
+          ? 'sftp://user:secret%20word@127.0.0.1:2222/tmp/slowremote/'
+          : 'sftp://user@127.0.0.1:2222/tmp/slowremote/';
         body = { success: true,
-          url: include
-            ? 'sftp://user:secret%20word@127.0.0.1:2222/tmp/slowremote/'
-            : 'sftp://user@127.0.0.1:2222/tmp/slowremote/',
+          url: mockUrl,
           open_command: 'open sftp://user@127.0.0.1:2222/tmp/slowremote/',
+          script_snippet: 'open "' + mockUrl + '"\ncd "/tmp/slowremote"',
+          openssh_command: "sftp -P 2222 user@127.0.0.1:'/tmp/slowremote'",
           path: '/tmp/slowremote', include_password: include,
           has_password: true, protocol: 'sftp', host: '127.0.0.1' };
       }
@@ -1428,13 +1431,19 @@ function options(id) {
         bookmarks: params.has('side') ? stored[params.get('side')] : stored };
       return Promise.resolve({ status: 200, payload: body });
     }
-    if (path === '/api/session/url') {
+    if (path === '/api/session/url' && (options.method || 'GET').toUpperCase() === 'GET') {
+      if (responses['/api/session/url']) {
+        return Promise.resolve({ status: 200, payload: responses['/api/session/url'] });
+      }
       const include = params.get('password') === '1';
+      const mockUrl = include
+        ? 'sftp://user:secret%20word@127.0.0.1:2222/tmp/slowremote/'
+        : 'sftp://user@127.0.0.1:2222/tmp/slowremote/';
       const body = { success: true,
-        url: include
-          ? 'sftp://user:secret%20word@127.0.0.1:2222/tmp/slowremote/'
-          : 'sftp://user@127.0.0.1:2222/tmp/slowremote/',
+        url: mockUrl,
         open_command: 'open sftp://user@127.0.0.1:2222/tmp/slowremote/',
+        script_snippet: 'open "' + mockUrl + '"\ncd "/tmp/slowremote"',
+        openssh_command: "sftp -P 2222 user@127.0.0.1:'/tmp/slowremote'",
         path: '/tmp/slowremote', include_password: include,
         has_password: true, protocol: 'sftp', host: '127.0.0.1' };
       return Promise.resolve({ status: 200, payload: body });
@@ -6349,6 +6358,112 @@ function options(id) {
       !!doc.querySelector('#editorHost .cm-search'));
     await window.closeEditor();
     delete responses['/api/local/edit'];
+
+    // 27. Session URL format switcher (Session URL / LinSCP script / OpenSSH command).
+    wfState.tabs = [{ id: 1, name: 'sftp-box', connected: true, is_local: false, remote_dir: '/srv/app' }];
+    wfState.activeTab = 1;
+    responses['/api/session/url'] = {
+      success: true,
+      url: 'sftp://alice@host.example.test:2222/srv/app',
+      open_command: 'open sftp://alice@host.example.test:2222/srv/app',
+      script_snippet: 'open "sftp://alice@host.example.test:2222/srv/app" -hostkey="ssh-ed25519 SHA256:Pin1"\ncd "/srv/app"',
+      openssh_command: "sftp -P 2222 alice@host.example.test:'/srv/app'",
+      include_password: false,
+      has_password: false,
+      protocol: 'sftp',
+      host: 'host.example.test'
+    };
+    await window.openSessionUrl();
+    doc.getElementById('sessionUrlFormat').value = 'script';
+    window.updateSessionUrlDisplay();
+    check('Session URL format=script displays script_snippet with hostkey and cd',
+      doc.getElementById('sessionUrlText').value.includes('-hostkey="ssh-ed25519 SHA256:Pin1"') &&
+      doc.getElementById('sessionUrlText').value.includes('\ncd "/srv/app"'));
+    doc.getElementById('sessionUrlFormat').value = 'openssh';
+    window.updateSessionUrlDisplay();
+    check('Session URL format=openssh displays OpenSSH CLI command',
+      doc.getElementById('sessionUrlText').value === "sftp -P 2222 alice@host.example.test:'/srv/app'");
+    window.closeModal('sessionUrlModal');
+    delete responses['/api/session/url'];
+
+    // 28. SSH Host Keys search filter & OpenSSH known_hosts import.
+    responses['/api/hostkeys'] = {
+      success: true,
+      imported: 2,
+      skipped: 1,
+      entries: [
+        { host: 'git.example.test', port: 22, host_port: 'git.example.test@22', key_type: 'ssh-ed25519', fingerprint: 'SHA256:GitFp1', pin: 'ssh-ed25519 SHA256:GitFp1' },
+        { host: 'db.example.test', port: 2222, host_port: 'db.example.test@2222', key_type: 'ecdsa-sha2-nistp256', fingerprint: 'SHA256:DbFp2', pin: 'ecdsa-sha2-nistp256 SHA256:DbFp2' }
+      ]
+    };
+    await window.openHostKeysManager();
+    await window.importDefaultKnownHosts();
+    const khImportCall = calls.filter(c => c.path === '/api/hostkeys' && c.options && c.options.method === 'POST').pop();
+    check('importDefaultKnownHosts posts action=import_known_hosts and updates status',
+      !!khImportCall &&
+      JSON.parse(khImportCall.options.body).action === 'import_known_hosts' &&
+      doc.getElementById('hostKeysStatus').textContent.includes('2'));
+    doc.getElementById('hostKeysSearchInput').value = 'db.example.test';
+    window.filterCachedHostKeys();
+    check('filterCachedHostKeys narrows #hostKeysList by query',
+      doc.getElementById('hostKeysList').children.length === 1 &&
+      doc.getElementById('hostKeysList').textContent.includes('db.example.test:2222'));
+    doc.getElementById('hostKeysSearchInput').value = '';
+    window.filterCachedHostKeys();
+    window.closeModal('hostKeysModal');
+    delete responses['/api/hostkeys'];
+
+    // 29. Keep Up to Date dual-local & custom octal permissions.
+    wfState.tabs = [{ id: 2, name: 'local-pair', connected: true, is_local: true, remote_dir: '/tmp/right' }];
+    wfState.activeTab = 2;
+    responses['/api/transfer/keepuptodate'] = { success: true, task_id: 201 };
+    window.openKeepUpToDate();
+    doc.getElementById('kudPermissions').value = 'mode';
+    window.kudPermissionsChanged();
+    doc.getElementById('kudPermissionsOctal').value = '0640';
+    await window.startKeepUpToDate();
+    const kudPermCall = calls.filter(c => c.path === '/api/transfer/keepuptodate').pop();
+    check('startKeepUpToDate supports dual-local tabs and forwards custom octal permissions',
+      !!kudPermCall &&
+      JSON.parse(kudPermCall.options.body).tab === 2 &&
+      JSON.parse(kudPermCall.options.body).permissions === '0640');
+    delete responses['/api/transfer/keepuptodate'];
+
+    // 30. Batch Retry failed transfers (`retryAllFailedTasks`).
+    responses['/api/queue/retry'] = { success: true, retried: 3 };
+    await window.retryAllFailedTasks();
+    const retryAllCall = calls.filter(c => c.path === '/api/queue/retry').pop();
+    check('retryAllFailedTasks posts all=true to /api/queue/retry',
+      !!retryAllCall &&
+      JSON.parse(retryAllCall.options.body).all === true);
+    delete responses['/api/queue/retry'];
+
+    // 31. Search result direct Download action via `.search-match-extra-actions`.
+    wfState.tabs = [{ id: 1, name: 'sftp-box', connected: true, is_local: false, remote_dir: '/srv/app' }];
+    wfState.activeTab = 1;
+    responses['/api/remote/search'] = {
+      success: true,
+      matches: [
+        { name: 'deep.log', path: '/srv/app/logs/deep.log', is_dir: false, size: 128 }
+      ]
+    };
+    responses['/api/transfer/download'] = { success: true };
+    doc.getElementById('searchTarget').value = 'remote';
+    doc.getElementById('searchContents').checked = false;
+    window.toggleSearchContents();
+    await window.runSearch();
+    const dlSearchBtn = doc.querySelector('#searchResults .search-match-extra-actions button');
+    check('Search file match renders Download action in .search-match-extra-actions',
+      !!dlSearchBtn && dlSearchBtn.textContent === 'Download');
+    dlSearchBtn.click();
+    await new Promise(resolve => setTimeout(resolve, 60));
+    const searchDlCall = calls.filter(c => c.path === '/api/transfer/download').pop();
+    check('Clicking Download on a search match queues /api/transfer/download with parent remote_dir',
+      !!searchDlCall &&
+      JSON.parse(searchDlCall.options.body).remote_dir === '/srv/app/logs' &&
+      JSON.parse(searchDlCall.options.body).names[0] === 'deep.log');
+    delete responses['/api/remote/search'];
+    delete responses['/api/transfer/download'];
 
     wfState.tabs = savedWfTabs;
     wfState.activeTab = savedWfActiveTab;
