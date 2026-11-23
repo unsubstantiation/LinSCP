@@ -6684,6 +6684,82 @@ function options(id) {
     doc.getElementById('siteProtocol').value = 'sftp';
     window.siteProtocolChanged();
     window.switchSiteFormTab('general');
+
+    // 38. Disconnected Remote Quick-Connect Hub, empty-filter clear action,
+    // toolbar hidden-files toggle, dock click-to-collapse, and 3-tab Preferences.
+    const prevTabs38 = wfState.tabs;
+    const prevActive38 = wfState.activeTab;
+    const prevSessions38 = wfState.sessions;
+    wfState.sessions = [
+      { name: 'Prod/api', protocol: 'sftp', host: 'api.example.internal', port: 22, username: 'deploy', color: '#3b82f6', last_used: 200 },
+      { name: 'Backups/s3', protocol: 's3', host: 's3.amazonaws.com', port: 443, username: 'AKIA', last_used: 100 }
+    ];
+    wfState.tabs = [];
+    wfState.activeTab = null;
+    window.renderTabs();
+    window.updateRemoteDesktopButton();
+    window.renderPane('remote');
+    check('disconnected remote pane shows Quick-Connect Hub, saved sites grid, and empty-tab hint instead of blank void',
+      !doc.getElementById('remoteEmptyHub').hidden &&
+      doc.getElementById('remoteFileTable').hidden &&
+      !doc.getElementById('emptyTabHint').hidden &&
+      doc.querySelectorAll('#quickConnectSites .quick-site-card').length === 2);
+    doc.getElementById('quickProtocol').value = 's3';
+    window.quickProtocolChanged();
+    check('quickProtocolChanged updates quickPort default from 22 to 443 for S3',
+      doc.getElementById('quickPort').value === '443');
+    doc.getElementById('quickProtocol').value = 'sftp';
+    window.quickProtocolChanged();
+
+    wfState.tabs = prevTabs38;
+    wfState.activeTab = prevActive38;
+    wfState.sessions = prevSessions38;
+    window.renderTabs();
+    window.updateRemoteDesktopButton();
+    window.renderPane('remote');
+    check('reconnected remote pane hides Quick-Connect Hub and shows uppercase protocol badge',
+      doc.getElementById('remoteEmptyHub').hidden &&
+      !doc.getElementById('remoteFileTable').hidden &&
+      doc.getElementById('emptyTabHint').hidden &&
+      !doc.getElementById('remoteProtoBadge').hidden);
+
+    doc.getElementById('localFilterInput').value = '__no_such_item_xyz__';
+    window.setPaneFilter('local', '__no_such_item_xyz__');
+    check('unmatched pane filter reveals empty-state message and Clear filter button',
+      !doc.getElementById('localEmptyState').hidden &&
+      !doc.getElementById('localClearFilterBtn').hidden);
+    window.clearPaneFilter('local');
+    check('clearPaneFilter resets filter input and hides empty-state notice',
+      doc.getElementById('localFilterInput').value === '' &&
+      doc.getElementById('localEmptyState').hidden);
+
+    const wasShowingHidden = Boolean(wfState.showHidden);
+    window.toggleHiddenFiles();
+    check('hiddenFilesToolbarBtn syncs active state and aria-pressed with toggleHiddenFiles',
+      doc.getElementById('hiddenFilesToolbarBtn').classList.contains('active') === !wasShowingHidden &&
+      doc.getElementById('hiddenFilesToolbarBtn').getAttribute('aria-pressed') === String(!wasShowingHidden));
+    window.toggleHiddenFiles();
+
+    window.switchTab('queue');
+    window.dockTabClick('queue');
+    check('clicking already-active dock tab collapses lowerPanel',
+      doc.getElementById('lowerPanel').classList.contains('collapsed'));
+    window.dockTabClick('queue');
+    await new Promise(resolve => setTimeout(resolve, 25));
+    check('clicking collapsed dock tab re-expands lowerPanel',
+      !doc.getElementById('lowerPanel').classList.contains('collapsed'));
+
+    window.switchPrefTab('safety');
+    check('Preferences 3-tab navigation switches cleanly between Transfers, Safety, and Scripts',
+      doc.getElementById('prefTabSafety').classList.contains('active') &&
+      !doc.getElementById('prefTabTransfers').classList.contains('active') &&
+      doc.getElementById('prefTabSafetyBtn').getAttribute('aria-selected') === 'true');
+    window.switchPrefTab('scripts');
+    check('Preferences Scripts sub-tab activates installer scripts section',
+      doc.getElementById('prefTabScripts').classList.contains('active') &&
+      !!doc.querySelector('#fullBackupModal .dialog-grid-2') &&
+      !!doc.querySelector('#davToolsModal .dialog-grid-2'));
+    window.switchPrefTab('transfers');
   }
 
   check('no script errors', errors.length === 0, errors.join(' | '));
