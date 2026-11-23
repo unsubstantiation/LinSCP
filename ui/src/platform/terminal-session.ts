@@ -33,6 +33,7 @@ export interface KeyEventLike {
   altKey?: boolean;
   shiftKey?: boolean;
   metaKey?: boolean;
+  isComposing?: boolean;
   preventDefault?: () => void;
 }
 
@@ -40,92 +41,128 @@ export interface KeyEventLike {
  * Encodes one key press as the bytes a terminal sends.
  *
  * Returns `null` for a key the terminal does not send anything for (a bare
- * modifier, a browser shortcut the page is allowed to keep). Printable text is
- * sent as UTF-8 by the caller, so this only decides the non-printable keys and
- * the control characters.
+ * modifier, an IME composition event, or an OS/browser shortcut the host keeps).
  *
- * `applicationCursor` switches the arrow and Home/End sequences, which is the
- * difference between working and broken arrow keys inside `vi`, `less` and
- * any other full-screen program.
+ * `applicationCursor` switches the unmodified arrow and Home/End sequences,
+ * which is the difference between working and broken arrow keys inside `vi`,
+ * `less` and any other full-screen program; xterm modifier parameters handle
+ * Shift/Alt/Ctrl combinations such as `Ctrl+ArrowLeft` word jumps.
  */
 export function encodeKey(event: KeyEventLike, applicationCursor: boolean): string | null {
+  if (event.isComposing) {
+    return null;
+  }
   const { key } = event;
   const ctrl = event.ctrlKey === true;
   const alt = event.altKey === true;
   const shift = event.shiftKey === true;
+  const meta = event.metaKey === true;
 
-  // Ctrl+letter is the ASCII control code; Ctrl+Space and Ctrl+@ are NUL.
-  if (ctrl && key.length === 1) {
+  if (meta && !ctrl && !alt) {
+    return null;
+  }
+
+  // Ctrl+letter and standard xterm Ctrl+symbol chords become ASCII control codes.
+  if (ctrl && [...key].length === 1) {
     const code = key.toUpperCase().charCodeAt(0);
-    if (key === ' ' || key === '@') {
+    if (key === ' ' || key === '@' || key === '2' || key === '`') {
       return alt ? '\x1b\x00' : '\x00';
     }
     if (code >= 0x40 && code <= 0x5f) {
       const control = String.fromCharCode(code - 0x40);
       return alt ? `\x1b${control}` : control;
     }
+    if (key === '/' || key === '-' || key === '7') {
+      return alt ? '\x1b\x1f' : '\x1f';
+    }
+    if (key === '?' || key === '8') {
+      return alt ? '\x1b\x7f' : '\x7f';
+    }
+    if (key === '3') {
+      return alt ? '\x1b\x1b' : '\x1b';
+    }
+    if (key === '4') {
+      return alt ? '\x1b\x1c' : '\x1c';
+    }
+    if (key === '5') {
+      return alt ? '\x1b\x1d' : '\x1d';
+    }
+    if (key === '6' || key === '~') {
+      return alt ? '\x1b\x1e' : '\x1e';
+    }
+    return null;
   }
 
   const cursor = applicationCursor;
+  const mod = 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0);
+  const csiCursor = (letter: string): string =>
+    mod > 1 ? `\x1b[1;${mod}${letter}` : (cursor ? `\x1bO${letter}` : `\x1b[${letter}`);
+  const csiTilde = (code: number): string =>
+    mod > 1 ? `\x1b[${code};${mod}~` : `\x1b[${code}~`;
+  const ss3Function = (letter: string, tildeCode: number): string =>
+    mod > 1 ? `\x1b[1;${mod}${letter}` : (cursor ? `\x1bO${letter}` : `\x1b[${tildeCode}~`);
+
   switch (key) {
     case 'Enter':
       return alt ? '\x1b\r' : '\r';
     case 'Tab':
-      return shift ? '\x1b[Z' : '\t';
+      if (ctrl) return null;
+      return shift ? '\x1b[Z' : (alt ? '\x1b\t' : '\t');
     case 'Backspace':
+      if (ctrl) return alt ? '\x1b\x08' : '\x08';
       return alt ? '\x1b\x7f' : '\x7f';
     case 'Escape':
-      return '\x1b';
+      return alt ? '\x1b\x1b' : '\x1b';
     case 'ArrowUp':
-      return cursor ? '\x1bOA' : '\x1b[A';
+      return csiCursor('A');
     case 'ArrowDown':
-      return cursor ? '\x1bOB' : '\x1b[B';
+      return csiCursor('B');
     case 'ArrowRight':
-      return cursor ? '\x1bOC' : '\x1b[C';
+      return csiCursor('C');
     case 'ArrowLeft':
-      return cursor ? '\x1bOD' : '\x1b[D';
+      return csiCursor('D');
     case 'Home':
-      return cursor ? '\x1bOH' : '\x1b[H';
+      return csiCursor('H');
     case 'End':
-      return cursor ? '\x1bOF' : '\x1b[F';
+      return csiCursor('F');
     case 'Insert':
-      return '\x1b[2~';
+      return csiTilde(2);
     case 'Delete':
-      return '\x1b[3~';
+      return csiTilde(3);
     case 'PageUp':
-      return '\x1b[5~';
+      return csiTilde(5);
     case 'PageDown':
-      return '\x1b[6~';
+      return csiTilde(6);
     case 'F1':
-      return cursor ? '\x1bOP' : '\x1b[11~';
+      return ss3Function('P', 11);
     case 'F2':
-      return cursor ? '\x1bOQ' : '\x1b[12~';
+      return ss3Function('Q', 12);
     case 'F3':
-      return cursor ? '\x1bOR' : '\x1b[13~';
+      return ss3Function('R', 13);
     case 'F4':
-      return cursor ? '\x1bOS' : '\x1b[14~';
+      return ss3Function('S', 14);
     case 'F5':
-      return '\x1b[15~';
+      return csiTilde(15);
     case 'F6':
-      return '\x1b[17~';
+      return csiTilde(17);
     case 'F7':
-      return '\x1b[18~';
+      return csiTilde(18);
     case 'F8':
-      return '\x1b[19~';
+      return csiTilde(19);
     case 'F9':
-      return '\x1b[20~';
+      return csiTilde(20);
     case 'F10':
-      return '\x1b[21~';
+      return csiTilde(21);
     case 'F11':
-      return '\x1b[23~';
+      return csiTilde(23);
     case 'F12':
-      return '\x1b[24~';
+      return csiTilde(24);
     default:
       break;
   }
   // A single printable character is the caller's to send, so the shift and
   // dead-key handling of the platform's own input method is not bypassed here.
-  if ([...key].length === 1) {
+  if (!ctrl && !meta && [...key].length === 1) {
     return alt ? `\x1b${key}` : key;
   }
   return null;
@@ -696,11 +733,21 @@ export class TerminalSession {
 
   /** Handles one key press and reports whether it was sent. */
   public handleKey(event: KeyEventLike, modes?: { app_cursor: boolean; bracketed_paste: boolean }): boolean {
+    if (event.isComposing) {
+      return false;
+    }
     const isCtrlPaste = event.ctrlKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 'v';
     const isShiftInsertPaste = event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && event.key === 'Insert';
     if (isCtrlPaste || isShiftInsertPaste) {
       event.preventDefault?.();
       void this.pasteClipboard(modes?.bracketed_paste);
+      return true;
+    }
+    if (event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey &&
+        (event.key === 'PageUp' || event.key === 'PageDown')) {
+      event.preventDefault?.();
+      const step = Math.max(1, this.grid.lines - 2);
+      void this.scroll(event.key === 'PageUp' ? step : -step);
       return true;
     }
     const active = modes ?? this.modes;
@@ -1204,7 +1251,16 @@ export class TerminalSession {
     }
     // Cancelling the press is what stops the WebView turning the drag into a
     // native drag of the canvas picture or a selection of the page around it.
+    // Because preventDefault also suppresses the browser's automatic blur on
+    // any previously focused toolbar button, release external focus explicitly
+    // so Space, Enter and Tab go back to the terminal.
     event.preventDefault?.();
+    if (!this.keyboard) {
+      const active = this.eventDoc?.activeElement as HTMLElement | null | undefined;
+      if (active && active !== this.eventDoc?.body && !this.container.contains?.(active)) {
+        try { active.blur?.(); } catch { /* Ignore focus errors. */ }
+      }
+    }
     const cell = this.cellAt(event);
     if (event.detail >= 3) {
       const line = this.lineRange(cell);

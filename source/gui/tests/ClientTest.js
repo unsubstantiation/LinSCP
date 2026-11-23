@@ -555,12 +555,63 @@ function options(id) {
     check('desktop terminal remembers adjusted font size in localStorage',
       terminalWindow.localStorage.getItem('lscp-terminal-font-size') === '13',
       terminalWindow.localStorage.getItem('lscp-terminal-font-size'));
-    let terminalHelp = ''; terminalWindow.alert = text => { terminalHelp = text; };
+    const terminalHelpModal = terminalWindow.document.getElementById('terminalHelpModal');
     help.click();
-    check('terminal help explains mouse selection and paste', terminalHelp.includes('mouse') && terminalHelp.includes('Right-click') && terminalHelp.includes('Ctrl+V'));
+    const terminalHelpText = terminalHelpModal ? terminalHelpModal.textContent : '';
+    check('terminal help opens rich help modal documenting keyboard input, mouse selection, paste, and scrollback',
+      !!terminalHelpModal &&
+      terminalHelpModal.classList.contains('open') &&
+      terminalHelpText.includes('mouse') &&
+      terminalHelpText.includes('Right-click') &&
+      terminalHelpText.includes('Ctrl+V') &&
+      terminalHelpText.includes('Copy All Text') &&
+      terminalHelpText.includes('F1–F12') &&
+      terminalHelpText.includes('- and +'));
+    const inputsBeforeHelpEsc = terminalCalls.filter(call => call && call.path === '/api/terminal/input' && call.body && call.body.data).length;
+    terminalWindow.document.dispatchEvent(
+      new terminalWindow.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const inputsAfterHelpEsc = terminalCalls.filter(call => call && call.path === '/api/terminal/input' && call.body && call.body.data).length;
+    check('Escape closes terminal help modal without sending ESC to the underlying shell',
+      !terminalHelpModal.classList.contains('open') && inputsAfterHelpEsc === inputsBeforeHelpEsc);
     copyAll.click();
     await new Promise(resolve => setTimeout(resolve, 30));
     check('desktop copy all reads model text including history', terminalWindow.copiedTerminalText === 'history\ncurrent');
+    let unexpectedPrompts = [];
+    terminalWindow.prompt = question => { unexpectedPrompts.push(question); return null; };
+    const pressPlain = (key, extra = {}) => terminalWindow.document.dispatchEvent(
+      new terminalWindow.KeyboardEvent('keydown', Object.assign({ key, bubbles: true, cancelable: true }, extra)));
+    pressPlain('-');
+    pressPlain('+');
+    pressPlain(' ');
+    pressPlain('Enter');
+    pressPlain('Backspace');
+    pressPlain('F1');
+    pressPlain('F10');
+    pressPlain('n', { ctrlKey: true });
+    pressPlain('l', { ctrlKey: true });
+    pressPlain('r', { ctrlKey: true });
+    pressPlain('a', { ctrlKey: true });
+    pressPlain('h', { ctrlKey: true });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    const typedPayloads = terminalCalls
+      .filter(call => call && call.path === '/api/terminal/input' && call.body && call.body.data)
+      .map(call => Buffer.from(call.body.data, 'base64').toString('utf8'));
+    check('typing -, +, Space, Enter, Backspace, F1, F10, and Ctrl+N/L/R/A/H in desktop terminal sends bytes to PTY without triggering Commander popups',
+      unexpectedPrompts.length === 0 &&
+      typedPayloads.includes('-') &&
+      typedPayloads.includes('+') &&
+      typedPayloads.includes(' ') &&
+      typedPayloads.includes('\r') &&
+      typedPayloads.includes('\x7f') &&
+      typedPayloads.includes('\x1b[11~') &&
+      typedPayloads.includes('\x1b[21~') &&
+      typedPayloads.includes('\x0e') &&
+      typedPayloads.includes('\x0c') &&
+      typedPayloads.includes('\x12') &&
+      typedPayloads.includes('\x01') &&
+      typedPayloads.includes('\x08'),
+      'prompts=' + JSON.stringify(unexpectedPrompts) + ' typed=' + JSON.stringify(typedPayloads));
     const press = (key, shift) => terminalWindow.document.dispatchEvent(
       new terminalWindow.KeyboardEvent('keydown', { key, ctrlKey: true, shiftKey: !!shift, cancelable: true }));
     press('c', true);
@@ -5042,6 +5093,30 @@ function options(id) {
     await wait(30);
     check('Ctrl+C inside embedded terminal copies active canvas selection instead of sending SIGINT',
       copiedEmbeddedText === 'selected canvas output');
+    const prevPromptEmbedded = window.prompt;
+    const embeddedPrompts = [];
+    window.prompt = question => { embeddedPrompts.push(question); return null; };
+    const disconnectsBeforeEmbeddedF10 = calls.filter(c => c.path === '/api/session/disconnect').length;
+    if (doc.activeElement && doc.activeElement !== doc.body && typeof doc.activeElement.blur === 'function') {
+      doc.activeElement.blur();
+    }
+    doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: '-', bubbles: true, cancelable: true }));
+    doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: '+', bubbles: true, cancelable: true }));
+    doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'F10', bubbles: true, cancelable: true }));
+    await wait(30);
+    window.prompt = prevPromptEmbedded;
+    check('Commander shortcuts (-, +, F10) never fire behind an open terminal modal even when body holds focus',
+      embeddedPrompts.length === 0 &&
+      calls.filter(c => c.path === '/api/session/disconnect').length === disconnectsBeforeEmbeddedF10);
+    window.showTerminalCopyHelp();
+    check('showTerminalCopyHelp opens #terminalHelpModal above #terminalModal',
+      doc.getElementById('terminalHelpModal').classList.contains('open') &&
+      doc.getElementById('terminalModal').classList.contains('open'));
+    doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    await wait(20);
+    check('Escape closes #terminalHelpModal while keeping #terminalModal open',
+      !doc.getElementById('terminalHelpModal').classList.contains('open') &&
+      doc.getElementById('terminalModal').classList.contains('open'));
     window.closeTerminal();
     await wait(40);
     window.LinSCPCore = prevTermCore;

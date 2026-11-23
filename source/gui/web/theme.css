@@ -2037,6 +2037,7 @@ body {
 /* Shared multi-server monitor: one component, native/browser/touch hosts. */
 .monitor-overlay { z-index: 1050; }
 #terminalModal { z-index: 1100; }
+#terminalHelpModal { z-index: 1200; }
 #hostKeyModal { z-index: 1200; }
 .monitor-box { width: min(1220px, 96vw); max-height: 94vh; height: min(860px, 94vh); }
 .monitor-body { padding: 0; overflow: hidden; }
@@ -2254,8 +2255,49 @@ body.terminal-only {
   overflow: hidden;
   background: var(--terminal-bg);
 }
-body.terminal-only > *:not(.terminal-window-screen):not(.terminal-window-ended):not(.terminal-window-toolbar) {
+body.terminal-only > *:not(.terminal-window-screen):not(.terminal-window-ended):not(.terminal-window-toolbar):not(#terminalHelpModal.open) {
   display: none !important;
+}
+.terminal-help-grid {
+  display: grid;
+  gap: var(--space-2);
+}
+.terminal-help-row {
+  display: grid;
+  grid-template-columns: minmax(175px, 215px) minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: baseline;
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+}
+.terminal-help-row:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+.terminal-help-keys {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.terminal-help-keys kbd {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-raised);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: 1.4;
+  white-space: nowrap;
+}
+@media (max-width: 560px) {
+  .terminal-help-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-1);
+  }
 }
 .terminal-window-toolbar {
   overflow-x: auto;

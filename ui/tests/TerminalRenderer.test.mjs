@@ -1627,5 +1627,80 @@ test('right-click paste and mouse copy use native Tauri clipboard when WebView c
   }
 });
 
+test('encodeKey covers printable symbols, xterm modifier sequences, control chords, and IME/Meta guards', () => {
+  // Printable symbols including '-' and '+' (which Commander uses for mask selection) go straight through.
+  assert.equal(encodeKey({ key: '-' }, false), '-');
+  assert.equal(encodeKey({ key: '+' }, false), '+');
+  assert.equal(encodeKey({ key: '/' }, false), '/');
+  assert.equal(encodeKey({ key: '~' }, false), '~');
+  assert.equal(encodeKey({ key: '-', altKey: true }, false), '\x1b-');
+
+  // Standard xterm Ctrl chords for readline/bash undo, delete, and NUL.
+  assert.equal(encodeKey({ key: '/', ctrlKey: true }, false), '\x1f');
+  assert.equal(encodeKey({ key: '-', ctrlKey: true }, false), '\x1f');
+  assert.equal(encodeKey({ key: '_', ctrlKey: true, shiftKey: true }, false), '\x1f');
+  assert.equal(encodeKey({ key: '?', ctrlKey: true, shiftKey: true }, false), '\x7f');
+  assert.equal(encodeKey({ key: 'Backspace', ctrlKey: true }, false), '\x08');
+  assert.equal(encodeKey({ key: 'Backspace', altKey: true }, false), '\x1b\x7f');
+
+  // Unmapped Ctrl+symbol or OS Meta shortcuts must not leak literal printable characters into the PTY.
+  assert.equal(encodeKey({ key: '=', ctrlKey: true }, false), null);
+  assert.equal(encodeKey({ key: '9', ctrlKey: true }, false), null);
+  assert.equal(encodeKey({ key: 'k', metaKey: true }, false), null);
+  assert.equal(encodeKey({ key: 'a', isComposing: true }, false), null);
+
+  // Word navigation and modified function/editing keys use xterm CSI modifier parameters.
+  assert.equal(encodeKey({ key: 'ArrowLeft', ctrlKey: true }, false), '\x1b[1;5D');
+  assert.equal(encodeKey({ key: 'ArrowRight', ctrlKey: true }, true), '\x1b[1;5C');
+  assert.equal(encodeKey({ key: 'ArrowLeft', altKey: true }, false), '\x1b[1;3D');
+  assert.equal(encodeKey({ key: 'Delete', ctrlKey: true }, false), '\x1b[3;5~');
+  assert.equal(encodeKey({ key: 'Home', shiftKey: true }, true), '\x1b[1;2H');
+  assert.equal(encodeKey({ key: 'F2', shiftKey: true }, false), '\x1b[1;2Q');
+  assert.equal(encodeKey({ key: 'F10' }, false), '\x1b[21~');
+});
+
+test('Shift+PageUp/PageDown scrolls terminal history and canvas mousedown blurs external toolbar focus', async () => {
+  const dom = installDom();
+  const transport = fakeTransport({
+    '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(80, 24) }),
+  });
+  const container = fakeContainer(720, 432);
+  const toolbarButton = dom.dom.window.document.createElement('button');
+  dom.dom.window.document.body.appendChild(toolbarButton);
+  const session = new TerminalSession({
+    transport,
+    terminal: 'term-keys-focus',
+    container,
+    pollInterval: 1000,
+  });
+  session.start();
+  try {
+    const win = dom.dom.window;
+    const pgUp = new win.KeyboardEvent('keydown', { key: 'PageUp', shiftKey: true, cancelable: true });
+    const pgDn = new win.KeyboardEvent('keydown', { key: 'PageDown', shiftKey: true, cancelable: true });
+    assert.equal(session.handleKey(pgUp), true);
+    assert.equal(session.handleKey(pgDn), true);
+    assert.equal(pgUp.defaultPrevented, true);
+    assert.equal(pgDn.defaultPrevented, true);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    const scrolls = transport.calls.filter((call) => call.path === '/api/terminal/scroll').map((call) => call.body.lines);
+    assert.equal(scrolls.length, 2);
+    assert.ok(scrolls[0] > 0 && scrolls[1] < 0);
+    assert.equal(
+      transport.calls.filter((call) => call.path === '/api/terminal/input' && call.body.data).length,
+      0,
+      'Shift+PageUp/PageDown scrolls history without sending bytes to the shell',
+    );
+
+    toolbarButton.focus();
+    assert.equal(win.document.activeElement, toolbarButton);
+    session.element.dispatchEvent(new win.MouseEvent('mousedown', { button: 0, detail: 1, clientX: 5, clientY: 5, cancelable: true }));
+    assert.notEqual(win.document.activeElement, toolbarButton, 'clicking terminal canvas releases focus from external toolbar buttons');
+  } finally {
+    await session.close();
+    dom.cleanup();
+  }
+});
+
 
 
