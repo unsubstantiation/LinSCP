@@ -5640,6 +5640,255 @@ function options(id) {
       doc.getElementById('editorModal').classList.contains('open') &&
       doc.getElementById('editorSaveBtn').style.display !== 'none');
     window.closeEditor();
+
+    // 7. Properties visual POSIX permissions matrix, recursive chmod, and directory size calculation.
+    const origInvokeProps = window.__TAURI_INTERNALS__.invoke;
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      if (cmd === 'linscp_invoke' && args && args.envelope && args.envelope.path === '/api/remote/properties') {
+        const bodyObj = typeof args.envelope.body === 'string' ? JSON.parse(args.envelope.body) : (args.envelope.body || {});
+        calls.push({ path: args.envelope.path, options: { method: 'POST', body: JSON.stringify(bodyObj) } });
+        if (bodyObj.calculate_size) {
+          return {
+            status: 200,
+            payload: {
+              success: true,
+              properties: [{
+                name: 'subdir', path: '/tmp/slowremote/subdir', is_dir: true,
+                size: 0, mode: 0o755, permissions: 'drwxr-xr-x',
+                total_size: 20480, file_count: 5, dir_count: 2, truncated: false
+              }]
+            }
+          };
+        }
+        return {
+          status: 200,
+          payload: {
+            success: true,
+            properties: [{
+              name: 'subdir', path: '/tmp/slowremote/subdir', is_dir: true,
+              size: 0, mode: 0o755, permissions: 'drwxr-xr-x', owner: '1000', group: '1000'
+            }]
+          }
+        };
+      }
+      return origInvokeProps(cmd, args);
+    };
+    const wfState = window.eval('state');
+    const savedWfRemoteEntries = wfState.remote.entries.slice();
+    const savedWfRemoteSel = new Set(wfState.remote.selection);
+    const savedWfTabs = wfState.tabs.slice();
+    const savedWfActiveTab = wfState.activeTab;
+    wfState.tabs = [{ id: 'tab-wf-remote', name: 'wf-sftp', protocol: 'sftp', connected: true, is_local: false }];
+    wfState.activeTab = 'tab-wf-remote';
+    wfState.remote.path = '/tmp/slowremote';
+    wfState.remote.entries = [
+      { name: 'subdir', is_dir: true, size: 0, permissions: 'drwxr-xr-x', mtime: 1791875271 },
+      { name: 'notes.txt', is_dir: false, size: 42, permissions: '-rw-r--r--', mtime: 1791875271 }
+    ];
+    wfState.remote.selection = new Set(['subdir']);
+    window.focusPane('remote');
+    await window.openProperties();
+    check('Properties dialog renders POSIX rights matrix and recursive checkbox for directories',
+      !!doc.getElementById('propertiesRightsMatrix') &&
+      !!doc.getElementById('propertiesRecursive') &&
+      doc.getElementById('propertiesMode').value === '755' &&
+      doc.getElementById('propRight_ur').checked &&
+      !doc.getElementById('propRight_gw').checked);
+    doc.getElementById('propRight_gw').checked = true;
+    doc.getElementById('propRight_gw').onchange();
+    doc.getElementById('propRight_suid').checked = true;
+    doc.getElementById('propRight_suid').onchange();
+    check('Toggling permission checkboxes updates #propertiesMode octal value including special bits',
+      doc.getElementById('propertiesMode').value === '4775');
+    doc.getElementById('propertiesMode').value = '0750';
+    doc.getElementById('propertiesMode').oninput();
+    check('Typing octal mode into #propertiesMode syncs checkboxes two-way',
+      !doc.getElementById('propRight_suid').checked &&
+      !doc.getElementById('propRight_gw').checked &&
+      !doc.getElementById('propRight_or').checked &&
+      doc.getElementById('propRight_gr').checked);
+    const calcBtn = doc.querySelector('#propertiesBody .prop-calc-size-btn');
+    calcBtn.click();
+    await new Promise(resolve => setTimeout(resolve, 40));
+    check('Calculate size button fetches recursive directory totals and updates Properties table',
+      doc.querySelector('#propertiesBody .prop-size-text').textContent.includes('5 files, 2 folders') &&
+      doc.getElementById('propBytes_0').textContent === '20480');
+    responses['/api/remote/rights'] = { success: true };
+    doc.getElementById('propertiesRecursive').checked = true;
+    await window.applyPropertiesRights('remote', ['subdir']);
+    const recRightsBody = JSON.parse(calls.filter(c => c.path === '/api/remote/rights').pop().options.body);
+    check('applyPropertiesRights forwards recursive=true when #propertiesRecursive is checked',
+      recRightsBody.recursive === true && recRightsBody.mode === '0750');
+    window.closeModal('propertiesModal');
+    window.__TAURI_INTERNALS__.invoke = origInvokeProps;
+
+    // 8. Selective Synchronize preview checkboxes + transfer options.
+    const prevSyncPreview = responses['/api/sync/preview'];
+    const prevSyncRun = responses['/api/sync/run'];
+    responses['/api/sync/preview'] = {
+      success: true,
+      plan: {
+        summary: { upload: 1, 'delete-remote': 2 },
+        items: [
+          { action: 'upload', path: 'fresh.txt', is_dir: false, size: 10, reason: 'New local file' },
+          { action: 'delete-remote', path: 'obsolete_dir', is_dir: true, size: 0, reason: 'Deleted locally' },
+          { action: 'delete-remote', path: 'obsolete_dir/keep.txt', is_dir: false, size: 5, reason: 'Deleted locally' }
+        ]
+      }
+    };
+    responses['/api/sync/run'] = { success: true, task_id: 99 };
+    window.openSynchronize();
+    doc.getElementById('syncTransferMode').value = 'ascii';
+    doc.getElementById('syncSpeed').value = '256';
+    doc.getElementById('syncPreserveTime').checked = false;
+    await window.previewSynchronization();
+    const syncBoxes = doc.querySelectorAll('#syncPreview .sync-item-check');
+    check('Synchronize preview renders per-item checkboxes and Select all / Clear all bar',
+      syncBoxes.length === 3 && !!doc.querySelector('#syncSummary .plan-select-bar'));
+    // Uncheck obsolete_dir/keep.txt -> parent obsolete_dir delete-remote must also be excluded.
+    syncBoxes[2].checked = false;
+    syncBoxes[2].onchange();
+    check('Unchecking a child item also prevents deleting its parent directory in sync preview',
+      !syncBoxes[1].checked && syncBoxes[0].checked &&
+      doc.querySelectorAll('#syncPreview .plan-item.excluded').length === 2);
+    const origConfirmSync = window.confirm;
+    window.confirm = () => true;
+    await window.runSynchronization();
+    window.confirm = origConfirmSync;
+    const syncRunBody = JSON.parse(calls.filter(c => c.path === '/api/sync/run').pop().options.body);
+    check('runSynchronization forwards transfer options and excluded_paths',
+      syncRunBody.transfer === 'ascii' &&
+      syncRunBody.speed === 256 &&
+      syncRunBody.preserve_time === false &&
+      Array.isArray(syncRunBody.excluded_paths) &&
+      syncRunBody.excluded_paths.includes('obsolete_dir/keep.txt') &&
+      syncRunBody.excluded_paths.includes('obsolete_dir'));
+    responses['/api/sync/preview'] = prevSyncPreview;
+    responses['/api/sync/run'] = prevSyncRun;
+
+    // 9. Keep Up to Date extended options.
+    responses['/api/transfer/keepuptodate'] = { success: true, task_id: 100 };
+    window.openKeepUpToDate();
+    doc.getElementById('kudTransferMode').value = 'ascii';
+    doc.getElementById('kudSpeed').value = '512';
+    doc.getElementById('kudPreserveTime').checked = false;
+    doc.getElementById('kudDelete').checked = true;
+    doc.getElementById('kudContinueOnError').checked = true;
+    await window.startKeepUpToDate();
+    const kudBody = JSON.parse(calls.filter(c => c.path === '/api/transfer/keepuptodate').pop().options.body);
+    check('startKeepUpToDate forwards transfer, speed, preserve_time, delete, and continue_on_error',
+      kudBody.transfer === 'ascii' &&
+      kudBody.speed === 512 &&
+      kudBody.preserve_time === false &&
+      kudBody.delete === true &&
+      kudBody.continue_on_error === true);
+
+    // 10. Site Manager extended S3, FTP, and TLS controls.
+    window.fillSiteForm({
+      name: 'MinIO Internal',
+      protocol: 's3',
+      host: 'minio.internal',
+      port: 80,
+      s3_protocol: '0',
+      s3_multipart_threshold: '33554432',
+      s3_min_part_size: '8388608',
+      s3_request_payer: '1',
+      ftp_force_pasv_ip: '2',
+      ftp_use_mlsd: '2',
+      ftp_account: 'billing',
+      tls_certificate_key_file: '/etc/ssl/private/client.key',
+      ca_certificate_dir: '/etc/ssl/certs'
+    });
+    check('fillSiteForm populates S3 HTTP, human-formatted multipart sizes, FTP PASV IP/3-state MLSD/ACCT, and TLS paths',
+      doc.getElementById('siteS3Protocol').value === '0' &&
+      doc.getElementById('sitePort').value === '80' &&
+      doc.getElementById('siteS3MultipartThreshold').value === '32M' &&
+      doc.getElementById('siteS3MinPartSize').value === '8M' &&
+      doc.getElementById('siteS3RequestPayer').checked === true &&
+      doc.getElementById('siteFtpPasvIp').value === '2' &&
+      doc.getElementById('siteFtpMlsd').value === '2' &&
+      doc.getElementById('siteFtpAccount').value === 'billing' &&
+      doc.getElementById('siteTlsKey').value === '/etc/ssl/private/client.key' &&
+      doc.getElementById('siteCaCertDir').value === '/etc/ssl/certs');
+    doc.getElementById('siteS3Protocol').value = '1';
+    window.siteS3ProtocolChanged();
+    const s3FormOut = window.currentSiteForm();
+    check('siteS3ProtocolChanged switches default port 80->443 and currentSiteForm serializes all extended fields',
+      s3FormOut.port === 443 &&
+      s3FormOut.s3_protocol === '1' &&
+      s3FormOut.s3_multipart_threshold === '32M' &&
+      s3FormOut.s3_min_part_size === '8M' &&
+      s3FormOut.s3_request_payer === true &&
+      s3FormOut.ftp_force_pasv_ip === '2' &&
+      s3FormOut.ftp_use_mlsd === '2' &&
+      s3FormOut.ftp_account === 'billing' &&
+      s3FormOut.tls_certificate_key_file === '/etc/ssl/private/client.key' &&
+      s3FormOut.ca_certificate_dir === '/etc/ssl/certs');
+
+    // 11. Custom Commands description, apply_to_directories, fileless run, and pane context menu button.
+    check('#paneContextMenu includes #paneCtxCustomCmdBtn', !!doc.getElementById('paneCtxCustomCmdBtn'));
+    const origInvokeCmd = window.__TAURI_INTERNALS__.invoke;
+    let savedCmdList = [
+      { name: 'PrintPWD', command: 'pwd', description: 'Show remote working dir', scope: 'remote', apply_to_directories: false },
+      { name: 'HashFiles', command: 'sha256sum {file}', description: 'Digest files only', scope: 'remote', apply_to_directories: false }
+    ];
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      if (cmd === 'linscp_invoke' && args && args.envelope && args.envelope.path === '/api/custom-commands') {
+        const b = typeof args.envelope.body === 'string' ? JSON.parse(args.envelope.body) : (args.envelope.body || {});
+        calls.push({ path: args.envelope.path, options: { method: 'POST', body: JSON.stringify(b) } });
+        if (b.action === 'list') {
+          return { status: 200, payload: { success: true, commands: savedCmdList } };
+        }
+        if (b.action === 'save') {
+          savedCmdList = [{ name: b.name, command: b.command, description: b.description, scope: b.scope, apply_to_directories: b.apply_to_directories }];
+          return { status: 200, payload: { success: true, commands: savedCmdList } };
+        }
+        if (b.action === 'run') {
+          return { status: 200, payload: { success: true, output: '/tmp/slowremote\n' } };
+        }
+      }
+      return origInvokeCmd(cmd, args);
+    };
+    window.focusPane('remote');
+    wfState.remote.entries = [
+      { name: 'subdir', is_dir: true, size: 0, permissions: 'drwxr-xr-x', mtime: 1791875271 },
+      { name: 'notes.txt', is_dir: false, size: 42, permissions: '-rw-r--r--', mtime: 1791875271 }
+    ];
+    wfState.remote.selection = new Set();
+    await window.openCustomCommands();
+    check('Custom commands list renders command descriptions',
+      doc.getElementById('customCommandsList').textContent.includes('Show remote working dir'));
+    window.selectCustomCommand(0);
+    const origConfirmCmd = window.confirm;
+    window.confirm = () => true;
+    await window.runCustomCommand();
+    const pwdRunCall = JSON.parse(calls.filter(c => c.path === '/api/custom-commands').pop().options.body);
+    check('Fileless custom command runs even with empty selection',
+      pwdRunCall.action === 'run' && pwdRunCall.name === 'PrintPWD' && Array.isArray(pwdRunCall.filenames) && pwdRunCall.filenames.length === 0);
+    // Select both 'subdir' and 'notes.txt' and run 'HashFiles' (apply_to_directories=false).
+    wfState.remote.entries = [
+      { name: 'subdir', is_dir: true, size: 0, permissions: 'drwxr-xr-x', mtime: 1791875271 },
+      { name: 'notes.txt', is_dir: false, size: 42, permissions: '-rw-r--r--', mtime: 1791875271 }
+    ];
+    wfState.remote.selection = new Set(['subdir', 'notes.txt']);
+    window.selectCustomCommand(1);
+    await window.runCustomCommand();
+    window.confirm = origConfirmCmd;
+    const hashRunCall = JSON.parse(calls.filter(c => c.path === '/api/custom-commands').pop().options.body);
+    check('Custom command with apply_to_directories=false filters out directories from selection',
+      hashRunCall.action === 'run' && hashRunCall.name === 'HashFiles' && JSON.stringify(hashRunCall.filenames) === JSON.stringify(['notes.txt']));
+    doc.getElementById('customCmdDescription').value = 'Updated desc';
+    doc.getElementById('customCmdDirs').checked = true;
+    await window.saveCustomCommand();
+    const saveCmdCall = JSON.parse(calls.filter(c => c.path === '/api/custom-commands').pop().options.body);
+    check('saveCustomCommand persists description and apply_to_directories',
+      saveCmdCall.description === 'Updated desc' && saveCmdCall.apply_to_directories === true);
+    window.closeModal('customCommandsModal');
+    window.__TAURI_INTERNALS__.invoke = origInvokeCmd;
+    wfState.remote.entries = savedWfRemoteEntries;
+    wfState.remote.selection = savedWfRemoteSel;
+    wfState.tabs = savedWfTabs;
+    wfState.activeTab = savedWfActiveTab;
   }
 
   check('no script errors', errors.length === 0, errors.join(' | '));

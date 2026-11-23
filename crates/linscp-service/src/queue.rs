@@ -4,6 +4,7 @@
 //! local-to-local copy/move (`ask`/`overwrite`/`skip`/`rename`), remote-to-remote
 //! copy/move, staging file cleanup (`cleanup_path`), and `sync/run` + `keepuptodate`.
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +15,7 @@ use linscp_engine::filemask::{join_remote_path, mode_from_permissions_str};
 use linscp_engine::keepuptodate::{run_keep_up_to_date, KeepUpToDateOptions};
 use linscp_engine::presets::PresetPermissions;
 use linscp_engine::sync_planner::{
-    apply_sync_plan, plan_synchronization, SyncOptions, SyncState,
+    apply_sync_plan, plan_synchronization, SyncAction, SyncItem, SyncOptions, SyncState,
 };
 use linscp_engine::text_mode::{convert_eol_bytes, wants_ascii_conversion, EolStyle};
 use linscp_engine::transfer::{
@@ -119,6 +120,7 @@ pub enum QueueJob {
         local_root: PathBuf,
         remote_root: String,
         opts: SyncOptions,
+        excluded_paths: BTreeSet<String>,
     },
     KeepUpToDate {
         session: Arc<dyn RemoteSession>,
@@ -126,6 +128,53 @@ pub enum QueueJob {
         remote_root: String,
         opts: KeepUpToDateOptions,
     },
+}
+
+/// Removes user-excluded items from a synchronization plan without marking
+/// un-synchronized files as `SyncAction::None` (which would falsely record
+/// them in the two-way `SyncState` baseline). Also skips deleting any
+/// directory whose descendant was excluded so `remove_dir` never fails on
+/// kept children.
+pub fn filter_excluded_sync_items(
+    items: Vec<SyncItem>,
+    excluded_paths: &BTreeSet<String>,
+) -> Vec<SyncItem> {
+    if excluded_paths.is_empty() {
+        return items;
+    }
+    let path_or_ancestor_excluded = |rel: &str| -> bool {
+        if excluded_paths.contains(rel) {
+            return true;
+        }
+        let mut cur = rel;
+        while let Some((parent, _)) = cur.rsplit_once('/') {
+            if excluded_paths.contains(parent) {
+                return true;
+            }
+            cur = parent;
+        }
+        false
+    };
+    items
+        .into_iter()
+        .filter(|item| {
+            if matches!(item.action, SyncAction::None | SyncAction::Conflict) {
+                return true;
+            }
+            if path_or_ancestor_excluded(&item.rel_path) {
+                return false;
+            }
+            if item.is_directory
+                && matches!(item.action, SyncAction::DeleteLocal | SyncAction::DeleteRemote)
+            {
+                let prefix = format!("{}/", item.rel_path);
+                if excluded_paths.iter().any(|ex| ex.starts_with(&prefix)) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
 }
 
 // Directory copies reject symlinks and use no-replace publication for files.
@@ -1302,6 +1351,7 @@ impl QueueManager {
                 local_root,
                 remote_root,
                 opts,
+                excluded_paths,
             } => {
                 let state_key = SyncState::make_key(
                     host_key,
@@ -1319,7 +1369,7 @@ impl QueueManager {
                 };
                 let mut run_opts = opts.clone();
                 run_opts.cancel_flag = Some(Arc::clone(&task.cancel_flag));
-                let items = plan_synchronization(
+                let planned_items = plan_synchronization(
                     session.as_ref(),
                     local_root,
                     remote_root,
@@ -1328,6 +1378,7 @@ impl QueueManager {
                     saf_fs,
                 )
                 .await?;
+                let items = filter_excluded_sync_items(planned_items, excluded_paths);
                 if let Err(err) = apply_sync_plan(
                     session.as_ref(),
                     local_root,
@@ -2257,5 +2308,46 @@ mod transfer_safety_tests {
         assert!(execute_local_item(&source, &target, false, ConflictPolicy::Overwrite, &cancel, &progress).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"original");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn filter_excluded_sync_items_preserves_baseline_and_kept_parent_dirs() {
+        let mk = |action: SyncAction, rel: &str, is_dir: bool| SyncItem {
+            action,
+            rel_path: rel.to_string(),
+            is_directory: is_dir,
+            local_size: 10,
+            remote_size: 10,
+            local_mtime: 100,
+            remote_mtime: 100,
+            local_mode: 0o644,
+            remote_mode: 0o644,
+            reason: String::new(),
+        };
+        let plan = vec![
+            mk(SyncAction::None, "same.txt", false),
+            mk(SyncAction::Conflict, "clash.txt", false),
+            mk(SyncAction::Upload, "docs", true),
+            mk(SyncAction::Upload, "docs/ready.txt", false),
+            mk(SyncAction::Upload, "docs/draft.txt", false),
+            mk(SyncAction::DeleteRemote, "old/keep.txt", false),
+            mk(SyncAction::DeleteRemote, "old/remove.txt", false),
+            mk(SyncAction::DeleteRemote, "old", true),
+        ];
+        let excluded: BTreeSet<String> = ["docs/draft.txt", "old/keep.txt"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let filtered = filter_excluded_sync_items(plan, &excluded);
+        let rels: Vec<&str> = filtered.iter().map(|i| i.rel_path.as_str()).collect();
+        assert_eq!(
+            rels,
+            vec!["same.txt", "clash.txt", "docs", "docs/ready.txt", "old/remove.txt"]
+        );
+
+        let dir_excluded: BTreeSet<String> = ["docs"].into_iter().map(String::from).collect();
+        let dir_filtered = filter_excluded_sync_items(filtered, &dir_excluded);
+        let dir_rels: Vec<&str> = dir_filtered.iter().map(|i| i.rel_path.as_str()).collect();
+        assert_eq!(dir_rels, vec!["same.txt", "clash.txt", "old/remove.txt"]);
     }
 }

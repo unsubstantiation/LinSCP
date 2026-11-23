@@ -539,6 +539,7 @@ impl CommanderService {
             ("POST", "/api/local/delete") => self.handle_local_delete(req.body),
             ("POST", "/api/local/rename") => self.handle_local_rename(req.body),
             ("POST", "/api/local/chmod") => self.handle_local_chmod(req.body),
+            ("POST", "/api/local/properties") => self.handle_local_properties(req.body),
             ("POST", "/api/local/checksum") => self.handle_local_checksum(req.body),
             ("POST", "/api/local/search") => self.handle_local_search(req.body),
             ("POST", "/api/local/link") => self.handle_local_link(req.body),
@@ -1169,6 +1170,7 @@ impl CommanderService {
         let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() { Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected") };
         if tab.is_local { return self.handle_remote_properties(body); }
         let session = match tab.remote { Some(session) => session, None => return api_error(400, "Not connected") };
+        let calculate_size = body.get("calculate_size").and_then(Value::as_bool).unwrap_or(false);
         let names = match body.get("names").and_then(Value::as_array) { Some(names) if !names.is_empty() && names.len() <= 1000 => names, _ => return api_error(400, "Select at least one item") };
         let mut rows = Vec::new();
         for item in names {
@@ -1188,10 +1190,18 @@ impl CommanderService {
                         String::new()
                     };
                     let mut row = json!(entry);
-                    row["path"] = json!(path);
+                    row["path"] = json!(&path);
                     row["is_link"] = json!(is_link);
                     row["is_broken"] = json!(is_broken);
                     row["link_target"] = json!(link_target);
+                    if calculate_size && entry.is_dir && !is_link {
+                        let (total_size, file_count, dir_count, truncated) =
+                            Self::scan_remote_dir_size(session.as_ref(), &path).await;
+                        row["total_size"] = json!(total_size);
+                        row["file_count"] = json!(file_count);
+                        row["dir_count"] = json!(dir_count);
+                        row["truncated"] = json!(truncated);
+                    }
                     rows.push(row);
                 }
                 Ok(None) => rows.push(json!({"name": name, "error": "No such item"})),
@@ -1199,6 +1209,49 @@ impl CommanderService {
             }
         }
         ApiReply { status: 200, payload: json!({"success": true, "name": rows.first().and_then(|r| r.get("name")).cloned().unwrap_or(json!("")), "properties": rows}) }
+    }
+
+    async fn scan_remote_dir_size(
+        session: &dyn linscp_proto::RemoteSession,
+        root: &str,
+    ) -> (u64, u64, u64, bool) {
+        const MAX_DEPTH: usize = 64;
+        const MAX_ENTRIES: usize = 25_000;
+        let mut total_size = 0u64;
+        let mut file_count = 0u64;
+        let mut dir_count = 0u64;
+        let mut scanned = 0usize;
+        let mut truncated = false;
+        let mut stack: Vec<(String, usize)> = vec![(root.to_string(), 0)];
+        while let Some((dir_path, depth)) = stack.pop() {
+            if depth > MAX_DEPTH {
+                truncated = true;
+                continue;
+            }
+            let Ok(children) = session.list_dir(&dir_path).await else {
+                truncated = true;
+                continue;
+            };
+            for child in children {
+                if child.name == "." || child.name == ".." || child.is_symlink {
+                    continue;
+                }
+                scanned += 1;
+                if scanned > MAX_ENTRIES {
+                    truncated = true;
+                    return (total_size, file_count, dir_count, truncated);
+                }
+                if child.is_dir {
+                    dir_count = dir_count.saturating_add(1);
+                    let sub = linscp_engine::filemask::join_remote_path(&dir_path, &child.name);
+                    stack.push((sub, depth + 1));
+                } else {
+                    file_count = file_count.saturating_add(1);
+                    total_size = total_size.saturating_add(child.size);
+                }
+            }
+        }
+        (total_size, file_count, dir_count, truncated)
     }
 
     async fn open_workspace_async(&self, body: Value) -> ApiReply {
@@ -1497,6 +1550,8 @@ impl CommanderService {
     /// pair, so it keeps using the local filesystem; a remote tab asks the
     /// server, exactly as the console client's `chmod` does.
     async fn chmod_remote_async(&self, body: Value) -> ApiReply {
+        const MAX_CHMOD_DEPTH: usize = 64;
+        const MAX_CHMOD_ITEMS: usize = 10_000;
         let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
         let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
             Some(tab) if tab.connected => tab, _ => return api_error(400, "Not connected"),
@@ -1506,6 +1561,7 @@ impl CommanderService {
         let names = remote_names(&body);
         if names.is_empty() { return api_error(400, "Select at least one file") }
         if names.len() > 1000 { return api_error(400, "Too many files selected") }
+        let recursive = body.get("recursive").and_then(Value::as_bool).unwrap_or(false);
         // Validate all leaf names and the mode specification before touching any entry.
         let raw_mode = body
             .get("permissions")
@@ -1513,7 +1569,7 @@ impl CommanderService {
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim();
-        if let Err(error) = linscp_engine::parse_chmod_spec(raw_mode, 0o644) {
+        if let Err(error) = linscp_engine::filemask::parse_permissions_expr(raw_mode, 0o644, false) {
             return api_error(400, error);
         }
         let mut leaves = Vec::new();
@@ -1522,6 +1578,7 @@ impl CommanderService {
             leaves.push(leaf.to_string());
         }
         let mut failures = Vec::new();
+        let mut changed = 0usize;
         for name in leaves {
             let path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
             let entry = match session.stat(&path).await {
@@ -1529,29 +1586,87 @@ impl CommanderService {
                 Ok(None) => { failures.push(format!("{name}: not found")); continue; }
                 Err(error) => { failures.push(format!("{name}: {error}")); continue; }
             };
-            if entry.is_symlink { failures.push(format!("{name}: a symbolic link is changed through its target")); continue; }
-            let current = linscp_engine::filemask::mode_from_permissions_str(&entry.permissions);
-            let mode = match linscp_engine::parse_chmod_spec(raw_mode, current) {
-                Ok(mode) => mode,
-                Err(error) => { failures.push(format!("{name}: {error}")); continue; }
-            };
-            match session.chmod(&path, mode).await {
-                Ok(()) => {
-                    self.record_gui_xml_action(&tab.name, |logger| {
-                        logger.record_chmod(&path, mode, false, Ok(()));
-                    });
+            if entry.is_symlink {
+                failures.push(format!("{name}: a symbolic link is changed through its target"));
+                continue;
+            }
+            let mut stack: Vec<(String, linscp_types::FileEntry, usize)> = vec![(path, entry, 0)];
+            while let Some((cur_path, cur_entry, depth)) = stack.pop() {
+                if cur_entry.is_symlink {
+                    continue;
                 }
-                Err(error) => {
-                    let msg = error.to_string();
-                    self.record_gui_xml_action(&tab.name, |logger| {
-                        logger.record_chmod(&path, mode, false, Err(&msg));
-                    });
-                    failures.push(format!("{name}: {error}"));
+                if changed >= MAX_CHMOD_ITEMS {
+                    failures.push(format!(
+                        "{name}: recursive permission limit ({MAX_CHMOD_ITEMS} entries) reached"
+                    ));
+                    break;
+                }
+                let current = linscp_engine::filemask::mode_from_permissions_str(&cur_entry.permissions);
+                let mode = match linscp_engine::filemask::parse_permissions_expr(
+                    raw_mode,
+                    current,
+                    cur_entry.is_dir,
+                ) {
+                    Ok(mode) => mode,
+                    Err(error) => {
+                        failures.push(format!("{cur_path}: {error}"));
+                        continue;
+                    }
+                };
+                match session.chmod(&cur_path, mode).await {
+                    Ok(()) => {
+                        changed += 1;
+                        self.record_gui_xml_action(&tab.name, |logger| {
+                            logger.record_chmod(&cur_path, mode, recursive, Ok(()));
+                        });
+                    }
+                    Err(error) => {
+                        let msg = error.to_string();
+                        self.record_gui_xml_action(&tab.name, |logger| {
+                            logger.record_chmod(&cur_path, mode, recursive, Err(&msg));
+                        });
+                        failures.push(format!("{cur_path}: {error}"));
+                        continue;
+                    }
+                }
+                if recursive && cur_entry.is_dir {
+                    if depth >= MAX_CHMOD_DEPTH {
+                        failures.push(format!(
+                            "{cur_path}: directory nesting limit ({MAX_CHMOD_DEPTH}) exceeded"
+                        ));
+                        continue;
+                    }
+                    match session.list_dir(&cur_path).await {
+                        Ok(children) => {
+                            for child in children {
+                                if child.name == "." || child.name == ".." || child.is_symlink {
+                                    continue;
+                                }
+                                let child_path = linscp_engine::filemask::join_remote_path(
+                                    &cur_path,
+                                    &child.name,
+                                );
+                                stack.push((child_path, child, depth + 1));
+                            }
+                        }
+                        Err(error) => {
+                            failures.push(format!("{cur_path}: {error}"));
+                        }
+                    }
                 }
             }
         }
-        if failures.is_empty() { ApiReply { status: 200, payload: json!({"success": true}) } }
-        else { ApiReply { status: 400, payload: json!({"success": false, "error": failures.join("; ")}) } }
+        if failures.is_empty() {
+            ApiReply {
+                status: 200,
+                payload: json!({"success": true, "changed": changed}),
+            }
+        } else {
+            ApiReply {
+                status: 400,
+                payload: json!({"success": false, "changed": changed, "error": failures.join("; ")}),
+            }
+        }
     }
 
     async fn s3_list_versions_async(&self, body: Value) -> ApiReply {
@@ -1830,10 +1945,28 @@ impl CommanderService {
         // The dialogue asks for seconds; the engine works in milliseconds, and
         // a zero interval means "as often as the watcher can".
         let interval_ms = seconds.saturating_mul(1000).clamp(500, 86_400_000);
+        let (transfer_mode, preserve_time, speed_kbytes_per_sec) =
+            match Self::parse_sync_transfer_options(&body) {
+                Ok(parsed) => parsed,
+                Err(error) => return api_error(400, error),
+            };
+        let delete_obsolete = body
+            .get("delete")
+            .or_else(|| body.get("delete_obsolete"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let continue_on_error = body
+            .get("continue_on_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let opts = KeepUpToDateOptions {
+            delete_obsolete,
+            continue_on_error,
             interval_ms,
             max_passes: body.get("count").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32,
-            preserve_time: true,
+            transfer_mode,
+            preserve_time,
+            speed_kbytes_per_sec,
             file_mask,
             ..KeepUpToDateOptions::default()
         };
@@ -2307,6 +2440,8 @@ impl CommanderService {
         let local_root = check_sync_local_dir(body.get("local_dir").and_then(Value::as_str).unwrap_or(""))?;
         let remote_root = validate_remote_absolute_path(body.get("remote_dir").and_then(Value::as_str).unwrap_or(""))?;
         let recursive = body.get("recursive").and_then(Value::as_bool).unwrap_or(true);
+        let (transfer_mode, preserve_time, speed_kbytes_per_sec) =
+            Self::parse_sync_transfer_options(body)?;
         let opts = SyncOptions {
             mode,
             criteria,
@@ -2314,7 +2449,9 @@ impl CommanderService {
             delete_obsolete,
             mirror,
             recursive,
-            preserve_time: true,
+            transfer_mode,
+            preserve_time,
+            speed_kbytes_per_sec,
             file_mask,
             // The planner never writes: a preview stops before applying, and
             // a queued run applies through `apply_sync_plan`, which is the
@@ -2323,6 +2460,73 @@ impl CommanderService {
             ..SyncOptions::default()
         };
         Ok((std::path::PathBuf::from(local_root), remote_root, opts))
+    }
+
+    fn parse_sync_transfer_options(
+        body: &Value,
+    ) -> Result<(linscp_types::TransferMode, bool, Option<u64>), String> {
+        let transfer_raw = body
+            .get("transfer")
+            .or_else(|| body.get("transfer_mode"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let transfer_mode = match transfer_raw.to_ascii_lowercase().as_str() {
+            "" | "binary" => linscp_types::TransferMode::Binary,
+            "ascii" => linscp_types::TransferMode::Ascii,
+            "automatic" | "auto" => linscp_types::TransferMode::Automatic,
+            _ => {
+                return Err(
+                    "Unsupported transfer mode (expected binary, ascii, or automatic)."
+                        .to_string(),
+                );
+            }
+        };
+        let preserve_time = match body.get("preserve_time") {
+            None => true,
+            Some(Value::Bool(b)) => *b,
+            Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                "" | "1" | "true" | "on" | "all" => true,
+                "0" | "false" | "off" => false,
+                _ => return Err("Invalid preserve_time setting.".to_string()),
+            },
+            _ => return Err("Invalid preserve_time setting.".to_string()),
+        };
+        let speed_kbytes_per_sec = match body.get("speed") {
+            None | Some(Value::Null) => None,
+            Some(Value::Number(n)) => match n.as_u64() {
+                Some(0) => None,
+                Some(v) if v <= 100_000_000 => Some(v),
+                _ => {
+                    return Err(
+                        "Speed limit must be an integer between 0 and 100000000 KiB/s.".to_string(),
+                    );
+                }
+            },
+            Some(Value::String(s)) => {
+                let t = s.trim();
+                if t.is_empty() || t == "0" {
+                    None
+                } else {
+                    let v: u64 = t.parse().map_err(|_| {
+                        "Speed limit must be an integer between 0 and 100000000 KiB/s.".to_string()
+                    })?;
+                    if v > 100_000_000 {
+                        return Err(
+                            "Speed limit must be an integer between 0 and 100000000 KiB/s."
+                                .to_string(),
+                        );
+                    }
+                    Some(v)
+                }
+            }
+            _ => {
+                return Err(
+                    "Speed limit must be an integer between 0 and 100000000 KiB/s.".to_string(),
+                );
+            }
+        };
+        Ok((transfer_mode, preserve_time, speed_kbytes_per_sec))
     }
 
     /// The session and the state key a synchronization of this tab uses.
@@ -2385,6 +2589,29 @@ impl CommanderService {
             local_root.is_dir()
         };
         if !local_is_dir { return api_error(400, "The local directory does not exist.") }
+        let mut excluded_paths = std::collections::BTreeSet::new();
+        if let Some(raw_ex) = body.get("excluded_paths") {
+            let Some(arr) = raw_ex.as_array() else {
+                return api_error(400, "excluded_paths must be an array of relative paths.");
+            };
+            if arr.len() > 10_000 {
+                return api_error(400, "Too many excluded synchronization items.");
+            }
+            for item in arr {
+                let Some(rel) = item.as_str() else {
+                    return api_error(400, "excluded_paths entries must be strings.");
+                };
+                let trimmed = rel.trim().trim_matches('/');
+                if trimmed.is_empty()
+                    || trimmed.chars().any(char::is_control)
+                    || trimmed.contains('\\')
+                    || trimmed.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..")
+                {
+                    return api_error(400, "Invalid relative path in excluded_paths.");
+                }
+                excluded_paths.insert(trimmed.to_string());
+            }
+        }
         let job = crate::queue::QueueJob::SyncRun {
             session,
             config_dir: config_root,
@@ -2392,6 +2619,7 @@ impl CommanderService {
             local_root: local_root.clone(),
             remote_root: remote_root.clone(),
             opts,
+            excluded_paths,
         };
         let task_id = self.queue.enqueue(Some(id), "sync", format!("Synchronize {remote_root}"),
             local_root.to_string_lossy().into_owned(), remote_root.clone(), 0,
@@ -6067,10 +6295,37 @@ impl CommanderService {
             .unwrap_or_else(|| self.active_local_dir(tab_id));
         let names = remote_names(&body);
         let perm = body.get("permissions").or_else(|| body.get("mode")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if names.is_empty() { return ApiReply{ status:400, payload: json!({"success": false, "error": "Select an item first."})}; }
-        if names.len() > 1000 { return api_error(400, "Too many files selected"); }
+        let recursive = body.get("recursive").and_then(Value::as_bool).unwrap_or(false);
+        self.apply_local_chmod_in_dir(&base, names, &perm, recursive)
+    }
+
+    fn apply_local_chmod_in_dir(
+        &self,
+        base: &str,
+        names: Vec<String>,
+        perm: &str,
+        recursive: bool,
+    ) -> ApiReply {
+        const MAX_CHMOD_DEPTH: usize = 64;
+        const MAX_CHMOD_ITEMS: usize = 10_000;
+        if names.is_empty() {
+            return ApiReply {
+                status: 400,
+                payload: json!({"success": false, "error": "Select an item first."}),
+            };
+        }
+        if names.len() > 1000 {
+            return api_error(400, "Too many files selected");
+        }
+        if let Err(error) = linscp_engine::filemask::parse_permissions_expr(perm, 0o644, false) {
+            return api_error(400, error);
+        }
+        let mut changed = 0usize;
         for name in names {
-            let target = match resolve_contained(&base, &name) { Ok(p)=>p, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
+            let target = match resolve_contained(base, &name) {
+                Ok(p) => p,
+                Err(e) => return api_error(400, e),
+            };
             if is_saf_path(&target) {
                 // `set_permissions_mode` is the bridge's own refusal: permissions
                 // do not exist on a granted folder, so it answers before reading
@@ -6080,19 +6335,291 @@ impl CommanderService {
                 // model worth honouring.
                 match self.local_fs.set_permissions_mode(&target, 0) {
                     Ok(()) => continue,
-                    Err(linscp_platform::PlatformError::UnsupportedUri(message)) => return ApiReply{ status:400, payload: json!({"success": false, "error": message})},
-                    Err(error) => return ApiReply{ status:400, payload: json!({"success": false, "error": error.to_string()})},
+                    Err(linscp_platform::PlatformError::UnsupportedUri(message)) => {
+                        return api_error(400, message);
+                    }
+                    Err(error) => return api_error(400, error.to_string()),
                 }
             }
-            let current = match gui_os::stat_extended(Path::new(&target)) { Ok(s)=> s.mode, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e.to_string()})},};
-            let new_mode = match linscp_engine::parse_chmod_spec(&perm, current) { Ok(m)=>m, Err(e)=> return ApiReply{ status:400, payload: json!({"success": false, "error": e})},};
-            if let Err(e) = gui_os::stat_extended(Path::new(&target))
-                .and_then(|_| linscp_platform::terminal::set_local_permissions(Path::new(&target), new_mode))
-            {
-                return ApiReply{ status: 400, payload: json!({"success": false, "error": e.to_string()})};
+            let info = match gui_os::stat_extended(Path::new(&target)) {
+                Ok(s) => s,
+                Err(e) => return api_error(400, e.to_string()),
+            };
+            if info.is_symlink {
+                return api_error(
+                    400,
+                    format!("{name}: a symbolic link is changed through its target"),
+                );
+            }
+            let mut stack: Vec<(PathBuf, usize)> = vec![(PathBuf::from(&target), 0)];
+            while let Some((cur_path, depth)) = stack.pop() {
+                if changed >= MAX_CHMOD_ITEMS {
+                    return api_error(
+                        400,
+                        format!(
+                            "Recursive permission limit ({MAX_CHMOD_ITEMS} entries) reached."
+                        ),
+                    );
+                }
+                let cur_info = match gui_os::stat_extended(&cur_path) {
+                    Ok(s) => s,
+                    Err(e) => return api_error(400, e.to_string()),
+                };
+                if cur_info.is_symlink {
+                    continue;
+                }
+                let new_mode = match linscp_engine::filemask::parse_permissions_expr(
+                    perm,
+                    cur_info.mode,
+                    cur_info.is_dir,
+                ) {
+                    Ok(m) => m,
+                    Err(e) => return api_error(400, e),
+                };
+                if let Err(e) =
+                    linscp_platform::terminal::set_local_permissions(&cur_path, new_mode)
+                {
+                    return api_error(400, e.to_string());
+                }
+                changed += 1;
+                if recursive && cur_info.is_dir {
+                    if depth >= MAX_CHMOD_DEPTH {
+                        return api_error(
+                            400,
+                            format!("Directory nesting limit ({MAX_CHMOD_DEPTH}) exceeded."),
+                        );
+                    }
+                    let rd = match std::fs::read_dir(&cur_path) {
+                        Ok(rd) => rd,
+                        Err(e) => return api_error(400, e.to_string()),
+                    };
+                    for child_res in rd {
+                        let child = match child_res {
+                            Ok(c) => c,
+                            Err(e) => return api_error(400, e.to_string()),
+                        };
+                        let child_path = child.path();
+                        let Ok(meta) = std::fs::symlink_metadata(&child_path) else {
+                            continue;
+                        };
+                        if meta.file_type().is_symlink() {
+                            continue;
+                        }
+                        stack.push((child_path, depth + 1));
+                    }
+                }
             }
         }
-        ApiReply{ status: 200, payload: json!({"success": true})}
+        ApiReply {
+            status: 200,
+            payload: json!({"success": true, "changed": changed}),
+        }
+    }
+
+    fn handle_local_properties(&self, body: Value) -> ApiReply {
+        let tab_id = tabs::parse_tab_id_value(body.get("tab"));
+        let base = body
+            .get("local_dir")
+            .or_else(|| body.get("path"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.active_local_dir(tab_id));
+        let checked_base = match check_local_pane_directory(&base, "local_dir") {
+            Ok(path) => path,
+            Err(error) => return api_error(400, error),
+        };
+        self.local_properties_for_base(&checked_base, &body)
+    }
+
+    fn local_properties_for_base(&self, base: &str, body: &Value) -> ApiReply {
+        let names: Vec<String> = body
+            .get("names")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| {
+                        e.get("name")
+                            .and_then(Value::as_str)
+                            .or(e.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                body.get("name")
+                    .and_then(Value::as_str)
+                    .map(|s| vec![s.to_string()])
+                    .unwrap_or_default()
+            });
+        if names.is_empty() || names.len() > 1000 {
+            return api_error(400, "Select at least one item.");
+        }
+        let calculate_size = body
+            .get("calculate_size")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut rows = Vec::new();
+        for n in names {
+            let p = match resolve_contained(base, &n) {
+                Ok(path) => path,
+                Err(error) => return api_error(400, error),
+            };
+            if is_saf_path(&p) {
+                match self.local_fs.stat(&p) {
+                    Ok(entry) => {
+                        let mut row = json!({
+                            "name": n,
+                            "path": p,
+                            "size": entry.size,
+                            "is_dir": entry.is_dir,
+                            "is_link": entry.is_symlink,
+                            "is_symlink": entry.is_symlink,
+                            "is_broken": entry.broken_link,
+                            "broken_link": entry.broken_link,
+                            "link_target": "",
+                            "permissions": entry.permissions,
+                            "mode": linscp_engine::filemask::mode_from_permissions_str(&entry.permissions),
+                            "mtime": entry.mtime,
+                            "owner": entry.owner.clone().unwrap_or_default(),
+                            "group": entry.group.clone().unwrap_or_default(),
+                        });
+                        if calculate_size && entry.is_dir && !entry.is_symlink {
+                            let (total_size, file_count, dir_count, truncated) =
+                                self.scan_local_dir_size(&p);
+                            row["total_size"] = json!(total_size);
+                            row["file_count"] = json!(file_count);
+                            row["dir_count"] = json!(dir_count);
+                            row["truncated"] = json!(truncated);
+                        }
+                        rows.push(row);
+                    }
+                    Err(error) => rows.push(json!({"name": n, "error": error.to_string()})),
+                }
+                continue;
+            }
+            match gui_os::stat_extended(Path::new(&p)) {
+                Ok(s) => {
+                    let mut row = json!({
+                        "name": n,
+                        "path": p,
+                        "size": s.size,
+                        "is_dir": s.is_dir,
+                        "is_link": s.is_symlink,
+                        "is_symlink": s.is_symlink,
+                        "is_broken": s.broken_link,
+                        "broken_link": s.broken_link,
+                        "link_target": s.link_target,
+                        "permissions": s.permissions,
+                        "mode": s.mode,
+                        "mtime": s.mtime_secs,
+                        "owner": s.owner,
+                        "group": s.group,
+                    });
+                    if calculate_size && s.is_dir && !s.is_symlink {
+                        let (total_size, file_count, dir_count, truncated) =
+                            self.scan_local_dir_size(&p);
+                        row["total_size"] = json!(total_size);
+                        row["file_count"] = json!(file_count);
+                        row["dir_count"] = json!(dir_count);
+                        row["truncated"] = json!(truncated);
+                    }
+                    rows.push(row);
+                }
+                Err(e) => rows.push(json!({"name": n, "error": e.to_string()})),
+            }
+        }
+        ApiReply {
+            status: 200,
+            payload: json!({
+                "success": true,
+                "properties": rows,
+                "name": rows.first().and_then(|v| v.get("name")).cloned().unwrap_or(json!("")),
+            }),
+        }
+    }
+
+    fn scan_local_dir_size(&self, root: &str) -> (u64, u64, u64, bool) {
+        const MAX_DEPTH: usize = 64;
+        const MAX_ENTRIES: usize = 25_000;
+        let mut total_size = 0u64;
+        let mut file_count = 0u64;
+        let mut dir_count = 0u64;
+        let mut scanned = 0usize;
+        let mut truncated = false;
+        if is_saf_path(root) {
+            let mut stack: Vec<(String, usize)> = vec![(root.to_string(), 0)];
+            while let Some((dir_uri, depth)) = stack.pop() {
+                if depth > MAX_DEPTH {
+                    truncated = true;
+                    continue;
+                }
+                let Ok(children) = self.local_fs.list_dir(&dir_uri) else {
+                    truncated = true;
+                    continue;
+                };
+                for child in children {
+                    if child.name == "." || child.name == ".." || child.is_symlink {
+                        continue;
+                    }
+                    scanned += 1;
+                    if scanned > MAX_ENTRIES {
+                        truncated = true;
+                        return (total_size, file_count, dir_count, truncated);
+                    }
+                    if child.is_dir {
+                        dir_count = dir_count.saturating_add(1);
+                        let sub = format!(
+                            "{}/document/{}",
+                            dir_uri.trim_end_matches('/'),
+                            linscp_platform::encode_saf_segment(&child.name)
+                        );
+                        stack.push((sub, depth + 1));
+                    } else {
+                        file_count = file_count.saturating_add(1);
+                        total_size = total_size.saturating_add(child.size);
+                    }
+                }
+            }
+            return (total_size, file_count, dir_count, truncated);
+        }
+        let mut stack: Vec<(PathBuf, usize)> = vec![(PathBuf::from(root), 0)];
+        while let Some((dir_path, depth)) = stack.pop() {
+            if depth > MAX_DEPTH {
+                truncated = true;
+                continue;
+            }
+            let Ok(rd) = std::fs::read_dir(&dir_path) else {
+                truncated = true;
+                continue;
+            };
+            for entry_res in rd {
+                let Ok(entry) = entry_res else {
+                    truncated = true;
+                    continue;
+                };
+                let p = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                scanned += 1;
+                if scanned > MAX_ENTRIES {
+                    truncated = true;
+                    return (total_size, file_count, dir_count, truncated);
+                }
+                if meta.is_dir() {
+                    dir_count = dir_count.saturating_add(1);
+                    stack.push((p, depth + 1));
+                } else {
+                    file_count = file_count.saturating_add(1);
+                    total_size = total_size.saturating_add(meta.len());
+                }
+            }
+        }
+        (total_size, file_count, dir_count, truncated)
     }
 
     fn compute_local_file_checksum(
@@ -7882,38 +8409,10 @@ impl CommanderService {
             Some(tab) if tab.is_local => {
                 // A local tab's "remote" side is the other local directory.
                 let names = remote_names(&body);
-                if names.is_empty() { return api_error(400, "Select an item first."); }
-                if names.len() > 1000 { return api_error(400, "Too many files selected"); }
                 let perm = body.get("permissions").or_else(|| body.get("mode"))
                     .and_then(|v| v.as_str()).unwrap_or("").to_string();
-                for name in names {
-                    let target = match resolve_contained(&tab.other_local_dir, &name) {
-                        Ok(path) => path,
-                        Err(error) => return api_error(400, error),
-                    };
-                    if is_saf_path(&target) {
-                        // The other pane refuses through the bridge, exactly as
-                        // the main pane does: the mode is unread, the 0 only
-                        // satisfies a trait written for filesystems with modes.
-                        match self.local_fs.set_permissions_mode(&target, 0) {
-                            Ok(()) => continue,
-                            Err(linscp_platform::PlatformError::UnsupportedUri(message)) => return api_error(400, message),
-                            Err(error) => return api_error(400, error.to_string()),
-                        }
-                    }
-                    let current = match gui_os::stat_extended(Path::new(&target)) {
-                        Ok(info) => info.mode,
-                        Err(error) => return api_error(400, error.to_string()),
-                    };
-                    let new_mode = match linscp_engine::parse_chmod_spec(&perm, current) {
-                        Ok(mode) => mode,
-                        Err(error) => return api_error(400, error),
-                    };
-                    if let Err(error) = linscp_platform::terminal::set_local_permissions(Path::new(&target), new_mode) {
-                        return api_error(400, error.to_string());
-                    }
-                }
-                ApiReply { status: 200, payload: json!({"success": true}) }
+                let recursive = body.get("recursive").and_then(Value::as_bool).unwrap_or(false);
+                self.apply_local_chmod_in_dir(&tab.other_local_dir, names, &perm, recursive)
             }
             _ => api_error(400, "Not connected"),
         }
@@ -7923,60 +8422,8 @@ impl CommanderService {
         let g = self.state.lock().expect("m");
         let tab = match tab_id.and_then(|id| g.tabs.get(&id).cloned()) { Some(t)=>t, None=> return ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})},};
         drop(g);
-        let names: Vec<String> = body.get("names").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| e.get("name").and_then(|v| v.as_str()).or(e.as_str()).map(|s| s.to_string())).collect()).unwrap_or_else(|| body.get("name").and_then(|v| v.as_str()).map(|s| vec![s.to_string()]).unwrap_or_default());
         if !tab.is_local { return Self::not_implemented(); }
-        let mut rows=Vec::new();
-        for n in names {
-            let p = match resolve_contained(&tab.other_local_dir, &n) { Ok(path) => path, Err(error) => return api_error(400, error) };
-            // A granted entry is statted through the bridge; a failure keeps
-            // the row shape a plain stat failure uses, so the dialogue
-            // shows the error beside the name instead of dying.
-            if is_saf_path(&p) {
-                match self.local_fs.stat(&p) {
-                    Ok(entry) => rows.push(json!({
-                        "name": n,
-                        "path": p,
-                        "size": entry.size,
-                        "is_dir": entry.is_dir,
-                        "is_link": entry.is_symlink,
-                        "is_symlink": entry.is_symlink,
-                        "is_broken": entry.broken_link,
-                        "broken_link": entry.broken_link,
-                        "link_target": "",
-                        "permissions": entry.permissions,
-                        "mode": linscp_engine::filemask::mode_from_permissions_str(&entry.permissions),
-                        "mtime": entry.mtime,
-                        "owner": entry.owner.clone().unwrap_or_default(),
-                        "group": entry.group.clone().unwrap_or_default(),
-                    })),
-                    Err(error) => rows.push(json!({"name": n, "error": error.to_string()})),
-                }
-                continue;
-            }
-            let info = if tab.is_local {
-                match gui_os::stat_extended(Path::new(&p)) {
-                    Ok(s)=> json!({
-                        "name": n,
-                        "path": p,
-                        "size": s.size,
-                        "is_dir": s.is_dir,
-                        "is_link": s.is_symlink,
-                        "is_symlink": s.is_symlink,
-                        "is_broken": s.broken_link,
-                        "broken_link": s.broken_link,
-                        "link_target": s.link_target,
-                        "permissions": s.permissions,
-                        "mode": s.mode,
-                        "mtime": s.mtime_secs,
-                        "owner": s.owner,
-                        "group": s.group,
-                    }),
-                    Err(e)=> json!({"name": n, "error": e.to_string()}),
-                }
-            } else { json!({"name": n, "size": 0, "is_dir": false, "permissions": "-rw-r--r--"})};
-            rows.push(info);
-        }
-        ApiReply{ status:200, payload: json!({"success": true, "properties": rows, "name": rows.get(0).and_then(|v| v.get("name")).cloned().unwrap_or(json!(""))})}
+        self.local_properties_for_base(&tab.other_local_dir, &body)
     }
     fn handle_remote_rights(&self, body: Value) -> ApiReply { self.handle_remote_chmod(body) }
     fn handle_remote_search(&self, body: Value) -> ApiReply {
@@ -17221,11 +17668,21 @@ mod tests {
 
         async fn list_dir(&self, remote_path: &str) -> Result<Vec<FileEntry>, ProtoError> {
             let docs = self.docs.lock().expect("m");
+            let perms = self.perms.lock().expect("m");
             let mut paths: Vec<String> = docs.keys()
                 .filter(|path| Self::parent_of(path) == remote_path && path.as_str() != remote_path)
                 .cloned().collect();
             paths.sort();
-            Ok(paths.iter().map(|path| Self::entry_for(path, &docs[path])).collect())
+            Ok(paths
+                .iter()
+                .map(|path| {
+                    let mut entry = Self::entry_for(path, &docs[path]);
+                    if let Some(p) = perms.get(path) {
+                        entry.permissions = p.clone();
+                    }
+                    entry
+                })
+                .collect())
         }
 
         async fn mkdir(&self, remote_path: &str) -> Result<(), ProtoError> {
@@ -19655,5 +20112,147 @@ mod tests {
         });
         let xml = xml_reply.payload["content"].as_str().unwrap_or("");
         assert!(xml.contains("<mv>") && xml.contains("/published.txt"), "WebDAV rename must log <mv>: {xml}");
+    }
+
+    #[tokio::test]
+    async fn recursive_chmod_dir_size_selective_sync_and_keepuptodate_options_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_dir = tmp.path().join("cfg");
+        let local_root = tmp.path().join("local");
+        std::fs::create_dir_all(local_root.join("tree/sub")).unwrap();
+        std::fs::write(local_root.join("tree/a.txt"), b"hello").unwrap();
+        std::fs::write(local_root.join("tree/sub/b.txt"), b"world!!").unwrap();
+
+        let svc = CommanderService::new(cfg_dir, Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSession::new());
+        session.add_dir("/remote_tree");
+        session.add_dir("/remote_tree/nested");
+        session.add_file("/remote_tree/f1.txt", b"12345");
+        session.add_file("/remote_tree/nested/f2.txt", b"1234567890");
+        session.set_permissions_str("/remote_tree", "drwxr-x---");
+        session.set_permissions_str("/remote_tree/nested", "drwxr-x---");
+        session.set_permissions_str("/remote_tree/f1.txt", "-rw-r-----");
+        session.set_permissions_str("/remote_tree/nested/f2.txt", "-rw-r-----");
+
+        let tab_id = insert_remote_tab(&svc, session.clone(), local_root.to_str().unwrap());
+
+        // 1. Remote & local directory size calculation (`calculate_size: true`).
+        let r_props = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/remote/properties".into(),
+                body: json!({"tab": tab_id, "names": ["remote_tree"], "calculate_size": true}),
+            })
+            .await;
+        assert_eq!(r_props.status, 200, "{}", r_props.payload);
+        assert_eq!(r_props.payload["properties"][0]["total_size"], json!(15));
+        assert_eq!(r_props.payload["properties"][0]["file_count"], json!(2));
+        assert_eq!(r_props.payload["properties"][0]["dir_count"], json!(1));
+
+        let l_props = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/properties".into(),
+            body: json!({"tab": tab_id, "names": ["tree"], "calculate_size": true}),
+        });
+        assert_eq!(l_props.status, 200, "{}", l_props.payload);
+        assert_eq!(l_props.payload["properties"][0]["total_size"], json!(12));
+        assert_eq!(l_props.payload["properties"][0]["file_count"], json!(2));
+        assert_eq!(l_props.payload["properties"][0]["dir_count"], json!(1));
+
+        // 2. Recursive remote & local chmod (`u+rwX,go=rX` gives 0755 to dirs and 0644 to non-exec files).
+        let r_chmod = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/remote/rights".into(),
+                body: json!({
+                    "tab": tab_id,
+                    "names": ["remote_tree"],
+                    "mode": "u=rwX,go=rX",
+                    "recursive": true,
+                }),
+            })
+            .await;
+        assert_eq!(r_chmod.status, 200, "{}", r_chmod.payload);
+        assert_eq!(r_chmod.payload["changed"], json!(4));
+        assert_eq!(session.mode_of("/remote_tree"), Some(0o755));
+        assert_eq!(session.mode_of("/remote_tree/nested"), Some(0o755));
+        assert_eq!(session.mode_of("/remote_tree/f1.txt"), Some(0o644));
+        assert_eq!(session.mode_of("/remote_tree/nested/f2.txt"), Some(0o644));
+
+        #[cfg(unix)]
+        {
+            let l_chmod = svc.dispatch(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/local/chmod".into(),
+                body: json!({
+                    "tab": tab_id,
+                    "names": ["tree"],
+                    "permissions": "u=rwX,go=rX",
+                    "recursive": true,
+                }),
+            });
+            assert_eq!(l_chmod.status, 200, "{}", l_chmod.payload);
+            assert_eq!(l_chmod.payload["changed"], json!(4));
+        }
+
+        // 3. Selective `/api/sync/run` (`excluded_paths`) skips unchecked items and keeps them pending.
+        let sync_local = tmp.path().join("sync_local");
+        std::fs::create_dir_all(&sync_local).unwrap();
+        std::fs::write(sync_local.join("include.txt"), b"upload me").unwrap();
+        std::fs::write(sync_local.join("skip.txt"), b"leave me pending").unwrap();
+        session.add_dir("/sync_remote");
+        let sync_res = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/sync/run".into(),
+                body: json!({
+                    "tab": tab_id,
+                    "local_dir": sync_local,
+                    "remote_dir": "/sync_remote",
+                    "mode": "remote",
+                    "transfer": "binary",
+                    "preserve_time": true,
+                    "speed": 2048,
+                    "excluded_paths": ["skip.txt"],
+                }),
+            })
+            .await;
+        assert_eq!(sync_res.status, 200, "{}", sync_res.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(
+            session.bytes_of("/sync_remote/include.txt").as_deref(),
+            Some(b"upload me".as_slice())
+        );
+        assert!(session.bytes_of("/sync_remote/skip.txt").is_none());
+
+        // 4. `/api/transfer/keepuptodate` honours `delete: true`, `continue_on_error`, `transfer`, `speed`.
+        session.add_file("/sync_remote/obsolete.txt", b"delete me");
+        let kud_res = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/transfer/keepuptodate".into(),
+                body: json!({
+                    "tab": tab_id,
+                    "local_dir": sync_local,
+                    "remote_dir": "/sync_remote",
+                    "count": 1,
+                    "delete": true,
+                    "continue_on_error": true,
+                    "transfer": "binary",
+                    "preserve_time": true,
+                    "speed": 1024,
+                }),
+            })
+            .await;
+        assert_eq!(kud_res.status, 200, "{}", kud_res.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert!(
+            session.bytes_of("/sync_remote/obsolete.txt").is_none(),
+            "delete: true must remove obsolete remote files during keepuptodate"
+        );
+        assert_eq!(
+            session.bytes_of("/sync_remote/skip.txt").as_deref(),
+            Some(b"leave me pending".as_slice())
+        );
     }
 }

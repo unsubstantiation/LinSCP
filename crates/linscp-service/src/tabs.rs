@@ -308,6 +308,27 @@ fn u16_field(obj: &Value, keys: &[&str], default: u16) -> Result<u16, String> {
     Ok(default)
 }
 
+fn parse_s3_byte_size_field(raw: &str, label: &str) -> Result<u64, String> {
+    let t = raw.trim();
+    let digits = t.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return Err(format!("Invalid {label} '{raw}'."));
+    }
+    let base: u64 = t[..digits]
+        .parse()
+        .map_err(|_| format!("{label} '{raw}' is out of range."))?;
+    let suffix = t[digits..].trim().to_ascii_uppercase();
+    let shift = match suffix.as_str() {
+        "" | "B" => 0u32,
+        "K" | "KB" | "KIB" => 10u32,
+        "M" | "MB" | "MIB" => 20u32,
+        "G" | "GB" | "GIB" => 30u32,
+        _ => return Err(format!("Invalid unit suffix in {label} '{raw}'.")),
+    };
+    base.checked_shl(shift)
+        .ok_or_else(|| format!("{label} '{raw}' overflows byte size."))
+}
+
 /// Parses a GUI session JSON object (optionally inheriting stored credentials
 /// from `site_name` when `password` is omitted) into a validated `ParsedSiteSpec`.
 pub fn parse_gui_session_spec(
@@ -653,6 +674,7 @@ pub fn parse_gui_session_spec(
         "s3_secret_key",
         "s3_session_token",
         "s3_region",
+        "s3_protocol",
         "s3_url_style",
         "s3_default_region",
         "s3_sse",
@@ -662,6 +684,9 @@ pub fn parse_gui_session_spec(
         "s3_acl",
         "s3_storage_class",
         "s3_metadata",
+        "s3_request_payer",
+        "s3_multipart_threshold",
+        "s3_min_part_size",
         "ftp_pasv_mode",
         "ftp_account",
         "ftp_use_mlsd",
@@ -824,6 +849,134 @@ pub fn parse_gui_session_spec(
             }
         }
     }
+    if let Some(proto_val) = spec.raw_fields.get("s3_protocol").cloned() {
+        let trimmed = proto_val.trim();
+        if trimmed.is_empty() {
+            spec.raw_fields.remove("s3_protocol");
+        } else {
+            let normalized = match trimmed.to_ascii_lowercase().as_str() {
+                "1" | "https" => "1",
+                "0" | "http" => "0",
+                _ => {
+                    return Err(format!(
+                        "Invalid S3 protocol '{trimmed}' (expected https/1 or http/0)."
+                    ));
+                }
+            };
+            spec.raw_fields
+                .insert("s3_protocol".to_string(), normalized.to_string());
+            let has_explicit_port = session.get("port").is_some_and(|v| match v {
+                Value::Number(n) => n.as_u64().unwrap_or(0) > 0,
+                Value::String(s) => !s.trim().is_empty() && s.trim() != "0",
+                _ => false,
+            }) || stored_base.as_ref().is_some_and(|b| b.port > 0);
+            if protocol == ProtocolScheme::S3 && !has_explicit_port {
+                spec.session.port = if normalized == "1" { 443 } else { 80 };
+            }
+        }
+    }
+    if let Some(payer_val) = spec.raw_fields.get("s3_request_payer").cloned() {
+        let trimmed = payer_val.trim();
+        if trimmed.is_empty() {
+            spec.raw_fields.remove("s3_request_payer");
+        } else {
+            let enabled = match trimmed.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" | "requester" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => {
+                    return Err(format!(
+                        "Invalid S3 request payer setting '{trimmed}'."
+                    ));
+                }
+            };
+            if enabled {
+                spec.raw_fields
+                    .insert("s3_request_payer".to_string(), "1".to_string());
+            } else {
+                spec.raw_fields.remove("s3_request_payer");
+            }
+        }
+    }
+    if let Some(raw_thresh) = spec.raw_fields.get("s3_multipart_threshold").cloned() {
+        let trimmed = raw_thresh.trim();
+        if trimmed.is_empty() || trimmed == "0" {
+            spec.raw_fields.remove("s3_multipart_threshold");
+        } else {
+            let bytes = parse_s3_byte_size_field(trimmed, "S3 multipart threshold")?;
+            if bytes == 0 {
+                spec.raw_fields.remove("s3_multipart_threshold");
+            } else {
+                spec.raw_fields
+                    .insert("s3_multipart_threshold".to_string(), bytes.to_string());
+            }
+        }
+    }
+    if let Some(raw_part) = spec.raw_fields.get("s3_min_part_size").cloned() {
+        let trimmed = raw_part.trim();
+        if trimmed.is_empty() || trimmed == "0" {
+            spec.raw_fields.remove("s3_min_part_size");
+        } else {
+            let bytes = parse_s3_byte_size_field(trimmed, "S3 minimum part size")?;
+            if bytes < 5 * 1024 * 1024 {
+                return Err(
+                    "S3 minimum part size must be at least 5 MiB (5242880 bytes or 5M)."
+                        .to_string(),
+                );
+            }
+            spec.raw_fields
+                .insert("s3_min_part_size".to_string(), bytes.to_string());
+        }
+    }
+    if let Some(mlsd_val) = spec.raw_fields.get("ftp_use_mlsd").cloned() {
+        let trimmed = mlsd_val.trim();
+        if trimmed.is_empty() {
+            spec.raw_fields.remove("ftp_use_mlsd");
+        } else {
+            let normalized = match trimmed.to_ascii_lowercase().as_str() {
+                "0" | "false" | "off" => "0",
+                "1" | "true" | "auto" => "1",
+                "2" | "on" | "require" => "2",
+                _ => {
+                    return Err(format!(
+                        "Invalid FTP MLSD setting '{trimmed}' (expected 0, 1, or 2)."
+                    ));
+                }
+            };
+            spec.raw_fields
+                .insert("ftp_use_mlsd".to_string(), normalized.to_string());
+        }
+    }
+    if let Some(pasv_ip_val) = spec.raw_fields.get("ftp_force_pasv_ip").cloned() {
+        let trimmed = pasv_ip_val.trim();
+        if trimmed.is_empty() {
+            spec.raw_fields.remove("ftp_force_pasv_ip");
+        } else {
+            let normalized = match trimmed.to_ascii_lowercase().as_str() {
+                "0" | "auto" => "0",
+                "1" | "true" | "on" => "1",
+                "2" | "false" | "off" => "2",
+                _ => {
+                    return Err(format!(
+                        "Invalid FTP PASV IP substitution setting '{trimmed}' (expected 0, 1, or 2)."
+                    ));
+                }
+            };
+            spec.raw_fields
+                .insert("ftp_force_pasv_ip".to_string(), normalized.to_string());
+        }
+    }
+    if let Some(acct_val) = spec.raw_fields.get("ftp_account").cloned() {
+        let trimmed = acct_val.trim();
+        if trimmed.chars().any(char::is_control) {
+            return Err("FTP account must not contain control characters.".to_string());
+        }
+        if trimmed.is_empty() {
+            spec.raw_fields.remove("ftp_account");
+        } else {
+            spec.raw_fields
+                .insert("ftp_account".to_string(), trimmed.to_string());
+        }
+    }
     if let Some(color_val) = spec.raw_fields.get("color").cloned() {
         let trimmed = color_val.trim();
         if trimmed.is_empty() {
@@ -934,7 +1087,32 @@ pub fn parse_gui_session_spec(
         ("tls_max_version", "max_tls_version"),
     ] {
         if let Some(value) = spec.raw_fields.remove(gui) {
-            spec.raw_fields.insert(engine.to_string(), value);
+            if !value.trim().is_empty() || !spec.raw_fields.contains_key(engine) {
+                spec.raw_fields.insert(engine.to_string(), value);
+            }
+        }
+    }
+    for tls_key in [
+        "ca_certificate_file",
+        "ca_certificate_dir",
+        "tls_certificate_file",
+        "tls_certificate_key_file",
+        "min_tls_version",
+        "max_tls_version",
+        "pinned_public_key",
+    ] {
+        if let Some(val) = spec.raw_fields.get(tls_key).cloned() {
+            let trimmed = val.trim();
+            if trimmed.chars().any(char::is_control) {
+                return Err(format!(
+                    "TLS option '{tls_key}' contains invalid control characters."
+                ));
+            }
+            if trimmed.is_empty() {
+                spec.raw_fields.remove(tls_key);
+            } else {
+                spec.raw_fields.insert(tls_key.to_string(), trimmed.to_string());
+            }
         }
     }
     if let Some(value) = spec.raw_fields.remove("tls_verify") {
@@ -980,7 +1158,7 @@ pub fn parse_gui_session_spec(
     if let Some(obj) = clean_view.as_object_mut() {
         obj.insert("protocol".into(), json!(protocol.as_str()));
         obj.insert("host".into(), json!(host));
-        obj.insert("port".into(), json!(port));
+        obj.insert("port".into(), json!(spec.session.port));
         obj.insert("alt_port".into(), json!(alt_port));
         obj.insert("username".into(), json!(spec.session.username));
         obj.insert("user".into(), json!(spec.session.username));
@@ -1304,6 +1482,68 @@ mod tests {
         assert!(parse_gui_session_spec(&invalid, None, &dir, &vault).is_err());
         invalid["ftps"] = json!("implicit");
         assert_eq!(parse_gui_session_spec(&invalid, None, &dir, &vault).unwrap().0.raw_fields["ftps"], "1");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gui_s3_ftp_and_tls_extended_fields_round_trip_and_validate() {
+        let dir = test_config_dir("s3-ftp-tls-extended");
+        let vault = linscp_platform::NativeSecretVault::new();
+        let s3_session = json!({
+            "protocol": "s3",
+            "host": "s3.example.test",
+            "username": "AKIAEXAMPLE",
+            "s3_protocol": "http",
+            "s3_request_payer": true,
+            "s3_multipart_threshold": "32M",
+            "s3_min_part_size": "8M",
+        });
+        let (s3_spec, _) = parse_gui_session_spec(&s3_session, None, &dir, &vault).unwrap();
+        assert_eq!(s3_spec.raw_fields.get("s3_protocol").map(String::as_str), Some("0"));
+        assert_eq!(s3_spec.session.port, 80);
+        assert_eq!(s3_spec.raw_fields.get("s3_request_payer").map(String::as_str), Some("1"));
+        assert_eq!(
+            s3_spec.raw_fields.get("s3_multipart_threshold").map(String::as_str),
+            Some("33554432")
+        );
+        assert_eq!(
+            s3_spec.raw_fields.get("s3_min_part_size").map(String::as_str),
+            Some("8388608")
+        );
+        let stored_s3 = build_stored_site_for_save("s3-site", &s3_spec);
+        let gui_s3 = stored_site_to_gui_json(&stored_s3);
+        assert_eq!(gui_s3["s3_protocol"], json!("0"));
+        assert_eq!(gui_s3["s3_request_payer"], json!("1"));
+        assert_eq!(gui_s3["s3_multipart_threshold"], json!("33554432"));
+        assert_eq!(gui_s3["s3_min_part_size"], json!("8388608"));
+
+        let mut too_small = s3_session.clone();
+        too_small["s3_min_part_size"] = json!("4M");
+        assert!(parse_gui_session_spec(&too_small, None, &dir, &vault).is_err());
+
+        let ftp_session = json!({
+            "protocol": "ftp",
+            "host": "ftp.example.test",
+            "ftps": "explicit",
+            "ftp_use_mlsd": "2",
+            "ftp_force_pasv_ip": "1",
+            "ftp_account": "billing-acct",
+            "tls_certificate_file": "/etc/ssl/client.pem",
+            "tls_certificate_key_file": "/etc/ssl/client.key",
+            "ca_certificate_dir": "/etc/ssl/certs",
+        });
+        let (ftp_spec, _) = parse_gui_session_spec(&ftp_session, None, &dir, &vault).unwrap();
+        assert_eq!(ftp_spec.raw_fields.get("ftp_use_mlsd").map(String::as_str), Some("2"));
+        assert_eq!(ftp_spec.raw_fields.get("ftp_force_pasv_ip").map(String::as_str), Some("1"));
+        assert_eq!(ftp_spec.raw_fields.get("ftp_account").map(String::as_str), Some("billing-acct"));
+        assert_eq!(
+            ftp_spec.raw_fields.get("tls_certificate_key_file").map(String::as_str),
+            Some("/etc/ssl/client.key")
+        );
+        assert_eq!(
+            ftp_spec.raw_fields.get("ca_certificate_dir").map(String::as_str),
+            Some("/etc/ssl/certs")
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
