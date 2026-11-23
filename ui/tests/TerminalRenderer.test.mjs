@@ -1657,25 +1657,79 @@ test('encodeKey covers printable symbols, xterm modifier sequences, control chor
   assert.equal(encodeKey({ key: 'Home', shiftKey: true }, true), '\x1b[1;2H');
   assert.equal(encodeKey({ key: 'F2', shiftKey: true }, false), '\x1b[1;2Q');
   assert.equal(encodeKey({ key: 'F10' }, false), '\x1b[21~');
+
+  // Every standard printable ASCII character (including '-', '+', '_', '=', '/', '~', '|', '\\') passes straight through.
+  for (let cp = 0x20; cp <= 0x7e; cp++) {
+    const ch = String.fromCharCode(cp);
+    assert.equal(encodeKey({ key: ch }, false), ch, `printable ASCII ${JSON.stringify(ch)} encodes 1:1`);
+  }
+
+  // Numpad and legacy WebView key names normalize cleanly to standard terminal sequences.
+  assert.equal(encodeKey({ key: 'Subtract' }, false), '-');
+  assert.equal(encodeKey({ key: 'Add' }, false), '+');
+  assert.equal(encodeKey({ key: 'Multiply' }, false), '*');
+  assert.equal(encodeKey({ key: 'Divide' }, false), '/');
+  assert.equal(encodeKey({ key: 'Decimal' }, false), '.');
+  assert.equal(encodeKey({ key: 'Spacebar' }, false), ' ');
+  assert.equal(encodeKey({ key: 'Esc' }, false), '\x1b');
+  assert.equal(encodeKey({ key: 'Del' }, false), '\x1b[3~');
+  assert.equal(encodeKey({ key: 'Ins' }, false), '\x1b[2~');
+  assert.equal(encodeKey({ key: 'Up' }, false), '\x1b[A');
+  assert.equal(encodeKey({ key: 'Down' }, true), '\x1bOB');
+  assert.equal(encodeKey({ key: 'Left' }, false), '\x1b[D');
+  assert.equal(encodeKey({ key: 'Right' }, true), '\x1bOC');
+
+  // International AltGr third-level symbols pass through as UTF-8 text instead of Ctrl+Alt control codes or null.
+  for (const sym of ['@', '|', '\\', '[', ']', '{', '}', '~', '€', 'µ', '²', '³']) {
+    assert.equal(
+      encodeKey({
+        key: sym,
+        ctrlKey: true,
+        altKey: true,
+        getModifierState: (mod) => mod === 'AltGraph',
+      }, false),
+      sym,
+      `AltGraph ${sym} encodes as UTF-8 text`,
+    );
+  }
+  for (const sym of ['@', '{', '|', '}', '~', '€', 'µ']) {
+    assert.equal(
+      encodeKey({ key: sym, ctrlKey: true, altKey: true, shiftKey: false }, false),
+      sym,
+      `Windows Ctrl+Alt AltGr fallback ${sym} encodes as UTF-8 text`,
+    );
+  }
 });
 
-test('Shift+PageUp/PageDown scrolls terminal history and canvas mousedown blurs external toolbar focus', async () => {
-  const dom = installDom();
+test('Shift+PageUp/PageDown scrolls terminal history and canvas mousedown focuses the terminal surface', async () => {
+  const realDom = new JSDOM('<!doctype html><div id="host"></div>', {
+    pretendToBeVisual: true,
+    url: 'https://tauri.localhost/',
+  });
+  realDom.window.HTMLCanvasElement.prototype.getContext = () => fakeCanvas().context;
+  const prevDoc = globalThis.document;
+  const prevDpr = globalThis.devicePixelRatio;
+  globalThis.document = realDom.window.document;
+  globalThis.devicePixelRatio = 1;
   const transport = fakeTransport({
     '/api/terminal/frame': () => ({ success: true, alive: true, frame: blankFrame(80, 24) }),
   });
-  const container = fakeContainer(720, 432);
-  const toolbarButton = dom.dom.window.document.createElement('button');
-  dom.dom.window.document.body.appendChild(toolbarButton);
+  const container = realDom.window.document.getElementById('host');
+  Object.defineProperty(container, 'clientWidth', { value: 720, configurable: true });
+  Object.defineProperty(container, 'clientHeight', { value: 432, configurable: true });
+  const toolbarButton = realDom.window.document.createElement('button');
+  realDom.window.document.body.appendChild(toolbarButton);
   const session = new TerminalSession({
     transport,
     terminal: 'term-keys-focus',
     container,
     pollInterval: 1000,
   });
+  assert.equal(session.element.tabIndex, -1, 'terminal canvas is programmatically focusable without stealing Tab');
   session.start();
   try {
-    const win = dom.dom.window;
+    const win = realDom.window;
+    assert.equal(win.document.activeElement, session.element, 'starting a desktop terminal focuses its canvas surface');
     const pgUp = new win.KeyboardEvent('keydown', { key: 'PageUp', shiftKey: true, cancelable: true });
     const pgDn = new win.KeyboardEvent('keydown', { key: 'PageDown', shiftKey: true, cancelable: true });
     assert.equal(session.handleKey(pgUp), true);
@@ -1692,13 +1746,31 @@ test('Shift+PageUp/PageDown scrolls terminal history and canvas mousedown blurs 
       'Shift+PageUp/PageDown scrolls history without sending bytes to the shell',
     );
 
+    // AltGr printable characters on the soft-keyboard textarea path defer to `input` so they are never sent twice.
+    assert.equal(
+      session.handleTypedKey({
+        key: '@',
+        ctrlKey: true,
+        altKey: true,
+        getModifierState: (mod) => mod === 'AltGraph',
+      }),
+      false,
+    );
+
     toolbarButton.focus();
     assert.equal(win.document.activeElement, toolbarButton);
     session.element.dispatchEvent(new win.MouseEvent('mousedown', { button: 0, detail: 1, clientX: 5, clientY: 5, cancelable: true }));
-    assert.notEqual(win.document.activeElement, toolbarButton, 'clicking terminal canvas releases focus from external toolbar buttons');
+    assert.equal(win.document.activeElement, session.element, 'clicking terminal canvas moves focus directly onto the canvas');
+    toolbarButton.focus();
+    session.focus();
+    assert.equal(win.document.activeElement, session.element, 'session.focus() restores focus onto the canvas');
   } finally {
     await session.close();
-    dom.cleanup();
+    realDom.window.close();
+    if (prevDoc === undefined) delete globalThis.document;
+    else globalThis.document = prevDoc;
+    if (prevDpr === undefined) delete globalThis.devicePixelRatio;
+    else globalThis.devicePixelRatio = prevDpr;
   }
 });
 

@@ -161,6 +161,7 @@ pub mod commands {
         }
         let label = format!("terminal-{safe}");
         if let Some(existing) = app.get_webview_window(&label) {
+            let _ = existing.show();
             let _ = existing.unminimize();
             existing.set_focus().map_err(|e| e.to_string())?;
             return Ok(json!({ "label": label, "existing": true }));
@@ -191,6 +192,7 @@ pub mod commands {
             // box: it is meant to be resized to fit half a screen or a second
             // monitor, and the page tells the remote PTY about every resize.
             .resizable(true)
+            .focused(true)
             // `&str` on the 2.1 API, `Into<String>` later: both are satisfied.
             .initialization_script(init_script.as_str())
             // A terminal is a text surface, and a dropped file has nowhere to
@@ -203,6 +205,11 @@ pub mod commands {
         if let Some(icon) = app.default_window_icon() {
             let _ = builder.set_icon(icon.clone());
         }
+        // Explicitly claim OS keyboard focus for the new window so typing
+        // immediately reaches the terminal instead of the Commander window
+        // behind it on Wayland/X11/Windows window managers.
+        let _ = builder.show();
+        let _ = builder.set_focus();
         // A closed window is a shell nobody is looking at, so closing it closes
         // the shell. The page cannot be relied on here: a window being
         // destroyed does not run its unload handlers, so a remote PTY would

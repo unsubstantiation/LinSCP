@@ -173,11 +173,13 @@ export class TerminalRenderer {
       ?? ((tag: 'canvas') => document.createElement(tag));
     this.canvas = createElement('canvas');
     this.canvas.className = 'terminal-canvas';
+    this.canvas.tabIndex = -1;
     this.canvas.setAttribute('role', 'img');
     this.canvas.setAttribute('aria-label', 'Terminal');
     this.canvas.style.display = 'block';
     this.canvas.style.width = '100%';
     this.canvas.style.height = '100%';
+    this.canvas.style.outline = 'none';
     this.container.appendChild(this.canvas);
     this.ctx = typeof this.canvas.getContext === 'function'
       ? this.canvas.getContext('2d')

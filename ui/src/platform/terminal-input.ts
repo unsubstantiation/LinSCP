@@ -33,10 +33,13 @@
 /** One key press, as much of it as the terminal needs to encode it. */
 export interface TerminalKeyEvent {
   key: string;
+  code?: string;
   ctrlKey?: boolean;
   altKey?: boolean;
   shiftKey?: boolean;
   metaKey?: boolean;
+  isComposing?: boolean;
+  getModifierState?: (keyArg: string) => boolean;
   preventDefault?: () => void;
 }
 
@@ -83,6 +86,7 @@ export class TerminalInput {
       : options.container.ownerDocument.createElement('textarea');
 
     const element = this.element;
+    element.className = 'terminal-input';
     element.setAttribute('aria-label', 'Terminal input');
     // Not `display: none` or `visibility: hidden`: an input method ignores, and
     // often cannot focus, an element that is not laid out. It is made

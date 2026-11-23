@@ -2333,7 +2333,8 @@ body.terminal-only > *:not(.terminal-window-screen):not(.terminal-window-ended):
   background: var(--banner-bg);
 }
 /* The canvas paints selectable text; right-click pastes into the terminal. */
-.terminal-canvas { display: block; cursor: text; }
+.terminal-canvas { display: block; cursor: text; outline: none; }
+.terminal-canvas:focus, .terminal-canvas:focus-visible { outline: none; }
 
 .auto-reconnect-row > label:first-child { width: auto; }
 .auto-reconnect-row > input[type="number"] { flex: 0 1 6em; min-width: 4em; }

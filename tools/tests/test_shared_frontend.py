@@ -126,6 +126,28 @@ class SharedFrontendTests(unittest.TestCase):
         for cleanup_id in ('"presets"', '"sync_state"', '"monitor"', '"auto_reconnect"'):
             self.assertIn(cleanup_id, ops_rs)
 
+    def test_terminal_window_focus_and_key_isolation_contracts(self):
+        root = pathlib.Path(__file__).resolve().parents[2]
+        tauri_lib = (root / "crates/linscp-tauri/src/lib.rs").read_text(encoding="utf-8")
+        term_input = (root / "ui/src/platform/terminal-input.ts").read_text(encoding="utf-8")
+        term_session = (root / "ui/src/platform/terminal-session.ts").read_text(encoding="utf-8")
+        term_canvas = (root / "ui/src/platform/terminal.ts").read_text(encoding="utf-8")
+        index_html = (root / "source/gui/web/index.html").read_text(encoding="utf-8")
+
+        open_fn = tauri_lib.split("pub async fn linscp_open_terminal_window", 1)[1].split("pub async fn ", 1)[0]
+        self.assertIn(".focused(true)", open_fn)
+        self.assertIn("builder.show()", open_fn)
+        self.assertIn("builder.set_focus()", open_fn)
+        self.assertIn("existing.show()", open_fn)
+        self.assertIn("existing.set_focus()", open_fn)
+
+        self.assertIn("element.className = 'terminal-input';", term_input)
+        self.assertIn("this.canvas.tabIndex = -1;", term_canvas)
+        self.assertIn("export function isAltGraphKey(", term_session)
+        self.assertIn("export function normalizeKeyName(", term_session)
+        self.assertIn("function isTerminalCapturingKeys()", index_html)
+        self.assertIn("function focusCliInput()", index_html)
+
 
 if __name__ == '__main__':
     unittest.main()
