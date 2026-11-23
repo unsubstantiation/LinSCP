@@ -194,7 +194,7 @@ pub fn stored_site_to_gui_json(site: &StoredSite) -> Value {
     obj.insert("alt_port".into(), json!(effective_site_alt_port(site)));
     obj.insert("alt_fallback".into(), json!(site.extra_fields.get("alt_fallback").is_some_and(|v| v == "1")));
     obj.insert("has_key_passphrase".into(), json!(has_key_passphrase));
-    obj.insert("has_unreadable_secret".into(), json!(site.summary().has_unreadable_secret));
+    obj.insert("has_unreadable_credential".into(), json!(site.summary().has_unreadable_secret));
     obj.insert(
         "keyfile".into(),
         json!(site.private_key.clone().unwrap_or_default()),
@@ -1318,6 +1318,15 @@ pub fn parse_desktop_uri(raw_url: &str, forbid_embedded_secrets: bool) -> Result
 
 /// Formats a clean shareable session URL without passwords (`sftp://user@host:2222/dir`).
 pub fn format_session_url(spec: &ParsedSiteSpec, remote_dir_override: Option<&str>) -> String {
+    format_session_url_with_options(spec, remote_dir_override, false)
+}
+
+/// Formats a session URL, optionally including the stored password when explicitly requested.
+pub fn format_session_url_with_options(
+    spec: &ParsedSiteSpec,
+    remote_dir_override: Option<&str>,
+    include_password: bool,
+) -> String {
     let proto = spec.session.protocol.as_str();
     let default_port = spec.session.protocol.default_port();
     let port = if spec.session.port == 0 {
@@ -1335,10 +1344,23 @@ pub fn format_session_url(spec: &ParsedSiteSpec, remote_dir_override: Option<&st
     } else {
         String::new()
     };
-    let user_part = if !spec.session.username.is_empty() {
-        format!("{}@", percent_encode_userinfo(&spec.session.username))
+    let pw_opt = if include_password {
+        spec.session
+            .password
+            .as_deref()
+            .filter(|pw| !pw.is_empty())
     } else {
-        String::new()
+        None
+    };
+    let user_part = match (!spec.session.username.is_empty(), pw_opt) {
+        (true, Some(pw)) => format!(
+            "{}:{}@",
+            percent_encode_userinfo(&spec.session.username),
+            percent_encode_userinfo(pw)
+        ),
+        (true, None) => format!("{}@", percent_encode_userinfo(&spec.session.username)),
+        (false, Some(pw)) => format!(":{}@", percent_encode_userinfo(pw)),
+        (false, None) => String::new(),
     };
     let raw_dir = remote_dir_override
         .unwrap_or(&spec.session.initial_dir)
@@ -1351,6 +1373,34 @@ pub fn format_session_url(spec: &ParsedSiteSpec, remote_dir_override: Option<&st
         format!("/{raw_dir}")
     };
     format!("{proto}://{user_part}{host_part}{port_part}{path_part}")
+}
+
+/// Converts a `ParsedSiteSpec` parsed from a session URL into the GUI session JSON shape.
+pub fn parsed_spec_to_gui_json(spec: &ParsedSiteSpec) -> Value {
+    let ftps = match spec.raw_fields.get("ftps").map(String::as_str) {
+        Some("1") => "implicit",
+        Some("3") => "explicit",
+        _ => "",
+    };
+    let has_password = spec
+        .session
+        .password
+        .as_deref()
+        .is_some_and(|pw| !pw.is_empty());
+    json!({
+        "name": if spec.session_label.is_empty() { spec.session.host.clone() } else { spec.session_label.clone() },
+        "protocol": spec.session.protocol.as_str(),
+        "host": spec.session.host,
+        "port": spec.session.port,
+        "username": spec.session.username,
+        "user": spec.session.username,
+        "password": spec.session.password.clone().unwrap_or_default(),
+        "has_password": has_password,
+        "remote_dir": spec.session.initial_dir,
+        "initial_dir": spec.session.initial_dir,
+        "ftps": ftps,
+        "s3_protocol": spec.raw_fields.get("s3_protocol").cloned().unwrap_or_default(),
+    })
 }
 
 pub(crate) fn percent_encode_userinfo(raw: &str) -> String {
@@ -1770,6 +1820,32 @@ mod tests {
         assert_eq!(gui_json["rdp_domain"], "CORP");
         assert_eq!(gui_json["rdp_width"], "1920");
         assert_eq!(gui_json["spice_tls_port"], "5901");
+        assert_eq!(gui_json["has_unreadable_credential"], false);
+        assert!(!gui_json.to_string().contains("secret"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_url_options_and_url_parse_round_trip() {
+        let parsed = linscp_engine::url_and_raw::parse_site_url(
+            "sftp://deploy:secret%20word@prod.example.test:2222/var/www/app",
+        )
+        .unwrap();
+        assert_eq!(
+            format_session_url(&parsed, Some("/srv/releases")),
+            "sftp://deploy@prod.example.test:2222/srv/releases"
+        );
+        assert_eq!(
+            format_session_url_with_options(&parsed, Some("/srv/releases"), true),
+            "sftp://deploy:secret%20word@prod.example.test:2222/srv/releases"
+        );
+        let gui = parsed_spec_to_gui_json(&parsed);
+        assert_eq!(gui["protocol"], "sftp");
+        assert_eq!(gui["host"], "prod.example.test");
+        assert_eq!(gui["port"], 2222);
+        assert_eq!(gui["username"], "deploy");
+        assert_eq!(gui["password"], "secret word");
+        assert_eq!(gui["has_password"], true);
+        assert_eq!(gui["initial_dir"], "/var/www/app");
     }
 }

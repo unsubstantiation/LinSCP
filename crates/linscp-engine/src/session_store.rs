@@ -895,12 +895,33 @@ impl SessionStore {
     }
 
     pub fn rename_folder(&mut self, old_folder: &str, new_folder: &str) -> usize {
-        if old_folder.is_empty() || new_folder.is_empty() || new_folder.contains('/') {
+        let valid_folder = |f: &str| {
+            !f.is_empty()
+                && !f.starts_with('/')
+                && !f.ends_with('/')
+                && !f.chars().any(char::is_control)
+                && f.split('/')
+                    .all(|seg| !seg.trim().is_empty() && seg != "." && seg != "..")
+        };
+        if !valid_folder(old_folder) || !valid_folder(new_folder) || old_folder == new_folder {
             return 0;
         }
         let old_prefix = format!("{old_folder}/");
         let new_prefix = format!("{new_folder}/");
-        if self.sites.iter().any(|s| s.name.starts_with(&new_prefix)) {
+        if new_folder.starts_with(&old_prefix) {
+            return 0;
+        }
+        let has_collision = self.sites.iter().any(|s| {
+            if let Some(rest) = s.name.strip_prefix(&old_prefix) {
+                let target = format!("{new_prefix}{rest}");
+                self.sites
+                    .iter()
+                    .any(|other| !other.name.starts_with(&old_prefix) && other.name == target)
+            } else {
+                false
+            }
+        });
+        if has_collision {
             return 0;
         }
         let mut count = 0usize;
@@ -1022,6 +1043,38 @@ mod tests {
         assert_eq!(
             final_load.find("prod/app").unwrap().key_passphrase.as_deref(),
             Some("key-secret")
+        );
+    }
+
+    #[test]
+    fn session_and_nested_folder_rename_preserve_secrets_and_reject_collisions() {
+        let mut store = SessionStore::new();
+        let mut s1 = StoredSite::new("Prod/Web/node1", ProtocolScheme::Sftp, "10.0.0.1");
+        s1.password = Some("pw1".to_string());
+        store.upsert(s1);
+        store.upsert(StoredSite::new("Prod/Web/node2", ProtocolScheme::Sftp, "10.0.0.2"));
+        store.upsert(StoredSite::new("Prod/Api/node1", ProtocolScheme::Sftp, "10.0.0.3"));
+
+        // Collision (`Prod/Api/node1` already exists) is refused cleanly.
+        assert_eq!(store.rename_folder("Prod/Web", "Prod/Api"), 0);
+        // Self-descendant move (`Prod` -> `Prod/Sub`) is refused cleanly.
+        assert_eq!(store.rename_folder("Prod", "Prod/Sub"), 0);
+
+        // Nested folder rename (`Prod/Web` -> `Prod/Edge`) updates matching sites and preserves secrets.
+        assert_eq!(store.rename_folder("Prod/Web", "Prod/Edge"), 2);
+        assert!(store.find("Prod/Web/node1").is_none());
+        assert_eq!(
+            store.find("Prod/Edge/node1").unwrap().password.as_deref(),
+            Some("pw1")
+        );
+        assert!(store.find("Prod/Edge/node2").is_some());
+
+        // Single-site rename rejects existing destination and renames cleanly otherwise.
+        assert!(!store.rename("Prod/Edge/node1", "Prod/Api/node1"));
+        assert!(store.rename("Prod/Edge/node1", "Prod/Edge/primary"));
+        assert_eq!(
+            store.find("Prod/Edge/primary").unwrap().password.as_deref(),
+            Some("pw1")
         );
     }
 }

@@ -126,6 +126,19 @@ impl HostKeyCache {
         Ok(())
     }
 
+    pub fn remove(&mut self, host_port: &str, key_type: &str) -> bool {
+        let norm_hp = host_port.trim().to_ascii_lowercase();
+        let kt = key_type.trim();
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| !(e.host_port == norm_hp && e.key_type == kt));
+        self.entries.len() != before
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     pub fn serialize(&self) -> String {
         let mut out = String::new();
         for entry in &self.entries {
@@ -158,10 +171,16 @@ mod tests {
             .upsert("bad\nhost", 22, "ssh-ed25519", "SHA256:x")
             .is_err());
 
-        let reparsed = HostKeyCache::parse(&cache.serialize());
+        let mut reparsed = HostKeyCache::parse(&cache.serialize());
         assert_eq!(
             reparsed.lookup("prod.example.com", 2222, "ssh-ed25519"),
             Some("SHA256:AbCdEf123")
+        );
+        assert!(!reparsed.remove("prod.example.com@2222", "ssh-rsa"));
+        assert!(reparsed.remove("PROD.EXAMPLE.COM@2222", "ssh-ed25519"));
+        assert_eq!(
+            reparsed.lookup("prod.example.com", 2222, "ssh-ed25519"),
+            None
         );
     }
 }

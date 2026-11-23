@@ -1660,6 +1660,26 @@ fn cleanup_catalog(config_root: &Path) -> Vec<(&'static str, &'static str, PathB
             config_root.join("preferences.json"),
         ),
         (
+            "presets",
+            "Transfer settings presets (transfer-presets.ini)",
+            config_root.join("transfer-presets.ini"),
+        ),
+        (
+            "sync_state",
+            "Two-way synchronization baselines (sync)",
+            config_root.join("sync"),
+        ),
+        (
+            "monitor",
+            "Server monitor settings (monitor.json)",
+            config_root.join("monitor.json"),
+        ),
+        (
+            "auto_reconnect",
+            "Auto-reconnect session state (auto-reconnect.json)",
+            config_root.join("auto-reconnect.json"),
+        ),
+        (
             "shell",
             "Pending shell-upload manifests",
             config_root.join("shell-manifests"),

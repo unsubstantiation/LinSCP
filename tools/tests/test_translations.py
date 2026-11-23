@@ -73,6 +73,8 @@ class TranslationTests(unittest.TestCase):
             "GLACIER_IR", "DEEP_ARCHIVE", "REDUCED_REDUNDANCY",
             "public-read", "authenticated-read", "bucket-owner-read",
             "bucket-owner-full-control", "SSE-S3 (AES256)", "SSE-KMS (aws:kms)",
+            "ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
+            "ecdsa-sha2-nistp521", "rsa-sha2-512", "rsa-sha2-256",
             # Product names of the services and tools being launched. Their
             # spelling is part of the name; only the surrounding words are
             # translated.

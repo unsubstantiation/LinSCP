@@ -37,17 +37,34 @@ class SharedFrontendTests(unittest.TestCase):
         lib_rs = (root / "crates/linscp-service/src/lib.rs").read_text(encoding="utf-8")
         queue_rs = (root / "crates/linscp-service/src/queue.rs").read_text(encoding="utf-8")
         tabs_rs = (root / "crates/linscp-service/src/tabs.rs").read_text(encoding="utf-8")
+        hostkeys_rs = (root / "crates/linscp-engine/src/hostkeys.rs").read_text(encoding="utf-8")
         index_html = (root / "source/gui/web/index.html").read_text(encoding="utf-8")
 
         self.assertIn('("POST", "/api/local/properties") => self.handle_local_properties(req.body)', lib_rs)
+        self.assertIn('("GET", "/api/hostkeys") => self.handle_hostkeys_get()', lib_rs)
+        self.assertIn('("POST", "/api/hostkeys") => self.handle_hostkeys_post(req.body)', lib_rs)
+        self.assertIn('("POST", "/api/session/url") => self.handle_session_url_post(req.body)', lib_rs)
+        self.assertIn('("POST", "/api/remote/save") => self.handle_remote_save(req.body)', lib_rs)
         self.assertIn("fn scan_remote_dir_size(", lib_rs)
         self.assertIn("fn scan_local_dir_size(", lib_rs)
         self.assertIn("fn apply_local_chmod_in_dir(", lib_rs)
         self.assertIn("pub fn filter_excluded_sync_items(", queue_rs)
         self.assertIn("fn parse_sync_transfer_options(", lib_rs)
         self.assertIn("fn parse_s3_byte_size_field(", tabs_rs)
+        self.assertIn("pub fn format_session_url_with_options(", tabs_rs)
+        self.assertIn("pub fn parsed_spec_to_gui_json(", tabs_rs)
+        self.assertIn('obj.insert("has_unreadable_credential".into(), json!(site.summary().has_unreadable_secret));', tabs_rs)
+        self.assertNotIn('"has_unreadable_secret"', tabs_rs)
+        self.assertIn("pub fn remove(&mut self, host_port: &str, key_type: &str) -> bool", hostkeys_rs)
+        self.assertIn("pub fn clear(&mut self)", hostkeys_rs)
+        self.assertIn("newFilePrompt('remote')", index_html)
+        self.assertIn("openHostKeysManager", index_html)
+        self.assertIn("openPasteSessionUrl", index_html)
         for elem_id in (
             "paneCtxCustomCmdBtn",
+            "paneCtxNewFileBtn",
+            "editorSaveAsBtn",
+            "editorReloadBtn",
             "siteS3Protocol",
             "siteS3MultipartThreshold",
             "siteS3MinPartSize",
@@ -67,8 +84,47 @@ class SharedFrontendTests(unittest.TestCase):
             "kudContinueOnError",
             "customCmdDescription",
             "customCmdDirs",
+            "hostKeysModal",
+            "hostKeyAddHost",
+            "hostKeyAddPort",
+            "hostKeyAddType",
+            "hostKeyAddFingerprint",
+            "hostKeysList",
+            "pasteSessionUrlInput",
+            "loadUrlIntoSiteBtn",
+            "connectPastedUrlBtn",
+            "bookmarkScopeSelect",
+            "prefResumeSupport",
+            "prefResumeSize",
+            "paneCtxDuplicateBtn",
+            "siteRenameBtn",
+            "workspaceCloseExisting",
+            "syncPermissions",
+            "syncPermissionsOctal",
         ):
             self.assertIn(f'id="{elem_id}"', index_html)
+        for fn_name in (
+            "promptDuplicate",
+            "renameSite",
+            "renameSiteFolder",
+            "renameWorkspace",
+            "appendMtimeEditor",
+            "applyPropertiesMtime",
+        ):
+            self.assertIn(f"function {fn_name}(", index_html)
+
+        for route in (
+            '"/api/local/touch"',
+            '"/api/remote/touch"',
+            '"/api/local/copy"',
+            '"/api/sessions/rename"',
+            '"/api/workspaces/rename"',
+        ):
+            self.assertIn(route, lib_rs)
+
+        ops_rs = (root / "crates/linscp-service/src/ops.rs").read_text(encoding="utf-8")
+        for cleanup_id in ('"presets"', '"sync_state"', '"monitor"', '"auto_reconnect"'):
+            self.assertIn(cleanup_id, ops_rs)
 
 
 if __name__ == '__main__':

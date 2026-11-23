@@ -5221,7 +5221,7 @@ function options(id) {
       port: 22,
       username: 'ops',
       has_password: true,
-      has_unreadable_secret: true
+      has_unreadable_credential: true
     };
     window.eval(`state.sessions = [${JSON.stringify(brokenSite)}]; renderSites();`);
     window.fillSiteForm(brokenSite);
@@ -5887,6 +5887,331 @@ function options(id) {
     window.__TAURI_INTERNALS__.invoke = origInvokeCmd;
     wfState.remote.entries = savedWfRemoteEntries;
     wfState.remote.selection = savedWfRemoteSel;
+    wfState.tabs = savedWfTabs;
+    wfState.activeTab = savedWfActiveTab;
+
+    // 12. SSH Host Keys Manager (`/api/hostkeys` list, add, delete).
+    const origInvokeHk = window.__TAURI_INTERNALS__.invoke;
+    let mockHostKeys = [{
+      host_port: 'bastion.example.test@22',
+      host: 'bastion.example.test',
+      port: 22,
+      key_type: 'ssh-ed25519',
+      fingerprint: 'SHA256:BastionKey1',
+      pin: 'ssh-ed25519 SHA256:BastionKey1'
+    }];
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      if (cmd === 'linscp_invoke' && args && args.envelope) {
+        const p = args.envelope.path || '';
+        const m = String(args.envelope.method || 'GET').toUpperCase();
+        const b = typeof args.envelope.body === 'string' ? JSON.parse(args.envelope.body) : (args.envelope.body || {});
+        if (p === '/api/hostkeys') {
+          calls.push({ path: p, options: { method: m, body: JSON.stringify(b) } });
+          if (m === 'GET') {
+            return { status: 200, payload: { success: true, entries: mockHostKeys } };
+          }
+          if (b.action === 'add') {
+            mockHostKeys.push({
+              host_port: b.host.toLowerCase() + '@' + b.port,
+              host: b.host.toLowerCase(),
+              port: b.port,
+              key_type: b.key_type,
+              fingerprint: b.fingerprint,
+              pin: b.key_type + ' ' + b.fingerprint
+            });
+            return { status: 200, payload: { success: true, entries: mockHostKeys } };
+          }
+          if (b.action === 'delete') {
+            mockHostKeys = mockHostKeys.filter(e => !(e.host_port === b.host_port && e.key_type === b.key_type));
+            return { status: 200, payload: { success: true, entries: mockHostKeys } };
+          }
+        }
+        if (p === '/api/session/url' && m === 'POST') {
+          calls.push({ path: p, options: { method: m, body: JSON.stringify(b) } });
+          return {
+            status: 200,
+            payload: {
+              success: true,
+              session: {
+                name: 'app.example.test',
+                protocol: 'ftpes',
+                host: 'app.example.test',
+                port: 2121,
+                username: 'deploy',
+                password: 'url-secret',
+                has_password: true,
+                initial_dir: '/var/www',
+                ftps: 'explicit'
+              }
+            }
+          };
+        }
+      }
+      return origInvokeHk(cmd, args);
+    };
+    await window.openHostKeysManager();
+    check('SSH Host Keys modal renders cached host keys',
+      doc.getElementById('hostKeysModal').classList.contains('open') &&
+      doc.getElementById('hostKeysList').textContent.includes('bastion.example.test:22') &&
+      doc.getElementById('hostKeysList').textContent.includes('SHA256:BastionKey1'));
+    doc.getElementById('hostKeyAddHost').value = 'Web.Example.Test';
+    doc.getElementById('hostKeyAddPort').value = '2222';
+    doc.getElementById('hostKeyAddType').value = 'ecdsa-sha2-nistp256';
+    doc.getElementById('hostKeyAddFingerprint').value = 'SHA256:WebFp99';
+    await window.addCachedHostKey();
+    check('Adding a cached SSH host key updates the rendered list',
+      doc.getElementById('hostKeysList').children.length === 2 &&
+      doc.getElementById('hostKeysList').textContent.includes('web.example.test:2222'));
+    const origConfirmHk = window.confirm;
+    window.confirm = () => true;
+    await window.deleteCachedHostKey(mockHostKeys[0]);
+    window.confirm = origConfirmHk;
+    check('Deleting a cached SSH host key removes it from the list',
+      doc.getElementById('hostKeysList').children.length === 1 &&
+      !doc.getElementById('hostKeysList').textContent.includes('bastion.example.test'));
+    window.closeModal('hostKeysModal');
+
+    // 13. Paste / Open Session URL loads parsed settings into Site Manager.
+    window.openPasteSessionUrl();
+    doc.getElementById('pasteSessionUrlInput').value = 'ftpes://deploy:url-secret@app.example.test:2121/var/www';
+    await window.loadPastedUrlIntoSiteManager();
+    check('loadPastedUrlIntoSiteManager populates Site Manager from POST /api/session/url',
+      doc.getElementById('siteModal').classList.contains('open') &&
+      doc.getElementById('siteProtocol').value === 'ftpes' &&
+      doc.getElementById('siteHost').value === 'app.example.test' &&
+      doc.getElementById('sitePort').value === '2121' &&
+      doc.getElementById('siteUser').value === 'deploy' &&
+      doc.getElementById('sitePass').value === 'url-secret' &&
+      doc.getElementById('siteRemoteDir').value === '/var/www');
+    window.closeModal('siteModal');
+    window.__TAURI_INTERNALS__.invoke = origInvokeHk;
+
+    // 14. New file (`newFilePrompt`) with `create_only: true` + Local `Save as` (`saveEditorFileAs`).
+    const origInvokeEdit = window.__TAURI_INTERNALS__.invoke;
+    let localSaveCalls = [];
+    let simulateExistsOnce = true;
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      if (cmd === 'linscp_invoke' && args && args.envelope && args.envelope.path === '/api/local/save') {
+        const b = typeof args.envelope.body === 'string' ? JSON.parse(args.envelope.body) : (args.envelope.body || {});
+        localSaveCalls.push(b);
+        if (b.create_only && simulateExistsOnce) {
+          simulateExistsOnce = false;
+          return { status: 409, payload: { success: false, exists: true, error: 'A file with that name already exists.' } };
+        }
+        return { status: 200, payload: { success: true, info: { size: (b.content || '').length, mtime: 1791875300, mtime_ns: '1791875300000000000' } } };
+      }
+      return origInvokeEdit(cmd, args);
+    };
+    const origPromptEdit = window.prompt;
+    const origConfirmEdit = window.confirm;
+    wfState.local.path = '/tmp/slowlocal';
+    window.prompt = () => 'fresh_note.txt';
+    await window.newFilePrompt('local');
+    check('newFilePrompt opens editor in new-file mode with Reload hidden and Save As visible',
+      doc.getElementById('editorModal').classList.contains('open') &&
+      wfState.editor.isNew === true &&
+      wfState.editor.path === '/tmp/slowlocal/fresh_note.txt' &&
+      doc.getElementById('editorReloadBtn').style.display === 'none' &&
+      doc.getElementById('editorSaveAsBtn').style.display === '');
+    window.setEditorValue('hello world\n');
+    window.confirm = () => true;
+    await window.saveEditorFile();
+    check('Saving a new file sends create_only first, confirms overwrite on 409 exists, and transitions out of isNew',
+      localSaveCalls.length === 2 &&
+      localSaveCalls[0].create_only === true &&
+      localSaveCalls[1].create_only === undefined &&
+      wfState.editor.isNew === false &&
+      doc.getElementById('editorReloadBtn').style.display === '');
+    window.prompt = () => 'copied_note.txt';
+    await window.saveEditorFileAs();
+    check('saveEditorFileAs works on local files and resolves relative leaf names in the parent directory',
+      localSaveCalls.length === 3 &&
+      localSaveCalls[2].path === '/tmp/slowlocal/copied_note.txt' &&
+      localSaveCalls[2].create_only === true &&
+      wfState.editor.path === '/tmp/slowlocal/copied_note.txt');
+    window.closeModal('editorModal');
+    window.prompt = origPromptEdit;
+    window.confirm = origConfirmEdit;
+    window.__TAURI_INTERNALS__.invoke = origInvokeEdit;
+
+    // 15. Paired Bookmarks (`side: 'both'` add, rename with `old_name`, and dual-panel `goBookmark`).
+    responses['/api/bookmarks'].bookmarks.both = [
+      { name: 'pair-1', local_path: '/tmp/pair-local', remote_path: '/tmp/pair-remote' }
+    ];
+    await window.openBookmarks('both');
+    check('Paired bookmarks render local and remote paths in bookmarksModal',
+      doc.getElementById('bookmarkScopeSelect').value === 'both' &&
+      doc.getElementById('bookmarkList').textContent.includes('/tmp/pair-local') &&
+      doc.getElementById('bookmarkList').textContent.includes('/tmp/pair-remote'));
+    const origPromptBm = window.prompt;
+    window.prompt = () => 'pair-renamed';
+    await window.renameBookmark('both', { name: 'pair-1', local_path: '/tmp/pair-local', remote_path: '/tmp/pair-remote' });
+    window.prompt = origPromptBm;
+    const bmRenameBody = JSON.parse(calls.filter(c => c.path === '/api/bookmarks/save').pop().options.body);
+    check('renameBookmark posts old_name, new name, local_path and remote_path',
+      bmRenameBody.side === 'both' &&
+      bmRenameBody.old_name === 'pair-1' &&
+      bmRenameBody.name === 'pair-renamed' &&
+      bmRenameBody.local_path === '/tmp/pair-local' &&
+      bmRenameBody.remote_path === '/tmp/pair-remote');
+    const localBeforePair = calls.filter(c => c.path === '/api/local/list').length;
+    const remoteBeforePair = calls.filter(c => c.path === '/api/remote/list').length;
+    wfState.tabs = [{ id: 1, name: 'box', connected: true, is_local: false }];
+    wfState.activeTab = 1;
+    await window.goBookmark('both', { local_path: '/tmp/pair-local', remote_path: '/tmp/pair-remote' });
+    check('goBookmark("both") navigates both local and remote panels',
+      calls.filter(c => c.path === '/api/local/list').length === localBeforePair + 1 &&
+      calls.filter(c => c.path === '/api/remote/list').length === remoteBeforePair + 1);
+    wfState.tabs = savedWfTabs;
+    wfState.activeTab = savedWfActiveTab;
+
+    // 16. Preferences Modal `resumesupport` (`#prefResumeSupport` + `#prefResumeSize`).
+    responses['/api/preferences'].preferences.resumesupport = '4096';
+    await window.loadTransferSettings();
+    await window.openPreferences();
+    check('Preferences modal loads numeric resumesupport into #prefResumeSupport="size" and #prefResumeSize',
+      doc.getElementById('prefResumeSupport').value === 'size' &&
+      doc.getElementById('prefResumeSize').value === '4096' &&
+      doc.getElementById('prefResumeSizeRow').style.display === 'flex');
+    doc.getElementById('prefResumeSize').value = '8192';
+    await window.savePreferences();
+    const prefRsCall = JSON.parse(calls.filter(c => c.path === '/api/preferences' && (c.options.method || 'GET').toUpperCase() === 'POST').pop().options.body);
+    check('Saving Preferences persists updated resumesupport threshold',
+      prefRsCall.preferences.resumesupport === '8192');
+    window.closeModal('preferencesModal');
+
+    // 17. Properties Modification Timestamp (`appendMtimeEditor` + `applyPropertiesMtime` on local & remote).
+    const prevWfLocalEntries = wfState.local.entries.slice();
+    const prevWfFocus = wfState.focusPane;
+    wfState.focusPane = 'local';
+    wfState.local.entries = [
+      { name: 'stamp.txt', is_dir: false, size: 128, mtime: 1700000000, permissions: '-rw-r--r--' },
+      { name: 'stamp_dir', is_dir: true, size: 0, mtime: 1700000100, permissions: 'drwxr-xr-x' }
+    ];
+    wfState.local.selection = new Set(['stamp_dir']);
+    responses['/api/local/touch'] = { success: true, changed: 3 };
+    await window.openProperties();
+    check('Properties modal renders #propertiesMtimeInput, #propertiesMtimeNowBtn and #propertiesMtimeRecursive for directory',
+      !!doc.getElementById('propertiesMtimeInput') &&
+      !!doc.getElementById('propertiesMtimeNowBtn') &&
+      !!doc.getElementById('propertiesMtimeRecursive') &&
+      doc.getElementById('propertiesMtimeInput').value.length >= 16);
+    doc.getElementById('propertiesMtimeNowBtn').click();
+    doc.getElementById('propertiesMtimeRecursive').checked = true;
+    await window.applyPropertiesMtime('local', ['stamp_dir']);
+    const localTouchBody = JSON.parse(calls.filter(c => c.path === '/api/local/touch').pop().options.body);
+    check('applyPropertiesMtime posts mtime and recursive=true to /api/local/touch',
+      typeof localTouchBody.mtime === 'number' &&
+      localTouchBody.mtime > 1700000000 &&
+      localTouchBody.recursive === true &&
+      Array.isArray(localTouchBody.names) &&
+      localTouchBody.names[0] === 'stamp_dir');
+    window.closeModal('propertiesModal');
+
+    // 18. Local File Duplicate (`promptDuplicate('local')` -> `/api/local/copy` & `#paneCtxDuplicateBtn`).
+    wfState.local.selection = new Set(['stamp.txt']);
+    responses['/api/local/copy'] = { success: true, destination: '/tmp/stamp.txt.copy' };
+    const origPromptDup = window.prompt;
+    window.prompt = () => 'stamp.txt.bak';
+    await window.promptDuplicate('local');
+    window.prompt = origPromptDup;
+    const localCopyBody = JSON.parse(calls.filter(c => c.path === '/api/local/copy').pop().options.body);
+    check('promptDuplicate("local") posts source and destination to /api/local/copy',
+      localCopyBody.source === 'stamp.txt' &&
+      localCopyBody.destination === 'stamp.txt.bak');
+    wfState.local.entries = [
+      { name: 'stamp.txt', is_dir: false, size: 128, mtime: 1700000000, permissions: '-rw-r--r--' },
+      { name: 'stamp_dir', is_dir: true, size: 0, mtime: 1700000100, permissions: 'drwxr-xr-x' }
+    ];
+    wfState.local.selection = new Set(['stamp.txt']);
+    window.openPaneContextMenu('local', { preventDefault() {}, clientX: 20, clientY: 20 });
+    check('#paneCtxDuplicateBtn is enabled for a single selected file',
+      doc.getElementById('paneCtxDuplicateBtn').disabled === false);
+    wfState.local.selection = new Set(['stamp_dir']);
+    window.openPaneContextMenu('local', { preventDefault() {}, clientX: 20, clientY: 20 });
+    check('#paneCtxDuplicateBtn is disabled when a directory is selected',
+      doc.getElementById('paneCtxDuplicateBtn').disabled === true);
+    window.closePaneContextMenu();
+    wfState.local.entries = prevWfLocalEntries;
+    wfState.focusPane = prevWfFocus;
+
+    // 19. Site & Folder Rename (`renameSite` & `renameSiteFolder` -> `/api/sessions/rename`).
+    const prevSessions = wfState.sessions.slice();
+    wfState.sessions = [
+      { name: 'Prod/web1', protocol: 'sftp', host: '10.0.0.5', port: 22, username: 'deploy' }
+    ];
+    wfState.selectedSite = 'Prod/web1';
+    window.renderSites();
+    check('renderSites renders folder rename button without breaking .site-folder delete count',
+      doc.querySelectorAll('#siteList .site-folder-rename').length === 1 &&
+      doc.querySelectorAll('#siteList .site-folder').length === 1);
+    responses['/api/sessions/rename'] = { success: true, name: 'Prod/web-primary', renamed: 1 };
+    const origPromptRen = window.prompt;
+    window.prompt = () => 'Prod/web-primary';
+    await window.renameSite();
+    const siteRenBody = JSON.parse(calls.filter(c => c.path === '/api/sessions/rename').pop().options.body);
+    check('renameSite posts old_name and new_name to /api/sessions/rename',
+      siteRenBody.old_name === 'Prod/web1' &&
+      siteRenBody.new_name === 'Prod/web-primary' &&
+      !siteRenBody.folder);
+    responses['/api/sessions/rename'] = { success: true, name: 'Staging', renamed: 1 };
+    window.prompt = () => 'Staging';
+    await window.renameSiteFolder('Prod');
+    window.prompt = origPromptRen;
+    const folderRenBody = JSON.parse(calls.filter(c => c.path === '/api/sessions/rename').pop().options.body);
+    check('renameSiteFolder posts folder=true to /api/sessions/rename',
+      folderRenBody.old_name === 'Prod' &&
+      folderRenBody.new_name === 'Staging' &&
+      folderRenBody.folder === true);
+    wfState.sessions = prevSessions;
+
+    // 20. Workspaces Rename (`renameWorkspace`) & `close_existing` (`#workspaceCloseExisting`).
+    responses['/api/workspaces'] = {
+      success: true,
+      file: '/tmp/workspaces.json',
+      workspaces: [{ name: 'ops', tab_count: 2, updated: 1700000500, tabs: [{ name: 'web1', site: 'Prod/web1' }] }]
+    };
+    responses['/api/workspaces/rename'] = { success: true, workspace: { name: 'ops-renamed', updated: 1700000600 } };
+    await window.openWorkspaces();
+    check('Workspaces modal keeps 1 row per workspace and renders Rename button + tab summary tooltip',
+      doc.getElementById('workspaceList').children.length === 1 &&
+      doc.getElementById('workspaceList').textContent.includes('Rename') &&
+      doc.querySelector('#workspaceList .site-item span').title.includes('Prod/web1'));
+    const origPromptWs = window.prompt;
+    window.prompt = () => 'ops-renamed';
+    await window.renameWorkspace('ops');
+    window.prompt = origPromptWs;
+    const wsRenBody = JSON.parse(calls.filter(c => c.path === '/api/workspaces/rename').pop().options.body);
+    check('renameWorkspace posts old_name and new_name to /api/workspaces/rename',
+      wsRenBody.old_name === 'ops' && wsRenBody.new_name === 'ops-renamed');
+    doc.getElementById('workspaceCloseExisting').checked = true;
+    responses['/api/workspaces/open'] = { success: true, opened: [{ name: 'web1', id: 9 }], failed: [] };
+    const origConfirmWs = window.confirm;
+    window.confirm = () => true;
+    await window.openWorkspace('ops');
+    await new Promise(resolve => setTimeout(resolve, 20));
+    window.confirm = origConfirmWs;
+    doc.getElementById('workspaceCloseExisting').checked = false;
+    const wsOpenCloseBody = JSON.parse(calls.filter(c => c.path === '/api/workspaces/open').pop().options.body);
+    check('openWorkspace forwards close_existing=true when #workspaceCloseExisting is checked',
+      wsOpenCloseBody.name === 'ops' && wsOpenCloseBody.close_existing === true);
+    window.closeModal('workspacesModal');
+
+    // 21. Synchronize Permissions (`#syncPermissions` + `#syncPermissionsOctal`).
+    wfState.tabs = [{ id: 1, name: 'box', connected: true, is_local: false }];
+    wfState.activeTab = 1;
+    window.openSynchronize();
+    doc.getElementById('syncPermissions').value = 'mode';
+    window.syncPermissionsChanged();
+    doc.getElementById('syncPermissionsOctal').value = '0750';
+    check('Selecting Custom octal mode in Synchronize reveals #syncPermissionsOctal',
+      doc.getElementById('syncPermissionsOctal').style.display !== 'none');
+    const syncPermSettings = window.syncSettings();
+    check('syncSettings includes octal permissions when #syncPermissions is "mode"',
+      syncPermSettings.permissions === '0750');
+    doc.getElementById('syncPermissions').value = '';
+    window.syncPermissionsChanged();
+    window.closeModal('syncModal');
     wfState.tabs = savedWfTabs;
     wfState.activeTab = savedWfActiveTab;
   }
