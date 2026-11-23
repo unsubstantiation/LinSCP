@@ -23199,7 +23199,7 @@ mod tests {
             if !svc.queue.has_unfinished_work() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         assert_eq!(session.bytes_of("/srv/validpkg/readme.txt").as_deref(), Some(b"hello".as_slice()));
         assert_eq!(session.bytes_of("/srv/validpkg/sub/data.txt").as_deref(), Some(b"world".as_slice()));
