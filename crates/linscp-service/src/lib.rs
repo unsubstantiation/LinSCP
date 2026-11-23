@@ -496,6 +496,8 @@ impl CommanderService {
             ("GET", "/api/vault/keys") => self.handle_vault_ssh_keys(),
             ("POST", "/api/vault/keys/import") => self.handle_vault_ssh_key_import(req.body),
             ("POST", "/api/vault/keys/delete") => self.handle_vault_ssh_key_delete(req.body),
+            ("GET", "/api/hostkeys") => self.handle_hostkeys_get(),
+            ("POST", "/api/hostkeys") => self.handle_hostkeys_post(req.body),
             ("GET", "/api/local/roots") => self.handle_local_roots(),
             ("GET", "/api/local/list") => self.handle_local_list(&query),
             ("GET", "/api/local/edit") => self.handle_local_edit_get(&query),
@@ -552,12 +554,14 @@ impl CommanderService {
             ("GET", "/api/shell/pending") => self.handle_shell_pending(),
             ("POST", "/api/shell/dismiss") => self.handle_shell_dismiss(req.body),
             ("GET", "/api/session/url") => self.handle_session_url(&query),
+            ("POST", "/api/session/url") => self.handle_session_url_post(req.body),
             ("GET", "/api/remote/transfer/targets") => self.handle_remote_transfer_targets(&query),
             ("POST", "/api/remote/mkdir") => self.handle_remote_mkdir(req.body),
             ("POST", "/api/remote/delete") => self.handle_remote_delete(req.body),
             ("POST", "/api/remote/rename") => self.handle_remote_rename(req.body),
             ("POST", "/api/remote/copy") => self.handle_remote_copy(req.body),
             ("POST", "/api/remote/link") => self.handle_remote_link(req.body),
+            ("POST", "/api/remote/save") => self.handle_remote_save(req.body),
             ("POST", "/api/remote/properties") => self.handle_remote_properties(req.body),
             ("POST", "/api/remote/rights") => self.handle_remote_rights(req.body),
             ("POST", "/api/remote/checksum") => self.handle_remote_checksum(req.body),
@@ -3671,6 +3675,7 @@ impl CommanderService {
         if content.len() as u64 > ops::MAX_GUI_EDIT_BYTES {
             return api_error(400, "Edited content is too large for the built-in editor.");
         }
+        let create_only = body.get("create_only").and_then(Value::as_bool).unwrap_or(false);
         let expected = body.get("base_mtime").and_then(Value::as_i64);
         let existing = match session.stat(&path).await {
             Ok(entry) => entry,
@@ -3679,6 +3684,16 @@ impl CommanderService {
         if let Some(entry) = existing.as_ref() {
             if entry.is_dir { return api_error(400, "Cannot overwrite a directory.") }
             if entry.is_symlink { return api_error(400, "Refusing to overwrite a symbolic link from the editor.") }
+            if create_only {
+                return ApiReply {
+                    status: 409,
+                    payload: json!({
+                        "success": false,
+                        "exists": true,
+                        "error": "A file with that name already exists.",
+                    }),
+                };
+            }
             if let Some(expected) = expected.filter(|seconds| *seconds > 0) {
                 if entry.mtime != expected {
                     return api_error(400, "The file changed while it was open in the editor; reload before saving.");
@@ -4713,6 +4728,170 @@ impl CommanderService {
                 "error": "The encrypted SSH key was deleted, but some metadata could not be removed."}) };
         }
         ApiReply { status: 200, payload: json!({"success": true, "deleted": true}) }
+    }
+
+    fn hostkey_entries_json(cache: &linscp_engine::hostkeys::HostKeyCache) -> Vec<Value> {
+        cache
+            .entries()
+            .iter()
+            .map(|entry| {
+                let (host, port) = match entry.host_port.rsplit_once('@') {
+                    Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(22)),
+                    None => (entry.host_port.clone(), 22u16),
+                };
+                json!({
+                    "host_port": entry.host_port,
+                    "host": host,
+                    "port": port,
+                    "key_type": entry.key_type,
+                    "fingerprint": entry.key,
+                    "pin": format!("{} {}", entry.key_type, entry.key),
+                })
+            })
+            .collect()
+    }
+
+    fn handle_hostkeys_get(&self) -> ApiReply {
+        let config_root = self.config_root();
+        match self.secret_vault.status(&config_root) {
+            Ok("unlocked") => {}
+            Ok(_) => return api_error(423, "Unlock the local vault before managing SSH host keys."),
+            Err(error) => return api_error(500, error.to_string()),
+        }
+        let path = config_root.join("sshhostkeys");
+        match linscp_engine::hostkeys::HostKeyCache::load_protected(&path, self.secret_vault.as_ref()) {
+            Ok(cache) => ApiReply {
+                status: 200,
+                payload: json!({"success": true, "entries": Self::hostkey_entries_json(&cache)}),
+            },
+            Err(error) => api_error(500, error),
+        }
+    }
+
+    fn handle_hostkeys_post(&self, body: Value) -> ApiReply {
+        let _guard = self.session_key_lock.lock().expect("session key lock");
+        let config_root = self.config_root();
+        match self.secret_vault.status(&config_root) {
+            Ok("unlocked") => {}
+            Ok(_) => return api_error(423, "Unlock the local vault before managing SSH host keys."),
+            Err(error) => return api_error(500, error.to_string()),
+        }
+        let path = config_root.join("sshhostkeys");
+        let mut cache = match linscp_engine::hostkeys::HostKeyCache::load_protected(&path, self.secret_vault.as_ref()) {
+            Ok(cache) => cache,
+            Err(error) => return api_error(500, error),
+        };
+        let action = body.get("action").and_then(Value::as_str).unwrap_or("");
+        match action {
+            "add" => {
+                let host = body.get("host").and_then(Value::as_str).unwrap_or("").trim();
+                if host.is_empty()
+                    || host.contains('@')
+                    || host.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    return api_error(400, "Enter a valid SSH host name.");
+                }
+                let port = match body.get("port") {
+                    None | Some(Value::Null) => 22u16,
+                    Some(Value::Number(n)) => match n.as_u64().and_then(|v| u16::try_from(v).ok()) {
+                        Some(p) if p > 0 => p,
+                        _ => return api_error(400, "Port must be between 1 and 65535."),
+                    },
+                    Some(Value::String(s)) if s.trim().is_empty() => 22u16,
+                    Some(Value::String(s)) => match s.trim().parse::<u16>() {
+                        Ok(p) if p > 0 => p,
+                        _ => return api_error(400, "Port must be between 1 and 65535."),
+                    },
+                    _ => return api_error(400, "Port must be between 1 and 65535."),
+                };
+                let mut key_type = body
+                    .get("key_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let raw_fp = body
+                    .get("fingerprint")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let fingerprint = if let Some((kt, fp)) = raw_fp.split_once(char::is_whitespace) {
+                    if key_type.is_empty() {
+                        key_type = kt.trim().to_string();
+                    }
+                    fp.trim()
+                } else {
+                    raw_fp
+                };
+                if key_type.is_empty()
+                    || key_type.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    return api_error(400, "Enter a valid SSH host key algorithm (e.g. ssh-ed25519).");
+                }
+                if fingerprint.is_empty()
+                    || fingerprint == "*"
+                    || fingerprint.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    return api_error(400, "Enter a valid SSH host key fingerprint.");
+                }
+                if let Err(error) = cache.upsert(host, port, &key_type, fingerprint) {
+                    return api_error(400, error);
+                }
+                if let Err(error) = cache.save_protected(&path, self.secret_vault.as_ref()) {
+                    return api_error(500, error);
+                }
+                ApiReply {
+                    status: 200,
+                    payload: json!({"success": true, "entries": Self::hostkey_entries_json(&cache)}),
+                }
+            }
+            "delete" => {
+                let host_port = if let Some(hp) = body
+                    .get("host_port")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    hp.to_ascii_lowercase()
+                } else {
+                    let host = body.get("host").and_then(Value::as_str).unwrap_or("").trim();
+                    let port = body
+                        .get("port")
+                        .and_then(Value::as_u64)
+                        .and_then(|v| u16::try_from(v).ok())
+                        .unwrap_or(22);
+                    if host.is_empty() {
+                        return api_error(400, "Specify host_port and key_type to delete.");
+                    }
+                    linscp_engine::hostkeys::format_host_port_key(host, port)
+                };
+                let key_type = body.get("key_type").and_then(Value::as_str).unwrap_or("").trim();
+                if key_type.is_empty() {
+                    return api_error(400, "Specify host_port and key_type to delete.");
+                }
+                if !cache.remove(&host_port, key_type) {
+                    return api_error(404, "Cached SSH host key not found.");
+                }
+                if let Err(error) = cache.save_protected(&path, self.secret_vault.as_ref()) {
+                    return api_error(500, error);
+                }
+                ApiReply {
+                    status: 200,
+                    payload: json!({"success": true, "entries": Self::hostkey_entries_json(&cache)}),
+                }
+            }
+            "clear" => {
+                cache.clear();
+                if let Err(error) = cache.save_protected(&path, self.secret_vault.as_ref()) {
+                    return api_error(500, error);
+                }
+                ApiReply {
+                    status: 200,
+                    payload: json!({"success": true, "entries": []}),
+                }
+            }
+            _ => api_error(400, "Unsupported host-key action; expected add, delete or clear."),
+        }
     }
 
     fn handle_vault_ssh_key_import(&self, mut body: Value) -> ApiReply {
@@ -5885,7 +6064,13 @@ impl CommanderService {
         let value: Value = serde_json::from_str(&text)
             .map_err(|e| format!("Invalid {}: {e}", path.display()))?;
         let valid = match kind {
-            "bookmarks" => value.is_object() && ["local", "remote"].iter().all(|key| value.get(*key).is_some_and(Value::is_array)),
+            "bookmarks" => {
+                value.is_object()
+                    && ["local", "remote"]
+                        .iter()
+                        .all(|key| value.get(*key).is_some_and(Value::is_array))
+                    && value.get("both").is_none_or(Value::is_array)
+            }
             "workspaces" => value.is_object() && value.get("workspaces").is_some_and(Value::is_object),
             _ => false,
         };
@@ -5898,7 +6083,9 @@ impl CommanderService {
         let path = cfg.join("bookmarks.json");
         let data = match Self::read_json_store(&path, json!({"local": [], "remote": []}), "bookmarks") { Ok(data) => data, Err(e) => return api_error(500, e) };
         if let Some(side) = query.get("side") {
-            if side != "local" && side != "remote" { return ApiReply{ status: 400, payload: json!({"success": false, "error": "side must be local or remote"})}; }
+            if !matches!(side.as_str(), "local" | "remote" | "both") {
+                return ApiReply{ status: 400, payload: json!({"success": false, "error": "side must be local, remote or both"})};
+            }
             let arr = data.get(side).cloned().unwrap_or(json!([]));
             ApiReply{ status: 200, payload: json!({"success": true, "bookmarks": arr, "file": path.to_string_lossy()})}
         } else {
@@ -5911,7 +6098,12 @@ impl CommanderService {
         let next = body.get("bookmarks").cloned().unwrap_or(body.clone());
         let path = cfg.join("bookmarks.json");
         if let Err(e) = Self::read_json_store(&path, json!({"local": [], "remote": []}), "bookmarks") { return api_error(500, e); }
-        if !next.is_object() || !["local", "remote"].iter().all(|key| next.get(*key).is_some_and(Value::is_array)) { return api_error(400, "Invalid bookmarks structure."); }
+        if !next.is_object()
+            || !["local", "remote"].iter().all(|key| next.get(*key).is_some_and(Value::is_array))
+            || !next.get("both").is_none_or(Value::is_array)
+        {
+            return api_error(400, "Invalid bookmarks structure.");
+        }
         let bytes = serde_json::to_vec_pretty(&next).unwrap_or_default();
         if let Err(e) = write_private_file_atomic(&path, &bytes) {
             return ApiReply{ status: 500, payload: json!({"success": false, "error": e.to_string()})};
@@ -5920,27 +6112,75 @@ impl CommanderService {
     }
     fn handle_bookmarks_save(&self, body: Value) -> ApiReply {
         let side = body.get("side").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let bm_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if side != "local" && side != "remote" { return ApiReply{ status: 400, payload: json!({"success": false, "error": "side must be local or remote"})}; }
-        if name.is_empty() || bm_path.is_empty() { return ApiReply{ status: 400, payload: json!({"success": false, "error": "name and path required"})}; }
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let old_name = body
+            .get("old_name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        if !matches!(side.as_str(), "local" | "remote" | "both") {
+            return ApiReply{ status: 400, payload: json!({"success": false, "error": "side must be local, remote or both"})};
+        }
+        if name.is_empty() || name.chars().any(char::is_control) {
+            return ApiReply{ status: 400, payload: json!({"success": false, "error": "A valid bookmark name is required"})};
+        }
+        let entry_json = if side == "both" {
+            let local_path = body.get("local_path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let remote_path = body.get("remote_path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            if local_path.is_empty()
+                || remote_path.is_empty()
+                || local_path.chars().any(char::is_control)
+                || remote_path.chars().any(char::is_control)
+            {
+                return ApiReply{ status: 400, payload: json!({"success": false, "error": "Both local_path and remote_path are required"})};
+            }
+            json!({"name": name, "local_path": local_path, "remote_path": remote_path})
+        } else {
+            let bm_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if bm_path.is_empty() || bm_path.chars().any(char::is_control) {
+                return ApiReply{ status: 400, payload: json!({"success": false, "error": "name and path required"})};
+            }
+            json!({"name": name, "path": bm_path})
+        };
         let cfg = self.state.lock().expect("m").config_root.clone();
         let file = cfg.join("bookmarks.json");
         let mut data = match Self::read_json_store(&file, json!({"local": [], "remote": []}), "bookmarks") { Ok(data) => data, Err(e) => return api_error(500, e) };
         if !data.is_object() { data = json!({"local": [], "remote": []}); }
-        let arr = data.get_mut(&side).and_then(|v| v.as_array_mut());
-        if let Some(a) = arr {
-            a.retain(|e| e.get("name").and_then(|v| v.as_str()).unwrap_or("") != name);
-            a.push(json!({"name": name, "path": bm_path}));
+        if data.get(&side).is_none() {
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert(side.clone(), json!([]));
+            }
+        }
+        if let Some(a) = data.get_mut(&side).and_then(|v| v.as_array_mut()) {
+            if let Some(ref prev) = old_name {
+                if prev != &name {
+                    a.retain(|e| e.get("name").and_then(|v| v.as_str()).unwrap_or("") != name);
+                }
+                if let Some(existing) = a
+                    .iter_mut()
+                    .find(|e| e.get("name").and_then(|v| v.as_str()).unwrap_or("") == prev)
+                {
+                    *existing = entry_json.clone();
+                } else {
+                    a.push(entry_json.clone());
+                }
+            } else {
+                a.retain(|e| e.get("name").and_then(|v| v.as_str()).unwrap_or("") != name);
+                a.push(entry_json.clone());
+            }
         }
         let bytes = serde_json::to_vec_pretty(&data).unwrap_or_default();
         if let Err(e) = write_private_file_atomic(&file, &bytes) {
             return ApiReply{ status: 500, payload: json!({"success": false, "error": e.to_string()})};
         }
-        ApiReply{ status: 200, payload: json!({"success": true, "bookmark": json!({"name": name, "path": bm_path}), "file": file.to_string_lossy()})}
+        ApiReply{ status: 200, payload: json!({"success": true, "bookmark": entry_json, "file": file.to_string_lossy()})}
     }
     fn handle_bookmarks_delete(&self, body: Value) -> ApiReply {
         let side = body.get("side").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !matches!(side.as_str(), "local" | "remote" | "both") {
+            return ApiReply{ status: 400, payload: json!({"success": false, "error": "side must be local, remote or both"})};
+        }
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let cfg = self.state.lock().expect("m").config_root.clone();
         let file = cfg.join("bookmarks.json");
@@ -6841,12 +7081,25 @@ impl CommanderService {
                     })
                     .map(|v| (v as i128) * 1_000_000_000)
             });
+        let create_only = body.get("create_only").and_then(Value::as_bool).unwrap_or(false);
         // A granted document writes through the bridge; a plain path keeps
         // the direct writer and its permission-bit recovery.
         if is_saf_path(&resolved) {
+            if create_only && self.local_fs.stat(&resolved).is_ok() {
+                return ApiReply {
+                    status: 409,
+                    payload: json!({"success": false, "exists": true, "error": "A file with that name already exists."}),
+                };
+            }
             return match ops::write_local_text_file_via_fs_encoded(self.local_fs.as_ref(), &resolved, &content, mtime_ns, encoding_opt, eol_opt, include_bom) {
                 Ok(info) => ApiReply{ status: 200, payload: json!({"success": true, "info": info})},
                 Err(error) => ApiReply{ status: 400, payload: json!({"success": false, "error": error})},
+            };
+        }
+        if create_only && std::fs::symlink_metadata(&resolved).is_ok() {
+            return ApiReply {
+                status: 409,
+                payload: json!({"success": false, "exists": true, "error": "A file with that name already exists."}),
             };
         }
         match ops::write_local_text_file_encoded(Path::new(&resolved), &content, mtime_ns, encoding_opt, eol_opt, include_bom) {
@@ -8279,12 +8532,60 @@ impl CommanderService {
         let g = self.state.lock().expect("m");
         let tab = tab_id.and_then(|id| g.tabs.get(&id).cloned()).or_else(|| g.tabs.values().next().cloned());
         if let Some(t) = tab {
+            if t.is_local {
+                return api_error(400, "A local tab has no session URL.");
+            }
             if let Some(spec) = t.spec {
-                let url = tabs::format_session_url(&spec, None);
-                return ApiReply{ status: 200, payload: json!({"success": true, "url": url})};
+                let has_password = spec
+                    .session
+                    .password
+                    .as_deref()
+                    .is_some_and(|pw| !pw.is_empty());
+                let want_password = matches!(
+                    query.get("password").map(String::as_str),
+                    Some("1" | "true")
+                );
+                let include_password = want_password && has_password;
+                let dir_override = if !t.remote_dir.is_empty() {
+                    Some(t.remote_dir.as_str())
+                } else {
+                    None
+                };
+                let clean_url = tabs::format_session_url(&spec, dir_override);
+                let url = tabs::format_session_url_with_options(&spec, dir_override, include_password);
+                return ApiReply {
+                    status: 200,
+                    payload: json!({
+                        "success": true,
+                        "url": url,
+                        "open_command": format!("open {clean_url}"),
+                        "path": t.remote_dir,
+                        "include_password": include_password,
+                        "has_password": has_password,
+                        "protocol": spec.session.protocol.as_str(),
+                        "host": spec.session.host,
+                    }),
+                };
             }
         }
         ApiReply{ status: 400, payload: json!({"success": false, "error": "No such tab"})}
+    }
+
+    fn handle_session_url_post(&self, body: Value) -> ApiReply {
+        let raw_url = body.get("url").and_then(Value::as_str).unwrap_or("").trim();
+        if raw_url.is_empty() {
+            return api_error(400, "Enter a session URL.");
+        }
+        match linscp_engine::url_and_raw::parse_site_url(raw_url) {
+            Ok(spec) => ApiReply {
+                status: 200,
+                payload: json!({
+                    "success": true,
+                    "session": tabs::parsed_spec_to_gui_json(&spec),
+                }),
+            },
+            Err(error) => api_error(400, error),
+        }
     }
     fn handle_remote_transfer_targets(&self, query: &BTreeMap<String,String>) -> ApiReply {
         let tab_id = query.get("tab").and_then(|s| parse_tab_id_str(Some(s)));
@@ -8460,9 +8761,30 @@ impl CommanderService {
         };
         self.compute_local_checksums_in_dir(&checked_base, &body)
     }
-    // The editor's save is answered in `dispatch_async`; without a session
-    // there is no remote path to write to.
-    fn handle_remote_save(&self, _body: Value) -> ApiReply { api_error(400, "Not connected") }
+    // The editor's remote save is answered in `dispatch_async`, while a
+    // dual-local tab resolves its right pane synchronously.
+    fn handle_remote_save(&self, body: Value) -> ApiReply {
+        let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else {
+            return api_error(400, "Not connected");
+        };
+        let Some(tab) = self.state.lock().expect("m").tabs.get(&id).cloned() else {
+            return api_error(400, "Not connected");
+        };
+        if !tab.connected || !tab.is_local {
+            return api_error(400, "Not connected");
+        }
+        let raw_path = body.get("path").and_then(Value::as_str).unwrap_or("");
+        let resolved = match resolve_editor_local_path(&tab.other_local_dir, raw_path) {
+            Ok(resolved) => resolved,
+            Err(error) => return api_error(400, error),
+        };
+        let mut local_body = body;
+        local_body["path"] = json!(resolved);
+        if let Some(obj) = local_body.as_object_mut() {
+            obj.remove("tab");
+        }
+        self.handle_local_save(local_body)
+    }
     fn handle_remote_copy(&self, body: Value) -> ApiReply {
         let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else {
             return api_error(400, "Not connected");
@@ -8564,7 +8886,26 @@ impl CommanderService {
             Err(error) => api_error(400, error.to_string()),
         }
     }
-    fn handle_remote_link(&self, _body: Value) -> ApiReply { api_error(501, "Symbolic links can be created only over SFTP or SCP/SSH.") }
+    fn handle_remote_link(&self, body: Value) -> ApiReply {
+        let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else {
+            return api_error(400, "Not connected");
+        };
+        let Some(tab) = self.state.lock().expect("m").tabs.get(&id).cloned() else {
+            return api_error(400, "Not connected");
+        };
+        if !tab.connected {
+            return api_error(400, "Not connected");
+        }
+        if tab.is_local {
+            let target = body.get("target").and_then(Value::as_str).unwrap_or("");
+            let name = body.get("name").and_then(Value::as_str).unwrap_or("");
+            return match create_local_link(&tab.other_local_dir, target, name) {
+                Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
+                Err(error) => api_error(400, error),
+            };
+        }
+        api_error(501, "Symbolic links can be created only over SFTP or SCP/SSH.")
+    }
     fn handle_sync_preview(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
     fn handle_sync_run(&self, body: Value) -> ApiReply { ApiReply{ status:400, payload: json!({"success": false, "error": "Not connected"})}}
     fn handle_transfer_upload(&self, _body: Value) -> ApiReply { Self::not_implemented() }
@@ -20254,5 +20595,281 @@ mod tests {
             session.bytes_of("/sync_remote/skip.txt").as_deref(),
             Some(b"leave me pending".as_slice())
         );
+    }
+
+    #[tokio::test]
+    async fn hostkeys_session_url_paired_bookmarks_and_create_only_save_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_dir = tmp.path().join("cfg");
+        let left_dir = tmp.path().join("left");
+        let right_dir = tmp.path().join("right");
+        std::fs::create_dir_all(&left_dir).unwrap();
+        std::fs::create_dir_all(&right_dir).unwrap();
+        std::fs::write(left_dir.join("existing.txt"), b"keep").unwrap();
+        std::fs::write(right_dir.join("right_existing.txt"), b"keep-right").unwrap();
+
+        let svc = CommanderService::new(cfg_dir, Arc::new(NativeLocalFs::new()));
+
+        // 1. `/api/hostkeys` requires an unlocked vault, then adds, lists, deletes, and clears entries.
+        let locked = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/hostkeys".into(),
+            body: json!({}),
+        });
+        assert_eq!(locked.status, 423, "{}", locked.payload);
+        unlock_for_test(&svc);
+
+        let added = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/hostkeys".into(),
+            body: json!({
+                "action": "add",
+                "host": "Prod.Example.Test",
+                "port": 2222,
+                "key_type": "ssh-ed25519",
+                "fingerprint": "SHA256:TestKeyFp123",
+            }),
+        });
+        assert_eq!(added.status, 200, "{}", added.payload);
+        assert_eq!(added.payload["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(added.payload["entries"][0]["host_port"], "prod.example.test@2222");
+        assert_eq!(
+            added.payload["entries"][0]["pin"],
+            "ssh-ed25519 SHA256:TestKeyFp123"
+        );
+
+        let listed = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/hostkeys".into(),
+            body: json!({}),
+        });
+        assert_eq!(listed.status, 200);
+        assert_eq!(listed.payload["entries"].as_array().unwrap().len(), 1);
+
+        let deleted = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/hostkeys".into(),
+            body: json!({
+                "action": "delete",
+                "host_port": "prod.example.test@2222",
+                "key_type": "ssh-ed25519",
+            }),
+        });
+        assert_eq!(deleted.status, 200, "{}", deleted.payload);
+        assert!(deleted.payload["entries"].as_array().unwrap().is_empty());
+
+        // 2. `GET /api/session/url` (`password=0` vs `password=1` + live `remote_dir`) and `POST /api/session/url`.
+        let session = Arc::new(MockSession::new());
+        session.add_file("/srv/app/existing.txt", b"remote-keep");
+        let parsed_spec = linscp_engine::url_and_raw::parse_site_url(
+            "sftp://deploy:secret%20pw@box.example.test:2222/home/deploy",
+        )
+        .unwrap();
+        let tab = TabRuntime {
+            id: 41,
+            name: "box".to_string(),
+            site_name: None,
+            is_local: false,
+            connected: true,
+            local_dir: left_dir.to_string_lossy().into_owned(),
+            remote_dir: "/srv/app".to_string(),
+            other_local_dir: String::new(),
+            observed_hostkey: String::new(),
+            hostkey_role: "destination".to_string(),
+            hostkey_changed: false,
+            error: String::new(),
+            spec: Some(parsed_spec),
+            session_json: json!({"protocol": "sftp"}),
+            remote: Some(session.clone()),
+        };
+        svc.state.lock().expect("state mutex").tabs.insert(41, tab);
+
+        let url_no_pw = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/session/url?tab=41&password=0".into(),
+            body: json!({}),
+        });
+        assert_eq!(url_no_pw.status, 200, "{}", url_no_pw.payload);
+        assert_eq!(
+            url_no_pw.payload["url"],
+            "sftp://deploy@box.example.test:2222/srv/app"
+        );
+        assert_eq!(url_no_pw.payload["has_password"], true);
+        assert_eq!(url_no_pw.payload["include_password"], false);
+        assert_eq!(
+            url_no_pw.payload["open_command"],
+            "open sftp://deploy@box.example.test:2222/srv/app"
+        );
+
+        let url_with_pw = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/session/url?tab=41&password=1".into(),
+            body: json!({}),
+        });
+        assert_eq!(url_with_pw.status, 200, "{}", url_with_pw.payload);
+        assert_eq!(
+            url_with_pw.payload["url"],
+            "sftp://deploy:secret%20pw@box.example.test:2222/srv/app"
+        );
+        assert_eq!(url_with_pw.payload["include_password"], true);
+
+        let parsed_url = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/session/url".into(),
+            body: json!({"url": "ftpes://alice:top%20secret@ftp.example.test:2121/pub/docs"}),
+        });
+        assert_eq!(parsed_url.status, 200, "{}", parsed_url.payload);
+        assert_eq!(parsed_url.payload["session"]["protocol"], "ftpes");
+        assert_eq!(parsed_url.payload["session"]["host"], "ftp.example.test");
+        assert_eq!(parsed_url.payload["session"]["port"], 2121);
+        assert_eq!(parsed_url.payload["session"]["username"], "alice");
+        assert_eq!(parsed_url.payload["session"]["password"], "top secret");
+        assert_eq!(parsed_url.payload["session"]["ftps"], "explicit");
+        assert_eq!(parsed_url.payload["session"]["initial_dir"], "/pub/docs");
+
+        // 3. Paired bookmarks (`side: "both"`) and `old_name` atomic rename.
+        let save_pair = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/bookmarks/save".into(),
+            body: json!({
+                "side": "both",
+                "name": "release-pair",
+                "local_path": "/srv/build",
+                "remote_path": "/var/www/html",
+            }),
+        });
+        assert_eq!(save_pair.status, 200, "{}", save_pair.payload);
+
+        let rename_pair = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/bookmarks/save".into(),
+            body: json!({
+                "side": "both",
+                "old_name": "release-pair",
+                "name": "prod-pair",
+                "local_path": "/srv/build",
+                "remote_path": "/var/www/html",
+            }),
+        });
+        assert_eq!(rename_pair.status, 200, "{}", rename_pair.payload);
+
+        let get_pairs = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/bookmarks?side=both".into(),
+            body: json!({}),
+        });
+        assert_eq!(get_pairs.status, 200);
+        assert_eq!(get_pairs.payload["bookmarks"].as_array().unwrap().len(), 1);
+        assert_eq!(get_pairs.payload["bookmarks"][0]["name"], "prod-pair");
+
+        let del_pair = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/bookmarks/delete".into(),
+            body: json!({"side": "both", "name": "prod-pair"}),
+        });
+        assert_eq!(del_pair.status, 200);
+
+        // 4. `create_only: true` refuses clobbering existing files with 409, creates new files,
+        //    and dual-local tabs support synchronous `/api/remote/save` (+ Unix `/api/remote/link`).
+        let conflict_local = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/save".into(),
+            body: json!({
+                "tab": 41,
+                "path": left_dir.join("existing.txt").to_string_lossy(),
+                "content": "clobber",
+                "create_only": true,
+            }),
+        });
+        assert_eq!(conflict_local.status, 409, "{}", conflict_local.payload);
+        assert_eq!(conflict_local.payload["exists"], true);
+        assert_eq!(std::fs::read(left_dir.join("existing.txt")).unwrap(), b"keep");
+
+        let created_local = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/local/save".into(),
+            body: json!({
+                "tab": 41,
+                "path": left_dir.join("brand_new.txt").to_string_lossy(),
+                "content": "fresh local\n",
+                "create_only": true,
+            }),
+        });
+        assert_eq!(created_local.status, 200, "{}", created_local.payload);
+        assert_eq!(
+            std::fs::read(left_dir.join("brand_new.txt")).unwrap(),
+            b"fresh local\n"
+        );
+
+        let conflict_remote = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/remote/save".into(),
+                body: json!({
+                    "tab": 41,
+                    "path": "/srv/app/existing.txt",
+                    "content": "clobber",
+                    "create_only": true,
+                }),
+            })
+            .await;
+        assert_eq!(conflict_remote.status, 409, "{}", conflict_remote.payload);
+        assert_eq!(conflict_remote.payload["exists"], true);
+
+        let created_remote = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/remote/save".into(),
+                body: json!({
+                    "tab": 41,
+                    "path": "/srv/app/new_remote.txt",
+                    "content": "fresh remote\n",
+                    "create_only": true,
+                }),
+            })
+            .await;
+        assert_eq!(created_remote.status, 200, "{}", created_remote.payload);
+        assert_eq!(
+            session.bytes_of("/srv/app/new_remote.txt").as_deref(),
+            Some(b"fresh remote\n".as_slice())
+        );
+
+        let open_local_tab = svc.create_local_tab(
+            left_dir.to_string_lossy().into_owned(),
+            right_dir.to_string_lossy().into_owned(),
+        );
+        assert_eq!(open_local_tab.status, 200, "{}", open_local_tab.payload);
+        let dual_id = open_local_tab.payload["tab"]["id"].as_u64().unwrap();
+
+        let dual_save = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/remote/save".into(),
+            body: json!({
+                "tab": dual_id,
+                "path": "dual_created.txt",
+                "content": "right pane save",
+                "create_only": true,
+            }),
+        });
+        assert_eq!(dual_save.status, 200, "{}", dual_save.payload);
+        assert_eq!(
+            std::fs::read(right_dir.join("dual_created.txt")).unwrap(),
+            b"right pane save"
+        );
+
+        #[cfg(unix)]
+        {
+            let dual_link = svc.dispatch(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/remote/link".into(),
+                body: json!({
+                    "tab": dual_id,
+                    "target": "dual_created.txt",
+                    "name": "dual_alias.txt",
+                }),
+            });
+            assert_eq!(dual_link.status, 200, "{}", dual_link.payload);
+            assert!(right_dir.join("dual_alias.txt").symlink_metadata().unwrap().file_type().is_symlink());
+        }
     }
 }
