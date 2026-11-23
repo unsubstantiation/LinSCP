@@ -744,6 +744,38 @@ impl QueueManager {
         ok
     }
 
+    pub fn retry_all_failed(&self) -> usize {
+        let mut count = 0usize;
+        {
+            let mut g = self.inner.lock().expect("queue mutex");
+            for t in &mut g.tasks {
+                if t.status == "failed" || t.status == "cancelled" {
+                    if let QueueJob::RemoteUpload {
+                        cleanup_path: Some(ref p),
+                        ..
+                    } = t.job
+                    {
+                        if !p.exists() {
+                            continue;
+                        }
+                    }
+                    t.status = "queued".to_string();
+                    t.bytes_done = 0;
+                    t.speed_bps = 0;
+                    t.error = None;
+                    t.cancel_flag = Arc::new(AtomicBool::new(false));
+                    count += 1;
+                }
+            }
+        }
+        if count > 0 {
+            self.broadcast_snapshot();
+            self.ensure_worker_running();
+            self.notify.notify_waiters();
+        }
+        count
+    }
+
     pub fn prioritize(&self, id: u64, action: &str) -> bool {
         let mut g = self.inner.lock().expect("queue mutex");
         let Some(idx) = g

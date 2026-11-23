@@ -3,7 +3,73 @@
 
 use std::path::Path;
 
+use base64::engine::general_purpose::{STANDARD as BASE64, STANDARD_NO_PAD as BASE64_NO_PAD};
+use base64::Engine as _;
 use linscp_platform::write_private_file_atomic;
+
+const MAX_KNOWN_HOSTS_BYTES: usize = 2 * 1024 * 1024;
+const KNOWN_SSH_KEY_TYPES: &[&str] = &[
+    "ssh-ed25519",
+    "ssh-rsa",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "sk-ssh-ed25519@openssh.com",
+    "sk-ecdsa-sha2-nistp256@openssh.com",
+];
+
+fn parse_known_hosts_host_token(token: &str) -> Option<(&str, u16)> {
+    let t = token.trim();
+    if t.is_empty()
+        || t.starts_with('!')
+        || t.contains('*')
+        || t.contains('?')
+        || t.contains('@')
+        || has_unsafe_token_char(t)
+    {
+        return None;
+    }
+    if let Some(rest) = t.strip_prefix('[') {
+        if let Some((host, port_str)) = rest.split_once("]:") {
+            let port = port_str.parse::<u16>().ok().filter(|&p| p > 0)?;
+            if host.is_empty() || host.contains('[') || host.contains(']') || has_unsafe_token_char(host) {
+                return None;
+            }
+            return Some((host, port));
+        }
+        if let Some(host) = rest.strip_suffix(']') {
+            if host.is_empty() || host.contains('[') || host.contains(']') || has_unsafe_token_char(host) {
+                return None;
+            }
+            return Some((host, 22));
+        }
+        return None;
+    }
+    if t.contains('[') || t.contains(']') {
+        return None;
+    }
+    Some((t, 22))
+}
+
+fn openssh_blob_sha256_fingerprint(key_type: &str, b64_blob: &str) -> Option<String> {
+    if !KNOWN_SSH_KEY_TYPES.contains(&key_type) {
+        return None;
+    }
+    let decoded = BASE64
+        .decode(b64_blob)
+        .or_else(|_| BASE64_NO_PAD.decode(b64_blob.trim_end_matches('=')))
+        .ok()?;
+    let kt_bytes = key_type.as_bytes();
+    if decoded.len() < 4 + kt_bytes.len() + 4 {
+        return None;
+    }
+    let header_len = u32::from_be_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]) as usize;
+    if header_len != kt_bytes.len() || &decoded[4..4 + kt_bytes.len()] != kt_bytes {
+        return None;
+    }
+    let digest = linscp_crypto::digests::sha256_bytes(&decoded);
+    Some(format!("SHA256:{}", BASE64_NO_PAD.encode(digest)))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedHostKeyEntry {
@@ -139,6 +205,59 @@ impl HostKeyCache {
         self.entries.clear();
     }
 
+    /// Imports plain OpenSSH `known_hosts` lines into the cache, returning
+    /// `(imported_entries, skipped_items)`. Hashed (`|1|...`), wildcard,
+    /// `@cert-authority`, `@revoked`, and malformed entries are skipped safely.
+    pub fn import_openssh_known_hosts(&mut self, text: &str) -> Result<(usize, usize), String> {
+        if text.len() > MAX_KNOWN_HOSTS_BYTES {
+            return Err("known_hosts file is too large (limit 2 MiB).".to_string());
+        }
+        if text.contains('\0') {
+            return Err("known_hosts content contains NUL bytes.".to_string());
+        }
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let Some(first) = parts.next() else {
+                continue;
+            };
+            if first.starts_with('@') {
+                skipped += 1;
+                continue;
+            }
+            let hosts_field = first;
+            let (Some(key_type), Some(b64_blob)) = (parts.next(), parts.next()) else {
+                skipped += 1;
+                continue;
+            };
+            if hosts_field.starts_with('|') {
+                skipped += 1;
+                continue;
+            }
+            let Some(fingerprint) = openssh_blob_sha256_fingerprint(key_type, b64_blob) else {
+                skipped += 1;
+                continue;
+            };
+            for token in hosts_field.split(',') {
+                let Some((host, port)) = parse_known_hosts_host_token(token) else {
+                    skipped += 1;
+                    continue;
+                };
+                if self.upsert(host, port, key_type, &fingerprint).is_ok() {
+                    imported += 1;
+                } else {
+                    skipped += 1;
+                }
+            }
+        }
+        Ok((imported, skipped))
+    }
+
     pub fn serialize(&self) -> String {
         let mut out = String::new();
         for entry in &self.entries {
@@ -182,5 +301,41 @@ mod tests {
             reparsed.lookup("prod.example.com", 2222, "ssh-ed25519"),
             None
         );
+    }
+
+    #[test]
+    fn import_openssh_known_hosts_parses_hosts_ports_and_skips_hashed_or_revoked() {
+        let ed_blob = "AAAAC3NzaC1lZDI1NTE5AAAAIAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g";
+        let expected_fp = "SHA256:mKqU+0K8OhKmA8bBQi9Rz0Q5l7/g160hIP+rJYSTNj4";
+        let sample = format!(
+            "# OpenSSH known_hosts sample\n\
+             Git.Example.com,[git.example.com]:2222,[::1]:2200 ssh-ed25519 {ed_blob} deploy@ws\n\
+             |1|F1E2D3C4=|A1B2C3D4= ssh-ed25519 {ed_blob}\n\
+             @revoked bad.example.com ssh-ed25519 {ed_blob}\n\
+             *.wildcard.example.com,plain.example.com ssh-ed25519 {ed_blob}\n\
+             mismatch.example.com ssh-rsa {ed_blob}\n"
+        );
+        let mut cache = HostKeyCache::new();
+        let (imported, skipped) = cache.import_openssh_known_hosts(&sample).unwrap();
+        assert_eq!(imported, 4);
+        assert_eq!(skipped, 4);
+        assert_eq!(
+            cache.lookup("git.example.com", 22, "ssh-ed25519"),
+            Some(expected_fp)
+        );
+        assert_eq!(
+            cache.lookup("git.example.com", 2222, "ssh-ed25519"),
+            Some(expected_fp)
+        );
+        assert_eq!(
+            cache.lookup("::1", 2200, "ssh-ed25519"),
+            Some(expected_fp)
+        );
+        assert_eq!(
+            cache.lookup("plain.example.com", 22, "ssh-ed25519"),
+            Some(expected_fp)
+        );
+        assert_eq!(cache.lookup("bad.example.com", 22, "ssh-ed25519"), None);
+        assert_eq!(cache.lookup("mismatch.example.com", 22, "ssh-rsa"), None);
     }
 }
