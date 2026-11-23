@@ -96,6 +96,8 @@ export interface MountedEditor {
   setValue(text: string): void;
   /** Select all text; used by a few tests and menu actions. */
   focus(): void;
+  /** Open the built-in Find / Replace search panel. */
+  openSearch(): void;
   get readOnly(): boolean;
   /** Detach the editor from the DOM and release its listeners. */
   destroy(): void;
@@ -342,6 +344,10 @@ export function mount(host: HTMLElement, options: MountOptions): MountedEditor {
       });
     },
     focus: () => { view.focus(); },
+    openSearch: () => {
+      view.focus();
+      openSearchPanel(view);
+    },
     get readOnly() { return view.state.readOnly; },
     destroy: () => { view.destroy(); },
   };

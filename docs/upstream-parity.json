@@ -2107,11 +2107,14 @@
           "test_webdav_lock_makes_the_other_writer_wait"
         ],
         "service": [
-          "s3_dav_x2go_and_desktop_tunnel_routes_validate_and_track_state"
+          "s3_dav_x2go_and_desktop_tunnel_routes_validate_and_track_state",
+          "dual_local_sync_s3_restore_dav_property_remove_and_last_used_round_trip"
         ],
         "gui": [
           "WebDAV lock populates the returned lock token",
-          "WebDAV unlock posts the lock token and clears it"
+          "WebDAV unlock posts the lock token and clears it",
+          "loadDavLockToken posts action=get and populates #davLockToken",
+          "openDavTools restores cached session lock token synchronously for same resource"
         ]
       },
       "verified_on": {
@@ -2160,11 +2163,13 @@
           "test_webdav_lock_makes_the_other_writer_wait"
         ],
         "service": [
-          "s3_dav_x2go_and_desktop_tunnel_routes_validate_and_track_state"
+          "s3_dav_x2go_and_desktop_tunnel_routes_validate_and_track_state",
+          "dual_local_sync_s3_restore_dav_property_remove_and_last_used_round_trip"
         ],
         "gui": [
           "WebDAV get property populates the value field",
-          "WebDAV set property posts action set and value"
+          "WebDAV set property posts action set and value",
+          "removeDavProperty posts action=remove and clears #davPropValue"
         ]
       },
       "verified_on": {
@@ -2981,26 +2986,41 @@
       "id": "sessions.site-manager",
       "area": "Sessions/configuration",
       "status": "partial",
-      "notes": "Stored sites can be saved, opened, removed, exported and imported.",
+      "notes": "Stored sites can be saved, renamed (including nested folders), filtered, sorted by name or last-connected timestamp (last_used), opened, removed, exported and imported.",
       "source": [
         "crates/linscp-engine/src/session_store.rs",
-        "crates/linscp-service/src/lib.rs"
+        "crates/linscp-service/src/lib.rs",
+        "source/gui/web/index.html"
       ],
       "checks": {
         "script": [
           "test_stored_sessions",
           "test_session_export_import"
+        ],
+        "service": [
+          "touch_local_copy_session_rename_workspaces_sync_perms_and_cleanup_work",
+          "dual_local_sync_s3_restore_dav_property_remove_and_last_used_round_trip"
+        ],
+        "gui": [
+          "Site Manager Recent sort orders most recently connected site first",
+          "Site Manager filter narrows #siteList by host/name",
+          "fillSiteForm displays Last connected timestamp when last_used is present"
         ]
       },
       "verified_on": {
         "linux": [
-          "script"
+          "script",
+          "service",
+          "gui"
         ],
         "windows": [
-          "script"
+          "script",
+          "service",
+          "gui"
         ],
         "android": [
-          "script"
+          "script",
+          "gui"
         ]
       },
       "gap": "No runnable suite evidences this: script needs a `linscp` binary this repo does not build.",
@@ -4948,7 +4968,7 @@
       "id": "s3.versioned-objects",
       "area": "Amazon S3",
       "status": "partial",
-      "notes": "`versions` lists exact-key or prefix history and delete markers through guarded ListObjectVersions pagination; `get -versionid=` reads one version, HEAD metadata handles delete markers, and resumable staging uses an ID-specific suffix; `rm -versionid=` deletes only the named version/marker. Live tests cover opaque query characters, a 1001-record two-page history plus missing/repeated pagination-marker refusals, historical/current downloads, isolated resume staging and marker creation/removal without losing other versions. Exposed in the native GUI via /api/s3/versions, /api/s3/version-download and /api/s3/version-delete (#s3VersionsModal), with conditional If-Match DELETE support for guarded moves.",
+      "notes": "`versions` lists exact-key or prefix history and delete markers through guarded ListObjectVersions pagination; `get -versionid=` reads one version, HEAD metadata handles delete markers, and resumable staging uses an ID-specific suffix; `rm -versionid=` deletes only the named version/marker. Live tests cover opaque query characters, a 1001-record two-page history plus missing/repeated pagination-marker refusals, historical/current downloads, isolated resume staging and marker creation/removal without losing other versions. Exposed in the native GUI via /api/s3/versions, /api/s3/version-download, /api/s3/version-delete and /api/s3/version-restore (#s3VersionsModal), with conditional If-Match DELETE support for guarded moves.",
       "source": [
         "crates/linscp-proto/src/s3.rs",
         "crates/linscp-engine/src/script.rs",
@@ -4962,12 +4982,15 @@
           "test_version_listing_rejects_broken_pagination_state"
         ],
         "service": [
-          "s3_dav_x2go_and_desktop_tunnel_routes_validate_and_track_state"
+          "s3_dav_x2go_and_desktop_tunnel_routes_validate_and_track_state",
+          "dual_local_sync_s3_restore_dav_property_remove_and_last_used_round_trip"
         ],
         "gui": [
           "S3 object versions modal lists returned versions",
           "S3 version download queues the selected version_id",
-          "S3 version delete posts the selected version_id"
+          "S3 version delete posts the selected version_id",
+          "S3 versions modal renders Restore button only for non-latest object versions",
+          "restoreS3Version posts name and version_id to /api/s3/version-restore"
         ]
       },
       "verified_on": {
@@ -5075,18 +5098,39 @@
     {
       "id": "gui.local-to-local",
       "area": "GUI",
-      "status": "partial",
-      "notes": "A local-to-local session is a tab whose protocol is 'local' and which names two absolute local directories (the upstream IsLocalBrowser/OtherLocalDirectory shape). CoreSession.start, connect and alive never spawn the core and never open a socket; the right pane lists its directory through the same API the remote pane uses. Copies and moves are planned and run in-process on the queue with byte progress and cancellation: recursive trees, merge into an existing directory, atomic per-file replacement through a temporary file, timestamps and modes preserved, symbolic links copied as links, and ask/skip/overwrite/rename decisions (the browser answers 'ask' once and retries). Source equal to or inside the destination is refused before queueing. The second pane also supports mkdir, rename, delete, chmod, properties, checksums, editor save and find. The server-only terminal, synchronization and remote transfer dialogs are not offered in this mode.",
+      "status": "verified",
+      "notes": "A local-to-local session is a tab whose protocol is 'local' and which names two absolute local directories (the upstream IsLocalBrowser/OtherLocalDirectory shape). CoreSession.start, connect and alive never spawn the core and never open a socket; the right pane lists its directory through the same API the remote pane uses. Copies and moves are planned and run in-process on the queue with byte progress and cancellation: recursive trees, merge into an existing directory, atomic per-file replacement through a temporary file, timestamps and modes preserved, symbolic links copied as links, and ask/skip/overwrite/rename decisions. Source equal to or inside the destination is refused before queueing. The second pane also supports mkdir, rename, delete, chmod, touch (set_mtime), symlink, properties, checksums, editor save (including create_only), search, and full one-way/mirror/checksum/bidirectional ('both') directory synchronization via LocalSyncSession.",
       "source": [
+        "crates/linscp-engine/src/sync_planner.rs",
         "crates/linscp-service/src/lib.rs",
+        "source/gui/web/index.html",
         "ui/src/index.ts"
       ],
-      "checks": {},
-      "gap": "No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on."
-      ]
+      "checks": {
+        "service": [
+          "saf_local_copy_moves_bytes_through_the_bridge",
+          "local_and_dual_local_navigation_editor_conflict_rename_overwrite_and_backup_save_dir",
+          "local_and_dual_local_checksum_multi_chmod_properties_and_copy",
+          "dual_local_sync_s3_restore_dav_property_remove_and_last_used_round_trip"
+        ],
+        "gui": [
+          "openNewLocalTabPrompt posts /api/tabs/local and activates the new dual-local tab",
+          "dual-local native drop onto right pane uses target=local and right-pane directory"
+        ]
+      },
+      "verified_on": {
+        "linux": [
+          "service",
+          "gui"
+        ],
+        "windows": [
+          "service",
+          "gui"
+        ],
+        "android": [
+          "gui"
+        ]
+      }
     },
     {
       "id": "gui.local-symlink",

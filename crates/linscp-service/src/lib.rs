@@ -696,6 +696,7 @@ impl CommanderService {
             ("POST", "/api/s3/versions") => self.s3_list_versions_async(req.body).await,
             ("POST", "/api/s3/version-download") => self.s3_version_download_async(req.body).await,
             ("POST", "/api/s3/version-delete") => self.s3_version_delete_async(req.body).await,
+            ("POST", "/api/s3/version-restore") => self.s3_version_restore_async(req.body).await,
             ("POST", "/api/dav/lock") => self.dav_lock_async(req.body).await,
             ("POST", "/api/dav/unlock") => self.dav_unlock_async(req.body).await,
             ("POST", "/api/dav/property") => self.dav_property_async(req.body).await,
@@ -728,7 +729,14 @@ impl CommanderService {
                 .get("other_local_dir")
                 .cloned()
                 .unwrap_or_else(|| spec.session.initial_dir.clone());
-            return self.create_local_tab(spec.session.local_dir.clone(), right);
+            let reply = self.create_local_tab(spec.session.local_dir.clone(), right);
+            if reply.status == 200 {
+                if let Some(name) = site_name {
+                    let _guard = self.session_key_lock.lock().expect("session key lock");
+                    Self::touch_saved_site_last_used_locked(&root, self.secret_vault.as_ref(), name);
+                }
+            }
+            return reply;
         }
         if let Some(expected) = body.get("expected_site") {
             if expected.get("host").and_then(Value::as_str) != Some(spec.session.host.as_str())
@@ -921,7 +929,10 @@ impl CommanderService {
                 state.challenges.remove(&tab.id);
                 state.active_tab_id = Some(tab.id);
                 state.tabs.insert(tab.id, tab.clone());
-                if let Some(name) = &tab.site_name { state.auto_suspended.remove(name); }
+                if let Some(name) = &tab.site_name {
+                    state.auto_suspended.remove(name);
+                    Self::touch_saved_site_last_used_locked(&config_root, self.secret_vault.as_ref(), name);
+                }
                 let warning = restore_identity.and_then(|identity| {
                     if let Some((name, identity)) = identity {
                         let mut intentions = auto_reconnect::load(&config_root, self.secret_vault.as_ref())?;
@@ -953,6 +964,28 @@ impl CommanderService {
                 }
                 api_error(400, error)
             }
+        }
+    }
+
+    fn touch_saved_site_last_used_locked(
+        config_root: &Path,
+        vault: &dyn linscp_platform::SecretVault,
+        site_name: &str,
+    ) {
+        let Ok(mut store) = SessionStore::load_from_dir(config_root, vault) else {
+            return;
+        };
+        let Some(mut site) = store.find(site_name).cloned() else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now > 0 {
+            site.last_used = Some(now);
+            store.upsert(site);
+            let _ = store.save_to_dir(config_root, vault);
         }
     }
 
@@ -1795,6 +1828,41 @@ impl CommanderService {
         }
     }
 
+    async fn s3_version_restore_async(&self, body: Value) -> ApiReply {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) {
+            Some(id) => id,
+            None => return api_error(400, "No active tab"),
+        };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected && !tab.is_local => tab,
+            _ => return api_error(400, "Not connected"),
+        };
+        let session = match tab.remote {
+            Some(session) if session.scheme() == linscp_types::ProtocolScheme::S3 => session,
+            _ => return api_error(400, "S3 object versions require an active S3 session."),
+        };
+        let name = match ops::validate_leaf_name(body.get("name").and_then(Value::as_str).unwrap_or("")) {
+            Ok(leaf) => leaf,
+            Err(error) => return api_error(400, error),
+        };
+        let version_id = body
+            .get("version_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if version_id.is_empty() || version_id.chars().any(char::is_control) {
+            return api_error(400, "A valid S3 version ID is required.");
+        }
+        let path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
+        match session.s3_restore_version(&path, version_id).await {
+            Ok(()) => ApiReply {
+                status: 200,
+                payload: json!({"success": true, "path": path, "name": name, "version_id": version_id}),
+            },
+            Err(error) => api_error(400, error.to_string()),
+        }
+    }
+
     async fn dav_lock_async(&self, body: Value) -> ApiReply {
         let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return api_error(400, "No active tab") };
         let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
@@ -1808,8 +1876,17 @@ impl CommanderService {
             Ok(leaf) => leaf,
             Err(error) => return api_error(400, error),
         };
-        let timeout_secs = body.get("timeout_secs").and_then(Value::as_u64).unwrap_or(300).clamp(1, 86_400) as u32;
         let path = format!("{}/{}", tab.remote_dir.trim_end_matches('/'), name);
+        if body.get("action").and_then(Value::as_str) == Some("get") {
+            return match session.dav_active_lock_token(&path).await {
+                Ok(token) => ApiReply {
+                    status: 200,
+                    payload: json!({"success": true, "path": path, "token": token}),
+                },
+                Err(error) => api_error(400, error.to_string()),
+            };
+        }
+        let timeout_secs = body.get("timeout_secs").and_then(Value::as_u64).unwrap_or(300).clamp(1, 86_400) as u32;
         match session.dav_lock(&path, timeout_secs).await {
             Ok(token) => ApiReply { status: 200, payload: json!({"success": true, "path": path, "token": token}) },
             Err(error) => api_error(400, error.to_string()),
@@ -1872,7 +1949,14 @@ impl CommanderService {
                     Err(error) => api_error(400, error.to_string()),
                 }
             }
-            _ => api_error(400, "Unsupported WebDAV property action (expected 'get' or 'set')."),
+            "remove" => match session.dav_remove_property(&path, prop_name).await {
+                Ok(()) => ApiReply {
+                    status: 200,
+                    payload: json!({"success": true, "path": path, "property": prop_name, "removed": true}),
+                },
+                Err(error) => api_error(400, error.to_string()),
+            },
+            _ => api_error(400, "Unsupported WebDAV property action (expected 'get', 'set', or 'remove')."),
         }
     }
 
@@ -2625,6 +2709,13 @@ impl CommanderService {
     /// planner's options. The page's three-way `mode` is the console's
     /// `-direction`, and the criteria string is `-criteria`.
     fn sync_options_from(body: &Value) -> Result<(std::path::PathBuf, String, linscp_engine::sync_planner::SyncOptions), String> {
+        Self::sync_options_for_tab(body, false)
+    }
+
+    fn sync_options_for_tab(
+        body: &Value,
+        is_local_tab: bool,
+    ) -> Result<(std::path::PathBuf, String, linscp_engine::sync_planner::SyncOptions), String> {
         use linscp_engine::sync_planner::{SyncConflictPolicy, SyncCriteria, SyncMode, SyncOptions};
         let mode = match body.get("mode").and_then(Value::as_str).unwrap_or("local") {
             "local" => SyncMode::Local,
@@ -2669,7 +2760,32 @@ impl CommanderService {
         let mirror = body.get("mirror").and_then(Value::as_bool).unwrap_or(false);
         let delete_obsolete = body.get("delete").and_then(Value::as_bool).unwrap_or(false) || mirror;
         let local_root = check_sync_local_dir(body.get("local_dir").and_then(Value::as_str).unwrap_or(""))?;
-        let remote_root = validate_remote_absolute_path(body.get("remote_dir").and_then(Value::as_str).unwrap_or(""))?;
+        let remote_root = if is_local_tab {
+            let right_root = check_sync_local_dir(
+                body.get("remote_dir").and_then(Value::as_str).unwrap_or(""),
+            )?;
+            if local_root == right_root {
+                return Err(
+                    "Source and destination directories must not be the same.".to_string()
+                );
+            }
+            if !is_saf_path(&local_root) && !is_saf_path(&right_root) {
+                if let (Ok(cl), Ok(cr)) = (
+                    std::fs::canonicalize(&local_root),
+                    std::fs::canonicalize(&right_root),
+                ) {
+                    if cl == cr || cl.starts_with(&cr) || cr.starts_with(&cl) {
+                        return Err(
+                            "Source and destination directories must not be identical or nested inside one another."
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            right_root
+        } else {
+            validate_remote_absolute_path(body.get("remote_dir").and_then(Value::as_str).unwrap_or(""))?
+        };
         let recursive = body.get("recursive").and_then(Value::as_bool).unwrap_or(true);
         let (transfer_mode, preserve_time, speed_kbytes_per_sec) =
             Self::parse_sync_transfer_options(body)?;
@@ -2800,19 +2916,64 @@ impl CommanderService {
     }
 
     /// The session and the state key a synchronization of this tab uses.
-    fn sync_target(&self, body: &Value) -> Result<(Arc<dyn linscp_proto::RemoteSession>, u64, String, String, String), ApiReply> {
-        let id = match tabs::parse_tab_id_value(body.get("tab")) { Some(id) => id, None => return Err(api_error(400, "No active tab")) };
-        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
-            Some(tab) if tab.connected && !tab.is_local => tab, _ => return Err(api_error(400, "Not connected")),
+    fn sync_target(
+        &self,
+        body: &Value,
+    ) -> Result<(Arc<dyn linscp_proto::RemoteSession>, u64, String, String, String, bool), ApiReply> {
+        let id = match tabs::parse_tab_id_value(body.get("tab")) {
+            Some(id) => id,
+            None => return Err(api_error(400, "No active tab")),
         };
-        let session = match tab.remote { Some(session) => session, None => return Err(api_error(400, "Not connected")) };
+        let tab = match self.state.lock().expect("state mutex").tabs.get(&id).cloned() {
+            Some(tab) if tab.connected => tab,
+            _ => return Err(api_error(400, "Not connected")),
+        };
+        if tab.is_local {
+            let right_raw = body
+                .get("remote_dir")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(&tab.other_local_dir);
+            let right_checked = match check_sync_local_dir(right_raw) {
+                Ok(dir) => dir,
+                Err(err) => return Err(api_error(400, err)),
+            };
+            let session: Arc<dyn linscp_proto::RemoteSession> = Arc::new(
+                linscp_engine::sync_planner::LocalSyncSession::new(
+                    right_checked.clone(),
+                    Arc::clone(&self.local_fs),
+                ),
+            );
+            let host_key = json!(["sync-v2", "local", &right_checked]).to_string();
+            let legacy_host_key = format!("local:{right_checked}");
+            return Ok((session, id, host_key, legacy_host_key, right_checked, true));
+        }
+        let session = match tab.remote {
+            Some(session) => session,
+            None => return Err(api_error(400, "Not connected")),
+        };
         // The previous record is kept per endpoint and directory pair, so a
         // second run with the same tab finds the first run's state.
-        let host_key = tab.spec.as_ref().map(|spec| json!(["sync-v2", spec.session.protocol.as_str(), spec.session.username, spec.session.host, spec.session.port]).to_string())
+        let host_key = tab
+            .spec
+            .as_ref()
+            .map(|spec| {
+                json!([
+                    "sync-v2",
+                    spec.session.protocol.as_str(),
+                    spec.session.username,
+                    spec.session.host,
+                    spec.session.port
+                ])
+                .to_string()
+            })
             .unwrap_or_else(|| format!("tab:{id}"));
-        let legacy_host_key = tab.spec.as_ref().map(|spec| format!("{}:{}", spec.session.host, spec.session.port))
+        let legacy_host_key = tab
+            .spec
+            .as_ref()
+            .map(|spec| format!("{}:{}", spec.session.host, spec.session.port))
             .unwrap_or_else(|| format!("tab:{id}"));
-        Ok((session, id, host_key, legacy_host_key, tab.remote_dir.clone()))
+        Ok((session, id, host_key, legacy_host_key, tab.remote_dir.clone(), false))
     }
 
     fn sync_state_path(config_root: &Path, host_key: &str, legacy_host: &str, local: &Path, remote: &str) -> Result<PathBuf, String> {
@@ -2829,13 +2990,14 @@ impl CommanderService {
 
     async fn sync_preview_async(&self, body: Value) -> ApiReply {
         use linscp_engine::sync_planner::{plan_synchronization, SyncState};
-        let (session, _id, host_key, legacy_host, _dir) = match self.sync_target(&body) { Ok(t) => t, Err(reply) => return reply };
-        let (local_root, remote_root, opts) = match Self::sync_options_from(&body) { Ok(t) => t, Err(error) => return api_error(400, error) };
+        let (session, _id, host_key, legacy_host, _dir, is_local_tab) = match self.sync_target(&body) { Ok(t) => t, Err(reply) => return reply };
+        let (local_root, remote_root_raw, opts) = match Self::sync_options_for_tab(&body, is_local_tab) { Ok(t) => t, Err(error) => return api_error(400, error) };
+        let planner_remote_root = if is_local_tab { "/".to_string() } else { remote_root_raw };
         let config_root = self.state.lock().expect("state mutex").config_root.clone();
-        let state_file = match Self::sync_state_path(&config_root, &host_key, &legacy_host, &local_root, &remote_root) { Ok(path) => path, Err(error) => return api_error(409, error) };
+        let state_file = match Self::sync_state_path(&config_root, &host_key, &legacy_host, &local_root, &planner_remote_root) { Ok(path) => path, Err(error) => return api_error(409, error) };
         let state = match SyncState::load(&state_file) { Ok(state) => state, Err(error) => return api_error(500, error) };
         let saf_fs = if is_saf_path(&local_root.to_string_lossy()) { Some(self.local_fs.as_ref()) } else { None };
-        match plan_synchronization(session.as_ref(), &local_root, &remote_root, &opts, &state, saf_fs).await {
+        match plan_synchronization(session.as_ref(), &local_root, &planner_remote_root, &opts, &state, saf_fs).await {
             Ok(items) => ApiReply { status: 200, payload: json!({"success": true, "plan": sync_plan_json(&items)}) },
             Err(error) => api_error(400, error),
         }
@@ -2844,21 +3006,32 @@ impl CommanderService {
     /// Queues a synchronization as one task, so the queue's pause, cancel and
     /// progress apply to it exactly as they do to a transfer.
     async fn sync_run_async(&self, body: Value) -> ApiReply {
-        let (session, id, host_key, legacy_host, _dir) = match self.sync_target(&body) { Ok(t) => t, Err(reply) => return reply };
-        let (local_root, remote_root, mut opts) = match Self::sync_options_from(&body) { Ok(t) => t, Err(error) => return api_error(400, error) };
+        let (session, id, host_key, legacy_host, _dir, is_local_tab) = match self.sync_target(&body) { Ok(t) => t, Err(reply) => return reply };
+        let (local_root, remote_root_raw, mut opts) = match Self::sync_options_for_tab(&body, is_local_tab) { Ok(t) => t, Err(error) => return api_error(400, error) };
+        let planner_remote_root = if is_local_tab { "/".to_string() } else { remote_root_raw.clone() };
         // The shared reader above defaults to preview-only so a preview can
         // never write; a run applies the plan, so it opts back out. Without
         // this the queued run plans, applies nothing, and reports success.
         opts.preview_only = false;
         // The same options a preview used, so what the user saw is what runs.
         let config_root = self.state.lock().expect("state mutex").config_root.clone();
-        if let Err(error) = Self::sync_state_path(&config_root, &host_key, &legacy_host, &local_root, &remote_root) { return api_error(409, error); }
+        if let Err(error) = Self::sync_state_path(&config_root, &host_key, &legacy_host, &local_root, &planner_remote_root) { return api_error(409, error); }
         let local_is_dir = if is_saf_path(&local_root.to_string_lossy()) {
             self.local_fs.stat(&local_root.to_string_lossy()).is_ok_and(|info| info.is_dir && !info.is_symlink)
         } else {
             local_root.is_dir()
         };
         if !local_is_dir { return api_error(400, "The local directory does not exist.") }
+        if is_local_tab {
+            let right_is_dir = if is_saf_path(&remote_root_raw) {
+                self.local_fs.stat(&remote_root_raw).is_ok_and(|info| info.is_dir && !info.is_symlink)
+            } else {
+                Path::new(&remote_root_raw).is_dir()
+            };
+            if !right_is_dir {
+                return api_error(400, "The destination local directory does not exist.");
+            }
+        }
         let mut excluded_paths = std::collections::BTreeSet::new();
         if let Some(raw_ex) = body.get("excluded_paths") {
             let Some(arr) = raw_ex.as_array() else {
@@ -2887,12 +3060,12 @@ impl CommanderService {
             config_dir: config_root,
             host_key,
             local_root: local_root.clone(),
-            remote_root: remote_root.clone(),
+            remote_root: planner_remote_root,
             opts,
             excluded_paths,
         };
-        let task_id = self.queue.enqueue(Some(id), "sync", format!("Synchronize {remote_root}"),
-            local_root.to_string_lossy().into_owned(), remote_root.clone(), 0,
+        let task_id = self.queue.enqueue(Some(id), "sync", format!("Synchronize {remote_root_raw}"),
+            local_root.to_string_lossy().into_owned(), remote_root_raw, 0,
             body.get("priority").and_then(Value::as_bool).unwrap_or(false), job);
         ApiReply { status: 200, payload: json!({"success": true, "task_id": task_id}) }
     }
@@ -9280,10 +9453,25 @@ impl CommanderService {
             Some(t) => t, None => return ApiReply{ status: 400, payload: json!({"success": false, "error": "Not connected"})},
         };
         if tab.is_local { return ApiReply{ status: 400, payload: json!({"success": false, "error": "A remote-to-remote copy starts in a connected remote tab."})}; }
-        let mut targets = vec![json!({"id": format!("tab:{}", tab.id), "kind": "tab", "tab": tab.id, "label": tab.name, "host": "", "protocol": tab.remote.as_ref().map(|session| format!("{:?}", session.scheme()).to_ascii_lowercase()).unwrap_or_default(), "current": true, "connected": true})];
+        let tab_host_label = |t: &TabRuntime| -> String {
+            if let Some(spec) = t.spec.as_ref() {
+                if !spec.session.host.is_empty() {
+                    if spec.session.port > 0 {
+                        return format!("{}:{}", spec.session.host, spec.session.port);
+                    }
+                    return spec.session.host.clone();
+                }
+            }
+            t.session_json
+                .get("host")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        let mut targets = vec![json!({"id": format!("tab:{}", tab.id), "kind": "tab", "tab": tab.id, "label": tab.name, "host": tab_host_label(&tab), "protocol": tab.remote.as_ref().map(|session| format!("{:?}", session.scheme()).to_ascii_lowercase()).unwrap_or_default(), "current": true, "connected": true})];
         for (id, other) in &g.tabs {
             if *id == tab.id || other.is_local { continue; }
-            targets.push(json!({"id": format!("tab:{}", id), "kind": "tab", "tab": id, "label": other.name, "host": "", "protocol": other.remote.as_ref().map(|session| format!("{:?}", session.scheme()).to_ascii_lowercase()).unwrap_or_default(), "current": false, "connected": other.connected}));
+            targets.push(json!({"id": format!("tab:{}", id), "kind": "tab", "tab": id, "label": other.name, "host": tab_host_label(other), "protocol": other.remote.as_ref().map(|session| format!("{:?}", session.scheme()).to_ascii_lowercase()).unwrap_or_default(), "current": false, "connected": other.connected}));
         }
         ApiReply{ status: 200, payload: json!({"success": true, "targets": targets})}
     }
@@ -9606,7 +9794,7 @@ impl CommanderService {
                         Path::new(&destination),
                         info.mode & 0o777,
                     );
-                    let _ = self.local_fs.set_mtime(&destination, info.mtime);
+                    let _ = self.local_fs.set_mtime(&destination, info.mtime_secs);
                 }
                 ApiReply { status: 200, payload: json!({"success": true, "destination": destination}) }
             }
@@ -18608,6 +18796,9 @@ mod tests {
         perms: Mutex<HashMap<String, String>>,
         modes: Mutex<HashMap<String, u32>>,
         symlinks: Mutex<Vec<(String, String)>>,
+        locks: Mutex<HashMap<String, String>>,
+        props: Mutex<HashMap<(String, String), String>>,
+        s3_versions: Mutex<HashMap<(String, String), Vec<u8>>>,
     }
 
     impl MockSession {
@@ -18623,6 +18814,9 @@ mod tests {
                 perms: Mutex::new(HashMap::new()),
                 modes: Mutex::new(HashMap::new()),
                 symlinks: Mutex::new(Vec::new()),
+                locks: Mutex::new(HashMap::new()),
+                props: Mutex::new(HashMap::new()),
+                s3_versions: Mutex::new(HashMap::new()),
             };
             session.add_dir("/");
             session
@@ -18852,6 +19046,90 @@ mod tests {
 
         async fn dav_get_etag(&self, _remote_path: &str) -> Result<(Option<String>, bool), ProtoError> {
             Ok((Some(Self::ETAG.to_string()), false))
+        }
+
+        async fn dav_lock(&self, remote_path: &str, _timeout_secs: u32) -> Result<String, ProtoError> {
+            let tok = format!("opaquelocktoken:mock:{}", remote_path.trim_matches('/'));
+            self.locks.lock().expect("m").insert(remote_path.to_string(), tok.clone());
+            Ok(tok)
+        }
+
+        async fn dav_unlock(&self, remote_path: &str, token: Option<&str>) -> Result<(), ProtoError> {
+            let mut locks = self.locks.lock().expect("m");
+            match locks.get(remote_path).cloned() {
+                Some(held) if token.is_none_or(|t| t == held) => {
+                    locks.remove(remote_path);
+                    Ok(())
+                }
+                _ => Err(ProtoError::Transport("No matching WebDAV lock token.".to_string())),
+            }
+        }
+
+        async fn dav_active_lock_token(&self, remote_path: &str) -> Result<Option<String>, ProtoError> {
+            Ok(self.locks.lock().expect("m").get(remote_path).cloned())
+        }
+
+        async fn dav_set_property(
+            &self,
+            remote_path: &str,
+            name: &str,
+            value: &str,
+        ) -> Result<(), ProtoError> {
+            self.props
+                .lock()
+                .expect("m")
+                .insert((remote_path.to_string(), name.to_string()), value.to_string());
+            Ok(())
+        }
+
+        async fn dav_get_property(
+            &self,
+            remote_path: &str,
+            name: &str,
+        ) -> Result<Option<String>, ProtoError> {
+            Ok(self
+                .props
+                .lock()
+                .expect("m")
+                .get(&(remote_path.to_string(), name.to_string()))
+                .cloned())
+        }
+
+        async fn dav_remove_property(
+            &self,
+            remote_path: &str,
+            name: &str,
+        ) -> Result<(), ProtoError> {
+            self.props
+                .lock()
+                .expect("m")
+                .remove(&(remote_path.to_string(), name.to_string()));
+            Ok(())
+        }
+
+        async fn s3_restore_version(
+            &self,
+            remote_path: &str,
+            version_id: &str,
+        ) -> Result<(), ProtoError> {
+            let bytes = self
+                .s3_versions
+                .lock()
+                .expect("m")
+                .get(&(remote_path.to_string(), version_id.to_string()))
+                .cloned()
+                .ok_or_else(|| {
+                    ProtoError::Transport(format!("Missing S3 version '{version_id}' for '{remote_path}'."))
+                })?;
+            self.docs.lock().expect("m").insert(
+                remote_path.to_string(),
+                MockRemoteDoc {
+                    bytes,
+                    is_dir: false,
+                    mtime: 1_777_000_000,
+                },
+            );
+            Ok(())
         }
 
         async fn remove_if_match(&self, remote_path: &str, etag: &str) -> Result<(), ProtoError> {
@@ -21657,7 +21935,7 @@ mod tests {
         assert_eq!(local_touch.status, 200, "{}", local_touch.payload);
         assert_eq!(local_touch.payload["changed"], 2);
         assert_eq!(
-            gui_os::stat_extended(&sub_local.join("child.txt")).unwrap().mtime,
+            gui_os::stat_extended(&sub_local.join("child.txt")).unwrap().mtime_secs,
             target_ts
         );
 
@@ -21851,5 +22129,232 @@ mod tests {
                 "missing cleanup id {expected} in {cleanup_ids:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn dual_local_sync_s3_restore_dav_property_remove_and_last_used_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_dir = tmp.path().join("cfg");
+        let left_dir = tmp.path().join("left_sync");
+        let right_dir = tmp.path().join("right_sync");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(left_dir.join("nested")).unwrap();
+        std::fs::create_dir_all(&right_dir).unwrap();
+        std::fs::write(left_dir.join("nested").join("alpha.txt"), b"alpha-v1").unwrap();
+        std::fs::write(right_dir.join("beta.txt"), b"beta-v1").unwrap();
+
+        let svc = CommanderService::new(cfg_dir.clone(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&svc);
+
+        // 1. Saved local site connection stamps `last_used` and `/api/sessions` exposes it.
+        let save_local_site = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/sessions/save".into(),
+            body: json!({
+                "name": "Local/Pair",
+                "session": {
+                    "protocol": "local",
+                    "local_dir": left_dir.to_string_lossy(),
+                    "other_local_dir": right_dir.to_string_lossy(),
+                },
+            }),
+        });
+        assert_eq!(save_local_site.status, 200, "{}", save_local_site.payload);
+        let open_local_site = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/tabs/open".into(),
+                body: json!({ "site_name": "Local/Pair" }),
+            })
+            .await;
+        assert_eq!(open_local_site.status, 200, "{}", open_local_site.payload);
+        let local_tab_id = open_local_site.payload["tab"]["id"].as_u64().unwrap();
+        let listed_sites = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/sessions".into(),
+            body: json!({}),
+        });
+        let pair_json = listed_sites.payload["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "Local/Pair")
+            .expect("Local/Pair in /api/sessions");
+        assert!(
+            pair_json["last_used"].as_u64().is_some_and(|ts| ts > 0),
+            "expected positive last_used in {pair_json}"
+        );
+
+        // 2. Dual-local sync rejects identical/nested directories and executes bidirectional ('both') sync.
+        let nested_reject = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/sync/preview".into(),
+                body: json!({
+                    "tab": local_tab_id,
+                    "local_dir": left_dir.to_string_lossy(),
+                    "remote_dir": left_dir.join("nested").to_string_lossy(),
+                    "mode": "both",
+                }),
+            })
+            .await;
+        assert_eq!(nested_reject.status, 400, "{}", nested_reject.payload);
+
+        let preview_both = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/sync/preview".into(),
+                body: json!({
+                    "tab": local_tab_id,
+                    "local_dir": left_dir.to_string_lossy(),
+                    "remote_dir": right_dir.to_string_lossy(),
+                    "mode": "both",
+                    "criteria": "either",
+                }),
+            })
+            .await;
+        assert_eq!(preview_both.status, 200, "{}", preview_both.payload);
+        assert!(!preview_both.payload["plan"].as_array().unwrap().is_empty());
+
+        let run_both = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/sync/run".into(),
+                body: json!({
+                    "tab": local_tab_id,
+                    "local_dir": left_dir.to_string_lossy(),
+                    "remote_dir": right_dir.to_string_lossy(),
+                    "mode": "both",
+                    "criteria": "either",
+                }),
+            })
+            .await;
+        assert_eq!(run_both.status, 200, "{}", run_both.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(
+            std::fs::read(right_dir.join("nested").join("alpha.txt")).unwrap(),
+            b"alpha-v1"
+        );
+        assert_eq!(
+            std::fs::read(left_dir.join("beta.txt")).unwrap(),
+            b"beta-v1"
+        );
+
+        // Checksum-based dual-local preview detects content edits of identical byte length.
+        std::fs::write(left_dir.join("beta.txt"), b"BETA-V2").unwrap();
+        let preview_cs = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/sync/preview".into(),
+                body: json!({
+                    "tab": local_tab_id,
+                    "local_dir": left_dir.to_string_lossy(),
+                    "remote_dir": right_dir.to_string_lossy(),
+                    "mode": "remote",
+                    "criteria": "checksum",
+                }),
+            })
+            .await;
+        assert_eq!(preview_cs.status, 200, "{}", preview_cs.payload);
+        assert!(
+            preview_cs.payload["plan"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["path"] == "beta.txt" && item["action"] == "upload"),
+            "checksum preview should detect modified beta.txt: {}",
+            preview_cs.payload
+        );
+
+        // 3. WebDAV active lock token query (`action: "get"`) & dead property removal (`action: "remove"`).
+        let dav_session = Arc::new(MockSession::new());
+        dav_session.add_file("/report.xml", b"<doc/>");
+        let dav_tab = insert_remote_tab(&svc, dav_session.clone(), &left_dir.to_string_lossy());
+        {
+            let mut g = svc.state.lock().expect("m");
+            if let Some(t) = g.tabs.get_mut(&dav_tab) {
+                t.session_json = json!({"protocol": "webdav", "host": "dav.example.test"});
+            }
+        }
+        let targets_reply = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: format!("/api/remote/transfer/targets?tab={dav_tab}"),
+            body: json!({}),
+        });
+        assert_eq!(targets_reply.status, 200);
+        assert_eq!(targets_reply.payload["targets"][0]["host"], "dav.example.test");
+
+        let lock_res = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/dav/lock".into(),
+                body: json!({"tab": dav_tab, "name": "report.xml", "timeout_secs": 120}),
+            })
+            .await;
+        assert_eq!(lock_res.status, 200, "{}", lock_res.payload);
+        let tok = lock_res.payload["token"].as_str().unwrap().to_string();
+        let get_lock = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/dav/lock".into(),
+                body: json!({"tab": dav_tab, "name": "report.xml", "action": "get"}),
+            })
+            .await;
+        assert_eq!(get_lock.status, 200, "{}", get_lock.payload);
+        assert_eq!(get_lock.payload["token"], tok);
+
+        let set_prop = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/dav/property".into(),
+                body: json!({"tab": dav_tab, "name": "report.xml", "action": "set", "property": "owner_tag", "value": "qa"}),
+            })
+            .await;
+        assert_eq!(set_prop.status, 200, "{}", set_prop.payload);
+        let rm_prop = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/dav/property".into(),
+                body: json!({"tab": dav_tab, "name": "report.xml", "action": "remove", "property": "owner_tag"}),
+            })
+            .await;
+        assert_eq!(rm_prop.status, 200, "{}", rm_prop.payload);
+        assert_eq!(rm_prop.payload["removed"], true);
+        let get_prop = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/dav/property".into(),
+                body: json!({"tab": dav_tab, "name": "report.xml", "action": "get", "property": "owner_tag"}),
+            })
+            .await;
+        assert_eq!(get_prop.status, 200);
+        assert!(get_prop.payload["value"].is_null());
+
+        // 4. S3 object version restore (`POST /api/s3/version-restore`).
+        let s3_session = Arc::new(MockSession::new());
+        s3_session.set_scheme(ProtocolScheme::S3);
+        s3_session.add_dir("/bucket");
+        s3_session.add_file("/bucket/config.json", b"{\"v\":2}");
+        s3_session
+            .s3_versions
+            .lock()
+            .expect("m")
+            .insert(("/bucket/config.json".to_string(), "ver-1".to_string()), b"{\"v\":1}".to_vec());
+        let s3_tab = insert_remote_tab(&svc, s3_session.clone(), &left_dir.to_string_lossy());
+        {
+            let mut g = svc.state.lock().expect("m");
+            if let Some(t) = g.tabs.get_mut(&s3_tab) {
+                t.remote_dir = "/bucket".to_string();
+            }
+        }
+        let restore_res = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/s3/version-restore".into(),
+                body: json!({"tab": s3_tab, "name": "config.json", "version_id": "ver-1"}),
+            })
+            .await;
+        assert_eq!(restore_res.status, 200, "{}", restore_res.payload);
+        assert_eq!(s3_session.bytes_of("/bucket/config.json").as_deref(), Some(b"{\"v\":1}".as_slice()));
     }
 }
