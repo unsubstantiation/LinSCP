@@ -9522,14 +9522,12 @@ impl CommanderService {
                 let clean_url = tabs::format_session_url(&spec, dir_override);
                 let url = tabs::format_session_url_with_options(&spec, dir_override, include_password);
                 let escaped_url = url.replace('"', "%22");
-                let hostkey_switch = spec
-                    .session
-                    .hostkey
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|hk| !hk.is_empty() && !hk.contains('"') && !hk.chars().any(char::is_control))
-                    .map(|hk| format!(" -hostkey=\"{hk}\""))
-                    .unwrap_or_default();
+                let hk = spec.session.hostkey.trim();
+                let hostkey_switch = if !hk.is_empty() && !hk.contains('"') && !hk.chars().any(char::is_control) {
+                    format!(" -hostkey=\"{hk}\"")
+                } else {
+                    String::new()
+                };
                 let mut script_snippet = format!("open \"{escaped_url}\"{hostkey_switch}");
                 if !t.remote_dir.is_empty()
                     && t.remote_dir != "/"
@@ -22674,7 +22672,7 @@ mod tests {
             if let Some(t) = g.tabs.get_mut(&rem_tab) {
                 t.remote_dir = "/srv/app".to_string();
                 let mut spec = linscp_engine::url_and_raw::parse_site_url("sftp://alice@host.example.test:2222/srv/app").unwrap();
-                spec.session.hostkey = Some("ssh-ed25519 SHA256:TestPin1".to_string());
+                spec.session.hostkey = "ssh-ed25519 SHA256:TestPin1".to_string();
                 t.spec = Some(spec);
             }
         }
