@@ -1687,7 +1687,7 @@ async fn s3_multipart_resumes_from_its_sidecar_and_refuses_a_hidden_completion_f
     let dir = tempfile::tempdir().expect("temp dir");
     let sidecar_path = dir.path().join("resume.json");
 
-    let connect_with = |store: Arc<MultipartResumeStore>, key: &str| {
+    let connect_with = |store: Arc<MultipartResumeStore>, key: &'static str| {
         let ca_cert_pem = pki.ca_cert_pem.clone();
         let pin = pki.server_spki_pin.clone();
         let port = port;
@@ -1795,7 +1795,7 @@ async fn s3_multipart_resumes_from_its_sidecar_and_refuses_a_hidden_completion_f
     assert_eq!(reassembled, payload);
 
     // A failure the server reports inside a successful status still fails.
-    state.lock().await.complete_reports_error = true;
+    state.lock().await.complete_reports_error.store(true, Ordering::SeqCst);
     let hidden = upload_bytes(
         &resumed,
         "/alpha-bucket/releases/hidden-failure.bin",

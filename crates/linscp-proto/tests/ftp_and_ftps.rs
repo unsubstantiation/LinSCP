@@ -803,7 +803,7 @@ async fn ftp_tls_version_bounds_are_enforced_on_the_control_connection() {
     let server_config = ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
-    .with_protocol_versions(&[rustls::version::TLS13])
+    .with_protocol_versions(&[&rustls::version::TLS13])
     .expect("server TLS versions")
     .with_no_client_auth()
     .with_single_cert(
