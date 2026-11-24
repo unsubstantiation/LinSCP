@@ -2712,7 +2712,7 @@
       "id": "sync.keepuptodate-inotify",
       "area": "Synchronization",
       "status": "partial",
-      "notes": "Nested local arrivals wake the recursive inotify watcher before the rescan interval.",
+      "notes": "A file that arrives in the watched tree wakes the watcher, so the next pass runs straight away instead of waiting for the rescan interval.",
       "source": [
         "crates/linscp-engine/src/sync_planner.rs",
         "crates/linscp-engine/src/script.rs"
@@ -2720,20 +2720,26 @@
       "checks": {
         "live-dav": [
           "test_keepuptodate_wakes_on_a_local_change"
+        ],
+        "engine-sftp": [
+          "test_keepuptodate_wakes_on_a_local_change"
         ]
       },
       "verified_on": {
         "linux": [
-          "live-dav"
+          "live-dav",
+          "engine-sftp"
         ],
         "windows": [
-          "live-dav"
+          "live-dav",
+          "engine-sftp"
         ],
         "android": [
-          "live-dav"
+          "live-dav",
+          "engine-sftp"
         ]
       },
-      "gap": "No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build.",
+      "gap": "The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which shows the arrival waking the watcher with an interval far longer than the wait it took.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
@@ -4428,7 +4434,7 @@
       "id": "platform.linux-file-events",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "The Linux synchronization watcher uses filesystem events and retains interval polling as a safety net when a watch cannot be installed.",
+      "notes": "The synchronization watcher uses filesystem events and retains interval polling as a safety net when a watch cannot be installed.",
       "source": [
         "crates/linscp-engine/src/sync_planner.rs",
         "crates/linscp-platform/src/linux.rs"
@@ -4437,20 +4443,26 @@
         "live-dav": [
           "test_keepuptodate_reflects_local_files_on_the_remote_side",
           "test_keepuptodate_wakes_on_a_local_change"
+        ],
+        "engine-sftp": [
+          "test_keepuptodate_wakes_on_a_local_change"
         ]
       },
       "verified_on": {
         "linux": [
-          "live-dav"
+          "live-dav",
+          "engine-sftp"
         ],
         "windows": [
-          "live-dav"
+          "live-dav",
+          "engine-sftp"
         ],
         "android": [
-          "live-dav"
+          "live-dav",
+          "engine-sftp"
         ]
       },
-      "gap": "No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build.",
+      "gap": "The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which shows the watcher ending the wait on a change rather than on the interval; the fallback polling for a root that cannot be watched stays unevidenced.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."

@@ -105,9 +105,9 @@ Local-to-remote keepuptodate and recursive one-way planning/upload run against t
 
 **Area:** Synchronization · **Status:** partial
 
-Nested local arrivals wake the recursive inotify watcher before the rescan interval.
+A file that arrives in the watched tree wakes the watcher, so the next pass runs straight away instead of waiting for the rescan interval.
 
-**Next:** No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which shows the arrival waking the watcher with an interval far longer than the wait it took.
 
 **Acceptance criteria:**
 
@@ -462,9 +462,9 @@ Linux command-line parsing, terminal-facing configuration and the native console
 
 **Area:** Packaging/platforms · **Status:** partial
 
-The Linux synchronization watcher uses filesystem events and retains interval polling as a safety net when a watch cannot be installed.
+The synchronization watcher uses filesystem events and retains interval polling as a safety net when a watch cannot be installed.
 
-**Next:** No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which shows the watcher ending the wait on a change rather than on the interval; the fallback polling for a root that cannot be watched stays unevidenced.
 
 **Acceptance criteria:**
 

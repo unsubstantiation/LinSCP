@@ -1547,13 +1547,14 @@ async fn test_script_command_list() {
     );
 
     // The interpreter splits a command string the way a script file is
-    // split, so a quoted ';' stays inside its argument.
+    // split, so a quoted ';' stays inside its argument. The parts keep the
+    // whitespace around them; the caller trims before it runs them.
     let parts = split_semicolon_commands("echo one; echo \"two; three\"; echo four");
     assert_eq!(
         parts,
         vec![
             "echo one".to_string(),
-            "echo \"two; three\"".to_string(),
+            " echo \"two; three\"".to_string(),
             " echo four".to_string(),
         ],
         "a quoted separator is not a command separator"

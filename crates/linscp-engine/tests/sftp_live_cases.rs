@@ -849,6 +849,77 @@ async fn test_synchronize_conflict_policy_and_keepuptodate() {
     sftp.close().await.unwrap();
 }
 
+/// The upstream case name is `test_keepuptodate_wakes_on_a_local_change`:
+/// a file that arrives in the watched tree wakes the watcher, so the next
+/// pass runs straight away instead of waiting for the rescan interval.
+///
+/// The interval is set far longer than the test may take, so only the
+/// watcher can end the wait: the new file is published well before the
+/// interval would have expired.
+#[tokio::test]
+async fn test_keepuptodate_wakes_on_a_local_change() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let watch = tmp.path().join("watch");
+    fs::create_dir_all(&watch).unwrap();
+
+    let (sftp, _fp) = connect_mock(0x71, 0x72).await;
+    sftp.mkdir("/home/tester/woken").await.expect("watch root");
+
+    let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
+    adopt(&mut interp, Arc::clone(&sftp), tmp.path());
+    let seen = interp.capture_console();
+
+    let script = format!(
+        "option confirm off ; option sftpriskypublish on ; \
+         keepuptodate -count=2 -interval=120 {} /home/tester/woken ; exit",
+        watch.display()
+    );
+    let handle = tokio::spawn(async move { interp.run_command_string(&script, false).await });
+
+    // The change is made after the first pass, so the watcher has to see it.
+    let first_pass = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let (out, _) = ScriptInterpreter::collected_console(&seen);
+        if out.contains("Pass 1") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < first_pass,
+            "the first pass ran: {out}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let arrived = std::time::Instant::now();
+    fs::write(watch.join("arrived.txt"), b"arrived\n").expect("write the arrival");
+
+    // The second pass publishes it. The wait ends long before the interval
+    // would have expired.
+    let published = arrived + std::time::Duration::from_secs(45);
+    loop {
+        if sftp
+            .stat("/home/tester/woken/arrived.txt")
+            .await
+            .expect("the remote side answers")
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < published,
+            "the arrival woke the watcher"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        arrived.elapsed() < std::time::Duration::from_secs(30),
+        "the arrival woke the watcher before the interval expired"
+    );
+
+    let _ = handle.await;
+    sftp.close().await.unwrap();
+}
+
 /// The default posture stays refused: without the acknowledgment
 /// `keepuptodate` fails closed naming the refusal instead of mirroring the
 /// watch directory. This pins the refusal by name as a change-guard; with
