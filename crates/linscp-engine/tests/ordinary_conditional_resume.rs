@@ -32,6 +32,7 @@ async fn resource(State(state): State<Arc<Mutex<Resource>>>, method: Method, hea
 }
 
 async fn exercise(session: &dyn RemoteSession, path: &str, state: Arc<Mutex<Resource>>) {
+    state.lock().unwrap().etag = "\"v1\"".into();
     let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("file.bin");
     let stage = tmp.path().join("file.bin.filepart");
