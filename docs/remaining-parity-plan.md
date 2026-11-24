@@ -37,14 +37,14 @@ The ASCII mode converts the line endings, the binary mode keeps the bytes, and t
 
 **Area:** Transfers · **Status:** partial
 
-Downloads can stage in a `.filepart` file beside the destination and resume from that staging file. A mid-flight interruption test verifies the old destination remains untouched, the partial survives and the resumed download is published. SFTP and FTP guarded uploads do not provide this `.filepart` resume behavior; their acknowledged staged publication requires a fresh copy. The GUI verified-resume path compares the checkpoint against remote bytes before resuming and publishes without replacing an existing destination. Ordinary SFTP resume now compares an existing prefix before continuing or adopting a destination, and refuses unsafe, complete, or oversized existing stages rather than deleting them.
+Downloads can stage in a `.filepart` file beside the destination and resume from that staging file. A mid-flight interruption test verifies the old destination remains untouched, the partial survives and the resumed download is published. SFTP and FTP guarded uploads do not provide this `.filepart` resume behavior; their acknowledged staged publication requires a fresh copy. The GUI verified-resume path compares the checkpoint against remote bytes before resuming and publishes without replacing an existing destination. Ordinary SFTP resume now compares an existing prefix before continuing or adopting a destination, and refuses unsafe, complete, or oversized existing stages rather than deleting them. Ordinary FTP resume also compares the saved prefix before modifying local files; FTP verification drains the full remote file with bounded memory and retains the control connection on mismatch.
 
-**Next:** Linux and Windows CI exercise interrupted and resumed SFTP downloads, including mismatched prefixes and preservation on refusal. The SFTP size/mtime guard is not an atomic snapshot: a remote or local file can still change concurrently, including with unchanged metadata. Other ordinary protocol resume paths do not yet verify prefixes. Guarded SFTP/FTP uploads still cannot resume; Android-device and live third-party server behavior remain unverified.
+**Next:** Linux and Windows loopback CI exercise interrupted SFTP downloads and stale SFTP/FTP prefix refusals. FTP and SFTP size/mtime checks are not atomic snapshots: a remote or local file can still change concurrently, including with unchanged metadata. Ordinary WebDAV/S3 resume paths do not yet verify prefixes. Guarded SFTP/FTP uploads still cannot resume; Android-device and live third-party server behavior remain unverified.
 
 **Acceptance criteria:**
 
-- [ ] Protect ordinary resume on the other protocols against stale prefixes and explicitly handle protocols without a strong remote version.
-- [ ] Address concurrent local and remote modification during SFTP resume without claiming size/mtime is an atomic snapshot.
+- [ ] Protect ordinary WebDAV and S3 resumes against stale prefixes using strong server-side version checks.
+- [ ] Address concurrent local and remote modification during FTP/SFTP resume without claiming size/mtime is an atomic snapshot.
 - [ ] Implement safe resumable guarded uploads, or document protocol-specific refusals and alternatives.
 - [ ] Exercise Android-device and relevant live-server behavior without the removed CLI.
 
