@@ -2,7 +2,7 @@ name: Windows build
 
 on:
   push:
-    branches: [master, arena/f2a71e52-linscp]
+    branches: [master]
   workflow_dispatch:
 
 concurrency:
